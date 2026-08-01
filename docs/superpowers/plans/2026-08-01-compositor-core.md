@@ -2128,7 +2128,7 @@ pub fn apply_config(&mut self, cfg: Config) -> Vec<Event> {
 }
 ```
 
-Add to `State`: `pub alt_tab: input::AltTabMachine`, `pub quitting: bool`, `pub pending_config_events: Vec<Event>`. `handle_key` maps keysym+mods via `input::match_action(&self.config.keybindings, mods, keysym)` and applies. `handle_pointer` begins a `DragMachine` on `DecorationAction::Move`, updates preview on motion (rendering consumes `drag.preview_zone()`), and on release calls `snap`/`snap_restore` or moves the window to `pointer - grab_offset`.
+Add to `State`: `pub alt_tab: input::AltTabMachine`, `pub quitting: bool`, `pub pending_config_events: Vec<Event>`, and `pub fn emit(&mut self, ev: Event)` that pushes into `self.window_manager.pending_events` (so `apply_action` can queue `AltTabState` and the like before the final `emit_pending()`). `handle_key` maps keysym+mods via `input::match_action(&self.config.keybindings, mods, keysym)` and applies. `handle_pointer` begins a `DragMachine` on `DecorationAction::Move`, updates preview on motion (rendering consumes `drag.preview_zone()`), and on release calls `snap`/`snap_restore` or moves the window to `pointer - grab_offset`.
 
 - [ ] **Step 4: Run tests**
 
