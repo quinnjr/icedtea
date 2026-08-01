@@ -1,0 +1,11 @@
+[package]
+name = "icedtea-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+icedtea-contract = { path = "../contract" }
+serde.workspace = true
+serde_json.workspace = true
+redb.workspace = true
