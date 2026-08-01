@@ -138,4 +138,37 @@ mod tests {
         assert!(u.maximized.is_none() && u.minimized.is_none() && u.fullscreen.is_none());
         assert!(u.focused.is_none());
     }
+
+    #[test]
+    fn window_update_option_round_trip() {
+        let ctxt = zvariant::serialized::Context::new_dbus(zvariant::LE, 0);
+        let some = WindowUpdate {
+            title: Some("New title".into()),
+            geometry: Some(Rectangle { x: 0, y: 0, width: 100, height: 80 }),
+            workspace: Some(2),
+            maximized: Some(true),
+            minimized: Some(false),
+            fullscreen: Some(true),
+            focused: Some(false),
+        };
+        let none = WindowUpdate::default();
+
+        for update in [&some, &none] {
+            let encoded = zvariant::to_bytes(ctxt, update).unwrap();
+            let decoded: WindowUpdate = encoded.deserialize().unwrap().0;
+            assert_eq!(update, &decoded);
+        }
+
+        // option-as-array encodes None as a 0-length array: in the all-None
+        // WindowUpdate the first field (`title`, an `as`) is an empty array.
+        let none_bytes = zvariant::to_bytes(ctxt, &none).unwrap();
+        assert_eq!(&none_bytes[..4], &[0, 0, 0, 0]);
+        // A bare Option<u32> is `au`: None is only the 4-byte length prefix.
+        let empty = zvariant::to_bytes(ctxt, &None::<u32>).unwrap();
+        assert_eq!(empty.len(), 4);
+        assert!(empty.iter().all(|b| *b == 0));
+        // Some(7) adds one u32 element: 4-byte length + 4-byte value.
+        let filled = zvariant::to_bytes(ctxt, &Some(7u32)).unwrap();
+        assert_eq!(filled.len(), 8);
+    }
 }

@@ -179,12 +179,27 @@ git commit -m "chore: scaffold icedtea workspace with contract, config, composit
   - `contract::Appearance { bar_position: String, bar_height: i32, corner_radius: i32, snap_gap: i32, palette: Palette, wallpaper: Option<String> }`
   - `contract::Event` enum, variants carry the same structs above.
 
+> **Wire signatures.** The concrete D-Bus signatures for the contract types:
+> - `WindowId` = `u`, `Rectangle` = `(iiii)`
+> - `WindowInfo` = `(ussuu(iiii)bbbb)`, `WorkspaceInfo` = `(us)`, `Snapshot` = `(ta(ussuu(iiii)bbbb)a(us)u)`
+> - `WindowUpdate` = `(asa(iiii)auabababab)`, `AltTabState` = `(baut)`*, `Palette` = `(sss)`, `Appearance` = `(siii(sss)as)`
+>
+> The `Option<T>` fields in `WindowUpdate` and `Appearance` marshal as 0/1-element arrays (`a<T>`): zvariant ≥ 5 dropped
+> the old VARIANT-based `Option` encoding, so `option-as-array` is the only D-Bus-valid encoding for `Option`. To make this
+> work, `contract/Cargo.toml` must declare `zvariant = { version = "5", features = ["option-as-array"] }`, and every Rust
+> crate that derives these `Type` types must use the same feature set (there is a single zvariant 5.13.1 in the workspace;
+> Cargo feature unification makes the feature globally effective once any crate enables it). The GTK shell (gio/D-Bus,
+> Plan 3) is not Rust: it must marshal the recorded signatures explicitly, including the `a`-array `Option` fields.
+>
+> \* `AltTabState.index` is `usize` and marshals as `t` (u64) on 64-bit targets; it would be `u` on 32-bit targets. All
+> icedtea targets are 64-bit Linux, so `t` is the effective signature.
+
 - [ ] **Step 1: Add `zvariant` to `contract`**
 
 In `contract/Cargo.toml` add:
 
 ```toml
-zvariant = "5"
+zvariant = { version = "5", features = ["option-as-array"] }
 ```
 
 - [ ] **Step 2: Write the wire types**
