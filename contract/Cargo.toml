@@ -6,3 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
+zvariant = { version = "5", features = ["option-as-array"] }
+
+[dev-dependencies]
+serde_json.workspace = true
