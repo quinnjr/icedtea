@@ -17,6 +17,15 @@ The name and original brief reference a "DWM" — the keyboard-driven ethos
 carries over (shortcuts for common operations), but the interaction model is
 floating-first with Win10-style snapping.
 
+## Version constraints
+
+- MSRV: Rust 1.94 (`rust-version = "1.94"` on every crate). All dependencies
+  support it.
+- Pinned majors: `smithay = "0.7"`, `zbus = "5"`, `redb = "3"`,
+  `gtk4-layer-shell = "0.8"`, `calloop` via smithay.
+- GTK3 layer-shell bindings (`gtk-layer-shell`) are unmaintained; GTK4 is the
+  only path. No GTK3 fallback.
+
 ## Goals
 
 - A usable floating WM with a polished Cinnamon/Win10-style shell.
@@ -365,8 +374,6 @@ lifecycle, so the DBus session bus is guaranteed present
 - The zbus ↔ calloop channel bridge is the main integration risk; it is small
   and isolated, but if it fights the event loop, an alternative is running the
   DBus service on a dedicated thread with a bounded channel.
-- `gtk4-layer-shell` maturity vs `gtk-layer-shell` (GTK3); fall back to GTK3
-  bindings if it blocks progress.
 - SSD rendering is a substantial slice of work; the hybrid mode limits the
   surface area (CSD-requesting apps are skipped).
 - Full scope in one plan carries mid-course redesign risk; the DBus contract
