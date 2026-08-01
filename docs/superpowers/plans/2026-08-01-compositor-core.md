@@ -21,6 +21,7 @@
 - No unsafe in icedtea code except `unsafe { redb::Database::create }` / `Database::open` (required by redb's mmap API), each with a comment.
 - Nested backend (`--nested`) is the dev/test backend; DRM + libinput is the real-session backend.
 - Follow `anvil` for all smithay glue; copy the relevant feature list from `anvil/Cargo.toml`.
+- **Threading:** the Wayland/render/input core stays on the single calloop loop. Blocking or CPU-heavy work (DBus service, config load/reload, wallpaper decode) runs on worker threads communicating with the main loop over crossbeam channels registered as calloop sources. Message passing only — no shared mutable state across threads; results are applied on the main loop when received.
 
 ---
 
@@ -1437,7 +1438,13 @@ Key adaptations, spelled out:
    ```rust
    fn main() {
        tracing_subscriber::fmt().with_env_filter(...).init();
-       let config = icedtea_config::load_or_default(&icedtea_config::default_db_path());
+       // Config I/O + JSON parse happens off the main thread.
+       let (config_tx, config_rx) = crossbeam_channel::bounded(1);
+       let db_path = icedtea_config::default_db_path();
+       std::thread::spawn(move || {
+           let _ = config_tx.send(icedtea_config::load_or_default(&db_path));
+       });
+       let config = config_rx.recv().expect("config worker finished");
        let (dbus_tx, _dbus_rx) = crossbeam_channel::unbounded::<Event>();
        let state = state::State::new(config, dbus_tx);
        // anvil's event loop setup, calling State::new(...)
@@ -1596,6 +1603,7 @@ Add `pub mod render;` to `compositor/src/main.rs`.
 Implement `draw_frame` by copying anvil's `render_output` (from `anvil/src/state.rs` or `anvil/src/render_elements.rs`) and adapting:
 
 - The scene tree from anvil (`AnvilState`'s `render_output`) becomes: render wallpaper element first (solid `[f32;4]` from `wallpaper_color`, or the loaded `image` stretched via `smithay::backend::renderer::element::solid::SolidColorRenderElement` / texture element — follow anvil's `render_elements.rs` `Wallpaper` element if present, else draw a `SolidColorRenderElement`), then each window's `WaylandSurfaceRenderElement`, then, when the drag machine is in `Preview` state (Task 9), a translucent accent `SolidColorRenderElement` covering the target `snapped_geometry`.
+- **Wallpaper decode runs on a worker thread.** On startup, `render.rs` spawns a thread that decodes `appearance.wallpaper` (via the `image` crate) into an `image::RgbaImage` and ships it over a bounded crossbeam channel to the main loop; the main loop registers the receiver as a calloop source. Until the decoded image arrives, the wallpaper renders as the solid `wallpaper_color`. When the buffer arrives, upload it to a GL texture on the render thread (texture upload must happen on the GL thread — the worker only decodes CPU-side). A `None`/failed decode stays on the solid color. This keeps the multi-megapixel JPEG decode entirely off the render loop.
 - Use `crate::decoration` metrics to render SSD strips (full SSD rendering lands in Task 10; here, wire the element slot and leave the geometry hook in place).
 
 - [ ] **Step 4: Run tests**
@@ -2429,6 +2437,8 @@ pub fn handle_command(&mut self, cmd: dbus::DbCommand) -> Option<()> {
 ```
 
 Simplify `reload_config_from_disk`'s event push (the `.into()` in the draft is wrong): just `events.push(Event::ConfigReloaded(self.config.appearance.clone()));`.
+
+**Threading requirement:** the redb I/O + JSON parse must never block the render loop. In `handle_command`, `DbCommand::ReloadConfig` spawns a worker thread that runs `load_or_default` and ships the `Config` back over a bounded crossbeam channel; the main loop registers the receiver as a calloop source and, when the config arrives, calls `apply_config` and emits `ConfigReloaded` (same as the sync path). `reload_config_from_disk` stays as the synchronous load+apply used by the test; `handle_command` routes through the async worker path.
 
 - [ ] **Step 4: Run tests**
 

@@ -84,6 +84,22 @@ Invariant: the compositor is the sole owner of window state. Every state
 change flows compositor → DBus signal → shell, so the taskbar, pager, and
 Alt+Tab can never disagree with reality.
 
+### Threading model
+
+- The Wayland dispatch, input, layout, and render core runs on a single
+  calloop loop. This is a hard constraint of smithay/Wayland (protocol
+  ordering, per-output GL contexts, seat state) — the loop is latency-bound,
+  not throughput-bound, so parallelism lives outside it.
+- Every blocking or CPU-heavy operation leaves the critical path and runs on
+  a dedicated worker thread that communicates with the main loop only by
+  message passing (crossbeam channels registered as calloop sources). No
+  shared mutable state across threads; results are applied on the main loop
+  when received.
+- Workers: DBus service + signal emitter (session bus on its own thread),
+  config load/reload (redb I/O + JSON parse), wallpaper image decode.
+- The shell (Plan 3) uses the same model: GTK main thread plus gio worker
+  threads for IPC reads and parsing.
+
 ## Crate layout
 
 | Crate | Responsibility |
