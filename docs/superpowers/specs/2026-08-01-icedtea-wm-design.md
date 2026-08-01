@@ -8,8 +8,10 @@ icedtea-wm is a floating Wayland window manager built on Smithay (pure-Rust
 compositor library) with a GTK4 shell that provides a Cinnamon/Windows 10
 desktop feel: taskbar with grouped app buttons, start menu, system tray,
 notifications, Alt+Tab switcher, workspace pager, and wallpaper. Configuration
-is GUI-driven and stored in a redb embedded database. Edge snapping
-(halves/quadrants) is the only "tiling" behavior; there is no auto-tiling.
+is GUI-driven and stored in a redb embedded database. Control flows over a
+single DBus control plane (`org.icedtea.WM`), and the whole session is composed
+as systemd user units. Edge snapping (halves/quadrants) is the only "tiling"
+behavior; there is no auto-tiling.
 
 The name and original brief reference a "DWM" — the keyboard-driven ethos
 carries over (shortcuts for common operations), but the interaction model is
@@ -21,9 +23,11 @@ floating-first with Win10-style snapping.
 - Config entirely managed through a GTK settings GUI, persisted in redb,
   applied live without restarting.
 - Clean separation: compositor owns window state; shell is a pure view plus
-  input source; they agree over a well-defined IPC protocol.
+  input source; they agree over a well-defined DBus contract.
 - Robustness: shell crash never takes down the compositor; config corruption
   never prevents startup.
+- First-class systemd integration: session lifecycle, crash recovery, and the
+  session DBus bus are all managed by the user manager.
 
 ## Non-goals (out of scope for v1)
 
@@ -31,12 +35,15 @@ floating-first with Win10-style snapping.
 - Snap-assist tile picker (the "fill the other half" overlay).
 - Live window thumbnails in the Alt+Tab switcher.
 - Manual (hand-edited) configuration files; the GUI is the only config writer.
-- A CLI or DBus interface for configuration.
+- A CLI for configuration.
 - Multi-session compositor or remote desktop.
 
 ## Architecture
 
-Two runtime processes plus two support crates, all in one Cargo workspace:
+Three runtime processes plus two support crates, all in one Cargo workspace.
+The compositor, shell, and settings all attach to the session DBus bus, which
+is managed by the systemd user manager. systemd also owns process lifecycle
+(see Systemd integration).
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -46,74 +53,90 @@ Two runtime processes plus two support crates, all in one Cargo workspace:
 │  │             edge-snap preview overlay                 │
 │  ├─ input: keybindings, pointer drag/move, alt-tab hold  │
 │  ├─ config: reads + hot-reloads redb                     │
-│  └─ IPC server (unix socket, JSONL) ◄────┐               │
-└──────────────────────────────────────────│───────────────┘
-                                           │ socket
-┌──────────────────────────────────────────│───────────────┐
-│ shell (GTK4, gtk4-layer-shell)           ▼               │
+│  ├─ hosts org.icedtea.WM DBus service ◄────┐             │
+│  └─ systemd: graphical-session.target unit │             │
+└────────────────────────────────────────────│─────────────┘
+                                              │ session bus
+┌────────────────────────────────────────────│─────────────┐
+│ shell (GTK4, gtk4-layer-shell)             ▼             │
 │  ├─ layer-surfaces: taskbar(+tray, pager), notifications,│
 │  │                  alt-tab switcher                     │
 │  ├─ start menu (popover) + settings launcher             │
-│  └─ IPC client ── window/workspace commands              │
+│  └─ DBus client (gio) ── window/workspace commands       │
 └──────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────┐
 │ settings (GTK4)                                          │
-│  ├─ writes config.redb, sends ReloadConfig over IPC      │
+│  ├─ writes config.redb, sends ReloadConfig over DBus     │
 │  └─ launched from the start menu                         │
 └──────────────────────────────────────────────────────────┘
 ```
 
 Invariant: the compositor is the sole owner of window state. Every state
-change flows compositor → IPC → shell, so the taskbar, pager, and Alt+Tab can
-never disagree with reality.
+change flows compositor → DBus signal → shell, so the taskbar, pager, and
+Alt+Tab can never disagree with reality.
 
 ## Crate layout
 
 | Crate | Responsibility |
 | --- | --- |
-| `ipc-proto` | Shared pure-data serde types for the IPC protocol. No runtime deps beyond serde. |
+| `contract` | Shared types and DBus interface name/string constants. No runtime deps beyond zbus and serde. |
 | `config` | Shared schema for configuration values, serialized into redb tables. |
-| `compositor` | The Smithay binary. |
-| `shell` | The GTK4 shell binary. |
+| `compositor` | The Smithay binary; hosts `org.icedtea.WM`. |
+| `shell` | The GTK4 shell binary; DBus client via gio. |
 | `settings` | The GTK4 settings GUI binary. |
 
-## IPC protocol
+## DBus control plane
 
-- Transport: newline-delimited JSON over a unix socket at
-  `$XDG_RUNTIME_DIR/icedtea-ipc.sock`, mode 0700.
-- Envelope: `{"seq": <n>, "type": "...", "payload": {...}}`.
-- Compositor is the server. Shell and settings connect as clients.
-- On connect, the client receives a full `Snapshot`, then applies deltas.
-- On disconnect the client keeps its UI alive and retries with backoff.
+The session bus is the single control plane. Transport is the standard DBus
+session bus (per-user, started by systemd); the interface is
+`org.icedtea.WM`, owned by the compositor. There is no other IPC channel.
 
-### Events (compositor → clients)
+### Client connection model
 
-- `WindowOpened { id, app_id, title, pid }`
-- `WindowClosed { id }`
-- `WindowUpdated { id, title?, geometry?, state?, workspace?, focused?,
-  minimized? }` — partial fields.
-- `WorkspaceSet { id, active }` — a workspace became current.
-- `WorkspaceList { workspaces: [...] }` — rename/add/remove.
-- `AltTabState { active, entries: [window ids], index }` — shell renders the
-  switcher while the compositor holds the Alt+Tab key.
-- `ConfigReloaded { appearance }` — theme colors, bar geometry, fonts.
+- Clients (shell, settings, external tools) call `GetState()` to receive a
+  full `Snapshot`, then subscribe to signals for deltas. The snapshot
+  envelope carries a monotonically increasing sequence number so a client can
+  detect missed events and re-sync.
+- A client whose connection drops keeps its UI alive and re-watches the
+  service name with backoff, then re-syncs via `GetState()`.
 
-### Commands (clients → compositor)
+### Methods (clients → compositor)
 
-- `FocusWindow { id }`, `CloseWindow { id }`
-- `MinimizeWindow { id, toggle }`, `MaximizeWindow { id, toggle }`,
-  `FullscreenWindow { id, toggle }`
-- `SetWorkspace { id }`, `MoveWindowToWorkspace { id, workspace }`
-- `ReloadConfig` (sent by `settings` after a commit), `Quit`
+- `FocusWindow(id)`, `CloseWindow(id)`
+- `MinimizeWindow(id, toggle)`, `MaximizeWindow(id, toggle)`,
+  `FullscreenWindow(id, toggle)`
+- `SetWorkspace(id)`, `MoveWindowToWorkspace(id, workspace)`
+- `GetState() → Snapshot`
+- `ReloadConfig()` (sent by `settings` after a commit), `Quit()`
+
+### Signals (compositor → clients)
+
+- `WindowOpened(id, app_id, title, pid)`
+- `WindowClosed(id)`
+- `WindowUpdated(id, {title?, geometry?, state?, workspace?, focused?,
+  minimized?})` — partial fields.
+- `WorkspaceSet(id, active)` — a workspace became current.
+- `WorkspaceList(workspaces)` — rename/add/remove.
+- `AltTabState(active, entries, index)` — shell renders the switcher while the
+  compositor holds the Alt+Tab key.
+- `ConfigReloaded(appearance)` — theme colors, bar geometry, fonts.
+
+### Compositor-side bridge
+
+The compositor runs Smithay's calloop event loop; zbus runs its own async
+runtime. The bridge is a small channel pair: an incoming channel (DBus method
+calls → compositor commands, drained by a calloop source) and an outgoing
+channel (compositor events → DBus signals, driven by the zbus runtime). No
+runtime fusion is attempted; the two loops communicate only through channels.
 
 ### Deliberate carve-outs
 
 - Drag-to-edge snap preview is compositor-drawn (translucent GL rectangles);
-  it tracks the pointer at frame rate and never round-trips over the socket.
+  it tracks the pointer at frame rate and never round-trips over DBus.
 - Alt+Tab is compositor-driven (it owns the keyboard); the shell is a pure
   renderer of the switcher UI.
 - The shell spawns apps it launches (start menu, taskbar pins) directly; app
-  launching is not an IPC concern.
+  launching is not a control-plane concern.
 
 ## Compositor design
 
@@ -129,7 +152,8 @@ never disagree with reality.
 - `input.rs` — keybindings, pointer drag/move, Alt+Tab hold.
 - `render.rs` — wallpaper, scene assembly, snap preview.
 - `config.rs` — redb reads and live reload.
-- `ipc/` — server and serialization.
+- `dbus.rs` — `org.icedtea.WM` service and the channel bridge into calloop.
+- `logind.rs` — suspend inhibition for fullscreen.
 
 ### State model
 
@@ -190,9 +214,10 @@ custom CSS theme built from config appearance.
 
 ### Threading
 
-IPC uses `gio::SocketClient` (async, unix socket) on the glib main context, so
-the compositor reader and GTK share one thread. No mutex in the state model.
-Events reduce into a state tree, then widgets are invalidated.
+The shell uses glib's native DBus integration (`gio::DBusConnection` +
+`DBusProxy`) on the glib main context, so compositor signals and GTK share one
+thread. No mutex in the state model. Signals reduce into a state tree, then
+widgets are invalidated.
 
 ### State model
 
@@ -202,7 +227,7 @@ ShellState { windows: HashMap<Id, Window>, workspaces, active_workspace,
 ```
 
 The reducer (snapshot → apply delta) is a pure function, unit-tested with
-scripted IPC event sequences.
+scripted DBus signal sequences.
 
 ### Surfaces
 
@@ -225,9 +250,9 @@ scripted IPC event sequences.
 ## Settings GUI
 
 A regular GTK window launched from the start menu. Reads and writes
-`$XDG_CONFIG_HOME/icedtea/config.redb`; after a commit it sends `ReloadConfig`
-to the compositor, which re-reads the DB and pushes `ConfigReloaded` to the
-shell.
+`$XDG_CONFIG_HOME/icedtea/config.redb`; after a commit it calls
+`ReloadConfig()` on `org.icedtea.WM`, and the compositor re-reads the DB and
+emits `ConfigReloaded` to the shell.
 
 Widgets:
 
@@ -254,14 +279,57 @@ Widgets:
 - On read failure or DB corruption, compositor falls back to baked-in defaults
   rather than crashing.
 - Multi-process model: single writer (settings), single reader (compositor).
-  The shell never opens the DB; it receives appearance over IPC.
+  The shell never opens the DB; it receives appearance over DBus.
 - redb has no change-watch API, so the writer signals the compositor via
-  `ReloadConfig` after each commit.
+  `ReloadConfig()` after each commit.
+
+## Systemd integration
+
+The session is composed of systemd user units against `graphical-session.target`
+— the standard pattern used by sway/Hyprland. The user manager owns process
+lifecycle, so the DBus session bus is guaranteed present
+(`dbus-broker.service`) and no `dbus-run-session` wrapper is needed.
+
+### Units
+
+- `icedtea-compositor.service` — runs the compositor; hosts `org.icedtea.WM`.
+  `WantedBy=graphical-session.target`, `After=graphical-session-pre.target`,
+  `Restart=on-failure`.
+- `icedtea-shell.service` — runs the shell. `WantedBy=graphical-session.target`,
+  `After=icedtea-compositor.service`, `Restart=always`. The existing
+  reconnect-with-backoff logic tolerates compositor restarts.
+- Both units set
+  `Environment=XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=icedtea XDG_SESSION_DESKTOP=icedtea`.
+- `settings` is not a service — it is a regular window launched on demand from
+  the start menu (D-Bus activation is future work).
+- `/usr/share/wayland-sessions/icedtea.desktop` registers the session so
+  GDM/lightdm/sddm can list it.
+
+### Integration points
+
+- **Autostart:** explicitly not re-implemented. `systemd-xdg-autostart-generator`
+  launches `.desktop` Autostart entries as user units; the start menu only
+  lists and launches apps on demand.
+- **Power menu:** `loginctl` (lock/logout/reboot/shutdown) — a logind client in
+  the shell.
+- **Fullscreen inhibit:** a focused fullscreen window holds a logind
+  `Inhibit` (suspend) so the screen does not blank/suspend during video; a
+  small `org.freedesktop.login1` client in the compositor.
+- **App launching:** spawned apps inherit the user-manager scope. Optional
+  follow-up: `systemd-run --user` for launch-and-manage (stop/restart from the
+  taskbar) — future work.
+
+### Crash policy
+
+- Compositor exit tears the session down (`PartOf=graphical-session.target`).
+- Shell restart is independent (`Restart=always`); a dead shell never kills the
+  WM, and a dead compositor does not wedge the shell — it reconnects on restart.
 
 ## Error handling
 
-- Shell/settings disconnect: client keeps UI alive, retries with backoff. The
-  WM keeps running without a shell.
+- Shell/settings disconnect: the client keeps its UI alive and re-watches the
+  service name with backoff, then re-syncs via `GetState()`. The WM keeps
+  running without a shell.
 - Config corruption: compositor uses defaults; settings shows an error and
   offers reset-to-defaults on open.
 - App crash isolation: a crashing client window is unmapped and cleaned up; the
@@ -271,28 +339,35 @@ Widgets:
 
 - `layout.rs`: unit tests for placement and snap-zone geometry, including
   HiDPI and multi-monitor scenarios.
-- `ipc-proto`: serde round-trip tests for every message.
+- `contract`: zbus type round-trip tests for every method/signal signature.
 - `config`: table round-trip tests and default-fallback tests.
-- Shell: unit tests for the state reducer against scripted IPC event
+- Shell: unit tests for the state reducer against scripted DBus signal
   sequences; `.desktop` parsing helpers.
 - Integration: nested Smithay Wayland backend opens surfaces and verifies
-  workspace/focus logic.
-- Manual: full session with real apps, dragging, snapping, shell behavior.
+  workspace/focus logic; the DBus bridge is exercised against a real session
+  bus in CI where available.
+- Manual: full session with real apps, dragging, snapping, shell behavior,
+  and systemd restart/recovery paths.
 
 ## Future work
 
 - Live window thumbnails in Alt+Tab (screencopy-style protocol).
 - Snap-assist tile picker.
-- DBus or CLI configuration interface.
+- CLI configuration interface (writes redb, mirrors the settings GUI).
+- D-Bus activation for the settings app.
+- `systemd-run --user` app launching with taskbar stop/restart.
 - Multi-monitor wallpaper per-output settings.
 - Session persistence / restore.
 
 ## Risks
 
 - Smithay API churn (active project; version pin recommended).
+- The zbus ↔ calloop channel bridge is the main integration risk; it is small
+  and isolated, but if it fights the event loop, an alternative is running the
+  DBus service on a dedicated thread with a bounded channel.
 - `gtk4-layer-shell` maturity vs `gtk-layer-shell` (GTK3); fall back to GTK3
   bindings if it blocks progress.
 - SSD rendering is a substantial slice of work; the hybrid mode limits the
   surface area (CSD-requesting apps are skipped).
-- Full scope in one plan carries mid-course redesign risk; the IPC contract
+- Full scope in one plan carries mid-course redesign risk; the DBus contract
   and pure-function boundaries are the pressure-release points.
