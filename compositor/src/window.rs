@@ -33,6 +33,8 @@ pub struct WindowManager {
     /// Pending events drained by the compositor each frame.
     pub pending_events: Vec<Event>,
     /// Focus history: most-recently-focused windows (head = most recent).
+    /// Invariant: every WindowId in self.windows is in focus_mru (guaranteed because
+    /// add_window always calls focus, and remove_window prunes from focus_mru).
     focus_mru: Vec<WindowId>,
 }
 
@@ -96,6 +98,8 @@ impl WindowManager {
         if was_focused {
             self.workspace_mut(workspace).focused_window = None;
         }
+        // Prune from focus MRU to prevent unbounded growth.
+        self.focus_mru.retain(|&wid| wid != id);
         self.emit(Event::WindowClosed(id));
         Some(window)
     }
@@ -221,6 +225,7 @@ impl WindowManager {
 
     pub fn windows(&self) -> impl Iterator<Item = &Window> {
         // Return windows ordered by focus MRU (most recent first).
+        // Invariant: every window in self.windows is in focus_mru, so filter_map is safe.
         self.focus_mru.iter().filter_map(move |id| self.windows.get(id))
     }
 
@@ -370,5 +375,24 @@ mod tests {
         m.focus(a).unwrap();
         let ids: Vec<_> = m.windows().map(|w| w.id).collect();
         assert_eq!(ids, vec![a, c, b]);
+    }
+
+    #[test]
+    fn remove_window_prunes_focus_mru() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1);
+        let b = m.add_window("b", "b", 2);
+        let c = m.add_window("c", "c", 3);
+        // MRU order: c, b, a
+        assert_eq!(m.windows().map(|w| w.id).collect::<Vec<_>>(), vec![c, b, a]);
+        // Remove b (middle of MRU).
+        m.remove_window(b).unwrap();
+        // Should have c, a in MRU order.
+        assert_eq!(m.windows().map(|w| w.id).collect::<Vec<_>>(), vec![c, a]);
+        // Add new window d, should be MRU first.
+        let d = m.add_window("d", "d", 4);
+        assert_eq!(m.windows().map(|w| w.id).collect::<Vec<_>>(), vec![d, c, a]);
+        // Verify b is not in the state at all.
+        assert!(m.get(b).is_none());
     }
 }
