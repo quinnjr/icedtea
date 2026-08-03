@@ -62,12 +62,28 @@ pub fn default_db_path() -> PathBuf {
 /// caught, the payload is logged, and we return a plain `redb::Error::Io` so
 /// the caller's `Result`-based fallback logic applies uniformly whether redb
 /// panicked or returned `Err` normally.
+///
+/// We also suppress the default panic hook for the duration of the call.
+/// Without that, `catch_unwind` still stops the unwind from propagating, but
+/// Rust's default hook runs *before* unwinding starts and prints a raw
+/// `thread '...' panicked at ...: assertion failed: ...` line straight to
+/// stderr — indistinguishable, to anyone tailing logs, from an unhandled
+/// crash, even though we go on to log a clean `tracing::warn!` and return
+/// defaults. `std::panic::set_hook` is process-global, so the swap is guarded
+/// by `PANIC_HOOK_LOCK` to serialize it against any other thread doing the
+/// same swap (e.g. concurrent test threads exercising this same function),
+/// and the previous hook is restored immediately after `catch_unwind`
+/// returns, before the lock is released. The one accepted trade-off: any
+/// *unrelated* panic on another thread that happens to land inside this
+/// narrow window will also print nothing, since the hook is process-wide;
+/// that window is a single `Database::create` call, so the exposure is
+/// small.
 pub fn open(db_path: &Path) -> Result<Database, redb::Error> {
     if let Some(dir) = db_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let owned_path = db_path.to_path_buf();
-    match std::panic::catch_unwind(move || Database::create(&owned_path)) {
+    match catch_unwind_silently(move || Database::create(&owned_path)) {
         Ok(result) => result.map_err(Into::into),
         Err(payload) => {
             let msg = panic_payload_message(&payload);
@@ -75,6 +91,27 @@ pub fn open(db_path: &Path) -> Result<Database, redb::Error> {
             Err(std::io::Error::other(format!("redb panicked while opening database: {msg}")).into())
         }
     }
+}
+
+/// Process-global lock serializing temporary panic-hook swaps (see
+/// `catch_unwind_silently`) so concurrent callers don't clobber each other's
+/// saved hook.
+static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Like `std::panic::catch_unwind`, but additionally installs a no-op panic
+/// hook for the duration of the call so an expected/handled panic doesn't
+/// print a raw backtrace line to stderr. The previous hook is restored
+/// before returning, whether `f` panicked or not.
+fn catch_unwind_silently<F, R>(f: F) -> std::thread::Result<R>
+where
+    F: FnOnce() -> R + std::panic::UnwindSafe,
+{
+    let _guard = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_info| {}));
+    let result = std::panic::catch_unwind(f);
+    std::panic::set_hook(previous_hook);
+    result
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
