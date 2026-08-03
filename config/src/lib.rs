@@ -45,11 +45,46 @@ pub fn default_db_path() -> PathBuf {
 
 /// Open the config DB. Missing file -> creates it. Corrupt/IO errors bubble up
 /// to the caller (which chooses defaults).
+///
+/// `redb::Database::create` is documented to return `Err` on a corrupt file,
+/// but in practice (observed with redb 3.1.3, see
+/// `config/tests/corruption_manual.rs::truncated_redb_file_returns_defaults`)
+/// a truncated/corrupt file can instead trip an internal `assert!` in redb's
+/// page manager and unwind as a panic rather than a `Result::Err`. We catch
+/// that unwind here and turn it into an `Err` so `load_or_default` can fall
+/// back to defaults, per the crate's never-panic contract.
+///
+/// This is sound: the panic occurs entirely inside the (failed) construction
+/// of the `Database` value being returned by this call — there is no
+/// partially-initialized `Database` escaping the panic, no shared/static/lock
+/// state that redb leaves poisoned across this boundary, and nothing else on
+/// this thread holds a reference into the half-built object. The unwind is
+/// caught, the payload is logged, and we return a plain `redb::Error::Io` so
+/// the caller's `Result`-based fallback logic applies uniformly whether redb
+/// panicked or returned `Err` normally.
 pub fn open(db_path: &Path) -> Result<Database, redb::Error> {
     if let Some(dir) = db_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    Database::create(db_path).map_err(Into::into)
+    let owned_path = db_path.to_path_buf();
+    match std::panic::catch_unwind(move || Database::create(&owned_path)) {
+        Ok(result) => result.map_err(Into::into),
+        Err(payload) => {
+            let msg = panic_payload_message(&payload);
+            tracing::warn!("config db open panicked ({msg}), treating file as corrupt");
+            Err(std::io::Error::other(format!("redb panicked while opening database: {msg}")).into())
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 fn read_json<T: DeserializeOwned>(

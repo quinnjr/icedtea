@@ -671,6 +671,8 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
