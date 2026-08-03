@@ -32,6 +32,8 @@ pub struct WindowManager {
     seq: u64,
     /// Pending events drained by the compositor each frame.
     pub pending_events: Vec<Event>,
+    /// Focus history: most-recently-focused windows (head = most recent).
+    focus_mru: Vec<WindowId>,
 }
 
 impl WindowManager {
@@ -48,6 +50,7 @@ impl WindowManager {
             next_id: 1,
             seq: 0,
             pending_events: Vec::new(),
+            focus_mru: Vec::new(),
         }
     }
 
@@ -58,6 +61,11 @@ impl WindowManager {
     fn emit(&mut self, event: Event) {
         self.bump();
         self.pending_events.push(event);
+    }
+
+    pub fn note_event(&mut self) -> &mut Vec<Event> {
+        self.bump();
+        &mut self.pending_events
     }
 
     pub fn add_window(&mut self, app_id: &str, title: &str, pid: u32) -> WindowId {
@@ -136,23 +144,36 @@ impl WindowManager {
             return None;
         }
         let w = self.windows.get_mut(&id)?;
+        let old_workspace = w.workspace;
+        let was_focused = w.focused;
         w.workspace = workspace;
         w.focused = false;
+        // Clear focus pointer from origin workspace if this window was focused there.
+        if was_focused && self.workspace_mut(old_workspace).focused_window == Some(id) {
+            self.workspace_mut(old_workspace).focused_window = None;
+        }
         self.emit(Event::WindowUpdated { id, update: WindowUpdate { workspace: Some(workspace), focused: Some(false), ..Default::default() } });
         Some(())
     }
 
     pub fn focus(&mut self, id: WindowId) -> Option<()> {
-        let w = self.windows.get_mut(&id)?;
-        if w.minimized {
-            w.minimized = false;
-        }
-        let (ws, was_focused) = {
+        let (ws, was_focused, was_minimized) = {
             let w = self.windows.get(&id)?;
-            (w.workspace, w.focused)
+            (w.workspace, w.focused, w.minimized)
         };
         if was_focused {
+            // If already focused but minimized, unminimize and emit event.
+            if was_minimized {
+                let w = self.windows.get_mut(&id)?;
+                w.minimized = false;
+                self.emit(Event::WindowUpdated { id, update: WindowUpdate { minimized: Some(false), ..Default::default() } });
+            }
             return Some(());
+        }
+        // Unminimize if needed.
+        if was_minimized {
+            let w = self.windows.get_mut(&id)?;
+            w.minimized = false;
         }
         // Clear prior focus on the same workspace.
         let old = self.workspace_mut(ws).focused_window.replace(id);
@@ -167,7 +188,15 @@ impl WindowManager {
         }
         let w = self.windows.get_mut(&id)?;
         w.focused = true;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { focused: Some(true), ..Default::default() } });
+        // Emit combined event if we unminimized during focus change.
+        if was_minimized {
+            self.emit(Event::WindowUpdated { id, update: WindowUpdate { focused: Some(true), minimized: Some(false), ..Default::default() } });
+        } else {
+            self.emit(Event::WindowUpdated { id, update: WindowUpdate { focused: Some(true), ..Default::default() } });
+        }
+        // Update focus MRU.
+        self.focus_mru.retain(|&wid| wid != id);
+        self.focus_mru.insert(0, id);
         Some(())
     }
 
@@ -191,7 +220,8 @@ impl WindowManager {
     }
 
     pub fn windows(&self) -> impl Iterator<Item = &Window> {
-        self.windows.values()
+        // Return windows ordered by focus MRU (most recent first).
+        self.focus_mru.iter().filter_map(move |id| self.windows.get(id))
     }
 
     pub fn windows_in_workspace(&self, ws: u32) -> Vec<&Window> {
@@ -279,6 +309,8 @@ mod tests {
         m.set_workspace(a, 1).unwrap();
         assert_eq!(m.get(a).unwrap().workspace, 1);
         assert!(!m.get(a).unwrap().focused);
+        // Verify focused_window() is cleared after move (stale pointer check).
+        assert!(m.focused_window().is_none());
     }
 
     #[test]
@@ -308,5 +340,35 @@ mod tests {
         let b = m.add_window("b", "b", 2);
         m.set_minimized(a, true).unwrap();
         assert_eq!(m.alt_tab_entries(), vec![b]);
+    }
+
+    #[test]
+    fn focus_minimized_already_focused_emits_event() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1);
+        // Minimize while focused.
+        m.set_minimized(a, true).unwrap();
+        m.pending_events.clear();
+        // Focus again (already focused, but minimized).
+        m.focus(a).unwrap();
+        // Should emit an event for the minimized state change.
+        assert!(!m.pending_events.is_empty());
+        assert!(matches!(m.pending_events.first(), Some(Event::WindowUpdated { .. })));
+        assert!(!m.get(a).unwrap().minimized);
+    }
+
+    #[test]
+    fn windows_ordered_by_mru() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1);
+        let b = m.add_window("b", "b", 2);
+        let c = m.add_window("c", "c", 3);
+        // Current order (MRU first): c, b, a
+        let ids: Vec<_> = m.windows().map(|w| w.id).collect();
+        assert_eq!(ids, vec![c, b, a]);
+        // Focus a, should move to front.
+        m.focus(a).unwrap();
+        let ids: Vec<_> = m.windows().map(|w| w.id).collect();
+        assert_eq!(ids, vec![a, c, b]);
     }
 }
