@@ -1,5 +1,6 @@
 pub mod window;
 pub mod layout;
+pub mod decoration;
 
 fn main() {
     tracing_subscriber::fmt()
