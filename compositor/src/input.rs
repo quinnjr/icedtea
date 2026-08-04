@@ -27,7 +27,14 @@ pub fn key_name_to_keysym(name: &str) -> u32 {
         "KEY_r" => 0x72,
         _ => {
             if let Some(Ok(digit)) = name.strip_prefix("KEY_").map(|rest| rest.parse::<u32>()) {
-                return 0x30 + digit; // KEY_1..KEY_9
+                // Bounded to 1..=9 to match the comment/round-trip contract
+                // (`keysym_to_key_name` only inverts 0x31..=0x39) -- the
+                // brief's sample parsed any numeric suffix unbounded (e.g.
+                // "KEY_99" would silently yield keysym 147), which is a real
+                // logic bug against its own stated intent, not just style.
+                if (1..=9).contains(&digit) {
+                    return 0x30 + digit; // KEY_1..KEY_9
+                }
             }
             tracing::warn!("unknown key name {name}");
             0
@@ -76,7 +83,20 @@ pub fn match_action(
                 "CTRL" => Modifiers::CTRL,
                 "ALT" => Modifiers::ALT,
                 "SHIFT" => Modifiers::SHIFT,
-                _ => Modifiers::empty(),
+                _ => {
+                    tracing::warn!("unrecognized modifier token {m} in binding for action {action}");
+                    // Route an unrecognized token (typo, wrong case, etc.)
+                    // to a sentinel bit outside the four defined flags
+                    // instead of `Modifiers::empty()`. Runtime `mods` values
+                    // are always built from just SUPER/CTRL/ALT/SHIFT, so
+                    // this permanently prevents `wanted == mods` from
+                    // matching -- a mistyped modifier makes the binding
+                    // unreachable (loud, once wired to real input logging),
+                    // rather than silently downgrading it to "no modifier
+                    // required" and matching a bare keypress or the wrong
+                    // combo.
+                    Modifiers::from_bits_retain(u32::MAX)
+                }
             }
         });
         if wanted == mods && key_name_to_keysym(&combo.key) == keysym {
@@ -181,16 +201,24 @@ impl DragMachine {
         self.preview_zone
     }
 
-    pub fn grab_offset(&self) -> (i32, i32) {
-        self.grab_offset
-    }
-
     pub fn end(&mut self) -> DragResult {
         match (self.window_id.take(), self.preview_zone.take()) {
             (Some(_), Some(zone)) => DragResult::Snapped(zone),
             (Some(_), None) => DragResult::Moved,
             _ => DragResult::Restored,
         }
+    }
+
+    // Reachable "abort mid-drag" transition (e.g. Escape during a drag):
+    // discards any in-flight window/preview state and always reports
+    // `Restored`, regardless of whether a snap preview was staged. Without
+    // this, `end()` can only produce `Restored` when `begin()` was never
+    // called (or a prior `end()`/`cancel()` already consumed the drag), so
+    // a drag that genuinely started had no way to signal "put it back."
+    pub fn cancel(&mut self) -> DragResult {
+        self.window_id = None;
+        self.preview_zone = None;
+        DragResult::Restored
     }
 }
 
@@ -218,6 +246,18 @@ mod tests {
     #[test]
     fn wrong_keysym_does_not_match() {
         assert_eq!(match_action(&bindings(), Modifiers::SUPER, 0x66), None);
+    }
+
+    #[test]
+    fn unknown_modifier_token_never_matches() {
+        let mut m = HashMap::new();
+        // A typo'd/mis-cased modifier ("Sooper" instead of "SUPER") must not
+        // silently fold to `Modifiers::empty()` -- that would make this
+        // binding fire on a bare `KEY_q` with no modifiers at all, or on
+        // any other combo that happens to share `wanted == mods`.
+        m.insert("typo".into(), KeyCombo { modifiers: vec!["Sooper".into()], key: "KEY_q".into() });
+        assert_eq!(match_action(&m, Modifiers::empty(), 0x71), None);
+        assert_eq!(match_action(&m, Modifiers::SUPER, 0x71), None);
     }
 
     #[test]
@@ -250,5 +290,19 @@ mod tests {
         m.motion((500, 400), output, 8);
         assert_eq!(m.preview_zone(), None);
         assert!(matches!(m.end(), DragResult::Moved));
+    }
+
+    #[test]
+    fn drag_cancel_restores() {
+        let output = Rectangle { x: 0, y: 0, width: 1000, height: 800 };
+        let mut m = DragMachine::new();
+        m.begin(WindowId(1), (10, 10));
+        m.motion((2, 400), output, 8);
+        assert_eq!(m.preview_zone(), Some(SnapZone::Left));
+        assert!(matches!(m.cancel(), DragResult::Restored));
+        // Cancel is one-shot too: the staged snap preview is discarded, not
+        // just skipped once.
+        assert_eq!(m.preview_zone(), None);
+        assert!(matches!(m.end(), DragResult::Restored));
     }
 }
