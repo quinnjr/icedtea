@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod config_combo;
+pub mod dbus;
 pub mod decoration;
 pub mod input;
 pub mod layout;
@@ -7,6 +8,7 @@ pub mod render;
 pub mod state;
 pub mod window;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use icedtea_contract::Event;
@@ -29,13 +31,30 @@ fn main() {
     let db_path = icedtea_config::default_db_path();
     let config = icedtea_config::load_or_default(&db_path);
 
-    let (dbus_tx, _dbus_rx) = crossbeam_channel::unbounded::<Event>();
-    // `_dbus_rx` has no consumer yet by design: Task 12's D-Bus thread is the
-    // intended consumer of this channel and becomes the drain.
+    let (dbus_tx, dbus_events_rx) = crossbeam_channel::unbounded::<Event>();
+    // `dbus_events_rx` is drained by the D-Bus service's emitter thread,
+    // spawned below via `dbus::spawn_service` -- the consumer this channel
+    // was created for back in task 7.
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new().expect("failed to create the event loop");
     let mut state = State::new(config, dbus_tx);
     state.set_loop_signal(event_loop.get_signal());
+
+    // The D-Bus service runs on its own thread (binding threading-model
+    // ruling from task 7) and talks back to this loop only via `cmd_channel`
+    // (see `dbus.rs`'s module doc for why that's a `calloop::channel`
+    // `Sender`, not the brief's literal `crossbeam_channel::Sender`).
+    let (cmd_tx, cmd_channel) = smithay::reexports::calloop::channel::channel::<dbus::DbCommand>();
+    let dbus_quit_signal = Arc::new(AtomicBool::new(false));
+    let _dbus_conn = dbus::spawn_service(dbus_events_rx, cmd_tx, dbus_quit_signal.clone());
+    event_loop
+        .handle()
+        .insert_source(cmd_channel, |event, _, state: &mut State| {
+            if let smithay::reexports::calloop::channel::Event::Msg(cmd) = event {
+                state.handle_dbus_command(cmd);
+            }
+        })
+        .expect("failed to insert the D-Bus command channel into the event loop");
 
     let display: Display<State> = state.take_display();
 
@@ -125,4 +144,9 @@ fn main() {
             let _ = state.display_handle.flush_clients();
         })
         .expect("event loop error");
+
+    // Let the D-Bus emitter thread's polling `recv_timeout` (see
+    // `dbus.rs`'s module doc) notice the shutdown and exit its loop rather
+    // than being severed mid-`emit_signal` when the process exits.
+    dbus_quit_signal.store(true, Ordering::Relaxed);
 }

@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod config_combo;
+pub mod dbus;
 pub mod decoration;
 pub mod input;
 pub mod layout;

@@ -306,8 +306,26 @@ impl State {
     /// the saved geometry. Emits WindowUpdated event.
     pub fn toggle_fullscreen(&mut self, id: WindowId) -> Option<()> {
         let w = self.window_manager.get(id)?;
-        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
         let target = !w.fullscreen;
+        self.set_fullscreen_target(id, target)
+    }
+
+    /// Set fullscreen to an explicit `target` value, saving/restoring
+    /// geometry exactly like `toggle_fullscreen` (which is now a thin
+    /// `target = !current` wrapper around this). Added for task 12's
+    /// `DbCommand::Fullscreen(id, toggle)` D-Bus command, whose `toggle`
+    /// argument (despite the name -- it's the interface method's parameter
+    /// name from the brief) is an explicit target state, not a flip
+    /// request; a `FullscreenWindow(id, true)` call on an
+    /// already-fullscreen window must stay a no-op rather than treating the
+    /// current geometry as a fresh "pre-fullscreen" save point and
+    /// clobbering the real one.
+    pub fn set_fullscreen_target(&mut self, id: WindowId, target: bool) -> Option<()> {
+        let w = self.window_manager.get(id)?;
+        if w.fullscreen == target {
+            return Some(());
+        }
+        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
         self.window_manager.set_fullscreen(id, target)?;
         if target {
             // Save current geometry before entering fullscreen
@@ -322,6 +340,56 @@ impl State {
         }
         self.emit_pending();
         Some(())
+    }
+
+    /// Apply a [`crate::dbus::DbCommand`] received from the D-Bus service
+    /// thread (see `dbus.rs`'s module doc for the threading model). Every
+    /// arm except `GetState` mirrors an `apply_action`/`WindowManager`
+    /// mutation and drains pending events on the way out, same as
+    /// `apply_action`; `GetState` is a synchronous read that never mutates
+    /// anything, so it doesn't need one.
+    pub fn handle_dbus_command(&mut self, cmd: crate::dbus::DbCommand) {
+        use crate::dbus::DbCommand;
+        match cmd {
+            DbCommand::Focus(id) => {
+                self.window_manager.focus(id);
+            }
+            DbCommand::Close(id) => {
+                self.window_manager.remove_window(id);
+            }
+            DbCommand::Minimize(id, value) => {
+                self.window_manager.set_minimized(id, value);
+            }
+            DbCommand::Maximize(id, value) => {
+                self.window_manager.set_maximized(id, value);
+            }
+            DbCommand::Fullscreen(id, value) => {
+                self.set_fullscreen_target(id, value);
+            }
+            DbCommand::SetWorkspace(id) => {
+                self.window_manager.set_active_workspace(id);
+            }
+            DbCommand::MoveToWorkspace(id, workspace) => {
+                self.window_manager.set_workspace(id, workspace);
+            }
+            DbCommand::ReloadConfig => {
+                let cfg = icedtea_config::load_or_default(&icedtea_config::default_db_path());
+                let events = self.apply_config(cfg);
+                self.pending_config_events.extend(events);
+            }
+            DbCommand::Quit => {
+                self.quitting = true;
+            }
+            DbCommand::GetState(reply_tx) => {
+                let _ = reply_tx.send(self.window_manager.snapshot());
+                // No model mutation happened; nothing new to flush. Return
+                // early so the unconditional `emit_pending()` below (a no-op
+                // here, but let's not rely on that) stays meaningful for
+                // every other arm.
+                return;
+            }
+        }
+        self.emit_pending();
     }
 
     /// Get the decoration action for a given window at the specified local coordinates.
