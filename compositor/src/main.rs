@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod decoration;
 pub mod layout;
+pub mod render;
 pub mod state;
 pub mod window;
 
@@ -69,6 +70,21 @@ fn main() {
         .expect("failed to insert the wayland display source into the event loop");
 
     tracing::info!(socket = %socket_name, "listening on wayland socket");
+
+    // Wallpaper decode runs on a worker thread (multi-megapixel JPEG decode
+    // is CPU-heavy and must stay off the render loop, per the threading
+    // model); the result comes back over a `calloop::channel`, which -- like
+    // Task 13's config-reload channel above -- *is* a calloop event source
+    // directly, so no `Generic`/fd wrapping is needed here.
+    let wallpaper_channel = render::spawn_wallpaper_decode(state.config.appearance.wallpaper.clone());
+    event_loop
+        .handle()
+        .insert_source(wallpaper_channel, |event, _, state: &mut State| {
+            if let smithay::reexports::calloop::channel::Event::Msg(image) = event {
+                state.wallpaper.set_decoded(image);
+            }
+        })
+        .expect("failed to insert the wallpaper decode channel into the event loop");
 
     let _backend = if nested {
         Backend::init_nested(&mut state, &event_loop.handle(), &socket_name)

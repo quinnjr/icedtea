@@ -50,6 +50,7 @@ use smithay::{
     delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
+use crate::render::WallpaperState;
 use crate::window::WindowManager;
 
 /// Per-client data attached by `insert_client`.
@@ -80,6 +81,14 @@ pub struct State {
 
     pub space: Space<Window>,
     pub popups: PopupManager,
+    /// Wallpaper decode/upload pipeline state (`render::draw_frame` drives
+    /// this each frame).
+    pub wallpaper: WallpaperState,
+    /// The drag machine's current snap-preview target, in output logical
+    /// coordinates, or `None` when no drag is in a snap-preview state. Set
+    /// by the drag machine (Task 9); this is the geometry hook `render.rs`
+    /// consumes.
+    pub snap_preview: Option<icedtea_contract::Rectangle>,
     /// Maps a mapped toplevel's underlying `wl_surface` to the `WindowId` our
     /// own model assigned it, so unmap/title-change events can be routed
     /// back into `window_manager` without re-deriving state from the
@@ -129,6 +138,8 @@ impl State {
             loop_signal: None,
             space: Space::default(),
             popups: PopupManager::default(),
+            wallpaper: WallpaperState::new(),
+            snap_preview: None,
             surface_to_window: HashMap::new(),
             compositor_state,
             xdg_shell_state,

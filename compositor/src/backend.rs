@@ -24,8 +24,6 @@
 //! logs a loud `tracing::error!` saying so rather than pretending to work.
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
 use smithay::backend::udev::UdevBackend;
@@ -34,6 +32,7 @@ use smithay::output::{Mode as OutputMode, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::LoopHandle;
 use smithay::utils::{Rectangle, Transform};
 
+use crate::render;
 use crate::state::State;
 
 /// A running compositor backend.
@@ -113,21 +112,16 @@ impl Backend {
                     let damage = Rectangle::from_size(size);
                     match winit_backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
-                            if let Err(err) = smithay::desktop::space::render_output::<
-                                _,
-                                WaylandSurfaceRenderElement<GlesRenderer>,
-                                _,
-                                _,
-                            >(
-                                &render_output,
+                            if let Err(err) = render::draw_frame(
                                 renderer,
                                 &mut framebuffer,
-                                1.0,
-                                0,
-                                [&state.space],
-                                &[],
                                 &mut damage_tracker,
-                                [0.05, 0.05, 0.08, 1.0],
+                                &render_output,
+                                &state.space,
+                                &state.config.appearance,
+                                &mut state.wallpaper,
+                                state.snap_preview,
+                                0,
                             ) {
                                 tracing::warn!("nested render_output failed: {err:?}");
                             }
