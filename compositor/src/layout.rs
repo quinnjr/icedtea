@@ -26,13 +26,13 @@ pub fn snap_zone_for_point(output: Rectangle, point: (i32, i32), threshold: i32)
     // Corners take priority over edges.
     let in_corner = (near_left || near_right) && (near_top || near_bottom);
     if in_corner {
-        return corner(near_left, near_top);
+        return corner(near_top, near_left);
     }
     if near_left || near_right {
         return edge(near_left, near_right);
     }
     if near_top || near_bottom {
-        return if near_top { Some(SnapZone::Top) } else { Some(SnapZone::Bottom) };
+        return if near_top && !near_bottom { Some(SnapZone::Top) } else if near_bottom && !near_top { Some(SnapZone::Bottom) } else { None };
     }
     None
 }
@@ -94,6 +94,19 @@ mod tests {
         assert_eq!(snap_zone_for_point(OUTPUT, (0, 0), 10), Some(SnapZone::TopLeft));
         assert_eq!(snap_zone_for_point(OUTPUT, (999, 799), 10), Some(SnapZone::BottomRight));
         assert_eq!(snap_zone_for_point(OUTPUT, (500, 0), 10), Some(SnapZone::Top));
+    }
+
+    #[test]
+    fn all_four_corners() {
+        let threshold = 10;
+        // Top-left corner
+        assert_eq!(snap_zone_for_point(OUTPUT, (0, 0), threshold), Some(SnapZone::TopLeft));
+        // Top-right corner
+        assert_eq!(snap_zone_for_point(OUTPUT, (999, 0), threshold), Some(SnapZone::TopRight));
+        // Bottom-left corner
+        assert_eq!(snap_zone_for_point(OUTPUT, (0, 799), threshold), Some(SnapZone::BottomLeft));
+        // Bottom-right corner
+        assert_eq!(snap_zone_for_point(OUTPUT, (999, 799), threshold), Some(SnapZone::BottomRight));
     }
 
     #[test]
