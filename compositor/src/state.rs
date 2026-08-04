@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use icedtea_config::Config;
-use icedtea_contract::{Event, WindowId};
+use icedtea_contract::{AltTabState, Event, Rectangle, WindowId};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::desktop::{PopupKind, PopupManager, Space, Window};
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -50,12 +50,26 @@ use smithay::{
     delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
+use crate::input;
+use crate::layout::{self, SnapZone};
 use crate::render::WallpaperState;
 use crate::window::WindowManager;
 
 /// Output geometry information (simplified from smithay's `Output`).
 pub struct OutputSurface {
     pub geometry: icedtea_contract::Rectangle,
+}
+
+/// Input passed to `State::handle_pointer`, in output logical coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerEvent {
+    /// Button pressed while the pointer is over `id`.
+    Press { id: WindowId, pointer: (i32, i32) },
+    /// Pointer moved during an in-progress drag.
+    Motion { pointer: (i32, i32) },
+    /// Button released, ending an in-progress drag (a no-op if none is
+    /// active).
+    Release { pointer: (i32, i32) },
 }
 
 /// Per-client data attached by `insert_client`.
@@ -104,6 +118,19 @@ pub struct State {
     /// Saved window geometries before fullscreen toggle, keyed by window ID.
     /// Used to restore non-fullscreen geometry when exiting fullscreen.
     pub saved_geometry: HashMap<WindowId, icedtea_contract::Rectangle>,
+    /// Alt-tab cycling state, driven by `apply_action("cycle:alt_tab")` and
+    /// consumed/reset by `handle_pointer`/`handle_key` release paths.
+    pub alt_tab: input::AltTabMachine,
+    /// Pointer-driven window move/snap state machine.
+    pub drag: input::DragMachine,
+    /// Set by `apply_action("quit")`; `main.rs`'s event-loop closure checks
+    /// this each iteration and calls `stop()` once true.
+    pub quitting: bool,
+    /// Events produced by `apply_config` (e.g. on `reload`) that don't flow
+    /// through `window_manager.pending_events` because `apply_config`
+    /// replaces `window_manager` wholesale. Drained by `emit_pending`
+    /// alongside `window_manager.pending_events`.
+    pub pending_config_events: Vec<Event>,
 
     // Wayland global state.
     pub compositor_state: CompositorState,
@@ -153,6 +180,10 @@ impl State {
             surface_to_window: HashMap::new(),
             outputs: HashMap::new(),
             saved_geometry: HashMap::new(),
+            alt_tab: input::AltTabMachine::new(),
+            drag: input::DragMachine::new(),
+            quitting: false,
+            pending_config_events: Vec::new(),
             compositor_state,
             xdg_shell_state,
             shm_state,
@@ -207,10 +238,25 @@ impl State {
 
     /// Drain `window_manager.pending_events` onto `dbus_tx`. Must be called
     /// after every mutation of `window_manager` so subscribers observe it.
+    ///
+    /// Also drains `pending_config_events`: `apply_config` replaces
+    /// `window_manager` wholesale (so it can't queue onto the old instance's
+    /// `pending_events`) and instead returns its events for the caller to
+    /// stash there; this is where they actually reach `dbus_tx`.
     pub fn emit_pending(&mut self) {
         for ev in self.window_manager.pending_events.drain(..) {
             let _ = self.dbus_tx.send(ev);
         }
+        for ev in self.pending_config_events.drain(..) {
+            let _ = self.dbus_tx.send(ev);
+        }
+    }
+
+    /// Queue an event for the next `emit_pending()` drain without it having
+    /// come from a `window_manager` mutation (e.g. `AltTabState`, which is
+    /// driven by `alt_tab`, not `window_manager`).
+    pub fn emit(&mut self, ev: Event) {
+        self.window_manager.pending_events.push(ev);
     }
 
     /// Toggle fullscreen state for a window. When entering fullscreen, saves the
@@ -270,6 +316,207 @@ impl State {
             }
         }
         self.emit_pending();
+    }
+
+    /// Dispatch a keybinding action string (e.g. from `handle_key`, or a
+    /// D-Bus-triggered action). Returns `None` for unrecognized actions or
+    /// when a precondition (no focused window, unknown output, etc.) isn't
+    /// met; `Some(())` on success. Always drains pending events on success.
+    pub fn apply_action(&mut self, action: &str) -> Option<()> {
+        let mut parts = action.splitn(2, ':');
+        let base = parts.next()?;
+        let arg = parts.next().map(|s| s.to_string());
+        match base {
+            "close" => {
+                let id = self.window_manager.focused_window()?.id;
+                self.window_manager.remove_window(id);
+            }
+            "fullscreen" => {
+                let id = self.window_manager.focused_window()?.id;
+                self.toggle_fullscreen(id)?;
+            }
+            "quit" => self.quitting = true,
+            "reload" => {
+                let cfg = icedtea_config::load_or_default(&icedtea_config::default_db_path());
+                let events = self.apply_config(cfg);
+                self.pending_config_events.extend(events);
+            }
+            // NOTE (brief deviation): the sample matched on the literal
+            // `"cycle:alt_tab"` here, but `action.splitn(2, ':')` above
+            // already split that string into `base = "cycle"`, `arg =
+            // Some("alt_tab")` -- a match on `base` can never see the colon,
+            // so as written this arm was as unreachable as the
+            // `"snap:restore"` arm noted above. Matching `"cycle"` and
+            // checking `arg` makes it reachable (and leaves room for other
+            // `cycle:*` variants later without another silent dead arm).
+            "cycle" => {
+                if arg.as_deref() != Some("alt_tab") {
+                    return None;
+                }
+                let entries = self.window_manager.alt_tab_entries();
+                if entries.is_empty() {
+                    return None;
+                }
+                if !self.alt_tab.is_active() {
+                    self.alt_tab.start(entries.clone());
+                } else {
+                    self.alt_tab.step(true);
+                }
+                let idx = self.alt_tab.index();
+                if let Some(wid) = entries.get(idx).copied() {
+                    self.window_manager.focus(wid);
+                }
+                self.emit(Event::AltTabState(AltTabState { active: true, entries, index: idx }));
+            }
+            "spawn" => {
+                let cmd = arg?;
+                std::process::Command::new("sh").arg("-c").arg(&cmd).spawn().ok();
+            }
+            "workspace" => {
+                let n: u32 = arg?.parse().ok()?;
+                self.window_manager.set_active_workspace(n - 1);
+            }
+            "move_to_workspace" => {
+                let id = self.window_manager.focused_window()?.id;
+                let n: u32 = arg?.parse().ok()?;
+                self.window_manager.set_workspace(id, n - 1)?;
+                self.window_manager.set_active_workspace(n - 1);
+            }
+            // NOTE (brief deviation): the sample dispatch code had a second,
+            // unreachable `"snap:restore" => ...` match arm alongside this
+            // one. `action.splitn(2, ':')` always assigns `base = "snap"`
+            // and `arg = Some("restore")` for the action string
+            // `"snap:restore"` -- matching on `base` can therefore never
+            // observe `"snap:restore"` as a whole. The restore case is
+            // folded into this arm's `match arg?.as_str()` instead, which is
+            // the only way it's reachable.
+            "snap" => {
+                let id = self.window_manager.focused_window()?.id;
+                match arg?.as_str() {
+                    "left" => self.snap(id, SnapZone::Left)?,
+                    "right" => self.snap(id, SnapZone::Right)?,
+                    "up" => self.snap(id, SnapZone::Top)?,
+                    "down" => self.snap(id, SnapZone::Bottom)?,
+                    "restore" => self.snap_restore(id)?,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+        self.emit_pending();
+        Some(())
+    }
+
+    /// Snap `id` to `zone` on the (first) output, saving its pre-snap
+    /// geometry so `snap_restore` can undo it.
+    pub fn snap(&mut self, id: WindowId, zone: SnapZone) -> Option<()> {
+        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        let gap = self.config.appearance.snap_gap;
+        let current = self.window_manager.get(id)?.geometry;
+        self.saved_geometry.entry(id).or_insert(current);
+        self.window_manager.set_geometry(id, layout::snapped_geometry(output_geo, zone, gap))?;
+        Some(())
+    }
+
+    /// Restore `id`'s geometry as it was before its most recent `snap`, if
+    /// any was saved.
+    pub fn snap_restore(&mut self, id: WindowId) -> Option<()> {
+        if let Some(orig) = self.saved_geometry.remove(&id) {
+            self.window_manager.set_geometry(id, orig)?;
+        }
+        Some(())
+    }
+
+    /// Rebuild `window_manager`'s workspaces from `cfg.workspace_names` and
+    /// swap in the new config (keybindings/appearance/behavior). Returns the
+    /// events the caller should queue (via `pending_config_events`) since
+    /// the just-replaced `window_manager` can't carry them.
+    pub fn apply_config(&mut self, cfg: Config) -> Vec<Event> {
+        self.config = cfg.clone();
+        self.window_manager = WindowManager::new(cfg.workspace_names.clone());
+        vec![
+            Event::WorkspaceList(self.window_manager.workspace_info()),
+            Event::ConfigReloaded(cfg.appearance.clone()),
+        ]
+    }
+
+    /// Resolve `mods`+`keysym` against the configured keybindings and apply
+    /// the matched action, if any.
+    pub fn handle_key(&mut self, mods: input::Modifiers, keysym: u32) -> Option<()> {
+        let action = input::match_action(&self.config.keybindings, mods, keysym)?;
+        self.apply_action(&action)
+    }
+
+    /// Dispatch a pointer event (output logical coordinates) through the
+    /// drag/snap state machine. See `PointerEvent` for the three cases.
+    pub fn handle_pointer(&mut self, event: PointerEvent) -> Option<()> {
+        match event {
+            PointerEvent::Press { id, pointer } => self.handle_pointer_press(id, pointer),
+            PointerEvent::Motion { pointer } => self.handle_pointer_motion(pointer),
+            PointerEvent::Release { pointer } => self.handle_pointer_release(pointer),
+        }
+    }
+
+    /// Pointer button press at `pointer` (output logical coordinates) on
+    /// window `id`: if it hits the title bar's move area, begins a drag;
+    /// otherwise applies whatever discrete decoration action (close/
+    /// maximize/minimize) was hit.
+    fn handle_pointer_press(&mut self, id: WindowId, pointer: (i32, i32)) -> Option<()> {
+        let geo = self.window_manager.get(id)?.geometry;
+        // Despite its parameter name, `decoration_action_for`/`hit_test`
+        // compares against `title_bar_rect`/`button_rects`, which are
+        // themselves in the window's absolute (output) geometry space (see
+        // the existing `decoration_action_for_returns_close_on_button_click`
+        // test, which passes `geo.x + geo.width - 5` -- an absolute
+        // coordinate -- as its "local" point). So `pointer` is passed
+        // through unconverted here; only the drag `grab_offset` below is a
+        // genuine window-relative offset.
+        let action = self.decoration_action_for(id, pointer)?;
+        if action == crate::decoration::DecorationAction::Move {
+            let grab_offset = (pointer.0 - geo.x, pointer.1 - geo.y);
+            self.drag.begin(id, grab_offset);
+        } else {
+            self.apply_decoration_action(id, action);
+        }
+        Some(())
+    }
+
+    /// Pointer motion at `pointer` (output logical coordinates) during an
+    /// in-progress drag: updates the snap-zone preview (rendering consumes
+    /// `self.snap_preview`).
+    fn handle_pointer_motion(&mut self, pointer: (i32, i32)) -> Option<()> {
+        self.drag.window_id()?;
+        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        let threshold = self.config.appearance.snap_gap.max(1) * 4;
+        self.drag.motion(pointer, output_geo, threshold);
+        self.snap_preview =
+            self.drag.preview_zone().map(|zone| layout::snapped_geometry(output_geo, zone, self.config.appearance.snap_gap));
+        Some(())
+    }
+
+    /// Pointer button release at `pointer` (output logical coordinates):
+    /// ends the drag, either snapping the window to the previewed zone or
+    /// moving it to `pointer - grab_offset`.
+    fn handle_pointer_release(&mut self, pointer: (i32, i32)) -> Option<()> {
+        let id = self.drag.window_id()?;
+        let grab_offset = self.drag.grab_offset();
+        self.snap_preview = None;
+        match self.drag.end() {
+            input::DragResult::Snapped(zone) => {
+                self.snap(id, zone)?;
+            }
+            input::DragResult::Moved => {
+                let geo = self.window_manager.get(id)?.geometry;
+                let new_pos = (pointer.0 - grab_offset.0, pointer.1 - grab_offset.1);
+                self.window_manager.set_geometry(
+                    id,
+                    Rectangle { x: new_pos.0, y: new_pos.1, width: geo.width, height: geo.height },
+                )?;
+            }
+            input::DragResult::Restored => {}
+        }
+        self.emit_pending();
+        Some(())
     }
 }
 
@@ -395,7 +642,17 @@ impl XdgShellHandler for State {
             .map(|c| c.pid as u32)
             .unwrap_or(0);
 
-        let id = self.window_manager.add_window(&app_id, &title, pid);
+        // Default toplevel size: real geometry arrives from the client's
+        // first commit (xdg_surface's set_window_geometry / buffer size),
+        // which isn't known yet at `new_toplevel` time; 640x400 is just the
+        // model's placeholder until then. Position cascades off whatever's
+        // already mapped so new windows don't stack exactly on top of each
+        // other.
+        let occupied: Vec<icedtea_contract::Rectangle> =
+            self.window_manager.windows().map(|w| w.geometry).collect();
+        let (x, y) = layout::cascade_point(&occupied, (640, 400), 24);
+        let geometry = icedtea_contract::Rectangle { x, y, width: 640, height: 400 };
+        let id = self.window_manager.add_window(&app_id, &title, pid, geometry);
         self.emit_pending();
         self.surface_to_window.insert(surface.wl_surface().clone(), id);
 
@@ -520,11 +777,13 @@ mod tests {
     use icedtea_config::default_config;
     use icedtea_contract::Rectangle;
 
+    const DEFAULT_GEO: Rectangle = Rectangle { x: 0, y: 0, width: 640, height: 400 };
+
     #[test]
     fn state_emits_pending_events_on_channel() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.window_manager.add_window("app", "t", 1);
+        state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.emit_pending();
         assert!(matches!(rx.try_recv(), Ok(Event::WindowOpened(_))));
     }
@@ -533,7 +792,7 @@ mod tests {
     fn decoration_action_for_returns_close_on_button_click() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        let id = state.window_manager.add_window("app", "t", 1);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.window_manager.set_geometry(id, Rectangle { x: 100, y: 100, width: 600, height: 400 }).unwrap();
         state.window_manager.focus(id).unwrap();
         let geo = Rectangle { x: 100, y: 100, width: 600, height: 400 };
@@ -546,8 +805,8 @@ mod tests {
     fn decoration_action_for_returns_none_for_unfocused_window() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        let id1 = state.window_manager.add_window("app1", "t1", 1);
-        let _id2 = state.window_manager.add_window("app2", "t2", 2);
+        let id1 = state.window_manager.add_window("app1", "t1", 1, DEFAULT_GEO);
+        let _id2 = state.window_manager.add_window("app2", "t2", 2, DEFAULT_GEO);
         // _id2 is now focused; id1 is unfocused
         state.window_manager.set_geometry(id1, Rectangle { x: 100, y: 100, width: 600, height: 400 }).unwrap();
         let geo = Rectangle { x: 100, y: 100, width: 600, height: 400 };
@@ -561,7 +820,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
-        let id = state.window_manager.add_window("app", "t", 1);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.window_manager.focus(id).unwrap();
         state.toggle_fullscreen(id).unwrap();
         let geo = Rectangle { x: 0, y: 0, width: 1920, height: 1080 };
@@ -574,7 +833,7 @@ mod tests {
     fn decoration_action_for_returns_none_for_csd_window() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        let id = state.window_manager.add_window("org.gtk.App", "t", 1);
+        let id = state.window_manager.add_window("org.gtk.App", "t", 1, DEFAULT_GEO);
         state.window_manager.set_geometry(id, Rectangle { x: 100, y: 100, width: 600, height: 400 }).unwrap();
         state.window_manager.focus(id).unwrap();
         state.window_manager.set_client_decorations_requested(id, Some(true)).unwrap();
@@ -590,10 +849,135 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
-        let id = state.window_manager.add_window("app", "t", 1);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.toggle_fullscreen(id).unwrap();
         let w = state.window_manager.get(id).unwrap();
         assert!(w.fullscreen);
         assert_eq!(w.geometry, Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+    }
+
+    // NOTE (brief deviation): the brief's Step-1 sample for
+    // `apply_action_switches_workspaces_and_snaps` calls
+    // `state.window_manager.add_window("app", "t", 1)` (3 args), never
+    // registers an output, and adds the window *before* switching
+    // workspaces. Three real bugs, not just transcription noise:
+    //   1. 3-arg `add_window` no longer compiles against the new 5-arg
+    //      signature (this task's own change).
+    //   2. `snap()` reads `self.outputs` (empty by default in `State::new`)
+    //      to find output geometry, despite the brief's own prose saying
+    //      "the tests assume ... a 1000x800 output" -- nothing in the
+    //      sample ever inserts one.
+    //   3. `WindowManager::focused_window()` is scoped to the *active*
+    //      workspace (established well before this task -- see
+    //      `window.rs`'s `move_to_workspace_keeps_focus_valid` test, which
+    //      asserts exactly this). Adding the window on workspace 0 and then
+    //      switching to workspace 2 (index 1) leaves workspace 1 with no
+    //      focused window at all, so `apply_action("snap:left")` -- which
+    //      dispatches through `focused_window()` -- would return `None`
+    //      and the `.unwrap()` would panic. Switching workspace *first*,
+    //      then adding the window (which auto-focuses on whatever is
+    //      currently active), keeps the window's workspace and the active
+    //      workspace in agreement, matching how a real "switch to an empty
+    //      workspace, open something there, then snap it" sequence would
+    //      actually behave.
+    // All three are fixed below; the assertions are unchanged from the
+    // brief.
+    #[test]
+    fn apply_action_switches_workspaces_and_snaps() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.apply_action("workspace:2").unwrap();
+        assert_eq!(state.window_manager.active_workspace(), 1);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        state.apply_action("snap:left").unwrap();
+        assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 1000 / 2 - 16);
+        state.apply_action("snap:restore").unwrap();
+        assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 640);
+    }
+
+    #[test]
+    fn apply_config_rebuilds_workspaces() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let mut cfg = icedtea_config::default_config();
+        cfg.workspace_names = vec!["A".into(), "B".into()];
+        let events = state.apply_config(cfg);
+        assert_eq!(state.window_manager.workspace_info().len(), 2);
+        assert!(events.iter().any(|e| matches!(e, Event::WorkspaceList(_))));
+    }
+
+    #[test]
+    fn close_action_removes_focused() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        state.apply_action("close").unwrap();
+        assert!(state.window_manager.get(id).is_none());
+    }
+
+    #[test]
+    fn alt_tab_cycles_focus() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+        state.apply_action("cycle:alt_tab").unwrap();
+        assert!(state.window_manager.get(a).unwrap().focused);
+        state.apply_action("cycle:alt_tab").unwrap();
+        assert!(state.window_manager.get(b).unwrap().focused);
+        state.apply_action("cycle:alt_tab").unwrap();
+        assert!(state.window_manager.get(a).unwrap().focused);
+    }
+
+    #[test]
+    fn handle_key_dispatches_bound_action() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        // Default config binds SUPER+q to "close" (see config/src/defaults.rs).
+        state.handle_key(input::Modifiers::SUPER, input::key_name_to_keysym("KEY_q")).unwrap();
+        assert!(state.window_manager.get(id).is_none());
+    }
+
+    #[test]
+    fn handle_key_ignores_unbound_combo() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert_eq!(state.handle_key(input::Modifiers::empty(), 0x12345), None);
+    }
+
+    #[test]
+    fn handle_pointer_drag_moves_window_without_snap() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 640, height: 400 });
+        state.window_manager.focus(id).unwrap();
+        // Press inside the title bar's move area (not on a button).
+        state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) }).unwrap();
+        // Drag to a point away from any snap edge.
+        state.handle_pointer(PointerEvent::Motion { pointer: (400, 400) }).unwrap();
+        assert_eq!(state.snap_preview, None);
+        state.handle_pointer(PointerEvent::Release { pointer: (400, 400) }).unwrap();
+        let geo = state.window_manager.get(id).unwrap().geometry;
+        // grab_offset was (20, 5); released at (400, 400) => top-left (380, 395).
+        assert_eq!((geo.x, geo.y), (380, 395));
+    }
+
+    #[test]
+    fn handle_pointer_drag_to_edge_snaps() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 640, height: 400 });
+        state.window_manager.focus(id).unwrap();
+        state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) }).unwrap();
+        state.handle_pointer(PointerEvent::Motion { pointer: (2, 400) }).unwrap();
+        assert!(state.snap_preview.is_some());
+        state.handle_pointer(PointerEvent::Release { pointer: (2, 400) }).unwrap();
+        let geo = state.window_manager.get(id).unwrap().geometry;
+        assert_eq!(geo.width, 1000 / 2 - 16);
+        assert_eq!(state.snap_preview, None);
     }
 }

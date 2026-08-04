@@ -72,7 +72,7 @@ impl WindowManager {
         &mut self.pending_events
     }
 
-    pub fn add_window(&mut self, app_id: &str, title: &str, pid: u32) -> WindowId {
+    pub fn add_window(&mut self, app_id: &str, title: &str, pid: u32, geometry: Rectangle) -> WindowId {
         let id = WindowId(self.next_id);
         self.next_id += 1;
         let window = Window {
@@ -81,7 +81,7 @@ impl WindowManager {
             title: title.to_string(),
             pid,
             workspace: self.active_workspace,
-            geometry: Rectangle { x: 0, y: 0, width: 0, height: 0 },
+            geometry,
             maximized: false,
             minimized: false,
             fullscreen: false,
@@ -307,10 +307,12 @@ mod tests {
         WindowManager::new(vec!["1".into(), "2".into()])
     }
 
+    const GEO: Rectangle = Rectangle { x: 0, y: 0, width: 640, height: 400 };
+
     #[test]
     fn add_focuses_window_and_emits_opened() {
         let mut m = mgr();
-        let id = m.add_window("app", "title", 1);
+        let id = m.add_window("app", "title", 1, GEO);
         assert!(m.get(id).unwrap().focused);
         assert!(matches!(m.pending_events.first(), Some(Event::WindowOpened(_))));
     }
@@ -318,8 +320,8 @@ mod tests {
     #[test]
     fn focus_unfocuses_previous() {
         let mut m = mgr();
-        let a = m.add_window("a", "a", 1);
-        let b = m.add_window("b", "b", 2);
+        let a = m.add_window("a", "a", 1, GEO);
+        let b = m.add_window("b", "b", 2, GEO);
         assert!(!m.get(a).unwrap().focused);
         assert!(m.get(b).unwrap().focused);
     }
@@ -327,7 +329,7 @@ mod tests {
     #[test]
     fn move_to_workspace_keeps_focus_valid() {
         let mut m = mgr();
-        let a = m.add_window("a", "a", 1);
+        let a = m.add_window("a", "a", 1, GEO);
         m.set_workspace(a, 1).unwrap();
         assert_eq!(m.get(a).unwrap().workspace, 1);
         assert!(!m.get(a).unwrap().focused);
@@ -338,7 +340,7 @@ mod tests {
     #[test]
     fn remove_clears_focus_to_none() {
         let mut m = mgr();
-        let a = m.add_window("a", "a", 1);
+        let a = m.add_window("a", "a", 1, GEO);
         m.remove_window(a).unwrap();
         assert!(m.focused_window().is_none());
     }
@@ -346,7 +348,7 @@ mod tests {
     #[test]
     fn snapshot_matches_state() {
         let mut m = mgr();
-        let id = m.add_window("app", "t", 7);
+        let id = m.add_window("app", "t", 7, GEO);
         let snap = m.snapshot();
         assert_eq!(snap.active_workspace, 0);
         assert_eq!(snap.windows.len(), 1);
@@ -358,8 +360,8 @@ mod tests {
     #[test]
     fn alt_tab_skips_minimized() {
         let mut m = mgr();
-        let a = m.add_window("a", "a", 1);
-        let b = m.add_window("b", "b", 2);
+        let a = m.add_window("a", "a", 1, GEO);
+        let b = m.add_window("b", "b", 2, GEO);
         m.set_minimized(a, true).unwrap();
         assert_eq!(m.alt_tab_entries(), vec![b]);
     }
@@ -367,7 +369,7 @@ mod tests {
     #[test]
     fn focus_minimized_already_focused_emits_event() {
         let mut m = mgr();
-        let a = m.add_window("a", "a", 1);
+        let a = m.add_window("a", "a", 1, GEO);
         // Minimize while focused.
         m.set_minimized(a, true).unwrap();
         m.pending_events.clear();
@@ -382,9 +384,9 @@ mod tests {
     #[test]
     fn windows_ordered_by_mru() {
         let mut m = mgr();
-        let a = m.add_window("a", "a", 1);
-        let b = m.add_window("b", "b", 2);
-        let c = m.add_window("c", "c", 3);
+        let a = m.add_window("a", "a", 1, GEO);
+        let b = m.add_window("b", "b", 2, GEO);
+        let c = m.add_window("c", "c", 3, GEO);
         // Current order (MRU first): c, b, a
         let ids: Vec<_> = m.windows().map(|w| w.id).collect();
         assert_eq!(ids, vec![c, b, a]);
@@ -397,9 +399,9 @@ mod tests {
     #[test]
     fn remove_window_prunes_focus_mru() {
         let mut m = mgr();
-        let a = m.add_window("a", "a", 1);
-        let b = m.add_window("b", "b", 2);
-        let c = m.add_window("c", "c", 3);
+        let a = m.add_window("a", "a", 1, GEO);
+        let b = m.add_window("b", "b", 2, GEO);
+        let c = m.add_window("c", "c", 3, GEO);
         // MRU order: c, b, a
         assert_eq!(m.windows().map(|w| w.id).collect::<Vec<_>>(), vec![c, b, a]);
         // Remove b (middle of MRU).
@@ -407,7 +409,7 @@ mod tests {
         // Should have c, a in MRU order.
         assert_eq!(m.windows().map(|w| w.id).collect::<Vec<_>>(), vec![c, a]);
         // Add new window d, should be MRU first.
-        let d = m.add_window("d", "d", 4);
+        let d = m.add_window("d", "d", 4, GEO);
         assert_eq!(m.windows().map(|w| w.id).collect::<Vec<_>>(), vec![d, c, a]);
         // Verify b is not in the state at all.
         assert!(m.get(b).is_none());

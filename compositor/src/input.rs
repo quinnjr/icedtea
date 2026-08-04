@@ -193,6 +193,22 @@ impl DragMachine {
         self.preview_zone
     }
 
+    /// The window currently being dragged, if a drag is in progress.
+    /// `end()`/`cancel()` consume `window_id` internally (they need to reset
+    /// it) without returning it, so callers that need "which window was this
+    /// drag for" (to apply the move/snap to the right window) must read it
+    /// before calling `end()`.
+    pub fn window_id(&self) -> Option<WindowId> {
+        self.window_id
+    }
+
+    /// The pointer-to-window-origin offset captured at `begin()`, used to
+    /// compute the window's new top-left from the pointer position on a
+    /// plain (non-snapped) move.
+    pub fn grab_offset(&self) -> (i32, i32) {
+        self.grab_offset
+    }
+
     // Alias named per the brief's Interfaces section (`drag_result()` for
     // preview state), kept alongside `preview_zone()` -- the Step 1 sample
     // code and its tests call the latter, so both names are exposed rather

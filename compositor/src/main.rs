@@ -114,6 +114,14 @@ fn main() {
 
     event_loop
         .run(None, &mut state, |state| {
+            // `apply_action("quit")` (bound to a keybinding by default) only
+            // sets the flag -- it can't call `state.stop()` itself without
+            // depending on the calloop signal that lives on the loop this
+            // closure runs inside, so this is where the flag actually stops
+            // the loop.
+            if state.quitting {
+                state.stop();
+            }
             let _ = state.display_handle.flush_clients();
         })
         .expect("event loop error");
