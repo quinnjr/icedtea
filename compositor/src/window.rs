@@ -15,6 +15,8 @@ pub struct Window {
     pub minimized: bool,
     pub fullscreen: bool,
     pub focused: bool,
+    /// Client's negotiated xdg-decoration mode: Some(true) for ClientSide, Some(false) for ServerSide, None if unset.
+    pub client_decorations_requested: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +86,7 @@ impl WindowManager {
             minimized: false,
             fullscreen: false,
             focused: false,
+            client_decorations_requested: None,
         };
         self.windows.insert(id, window.clone());
         self.emit(Event::WindowOpened(self.to_info(&self.windows[&id])));
@@ -129,6 +132,14 @@ impl WindowManager {
         Some(())
     }
 
+    pub fn toggle_maximized(&mut self, id: WindowId) -> Option<()> {
+        let w = self.windows.get_mut(&id)?;
+        let new_value = !w.maximized;
+        w.maximized = new_value;
+        self.emit(Event::WindowUpdated { id, update: WindowUpdate { maximized: Some(new_value), ..Default::default() } });
+        Some(())
+    }
+
     pub fn set_minimized(&mut self, id: WindowId, value: bool) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         w.minimized = value;
@@ -140,6 +151,12 @@ impl WindowManager {
         let w = self.windows.get_mut(&id)?;
         w.fullscreen = value;
         self.emit(Event::WindowUpdated { id, update: WindowUpdate { fullscreen: Some(value), ..Default::default() } });
+        Some(())
+    }
+
+    pub fn set_client_decorations_requested(&mut self, id: WindowId, value: Option<bool>) -> Option<()> {
+        let w = self.windows.get_mut(&id)?;
+        w.client_decorations_requested = value;
         Some(())
     }
 

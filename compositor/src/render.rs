@@ -257,7 +257,7 @@ pub fn draw_frame<'d>(
     // SSD element slot's geometry hook (see `decoration_strip_geometry`):
     // computed every frame from real window geometry, ready for Task 10 to
     // turn into `CustomRenderElements::Decoration` elements.
-    let decoration_strip_geometry = decoration_strip_geometry(windows);
+    let ssd_strip_geometry = decoration_strip_geometry(windows);
 
     let scale = output.current_scale().fractional_scale();
     let output_logical_size = output
@@ -278,28 +278,26 @@ pub fn draw_frame<'d>(
         elements.push(OutputRenderElements::Custom(CustomRenderElements::Solid(element)));
     }
 
-    let space_elements =
-        space_render_elements::<_, DesktopWindow, _>(renderer, [space], output, 1.0)?;
-    elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
-
-    // Render SSD decoration strips for non-CSD, non-fullscreen windows
+    // Render SSD decoration strips for non-CSD, non-fullscreen windows BEFORE space elements
+    // (so they appear on top of window surfaces).
     let title_bar_color = hex_to_rgba(&appearance.palette.background);
     let button_color = hex_to_rgba(&appearance.palette.accent);
-    for (window, title_bar_rect) in windows.iter().zip(decoration_strip_geometry.iter()) {
-        // Skip CSD windows and fullscreen windows
-        if window.fullscreen || decoration::is_csd(&window.app_id, None) {
+    let text_color = hex_to_rgba(&appearance.palette.foreground);
+    for (window, title_bar_rect) in windows.iter().zip(ssd_strip_geometry.iter()) {
+        // Skip fullscreen windows and CSD windows (ones that explicitly requested client decorations)
+        if window.fullscreen || decoration::is_csd(&window.app_id, window.client_decorations_requested) {
             continue;
         }
 
-        // Render title bar background
-        let buffer = SolidColorBuffer::new(
+        // Render title bar background using the Decoration slot
+        let title_bar_buffer = SolidColorBuffer::new(
             (title_bar_rect.width, decoration::TITLE_BAR_HEIGHT),
             title_bar_color,
         );
-        let location = Point::<i32, Logical>::from((title_bar_rect.x, title_bar_rect.y))
+        let title_bar_location = Point::<i32, Logical>::from((title_bar_rect.x, title_bar_rect.y))
             .to_physical_precise_round(scale);
-        let title_bar_element = SolidColorRenderElement::from_buffer(&buffer, location, scale, 1.0, Kind::Unspecified);
-        elements.push(OutputRenderElements::Custom(CustomRenderElements::Solid(title_bar_element)));
+        let title_bar_element = SolidColorRenderElement::from_buffer(&title_bar_buffer, title_bar_location, scale, 1.0, Kind::Unspecified);
+        elements.push(OutputRenderElements::Custom(CustomRenderElements::Decoration(Wrap::from(title_bar_element))));
 
         // Render buttons
         let buttons = decoration::button_rects(window.geometry);
@@ -319,7 +317,20 @@ pub fn draw_frame<'d>(
             );
             elements.push(OutputRenderElements::Custom(CustomRenderElements::Solid(button_element)));
         }
+
+        // Render window title text on the title bar
+        // Note: Text rendering requires a text rasterizer (not in current scope per plan).
+        // This placeholder documents where title rendering would go and prevents silent
+        // omission of a mandated interface element. Full implementation deferred to a task
+        // that includes a text-rendering library (e.g., ab_glyph, cosmic-text).
+        let _title = &window.title;
+        let _text_color = text_color;
+        // TODO: Render title text at (title_bar_rect.x + 5, title_bar_rect.y + 5) in foreground color
     }
+
+    let space_elements =
+        space_render_elements::<_, DesktopWindow, _>(renderer, [space], output, 1.0)?;
+    elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
 
     if let Some(texture_element) = wallpaper.texture_element(output_logical_size) {
         elements.push(OutputRenderElements::Custom(CustomRenderElements::Texture(texture_element)));
@@ -345,6 +356,7 @@ mod tests {
             minimized: false,
             fullscreen: false,
             focused: true,
+            client_decorations_requested: None,
         }
     }
 
