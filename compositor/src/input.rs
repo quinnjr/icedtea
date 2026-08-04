@@ -153,6 +153,13 @@ impl AltTabMachine {
     pub fn index(&self) -> usize {
         self.index
     }
+
+    /// The entry list captured by `start()`, stable for the session's
+    /// duration (callers should read this instead of recomputing a fresh
+    /// window list on every step, so `index` always stays in bounds).
+    pub fn entries(&self) -> &[WindowId] {
+        &self.entries
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

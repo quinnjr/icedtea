@@ -117,9 +117,24 @@ pub struct State {
     pub outputs: HashMap<u32, OutputSurface>,
     /// Saved window geometries before fullscreen toggle, keyed by window ID.
     /// Used to restore non-fullscreen geometry when exiting fullscreen.
-    pub saved_geometry: HashMap<WindowId, icedtea_contract::Rectangle>,
+    ///
+    /// Kept separate from `snap_saved_geometry` (Task 11 review #2): both
+    /// `toggle_fullscreen` and `snap` used to share one `saved_geometry` map
+    /// keyed only by `WindowId`, so snapping a window and then
+    /// fullscreening it clobbered the pre-snap geometry with the snapped
+    /// one, and `snap_restore` after unfullscreening silently restored
+    /// nothing (it returns `Some(())` on a missing entry). Two independent
+    /// save slots per window means each feature's restore point survives
+    /// the other feature running in between.
+    pub fullscreen_saved_geometry: HashMap<WindowId, icedtea_contract::Rectangle>,
+    /// Saved window geometry before a `snap`, keyed by window ID. Used by
+    /// `snap_restore`. See `fullscreen_saved_geometry`'s doc for why this is
+    /// a separate map.
+    pub snap_saved_geometry: HashMap<WindowId, icedtea_contract::Rectangle>,
     /// Alt-tab cycling state, driven by `apply_action("cycle:alt_tab")` and
-    /// consumed/reset by `handle_pointer`/`handle_key` release paths.
+    /// ended by `end_alt_tab` (called from `backend.rs`'s keyboard filter
+    /// when the held modifier is released -- see `end_alt_tab`'s doc for
+    /// why that's the chosen end condition).
     pub alt_tab: input::AltTabMachine,
     /// Pointer-driven window move/snap state machine.
     pub drag: input::DragMachine,
@@ -131,6 +146,11 @@ pub struct State {
     /// replaces `window_manager` wholesale. Drained by `emit_pending`
     /// alongside `window_manager.pending_events`.
     pub pending_config_events: Vec<Event>,
+    /// Last known pointer position in output logical coordinates. `backend.rs`
+    /// updates this on every `PointerMotionAbsolute` event; `PointerButton`
+    /// events (which carry no position of their own) read it back to build
+    /// `PointerEvent::Press`/`Release`.
+    pub pointer_location: (i32, i32),
 
     // Wayland global state.
     pub compositor_state: CompositorState,
@@ -179,11 +199,13 @@ impl State {
             snap_preview: None,
             surface_to_window: HashMap::new(),
             outputs: HashMap::new(),
-            saved_geometry: HashMap::new(),
+            fullscreen_saved_geometry: HashMap::new(),
+            snap_saved_geometry: HashMap::new(),
             alt_tab: input::AltTabMachine::new(),
             drag: input::DragMachine::new(),
             quitting: false,
             pending_config_events: Vec::new(),
+            pointer_location: (0, 0),
             compositor_state,
             xdg_shell_state,
             shm_state,
@@ -233,6 +255,18 @@ impl State {
         output.change_current_state(Some(mode), Some(transform), None, Some((0, 0).into()));
         output.set_preferred(mode);
         self.space.map_output(&output, (0, 0));
+        // Task 11 review (minor): `self.outputs` -- the geometry map `snap`,
+        // `snap_restore`'s counterpart `toggle_fullscreen`, and
+        // `handle_pointer_motion` all read -- was never populated outside
+        // test bodies, so every snap/fullscreen action was a silent runtime
+        // no-op. Single-output-at-(0,0) only for now (matches
+        // `space.map_output(&output, (0, 0))` above); multi-output geometry
+        // placement is out of this task's scope.
+        let index = self.outputs.len() as u32;
+        self.outputs.insert(
+            index,
+            OutputSurface { geometry: icedtea_contract::Rectangle { x: 0, y: 0, width: mode.size.w, height: mode.size.h } },
+        );
         output
     }
 
@@ -270,12 +304,12 @@ impl State {
         if target {
             // Save current geometry before entering fullscreen
             if let Some(w) = self.window_manager.get(id) {
-                self.saved_geometry.insert(id, w.geometry);
+                self.fullscreen_saved_geometry.insert(id, w.geometry);
             }
             self.window_manager.set_geometry(id, output_geo)?;
         } else {
             // Restore saved geometry when exiting fullscreen
-            let saved = self.saved_geometry.remove(&id)?;
+            let saved = self.fullscreen_saved_geometry.remove(&id)?;
             self.window_manager.set_geometry(id, saved)?;
         }
         self.emit_pending();
@@ -349,20 +383,29 @@ impl State {
             // `"snap:restore"` arm noted above. Matching `"cycle"` and
             // checking `arg` makes it reachable (and leaves room for other
             // `cycle:*` variants later without another silent dead arm).
+            //
+            // Task 11 review #1: a session's entry list is now captured
+            // once by `AltTabMachine::start` and kept stable for the whole
+            // session -- steps read it back via `self.alt_tab.entries()`
+            // instead of recomputing `alt_tab_entries()` (and therefore a
+            // possibly different length/order) on every keypress. The
+            // session itself is ended by `end_alt_tab` (see its doc for the
+            // chosen end condition), not here.
             "cycle" => {
                 if arg.as_deref() != Some("alt_tab") {
                     return None;
                 }
-                let entries = self.window_manager.alt_tab_entries();
-                if entries.is_empty() {
-                    return None;
-                }
                 if !self.alt_tab.is_active() {
-                    self.alt_tab.start(entries.clone());
+                    let entries = self.window_manager.alt_tab_entries();
+                    if entries.is_empty() {
+                        return None;
+                    }
+                    self.alt_tab.start(entries);
                 } else {
                     self.alt_tab.step(true);
                 }
                 let idx = self.alt_tab.index();
+                let entries = self.alt_tab.entries().to_vec();
                 if let Some(wid) = entries.get(idx).copied() {
                     self.window_manager.focus(wid);
                 }
@@ -372,15 +415,32 @@ impl State {
                 let cmd = arg?;
                 std::process::Command::new("sh").arg("-c").arg(&cmd).spawn().ok();
             }
+            // Task 11 review #4: `n: u32` from an externally-parseable
+            // action string (this dispatcher's own doc says it's also
+            // reachable "from a D-Bus-triggered action") minus 1 is unsigned
+            // subtraction -- `"workspace:0"` panicked the whole compositor
+            // in debug builds (and silently wrapped to `u32::MAX` in
+            // release). `checked_sub` turns that into a clean `None`
+            // instead. Separately, `set_active_workspace` returns `bool`
+            // ("does this workspace exist") and was being discarded, so an
+            // out-of-range `"workspace:7"` against the 4-workspace default
+            // used to report success (`Some(())`) having silently done
+            // nothing; it's now propagated as a real failure.
             "workspace" => {
                 let n: u32 = arg?.parse().ok()?;
-                self.window_manager.set_active_workspace(n - 1);
+                let idx = n.checked_sub(1)?;
+                if !self.window_manager.set_active_workspace(idx) {
+                    return None;
+                }
             }
             "move_to_workspace" => {
                 let id = self.window_manager.focused_window()?.id;
                 let n: u32 = arg?.parse().ok()?;
-                self.window_manager.set_workspace(id, n - 1)?;
-                self.window_manager.set_active_workspace(n - 1);
+                let idx = n.checked_sub(1)?;
+                self.window_manager.set_workspace(id, idx)?;
+                if !self.window_manager.set_active_workspace(idx) {
+                    return None;
+                }
             }
             // NOTE (brief deviation): the sample dispatch code had a second,
             // unreachable `"snap:restore" => ...` match arm alongside this
@@ -407,13 +467,40 @@ impl State {
         Some(())
     }
 
+    /// End an in-progress alt-tab session, if one is active: marks the
+    /// machine inactive and emits the terminal `AltTabState { active: false,
+    /// .. }` so the shell's overlay (the `contract::Event` consumer) can
+    /// dismiss itself. A no-op (no event emitted) if no session is active,
+    /// so callers can call this unconditionally.
+    ///
+    /// Task 11 review #1: nothing called `AltTabMachine::end()` anywhere in
+    /// the compositor, so a session never terminated -- `is_active()` stayed
+    /// `true` forever after the first `SUPER+Tab` and the shell's overlay
+    /// had no way to ever be told to close. The brief/spec don't name an
+    /// explicit end mechanism, so the one real WMs use was picked: alt-tab
+    /// ends when the held modifier (SUPER, per the default `cycle:alt_tab`
+    /// binding) is released. `backend.rs`'s keyboard filter calls this on
+    /// every key event where the current modifier state no longer includes
+    /// SUPER, which covers both "released the modifier while still holding
+    /// Tab" and "released Tab first, then the modifier."
+    pub fn end_alt_tab(&mut self) {
+        if !self.alt_tab.is_active() {
+            return;
+        }
+        let entries = self.alt_tab.entries().to_vec();
+        let idx = self.alt_tab.index();
+        self.alt_tab.end();
+        self.emit(Event::AltTabState(AltTabState { active: false, entries, index: idx }));
+        self.emit_pending();
+    }
+
     /// Snap `id` to `zone` on the (first) output, saving its pre-snap
     /// geometry so `snap_restore` can undo it.
     pub fn snap(&mut self, id: WindowId, zone: SnapZone) -> Option<()> {
         let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
         let gap = self.config.appearance.snap_gap;
         let current = self.window_manager.get(id)?.geometry;
-        self.saved_geometry.entry(id).or_insert(current);
+        self.snap_saved_geometry.entry(id).or_insert(current);
         self.window_manager.set_geometry(id, layout::snapped_geometry(output_geo, zone, gap))?;
         Some(())
     }
@@ -421,7 +508,7 @@ impl State {
     /// Restore `id`'s geometry as it was before its most recent `snap`, if
     /// any was saved.
     pub fn snap_restore(&mut self, id: WindowId) -> Option<()> {
-        if let Some(orig) = self.saved_geometry.remove(&id) {
+        if let Some(orig) = self.snap_saved_geometry.remove(&id) {
             self.window_manager.set_geometry(id, orig)?;
         }
         Some(())
@@ -431,13 +518,52 @@ impl State {
     /// swap in the new config (keybindings/appearance/behavior). Returns the
     /// events the caller should queue (via `pending_config_events`) since
     /// the just-replaced `window_manager` can't carry them.
+    ///
+    /// Task 11 review #3: this used to replace `window_manager` with a
+    /// brand-new, empty one and return only `WorkspaceList`/`ConfigReloaded`
+    /// -- every live window vanished from the model with zero
+    /// `WindowClosed` events (a direct violation of "every state change
+    /// emits"; the shell kept showing windows the compositor no longer
+    /// tracked), `surface_to_window` kept pointing at now-nonexistent ids
+    /// (so a later `toplevel_destroyed` for one of those surfaces would
+    /// silently no-op instead of cleaning up), and the fresh
+    /// `WindowManager`'s id counter reset to 1, so windows mapped after the
+    /// reload could collide with ids the shell might still remember as
+    /// live. Fixed here: emit `WindowClosed` for every window that's about
+    /// to disappear, unmap their still-mapped `wl_surface`s from `space` and
+    /// clear `surface_to_window`, and floor the new `WindowManager`'s id
+    /// counter at the old one's high-water mark so no id is ever reissued.
+    /// The plan's actual invariant (workspaces rebuilt from config) is
+    /// preserved unchanged; only the "silently destroy live state" part of
+    /// the sample was a bug.
     pub fn apply_config(&mut self, cfg: Config) -> Vec<Event> {
+        let mut events: Vec<Event> =
+            self.window_manager.windows().map(|w| Event::WindowClosed(w.id)).collect();
+
+        for surface in self.surface_to_window.keys().cloned().collect::<Vec<_>>() {
+            let window = self
+                .space
+                .elements()
+                .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &surface))
+                .cloned();
+            if let Some(window) = window {
+                self.space.unmap_elem(&window);
+            }
+        }
+        self.surface_to_window.clear();
+        // Stale restore points would otherwise reference ids that can never
+        // come back (the floor below guarantees that).
+        self.fullscreen_saved_geometry.clear();
+        self.snap_saved_geometry.clear();
+
+        let next_id_floor = self.window_manager.next_id();
         self.config = cfg.clone();
         self.window_manager = WindowManager::new(cfg.workspace_names.clone());
-        vec![
-            Event::WorkspaceList(self.window_manager.workspace_info()),
-            Event::ConfigReloaded(cfg.appearance.clone()),
-        ]
+        self.window_manager.raise_id_floor(next_id_floor);
+
+        events.push(Event::WorkspaceList(self.window_manager.workspace_info()));
+        events.push(Event::ConfigReloaded(cfg.appearance.clone()));
+        events
     }
 
     /// Resolve `mods`+`keysym` against the configured keybindings and apply
@@ -979,5 +1105,153 @@ mod tests {
         let geo = state.window_manager.get(id).unwrap().geometry;
         assert_eq!(geo.width, 1000 / 2 - 16);
         assert_eq!(state.snap_preview, None);
+    }
+
+    // --- Review fix-round tests (task-11-review.md) ---
+
+    /// Important #1: a session's entry list is frozen at `start()` and used
+    /// for the whole session even if `window_manager` changes underneath it
+    /// mid-cycle -- stepping must not panic or desync just because a window
+    /// in the frozen list got removed.
+    #[test]
+    fn alt_tab_session_survives_churn_and_ends_cleanly() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+        let c = state.window_manager.add_window("c", "c", 3, DEFAULT_GEO);
+        // `alt_tab_entries()` is id-ordered: [a, b, c]. First cycle starts
+        // the session and focuses entries[0] = a.
+        state.apply_action("cycle:alt_tab").unwrap();
+        assert!(state.alt_tab.is_active());
+        assert!(state.window_manager.get(a).unwrap().focused);
+
+        // Churn mid-session: a window in the frozen entry list disappears.
+        state.window_manager.remove_window(b);
+
+        // Stepping must not panic even though the stored entries still
+        // reference the now-gone `b` (index 1); `WindowManager::focus`
+        // quietly no-ops on a missing id instead of this call failing.
+        state.apply_action("cycle:alt_tab").unwrap(); // steps to index 1 (b, gone)
+        state.apply_action("cycle:alt_tab").unwrap(); // steps to index 2 (c)
+        assert!(state.alt_tab.is_active());
+        assert_eq!(state.alt_tab.entries().len(), 3, "entry list must stay frozen across churn");
+        assert!(state.window_manager.get(c).unwrap().focused);
+
+        // Drain events so we can inspect exactly what `end_alt_tab` sends.
+        let _ = rx.try_iter().count();
+        state.end_alt_tab();
+        assert!(!state.alt_tab.is_active());
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(|e| matches!(e, Event::AltTabState(AltTabState { active: false, .. }))),
+            "end_alt_tab must emit a terminal AltTabState so the shell overlay can dismiss"
+        );
+
+        // A no-op call afterwards must not emit a second terminal event.
+        state.end_alt_tab();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn end_alt_tab_is_a_noop_when_no_session_is_active() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert!(!state.alt_tab.is_active());
+        state.end_alt_tab();
+        assert!(rx.try_recv().is_err(), "no session was active, nothing should be emitted");
+    }
+
+    /// Important #2: `saved_geometry` used to be a single map shared by
+    /// `toggle_fullscreen` and `snap`; snapping then fullscreening a window
+    /// clobbered the pre-snap restore point with the snapped geometry, and
+    /// `snap_restore` after exiting fullscreen silently did nothing.
+    #[test]
+    fn snap_then_fullscreen_then_unfullscreen_then_snap_restore_round_trips() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        let original = Rectangle { x: 50, y: 60, width: 300, height: 200 };
+        let id = state.window_manager.add_window("app", "t", 1, original);
+        state.window_manager.focus(id).unwrap();
+
+        state.snap(id, SnapZone::Left).unwrap();
+        assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 1000 / 2 - 16);
+
+        state.toggle_fullscreen(id).unwrap(); // enter fullscreen from the snapped geometry
+        assert!(state.window_manager.get(id).unwrap().fullscreen);
+        state.toggle_fullscreen(id).unwrap(); // exit fullscreen
+        assert!(!state.window_manager.get(id).unwrap().fullscreen);
+        // Exiting fullscreen must restore the *snapped* geometry, not the
+        // pre-snap original -- fullscreen's own restore point is untouched
+        // by snap's map.
+        assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 1000 / 2 - 16);
+
+        state.snap_restore(id).unwrap();
+        assert_eq!(state.window_manager.get(id).unwrap().geometry, original);
+    }
+
+    /// Important #3: `apply_config` must emit `WindowClosed` for every
+    /// window it discards, clear `surface_to_window` (no direct accessor,
+    /// so this asserts the externally observable state that depends on it:
+    /// a `toplevel_destroyed`-style removal after reload no longer applies
+    /// to any window in the new manager), and never let a post-reload
+    /// `add_window` reuse an id from before the reload.
+    #[test]
+    fn apply_config_emits_window_closed_and_floors_id_counter() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+
+        let mut cfg = icedtea_config::default_config();
+        cfg.workspace_names = vec!["A".into(), "B".into()];
+        let events = state.apply_config(cfg);
+
+        let closed: Vec<WindowId> =
+            events.iter().filter_map(|e| if let Event::WindowClosed(id) = e { Some(*id) } else { None }).collect();
+        assert_eq!(closed.len(), 2, "one WindowClosed per pre-reload window");
+        assert!(closed.contains(&a));
+        assert!(closed.contains(&b));
+        assert!(events.iter().any(|e| matches!(e, Event::WorkspaceList(_))));
+        assert!(events.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
+
+        // The old windows are gone from the (now-empty) manager.
+        assert!(state.window_manager.get(a).is_none());
+        assert!(state.window_manager.get(b).is_none());
+
+        // A window mapped after the reload must never collide with a
+        // pre-reload id the shell might still remember as live.
+        let c = state.window_manager.add_window("c", "c", 3, DEFAULT_GEO);
+        assert!(c.0 > a.0 && c.0 > b.0);
+    }
+
+    /// Important #4: `n - 1` on a `u32` action argument must never panic,
+    /// and an out-of-range workspace index must be a reported failure, not
+    /// a silent no-op success.
+    #[test]
+    fn workspace_zero_does_not_panic_and_fails_cleanly() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert_eq!(state.apply_action("workspace:0"), None);
+        assert_eq!(state.window_manager.active_workspace(), 0, "a failed switch must not move the active workspace");
+    }
+
+    #[test]
+    fn workspace_out_of_range_fails_instead_of_reporting_success() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        // Default config has 4 workspaces (config/src/defaults.rs); 99 is
+        // well out of range.
+        assert_eq!(state.apply_action("workspace:99"), None);
+        assert_eq!(state.window_manager.active_workspace(), 0);
+    }
+
+    #[test]
+    fn move_to_workspace_zero_does_not_panic_and_fails_cleanly() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        assert_eq!(state.apply_action("move_to_workspace:0"), None);
     }
 }

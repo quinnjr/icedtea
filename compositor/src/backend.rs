@@ -23,17 +23,23 @@
 //! silently listen on a wayland socket with nothing behind it, `init_drm`
 //! logs a loud `tracing::error!` saying so rather than pretending to work.
 
+use smithay::backend::input::{
+    AbsolutePositionEvent, ButtonState, Event as InputEventTrait, InputEvent, KeyState, KeyboardKeyEvent,
+    PointerButtonEvent,
+};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
 use smithay::backend::udev::UdevBackend;
-use smithay::backend::winit::{self, WinitEvent};
+use smithay::backend::winit::{self, WinitEvent, WinitInput};
+use smithay::input::keyboard::FilterResult;
 use smithay::output::{Mode as OutputMode, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::LoopHandle;
-use smithay::utils::{Rectangle, Transform};
+use smithay::utils::{Rectangle, Transform, SERIAL_COUNTER};
 
+use crate::input as icedtea_input;
 use crate::render;
-use crate::state::State;
+use crate::state::{PointerEvent, State};
 
 /// A running compositor backend.
 pub enum Backend {
@@ -103,9 +109,17 @@ impl Backend {
                         None,
                         None,
                     );
+                    // Keep `state.outputs` (snap/fullscreen/pointer-motion's
+                    // geometry source, populated by `create_output`) in sync
+                    // so a resized nested window doesn't leave those acting
+                    // on the stale boot-time size.
+                    if let Some(o) = state.outputs.get_mut(&0) {
+                        o.geometry.width = size.w;
+                        o.geometry.height = size.h;
+                    }
                 }
-                WinitEvent::Input(_input_event) => {
-                    // Routing input into the seat lands in a later task.
+                WinitEvent::Input(input_event) => {
+                    process_winit_input(state, input_event);
                 }
                 WinitEvent::Redraw => {
                     let size = winit_backend.window_size();
@@ -179,4 +193,107 @@ impl Backend {
 
         Backend::Drm(DrmBackend { seat_name, _session: session })
     }
+}
+
+/// Route a winit `InputEvent` to `State::handle_key`/`State::handle_pointer`.
+///
+/// Task 11 review #5 (human-ruling scope extension: the brief's file list
+/// excludes `backend.rs`, overridden here): previously `WinitEvent::Input`
+/// was entirely discarded ("Routing input into the seat lands in a later
+/// task"), which meant nothing in the plan ever actually called `handle_key`
+/// or `handle_pointer` -- Task 11's dispatch/drag logic was unit-tested but
+/// unreachable at runtime. This is deliberately thin: it only translates
+/// winit/xkb event shapes into the types `State`'s existing dispatchers
+/// already accept and calls them; no keybinding/drag/snap decision-making
+/// lives here.
+fn process_winit_input(state: &mut State, event: InputEvent<WinitInput>) {
+    match event {
+        InputEvent::Keyboard { event, .. } => {
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = InputEventTrait::time_msec(&event);
+            let keycode = event.key_code();
+            let key_state = event.state();
+            let Some(keyboard) = state.seat.get_keyboard() else { return };
+            keyboard.input::<(), _>(state, keycode, key_state, serial, time, |data, mods, handle| {
+                // Item 1's chosen end condition: alt-tab ends when the held
+                // modifier (SUPER, per the default `cycle:alt_tab` binding)
+                // is no longer down, regardless of which specific key this
+                // event is for -- covers releasing the modifier first or
+                // last relative to Tab.
+                if data.alt_tab.is_active() && !mods.logo {
+                    data.end_alt_tab();
+                }
+                if key_state == KeyState::Pressed {
+                    let our_mods = to_icedtea_modifiers(mods);
+                    let keysym = handle.modified_sym().raw();
+                    if data.handle_key(our_mods, keysym).is_some() {
+                        // Consumed by a compositor keybinding: don't forward
+                        // to the focused client.
+                        return FilterResult::Intercept(());
+                    }
+                }
+                FilterResult::Forward
+            });
+        }
+        InputEvent::PointerMotionAbsolute { event, .. } => {
+            let Some(output_geo) = state.outputs.values().next().map(|o| o.geometry) else { return };
+            let size: smithay::utils::Size<i32, smithay::utils::Logical> =
+                (output_geo.width, output_geo.height).into();
+            let pos = event.position_transformed(size);
+            let pointer = (pos.x as i32 + output_geo.x, pos.y as i32 + output_geo.y);
+            state.pointer_location = pointer;
+            state.handle_pointer(PointerEvent::Motion { pointer });
+        }
+        InputEvent::PointerButton { event, .. } => {
+            // BTN_LEFT only: decoration hit-testing/drag is a left-click
+            // interaction (matches `WinitMouseInputEvent::button_code`'s
+            // `0x110` for `WinitMouseButton::Left`).
+            if event.button_code() != 0x110 {
+                return;
+            }
+            let pointer = state.pointer_location;
+            match event.state() {
+                ButtonState::Pressed => {
+                    // No client input-focus forwarding is wired yet (see
+                    // module docs), so "which window is under the pointer"
+                    // is answered from our own window model rather than
+                    // smithay's `Space`: the MRU-first order `windows()`
+                    // returns is a reasonable topmost-first stand-in.
+                    let id = state
+                        .window_manager
+                        .windows()
+                        .find(|w| w.geometry.contains(pointer.0, pointer.1))
+                        .map(|w| w.id);
+                    if let Some(id) = id {
+                        state.handle_pointer(PointerEvent::Press { id, pointer });
+                    }
+                }
+                ButtonState::Released => {
+                    state.handle_pointer(PointerEvent::Release { pointer });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Translate smithay's keyboard modifier state (as tracked by the seat's
+/// xkb state) to `input::Modifiers`. `logo` is the "Super"/"Windows" key,
+/// matching this project's `SUPER` binding token
+/// (`config/src/defaults.rs`).
+fn to_icedtea_modifiers(mods: &smithay::input::keyboard::ModifiersState) -> icedtea_input::Modifiers {
+    let mut out = icedtea_input::Modifiers::empty();
+    if mods.logo {
+        out |= icedtea_input::Modifiers::SUPER;
+    }
+    if mods.ctrl {
+        out |= icedtea_input::Modifiers::CTRL;
+    }
+    if mods.alt {
+        out |= icedtea_input::Modifiers::ALT;
+    }
+    if mods.shift {
+        out |= icedtea_input::Modifiers::SHIFT;
+    }
+    out
 }

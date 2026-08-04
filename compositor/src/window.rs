@@ -286,6 +286,24 @@ impl WindowManager {
             .collect()
     }
 
+    /// The id the next `add_window` call will assign.
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
+    /// Raise the id counter to at least `min_next_id`, never lowering it.
+    /// Used by `State::apply_config` (Task 11 review #3): that method
+    /// discards all windows and rebuilds a fresh `WindowManager`, but must
+    /// not let the fresh instance start reissuing ids from 1 -- a shell that
+    /// hasn't yet processed the `WindowClosed` events for the old windows
+    /// could otherwise see a brand-new window claim an id it still believes
+    /// is live.
+    pub fn raise_id_floor(&mut self, min_next_id: u32) {
+        if min_next_id > self.next_id {
+            self.next_id = min_next_id;
+        }
+    }
+
     fn workspace(&self, id: u32) -> Option<&Workspace> {
         self.workspaces.get(id as usize)
     }
