@@ -256,9 +256,8 @@ pub fn draw_frame<'d>(
 
     // SSD element slot's geometry hook (see `decoration_strip_geometry`):
     // computed every frame from real window geometry, ready for Task 10 to
-    // turn into `CustomRenderElements::Decoration` elements. Not rendered
-    // yet -- full SSD styling/painting is Task 10's scope.
-    let _decoration_strip_geometry = decoration_strip_geometry(windows);
+    // turn into `CustomRenderElements::Decoration` elements.
+    let decoration_strip_geometry = decoration_strip_geometry(windows);
 
     let scale = output.current_scale().fractional_scale();
     let output_logical_size = output
@@ -282,6 +281,45 @@ pub fn draw_frame<'d>(
     let space_elements =
         space_render_elements::<_, DesktopWindow, _>(renderer, [space], output, 1.0)?;
     elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+
+    // Render SSD decoration strips for non-CSD, non-fullscreen windows
+    let title_bar_color = hex_to_rgba(&appearance.palette.background);
+    let button_color = hex_to_rgba(&appearance.palette.accent);
+    for (window, title_bar_rect) in windows.iter().zip(decoration_strip_geometry.iter()) {
+        // Skip CSD windows and fullscreen windows
+        if window.fullscreen || decoration::is_csd(&window.app_id, None) {
+            continue;
+        }
+
+        // Render title bar background
+        let buffer = SolidColorBuffer::new(
+            (title_bar_rect.width, decoration::TITLE_BAR_HEIGHT),
+            title_bar_color,
+        );
+        let location = Point::<i32, Logical>::from((title_bar_rect.x, title_bar_rect.y))
+            .to_physical_precise_round(scale);
+        let title_bar_element = SolidColorRenderElement::from_buffer(&buffer, location, scale, 1.0, Kind::Unspecified);
+        elements.push(OutputRenderElements::Custom(CustomRenderElements::Solid(title_bar_element)));
+
+        // Render buttons
+        let buttons = decoration::button_rects(window.geometry);
+        for button_rect in buttons.iter() {
+            let button_buffer = SolidColorBuffer::new(
+                (decoration::BUTTON_WIDTH, decoration::TITLE_BAR_HEIGHT),
+                button_color,
+            );
+            let button_location = Point::<i32, Logical>::from((button_rect.x, button_rect.y))
+                .to_physical_precise_round(scale);
+            let button_element = SolidColorRenderElement::from_buffer(
+                &button_buffer,
+                button_location,
+                scale,
+                1.0,
+                Kind::Unspecified,
+            );
+            elements.push(OutputRenderElements::Custom(CustomRenderElements::Solid(button_element)));
+        }
+    }
 
     if let Some(texture_element) = wallpaper.texture_element(output_logical_size) {
         elements.push(OutputRenderElements::Custom(CustomRenderElements::Texture(texture_element)));

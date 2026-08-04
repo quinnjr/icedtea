@@ -53,6 +53,11 @@ use smithay::{
 use crate::render::WallpaperState;
 use crate::window::WindowManager;
 
+/// Output geometry information (simplified from smithay's `Output`).
+pub struct OutputSurface {
+    pub geometry: icedtea_contract::Rectangle,
+}
+
 /// Per-client data attached by `insert_client`.
 #[derive(Default)]
 pub struct ClientState {
@@ -94,6 +99,11 @@ pub struct State {
     /// back into `window_manager` without re-deriving state from the
     /// wayland-protocol object.
     surface_to_window: HashMap<WlSurface, WindowId>,
+    /// Output geometries keyed by output index. Used by fullscreen toggle.
+    pub outputs: HashMap<u32, OutputSurface>,
+    /// Saved window geometries before fullscreen toggle, keyed by window ID.
+    /// Used to restore non-fullscreen geometry when exiting fullscreen.
+    pub saved_geometry: HashMap<WindowId, icedtea_contract::Rectangle>,
 
     // Wayland global state.
     pub compositor_state: CompositorState,
@@ -141,6 +151,8 @@ impl State {
             wallpaper: WallpaperState::new(),
             snap_preview: None,
             surface_to_window: HashMap::new(),
+            outputs: HashMap::new(),
+            saved_geometry: HashMap::new(),
             compositor_state,
             xdg_shell_state,
             shm_state,
@@ -199,6 +211,39 @@ impl State {
         for ev in self.window_manager.pending_events.drain(..) {
             let _ = self.dbus_tx.send(ev);
         }
+    }
+
+    /// Toggle fullscreen state for a window. When entering fullscreen, saves the
+    /// current geometry and sets geometry to the output rect. When exiting, restores
+    /// the saved geometry. Emits WindowUpdated event.
+    pub fn toggle_fullscreen(&mut self, id: WindowId) -> Option<()> {
+        let w = self.window_manager.get(id)?;
+        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        let target = !w.fullscreen;
+        self.window_manager.set_fullscreen(id, target)?;
+        if target {
+            // Save current geometry before entering fullscreen
+            if let Some(w) = self.window_manager.get(id) {
+                self.saved_geometry.insert(id, w.geometry);
+            }
+            self.window_manager.set_geometry(id, output_geo)?;
+        } else {
+            // Restore saved geometry when exiting fullscreen
+            let saved = self.saved_geometry.remove(&id)?;
+            self.window_manager.set_geometry(id, saved)?;
+        }
+        self.emit_pending();
+        Some(())
+    }
+
+    /// Get the decoration action for a given window at the specified local coordinates.
+    /// Returns the action if the window is focused and not fullscreen, None otherwise.
+    pub fn decoration_action_for(&self, id: WindowId, local: (i32, i32)) -> Option<crate::decoration::DecorationAction> {
+        let w = self.window_manager.get(id)?;
+        if !w.focused || w.fullscreen {
+            return None;
+        }
+        Some(crate::decoration::hit_test(w.geometry, local))
     }
 }
 
@@ -434,6 +479,7 @@ delegate_xdg_decoration!(State);
 mod tests {
     use super::*;
     use icedtea_config::default_config;
+    use icedtea_contract::Rectangle;
 
     #[test]
     fn state_emits_pending_events_on_channel() {
@@ -442,5 +488,26 @@ mod tests {
         state.window_manager.add_window("app", "t", 1);
         state.emit_pending();
         assert!(matches!(rx.try_recv(), Ok(Event::WindowOpened(_))));
+    }
+
+    #[test]
+    fn decoration_action_round_trips_through_hit_test() {
+        use crate::decoration::hit_test;
+        let geo = Rectangle { x: 100, y: 100, width: 600, height: 400 };
+        // title-bar center -> Move (drag); rightmost button -> Close
+        let close_pt = (geo.x + geo.width - 5, geo.y + 5);
+        assert_eq!(hit_test(geo, close_pt), crate::decoration::DecorationAction::Close);
+    }
+
+    #[test]
+    fn toggle_fullscreen_flips_state_and_geometry() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+        let id = state.window_manager.add_window("app", "t", 1);
+        state.toggle_fullscreen(id).unwrap();
+        let w = state.window_manager.get(id).unwrap();
+        assert!(w.fullscreen);
+        assert_eq!(w.geometry, Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
     }
 }
