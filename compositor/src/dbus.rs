@@ -65,12 +65,21 @@
 //!   single variable -- that doesn't type-check (a `match` expression must
 //!   produce one concrete type). `emit_signal` is called directly inside
 //!   each arm below instead, each against its own concretely-typed body.
-//! - **`quit_signal`'s use.** Present in the brief's "Produces" signature
-//!   but absent from its Step-3 sample body. Used here to turn the emitter
-//!   thread's blocking `recv()` into a polling `recv_timeout`, so the
-//!   thread can notice the compositor shutting down and exit its loop
-//!   between messages instead of being severed mid-`emit_signal` when the
-//!   process exits (`main.rs` sets it once `event_loop.run()` returns).
+//! - **`quit_signal`'s use, and the return type that carries it.** Present
+//!   in the brief's "Produces" signature but absent from its Step-3 sample
+//!   body. Used here to turn the emitter thread's blocking `recv()` into a
+//!   polling `recv_timeout`, so the thread can notice the compositor
+//!   shutting down and exit its loop between messages instead of being
+//!   severed mid-`emit_signal` when the process exits. Setting the flag
+//!   alone doesn't achieve that, though: `main.rs` sets it as its last
+//!   statement, and if nothing then waits for the thread to actually act on
+//!   it, `main` (and the process with it) can return before the next
+//!   `recv_timeout` tick ever wakes up -- the flag would be set on a thread
+//!   that's already gone. So `spawn_service` returns
+//!   `(Connection, JoinHandle<()>)`, not just the brief's bare
+//!   `Connection`, and `main.rs` joins that handle immediately after
+//!   setting the flag; the join is bounded by the `recv_timeout` tick
+//!   (200ms) it's waiting on, not by traffic on `events_rx`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -170,19 +179,28 @@ impl WmInterface {
 /// [`WmInterface`] at [`WM_PATH`], claims [`WM_BUS_NAME`], and starts a
 /// dedicated emitter thread that turns every `contract::Event` received on
 /// `events_rx` into a D-Bus signal. Returns the shared connection (kept
-/// alive by the caller for as long as the service should stay registered).
+/// alive by the caller for as long as the service should stay registered)
+/// and the emitter thread's `JoinHandle`, so the caller can wait for it to
+/// actually observe `quit_signal` on shutdown (see this module's doc for
+/// why a bare `Connection` return, as the brief's "Produces" line has it,
+/// isn't enough for that).
 pub fn spawn_service(
     events_rx: Receiver<Event>,
     cmd_tx: calloop::channel::Sender<DbCommand>,
     quit_signal: Arc<AtomicBool>,
-) -> Connection {
+) -> (Connection, std::thread::JoinHandle<()>) {
     let conn = Connection::session().expect("session bus available");
     let iface = WmInterface { cmd_tx: Mutex::new(cmd_tx) };
     conn.object_server().at(WM_PATH, iface).expect("register org.icedtea.WM interface");
-    conn.request_name(WM_BUS_NAME).expect("acquire org.icedtea.WM bus name");
+    conn.request_name(WM_BUS_NAME).unwrap_or_else(|err| {
+        panic!(
+            "failed to acquire the {WM_BUS_NAME} bus name -- is another icedtea-compositor \
+             instance (or a stale connection holding the name) already running? ({err})"
+        )
+    });
 
     let emitter_conn = conn.clone();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         loop {
             if quit_signal.load(Ordering::Relaxed) {
                 break;
@@ -215,19 +233,35 @@ pub fn spawn_service(
         }
     });
 
-    conn
+    (conn, handle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icedtea_contract::{Appearance, Rectangle, WindowInfo};
+    use icedtea_contract::{AltTabState, Appearance, Rectangle, WindowInfo, WindowUpdate, WorkspaceInfo};
 
     #[test]
     fn event_names_match_interface() {
         assert_eq!(event_signal_name(&Event::WindowOpened(sample_info())), "WindowOpened");
         assert_eq!(event_signal_name(&Event::WindowClosed(WindowId(1))), "WindowClosed");
         assert_eq!(event_signal_name(&Event::ConfigReloaded(default_appearance())), "ConfigReloaded");
+        // Fix-round addition: the brief's own Step-1 sample only exercised
+        // 3 of the 7 `Event` variants; cover the remaining 4 so every
+        // `event_signal_name` match arm has a passing assertion behind it.
+        assert_eq!(
+            event_signal_name(&Event::WindowUpdated { id: WindowId(1), update: WindowUpdate::default() }),
+            "WindowUpdated"
+        );
+        assert_eq!(event_signal_name(&Event::WorkspaceSet { id: 0, active: true }), "WorkspaceSet");
+        assert_eq!(
+            event_signal_name(&Event::WorkspaceList(vec![WorkspaceInfo { id: 0, name: "1".into() }])),
+            "WorkspaceList"
+        );
+        assert_eq!(
+            event_signal_name(&Event::AltTabState(AltTabState { active: true, entries: vec![], index: 0 })),
+            "AltTabState"
+        );
     }
 
     fn sample_info() -> WindowInfo {

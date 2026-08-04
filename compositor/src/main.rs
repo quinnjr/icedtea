@@ -46,7 +46,7 @@ fn main() {
     // `Sender`, not the brief's literal `crossbeam_channel::Sender`).
     let (cmd_tx, cmd_channel) = smithay::reexports::calloop::channel::channel::<dbus::DbCommand>();
     let dbus_quit_signal = Arc::new(AtomicBool::new(false));
-    let _dbus_conn = dbus::spawn_service(dbus_events_rx, cmd_tx, dbus_quit_signal.clone());
+    let (_dbus_conn, dbus_emitter_thread) = dbus::spawn_service(dbus_events_rx, cmd_tx, dbus_quit_signal.clone());
     event_loop
         .handle()
         .insert_source(cmd_channel, |event, _, state: &mut State| {
@@ -147,6 +147,12 @@ fn main() {
 
     // Let the D-Bus emitter thread's polling `recv_timeout` (see
     // `dbus.rs`'s module doc) notice the shutdown and exit its loop rather
-    // than being severed mid-`emit_signal` when the process exits.
+    // than being severed mid-`emit_signal` when the process exits. Setting
+    // the flag alone isn't enough -- `main` returning (ending the process)
+    // races the thread's next wakeup -- so this joins the thread, which
+    // `spawn_service`'s `JoinHandle` return exists for; the join is bounded
+    // by the `recv_timeout` tick it's waiting on (200ms), not by traffic on
+    // the events channel.
     dbus_quit_signal.store(true, Ordering::Relaxed);
+    let _ = dbus_emitter_thread.join();
 }
