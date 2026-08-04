@@ -161,15 +161,22 @@ impl State {
     }
 
     /// Register a new output (backends call this once they know the mode).
+    ///
+    /// `transform` is backend-specific, not a fixed default: winit/GL
+    /// framebuffers are Y-flipped relative to the compositor's logical space,
+    /// so the nested backend must pass `Transform::Flipped180` (matching
+    /// `smallvil/src/winit.rs:40` and `anvil/src/winit.rs:125`), while a real
+    /// DRM scanout output uses `Transform::Normal`.
     pub fn create_output(
         &mut self,
         name: &str,
         physical: smithay::output::PhysicalProperties,
         mode: smithay::output::Mode,
+        transform: smithay::utils::Transform,
     ) -> Output {
         let output = Output::new(name.to_string(), physical);
         output.create_global::<Self>(&self.display_handle);
-        output.change_current_state(Some(mode), Some(smithay::utils::Transform::Normal), None, Some((0, 0).into()));
+        output.change_current_state(Some(mode), Some(transform), None, Some((0, 0).into()));
         output.set_preferred(mode);
         self.space.map_output(&output, (0, 0));
         output

@@ -19,17 +19,16 @@ fn main() {
 
     let nested = std::env::args().any(|a| a == "--nested");
 
-    // Config I/O + JSON parse happens off the main thread; the main loop
-    // blocks briefly on the single result rather than doing redb/JSON work
-    // itself (see the plan's threading-model constraint).
-    let (config_tx, config_rx) = crossbeam_channel::bounded(1);
+    // The event loop isn't running yet, so there is nothing else useful to
+    // overlap this with -- a synchronous load is correct here. Task 13 owns
+    // the *async reload* mechanism (a `calloop::channel` source draining a
+    // worker-thread result onto the main loop); this is boot-time only.
     let db_path = icedtea_config::default_db_path();
-    std::thread::spawn(move || {
-        let _ = config_tx.send(icedtea_config::load_or_default(&db_path));
-    });
-    let config = config_rx.recv().expect("config worker finished");
+    let config = icedtea_config::load_or_default(&db_path);
 
     let (dbus_tx, _dbus_rx) = crossbeam_channel::unbounded::<Event>();
+    // `_dbus_rx` has no consumer yet by design: Task 12's D-Bus thread is the
+    // intended consumer of this channel and becomes the drain.
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new().expect("failed to create the event loop");
     let mut state = State::new(config, dbus_tx);
@@ -54,9 +53,16 @@ fn main() {
     event_loop
         .handle()
         .insert_source(Generic::new(display, Interest::READ, Mode::Level), |_, display, state: &mut State| {
-            // Safety: the display is owned by this closure and outlives every dispatch.
+            // SAFETY: `Generic::get_mut`'s obligation is that the wrapped
+            // `Display` is not dropped (nor its fd closed) while this source
+            // remains registered with the loop. It stays alive inside this
+            // closure's captured source data for as long as the source is
+            // registered, and is only ever removed by dropping the whole
+            // event loop, so that obligation holds.
             unsafe {
-                display.get_mut().dispatch_clients(state).unwrap();
+                if let Err(err) = display.get_mut().dispatch_clients(state) {
+                    tracing::warn!("error dispatching wayland client requests: {err}");
+                }
             }
             Ok(PostAction::Continue)
         })
@@ -65,7 +71,7 @@ fn main() {
     tracing::info!(socket = %socket_name, "listening on wayland socket");
 
     let _backend = if nested {
-        Backend::init_nested(&mut state, &event_loop.handle())
+        Backend::init_nested(&mut state, &event_loop.handle(), &socket_name)
     } else {
         Backend::init_drm()
     };
