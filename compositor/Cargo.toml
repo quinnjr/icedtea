@@ -15,6 +15,7 @@ crossbeam-channel.workspace = true
 image.workspace = true
 zbus.workspace = true
 redb.workspace = true
+bitflags = "2"
 
 # NOTE: the task-7 brief's sample feature list (`backend_wayland`, `layer_shell`,
 # `xdg_decoration`) does not match smithay 0.7.0's actual Cargo features --
