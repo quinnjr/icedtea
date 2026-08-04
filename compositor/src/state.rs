@@ -575,6 +575,22 @@ impl State {
         // Drop any in-flight interaction that referenced the about-to-vanish
         // windows.
         self.drag = input::DragMachine::new();
+        // Task 11 re-review round 3 #1: resetting `alt_tab` (below) is a
+        // state change, not an event -- a reload mid-cycle used to leave
+        // whatever shell overlay is rendered from the session's last
+        // `AltTabState{active: true, ..}` with no dismiss signal at all.
+        // The terminal event is appended to `events` here (rather than
+        // calling `end_alt_tab()`, which also calls `self.emit_pending()`
+        // itself) so it drains alongside -- in the same order as -- the
+        // `WindowClosed`/`WorkspaceList`/`ConfigReloaded` events this same
+        // call produces, instead of jumping the queue as a side effect.
+        if self.alt_tab.is_active() {
+            events.push(Event::AltTabState(AltTabState {
+                active: false,
+                entries: self.alt_tab.entries().to_vec(),
+                index: self.alt_tab.index(),
+            }));
+        }
         self.alt_tab = input::AltTabMachine::new();
         self.snap_preview = None;
 
@@ -623,6 +639,13 @@ impl State {
     /// click-to-focus window manager behavior.
     fn handle_pointer_press(&mut self, id: WindowId, pointer: (i32, i32)) -> Option<()> {
         self.window_manager.focus(id)?;
+        // Task 11 re-review round 3 #2: flush right after `focus()`
+        // mutates, before any of the `?`-early-returns below (e.g.
+        // `decoration_action_for` returning `None` for a fullscreen
+        // window) can skip the trailing `emit_pending()` call at the end
+        // of this function and leave the focus event sitting queued until
+        // some unrelated later flush.
+        self.emit_pending();
         let geo = self.window_manager.get(id)?.geometry;
         // Despite its parameter name, `decoration_action_for`/`hit_test`
         // compares against `title_bar_rect`/`button_rects`, which are
@@ -1376,6 +1399,68 @@ mod tests {
         assert!(
             state.window_manager.snapshot().seq > seq_before,
             "State::emit must bump seq like every other pending-event producer"
+        );
+    }
+
+    // --- Re-review fix-round-3 tests (task-11-review.md round 3) ---
+
+    /// Important #1: a reload mid-alt-tab-cycle must emit the terminal
+    /// `AltTabState{active: false, ..}` so a shell overlay rendered from
+    /// the session's last `active: true` event has a dismiss signal,
+    /// instead of `apply_config` just silently resetting the machine.
+    #[test]
+    fn apply_config_mid_cycle_emits_alt_tab_inactive() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+        state.apply_action("cycle:alt_tab").unwrap();
+        assert!(state.alt_tab.is_active());
+
+        let events = state.apply_config(icedtea_config::default_config());
+
+        assert!(
+            events.iter().any(|e| matches!(e, Event::AltTabState(AltTabState { active: false, .. }))),
+            "reload mid-cycle must emit the terminal AltTabState"
+        );
+        assert!(!state.alt_tab.is_active());
+    }
+
+    #[test]
+    fn apply_config_when_alt_tab_inactive_emits_no_extra_alt_tab_state() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert!(!state.alt_tab.is_active());
+        let events = state.apply_config(icedtea_config::default_config());
+        assert!(!events.iter().any(|e| matches!(e, Event::AltTabState(_))));
+    }
+
+    /// Minor #2: `handle_pointer_press`'s `focus()` mutation must flush
+    /// immediately, not get deferred by an early `?`-return further down
+    /// the same function (e.g. `decoration_action_for` returning `None`
+    /// for a fullscreen window).
+    #[test]
+    fn press_on_unfocused_fullscreen_window_flushes_focus_immediately() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let _b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+        state.window_manager.set_fullscreen(a, true).unwrap();
+        let _ = rx.try_iter().count(); // drain setup events
+        assert!(!state.window_manager.get(a).unwrap().focused, "b was added last and is focused, not a");
+
+        // `decoration_action_for` returns `None` for a fullscreen window,
+        // so this call itself returns `None` -- but the focus mutation
+        // must already be visible on the channel by the time it does.
+        assert_eq!(state.handle_pointer(PointerEvent::Press { id: a, pointer: (20, 5) }), None);
+        assert!(state.window_manager.get(a).unwrap().focused);
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::WindowUpdated { id, update } if *id == a && update.focused == Some(true))),
+            "focus event must be flushed immediately, not deferred until an unrelated later flush"
         );
     }
 }
