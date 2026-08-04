@@ -73,15 +73,33 @@ fn main() {
 
     // Wallpaper decode runs on a worker thread (multi-megapixel JPEG decode
     // is CPU-heavy and must stay off the render loop, per the threading
-    // model); the result comes back over a `calloop::channel`, which -- like
-    // Task 13's config-reload channel above -- *is* a calloop event source
-    // directly, so no `Generic`/fd wrapping is needed here.
+    // model); the result comes back over a `calloop::channel`, whose
+    // `Channel<T>` *is* a calloop event source directly, so no
+    // `Generic`/fd wrapping is needed here (see `render.rs`'s module doc
+    // for why this is `calloop::channel` and not a bare
+    // `crossbeam_channel::Receiver`).
+    let mut wallpaper_decoded = false;
     let wallpaper_channel = render::spawn_wallpaper_decode(state.config.appearance.wallpaper.clone());
     event_loop
         .handle()
-        .insert_source(wallpaper_channel, |event, _, state: &mut State| {
-            if let smithay::reexports::calloop::channel::Event::Msg(image) = event {
+        .insert_source(wallpaper_channel, move |event, _, state: &mut State| match event {
+            smithay::reexports::calloop::channel::Event::Msg(image) => {
+                wallpaper_decoded = true;
                 state.wallpaper.set_decoded(image);
+            }
+            smithay::reexports::calloop::channel::Event::Closed => {
+                // The sender side is dropped once the worker thread ends,
+                // which happens both on the normal "sent a result, thread
+                // exits" path and on a panic. Only the panic case -- closed
+                // without ever having sent -- is worth a log; the normal
+                // case would otherwise spam a misleading warning on every
+                // boot.
+                if !wallpaper_decoded {
+                    tracing::warn!(
+                        "wallpaper decode worker thread exited without producing a result \
+                         (it likely panicked); wallpaper stays solid-color"
+                    );
+                }
             }
         })
         .expect("failed to insert the wallpaper decode channel into the event loop");

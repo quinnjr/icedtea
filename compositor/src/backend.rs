@@ -110,6 +110,7 @@ impl Backend {
                 WinitEvent::Redraw => {
                     let size = winit_backend.window_size();
                     let damage = Rectangle::from_size(size);
+                    let windows: Vec<&crate::window::Window> = state.window_manager.windows().collect();
                     match winit_backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
                             if let Err(err) = render::draw_frame(
@@ -118,6 +119,7 @@ impl Backend {
                                 &mut damage_tracker,
                                 &render_output,
                                 &state.space,
+                                &windows,
                                 &state.config.appearance,
                                 &mut state.wallpaper,
                                 state.snap_preview,

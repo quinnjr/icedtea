@@ -19,14 +19,13 @@
 //! pairing it with a separate eventfd). `calloop::channel` is smithay's own
 //! purpose-built primitive for exactly this "worker thread result delivered
 //! into the main loop" shape -- its `Channel<T>` *is* an `EventSource`
-//! directly -- and it is already the established idiom in this codebase for
-//! the structurally identical case (see `main.rs`'s doc comment on Task 13's
-//! async config reload: "a `calloop::channel` source draining a
-//! worker-thread result onto the main loop"). `spawn_wallpaper_decode` below
-//! follows that precedent instead of the brief's literal wording. The
-//! invariant the brief actually cares about -- CPU-heavy decode runs off the
-//! render loop, result delivered to the main loop without shared mutable
-//! state -- is preserved exactly.
+//! directly -- and it matches the documented intent for Task 13's (not yet
+//! built) async config reload, per `main.rs`'s comment there: "a
+//! `calloop::channel` source draining a worker-thread result onto the main
+//! loop." `spawn_wallpaper_decode` below follows that same shape instead of
+//! the brief's literal wording. The invariant the brief actually cares
+//! about -- CPU-heavy decode runs off the render loop, result delivered to
+//! the main loop without shared mutable state -- is preserved exactly.
 
 use icedtea_contract::{Appearance, Rectangle};
 use smithay::backend::allocator::Fourcc;
@@ -36,7 +35,7 @@ use smithay::backend::renderer::damage::{
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::{TextureBuffer, TextureRenderElement};
-use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::{Kind, Wrap};
 use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::RendererSuper;
 use smithay::desktop::space::{space_render_elements, SpaceRenderElements};
@@ -44,6 +43,7 @@ use smithay::desktop::{Space, Window as DesktopWindow};
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Size, Transform};
 
+use crate::decoration;
 use crate::window::Window;
 
 /// Z-order layers in a frame, back to front. Used by `scene_order` (pure,
@@ -69,6 +69,18 @@ pub fn scene_order(windows: &[&Window], snap_active: bool) -> Vec<SceneLayer> {
     order
 }
 
+/// The SSD title-bar strip's geometry, one rectangle per window, computed
+/// via `crate::decoration::title_bar_rect`. This is the "geometry hook" the
+/// brief's Step 3 calls for -- real geometry, derived from each window's
+/// real position/size -- paired with the `CustomRenderElements::Decoration`
+/// element slot below. Task 10 owns turning this geometry (plus
+/// `crate::decoration::button_rects` and whatever SSD styling it designs)
+/// into actual painted `Decoration` elements in `draw_frame`; this task only
+/// wires the plumbing; the slot is real but stays unpopulated here.
+pub fn decoration_strip_geometry(windows: &[&Window]) -> Vec<Rectangle> {
+    windows.iter().map(|w| decoration::title_bar_rect(w.geometry)).collect()
+}
+
 /// The solid wallpaper color: `appearance.palette.background` converted to
 /// RGBA. Used as the frame's clear color, and as the fallback until (or
 /// unless) `appearance.wallpaper`'s image has finished decoding.
@@ -89,10 +101,16 @@ pub fn hex_to_rgba(hex: &str) -> [f32; 4] {
 
 smithay::backend::renderer::element::render_elements! {
     /// Non-window elements drawn each frame: the (optional) wallpaper
-    /// texture and the (optional) translucent snap-preview rectangle.
+    /// texture, the (optional) translucent snap-preview rectangle, and the
+    /// SSD title-bar strip slot (unpopulated until Task 10 designs what a
+    /// decorated strip looks like -- see `decoration_strip_geometry`).
     pub CustomRenderElements<=GlesRenderer>;
     Solid=SolidColorRenderElement,
     Texture=TextureRenderElement<GlesTexture>,
+    // `Wrap<...>` (rather than a second bare `SolidColorRenderElement`
+    // variant) because the macro generates one `From<FieldType>` impl per
+    // variant, and two variants with an identical field type collide.
+    Decoration=Wrap<SolidColorRenderElement>,
 }
 
 smithay::backend::renderer::element::render_elements! {
@@ -215,8 +233,12 @@ impl WallpaperState {
 /// populated) lands in Task 9 -- this is the geometry hook the brief asks
 /// for.
 ///
-/// SSD strip rendering itself lands in Task 10; `crate::decoration`'s
-/// metrics aren't drawn here yet, only the element slot/ordering exists.
+/// `windows` (our own model, geometry in output logical coordinates) feeds
+/// `decoration_strip_geometry` -- the SSD element slot/geometry hook. Full
+/// SSD rendering (turning that geometry into painted
+/// `CustomRenderElements::Decoration` elements) lands in Task 10; this task
+/// only computes the geometry and reserves the slot, it doesn't push any
+/// `Decoration` elements yet.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_frame<'d>(
     renderer: &mut GlesRenderer,
@@ -224,12 +246,19 @@ pub fn draw_frame<'d>(
     damage_tracker: &'d mut OutputDamageTracker,
     output: &Output,
     space: &Space<DesktopWindow>,
+    windows: &[&Window],
     appearance: &Appearance,
     wallpaper: &mut WallpaperState,
     snap_preview: Option<Rectangle>,
     age: usize,
 ) -> Result<RenderOutputResult<'d>, DamageTrackerError<GlesError>> {
     wallpaper.upload_pending(renderer);
+
+    // SSD element slot's geometry hook (see `decoration_strip_geometry`):
+    // computed every frame from real window geometry, ready for Task 10 to
+    // turn into `CustomRenderElements::Decoration` elements. Not rendered
+    // yet -- full SSD styling/painting is Task 10's scope.
+    let _decoration_strip_geometry = decoration_strip_geometry(windows);
 
     let scale = output.current_scale().fractional_scale();
     let output_logical_size = output
@@ -300,5 +329,28 @@ mod tests {
     fn hex_conversion() {
         assert_eq!(hex_to_rgba("#ff0000"), [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(hex_to_rgba("#1e1e2e"), [30.0 / 255.0, 30.0 / 255.0, 46.0 / 255.0, 1.0]);
+    }
+
+    #[test]
+    fn decoration_strip_geometry_uses_title_bar_rect() {
+        let w = fake_window();
+        assert_eq!(decoration_strip_geometry(&[&w]), vec![decoration::title_bar_rect(w.geometry)]);
+    }
+
+    #[test]
+    fn decoration_strip_geometry_is_empty_with_no_windows() {
+        assert_eq!(decoration_strip_geometry(&[]), Vec::<Rectangle>::new());
+    }
+
+    #[test]
+    fn decoration_element_slot_constructs() {
+        // Proves `CustomRenderElements::Decoration` -- the SSD element slot
+        // the brief's Step 3 asks for -- actually exists and type-checks.
+        // Task 10 is the one that constructs it from real geometry inside
+        // `draw_frame`; this only confirms the slot itself is wired.
+        let buffer = SolidColorBuffer::new((10, 10), [1.0, 1.0, 1.0, 1.0]);
+        let element = SolidColorRenderElement::from_buffer(&buffer, (0, 0), 1.0, 1.0, Kind::Unspecified);
+        let slot = CustomRenderElements::Decoration(Wrap::from(element));
+        assert!(matches!(slot, CustomRenderElements::Decoration(_)));
     }
 }
