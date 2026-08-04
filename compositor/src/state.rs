@@ -289,8 +289,16 @@ impl State {
     /// Queue an event for the next `emit_pending()` drain without it having
     /// come from a `window_manager` mutation (e.g. `AltTabState`, which is
     /// driven by `alt_tab`, not `window_manager`).
+    ///
+    /// Task 11 re-review #4: this used to push straight onto
+    /// `pending_events`, bypassing `WindowManager::bump()` -- every
+    /// `AltTabState` went out without ever advancing `seq`, so
+    /// `snapshot().seq` couldn't be used to detect that an alt-tab change
+    /// had happened. Routed through `note_event()` (which bumps then
+    /// returns the same `pending_events` vec) so it participates in the
+    /// same sequence counter as every other event.
     pub fn emit(&mut self, ev: Event) {
-        self.window_manager.pending_events.push(ev);
+        self.window_manager.note_event().push(ev);
     }
 
     /// Toggle fullscreen state for a window. When entering fullscreen, saves the
@@ -536,6 +544,15 @@ impl State {
     /// The plan's actual invariant (workspaces rebuilt from config) is
     /// preserved unchanged; only the "silently destroy live state" part of
     /// the sample was a bug.
+    ///
+    /// Task 11 re-review, same reload seam: also resets `drag`, `alt_tab`,
+    /// and `snap_preview` (all of which can be referencing a window id
+    /// that's about to stop existing -- a reload mid-drag would otherwise
+    /// leave a permanently rendered stale `snap_preview`, and a reload
+    /// mid-alt-tab would leave `alt_tab.is_active()` true forever with a
+    /// dead entry list), and floors the fresh `WindowManager`'s `seq`
+    /// counter the same way `next_id` is floored, so `snapshot().seq`
+    /// cannot go backwards across a reload.
     pub fn apply_config(&mut self, cfg: Config) -> Vec<Event> {
         let mut events: Vec<Event> =
             self.window_manager.windows().map(|w| Event::WindowClosed(w.id)).collect();
@@ -555,11 +572,18 @@ impl State {
         // come back (the floor below guarantees that).
         self.fullscreen_saved_geometry.clear();
         self.snap_saved_geometry.clear();
+        // Drop any in-flight interaction that referenced the about-to-vanish
+        // windows.
+        self.drag = input::DragMachine::new();
+        self.alt_tab = input::AltTabMachine::new();
+        self.snap_preview = None;
 
         let next_id_floor = self.window_manager.next_id();
+        let seq_floor = self.window_manager.seq();
         self.config = cfg.clone();
         self.window_manager = WindowManager::new(cfg.workspace_names.clone());
         self.window_manager.raise_id_floor(next_id_floor);
+        self.window_manager.raise_seq_floor(seq_floor);
 
         events.push(Event::WorkspaceList(self.window_manager.workspace_info()));
         events.push(Event::ConfigReloaded(cfg.appearance.clone()));
@@ -584,10 +608,21 @@ impl State {
     }
 
     /// Pointer button press at `pointer` (output logical coordinates) on
-    /// window `id`: if it hits the title bar's move area, begins a drag;
-    /// otherwise applies whatever discrete decoration action (close/
-    /// maximize/minimize) was hit.
+    /// window `id`: focuses the window (click-to-focus), then, if the press
+    /// hits the title bar's move area, begins a drag; otherwise applies
+    /// whatever discrete decoration action (close/maximize/minimize) was
+    /// hit.
+    ///
+    /// Task 11 re-review #2: this used to skip straight to
+    /// `decoration_action_for`, which gates on `w.focused` -- so pressing
+    /// an unfocused window's title bar or buttons did nothing at all (no
+    /// focus change, no drag, no click action) since the gate always failed
+    /// on the first click. Focusing first (unconditionally; `focus` on an
+    /// already-focused window is a no-op) makes the very click that should
+    /// raise a window also be the click that acts on it, matching ordinary
+    /// click-to-focus window manager behavior.
     fn handle_pointer_press(&mut self, id: WindowId, pointer: (i32, i32)) -> Option<()> {
+        self.window_manager.focus(id)?;
         let geo = self.window_manager.get(id)?.geometry;
         // Despite its parameter name, `decoration_action_for`/`hit_test`
         // compares against `title_bar_rect`/`button_rects`, which are
@@ -604,6 +639,7 @@ impl State {
         } else {
             self.apply_decoration_action(id, action);
         }
+        self.emit_pending();
         Some(())
     }
 
@@ -1253,5 +1289,93 @@ mod tests {
         let mut state = State::new(default_config(), tx);
         state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         assert_eq!(state.apply_action("move_to_workspace:0"), None);
+    }
+
+    // --- Re-review fix-round tests (task-11-review.md round 2) ---
+
+    /// Important #2: pressing an unfocused window must focus it, and that
+    /// focus must take effect *before* the decoration action for the same
+    /// click is evaluated (so the click that raises a window can also act
+    /// on it in one motion, matching ordinary click-to-focus behavior).
+    #[test]
+    fn press_on_unfocused_window_focuses_then_hits_its_decorations() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let a_geo = Rectangle { x: 0, y: 0, width: 640, height: 400 };
+        let a = state.window_manager.add_window("a", "a", 1, a_geo);
+        let b = state.window_manager.add_window("b", "b", 2, Rectangle { x: 700, y: 0, width: 640, height: 400 });
+        // `b` was added last, so it's focused; `a` is not.
+        assert!(!state.window_manager.get(a).unwrap().focused);
+        assert!(state.window_manager.get(b).unwrap().focused);
+
+        // Press on `a`'s title bar (not a button): before the fix,
+        // `decoration_action_for` would gate on `a.focused` (false) and
+        // this whole call would return `None`, doing nothing.
+        state.handle_pointer(PointerEvent::Press { id: a, pointer: (20, 5) }).unwrap();
+        assert!(state.window_manager.get(a).unwrap().focused);
+        assert!(!state.window_manager.get(b).unwrap().focused);
+
+        // Now that `a` is focused, a press on its close button must close
+        // it -- proving the *same* click sequence both focuses and acts.
+        let close_pt = (a_geo.x + a_geo.width - 5, a_geo.y + 5);
+        state.handle_pointer(PointerEvent::Press { id: a, pointer: close_pt }).unwrap();
+        assert!(state.window_manager.get(a).is_none());
+    }
+
+    /// Important #3 (adjacent staleness bugs on the reload seam): a reload
+    /// mid-drag/mid-alt-tab must not leave `drag`/`alt_tab`/`snap_preview`
+    /// referencing windows that `apply_config` is about to discard.
+    #[test]
+    fn apply_config_resets_drag_alt_tab_and_snap_preview() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+
+        state.drag.begin(a, (5, 5));
+        state.alt_tab.start(vec![a, b]);
+        state.snap_preview = Some(Rectangle { x: 0, y: 0, width: 500, height: 800 });
+        assert!(state.drag.window_id().is_some());
+        assert!(state.alt_tab.is_active());
+        assert!(state.snap_preview.is_some());
+
+        let _ = state.apply_config(icedtea_config::default_config());
+
+        assert!(state.drag.window_id().is_none(), "drag must not survive a reload mid-drag");
+        assert!(!state.alt_tab.is_active(), "alt-tab session must not survive a reload mid-cycle");
+        assert!(state.snap_preview.is_none(), "a stale snap preview must not render forever after reload");
+    }
+
+    /// Important #4: `snapshot().seq` must never go backwards across a
+    /// reload, and `State::emit` (used for `AltTabState`) must advance the
+    /// same counter as every other event.
+    #[test]
+    fn apply_config_does_not_regress_seq() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+        let seq_before = state.window_manager.snapshot().seq;
+        assert!(seq_before > 0);
+
+        let _ = state.apply_config(icedtea_config::default_config());
+
+        assert!(
+            state.window_manager.snapshot().seq >= seq_before,
+            "a fresh WindowManager's seq must be floored at the pre-reload high-water mark"
+        );
+    }
+
+    #[test]
+    fn emit_advances_seq() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let seq_before = state.window_manager.snapshot().seq;
+        state.emit(Event::AltTabState(AltTabState { active: true, entries: vec![], index: 0 }));
+        assert!(
+            state.window_manager.snapshot().seq > seq_before,
+            "State::emit must bump seq like every other pending-event producer"
+        );
     }
 }

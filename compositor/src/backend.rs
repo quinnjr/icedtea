@@ -225,7 +225,8 @@ fn process_winit_input(state: &mut State, event: InputEvent<WinitInput>) {
                 }
                 if key_state == KeyState::Pressed {
                     let our_mods = to_icedtea_modifiers(mods);
-                    let keysym = handle.modified_sym().raw();
+                    let keysym =
+                        resolve_keysym(handle.raw_latin_sym_or_raw_current_sym().map(|s| s.raw()), handle.modified_sym().raw());
                     if data.handle_key(our_mods, keysym).is_some() {
                         // Consumed by a compositor keybinding: don't forward
                         // to the focused client.
@@ -296,4 +297,51 @@ fn to_icedtea_modifiers(mods: &smithay::input::keyboard::ModifiersState) -> iced
         out |= icedtea_input::Modifiers::SHIFT;
     }
     out
+}
+
+/// Pick which keysym to feed to `handle_key`/`input::match_action`.
+///
+/// Task 11 re-review #1: the previous code always used
+/// `KeysymHandle::modified_sym()`, which applies the keyboard's active
+/// shift level. `input::key_name_to_keysym` (and every default binding in
+/// `config/src/defaults.rs`) encodes the *unshifted* keysym for a key --
+/// `"KEY_q"` is `0x71` (lowercase `q`). But `SUPER+SHIFT+q` (the default
+/// `quit` binding) has shift held, so `modified_sym()` for that keypress is
+/// `0x51` (`XK_Q`, uppercase) -- it can never equal `0x71`, so `quit` (and
+/// `reload`, `SUPER+SHIFT+r`) were unreachable. The same mismatch happens
+/// with Caps Lock active on plain `SUPER+q`/`SUPER+f`. Preferring
+/// `raw_latin_sym_or_raw_current_sym()` -- which is deliberately
+/// shift/caps-lock-agnostic (smithay's own doc: "handy to implement layout
+/// agnostic bindings") -- fixes this; it's `None` only when the keycode
+/// doesn't produce a keysym at all, in which case `modified_sym()` is used
+/// as a fallback so a key press is never silently dropped.
+///
+/// Factored out as a pure function (rather than inlined at the call site)
+/// specifically so it has a unit-testable seam: `KeysymHandle` itself can't
+/// be constructed outside a live xkb session, so nothing in this file can
+/// unit-test the real event path, but the "which of these two already-read
+/// keysyms wins" decision can be.
+fn resolve_keysym(raw_latin: Option<u32>, modified_fallback: u32) -> u32 {
+    raw_latin.unwrap_or(modified_fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_keysym_prefers_raw_latin_over_shifted_modified_sym() {
+        // The actual bug: modified_sym for SUPER+SHIFT+q is XK_Q (0x51),
+        // not the 0x71 every binding is keyed on. raw_latin_sym is
+        // shift-agnostic and reports 0x71 for the same physical key.
+        assert_eq!(resolve_keysym(Some(0x71), 0x51), 0x71);
+    }
+
+    #[test]
+    fn resolve_keysym_falls_back_when_raw_latin_is_unavailable() {
+        // `raw_latin_sym_or_raw_current_sym()` returns `None` only when the
+        // keycode produces no keysym at all; `modified_sym()` is still used
+        // rather than silently dropping the key press.
+        assert_eq!(resolve_keysym(None, 0xff0d), 0xff0d);
+    }
 }

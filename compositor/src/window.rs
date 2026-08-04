@@ -304,6 +304,23 @@ impl WindowManager {
         }
     }
 
+    /// The current snapshot sequence number (`Snapshot::seq`).
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Raise the sequence counter to at least `min_seq`, never lowering it.
+    /// Same rationale as `raise_id_floor`: a fresh `WindowManager` built by
+    /// `State::apply_config` starts `seq` back at 0, which would make
+    /// `snapshot().seq` go backwards across a reload -- a subscriber
+    /// comparing sequence numbers to detect missed updates would wrongly
+    /// conclude nothing changed (or that time ran backwards).
+    pub fn raise_seq_floor(&mut self, min_seq: u64) {
+        if min_seq > self.seq {
+            self.seq = min_seq;
+        }
+    }
+
     fn workspace(&self, id: u32) -> Option<&Workspace> {
         self.workspaces.get(id as usize)
     }
