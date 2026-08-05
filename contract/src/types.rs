@@ -114,6 +114,27 @@ mod tests {
         }
     }
 
+    /// Review finding M4: the Plan-3 shell is not Rust and must marshal
+    /// these signatures explicitly, so the wire encoding is part of the
+    /// contract, not an implementation detail. Nothing used to fail if the
+    /// `option-as-array` feature were dropped from `zvariant` in
+    /// `contract/Cargo.toml` -- the round-trip tests below still pass while
+    /// the wire format silently changes from `as`/`au`/`ab` to a
+    /// variant-based `Option` encoding. These assertions lock it.
+    #[test]
+    fn wire_signatures_are_locked() {
+        use zvariant::Type;
+        assert_eq!(WindowUpdate::SIGNATURE.to_string(), "(asa(iiii)auabababab)");
+        assert_eq!(Appearance::SIGNATURE.to_string(), "(siii(sss)as)");
+        assert_eq!(WindowId::SIGNATURE.to_string(), "u");
+        assert_eq!(Rectangle::SIGNATURE.to_string(), "(iiii)");
+        assert_eq!(WindowInfo::SIGNATURE.to_string(), "(ussuu(iiii)bbbb)");
+        assert_eq!(WorkspaceInfo::SIGNATURE.to_string(), "(us)");
+        assert_eq!(Snapshot::SIGNATURE.to_string(), "(ta(ussuu(iiii)bbbb)a(us)u)");
+        // `index: usize` marshals as `t` (u64) on 64-bit targets.
+        assert_eq!(AltTabState::SIGNATURE.to_string(), "(baut)");
+    }
+
     #[test]
     fn snapshot_json_round_trip() {
         let s = sample_snapshot();
