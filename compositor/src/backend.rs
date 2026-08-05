@@ -124,7 +124,12 @@ impl Backend {
                 WinitEvent::Redraw => {
                     let size = winit_backend.window_size();
                     let damage = Rectangle::from_size(size);
-                    let windows: Vec<&crate::window::Window> = state.window_manager.windows().collect();
+                    // Review finding I1: only the active workspace's
+                    // non-minimized windows are drawn -- this list feeds the
+                    // SSD title-bar/button elements, and `Space` itself is
+                    // kept in step by `State::sync_space` (which unmaps
+                    // everything else).
+                    let windows: Vec<&crate::window::Window> = state.window_manager.visible_windows();
                     match winit_backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
                             if let Err(err) = render::draw_frame(
@@ -258,13 +263,13 @@ fn process_winit_input(state: &mut State, event: InputEvent<WinitInput>) {
                     // No client input-focus forwarding is wired yet (see
                     // module docs), so "which window is under the pointer"
                     // is answered from our own window model rather than
-                    // smithay's `Space`: the MRU-first order `windows()`
-                    // returns is a reasonable topmost-first stand-in.
-                    let id = state
-                        .window_manager
-                        .windows()
-                        .find(|w| w.geometry.contains(pointer.0, pointer.1))
-                        .map(|w| w.id);
+                    // smithay's `Space`: the MRU-first order
+                    // `visible_windows()` returns is a reasonable
+                    // topmost-first stand-in. Review finding I1: it is
+                    // `visible_windows()` (active workspace, not minimized)
+                    // rather than the full list, so a click can no longer
+                    // focus or close a window on an inactive workspace.
+                    let id = state.window_manager.window_at(pointer).map(|w| w.id);
                     if let Some(id) = id {
                         state.handle_pointer(PointerEvent::Press { id, pointer });
                     }

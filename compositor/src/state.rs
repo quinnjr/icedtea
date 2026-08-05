@@ -20,12 +20,16 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use icedtea_config::Config;
-use icedtea_contract::{AltTabState, Event, Rectangle, WindowId};
+use icedtea_contract::{AltTabState, Event, Rectangle, SeqEvent, WindowId};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::desktop::{PopupKind, PopupManager, Space, Window};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::{
+    ResizeEdge as XdgResizeEdge, State as XdgToplevelState,
+};
+use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_surface::WlSurface};
@@ -87,7 +91,10 @@ impl ClientData for ClientState {
 pub struct State {
     pub window_manager: WindowManager,
     pub config: Config,
-    pub dbus_tx: crossbeam_channel::Sender<Event>,
+    /// Outbound event channel. Every message carries the `seq` its mutation
+    /// produced (review finding I2) so a subscriber can order signals
+    /// against a `GetState()` snapshot and detect gaps.
+    pub dbus_tx: crossbeam_channel::Sender<SeqEvent>,
 
     pub display_handle: DisplayHandle,
     /// Held until `take_display` is called once the event loop exists (see
@@ -114,6 +121,12 @@ pub struct State {
     /// back into `window_manager` without re-deriving state from the
     /// wayland-protocol object.
     surface_to_window: HashMap<WlSurface, WindowId>,
+    /// The `Space` element backing each model window, kept here rather than
+    /// looked up by scanning `space.elements()`: an element that is unmapped
+    /// (because its workspace isn't active -- review finding I1) is no
+    /// longer *in* the `Space` at all, so a scan could never find it again
+    /// to map it back when its workspace returns.
+    elements: HashMap<WindowId, Window>,
     /// Output geometries keyed by output index. Used by fullscreen toggle.
     pub outputs: HashMap<u32, OutputSurface>,
     /// Saved window geometries before fullscreen toggle, keyed by window ID.
@@ -132,6 +145,11 @@ pub struct State {
     /// `snap_restore`. See `fullscreen_saved_geometry`'s doc for why this is
     /// a separate map.
     pub snap_saved_geometry: HashMap<WindowId, icedtea_contract::Rectangle>,
+    /// Saved window geometry before a maximize, keyed by window ID. Its own
+    /// slot for the same reason `fullscreen_saved_geometry` and
+    /// `snap_saved_geometry` are separate: maximizing a snapped window must
+    /// not clobber snap's restore point (review finding I5).
+    pub maximized_saved_geometry: HashMap<WindowId, icedtea_contract::Rectangle>,
     /// Alt-tab cycling state, driven by `apply_action("cycle:alt_tab")` and
     /// ended by `end_alt_tab` (called from `backend.rs`'s keyboard filter
     /// when the held modifier is released -- see `end_alt_tab`'s doc for
@@ -139,14 +157,13 @@ pub struct State {
     pub alt_tab: input::AltTabMachine,
     /// Pointer-driven window move/snap state machine.
     pub drag: input::DragMachine,
+    /// Pointer-driven interactive-resize state machine, started by the xdg
+    /// `resize_request` handler and stepped by the same pointer
+    /// motion/release path the drag machine uses.
+    pub resize: input::ResizeMachine,
     /// Set by `apply_action("quit")`; `main.rs`'s event-loop closure checks
     /// this each iteration and calls `stop()` once true.
     pub quitting: bool,
-    /// Events produced by `apply_config` (e.g. on `reload`) that don't flow
-    /// through `window_manager.pending_events` because `apply_config`
-    /// replaces `window_manager` wholesale. Drained by `emit_pending`
-    /// alongside `window_manager.pending_events`.
-    pub pending_config_events: Vec<Event>,
     /// Last known pointer position in output logical coordinates. `backend.rs`
     /// updates this on every `PointerMotionAbsolute` event; `PointerButton`
     /// events (which carry no position of their own) read it back to build
@@ -181,7 +198,7 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(config: Config, dbus_tx: crossbeam_channel::Sender<Event>) -> Self {
+    pub fn new(config: Config, dbus_tx: crossbeam_channel::Sender<SeqEvent>) -> Self {
         let display: Display<State> = Display::new().expect("failed to create wayland display");
         let dh = display.handle();
 
@@ -199,6 +216,9 @@ impl State {
         seat.add_keyboard(Default::default(), 200, 25).expect("failed to initialize keyboard");
 
         let workspace_names = config.workspace_names.clone();
+        // Review finding I4: report unusable bindings once, here, instead of
+        // from inside the per-key-press lookup.
+        input::warn_about_keybindings(&config.keybindings);
 
         Self {
             window_manager: WindowManager::new(workspace_names),
@@ -213,13 +233,15 @@ impl State {
             wallpaper: WallpaperState::new(),
             snap_preview: None,
             surface_to_window: HashMap::new(),
+            elements: HashMap::new(),
             outputs: HashMap::new(),
             fullscreen_saved_geometry: HashMap::new(),
             snap_saved_geometry: HashMap::new(),
+            maximized_saved_geometry: HashMap::new(),
             alt_tab: input::AltTabMachine::new(),
             drag: input::DragMachine::new(),
+            resize: input::ResizeMachine::new(),
             quitting: false,
-            pending_config_events: Vec::new(),
             pointer_location: (0, 0),
             config_path: None,
             config_reload_tx: None,
@@ -299,15 +321,12 @@ impl State {
     /// Drain `window_manager.pending_events` onto `dbus_tx`. Must be called
     /// after every mutation of `window_manager` so subscribers observe it.
     ///
-    /// Also drains `pending_config_events`: `apply_config` replaces
-    /// `window_manager` wholesale (so it can't queue onto the old instance's
-    /// `pending_events`) and instead returns its events for the caller to
-    /// stash there; this is where they actually reach `dbus_tx`.
+    /// Each event goes out as a `SeqEvent` carrying the `seq` its mutation
+    /// produced (review finding I2); `apply_reloaded_config` pushes
+    /// `apply_config`'s events through `WindowManager::push_event` for the
+    /// same reason, so there is exactly one queue and one counter.
     pub fn emit_pending(&mut self) {
         for ev in self.window_manager.pending_events.drain(..) {
-            let _ = self.dbus_tx.send(ev);
-        }
-        for ev in self.pending_config_events.drain(..) {
             let _ = self.dbus_tx.send(ev);
         }
     }
@@ -324,7 +343,157 @@ impl State {
     /// returns the same `pending_events` vec) so it participates in the
     /// same sequence counter as every other event.
     pub fn emit(&mut self, ev: Event) {
-        self.window_manager.note_event().push(ev);
+        self.window_manager.push_event(ev);
+    }
+
+    // --- Model <-> `Space`/xdg reconciliation (review finding C1) ---
+    //
+    // Before this, `new_toplevel`'s `map_element(window, (0, 0), false)` was
+    // the only call that ever positioned anything in the `Space`, and no
+    // `send_configure`/`send_close` existed anywhere in the tree: every
+    // client rendered at (0,0), was never told its size, and never learned
+    // it had been asked to close, fullscreen, or maximize. The model, the
+    // D-Bus surface, and the tests were all self-consistent -- it was the
+    // model -> Wayland edge that was missing, and no single task owned it.
+    //
+    // The whole edge is these three functions plus their call sites: every
+    // geometry/state mutation ends in `sync_window_to_space`, every
+    // workspace/visibility change ends in `sync_space`, and every close goes
+    // through `request_close`.
+
+    /// The `Space` element backing model window `id`, if any -- mapped or
+    /// not (see the `elements` field). Model windows created by tests (and
+    /// by any future non-Wayland source) have no element; every caller
+    /// treats that as "nothing to push to a client".
+    fn element_for(&self, id: WindowId) -> Option<Window> {
+        self.elements.get(&id).cloned()
+    }
+
+    /// Push model window `id`'s geometry, visibility, and xdg state onto its
+    /// client: (re)map the `Space` element at the model's position, or unmap
+    /// it when the window isn't on the active workspace (review finding I1),
+    /// and configure the toplevel with the model's size plus the
+    /// maximized/fullscreen/activated states.
+    ///
+    /// Call this at the tail of *every* geometry or state mutation. A window
+    /// with no backing surface is a silent no-op.
+    pub fn sync_window_to_space(&mut self, id: WindowId) {
+        let Some(element) = self.element_for(id) else { return };
+        let Some(w) = self.window_manager.get(id) else {
+            // The model window is gone but its element is still mapped
+            // (e.g. a close that raced the client's destroy): drop it rather
+            // than rendering a window nothing tracks.
+            self.space.unmap_elem(&element);
+            self.elements.remove(&id);
+            return;
+        };
+        let (geo, fullscreen, maximized, focused) = (w.geometry, w.fullscreen, w.maximized, w.focused);
+        let visible = self.window_manager.is_visible(w);
+
+        if !visible {
+            self.space.unmap_elem(&element);
+        } else {
+            let mapped_at = self.space.element_location(&element);
+            let moved = mapped_at != Some((geo.x, geo.y).into());
+            // `Space::map_element` also restacks the element to the top, so
+            // it is the raise operation as well as the move one. Ledger item
+            // 28 / recommendation 4: `behavior.raise_on_focus` is what
+            // decides whether a focus change alone is allowed to raise --
+            // with it off, a focused window is still activated and
+            // configured, it just keeps its place in the stack unless its
+            // geometry actually changed.
+            if moved || (focused && self.config.behavior.raise_on_focus) {
+                self.space.map_element(element.clone(), (geo.x, geo.y), focused);
+            }
+        }
+
+        if let Some(toplevel) = element.toplevel() {
+            toplevel.with_pending_state(|state| {
+                state.size = Some((geo.width.max(1), geo.height.max(1)).into());
+                let set = |states: &mut smithay::wayland::shell::xdg::ToplevelStateSet,
+                           flag: XdgToplevelState,
+                           on: bool| {
+                    if on {
+                        states.set(flag);
+                    } else {
+                        states.unset(flag);
+                    }
+                };
+                set(&mut state.states, XdgToplevelState::Maximized, maximized);
+                set(&mut state.states, XdgToplevelState::Fullscreen, fullscreen);
+                set(&mut state.states, XdgToplevelState::Activated, focused && visible);
+            });
+            // Before the initial configure the client hasn't committed yet;
+            // `CompositorHandler::commit` sends that first configure, and it
+            // picks up whatever pending state was staged above.
+            if toplevel.is_initial_configure_sent() {
+                toplevel.send_pending_configure();
+            }
+        }
+
+        // Keyboard focus is the other half of "focus reached the client":
+        // `backend.rs`'s keyboard filter forwards every unconsumed key press
+        // to the seat's current focus, and nothing ever set one, so no
+        // client could receive a single keystroke. Re-set only on an actual
+        // change, so an ordinary geometry sync doesn't churn
+        // `leave`/`enter` pairs at the client.
+        if focused && visible {
+            let surface = element.toplevel().map(|t| t.wl_surface().clone());
+            if let Some(keyboard) = self.seat.get_keyboard()
+                && keyboard.current_focus() != surface
+            {
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                keyboard.set_focus(self, surface, serial);
+            }
+        }
+    }
+
+    /// Reconcile every model window with the `Space` at once. Used after
+    /// changes that can alter many windows' visibility in one go (workspace
+    /// switch, config reload).
+    pub fn sync_space(&mut self) {
+        let ids: Vec<WindowId> = self.window_manager.windows().map(|w| w.id).collect();
+        for id in ids {
+            self.sync_window_to_space(id);
+        }
+    }
+
+    /// Ask window `id` to close.
+    ///
+    /// For a real client this is `xdg_toplevel.close`, and the model entry
+    /// stays until the client actually destroys its toplevel (which lands in
+    /// `toplevel_destroyed` and drives `remove_window`) -- previously the
+    /// model row was dropped immediately while the client kept running and
+    /// rendering forever, *and* `surface_to_window` kept a stale entry that
+    /// made the eventual real `toplevel_destroyed` a silent no-op. A model
+    /// window with no backing surface (tests, and any future non-Wayland
+    /// source) is removed synchronously, since nothing will ever send a
+    /// destroy for it.
+    pub fn request_close(&mut self, id: WindowId) {
+        if let Some(toplevel) = self.element_for(id).and_then(|e| e.toplevel().cloned()) {
+            toplevel.send_close();
+            return;
+        }
+        self.surface_to_window.retain(|_, wid| *wid != id);
+        self.elements.remove(&id);
+        self.forget_window(id);
+        self.emit_pending();
+    }
+
+    /// Drop every trace of `id` from the model and its side tables, then
+    /// hand focus to whatever is left on the active workspace (review
+    /// finding I6's coherence requirement, applied to closes as well as
+    /// moves: an action right after a close must not no-op on a dangling
+    /// focus pointer).
+    fn forget_window(&mut self, id: WindowId) {
+        self.window_manager.remove_window(id);
+        self.fullscreen_saved_geometry.remove(&id);
+        self.snap_saved_geometry.remove(&id);
+        self.maximized_saved_geometry.remove(&id);
+        if self.window_manager.focused_window().is_none() {
+            let active = self.window_manager.active_workspace();
+            self.window_manager.focus_mru_in_workspace(active);
+        }
     }
 
     /// Toggle fullscreen state for a window. When entering fullscreen, saves the
@@ -364,6 +533,40 @@ impl State {
             let saved = self.fullscreen_saved_geometry.remove(&id)?;
             self.window_manager.set_geometry(id, saved)?;
         }
+        self.sync_window_to_space(id);
+        self.emit_pending();
+        Some(())
+    }
+
+    /// Toggle maximized state for `id`.
+    pub fn toggle_maximized(&mut self, id: WindowId) -> Option<()> {
+        let target = !self.window_manager.get(id)?.maximized;
+        self.set_maximized_target(id, target)
+    }
+
+    /// Set maximized to an explicit `target`, computing and applying real
+    /// geometry (the output rect inset by `snap_gap`) with its own restore
+    /// slot, mirroring `set_fullscreen_target`.
+    ///
+    /// Review finding I5: `toggle_maximized` used to flip a flag and emit,
+    /// with no geometry and no configure -- the maximize button, the
+    /// `MaximizeWindow` D-Bus method, and the client's own
+    /// `xdg_toplevel.set_maximized` were all visual no-ops.
+    pub fn set_maximized_target(&mut self, id: WindowId, target: bool) -> Option<()> {
+        if self.window_manager.get(id)?.maximized == target {
+            return Some(());
+        }
+        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        self.window_manager.set_maximized(id, target)?;
+        if target {
+            let current = self.window_manager.get(id)?.geometry;
+            self.maximized_saved_geometry.insert(id, current);
+            let gap = self.config.appearance.snap_gap;
+            self.window_manager.set_geometry(id, layout::maximized_geometry(output_geo, gap))?;
+        } else if let Some(saved) = self.maximized_saved_geometry.remove(&id) {
+            self.window_manager.set_geometry(id, saved)?;
+        }
+        self.sync_window_to_space(id);
         self.emit_pending();
         Some(())
     }
@@ -404,7 +607,7 @@ impl State {
     /// Apply a `Config` (already loaded, whether synchronously by
     /// `reload_config_from_disk` or on a worker thread by
     /// `handle_command`'s `ReloadConfig` async path): calls `apply_config`,
-    /// stashes its events onto `pending_config_events`, and flushes them
+    /// pushes its events onto the ordinary seq-tagged event queue, and flushes them
     /// immediately (via `emit_pending`) so the D-Bus emitter thread
     /// observes `ConfigReloaded` (and any `WindowClosed`/`WorkspaceList`/
     /// terminal `AltTabState` it carries) right away rather than waiting for
@@ -413,7 +616,17 @@ impl State {
     /// to inspect what was produced.
     pub fn apply_reloaded_config(&mut self, cfg: Config) -> Vec<Event> {
         let events = self.apply_config(cfg);
-        self.pending_config_events.extend(events.clone());
+        // Review finding I2: these used to be extended onto a separate
+        // `pending_config_events` vec that bypassed the sequence counter
+        // entirely, so the reload's events went out with no seq of their
+        // own. `apply_config` has already replaced `window_manager` (whose
+        // `seq` is floored at the pre-reload high-water mark and whose
+        // pending queue is empty) by the time this runs, so pushing them
+        // through the ordinary queue both preserves their order and gives
+        // each one a real, monotonically increasing seq.
+        for ev in &events {
+            self.window_manager.push_event(ev.clone());
+        }
         self.emit_pending();
         events
     }
@@ -455,20 +668,21 @@ impl State {
     pub fn handle_command(&mut self, cmd: crate::dbus::DbCommand) -> Option<()> {
         use crate::dbus::DbCommand;
         match cmd {
-            DbCommand::Focus(id) => self.window_manager.focus(id)?,
-            DbCommand::Close(id) => {
-                self.window_manager.remove_window(id);
+            DbCommand::Focus(id) => {
+                self.window_manager.focus(id)?;
+                self.sync_window_to_space(id);
             }
-            DbCommand::Minimize(id, value) => self.window_manager.set_minimized(id, value)?,
-            DbCommand::Maximize(id, value) => self.window_manager.set_maximized(id, value)?,
+            DbCommand::Close(id) => self.request_close(id),
+            DbCommand::Minimize(id, value) => {
+                self.window_manager.set_minimized(id, value)?;
+                self.sync_window_to_space(id);
+            }
+            DbCommand::Maximize(id, value) => self.set_maximized_target(id, value)?,
             DbCommand::Fullscreen(id, value) => self.set_fullscreen_target(id, value)?,
             DbCommand::SetWorkspace(id) => {
-                self.window_manager.set_active_workspace(id);
+                self.switch_workspace(id)?;
             }
-            DbCommand::MoveToWorkspace(id, workspace) => {
-                self.window_manager.set_workspace(id, workspace)?;
-                self.window_manager.set_active_workspace(workspace);
-            }
+            DbCommand::MoveToWorkspace(id, workspace) => self.move_to_workspace(id, workspace)?,
             DbCommand::GetState(reply_tx) => {
                 let _ = reply_tx.send(self.window_manager.snapshot());
                 // No model mutation happened; nothing new to flush. Return
@@ -484,6 +698,41 @@ impl State {
             DbCommand::Quit => self.quitting = true,
         }
         self.emit_pending();
+        Some(())
+    }
+
+    /// Switch the active workspace to `workspace`, give it a focused window
+    /// if it has a focusable one, and reconcile the `Space` so only its
+    /// windows are mapped (review findings I1 and I6).
+    pub fn switch_workspace(&mut self, workspace: u32) -> Option<()> {
+        if !self.window_manager.set_active_workspace(workspace) {
+            return None;
+        }
+        if self.window_manager.focused_window().is_none() {
+            self.window_manager.focus_mru_in_workspace(workspace);
+        }
+        self.sync_space();
+        Some(())
+    }
+
+    /// Move `id` to `workspace`, switch to it, and focus the moved window
+    /// there -- leaving the origin workspace focused on whatever it has left.
+    ///
+    /// Review finding I6: `set_workspace` cleared the origin's focus pointer
+    /// and never set the destination's, so after `MoveToWorkspace` the
+    /// active workspace had no focused window and the very next
+    /// `close`/`fullscreen`/`snap` action silently no-opped.
+    pub fn move_to_workspace(&mut self, id: WindowId, workspace: u32) -> Option<()> {
+        let origin = self.window_manager.get(id)?.workspace;
+        self.window_manager.set_workspace(id, workspace)?;
+        if origin != workspace {
+            self.window_manager.focus_mru_in_workspace(origin);
+        }
+        if !self.window_manager.set_active_workspace(workspace) {
+            return None;
+        }
+        self.window_manager.focus(id);
+        self.sync_space();
         Some(())
     }
 
@@ -504,13 +753,21 @@ impl State {
         use crate::decoration::DecorationAction;
         match action {
             DecorationAction::Close => {
-                self.window_manager.remove_window(id);
+                // Asks the client to close (and lets its own destroy drive
+                // the model removal) rather than dropping the model row out
+                // from under a still-running client -- see `request_close`.
+                self.request_close(id);
             }
             DecorationAction::Maximize => {
-                let _ = self.window_manager.toggle_maximized(id);
+                let _ = self.toggle_maximized(id);
             }
             DecorationAction::Minimize => {
                 let _ = self.window_manager.set_minimized(id, true);
+                if self.window_manager.focused_window().map(|w| w.id) == Some(id) {
+                    let active = self.window_manager.active_workspace();
+                    self.window_manager.focus_mru_in_workspace(active);
+                }
+                self.sync_window_to_space(id);
             }
             DecorationAction::Move => {
                 // Move is handled by the input layer (pointer drag),
@@ -534,7 +791,11 @@ impl State {
         match base {
             "close" => {
                 let id = self.window_manager.focused_window()?.id;
-                self.window_manager.remove_window(id);
+                self.request_close(id);
+            }
+            "maximize" => {
+                let id = self.window_manager.focused_window()?.id;
+                self.toggle_maximized(id)?;
             }
             "fullscreen" => {
                 let id = self.window_manager.focused_window()?.id;
@@ -581,6 +842,7 @@ impl State {
                 let entries = self.alt_tab.entries().to_vec();
                 if let Some(wid) = entries.get(idx).copied() {
                     self.window_manager.focus(wid);
+                    self.sync_window_to_space(wid);
                 }
                 self.emit(Event::AltTabState(AltTabState { active: true, entries, index: idx }));
             }
@@ -602,18 +864,13 @@ impl State {
             "workspace" => {
                 let n: u32 = arg?.parse().ok()?;
                 let idx = n.checked_sub(1)?;
-                if !self.window_manager.set_active_workspace(idx) {
-                    return None;
-                }
+                self.switch_workspace(idx)?;
             }
             "move_to_workspace" => {
                 let id = self.window_manager.focused_window()?.id;
                 let n: u32 = arg?.parse().ok()?;
                 let idx = n.checked_sub(1)?;
-                self.window_manager.set_workspace(id, idx)?;
-                if !self.window_manager.set_active_workspace(idx) {
-                    return None;
-                }
+                self.move_to_workspace(id, idx)?;
             }
             // NOTE (brief deviation): the sample dispatch code had a second,
             // unreachable `"snap:restore" => ...` match arm alongside this
@@ -669,27 +926,38 @@ impl State {
 
     /// Snap `id` to `zone` on the (first) output, saving its pre-snap
     /// geometry so `snap_restore` can undo it.
+    /// Snap `id` to `zone` on the (first) output, saving its pre-snap
+    /// geometry so `snap_restore` can undo it. A no-op returning `None` when
+    /// `behavior.snap_enabled` is off (review finding I3: the flag had no
+    /// consumers, so a user who disabled snapping still got snapping from
+    /// both the `snap:*` actions and the drag machine).
     pub fn snap(&mut self, id: WindowId, zone: SnapZone) -> Option<()> {
+        if !self.config.behavior.snap_enabled {
+            return None;
+        }
         let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
         let gap = self.config.appearance.snap_gap;
         let current = self.window_manager.get(id)?.geometry;
         self.snap_saved_geometry.entry(id).or_insert(current);
         self.window_manager.set_geometry(id, layout::snapped_geometry(output_geo, zone, gap))?;
+        self.sync_window_to_space(id);
         Some(())
     }
 
     /// Restore `id`'s geometry as it was before its most recent `snap`, if
-    /// any was saved.
+    /// any was saved. Deliberately *not* gated on `snap_enabled`: a window
+    /// snapped before the flag was turned off must still be restorable.
     pub fn snap_restore(&mut self, id: WindowId) -> Option<()> {
         if let Some(orig) = self.snap_saved_geometry.remove(&id) {
             self.window_manager.set_geometry(id, orig)?;
+            self.sync_window_to_space(id);
         }
         Some(())
     }
 
     /// Rebuild `window_manager`'s workspaces from `cfg.workspace_names` and
     /// swap in the new config (keybindings/appearance/behavior). Returns the
-    /// events the caller should queue (via `pending_config_events`) since
+    /// events the caller should queue (via `apply_reloaded_config`) since
     /// the just-replaced `window_manager` can't carry them.
     ///
     /// Task 11 review #3: this used to replace `window_manager` with a
@@ -722,24 +990,20 @@ impl State {
         let mut events: Vec<Event> =
             self.window_manager.windows().map(|w| Event::WindowClosed(w.id)).collect();
 
-        for surface in self.surface_to_window.keys().cloned().collect::<Vec<_>>() {
-            let window = self
-                .space
-                .elements()
-                .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &surface))
-                .cloned();
-            if let Some(window) = window {
-                self.space.unmap_elem(&window);
-            }
+        for window in self.elements.values().cloned().collect::<Vec<_>>() {
+            self.space.unmap_elem(&window);
         }
+        self.elements.clear();
         self.surface_to_window.clear();
         // Stale restore points would otherwise reference ids that can never
         // come back (the floor below guarantees that).
         self.fullscreen_saved_geometry.clear();
         self.snap_saved_geometry.clear();
+        self.maximized_saved_geometry.clear();
         // Drop any in-flight interaction that referenced the about-to-vanish
         // windows.
         self.drag = input::DragMachine::new();
+        self.resize = input::ResizeMachine::new();
         // Task 11 re-review round 3 #1: resetting `alt_tab` (below) is a
         // state change, not an event -- a reload mid-cycle used to leave
         // whatever shell overlay is rendered from the session's last
@@ -761,6 +1025,9 @@ impl State {
 
         let next_id_floor = self.window_manager.next_id();
         let seq_floor = self.window_manager.seq();
+        // Review finding I4: the reload is the other place a binding can
+        // become unusable, so it's the other place to say so -- once.
+        input::warn_about_keybindings(&cfg.keybindings);
         self.config = cfg.clone();
         self.window_manager = WindowManager::new(cfg.workspace_names.clone());
         self.window_manager.raise_id_floor(next_id_floor);
@@ -804,6 +1071,9 @@ impl State {
     /// click-to-focus window manager behavior.
     fn handle_pointer_press(&mut self, id: WindowId, pointer: (i32, i32)) -> Option<()> {
         self.window_manager.focus(id)?;
+        // Focus changes the toplevel's `Activated` state and the `Space`
+        // element's activation, so it has to reach the client too (C1).
+        self.sync_window_to_space(id);
         // Task 11 re-review round 3 #2: flush right after `focus()`
         // mutates, before any of the `?`-early-returns below (e.g.
         // `decoration_action_for` returning `None` for a fullscreen
@@ -835,12 +1105,31 @@ impl State {
     /// in-progress drag: updates the snap-zone preview (rendering consumes
     /// `self.snap_preview`).
     fn handle_pointer_motion(&mut self, pointer: (i32, i32)) -> Option<()> {
+        // An interactive resize (started by the client's `resize_request`)
+        // takes precedence: it owns the pointer until the button is
+        // released.
+        if let Some(id) = self.resize.window_id() {
+            let geometry = self.resize.geometry_for(pointer)?;
+            self.window_manager.set_geometry(id, geometry)?;
+            self.sync_window_to_space(id);
+            self.emit_pending();
+            return Some(());
+        }
         self.drag.window_id()?;
         let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
         let threshold = self.config.appearance.snap_gap.max(1) * 4;
+        // Review finding I3: with snapping disabled the drag machine is
+        // never told about zones at all, so no preview is staged *and*
+        // `handle_pointer_release` can only ever produce a plain move.
+        if !self.config.behavior.snap_enabled {
+            self.snap_preview = None;
+            return Some(());
+        }
         self.drag.motion(pointer, output_geo, threshold);
-        self.snap_preview =
-            self.drag.preview_zone().map(|zone| layout::snapped_geometry(output_geo, zone, self.config.appearance.snap_gap));
+        self.snap_preview = self
+            .drag
+            .preview_zone()
+            .map(|zone| layout::snapped_geometry(output_geo, zone, self.config.appearance.snap_gap));
         Some(())
     }
 
@@ -848,6 +1137,16 @@ impl State {
     /// ends the drag, either snapping the window to the previewed zone or
     /// moving it to `pointer - grab_offset`.
     fn handle_pointer_release(&mut self, pointer: (i32, i32)) -> Option<()> {
+        if self.resize.window_id().is_some() {
+            let final_geometry = self.resize.geometry_for(pointer);
+            let id = self.resize.end()?;
+            if let Some(geometry) = final_geometry {
+                self.window_manager.set_geometry(id, geometry)?;
+            }
+            self.sync_window_to_space(id);
+            self.emit_pending();
+            return Some(());
+        }
         let id = self.drag.window_id()?;
         let grab_offset = self.drag.grab_offset();
         self.snap_preview = None;
@@ -862,6 +1161,7 @@ impl State {
                     id,
                     Rectangle { x: new_pos.0, y: new_pos.1, width: geo.width, height: geo.height },
                 )?;
+                self.sync_window_to_space(id);
             }
             input::DragResult::Restored => {}
         }
@@ -888,16 +1188,17 @@ impl CompositorHandler for State {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            if let Some(window) =
-                self.space.elements().find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &root))
-            {
+            // Looked up through `elements` rather than `space.elements()`:
+            // a window on an inactive workspace is unmapped from the
+            // `Space` (review finding I1) but must still process commits.
+            if let Some(window) = self.surface_to_window.get(&root).and_then(|id| self.elements.get(id)) {
                 window.on_commit();
             }
         }
 
         // Send the initial xdg_toplevel configure once a client commits after mapping.
         if let Some(window) =
-            self.space.elements().find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface)).cloned()
+            self.surface_to_window.get(surface).and_then(|id| self.elements.get(id)).cloned()
         {
             let initial_configure_sent = smithay::wayland::compositor::with_states(surface, |states| {
                 states.data_map.get::<XdgToplevelSurfaceData>().unwrap().lock().unwrap().initial_configure_sent
@@ -998,31 +1299,105 @@ impl XdgShellHandler for State {
         // model's placeholder until then. Position cascades off whatever's
         // already mapped so new windows don't stack exactly on top of each
         // other.
-        let occupied: Vec<icedtea_contract::Rectangle> =
-            self.window_manager.windows().map(|w| w.geometry).collect();
-        let (x, y) = layout::cascade_point(&occupied, (640, 400), 24);
+        let occupied: Vec<icedtea_contract::Rectangle> = self
+            .window_manager
+            .windows_in_workspace(self.window_manager.active_workspace())
+            .iter()
+            .map(|w| w.geometry)
+            .collect();
+        let output_geo = self
+            .outputs
+            .values()
+            .next()
+            .map(|o| o.geometry)
+            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+        // Review finding M7: cascade positions now wrap inside the output
+        // (and count only this workspace's windows) so the Nth window can't
+        // open off-screen with no title bar to grab.
+        let (x, y) = layout::cascade_point_in(&occupied, (640, 400), 24, output_geo);
         let geometry = icedtea_contract::Rectangle { x, y, width: 640, height: 400 };
         let id = self.window_manager.add_window(&app_id, &title, pid, geometry);
-        self.emit_pending();
         self.surface_to_window.insert(surface.wl_surface().clone(), id);
 
         let window = Window::new_wayland_window(surface);
-        self.space.map_element(window, (0, 0), false);
+        // Map at the model's geometry, not (0, 0) -- see `sync_window_to_space`.
+        self.space.map_element(window.clone(), (geometry.x, geometry.y), true);
+        self.elements.insert(id, window);
+        self.sync_window_to_space(id);
+        self.emit_pending();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        if let Some(id) = self.surface_to_window.remove(surface.wl_surface()) {
-            self.window_manager.remove_window(id);
-            self.emit_pending();
-        }
-        let window = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface.wl_surface()))
-            .cloned();
-        if let Some(window) = window {
+        let removed = self.surface_to_window.remove(surface.wl_surface());
+        if let Some(window) = removed.and_then(|id| self.elements.remove(&id)) {
             self.space.unmap_elem(&window);
         }
+        if let Some(id) = removed {
+            self.forget_window(id);
+            self.emit_pending();
+        }
+    }
+
+    // --- Client-driven window management (ledger item 15, part of C1) ---
+    //
+    // These five were `XdgShellHandler`'s default no-op bodies, so a client
+    // pressing its own maximize button, or dragging its own CSD title bar,
+    // did nothing at all. Each now routes into exactly the same `State`
+    // method the keybinding and D-Bus paths use, so there is one
+    // implementation of "maximize a window" and it always ends in a
+    // configure.
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
+            self.set_maximized_target(id, true);
+        } else {
+            surface.send_configure();
+        }
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
+            self.set_maximized_target(id, false);
+        }
+    }
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
+            self.set_fullscreen_target(id, true);
+        } else {
+            surface.send_configure();
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
+            self.set_fullscreen_target(id, false);
+        }
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
+            self.apply_decoration_action(id, crate::decoration::DecorationAction::Minimize);
+        }
+    }
+
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, _serial: Serial) {
+        let Some(&id) = self.surface_to_window.get(surface.wl_surface()) else { return };
+        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else { return };
+        let pointer = self.pointer_location;
+        // The client already holds the button down, so the ordinary
+        // motion/release path takes it from here.
+        self.drag.begin(id, (pointer.0 - geo.x, pointer.1 - geo.y));
+    }
+
+    fn resize_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, _serial: Serial, edges: XdgResizeEdge) {
+        let Some(&id) = self.surface_to_window.get(surface.wl_surface()) else { return };
+        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else { return };
+        let edges = resize_edges_from_xdg(edges);
+        if edges.is_empty() {
+            return;
+        }
+        self.resize.begin(id, edges, geo, self.pointer_location);
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
@@ -1054,6 +1429,24 @@ impl XdgShellHandler for State {
 }
 
 delegate_xdg_shell!(State);
+
+/// Translate xdg-shell's `resize_edge` enum into the compositor's own
+/// [`input::ResizeEdges`] set. `None` (and any unknown future value) yields
+/// an empty set, which `resize_request` treats as "nothing to resize".
+fn resize_edges_from_xdg(edges: XdgResizeEdge) -> input::ResizeEdges {
+    use input::ResizeEdges;
+    match edges {
+        XdgResizeEdge::Top => ResizeEdges { top: true, ..Default::default() },
+        XdgResizeEdge::Bottom => ResizeEdges { bottom: true, ..Default::default() },
+        XdgResizeEdge::Left => ResizeEdges { left: true, ..Default::default() },
+        XdgResizeEdge::Right => ResizeEdges { right: true, ..Default::default() },
+        XdgResizeEdge::TopLeft => ResizeEdges { top: true, left: true, ..Default::default() },
+        XdgResizeEdge::TopRight => ResizeEdges { top: true, right: true, ..Default::default() },
+        XdgResizeEdge::BottomLeft => ResizeEdges { bottom: true, left: true, ..Default::default() },
+        XdgResizeEdge::BottomRight => ResizeEdges { bottom: true, right: true, ..Default::default() },
+        _ => ResizeEdges::default(),
+    }
+}
 
 // --- zwlr_layer_shell_v1 ---
 
@@ -1135,7 +1528,7 @@ mod tests {
         let mut state = State::new(default_config(), tx);
         state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.emit_pending();
-        assert!(matches!(rx.try_recv(), Ok(Event::WindowOpened(_))));
+        assert!(matches!(rx.try_recv().map(|e| e.event), Ok(Event::WindowOpened(_))));
     }
 
     #[test]
@@ -1180,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn decoration_action_for_returns_none_for_csd_window() {
+    fn decoration_action_for_ignores_csd_and_still_returns_close() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         let id = state.window_manager.add_window("org.gtk.App", "t", 1, DEFAULT_GEO);
@@ -1368,7 +1761,7 @@ mod tests {
         assert!(!state.alt_tab.is_active());
         let events: Vec<_> = rx.try_iter().collect();
         assert!(
-            events.iter().any(|e| matches!(e, Event::AltTabState(AltTabState { active: false, .. }))),
+            events.iter().any(|e| matches!(e.event, Event::AltTabState(AltTabState { active: false, .. }))),
             "end_alt_tab must emit a terminal AltTabState so the shell overlay can dismiss"
         );
 
@@ -1624,7 +2017,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, Event::WindowUpdated { id, update } if *id == a && update.focused == Some(true))),
+                .any(|e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.focused == Some(true))),
             "focus event must be flushed immediately, not deferred until an unrelated later flush"
         );
     }
@@ -1649,7 +2042,7 @@ mod tests {
         assert_eq!(state.window_manager.workspace_info().len(), 3);
         assert!(events.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
         let emitted = rx.try_iter().collect::<Vec<_>>();
-        assert!(emitted.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
+        assert!(emitted.iter().any(|e| matches!(e.event, Event::ConfigReloaded(_))));
     }
 
     /// `handle_command`'s `ReloadConfig` arm must go through the async
@@ -1707,7 +2100,7 @@ mod tests {
         state.apply_reloaded_config(cfg);
         assert_eq!(state.window_manager.workspace_info().len(), 2);
         let emitted = rx.try_iter().collect::<Vec<_>>();
-        assert!(emitted.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
+        assert!(emitted.iter().any(|e| matches!(e.event, Event::ConfigReloaded(_))));
     }
 
     /// The keybinding-triggered `"reload"` action (`SUPER+SHIFT+r` by
@@ -1754,5 +2147,259 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         assert_eq!(state.apply_action("reload"), Some(()));
+    }
+
+    // --- Final-review fix-round tests ---
+
+    fn state_with_output(width: i32, height: i32) -> (State, crossbeam_channel::Receiver<SeqEvent>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width, height } });
+        (state, rx)
+    }
+
+    /// C1/I5: maximize computes and applies real geometry against its own
+    /// restore slot, and toggling back returns exactly the pre-maximize
+    /// geometry -- it used to flip a flag and nothing else.
+    #[test]
+    fn maximize_applies_output_geometry_and_restores_it() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let original = Rectangle { x: 40, y: 50, width: 300, height: 200 };
+        let id = state.window_manager.add_window("app", "t", 1, original);
+
+        state.toggle_maximized(id).unwrap();
+        let w = state.window_manager.get(id).unwrap();
+        assert!(w.maximized);
+        assert_eq!(w.geometry, layout::maximized_geometry(Rectangle { x: 0, y: 0, width: 1000, height: 800 }, 8));
+
+        state.toggle_maximized(id).unwrap();
+        let w = state.window_manager.get(id).unwrap();
+        assert!(!w.maximized);
+        assert_eq!(w.geometry, original);
+    }
+
+    /// I5: maximize's restore slot is independent of snap's, exactly like
+    /// fullscreen's -- snapping between maximize and unmaximize must not
+    /// clobber either restore point.
+    #[test]
+    fn maximize_and_snap_keep_independent_restore_points() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let original = Rectangle { x: 40, y: 50, width: 300, height: 200 };
+        let id = state.window_manager.add_window("app", "t", 1, original);
+        state.window_manager.focus(id).unwrap();
+
+        state.snap(id, SnapZone::Left).unwrap();
+        let snapped = state.window_manager.get(id).unwrap().geometry;
+        state.set_maximized_target(id, true).unwrap();
+        state.set_maximized_target(id, false).unwrap();
+        assert_eq!(state.window_manager.get(id).unwrap().geometry, snapped, "unmaximize returns to the snapped geometry");
+        state.snap_restore(id).unwrap();
+        assert_eq!(state.window_manager.get(id).unwrap().geometry, original);
+    }
+
+    /// I5: `MaximizeWindow` over D-Bus is not a visual no-op any more, and
+    /// an explicit target that already holds stays a no-op (it must not
+    /// re-save the current geometry as a fresh restore point).
+    #[test]
+    fn maximize_command_is_idempotent_on_its_target() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let original = Rectangle { x: 40, y: 50, width: 300, height: 200 };
+        let id = state.window_manager.add_window("app", "t", 1, original);
+        state.handle_command(crate::dbus::DbCommand::Maximize(id, true)).unwrap();
+        let maximized = state.window_manager.get(id).unwrap().geometry;
+        state.handle_command(crate::dbus::DbCommand::Maximize(id, true)).unwrap();
+        assert_eq!(state.window_manager.get(id).unwrap().geometry, maximized);
+        state.handle_command(crate::dbus::DbCommand::Maximize(id, false)).unwrap();
+        assert_eq!(state.window_manager.get(id).unwrap().geometry, original, "the restore point survived the no-op");
+    }
+
+    /// I3: `behavior.snap_enabled` is actually consumed -- with snapping
+    /// off, neither the `snap:*` actions nor a drag to an edge snap
+    /// anything, and the drag still performs a plain move.
+    #[test]
+    fn snap_disabled_blocks_actions_and_drag_snapping() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        state.config.behavior.snap_enabled = false;
+        let geo = Rectangle { x: 100, y: 100, width: 640, height: 400 };
+        let id = state.window_manager.add_window("app", "t", 1, geo);
+        state.window_manager.focus(id).unwrap();
+
+        assert_eq!(state.apply_action("snap:left"), None, "the snap action must not fire when snapping is off");
+        assert_eq!(state.window_manager.get(id).unwrap().geometry, geo);
+
+        // A drag to the left edge shows no preview and ends as a plain move.
+        state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) }).unwrap();
+        state.handle_pointer(PointerEvent::Motion { pointer: (2, 400) }).unwrap();
+        assert_eq!(state.snap_preview, None, "no snap preview may be drawn when snapping is off");
+        state.handle_pointer(PointerEvent::Release { pointer: (2, 400) }).unwrap();
+        let moved = state.window_manager.get(id).unwrap().geometry;
+        assert_eq!((moved.x, moved.y), (2 - 20, 400 - 5), "the drag still moves the window");
+        assert_eq!((moved.width, moved.height), (geo.width, geo.height), "…without resizing it");
+    }
+
+    /// I3 (the other direction): the default config leaves snapping on, so
+    /// nothing about the existing behavior changes.
+    #[test]
+    fn snap_enabled_by_default_still_snaps() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        assert!(state.config.behavior.snap_enabled);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        state.window_manager.focus(id).unwrap();
+        assert_eq!(state.apply_action("snap:left"), Some(()));
+        assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 1000 / 2 - 16);
+    }
+
+    /// I6: after `MoveToWorkspace` the destination has a focused window, so
+    /// the *next* action isn't a silent no-op -- and the origin workspace is
+    /// left focused on whatever it still has.
+    #[test]
+    fn move_to_workspace_focuses_the_moved_window_and_reseats_the_origin() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+        // `b` is focused (added last) and is the one that moves.
+        state.handle_command(crate::dbus::DbCommand::MoveToWorkspace(b, 1)).unwrap();
+
+        assert_eq!(state.window_manager.active_workspace(), 1);
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(b), "the moved window is focused there");
+        // The origin kept a coherent focus rather than a dangling pointer.
+        state.switch_workspace(0).unwrap();
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a));
+    }
+
+    /// I6, via the keybinding path: the action that used to leave the
+    /// destination unfocused is followed by a `fullscreen` that must act on
+    /// the moved window.
+    #[test]
+    fn action_after_move_to_workspace_is_not_a_noop() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        state.apply_action("move_to_workspace:2").unwrap();
+        assert_eq!(state.apply_action("fullscreen"), Some(()), "the next action must find a focused window");
+        assert!(state.window_manager.get(id).unwrap().fullscreen);
+    }
+
+    /// I1/I6: switching to a workspace that has windows focuses its MRU
+    /// head, so actions work there immediately; switching to an empty one
+    /// leaves focus cleanly absent rather than pointing elsewhere.
+    #[test]
+    fn switch_workspace_focuses_that_workspaces_mru_head() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        state.switch_workspace(1).unwrap();
+        assert!(state.window_manager.focused_window().is_none(), "workspace 2 is empty");
+        assert_eq!(state.apply_action("close"), None, "…so an action there is a clean no-op");
+        state.switch_workspace(0).unwrap();
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a));
+    }
+
+    /// I2: every event reaching the D-Bus channel carries the seq its
+    /// mutation produced, those seqs strictly increase, and the last one
+    /// matches `snapshot().seq` -- which is what lets a subscriber order
+    /// signals against a `GetState()` snapshot.
+    #[test]
+    fn emitted_events_carry_monotonic_seq_matching_the_snapshot() {
+        let (mut state, rx) = state_with_output(1000, 800);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        state.emit_pending();
+        state.handle_command(crate::dbus::DbCommand::Fullscreen(id, true)).unwrap();
+        state.handle_command(crate::dbus::DbCommand::SetWorkspace(1)).unwrap();
+
+        let events: Vec<SeqEvent> = rx.try_iter().collect();
+        assert!(events.len() >= 3, "expected several events, got {}", events.len());
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[1] > w[0]), "seqs must strictly increase: {seqs:?}");
+        assert_eq!(*seqs.last().unwrap(), state.window_manager.snapshot().seq);
+        assert!(seqs[0] > 0, "seq 0 means 'nothing has happened yet' and must never be emitted");
+    }
+
+    /// I2: the reload path used to bypass the counter entirely (its events
+    /// went out through a separate queue with no seq of their own).
+    #[test]
+    fn reloaded_config_events_carry_seq_and_never_regress() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        state.emit_pending();
+        let before = state.window_manager.snapshot().seq;
+        let drained: Vec<SeqEvent> = rx.try_iter().collect();
+        assert!(drained.iter().all(|e| e.seq <= before));
+
+        state.apply_reloaded_config(icedtea_config::default_config());
+        let events: Vec<SeqEvent> = rx.try_iter().collect();
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|e| e.seq > before), "reload events must advance past the pre-reload high-water mark");
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[1] > w[0]), "seqs must strictly increase: {seqs:?}");
+        assert!(events.iter().any(|e| matches!(e.event, Event::ConfigReloaded(_))));
+    }
+
+    /// C1: closing a model window with no backing client surface still
+    /// removes it synchronously (there is no client to send `close` to and
+    /// no destroy will ever arrive), and focus lands somewhere sensible.
+    #[test]
+    fn request_close_without_a_surface_removes_and_reseats_focus() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+        state.request_close(b);
+        assert!(state.window_manager.get(b).is_none());
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a), "focus must not dangle after a close");
+    }
+
+    /// C1: closing must not leave restore points behind for an id that can
+    /// never come back.
+    #[test]
+    fn closing_clears_saved_geometry_slots() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        state.window_manager.focus(id).unwrap();
+        state.snap(id, SnapZone::Left).unwrap();
+        state.set_maximized_target(id, true).unwrap();
+        state.set_fullscreen_target(id, true).unwrap();
+        assert!(state.snap_saved_geometry.contains_key(&id));
+        state.request_close(id);
+        assert!(!state.snap_saved_geometry.contains_key(&id));
+        assert!(!state.maximized_saved_geometry.contains_key(&id));
+        assert!(!state.fullscreen_saved_geometry.contains_key(&id));
+    }
+
+    /// C1 (`resize_request`'s model half): an interactive resize driven by
+    /// the pointer path updates the model geometry as it goes and commits
+    /// the final one on release.
+    #[test]
+    fn interactive_resize_updates_geometry_and_ends_on_release() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let geo = Rectangle { x: 100, y: 100, width: 400, height: 300 };
+        let id = state.window_manager.add_window("app", "t", 1, geo);
+        state.resize.begin(id, input::ResizeEdges { bottom: true, right: true, ..Default::default() }, geo, (500, 400));
+
+        state.handle_pointer(PointerEvent::Motion { pointer: (560, 430) }).unwrap();
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry,
+            Rectangle { x: 100, y: 100, width: 460, height: 330 }
+        );
+
+        state.handle_pointer(PointerEvent::Release { pointer: (600, 500) }).unwrap();
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry,
+            Rectangle { x: 100, y: 100, width: 500, height: 400 }
+        );
+        assert!(state.resize.window_id().is_none(), "the resize ended on release");
+        // A later motion with no resize and no drag is a clean no-op.
+        assert_eq!(state.handle_pointer(PointerEvent::Motion { pointer: (700, 700) }), None);
+    }
+
+    /// M2: `State::new` accepts an arbitrary `Config`, including one with no
+    /// workspace names -- that must not leave a reachable index panic.
+    #[test]
+    fn state_with_no_configured_workspaces_does_not_panic() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut cfg = default_config();
+        cfg.workspace_names = vec![];
+        let mut state = State::new(cfg, tx);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        assert_eq!(state.window_manager.workspace_info().len(), 1);
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(id));
     }
 }

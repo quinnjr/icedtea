@@ -53,6 +53,18 @@ pub fn snapped_geometry(output: Rectangle, zone: SnapZone, gap: i32) -> Rectangl
     }
 }
 
+/// The geometry a maximized window occupies: the output rect inset by
+/// `gap` on every side (review finding I5 -- maximize had no geometry
+/// concept at all before).
+pub fn maximized_geometry(output: Rectangle, gap: i32) -> Rectangle {
+    Rectangle {
+        x: output.x + gap,
+        y: output.y + gap,
+        width: (output.width - 2 * gap).max(1),
+        height: (output.height - 2 * gap).max(1),
+    }
+}
+
 pub fn restored_geometry(original: Rectangle, _snapped: Rectangle) -> Rectangle {
     original
 }
@@ -64,6 +76,16 @@ pub fn is_edge_point(output: Rectangle, point: (i32, i32), threshold: i32) -> bo
 pub fn cascade_point(occupied: &[Rectangle], _size: (i32, i32), step: i32) -> (i32, i32) {
     let base = (occupied.len() as i32 * step, occupied.len() as i32 * step);
     (base.0, base.1)
+}
+
+/// `cascade_point`, wrapped so a new window always lands fully inside
+/// `output` (review finding M7: the unbounded version put the 40th window at
+/// (960, 960) -- off-screen on a 1080p output, with no title bar to grab).
+pub fn cascade_point_in(occupied: &[Rectangle], size: (i32, i32), step: i32, output: Rectangle) -> (i32, i32) {
+    let (x, y) = cascade_point(occupied, size, step);
+    let span_x = (output.width - size.0).max(1);
+    let span_y = (output.height - size.1).max(1);
+    (output.x + x.rem_euclid(span_x), output.y + y.rem_euclid(span_y))
 }
 
 #[cfg(test)]
@@ -122,6 +144,31 @@ mod tests {
             assert!(g.x + g.width <= OUTPUT.width);
             assert!(g.y + g.height <= OUTPUT.height);
         }
+    }
+
+    #[test]
+    fn maximized_is_output_minus_gap() {
+        let g = maximized_geometry(OUTPUT, 8);
+        assert_eq!(g, Rectangle { x: 8, y: 8, width: 1000 - 16, height: 800 - 16 });
+        assert_eq!(maximized_geometry(OUTPUT, 0), OUTPUT);
+    }
+
+    #[test]
+    fn maximized_never_degenerates_on_a_tiny_output() {
+        let tiny = Rectangle { x: 0, y: 0, width: 10, height: 10 };
+        let g = maximized_geometry(tiny, 8);
+        assert!(g.width >= 1 && g.height >= 1);
+    }
+
+    #[test]
+    fn cascade_wraps_inside_the_output() {
+        // M7: the 40th window used to open at (960, 960) -- off-screen on a
+        // 1080p output. Positions now wrap so a window always lands where it
+        // can be seen and grabbed.
+        let occupied: Vec<Rectangle> = (0..40).map(|_| Rectangle { x: 0, y: 0, width: 1, height: 1 }).collect();
+        let (x, y) = cascade_point_in(&occupied, (640, 400), 24, OUTPUT);
+        assert!(x >= OUTPUT.x && x + 640 <= OUTPUT.x + OUTPUT.width, "x = {x}");
+        assert!(y >= OUTPUT.y && y + 400 <= OUTPUT.y + OUTPUT.height, "y = {y}");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use icedtea_contract as contract;
-use contract::{Event, Rectangle, Snapshot, WindowId, WindowInfo, WindowUpdate, WorkspaceInfo};
+use contract::{Event, Rectangle, SeqEvent, Snapshot, WindowId, WindowInfo, WindowUpdate, WorkspaceInfo};
 
 #[derive(Debug, Clone)]
 pub struct Window {
@@ -32,8 +32,10 @@ pub struct WindowManager {
     active_workspace: u32,
     next_id: u32,
     seq: u64,
-    /// Pending events drained by the compositor each frame.
-    pub pending_events: Vec<Event>,
+    /// Pending events drained by the compositor each frame, each tagged with
+    /// the `seq` value its mutation advanced the counter to (review finding
+    /// I2 -- see `contract::SeqEvent`).
+    pub pending_events: Vec<SeqEvent>,
     /// Focus history: most-recently-focused windows (head = most recent).
     /// Invariant: every WindowId in self.windows is in focus_mru (guaranteed because
     /// add_window always calls focus, and remove_window prunes from focus_mru).
@@ -42,6 +44,14 @@ pub struct WindowManager {
 
 impl WindowManager {
     pub fn new(workspace_names: Vec<String>) -> Self {
+        // Review finding M2: `workspace_mut` indexes `self.workspaces`
+        // directly, so a manager built with an empty name list panicked on
+        // the first `add_window`. Production callers are guarded
+        // (`load_or_default` rejects an empty list), but `State::new` accepts
+        // an arbitrary `Config`, so fall back to a single workspace here
+        // rather than leaving a reachable index panic.
+        let workspace_names =
+            if workspace_names.is_empty() { vec!["1".to_string()] } else { workspace_names };
         let workspaces = workspace_names
             .iter()
             .enumerate()
@@ -64,12 +74,15 @@ impl WindowManager {
 
     fn emit(&mut self, event: Event) {
         self.bump();
-        self.pending_events.push(event);
+        let seq = self.seq;
+        self.pending_events.push(SeqEvent { seq, event });
     }
 
-    pub fn note_event(&mut self) -> &mut Vec<Event> {
-        self.bump();
-        &mut self.pending_events
+    /// Queue an event that didn't come from one of this type's own mutators
+    /// (e.g. `AltTabState`, driven by `State::alt_tab`), advancing the same
+    /// sequence counter every other event uses.
+    pub fn push_event(&mut self, event: Event) {
+        self.emit(event);
     }
 
     pub fn add_window(&mut self, app_id: &str, title: &str, pid: u32, geometry: Rectangle) -> WindowId {
@@ -250,6 +263,56 @@ impl WindowManager {
         self.windows.values().filter(|w| w.workspace == ws).collect()
     }
 
+    /// The windows that should actually be drawn and hit-tested right now:
+    /// the active workspace's non-minimized windows, topmost (most recently
+    /// focused) first.
+    ///
+    /// Review finding I1: rendering and click-to-focus both consumed the raw
+    /// `windows()` MRU list -- every window on *every* workspace, minimized
+    /// ones included -- so switching workspaces changed nothing on screen and
+    /// a click could focus (or close) a window belonging to an inactive
+    /// workspace.
+    pub fn visible_windows(&self) -> Vec<&Window> {
+        self.windows().filter(|w| self.is_visible(w)).collect()
+    }
+
+    /// Whether `w` belongs to the active workspace and isn't minimized (see
+    /// `visible_windows`).
+    pub fn is_visible(&self, w: &Window) -> bool {
+        w.workspace == self.active_workspace && !w.minimized
+    }
+
+    /// Same predicate as `is_visible`, by id (`false` for an unknown id).
+    pub fn is_visible_id(&self, id: WindowId) -> bool {
+        self.get(id).is_some_and(|w| self.is_visible(w))
+    }
+
+    /// The topmost visible window containing `point` (output logical
+    /// coordinates), i.e. what a click at that point acts on. Used by the
+    /// backend's click-to-focus path (review finding I1).
+    pub fn window_at(&self, point: (i32, i32)) -> Option<&Window> {
+        self.visible_windows().into_iter().find(|w| w.geometry.contains(point.0, point.1))
+    }
+
+    /// Focus the most-recently-focused non-minimized window on `ws`, if any.
+    /// Returns the id focused, or `None` when the workspace has nothing
+    /// focusable (in which case its focus pointer is left cleared).
+    ///
+    /// Review finding I6: `set_workspace` cleared the *origin* workspace's
+    /// focus pointer but never gave the destination one, so
+    /// `MoveToWorkspace` (which then switches to that workspace) left
+    /// `focused_window()` as `None` and the very next `close`/`fullscreen`/
+    /// `snap` action silently no-opped.
+    pub fn focus_mru_in_workspace(&mut self, ws: u32) -> Option<WindowId> {
+        let candidate = self
+            .focus_mru
+            .iter()
+            .copied()
+            .find(|id| self.windows.get(id).is_some_and(|w| w.workspace == ws && !w.minimized))?;
+        self.focus(candidate)?;
+        Some(candidate)
+    }
+
     pub fn to_info(&self, w: &Window) -> WindowInfo {
         WindowInfo {
             id: w.id,
@@ -349,7 +412,7 @@ mod tests {
         let mut m = mgr();
         let id = m.add_window("app", "title", 1, GEO);
         assert!(m.get(id).unwrap().focused);
-        assert!(matches!(m.pending_events.first(), Some(Event::WindowOpened(_))));
+        assert!(matches!(m.pending_events.first(), Some(SeqEvent { event: Event::WindowOpened(_), .. })));
     }
 
     #[test]
@@ -412,7 +475,7 @@ mod tests {
         m.focus(a).unwrap();
         // Should emit an event for the minimized state change.
         assert!(!m.pending_events.is_empty());
-        assert!(matches!(m.pending_events.first(), Some(Event::WindowUpdated { .. })));
+        assert!(matches!(m.pending_events.first(), Some(SeqEvent { event: Event::WindowUpdated { .. }, .. })));
         assert!(!m.get(a).unwrap().minimized);
     }
 
@@ -448,5 +511,85 @@ mod tests {
         assert_eq!(m.windows().map(|w| w.id).collect::<Vec<_>>(), vec![d, c, a]);
         // Verify b is not in the state at all.
         assert!(m.get(b).is_none());
+    }
+
+    // --- Final-review fix-round tests ---
+
+    /// M2: a manager built from a config with no workspace names must not
+    /// leave a reachable index panic in `workspace_mut`.
+    #[test]
+    fn empty_workspace_list_falls_back_to_one_workspace() {
+        let mut m = WindowManager::new(vec![]);
+        assert_eq!(m.workspace_info().len(), 1);
+        let id = m.add_window("a", "a", 1, GEO);
+        assert!(m.get(id).unwrap().focused);
+    }
+
+    /// I1: only the active workspace's non-minimized windows are drawn and
+    /// hit-tested, topmost (MRU) first.
+    #[test]
+    fn visible_windows_filters_by_workspace_and_minimized() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        let b = m.add_window("b", "b", 2, GEO);
+        let c = m.add_window("c", "c", 3, GEO);
+        m.set_workspace(c, 1).unwrap();
+        m.set_minimized(b, true).unwrap();
+
+        assert_eq!(m.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(), vec![a]);
+        assert!(m.is_visible_id(a));
+        assert!(!m.is_visible_id(b), "minimized windows are not drawn or clickable");
+        assert!(!m.is_visible_id(c), "another workspace's windows are not drawn or clickable");
+
+        m.set_active_workspace(1);
+        assert_eq!(m.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(), vec![c]);
+    }
+
+    /// I1: a click must never land on a window from an inactive workspace,
+    /// even when its geometry contains the point.
+    #[test]
+    fn window_at_only_hits_visible_windows() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        let b = m.add_window("b", "b", 2, GEO);
+        // Both cover (10, 10); `b` is MRU head, so it wins while visible.
+        assert_eq!(m.window_at((10, 10)).map(|w| w.id), Some(b));
+        m.set_workspace(b, 1).unwrap();
+        assert_eq!(m.window_at((10, 10)).map(|w| w.id), Some(a));
+        m.set_minimized(a, true).unwrap();
+        assert!(m.window_at((10, 10)).is_none());
+        assert!(m.window_at((10_000, 10_000)).is_none());
+    }
+
+    /// I6: after a window is moved away, the workspace it lands on has a
+    /// focusable head that the next action can act on.
+    #[test]
+    fn focus_mru_in_workspace_picks_head_and_skips_minimized() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        let b = m.add_window("b", "b", 2, GEO);
+        m.set_workspace(b, 1).unwrap();
+        // Workspace 1 now holds only `b`, unfocused.
+        assert_eq!(m.focus_mru_in_workspace(1), Some(b));
+        assert!(m.get(b).unwrap().focused);
+
+        // Minimized windows aren't focus candidates; an empty workspace
+        // reports `None` rather than focusing something on another one.
+        m.set_minimized(b, true).unwrap();
+        assert_eq!(m.focus_mru_in_workspace(1), None);
+        assert_eq!(m.focus_mru_in_workspace(0), Some(a));
+    }
+
+    /// I2: every queued event carries the seq its mutation produced, and
+    /// those seqs are strictly increasing.
+    #[test]
+    fn pending_events_carry_increasing_seq() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        m.set_title(a, "new".into()).unwrap();
+        let seqs: Vec<u64> = m.pending_events.iter().map(|e| e.seq).collect();
+        assert!(seqs.len() >= 2);
+        assert!(seqs.windows(2).all(|w| w[1] > w[0]), "seqs must strictly increase: {seqs:?}");
+        assert_eq!(*seqs.last().unwrap(), m.seq(), "the last queued event carries the current seq");
     }
 }

@@ -15,14 +15,14 @@ path = "src/main.rs"
 [dependencies]
 icedtea-contract = { path = "../contract" }
 icedtea-config = { path = "../config" }
-serde.workspace = true
-serde_json.workspace = true
+# NOTE (review finding M3): `serde`, `serde_json`, and `redb` used to be
+# declared here with no reference anywhere in `compositor/src` -- config
+# persistence is entirely the `icedtea-config` crate's job. Dropped.
 tracing.workspace = true
 tracing-subscriber.workspace = true
 crossbeam-channel.workspace = true
 image.workspace = true
 zbus.workspace = true
-redb.workspace = true
 bitflags = "2"
 
 # NOTE: the task-7 brief's sample feature list (`backend_wayland`, `layer_shell`,

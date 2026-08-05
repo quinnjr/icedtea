@@ -194,6 +194,22 @@ git commit -m "chore: scaffold icedtea workspace with contract, config, composit
 > \* `AltTabState.index` is `usize` and marshals as `t` (u64) on 64-bit targets; it would be `u` on 32-bit targets. All
 > icedtea targets are 64-bit Linux, so `t` is the effective signature.
 
+> **Signal signatures (amended by the final-review fix wave, finding I2).** Every `org.icedtea.WM` signal carries the
+> emitting mutation's sequence number as its **first** argument (`t`), so a client that calls `GetState()` at seq N and
+> then subscribes can discard signals with `seq <= N` and detect a gap (`seq > last_seen + 1`) that means it must
+> re-sync — the resync protocol the design doc's client-connection model specifies. Signal signatures are therefore:
+> - `WindowOpened` = `t(ussuu(iiii)bbbb)`, `WindowClosed` = `tu`, `WindowUpdated` = `tu(asa(iiii)auabababab)`
+> - `WorkspaceSet` = `tub`, `WorkspaceList` = `ta(us)`, `AltTabState` = `t(baut)`, `ConfigReloaded` = `t(siii(sss)as)`
+>
+> Internally the compositor's event channel carries `contract::SeqEvent { seq: u64, event: Event }`; the type signatures
+> above are locked by `contract/src/types.rs::wire_signatures_are_locked` (finding M4).
+
+> **Known-inert config knobs** (recommendation 4). After the final-review fix wave, `behavior.snap_enabled` (finding I3)
+> and `behavior.raise_on_focus` (ledger item 28) are both consumed. Still inert, and deliberately so — they belong to
+> Plan 3's shell/bar, which does not exist yet: `behavior.hide_bar_on_fullscreen`, `appearance.bar_position`,
+> `appearance.bar_height`, and `appearance.corner_radius`. Anyone reading the settings-GUI spec should not assume these
+> four do anything in Plan 1.
+
 - [ ] **Step 1: Add `zvariant` to `contract`**
 
 In `contract/Cargo.toml` add:

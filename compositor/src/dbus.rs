@@ -86,7 +86,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use icedtea_contract::{Event, Snapshot, WindowId, WM_BUS_NAME, WM_PATH};
+use icedtea_contract::{Event, SeqEvent, Snapshot, WindowId, WM_BUS_NAME, WM_PATH};
 use smithay::reexports::calloop;
 use zbus::blocking::Connection;
 use zbus::interface;
@@ -185,7 +185,7 @@ impl WmInterface {
 /// why a bare `Connection` return, as the brief's "Produces" line has it,
 /// isn't enough for that).
 pub fn spawn_service(
-    events_rx: Receiver<Event>,
+    events_rx: Receiver<SeqEvent>,
     cmd_tx: calloop::channel::Sender<DbCommand>,
     quit_signal: Arc<AtomicBool>,
 ) -> (Connection, std::thread::JoinHandle<()>) {
@@ -205,27 +205,43 @@ pub fn spawn_service(
             if quit_signal.load(Ordering::Relaxed) {
                 break;
             }
-            let event = match events_rx.recv_timeout(Duration::from_millis(200)) {
+            let SeqEvent { seq, event } = match events_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(event) => event,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
             };
             let name = event_signal_name(&event);
             let dest: Option<&str> = None;
+            // Review finding I2: `seq` is the first argument of every
+            // signal, so a subscriber can drop signals already folded into
+            // the `GetState()` snapshot it started from (`seq <=
+            // snapshot.seq`) and detect a gap (`seq > last_seen + 1`) that
+            // means it must re-sync. Recorded signatures:
+            //   WindowOpened   t(ussuu(iiii)bbbb)
+            //   WindowClosed   tu
+            //   WindowUpdated  tu(asa(iiii)auabababab)
+            //   WorkspaceSet   tub
+            //   WorkspaceList  ta(us)
+            //   AltTabState    t(baut)
+            //   ConfigReloaded t(siii(sss)as)
             let result = match &event {
                 Event::WindowOpened(info) => {
-                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(info.clone(),))
+                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, info.clone()))
                 }
-                Event::WindowClosed(id) => emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(id.0,)),
+                Event::WindowClosed(id) => emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, id.0)),
                 Event::WindowUpdated { id, update } => {
-                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(id.0, update.clone()))
+                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, id.0, update.clone()))
                 }
                 Event::WorkspaceSet { id, active } => {
-                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(*id, *active))
+                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, *id, *active))
                 }
-                Event::WorkspaceList(ws) => emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(ws.clone(),)),
-                Event::AltTabState(s) => emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(s.clone(),)),
-                Event::ConfigReloaded(a) => emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(a.clone(),)),
+                Event::WorkspaceList(ws) => {
+                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, ws.clone()))
+                }
+                Event::AltTabState(s) => emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, s.clone())),
+                Event::ConfigReloaded(a) => {
+                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, a.clone()))
+                }
             };
             if let Err(err) = result {
                 tracing::warn!(signal = name, error = %err, "failed to emit D-Bus signal");

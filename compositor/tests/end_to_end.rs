@@ -29,7 +29,7 @@ fn window_lifecycle_and_dbus_commands() {
     // it would never observe the event. Draining explicitly here restores
     // the sample's evident intent without changing what's under test.
     state.emit_pending();
-    assert!(matches!(rx.try_recv(), Ok(Event::WindowOpened(_))));
+    assert!(matches!(rx.try_recv().map(|e| e.event), Ok(Event::WindowOpened(_))));
 
     // DBus commands mutate the model.
     state.handle_command(DbCommand::Focus(id)).unwrap();
@@ -50,7 +50,7 @@ fn window_lifecycle_and_dbus_commands() {
 
     state.handle_command(DbCommand::Close(id)).unwrap();
     assert!(state.window_manager.get(id).is_none());
-    assert!(matches!(rx.try_recv(), Ok(Event::WindowClosed(_))));
+    assert!(matches!(rx.try_recv().map(|e| e.event), Ok(Event::WindowClosed(_))));
 }
 
 #[test]
@@ -68,6 +68,7 @@ fn action_dispatch_cover_all_default_actions() {
     for action in [
         "close",
         "fullscreen",
+        "maximize",
         "workspace:2",
         "move_to_workspace:1",
         "snap:left",
@@ -88,4 +89,67 @@ fn action_dispatch_cover_all_default_actions() {
         state.window_manager.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 640, height: 400 });
         assert!(state.apply_action(action).is_some(), "action {action} should dispatch");
     }
+}
+
+/// Final-review finding I2: a shell that reads a snapshot and then folds in
+/// signals needs each signal's `seq` to know which ones the snapshot already
+/// covers and whether it missed any. This drives the whole loop the shell
+/// will: snapshot, subscribe, apply, re-snapshot.
+#[test]
+fn signals_carry_seq_that_orders_against_the_snapshot() {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(default_config(), tx);
+    state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+
+    let id = state
+        .window_manager
+        .add_window("org.test.App", "App", 42, Rectangle { x: 0, y: 0, width: 640, height: 400 });
+    state.emit_pending();
+
+    // The shell's initial GetState().
+    let snapshot = state.window_manager.snapshot();
+    let already_seen: Vec<u64> = rx.try_iter().map(|e| e.seq).collect();
+    assert!(
+        already_seen.iter().all(|s| *s <= snapshot.seq),
+        "every signal produced before the snapshot must be discardable by seq: {already_seen:?} vs {}",
+        snapshot.seq
+    );
+
+    // Everything after it is strictly newer, gapless, and ends exactly where
+    // the next snapshot would.
+    state.handle_command(DbCommand::Maximize(id, true)).unwrap();
+    state.handle_command(DbCommand::Fullscreen(id, true)).unwrap();
+    state.handle_command(DbCommand::SetWorkspace(1)).unwrap();
+    let after: Vec<u64> = rx.try_iter().map(|e| e.seq).collect();
+    assert!(!after.is_empty());
+    assert!(after[0] > snapshot.seq, "signals after the snapshot must have a higher seq");
+    assert!(after.windows(2).all(|w| w[1] == w[0] + 1), "no gaps within one uninterrupted stream: {after:?}");
+    assert_eq!(*after.last().unwrap(), state.window_manager.snapshot().seq);
+}
+
+/// Final-review finding I1: rendering and click-to-focus consume only the
+/// active workspace's non-minimized windows, so switching workspaces
+/// actually changes what is on screen and what a click can hit.
+#[test]
+fn only_the_active_workspace_is_rendered_and_clickable() {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(default_config(), tx);
+    state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+    let geo = Rectangle { x: 0, y: 0, width: 640, height: 400 };
+    let a = state.window_manager.add_window("a", "a", 1, geo);
+    let b = state.window_manager.add_window("b", "b", 2, geo);
+
+    state.move_to_workspace(b, 1).unwrap();
+    // Workspace 2 is active and holds only `b`.
+    assert_eq!(state.window_manager.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(), vec![b]);
+    assert_eq!(state.window_manager.window_at((10, 10)).map(|w| w.id), Some(b));
+
+    state.switch_workspace(0).unwrap();
+    assert_eq!(state.window_manager.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(), vec![a]);
+    assert_eq!(state.window_manager.window_at((10, 10)).map(|w| w.id), Some(a), "a click can't reach another workspace");
+
+    // Minimizing removes the last one from both lists.
+    state.handle_command(DbCommand::Minimize(a, true)).unwrap();
+    assert!(state.window_manager.visible_windows().is_empty());
+    assert!(state.window_manager.window_at((10, 10)).is_none());
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use icedtea_contract::{Rectangle, WindowId};
+use smithay::input::keyboard::xkb;
 
 use crate::layout::{snap_zone_for_point, SnapZone};
 
@@ -14,55 +15,79 @@ bitflags::bitflags! {
     }
 }
 
+/// The modifier tokens a `KeyCombo` may name.
+pub const MODIFIER_TOKENS: [&str; 4] = ["SUPER", "CTRL", "ALT", "SHIFT"];
+
+/// Resolve a binding's key name (`"KEY_<xkb keysym name>"`, e.g. `"KEY_q"`,
+/// `"KEY_Return"`, `"KEY_F5"`, `"KEY_bracketleft"`) to its keysym, or `0`
+/// when the name names no keysym at all.
+///
+/// Review finding I4: this used to be a hand-written table of nine keys plus
+/// the digits `1..=9`; *everything* else -- every letter but `q`/`f`/`r`,
+/// every function key, every punctuation key -- resolved to `0`, so a
+/// perfectly ordinary custom binding like `SUPER+a` could never fire. It
+/// also logged a `tracing::warn!` on the miss, and `match_action` calls this
+/// once per binding per key press, so a single unresolvable binding produced
+/// a warn line on *every* keystroke. Resolution now goes through xkb (the
+/// same keysym database the input path itself uses, so names and runtime
+/// keysyms cannot drift apart), and the diagnostics moved to
+/// `validate_keybindings`, which runs once at config load/reload.
 pub fn key_name_to_keysym(name: &str) -> u32 {
-    match name {
-        "KEY_Return" => 0xff0d,
-        "KEY_Tab" => 0xff09,
-        "KEY_Left" => 0xff51,
-        "KEY_Up" => 0xff52,
-        "KEY_Right" => 0xff53,
-        "KEY_Down" => 0xff54,
-        "KEY_q" => 0x71,
-        "KEY_f" => 0x66,
-        "KEY_r" => 0x72,
-        _ => {
-            if let Some(Ok(digit)) = name.strip_prefix("KEY_").map(|rest| rest.parse::<u32>()) {
-                // Bounded to 1..=9 to match the comment/round-trip contract
-                // (`keysym_to_key_name` only inverts 0x31..=0x39) -- the
-                // brief's sample parsed any numeric suffix unbounded (e.g.
-                // "KEY_99" would silently yield keysym 147), which is a real
-                // logic bug against its own stated intent, not just style.
-                if (1..=9).contains(&digit) {
-                    return 0x30 + digit; // KEY_1..KEY_9
-                }
-            }
-            tracing::warn!("unknown key name {name}");
-            0
-        }
+    let bare = name.strip_prefix("KEY_").unwrap_or(name);
+    let sym = xkb::keysym_from_name(bare, xkb::KEYSYM_NO_FLAGS);
+    if sym.raw() != xkb::keysyms::KEY_NoSymbol {
+        return sym.raw();
     }
+    // Second pass, per xkbcommon's own recommendation: a case-insensitive
+    // lookup catches `"KEY_TAB"`/`"KEY_return"`-style spellings. Bindings
+    // that only resolve this way are reported by `validate_keybindings`.
+    xkb::keysym_from_name(bare, xkb::KEYSYM_CASE_INSENSITIVE).raw()
 }
 
+/// Inverse of [`key_name_to_keysym`]; used for D-Bus/debug output.
 pub fn keysym_to_key_name(keysym: u32) -> String {
-    // Inverse of key_name_to_keysym; used for DBus/debug output.
-    for (name, sym) in [
-        ("KEY_Return", 0xff0d),
-        ("KEY_Tab", 0xff09),
-        ("KEY_Left", 0xff51),
-        ("KEY_Up", 0xff52),
-        ("KEY_Right", 0xff53),
-        ("KEY_Down", 0xff54),
-        ("KEY_q", 0x71),
-        ("KEY_f", 0x66),
-        ("KEY_r", 0x72),
-    ] {
-        if sym == keysym {
-            return name.to_string();
+    let name = xkb::keysym_get_name(xkb::Keysym::new(keysym));
+    if name.is_empty() {
+        return format!("KEY_{keysym}");
+    }
+    format!("KEY_{name}")
+}
+
+/// Check every configured binding once, returning a human-readable problem
+/// description per unusable binding: an unrecognized modifier token, or a
+/// key name that names no keysym.
+///
+/// Review finding I4: `match_action` used to warn from inside the per-event
+/// lookup, so a typo'd binding spammed the log on every single key press.
+/// `State` calls this at config load and on every reload instead, so each
+/// problem is reported exactly once per config.
+pub fn validate_keybindings(bindings: &HashMap<String, crate::config_combo::KeyCombo>) -> Vec<String> {
+    let mut problems: Vec<String> = Vec::new();
+    for (action, combo) in bindings {
+        for m in &combo.modifiers {
+            if !MODIFIER_TOKENS.contains(&m.as_str()) {
+                problems.push(format!(
+                    "binding for action {action:?} names unrecognized modifier {m:?} \
+                     (expected one of {MODIFIER_TOKENS:?}); it can never fire"
+                ));
+            }
+        }
+        if key_name_to_keysym(&combo.key) == xkb::keysyms::KEY_NoSymbol {
+            problems.push(format!(
+                "binding for action {action:?} names unknown key {:?}; it can never fire",
+                combo.key
+            ));
         }
     }
-    if (0x31..=0x39).contains(&keysym) {
-        return format!("KEY_{}", keysym - 0x30);
+    problems.sort();
+    problems
+}
+
+/// Log whatever [`validate_keybindings`] found, once.
+pub fn warn_about_keybindings(bindings: &HashMap<String, crate::config_combo::KeyCombo>) {
+    for problem in validate_keybindings(bindings) {
+        tracing::warn!("{problem}");
     }
-    format!("KEY_{keysym}")
 }
 
 // NOTE (brief deviation): the brief's sample `match_action` body has a
@@ -84,7 +109,11 @@ pub fn match_action(
                 "ALT" => Modifiers::ALT,
                 "SHIFT" => Modifiers::SHIFT,
                 _ => {
-                    tracing::warn!("unrecognized modifier token {m} in binding for action {action}");
+                    // Review finding I4: the `tracing::warn!` that used to
+                    // live here ran once per binding per key press.
+                    // Diagnostics now come from `validate_keybindings`, at
+                    // config load/reload time.
+                    //
                     // Route an unrecognized token (typo, wrong case, etc.)
                     // to a sentinel bit outside the four defined flags
                     // instead of `Modifiers::empty()`. Runtime `mods` values
@@ -99,7 +128,14 @@ pub fn match_action(
                 }
             }
         });
-        if wanted == mods && key_name_to_keysym(&combo.key) == keysym {
+        let wanted_sym = key_name_to_keysym(&combo.key);
+        // An unresolvable key name must never match: without this guard a
+        // typo'd binding would fire for any key press whose keysym also
+        // failed to resolve (both being `NoSymbol`).
+        if wanted_sym == xkb::keysyms::KEY_NoSymbol {
+            continue;
+        }
+        if wanted == mods && wanted_sym == keysym {
             return Some(action.clone());
         }
     }
@@ -245,6 +281,94 @@ impl DragMachine {
     }
 }
 
+/// Which window edges an interactive resize is dragging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResizeEdges {
+    pub top: bool,
+    pub bottom: bool,
+    pub left: bool,
+    pub right: bool,
+}
+
+impl ResizeEdges {
+    pub fn is_empty(self) -> bool {
+        !(self.top || self.bottom || self.left || self.right)
+    }
+}
+
+/// Smallest interactive-resize result, so a client can't be configured to a
+/// zero (or negative) size by dragging past the opposite edge.
+pub const MIN_WINDOW_SIZE: (i32, i32) = (160, 80);
+
+/// Pointer-driven interactive resize, the counterpart of [`DragMachine`].
+/// Started by the xdg `resize_request` handler (the client asks for it while
+/// already holding the button down) and stepped by the same pointer
+/// motion/release path the drag machine uses.
+pub struct ResizeMachine {
+    window_id: Option<WindowId>,
+    edges: ResizeEdges,
+    start_geometry: Rectangle,
+    start_pointer: (i32, i32),
+}
+
+impl Default for ResizeMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResizeMachine {
+    pub fn new() -> Self {
+        Self {
+            window_id: None,
+            edges: ResizeEdges::default(),
+            start_geometry: Rectangle { x: 0, y: 0, width: 0, height: 0 },
+            start_pointer: (0, 0),
+        }
+    }
+
+    pub fn begin(&mut self, window_id: WindowId, edges: ResizeEdges, geometry: Rectangle, pointer: (i32, i32)) {
+        self.window_id = Some(window_id);
+        self.edges = edges;
+        self.start_geometry = geometry;
+        self.start_pointer = pointer;
+    }
+
+    pub fn window_id(&self) -> Option<WindowId> {
+        self.window_id
+    }
+
+    /// The geometry the window should have with the pointer at `pointer`,
+    /// clamped to [`MIN_WINDOW_SIZE`]. `None` when no resize is in progress.
+    pub fn geometry_for(&self, pointer: (i32, i32)) -> Option<Rectangle> {
+        self.window_id?;
+        let (dx, dy) = (pointer.0 - self.start_pointer.0, pointer.1 - self.start_pointer.1);
+        let g = self.start_geometry;
+        let (mut x, mut y, mut width, mut height) = (g.x, g.y, g.width, g.height);
+        if self.edges.right {
+            width = (g.width + dx).max(MIN_WINDOW_SIZE.0);
+        }
+        if self.edges.left {
+            width = (g.width - dx).max(MIN_WINDOW_SIZE.0);
+            x = g.x + g.width - width;
+        }
+        if self.edges.bottom {
+            height = (g.height + dy).max(MIN_WINDOW_SIZE.1);
+        }
+        if self.edges.top {
+            height = (g.height - dy).max(MIN_WINDOW_SIZE.1);
+            y = g.y + g.height - height;
+        }
+        Some(Rectangle { x, y, width, height })
+    }
+
+    /// End the resize, returning the window it applied to (if any).
+    pub fn end(&mut self) -> Option<WindowId> {
+        self.edges = ResizeEdges::default();
+        self.window_id.take()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +405,106 @@ mod tests {
         m.insert("typo".into(), KeyCombo { modifiers: vec!["Sooper".into()], key: "KEY_q".into() });
         assert_eq!(match_action(&m, Modifiers::empty(), 0x71), None);
         assert_eq!(match_action(&m, Modifiers::SUPER, 0x71), None);
+    }
+
+    // --- Final-review fix-round tests (I4) ---
+
+    /// I4: the nine-key hand table is gone -- every xkb keysym name is
+    /// bindable now -- while the names the old table did know keep resolving
+    /// to exactly the same keysyms (so no existing config silently changes
+    /// meaning).
+    #[test]
+    fn key_names_resolve_through_xkb_without_regressing_the_old_table() {
+        for (name, sym) in [
+            ("KEY_Return", 0xff0d),
+            ("KEY_Tab", 0xff09),
+            ("KEY_Left", 0xff51),
+            ("KEY_Up", 0xff52),
+            ("KEY_Right", 0xff53),
+            ("KEY_Down", 0xff54),
+            ("KEY_q", 0x71),
+            ("KEY_f", 0x66),
+            ("KEY_r", 0x72),
+            ("KEY_1", 0x31),
+            ("KEY_9", 0x39),
+        ] {
+            assert_eq!(key_name_to_keysym(name), sym, "{name} must keep its keysym");
+        }
+        // Newly bindable: the other 23 letters, function keys, punctuation.
+        assert_eq!(key_name_to_keysym("KEY_a"), 0x61);
+        assert_eq!(key_name_to_keysym("KEY_z"), 0x7a);
+        assert_eq!(key_name_to_keysym("KEY_F5"), 0xffc2);
+        assert_eq!(key_name_to_keysym("KEY_space"), 0x20);
+        assert_eq!(key_name_to_keysym("KEY_bracketleft"), 0x5b);
+        // Still unresolvable, still reported as `NoSymbol`.
+        assert_eq!(key_name_to_keysym("KEY_definitely_not_a_key"), xkb::keysyms::KEY_NoSymbol);
+    }
+
+    #[test]
+    fn key_name_round_trips_through_keysym_to_key_name() {
+        for name in ["KEY_Return", "KEY_Tab", "KEY_q", "KEY_a", "KEY_F5", "KEY_1", "KEY_space"] {
+            assert_eq!(keysym_to_key_name(key_name_to_keysym(name)), name);
+        }
+    }
+
+    /// I4: a letter binding that could never fire before now dispatches.
+    #[test]
+    fn letter_bindings_can_match() {
+        let mut m = HashMap::new();
+        m.insert("spawn:menu".into(), KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_a".into() });
+        assert_eq!(match_action(&m, Modifiers::SUPER, 0x61), Some("spawn:menu".into()));
+    }
+
+    /// I4: problems are reported once, by an explicit validation pass, not
+    /// from inside the per-key-press lookup.
+    #[test]
+    fn validate_keybindings_reports_bad_modifier_and_bad_key() {
+        let mut m = HashMap::new();
+        m.insert("good".into(), KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_q".into() });
+        m.insert("bad_mod".into(), KeyCombo { modifiers: vec!["Sooper".into()], key: "KEY_q".into() });
+        m.insert("bad_key".into(), KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_nope".into() });
+        let problems = validate_keybindings(&m);
+        assert_eq!(problems.len(), 2, "one problem per unusable binding: {problems:?}");
+        assert!(problems.iter().any(|p| p.contains("bad_mod") && p.contains("Sooper")));
+        assert!(problems.iter().any(|p| p.contains("bad_key") && p.contains("KEY_nope")));
+        assert!(validate_keybindings(&bindings()).is_empty(), "the default-shaped bindings are clean");
+    }
+
+    /// I4: an unresolvable key name must not match a key press whose keysym
+    /// also failed to resolve (both `NoSymbol`).
+    #[test]
+    fn unresolvable_key_name_never_matches() {
+        let mut m = HashMap::new();
+        m.insert("typo".into(), KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_nope".into() });
+        assert_eq!(match_action(&m, Modifiers::SUPER, xkb::keysyms::KEY_NoSymbol), None);
+    }
+
+    // --- Interactive resize (C1 / ledger item 15: xdg `resize_request`) ---
+
+    #[test]
+    fn resize_from_bottom_right_grows_without_moving_the_origin() {
+        let mut m = ResizeMachine::new();
+        let geo = Rectangle { x: 100, y: 100, width: 400, height: 300 };
+        m.begin(WindowId(1), ResizeEdges { bottom: true, right: true, ..Default::default() }, geo, (500, 400));
+        assert_eq!(
+            m.geometry_for((550, 450)),
+            Some(Rectangle { x: 100, y: 100, width: 450, height: 350 })
+        );
+        assert_eq!(m.end(), Some(WindowId(1)));
+        assert_eq!(m.geometry_for((550, 450)), None, "no resize in progress after end()");
+    }
+
+    #[test]
+    fn resize_from_top_left_moves_the_origin_and_clamps_to_minimum() {
+        let mut m = ResizeMachine::new();
+        let geo = Rectangle { x: 100, y: 100, width: 400, height: 300 };
+        m.begin(WindowId(1), ResizeEdges { top: true, left: true, ..Default::default() }, geo, (100, 100));
+        assert_eq!(m.geometry_for((150, 140)), Some(Rectangle { x: 150, y: 140, width: 350, height: 260 }));
+        // Dragging past the opposite edge clamps instead of inverting.
+        let clamped = m.geometry_for((10_000, 10_000)).unwrap();
+        assert_eq!((clamped.width, clamped.height), MIN_WINDOW_SIZE);
+        assert_eq!(clamped.x + clamped.width, geo.x + geo.width, "the far edge stays put");
+        assert_eq!(clamped.y + clamped.height, geo.y + geo.height);
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub mod window;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use icedtea_contract::Event;
+use icedtea_contract::SeqEvent;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::Display;
@@ -39,7 +39,7 @@ pub fn run() {
     let db_path = icedtea_config::default_db_path();
     let config = icedtea_config::load_or_default(&db_path);
 
-    let (dbus_tx, dbus_events_rx) = crossbeam_channel::unbounded::<Event>();
+    let (dbus_tx, dbus_events_rx) = crossbeam_channel::unbounded::<SeqEvent>();
     // `dbus_events_rx` is drained by the D-Bus service's emitter thread,
     // spawned below via `dbus::spawn_service` -- the consumer this channel
     // was created for back in task 7.
