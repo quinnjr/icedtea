@@ -51,10 +51,28 @@ fn main() {
         .handle()
         .insert_source(cmd_channel, |event, _, state: &mut State| {
             if let smithay::reexports::calloop::channel::Event::Msg(cmd) = event {
-                state.handle_dbus_command(cmd);
+                state.handle_command(cmd);
             }
         })
         .expect("failed to insert the D-Bus command channel into the event loop");
+
+    // `ReloadConfig`'s redb I/O + JSON parse must never block the render
+    // loop (task 13's threading requirement): `handle_command` spawns a
+    // worker thread that does the actual load and ships the result back
+    // over this channel; this source applies it on the main loop the same
+    // way the wallpaper-decode channel below applies its own worker's
+    // result.
+    let (config_reload_tx, config_reload_channel) =
+        smithay::reexports::calloop::channel::channel::<icedtea_config::Config>();
+    state.set_config_reload_sender(config_reload_tx);
+    event_loop
+        .handle()
+        .insert_source(config_reload_channel, |event, _, state: &mut State| {
+            if let smithay::reexports::calloop::channel::Event::Msg(cfg) = event {
+                let _ = state.apply_reloaded_config(cfg);
+            }
+        })
+        .expect("failed to insert the config reload channel into the event loop");
 
     let display: Display<State> = state.take_display();
 

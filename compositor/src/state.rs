@@ -16,6 +16,7 @@
 //! standard `ListeningSocketSource` + `Generic` dispatch wiring.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use icedtea_config::Config;
@@ -151,6 +152,20 @@ pub struct State {
     /// events (which carry no position of their own) read it back to build
     /// `PointerEvent::Press`/`Release`.
     pub pointer_location: (i32, i32),
+    /// On-disk location `reload_config_from_disk`/`handle_command`'s
+    /// `ReloadConfig` worker thread reads from. `None` (the boot-time
+    /// default) means "use `icedtea_config::default_db_path()`" -- this is
+    /// only ever overridden by tests, which need an isolated temp DB rather
+    /// than the real XDG path.
+    pub config_path: Option<PathBuf>,
+    /// Set by `main.rs` via `set_config_reload_sender` once the event loop
+    /// exists (unavailable at `State::new` time, same reason
+    /// `loop_signal` is). `handle_command`'s `ReloadConfig` arm sends the
+    /// freshly-loaded `Config` back over this from a worker thread so the
+    /// redb I/O + JSON parse never blocks the render loop (task-13's
+    /// threading requirement); `None` before that wiring exists is a no-op
+    /// (nothing to reload into).
+    config_reload_tx: Option<smithay::reexports::calloop::channel::Sender<Config>>,
 
     // Wayland global state.
     pub compositor_state: CompositorState,
@@ -206,6 +221,8 @@ impl State {
             quitting: false,
             pending_config_events: Vec::new(),
             pointer_location: (0, 0),
+            config_path: None,
+            config_reload_tx: None,
             compositor_state,
             xdg_shell_state,
             shm_state,
@@ -227,6 +244,15 @@ impl State {
     /// Wire up the calloop stop signal once the event loop exists.
     pub fn set_loop_signal(&mut self, signal: smithay::reexports::calloop::LoopSignal) {
         self.loop_signal = Some(signal);
+    }
+
+    /// Wire up the config-reload result channel once the event loop exists
+    /// (see `config_reload_tx`'s field doc for why this can't be done in
+    /// `State::new`). `main.rs` registers the paired receiver half as a
+    /// calloop source that applies whatever `Config` arrives via
+    /// `apply_reloaded_config`.
+    pub fn set_config_reload_sender(&mut self, tx: smithay::reexports::calloop::channel::Sender<Config>) {
+        self.config_reload_tx = Some(tx);
     }
 
     /// Request the event loop to stop (e.g. on `WinitEvent::CloseRequested`).
@@ -342,54 +368,123 @@ impl State {
         Some(())
     }
 
-    /// Apply a [`crate::dbus::DbCommand`] received from the D-Bus service
-    /// thread (see `dbus.rs`'s module doc for the threading model). Every
-    /// arm except `GetState` mirrors an `apply_action`/`WindowManager`
-    /// mutation and drains pending events on the way out, same as
-    /// `apply_action`; `GetState` is a synchronous read that never mutates
-    /// anything, so it doesn't need one.
-    pub fn handle_dbus_command(&mut self, cmd: crate::dbus::DbCommand) {
+    /// Synchronously reload the config from `self.config_path` (falling
+    /// back to `icedtea_config::default_db_path()` when unset) and apply it.
+    /// Returns the events `apply_config` produced (which already includes a
+    /// trailing `Event::ConfigReloaded` -- see that method's doc -- so
+    /// nothing is pushed again here).
+    ///
+    /// This is the *synchronous* load+apply path -- both the load and the
+    /// apply happen on whatever thread calls it, in one blocking call. It
+    /// exists for tests (task-13's Step-1 test calls it against a temp DB,
+    /// where the extra thread hop of the async path would just be noise)
+    /// and is *not* wired to either live reload trigger: per the module's
+    /// threading requirement, the redb I/O + JSON parse must never run on
+    /// the render loop, so neither `handle_command`'s `ReloadConfig` arm nor
+    /// `apply_action`'s `"reload"` arm calls this directly -- they both go
+    /// through `spawn_config_reload`'s worker-thread + channel path instead,
+    /// which lands on `apply_reloaded_config` (the same apply+emit tail this
+    /// method also uses) once the load finishes off-loop.
+    ///
+    /// NOTE (brief deviation): the brief's Step-3 sample pushed a *second*
+    /// `Event::ConfigReloaded(self.config.appearance.clone())` after calling
+    /// `apply_config`. `apply_config` (task 11) already appends its own
+    /// `Event::ConfigReloaded(cfg.appearance.clone())` to the vec it
+    /// returns, so following the sample literally would emit the signal
+    /// twice per reload -- a genuine duplicate-event bug, not just
+    /// transcription noise (the standing human ruling is to fix genuine
+    /// sample bugs and document them here). Dropped; `apply_config`'s event
+    /// is the one and only `ConfigReloaded` this path emits.
+    pub fn reload_config_from_disk(&mut self) -> Vec<Event> {
+        let path = self.config_path.clone().unwrap_or_else(icedtea_config::default_db_path);
+        let cfg = icedtea_config::load_or_default(&path);
+        self.apply_reloaded_config(cfg)
+    }
+
+    /// Apply a `Config` (already loaded, whether synchronously by
+    /// `reload_config_from_disk` or on a worker thread by
+    /// `handle_command`'s `ReloadConfig` async path): calls `apply_config`,
+    /// stashes its events onto `pending_config_events`, and flushes them
+    /// immediately (via `emit_pending`) so the D-Bus emitter thread
+    /// observes `ConfigReloaded` (and any `WindowClosed`/`WorkspaceList`/
+    /// terminal `AltTabState` it carries) right away rather than waiting for
+    /// some unrelated later mutation to flush the queue. Returns the same
+    /// events, for callers (like `reload_config_from_disk`'s test) that want
+    /// to inspect what was produced.
+    pub fn apply_reloaded_config(&mut self, cfg: Config) -> Vec<Event> {
+        let events = self.apply_config(cfg);
+        self.pending_config_events.extend(events.clone());
+        self.emit_pending();
+        events
+    }
+
+    /// Spawn the off-loop worker thread shared by both async reload
+    /// triggers -- `handle_command`'s `DbCommand::ReloadConfig` arm and
+    /// `apply_action`'s `"reload"` arm (bound to `SUPER+SHIFT+r` by
+    /// default). Loads `self.config_path` (falling back to
+    /// `icedtea_config::default_db_path()`) on the worker thread and ships
+    /// the result back over `config_reload_tx`; `main.rs`'s calloop source
+    /// for that channel calls `apply_reloaded_config` once it arrives. A
+    /// no-op if `config_reload_tx` hasn't been wired yet (only possible
+    /// before `main.rs` finishes event-loop setup).
+    fn spawn_config_reload(&self) {
+        let Some(tx) = self.config_reload_tx.clone() else { return };
+        let path = self.config_path.clone().unwrap_or_else(icedtea_config::default_db_path);
+        std::thread::spawn(move || {
+            let cfg = icedtea_config::load_or_default(&path);
+            let _ = tx.send(cfg);
+        });
+    }
+
+    /// Central dispatcher for every [`crate::dbus::DbCommand`] received from
+    /// the D-Bus service thread (see `dbus.rs`'s module doc for the
+    /// threading model). Mirrors `apply_action`'s shape: `?`-propagates a
+    /// failed precondition as `None` (skipping the trailing
+    /// `emit_pending()`, which would be a no-op anyway since nothing queued
+    /// on a failed mutation), `Some(())` on success.
+    ///
+    /// `ReloadConfig` is the one arm that doesn't mutate anything itself:
+    /// per this task's threading requirement, the redb I/O + JSON parse
+    /// must never block the render loop, so this spawns a worker thread
+    /// (see `reload_config_from_disk`'s doc) that loads the config off-loop
+    /// and ships the result back over `config_reload_tx`; `main.rs`'s
+    /// calloop source for that channel is what actually calls
+    /// `apply_reloaded_config` once the load finishes. If
+    /// `config_reload_tx` hasn't been wired yet (only possible before
+    /// `main.rs` finishes event-loop setup), this is a no-op.
+    pub fn handle_command(&mut self, cmd: crate::dbus::DbCommand) -> Option<()> {
         use crate::dbus::DbCommand;
         match cmd {
-            DbCommand::Focus(id) => {
-                self.window_manager.focus(id);
-            }
+            DbCommand::Focus(id) => self.window_manager.focus(id)?,
             DbCommand::Close(id) => {
                 self.window_manager.remove_window(id);
             }
-            DbCommand::Minimize(id, value) => {
-                self.window_manager.set_minimized(id, value);
-            }
-            DbCommand::Maximize(id, value) => {
-                self.window_manager.set_maximized(id, value);
-            }
-            DbCommand::Fullscreen(id, value) => {
-                self.set_fullscreen_target(id, value);
-            }
+            DbCommand::Minimize(id, value) => self.window_manager.set_minimized(id, value)?,
+            DbCommand::Maximize(id, value) => self.window_manager.set_maximized(id, value)?,
+            DbCommand::Fullscreen(id, value) => self.set_fullscreen_target(id, value)?,
             DbCommand::SetWorkspace(id) => {
                 self.window_manager.set_active_workspace(id);
             }
             DbCommand::MoveToWorkspace(id, workspace) => {
-                self.window_manager.set_workspace(id, workspace);
-            }
-            DbCommand::ReloadConfig => {
-                let cfg = icedtea_config::load_or_default(&icedtea_config::default_db_path());
-                let events = self.apply_config(cfg);
-                self.pending_config_events.extend(events);
-            }
-            DbCommand::Quit => {
-                self.quitting = true;
+                self.window_manager.set_workspace(id, workspace)?;
+                self.window_manager.set_active_workspace(workspace);
             }
             DbCommand::GetState(reply_tx) => {
                 let _ = reply_tx.send(self.window_manager.snapshot());
                 // No model mutation happened; nothing new to flush. Return
-                // early so the unconditional `emit_pending()` below (a no-op
-                // here, but let's not rely on that) stays meaningful for
-                // every other arm.
-                return;
+                // early so the unconditional `emit_pending()` below (a
+                // no-op here, but let's not rely on that) stays meaningful
+                // for every other arm.
+                return Some(());
             }
+            DbCommand::ReloadConfig => {
+                self.spawn_config_reload();
+                return Some(());
+            }
+            DbCommand::Quit => self.quitting = true,
         }
         self.emit_pending();
+        Some(())
     }
 
     /// Get the decoration action for a given window at the specified local coordinates.
@@ -446,11 +541,13 @@ impl State {
                 self.toggle_fullscreen(id)?;
             }
             "quit" => self.quitting = true,
-            "reload" => {
-                let cfg = icedtea_config::load_or_default(&icedtea_config::default_db_path());
-                let events = self.apply_config(cfg);
-                self.pending_config_events.extend(events);
-            }
+            // Task 13 threading requirement (binding, carried over from the
+            // task-7 threading-model ruling): the redb I/O + JSON parse must
+            // never block the render loop, for the keybinding-triggered
+            // reload just as much as the D-Bus `ReloadConfig` method --
+            // `handle_command`'s `ReloadConfig` arm and this arm share the
+            // exact same worker-thread dispatch for that reason.
+            "reload" => self.spawn_config_reload(),
             // NOTE (brief deviation): the sample matched on the literal
             // `"cycle:alt_tab"` here, but `action.splitn(2, ':')` above
             // already split that string into `base = "cycle"`, `arg =
@@ -1530,5 +1627,132 @@ mod tests {
                 .any(|e| matches!(e, Event::WindowUpdated { id, update } if *id == a && update.focused == Some(true))),
             "focus event must be flushed immediately, not deferred until an unrelated later flush"
         );
+    }
+
+    // --- Task 13: config hot reload over `ReloadConfig` ---
+
+    #[test]
+    fn reload_config_applies_new_workspaces_and_emits() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        // Persist a config with different workspace names, then reload from disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let db = icedtea_config::open(&path).unwrap();
+        let mut cfg = icedtea_config::default_config();
+        cfg.workspace_names = vec!["A".into(), "B".into(), "C".into()];
+        cfg.save(&db).unwrap();
+        drop(db);
+
+        state.config_path = Some(path.clone());
+        let events = state.reload_config_from_disk();
+        assert_eq!(state.window_manager.workspace_info().len(), 3);
+        assert!(events.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
+        let emitted = rx.try_iter().collect::<Vec<_>>();
+        assert!(emitted.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
+    }
+
+    /// `handle_command`'s `ReloadConfig` arm must go through the async
+    /// worker path -- it only spawns a thread and returns, never blocking
+    /// on the load itself -- and must be a harmless no-op when
+    /// `config_reload_tx` hasn't been wired (as in every other test in this
+    /// module, which never call `set_config_reload_sender`).
+    #[test]
+    fn handle_command_reload_without_sender_wired_is_a_harmless_noop() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert_eq!(state.handle_command(crate::dbus::DbCommand::ReloadConfig), Some(()));
+    }
+
+    /// The async worker path actually delivers a reloaded config back to
+    /// the channel `set_config_reload_sender` was given, and
+    /// `apply_reloaded_config` applies + emits it exactly like the sync
+    /// path.
+    #[test]
+    fn handle_command_reload_spawns_worker_that_delivers_config() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let db = icedtea_config::open(&path).unwrap();
+        let mut cfg = icedtea_config::default_config();
+        cfg.workspace_names = vec!["X".into(), "Y".into()];
+        cfg.save(&db).unwrap();
+        drop(db);
+        state.config_path = Some(path);
+
+        let (reload_tx, reload_rx) = smithay::reexports::calloop::channel::channel::<Config>();
+        state.set_config_reload_sender(reload_tx);
+
+        assert_eq!(state.handle_command(crate::dbus::DbCommand::ReloadConfig), Some(()));
+
+        // The worker thread runs off-loop; block briefly for its result
+        // (mirrors how `main.rs`'s calloop source would be woken).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut received = None;
+        while std::time::Instant::now() < deadline {
+            match reload_rx.try_recv() {
+                Ok(cfg) => {
+                    received = Some(cfg);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        let cfg = received.expect("worker thread must deliver a Config over the reload channel");
+        assert_eq!(cfg.workspace_names, vec!["X".to_string(), "Y".to_string()]);
+
+        state.apply_reloaded_config(cfg);
+        assert_eq!(state.window_manager.workspace_info().len(), 2);
+        let emitted = rx.try_iter().collect::<Vec<_>>();
+        assert!(emitted.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
+    }
+
+    /// The keybinding-triggered `"reload"` action (`SUPER+SHIFT+r` by
+    /// default) must go through the exact same async worker path as the
+    /// D-Bus `ReloadConfig` command -- per the task-13 threading
+    /// requirement, neither may block the render loop with redb I/O.
+    #[test]
+    fn apply_action_reload_spawns_worker_that_delivers_config() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let db = icedtea_config::open(&path).unwrap();
+        let mut cfg = icedtea_config::default_config();
+        cfg.workspace_names = vec!["P".into(), "Q".into()];
+        cfg.save(&db).unwrap();
+        drop(db);
+        state.config_path = Some(path);
+
+        let (reload_tx, reload_rx) = smithay::reexports::calloop::channel::channel::<Config>();
+        state.set_config_reload_sender(reload_tx);
+
+        assert_eq!(state.apply_action("reload"), Some(()));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut received = None;
+        while std::time::Instant::now() < deadline {
+            match reload_rx.try_recv() {
+                Ok(cfg) => {
+                    received = Some(cfg);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        let cfg = received.expect("worker thread must deliver a Config over the reload channel");
+        assert_eq!(cfg.workspace_names, vec!["P".to_string(), "Q".to_string()]);
+    }
+
+    #[test]
+    fn apply_action_reload_without_sender_wired_is_a_harmless_noop() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert_eq!(state.apply_action("reload"), Some(()));
     }
 }

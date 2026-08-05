@@ -12,7 +12,7 @@
 //!   `main.rs` promised for the previously-undrained `_dbus_rx` channel.
 //! - `cmd_tx` (this thread -> compositor): [`DbCommand`]s produced by
 //!   incoming [`WmInterface`] method calls, drained by `main.rs`'s calloop
-//!   loop and applied to `State` (see `State::handle_dbus_command`).
+//!   loop and applied to `State` (see `State::handle_command`).
 //!
 //! ## Deviations from the task-12 brief
 //!
@@ -92,7 +92,7 @@ use zbus::blocking::Connection;
 use zbus::interface;
 
 /// Commands sent from the D-Bus interface thread to the compositor's main
-/// (calloop) loop. Applied to `State` by `State::handle_dbus_command`.
+/// (calloop) loop. Applied to `State` by `State::handle_command`.
 #[derive(Debug, Clone)]
 pub enum DbCommand {
     Focus(WindowId),
@@ -160,7 +160,7 @@ impl WmInterface {
     fn get_state(&self) -> Snapshot {
         // Synchronous round-trip: ask the compositor for a snapshot. The
         // calloop loop answers this the moment it drains the `GetState`
-        // command (see `State::handle_dbus_command`), so this blocks the
+        // command (see `State::handle_command`), so this blocks the
         // zbus dispatch for this connection only as long as one loop
         // iteration takes -- by design, per the brief.
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);

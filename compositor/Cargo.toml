@@ -42,3 +42,6 @@ smithay = { version = "0.7", default-features = false, features = [
   "wayland_frontend",
   "xwayland",
 ] }
+
+[dev-dependencies]
+tempfile = "3"
