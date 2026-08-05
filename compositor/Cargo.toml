@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "icedtea_compositor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "icedtea-compositor"
+path = "src/main.rs"
+
 [dependencies]
 icedtea-contract = { path = "../contract" }
 icedtea-config = { path = "../config" }
