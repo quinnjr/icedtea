@@ -132,7 +132,7 @@ Object paths:
 `ReadAlias`, `SetAlias`, `Lock`, `Unlock`, `DeleteAlias`, `ChangePassword`.
 Properties: `Collections`, `DefaultAlias`, `Locked`.
 
-**Collection** — methods: `CreateItem`, `UpdateItemChoice`, `Delete`,
+**Collection** — methods: `CreateItem`, `UpdateItem`, `Delete`,
 `SearchItems`, `SetLabel`. Properties: `Items`, `Label`, `Locked`, `Created`,
 `Modified`.
 
