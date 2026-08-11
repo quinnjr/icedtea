@@ -85,6 +85,49 @@ pub fn shutdown_source(runtime: &wlr::Runtime) -> std::io::Result<wlr::SourceId>
     Ok(runtime.add_fd(fd, wlr::Interest::READABLE))
 }
 
+/// Register a wake pipe: an `add_fd` source whose write half lets another
+/// thread end a blocked `dispatch(-1)` wait the moment it puts something on
+/// a `crossbeam_channel` that `state.rs` only ever drains from inside a
+/// handler.
+///
+/// Same self-pipe shape as [`shutdown_source`], generalized: a
+/// `crossbeam_channel` has no fd of its own to register as a source, so
+/// without one of these a send from another thread (a D-Bus command, a
+/// finished config reload) sits unseen until some unrelated event — a
+/// frame, an input event — happens to wake the loop anyway, or, on an
+/// otherwise idle compositor blocked in `Until::Stop`'s `dispatch(-1)`,
+/// never.
+///
+/// The write half comes back non-blocking: a burst of sends from the D-Bus
+/// service thread or the config-reload worker must never block on the
+/// compositor's own loop cadence, so [`wake`] treats a full pipe as success
+/// rather than propagating `WouldBlock`.
+pub fn wake_source(runtime: &wlr::Runtime) -> std::io::Result<(UnixStream, wlr::SourceId)> {
+    let (read, write) = UnixStream::pair()?;
+    write.set_nonblocking(true)?;
+    let fd = OwnedFd::from(read);
+    let id = runtime.add_fd(fd, wlr::Interest::READABLE);
+    Ok((write, id))
+}
+
+/// Nudge a [`wake_source`]'s write half so the loop's next `dispatch` sees
+/// it readable.
+///
+/// Errors other than a full pipe (`EAGAIN`/`EWOULDBLOCK` — the write half is
+/// non-blocking) are logged, not propagated: a failed wake degrades to "the
+/// next unrelated event drains the channel instead," not a crash, and this
+/// itself runs from a producer thread (the D-Bus service thread, a
+/// config-reload worker) that must never block on the compositor's own
+/// cadence.
+pub fn wake(write: &UnixStream) {
+    if let Err(err) = rustix::io::write(write, &[0u8])
+        && err != rustix::io::Errno::AGAIN
+        && err != rustix::io::Errno::WOULDBLOCK
+    {
+        tracing::debug!(?err, "failed to wake the event loop");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +158,18 @@ mod shutdown_tests {
         let a = shutdown_source(&runtime).expect("first");
         let b = shutdown_source(&runtime).expect("second");
         assert_ne!(a, b, "each registration gets its own id");
+    }
+
+    /// Same shape as `a_shutdown_source_registers_against_a_bare_runtime`,
+    /// for the wake pipe: registration alone must succeed independently of
+    /// any backend, and a nudge on the (non-blocking) write half must not
+    /// error even with nobody reading yet.
+    #[test]
+    fn a_wake_source_registers_and_accepts_a_nudge() {
+        let runtime = wlr::Runtime::new().expect("runtime");
+        let (write, id) = wake_source(&runtime).expect("wake source");
+        wake(&write);
+        let (_write2, id2) = wake_source(&runtime).expect("second wake source");
+        assert_ne!(id, id2, "each registration gets its own id");
     }
 }

@@ -28,33 +28,31 @@ use state::State;
 ///
 /// 1. `apply_backend_choice` before anything, because `autocreate` reads
 ///    `WLR_BACKENDS` when it runs and never again.
-/// 2. `Runtime::new` before `Backend::autocreate`, because the scene has to
-///    exist before an output can be announced into it — a backend announces
-///    the outputs it already has from inside its own start, and nothing
-///    replays that announcement.
-/// 3. `add_socket_auto` and the `WAYLAND_DISPLAY` set after the backend, so
-///    that a nested backend opens its window against the *host* session's
-///    display before that variable is clobbered for our own children.
+/// 2. `Runtime::new` before `init_graphics`, which needs the display, the
+///    backend, and the runtime all to already exist. There is no ordering
+///    requirement between `Runtime::new` and `Backend::autocreate`
+///    themselves: `Backend::autocreate` announces nothing on its own -- the
+///    backend's existing outputs are announced to `OutputHandler::new_output`
+///    from inside `run_all`'s own start (`ensure_started`), well after
+///    `state.wayland.attach` below has already handed the seam a runtime to
+///    enable/init an output against.
+/// 3. `state` is constructed after `display`/`runtime`/`backend` (and so, by
+///    ordinary end-of-scope drop order, is dropped before them): `attach`
+///    gives `state.wayland` a `Runtime` clone, and `wlr` documents that a
+///    `Runtime` must not outlive the `Display` it was initialized against.
+/// 4. `add_socket_auto` and the `WAYLAND_DISPLAY` set happen after the
+///    backend, so that a nested backend opens its window against the
+///    *host* session's display before that variable is clobbered for our
+///    own children -- and, just as importantly, before the D-Bus service or
+///    the wallpaper decode worker are spawned: the `set_var` below is
+///    single-threaded-with-respect-to-the-environment only if nothing else
+///    is running yet, so both of those threads start *after* it, not before.
 pub fn run() {
     let choice = backend::BackendChoice::from_args(std::env::args());
     backend::apply_backend_choice(choice);
 
     let db_path = icedtea_config::default_db_path();
     let config = icedtea_config::load_or_default(&db_path);
-
-    let (dbus_tx, dbus_events_rx) = crossbeam_channel::unbounded::<SeqEvent>();
-    let mut state = State::new(config, dbus_tx);
-
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<dbus::DbCommand>();
-    let dbus_quit_signal = Arc::new(AtomicBool::new(false));
-    let (_dbus_conn, dbus_emitter_thread) =
-        dbus::spawn_service(dbus_events_rx, cmd_tx, dbus_quit_signal.clone());
-    state.set_command_receiver(cmd_rx);
-
-    let (config_reload_tx, config_reload_rx) =
-        crossbeam_channel::unbounded::<icedtea_config::Config>();
-    state.set_config_reload_sender(config_reload_tx);
-    state.set_config_reload_receiver(config_reload_rx);
 
     let display = wlr::Display::new().expect("failed to create the wayland display");
     let runtime = wlr::Runtime::new().expect("failed to create the scene graph");
@@ -63,7 +61,18 @@ pub fn run() {
     runtime
         .init_graphics(&display, &backend)
         .expect("failed to create the renderer and the core protocol globals");
+
+    let (dbus_tx, dbus_events_rx) = crossbeam_channel::unbounded::<SeqEvent>();
+    let mut state = State::new(config, dbus_tx);
     state.wayland.attach(runtime.clone());
+
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<dbus::DbCommand>();
+    state.set_command_receiver(cmd_rx);
+
+    let (config_reload_tx, config_reload_rx) =
+        crossbeam_channel::unbounded::<icedtea_config::Config>();
+    state.set_config_reload_sender(config_reload_tx);
+    state.set_config_reload_receiver(config_reload_rx);
 
     // Sized to nothing until an output arrives with a mode; `new_output`
     // resizes it. Lowered now so nothing later has to remember to.
@@ -80,18 +89,39 @@ pub fn run() {
         Err(err) => tracing::error!(%err, "SIGINT/SIGTERM will not stop the compositor"),
     }
 
+    // Wake sources for the two `crossbeam_channel`s the loop can only drain
+    // from inside a handler (see `backend::wake_source`'s doc): without
+    // these, a D-Bus command or a finished config reload sent while the loop
+    // is idle in `Until::Stop`'s blocking `dispatch(-1)` sits unseen until
+    // some unrelated event happens to wake it, or never. Registration
+    // failure here is as fatal as the setup above it -- there would be no
+    // way to ever apply a D-Bus command or a config reload, which is not a
+    // compositor worth booting.
+    let (cmd_wake_write, cmd_wake_id) =
+        backend::wake_source(&runtime).expect("failed to register the D-Bus command wake pipe");
+    state.set_cmd_wake_source(cmd_wake_id);
+
+    let (reload_wake_write, reload_wake_id) =
+        backend::wake_source(&runtime).expect("failed to register the config-reload wake pipe");
+    state.set_config_reload_wake_source(reload_wake_id);
+    state.set_config_reload_wake(reload_wake_write);
+
     let socket = display
         .add_socket_auto()
         .expect("failed to create a wayland socket; is XDG_RUNTIME_DIR set?");
-    // SAFETY (icedtea unsafe exception (c)): single-threaded with respect to
-    // the environment at this point. The D-Bus thread and the wallpaper
-    // worker are already running but neither reads the environment, and this
-    // must happen after `autocreate` so a nested backend connected to the
-    // host's display first.
+    // SAFETY (icedtea unsafe exception (c)): single-threaded, full stop --
+    // nothing above this point spawns a thread. The D-Bus service and the
+    // wallpaper decode worker are both started below, after this write, so
+    // nothing else in the process can be reading or writing the environment
+    // concurrently with it.
     unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &socket);
     }
     tracing::info!(%socket, "listening on wayland socket");
+
+    let dbus_quit_signal = Arc::new(AtomicBool::new(false));
+    let (_dbus_conn, dbus_emitter_thread) =
+        dbus::spawn_service(dbus_events_rx, cmd_tx, dbus_quit_signal.clone(), cmd_wake_write);
 
     let wallpaper_rx = render::spawn_wallpaper_decode(state.config.appearance.wallpaper.clone());
 

@@ -62,6 +62,7 @@
 //!   setting the flag; the join is bounded by the `recv_timeout` tick
 //!   (200ms) it's waiting on, not by traffic on `events_rx`.
 
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,11 +107,18 @@ pub fn event_signal_name(event: &Event) -> &'static str {
 /// mutate compositor state directly (see this module's doc for why).
 pub struct WmInterface {
     cmd_tx: crossbeam_channel::Sender<DbCommand>,
+    /// Write half of the loop's D-Bus command wake pipe
+    /// (`backend::wake_source`). `send` nudges it after every command so a
+    /// compositor blocked in `dispatch(-1)` (idle: no damage, no input)
+    /// wakes to drain `cmd_tx`'s receiver instead of waiting for whatever
+    /// unrelated event happens along next.
+    wake: UnixStream,
 }
 
 impl WmInterface {
     fn send(&self, cmd: DbCommand) {
         let _ = self.cmd_tx.send(cmd);
+        crate::backend::wake(&self.wake);
     }
 }
 
@@ -164,13 +172,18 @@ impl WmInterface {
 /// actually observe `quit_signal` on shutdown (see this module's doc for
 /// why a bare `Connection` return, as the brief's "Produces" line has it,
 /// isn't enough for that).
+///
+/// `cmd_wake` is the write half of a `backend::wake_source` registered by
+/// the caller against the same `Runtime` the loop runs on -- see
+/// `WmInterface::send`'s doc for why a command needs one at all.
 pub fn spawn_service(
     events_rx: Receiver<SeqEvent>,
     cmd_tx: crossbeam_channel::Sender<DbCommand>,
     quit_signal: Arc<AtomicBool>,
+    cmd_wake: UnixStream,
 ) -> (Connection, std::thread::JoinHandle<()>) {
     let conn = Connection::session().expect("session bus available");
-    let iface = WmInterface { cmd_tx };
+    let iface = WmInterface { cmd_tx, wake: cmd_wake };
     conn.object_server().at(WM_PATH, iface).expect("register org.icedtea.WM interface");
     conn.request_name(WM_BUS_NAME).unwrap_or_else(|err| {
         panic!(

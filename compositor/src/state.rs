@@ -130,8 +130,26 @@ pub struct State {
     /// The fd source SIGINT/SIGTERM write to. Compared in `fd_ready` so that
     /// a future second source cannot be mistaken for this one.
     shutdown_source: Option<wlr::SourceId>,
-    /// The D-Bus service's command channel, drained once per loop turn.
+    /// The D-Bus service's command channel, drained once per loop turn (by
+    /// `fd_ready`'s `cmd_wake_source` arm, and as a backstop by
+    /// `should_stop`).
     cmd_rx: Option<crossbeam_channel::Receiver<crate::dbus::DbCommand>>,
+    /// The fd source `WmInterface::send` (`dbus.rs`) nudges after every
+    /// command it forwards onto `cmd_rx`. Compared in `fd_ready` the same
+    /// way `shutdown_source` is; without it a command sent while the loop is
+    /// blocked in `dispatch(-1)` would sit undrained until some unrelated
+    /// event happened to wake the loop anyway.
+    cmd_wake_source: Option<wlr::SourceId>,
+    /// The fd source `spawn_config_reload`'s worker thread nudges after
+    /// sending a freshly-loaded config over `config_reload_tx`. Same
+    /// purpose as `cmd_wake_source`, for `drain_config_reload`.
+    config_reload_wake_source: Option<wlr::SourceId>,
+    /// Write half of the pipe registered as `config_reload_wake_source`.
+    /// Kept here (not just handed to the one worker thread that exists when
+    /// `set_config_reload_wake` runs) because `spawn_config_reload` can spin
+    /// up a fresh worker on every reload trigger, and each one needs its own
+    /// `try_clone`d handle -- see that method's doc.
+    config_reload_wake: Option<std::os::unix::net::UnixStream>,
 }
 
 impl State {
@@ -165,6 +183,9 @@ impl State {
             background: None,
             shutdown_source: None,
             cmd_rx: None,
+            cmd_wake_source: None,
+            config_reload_wake_source: None,
+            config_reload_wake: None,
         }
     }
 
@@ -656,9 +677,20 @@ impl State {
     fn spawn_config_reload(&self) {
         let Some(tx) = self.config_reload_tx.clone() else { return };
         let path = self.config_path.clone().unwrap_or_else(icedtea_config::default_db_path);
+        // `try_clone` dup(2)s the wake pipe's write half so the worker
+        // thread owns a handle it can move across the `'static` bound
+        // rather than borrowing `self`'s. `None` (no test wires this, and a
+        // failed `try_clone` degrades the same way) means no wake is sent
+        // and `drain_config_reload`'s periodic poll from `should_stop`
+        // remains the only way the result is ever picked up -- exactly the
+        // pre-wake-pipe behavior, not a regression.
+        let wake = self.config_reload_wake.as_ref().and_then(|w| w.try_clone().ok());
         std::thread::spawn(move || {
             let cfg = icedtea_config::load_or_default(&path);
             let _ = tx.send(cfg);
+            if let Some(wake) = wake {
+                crate::backend::wake(&wake);
+            }
         });
     }
 
@@ -1260,6 +1292,25 @@ impl State {
         self.cmd_rx = Some(rx);
     }
 
+    /// The `SourceId` `fd_ready` compares against to route a wake to
+    /// `drain_pending_commands`. See `cmd_wake_source`'s field doc.
+    pub fn set_cmd_wake_source(&mut self, id: wlr::SourceId) {
+        self.cmd_wake_source = Some(id);
+    }
+
+    /// The `SourceId` `fd_ready` compares against to route a wake to
+    /// `drain_config_reload`. See `config_reload_wake_source`'s field doc.
+    pub fn set_config_reload_wake_source(&mut self, id: wlr::SourceId) {
+        self.config_reload_wake_source = Some(id);
+    }
+
+    /// The write half `spawn_config_reload` nudges its worker threads with.
+    /// See `config_reload_wake`'s field doc for why it lives on `State`
+    /// rather than being handed to one worker directly.
+    pub fn set_config_reload_wake(&mut self, write: std::os::unix::net::UnixStream) {
+        self.config_reload_wake = Some(write);
+    }
+
     /// Apply every D-Bus command that arrived since the last turn.
     ///
     /// Collected before applying, rather than iterated lazily: `handle_command`
@@ -1294,8 +1345,15 @@ impl wlr::OutputHandler for State {
         }
 
         let (width, height) = output.size();
-        // Single output at (0, 0) for the slice, matching the scene's own
-        // output layout placement; multi-output geometry is parity work.
+        // Single output at (0, 0) for the slice. `self.outputs.len()` as the
+        // index is only correct because of that -- it is not a real
+        // hotplug-safe id allocator: remove output 0, then add a new one,
+        // and `len()` computes `0` again, colliding with whatever the model
+        // (or a client-facing consumer) still remembers about the old
+        // index. A monotonic counter is the actual fix and belongs to
+        // multi-output geometry, which is parity work; this comment is the
+        // ledger entry for why `new_output` doesn't pretend to have solved
+        // it already.
         let index = self.outputs.len() as u32;
         self.create_output(index, icedtea_contract::Rectangle { x: 0, y: 0, width, height });
         self.output_ids.insert(output.id(), index);
@@ -1334,25 +1392,39 @@ impl wlr::OutputHandler for State {
 
 impl wlr::FdHandler for State {
     fn fd_ready(&mut self, source: wlr::SourceId, fd: std::os::fd::BorrowedFd<'_>, _readiness: wlr::Readiness) {
-        if Some(source) != self.shutdown_source {
+        // Drain whatever byte(s) woke this source before acting on it, for
+        // every arm below: libwayland's loop is level-triggered, so a
+        // handler that leaves data behind is called again every turn
+        // forever.
+        let mut buf = [0u8; 32];
+        if Some(source) == self.shutdown_source {
+            let _ = rustix::io::read(fd, &mut buf);
+            tracing::info!("shutdown signal received");
+            self.quitting = true;
             return;
         }
-        // Drain it: libwayland's loop is level-triggered, so a handler that
-        // reads nothing is called again every turn forever.
-        let mut buf = [0u8; 32];
-        let _ = rustix::io::read(fd, &mut buf);
-        tracing::info!("shutdown signal received");
-        self.quitting = true;
+        if Some(source) == self.cmd_wake_source {
+            let _ = rustix::io::read(fd, &mut buf);
+            self.drain_pending_commands();
+            return;
+        }
+        if Some(source) == self.config_reload_wake_source {
+            let _ = rustix::io::read(fd, &mut buf);
+            self.drain_config_reload();
+        }
     }
 }
 
 impl wlr::LoopHandler for State {
     fn should_stop(&mut self) -> bool {
         // Not called from C — this is the one handler that may panic safely —
-        // but it is still not a place to. Per-turn housekeeping that used to
-        // be calloop event sources lives here: the D-Bus command channel and
-        // the config-reload result channel are both polled rather than
-        // waking the loop themselves.
+        // but it is still not a place to. `fd_ready`'s `cmd_wake_source` and
+        // `config_reload_wake_source` arms above are what actually pull the
+        // loop out of a blocked `dispatch(-1)` the instant either channel
+        // has something; these two calls are a backstop that runs on every
+        // turn regardless of *why* it woke, so a command or reload result
+        // is never left sitting past whatever else already woke the loop
+        // for an unrelated reason (a frame, input, the shutdown source).
         self.drain_pending_commands();
         self.drain_config_reload();
         self.quitting
