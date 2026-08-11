@@ -69,6 +69,11 @@ pub fn restored_geometry(original: Rectangle, _snapped: Rectangle) -> Rectangle 
     original
 }
 
+/// Currently-unused public API: no production call site exists yet (the
+/// drag/snap-preview path in `state.rs` calls `snap_zone_for_point`
+/// directly rather than through this boolean wrapper). Retained for the
+/// shell/drag integration, where "is this point near a snap edge at all"
+/// is a natural predicate independent of *which* zone it is.
 pub fn is_edge_point(output: Rectangle, point: (i32, i32), threshold: i32) -> bool {
     snap_zone_for_point(output, point, threshold).is_some()
 }

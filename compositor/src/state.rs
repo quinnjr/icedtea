@@ -34,7 +34,7 @@ use smithay::reexports::wayland_server::backend::{ClientData, ClientId, Disconne
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
-use smithay::utils::Serial;
+use smithay::utils::{Logical, Serial, Size};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     get_parent, is_sync_subsurface, CompositorClientState, CompositorHandler, CompositorState,
@@ -949,7 +949,9 @@ impl State {
     /// snapped before the flag was turned off must still be restorable.
     pub fn snap_restore(&mut self, id: WindowId) -> Option<()> {
         if let Some(orig) = self.snap_saved_geometry.remove(&id) {
-            self.window_manager.set_geometry(id, orig)?;
+            let snapped = self.window_manager.get(id)?.geometry;
+            let restored = layout::restored_geometry(orig, snapped);
+            self.window_manager.set_geometry(id, restored)?;
             self.sync_window_to_space(id);
         }
         Some(())
@@ -1463,9 +1465,22 @@ impl WlrLayerShellHandler for State {
         _namespace: String,
     ) {
         // Layer-surface placement (bars, docks, overlays) lands in the
-        // layout task; for now we just acknowledge the global exists so
-        // wlr-layer-shell clients (e.g. a status bar) can bind it.
-        let _ = surface;
+        // layout task; for now we just send the initial configure so
+        // wlr-layer-shell clients (e.g. a status bar) aren't left hanging --
+        // per the protocol a client cannot commit a buffer before its first
+        // configure. Size it to the first known output when one exists;
+        // 0x0 (no outputs yet) tells the client to pick its own size, which
+        // is a valid configure per the protocol.
+        let size = self
+            .outputs
+            .values()
+            .next()
+            .map(|o| Size::<i32, Logical>::from((o.geometry.width, o.geometry.height)))
+            .unwrap_or_default();
+        surface.with_pending_state(|state| {
+            state.size = Some(size);
+        });
+        surface.send_configure();
     }
 }
 

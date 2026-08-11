@@ -318,14 +318,14 @@ pub fn draw_frame<'d>(
             elements.push(OutputRenderElements::Custom(CustomRenderElements::Solid(button_element)));
         }
 
-        // Render window title text on the title bar
-        // Note: Text rendering requires a text rasterizer (not in current scope per plan).
-        // This placeholder documents where title rendering would go and prevents silent
-        // omission of a mandated interface element. Full implementation deferred to a task
-        // that includes a text-rendering library (e.g., ab_glyph, cosmic-text).
+        // Window title text rendering: ACCEPTED DEFERRAL per Task 10 ruling.
+        // Title text rendering is deferred until the implementation plan pins a
+        // text-rasterization dependency (e.g., cosmic-text). The title bar currently
+        // renders only the background strip and three control buttons. The `_title`
+        // and `_text_color` bindings mark the insertion point for future rendering at
+        // (title_bar_rect.x + 5, title_bar_rect.y + 5) in foreground color.
         let _title = &window.title;
         let _text_color = text_color;
-        // TODO: Render title text at (title_bar_rect.x + 5, title_bar_rect.y + 5) in foreground color
     }
 
     let space_elements =

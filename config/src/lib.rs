@@ -10,6 +10,12 @@ pub mod schema;
 
 use schema::*;
 
+/// Written into `DB_META` on every `Config::save`, for the future settings
+/// crate (the plan's single config writer) to use for migrations. It is
+/// deliberately never read/checked here: `load_or_default` already falls
+/// back per-field for anything missing or unparsable, so an unknown/older
+/// on-disk layout degrades gracefully without needing a version check on
+/// this read path.
 pub const SCHEMA_VERSION: u64 = 1;
 
 pub use defaults::default_config;
@@ -52,7 +58,13 @@ pub fn default_db_path() -> PathBuf {
 /// a truncated/corrupt file can instead trip an internal `assert!` in redb's
 /// page manager and unwind as a panic rather than a `Result::Err`. We catch
 /// that unwind here and turn it into an `Err` so `load_or_default` can fall
-/// back to defaults, per the crate's never-panic contract.
+/// back to defaults, per the crate's never-panic contract. A file can also
+/// open cleanly here yet still have corrupt page/table data that only
+/// surfaces once it's actually read; `load_or_default` wraps its own read
+/// path (`begin_read`, `open_table`, table gets, the keybindings cursor) in
+/// the same `catch_unwind_silently` machinery for that case, so the
+/// unwind-safety net covers the whole open-then-read path, not just this
+/// function.
 ///
 /// This is sound: the panic occurs entirely inside the (failed) construction
 /// of the `Database` value being returned by this call — there is no
@@ -132,7 +144,11 @@ fn read_json<T: DeserializeOwned>(
 }
 
 /// Load config, falling back to defaults for every individual field that is
-/// missing or unparsable. Never returns Err.
+/// missing or unparsable. Never returns Err and never panics: a file that
+/// opens cleanly (see `open`) but has corrupt page/table data can still trip
+/// an internal redb assert during `begin_read`, `open_table`, or a table
+/// read/cursor call, so the entire read path below is wrapped in
+/// `catch_unwind_silently` in addition to `open`'s own protection.
 pub fn load_or_default(db_path: &Path) -> Config {
     let default = default_config();
     let db = match open(db_path) {
@@ -142,42 +158,68 @@ pub fn load_or_default(db_path: &Path) -> Config {
             return default;
         }
     };
-    let Ok(read_txn) = db.begin_read() else { return default };
-    let Ok(table) = read_txn.open_table(DB_APPEARANCE) else { return default };
 
-    let mut cfg = default;
-    if let Some(appearance) = read_json::<Appearance>(&table, KEY_APPEARANCE) {
-        cfg.appearance = appearance;
-    }
-    if let Ok(behavior_table) = read_txn.open_table(DB_BEHAVIOR)
-        && let Some(b) = read_json::<Behavior>(&behavior_table, KEY_BEHAVIOR)
-    {
-        cfg.behavior = b;
-    }
-    if let Ok(ws_table) = read_txn.open_table(DB_WORKSPACES)
-        && let Some(names) = read_json::<Vec<String>>(&ws_table, KEY_WORKSPACES)
-        && !names.is_empty()
-    {
-        cfg.workspace_names = names;
-    }
-    if let Ok(kb_table) = read_txn.open_table(DB_KEYBINDINGS)
-        && read_json::<u64>(&kb_table, KEY_ACTION_COUNT).unwrap_or(0) > 0
-    {
-        let mut keybindings = HashMap::new();
-        let mut cursor = kb_table.range(KEY_ACTION..).ok();
-        while let Some(Ok((k, v))) = cursor.as_mut().and_then(|c| c.next()) {
-            if let Ok(action) = std::str::from_utf8(k.value().as_bytes())
-                && let Some(action) = action.strip_prefix(KEY_ACTION)
-                && let Ok(combo) = serde_json::from_slice::<KeyCombo>(v.value())
-            {
-                keybindings.insert(action.to_string(), combo);
+    // Soundness of the `AssertUnwindSafe`/`catch_unwind` pair below mirrors
+    // the argument on `open`: if redb panics partway through, the panic
+    // aborts construction of values local to this closure (`read_txn`,
+    // `table`, `cfg`, ...). The closure builds a fresh `Config` starting
+    // from a clone of `default` and only returns it on success, so nothing
+    // partially-read or partially-mutated escapes the unwind boundary.
+    // `db` itself is only read (never written) here, so even though the
+    // closure borrows it across the boundary, a panic mid-read leaves no
+    // outward-visible mutation for later callers to observe.
+    let default_for_closure = default.clone();
+    let result = catch_unwind_silently(std::panic::AssertUnwindSafe(move || {
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(DB_APPEARANCE)?;
+
+        let mut cfg = default_for_closure;
+        if let Some(appearance) = read_json::<Appearance>(&table, KEY_APPEARANCE) {
+            cfg.appearance = appearance;
+        }
+        if let Ok(behavior_table) = read_txn.open_table(DB_BEHAVIOR)
+            && let Some(b) = read_json::<Behavior>(&behavior_table, KEY_BEHAVIOR)
+        {
+            cfg.behavior = b;
+        }
+        if let Ok(ws_table) = read_txn.open_table(DB_WORKSPACES)
+            && let Some(names) = read_json::<Vec<String>>(&ws_table, KEY_WORKSPACES)
+            && !names.is_empty()
+        {
+            cfg.workspace_names = names;
+        }
+        if let Ok(kb_table) = read_txn.open_table(DB_KEYBINDINGS)
+            && read_json::<u64>(&kb_table, KEY_ACTION_COUNT).unwrap_or(0) > 0
+        {
+            let mut keybindings = HashMap::new();
+            let mut cursor = kb_table.range(KEY_ACTION..).ok();
+            while let Some(Ok((k, v))) = cursor.as_mut().and_then(|c| c.next()) {
+                if let Ok(action) = std::str::from_utf8(k.value().as_bytes())
+                    && let Some(action) = action.strip_prefix(KEY_ACTION)
+                    && let Ok(combo) = serde_json::from_slice::<KeyCombo>(v.value())
+                {
+                    keybindings.insert(action.to_string(), combo);
+                }
+            }
+            if !keybindings.is_empty() {
+                cfg.keybindings = keybindings;
             }
         }
-        if !keybindings.is_empty() {
-            cfg.keybindings = keybindings;
+        Ok::<Config, redb::Error>(cfg)
+    }));
+
+    match result {
+        Ok(Ok(cfg)) => cfg,
+        Ok(Err(e)) => {
+            tracing::warn!("config db read failed ({e}), using defaults");
+            default
+        }
+        Err(payload) => {
+            let msg = panic_payload_message(&payload);
+            tracing::warn!("config db read panicked ({msg}), treating as corrupt and using defaults");
+            default
         }
     }
-    cfg
 }
 
 impl Config {
