@@ -39,11 +39,28 @@ pub struct Wayland {
     /// toplevel → model, so both directions are hot.
     toplevel_to_window: HashMap<ToplevelKey, WindowId>,
     window_to_toplevel: HashMap<WindowId, ToplevelKey>,
+    /// The compositor library's long-lived handle, once boot has created one.
+    ///
+    /// `Option` because `State::new` runs before any of it exists — the model
+    /// is constructible with no compositor at all, which is what every model
+    /// test relies on — and because that is exactly the condition each
+    /// outbound method already had to tolerate.
+    runtime: Option<wlr::Runtime>,
 }
 
 impl Wayland {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Hand the seam the compositor library's handle, once boot has one.
+    pub fn attach(&mut self, runtime: wlr::Runtime) {
+        self.runtime = Some(runtime);
+    }
+
+    /// The handle, or `None` in a model-only build (every unit test).
+    pub fn runtime(&self) -> Option<&wlr::Runtime> {
+        self.runtime.as_ref()
     }
 
     /// Record that `toplevel` backs model window `id`.
@@ -113,13 +130,16 @@ impl Wayland {
 
     /// Point the seat's keyboard at `id`, or at nothing.
     pub fn keyboard_focus(&self, id: Option<WindowId>) {
+        let Some(_runtime) = self.runtime() else { return };
         let _ = id;
+        // Filled in when the seat exists (0.20.3).
     }
 
     /// Ask the client to close. Returns whether a request was actually sent —
     /// `false` means there is no client, and the caller must remove the model
     /// row itself because no destroy will ever arrive.
     pub fn close(&self, id: WindowId) -> bool {
+        let Some(_runtime) = self.runtime() else { return false };
         let _ = id;
         false
     }
@@ -172,5 +192,15 @@ mod tests {
     fn raising_an_unbound_toplevel_is_harmless() {
         let w = Wayland::new();
         w.raise(ToplevelKey(1));
+    }
+
+    #[test]
+    fn a_seam_with_no_runtime_stays_a_no_op_rather_than_panicking() {
+        let w = Wayland::new();
+        assert!(w.runtime().is_none());
+        w.keyboard_focus(Some(WindowId(1)));
+        w.set_position(WindowId(1), 10, 10);
+        w.set_visible(WindowId(1), true);
+        assert!(!w.close(WindowId(1)));
     }
 }

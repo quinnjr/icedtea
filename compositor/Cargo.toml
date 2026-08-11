@@ -29,5 +29,25 @@ bitflags = "2"
 # to provide it is gone.
 xkbcommon = "0.8"
 
+# The compositor library. crates.io only, pinned to the release that froze
+# the API this crate uses — never a path or git dependency (a path dep would
+# put an unpublished wlr-sys in the graph, and `links = "wlroots"` makes that
+# unresolvable the moment anything else pulls the published one).
+wlr = "0.20.1"
+
+# SIGINT/SIGTERM without writing any unsafe: `low_level::pipe::register`
+# installs a handler that writes one byte to a socket, and the read end
+# becomes an ordinary wlr fd source. signalfd(2) would need `unsafe` in this
+# crate, which the project's unsafe policy does not permit.
+signal-hook = "0.3"
+
+# Borrowed-fd reads for the shutdown source's handler. `FdHandler::fd_ready`
+# hands out a BorrowedFd that must not be closed, which rules out wrapping it
+# in a File.
+rustix = { version = "1", features = ["std"] }
+
 [dev-dependencies]
 tempfile = "3"
+wlr = "0.20.1"
+crossbeam-channel.workspace = true
+signal-hook = "0.3"

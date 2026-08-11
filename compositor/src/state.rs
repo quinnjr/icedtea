@@ -120,6 +120,18 @@ pub struct State {
     /// wires it -- tests that only exercise the sender side (the reload
     /// tests below) never set this.
     config_reload_rx: Option<crossbeam_channel::Receiver<Config>>,
+    /// Which model output index each library output id maps to.
+    ///
+    /// Kept because `OutputHandler::destroyed` is given only an id, and the
+    /// model's geometry map is keyed by index.
+    output_ids: HashMap<wlr::OutputId, u32>,
+    /// The scene rect painted behind everything, once boot has made one.
+    background: Option<wlr::RectId>,
+    /// The fd source SIGINT/SIGTERM write to. Compared in `fd_ready` so that
+    /// a future second source cannot be mistaken for this one.
+    shutdown_source: Option<wlr::SourceId>,
+    /// The D-Bus service's command channel, drained once per loop turn.
+    cmd_rx: Option<crossbeam_channel::Receiver<crate::dbus::DbCommand>>,
 }
 
 impl State {
@@ -149,6 +161,10 @@ impl State {
             config_path: None,
             config_reload_tx: None,
             config_reload_rx: None,
+            output_ids: HashMap::new(),
+            background: None,
+            shutdown_source: None,
+            cmd_rx: None,
         }
     }
 
@@ -1227,7 +1243,126 @@ impl State {
     pub fn window_at_point(&self, point: (i32, i32)) -> Option<WindowId> {
         self.window_manager.window_at(point).map(|w| w.id)
     }
+
+    pub fn set_background(&mut self, rect: wlr::RectId) {
+        self.background = Some(rect);
+    }
+
+    pub fn background(&self) -> Option<wlr::RectId> {
+        self.background
+    }
+
+    pub fn set_shutdown_source(&mut self, id: wlr::SourceId) {
+        self.shutdown_source = Some(id);
+    }
+
+    pub fn set_command_receiver(&mut self, rx: crossbeam_channel::Receiver<crate::dbus::DbCommand>) {
+        self.cmd_rx = Some(rx);
+    }
+
+    /// Apply every D-Bus command that arrived since the last turn.
+    ///
+    /// Collected before applying, rather than iterated lazily: `handle_command`
+    /// takes `&mut self`, and the receiver lives in `self`.
+    fn drain_pending_commands(&mut self) {
+        let Some(rx) = self.cmd_rx.as_ref() else { return };
+        let pending: Vec<crate::dbus::DbCommand> = rx.try_iter().collect();
+        for cmd in pending {
+            self.handle_command(cmd);
+        }
+    }
 }
+
+// --- Compositor library handlers ---
+//
+// Every method below runs underneath an `extern "C"` frame: a panic escaping
+// one aborts the process rather than failing anything. So there is no
+// `unwrap`, no `expect`, no `assert!`, and no indexing in any of these
+// bodies — a condition that cannot be handled is recorded in `State` and
+// acted on once control is back on the loop.
+
+impl wlr::OutputHandler for State {
+    fn new_output(&mut self, output: &wlr::Output<'_>) {
+        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+        if let Err(err) = output.enable_with_preferred_mode() {
+            tracing::error!(?err, "could not enable output");
+            return;
+        }
+        if let Err(err) = runtime.init_output(output) {
+            tracing::error!(?err, "could not give output a renderer");
+            return;
+        }
+
+        let (width, height) = output.size();
+        // Single output at (0, 0) for the slice, matching the scene's own
+        // output layout placement; multi-output geometry is parity work.
+        let index = self.outputs.len() as u32;
+        self.create_output(index, icedtea_contract::Rectangle { x: 0, y: 0, width, height });
+        self.output_ids.insert(output.id(), index);
+
+        // The background covers the whole output. Sized here rather than at
+        // creation because the mode is not known until now.
+        if let Some(rect) = self.background {
+            runtime.set_rect_size(rect, width, height);
+            runtime.set_rect_position(rect, 0, 0);
+        }
+
+        // Existing windows (there are none at boot, but a hotplugged output
+        // is the same code path) need their geometry pushed at the new size.
+        self.sync_scene();
+        self.emit_pending();
+    }
+
+    fn frame(&mut self, output: &wlr::Output<'_>) {
+        let Some(runtime) = self.wayland.runtime() else { return };
+        // A rejected commit is routine — wlroots rejects one when nothing
+        // changed — so it is logged at debug and never escalated.
+        if let Err(err) = runtime.commit_output(output) {
+            tracing::debug!(?err, "scene commit rejected");
+        }
+    }
+
+    fn destroyed(&mut self, id: wlr::OutputId) {
+        // `remove` on an unknown id, not indexing: this can name an output
+        // this handler was never told about (see the library's own docs), and
+        // a panic here aborts.
+        if let Some(index) = self.output_ids.remove(&id) {
+            self.outputs.remove(&index);
+        }
+    }
+}
+
+impl wlr::FdHandler for State {
+    fn fd_ready(&mut self, source: wlr::SourceId, fd: std::os::fd::BorrowedFd<'_>, _readiness: wlr::Readiness) {
+        if Some(source) != self.shutdown_source {
+            return;
+        }
+        // Drain it: libwayland's loop is level-triggered, so a handler that
+        // reads nothing is called again every turn forever.
+        let mut buf = [0u8; 32];
+        let _ = rustix::io::read(fd, &mut buf);
+        tracing::info!("shutdown signal received");
+        self.quitting = true;
+    }
+}
+
+impl wlr::LoopHandler for State {
+    fn should_stop(&mut self) -> bool {
+        // Not called from C — this is the one handler that may panic safely —
+        // but it is still not a place to. Per-turn housekeeping that used to
+        // be calloop event sources lives here: the D-Bus command channel and
+        // the config-reload result channel are both polled rather than
+        // waking the loop themselves.
+        self.drain_pending_commands();
+        self.drain_config_reload();
+        self.quitting
+    }
+}
+
+// No methods until the xdg-shell and seat releases; the empty impls are what
+// make `State` satisfy `wlr::Handlers` today.
+impl wlr::ToplevelHandler for State {}
+impl wlr::SeatHandler for State {}
 
 #[cfg(test)]
 mod tests {
