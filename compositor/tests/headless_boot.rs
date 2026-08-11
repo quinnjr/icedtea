@@ -200,7 +200,7 @@ fn a_toplevel_becomes_a_model_window_and_releases_it_on_destroy() {
     assert!(w.focused, "a new toplevel takes focus");
     assert_eq!(
         (w.geometry.width, w.geometry.height),
-        (640, 400),
+        icedtea_compositor::state::PLACEHOLDER_SIZE,
         "the model's placeholder size until the client's first commit"
     );
 

@@ -23,6 +23,14 @@ use crate::layout::{self, SnapZone};
 use crate::render::WallpaperState;
 use crate::window::WindowManager;
 
+/// The model's placeholder toplevel size: staged as both the new window's
+/// frame geometry and the client's first configure, until the client's own
+/// first commit says otherwise. One constant rather than the literal
+/// `(640, 400)` repeated at each site (`new_toplevel`'s cascade placement,
+/// `initial_commit`'s configure, and the test that asserts on it) so the
+/// three/four call sites cannot drift apart from each other.
+pub const PLACEHOLDER_SIZE: (i32, i32) = (640, 400);
+
 /// Output geometry information (simplified from smithay's `Output`).
 pub struct OutputSurface {
     pub geometry: icedtea_contract::Rectangle,
@@ -1214,9 +1222,10 @@ impl State {
     /// position, binds it to `toplevel`, and reconciles focus.
     pub fn new_toplevel(&mut self, toplevel: crate::wayland::ToplevelKey, app_id: &str, title: &str, pid: u32) {
         // Default toplevel size: real geometry arrives from the client's
-        // first commit, which isn't known yet; 640x400 is the model's
-        // placeholder until then. Position cascades off whatever is already
-        // mapped so new windows don't stack exactly on top of each other.
+        // first commit, which isn't known yet; `PLACEHOLDER_SIZE` is the
+        // model's placeholder until then. Position cascades off whatever is
+        // already mapped so new windows don't stack exactly on top of each
+        // other.
         let occupied: Vec<icedtea_contract::Rectangle> = self
             .window_manager
             .windows_in_workspace(self.window_manager.active_workspace())
@@ -1232,8 +1241,9 @@ impl State {
         // Review finding M7: cascade positions wrap inside the output (and
         // count only this workspace's windows) so the Nth window can't open
         // off-screen with no title bar to grab.
-        let (x, y) = layout::cascade_point_in(&occupied, (640, 400), 24, output_geo);
-        let geometry = icedtea_contract::Rectangle { x, y, width: 640, height: 400 };
+        let (x, y) = layout::cascade_point_in(&occupied, PLACEHOLDER_SIZE, 24, output_geo);
+        let geometry =
+            icedtea_contract::Rectangle { x, y, width: PLACEHOLDER_SIZE.0, height: PLACEHOLDER_SIZE.1 };
         // `add_window` autofocuses, so this is a focus change like any other
         // (New-1): capture the outgoing focus before it happens.
         let previous = self.focused_id();
@@ -1455,9 +1465,27 @@ impl wlr::ToplevelHandler for State {
     fn initial_commit(&mut self, toplevel: &wlr::Toplevel<'_>) {
         // xdg-shell requires a configure here. Staging the model's
         // placeholder size means the client's very first buffer is already
-        // the right size, rather than being resized one frame later.
+        // the right size, rather than being resized one frame later --
+        // except the size the client must be told is the *content* size,
+        // not the model's frame size: `mapped`/`new_toplevel` hasn't run
+        // yet, so there is no model window and no `client_decorations_requested`
+        // to read, but a window's default SSD-or-not answer only depends on
+        // `app_id` (`decoration::has_ssd`'s `requested: None` case), which
+        // `Toplevel::app_id` already has at this point. Skipping
+        // `content_rect` here would configure a default (SSD) window's
+        // client one `TITLE_BAR_HEIGHT` too tall -- the exact one-frame-late
+        // resize this comment already claims not to have.
         let Some(runtime) = self.wayland.runtime() else { return };
-        runtime.set_toplevel_size(toplevel.id(), 640, 400);
+        let app_id = toplevel.app_id().unwrap_or_default();
+        let ssd = crate::decoration::has_ssd(&app_id, None, false);
+        let placeholder = icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: PLACEHOLDER_SIZE.0,
+            height: PLACEHOLDER_SIZE.1,
+        };
+        let content = crate::decoration::content_rect(placeholder, ssd);
+        runtime.set_toplevel_size(toplevel.id(), content.width, content.height);
     }
 
     fn mapped(&mut self, toplevel: &wlr::Toplevel<'_>) {
@@ -1481,6 +1509,20 @@ impl wlr::ToplevelHandler for State {
     fn unmapped(&mut self, id: wlr::ToplevelId) {
         // An unmap is not a destroy: the client may map again with the same
         // id. Hide it, and let the model keep the row.
+        //
+        // Note what this deliberately does *not* do: the model itself has no
+        // "unmapped" concept, only workspace visibility and minimization --
+        // `window_manager.get(window)` still returns the row, `is_visible`
+        // and `focused` are whatever they already were, and `is_backed`
+        // stays `true`. `set_visible(window, false)` only reaches the
+        // client's scene node; nothing here clears the model's own focus
+        // pointer. That is fine as long as nothing routes input to an
+        // unmapped surface -- but it is a real trap for whichever task wires
+        // the seat: keyboard focus must not be handed to a window this
+        // handler just hid, and `sync_seat_focus`'s filters (visibility +
+        // `is_backed`) do not know an unmapped-but-still-"visible"-by-model
+        // window from a mapped one. Ledgered here for that task, not solved
+        // by it.
         tracing::info!(?id, "toplevel unmapped");
         let key = crate::wayland::ToplevelKey::new(id);
         let Some(window) = self.wayland.window_for(key) else { return };

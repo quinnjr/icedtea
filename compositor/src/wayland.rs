@@ -172,18 +172,40 @@ impl Wayland {
     }
 
     /// Ask the client to close. `false` means there is no client, and the
-    /// caller must remove the model row itself.
+    /// caller must remove the model row itself; `true` means the caller must
+    /// leave the row alone and wait for `toplevel_destroyed`.
+    ///
+    /// Three states, not two, hide behind that boolean:
+    ///
+    /// - No binding (`toplevel_for(id)` is `None`): `false`. There never was
+    ///   or no longer is a client; nothing to ask.
+    /// - A binding *and* a runtime: `true`, and `close_toplevel` is actually
+    ///   called.
+    /// - A binding but **no runtime attached** (every unit test that never
+    ///   calls `attach`): also `true`, but `close_toplevel` is never called
+    ///   at all — there is no library handle to call it on. This still
+    ///   reports "wait for the destroy" rather than "remove now" because the
+    ///   binding is the only fact this branch has to go on, and a bound
+    ///   window in a real boot always does have a client behind it.
     ///
     /// The return value reports whether *this seam* still considers `id`
     /// backed (i.e. `bind` was called for it and nothing has `forget`-ten it
     /// since) — not whether `close_toplevel` itself reported success. A
-    /// binding without a runtime resolution can only mean the `ToplevelId`
-    /// went stale (the `run_all` that announced it has already returned,
-    /// which every by-id `wlr` mutator treats as a plain miss, never a
-    /// panic); the request is best-effort in that case, but `request_close`
-    /// must still wait for `toplevel_destroyed` rather than dropping the row
-    /// out from under a client that, for all this seam's bookkeeping can
-    /// tell, is still there.
+    /// binding whose `close_toplevel` call misses (runtime attached, but the
+    /// `ToplevelId` doesn't resolve) can only mean the id went stale — the
+    /// `run_all` that announced it has already returned, which every by-id
+    /// `wlr` mutator treats as a plain miss, never a panic — and the request
+    /// is best-effort in that case: `request_close` still waits for
+    /// `toplevel_destroyed` rather than dropping the row out from under a
+    /// client that, for all this seam's bookkeeping can tell, is still
+    /// there. The cost of that choice is real, not just theoretical: a
+    /// binding that goes stale with no destroy ever arriving in between (the
+    /// per-`run_all` destroy listener that would fire it is torn down with
+    /// the `run_all` that's already returned) leaves its model row waiting
+    /// forever — a genuine leak, not merely a stale id being tolerated. See
+    /// the task 8 report for why this is accepted rather than fixed here:
+    /// it only happens across two separate `run_all` calls, which is outside
+    /// what a single close request can detect or a headless test can set up.
     pub fn close(&self, id: WindowId) -> bool {
         let Some(key) = self.toplevel_for(id) else { return false };
         if let Some(runtime) = self.runtime() {

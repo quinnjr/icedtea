@@ -33,7 +33,7 @@ xkbcommon = "0.8"
 # the API this crate uses — never a path or git dependency (a path dep would
 # put an unpublished wlr-sys in the graph, and `links = "wlroots"` makes that
 # unresolvable the moment anything else pulls the published one).
-wlr = "0.20.2"
+wlr = "0.20.3"
 
 # SIGINT/SIGTERM without writing any unsafe: `low_level::pipe::register`
 # installs a handler that writes one byte to a socket, and the read end
@@ -48,6 +48,6 @@ rustix = { version = "1", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
-wlr = "0.20.2"
+wlr = "0.20.3"
 crossbeam-channel.workspace = true
 signal-hook = "0.3"
