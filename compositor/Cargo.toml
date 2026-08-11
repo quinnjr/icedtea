@@ -1,0 +1,55 @@
+[package]
+name = "icedtea-compositor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "icedtea_compositor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "icedtea-compositor"
+path = "src/main.rs"
+
+[dependencies]
+icedtea-contract = { path = "../contract" }
+icedtea-config = { path = "../config" }
+# NOTE (review finding M3): `serde`, `serde_json`, and `redb` used to be
+# declared here with no reference anywhere in `compositor/src` -- config
+# persistence is entirely the `icedtea-config` crate's job. Dropped.
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossbeam-channel.workspace = true
+image.workspace = true
+zbus.workspace = true
+bitflags = "2"
+
+# NOTE: the task-7 brief's sample feature list (`backend_wayland`, `layer_shell`,
+# `xdg_decoration`) does not match smithay 0.7.0's actual Cargo features --
+# verified against the `v0.7.0` tag, none of those three feature names exist
+# in smithay's `Cargo.toml`. The wlr-layer-shell and xdg-decoration protocols
+# are unconditionally bundled inside `wayland_frontend` in this version, and
+# "nested inside an existing session" is provided by the `backend_winit`
+# feature (what anvil itself calls the "winit" backend), not a
+# `backend_wayland` feature. This feature set instead mirrors the union of
+# anvil's own `Cargo.toml` `winit` + `udev` (DRM/GBM/libinput/session) +
+# default `wayland_frontend`/`xwayland` features, minus the `x11` backend
+# (out of scope here: we only need nested-via-winit and DRM).
+smithay = { version = "0.7", default-features = false, features = [
+  "backend_drm",
+  "backend_gbm",
+  "backend_egl",
+  "backend_libinput",
+  "backend_session",
+  "backend_session_libseat",
+  "backend_udev",
+  "backend_winit",
+  "renderer_gl",
+  "desktop",
+  "wayland_frontend",
+  "xwayland",
+] }
+
+[dev-dependencies]
+tempfile = "3"
