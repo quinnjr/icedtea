@@ -60,12 +60,19 @@ pub fn has_ssd(app_id: &str, requested: Option<bool>, fullscreen: bool) -> bool 
 /// occupies. `ssd == false` (CSD, or fullscreen) yields the frame unchanged
 /// -- those windows own every pixel of their geometry.
 ///
-/// The height is floored at 1: xdg-shell has no meaningful zero/negative
-/// size, and a frame shorter than the title bar (only reachable from a
-/// degenerate model geometry) must not configure a client with one.
+/// Width and height are floored at 1 on *both* branches: xdg-shell has no
+/// meaningful zero/negative size, and a frame shorter than the title bar
+/// (only reachable from a degenerate model geometry) must not configure a
+/// client with one. Callers can stage the result directly without their own
+/// floor (re-review minor 5: a single owner for the floor, not one per
+/// branch split across two files).
 pub fn content_rect(geometry: Rectangle, ssd: bool) -> Rectangle {
     if !ssd {
-        return geometry;
+        return Rectangle {
+            width: geometry.width.max(1),
+            height: geometry.height.max(1),
+            ..geometry
+        };
     }
     Rectangle {
         x: geometry.x,

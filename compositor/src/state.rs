@@ -377,7 +377,21 @@ impl State {
     ///
     /// Call this at the tail of *every* geometry or state mutation. A window
     /// with no backing surface is a silent no-op.
+    ///
+    /// Coordinate spaces (re-review minor 3): the model (`window.rs`,
+    /// `window_at`, `decoration::hit_test`, drag offsets) is in *frame*
+    /// space; the `Space` element location and staged size are in *content*
+    /// space -- for an SSD window they differ by `TITLE_BAR_HEIGHT`. Any
+    /// future consumer of `space.element_location`/`element_under` (e.g.
+    /// pointer forwarding into client surfaces) must convert with
+    /// `decoration::content_rect`, never compare the two spaces directly.
+    /// `render.rs` documents the render half of this invariant.
     pub fn sync_window_to_space(&mut self, id: WindowId) {
+        // Note (re-review minor 4): this guard means the trailing
+        // `sync_seat_focus` below only runs for windows that still have a
+        // mapped element. Focus-clearing on removal paths therefore must not
+        // rely on this tail -- `forget_window` calls `sync_focus_change(None)`
+        // explicitly for exactly that reason.
         let Some(element) = self.element_for(id) else { return };
         let Some(w) = self.window_manager.get(id) else {
             // The model window is gone but its element is still mapped
@@ -416,7 +430,7 @@ impl State {
 
         if let Some(toplevel) = element.toplevel() {
             toplevel.with_pending_state(|state| {
-                state.size = Some((content.width.max(1), content.height.max(1)).into());
+                state.size = Some((content.width, content.height).into());
                 let set = |states: &mut smithay::wayland::shell::xdg::ToplevelStateSet,
                            flag: XdgToplevelState,
                            on: bool| {
@@ -508,6 +522,38 @@ impl State {
             // so clear the seat here (New-3).
             None => self.sync_seat_focus(),
         }
+    }
+
+    /// Minimize or restore window `id`, handing focus to the workspace's MRU
+    /// successor when the focused window is the one being minimized, then
+    /// reconcile both ends of the transition out to the clients.
+    ///
+    /// Re-review Important 1: `DbCommand::Minimize` mutated the model and
+    /// synced only `id`, bypassing the focus-transition path entirely --
+    /// minimizing the focused window from the taskbar (the common entry
+    /// point) left the model's focus on a now-invisible window, activated no
+    /// successor, and `sync_seat_focus`'s visibility filter then cleared the
+    /// seat: a dead keyboard with windows still on screen, New-2's symptom
+    /// through a different door. The title-bar button already did this
+    /// correctly; this is that arm's body, extracted so "minimize a window"
+    /// has exactly one implementation, matching the maximize/fullscreen
+    /// handlers' pattern.
+    fn set_minimized_and_reconcile(&mut self, id: WindowId, value: bool) -> Option<()> {
+        let previous = self.focused_id();
+        self.window_manager.set_minimized(id, value)?;
+        if value && previous == Some(id) {
+            let active = self.window_manager.active_workspace();
+            self.window_manager.focus_mru_in_workspace(active);
+        }
+        // `id` itself always needs a sync (its visibility just changed),
+        // even when it wasn't the focused window; `sync_focus_change` then
+        // handles the successor and the seat (New-1/2/3). On restore, if the
+        // model's focus pointer never left `id`, the visibility filter now
+        // passes again and this same pair re-activates it and returns it the
+        // keyboard.
+        self.sync_window_to_space(id);
+        self.sync_focus_change(previous);
+        Some(())
     }
 
     /// Reconcile every model window with the `Space` at once. Used after
@@ -772,10 +818,7 @@ impl State {
                 self.sync_focus_change(previous);
             }
             DbCommand::Close(id) => self.request_close(id),
-            DbCommand::Minimize(id, value) => {
-                self.window_manager.set_minimized(id, value)?;
-                self.sync_window_to_space(id);
-            }
+            DbCommand::Minimize(id, value) => self.set_minimized_and_reconcile(id, value)?,
             DbCommand::Maximize(id, value) => self.set_maximized_target(id, value)?,
             DbCommand::Fullscreen(id, value) => self.set_fullscreen_target(id, value)?,
             DbCommand::SetWorkspace(id) => {
@@ -861,17 +904,7 @@ impl State {
                 let _ = self.toggle_maximized(id);
             }
             DecorationAction::Minimize => {
-                let previous = self.focused_id();
-                let _ = self.window_manager.set_minimized(id, true);
-                if self.window_manager.focused_window().map(|w| w.id) == Some(id) {
-                    let active = self.window_manager.active_workspace();
-                    self.window_manager.focus_mru_in_workspace(active);
-                }
-                // `id` itself always needs a sync (it just became invisible),
-                // even when it wasn't the focused window; `sync_focus_change`
-                // then handles the successor and the seat (New-1/2/3).
-                self.sync_window_to_space(id);
-                self.sync_focus_change(previous);
+                let _ = self.set_minimized_and_reconcile(id, true);
             }
             DecorationAction::Move => {
                 // Move is handled by the input layer (pointer drag),
@@ -1443,6 +1476,13 @@ impl XdgShellHandler for State {
         let content = crate::decoration::content_rect(geometry, ssd);
         self.space.map_element(window.clone(), (content.x, content.y), true);
         self.elements.insert(id, window);
+        // Explicit sync of the new window first (re-review minor 2):
+        // `sync_focus_change` also reaches it today, but only because
+        // `add_window` autofocuses onto the active workspace. Keeping the
+        // direct call (it's idempotent) means a future "open unfocused /
+        // open elsewhere" change can't silently leave the element
+        // unconfigured.
+        self.sync_window_to_space(id);
         self.sync_focus_change(previous);
         self.emit_pending();
     }
@@ -2357,6 +2397,28 @@ mod tests {
         assert_eq!(state.window_manager.get(id).unwrap().geometry, maximized);
         state.handle_command(crate::dbus::DbCommand::Maximize(id, false)).unwrap();
         assert_eq!(state.window_manager.get(id).unwrap().geometry, original, "the restore point survived the no-op");
+    }
+
+    /// Re-review Important 1: `DbCommand::Minimize` goes through the same
+    /// implementation as the title-bar button, so minimizing the focused
+    /// window over D-Bus (the taskbar path) hands focus to the workspace's
+    /// MRU successor instead of leaving the model's focus pointer on a
+    /// now-invisible window and the keyboard dead.
+    #[test]
+    fn dbus_minimize_of_focused_window_hands_focus_to_successor() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let geo = Rectangle { x: 10, y: 10, width: 300, height: 200 };
+        let a = state.window_manager.add_window("app", "a", 1, geo);
+        let b = state.window_manager.add_window("app", "b", 2, geo);
+        state.window_manager.focus(b).unwrap();
+
+        state.handle_command(crate::dbus::DbCommand::Minimize(b, true)).unwrap();
+        assert!(state.window_manager.get(b).unwrap().minimized);
+        assert_eq!(
+            state.window_manager.focused_window().map(|w| w.id),
+            Some(a),
+            "focus handed to the MRU successor, matching the title-bar button"
+        );
     }
 
     /// I3: `behavior.snap_enabled` is actually consumed -- with snapping
