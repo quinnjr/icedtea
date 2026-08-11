@@ -137,6 +137,20 @@ pub fn match_action(
         if wanted_sym == xkb::keysyms::KEY_NoSymbol {
             continue;
         }
+        // Task 11 re-review #1 (binding on whoever reimplements keysym
+        // resolution against wlr, since the smithay-era `backend.rs` that
+        // documented this is gone): `keysym` here must be resolved
+        // shift/caps-lock-agnostic, preferring a raw/latin keysym and
+        // falling back to the modified one only when the keycode produces
+        // no raw keysym at all. `key_name_to_keysym` above always encodes
+        // the *unshifted* keysym for a binding (`"KEY_q"` is `0x71`), so an
+        // input path that instead feeds this the keyboard's shifted
+        // `modified_sym()` breaks two ways: `SUPER+SHIFT+q` (the default
+        // `quit` binding) reports `0x51` (`XK_Q`) and can never equal
+        // `0x71`, making `quit`/`reload` unreachable; and plain `SUPER+q`
+        // with Caps Lock active reports the same wrong-cased mismatch. The
+        // fix is resolving on the raw/latin keysym first, exactly as this
+        // matcher already assumes.
         if wanted == mods && wanted_sym == keysym {
             return Some(action.clone());
         }

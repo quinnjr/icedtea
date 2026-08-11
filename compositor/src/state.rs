@@ -292,6 +292,19 @@ impl State {
         }
         self.wayland
             .configure(id, content, focused && visible, maximized, fullscreen);
+        // Ledger item 28 / recommendation 4: `raise_on_focus` decides
+        // whether a focus change alone may raise; with it off a focused
+        // window is still activated and configured but keeps its stack
+        // position unless its geometry actually changed. `wayland.raise` is
+        // a no-op until wlr 0.20.2 ships a scene-node raise mutator (see its
+        // doc), but the consumption belongs here regardless so the config
+        // knob isn't silently unwired.
+        if focused
+            && self.config.behavior.raise_on_focus
+            && let Some(toplevel) = self.wayland.toplevel_for(id)
+        {
+            self.wayland.raise(toplevel);
+        }
 
         // Keyboard focus is the other half of "focus reached the client".
         self.sync_seat_focus();
@@ -530,7 +543,7 @@ impl State {
     /// Kept now (with the `ToplevelKey` signature already in place) so that
     /// wiring is a call site, not a rewrite.
     #[allow(dead_code)]
-    fn reconcile_maximized(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
+    pub fn reconcile_maximized(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
         let Some(id) = self.wayland.window_for(toplevel) else { return false };
         let changes = self.window_manager.get(id).is_some_and(|w| w.maximized != target);
         changes && self.set_maximized_target(id, target).is_some()
@@ -539,7 +552,7 @@ impl State {
     /// Fullscreen counterpart of [`Self::reconcile_maximized`]; same
     /// "did a configure actually go out" contract.
     #[allow(dead_code)]
-    fn reconcile_fullscreen(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
+    pub fn reconcile_fullscreen(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
         let Some(id) = self.wayland.window_for(toplevel) else { return false };
         let changes = self.window_manager.get(id).is_some_and(|w| w.fullscreen != target);
         changes && self.set_fullscreen_target(id, target).is_some()

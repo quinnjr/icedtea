@@ -7,12 +7,13 @@
 //! dependency be removed in one commit without touching a line of the model:
 //! this file is the whole of what had to be re-implemented afterwards.
 //!
-//! In this commit every outbound method is a deliberate no-op and
-//! [`Wayland::is_backed`] is always false, which is exactly the behaviour the
-//! model already tolerates — `sync_window_to_scene`'s "a window with no
-//! backing surface is a silent no-op" contract predates the port. The model
-//! tests therefore pass unchanged, and they are the reason this intermediate
-//! state exists at all.
+//! In this commit every outbound method is a deliberate no-op. No client is
+//! ever bound in this commit, so [`Wayland::is_backed`] is false in
+//! practice — which is exactly the behaviour the model already tolerates:
+//! `sync_window_to_scene`'s "a window with no backing surface is a silent
+//! no-op" contract predates the port. The model tests therefore pass
+//! unchanged, and they are the reason this intermediate state exists at
+//! all.
 
 use std::collections::HashMap;
 
@@ -93,6 +94,17 @@ impl Wayland {
         let _ = (id, x, y);
     }
 
+    /// Restack the toplevel's scene node to the top.
+    ///
+    /// A deliberate no-op until `wlr` ships a scene-node raise mutator —
+    /// planned for 0.20.2, after this port's pinned 0.20.1. Kept as a real
+    /// method (rather than left unwired) so `sync_window_to_scene` can call
+    /// it unconditionally now and task 5 only has to fill this one body in,
+    /// not go find every call site that should have raised.
+    pub fn raise(&self, toplevel: ToplevelKey) {
+        let _ = toplevel;
+    }
+
     /// Show or hide the window's scene node (a window on an inactive
     /// workspace, or a minimized one, is hidden rather than unmapped).
     pub fn set_visible(&self, id: WindowId, visible: bool) {
@@ -151,5 +163,14 @@ mod tests {
     fn closing_an_unbacked_window_reports_that_nothing_was_sent() {
         let w = Wayland::new();
         assert!(!w.close(WindowId(1)));
+    }
+
+    /// `raise` on a key nothing is bound to is a harmless no-op, matching
+    /// every other outbound method in this commit -- there is no scene-node
+    /// mutator behind it yet (see `raise`'s doc).
+    #[test]
+    fn raising_an_unbound_toplevel_is_harmless() {
+        let w = Wayland::new();
+        w.raise(ToplevelKey(1));
     }
 }
