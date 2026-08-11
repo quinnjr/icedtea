@@ -39,8 +39,10 @@ pub fn key_name_to_keysym(name: &str) -> u32 {
         return sym.raw();
     }
     // Second pass, per xkbcommon's own recommendation: a case-insensitive
-    // lookup catches `"KEY_TAB"`/`"KEY_return"`-style spellings. Bindings
-    // that only resolve this way are reported by `validate_keybindings`.
+    // lookup catches `"KEY_TAB"`/`"KEY_return"`-style spellings. Resolving
+    // only on this pass is accepted silently -- `validate_keybindings` calls
+    // this same function and reports a binding only when *both* passes come
+    // back `KEY_NoSymbol`, i.e. when the name matches no keysym at all.
     xkb::keysym_from_name(bare, xkb::KEYSYM_CASE_INSENSITIVE).raw()
 }
 

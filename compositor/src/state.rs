@@ -389,12 +389,19 @@ impl State {
         };
         let (geo, fullscreen, maximized, focused) = (w.geometry, w.fullscreen, w.maximized, w.focused);
         let visible = self.window_manager.is_visible(w);
+        // Re-review finding New-4: the model's geometry is the *frame*; a
+        // server-side-decorated window's client owns only the band below the
+        // title bar. Both the staged size and the mapped position use the
+        // inset rect so the strip `render::draw_frame` paints lands on
+        // compositor-owned pixels instead of over the client's buffer.
+        let ssd = crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, fullscreen);
+        let content = crate::decoration::content_rect(geo, ssd);
 
         if !visible {
             self.space.unmap_elem(&element);
         } else {
             let mapped_at = self.space.element_location(&element);
-            let moved = mapped_at != Some((geo.x, geo.y).into());
+            let moved = mapped_at != Some((content.x, content.y).into());
             // `Space::map_element` also restacks the element to the top, so
             // it is the raise operation as well as the move one. Ledger item
             // 28 / recommendation 4: `behavior.raise_on_focus` is what
@@ -403,13 +410,13 @@ impl State {
             // configured, it just keeps its place in the stack unless its
             // geometry actually changed.
             if moved || (focused && self.config.behavior.raise_on_focus) {
-                self.space.map_element(element.clone(), (geo.x, geo.y), focused);
+                self.space.map_element(element.clone(), (content.x, content.y), focused);
             }
         }
 
         if let Some(toplevel) = element.toplevel() {
             toplevel.with_pending_state(|state| {
-                state.size = Some((geo.width.max(1), geo.height.max(1)).into());
+                state.size = Some((content.width.max(1), content.height.max(1)).into());
                 let set = |states: &mut smithay::wayland::shell::xdg::ToplevelStateSet,
                            flag: XdgToplevelState,
                            on: bool| {
@@ -434,28 +441,90 @@ impl State {
         // Keyboard focus is the other half of "focus reached the client":
         // `backend.rs`'s keyboard filter forwards every unconsumed key press
         // to the seat's current focus, and nothing ever set one, so no
-        // client could receive a single keystroke. Re-set only on an actual
-        // change, so an ordinary geometry sync doesn't churn
-        // `leave`/`enter` pairs at the client.
-        if focused && visible {
-            let surface = element.toplevel().map(|t| t.wl_surface().clone());
-            if let Some(keyboard) = self.seat.get_keyboard()
-                && keyboard.current_focus() != surface
-            {
-                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                keyboard.set_focus(self, surface, serial);
-            }
+        // client could receive a single keystroke.
+        self.sync_seat_focus();
+    }
+
+    /// The active workspace's focused window id, if any. Callers capture this
+    /// *before* a focus-changing mutation and hand it to `sync_focus_change`.
+    fn focused_id(&self) -> Option<WindowId> {
+        self.window_manager.focused_window().map(|w| w.id)
+    }
+
+    /// Point the seat's keyboard at whatever the model currently says is
+    /// focused -- or at nothing, when it says nothing is.
+    ///
+    /// Re-review finding New-3: seat keyboard focus was set-only. Nothing
+    /// ever called `set_focus(.., None, ..)`, so after the last window on a
+    /// workspace was closed, minimized, or left behind by a workspace
+    /// switch, the seat kept pointing at a surface the user can no longer
+    /// see (or one whose client is gone), and every subsequent unconsumed key
+    /// press was delivered to it. Driving the surface from the model -- not
+    /// from whichever window a caller happens to be syncing -- makes this
+    /// idempotent, which is why `sync_window_to_space` can call it
+    /// unconditionally. The `current_focus()` comparison keeps an ordinary
+    /// geometry sync from churning `leave`/`enter` pairs at the client.
+    fn sync_seat_focus(&mut self) {
+        let focused = self.focused_id().filter(|&id| self.window_manager.is_visible_id(id));
+        let surface = focused
+            .and_then(|id| self.element_for(id))
+            .and_then(|e| e.toplevel().map(|t| t.wl_surface().clone()));
+        let Some(keyboard) = self.seat.get_keyboard() else { return };
+        if keyboard.current_focus() == surface {
+            return;
+        }
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        keyboard.set_focus(self, surface, serial);
+    }
+
+    /// Reconcile a focus transition all the way out to the clients.
+    /// `previous` is what `focused_id()` returned *before* the model
+    /// mutation; pass `None` when the previously focused window is already
+    /// gone from the model (a close/destroy).
+    ///
+    /// Re-review findings New-1 and New-2. New-1: every focus path synced
+    /// only the window that *gained* focus, so the one that lost it kept its
+    /// `Activated` xdg state and its client went on rendering itself as the
+    /// active window -- moving focus A -> B left two windows looking focused.
+    /// New-2: when the focused toplevel was destroyed the model picked a
+    /// successor (`forget_window` -> `focus_mru_in_workspace`) that was never
+    /// synced, so the successor's client was never activated and never
+    /// received seat keyboard focus -- the keyboard was dead until the user
+    /// clicked something. Both are the same missing step: a focus change has
+    /// two ends, and both have to be pushed.
+    ///
+    /// Wayland-side only: the model mutation that moved focus already emitted
+    /// its own `WindowUpdated` events (`WindowManager::focus` emits for the
+    /// window losing focus as well as the one gaining it), so nothing here
+    /// emits.
+    fn sync_focus_change(&mut self, previous: Option<WindowId>) {
+        let current = self.focused_id();
+        if let Some(prev) = previous.filter(|prev| Some(*prev) != current) {
+            self.sync_window_to_space(prev);
+        }
+        match current {
+            Some(id) => self.sync_window_to_space(id),
+            // Nothing focused: `sync_window_to_space` isn't reached at all,
+            // so clear the seat here (New-3).
+            None => self.sync_seat_focus(),
         }
     }
 
     /// Reconcile every model window with the `Space` at once. Used after
     /// changes that can alter many windows' visibility in one go (workspace
     /// switch, config reload).
+    ///
+    /// Per-window syncing covers the focus transition's two ends on its own
+    /// (every window is synced, including whichever one just lost focus), but
+    /// the trailing `sync_seat_focus` is still needed for New-3's
+    /// "switched to an empty workspace" case: with nothing focused *and*
+    /// possibly nothing to iterate, the loop body may never run.
     pub fn sync_space(&mut self) {
         let ids: Vec<WindowId> = self.window_manager.windows().map(|w| w.id).collect();
         for id in ids {
             self.sync_window_to_space(id);
         }
+        self.sync_seat_focus();
     }
 
     /// Ask window `id` to close.
@@ -494,6 +563,14 @@ impl State {
             let active = self.window_manager.active_workspace();
             self.window_manager.focus_mru_in_workspace(active);
         }
+        // Re-review finding New-2: picking a successor in the model was only
+        // half the job -- it also has to reach the client (`Activated`) and
+        // the seat (keyboard focus), and when the workspace has no successor
+        // left the seat's focus has to be cleared rather than left pointing
+        // at the destroyed surface. `previous` is `None` because `id` is
+        // already out of the model by this point (and its element out of
+        // `elements`), so there is nothing left to sync on the losing end.
+        self.sync_focus_change(None);
     }
 
     /// Toggle fullscreen state for a window. When entering fullscreen, saves the
@@ -569,6 +646,27 @@ impl State {
         self.sync_window_to_space(id);
         self.emit_pending();
         Some(())
+    }
+
+    /// Apply a client-requested maximize/unmaximize for `surface`, reporting
+    /// whether the model actually changed -- i.e. whether
+    /// `sync_window_to_space` will have sent the client a configure of its
+    /// own. `false` (unknown surface, state already as requested, or a failed
+    /// precondition such as no known output) tells the xdg handler to answer
+    /// with a bare `send_configure` instead, so the request is never left
+    /// unanswered.
+    fn reconcile_maximized(&mut self, surface: &WlSurface, target: bool) -> bool {
+        let Some(&id) = self.surface_to_window.get(surface) else { return false };
+        let changes = self.window_manager.get(id).is_some_and(|w| w.maximized != target);
+        changes && self.set_maximized_target(id, target).is_some()
+    }
+
+    /// Fullscreen counterpart of [`Self::reconcile_maximized`]; same
+    /// "did a configure actually go out" contract.
+    fn reconcile_fullscreen(&mut self, surface: &WlSurface, target: bool) -> bool {
+        let Some(&id) = self.surface_to_window.get(surface) else { return false };
+        let changes = self.window_manager.get(id).is_some_and(|w| w.fullscreen != target);
+        changes && self.set_fullscreen_target(id, target).is_some()
     }
 
     /// Synchronously reload the config from `self.config_path` (falling
@@ -669,8 +767,9 @@ impl State {
         use crate::dbus::DbCommand;
         match cmd {
             DbCommand::Focus(id) => {
+                let previous = self.focused_id();
                 self.window_manager.focus(id)?;
-                self.sync_window_to_space(id);
+                self.sync_focus_change(previous);
             }
             DbCommand::Close(id) => self.request_close(id),
             DbCommand::Minimize(id, value) => {
@@ -762,12 +861,17 @@ impl State {
                 let _ = self.toggle_maximized(id);
             }
             DecorationAction::Minimize => {
+                let previous = self.focused_id();
                 let _ = self.window_manager.set_minimized(id, true);
                 if self.window_manager.focused_window().map(|w| w.id) == Some(id) {
                     let active = self.window_manager.active_workspace();
                     self.window_manager.focus_mru_in_workspace(active);
                 }
+                // `id` itself always needs a sync (it just became invisible),
+                // even when it wasn't the focused window; `sync_focus_change`
+                // then handles the successor and the seat (New-1/2/3).
                 self.sync_window_to_space(id);
+                self.sync_focus_change(previous);
             }
             DecorationAction::Move => {
                 // Move is handled by the input layer (pointer drag),
@@ -841,8 +945,9 @@ impl State {
                 let idx = self.alt_tab.index();
                 let entries = self.alt_tab.entries().to_vec();
                 if let Some(wid) = entries.get(idx).copied() {
+                    let previous = self.focused_id();
                     self.window_manager.focus(wid);
-                    self.sync_window_to_space(wid);
+                    self.sync_focus_change(previous);
                 }
                 self.emit(Event::AltTabState(AltTabState { active: true, entries, index: idx }));
             }
@@ -1072,10 +1177,12 @@ impl State {
     /// raise a window also be the click that acts on it, matching ordinary
     /// click-to-focus window manager behavior.
     fn handle_pointer_press(&mut self, id: WindowId, pointer: (i32, i32)) -> Option<()> {
+        let previous = self.focused_id();
         self.window_manager.focus(id)?;
         // Focus changes the toplevel's `Activated` state and the `Space`
-        // element's activation, so it has to reach the client too (C1).
-        self.sync_window_to_space(id);
+        // element's activation, so it has to reach the client too (C1) --
+        // both ends of the transition, not just the new one (New-1).
+        self.sync_focus_change(previous);
         // Task 11 re-review round 3 #2: flush right after `focus()`
         // mutates, before any of the `?`-early-returns below (e.g.
         // `decoration_action_for` returning `None` for a fullscreen
@@ -1318,14 +1425,25 @@ impl XdgShellHandler for State {
         // open off-screen with no title bar to grab.
         let (x, y) = layout::cascade_point_in(&occupied, (640, 400), 24, output_geo);
         let geometry = icedtea_contract::Rectangle { x, y, width: 640, height: 400 };
+        // `add_window` autofocuses, so this is a focus change like any other
+        // (New-1): capture the outgoing focus before it happens.
+        let previous = self.focused_id();
         let id = self.window_manager.add_window(&app_id, &title, pid, geometry);
         self.surface_to_window.insert(surface.wl_surface().clone(), id);
 
         let window = Window::new_wayland_window(surface);
-        // Map at the model's geometry, not (0, 0) -- see `sync_window_to_space`.
-        self.space.map_element(window.clone(), (geometry.x, geometry.y), true);
+        // Map at the model's geometry, not (0, 0) -- see
+        // `sync_window_to_space`, whose `content_rect` inset (New-4) this
+        // initial placement has to agree with or the very first frame draws
+        // the client a title bar's worth too high.
+        let ssd = self
+            .window_manager
+            .get(id)
+            .is_some_and(|w| crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen));
+        let content = crate::decoration::content_rect(geometry, ssd);
+        self.space.map_element(window.clone(), (content.x, content.y), true);
         self.elements.insert(id, window);
-        self.sync_window_to_space(id);
+        self.sync_focus_change(previous);
         self.emit_pending();
     }
 
@@ -1349,31 +1467,37 @@ impl XdgShellHandler for State {
     // implementation of "maximize a window" and it always ends in a
     // configure.
 
+    // Re-review (adjacent minor): each of these must answer the client with
+    // a configure *unconditionally*, per xdg-shell -- a client that calls
+    // `set_maximized`/`unset_maximized`/`set_fullscreen`/`unset_fullscreen`
+    // waits for one, and treating "the model already said that" as "nothing
+    // to say" leaves it waiting forever. `set_*_target` only configures when
+    // it actually mutated the model (and returns `None` when a precondition
+    // like a known output is missing), so each handler tracks whether a
+    // configure was really sent and falls back to a bare `send_configure`
+    // when it wasn't.
+
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
-            self.set_maximized_target(id, true);
-        } else {
+        if !self.reconcile_maximized(surface.wl_surface(), true) {
             surface.send_configure();
         }
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
-            self.set_maximized_target(id, false);
+        if !self.reconcile_maximized(surface.wl_surface(), false) {
+            surface.send_configure();
         }
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
-        if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
-            self.set_fullscreen_target(id, true);
-        } else {
+        if !self.reconcile_fullscreen(surface.wl_surface(), true) {
             surface.send_configure();
         }
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
-            self.set_fullscreen_target(id, false);
+        if !self.reconcile_fullscreen(surface.wl_surface(), false) {
+            surface.send_configure();
         }
     }
 
@@ -1381,6 +1505,13 @@ impl XdgShellHandler for State {
         if let Some(&id) = self.surface_to_window.get(surface.wl_surface()) {
             self.apply_decoration_action(id, crate::decoration::DecorationAction::Minimize);
         }
+        // Unconditional, unlike its maximize/fullscreen siblings: "minimized"
+        // has no xdg toplevel state of its own, so the sync path has no state
+        // bit to flip and `send_pending_configure` may legitimately find
+        // nothing to send even when the model *did* change (a minimized
+        // background window was never activated to begin with). A repeat
+        // configure is legal and cheap; a missing one hangs the client.
+        surface.send_configure();
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, _serial: Serial) {
@@ -2416,5 +2547,135 @@ mod tests {
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         assert_eq!(state.window_manager.workspace_info().len(), 1);
         assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(id));
+    }
+
+    // --- Re-review fix round: New-1 / New-2 / New-3 ---
+    //
+    // These cover the *model* half of the focus-sync work plus the fact that
+    // every focus path now runs `sync_focus_change`/`sync_seat_focus` without
+    // panicking against a live `Seat`. The Wayland half proper -- that the
+    // losing window's client is staged `Activated = false`, that the
+    // successor's client is staged `Activated = true`, and that
+    // `keyboard.set_focus(.., Some(surface), ..)` is issued -- is **not**
+    // testable headlessly: all three require a `ToplevelSurface`, which can
+    // only exist for a real client bound to a real `wl_display` connection.
+    // `elements` is therefore empty in every test here, so
+    // `sync_window_to_space` short-circuits before touching xdg state and the
+    // seat's focus is always `None`. See the fix report for the manual-trace
+    // argument that stands in for those.
+
+    /// New-2: the successor `forget_window` picks is reconciled, not just
+    /// chosen -- and the model never ends up with a dangling focus pointer.
+    #[test]
+    fn closing_the_focused_window_reconciles_the_mru_successor() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+        assert_eq!(state.focused_id(), Some(b));
+
+        state.request_close(b);
+        assert_eq!(state.focused_id(), Some(a), "the successor is focused, not left dangling");
+        assert!(state.window_manager.get(a).unwrap().focused);
+    }
+
+    /// New-2/New-3: with no successor left there is nothing to activate, and
+    /// the seat's keyboard focus must end up cleared rather than pointing at
+    /// the destroyed surface.
+    #[test]
+    fn closing_the_last_window_leaves_nothing_focused_and_clears_the_seat() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let id = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        state.request_close(id);
+        assert_eq!(state.focused_id(), None);
+        assert!(state.seat.get_keyboard().unwrap().current_focus().is_none());
+    }
+
+    /// New-1: a focus change reports the window that *lost* focus as
+    /// unfocused in the model, which is the state `sync_focus_change` then
+    /// pushes to that window's client as `Activated = false`.
+    #[test]
+    fn click_to_focus_unfocuses_the_previous_window() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+        assert!(state.window_manager.get(b).unwrap().focused);
+
+        state.handle_pointer(PointerEvent::Press { id: a, pointer: (5, 5) });
+        assert!(state.window_manager.get(a).unwrap().focused);
+        assert!(!state.window_manager.get(b).unwrap().focused, "the old focus is dropped");
+    }
+
+    /// New-3: switching to an empty workspace leaves nothing focused, and
+    /// `sync_space`'s trailing `sync_seat_focus` runs even though the
+    /// per-window loop has nothing visible to say about it.
+    #[test]
+    fn switching_to_an_empty_workspace_clears_focus_and_the_seat() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let id = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        assert_eq!(state.focused_id(), Some(id));
+
+        state.switch_workspace(1).unwrap();
+        assert_eq!(state.focused_id(), None, "workspace 2 is empty");
+        assert!(state.seat.get_keyboard().unwrap().current_focus().is_none());
+
+        // And switching back re-focuses the workspace's MRU head.
+        state.switch_workspace(0).unwrap();
+        assert_eq!(state.focused_id(), Some(id));
+    }
+
+    /// New-3: minimizing the focused window hands focus on when there is a
+    /// successor, and leaves nothing focused (hence nothing on the seat) when
+    /// there isn't.
+    #[test]
+    fn minimizing_the_focused_window_moves_focus_on() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
+
+        state.apply_decoration_action(b, crate::decoration::DecorationAction::Minimize);
+        assert!(state.window_manager.get(b).unwrap().minimized);
+        assert_eq!(state.focused_id(), Some(a));
+
+        state.apply_decoration_action(a, crate::decoration::DecorationAction::Minimize);
+        // With no successor the model leaves its focus pointer on `a` (that
+        // is pre-existing `focus_mru_in_workspace` behaviour: it clears
+        // nothing when it finds nothing). What must *not* happen is the seat
+        // going on delivering keys to a window the user can no longer see --
+        // `sync_seat_focus` gates on `is_visible_id`, so an invisible focus
+        // is the same as no focus as far as the keyboard is concerned.
+        assert!(!state.window_manager.is_visible_id(a));
+        assert!(state.seat.get_keyboard().unwrap().current_focus().is_none());
+    }
+
+    /// New-4: the inset the sync path applies is the shared
+    /// `decoration::content_rect`, keyed off the same `has_ssd` predicate the
+    /// renderer uses -- so a decorated window's client is configured a title
+    /// bar shorter and a title bar lower, and a CSD one is left alone.
+    /// (`sync_window_to_space` itself can't be observed without a real
+    /// toplevel; this pins the geometry contract it consumes.)
+    #[test]
+    fn ssd_inset_applies_to_decorated_windows_only() {
+        use crate::decoration::{content_rect, has_ssd, TITLE_BAR_HEIGHT};
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let geo = Rectangle { x: 10, y: 20, width: 400, height: 300 };
+        let ssd = state.window_manager.add_window("org.example.Ssd", "t", 1, geo);
+        let csd = state.window_manager.add_window("org.gtk.Csd", "t", 2, geo);
+
+        let w = state.window_manager.get(ssd).unwrap();
+        assert!(has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen));
+        assert_eq!(
+            content_rect(w.geometry, true),
+            Rectangle { x: 10, y: 20 + TITLE_BAR_HEIGHT, width: 400, height: 300 - TITLE_BAR_HEIGHT }
+        );
+
+        let w = state.window_manager.get(csd).unwrap();
+        assert!(!has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen));
+        assert_eq!(content_rect(w.geometry, false), geo, "CSD windows are untouched");
+
+        // Fullscreen drops the strip, so the client gets the whole output.
+        state.set_fullscreen_target(ssd, true).unwrap();
+        let w = state.window_manager.get(ssd).unwrap();
+        assert!(!has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen));
+        assert_eq!(content_rect(w.geometry, false), w.geometry);
     }
 }

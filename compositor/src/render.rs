@@ -77,6 +77,13 @@ pub fn scene_order(windows: &[&Window], snap_active: bool) -> Vec<SceneLayer> {
 /// `crate::decoration::button_rects` and whatever SSD styling it designs)
 /// into actual painted `Decoration` elements in `draw_frame`; this task only
 /// wires the plumbing; the slot is real but stays unpopulated here.
+///
+/// These rects are **frame**-relative -- `w.geometry` is the whole frame, and
+/// the strip is its top `TITLE_BAR_HEIGHT` rows. Re-review finding New-4: an
+/// SSD client is now configured and mapped at
+/// `decoration::content_rect(w.geometry, true)`, which starts exactly where
+/// these strips end, so the two no longer overlap. Anything that changes one
+/// side of that has to change the other.
 pub fn decoration_strip_geometry(windows: &[&Window]) -> Vec<Rectangle> {
     windows.iter().map(|w| decoration::title_bar_rect(w.geometry)).collect()
 }
@@ -284,8 +291,13 @@ pub fn draw_frame<'d>(
     let button_color = hex_to_rgba(&appearance.palette.accent);
     let text_color = hex_to_rgba(&appearance.palette.foreground);
     for (window, title_bar_rect) in windows.iter().zip(ssd_strip_geometry.iter()) {
-        // Skip fullscreen windows and CSD windows (ones that explicitly requested client decorations)
-        if window.fullscreen || decoration::is_csd(&window.app_id, window.client_decorations_requested) {
+        // Skip fullscreen windows and CSD windows (ones that explicitly
+        // requested client decorations). Re-review finding New-4: this is the
+        // *same* predicate `State::sync_window_to_space` uses to decide
+        // whether to inset the client's size/position, so the strip below is
+        // painted exactly over the band the client was configured out of --
+        // it must stay a single shared definition.
+        if !decoration::has_ssd(&window.app_id, window.client_decorations_requested, window.fullscreen) {
             continue;
         }
 
