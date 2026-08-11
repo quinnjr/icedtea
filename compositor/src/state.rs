@@ -295,10 +295,20 @@ impl State {
         // Ledger item 28 / recommendation 4: `raise_on_focus` decides
         // whether a focus change alone may raise; with it off a focused
         // window is still activated and configured but keeps its stack
-        // position unless its geometry actually changed. `wayland.raise` is
-        // a no-op until wlr 0.20.2 ships a scene-node raise mutator (see its
-        // doc), but the consumption belongs here regardless so the config
-        // knob isn't silently unwired.
+        // position. `wayland.raise` is a no-op until wlr 0.20.2 ships a
+        // scene-node raise mutator (see its doc), but the consumption
+        // belongs here regardless so the config knob isn't silently
+        // unwired.
+        //
+        // Deliberately not carried through the seam: the pre-port
+        // (smithay) code also raised on *any* geometry change, regardless
+        // of `raise_on_focus`, because `Space::map_element` was both the
+        // move and the raise in one call -- an artifact of that API, not a
+        // documented behavior this seam owes. Post-port, a pure move
+        // (`set_position` above) never restacks on its own. Whether
+        // moved-implies-raise should return is an explicit decision left to
+        // whichever task wires the real `wlr` 0.20.2 raise mutator; this
+        // comment is the ledger entry for that decision.
         if focused
             && self.config.behavior.raise_on_focus
             && let Some(toplevel) = self.wayland.toplevel_for(id)
