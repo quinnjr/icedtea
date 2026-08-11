@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use icedtea_contract::{Rectangle, WindowId};
-use smithay::input::keyboard::xkb;
+use xkbcommon::xkb;
 
 use crate::layout::{snap_zone_for_point, SnapZone};
 

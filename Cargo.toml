@@ -8,7 +8,6 @@ edition = "2024"
 rust-version = "1.94"
 
 [workspace.dependencies]
-smithay = { version = "0.7", features = [] }
 zbus = "5"
 redb = "3"
 serde = { version = "1", features = ["derive"] }
