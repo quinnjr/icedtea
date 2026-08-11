@@ -51,6 +51,7 @@ fn a_headless_compositor_boots_runs_and_stops() {
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
     runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
 
     // `state` is declared (and so, by ordinary end-of-scope drop order, is
     // dropped) after `display`/`backend`/`runtime`: `attach` below gives
@@ -167,4 +168,115 @@ fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
         .expect("run_all");
 
     assert!(state.quitting, "the Quit command must have reached State through the wake pipe");
+}
+
+/// The seam turns a library id into a model window and back, and every
+/// outbound push resolves through it.
+///
+/// Drives `State`'s toplevel entry points directly rather than through a real
+/// client: a client-driven test needs a Wayland client library this workspace
+/// does not depend on, and is parity-milestone work. What is provable here is
+/// the whole of the compositor's own half — the model row, the binding, the
+/// cascade position, focus reconciliation, and destruction.
+#[test]
+fn a_toplevel_becomes_a_model_window_and_releases_it_on_destroy() {
+    use icedtea_compositor::wayland::ToplevelKey;
+
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+
+    let runtime = wlr::Runtime::new().expect("runtime");
+    state.wayland.attach(runtime);
+
+    let first = ToplevelKey::for_test(1);
+    state.new_toplevel(first, "term", "Terminal", 4242);
+
+    let id = state.wayland.window_for(first).expect("the key resolves to a model window");
+    let w = state.window_manager.get(id).expect("model row exists");
+    assert_eq!(w.app_id, "term");
+    assert_eq!(w.title, "Terminal");
+    assert_eq!(w.pid, 4242);
+    assert!(w.focused, "a new toplevel takes focus");
+    assert_eq!(
+        (w.geometry.width, w.geometry.height),
+        (640, 400),
+        "the model's placeholder size until the client's first commit"
+    );
+
+    // A second toplevel cascades rather than stacking exactly on the first.
+    let second = ToplevelKey::for_test(2);
+    state.new_toplevel(second, "editor", "Editor", 4243);
+    let id2 = state.wayland.window_for(second).expect("second key resolves");
+    let g1 = state.window_manager.get(id).expect("first still there").geometry;
+    let g2 = state.window_manager.get(id2).expect("second").geometry;
+    assert_ne!((g1.x, g1.y), (g2.x, g2.y), "cascade, not overlap");
+    assert!(
+        state.window_manager.get(id2).is_some_and(|w| w.focused),
+        "the newest toplevel has focus"
+    );
+    assert!(
+        state.window_manager.get(id).is_some_and(|w| !w.focused),
+        "and the previous one lost it -- both ends of the transition"
+    );
+
+    // Title changes route back into the model.
+    state.toplevel_title_changed(second, "Editor — file.rs");
+    assert_eq!(
+        state.window_manager.get(id2).map(|w| w.title.as_str()),
+        Some("Editor — file.rs")
+    );
+
+    // Destruction drops the row, the binding, and hands focus back.
+    state.forget_toplevel(second);
+    assert!(state.wayland.window_for(second).is_none(), "binding cleared");
+    assert!(state.window_manager.get(id2).is_none(), "model row cleared");
+    assert!(
+        state.window_manager.get(id).is_some_and(|w| w.focused),
+        "focus falls back to the MRU survivor"
+    );
+
+    // Every mutation above emitted; nothing was left queued.
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(!events.is_empty(), "model mutations must reach the event channel");
+    assert!(
+        events.windows(2).all(|p| p[0].seq < p[1].seq),
+        "sequence numbers are strictly monotonic: {:?}",
+        events.iter().map(|e| e.seq).collect::<Vec<_>>()
+    );
+}
+
+/// `request_close` on a backed window asks the client and leaves the model
+/// row alone; on an unbacked one it removes the row synchronously, because
+/// no destroy will ever arrive for it.
+#[test]
+fn closing_distinguishes_a_real_client_from_a_model_only_window() {
+    use icedtea_compositor::wayland::ToplevelKey;
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+    let runtime = wlr::Runtime::new().expect("runtime");
+    state.wayland.attach(runtime);
+
+    let model_only = state.window_manager.add_window(
+        "ghost",
+        "Ghost",
+        1,
+        icedtea_contract::Rectangle { x: 0, y: 0, width: 10, height: 10 },
+    );
+    state.request_close(model_only);
+    assert!(
+        state.window_manager.get(model_only).is_none(),
+        "a window with no client is removed at once"
+    );
+
+    let key = ToplevelKey::for_test(9);
+    state.new_toplevel(key, "term", "Terminal", 7);
+    let backed = state.wayland.window_for(key).expect("resolves");
+    state.request_close(backed);
+    assert!(
+        state.window_manager.get(backed).is_some(),
+        "a real client keeps its model row until it destroys its toplevel"
+    );
 }

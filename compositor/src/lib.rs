@@ -61,6 +61,9 @@ pub fn run() {
     runtime
         .init_graphics(&display, &backend)
         .expect("failed to create the renderer and the core protocol globals");
+    runtime
+        .create_xdg_shell(&display, 6)
+        .expect("failed to advertise xdg_wm_base");
 
     let (dbus_tx, dbus_events_rx) = crossbeam_channel::unbounded::<SeqEvent>();
     let mut state = State::new(config, dbus_tx);

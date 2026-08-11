@@ -7,13 +7,12 @@
 //! dependency be removed in one commit without touching a line of the model:
 //! this file is the whole of what had to be re-implemented afterwards.
 //!
-//! In this commit every outbound method is a deliberate no-op. No client is
-//! ever bound in this commit, so [`Wayland::is_backed`] is false in
-//! practice — which is exactly the behaviour the model already tolerates:
-//! `sync_window_to_scene`'s "a window with no backing surface is a silent
-//! no-op" contract predates the port. The model tests therefore pass
-//! unchanged, and they are the reason this intermediate state exists at
-//! all.
+//! Every outbound method now really talks to `wlr` once a `Runtime` is
+//! attached (`attach`): each one resolves `id`/`toplevel` through the
+//! bind/forget maps below and, on a miss (no runtime, no binding, or a
+//! `ToplevelId` gone stale since the `run_all` that announced it returned),
+//! is a silent no-op rather than a panic. `keyboard_focus` is the one
+//! exception, still a guarded no-op until the seat exists — see its doc.
 
 use std::collections::HashMap;
 
@@ -21,13 +20,31 @@ use icedtea_contract::{Rectangle, WindowId};
 
 /// Identifies one client toplevel.
 ///
-/// A `u64` newtype rather than the library's own id type so this file — and
-/// so the whole compositor crate — compiles with no compositor library at
-/// all. It becomes a wrapper around `wlr::ToplevelId` in the port's next
-/// step; nothing outside this file constructs one from an integer, so that
-/// change reaches no other module.
+/// A transparent wrapper around the compositor library's own id, which is
+/// stable, comparable and hashable and outlives the object it names — so a
+/// key held past the client's departure resolves to nothing rather than to
+/// freed memory or to a different window. Wrapped rather than used directly
+/// so that this file stays the only one that mentions the library's types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ToplevelKey(pub u64);
+pub struct ToplevelKey(pub(crate) wlr::ToplevelId);
+
+impl ToplevelKey {
+    /// Wrap a library id. Only the handler impls call this.
+    pub(crate) fn new(id: wlr::ToplevelId) -> Self {
+        ToplevelKey(id)
+    }
+
+    /// A key that no live client can have, for tests that drive `State`'s
+    /// toplevel entry points without a client.
+    ///
+    /// `n` distinguishes one test key from another; it has no meaning beyond
+    /// that, and a key built this way never resolves to a live toplevel, so
+    /// every outbound push through it is a no-op — which is exactly the
+    /// property that makes it safe to hand to `State`.
+    pub fn for_test(n: u64) -> Self {
+        ToplevelKey(wlr::ToplevelId::dangling_nth_for_test(n))
+    }
+}
 
 /// The compositor's Wayland side.
 #[derive(Default)]
@@ -93,8 +110,13 @@ impl Wayland {
     }
 
     /// Stage `content` (already in **content** space — the caller applied
-    /// `decoration::content_rect`) plus the three xdg states, and send the
-    /// client a configure.
+    /// `decoration::content_rect`) plus the three xdg states, and let the
+    /// library send one configure carrying all of them.
+    ///
+    /// Staged rather than sent one field at a time: the library coalesces
+    /// every change made in an event-loop turn into a single configure, so a
+    /// geometry change and an activation change reach the client together
+    /// rather than as two round trips.
     pub fn configure(
         &self,
         id: WindowId,
@@ -103,45 +125,71 @@ impl Wayland {
         maximized: bool,
         fullscreen: bool,
     ) {
-        let _ = (id, content, activated, maximized, fullscreen);
+        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else { return };
+        runtime.set_toplevel_size(key.0, content.width, content.height);
+        runtime.set_toplevel_activated(key.0, activated);
+        runtime.set_toplevel_maximized(key.0, maximized);
+        runtime.set_toplevel_fullscreen(key.0, fullscreen);
     }
 
     /// Move the window's scene node. `x`/`y` are **content**-space.
     pub fn set_position(&self, id: WindowId, x: i32, y: i32) {
-        let _ = (id, x, y);
+        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else { return };
+        runtime.set_toplevel_position(key.0, x, y);
     }
 
-    /// Restack the toplevel's scene node to the top.
+    /// Show or hide the window's scene node.
     ///
-    /// A deliberate no-op until `wlr` ships a scene-node raise mutator —
-    /// planned for 0.20.2, after this port's pinned 0.20.1. Kept as a real
-    /// method (rather than left unwired) so `sync_window_to_scene` can call
-    /// it unconditionally now and task 5 only has to fill this one body in,
-    /// not go find every call site that should have raised.
-    pub fn raise(&self, toplevel: ToplevelKey) {
-        let _ = toplevel;
+    /// Hiding rather than unmapping, which is the distinction the smithay
+    /// implementation's `Space::unmap_elem` blurred: a window on an inactive
+    /// workspace keeps its buffer and its configure state and is simply not
+    /// drawn, so returning to that workspace does not make the client
+    /// re-render from nothing.
+    pub fn set_visible(&self, id: WindowId, visible: bool) {
+        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else { return };
+        runtime.set_toplevel_visible(key.0, visible);
     }
 
-    /// Show or hide the window's scene node (a window on an inactive
-    /// workspace, or a minimized one, is hidden rather than unmapped).
-    pub fn set_visible(&self, id: WindowId, visible: bool) {
-        let _ = (id, visible);
+    /// Raise the window above its siblings.
+    ///
+    /// Separate from `set_position` because `behavior.raise_on_focus` decides
+    /// whether a focus change alone may restack (ledger item 28): with it
+    /// off, a focused window is still activated and configured, it just keeps
+    /// its place in the stack.
+    pub fn raise(&self, id: WindowId) {
+        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else { return };
+        runtime.raise_toplevel(key.0);
     }
 
     /// Point the seat's keyboard at `id`, or at nothing.
+    ///
+    /// A no-op until the seat exists; `sync_seat_focus` calls it
+    /// unconditionally either way, so the model half of focus is already
+    /// correct and only the delivery is pending.
     pub fn keyboard_focus(&self, id: Option<WindowId>) {
         let Some(_runtime) = self.runtime() else { return };
         let _ = id;
-        // Filled in when the seat exists (0.20.3).
     }
 
-    /// Ask the client to close. Returns whether a request was actually sent —
-    /// `false` means there is no client, and the caller must remove the model
-    /// row itself because no destroy will ever arrive.
+    /// Ask the client to close. `false` means there is no client, and the
+    /// caller must remove the model row itself.
+    ///
+    /// The return value reports whether *this seam* still considers `id`
+    /// backed (i.e. `bind` was called for it and nothing has `forget`-ten it
+    /// since) — not whether `close_toplevel` itself reported success. A
+    /// binding without a runtime resolution can only mean the `ToplevelId`
+    /// went stale (the `run_all` that announced it has already returned,
+    /// which every by-id `wlr` mutator treats as a plain miss, never a
+    /// panic); the request is best-effort in that case, but `request_close`
+    /// must still wait for `toplevel_destroyed` rather than dropping the row
+    /// out from under a client that, for all this seam's bookkeeping can
+    /// tell, is still there.
     pub fn close(&self, id: WindowId) -> bool {
-        let Some(_runtime) = self.runtime() else { return false };
-        let _ = id;
-        false
+        let Some(key) = self.toplevel_for(id) else { return false };
+        if let Some(runtime) = self.runtime() {
+            runtime.close_toplevel(key.0);
+        }
+        true
     }
 }
 
@@ -153,7 +201,7 @@ mod tests {
     fn binding_is_visible_from_both_directions_and_forgetting_clears_both() {
         let mut w = Wayland::new();
         let id = WindowId(7);
-        let key = ToplevelKey(42);
+        let key = ToplevelKey::for_test(42);
 
         assert!(!w.is_backed(id));
         w.bind(id, key);
@@ -185,13 +233,13 @@ mod tests {
         assert!(!w.close(WindowId(1)));
     }
 
-    /// `raise` on a key nothing is bound to is a harmless no-op, matching
-    /// every other outbound method in this commit -- there is no scene-node
-    /// mutator behind it yet (see `raise`'s doc).
+    /// `raise` on a window with no runtime attached is a harmless no-op,
+    /// matching every other outbound method's "no runtime, no binding -> silent
+    /// no-op" contract.
     #[test]
-    fn raising_an_unbound_toplevel_is_harmless() {
+    fn raising_an_unbound_window_is_harmless() {
         let w = Wayland::new();
-        w.raise(ToplevelKey(1));
+        w.raise(WindowId(1));
     }
 
     #[test]

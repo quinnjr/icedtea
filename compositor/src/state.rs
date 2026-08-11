@@ -326,32 +326,29 @@ impl State {
         self.wayland.set_visible(id, visible);
         if visible {
             self.wayland.set_position(id, content.x, content.y);
+            // Ledger item 28 / recommendation 4: `behavior.raise_on_focus`
+            // decides whether a focus change alone may restack. With it off a
+            // focused window is still activated and configured, it just keeps
+            // its place in the stack.
+            //
+            // LEDGER DECISION (task 8): the pre-port smithay code also raised
+            // on *any* geometry change, with no `raise_on_focus` check at
+            // all -- `Space::map_element` was both the move and the raise in
+            // one call, so every move restacked whether or not the mover was
+            // the focused window. That does not return here. It was an
+            // artifact of `map_element`'s API shape, not a documented
+            // behavior the seam owes: a pure move not restacking is the
+            // better floating-WM behavior, and it is what `raise_on_focus`'s
+            // own name promises -- a knob that says "raise on focus," not
+            // "raise on focus or move." Reintroducing moved-implies-raise
+            // would make the knob lie for drag-move, which is by far the most
+            // common source of geometry changes.
+            if focused && self.config.behavior.raise_on_focus {
+                self.wayland.raise(id);
+            }
         }
         self.wayland
             .configure(id, content, focused && visible, maximized, fullscreen);
-        // Ledger item 28 / recommendation 4: `raise_on_focus` decides
-        // whether a focus change alone may raise; with it off a focused
-        // window is still activated and configured but keeps its stack
-        // position. `wayland.raise` is a no-op until wlr 0.20.2 ships a
-        // scene-node raise mutator (see its doc), but the consumption
-        // belongs here regardless so the config knob isn't silently
-        // unwired.
-        //
-        // Deliberately not carried through the seam: the pre-port
-        // (smithay) code also raised on *any* geometry change, regardless
-        // of `raise_on_focus`, because `Space::map_element` was both the
-        // move and the raise in one call -- an artifact of that API, not a
-        // documented behavior this seam owes. Post-port, a pure move
-        // (`set_position` above) never restacks on its own. Whether
-        // moved-implies-raise should return is an explicit decision left to
-        // whichever task wires the real `wlr` 0.20.2 raise mutator; this
-        // comment is the ledger entry for that decision.
-        if focused
-            && self.config.behavior.raise_on_focus
-            && let Some(toplevel) = self.wayland.toplevel_for(id)
-        {
-            self.wayland.raise(toplevel);
-        }
 
         // Keyboard focus is the other half of "focus reached the client".
         self.sync_seat_focus();
@@ -469,7 +466,7 @@ impl State {
     pub fn request_close(&mut self, id: WindowId) {
         if self.wayland.close(id) {
             // A real client: the model row stays until the client actually
-            // destroys its toplevel, which lands in `toplevel_destroyed`.
+            // destroys its toplevel, which lands in `forget_toplevel`.
             return;
         }
         self.wayland.forget(id);
@@ -1251,7 +1248,17 @@ impl State {
     }
 
     /// A client destroyed its toplevel.
-    pub fn toplevel_destroyed(&mut self, toplevel: crate::wayland::ToplevelKey) {
+    ///
+    /// Named `forget_toplevel` rather than `toplevel_destroyed` (task 8):
+    /// `wlr::ToplevelHandler::toplevel_destroyed` now exists as a same-named
+    /// trait method on `State`, and while the two don't collide (an inherent
+    /// method always wins over a trait method of the same name during
+    /// resolution, so `self.toplevel_destroyed(key)` would keep working), the
+    /// call site inside the trait impl would read as a same-name recursive
+    /// call to a reader who can't see that resolution rule. Renaming the
+    /// inherent method removes the ambiguity at the source instead of relying
+    /// on it being resolved correctly.
+    pub fn forget_toplevel(&mut self, toplevel: crate::wayland::ToplevelKey) {
         let Some(id) = self.wayland.window_for(toplevel) else { return };
         self.wayland.forget(id);
         self.forget_window(id);
@@ -1335,12 +1342,16 @@ impl State {
 impl wlr::OutputHandler for State {
     fn new_output(&mut self, output: &wlr::Output<'_>) {
         let Some(runtime) = self.wayland.runtime().cloned() else { return };
-        if let Err(err) = output.enable_with_preferred_mode() {
-            tracing::error!(?err, "could not enable output");
-            return;
-        }
+        // Renderer before enable: the DRM backend's enabling commit needs a
+        // framebuffer, which wlroots can only allocate once the output has
+        // its renderer/allocator. Nested backends tolerate either order,
+        // which is how enable-first survived until the first real-DRM boot.
         if let Err(err) = runtime.init_output(output) {
             tracing::error!(?err, "could not give output a renderer");
+            return;
+        }
+        if let Err(err) = output.enable_with_preferred_mode() {
+            tracing::error!(?err, "could not enable output");
             return;
         }
 
@@ -1431,9 +1442,67 @@ impl wlr::LoopHandler for State {
     }
 }
 
-// No methods until the xdg-shell and seat releases; the empty impls are what
-// make `State` satisfy `wlr::Handlers` today.
-impl wlr::ToplevelHandler for State {}
+impl wlr::ToplevelHandler for State {
+    fn new_toplevel(&mut self, toplevel: &wlr::Toplevel<'_>) {
+        // Nothing is created in the model yet: at this point the client has
+        // sent no buffer and no size, and it may never map at all. The model
+        // row is created on `mapped`, which is the first moment a window
+        // genuinely exists on screen — and the moment the smithay
+        // implementation's `new_toplevel` was standing in for.
+        let _ = toplevel;
+    }
+
+    fn initial_commit(&mut self, toplevel: &wlr::Toplevel<'_>) {
+        // xdg-shell requires a configure here. Staging the model's
+        // placeholder size means the client's very first buffer is already
+        // the right size, rather than being resized one frame later.
+        let Some(runtime) = self.wayland.runtime() else { return };
+        runtime.set_toplevel_size(toplevel.id(), 640, 400);
+    }
+
+    fn mapped(&mut self, toplevel: &wlr::Toplevel<'_>) {
+        let id = toplevel.id();
+        let key = crate::wayland::ToplevelKey::new(id);
+        if let Some(window_id) = self.wayland.window_for(key) {
+            // Remapped after an unmap: the model row survived, so this is a
+            // visibility change rather than a new window.
+            tracing::info!(?id, ?window_id, "toplevel remapped");
+            self.sync_window_to_scene(window_id);
+            self.emit_pending();
+            return;
+        }
+        let app_id = toplevel.app_id().unwrap_or_default();
+        let title = toplevel.title().unwrap_or_default();
+        let pid = toplevel.pid().unwrap_or(0);
+        tracing::info!(?id, %app_id, %title, pid, "toplevel mapped");
+        self.new_toplevel(key, &app_id, &title, pid);
+    }
+
+    fn unmapped(&mut self, id: wlr::ToplevelId) {
+        // An unmap is not a destroy: the client may map again with the same
+        // id. Hide it, and let the model keep the row.
+        tracing::info!(?id, "toplevel unmapped");
+        let key = crate::wayland::ToplevelKey::new(id);
+        let Some(window) = self.wayland.window_for(key) else { return };
+        self.wayland.set_visible(window, false);
+    }
+
+    fn title_changed(&mut self, toplevel: &wlr::Toplevel<'_>) {
+        let id = toplevel.id();
+        let key = crate::wayland::ToplevelKey::new(id);
+        let title = toplevel.title().unwrap_or_default();
+        tracing::info!(?id, %title, "toplevel title changed");
+        self.toplevel_title_changed(key, &title);
+    }
+
+    fn toplevel_destroyed(&mut self, id: wlr::ToplevelId) {
+        // Safe against an id we were never told about (the library documents
+        // that this can happen): `forget_toplevel` resolves through the map
+        // and returns early on a miss, and never indexes.
+        tracing::info!(?id, "toplevel destroyed");
+        self.forget_toplevel(crate::wayland::ToplevelKey::new(id));
+    }
+}
 impl wlr::SeatHandler for State {}
 
 #[cfg(test)]
