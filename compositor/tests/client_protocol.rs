@@ -61,7 +61,14 @@ fn closing_from_the_model_reaches_the_client() {
         "client never saw xdg_toplevel.close"
     );
 
+    // And the model half of the same round trip: a well-behaved client
+    // answers `close` by destroying its toplevel, which must take the row
+    // with it. `Close` alone deliberately does not — the client is the one
+    // that decides.
     client.detach();
+    let closed = comp.wait_event(|e| matches!(e, Event::WindowClosed(id) if *id == info.id));
+    let Event::WindowClosed(_) = closed else { unreachable!() };
+    assert!(comp.snapshot().windows.is_empty());
 }
 
 /// A title set after mapping propagates to the model through
@@ -106,11 +113,24 @@ fn a_model_side_maximize_reaches_the_client_as_a_configure_state() {
         "a freshly mapped window is not maximized"
     );
 
+    assert!(!comp.snapshot().windows[0].maximized);
+
+    // Latched the way later tasks' idempotent-looking assertions must:
+    // `wait_until` checks its predicate before pumping, so only a monotonic
+    // counter proves a *new* configure arrived rather than the old one
+    // still reading the way the test hoped.
+    let configures = client.configure_count();
     comp.send(icedtea_compositor::dbus::DbCommand::Maximize(info.id, true));
     assert!(
-        client.wait_until(|c| c.states().contains(&MAXIMIZED)),
+        client.wait_until(|c| c.configure_count() > configures && c.states().contains(&MAXIMIZED)),
         "client never got a configure with the maximized state, last states: {:?}",
         client.states()
+    );
+    // Both sides of the seam, not just the client's half: the model has to
+    // agree with what it told the client.
+    assert!(
+        comp.snapshot().windows[0].maximized,
+        "the model must record the maximize it configured the client with"
     );
 
     comp.send(icedtea_compositor::dbus::DbCommand::Maximize(info.id, false));
@@ -118,6 +138,7 @@ fn a_model_side_maximize_reaches_the_client_as_a_configure_state() {
         client.wait_until(|c| !c.states().contains(&MAXIMIZED)),
         "client never got a configure clearing the maximized state"
     );
+    assert!(!comp.snapshot().windows[0].maximized);
 
     client.detach();
 }

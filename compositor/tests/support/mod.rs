@@ -100,6 +100,19 @@ fn ensure_headless_env() {
 /// something the compositor could opt out of, so serializing boot is the
 /// fix rather than serializing the tests: clients, event loops and
 /// assertions all still run fully in parallel.
+///
+/// **Constraint on future changes.** The paragraph above is only sound
+/// because *every* boot in the process registers the identical set of
+/// static interface pointers, which is what makes "written only by the
+/// first boot" true. This lock excludes writers from each other; it does
+/// **not** exclude readers, and it cannot — the readers are other
+/// compositors' running event loops. So a test binary that ever boots a
+/// compositor with a *different* graphics configuration (a different
+/// renderer, or one that skips linux-dmabuf) re-opens the race outright:
+/// that boot would take the `wl_array_add` path with other compositors
+/// live and walking the array. If a later task needs that, the boots with
+/// differing configurations have to be kept out of the same process, not
+/// merely out of each other's way.
 static BOOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A headless compositor running the production event loop on its own thread.
@@ -261,11 +274,21 @@ struct ClientState {
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     /// Most recent `xdg_toplevel.configure` size.
     configured: Option<(i32, i32)>,
-    /// Set by the first `xdg_surface.configure`; the gate `map_toplevel`
-    /// waits on before attaching its first buffer. Every configure is acked
-    /// in the handler itself (see [`ClientState`]'s `xdg_surface` impl), so
-    /// this is only ever a "the first one has happened" flag.
-    first_configure: bool,
+    /// How many `xdg_surface.configure` events have arrived, ever.
+    ///
+    /// Both the gate `map_toplevel` waits on before attaching its first
+    /// buffer (`> 0`) and — via [`TestClient::configure_count`] — the only
+    /// reliable "a *new* configure arrived" signal a test has. A counter
+    /// rather than a flag or a serial because every configure is acked in
+    /// the handler itself, so no serial ever survives to the caller, while
+    /// `configured`/`states` only ever report the *latest* values:
+    /// [`TestClient::wait_until`] evaluates its predicate before it pumps,
+    /// so a predicate phrased over those alone returns `true` instantly on
+    /// stale state if it already happened to hold. Anything asserting an
+    /// idempotent-looking round trip ("request maximize while already
+    /// maximized", "resize to the same geometry") must latch this counter
+    /// first and wait for it to advance.
+    configures: u32,
     /// `xdg_toplevel` states from the most recent configure.
     states: Vec<u32>,
     closed: bool,
@@ -326,7 +349,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for ClientState {
         // test that resizes, maximizes or fullscreens after mapping.
         if let xdg_surface::Event::Configure { serial } = event {
             surface.ack_configure(serial);
-            state.first_configure = true;
+            state.configures = state.configures.saturating_add(1);
         }
     }
 }
@@ -414,13 +437,21 @@ impl TestClient {
         surface.commit();
         conn.flush().expect("flush");
 
+        // `roundtrip`, not `blocking_dispatch`, for the same reason
+        // `wait_until` uses it: `blocking_dispatch` returns only once *some*
+        // event has been dispatched, so against a compositor that is alive
+        // but never answers the initial commit it blocks forever and the
+        // deadline below is never re-evaluated — a wedged CI job with no
+        // output instead of a 5s assertion failure. A roundtrip's own
+        // `wl_display.sync` reply is guaranteed by any live loop, so the
+        // deadline stays honest.
         let deadline = Instant::now() + TIMEOUT;
-        while !state.first_configure {
+        while state.configures == 0 {
             assert!(
                 Instant::now() < deadline,
                 "no xdg_surface.configure within {TIMEOUT:?}"
             );
-            queue.blocking_dispatch(&mut state).expect("dispatch");
+            queue.roundtrip(&mut state).expect("configure roundtrip");
         }
 
         // A configure of 0x0 means "you choose"; the compositor's
@@ -497,6 +528,23 @@ impl TestClient {
     /// `xdg_toplevel` states from the most recent configure.
     pub fn states(&self) -> &[u32] {
         &self.state.states
+    }
+
+    /// How many `xdg_surface.configure` events this client has seen.
+    ///
+    /// Monotonic, so it is the one signal that distinguishes "a new
+    /// configure arrived" from "the old one still says what I expected".
+    /// [`TestClient::wait_until`] checks its predicate *before* pumping, so
+    /// any assertion whose expected end state may already hold — a second
+    /// maximize, a resize to the same geometry — has to latch this first:
+    ///
+    /// ```ignore
+    /// let n = client.configure_count();
+    /// comp.send(/* … */);
+    /// assert!(client.wait_until(|c| c.configure_count() > n));
+    /// ```
+    pub fn configure_count(&self) -> u32 {
+        self.state.configures
     }
 
     /// Whether `xdg_toplevel.close` has arrived.

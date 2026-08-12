@@ -41,16 +41,53 @@ fn ensure_headless_env() {
     });
 }
 
+/// Serializes compositor *creation* across this binary's test threads.
+///
+/// wlroots keeps one process-global, unsynchronized `wl_array` of
+/// buffer-resource interfaces (`buffer_resource_interfaces` in
+/// `types/buffer/resource.c`). `wlr_buffer_register_resource_interface` —
+/// reached from `init_graphics`, via the shm/linux-dmabuf/wl_drm globals —
+/// grows it with `wl_array_add`, which *reallocs*, while
+/// `wlr_buffer_try_from_resource` walks it from every running compositor's
+/// `wl_surface.attach` handler. Neither side takes a lock.
+///
+/// `tests/client_protocol.rs` hits the full version of this hazard (it has
+/// real clients attaching real buffers) and segfaulted about one run in six
+/// before growing the same lock. Nothing in *this* binary ever attaches a
+/// buffer, so the read side is absent and no crash has been observed here —
+/// but two first boots racing each other's `wl_array_add` and dedup walk is
+/// the same unsynchronized write, so the file is latently flaky rather than
+/// safe. Three lines, duplicated rather than shared because each
+/// integration test file is its own binary with its own statics.
+///
+/// Only creation is serialized: every `run_all` below still runs in
+/// parallel. See `tests/support/mod.rs`'s `BOOT_LOCK` for the full argument,
+/// including the constraint that it holds only while every boot in the
+/// process registers the identical static interface set.
+static BOOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`BOOT_LOCK`] (and set the headless environment) for the duration
+/// of one compositor's creation. `drop` the returned guard once the
+/// display/backend/runtime triple exists.
+///
+/// A guard rather than a `boot_headless() -> (Display, Backend, Runtime)`
+/// helper because `wlr::Backend<'a>` borrows the `Display`'s event loop, so
+/// the triple cannot leave the scope that created it.
+fn boot_lock() -> std::sync::MutexGuard<'static, ()> {
+    ensure_headless_env();
+    BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn a_headless_compositor_boots_runs_and_stops() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
     runtime.init_graphics(&display, &backend).expect("graphics");
     runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
     runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
 
     // `state` is declared (and so, by ordinary end-of-scope drop order, is
     // dropped) after `display`/`backend`/`runtime`: `attach` below gives
@@ -127,11 +164,11 @@ fn a_headless_compositor_boots_runs_and_stops() {
 
 #[test]
 fn the_shutdown_source_stops_the_loop() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
+    drop(boot);
 
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
@@ -165,11 +202,11 @@ fn the_shutdown_source_stops_the_loop() {
 /// up."
 #[test]
 fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
+    drop(boot);
 
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
@@ -219,11 +256,11 @@ fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
 /// something regresses.
 #[test]
 fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
+    drop(boot);
 
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
@@ -308,11 +345,11 @@ fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
 /// restore it) before being checked in passing.
 #[test]
 fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
+    drop(boot);
 
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
@@ -389,14 +426,14 @@ fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
 fn an_ssd_window_with_no_live_toplevel_never_gets_a_rect() {
     use icedtea_compositor::wayland::ToplevelKey;
 
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
     runtime.init_graphics(&display, &backend).expect("graphics");
     runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
     runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut state = State::new(icedtea_config::default_config(), tx);
