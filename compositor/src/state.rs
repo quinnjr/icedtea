@@ -125,6 +125,11 @@ pub struct State {
     /// by the drag machine (Task 9); this is the geometry hook `render.rs`
     /// consumes.
     pub snap_preview: Option<icedtea_contract::Rectangle>,
+    /// The scene rect node backing `snap_preview`, or `None` when no drag is
+    /// showing one. Reconciled by `sync_snap_preview`, which must run
+    /// immediately after every `snap_preview` assignment -- see that
+    /// method's doc.
+    snap_preview_rect: Option<wlr::RectId>,
     /// Output geometries keyed by output index. Used by fullscreen toggle.
     pub outputs: HashMap<u32, OutputSurface>,
     /// The next index `new_output` hands out. Monotonic, never reused --
@@ -391,6 +396,7 @@ impl State {
             start_time: Instant::now(),
             wallpaper: WallpaperState::new(),
             snap_preview: None,
+            snap_preview_rect: None,
             outputs: HashMap::new(),
             next_output_index: 0,
             turns: 0,
@@ -508,6 +514,20 @@ impl State {
     /// with nothing changed just re-sets each node's position/size and
     /// re-lowers it, which are all no-ops on an already-correct scene.
     ///
+    /// **Contract (task 7/14): nodes are never pixel-refreshed in place.**
+    /// The existing-node branch below only repositions/resizes; it never
+    /// calls `update_buffer` (or re-creates the node) to show a *different*
+    /// image's pixels under an unchanged output index. That branch was
+    /// unreachable until task 14 gave `apply_reloaded_config` a wallpaper
+    /// swap path -- reachable now, so the contract has to be stated rather
+    /// than left implicit: a wallpaper change must clear first
+    /// (`wallpaper.set_decoded(None)` + a call here to tear every node
+    /// down) before the fresh decode's result calls this again to rebuild
+    /// them. `apply_reloaded_config` enforces exactly that ordering; nothing
+    /// here checks it, so a caller that skips the clear would silently keep
+    /// showing the old image at the old node's size/position rather than
+    /// picking up the new one.
+    ///
     /// Called whenever either side of the sync could have changed: a fresh
     /// decode landing (`drain_wallpaper`), or the output set changing
     /// (`OutputHandler::new_output`/`destroyed`). Not a model mutation --
@@ -577,6 +597,46 @@ impl State {
         for index in gone {
             if let Some(node) = self.wallpaper_nodes.remove(&index) {
                 runtime.remove_buffer(node);
+            }
+        }
+    }
+
+    /// Reconcile the snap-preview scene rect with `self.snap_preview`:
+    /// create it (accent color at 35% alpha, premultiplied) the moment a
+    /// drag starts showing a target, reposition/resize it in place as the
+    /// target changes, and remove it the moment there is no longer one to
+    /// show.
+    ///
+    /// Call this immediately after every assignment to `snap_preview` --
+    /// the two fields are meant to be read as one unit, and nothing else
+    /// keeps them in sync. With no runtime attached (every unit test that
+    /// never calls `wayland.attach`) this is a no-op, the same degradation
+    /// `sync_wallpaper_nodes` documents for the identical reason: there is
+    /// no `RectId` a real call could have returned to put in
+    /// `snap_preview_rect`.
+    pub fn sync_snap_preview(&mut self) {
+        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+        match self.snap_preview {
+            Some(rect) => match self.snap_preview_rect {
+                Some(id) => {
+                    runtime.set_rect_position(id, rect.x, rect.y);
+                    runtime.set_rect_size(id, rect.width, rect.height);
+                }
+                None => {
+                    let color = premultiply(
+                        render::hex_to_rgba(&self.config.appearance.palette.accent),
+                        0.35,
+                    );
+                    if let Ok(id) = runtime.add_rect(rect.width, rect.height, color) {
+                        runtime.set_rect_position(id, rect.x, rect.y);
+                        self.snap_preview_rect = Some(id);
+                    }
+                }
+            },
+            None => {
+                if let Some(id) = self.snap_preview_rect.take() {
+                    runtime.remove_rect(id);
+                }
             }
         }
     }
@@ -1133,6 +1193,11 @@ impl State {
     /// events, for callers (like `reload_config_from_disk`'s test) that want
     /// to inspect what was produced.
     pub fn apply_reloaded_config(&mut self, cfg: Config) -> Vec<Event> {
+        // Captured before `apply_config` overwrites `self.config` -- this is
+        // the only way to tell whether the wallpaper *path* changed rather
+        // than merely being reapplied.
+        let old_wallpaper = self.config.appearance.wallpaper.clone();
+
         let events = self.apply_config(cfg);
         // Review finding I2: these used to be extended onto a separate
         // `pending_config_events` vec that bypassed the sequence counter
@@ -1145,6 +1210,38 @@ impl State {
         for ev in &events {
             self.window_manager.push_event(ev.clone());
         }
+
+        // Task 14 gap-close: `apply_config` swaps `self.config` in but never
+        // touched anything downstream of it -- the background rect kept the
+        // old color, a wallpaper path change never re-decoded, and
+        // (already covered above via `apply_config`'s own
+        // `input::warn_about_keybindings` call) keybinding revalidation was
+        // the one piece that already worked.
+        if let Some(bg) = self.background
+            && let Some(runtime) = self.wayland.runtime()
+        {
+            runtime.set_rect_color(bg, render::wallpaper_color(&self.config.appearance));
+        }
+        if self.config.appearance.wallpaper != old_wallpaper {
+            // Carried-forward obligation (task 7 review): clear the decoded
+            // image and tear down every wallpaper node *before* the fresh
+            // decode can land, so `sync_wallpaper_nodes`'s existing-node
+            // branch (which never refreshes pixels in place -- see its own
+            // doc) is never asked to show stale pixels under a new path.
+            self.wallpaper.set_decoded(None);
+            self.sync_wallpaper_nodes();
+            let path = self.config.appearance.wallpaper.clone();
+            self.spawn_wallpaper(path);
+        }
+        // `apply_config` already discarded every window (emitting
+        // `WindowClosed` for each, folded into `events` above), so there is
+        // nothing left to re-sync here in practice -- but this stays
+        // unconditional rather than special-cased on "did anything survive"
+        // so a future reload that stops destroying windows gets the
+        // palette/bar-color re-sync for free instead of silently needing a
+        // second gap-close task.
+        self.sync_scene();
+
         self.emit_pending();
         events
     }
@@ -1598,6 +1695,7 @@ impl State {
         }
         self.alt_tab = input::AltTabMachine::new();
         self.snap_preview = None;
+        self.sync_snap_preview();
 
         let next_id_floor = self.window_manager.next_id();
         let seq_floor = self.window_manager.seq();
@@ -1753,6 +1851,7 @@ impl State {
         // `handle_pointer_release` can only ever produce a plain move.
         if !self.config.behavior.snap_enabled {
             self.snap_preview = None;
+            self.sync_snap_preview();
             return Some(());
         }
         self.drag.motion(pointer, output_geo, threshold);
@@ -1760,6 +1859,7 @@ impl State {
             .drag
             .preview_zone()
             .map(|zone| layout::snapped_geometry(output_geo, zone, self.config.appearance.snap_gap));
+        self.sync_snap_preview();
         Some(())
     }
 
@@ -1780,6 +1880,7 @@ impl State {
         let id = self.drag.window_id()?;
         let grab_offset = self.drag.grab_offset();
         self.snap_preview = None;
+        self.sync_snap_preview();
         match self.drag.end() {
             input::DragResult::Snapped(zone) => {
                 self.snap(id, zone)?;
@@ -1900,6 +2001,12 @@ impl State {
 
     pub fn background(&self) -> Option<wlr::RectId> {
         self.background
+    }
+
+    /// The scene rect node currently backing `snap_preview`, if any.
+    /// Introspection for tests -- mirrors `background()`.
+    pub fn snap_preview_rect(&self) -> Option<wlr::RectId> {
+        self.snap_preview_rect
     }
 
     pub fn set_shutdown_source(&mut self, id: wlr::SourceId) {
@@ -2158,8 +2265,12 @@ impl wlr::ToplevelHandler for State {
         let key = crate::wayland::ToplevelKey::new(id);
         if let Some(window_id) = self.wayland.window_for(key) {
             // Remapped after an unmap: the model row survived, so this is a
-            // visibility change rather than a new window.
+            // visibility change rather than a new window. Task 14: the
+            // model itself now tracks that state, so flip it back before
+            // syncing -- otherwise `is_visible`/`alt_tab_entries` would keep
+            // treating a window the client just remapped as still absent.
             tracing::info!(?id, ?window_id, "toplevel remapped");
+            self.window_manager.set_mapped(window_id, true);
             self.sync_window_to_scene(window_id);
             self.emit_pending();
             return;
@@ -2175,34 +2286,37 @@ impl wlr::ToplevelHandler for State {
         // An unmap is not a destroy: the client may map again with the same
         // id. Hide it, and let the model keep the row.
         //
-        // Note what this deliberately does *not* do: the model itself has no
-        // "unmapped" concept, only workspace visibility and minimization --
-        // `window_manager.get(window)` still returns the row, `is_visible`
-        // and `focused` are whatever they already were, and `is_backed`
-        // stays `true`. `set_visible(window, false)` only reaches the
-        // client's scene node; nothing here clears the model's own focus
-        // *pointer* -- that is left ledgered, deliberately: changing what
-        // the model itself considers "focused" on an unmap would be a model
-        // semantics change, and this task doesn't make one.
+        // Task 14: the model now has its own "unmapped" concept
+        // (`Window::mapped`, `WindowManager::set_mapped`) instead of the
+        // ledgered gap task 11 documented here -- `is_visible` and
+        // `alt_tab_entries` both gate on it, and `focus`/
+        // `focus_mru_in_workspace` refuse an unmapped window as a candidate.
+        // So an unmap that hits the focused window now really does move
+        // focus to the next mapped candidate on the same workspace, the
+        // same way `set_minimized_and_reconcile` already does for
+        // minimizing the focused window; `window_manager.get(window)` still
+        // returns the row (unchanged geometry/title/etc, per `set_mapped`'s
+        // own doc), and `is_backed` stays `true` -- only mapped-ness and
+        // its consequences on visibility/focus change.
         //
-        // What task 11 *does* close is the seat trap this comment used to
-        // describe and leave open: `sync_seat_focus`'s filters (visibility +
-        // `is_backed`) can't tell an unmapped-but-still-"visible"-by-model
-        // window from a mapped one, so without re-deriving the seat's
-        // target here, a focused window's keyboard focus survived its own
-        // unmap pointed at a surface the client just told wlroots to stop
-        // showing. The call below re-runs that derivation right after the
-        // hide: if `window` was the focused one, `keyboard_focus` resolves
-        // it, `Runtime::focus_toplevel_keyboard` refuses it (the surface is
-        // unmapped -- see that method's doc), and its `None` fallback
-        // (`Wayland::keyboard_focus`'s doc, task 11's fix-round item 2)
-        // clears the seat's keyboard focus instead of leaving it pointed at
-        // a hidden surface.
+        // The seat trap task 11 closed still matters here too:
+        // `sync_focus_change` re-derives keyboard focus from the model
+        // (`sync_seat_focus`, at the tail of `sync_window_to_scene` or
+        // directly when nothing is focused), so a focused window unmapping
+        // with nothing to hand focus to still clears the seat rather than
+        // leaving it pointed at a hidden surface.
         tracing::info!(?id, "toplevel unmapped");
         let key = crate::wayland::ToplevelKey::new(id);
         let Some(window) = self.wayland.window_for(key) else { return };
         self.wayland.set_visible(window, false);
-        self.sync_seat_focus();
+        let previous = self.focused_id();
+        self.window_manager.set_mapped(window, false);
+        if previous == Some(window) {
+            let active = self.window_manager.active_workspace();
+            self.window_manager.focus_mru_in_workspace(active);
+        }
+        self.sync_focus_change(previous);
+        self.emit_pending();
     }
 
     fn title_changed(&mut self, toplevel: &wlr::Toplevel<'_>) {
@@ -3868,5 +3982,152 @@ mod tests {
                 assert!(*channel <= color[3] + f32::EPSILON, "{color:?} is not premultiplied");
             }
         }
+    }
+
+    // --- Task 14: snap preview rect, model-level unmapped, reload gap-close ---
+
+    /// Without a runtime attached, `sync_snap_preview` is a seam no-op both
+    /// ways -- but the `Option` field must still mirror `snap_preview`
+    /// exactly (no stale id kept). The runtime-backed version of this test
+    /// lives in `tests/headless_boot.rs`.
+    #[test]
+    fn snap_preview_rect_bookkeeping_follows_the_preview() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.snap_preview = Some(Rectangle { x: 0, y: 0, width: 400, height: 600 });
+        state.sync_snap_preview();
+        state.snap_preview = None;
+        state.sync_snap_preview();
+        assert!(state.snap_preview_rect.is_none());
+    }
+
+    /// Task 14 Step 2: `ToplevelHandler::unmapped` now moves focus to the
+    /// next mapped candidate on the same workspace when it unmaps the
+    /// focused window, the same shape `set_minimized_and_reconcile` already
+    /// gives minimizing the focused window.
+    #[test]
+    fn unmapping_the_focused_window_moves_focus_to_the_next_candidate() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 1, DEFAULT_GEO);
+        let key_b = crate::wayland::ToplevelKey::for_test(2);
+        state.wayland.bind(b, key_b);
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(b));
+
+        wlr::ToplevelHandler::unmapped(&mut state, key_b.0);
+
+        assert_eq!(state.window_manager.get(b).map(|w| w.mapped), Some(false));
+        assert_eq!(
+            state.window_manager.focused_window().map(|w| w.id),
+            Some(a),
+            "focus must fall to the next mapped candidate"
+        );
+    }
+
+    /// Step 2's focus-refusal decision, exercised through the D-Bus surface:
+    /// `Focus` on an unmapped window's id must refuse, not remap-safely
+    /// no-op.
+    #[test]
+    fn handle_command_focus_refuses_an_unmapped_window() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        state.window_manager.set_mapped(a, false).unwrap();
+        assert_eq!(
+            state.handle_command(crate::dbus::DbCommand::Focus(a)),
+            None,
+            "an unmapped window must never be focused via D-Bus either"
+        );
+    }
+
+    /// Baseline DBus surface audit (Step 3): `GetState` had no direct
+    /// `handle_command` test anywhere in the workspace -- the round trip is
+    /// via `reply_tx`, not the model, so nothing else in this file happened
+    /// to cover it.
+    #[test]
+    fn handle_command_get_state_replies_with_a_snapshot() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        assert_eq!(state.handle_command(crate::dbus::DbCommand::GetState(reply_tx)), Some(()));
+        let snapshot = reply_rx.try_recv().expect("GetState must reply synchronously");
+        assert_eq!(snapshot.windows.len(), 1);
+    }
+
+    /// Baseline DBus surface audit (Step 3): `Quit` likewise had no direct
+    /// `handle_command` test -- every existing coverage went through
+    /// `apply_action("quit")` or sent the command on a channel a live loop
+    /// drains, never `handle_command` itself.
+    #[test]
+    fn handle_command_quit_sets_the_quitting_flag() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert_eq!(state.handle_command(crate::dbus::DbCommand::Quit), Some(()));
+        assert!(state.quitting);
+    }
+
+    /// Reload audit (Step 3): a config with a new background color lands
+    /// through the reload path and `state.config` reflects it. This baseline
+    /// already worked before this task (`apply_config` swaps `self.config`
+    /// wholesale) -- documented here rather than left unasserted.
+    #[test]
+    fn reload_applies_appearance_to_live_state() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let mut cfg = default_config();
+        cfg.appearance.palette.background = "#ff0000".into();
+        state.apply_reloaded_config(cfg);
+        assert_eq!(state.config.appearance.palette.background, "#ff0000");
+    }
+
+    /// Reload audit (Step 3): a reloaded config with an unparseable key
+    /// takes the same warn-and-skip path load-time validation uses
+    /// (`input::warn_about_keybindings`, already called from `apply_config`)
+    /// rather than panicking or poisoning the rest of the map.
+    #[test]
+    fn reload_revalidates_keybindings() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let mut cfg = default_config();
+        cfg.keybindings.insert(
+            "broken".into(),
+            icedtea_config::KeyCombo { modifiers: vec![], key: "NoSuchKeysym".into() },
+        );
+        state.apply_reloaded_config(cfg);
+        // Surviving proof: the compositor did not panic and a real binding
+        // still resolves to a real keysym.
+        let combo = &state.config.keybindings["quit"];
+        assert!(crate::input::key_name_to_keysym(&combo.key) != 0);
+    }
+
+    /// Reload gap-close (Step 3): an `appearance.wallpaper` path change
+    /// clears the decoded image so no stale pixels survive under the new
+    /// path -- the fresh decode is spawned but this test doesn't wait on it
+    /// (the point under test is that the *old* image is gone immediately,
+    /// not that the new one has landed yet).
+    #[test]
+    fn reload_swaps_the_wallpaper_when_the_path_changed() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.wallpaper.set_decoded(Some(image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]))));
+        let mut cfg = default_config();
+        cfg.appearance.wallpaper = Some("/nonexistent/new.png".into());
+        state.apply_reloaded_config(cfg);
+        assert!(state.wallpaper.decoded().is_none(), "stale wallpaper must not survive a path change");
+    }
+
+    /// The wallpaper path staying the same across a reload must not tear
+    /// down and respawn the decode worker for no reason.
+    #[test]
+    fn reload_leaves_the_wallpaper_alone_when_the_path_is_unchanged() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([9, 9, 9, 255]));
+        state.wallpaper.set_decoded(Some(image.clone()));
+        let cfg = default_config(); // same (absent) wallpaper as boot
+        state.apply_reloaded_config(cfg);
+        assert_eq!(state.wallpaper.decoded(), Some(&image), "an unrelated reload must not clear the wallpaper");
     }
 }

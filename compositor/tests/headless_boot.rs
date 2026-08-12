@@ -870,3 +870,40 @@ fn a_decoded_wallpaper_gets_one_buffer_node_per_output() {
         "a second sync with nothing changed keeps the node count stable"
     );
 }
+
+/// Task 14, runtime-backed half of `snap_preview_rect_bookkeeping_follows_
+/// the_preview`: with a live scene graph, setting `snap_preview` and
+/// syncing really does create a rect, and clearing it really does remove
+/// it. Needs only `init_graphics` (`add_rect` is root-level, unlike the
+/// wallpaper buffer nodes above, so no output is required at all).
+#[test]
+fn snap_preview_rect_is_created_and_torn_down_against_a_live_scene() {
+    let boot = boot_lock();
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime);
+
+    assert!(state.snap_preview_rect().is_none());
+
+    state.snap_preview = Some(icedtea_contract::Rectangle { x: 10, y: 20, width: 400, height: 600 });
+    state.sync_snap_preview();
+    assert!(state.snap_preview_rect().is_some(), "a preview target must create a rect");
+
+    // Reposition: the same rect id is kept, not recreated.
+    let id = state.snap_preview_rect().unwrap();
+    state.snap_preview = Some(icedtea_contract::Rectangle { x: 30, y: 40, width: 500, height: 700 });
+    state.sync_snap_preview();
+    assert_eq!(state.snap_preview_rect(), Some(id), "a changed target repositions, does not recreate");
+
+    state.snap_preview = None;
+    state.sync_snap_preview();
+    assert!(state.snap_preview_rect().is_none(), "clearing the preview must remove the rect");
+}

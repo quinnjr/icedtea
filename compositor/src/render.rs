@@ -169,6 +169,7 @@ mod tests {
             minimized: false,
             fullscreen: false,
             focused: true,
+            mapped: true,
             client_decorations_requested: None,
         }
     }

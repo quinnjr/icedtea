@@ -275,3 +275,27 @@ fn csd_is_negotiated_for_a_client_that_draws_its_own() {
 
     client.detach();
 }
+
+/// Task 14: a client that unmaps (attaches a null buffer and commits, not a
+/// destroy) releases focus and alt-tab candidacy exactly the way
+/// `ToplevelHandler::unmapped` now does against the model, and the row
+/// survives -- this is `Wayland::keyboard_focus`/`configure` going out to a
+/// *real* second client, which a synthetic `ToplevelKey` cannot exercise.
+#[test]
+fn an_unmapping_client_releases_focus_and_alt_tab() {
+    let comp = Compositor::spawn();
+    let mut first = TestClient::map_toplevel(&comp.socket, "harness.stay", "stays");
+    let mut second = TestClient::map_toplevel(&comp.socket, "harness.go", "goes");
+    // second has focus (latest map wins). Unmap it: attach a null buffer +
+    // commit.
+    second.unmap();
+    assert!(
+        first.wait_until(|c| c.states().contains(&4)), // 4 == activated
+        "focus must return to the surviving client"
+    );
+    let snap = comp.snapshot();
+    assert!(snap.windows.iter().any(|w| w.title == "goes"), "row survives the unmap");
+
+    first.detach();
+    second.detach();
+}

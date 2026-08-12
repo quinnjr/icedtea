@@ -659,6 +659,16 @@ impl TestClient {
         self.conn.flush().expect("flush");
     }
 
+    /// Unmap without destroying: attach a null buffer and commit, exactly
+    /// what a real client does to hide itself while keeping its toplevel
+    /// alive (xdg-shell's "you may attach `null` to unmap" — the model row
+    /// survives this, unlike [`TestClient::detach`]).
+    pub fn unmap(&mut self) {
+        self.surface.attach(None, 0, 0);
+        self.surface.commit();
+        self.conn.flush().expect("flush");
+    }
+
     /// Destroy the toplevel cleanly, in the order xdg-shell requires
     /// (toplevel, then xdg_surface, then the wl_surface), and flush so the
     /// compositor sees it before the connection goes away.
