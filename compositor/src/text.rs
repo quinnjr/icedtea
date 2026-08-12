@@ -35,6 +35,31 @@
 /// show the plain band with no title node over it. That is the spec's
 /// error-handling rule for decorations -- a title that cannot be drawn
 /// degrades the decoration, it never fails the window.
+/// The most bytes of `text` this function will ever hand to cosmic-text for
+/// shaping (finding 3, security): a client's `xdg_toplevel.set_title` is
+/// otherwise unbounded, and the title band clips the result visually
+/// regardless of how long the string is, so nothing past this point could
+/// ever be seen -- only shaped, at whatever cost an adversarial or buggy
+/// client's string imposes. Comfortably longer than any title a real band
+/// could show even at the smallest sane font size, short enough that
+/// shaping it is not itself a way to burn CPU on every `set_title`.
+pub(crate) const MAX_TITLE_BYTES: usize = 512;
+
+/// `text` truncated to at most [`MAX_TITLE_BYTES`] bytes, on a `char`
+/// boundary -- never splitting a multi-byte UTF-8 sequence, which would
+/// otherwise hand cosmic-text (or a `str` slice) invalid input for a title
+/// ending mid-codepoint.
+pub(crate) fn cap_title(text: &str) -> &str {
+    if text.len() <= MAX_TITLE_BYTES {
+        return text;
+    }
+    let mut end = MAX_TITLE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 pub fn rasterize_title(
     fonts: &mut cosmic_text::FontSystem,
     swash: &mut cosmic_text::SwashCache,
@@ -47,6 +72,7 @@ pub fn rasterize_title(
     if width < 1 || height < 1 {
         return None;
     }
+    let text = cap_title(text);
     use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
 
     // 55% of the band is the usual title-bar proportion (28px band -> ~15px
@@ -168,5 +194,30 @@ mod tests {
         let mut fonts = cosmic_text::FontSystem::new();
         let mut swash = cosmic_text::SwashCache::new();
         assert!(rasterize_title(&mut fonts, &mut swash, "", 200, 28, 8, [255; 4]).is_none());
+    }
+
+    /// Finding 3: an unbounded client title must not reach cosmic-text at
+    /// full length -- a string under the cap passes through untouched, one
+    /// over it is truncated to exactly `MAX_TITLE_BYTES`, and the cut never
+    /// lands mid-codepoint.
+    #[test]
+    fn cap_title_truncates_on_a_char_boundary() {
+        let short = "a normal title";
+        assert_eq!(cap_title(short), short, "under the cap must pass through unchanged");
+
+        let long = "x".repeat(MAX_TITLE_BYTES + 100);
+        let capped = cap_title(&long);
+        assert_eq!(capped.len(), MAX_TITLE_BYTES);
+
+        // A multi-byte character straddling the cap must not be split --
+        // the cut backs off to the nearest earlier char boundary instead of
+        // slicing through the codepoint.
+        let mut straddling = "y".repeat(MAX_TITLE_BYTES - 1);
+        straddling.push('窓'); // 3-byte character landing right at the cap
+        straddling.push_str(&"z".repeat(50));
+        let capped = cap_title(&straddling);
+        assert!(capped.len() <= MAX_TITLE_BYTES);
+        assert!(straddling.is_char_boundary(capped.len()));
+        assert!(capped.chars().all(|c| c != '\u{FFFD}'), "no replacement character from a mid-codepoint cut");
     }
 }

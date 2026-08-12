@@ -108,3 +108,75 @@ fn a_second_headless_output_is_tracked_with_a_layout_box() {
     let disjoint = a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y;
     assert!(disjoint, "the two outputs' layout boxes must not overlap, got {a:?} and {b:?}");
 }
+
+/// [HIGH H4] `sync_wallpaper_nodes`' hot-unplug cleanup branch: a wallpaper
+/// buffer node for an output that is no longer in `state.outputs` (simulating
+/// `OutputHandler::destroyed` having already removed it) must be torn down on
+/// the next sync, not left dangling.
+///
+/// Needs the two-output headless boot this file already sets up
+/// (`WLR_HEADLESS_OUTPUTS=2`): one wallpaper node per output is created first,
+/// then one output is removed from the model directly (the same thing
+/// `OutputHandler::destroyed` does before calling `sync_wallpaper_nodes`), and
+/// a second sync must drop the orphaned node.
+#[test]
+fn sync_wallpaper_nodes_removes_a_node_for_an_output_that_is_gone() {
+    let boot = boot_lock();
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
+
+    // `state` is declared (and so dropped) after `display`/`backend`/`runtime`
+    // for the same reason as every other test in this file.
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime.clone());
+
+    let background = runtime
+        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .expect("background rect");
+    runtime.lower_rect_to_bottom(background);
+    state.set_background(background);
+
+    // The command channel and its wake pipe, used only as this test's
+    // bounded backstop -- gives both headless outputs time to arrive before
+    // asking the loop to stop.
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let _ = cmd_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&cmd_wake_write);
+    });
+
+    backend
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
+        .expect("run_all");
+
+    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+    assert_eq!(state.outputs.len(), 2, "both headless outputs must have reached the model");
+
+    let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 8, 7, 255]));
+    state.wallpaper.set_decoded(Some(image));
+    state.sync_wallpaper_nodes();
+    assert_eq!(state.wallpaper_node_count(), 2, "one buffer node per output");
+
+    // Simulate `OutputHandler::destroyed`: it removes the output from the
+    // model before calling `sync_wallpaper_nodes` (see `state.rs`), so drop
+    // one output out from under the wallpaper node map here directly.
+    let gone_index = *state.outputs.keys().min().expect("at least one output");
+    state.outputs.remove(&gone_index);
+    state.sync_wallpaper_nodes();
+
+    assert_eq!(
+        state.wallpaper_node_count(),
+        1,
+        "the node for the removed output must be torn down on the next sync"
+    );
+}

@@ -158,22 +158,52 @@ pub struct LayerEntry {
 /// two calls need to compute an identical fold, and a second
 /// hand-written copy of this arithmetic is one more place for them to
 /// drift apart.
+///
+/// H2: every arithmetic op here is saturating. `exclusive` is captured
+/// (clamped) at `new_layer_surface`/`layer_surface_commit` before it ever
+/// reaches this function, but this function has no way to enforce that on
+/// its own -- and it folds over every mapped layer entry on every
+/// `arrange_layers`/`usable_before` pass, so a second, defense-in-depth
+/// guard here costs nothing and turns "two large-exclusive panels overflow
+/// `rect.x`/`rect.y`" from a debug-build panic (release: silent i32
+/// wraparound corruption) into a saturated, still-sane rect.
 fn fold_exclusive_zone(mut rect: Rectangle, anchor: wlr::Anchor, exclusive: i32) -> Rectangle {
     if exclusive <= 0 {
         return rect;
     }
     if anchor.top != anchor.bottom {
         if anchor.top {
-            rect.y += exclusive;
+            rect.y = rect.y.saturating_add(exclusive);
         }
-        rect.height = (rect.height - exclusive).max(0);
+        rect.height = rect.height.saturating_sub(exclusive).max(0);
     } else if anchor.left != anchor.right {
         if anchor.left {
-            rect.x += exclusive;
+            rect.x = rect.x.saturating_add(exclusive);
         }
-        rect.width = (rect.width - exclusive).max(0);
+        rect.width = rect.width.saturating_sub(exclusive).max(0);
     }
     rect
+}
+
+/// H2: bound a client-controlled exclusive zone to something sane before it
+/// is stored, so two panels with pathological `exclusive_zone` requests (a
+/// hostile or buggy client can request anything up to `i32::MAX`) cannot
+/// together carve past an output's own extent -- the belt to
+/// `fold_exclusive_zone`'s saturating-arithmetic suspenders. Clamped
+/// against `max(output.width, output.height)`, since a zone only ever
+/// folds a single axis and either axis's whole span is already generous
+/// headroom for a real panel; `None` (no output resolved yet, e.g. the
+/// [`NO_OUTPUT`] sentinel) leaves the value unclamped here and relies
+/// entirely on the saturating fold. `exclusive <= 0` ("reserve nothing",
+/// see [`LayerEntry::exclusive`]'s doc) passes through untouched -- only
+/// the reservation itself is bounded, not the "don't reserve" sentinel
+/// space.
+fn clamp_exclusive_zone(exclusive: i32, output: Option<&OutputSurface>) -> i32 {
+    if exclusive <= 0 {
+        return exclusive;
+    }
+    let bound = output.map(|o| o.geometry.width.max(o.geometry.height)).unwrap_or(i32::MAX);
+    exclusive.min(bound)
 }
 
 /// Whether [`State::sync_seat_focus`] must leave the seat's real keyboard
@@ -263,6 +293,12 @@ fn wallpaper_lower_plan(created: usize, has_background: bool) -> Vec<LowerStep> 
 /// its own size, flush into the corner. A four-edge-anchored 0x0 locker
 /// gets the whole box on both axes.
 fn layer_axis_placement(start: bool, end: bool, desired: u32, origin: i32, span: i32) -> (i32, i32) {
+    // Finding 7, security: `desired` is client-controlled and otherwise
+    // casts straight to `i32` -- a value at or past `i32::MAX` would wrap
+    // negative on the cast, handing a negative "size" into the arithmetic
+    // below. Clamped to the output's own span first: no legitimate panel
+    // needs to claim more than the box it is being placed in.
+    let desired = desired.min(span.max(0) as u32);
     let size = if start && end {
         span
     } else if desired != 0 {
@@ -287,6 +323,17 @@ fn layer_holds_keyboard_focus(
     layers: &HashMap<wlr::LayerSurfaceId, LayerEntry>,
 ) -> bool {
     layer_focus.is_some_and(|id| layers.get(&id).is_some_and(|entry| entry.mapped))
+}
+
+/// Finding 6, testing: the client's `wlr::Edges` -> `input::ResizeEdges`
+/// mapping [`State::begin_client_resize`] uses, extracted as a pure
+/// field-by-field translation so it is unit-testable without a live
+/// `wlr::Runtime` -- `begin_client_resize`'s own success path (a pointer
+/// actually positioned over the window, `pointer_pressed` true) has no
+/// headless-runtime way to inject a pointer position at all, so this
+/// mapping is what stays testable of it.
+fn resize_edges_from_wlr(edges: wlr::Edges) -> input::ResizeEdges {
+    input::ResizeEdges { top: edges.top, bottom: edges.bottom, left: edges.left, right: edges.right }
 }
 
 /// Translate the compositor library's modifier booleans into the model's
@@ -849,11 +896,23 @@ impl State {
             if let Some(&node) = self.wallpaper_nodes.get(index) {
                 runtime.set_buffer_position(node, dest.x, dest.y);
                 runtime.set_buffer_dest_size(node, dest.width, dest.height);
-            } else if let Ok(node) = runtime.add_buffer(width, height, rgba) {
-                runtime.set_buffer_position(node, dest.x, dest.y);
-                runtime.set_buffer_dest_size(node, dest.width, dest.height);
-                created.push(node);
-                self.wallpaper_nodes.insert(*index, node);
+            } else {
+                match runtime.add_buffer(width, height, rgba) {
+                    Ok(node) => {
+                        runtime.set_buffer_position(node, dest.x, dest.y);
+                        runtime.set_buffer_dest_size(node, dest.width, dest.height);
+                        created.push(node);
+                        self.wallpaper_nodes.insert(*index, node);
+                    }
+                    // Finding 5, errors: the failure used to be silently
+                    // dropped, leaving that output with no wallpaper node
+                    // and no trace of why -- named with the output index so
+                    // a multi-output setup's log points at the one output
+                    // actually missing its wallpaper.
+                    Err(err) => {
+                        tracing::warn!(output = index, ?err, "failed to create wallpaper buffer node for output");
+                    }
+                }
             }
         }
         // Review finding C1: every wallpaper node used to be lowered inline
@@ -1004,6 +1063,18 @@ impl State {
             return Some(idx);
         }
         self.output_for_pointer()
+    }
+
+    /// Finding 4, maintainability: the `usable` rect of whatever output
+    /// [`Self::output_for_pointer`] names, extracted once rather than
+    /// inlined at each pointer-correct call site (`snap`,
+    /// `handle_pointer_motion`, `new_toplevel`'s cascade placement) --
+    /// those genuinely run inside a user-initiated, pointer-driven action
+    /// (see `output_for_window`'s own doc for the distinction from a
+    /// client-request/D-Bus path, which is not one of these). `None` when
+    /// no output resolves at all.
+    fn usable_geo_for_pointer(&self) -> Option<Rectangle> {
+        self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)
     }
 
     /// Recompute every output's `usable` rect from its layer surfaces'
@@ -1474,6 +1545,15 @@ impl State {
     /// title runs out of room before it runs under the close button rather
     /// than being drawn beneath it.
     fn ensure_title_raster(&mut self, id: WindowId, title: String, bar: Rectangle, focused: bool) {
+        // Finding 3, security: cap the title before it becomes the cache
+        // key, not just before it reaches `rasterize_title` -- otherwise
+        // two distinct multi-kilobyte titles that agree on their first
+        // `MAX_TITLE_BYTES` bytes would shape identically but still cache
+        // (and compare) as different keys, defeating the point of capping.
+        // `rasterize_title` caps again internally (its own contract, kept
+        // independent of this caller), so this is belt and suspenders on
+        // the same bound, not two different ones.
+        let title = if title.len() > crate::text::MAX_TITLE_BYTES { crate::text::cap_title(&title).to_owned() } else { title };
         let width = (bar.width - 3 * crate::decoration::BUTTON_WIDTH).max(1);
         let height = bar.height.max(1);
 
@@ -1739,7 +1819,16 @@ impl State {
         if w.fullscreen == target {
             return Some(());
         }
-        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
+        // H1: resolved via the window's own frame center
+        // (`output_for_window`), not the pointer -- this is reached from
+        // client requests and `DbCommand::Fullscreen`, neither of which
+        // correlates the pointer with the target window, so the old
+        // `output_for_pointer` call fullscreened onto whatever output the
+        // mouse happened to be resting on. `w.geometry` is read here,
+        // before the borrow on `w` would otherwise need to outlive the
+        // mutable calls below.
+        let geometry = w.geometry;
+        let output_geo = self.output_for_window(geometry).and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
         self.window_manager.set_fullscreen(id, target)?;
         if target {
             // Save current geometry before entering fullscreen
@@ -1772,13 +1861,19 @@ impl State {
     /// `MaximizeWindow` D-Bus method, and the client's own
     /// `xdg_toplevel.set_maximized` were all visual no-ops.
     pub fn set_maximized_target(&mut self, id: WindowId, target: bool) -> Option<()> {
-        if self.window_manager.get(id)?.maximized == target {
+        let w = self.window_manager.get(id)?;
+        if w.maximized == target {
             return Some(());
         }
         // Maximize honors the usable area (panels' exclusive zones carve
         // into it); fullscreen, just below, deliberately keeps the full
         // `geometry` instead.
-        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)?;
+        //
+        // H1: resolved via the window's own frame center
+        // (`output_for_window`), not the pointer -- see
+        // `set_fullscreen_target`'s identical fix just above for why.
+        let geometry = w.geometry;
+        let output_geo = self.output_for_window(geometry).and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)?;
         self.window_manager.set_maximized(id, target)?;
         if target {
             let current = self.window_manager.get(id)?.geometry;
@@ -2288,7 +2383,7 @@ impl State {
         if !self.config.behavior.snap_enabled {
             return None;
         }
-        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)?;
+        let output_geo = self.usable_geo_for_pointer()?;
         let gap = self.config.appearance.snap_gap;
         let current = self.window_manager.get(id)?.geometry;
         self.snap_saved_geometry.entry(id).or_insert(current);
@@ -2516,6 +2611,13 @@ impl State {
     /// `wlr::ToplevelHandler::request_move`'s doc, an interactive move that
     /// never starts is legal, not a protocol violation, so there is nothing
     /// to answer.
+    ///
+    /// Finding 6, testing: the success path (guards pass, `self.drag.begin`
+    /// actually runs) is untested -- it needs a live `wlr::Runtime` to read
+    /// a real `pointer_position()` from, and there is no headless-runtime
+    /// way to inject one in this crate's unit tests, the same gap
+    /// `arrange_layers_leaves_layer_focus_alone_and_unmap_clears_it`
+    /// documents for a live keyboard device.
     fn begin_client_move(&mut self, id: WindowId) {
         if !self.pointer_pressed {
             return;
@@ -2540,8 +2642,14 @@ impl State {
     }
 
     /// Same guards as [`Self::begin_client_move`], for `xdg_toplevel.resize`:
-    /// maps the client's `wlr::Edges` onto `input::ResizeEdges` field-by-field
-    /// and begins the existing `ResizeMachine` grab.
+    /// maps the client's `wlr::Edges` onto `input::ResizeEdges`
+    /// ([`resize_edges_from_wlr`]) and begins the existing `ResizeMachine`
+    /// grab.
+    ///
+    /// Finding 6, testing: same untested-success-path limitation as
+    /// `begin_client_move` -- see its doc. `resize_edges_from_wlr` is
+    /// exactly the part of this method that stays testable without a live
+    /// pointer.
     fn begin_client_resize(&mut self, id: WindowId, edges: wlr::Edges) {
         if !self.pointer_pressed {
             return;
@@ -2553,13 +2661,7 @@ impl State {
             return;
         }
         let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else { return };
-        let resize_edges = input::ResizeEdges {
-            top: edges.top,
-            bottom: edges.bottom,
-            left: edges.left,
-            right: edges.right,
-        };
-        self.resize.begin(id, resize_edges, geo, pointer);
+        self.resize.begin(id, resize_edges_from_wlr(edges), geo, pointer);
     }
 
     /// Pointer motion at `pointer` (output logical coordinates) during an
@@ -2577,7 +2679,7 @@ impl State {
             return Some(());
         }
         self.drag.window_id()?;
-        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)?;
+        let output_geo = self.usable_geo_for_pointer()?;
         let threshold = self.config.appearance.snap_gap.max(1) * 4;
         // Review finding I3: with snapping disabled the drag machine is
         // never told about zones at all, so no preview is staged *and*
@@ -2648,9 +2750,7 @@ impl State {
             .map(|w| w.geometry)
             .collect();
         let output_geo = self
-            .output_for_pointer()
-            .and_then(|idx| self.outputs.get(&idx))
-            .map(|o| o.usable)
+            .usable_geo_for_pointer()
             .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
         // Review finding M7: cascade positions wrap inside the output (and
         // count only this workspace's windows) so the Nth window can't open
@@ -3227,6 +3327,9 @@ impl wlr::ToplevelHandler for State {
             .or_else(|| self.output_for_pointer());
         let sequence = self.next_layer_sequence;
         self.next_layer_sequence += 1;
+        // H2: bound the client-controlled exclusive zone at capture time --
+        // see `clamp_exclusive_zone`'s own doc.
+        let exclusive = clamp_exclusive_zone(surface.exclusive_zone(), output.and_then(|idx| self.outputs.get(&idx)));
         self.layers.insert(
             id,
             LayerEntry {
@@ -3234,7 +3337,7 @@ impl wlr::ToplevelHandler for State {
                 sequence,
                 layer: surface.layer(),
                 anchor: surface.anchor(),
-                exclusive: surface.exclusive_zone(),
+                exclusive,
                 size: surface.desired_size(),
                 // Always `false` here regardless of what the client asked
                 // for -- `keyboard_interactive` reads `current`, which is
@@ -3267,10 +3370,15 @@ impl wlr::ToplevelHandler for State {
     /// in this file takes.
     fn layer_surface_commit(&mut self, surface: &wlr::LayerSurface<'_>) {
         let id = surface.id();
+        let Some(output_idx) = self.layers.get(&id).map(|e| e.output) else { return };
+        // H2: bound the client-controlled exclusive zone at capture time --
+        // see `clamp_exclusive_zone`'s own doc. Looked up before the
+        // `entry` borrow below, since both read `self.outputs`.
+        let exclusive = clamp_exclusive_zone(surface.exclusive_zone(), self.outputs.get(&output_idx));
         let Some(entry) = self.layers.get_mut(&id) else { return };
         entry.layer = surface.layer();
         entry.anchor = surface.anchor();
-        entry.exclusive = surface.exclusive_zone();
+        entry.exclusive = exclusive;
         entry.size = surface.desired_size();
         entry.interactive = surface.keyboard_interactive();
         self.configure_layer(id);
@@ -3299,6 +3407,12 @@ impl wlr::ToplevelHandler for State {
         let Some(runtime) = self.wayland.runtime() else { return };
         if runtime.focus_layer_keyboard(id).is_some() {
             self.layer_focus = Some(id);
+        } else {
+            // Finding 8, errors: an interactive panel that just mapped and
+            // failed to take keyboard focus used to fail silently, leaving
+            // no trace of why an auto-hide launcher/locker never got
+            // keyboard input.
+            tracing::debug!(?id, "interactive layer surface mapped but did not take keyboard focus");
         }
     }
 
@@ -4149,6 +4263,47 @@ mod tests {
         assert_eq!(state.window_manager.get(id).unwrap().geometry, maximized);
         state.handle_command(crate::dbus::DbCommand::Maximize(id, false)).unwrap();
         assert_eq!(state.window_manager.get(id).unwrap().geometry, original, "the restore point survived the no-op");
+    }
+
+    /// H1: `set_maximized_target` resolves the output via the window's own
+    /// frame center (`output_for_window`), not the pointer -- with two
+    /// outputs and no runtime attached, `output_for_pointer`'s own fallback
+    /// is the *lowest* index (output 0), which is exactly the wrong output
+    /// for a window that lives on output 1. Reached from client requests
+    /// and `DbCommand::Maximize`, neither of which carries any pointer
+    /// correlation with the target window at all.
+    #[test]
+    fn set_maximized_target_resolves_via_the_windows_own_output_not_the_pointer() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.config.appearance.snap_gap = 0;
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 810, y: 10, width: 300, height: 200 });
+        state.set_maximized_target(id, true).unwrap();
+
+        let geo = state.window_manager.get(id).unwrap().geometry;
+        assert_eq!(geo, state.outputs[&1].usable, "must maximize onto output 1's usable rect, not output 0's");
+        assert!(geo.x >= 800, "must not have resolved onto output 0, got {geo:?}");
+    }
+
+    /// H1's fullscreen counterpart: `set_fullscreen_target` resolves via the
+    /// window's own frame center too, and keeps `.geometry` (not `.usable`)
+    /// once it does -- fullscreen covers panels by definition.
+    #[test]
+    fn set_fullscreen_target_resolves_via_the_windows_own_output_not_the_pointer() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 810, y: 10, width: 300, height: 200 });
+        state.set_fullscreen_target(id, true).unwrap();
+
+        let geo = state.window_manager.get(id).unwrap().geometry;
+        assert_eq!(geo, state.outputs[&1].geometry, "must fullscreen onto output 1's geometry, not output 0's");
+        assert!(geo.x >= 800, "must not have resolved onto output 0, got {geo:?}");
     }
 
     /// Re-review Important 1: `DbCommand::Minimize` goes through the same
@@ -5405,6 +5560,41 @@ mod tests {
         assert!(layer_holds_keyboard_focus(Some(id), &layers), "a mapped entry must block the model's own focus");
     }
 
+    /// Finding 6: `resize_edges_from_wlr`'s field-by-field mapping, for
+    /// every single edge and every corner (two edges at once) --
+    /// `begin_client_resize`'s own success path has no headless way to
+    /// exercise (see that method's doc), so this is the pure part of it
+    /// that stays directly testable.
+    #[test]
+    fn resize_edges_from_wlr_maps_every_edge_and_corner() {
+        let none = wlr::Edges::default();
+        assert_eq!(resize_edges_from_wlr(none), input::ResizeEdges { top: false, bottom: false, left: false, right: false });
+
+        let top = wlr::Edges { top: true, ..none };
+        assert_eq!(resize_edges_from_wlr(top), input::ResizeEdges { top: true, bottom: false, left: false, right: false });
+
+        let bottom = wlr::Edges { bottom: true, ..none };
+        assert_eq!(resize_edges_from_wlr(bottom), input::ResizeEdges { top: false, bottom: true, left: false, right: false });
+
+        let left = wlr::Edges { left: true, ..none };
+        assert_eq!(resize_edges_from_wlr(left), input::ResizeEdges { top: false, bottom: false, left: true, right: false });
+
+        let right = wlr::Edges { right: true, ..none };
+        assert_eq!(resize_edges_from_wlr(right), input::ResizeEdges { top: false, bottom: false, left: false, right: true });
+
+        let top_left = wlr::Edges { top: true, left: true, ..none };
+        assert_eq!(resize_edges_from_wlr(top_left), input::ResizeEdges { top: true, bottom: false, left: true, right: false });
+
+        let top_right = wlr::Edges { top: true, right: true, ..none };
+        assert_eq!(resize_edges_from_wlr(top_right), input::ResizeEdges { top: true, bottom: false, left: false, right: true });
+
+        let bottom_left = wlr::Edges { bottom: true, left: true, ..none };
+        assert_eq!(resize_edges_from_wlr(bottom_left), input::ResizeEdges { top: false, bottom: true, left: true, right: false });
+
+        let bottom_right = wlr::Edges { bottom: true, right: true, ..none };
+        assert_eq!(resize_edges_from_wlr(bottom_right), input::ResizeEdges { top: false, bottom: true, left: false, right: true });
+    }
+
     /// J3's wiring: with an interactive panel holding `layer_focus` and a
     /// maximized window present (so `arrange_layers` has something to
     /// re-sync -- the exact path that used to reassert toplevel focus over
@@ -5482,6 +5672,46 @@ mod tests {
             Rectangle { x: 0, y: 0, width: 800, height: 600 },
             "an unmapped earlier entry must not shrink a later panel's placement base"
         );
+    }
+
+    /// H2: two panels each requesting a pathologically large
+    /// `exclusive_zone` (well past the output's own extent -- what a
+    /// hostile or buggy client can ask for) must not panic
+    /// (`rect.y += exclusive` overflowing `i32` in a debug build) or wrap
+    /// into a corrupted rect in release; `usable` must saturate at a sane,
+    /// non-negative box instead.
+    #[test]
+    fn two_large_exclusive_top_panels_do_not_overflow_or_panic() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+
+        let first = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(first, LayerEntry { sequence: 0, exclusive: i32::MAX, ..top_panel_entry(i32::MAX, true) });
+        let second = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(second, LayerEntry { sequence: 1, exclusive: i32::MAX, ..top_panel_entry(i32::MAX, true) });
+
+        state.arrange_layers();
+
+        let usable = state.outputs[&0].usable;
+        assert!(usable.height >= 0, "height must never go negative, got {usable:?}");
+        assert!(usable.width >= 0, "width must never go negative, got {usable:?}");
+        assert!(usable.y >= 0, "y must stay a sane, saturated value, got {usable:?}");
+    }
+
+    /// H2: the exclusive zone is also clamped where it is captured --
+    /// `new_layer_surface`/`layer_surface_commit` -- not only where it is
+    /// folded, so `LayerEntry::exclusive` itself never holds a
+    /// pathological value in the first place. `clamp_exclusive_zone`'s
+    /// contract directly, since a client-supplied `wlr::LayerSurface` has
+    /// no test constructor for `exclusive_zone()`.
+    #[test]
+    fn clamp_exclusive_zone_bounds_a_positive_value_to_the_outputs_extent() {
+        let output = OutputSurface::new(Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        assert_eq!(clamp_exclusive_zone(i32::MAX, Some(&output)), 800, "clamped to max(width, height)");
+        assert_eq!(clamp_exclusive_zone(30, Some(&output)), 30, "a sane value passes through unchanged");
+        assert_eq!(clamp_exclusive_zone(-5, Some(&output)), -5, "a non-positive sentinel is never touched");
+        assert_eq!(clamp_exclusive_zone(i32::MAX, None), i32::MAX, "no output resolved yet: left to the saturating fold");
     }
 
     // --- Task 20 re-review: Important-1, Minor-1 ---
@@ -5823,6 +6053,46 @@ mod tests {
         );
         state.configure_layer(id);
         assert_eq!(state.layers[&id].last_configured, Some((400, 200, 200, 200)));
+    }
+
+    /// Finding 7, security: a client-supplied `desired` size that dwarfs
+    /// the output (up to `u32::MAX`) must not wrap negative on the `as
+    /// i32` cast -- clamped to the output's own span first, `configure_layer`
+    /// must never hand wlroots a negative width/height.
+    #[test]
+    fn a_pathologically_large_desired_size_is_clamped_to_the_output() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: false, bottom: false, left: false, right: false },
+                exclusive: 0,
+                size: (u32::MAX, u32::MAX),
+                interactive: true,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        let (w, h, _, _) = state.layers[&id].last_configured.unwrap();
+        assert_eq!(w, 800, "width must clamp to the output's own span, not wrap negative");
+        assert_eq!(h, 600, "height must clamp to the output's own span, not wrap negative");
+    }
+
+    /// `layer_axis_placement` directly, for the same clamp: `desired` past
+    /// `span` is bounded to `span` before the cast, whichever of `start`/
+    /// `end` is set.
+    #[test]
+    fn layer_axis_placement_clamps_desired_to_the_span() {
+        assert_eq!(layer_axis_placement(false, false, u32::MAX, 0, 800), (800, 0));
+        assert_eq!(layer_axis_placement(true, false, u32::MAX, 0, 800), (800, 0), "flush start, still clamped");
+        assert_eq!(layer_axis_placement(false, true, u32::MAX, 0, 800), (800, 0), "flush end, still clamped");
     }
 
     // --- Final review I1: a remapped layer surface must be reconfigured ---

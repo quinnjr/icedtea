@@ -401,13 +401,15 @@ fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
     );
 }
 
-/// Review finding I2: the SSD title-bar band is painted as a scene rect,
-/// tracked one-per-window at the seam the same way toplevel bindings are.
+/// Review finding I2: the SSD title-bar band, its three buttons, and its
+/// title raster are painted as scene nodes, tracked one-per-window at the
+/// seam the same way toplevel bindings are.
 ///
-/// wlr 0.20.5's `Runtime::add_rect_in_toplevel` parents the band into the
-/// *toplevel's own* scene tree (closing the z-order defect structurally --
-/// see `Wayland::sync_ssd_rect`'s doc), which means it needs a live
-/// `ToplevelId` wlroots itself issued, not one of `ToplevelKey::for_test`'s
+/// wlr 0.20.5's `Runtime::add_rect_in_toplevel` parents the band (and
+/// `add_rect_in_toplevel`/`add_buffer_in_toplevel` the buttons and title)
+/// into the *toplevel's own* scene tree (closing the z-order defect
+/// structurally -- see `Wayland::sync_ssd`'s doc), which means it needs a
+/// live `ToplevelId` wlroots itself issued, not one of `ToplevelKey::for_test`'s
 /// dangling ids: `dangling_nth_for_test`'s own contract is that *no* live
 /// toplevel, real or fake, can ever have that id, so `add_rect_in_toplevel`
 /// always misses on one by design. This test harness drives handler entry
@@ -418,9 +420,9 @@ fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
 /// reachable, and worth pinning, is that the seam stays a silent no-op
 /// (never panics, never leaves a stale map entry) when asked to paint a band
 /// for a window whose toplevel id doesn't resolve, exactly as every other
-/// by-id `Wayland` method already behaves. The pure position math
-/// `sync_ssd_rect` must feed `add_rect_in_toplevel`/`set_rect_position` is
-/// covered directly in `wayland.rs`'s own unit tests
+/// by-id `Wayland` method already behaves. The pure position math `sync_ssd`
+/// must feed `add_rect_in_toplevel`/`set_rect_position` for the band and
+/// buttons is covered directly in `wayland.rs`'s own unit tests
 /// (`ssd_rect_relative_offset_is_zero_minus_titlebar`).
 #[test]
 fn an_ssd_window_with_no_live_toplevel_never_gets_a_rect() {
@@ -915,4 +917,50 @@ fn snap_preview_rect_is_created_and_torn_down_against_a_live_scene() {
     state.snap_preview = None;
     state.sync_snap_preview();
     assert!(state.snap_preview_rect().is_none(), "clearing the preview must remove the rect");
+}
+
+/// [HIGH H5] `migrate_windows_from`'s oversized-window clamp guard: when the
+/// migrated window's frame is wider and/or taller than the surviving output,
+/// `(survivor.x + offset).clamp(survivor.x, survivor.x + survivor.width -
+/// geometry.width)` would hand `clamp` a `max` bound below its `min` bound
+/// and panic. The `if geometry.width >= survivor.width { survivor.x } else
+/// { ... }` guard (and its height counterpart) exists to take the window's
+/// origin straight to the survivor's own origin on that axis instead of ever
+/// reaching the clamp -- every other migration test uses a window (300x200)
+/// smaller than its survivor (800x600) on both axes, so this branch has never
+/// run. No runtime needed: `migrate_windows_from` and the model-only window
+/// this test uses (see `windows_migrate_off_a_removed_output` in
+/// `state.rs`'s own unit tests for the identical no-runtime pattern) never
+/// touch `wlr`.
+#[test]
+fn migration_clamps_an_oversized_window_into_the_survivor_without_panicking() {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+
+    // The dead output the oversized window is currently on.
+    state.create_output(1, icedtea_contract::Rectangle { x: 800, y: 0, width: 1000, height: 800 });
+    // The surviving output, smaller on both axes than the window below.
+    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 800, height: 600 });
+
+    let id = state.window_manager.add_window(
+        "app",
+        "t",
+        1,
+        icedtea_contract::Rectangle { x: 800, y: 0, width: 1000, height: 800 },
+    );
+
+    let dead = state.outputs.remove(&1).expect("output 1").geometry;
+    state.migrate_windows_from(dead);
+
+    let survivor = state.outputs[&0].geometry;
+    let geo = state
+        .window_manager
+        .get(id)
+        .expect("the oversized window survives migration without panicking")
+        .geometry;
+    assert_eq!(
+        (geo.x, geo.y),
+        (survivor.x, survivor.y),
+        "a window wider and taller than the survivor must land at the survivor's own origin, got {geo:?}"
+    );
 }
