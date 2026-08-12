@@ -113,10 +113,14 @@ pub fn wake_source(runtime: &wlr::Runtime) -> std::io::Result<(UnixStream, wlr::
 /// Nudge a [`wake_source`]'s write half so the loop's next `dispatch` sees
 /// it readable.
 ///
-/// Errors other than a full pipe (`EAGAIN`/`EWOULDBLOCK` — the write half is
-/// non-blocking) are logged, not propagated: a failed wake degrades to "the
-/// next unrelated event drains the channel instead," not a crash, and this
-/// itself runs from a producer thread (the D-Bus service thread, a
+/// A full pipe (`EAGAIN`/`EWOULDBLOCK` — the write half is non-blocking) is
+/// silently skipped: the loop is already going to wake up and drain the
+/// channel, so another byte queued behind the first would add nothing.
+/// Every other error is logged at `warn`, not propagated: a failed wake
+/// degrades to "the next unrelated event drains the channel instead," not a
+/// crash, but it is surprising enough — the wake pipe is not supposed to
+/// fail — to want visibility by default rather than only under `debug`, and
+/// this itself runs from a producer thread (the D-Bus service thread, a
 /// config-reload worker) that must never block on the compositor's own
 /// cadence.
 pub fn wake(write: &UnixStream) {
@@ -124,7 +128,7 @@ pub fn wake(write: &UnixStream) {
         && err != rustix::io::Errno::AGAIN
         && err != rustix::io::Errno::WOULDBLOCK
     {
-        tracing::debug!(?err, "failed to wake the event loop");
+        tracing::warn!(?err, "failed to wake the event loop");
     }
 }
 

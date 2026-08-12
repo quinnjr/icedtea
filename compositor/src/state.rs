@@ -216,6 +216,18 @@ pub struct State {
     /// up a fresh worker on every reload trigger, and each one needs its own
     /// `try_clone`d handle -- see that method's doc.
     config_reload_wake: Option<std::os::unix::net::UnixStream>,
+    /// The receiving half of `render::spawn_wallpaper_decode`'s channel,
+    /// drained once per turn by `drain_wallpaper` (mirrors `config_reload_rx`
+    /// for the wallpaper decode worker). `None` until `set_wallpaper_receiver`
+    /// wires it -- boot is the only caller, since there is exactly one decode
+    /// worker per process lifetime.
+    wallpaper_rx: Option<crossbeam_channel::Receiver<Option<image::RgbaImage>>>,
+    /// The fd source the wallpaper decode worker nudges after it sends its
+    /// result. Compared in `fd_ready` the same way `config_reload_wake_source`
+    /// is, so a result produced while the loop is idle in `Until::Stop`'s
+    /// blocking `dispatch(-1)` is picked up immediately rather than sitting
+    /// unseen until an unrelated event happens to wake the loop.
+    wallpaper_wake_source: Option<wlr::SourceId>,
 }
 
 impl State {
@@ -252,6 +264,8 @@ impl State {
             cmd_wake_source: None,
             config_reload_wake_source: None,
             config_reload_wake: None,
+            wallpaper_rx: None,
+            wallpaper_wake_source: None,
         }
     }
 
@@ -280,6 +294,29 @@ impl State {
         let pending: Vec<Config> = rx.try_iter().collect();
         for cfg in pending {
             let _ = self.apply_reloaded_config(cfg);
+        }
+    }
+
+    /// Apply the wallpaper decode worker's result, if it has sent one.
+    ///
+    /// Called once per event-loop turn, the same shape as
+    /// `drain_config_reload`: non-blocking (`try_recv` on an empty channel
+    /// is the overwhelmingly common case, both before the worker finishes
+    /// and forever after, since it sends exactly one result and exits), and
+    /// panic-free on a disconnected sender -- `spawn_wallpaper_decode`'s
+    /// thread has either not sent yet, sent once, or panicked, and none of
+    /// those is a reason for this handler to abort the process.
+    pub fn drain_wallpaper(&mut self) {
+        let Some(rx) = self.wallpaper_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(image) => self.wallpaper.set_decoded(image),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                tracing::warn!(
+                    "wallpaper decode worker thread exited without producing a result \
+                     (it likely panicked); wallpaper stays solid-color"
+                );
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
     }
 
@@ -1404,6 +1441,18 @@ impl State {
         self.config_reload_wake = Some(write);
     }
 
+    /// Keep the receiving half of `render::spawn_wallpaper_decode`'s channel
+    /// so [`Self::drain_wallpaper`] has somewhere to read from.
+    pub fn set_wallpaper_receiver(&mut self, rx: crossbeam_channel::Receiver<Option<image::RgbaImage>>) {
+        self.wallpaper_rx = Some(rx);
+    }
+
+    /// The `SourceId` `fd_ready` compares against to route a wake to
+    /// `drain_wallpaper`. See `wallpaper_wake_source`'s field doc.
+    pub fn set_wallpaper_wake_source(&mut self, id: wlr::SourceId) {
+        self.wallpaper_wake_source = Some(id);
+    }
+
     /// Apply every D-Bus command that arrived since the last turn.
     ///
     /// Collected before applying, rather than iterated lazily: `handle_command`
@@ -1508,6 +1557,11 @@ impl wlr::FdHandler for State {
         if Some(source) == self.config_reload_wake_source {
             let _ = rustix::io::read(fd, &mut buf);
             self.drain_config_reload();
+            return;
+        }
+        if Some(source) == self.wallpaper_wake_source {
+            let _ = rustix::io::read(fd, &mut buf);
+            self.drain_wallpaper();
         }
     }
 }

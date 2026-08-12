@@ -171,6 +171,89 @@ fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
     assert!(state.quitting, "the Quit command must have reached State through the wake pipe");
 }
 
+/// The config-reload counterpart to `a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe`:
+/// a freshly-loaded `Config` sent on `config_reload_tx` from another thread
+/// is invisible to a blocked loop unless the config-reload wake pipe is
+/// registered and nudged, exactly like the D-Bus command channel. This is
+/// the path `lib.rs`'s `run()` wires for real (`set_config_reload_receiver`
+/// and `set_config_reload_wake_source`), and until this test it had zero
+/// coverage: nothing exercised a reload arriving *through the wake pipe*
+/// while the loop was idle, only `apply_config`/`apply_reloaded_config`
+/// called directly and synchronously.
+///
+/// `Until::Stop` is used here too, for the same reason as the sibling test:
+/// a bounded `Until::Turns` would pass even if the wake pipe were never
+/// registered, by just running out the clock without ever seeing the
+/// reload. The command channel (already proven to wake the loop by the
+/// sibling test) is reused as this test's own bounded backstop -- the
+/// worker thread sends the reload, nudges *that* wake pipe, and only after
+/// a further bounded sleep sends `Quit` on the command channel and nudges
+/// its wake pipe, so the loop is guaranteed to stop rather than hang if
+/// something regresses.
+#[test]
+fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
+    ensure_headless_env();
+
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+
+    // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
+    // declared after `display`/`backend`/`runtime`.
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime.clone());
+
+    // The reload channel and its wake pipe -- the thing under test.
+    let (reload_tx, reload_rx) = crossbeam_channel::unbounded();
+    state.set_config_reload_receiver(reload_rx);
+    let (reload_wake_write, reload_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("reload wake source");
+    state.set_config_reload_wake_source(reload_wake_id);
+
+    // The command channel and its wake pipe, reused only as this test's
+    // bounded backstop -- see the doc above.
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+
+    let starting_workspaces = state.window_manager.workspace_info().len();
+
+    // From another thread, exactly like the real producer
+    // (`State::spawn_config_reload`'s worker thread): send the freshly
+    // "loaded" config, then nudge the wake pipe.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut reloaded = icedtea_config::default_config();
+        reloaded.workspace_names = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        let _ = reload_tx.send(reloaded);
+        icedtea_compositor::backend::wake(&reload_wake_write);
+
+        // Bounded backstop: give the loop time to wake, drain, and apply
+        // the reload before asking it to stop.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = cmd_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&cmd_wake_write);
+    });
+
+    backend
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
+        .expect("run_all");
+
+    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+    assert_eq!(
+        state.window_manager.workspace_info().len(),
+        3,
+        "the reloaded config's workspace_names must have reached State through the wake pipe"
+    );
+    assert_ne!(
+        state.window_manager.workspace_info().len(),
+        starting_workspaces,
+        "the reload must actually have changed the model, not just left it as booted"
+    );
+}
+
 /// The seam turns a library id into a model window and back, and every
 /// outbound push resolves through it.
 ///

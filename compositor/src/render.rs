@@ -11,6 +11,8 @@
 //! What this crate still decides is *what colour* and *in what order*, which
 //! is what remains here.
 
+use std::os::unix::net::UnixStream;
+
 use icedtea_contract::{Appearance, Rectangle};
 
 use crate::decoration;
@@ -86,7 +88,19 @@ const WALLPAPER_CHANNEL_BOUND: usize = 1;
 /// Decoding a multi-megapixel image is CPU-heavy; keeping it on a worker
 /// thread (per the binding threading model) keeps the caller's loop from
 /// stalling on it.
-pub fn spawn_wallpaper_decode(path: Option<String>) -> crossbeam_channel::Receiver<Option<image::RgbaImage>> {
+///
+/// `wake`, when given, is nudged (`backend::wake`) after the result is sent
+/// on `tx` -- the same wake-pipe treatment `State::spawn_config_reload`
+/// gives the config-reload channel, so a loop blocked in `Until::Stop`'s
+/// `dispatch(-1)` sees the decode result the moment it arrives instead of
+/// only once some unrelated event wakes it (or, on an otherwise idle
+/// compositor, not until shutdown). `None` (no caller wires one) degrades to
+/// the pre-wake-pipe behavior: the result sits on the channel until
+/// something else wakes the loop.
+pub fn spawn_wallpaper_decode(
+    path: Option<String>,
+    wake: Option<UnixStream>,
+) -> crossbeam_channel::Receiver<Option<image::RgbaImage>> {
     let (tx, rx) = crossbeam_channel::bounded(WALLPAPER_CHANNEL_BOUND);
     std::thread::spawn(move || {
         let decoded = path.as_deref().and_then(|p| match image::open(p) {
@@ -97,6 +111,9 @@ pub fn spawn_wallpaper_decode(path: Option<String>) -> crossbeam_channel::Receiv
             }
         });
         let _ = tx.send(decoded);
+        if let Some(wake) = wake {
+            crate::backend::wake(&wake);
+        }
     });
     rx
 }

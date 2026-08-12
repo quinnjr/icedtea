@@ -95,14 +95,15 @@ pub fn run() {
         Err(err) => tracing::error!(%err, "SIGINT/SIGTERM will not stop the compositor"),
     }
 
-    // Wake sources for the two `crossbeam_channel`s the loop can only drain
-    // from inside a handler (see `backend::wake_source`'s doc): without
-    // these, a D-Bus command or a finished config reload sent while the loop
-    // is idle in `Until::Stop`'s blocking `dispatch(-1)` sits unseen until
-    // some unrelated event happens to wake it, or never. Registration
-    // failure here is as fatal as the setup above it -- there would be no
-    // way to ever apply a D-Bus command or a config reload, which is not a
-    // compositor worth booting.
+    // Wake sources for the three `crossbeam_channel`s the loop can only
+    // drain from inside a handler (see `backend::wake_source`'s doc):
+    // without these, a D-Bus command, a finished config reload, or a
+    // finished wallpaper decode sent while the loop is idle in
+    // `Until::Stop`'s blocking `dispatch(-1)` sits unseen until some
+    // unrelated event happens to wake it, or never. Registration failure
+    // here is as fatal as the setup above it -- there would be no way to
+    // ever apply a D-Bus command, a config reload, or a wallpaper decode,
+    // which is not a compositor worth booting.
     let (cmd_wake_write, cmd_wake_id) =
         backend::wake_source(&runtime).expect("failed to register the D-Bus command wake pipe");
     state.set_cmd_wake_source(cmd_wake_id);
@@ -111,6 +112,10 @@ pub fn run() {
         backend::wake_source(&runtime).expect("failed to register the config-reload wake pipe");
     state.set_config_reload_wake_source(reload_wake_id);
     state.set_config_reload_wake(reload_wake_write);
+
+    let (wallpaper_wake_write, wallpaper_wake_id) =
+        backend::wake_source(&runtime).expect("failed to register the wallpaper-decode wake pipe");
+    state.set_wallpaper_wake_source(wallpaper_wake_id);
 
     let socket = display
         .add_socket_auto()
@@ -129,31 +134,26 @@ pub fn run() {
     let (_dbus_conn, dbus_emitter_thread) =
         dbus::spawn_service(dbus_events_rx, cmd_tx, dbus_quit_signal.clone(), cmd_wake_write);
 
-    let wallpaper_rx = render::spawn_wallpaper_decode(state.config.appearance.wallpaper.clone());
+    let wallpaper_rx =
+        render::spawn_wallpaper_decode(state.config.appearance.wallpaper.clone(), Some(wallpaper_wake_write));
+    state.set_wallpaper_receiver(wallpaper_rx);
 
     if let Err(err) = backend.run_all(&display, &mut state, &runtime, wlr::Until::Stop) {
         tracing::error!(?err, "event loop ended with an error");
     }
 
-    // The decode worker may still be running; taking its result (if any) here
-    // keeps the channel from being dropped mid-send. `set_decoded` is called
-    // on a real result, matching the pre-port (calloop) handler's contract;
-    // the ported-forward diagnostic is the `Disconnected` arm below, which
-    // restores the warning the calloop version logged when the worker died
-    // without ever sending one (a panic) -- Task 4's stub run() dropped that
-    // diagnostic along with the rest of the event loop, and this is where it
-    // belongs again. Neither arm paints anything: there is no image node
-    // until parity work gives the scene one.
-    match wallpaper_rx.try_recv() {
-        Ok(image) => state.wallpaper.set_decoded(image),
-        Err(crossbeam_channel::TryRecvError::Disconnected) => {
-            tracing::warn!(
-                "wallpaper decode worker thread exited without producing a result \
-                 (it likely panicked); wallpaper stays solid-color"
-            );
-        }
-        Err(crossbeam_channel::TryRecvError::Empty) => {}
-    }
+    // Live delivery is `wallpaper_wake_source`'s `fd_ready` arm above,
+    // wired the same way the D-Bus command and config-reload channels are:
+    // the decode worker nudges the wake pipe after it sends, so a result
+    // that arrives while the loop is running is applied within that same
+    // turn, not after `run_all` returns. This call is the shutdown safety
+    // net for the one case that wiring can't cover -- a result that arrives
+    // (or a decode that finishes) after `run_all` has already returned --
+    // so the channel isn't dropped mid-send and `state.wallpaper` still
+    // ends up correct even on a compositor that quit immediately after
+    // boot. `drain_wallpaper` is panic-free on a disconnected sender, same
+    // as the live path.
+    state.drain_wallpaper();
 
     dbus_quit_signal.store(true, Ordering::Relaxed);
     let _ = dbus_emitter_thread.join();

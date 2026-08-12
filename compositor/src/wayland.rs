@@ -112,6 +112,19 @@ impl Wayland {
         self.window_to_toplevel.contains_key(&id)
     }
 
+    /// Resolve `id` to the runtime handle and toplevel key needed to act on
+    /// it, or `None` if either is missing.
+    ///
+    /// `None` means gone, not error: a model-only build has no runtime, and
+    /// a window with no bound toplevel is normal (see `forget`). Callers
+    /// treat either case as a silent no-op.
+    fn resolve(&self, id: WindowId) -> Option<(&wlr::Runtime, ToplevelKey)> {
+        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else {
+            return None;
+        };
+        Some((runtime, key))
+    }
+
     /// Stage `content` (already in **content** space — the caller applied
     /// `decoration::content_rect`) plus the three xdg states, and let the
     /// library send one configure carrying all of them.
@@ -128,7 +141,7 @@ impl Wayland {
         maximized: bool,
         fullscreen: bool,
     ) {
-        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else { return };
+        let Some((runtime, key)) = self.resolve(id) else { return };
         runtime.set_toplevel_size(key.0, content.width, content.height);
         runtime.set_toplevel_activated(key.0, activated);
         runtime.set_toplevel_maximized(key.0, maximized);
@@ -137,7 +150,7 @@ impl Wayland {
 
     /// Move the window's scene node. `x`/`y` are **content**-space.
     pub fn set_position(&self, id: WindowId, x: i32, y: i32) {
-        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else { return };
+        let Some((runtime, key)) = self.resolve(id) else { return };
         runtime.set_toplevel_position(key.0, x, y);
     }
 
@@ -149,7 +162,7 @@ impl Wayland {
     /// drawn, so returning to that workspace does not make the client
     /// re-render from nothing.
     pub fn set_visible(&self, id: WindowId, visible: bool) {
-        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else { return };
+        let Some((runtime, key)) = self.resolve(id) else { return };
         runtime.set_toplevel_visible(key.0, visible);
     }
 
@@ -160,7 +173,7 @@ impl Wayland {
     /// off, a focused window is still activated and configured, it just keeps
     /// its place in the stack.
     pub fn raise(&self, id: WindowId) {
-        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else { return };
+        let Some((runtime, key)) = self.resolve(id) else { return };
         runtime.raise_toplevel(key.0);
     }
 
