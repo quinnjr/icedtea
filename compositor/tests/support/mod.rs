@@ -686,6 +686,7 @@ impl TestClient {
         self.state.closed
     }
 
+
     /// The mode from the most recent decoration `configure`: `1` client-side,
     /// `2` server-side, `None` if none has arrived.
     pub fn decoration_mode(&self) -> Option<u32> {
@@ -875,6 +876,18 @@ impl LayerPanelClient {
     /// Most recent `zwlr_layer_surface_v1.configure` size.
     pub fn layer_configure(&self) -> Option<(i32, i32)> {
         self.state.layer_configured.map(|(w, h)| (w as i32, h as i32))
+    }
+
+    /// Unmap without destroying: attach a null buffer and commit. Mirrors
+    /// [`TestClient::unmap`] -- wlr-layer-shell defines the identical
+    /// "attach null to unmap, the surface returns to its
+    /// right-after-`get_layer_surface` state" contract (`layer.rs`'s own
+    /// module doc), and the entry survives on the compositor side so a
+    /// remap would find it again.
+    pub fn unmap(&mut self) {
+        self.surface.attach(None, 0, 0);
+        self.surface.commit();
+        self.conn.flush().expect("flush");
     }
 }
 
