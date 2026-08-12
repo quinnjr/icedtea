@@ -64,6 +64,36 @@ pub fn to_model_modifiers(logo: bool, ctrl: bool, alt: bool, shift: bool) -> inp
     out
 }
 
+/// Whether an in-progress alt-tab session should end on this key event.
+///
+/// `watched` is the modifier flags [`input::modifiers_for_tokens`] derives
+/// from the configured `cycle:alt_tab` binding -- not hardcoded to SUPER, so
+/// a rebind (e.g. to ALT+Tab) still ends its session on the right key.
+///
+/// Two independent checks, not one, because neither alone is enough:
+///
+/// - `keysym_is_modifier(watched, keysym)` on a *release* (`!pressed`)
+///   catches the modifier's own release **on that very event**. This is the
+///   one that matters: wlroots' `keyboard_key_update` emits the `key` signal
+///   *before* it calls `xkb_state_update_key`/`keyboard_modifier_update`
+///   (`types/wlr_keyboard.c`), so `event.modifiers()` on the modifier key's
+///   own release event still reports that modifier held -- `mods` cannot
+///   see its own key going up. Only the keysym can.
+/// - `!mods.contains(watched)` is the fallback for every event *after*
+///   that one (or for any case the keysym check doesn't cover): once the
+///   library's modifier state has actually updated, a session that somehow
+///   missed its modifier's release event still ends on the very next key,
+///   rather than lingering until an unrelated later sync.
+///
+/// A free function taking plain values rather than `&wlr::KeyEvent`, for the
+/// same reason `to_model_modifiers` is one: `wlr::KeyEvent::new` is
+/// `pub(crate)` to the `wlr` crate, so no test outside it can construct a
+/// real one, and this is the only shape of the decision a test *can* drive.
+pub fn alt_tab_should_end(watched: input::Modifiers, mods: input::Modifiers, pressed: bool, keysym: u32) -> bool {
+    let modifier_released_this_event = !pressed && input::keysym_is_modifier(watched, keysym);
+    modifier_released_this_event || !mods.contains(watched)
+}
+
 /// Input passed to `State::handle_pointer`, in output logical coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerEvent {
@@ -979,12 +1009,16 @@ impl State {
     /// `true` forever after the first `SUPER+Tab` and the shell's overlay
     /// had no way to ever be told to close. The brief/spec don't name an
     /// explicit end mechanism, so the one real WMs use was picked: alt-tab
-    /// ends when the held modifier (SUPER, per the default `cycle:alt_tab`
-    /// binding) is released. The keyboard filter (task 5 reintroduces one)
-    /// calls this on every key event where the current modifier state no
-    /// longer includes SUPER, which covers both "released the modifier
-    /// while still holding Tab" and "released Tab first, then the
-    /// modifier."
+    /// ends when the *configured `cycle:alt_tab` binding's* modifier is
+    /// released -- SUPER for the default binding, but not hardcoded to it
+    /// (see `watched_alt_tab_modifiers`, `alt_tab_should_end`). `SeatHandler::key`
+    /// (`wlr::SeatHandler` impl below) calls this via `alt_tab_should_end`
+    /// on every key event, which covers "released the modifier while still
+    /// holding Tab" and "released Tab first, then the modifier" alike, and
+    /// -- the fix-round correction -- recognizes the modifier's own release
+    /// event by its keysym rather than relying solely on the (there, stale)
+    /// modifier-held booleans; see `alt_tab_should_end`'s doc for why the
+    /// booleans alone miss that event.
     pub fn end_alt_tab(&mut self) {
         if !self.alt_tab.is_active() {
             return;
@@ -994,6 +1028,20 @@ impl State {
         self.alt_tab.end();
         self.emit(Event::AltTabState(AltTabState { active: false, entries, index: idx }));
         self.emit_pending();
+    }
+
+    /// The modifier flags `SeatHandler::key` should watch for alt-tab's end
+    /// condition: whatever the configured `cycle:alt_tab` binding names, or
+    /// `SUPER` (the default binding's own modifier) if that action has no
+    /// binding at all -- which cannot happen with `default_config()` but is
+    /// not assumed here, since a config can in principle drop the binding
+    /// entirely while alt-tab is mid-session from before the reload.
+    fn watched_alt_tab_modifiers(&self) -> input::Modifiers {
+        self.config
+            .keybindings
+            .get("cycle:alt_tab")
+            .map(|combo| input::modifiers_for_tokens(&combo.modifiers))
+            .unwrap_or(input::Modifiers::SUPER)
     }
 
     /// Snap `id` to `zone` on the (first) output, saving its pre-snap
@@ -1544,17 +1592,28 @@ impl wlr::ToplevelHandler for State {
         // and `focused` are whatever they already were, and `is_backed`
         // stays `true`. `set_visible(window, false)` only reaches the
         // client's scene node; nothing here clears the model's own focus
-        // pointer. That is fine as long as nothing routes input to an
-        // unmapped surface -- but it is a real trap for whichever task wires
-        // the seat: keyboard focus must not be handed to a window this
-        // handler just hid, and `sync_seat_focus`'s filters (visibility +
-        // `is_backed`) do not know an unmapped-but-still-"visible"-by-model
-        // window from a mapped one. Ledgered here for that task, not solved
-        // by it.
+        // *pointer* -- that is left ledgered, deliberately: changing what
+        // the model itself considers "focused" on an unmap would be a model
+        // semantics change, and this task doesn't make one.
+        //
+        // What task 11 *does* close is the seat trap this comment used to
+        // describe and leave open: `sync_seat_focus`'s filters (visibility +
+        // `is_backed`) can't tell an unmapped-but-still-"visible"-by-model
+        // window from a mapped one, so without re-deriving the seat's
+        // target here, a focused window's keyboard focus survived its own
+        // unmap pointed at a surface the client just told wlroots to stop
+        // showing. The call below re-runs that derivation right after the
+        // hide: if `window` was the focused one, `keyboard_focus` resolves
+        // it, `Runtime::focus_toplevel_keyboard` refuses it (the surface is
+        // unmapped -- see that method's doc), and its `None` fallback
+        // (`Wayland::keyboard_focus`'s doc, task 11's fix-round item 2)
+        // clears the seat's keyboard focus instead of leaving it pointed at
+        // a hidden surface.
         tracing::info!(?id, "toplevel unmapped");
         let key = crate::wayland::ToplevelKey::new(id);
         let Some(window) = self.wayland.window_for(key) else { return };
         self.wayland.set_visible(window, false);
+        self.sync_seat_focus();
     }
 
     fn title_changed(&mut self, toplevel: &wlr::Toplevel<'_>) {
@@ -1578,13 +1637,17 @@ impl wlr::SeatHandler for State {
         let m = event.modifiers();
         let mods = to_model_modifiers(m.logo(), m.ctrl(), m.alt(), m.shift());
 
-        // Alt-tab's chosen end condition: the session ends when the held
-        // modifier (SUPER, per the default `cycle:alt_tab` binding) is no
-        // longer down, whichever key this event is for -- which covers
-        // releasing the modifier before or after Tab.
-        if self.alt_tab.is_active() && !m.logo() {
-            self.end_alt_tab();
-            self.emit_pending();
+        // Alt-tab's chosen end condition: the session ends when the
+        // configured `cycle:alt_tab` binding's modifier is no longer down.
+        // See `alt_tab_should_end`'s doc for why this event's own `keysym`,
+        // not just its (stale, on a modifier's own release) `mods`, has to
+        // be consulted.
+        if self.alt_tab.is_active() {
+            let watched = self.watched_alt_tab_modifiers();
+            if alt_tab_should_end(watched, mods, event.pressed(), event.keysym()) {
+                // Emits its own event internally; nothing to flush here.
+                self.end_alt_tab();
+            }
         }
 
         // Releases are never consumed: a client that is sent a press but not
@@ -1613,6 +1676,17 @@ impl wlr::SeatHandler for State {
     }
 
     fn pointer_button(&mut self, x: f64, y: f64, button: u32, pressed: bool, _time_msec: u32) {
+        // Recorded before the `BTN_LEFT` gate below, not after: this is the
+        // same `pointer_location` `pointer_motion` updates, and a
+        // button-only event (which carries no position of its own once
+        // `handle_pointer` reads it back) must not skip the update just
+        // because the button that arrived happens to not be the left one --
+        // a right-click at a new position must still leave
+        // `pointer_location` correct for whatever left-click/drag comes
+        // next.
+        let pointer = (x as i32, y as i32);
+        self.pointer_location = pointer;
+
         // BTN_LEFT only: every decoration interaction this compositor has is
         // a left-click one, and forwarding the rest to the client unchanged
         // is the correct behaviour for them.
@@ -1620,8 +1694,6 @@ impl wlr::SeatHandler for State {
         if button != BTN_LEFT {
             return;
         }
-        let pointer = (x as i32, y as i32);
-        self.pointer_location = pointer;
 
         if pressed {
             // The model answers "what is under the pointer", not the scene:

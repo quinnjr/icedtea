@@ -355,6 +355,13 @@ fn a_press_on_an_unfocused_window_moves_focus_at_both_ends() {
         state.window_manager.get(b).is_some_and(|w| !w.focused),
         "B lost it -- both ends, not just the winner"
     );
+
+    // The press point is inside A's title bar move area, so
+    // `handle_pointer_press` began a drag (`DragMachine::begin`). Release it
+    // so the test doesn't leave the drag machine mid-drag on drop -- a real
+    // seat always pairs a press with a release, and leaving one dangling
+    // here would be testing a state no real input sequence produces.
+    state.handle_pointer(PointerEvent::Release { pointer: point });
 }
 
 /// A bound key is consumed and does not reach the client; an unbound one is
@@ -380,4 +387,119 @@ fn a_bound_key_is_consumed_and_an_unbound_one_is_forwarded() {
         None,
         "a plain 'a' is nobody's binding and must be forwarded"
     );
+}
+
+// --- Task 11 fix round: alt-tab's end condition, and the unmap seat trap ---
+
+/// `alt_tab_should_end` is the pure decision `SeatHandler::key` makes on
+/// every event while a session is active; `wlr::KeyEvent` can't be built
+/// outside the `wlr` crate (`KeyEvent::new` is `pub(crate)`), so this drives
+/// the decision function directly with synthetic values rather than a real
+/// event -- which is the layer `SeatHandler::key` itself is exercised at,
+/// too (see the report's note on why the trait method has no direct
+/// automated coverage).
+#[test]
+fn alt_tab_ends_on_the_watched_modifiers_own_release_event() {
+    use icedtea_compositor::input::Modifiers;
+    use icedtea_compositor::state::alt_tab_should_end;
+
+    let watched = Modifiers::SUPER;
+
+    // The bug this test exists for: wlroots emits the key event *before*
+    // updating its own modifier state, so the Super_L release event's
+    // `mods` still reports SUPER held. A check that only looked at `mods`
+    // would say "keep going" here and the session would linger until some
+    // unrelated later key. `alt_tab_should_end` must say "end" from the
+    // keysym alone.
+    const KEY_SUPER_L: u32 = 0xffeb;
+    assert!(
+        alt_tab_should_end(watched, /* mods (stale) */ Modifiers::SUPER, /* pressed */ false, KEY_SUPER_L),
+        "the modifier's own release event must end the session even though \
+         its reported `mods` still shows it held"
+    );
+
+    // Releasing an unrelated key (Tab) while SUPER is still down must NOT
+    // end the session -- that is the middle of an ordinary alt-tab cycle,
+    // not its end.
+    const KEY_TAB: u32 = 0xff09;
+    assert!(
+        !alt_tab_should_end(watched, Modifiers::SUPER, false, KEY_TAB),
+        "releasing Tab while the modifier is still held keeps cycling"
+    );
+
+    // The fallback path: some later event's `mods` genuinely no longer
+    // contains the watched modifier (the library's state has caught up by
+    // now), regardless of which key it's for.
+    assert!(
+        alt_tab_should_end(watched, Modifiers::empty(), true, 0x61),
+        "any event once the modifier state has caught up must end a lingering session"
+    );
+
+    // A key that is neither a release of the watched modifier nor missing
+    // it from `mods` must not end the session.
+    assert!(!alt_tab_should_end(watched, Modifiers::SUPER, true, KEY_TAB), "Tab press mid-cycle keeps going");
+}
+
+/// A rebound `cycle:alt_tab` (e.g. ALT+Tab) must watch the modifier it was
+/// actually bound to, not a hardcoded SUPER -- releasing Super while ALT is
+/// still held (a plausible accident: many keyboards have both keys within
+/// reach) must not be mistaken for ending an ALT-Tab session.
+#[test]
+fn alt_tab_end_condition_follows_a_rebound_modifier_not_a_hardcoded_one() {
+    use icedtea_compositor::input::Modifiers;
+    use icedtea_compositor::state::alt_tab_should_end;
+
+    let watched = Modifiers::ALT;
+    const KEY_SUPER_L: u32 = 0xffeb;
+    const KEY_ALT_L: u32 = 0xffe9;
+
+    assert!(
+        !alt_tab_should_end(watched, Modifiers::ALT | Modifiers::SUPER, false, KEY_SUPER_L),
+        "releasing an unwatched modifier (SUPER) must not end an ALT-watched session"
+    );
+    assert!(
+        alt_tab_should_end(watched, Modifiers::ALT, false, KEY_ALT_L),
+        "releasing the actually-watched modifier (ALT) ends it"
+    );
+}
+
+/// The trap task 11's fix round closed: before the fix, unmapping the
+/// focused window hid it but never re-derived the seat's keyboard target,
+/// so a real seat kept pointing at a surface wlroots was told to stop
+/// showing. This can't observe the seat's internal C state from outside the
+/// `wlr` crate, but it does prove the whole path -- `ToplevelHandler::unmapped`
+/// calling `sync_seat_focus`, which calls `Wayland::keyboard_focus`, which
+/// calls `Runtime::focus_toplevel_keyboard`/`clear_keyboard_focus` on a
+/// dangling test id with no live client and no seat -- runs to completion
+/// with no panic, which is exactly what "handler bodies must be panic-free"
+/// requires of it.
+#[test]
+fn unmapping_the_focused_window_reroutes_the_seat_without_panicking() {
+    use icedtea_compositor::wayland::ToplevelKey;
+    use wlr::ToplevelHandler;
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+    let runtime = wlr::Runtime::new().expect("runtime");
+    state.wayland.attach(runtime);
+
+    let key = ToplevelKey::for_test(1);
+    state.new_toplevel(key, "a", "A", 1);
+    let id = state.wayland.window_for(key).expect("bound");
+    assert!(state.window_manager.get(id).is_some_and(|w| w.focused), "the only window is focused");
+
+    // `for_test(1)` and `wlr::ToplevelId::dangling_nth_for_test(1)` name the
+    // same underlying id (`ToplevelKey::for_test` is a thin wrapper over
+    // it), so this resolves back through `wayland.window_for` to `id`
+    // exactly as a real `unmapped(toplevel.id())` call would.
+    state.unmapped(wlr::ToplevelId::dangling_nth_for_test(1));
+
+    // Ledgered, not fixed by this task (see `unmapped`'s doc): the model's
+    // own bookkeeping doesn't change on an unmap.
+    assert!(
+        state.window_manager.get(id).is_some_and(|w| w.focused),
+        "the model still reports it focused -- the model has no unmapped concept"
+    );
+    assert!(state.wayland.is_backed(id), "still bound -- an unmap is not a destroy");
 }
