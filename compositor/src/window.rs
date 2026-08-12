@@ -275,6 +275,54 @@ impl WindowManager {
         Some(())
     }
 
+    /// Drop `id`'s claim on **its own** workspace's focus pointer and hand
+    /// focus to that workspace's next MRU candidate, if it has one.
+    /// Returns the id that took over, or `None` when `id` did not hold the
+    /// pointer or nothing focusable was left behind.
+    ///
+    /// Review finding I2: the unmap path re-picked a successor only when
+    /// the unmapping window was the *active* workspace's focus, so a
+    /// focused window that unmapped while its workspace was in the
+    /// background left its `focused_window` pointer intact on an unmapped
+    /// row. `switch_workspace` re-picks only on `is_none()`, so switching
+    /// back restored a focus pointer aimed at an invisible window: the seat
+    /// correctly refused it (`sync_seat_focus`/`is_visible_id`), leaving the
+    /// keyboard dead, while `apply_action("close"/"maximize"/"fullscreen"/
+    /// "snap")` and the decoration actions all still resolved to it.
+    ///
+    /// The no-successor behavior deliberately matches [`Self::remove_window`]:
+    /// the pointer is cleared either way, so "focused" is never left naming a
+    /// window that cannot be focused. Workspace visibility is irrelevant here
+    /// on purpose -- the workspace this acts on is whichever one `id` is on.
+    pub fn release_focus(&mut self, id: WindowId) -> Option<WindowId> {
+        let ws = self.windows.get(&id)?.workspace;
+        // Indexed through `get_mut`, not `workspace_mut`: this is reachable
+        // straight from a wlroots handler (`State::unmapped`), where the
+        // panic-free policy applies, and a row naming a workspace the
+        // current `workspaces` vec no longer has is exactly the kind of
+        // thing a config reload could in principle leave behind.
+        let slot = self.workspaces.get_mut(ws as usize)?;
+        if slot.focused_window != Some(id) {
+            return None;
+        }
+        slot.focused_window = None;
+        // One event for the one mutation: the flag only flips (and only
+        // emits) when it was actually set, the same "no-op on no change"
+        // shape every setter in this file follows. The successor's own
+        // `focus()` below emits its own `focused: true` and, finding the
+        // pointer already cleared, emits nothing further for `id`.
+        if self.windows.get(&id).is_some_and(|w| w.focused) {
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.focused = false;
+            }
+            self.emit(Event::WindowUpdated {
+                id,
+                update: WindowUpdate { focused: Some(false), ..Default::default() },
+            });
+        }
+        self.focus_mru_in_workspace(ws)
+    }
+
     pub fn focused_window(&self) -> Option<&Window> {
         self.workspace(self.active_workspace)
             .and_then(|ws| ws.focused_window)

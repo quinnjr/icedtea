@@ -191,6 +191,97 @@ fn fold_exclusive_zone(mut rect: Rectangle, anchor: wlr::Anchor, exclusive: i32)
 /// should not happen, but this is the one guard standing between that and
 /// a permanently dead keyboard) must not block the model's own focus from
 /// ever being asserted again.
+/// One `lower_*_to_bottom` call [`State::sync_wallpaper_nodes`] issues, in
+/// the order it issues them.
+///
+/// Extracted (with [`wallpaper_lower_plan`]) purely so review finding C1's
+/// ordering contract is *assertable*: `wlr` exposes no scene z-query, and
+/// `BufferId`/`RectId` have no `dangling_for_test` constructor, so neither
+/// the resulting stacking order nor the ids involved can be observed from a
+/// test. What can be pinned is the sequence of lower calls the sync will
+/// make, which is where the whole bug lived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowerStep {
+    /// The freshly created wallpaper node at this index in the caller's
+    /// created-in-this-pass list.
+    Wallpaper(usize),
+    /// The boot-time full-output background rect (`lib.rs::run()`).
+    Background,
+}
+
+/// The order in which [`State::sync_wallpaper_nodes`] must lower the
+/// `created` wallpaper nodes it just made, plus the background rect.
+///
+/// **The contract: the background rect is lowered LAST.** `lower_*_to_bottom`
+/// moves its target to the very bottom of the root's children, so the last
+/// call wins the bottom. Lowering a wallpaper node last (what the code did
+/// before finding C1) buried it under the opaque background rect and the
+/// wallpaper was never visible; lowering the background last leaves it at
+/// the very bottom with the wallpaper immediately above it and everything
+/// else above that.
+///
+/// Empty when nothing was created: an existing node is already correctly
+/// stacked, and re-lowering the background for a pass that changed nothing
+/// would be pure churn.
+fn wallpaper_lower_plan(created: usize, has_background: bool) -> Vec<LowerStep> {
+    if created == 0 {
+        return Vec::new();
+    }
+    let mut plan: Vec<LowerStep> = (0..created).map(LowerStep::Wallpaper).collect();
+    if has_background {
+        plan.push(LowerStep::Background);
+    }
+    plan
+}
+
+/// One axis of a layer surface's placement: its size along that axis and
+/// its position, from the two anchors on that axis, the client's
+/// `desired` size (0 = "compositor decides"), and the usable box's
+/// `origin`/`span` on that axis.
+///
+/// The wlr-layer-shell rule, per axis (review finding I3):
+///
+/// | anchors on the axis | size                        | position                          |
+/// |---------------------|-----------------------------|-----------------------------------|
+/// | both edges          | span the box                | box origin                        |
+/// | exactly one edge    | `desired`, else 30px        | flush against the anchored edge   |
+/// | neither edge        | `desired`, else span the box| centered (origin when it spans)   |
+///
+/// The three fallbacks are each the protocol's own answer to a 0 the
+/// client left for the compositor to choose: an axis anchored to both
+/// edges *must* span it (a 0 there is not merely allowed but expected);
+/// an axis anchored to exactly one edge is a panel's thickness, where 30px
+/// is this compositor's house default; an axis anchored to neither with no
+/// desired size is the protocol's fill case (all-four-anchors and
+/// zero-anchors lockers/launchers alike) and gets the whole usable box
+/// rather than an arbitrary 200px.
+///
+/// Worked examples: a `TOP|LEFT|RIGHT` 800x30 panel gets `(800, box.x)`
+/// horizontally (both edges) and `(30, box.y)` vertically (one edge,
+/// desired honored) -- unchanged from before. A `TOP|RIGHT` 300x100
+/// notification gets `(300, box.x + box.width - 300)` and `(100, box.y)`:
+/// its own size, flush into the corner. A four-edge-anchored 0x0 locker
+/// gets the whole box on both axes.
+fn layer_axis_placement(start: bool, end: bool, desired: u32, origin: i32, span: i32) -> (i32, i32) {
+    let size = if start && end {
+        span
+    } else if desired != 0 {
+        desired as i32
+    } else if start || end {
+        30
+    } else {
+        span
+    };
+    let pos = if start || (start == end && size >= span) {
+        origin
+    } else if end {
+        origin + span - size
+    } else {
+        origin + (span - size) / 2
+    };
+    (size, pos)
+}
+
 fn layer_holds_keyboard_focus(
     layer_focus: Option<wlr::LayerSurfaceId>,
     layers: &HashMap<wlr::LayerSurfaceId, LayerEntry>,
@@ -749,6 +840,10 @@ impl State {
         }
         let rgba = img.as_raw().as_slice();
 
+        // Freshly created nodes, in creation order. Collected rather than
+        // lowered inline because the lowering *order* is the whole
+        // correctness question here -- see `wallpaper_lower_plan`.
+        let mut created: Vec<wlr::BufferId> = Vec::new();
         for (index, surface) in &self.outputs {
             let dest = render::wallpaper_dest(surface.geometry);
             if let Some(&node) = self.wallpaper_nodes.get(index) {
@@ -757,15 +852,32 @@ impl State {
             } else if let Ok(node) = runtime.add_buffer(width, height, rgba) {
                 runtime.set_buffer_position(node, dest.x, dest.y);
                 runtime.set_buffer_dest_size(node, dest.width, dest.height);
-                // Lowered *after* creation: wlroots' lower-to-bottom moves
-                // the most recently lowered node to the very back, so a
-                // node lowered here lands above the boot-time background
-                // rect (`lib.rs::run()` lowers that one once, at boot,
-                // before any wallpaper node exists) rather than beneath it
-                // -- the solid color stays the pre-decode/decode-failure
-                // fallback, not a permanent occlusion of the image.
-                runtime.lower_buffer_to_bottom(node);
+                created.push(node);
                 self.wallpaper_nodes.insert(*index, node);
+            }
+        }
+        // Review finding C1: every wallpaper node used to be lowered inline
+        // right here, *after* `lib.rs::run()` had already lowered the
+        // opaque background rect at boot -- and `lower_*_to_bottom` moves
+        // its target to the very bottom of the root's children, so the
+        // most recently lowered node wins the bottom. That put every
+        // wallpaper node *underneath* the full-output opaque rect and the
+        // wallpaper was never visible at all. The background rect goes
+        // last now, which is what actually puts it at the very bottom and
+        // leaves the wallpaper directly above it -- solid color as the
+        // pre-decode/decode-failure fallback, not a permanent occlusion.
+        for step in wallpaper_lower_plan(created.len(), self.background.is_some()) {
+            match step {
+                LowerStep::Wallpaper(i) => {
+                    if let Some(&node) = created.get(i) {
+                        runtime.lower_buffer_to_bottom(node);
+                    }
+                }
+                LowerStep::Background => {
+                    if let Some(bg) = self.background {
+                        runtime.lower_rect_to_bottom(bg);
+                    }
+                }
             }
         }
 
@@ -1029,27 +1141,15 @@ impl State {
         // other. See `usable_before`'s own doc.
         let Some(box_) = self.usable_before(output_idx, sequence) else { return };
 
-        // Anchored to exactly one of {top,bottom} (whether or not `left`
-        // and `right` are also set -- "single edge or edge+both
-        // perpendicular" both span the same way): a horizontal panel the
-        // full width of the box, thickness from the client's desired
-        // height or a 30px fallback.
-        let (w, h, x, y) = if a.top != a.bottom {
-            let thickness = if desired_h != 0 { desired_h as i32 } else { 30 };
-            let y = if a.top { box_.y } else { box_.y + box_.height - thickness };
-            (box_.width, thickness, box_.x, y)
-        } else if a.left != a.right {
-            let thickness = if desired_w != 0 { desired_w as i32 } else { 30 };
-            let x = if a.left { box_.x } else { box_.x + box_.width - thickness };
-            (thickness, box_.height, x, box_.y)
-        } else {
-            // Anchored to all four edges, or to none: centered at the
-            // client's desired size, falling back to 200x200 on whichever
-            // axis it left at 0 ("compositor decides").
-            let w = if desired_w != 0 { desired_w as i32 } else { 200 };
-            let h = if desired_h != 0 { desired_h as i32 } else { 200 };
-            (w, h, box_.x + (box_.width - w) / 2, box_.y + (box_.height - h) / 2)
-        };
+        // Placement is per-axis and independent (review finding I3) -- see
+        // `layer_axis_placement`. The rule task 20 shipped keyed on
+        // `a.top != a.bottom` / `a.left != a.right` for the *whole*
+        // placement, which spanned a corner-anchored notification across
+        // the full output width (discarding its desired width outright) and
+        // dropped a four-edge-anchored 0x0 locker into a centered 200x200
+        // box instead of filling the output.
+        let (w, x) = layer_axis_placement(a.left, a.right, desired_w, box_.x, box_.width);
+        let (h, y) = layer_axis_placement(a.top, a.bottom, desired_h, box_.y, box_.height);
 
         let (w, h) = (w.max(0) as u32, h.max(0) as u32);
         let placement = (w, h, x, y);
@@ -1934,7 +2034,15 @@ impl State {
         if !self.window_manager.set_active_workspace(workspace) {
             return None;
         }
-        if self.window_manager.focused_window().is_none() {
+        // Review finding I2, second half: `is_none()` alone let a focus
+        // pointer that names an *unfocusable* row (unmapped, or minimized --
+        // the same shape, which predates this branch) survive a workspace
+        // switch and go on answering `close`/`maximize`/`snap` while the
+        // seat correctly refused it. `release_focus` on the unmap path is
+        // what stops the unmapped case from arising at all; this is the
+        // belt-and-braces re-pick for anything that still slips through.
+        let current = self.window_manager.focused_window().map(|w| w.id);
+        if current.is_none_or(|id| !self.window_manager.is_visible_id(id)) {
             self.window_manager.focus_mru_in_workspace(workspace);
         }
         self.sync_scene();
@@ -2207,6 +2315,28 @@ impl State {
     /// events the caller should queue (via `apply_reloaded_config`) since
     /// the just-replaced `window_manager` can't carry them.
     ///
+    /// # KNOWN LIMITATION -- a live reload abandons its clients
+    ///
+    /// **This drops every model row and every client binding; it does not
+    /// close, and cannot close, the clients themselves.** Their scene nodes
+    /// are hidden (review finding I4, in the `forget` loop below), so they
+    /// no longer render over the fresh session -- but the processes stay
+    /// alive, permanently invisible, with no path back into the model:
+    /// `raise_id_floor` guarantees their ids can never be reissued, and
+    /// since a reload is neither an unmap nor a destroy, no wlroots event
+    /// will ever re-announce them. `SUPER+SHIFT+r` and D-Bus `ReloadConfig`
+    /// both reach here, so this is user-reachable.
+    ///
+    /// The real fix is to stop discarding windows at all -- preserve the
+    /// rows across the reload and re-sync them, which tasks 13/14 already
+    /// made safe on the rendering side (palette-keyed raster cache, full
+    /// `sync_scene` re-push). That is a behavior change to this method's
+    /// pinned contract (`apply_config_emits_window_closed_and_floors_id_counter`,
+    /// `apply_config_rebuilds_workspaces`, the `next_id`/`seq` floor
+    /// machinery, and every consumer of the `WindowClosed` burst), so it is
+    /// recorded here as an owned defect rather than smuggled into a fix
+    /// round. Do not treat the hidden-node mitigation as closing it.
+    ///
     /// Task 11 review #3: this used to replace `window_manager` with a
     /// brand-new, empty one and return only `WorkspaceList`/`ConfigReloaded`
     /// -- every live window vanished from the model with zero
@@ -2241,6 +2371,20 @@ impl State {
         // which model window.
         let ids: Vec<WindowId> = self.window_manager.windows().map(|w| w.id).collect();
         for id in ids {
+            // Review finding I4: hidden *before* the binding is dropped,
+            // which is the only order that works -- `forget` removes the
+            // `window -> toplevel` mapping every scene call resolves
+            // through, so a `set_visible` after it is a silent no-op.
+            //
+            // Without this the reload orphaned the scene node outright: the
+            // client is still alive (nothing here closes it, and no
+            // `unmapped`/`mapped` will ever fire for it), so its toplevel
+            // kept rendering on top of the fresh session while being
+            // invisible to the model -- unfocusable, un-hit-testable,
+            // unclosable. Hiding is the smallest correct answer to that;
+            // see `apply_config`'s own doc for the residual it does *not*
+            // close.
+            self.wayland.set_visible(id, false);
             self.wayland.forget(id);
         }
         // Stale restore points would otherwise reference ids that can never
@@ -2927,10 +3071,17 @@ impl wlr::ToplevelHandler for State {
         self.wayland.set_visible(window, false);
         let previous = self.focused_id();
         self.window_manager.set_mapped(window, false);
-        if previous == Some(window) {
-            let active = self.window_manager.active_workspace();
-            self.window_manager.focus_mru_in_workspace(active);
-        }
+        // Review finding I2: this used to re-pick only when the unmapping
+        // window was the *active* workspace's focus, so an unmap on an
+        // inactive workspace left that workspace's `focused_window` pointing
+        // at the now-unmapped row -- dead to the seat, but still live to
+        // `apply_action("close"/"maximize"/"fullscreen"/"snap")` and the
+        // decoration actions once the user switched back.
+        // `release_focus` resolves the window's *own* workspace, so the
+        // active case behaves exactly as before and the inactive case is
+        // covered too; when no successor exists it clears the pointer,
+        // matching `remove_window`.
+        self.window_manager.release_focus(window);
         self.sync_focus_change(previous);
         self.emit_pending();
     }
@@ -3164,6 +3315,19 @@ impl wlr::ToplevelHandler for State {
     fn layer_surface_unmapped(&mut self, id: wlr::LayerSurfaceId) {
         if let Some(entry) = self.layers.get_mut(&id) {
             entry.mapped = false;
+            // Review finding I1: wlroots resets the surface's `initialized`
+            // flag on every unmap (documented in wlr 0.20.11's `layer.rs`;
+            // the crate deliberately refuses to synthesize a fallback
+            // configure), so a remap needs a *fresh* mandatory configure --
+            // but the remap commit recomputes the identical placement, and
+            // `configure_layer`'s storm guard would suppress the send
+            // against a surviving `last_configured`. The surface would then
+            // never become `mapped`, which is the only thing
+            // `arrange_layers`' sweep reconfigures, and the client hangs
+            // forever: the auto-hide-panel / toggle-launcher sequence.
+            // Forgetting the placement here is what makes the next
+            // `configure_layer` unconditionally send.
+            entry.last_configured = None;
         }
         if self.layer_focus == Some(id) {
             self.layer_focus = None;
@@ -5470,5 +5634,313 @@ mod tests {
 
         state.arrange_layers();
         assert_eq!(state.layers[&id].last_configured, placement, "an unchanged panel's placement must not be re-recorded");
+    }
+
+    // --- Final review C1: wallpaper / background lowering order ---
+
+    /// C1's regression guard. The scene's actual stacking order is not
+    /// observable -- `wlr` exposes no z-query, and `BufferId`/`RectId` have
+    /// no synthetic constructor -- so what is pinned is the thing that was
+    /// wrong: the *order* of the lower calls `sync_wallpaper_nodes` issues.
+    /// `lower_*_to_bottom` gives the bottom to whichever node was lowered
+    /// last, so the background rect must come last or it sits on top of the
+    /// wallpaper and the wallpaper is never seen (which is exactly what
+    /// shipped).
+    #[test]
+    fn the_background_rect_is_lowered_after_every_wallpaper_node() {
+        assert_eq!(
+            wallpaper_lower_plan(1, true),
+            vec![LowerStep::Wallpaper(0), LowerStep::Background],
+            "one output: the background must be lowered last"
+        );
+        assert_eq!(
+            wallpaper_lower_plan(3, true),
+            vec![
+                LowerStep::Wallpaper(0),
+                LowerStep::Wallpaper(1),
+                LowerStep::Wallpaper(2),
+                LowerStep::Background,
+            ],
+            "multi-output: still exactly one background lower, still last"
+        );
+        assert_eq!(
+            wallpaper_lower_plan(3, true).last(),
+            Some(&LowerStep::Background),
+            "the contract in one line: last call wins the bottom, and it must be the background"
+        );
+    }
+
+    /// The two degenerate inputs. Nothing created means nothing to restack
+    /// (existing nodes are already correctly ordered, and re-lowering the
+    /// background every idempotent re-sync would be pure churn); no
+    /// background rect at all -- every model-only build, and the window
+    /// between `State::new` and `set_background` -- still lowers the
+    /// wallpaper nodes it made.
+    #[test]
+    fn the_lower_plan_is_empty_when_nothing_was_created() {
+        assert_eq!(wallpaper_lower_plan(0, true), Vec::new());
+        assert_eq!(wallpaper_lower_plan(0, false), Vec::new());
+        assert_eq!(
+            wallpaper_lower_plan(2, false),
+            vec![LowerStep::Wallpaper(0), LowerStep::Wallpaper(1)],
+            "no background rect to lower, but the new nodes still get lowered"
+        );
+    }
+
+    // --- Final review I3: per-axis layer placement ---
+
+    /// The panel case, unchanged by I3: `TOP | LEFT | RIGHT`, desired
+    /// `(800, 30)` -- both horizontal edges anchored so the width spans the
+    /// box, one vertical edge anchored so the height is the client's 30 and
+    /// it sits flush against the top.
+    #[test]
+    fn a_top_anchored_panel_still_spans_the_box_at_its_desired_thickness() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, true));
+        state.configure_layer(id);
+        assert_eq!(state.layers[&id].last_configured, Some((800, 30, 0, 0)));
+    }
+
+    /// I3, first half: a corner-anchored notification (`TOP | RIGHT`,
+    /// 300x100 -- the shape every notification daemon uses) must get *its
+    /// own* width, flush into the top-right corner. The shipped rule keyed
+    /// the whole placement on `a.top != a.bottom` and stretched it across
+    /// the full 800px output width, discarding `desired_size` outright.
+    #[test]
+    fn a_corner_anchored_layer_surface_keeps_its_desired_size() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, right: true, left: false, bottom: false },
+                exclusive: 0,
+                size: (300, 100),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        assert_eq!(
+            state.layers[&id].last_configured,
+            Some((300, 100, 500, 0)),
+            "300x100 flush into the top-right corner (x = 800 - 300), not stretched to 800 wide"
+        );
+    }
+
+    /// I3, second half: a surface anchored to all four edges with a `0x0`
+    /// desired size -- the protocol's fill-the-output case, what lockers
+    /// and fullscreen launchers use -- must get the whole usable box. The
+    /// shipped rule fell through to the `else` arm and handed it a centered
+    /// 200x200. The offset origin proves it used the real box rather than
+    /// a `(0, 0)` fallback.
+    #[test]
+    fn a_four_edge_anchored_layer_surface_fills_the_usable_box() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 100, y: 50, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Overlay,
+                anchor: wlr::Anchor { top: true, bottom: true, left: true, right: true },
+                exclusive: 0,
+                size: (0, 0),
+                interactive: true,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        assert_eq!(
+            state.layers[&id].last_configured,
+            Some((800, 600, 100, 50)),
+            "all four anchors with a 0x0 desired size fills the box, not a centered 200x200"
+        );
+    }
+
+    /// The other fill spelling the protocol allows: *no* anchors and a
+    /// `0x0` desired size. Same answer, and the same arm of
+    /// `layer_axis_placement` (neither edge, no desired -> span).
+    #[test]
+    fn an_unanchored_zero_sized_layer_surface_also_fills_the_usable_box() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Overlay,
+                anchor: wlr::Anchor { top: false, bottom: false, left: false, right: false },
+                exclusive: 0,
+                size: (0, 0),
+                interactive: true,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        assert_eq!(state.layers[&id].last_configured, Some((800, 600, 0, 0)));
+    }
+
+    /// And an unanchored surface that *did* name a size is still centered
+    /// at exactly that size -- the one behavior of the old `else` arm that
+    /// was already right, kept.
+    #[test]
+    fn an_unanchored_sized_layer_surface_is_centered() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Overlay,
+                anchor: wlr::Anchor { top: false, bottom: false, left: false, right: false },
+                exclusive: 0,
+                size: (400, 200),
+                interactive: true,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        assert_eq!(state.layers[&id].last_configured, Some((400, 200, 200, 200)));
+    }
+
+    // --- Final review I1: a remapped layer surface must be reconfigured ---
+
+    /// I1 at the model level (the wire-level half lives in
+    /// `client_protocol::a_remapped_layer_panel_is_configured_again`):
+    /// `layer_surface_unmapped` must forget `last_configured`, or
+    /// `configure_layer`'s storm guard suppresses the mandatory configure
+    /// the remap needs -- with an identical placement, which is the normal
+    /// case for an auto-hide panel, the guard matches and the client hangs
+    /// forever.
+    #[test]
+    fn unmapping_a_layer_surface_forgets_its_placement_so_a_remap_reconfigures() {
+        use wlr::ToplevelHandler;
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, true));
+
+        state.configure_layer(id);
+        assert_eq!(state.layers[&id].last_configured, Some((800, 30, 0, 0)));
+
+        state.layer_surface_unmapped(id);
+        assert_eq!(
+            state.layers[&id].last_configured, None,
+            "an unmap must forget the placement -- wlroots resets `initialized`, so the remap needs a fresh configure"
+        );
+
+        // The remap: same output, same anchors, so the recomputed placement
+        // is byte-identical to the one before the unmap. That is precisely
+        // the case the storm guard used to swallow.
+        if let Some(entry) = state.layers.get_mut(&id) {
+            entry.mapped = true;
+        }
+        state.configure_layer(id);
+        assert_eq!(
+            state.layers[&id].last_configured,
+            Some((800, 30, 0, 0)),
+            "the remap must re-send the identical placement, not be suppressed as unchanged"
+        );
+    }
+
+    // --- Final review I2: unmapping on an inactive workspace ---
+
+    /// I2. A window focused on workspace 2 unmaps while workspace 1 is
+    /// active. Before the fix, `unmapped` re-picked only when the unmapping
+    /// window was the *active* workspace's focus, so workspace 2 kept a
+    /// `focused_window` pointer aimed at an unmapped row; switching back
+    /// re-picked only on `is_none()`, so the pointer survived, the seat went
+    /// dead (correctly refusing an invisible window), and `close`/
+    /// `maximize`/`fullscreen`/`snap` all still resolved to it.
+    #[test]
+    fn unmapping_on_an_inactive_workspace_does_not_leave_a_stale_focus_pointer() {
+        use wlr::ToplevelHandler;
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+
+        let key = crate::wayland::ToplevelKey::for_test(1);
+        state.new_toplevel(key, "a", "A", 1);
+        let id = state.wayland.window_for(key).expect("bound");
+
+        // Focus it on workspace 1 (`move_to_workspace` switches there and
+        // focuses it), then leave for workspace 0.
+        state.move_to_workspace(id, 1).expect("moved to workspace 1");
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(id));
+        state.switch_workspace(0).expect("switched away");
+
+        // The unmap happens while workspace 1 is *not* the active one.
+        state.unmapped(wlr::ToplevelId::dangling_nth_for_test(1));
+
+        state.switch_workspace(1).expect("switched back");
+        assert!(
+            state.window_manager.focused_window().is_none(),
+            "workspace 1 must have no focused window: its only candidate is unmapped"
+        );
+        assert!(
+            state.window_manager.get(id).is_some_and(|w| !w.focused),
+            "the unmapped row must not still claim focus"
+        );
+        // The consequence that made the stale pointer actionable rather
+        // than merely untidy: a focus-targeted command must find nothing.
+        assert!(
+            state.apply_action("close").is_none(),
+            "a close action must not resolve to the unmapped window"
+        );
+        assert!(
+            state.apply_action("maximize").is_none(),
+            "a maximize action must not resolve to the unmapped window"
+        );
+    }
+
+    /// The other half of I2's fix: `switch_workspace`'s guard widened from
+    /// `is_none()` to "no focusable focus", which also covers the
+    /// pre-existing minimized case -- switching to a workspace whose focus
+    /// pointer names a minimized window now hands focus to a real
+    /// candidate instead of leaving the seat dead.
+    #[test]
+    fn switching_to_a_workspace_whose_focus_is_minimized_repicks() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+
+        let a = state.window_manager.add_window("a", "A", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        let b = state.window_manager.add_window("b", "B", 2, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        // `b` was added second so it is focused; minimize it and leave.
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(b));
+        state.window_manager.set_minimized(b, true);
+        state.switch_workspace(1).expect("switched away");
+        state.switch_workspace(0).expect("switched back");
+
+        assert_eq!(
+            state.window_manager.focused_window().map(|w| w.id),
+            Some(a),
+            "a minimized focus pointer must be re-picked on switch-back, not kept"
+        );
     }
 }

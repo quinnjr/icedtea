@@ -370,3 +370,67 @@ fn unmapping_a_layer_panel_gives_the_usable_area_back() {
 
     win.detach();
 }
+
+/// Final review I1, at the wire: an auto-hide panel that unmaps and maps
+/// again must be configured again.
+///
+/// wlroots clears the layer surface's `initialized` flag on every unmap, so
+/// the remap's initial commit owes a *mandatory* configure — but the
+/// compositor recomputes the same placement it had before (same output,
+/// same anchors, nothing moved), and `configure_layer`'s storm guard used
+/// to match that against a `last_configured` no one had cleared and
+/// suppress the send. The panel then never becomes `mapped`, which is the
+/// only thing `arrange_layers`' sweep reconfigures, so nothing ever rescued
+/// it: `remap()` returned `false` and the client hung forever. This is the
+/// toggle-launcher / auto-hide-panel sequence, and the harness previously
+/// unmapped a panel without ever remapping one.
+///
+/// The exclusive zone is asserted on both sides of the round trip, through
+/// a maximized toplevel, so this pins that the panel really re-mapped
+/// rather than merely being sent bytes: `646` and `676` are
+/// `a_layer_panel_gets_configured_and_carves_the_workspace`'s and
+/// `unmapping_a_layer_panel_gives_the_usable_area_back`'s own derived
+/// heights, with and without the panel's 30px carve.
+#[test]
+fn a_remapped_layer_panel_is_configured_again_and_re_carves_the_workspace() {
+    let comp = Compositor::spawn();
+    let mut panel = TestClient::map_layer_panel(&comp.socket, 30);
+    assert!(panel.wait_until(|c| c.layer_configure().is_some()), "panel must be configured");
+
+    let mut win = TestClient::map_toplevel(&comp.socket, "harness.tiled", "t");
+    let id = comp.snapshot().windows[0].id;
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(id, true));
+    assert!(
+        win.wait_until(|c| c.last_configure().map(|(_, h)| h) == Some(646)),
+        "maximized height must exclude the panel's zone to begin with, last configure: {:?}",
+        win.last_configure()
+    );
+
+    let n = win.configure_count();
+    panel.unmap();
+    assert!(
+        win.wait_until(|c| c.configure_count() > n && c.last_configure().map(|(_, h)| h) == Some(676)),
+        "the unmap must give the zone back first, last configure: {:?}",
+        win.last_configure()
+    );
+
+    let before = panel.layer_configure_count();
+    assert!(
+        panel.remap(),
+        "a remapped panel must be sent a fresh configure (had {before} before the remap)"
+    );
+    assert_eq!(
+        panel.layer_configure(),
+        Some((1280, 30)),
+        "and at the same placement it had before -- which is exactly why the storm guard swallowed it"
+    );
+
+    let n = win.configure_count();
+    assert!(
+        win.wait_until(|c| c.configure_count() > n && c.last_configure().map(|(_, h)| h) == Some(646)),
+        "the remapped panel must carve its zone again, last configure: {:?}",
+        win.last_configure()
+    );
+
+    win.detach();
+}

@@ -789,11 +789,20 @@ fn unmapping_the_focused_window_reroutes_the_seat_without_panicking() {
     // exactly as a real `unmapped(toplevel.id())` call would.
     state.unmapped(wlr::ToplevelId::dangling_nth_for_test(1));
 
-    // Ledgered, not fixed by this task (see `unmapped`'s doc): the model's
-    // own bookkeeping doesn't change on an unmap.
+    // Task 14 gave the model its own unmapped concept, and review finding
+    // I2 finished the focus half of it: the sole window unmapping leaves no
+    // successor to hand focus to, so the workspace's focus pointer is
+    // *cleared* rather than left naming an unfocusable row -- the same
+    // no-successor behavior `remove_window` has always had. Before I2 the
+    // row stayed `focused: true` here, which is what made
+    // `close`/`maximize`/`snap` still resolve to an invisible window.
     assert!(
-        state.window_manager.get(id).is_some_and(|w| w.focused),
-        "the model still reports it focused -- the model has no unmapped concept"
+        state.window_manager.get(id).is_some_and(|w| !w.focused),
+        "an unmap with no successor must release focus, not leave it on the unmapped row"
+    );
+    assert!(
+        state.window_manager.focused_window().is_none(),
+        "the workspace's focus pointer must be cleared, not left dangling"
     );
     assert!(state.wayland.is_backed(id), "still bound -- an unmap is not a destroy");
 }

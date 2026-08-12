@@ -317,6 +317,15 @@ struct ClientState {
     closed: bool,
     /// Most recent `zwlr_layer_surface_v1.configure` size.
     layer_configured: Option<(u32, u32)>,
+    /// How many `zwlr_layer_surface_v1.configure` events have arrived, ever
+    /// — the layer analogue of [`ClientState::configures`], and for the same
+    /// reason: `layer_configured` only ever reports the *latest* size, so a
+    /// predicate over it alone cannot tell "a fresh configure arrived" from
+    /// "the old one is still sitting there". The unmap/remap round trip
+    /// (final review I1) is exactly that case: the placement a remapped
+    /// panel is configured with is byte-identical to the one it had before
+    /// it unmapped, so only the counter can see the second one.
+    layer_configures: u32,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
@@ -444,6 +453,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for ClientState {
         if let zwlr_layer_surface_v1::Event::Configure { serial, width, height } = event {
             surface.ack_configure(serial);
             state.layer_configured = Some((width, height));
+            state.layer_configures += 1;
         }
     }
 }
@@ -773,11 +783,14 @@ impl TestClient {
 pub struct LayerPanelClient {
     surface: wl_surface::WlSurface,
     layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-    // Kept alive for as long as the client is, even though nothing reads
-    // them again after the attach below -- dropping the pool/buffer/file
-    // early would free the backing memory out from under a compositor that
-    // may still be reading it.
-    _buffer: wl_buffer::WlBuffer,
+    /// The mapped buffer. Re-attached verbatim by [`LayerPanelClient::remap`]
+    /// (the panel maps back at the same size it had), and kept alive for as
+    /// long as the client is regardless: dropping the pool/buffer/file early
+    /// would free the backing memory out from under a compositor that may
+    /// still be reading it.
+    buffer: wl_buffer::WlBuffer,
+    /// The size `buffer` was created at, for `remap`'s damage rectangle.
+    size: (i32, i32),
     _pool: wl_shm_pool::WlShmPool,
     _shm_file: std::fs::File,
     state: ClientState,
@@ -844,7 +857,8 @@ impl LayerPanelClient {
         LayerPanelClient {
             surface,
             layer_surface,
-            _buffer: buffer,
+            buffer,
+            size: (w, h),
             _pool: pool,
             _shm_file: shm_file,
             state,
@@ -887,6 +901,40 @@ impl LayerPanelClient {
         self.surface.attach(None, 0, 0);
         self.surface.commit();
         self.conn.flush().expect("flush");
+    }
+
+    /// How many `zwlr_layer_surface_v1.configure` events have arrived, ever.
+    /// See [`ClientState::layer_configures`] for why a remap test cannot use
+    /// [`Self::layer_configure`] instead.
+    pub fn layer_configure_count(&self) -> u32 {
+        self.state.layer_configures
+    }
+
+    /// Map again after [`Self::unmap`], following the protocol's own
+    /// re-initialization sequence: an empty commit (wlroots cleared the
+    /// surface's `initialized` flag on the unmap, so this is a fresh
+    /// *initial* commit and the compositor owes a mandatory configure),
+    /// then — once that configure has arrived and been acked in the
+    /// `Dispatch` impl — the buffer attach and the commit that maps it.
+    ///
+    /// Returns whether the mandatory configure actually arrived within
+    /// [`TIMEOUT`]. `false` is the exact symptom of final review I1: the
+    /// compositor recomputes the identical placement, its storm guard
+    /// suppresses the send, and the client waits forever for a configure it
+    /// can never map without.
+    pub fn remap(&mut self) -> bool {
+        let before = self.state.layer_configures;
+        self.surface.commit();
+        self.conn.flush().expect("flush");
+        if !self.wait_until(|c| c.layer_configure_count() > before) {
+            return false;
+        }
+        let (w, h) = self.size;
+        self.surface.attach(Some(&self.buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, w, h);
+        self.surface.commit();
+        self.conn.flush().expect("flush");
+        true
     }
 }
 
