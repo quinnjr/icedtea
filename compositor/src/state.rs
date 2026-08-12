@@ -127,6 +127,25 @@ pub struct State {
     pub snap_preview: Option<icedtea_contract::Rectangle>,
     /// Output geometries keyed by output index. Used by fullscreen toggle.
     pub outputs: HashMap<u32, OutputSurface>,
+    /// The next index `new_output` hands out. Monotonic, never reused --
+    /// `outputs.len()` was tried first and is wrong the moment an output is
+    /// removed and a new one added: `len()` computes the same index the
+    /// removed output had, colliding with whatever the model (or a
+    /// client-facing consumer) still remembers about it (review finding M2).
+    next_output_index: u32,
+    /// Incremented once per `LoopHandler::should_stop` call, i.e. once per
+    /// event-loop turn regardless of what woke it (see that method's doc).
+    /// Not read anywhere in a real boot -- this exists so a test can prove a
+    /// negative ("the loop did not busy-spin") that no other observable
+    /// state can: a wedged wake pipe (review finding C1) doesn't fail any
+    /// assertion about *what* the loop did, only about how relentlessly it
+    /// did nothing, and turn count is the only signal for that.
+    pub turns: u64,
+    /// Incremented once per `OutputHandler::frame` call. Review finding I1's
+    /// test coverage: proves `new_output`'s `schedule_frame()` call actually
+    /// results in at least one `frame` callback, not just that it compiles
+    /// and doesn't panic.
+    pub frames: u64,
     /// Saved window geometries before fullscreen toggle, keyed by window ID.
     /// Used to restore non-fullscreen geometry when exiting fullscreen.
     ///
@@ -222,12 +241,33 @@ pub struct State {
     /// wires it -- boot is the only caller, since there is exactly one decode
     /// worker per process lifetime.
     wallpaper_rx: Option<crossbeam_channel::Receiver<Option<image::RgbaImage>>>,
+    /// Whether `drain_wallpaper` has ever successfully received a result on
+    /// `wallpaper_rx`. Distinguishes the two ways the channel can report
+    /// `Disconnected`: before this is `true`, disconnect-without-a-message
+    /// means the worker really did exit early (panicked) and is worth a
+    /// warn; after it, the worker sent its one message and exited exactly as
+    /// designed, and the sender dropping is the expected, silent end of its
+    /// lifetime (review finding M4).
+    wallpaper_received: bool,
     /// The fd source the wallpaper decode worker nudges after it sends its
     /// result. Compared in `fd_ready` the same way `config_reload_wake_source`
     /// is, so a result produced while the loop is idle in `Until::Stop`'s
     /// blocking `dispatch(-1)` is picked up immediately rather than sitting
     /// unseen until an unrelated event happens to wake the loop.
     wallpaper_wake_source: Option<wlr::SourceId>,
+    /// Write half of the pipe registered as `wallpaper_wake_source`, kept
+    /// alive here for the same reason `config_reload_wake` is (review
+    /// finding C1, fixed the same way `shutdown_source`'s sibling comment
+    /// and `spawn_config_reload` both already document): the wallpaper
+    /// decode worker is only ever handed a `try_clone`d copy, never this
+    /// original. Without an owner that outlives the worker thread, the
+    /// worker's clone was the *only* live write half, and it dropped the
+    /// moment the thread exited after its one send -- leaving the
+    /// registered read end with a permanent `EPOLLHUP` on libwayland's
+    /// level-triggered loop, so `fd_ready`'s wallpaper arm (and
+    /// `drain_wallpaper`'s "likely panicked" warn, before the M4 fix above)
+    /// fired every single turn forever, for the rest of the process's life.
+    wallpaper_wake: Option<std::os::unix::net::UnixStream>,
 }
 
 impl State {
@@ -246,6 +286,9 @@ impl State {
             wallpaper: WallpaperState::new(),
             snap_preview: None,
             outputs: HashMap::new(),
+            next_output_index: 0,
+            turns: 0,
+            frames: 0,
             fullscreen_saved_geometry: HashMap::new(),
             snap_saved_geometry: HashMap::new(),
             maximized_saved_geometry: HashMap::new(),
@@ -265,7 +308,9 @@ impl State {
             config_reload_wake_source: None,
             config_reload_wake: None,
             wallpaper_rx: None,
+            wallpaper_received: false,
             wallpaper_wake_source: None,
+            wallpaper_wake: None,
         }
     }
 
@@ -309,13 +354,30 @@ impl State {
     pub fn drain_wallpaper(&mut self) {
         let Some(rx) = self.wallpaper_rx.as_ref() else { return };
         match rx.try_recv() {
-            Ok(image) => self.wallpaper.set_decoded(image),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            Ok(image) => {
+                self.wallpaper.set_decoded(image);
+                self.wallpaper_received = true;
+            }
+            // Review finding M4: `Disconnected` means two different things
+            // depending on `wallpaper_received`. Before a result has ever
+            // arrived, the worker exiting without sending one really is
+            // abnormal (a panic) and is worth a warn. After one has arrived,
+            // the sender dropping is just the worker reaching the end of its
+            // one-shot lifetime -- `spawn_wallpaper_decode` sends exactly
+            // once and returns -- and this arm is reached on every
+            // subsequent turn's poll, so warning here would be a false
+            // "likely panicked" on every turn of an otherwise healthy,
+            // long-idle compositor.
+            Err(crossbeam_channel::TryRecvError::Disconnected) if !self.wallpaper_received => {
                 tracing::warn!(
                     "wallpaper decode worker thread exited without producing a result \
                      (it likely panicked); wallpaper stays solid-color"
                 );
+                // Only warn once: this arm's condition would otherwise stay
+                // true and re-fire the same warn on every future turn too.
+                self.wallpaper_received = true;
             }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {}
             Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
     }
@@ -425,6 +487,15 @@ impl State {
         // SSD window's client owns only the band below the title bar.
         let ssd = crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, fullscreen);
         let content = crate::decoration::content_rect(geo, ssd);
+
+        // Review finding I2: paint (or hide) the SSD title-bar band. `geo`,
+        // not `content` -- `title_bar_rect` is frame-space, same as
+        // `content_rect`'s input, and the two are computed from the same
+        // `geo` precisely so they can never disagree about where the band
+        // ends and the client's content begins.
+        let bar_color = crate::render::hex_to_rgba(&self.config.appearance.palette.background);
+        self.wayland
+            .sync_ssd_rect(id, ssd, visible, crate::decoration::title_bar_rect(geo), bar_color);
 
         self.wayland.set_visible(id, visible);
         if visible {
@@ -792,6 +863,31 @@ impl State {
                 crate::backend::wake(&wake);
             }
         });
+    }
+
+    /// Spawn the wallpaper decode worker and wire up the receiving end of
+    /// its result channel. The one and only caller in a real boot is
+    /// `run()`; tests that want to exercise the exact wake-pipe path a real
+    /// boot takes call this too, rather than `render::spawn_wallpaper_decode`
+    /// directly.
+    ///
+    /// Mirrors `spawn_config_reload`'s wake-pipe handling exactly (review
+    /// finding C1): the worker thread is handed a `try_clone`d copy of
+    /// `self.wallpaper_wake`, never the original. Before this fix, callers
+    /// passed the wake pipe's only write half straight into the worker
+    /// thread by value; it dropped the moment that (one-shot, exits after
+    /// its single send) thread ended, leaving the registered read end with a
+    /// permanent `EPOLLHUP` on libwayland's level-triggered loop for the
+    /// rest of the process's life -- `fd_ready`'s wallpaper arm firing, and
+    /// `drain_wallpaper` re-entering its (now also fixed, see M4)
+    /// "disconnected" arm, on every single turn forever. Keeping the
+    /// original alive on `State` (`set_wallpaper_wake`, called once at boot)
+    /// closes that off the same way `config_reload_wake` already does for
+    /// its own channel.
+    pub fn spawn_wallpaper(&mut self, path: Option<String>) {
+        let wake = self.wallpaper_wake.as_ref().and_then(|w| w.try_clone().ok());
+        let rx = crate::render::spawn_wallpaper_decode(path, wake);
+        self.wallpaper_rx = Some(rx);
     }
 
     /// Central dispatcher for every [`crate::dbus::DbCommand`] received from
@@ -1453,6 +1549,14 @@ impl State {
         self.wallpaper_wake_source = Some(id);
     }
 
+    /// Keep the wake pipe's write half alive for the process's life. See
+    /// `wallpaper_wake`'s field doc (review finding C1) for why this must be
+    /// called with the *original*, not a clone -- callers hand
+    /// `render::spawn_wallpaper_decode` a `try_clone`d copy instead.
+    pub fn set_wallpaper_wake(&mut self, write: std::os::unix::net::UnixStream) {
+        self.wallpaper_wake = Some(write);
+    }
+
     /// Apply every D-Bus command that arrived since the last turn.
     ///
     /// Collected before applying, rather than iterated lazily: `handle_command`
@@ -1491,16 +1595,15 @@ impl wlr::OutputHandler for State {
         }
 
         let (width, height) = output.size();
-        // Single output at (0, 0) for the slice. `self.outputs.len()` as the
-        // index is only correct because of that -- it is not a real
-        // hotplug-safe id allocator: remove output 0, then add a new one,
-        // and `len()` computes `0` again, colliding with whatever the model
-        // (or a client-facing consumer) still remembers about the old
-        // index. A monotonic counter is the actual fix and belongs to
-        // multi-output geometry, which is parity work; this comment is the
-        // ledger entry for why `new_output` doesn't pretend to have solved
-        // it already.
-        let index = self.outputs.len() as u32;
+        // Single output at (0, 0) for the slice. `next_output_index` is a
+        // monotonic counter, not `outputs.len()` (review finding M2): `len()`
+        // recomputes the same index a just-removed output had the moment a
+        // new one is added, colliding with whatever the model (or a
+        // client-facing consumer) still remembers about the old one. Actual
+        // multi-output *placement* (anything beyond "assign a never-reused
+        // index") is still parity work; this only fixes the collision.
+        let index = self.next_output_index;
+        self.next_output_index += 1;
         self.create_output(index, icedtea_contract::Rectangle { x: 0, y: 0, width, height });
         self.output_ids.insert(output.id(), index);
 
@@ -1515,9 +1618,18 @@ impl wlr::OutputHandler for State {
         // is the same code path) need their geometry pushed at the new size.
         self.sync_scene();
         self.emit_pending();
+
+        // Review finding I1: nothing else owns the first frame -- it used to
+        // arrive only incidentally, whenever the background rect's own
+        // damage happened to trigger one. `schedule_frame` (public since
+        // 0.20.1) asks wlroots to fire `OutputHandler::frame` for this
+        // output on its own, so a freshly enabled output that draws nothing
+        // still gets a `frame` callback and a first commit.
+        output.schedule_frame();
     }
 
     fn frame(&mut self, output: &wlr::Output<'_>) {
+        self.frames += 1;
         let Some(runtime) = self.wayland.runtime() else { return };
         // A rejected commit is routine — wlroots rejects one when nothing
         // changed — so it is logged at debug and never escalated.
@@ -1568,6 +1680,7 @@ impl wlr::FdHandler for State {
 
 impl wlr::LoopHandler for State {
     fn should_stop(&mut self) -> bool {
+        self.turns += 1;
         // Not called from C — this is the one handler that may panic safely —
         // but it is still not a place to. `fd_ready`'s `cmd_wake_source` and
         // `config_reload_wake_source` arms above are what actually pull the
@@ -1578,6 +1691,11 @@ impl wlr::LoopHandler for State {
         // for an unrelated reason (a frame, input, the shutdown source).
         self.drain_pending_commands();
         self.drain_config_reload();
+        // Review finding I3: the wallpaper decode channel gets the same
+        // per-turn backstop as the other two, for the same reason -- a
+        // result that arrived while something unrelated woke the loop must
+        // not sit past this turn just because it wasn't *this* wake source.
+        self.drain_wallpaper();
         self.quitting
     }
 }

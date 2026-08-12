@@ -6,11 +6,9 @@
 //! without a winit window. `a_headless_compositor_boots_runs_and_stops` is
 //! the test that would have caught a boot that silently listens on a socket
 //! nothing renders to: it asserts the headless backend's output actually
-//! reached the model's geometry map with a real size. It does *not* assert
-//! that a frame was ever rendered or a scene commit accepted --
-//! `OutputHandler::frame`/`Runtime::commit_output` aren't observable from
-//! outside `State` today, so proving that would need its own
-//! instrumentation, which is out of scope here. `the_shutdown_source_stops_the_loop`
+//! reached the model's geometry map with a real size, and (review finding
+//! I1's `State::frames` counter) that a real frame callback fired at least
+//! once. `the_shutdown_source_stops_the_loop`
 //! and `a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe` cover the two
 //! ways something outside the loop asks it to act while it's blocked: a
 //! real signal, and a `crossbeam_channel` send nudged through a wake pipe.
@@ -76,10 +74,32 @@ fn a_headless_compositor_boots_runs_and_stops() {
     // `raise(SIGINT)` on a parallel libtest thread would write into this
     // test's pipe too, and if the two tests' `run_all` windows overlapped,
     // `fd_ready` would set `quitting` here and flake the assertion below.
-    // Bounded (`Turns`, not `Until::Stop`) is what makes that safe to skip:
-    // nothing else in this test asks the loop to stop either.
+    //
+    // Review finding I1's frame assertion is why this is `Until::Stop` with a
+    // bounded backstop rather than a bounded `Until::Turns` directly: `Turns`
+    // dispatches with a `0` timeout on every iteration (see `run_all`'s own
+    // doc), which never actually blocks -- and `wlr_output_schedule_frame`'s
+    // headless backend implementation matures on a real timer, not an idle
+    // callback, so a purely non-blocking loop can spin through hundreds of
+    // zero-timeout dispatches without that timer ever being live long enough
+    // to fire. `Until::Stop`'s blocking `dispatch(-1)` computes the correct
+    // wait from the timer wlroots actually armed and sleeps until it's due,
+    // which is what lets the frame genuinely arrive. The command channel
+    // (already proven to wake the loop by `a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe`)
+    // is reused as this test's own bounded backstop so a regression here
+    // fails the test rather than hanging it.
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = cmd_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&cmd_wake_write);
+    });
+
     backend
-        .run_all(&display, &mut state, &runtime, wlr::Until::Turns(8))
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
         .expect("run_all");
 
     assert_eq!(
@@ -92,9 +112,16 @@ fn a_headless_compositor_boots_runs_and_stops() {
         geo.width > 0 && geo.height > 0,
         "an enabled output reports a real size, got {geo:?}"
     );
+    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+    // Review finding I1: before `new_output` called `output.schedule_frame()`,
+    // nothing owned the first frame -- it arrived only incidentally, via
+    // whatever damage the background rect's own resize happened to cause.
+    // `state.frames` (incremented in `OutputHandler::frame`) is the proof
+    // that a frame callback actually fired at least once over the window
+    // above.
     assert!(
-        !state.quitting,
-        "nothing asked the compositor to quit, so the stop flag must be clear"
+        state.frames >= 1,
+        "new_output's schedule_frame() must have produced at least one frame callback"
     );
 }
 
@@ -252,6 +279,147 @@ fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
         starting_workspaces,
         "the reload must actually have changed the model, not just left it as booted"
     );
+}
+
+/// The regression test for review finding C1: the wallpaper decode wake
+/// pipe's write half must survive the one-shot worker thread exiting.
+///
+/// Before the fix, `spawn_wallpaper_decode` was handed the wake pipe's only
+/// write half *by value*; it moved into the worker thread and dropped the
+/// instant that thread ended (right after its single `tx.send`). The
+/// registered read end then reported a permanent `EPOLLHUP` on libwayland's
+/// level-triggered loop -- `dispatch(-1)` never blocks again, `fd_ready`'s
+/// wallpaper arm fires on every turn forever, and (pre-M4) `drain_wallpaper`
+/// re-entered its "likely panicked" warn on every one of those turns too, on
+/// an otherwise completely idle compositor.
+///
+/// `State::turns` is what makes this provable without an actual clock-bound
+/// core-burn measurement: it counts `should_stop` calls, one per event-loop
+/// turn regardless of what woke it. A wedged read end means hundreds of
+/// turns fire during the idle window below (empirically, on the pre-fix
+/// code, thousands); a healthy one means only the handful genuinely woken by
+/// the decode's own wake and the backstop `Quit`. `TURNS_BOUND` sits
+/// comfortably above that handful and nowhere near a busy-spin's count, so
+/// this is not a timing-flake-prone assertion.
+///
+/// This was confirmed to fail against the pre-fix code (`git stash` the
+/// `State::spawn_wallpaper`/`set_wallpaper_wake` fix, rerun, observe
+/// `state.turns` in the thousands and the assertion fail; `git stash pop` to
+/// restore it) before being checked in passing.
+#[test]
+fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
+    ensure_headless_env();
+
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+
+    // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
+    // declared after `display`/`backend`/`runtime`.
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime.clone());
+
+    // The wallpaper wake pipe, wired exactly like `run()` wires it.
+    let (wallpaper_wake_write, wallpaper_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("wallpaper wake source");
+    state.set_wallpaper_wake_source(wallpaper_wake_id);
+    state.set_wallpaper_wake(wallpaper_wake_write);
+
+    // The command channel and its wake pipe, used only as this test's
+    // bounded backstop -- same role as in the config-reload sibling test.
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+
+    // No image path: the worker resolves to `None` almost instantly. What
+    // matters here is only that it sends its one result and exits -- not
+    // what it sends.
+    state.spawn_wallpaper(None);
+
+    // Give the one-shot worker thread time to finish and exit (and, on the
+    // buggy code, time for the loop to spin many, many times on the dead
+    // read end) before asking the loop to stop.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = cmd_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&cmd_wake_write);
+    });
+
+    backend
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
+        .expect("run_all");
+
+    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+
+    const TURNS_BOUND: u64 = 50;
+    assert!(
+        state.turns < TURNS_BOUND,
+        "the loop turned {} times over a 300ms idle window after the wallpaper decode \
+         landed -- a wedged wake pipe (its write half dropped when the one-shot worker \
+         thread exited) leaves the read end permanently EPOLLHUP-ready and the loop never \
+         blocks again",
+        state.turns
+    );
+}
+
+/// Review finding I2: the SSD title-bar band is painted as a scene rect
+/// (interim, per the spec's own words -- see `Wayland::sync_ssd_rect`'s
+/// doc), tracked one-per-window at the seam the same way toplevel bindings
+/// are. This needs a real `Runtime` with `init_graphics` already run --
+/// `add_rect` errors otherwise -- which is why this lives here rather than
+/// in `wayland.rs`'s own unit tests (which only ever construct a bare,
+/// ungraphics'd `Runtime` or no runtime at all).
+#[test]
+fn an_ssd_window_gets_exactly_one_title_bar_rect_and_a_csd_window_gets_none() {
+    use icedtea_compositor::wayland::ToplevelKey;
+
+    ensure_headless_env();
+
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+    state.wayland.attach(runtime);
+
+    // Default app id ("term") has no CSD request and doesn't match the
+    // `org.gtk*` CSD heuristic, so `decoration::has_ssd` says yes -- exactly
+    // the common case a real terminal or editor hits.
+    let ssd_key = ToplevelKey::for_test(1);
+    state.new_toplevel(ssd_key, "term", "Terminal", 1);
+    assert_eq!(
+        state.wayland.ssd_rect_count(),
+        1,
+        "mapping an SSD window must create exactly one title-bar rect"
+    );
+
+    // `org.gtk`-prefixed app ids are CSD by the same heuristic -- no strip,
+    // no rect.
+    let csd_key = ToplevelKey::for_test(2);
+    state.new_toplevel(csd_key, "org.gtk.MyApp", "GTK App", 2);
+    assert_eq!(
+        state.wayland.ssd_rect_count(),
+        1,
+        "a CSD window draws its own decorations and must not get a rect"
+    );
+
+    // Forgetting the SSD window drops its rect bookkeeping; the CSD window
+    // never had any to begin with.
+    state.forget_toplevel(ssd_key);
+    assert_eq!(
+        state.wayland.ssd_rect_count(),
+        0,
+        "forgetting a window must drop its rect bookkeeping too, not leak it"
+    );
+
+    state.forget_toplevel(csd_key);
 }
 
 /// The seam turns a library id into a model window and back, and every

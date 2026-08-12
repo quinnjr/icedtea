@@ -59,6 +59,14 @@ pub struct Wayland {
     /// toplevel → model, so both directions are hot.
     toplevel_to_window: HashMap<ToplevelKey, WindowId>,
     window_to_toplevel: HashMap<WindowId, ToplevelKey>,
+    /// One scene rect per window currently painting an SSD title-bar band,
+    /// keyed the same way the toplevel maps are (review finding I2). `None`
+    /// (no entry) means gone -- no rect exists for that window right now --
+    /// the same discipline `toplevel_to_window`/`window_to_toplevel` already
+    /// follow. Created lazily by `sync_ssd_rect` the first time a window
+    /// needs a band, and dropped from this map by `remove_ssd_rect` (called
+    /// from `forget`) once the window is gone for good.
+    ssd_rects: HashMap<WindowId, wlr::RectId>,
     /// The compositor library's long-lived handle, once boot has created one.
     ///
     /// `Option` because `State::new` runs before any of it exists — the model
@@ -97,6 +105,7 @@ impl Wayland {
         if let Some(key) = self.window_to_toplevel.remove(&id) {
             self.toplevel_to_window.remove(&key);
         }
+        self.remove_ssd_rect(id);
     }
 
     pub fn window_for(&self, toplevel: ToplevelKey) -> Option<WindowId> {
@@ -249,6 +258,82 @@ impl Wayland {
             runtime.close_toplevel(key.0);
         }
         true
+    }
+
+    /// Paint (or update, or hide) window `id`'s SSD title-bar band.
+    ///
+    /// Interim fix for review finding I2: `draw_frame` -- and every custom
+    /// render element it built, `Decoration` included -- died with smithay,
+    /// so the 28px band `decoration::content_rect` reserves above every SSD
+    /// window's content has been invisible since the port. The spec's own
+    /// words for the interim state are "SSD strips reuse [rect nodes] at
+    /// parity", so this reuses exactly the rect machinery `run()` already
+    /// uses for the wallpaper background: one more solid-color
+    /// `Runtime::add_rect`, sized and positioned like any other scene node.
+    /// No buttons, no title text -- those need real render elements
+    /// (glyphs, hit-tested sub-rects) that are M2 work, not a rect.
+    ///
+    /// `bar` is frame-space, matching `decoration::title_bar_rect`'s own
+    /// contract; the caller (`State::sync_window_to_scene`) already computes
+    /// it from the same `w.geometry` the content rect is derived from, so
+    /// the two can never drift apart from each other. Hides (rather than
+    /// destroys) the rect when `ssd` is `false` or the window isn't
+    /// currently visible -- see the field doc on `ssd_rects` and this
+    /// method's own note below for why "hide" is `set_rect_size` to zero
+    /// rather than an actual removal.
+    pub fn sync_ssd_rect(&mut self, id: WindowId, ssd: bool, visible: bool, bar: Rectangle, color: [f32; 4]) {
+        let Some(runtime) = self.runtime.clone() else { return };
+        if !ssd || !visible {
+            if let Some(rect) = self.ssd_rects.get(&id) {
+                // No removal-by-id exists in this wlr crate version
+                // (0.20.4; see `RectId`'s own doc in the `wlr` crate) --
+                // shrinking to zero is the documented-in-comment workaround
+                // this task calls for. The entry stays in `ssd_rects` (the
+                // rect itself still exists, just invisible) so a window that
+                // becomes SSD/visible again reuses it instead of leaking a
+                // second one; `remove_ssd_rect` is the one path that drops
+                // the entry, once `id` itself is gone for good.
+                runtime.set_rect_size(*rect, 0, 0);
+            }
+            return;
+        }
+        let width = bar.width.max(1);
+        let height = bar.height.max(1);
+        let rect = match self.ssd_rects.get(&id) {
+            Some(rect) => *rect,
+            None => {
+                let Ok(rect) = runtime.add_rect(width, height, color) else { return };
+                self.ssd_rects.insert(id, rect);
+                rect
+            }
+        };
+        runtime.set_rect_size(rect, width, height);
+        runtime.set_rect_position(rect, bar.x, bar.y);
+        runtime.set_rect_color(rect, color);
+    }
+
+    /// Drop `id`'s SSD rect for good. Called from `forget` so a window's
+    /// rect never outlives the window itself.
+    ///
+    /// Same "no removal by id" limitation as `sync_ssd_rect`'s hide path:
+    /// this shrinks the rect to zero (best-effort cleanup of the scene
+    /// node's footprint) and then drops it from `ssd_rects`, so the id is
+    /// free to be reused by an unrelated future window without colliding
+    /// with a rect this window owned. The underlying `wlr_scene_rect` itself
+    /// is not freed -- it lives, invisible, for the rest of the `Runtime`'s
+    /// life, exactly as `RectId`'s doc says a rect does in this crate
+    /// version.
+    fn remove_ssd_rect(&mut self, id: WindowId) {
+        let Some(rect) = self.ssd_rects.remove(&id) else { return };
+        if let Some(runtime) = self.runtime() {
+            runtime.set_rect_size(rect, 0, 0);
+        }
+    }
+
+    /// How many SSD rects are currently tracked. Introspection for tests --
+    /// nothing in a real boot needs to count these itself.
+    pub fn ssd_rect_count(&self) -> usize {
+        self.ssd_rects.len()
     }
 }
 

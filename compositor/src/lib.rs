@@ -116,6 +116,12 @@ pub fn run() {
     let (wallpaper_wake_write, wallpaper_wake_id) =
         backend::wake_source(&runtime).expect("failed to register the wallpaper-decode wake pipe");
     state.set_wallpaper_wake_source(wallpaper_wake_id);
+    // Review finding C1: `wallpaper_wake_write` is *not* handed to the
+    // decode worker thread directly -- that was the bug (see
+    // `State::spawn_wallpaper`'s doc). Keeping the original here and letting
+    // `spawn_wallpaper` hand the worker a `try_clone`d copy is the same
+    // pattern `config_reload_wake`/`spawn_config_reload` already use.
+    state.set_wallpaper_wake(wallpaper_wake_write);
 
     let socket = display
         .add_socket_auto()
@@ -134,9 +140,8 @@ pub fn run() {
     let (_dbus_conn, dbus_emitter_thread) =
         dbus::spawn_service(dbus_events_rx, cmd_tx, dbus_quit_signal.clone(), cmd_wake_write);
 
-    let wallpaper_rx =
-        render::spawn_wallpaper_decode(state.config.appearance.wallpaper.clone(), Some(wallpaper_wake_write));
-    state.set_wallpaper_receiver(wallpaper_rx);
+    let wallpaper_path = state.config.appearance.wallpaper.clone();
+    state.spawn_wallpaper(wallpaper_path);
 
     if let Err(err) = backend.run_all(&display, &mut state, &runtime, wlr::Until::Stop) {
         tracing::error!(?err, "event loop ended with an error");
