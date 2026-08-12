@@ -797,3 +797,76 @@ fn unmapping_the_focused_window_reroutes_the_seat_without_panicking() {
     );
     assert!(state.wayland.is_backed(id), "still bound -- an unmap is not a destroy");
 }
+
+/// Task 7: a decoded wallpaper gets one buffer scene node per output, and
+/// re-syncing with nothing changed is a no-op on the node count.
+///
+/// Needs a live runtime with `init_graphics` already run (`sync_wallpaper_nodes`'s
+/// `add_buffer` call is a `wlr::Error::Create` without it, mirroring
+/// `add_rect`), and a real output for `state.outputs` to have an entry in --
+/// this is exactly `a_headless_compositor_boots_runs_and_stops`'s boot
+/// preamble, with `WLR_HEADLESS_OUTPUTS=1` producing the one output.
+#[test]
+fn a_decoded_wallpaper_gets_one_buffer_node_per_output() {
+    let boot = boot_lock();
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
+
+    // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
+    // declared after `display`/`backend`/`runtime`.
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime.clone());
+
+    let background = runtime
+        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .expect("background rect");
+    runtime.lower_rect_to_bottom(background);
+    state.set_background(background);
+
+    // The command channel and its wake pipe, used only as this test's
+    // bounded backstop -- same role as in the other `run_all` tests in this
+    // file: it gives the headless backend's output time to arrive (and so
+    // `OutputHandler::new_output` time to populate `state.outputs`) before
+    // asking the loop to stop.
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = cmd_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&cmd_wake_write);
+    });
+
+    backend
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
+        .expect("run_all");
+
+    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+    assert_eq!(state.outputs.len(), 1, "the headless output must have reached the model");
+
+    let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
+    state.wallpaper.set_decoded(Some(image));
+    state.sync_wallpaper_nodes();
+    assert_eq!(
+        state.wallpaper_node_count(),
+        state.outputs.len(),
+        "one buffer node per output"
+    );
+
+    // Idempotence: re-syncing with nothing changed must not grow the map --
+    // an existing node is updated in place (position/dest-size), not
+    // duplicated.
+    state.sync_wallpaper_nodes();
+    assert_eq!(
+        state.wallpaper_node_count(),
+        state.outputs.len(),
+        "a second sync with nothing changed keeps the node count stable"
+    );
+}

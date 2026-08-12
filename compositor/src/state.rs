@@ -20,7 +20,7 @@ use icedtea_contract::{AltTabState, Event, Rectangle, SeqEvent, WindowId};
 
 use crate::input;
 use crate::layout::{self, SnapZone};
-use crate::render::WallpaperState;
+use crate::render::{self, WallpaperState};
 use crate::window::WindowManager;
 
 /// The model's placeholder toplevel size: staged as both the new window's
@@ -268,6 +268,14 @@ pub struct State {
     /// `drain_wallpaper`'s "likely panicked" warn, before the M4 fix above)
     /// fired every single turn forever, for the rest of the process's life.
     wallpaper_wake: Option<std::os::unix::net::UnixStream>,
+    /// One buffer scene node per output currently showing the decoded
+    /// wallpaper image, keyed by the same model output index `outputs` is.
+    /// Empty whenever `wallpaper.decoded()` is `None` (pre-decode, or a
+    /// decode that failed) -- `sync_wallpaper_nodes` tears every node down
+    /// in that case, leaving the solid `background` rect (`lib.rs::run()`)
+    /// as the only thing on screen. `pub(crate)` so `wallpaper_node_count`
+    /// can read it for test introspection without exposing the map itself.
+    wallpaper_nodes: HashMap<u32, wlr::BufferId>,
 }
 
 impl State {
@@ -311,6 +319,7 @@ impl State {
             wallpaper_received: false,
             wallpaper_wake_source: None,
             wallpaper_wake: None,
+            wallpaper_nodes: HashMap::new(),
         }
     }
 
@@ -357,6 +366,7 @@ impl State {
             Ok(image) => {
                 self.wallpaper.set_decoded(image);
                 self.wallpaper_received = true;
+                self.sync_wallpaper_nodes();
             }
             // Review finding M4: `Disconnected` means two different things
             // depending on `wallpaper_received`. Before a result has ever
@@ -379,6 +389,92 @@ impl State {
             }
             Err(crossbeam_channel::TryRecvError::Disconnected) => {}
             Err(crossbeam_channel::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// How many wallpaper buffer nodes are currently tracked. Introspection
+    /// for tests -- nothing in a real boot needs to count these itself
+    /// (mirrors `Wayland::ssd_rect_count`).
+    pub fn wallpaper_node_count(&self) -> usize {
+        self.wallpaper_nodes.len()
+    }
+
+    /// Creates/updates one wallpaper buffer node per output from the
+    /// decoded image, stretched to fill (`render::wallpaper_dest`); removes
+    /// nodes for outputs that are gone. Idempotent -- calling this again
+    /// with nothing changed just re-sets each node's position/size and
+    /// re-lowers it, which are all no-ops on an already-correct scene.
+    ///
+    /// Called whenever either side of the sync could have changed: a fresh
+    /// decode landing (`drain_wallpaper`), or the output set changing
+    /// (`OutputHandler::new_output`/`destroyed`). Not a model mutation --
+    /// these are scene bookkeeping only, so this never touches
+    /// `window_manager` or emits an event (the exactly-one-event-per-mutation
+    /// invariant has nothing to say about a rect existing on screen).
+    ///
+    /// With no runtime attached (every unit test that never calls
+    /// `wayland.attach`), every `wlr` call below is a no-op that returns
+    /// `None`/does nothing, so this degrades to a harmless no-op that also
+    /// never populates `wallpaper_nodes` -- there is no `BufferId` a real
+    /// call could have returned to put in the map.
+    pub fn sync_wallpaper_nodes(&mut self) {
+        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+
+        let Some(img) = self.wallpaper.decoded() else {
+            // No decoded image (pre-decode, or a decode that failed): tear
+            // every node down and fall back to the solid background rect.
+            // `remove_buffer` tolerates a stale id (already gone via its own
+            // toplevel teardown, though wallpaper nodes are root buffers so
+            // that specific race does not apply here) -- just `None`, never
+            // a panic.
+            for (_, node) in self.wallpaper_nodes.drain() {
+                runtime.remove_buffer(node);
+            }
+            return;
+        };
+
+        let width = img.width() as i32;
+        let height = img.height() as i32;
+        // Never panic in handler-reachable code: a zero-dimension decode
+        // (which `image` should never actually produce, but nothing here
+        // proves it can't) skips every output rather than handing wlroots a
+        // buffer `add_buffer`/`update_buffer` would reject anyway.
+        if width == 0 || height == 0 {
+            return;
+        }
+        let rgba = img.as_raw().as_slice();
+
+        for (index, surface) in &self.outputs {
+            let dest = render::wallpaper_dest(surface.geometry);
+            if let Some(&node) = self.wallpaper_nodes.get(index) {
+                runtime.set_buffer_position(node, dest.x, dest.y);
+                runtime.set_buffer_dest_size(node, dest.width, dest.height);
+            } else if let Ok(node) = runtime.add_buffer(width, height, rgba) {
+                runtime.set_buffer_position(node, dest.x, dest.y);
+                runtime.set_buffer_dest_size(node, dest.width, dest.height);
+                // Lowered *after* creation: wlroots' lower-to-bottom moves
+                // the most recently lowered node to the very back, so a
+                // node lowered here lands above the boot-time background
+                // rect (`lib.rs::run()` lowers that one once, at boot,
+                // before any wallpaper node exists) rather than beneath it
+                // -- the solid color stays the pre-decode/decode-failure
+                // fallback, not a permanent occlusion of the image.
+                runtime.lower_buffer_to_bottom(node);
+                self.wallpaper_nodes.insert(*index, node);
+            }
+        }
+
+        // Drop nodes for outputs that are gone.
+        let gone: Vec<u32> = self
+            .wallpaper_nodes
+            .keys()
+            .filter(|index| !self.outputs.contains_key(index))
+            .copied()
+            .collect();
+        for index in gone {
+            if let Some(node) = self.wallpaper_nodes.remove(&index) {
+                runtime.remove_buffer(node);
+            }
         }
     }
 
@@ -1612,6 +1708,10 @@ impl wlr::OutputHandler for State {
         self.next_output_index += 1;
         self.create_output(index, icedtea_contract::Rectangle { x: 0, y: 0, width, height });
         self.output_ids.insert(output.id(), index);
+        // A new output needs its own wallpaper node (if a decode has
+        // already landed) at this output's own size -- nothing else calls
+        // `sync_wallpaper_nodes` when the output set grows.
+        self.sync_wallpaper_nodes();
 
         // The background covers the whole output. Sized here rather than at
         // creation because the mode is not known until now.
@@ -1650,6 +1750,11 @@ impl wlr::OutputHandler for State {
         // a panic here aborts.
         if let Some(index) = self.output_ids.remove(&id) {
             self.outputs.remove(&index);
+            // The gone output's wallpaper node (if any) must go with it --
+            // nothing else calls `sync_wallpaper_nodes` when the output set
+            // shrinks, and a stale node would otherwise sit in the scene
+            // pointing at nothing.
+            self.sync_wallpaper_nodes();
         }
     }
 }
@@ -2966,5 +3071,19 @@ mod tests {
         let mut state = State::new(default_config(), tx);
         let ev = wlr::KeyEvent::for_test(0x61 /* 'a' */, wlr::Modifiers::default(), true, 1);
         assert!(!wlr::SeatHandler::key(&mut state, &ev));
+    }
+
+    #[test]
+    fn wallpaper_nodes_track_outputs() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 9, 9, 255]));
+        state.wallpaper.set_decoded(Some(img));
+        state.sync_wallpaper_nodes();
+        // No runtime: node creation returns None, so the map stays empty --
+        // the assertion here is that the call is a clean no-op without a
+        // runtime.
+        assert!(state.wallpaper_nodes.is_empty());
     }
 }
