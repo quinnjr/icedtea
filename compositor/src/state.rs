@@ -186,6 +186,15 @@ pub struct State {
     /// button-only events (which carry no position of their own) read it
     /// back to build `PointerEvent::Press`/`Release`.
     pub pointer_location: (i32, i32),
+    /// Whether a pointer button is currently held down. Maintained at the
+    /// top of `SeatHandler::pointer_button`, before any routing, so
+    /// `begin_client_move`/`begin_client_resize` can enforce the policy this
+    /// crate substitutes for the seat/serial the library deliberately does
+    /// not forward with `request_move`/`request_resize` (see `wlr::Toplevel
+    /// Handler`'s doc on those methods): honor an interactive move/resize
+    /// request only while a real button-down backs it, never on the
+    /// client's claim alone.
+    pub pointer_pressed: bool,
     /// On-disk location `reload_config_from_disk`/`handle_command`'s
     /// `ReloadConfig` worker thread reads from. `None` (the boot-time
     /// default) means "use `icedtea_config::default_db_path()`" -- this is
@@ -305,6 +314,7 @@ impl State {
             resize: input::ResizeMachine::new(),
             quitting: false,
             pointer_location: (0, 0),
+            pointer_pressed: false,
             config_path: None,
             config_reload_tx: None,
             config_reload_rx: None,
@@ -858,11 +868,7 @@ impl State {
     /// answer with a bare configure instead, so the request is never left
     /// unanswered.
     ///
-    /// Unused in this commit: nothing constructs a `ToplevelKey` until task 5
-    /// wires a client-driven maximize/fullscreen request onto this seam.
-    /// Kept now (with the `ToplevelKey` signature already in place) so that
-    /// wiring is a call site, not a rewrite.
-    #[allow(dead_code)]
+    /// Wired to `ToplevelHandler::request_maximize`.
     pub fn reconcile_maximized(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
         let Some(id) = self.wayland.window_for(toplevel) else { return false };
         let changes = self.window_manager.get(id).is_some_and(|w| w.maximized != target);
@@ -870,8 +876,8 @@ impl State {
     }
 
     /// Fullscreen counterpart of [`Self::reconcile_maximized`]; same
-    /// "did a configure actually go out" contract.
-    #[allow(dead_code)]
+    /// "did a configure actually go out" contract. Wired to
+    /// `ToplevelHandler::request_fullscreen`.
     pub fn reconcile_fullscreen(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
         let Some(id) = self.wayland.window_for(toplevel) else { return false };
         let changes = self.window_manager.get(id).is_some_and(|w| w.fullscreen != target);
@@ -1461,6 +1467,58 @@ impl State {
         Some(())
     }
 
+    /// Honors a client move request (`xdg_toplevel.move`): only when the
+    /// pointer is pressed and currently over `id`'s window; begins the
+    /// existing `DragMachine` grab. A no-op otherwise -- per
+    /// `wlr::ToplevelHandler::request_move`'s doc, an interactive move that
+    /// never starts is legal, not a protocol violation, so there is nothing
+    /// to answer.
+    fn begin_client_move(&mut self, id: WindowId) {
+        if !self.pointer_pressed {
+            return;
+        }
+        let Some(rt) = self.wayland.runtime() else { return };
+        let (px, py) = rt.pointer_position();
+        let pointer = (px as i32, py as i32);
+        if self.window_at_point(pointer) != Some(id) {
+            return;
+        }
+        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else { return };
+        // Baseline behavior: an interactive move raises and focuses, the
+        // same as `handle_pointer_press`'s click-to-focus-then-drag path.
+        let previous = self.focused_id();
+        if self.window_manager.focus(id).is_none() {
+            return;
+        }
+        self.sync_focus_change(previous);
+        let grab_offset = (pointer.0 - geo.x, pointer.1 - geo.y);
+        self.drag.begin(id, grab_offset);
+        self.emit_pending();
+    }
+
+    /// Same guards as [`Self::begin_client_move`], for `xdg_toplevel.resize`:
+    /// maps the client's `wlr::Edges` onto `input::ResizeEdges` field-by-field
+    /// and begins the existing `ResizeMachine` grab.
+    fn begin_client_resize(&mut self, id: WindowId, edges: wlr::Edges) {
+        if !self.pointer_pressed {
+            return;
+        }
+        let Some(rt) = self.wayland.runtime() else { return };
+        let (px, py) = rt.pointer_position();
+        let pointer = (px as i32, py as i32);
+        if self.window_at_point(pointer) != Some(id) {
+            return;
+        }
+        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else { return };
+        let resize_edges = input::ResizeEdges {
+            top: edges.top,
+            bottom: edges.bottom,
+            left: edges.left,
+            right: edges.right,
+        };
+        self.resize.begin(id, resize_edges, geo, pointer);
+    }
+
     /// Pointer motion at `pointer` (output logical coordinates) during an
     /// in-progress drag: updates the snap-zone preview (rendering consumes
     /// `self.snap_preview`).
@@ -1914,6 +1972,37 @@ impl wlr::ToplevelHandler for State {
         tracing::info!(?id, "toplevel destroyed");
         self.forget_toplevel(crate::wayland::ToplevelKey::new(id));
     }
+
+    fn request_maximize(&mut self, toplevel: &wlr::Toplevel<'_>, maximize: bool) {
+        let key = crate::wayland::ToplevelKey::new(toplevel.id());
+        if !self.reconcile_maximized(key, maximize) {
+            // The model didn't change (unknown toplevel, no output yet, or
+            // already at the requested state) -- the dispatch layer answers
+            // with a bare configure regardless, so xdg-shell's "every
+            // request gets a configure" contract is honored either way.
+            // Nothing to do here.
+        }
+    }
+
+    fn request_fullscreen(&mut self, toplevel: &wlr::Toplevel<'_>, fullscreen: bool) {
+        let key = crate::wayland::ToplevelKey::new(toplevel.id());
+        if !self.reconcile_fullscreen(key, fullscreen) {
+            // Same contract as `request_maximize` above: dispatch already
+            // answers with a bare configure when the model didn't change.
+        }
+    }
+
+    fn request_move(&mut self, id: wlr::ToplevelId) {
+        let key = crate::wayland::ToplevelKey::new(id);
+        let Some(window_id) = self.wayland.window_for(key) else { return };
+        self.begin_client_move(window_id);
+    }
+
+    fn request_resize(&mut self, id: wlr::ToplevelId, edges: wlr::Edges) {
+        let key = crate::wayland::ToplevelKey::new(id);
+        let Some(window_id) = self.wayland.window_for(key) else { return };
+        self.begin_client_resize(window_id, edges);
+    }
 }
 impl wlr::SeatHandler for State {
     fn key(&mut self, event: &wlr::KeyEvent<'_>) -> bool {
@@ -1959,6 +2048,13 @@ impl wlr::SeatHandler for State {
     }
 
     fn pointer_button(&mut self, x: f64, y: f64, button: u32, pressed: bool, _time_msec: u32) {
+        // Set before any routing (Deviation 8): `begin_client_move`/
+        // `begin_client_resize` gate an interactive move/resize on this, and
+        // it must already reflect *this* event by the time anything below
+        // reads it -- including a request that arrives interleaved with the
+        // button event itself.
+        self.pointer_pressed = pressed;
+
         // Recorded before the `BTN_LEFT` gate below, not after: this is the
         // same `pointer_location` `pointer_motion` updates, and a
         // button-only event (which carries no position of its own once
@@ -3085,5 +3181,35 @@ mod tests {
         // the assertion here is that the call is a clean no-op without a
         // runtime.
         assert!(state.wallpaper_nodes.is_empty());
+    }
+
+    /// Task 10: `ToplevelHandler::request_maximize`'s model half --
+    /// `reconcile_maximized` actually mutates the model, and reports whether
+    /// it did so the dispatch layer knows when a bare configure is enough.
+    #[test]
+    fn a_client_maximize_request_reaches_the_model() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 10, y: 10, width: 200, height: 100 });
+        let key = crate::wayland::ToplevelKey::for_test(1);
+        state.wayland.bind(id, key);
+        assert!(state.reconcile_maximized(key, true), "model must change");
+        assert!(state.window_manager.get(id).expect("window").maximized);
+        assert!(!state.reconcile_maximized(key, true), "idempotent request must report no change");
+    }
+
+    /// Task 10 (Deviation 8): a move request that arrives with no button
+    /// held must not start a grab -- the crate deliberately forwards no
+    /// seat/serial with `request_move`, so the compositor enforces its own
+    /// pointer-pressed policy instead of trusting the client's claim.
+    #[test]
+    fn a_move_request_without_a_pressed_pointer_is_ignored() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        state.pointer_pressed = false;
+        state.begin_client_move(id);
+        assert!(state.drag.window_id().is_none(), "no grab without a pressed pointer");
     }
 }

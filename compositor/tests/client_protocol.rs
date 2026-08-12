@@ -169,3 +169,39 @@ fn destroying_one_of_two_clients_leaves_the_other() {
 
     second.detach();
 }
+
+/// Task 10: a client-driven `xdg_toplevel.set_maximized` reaches
+/// `ToplevelHandler::request_maximize`, which routes onto
+/// `reconcile_maximized` -- both the client's configure and the model must
+/// agree, the same "both sides of the seam" shape as the model-side test
+/// above, but this time initiated by the client rather than the D-Bus API.
+#[test]
+fn a_client_maximize_request_round_trips_through_the_compositor() {
+    let comp = Compositor::spawn();
+    let mut client = TestClient::map_toplevel(&comp.socket, "harness.max", "maxi");
+    client.request_maximize(true);
+    // xdg_toplevel state 1 == maximized (xdg-shell spec numeric value).
+    assert!(client.wait_until(|c| c.states().contains(&1)), "client never saw the maximized state in a configure");
+    let snap = comp.snapshot();
+    assert!(snap.windows.iter().any(|w| w.maximized), "model must agree");
+    client.detach();
+}
+
+/// Task 10: xdg-shell requires the compositor to answer every
+/// `set_maximized`/`set_fullscreen` request with a configure, even one that
+/// changes nothing in the model -- the dispatch layer's guarantee, not
+/// `reconcile_fullscreen`'s job. Fullscreen once, then send a redundant
+/// second request and prove a configure still arrives via the monotonic
+/// counter (an equality check on `states()` alone can't tell a fresh
+/// configure from the stale one still reading the way the test hoped).
+#[test]
+fn an_unhonored_request_still_gets_a_configure() {
+    let comp = Compositor::spawn();
+    let mut client = TestClient::map_toplevel(&comp.socket, "harness.fs", "fs");
+    client.request_fullscreen(true);
+    assert!(client.wait_until(|c| c.states().contains(&2)), "fullscreen state expected"); // 2 == fullscreen
+    let before = client.configure_count();
+    client.request_fullscreen(true); // redundant: already fullscreen
+    assert!(client.wait_until(|c| c.configure_count() > before), "no answer to the redundant request");
+    client.detach();
+}
