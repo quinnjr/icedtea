@@ -2048,12 +2048,27 @@ impl wlr::SeatHandler for State {
     }
 
     fn pointer_button(&mut self, x: f64, y: f64, button: u32, pressed: bool, _time_msec: u32) {
+        // BTN_LEFT only: every decoration interaction this compositor has is
+        // a left-click one, and forwarding the rest to the client unchanged
+        // is the correct behaviour for them. Hoisted above `pointer_pressed`
+        // below (review: state.rs:2050-2056) -- both need it before the
+        // early return this gate gives everything past it.
+        const BTN_LEFT: u32 = 0x110;
+
         // Set before any routing (Deviation 8): `begin_client_move`/
         // `begin_client_resize` gate an interactive move/resize on this, and
         // it must already reflect *this* event by the time anything below
         // reads it -- including a request that arrives interleaved with the
-        // button event itself.
-        self.pointer_pressed = pressed;
+        // button event itself. Gated on `BTN_LEFT` -- the same button the
+        // grab/release path below acts on exclusively -- because this is a
+        // single scalar, not a per-button set: an ungated assignment means a
+        // right/middle release while the left button is still held wrongly
+        // clears it (spuriously rejecting a legit move grab), and a lone
+        // right-click press wrongly sets it. "Left button held" is the only
+        // reading that matches the grab semantics throughout this file.
+        if button == BTN_LEFT {
+            self.pointer_pressed = pressed;
+        }
 
         // Recorded before the `BTN_LEFT` gate below, not after: this is the
         // same `pointer_location` `pointer_motion` updates, and a
@@ -2066,10 +2081,6 @@ impl wlr::SeatHandler for State {
         let pointer = (x as i32, y as i32);
         self.pointer_location = pointer;
 
-        // BTN_LEFT only: every decoration interaction this compositor has is
-        // a left-click one, and forwarding the rest to the client unchanged
-        // is the correct behaviour for them.
-        const BTN_LEFT: u32 = 0x110;
         if button != BTN_LEFT {
             return;
         }
@@ -3211,5 +3222,47 @@ mod tests {
         state.pointer_pressed = false;
         state.begin_client_move(id);
         assert!(state.drag.window_id().is_none(), "no grab without a pressed pointer");
+    }
+
+    /// Review fix (task 10): `pointer_pressed` is a single scalar tracking
+    /// "the left button is held", not a per-button set -- every button's
+    /// `pressed` value used to overwrite it unconditionally, so a
+    /// right-button press or release interleaved with a held left button
+    /// spuriously set or cleared the flag `begin_client_move`/
+    /// `begin_client_resize` gate on. Gating the assignment on `BTN_LEFT`
+    /// fixes it: a right press/release while the left button stays down
+    /// must leave `pointer_pressed` (and so a move grab) untouched.
+    #[test]
+    fn a_right_click_does_not_disturb_a_held_left_button() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        const BTN_LEFT: u32 = 0x110;
+        const BTN_RIGHT: u32 = 0x111;
+
+        wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_LEFT, true, 0);
+        assert!(state.pointer_pressed, "a left press must set pointer_pressed");
+
+        wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_RIGHT, true, 0);
+        assert!(state.pointer_pressed, "a right press must not clear a held left button");
+
+        wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_RIGHT, false, 0);
+        assert!(state.pointer_pressed, "a right release must not clear a held left button");
+    }
+
+    /// Counterpart: a lone right-click (no left button ever pressed) must
+    /// never set `pointer_pressed`, so a `request_move` that happens to
+    /// arrive during it is still ignored.
+    #[test]
+    fn a_lone_right_click_leaves_pointer_pressed_false() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        const BTN_RIGHT: u32 = 0x111;
+
+        wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_RIGHT, true, 0);
+        assert!(!state.pointer_pressed, "a lone right press must not set pointer_pressed");
+
+        state.begin_client_move(id);
+        assert!(state.drag.window_id().is_none(), "request_move must be ignored without a held left button");
     }
 }
