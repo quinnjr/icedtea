@@ -1887,11 +1887,18 @@ impl State {
         use crate::dbus::DbCommand;
         match cmd {
             DbCommand::Focus(id) => {
-                // Re-review finding Important-1: an explicit toplevel-focus
-                // assertion -- see `release_layer_focus`'s own doc.
-                self.release_layer_focus();
                 let previous = self.focused_id();
                 self.window_manager.focus(id)?;
+                // Re-review finding Important-1: an explicit toplevel-focus
+                // assertion -- see `release_layer_focus`'s own doc. Round-2
+                // finding Important-2: after the `?`, not before -- `id`
+                // can name a stale/unknown window (this arm is reachable
+                // from a D-Bus caller with a wire id this compositor never
+                // heard of), and an early return must leave `layer_focus`
+                // exactly as it was, not silently defeat a panel's
+                // keyboard grab for a focus assertion that never actually
+                // happened.
+                self.release_layer_focus();
                 self.sync_focus_change(previous);
             }
             DbCommand::Close(id) => self.request_close(id),
@@ -2319,11 +2326,15 @@ impl State {
     /// raise a window also be the click that acts on it, matching ordinary
     /// click-to-focus window manager behavior.
     fn handle_pointer_press(&mut self, id: WindowId, pointer: (i32, i32)) -> Option<()> {
-        // Re-review finding Important-1: click-to-focus is an explicit
-        // toplevel-focus assertion -- see `release_layer_focus`'s own doc.
-        self.release_layer_focus();
         let previous = self.focused_id();
         self.window_manager.focus(id)?;
+        // Re-review finding Important-1: click-to-focus is an explicit
+        // toplevel-focus assertion -- see `release_layer_focus`'s own doc.
+        // Round-2 finding Important-2: after the `?`, not before -- an
+        // early return here (an unknown `id`) must leave `layer_focus`
+        // untouched, not clear it for a focus assertion that never
+        // actually happened.
+        self.release_layer_focus();
         // Focus changes the client's activation state, so it has to reach
         // the client too (C1) -- both ends of the transition, not just the
         // new one (New-1).
@@ -5349,6 +5360,35 @@ mod tests {
         state.handle_command(crate::dbus::DbCommand::Focus(a)).unwrap();
         assert_eq!(state.layer_focus, None, "DbCommand::Focus must release layer_focus");
         assert!(state.window_manager.get(a).unwrap().focused);
+    }
+
+    /// Round-2 re-review finding Important-2: `release_layer_focus()` ran
+    /// *before* the fallible `window_manager.focus(id)?` in both
+    /// `DbCommand::Focus` and `handle_pointer_press`, so a focus request
+    /// naming a window that cannot actually be focused (unmapped, or --
+    /// `DbCommand::Focus` is reachable straight from a D-Bus caller -- a
+    /// stale wire id) still cleared `layer_focus` on its way to the early
+    /// return, silently defeating an interactive panel's keyboard grab for
+    /// a focus assertion that never happened. `release_layer_focus` now
+    /// runs after the `?` at both sites.
+    #[test]
+    fn a_failing_db_command_focus_does_not_release_layer_focus() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let a = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.window_manager.set_mapped(a, false).unwrap();
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(panel_id);
+
+        assert_eq!(
+            state.handle_command(crate::dbus::DbCommand::Focus(a)),
+            None,
+            "an unmapped window must never be focused via D-Bus"
+        );
+        assert_eq!(state.layer_focus, Some(panel_id), "a failing focus request must not release layer_focus");
     }
 
     /// Important-1: alt-tab's per-step focus is the third explicit path
