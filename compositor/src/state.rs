@@ -980,7 +980,9 @@ impl State {
                         render::hex_to_rgba(&self.config.appearance.palette.accent),
                         0.35,
                     );
-                    if let Ok(id) = runtime.add_rect(rect.width, rect.height, color) {
+                    if let Ok(id) =
+                        runtime.add_rect_in_band(wlr::Band::Overlay, rect.width, rect.height, color)
+                    {
                         runtime.set_rect_position(id, rect.x, rect.y);
                         self.snap_preview_rect = Some(id);
                     }
@@ -5070,6 +5072,31 @@ mod tests {
         state.snap_preview = None;
         state.sync_snap_preview();
         assert!(state.snap_preview_rect.is_none());
+    }
+
+    /// Task 3 (wlr-port M3): the snap-preview rect is model-only overlay
+    /// chrome, never a hit target. `window_at_point` consults only
+    /// `window_manager`'s windows, so a click inside both an active preview
+    /// and the window it overlaps must still resolve to the window -- this
+    /// pins the model contract the `Band::Overlay` move (see
+    /// `sync_snap_preview`) is meant to preserve at the wlr layer too.
+    #[test]
+    fn a_click_under_an_active_snap_preview_hits_the_window() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle { x: 100, y: 100, width: 300, height: 200 },
+        );
+        state.snap_preview = Some(Rectangle { x: 0, y: 0, width: 400, height: 600 });
+        state.sync_snap_preview();
+        // The window at a point inside both the preview and the window must
+        // still resolve to the window -- the preview rect is not a hit
+        // target.
+        assert_eq!(state.window_at_point((150, 150)), Some(id));
     }
 
     /// Task 14 Step 2: `ToplevelHandler::unmapped` now moves focus to the
