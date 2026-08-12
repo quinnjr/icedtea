@@ -205,3 +205,65 @@ fn an_unhonored_request_still_gets_a_configure() {
     assert!(client.wait_until(|c| c.configure_count() > before), "no answer to the redundant request");
     client.detach();
 }
+
+/// Task 13: a client that creates a decoration object and states no
+/// preference must be told **server-side** — this compositor draws the band
+/// itself for anything that isn't a known CSD app.
+///
+/// This is also the first test in the suite where a *real* toplevel reaches
+/// the whole in-tree decoration stack: answering the negotiation re-syncs
+/// the window, which builds the band rect, the three button rects and the
+/// cosmic-text title buffer node inside that toplevel's own scene tree
+/// against a live wlroots scene. Nothing but a real client can exercise
+/// those calls (a `for_test` id makes every one of them a no-op), so a
+/// crash, a mis-sized buffer or a rejected node shows up here and nowhere
+/// else.
+#[test]
+fn ssd_is_negotiated_for_a_client_that_defers() {
+    let comp = Compositor::spawn();
+    let mut client = TestClient::map_decorated_toplevel(&comp.socket, "harness.ssd", "decorated");
+    // 2 == server_side in zxdg_toplevel_decoration_v1.
+    assert!(client.wait_until(|c| c.decoration_mode() == Some(2)), "server-side expected");
+
+    // And the band is really reserved: an SSD window's client is configured
+    // at the frame height minus the title bar, never at the whole frame.
+    let snap = comp.snapshot();
+    let frame = snap.windows.first().expect("one mapped window").geometry;
+    assert!(
+        client.wait_until(|c| c.last_configure() == Some((frame.width, frame.height - 28))),
+        "an SSD client must be sized to the content rect, got {:?} for frame {:?}",
+        client.last_configure(),
+        frame
+    );
+
+    // Retitling drives `update_buffer` on the live title node: the model
+    // must take the new title and the client must survive it.
+    client.set_title("renamed");
+    comp.wait_event(|e| matches!(e, Event::WindowUpdated { update, .. } if update.title.as_deref() == Some("renamed")));
+    assert!(client.wait_until(|c| !c.closed()), "the client must still be alive");
+
+    client.detach();
+}
+
+/// The other answer: a client this compositor treats as client-side
+/// decorated (`decoration::is_csd`'s app-id rule) is told **client-side**,
+/// and gets its whole frame rather than a content rect inset by a band it
+/// will never be shown.
+#[test]
+fn csd_is_negotiated_for_a_client_that_draws_its_own() {
+    let comp = Compositor::spawn();
+    let mut client = TestClient::map_decorated_toplevel(&comp.socket, "org.gtk.Harness", "own frame");
+    // 1 == client_side.
+    assert!(client.wait_until(|c| c.decoration_mode() == Some(1)), "client-side expected");
+
+    let snap = comp.snapshot();
+    let frame = snap.windows.first().expect("one mapped window").geometry;
+    assert!(
+        client.wait_until(|c| c.last_configure() == Some((frame.width, frame.height))),
+        "a CSD client owns every pixel of its frame, got {:?} for frame {:?}",
+        client.last_configure(),
+        frame
+    );
+
+    client.detach();
+}

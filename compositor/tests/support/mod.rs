@@ -41,6 +41,9 @@ use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
+};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 /// How long any "wait for the compositor to do a thing" helper waits before
@@ -158,6 +161,12 @@ impl Compositor {
             let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
             runtime.init_graphics(&display, &backend).expect("graphics");
             runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+            // Unlike `lib.rs::run()`, which degrades, a harness that cannot
+            // advertise xdg-decoration is simply broken: the SSD negotiation
+            // test would then assert against a global that was never there.
+            runtime
+                .create_xdg_decoration_manager(&display)
+                .expect("zxdg_decoration_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
 
             // `state` is declared after `display`/`runtime`/`backend` so that
@@ -272,6 +281,10 @@ struct ClientState {
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
+    decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+    /// `mode` from the most recent `zxdg_toplevel_decoration_v1.configure`
+    /// (1 = client-side, 2 = server-side), or `None` before the first one.
+    decoration_mode: Option<u32>,
     /// Most recent `xdg_toplevel.configure` size.
     configured: Option<(i32, i32)>,
     /// How many `xdg_surface.configure` events have arrived, ever.
@@ -311,6 +324,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
                 "xdg_wm_base" => {
                     state.wm_base = Some(registry.bind(name, version.min(6), qh, ()));
+                }
+                "zxdg_decoration_manager_v1" => {
+                    state.decoration_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -377,6 +393,24 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for ClientState {
     }
 }
 
+impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        event: zxdg_toplevel_decoration_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // The mode is recorded raw (`1` client-side, `2` server-side) rather
+        // than as the generated enum: the assertion a test wants to make is
+        // about the value that crossed the wire.
+        if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = event {
+            state.decoration_mode = mode.into_result().ok().map(|mode| mode as u32);
+        }
+    }
+}
+
 // wayland-client requires a `Dispatch` impl per bound interface; these five
 // carry nothing the harness asserts on.
 delegate_noop!(ClientState: ignore wl_compositor::WlCompositor);
@@ -384,11 +418,13 @@ delegate_noop!(ClientState: ignore wl_surface::WlSurface);
 delegate_noop!(ClientState: ignore wl_shm::WlShm);
 delegate_noop!(ClientState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(ClientState: ignore wl_buffer::WlBuffer);
+delegate_noop!(ClientState: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 
 /// A real wayland client with exactly one mapped xdg toplevel.
 pub struct TestClient {
     // Field order is drop order: the wayland objects go before the queue and
     // the connection that own their backing.
+    decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     buffer: wl_buffer::WlBuffer,
     pool: wl_shm_pool::WlShmPool,
     toplevel: xdg_toplevel::XdgToplevel,
@@ -406,6 +442,27 @@ impl TestClient {
     /// Connect to `socket`, bind the globals, and map one shm-backed toplevel
     /// for real: commit, await configure, ack, attach, commit.
     pub fn map_toplevel(socket: &str, app_id: &str, title: &str) -> TestClient {
+        Self::map(socket, app_id, title, false)
+    }
+
+    /// As [`TestClient::map_toplevel`], but the toplevel also gets a
+    /// `zxdg_toplevel_decoration_v1` and states no mode preference of its
+    /// own -- the "the compositor decides" path a client that defers to the
+    /// server takes. Read the compositor's answer with
+    /// [`TestClient::decoration_mode`].
+    ///
+    /// Created here rather than through a `create_decoration()` a test could
+    /// call after mapping, because the protocol forbids that outright:
+    /// wlroots raises `xdg_toplevel_decoration must not have a buffer at
+    /// creation` (an unrecoverable protocol error that kills the
+    /// connection) for a decoration created against a surface that already
+    /// has one. The decoration therefore has to exist before the very first
+    /// buffer attach, which is inside this constructor.
+    pub fn map_decorated_toplevel(socket: &str, app_id: &str, title: &str) -> TestClient {
+        Self::map(socket, app_id, title, true)
+    }
+
+    fn map(socket: &str, app_id: &str, title: &str, decorated: bool) -> TestClient {
         let dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR must be set");
         let path = std::path::Path::new(&dir).join(socket);
         let stream = UnixStream::connect(&path)
@@ -432,6 +489,15 @@ impl TestClient {
         let toplevel = xdg_surface.get_toplevel(&qh, ());
         toplevel.set_app_id(app_id.to_string());
         toplevel.set_title(title.to_string());
+        let decoration = decorated.then(|| {
+            let manager = state
+                .decoration_manager
+                .clone()
+                .expect("compositor did not advertise zxdg_decoration_manager_v1");
+            // No `set_mode` call at all: the client states no preference and
+            // leaves the decision entirely to the compositor.
+            manager.get_toplevel_decoration(&toplevel, &qh, ())
+        });
         // The initial-commit handshake: an empty commit, then wait for the
         // compositor's first configure (acked inside the `Dispatch` impl).
         surface.commit();
@@ -482,6 +548,7 @@ impl TestClient {
         queue.roundtrip(&mut state).expect("map roundtrip");
 
         TestClient {
+            decoration,
             buffer,
             pool,
             toplevel,
@@ -552,6 +619,12 @@ impl TestClient {
         self.state.closed
     }
 
+    /// The mode from the most recent decoration `configure`: `1` client-side,
+    /// `2` server-side, `None` if none has arrived.
+    pub fn decoration_mode(&self) -> Option<u32> {
+        self.state.decoration_mode
+    }
+
     pub fn set_title(&mut self, title: &str) {
         self.toplevel.set_title(title.to_string());
         self.surface.commit();
@@ -580,6 +653,9 @@ impl TestClient {
     /// (toplevel, then xdg_surface, then the wl_surface), and flush so the
     /// compositor sees it before the connection goes away.
     pub fn detach(self) {
+        if let Some(decoration) = &self.decoration {
+            decoration.destroy();
+        }
         self.buffer.destroy();
         self.pool.destroy();
         self.toplevel.destroy();

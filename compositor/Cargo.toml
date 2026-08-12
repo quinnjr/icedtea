@@ -64,7 +64,9 @@ signal-hook = "0.3"
 # xdg-shell to the compositor under test over a real socket. Dev-only --
 # nothing in `src/` is a wayland *client*.
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
+# `unstable` for `xdg::decoration::zv1` (zxdg_decoration_manager_v1), which
+# the SSD negotiation test binds like any other global.
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 # `memfd_create`/`ftruncate` for the shm buffer the test client attaches.
 # `rustix` is already a normal dependency (features = ["std"]); these extra
 # features are additive and only reach the test binaries.

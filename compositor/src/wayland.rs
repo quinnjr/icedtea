@@ -49,6 +49,27 @@ impl ToplevelKey {
     }
 }
 
+/// Every scene node one server-side-decorated window's title bar is made
+/// of, all parented into that window's own toplevel tree.
+///
+/// One struct rather than three maps because they share a lifetime exactly:
+/// they are created together the first time a window needs decorations and
+/// destroyed together when it stops (`sync_ssd`) or dies (`remove_ssd`).
+/// The two `Option`s inside are the pieces that can legitimately be absent
+/// while the band itself exists: a title that rasterized to nothing (an
+/// empty title, or no font on the machine with the glyphs for it), and a
+/// button rect wlroots refused to create. Neither is a reason to drop the
+/// band -- a decoration degrades, it never fails the window.
+struct SsdVisual {
+    /// The title-bar band, the full width of the frame.
+    band: wlr::RectId,
+    /// The rasterized title, sitting over the band's left-hand span.
+    title: Option<wlr::BufferId>,
+    /// Minimize, maximize, close -- `decoration::button_rects`' own order,
+    /// left to right, which is also the order `hit_test` maps them in.
+    buttons: [Option<wlr::RectId>; 3],
+}
+
 /// The compositor's Wayland side.
 #[derive(Default)]
 pub struct Wayland {
@@ -59,18 +80,19 @@ pub struct Wayland {
     /// toplevel → model, so both directions are hot.
     toplevel_to_window: HashMap<ToplevelKey, WindowId>,
     window_to_toplevel: HashMap<WindowId, ToplevelKey>,
-    /// One scene rect per window currently painting an SSD title-bar band,
-    /// keyed the same way the toplevel maps are (review finding I2). `None`
-    /// (no entry) means gone -- no rect exists for that window right now --
-    /// the same discipline `toplevel_to_window`/`window_to_toplevel` already
-    /// follow. Created lazily by `sync_ssd_rect` the first time a window
-    /// needs a band, parented into that window's own toplevel scene tree
-    /// (`Runtime::add_rect_in_toplevel`) so it rides the toplevel's z-order
-    /// with no separate raise bookkeeping. Dropped from this map both when
-    /// the band becomes hidden (`sync_ssd_rect`, which removes rather than
-    /// merely hides it now) and when the window is gone for good
-    /// (`remove_ssd_rect`, called from `forget`).
-    ssd_rects: HashMap<WindowId, wlr::RectId>,
+    /// One [`SsdVisual`] per window currently wearing server-side
+    /// decorations, keyed the same way the toplevel maps are (review finding
+    /// I2). `None` (no entry) means gone -- nothing is painted for that
+    /// window right now -- the same discipline
+    /// `toplevel_to_window`/`window_to_toplevel` already follow. Created
+    /// lazily by `sync_ssd` the first time a window needs decorations, every
+    /// node parented into that window's own toplevel scene tree
+    /// (`Runtime::add_rect_in_toplevel`/`add_buffer_in_toplevel`) so the
+    /// whole decoration rides the toplevel's z-order with no separate raise
+    /// bookkeeping. Dropped from this map both when the decoration becomes
+    /// hidden (`sync_ssd`, which removes rather than merely hides it) and
+    /// when the window is gone for good (`remove_ssd`, called from `forget`).
+    ssd: HashMap<WindowId, SsdVisual>,
     /// The compositor library's long-lived handle, once boot has created one.
     ///
     /// `Option` because `State::new` runs before any of it exists — the model
@@ -109,7 +131,7 @@ impl Wayland {
         if let Some(key) = self.window_to_toplevel.remove(&id) {
             self.toplevel_to_window.remove(&key);
         }
-        self.remove_ssd_rect(id);
+        self.remove_ssd(id);
     }
 
     pub fn window_for(&self, toplevel: ToplevelKey) -> Option<WindowId> {
@@ -264,88 +286,194 @@ impl Wayland {
         true
     }
 
-    /// Paint (or update, or hide) window `id`'s SSD title-bar band.
+    /// Answer a client's xdg-decoration negotiation for `toplevel`.
     ///
-    /// Fix for review finding I2: `draw_frame` -- and every custom render
-    /// element it built, `Decoration` included -- died with smithay, so the
-    /// 28px band `decoration::content_rect` reserves above every SSD
-    /// window's content has to be painted some other way. This uses
-    /// `Runtime::add_rect_in_toplevel` to parent the band rect into the
-    /// window's own toplevel scene tree, so it rides the toplevel: raising,
-    /// lowering or restacking the window moves the band with it with no
-    /// separate bookkeeping, closing the z-order defect structurally rather
-    /// than by re-raising the rect on every restack. No buttons, no title
-    /// text -- those need real render elements (glyphs, hit-tested
-    /// sub-rects) that are M2 work, not a rect.
+    /// Keyed by `ToplevelKey`, not `WindowId`, because this is the one
+    /// outbound push that legitimately happens *before* the model has a
+    /// window at all: a client creates its decoration object and states its
+    /// preference before the initial commit, and `mapped` -- which is what
+    /// creates the model row -- has not run yet.
+    ///
+    /// Silent no-op on a miss, like every other method here: no runtime, a
+    /// stale id, or a toplevel whose client never created a decoration
+    /// object (by far the most common case -- most clients never bind
+    /// `zxdg_decoration_manager_v1` at all) each report `None`, and none of
+    /// them is an error.
+    pub fn set_decoration_mode(&self, toplevel: ToplevelKey, mode: wlr::DecorationMode) {
+        let Some(runtime) = self.runtime() else { return };
+        runtime.set_decoration_mode(toplevel.0, mode);
+    }
+
+    /// Paint (or update, or hide) window `id`'s whole server-side
+    /// decoration: the title-bar band, the rasterized title over it, and the
+    /// three button rects.
+    ///
+    /// Fix for review finding I2, completed: `draw_frame` -- and every
+    /// custom render element it built, `Decoration` included -- died with
+    /// smithay, so the 28px band `decoration::content_rect` reserves above
+    /// every SSD window's content has to be painted some other way. Every
+    /// node here is parented into the window's own toplevel scene tree
+    /// (`add_rect_in_toplevel`/`add_buffer_in_toplevel`), so the decoration
+    /// rides the toplevel: raising, lowering or restacking the window moves
+    /// the whole title bar with it with no separate bookkeeping, closing the
+    /// z-order defect structurally rather than by re-raising nodes on every
+    /// restack.
+    ///
+    /// Hit-testing is deliberately *not* derived from these nodes.
+    /// `decoration::hit_test` answers from the model's frame geometry, the
+    /// same geometry this function is handed, so a click and a pixel can
+    /// never disagree about which button they mean -- and the scene nodes
+    /// stay pure output, with no input role at all.
     ///
     /// `bar` is frame-space, matching `decoration::title_bar_rect`'s own
     /// contract; `content` is `decoration::content_rect`'s output for the
     /// same frame. Both come from the same `w.geometry` in the caller
     /// (`State::sync_window_to_scene`), so they can never drift apart from
-    /// each other. `bar.x - content.x, bar.y - content.y` is the band's
-    /// position relative to the toplevel tree's own origin --
-    /// `add_rect_in_toplevel`'s coordinates are relative to that origin, not
-    /// the scene root's, the same origin `set_position` moves via
-    /// `set_toplevel_position`.
+    /// each other. `r.x - content.x, r.y - content.y` is a node's position
+    /// relative to the toplevel tree's own origin -- these calls' coordinates
+    /// are relative to that origin, not the scene root's, the same origin
+    /// `set_position` moves via `set_toplevel_position`.
     ///
-    /// Removes (rather than merely hides) the rect when `ssd` is `false` or
-    /// the window isn't currently visible: a hidden band is cheaper to
-    /// recreate than to keep, and unlike the old root-rect scheme there is
+    /// `title_px` is `(width, height, premultiplied RGBA)` from
+    /// `text::rasterize_title`; `None` means the title rasterized to nothing
+    /// (an empty title, or no font on this machine that can shape it) and
+    /// the band is shown bare -- the spec's error-handling rule that a
+    /// decoration degrades rather than failing the window.
+    ///
+    /// Removes (rather than merely hides) every node when `ssd` is `false`
+    /// or the window isn't currently visible: a hidden decoration is cheaper
+    /// to recreate than to keep, and unlike the old root-rect scheme there is
     /// no stacking-order reason to keep it around invisible.
-    pub fn sync_ssd_rect(
+    // Nine arguments, deliberately: every one of them is a fact the caller
+    // (`State::sync_window_to_scene`) already has and this seam must not
+    // re-derive -- the model's geometry, its palette, and its title pixels.
+    // Bundling them into a struct would only move the same nine fields one
+    // line up at the single call site, while making the "no model types
+    // below this seam" rule harder to keep.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_ssd(
         &mut self,
         id: WindowId,
         ssd: bool,
         visible: bool,
         bar: Rectangle,
         content: Rectangle,
-        color: [f32; 4],
+        band_color: [f32; 4],
+        button_colors: [[f32; 4]; 3],
+        title_px: Option<(i32, i32, Vec<u8>)>,
     ) {
-        let Some(runtime) = self.runtime.clone() else { return };
         if !ssd || !visible {
-            if let Some(rect) = self.ssd_rects.remove(&id) {
-                runtime.remove_rect(rect);
-            }
+            self.remove_ssd(id);
             return;
         }
+        let Some(runtime) = self.runtime.clone() else { return };
         let width = bar.width.max(1);
         let height = bar.height.max(1);
         let (rel_x, rel_y) = (bar.x - content.x, bar.y - content.y);
-        let rect = match self.ssd_rects.get(&id) {
-            Some(rect) => *rect,
-            None => {
-                let Some(key) = self.toplevel_for(id) else { return };
-                let Some(rect) = runtime.add_rect_in_toplevel(key.0, width, height, color) else {
-                    return;
-                };
-                self.ssd_rects.insert(id, rect);
-                rect
+
+        // The band is the entry: no band, no decoration. It is also created
+        // first so that every node added below lands above it in the
+        // toplevel tree's own stacking order -- buttons and title over the
+        // band, never under it.
+        if !self.ssd.contains_key(&id) {
+            let Some(key) = self.toplevel_for(id) else { return };
+            let Some(band) = runtime.add_rect_in_toplevel(key.0, width, height, band_color) else {
+                return;
+            };
+            self.ssd.insert(
+                id,
+                SsdVisual {
+                    band,
+                    title: None,
+                    buttons: [None; 3],
+                },
+            );
+        }
+        let key = self.toplevel_for(id);
+        let Some(visual) = self.ssd.get_mut(&id) else { return };
+
+        runtime.set_rect_size(visual.band, width, height);
+        runtime.set_rect_position(visual.band, rel_x, rel_y);
+        runtime.set_rect_color(visual.band, band_color);
+
+        // `button_rects` takes the frame, but reads only `x`, `y` and
+        // `width` off it -- all three identical in `bar`, which
+        // `title_bar_rect` derived from that same frame. Passing `bar`
+        // keeps this function from needing the frame as a fourth
+        // near-duplicate rectangle argument.
+        let rects = crate::decoration::button_rects(bar);
+        for (i, r) in rects.iter().enumerate() {
+            let slot = &mut visual.buttons[i];
+            if slot.is_none() {
+                let Some(key) = key else { continue };
+                *slot = runtime.add_rect_in_toplevel(
+                    key.0,
+                    r.width.max(1),
+                    r.height.max(1),
+                    button_colors[i],
+                );
             }
-        };
-        runtime.set_rect_size(rect, width, height);
-        runtime.set_rect_position(rect, rel_x, rel_y);
-        runtime.set_rect_color(rect, color);
+            let Some(rect) = *slot else { continue };
+            runtime.set_rect_size(rect, r.width.max(1), r.height.max(1));
+            runtime.set_rect_position(rect, r.x - content.x, r.y - content.y);
+            runtime.set_rect_color(rect, button_colors[i]);
+        }
+
+        match title_px {
+            Some((tw, th, px)) => {
+                // `update_buffer` rather than remove-and-re-add: it exists
+                // for exactly this (a re-titled or resized window), and it
+                // keeps the node's place in the stacking order instead of
+                // re-adding it on top of whatever was added since. A `None`
+                // from it means the id went stale (its parent toplevel was
+                // torn down), so the node is dropped and rebuilt.
+                let updated = visual
+                    .title
+                    .and_then(|buffer| runtime.update_buffer(buffer, tw, th, &px));
+                if updated.is_none() {
+                    if let Some(stale) = visual.title.take() {
+                        runtime.remove_buffer(stale);
+                    }
+                    let Some(key) = key else { return };
+                    visual.title = runtime.add_buffer_in_toplevel(key.0, tw, th, &px);
+                }
+                if let Some(buffer) = visual.title {
+                    runtime.set_buffer_position(buffer, rel_x, rel_y);
+                }
+            }
+            None => {
+                if let Some(buffer) = visual.title.take() {
+                    runtime.remove_buffer(buffer);
+                }
+            }
+        }
     }
 
-    /// Drop `id`'s SSD rect for good. Called from `forget` so a window's
-    /// rect never outlives the window itself.
+    /// Drop `id`'s SSD nodes for good. Called from `forget` so a window's
+    /// decoration never outlives the window itself.
     ///
-    /// Tolerates `remove_rect` reporting `None`: the rect may already be
-    /// gone because its parent toplevel died first (a toplevel's tree, and
-    /// every rect parented into it, is freed when the toplevel is torn
+    /// Tolerates every removal reporting `None`: a node may already be gone
+    /// because its parent toplevel died first (a toplevel's tree, and every
+    /// rect or buffer parented into it, is freed when the toplevel is torn
     /// down), which is a normal race between the two teardown paths, not an
     /// error.
-    fn remove_ssd_rect(&mut self, id: WindowId) {
-        let Some(rect) = self.ssd_rects.remove(&id) else { return };
-        if let Some(runtime) = self.runtime() {
+    fn remove_ssd(&mut self, id: WindowId) {
+        let Some(visual) = self.ssd.remove(&id) else { return };
+        let Some(runtime) = self.runtime() else { return };
+        runtime.remove_rect(visual.band);
+        if let Some(buffer) = visual.title {
+            runtime.remove_buffer(buffer);
+        }
+        for rect in visual.buttons.into_iter().flatten() {
             runtime.remove_rect(rect);
         }
     }
 
-    /// How many SSD rects are currently tracked. Introspection for tests --
-    /// nothing in a real boot needs to count these itself.
+    /// How many SSD title bars are currently tracked -- one per decorated
+    /// window, whatever it is made of. Introspection for tests; nothing in a
+    /// real boot needs to count these itself.
     pub fn ssd_rect_count(&self) -> usize {
-        self.ssd_rects.len()
+        self.ssd.len()
     }
 }
 
@@ -408,7 +536,7 @@ mod tests {
         assert!(!w.close(WindowId(1)));
     }
 
-    /// The pure coordinate math `sync_ssd_rect` must feed
+    /// The pure coordinate math `sync_ssd` must feed
     /// `add_rect_in_toplevel`/`set_rect_position`: the band sits flush with
     /// the toplevel tree's origin horizontally and `TITLE_BAR_HEIGHT` pixels
     /// above it vertically, since `content_rect` moves the content down by
@@ -427,12 +555,11 @@ mod tests {
     }
 
     /// No runtime attached (every unit test that never calls `attach`) means
-    /// `sync_ssd_rect`/`remove_ssd_rect` are no-ops, matching every other
-    /// outbound method's contract -- and in particular never populate
-    /// `ssd_rects`, since there is no `RectId` a real call could have
-    /// returned.
+    /// `sync_ssd`/`remove_ssd` are no-ops, matching every other outbound
+    /// method's contract -- and in particular never populate `ssd`, since
+    /// there is no `RectId` a real call could have returned.
     #[test]
-    fn syncing_ssd_rect_with_no_runtime_is_harmless() {
+    fn syncing_ssd_with_no_runtime_is_harmless() {
         let mut w = Wayland::new();
         let id = WindowId(3);
         let frame = Rectangle { x: 100, y: 200, width: 400, height: 300 };
@@ -440,13 +567,53 @@ mod tests {
         let content = crate::decoration::content_rect(frame, true);
         let color = [1.0, 1.0, 1.0, 1.0];
 
-        w.sync_ssd_rect(id, true, true, bar, content, color);
+        w.sync_ssd(id, true, true, bar, content, color, [[0.0; 4]; 3], None);
         assert_eq!(w.ssd_rect_count(), 0);
 
-        w.sync_ssd_rect(id, false, true, bar, content, color);
+        w.sync_ssd(id, false, true, bar, content, color, [[0.0; 4]; 3], None);
         assert_eq!(w.ssd_rect_count(), 0);
 
         w.forget(id);
         assert_eq!(w.ssd_rect_count(), 0);
+    }
+
+    /// Even with real title pixels and real button colors, a seam with no
+    /// runtime creates nothing and panics on nothing: the buffer-node path
+    /// (`add_buffer_in_toplevel`/`update_buffer`) has the same "no runtime,
+    /// no binding -> silent no-op" contract the rect path has.
+    #[test]
+    fn syncing_ssd_with_title_pixels_and_no_runtime_is_harmless() {
+        let mut w = Wayland::new();
+        let id = WindowId(4);
+        let frame = Rectangle { x: 0, y: 0, width: 400, height: 300 };
+        let bar = crate::decoration::title_bar_rect(frame);
+        let content = crate::decoration::content_rect(frame, true);
+        let px = vec![0u8; (bar.width as usize) * (bar.height as usize) * 4];
+
+        w.sync_ssd(
+            id,
+            true,
+            true,
+            bar,
+            content,
+            [0.1, 0.1, 0.1, 1.0],
+            [[1.0, 0.0, 0.0, 1.0]; 3],
+            Some((bar.width, bar.height, px)),
+        );
+        assert_eq!(w.ssd_rect_count(), 0);
+    }
+
+    /// The button rects `sync_ssd` positions come from
+    /// `decoration::button_rects` applied to the *bar*, not the frame -- the
+    /// two must agree, since `hit_test` (which answers clicks) reads the
+    /// frame while the scene nodes are placed from the bar.
+    #[test]
+    fn button_rects_agree_whether_derived_from_the_frame_or_the_bar() {
+        let frame = Rectangle { x: 100, y: 200, width: 400, height: 300 };
+        let bar = crate::decoration::title_bar_rect(frame);
+        assert_eq!(
+            crate::decoration::button_rects(bar),
+            crate::decoration::button_rects(frame)
+        );
     }
 }

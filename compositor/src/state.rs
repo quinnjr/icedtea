@@ -285,6 +285,68 @@ pub struct State {
     /// as the only thing on screen. `pub(crate)` so `wallpaper_node_count`
     /// can read it for test introspection without exposing the map itself.
     wallpaper_nodes: HashMap<u32, wlr::BufferId>,
+    /// Font enumeration and glyph raster caches for `text::rasterize_title`.
+    ///
+    /// Deviation 5: built lazily, once, and never rebuilt.
+    /// `FontSystem::new` walks every font directory on the machine (tens of
+    /// milliseconds), and `SwashCache` is pure memoization of glyph rasters,
+    /// so both belong to the process rather than to a call. A `OnceCell`
+    /// rather than an eager field because the overwhelming majority of this
+    /// crate's `State`s -- every unit test -- never rasterize anything at
+    /// all, and must not pay for a font scan to construct a model.
+    fonts: std::cell::OnceCell<(cosmic_text::FontSystem, cosmic_text::SwashCache)>,
+    /// Per-window memo of the last title raster: the inputs it was made from
+    /// and the pixels that came out.
+    ///
+    /// `sync_window_to_scene` runs on every geometry mutation -- once per
+    /// pointer motion during a drag -- while a title's *pixels* only change
+    /// when the text, the width available for it, or the focused-ness that
+    /// picks its color changes. Shaping a string is far more expensive than
+    /// copying the pixels it produced, so a hit here re-hands the cached
+    /// buffer to the seam (`sync_ssd` needs owned pixels, and holding them
+    /// here is what lets a miss be the only path that shapes).
+    ///
+    /// `None` on the pixel side is a *cached negative*: this title
+    /// rasterized to nothing (empty, or unshapeable on this machine) and
+    /// must not be retried on every sync. Dropped in `forget_window`, so a
+    /// window's raster never outlives it.
+    title_rasters: HashMap<WindowId, (TitleRasterKey, Option<TitleRaster>)>,
+    /// Decoration preferences stated by clients that have no model window
+    /// yet, in `Window::client_decorations_requested`'s own three-valued
+    /// spelling.
+    ///
+    /// A client creates its `zxdg_toplevel_decoration_v1` and calls
+    /// `set_mode` on it *before* its initial commit, which is well before
+    /// `mapped` creates the model row -- so the preference arrives with
+    /// nowhere to put it. Parking it here and applying it at `new_toplevel`
+    /// is what keeps an explicit "I draw my own decorations" from being
+    /// silently dropped and the window handed a band it asked not to have.
+    /// Entries are removed when the toplevel is bound (`new_toplevel`) or
+    /// dies unmapped (`forget_toplevel`), so this never outgrows the set of
+    /// unmapped toplevels.
+    pending_decorations: HashMap<crate::wayland::ToplevelKey, Option<bool>>,
+}
+
+/// What a cached title raster depends on: the title text, the pixel width
+/// available for it, and whether the window is focused (which picks the
+/// text color). Anything else changing -- position, height, workspace --
+/// cannot change the pixels.
+type TitleRasterKey = (String, i32, bool);
+
+/// A rasterized title: `(width, height, premultiplied RGBA)`, exactly what
+/// `Wayland::sync_ssd` hands to the buffer node.
+type TitleRaster = (i32, i32, Vec<u8>);
+
+/// Left inset of the title text inside the band, in pixels.
+const TITLE_PAD_X: i32 = 8;
+
+/// `color` at `alpha`, premultiplied -- every channel scaled, not just the
+/// alpha one, because the wlroots scene graph composites premultiplied
+/// colors and a rect whose RGB outran its alpha would come out brighter than
+/// the same color opaque.
+fn premultiply(color: [f32; 4], alpha: f32) -> [f32; 4] {
+    let a = (color[3] * alpha).clamp(0.0, 1.0);
+    [color[0] * a, color[1] * a, color[2] * a, a]
 }
 
 impl State {
@@ -330,6 +392,9 @@ impl State {
             wallpaper_wake_source: None,
             wallpaper_wake: None,
             wallpaper_nodes: HashMap::new(),
+            fonts: std::cell::OnceCell::new(),
+            title_rasters: HashMap::new(),
+            pending_decorations: HashMap::new(),
         }
     }
 
@@ -594,19 +659,32 @@ impl State {
         let ssd = crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, fullscreen);
         let content = crate::decoration::content_rect(geo, ssd);
 
-        // Review finding I2: paint (or hide) the SSD title-bar band. `geo`,
+        // Review finding I2: paint (or hide) the SSD decoration. `geo`,
         // not `content` -- `title_bar_rect` is frame-space, same as
         // `content_rect`'s input, and the two are computed from the same
         // `geo` precisely so they can never disagree about where the band
         // ends and the client's content begins.
+        let bar = crate::decoration::title_bar_rect(geo);
         let bar_color = crate::render::hex_to_rgba(&self.config.appearance.palette.background);
-        self.wayland.sync_ssd_rect(
+        let button_colors = self.button_colors();
+        // Only rasterize for a window that will actually show a band: a CSD
+        // or fullscreen window's title is never drawn, and shaping it would
+        // be pure waste on the most common client kind there is.
+        let title_px = if ssd && visible {
+            let title = w.title.clone();
+            self.rasterized_title_for(id, title, bar, focused)
+        } else {
+            None
+        };
+        self.wayland.sync_ssd(
             id,
             ssd,
             visible,
-            crate::decoration::title_bar_rect(geo),
+            bar,
             content,
             bar_color,
+            button_colors,
+            title_px,
         );
 
         self.wayland.set_visible(id, visible);
@@ -638,6 +716,82 @@ impl State {
 
         // Keyboard focus is the other half of "focus reached the client".
         self.sync_seat_focus();
+    }
+
+    /// The three title-bar button colors, in `decoration::button_rects`'
+    /// order: minimize, maximize, close.
+    ///
+    /// Close is the palette's accent -- it is the destructive one and the
+    /// one a user aims at without looking. The other two are the foreground
+    /// color at 40% alpha, which reads as a subdued chip against the band
+    /// whatever the palette is, without inventing two more color names the
+    /// config has no field for.
+    ///
+    /// Premultiplied, like every other color that reaches a scene node: the
+    /// wlroots scene graph composites premultiplied alpha, so scaling only
+    /// the alpha channel and leaving RGB at full strength would paint the
+    /// chips brighter than opaque foreground rather than fainter.
+    fn button_colors(&self) -> [[f32; 4]; 3] {
+        let fg = crate::render::hex_to_rgba(&self.config.appearance.palette.foreground);
+        let accent = crate::render::hex_to_rgba(&self.config.appearance.palette.accent);
+        let chip = premultiply(fg, 0.4);
+        [chip, chip, accent]
+    }
+
+    /// The title pixels for window `id`'s band, or `None` if there are none
+    /// to draw (an empty title, or a string no font on this machine can
+    /// shape -- `sync_ssd` then shows the plain band).
+    ///
+    /// Memoized on `(title, width, focused)` through `title_rasters`: see
+    /// that field's doc for why a drag must not re-shape the same string
+    /// sixty times a second, and why a negative result is cached too.
+    ///
+    /// The title node spans the band minus the three buttons, so a long
+    /// title runs out of room before it runs under the close button rather
+    /// than being drawn beneath it.
+    fn rasterized_title_for(
+        &mut self,
+        id: WindowId,
+        title: String,
+        bar: Rectangle,
+        focused: bool,
+    ) -> Option<TitleRaster> {
+        let width = (bar.width - 3 * crate::decoration::BUTTON_WIDTH).max(1);
+        let height = bar.height.max(1);
+        let key: TitleRasterKey = (title, width, focused);
+        if let Some((cached_key, px)) = self.title_rasters.get(&id)
+            && *cached_key == key
+        {
+            return px.clone();
+        }
+
+        // Unfocused windows get the same text at 60% strength rather than a
+        // second palette color: the config has one foreground, and dimming
+        // it is the least surprising way to say "this window is not the
+        // active one" in a title bar that is otherwise identical.
+        //
+        // Dimmed in RGB, not in alpha, and that is not a style choice:
+        // cosmic-text's `SwashCache::with_pixels` builds each mask-glyph
+        // pixel as `coverage << 24 | base.0 & 0xFF_FF_FF` -- it takes the
+        // base color's *channels* and discards its alpha outright (the
+        // upstream source says as much, in a `TODO: blend base alpha?`).
+        // Asking for translucent text by lowering the alpha byte would
+        // therefore change nothing at all on screen.
+        let fg = crate::render::hex_to_rgba(&self.config.appearance.palette.foreground);
+        let dim = if focused { 1.0 } else { 0.6 };
+        let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * dim * 255.0).round() as u8;
+        let fg = [to_u8(fg[0]), to_u8(fg[1]), to_u8(fg[2]), 255];
+
+        self.fonts
+            .get_or_init(|| (cosmic_text::FontSystem::new(), cosmic_text::SwashCache::new()));
+        // `get_mut` cannot miss after `get_or_init`; the `?` is the
+        // panic-free spelling of that, not a case with any behavior of its
+        // own.
+        let (fonts, swash) = self.fonts.get_mut()?;
+        let px = crate::text::rasterize_title(fonts, swash, &key.0, width, height, TITLE_PAD_X, fg)
+            .map(|px| (width, height, px));
+        self.title_rasters.insert(id, (key, px.clone()));
+        px
     }
 
     /// The active workspace's focused window id, if any. Callers capture this
@@ -771,6 +925,10 @@ impl State {
         self.fullscreen_saved_geometry.remove(&id);
         self.snap_saved_geometry.remove(&id);
         self.maximized_saved_geometry.remove(&id);
+        // The scene nodes went with `wayland.forget` above; this is their
+        // CPU-side memo, and a window's title pixels must not outlive it
+        // (ids are never reused, so a stale entry would simply leak).
+        self.title_rasters.remove(&id);
         if self.window_manager.focused_window().is_none() {
             let active = self.window_manager.active_workspace();
             self.window_manager.focus_mru_in_workspace(active);
@@ -1618,6 +1776,23 @@ impl State {
         let previous = self.focused_id();
         let id = self.window_manager.add_window(app_id, title, pid, geometry);
         self.wayland.bind(id, toplevel);
+        // Any decoration preference this client stated before it had a model
+        // row (the normal ordering -- see `pending_decorations`) lands now,
+        // and the negotiation is re-answered with the app-id in hand: the
+        // pre-map answer had to be made from the preference alone, which
+        // gets a GTK-style client that stated no preference the server-side
+        // default even though `has_ssd` will refuse to draw it a band.
+        // Re-answering is a silent no-op for the common client that never
+        // created a decoration object at all.
+        let requested = self.pending_decorations.remove(&toplevel).flatten();
+        if requested.is_some() {
+            self.window_manager.set_client_decorations_requested(id, requested);
+        }
+        let ssd = crate::decoration::has_ssd(app_id, requested, false);
+        self.wayland.set_decoration_mode(
+            toplevel,
+            if ssd { wlr::DecorationMode::ServerSide } else { wlr::DecorationMode::ClientSide },
+        );
         // Explicit sync of the new window first (re-review minor 2):
         // `sync_focus_change` also reaches it today, but only because
         // `add_window` autofocuses onto the active workspace.
@@ -1638,6 +1813,10 @@ impl State {
     /// inherent method removes the ambiguity at the source instead of relying
     /// on it being resolved correctly.
     pub fn forget_toplevel(&mut self, toplevel: crate::wayland::ToplevelKey) {
+        // Before the early return: a toplevel that dies without ever
+        // mapping still had a decoration preference parked for it, and
+        // nothing else would ever come to collect it.
+        self.pending_decorations.remove(&toplevel);
         let Some(id) = self.wayland.window_for(toplevel) else { return };
         self.wayland.forget(id);
         self.forget_window(id);
@@ -1645,9 +1824,15 @@ impl State {
     }
 
     /// A client changed its title.
+    ///
+    /// The scene sync is not optional bookkeeping: the title is *drawn* now
+    /// (`sync_ssd`'s buffer node), so a retitle that only updated the model
+    /// would leave the old string on screen until some unrelated geometry
+    /// change happened to re-sync the window.
     pub fn toplevel_title_changed(&mut self, toplevel: crate::wayland::ToplevelKey, title: &str) {
         let Some(id) = self.wayland.window_for(toplevel) else { return };
         if self.window_manager.set_title(id, title.to_string()).is_some() {
+            self.sync_window_to_scene(id);
             self.emit_pending();
         }
     }
@@ -2002,6 +2187,71 @@ impl wlr::ToplevelHandler for State {
         let key = crate::wayland::ToplevelKey::new(id);
         let Some(window_id) = self.wayland.window_for(key) else { return };
         self.begin_client_resize(window_id, edges);
+    }
+
+    /// xdg-decoration negotiation, both halves in one place: record what the
+    /// client asked for in the model, then answer with what this compositor
+    /// is actually going to do.
+    ///
+    /// The answer is `decoration::has_ssd`, not an echo of the preference:
+    /// that predicate is already the single definition of "do we draw a
+    /// title bar for this window" (`sync_window_to_scene`, `content_rect`,
+    /// the hit-test), so routing the reply through it is what keeps the
+    /// client's belief and the compositor's own drawing from ever
+    /// disagreeing. A client asking for client-side decorations gets them
+    /// (`is_csd` honors an explicit request); a client asking for
+    /// server-side, or stating no preference at all, gets our band.
+    ///
+    /// A toplevel with no model window yet -- the normal case, since a
+    /// decoration is created before the initial commit and `mapped` has not
+    /// run -- is answered from the preference alone (there is no app-id to
+    /// read without a `Toplevel`, only an id), and its preference is parked
+    /// in `pending_decorations` for `new_toplevel` to apply and re-answer
+    /// with the app-id in hand.
+    fn request_decoration_mode(
+        &mut self,
+        id: wlr::ToplevelId,
+        preference: Option<wlr::DecorationMode>,
+    ) {
+        // `client_decorations_requested` is the model's own spelling of the
+        // same three-valued answer: "the client wants to draw them itself",
+        // "the client wants the server to", "the client did not say".
+        let requested = match preference {
+            Some(wlr::DecorationMode::ClientSide) => Some(true),
+            Some(wlr::DecorationMode::ServerSide) => Some(false),
+            None => None,
+        };
+        let key = crate::wayland::ToplevelKey::new(id);
+        let window = self.wayland.window_for(key);
+        let (app_id, fullscreen) = match window.and_then(|w| self.window_manager.get(w)) {
+            Some(w) => (w.app_id.clone(), w.fullscreen),
+            None => (String::new(), false),
+        };
+        match window {
+            Some(window) => {
+                self.window_manager
+                    .set_client_decorations_requested(window, requested);
+            }
+            None => {
+                self.pending_decorations.insert(key, requested);
+            }
+        }
+
+        let ssd = crate::decoration::has_ssd(&app_id, requested, fullscreen);
+        let mode = if ssd {
+            wlr::DecorationMode::ServerSide
+        } else {
+            wlr::DecorationMode::ClientSide
+        };
+        self.wayland.set_decoration_mode(key, mode);
+
+        // The band may have to appear or vanish, and the client's content
+        // rect changes with it. A window that isn't in the model yet has
+        // nothing to sync -- its first sync comes with `mapped`.
+        if let Some(window) = window {
+            self.sync_window_to_scene(window);
+            self.emit_pending();
+        }
     }
 }
 impl wlr::SeatHandler for State {
@@ -3264,5 +3514,219 @@ mod tests {
 
         state.begin_client_move(id);
         assert!(state.drag.window_id().is_none(), "request_move must be ignored without a held left button");
+    }
+
+    // --- Task 13: full server-side decorations ---
+
+    /// A left press on the rightmost `BUTTON_WIDTH` of a title bar is a
+    /// close, all the way through the library's own seat entry point --
+    /// `hit_test` maps it to `DecorationAction::Close`, which takes
+    /// `request_close`'s path like every other close in this file.
+    ///
+    /// Deliberately *not* bound to a toplevel: `Wayland::close` reports
+    /// `true` for a bound window (wait for the client's destroy) and `false`
+    /// for an unbacked one (remove the row now), and only the second is
+    /// observable without a live client, so this asserts the row is gone.
+    #[test]
+    fn a_titlebar_close_click_routes_to_request_close() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "t",
+            1,
+            Rectangle { x: 100, y: 100, width: 300, height: 200 },
+        );
+        let frame = state.window_manager.get(id).expect("w").geometry;
+        let bar = crate::decoration::title_bar_rect(frame);
+        // The close button is the rightmost of the three (`button_rects`
+        // orders them minimize, maximize, close).
+        let click = (bar.x + bar.width - 5, bar.y + 5);
+
+        wlr::SeatHandler::pointer_button(&mut state, click.0 as f64, click.1 as f64, 0x110, true, 1);
+
+        assert!(state.window_manager.get(id).is_none(), "close button must close");
+        assert!(
+            rx.try_iter().any(|e| matches!(e.event, icedtea_contract::Event::WindowClosed { .. })),
+            "the close must have been announced"
+        );
+    }
+
+    /// The middle button is maximize and the leftmost is minimize -- the
+    /// same three model command paths D-Bus drives, reached by pointer.
+    #[test]
+    fn titlebar_buttons_hit_the_models_own_command_paths() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "t",
+            1,
+            Rectangle { x: 100, y: 100, width: 300, height: 200 },
+        );
+        let frame = state.window_manager.get(id).expect("w").geometry;
+        let rects = crate::decoration::button_rects(frame);
+
+        let maximize = (rects[1].x + 5, rects[1].y + 5);
+        wlr::SeatHandler::pointer_button(&mut state, maximize.0 as f64, maximize.1 as f64, 0x110, true, 1);
+        assert!(state.window_manager.get(id).expect("w").maximized, "middle button maximizes");
+
+        let minimize = (rects[0].x + 5, rects[0].y + 5);
+        // The window is maximized now, so its frame moved; re-derive.
+        let frame = state.window_manager.get(id).expect("w").geometry;
+        let minimize = if crate::decoration::button_rects(frame)[0].contains(minimize.0, minimize.1) {
+            minimize
+        } else {
+            let r = crate::decoration::button_rects(frame)[0];
+            (r.x + 5, r.y + 5)
+        };
+        wlr::SeatHandler::pointer_button(&mut state, minimize.0 as f64, minimize.1 as f64, 0x110, true, 1);
+        assert!(state.window_manager.get(id).expect("w").minimized, "left button minimizes");
+    }
+
+    /// The negotiation's model half: a client asking to draw its own
+    /// decorations is recorded as such, which is what `has_ssd` then reads.
+    #[test]
+    fn decoration_mode_request_updates_the_model_preference() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        let key = crate::wayland::ToplevelKey::for_test(1);
+        state.wayland.bind(id, key);
+
+        wlr::ToplevelHandler::request_decoration_mode(
+            &mut state,
+            key.0,
+            Some(wlr::DecorationMode::ClientSide),
+        );
+        assert_eq!(state.window_manager.get(id).expect("w").client_decorations_requested, Some(true));
+
+        wlr::ToplevelHandler::request_decoration_mode(
+            &mut state,
+            key.0,
+            Some(wlr::DecorationMode::ServerSide),
+        );
+        assert_eq!(state.window_manager.get(id).expect("w").client_decorations_requested, Some(false));
+
+        wlr::ToplevelHandler::request_decoration_mode(&mut state, key.0, None);
+        assert_eq!(state.window_manager.get(id).expect("w").client_decorations_requested, None);
+    }
+
+    /// The ordering that actually happens on the wire: the client states its
+    /// preference before its initial commit, so there is no model window to
+    /// record it against yet. It must not be lost -- `new_toplevel` collects
+    /// it when the window is finally mapped.
+    #[test]
+    fn a_preference_stated_before_mapping_survives_until_the_window_exists() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let key = crate::wayland::ToplevelKey::for_test(9);
+
+        wlr::ToplevelHandler::request_decoration_mode(
+            &mut state,
+            key.0,
+            Some(wlr::DecorationMode::ClientSide),
+        );
+        assert!(state.window_manager.windows().next().is_none(), "nothing is mapped yet");
+
+        state.new_toplevel(key, "plain.app", "t", 1);
+        let id = state.wayland.window_for(key).expect("bound at map");
+        assert_eq!(
+            state.window_manager.get(id).expect("w").client_decorations_requested,
+            Some(true),
+            "the pre-map preference must reach the model"
+        );
+        assert!(
+            !crate::decoration::has_ssd("plain.app", Some(true), false),
+            "and must suppress the band"
+        );
+    }
+
+    /// A toplevel that dies before mapping takes its parked preference with
+    /// it, rather than leaving an entry nothing will ever collect.
+    #[test]
+    fn a_preference_parked_for_a_toplevel_that_never_maps_is_dropped() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let key = crate::wayland::ToplevelKey::for_test(11);
+
+        wlr::ToplevelHandler::request_decoration_mode(
+            &mut state,
+            key.0,
+            Some(wlr::DecorationMode::ClientSide),
+        );
+        assert_eq!(state.pending_decorations.len(), 1);
+        state.forget_toplevel(key);
+        assert!(state.pending_decorations.is_empty(), "an unmapped toplevel's preference must not leak");
+    }
+
+    /// The title raster is memoized on `(title, width, focused)`: the same
+    /// window synced twice shapes once, and a retitle invalidates it.
+    #[test]
+    fn title_rasters_are_memoized_and_invalidated_by_a_retitle() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "first",
+            1,
+            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+        );
+        let bar = crate::decoration::title_bar_rect(
+            state.window_manager.get(id).expect("w").geometry,
+        );
+
+        let first = state.rasterized_title_for(id, "first".into(), bar, true);
+        assert_eq!(state.title_rasters.len(), 1, "the raster must be cached");
+        let again = state.rasterized_title_for(id, "first".into(), bar, true);
+        assert_eq!(first, again, "an unchanged title must reuse the cached pixels");
+
+        let renamed = state.rasterized_title_for(id, "second".into(), bar, true);
+        assert_eq!(state.title_rasters.len(), 1, "one entry per window, replaced not appended");
+        assert_ne!(first, renamed, "a retitle must produce different pixels");
+        // The cache key really is the new title, so the *next* sync of the
+        // old title shapes again rather than returning the new pixels.
+        assert_eq!(state.rasterized_title_for(id, "first".into(), bar, true), first);
+
+        state.forget_window(id);
+        assert!(state.title_rasters.is_empty(), "a closed window's raster must not outlive it");
+    }
+
+    /// The title node is inset by the three buttons, so a long title runs
+    /// out of room before it runs underneath the close button.
+    #[test]
+    fn the_title_raster_is_narrower_than_the_band_by_the_button_span() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "a very long window title that would otherwise run under the buttons",
+            1,
+            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+        );
+        let bar = crate::decoration::title_bar_rect(
+            state.window_manager.get(id).expect("w").geometry,
+        );
+        let title = state.window_manager.get(id).expect("w").title.clone();
+
+        let (w, h, px) = state.rasterized_title_for(id, title, bar, true).expect("pixels");
+        assert_eq!(w, bar.width - 3 * crate::decoration::BUTTON_WIDTH);
+        assert_eq!(h, bar.height);
+        assert_eq!(px.len(), (w * h * 4) as usize);
+    }
+
+    /// Button colors are premultiplied (every channel no greater than the
+    /// alpha), which is what the wlroots scene graph composites.
+    #[test]
+    fn button_colors_are_premultiplied() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let state = State::new(default_config(), tx);
+        for color in state.button_colors() {
+            for channel in &color[..3] {
+                assert!(*channel <= color[3] + f32::EPSILON, "{color:?} is not premultiplied");
+            }
+        }
     }
 }
