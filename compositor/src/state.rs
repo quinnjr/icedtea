@@ -1990,9 +1990,8 @@ impl State {
             .map(|w| w.geometry)
             .collect();
         let output_geo = self
-            .outputs
-            .values()
-            .next()
+            .output_for_pointer()
+            .and_then(|idx| self.outputs.get(&idx))
             .map(|o| o.geometry)
             .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
         // Review finding M7: cascade positions wrap inside the output (and
@@ -4258,5 +4257,45 @@ mod tests {
         let dead = state.outputs.remove(&0).expect("output 0").geometry;
         state.migrate_windows_from(dead); // zero outputs left: must not panic, must not move
         assert_eq!(state.window_manager.get(id).expect("w").geometry.x, 10);
+    }
+
+    /// Review fix: `new_toplevel`'s cascade placement used to read
+    /// `outputs.values().next()` -- arbitrary `HashMap` iteration order, not
+    /// even deterministic -- instead of routing through `output_for_pointer`
+    /// like the other three placement consumers. With no runtime attached
+    /// (the fallback path), `output_for_pointer` always resolves to the
+    /// lowest index, so a two-output state must place a new window inside
+    /// output 0's box every time, and the cascade origin itself must come
+    /// from that box's own `(x, y)` -- not `(0, 0)` -- so this also pins
+    /// down that the placeholder-1920x1080 fallback rect isn't what's
+    /// actually feeding `cascade_point_in` here.
+    #[test]
+    fn new_toplevel_cascades_inside_the_lowest_index_output_without_a_runtime() {
+        use crate::wayland::ToplevelKey;
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 1000, y: 2000, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 1800, y: 2000, width: 800, height: 600 });
+
+        let key = ToplevelKey::for_test(1);
+        state.new_toplevel(key, "app", "t", 1);
+        let id = state.wayland.window_for(key).expect("bound");
+        let geo = state.window_manager.get(id).expect("model row").geometry;
+
+        let output0 = state.outputs[&0].geometry;
+        assert!(
+            geo.x >= output0.x
+                && geo.x + geo.width <= output0.x + output0.width
+                && geo.y >= output0.y
+                && geo.y + geo.height <= output0.y + output0.height,
+            "the new window must cascade inside output 0's box, got {geo:?}, output 0 is {output0:?}"
+        );
+        // The cascade origin for the very first window in a workspace is the
+        // output box's own top-left corner (`cascade_point_in` with no
+        // occupied rects yet) -- pinning that it's `output0`'s `(x, y)`
+        // (1000, 2000), not `(0, 0)`, is what actually distinguishes "used
+        // the real box" from "used the (0,0)-origin fallback rect."
+        assert_eq!((geo.x, geo.y), (output0.x, output0.y), "cascade origin must be the output box's own (x, y)");
     }
 }
