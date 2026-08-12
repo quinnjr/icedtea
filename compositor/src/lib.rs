@@ -12,6 +12,7 @@ pub mod input;
 pub mod layout;
 pub mod render;
 pub mod state;
+pub mod text;
 pub mod wayland;
 pub mod window;
 
@@ -64,6 +65,19 @@ pub fn run() {
     runtime
         .create_xdg_shell(&display, 6)
         .expect("failed to advertise xdg_wm_base");
+    // Not fatal, matching the shutdown source's tone below: without the
+    // manager a client simply never gets to state a decoration preference
+    // and draws its own or not on its own defaults, which is a degraded
+    // compositor, not a dead one.
+    if let Err(err) = runtime.create_xdg_decoration_manager(&display) {
+        tracing::error!(%err, "xdg-decoration negotiation is unavailable");
+    }
+    // Same non-fatal tone as the decoration manager just above: without
+    // this global, panels/bars simply cannot bind `zwlr_layer_shell_v1` and
+    // the desktop runs with no shell chrome, which is degraded, not dead.
+    if let Err(err) = runtime.create_layer_shell(&display, 4) {
+        tracing::error!(%err, "layer-shell is unavailable");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");

@@ -41,16 +41,53 @@ fn ensure_headless_env() {
     });
 }
 
+/// Serializes compositor *creation* across this binary's test threads.
+///
+/// wlroots keeps one process-global, unsynchronized `wl_array` of
+/// buffer-resource interfaces (`buffer_resource_interfaces` in
+/// `types/buffer/resource.c`). `wlr_buffer_register_resource_interface` —
+/// reached from `init_graphics`, via the shm/linux-dmabuf/wl_drm globals —
+/// grows it with `wl_array_add`, which *reallocs*, while
+/// `wlr_buffer_try_from_resource` walks it from every running compositor's
+/// `wl_surface.attach` handler. Neither side takes a lock.
+///
+/// `tests/client_protocol.rs` hits the full version of this hazard (it has
+/// real clients attaching real buffers) and segfaulted about one run in six
+/// before growing the same lock. Nothing in *this* binary ever attaches a
+/// buffer, so the read side is absent and no crash has been observed here —
+/// but two first boots racing each other's `wl_array_add` and dedup walk is
+/// the same unsynchronized write, so the file is latently flaky rather than
+/// safe. Three lines, duplicated rather than shared because each
+/// integration test file is its own binary with its own statics.
+///
+/// Only creation is serialized: every `run_all` below still runs in
+/// parallel. See `tests/support/mod.rs`'s `BOOT_LOCK` for the full argument,
+/// including the constraint that it holds only while every boot in the
+/// process registers the identical static interface set.
+static BOOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`BOOT_LOCK`] (and set the headless environment) for the duration
+/// of one compositor's creation. `drop` the returned guard once the
+/// display/backend/runtime triple exists.
+///
+/// A guard rather than a `boot_headless() -> (Display, Backend, Runtime)`
+/// helper because `wlr::Backend<'a>` borrows the `Display`'s event loop, so
+/// the triple cannot leave the scope that created it.
+fn boot_lock() -> std::sync::MutexGuard<'static, ()> {
+    ensure_headless_env();
+    BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn a_headless_compositor_boots_runs_and_stops() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
     runtime.init_graphics(&display, &backend).expect("graphics");
     runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
     runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
 
     // `state` is declared (and so, by ordinary end-of-scope drop order, is
     // dropped) after `display`/`backend`/`runtime`: `attach` below gives
@@ -127,11 +164,11 @@ fn a_headless_compositor_boots_runs_and_stops() {
 
 #[test]
 fn the_shutdown_source_stops_the_loop() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
+    drop(boot);
 
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
@@ -165,11 +202,11 @@ fn the_shutdown_source_stops_the_loop() {
 /// up."
 #[test]
 fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
+    drop(boot);
 
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
@@ -219,11 +256,11 @@ fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
 /// something regresses.
 #[test]
 fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
+    drop(boot);
 
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
@@ -308,11 +345,11 @@ fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
 /// restore it) before being checked in passing.
 #[test]
 fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
+    drop(boot);
 
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
@@ -364,25 +401,41 @@ fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
     );
 }
 
-/// Review finding I2: the SSD title-bar band is painted as a scene rect
-/// (interim, per the spec's own words -- see `Wayland::sync_ssd_rect`'s
-/// doc), tracked one-per-window at the seam the same way toplevel bindings
-/// are. This needs a real `Runtime` with `init_graphics` already run --
-/// `add_rect` errors otherwise -- which is why this lives here rather than
-/// in `wayland.rs`'s own unit tests (which only ever construct a bare,
-/// ungraphics'd `Runtime` or no runtime at all).
+/// Review finding I2: the SSD title-bar band, its three buttons, and its
+/// title raster are painted as scene nodes, tracked one-per-window at the
+/// seam the same way toplevel bindings are.
+///
+/// wlr 0.20.5's `Runtime::add_rect_in_toplevel` parents the band (and
+/// `add_rect_in_toplevel`/`add_buffer_in_toplevel` the buttons and title)
+/// into the *toplevel's own* scene tree (closing the z-order defect
+/// structurally -- see `Wayland::sync_ssd`'s doc), which means it needs a
+/// live `ToplevelId` wlroots itself issued, not one of `ToplevelKey::for_test`'s
+/// dangling ids: `dangling_nth_for_test`'s own contract is that *no* live
+/// toplevel, real or fake, can ever have that id, so `add_rect_in_toplevel`
+/// always misses on one by design. This test harness drives handler entry
+/// points directly with no real Wayland client behind them (see every other
+/// test in this file), so it cannot produce a genuine toplevel scene tree to
+/// parent a rect into -- exercising `add_rect_in_toplevel` actually
+/// succeeding needs a real client and is out of reach here. What *is*
+/// reachable, and worth pinning, is that the seam stays a silent no-op
+/// (never panics, never leaves a stale map entry) when asked to paint a band
+/// for a window whose toplevel id doesn't resolve, exactly as every other
+/// by-id `Wayland` method already behaves. The pure position math `sync_ssd`
+/// must feed `add_rect_in_toplevel`/`set_rect_position` for the band and
+/// buttons is covered directly in `wayland.rs`'s own unit tests
+/// (`ssd_rect_relative_offset_is_zero_minus_titlebar`).
 #[test]
-fn an_ssd_window_gets_exactly_one_title_bar_rect_and_a_csd_window_gets_none() {
+fn an_ssd_window_with_no_live_toplevel_never_gets_a_rect() {
     use icedtea_compositor::wayland::ToplevelKey;
 
-    ensure_headless_env();
-
+    let boot = boot_lock();
     let display = wlr::Display::new().expect("display");
     let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
     let runtime = wlr::Runtime::new().expect("runtime");
     runtime.init_graphics(&display, &backend).expect("graphics");
     runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
     runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut state = State::new(icedtea_config::default_config(), tx);
@@ -391,35 +444,27 @@ fn an_ssd_window_gets_exactly_one_title_bar_rect_and_a_csd_window_gets_none() {
 
     // Default app id ("term") has no CSD request and doesn't match the
     // `org.gtk*` CSD heuristic, so `decoration::has_ssd` says yes -- exactly
-    // the common case a real terminal or editor hits.
+    // the common case a real terminal or editor hits. Its `ToplevelKey` is
+    // still one of `for_test`'s dangling ids, though, so the rect creation
+    // this would trigger against a real client instead misses cleanly.
     let ssd_key = ToplevelKey::for_test(1);
     state.new_toplevel(ssd_key, "term", "Terminal", 1);
     assert_eq!(
         state.wayland.ssd_rect_count(),
-        1,
-        "mapping an SSD window must create exactly one title-bar rect"
+        0,
+        "a dangling toplevel id can never resolve inside add_rect_in_toplevel"
     );
 
     // `org.gtk`-prefixed app ids are CSD by the same heuristic -- no strip,
-    // no rect.
+    // no rect, independent of whether the toplevel id resolves at all.
     let csd_key = ToplevelKey::for_test(2);
     state.new_toplevel(csd_key, "org.gtk.MyApp", "GTK App", 2);
-    assert_eq!(
-        state.wayland.ssd_rect_count(),
-        1,
-        "a CSD window draws its own decorations and must not get a rect"
-    );
+    assert_eq!(state.wayland.ssd_rect_count(), 0, "a CSD window must not get a rect");
 
-    // Forgetting the SSD window drops its rect bookkeeping; the CSD window
-    // never had any to begin with.
+    // Forgetting either window is still harmless with no rect ever recorded.
     state.forget_toplevel(ssd_key);
-    assert_eq!(
-        state.wayland.ssd_rect_count(),
-        0,
-        "forgetting a window must drop its rect bookkeeping too, not leak it"
-    );
-
     state.forget_toplevel(csd_key);
+    assert_eq!(state.wayland.ssd_rect_count(), 0);
 }
 
 /// The seam turns a library id into a model window and back, and every
@@ -746,11 +791,176 @@ fn unmapping_the_focused_window_reroutes_the_seat_without_panicking() {
     // exactly as a real `unmapped(toplevel.id())` call would.
     state.unmapped(wlr::ToplevelId::dangling_nth_for_test(1));
 
-    // Ledgered, not fixed by this task (see `unmapped`'s doc): the model's
-    // own bookkeeping doesn't change on an unmap.
+    // Task 14 gave the model its own unmapped concept, and review finding
+    // I2 finished the focus half of it: the sole window unmapping leaves no
+    // successor to hand focus to, so the workspace's focus pointer is
+    // *cleared* rather than left naming an unfocusable row -- the same
+    // no-successor behavior `remove_window` has always had. Before I2 the
+    // row stayed `focused: true` here, which is what made
+    // `close`/`maximize`/`snap` still resolve to an invisible window.
     assert!(
-        state.window_manager.get(id).is_some_and(|w| w.focused),
-        "the model still reports it focused -- the model has no unmapped concept"
+        state.window_manager.get(id).is_some_and(|w| !w.focused),
+        "an unmap with no successor must release focus, not leave it on the unmapped row"
+    );
+    assert!(
+        state.window_manager.focused_window().is_none(),
+        "the workspace's focus pointer must be cleared, not left dangling"
     );
     assert!(state.wayland.is_backed(id), "still bound -- an unmap is not a destroy");
+}
+
+/// Task 7: a decoded wallpaper gets one buffer scene node per output, and
+/// re-syncing with nothing changed is a no-op on the node count.
+///
+/// Needs a live runtime with `init_graphics` already run (`sync_wallpaper_nodes`'s
+/// `add_buffer` call is a `wlr::Error::Create` without it, mirroring
+/// `add_rect`), and a real output for `state.outputs` to have an entry in --
+/// this is exactly `a_headless_compositor_boots_runs_and_stops`'s boot
+/// preamble, with `WLR_HEADLESS_OUTPUTS=1` producing the one output.
+#[test]
+fn a_decoded_wallpaper_gets_one_buffer_node_per_output() {
+    let boot = boot_lock();
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
+
+    // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
+    // declared after `display`/`backend`/`runtime`.
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime.clone());
+
+    let background = runtime
+        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .expect("background rect");
+    runtime.lower_rect_to_bottom(background);
+    state.set_background(background);
+
+    // The command channel and its wake pipe, used only as this test's
+    // bounded backstop -- same role as in the other `run_all` tests in this
+    // file: it gives the headless backend's output time to arrive (and so
+    // `OutputHandler::new_output` time to populate `state.outputs`) before
+    // asking the loop to stop.
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = cmd_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&cmd_wake_write);
+    });
+
+    backend
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
+        .expect("run_all");
+
+    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+    assert_eq!(state.outputs.len(), 1, "the headless output must have reached the model");
+
+    let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
+    state.wallpaper.set_decoded(Some(image));
+    state.sync_wallpaper_nodes();
+    assert_eq!(
+        state.wallpaper_node_count(),
+        state.outputs.len(),
+        "one buffer node per output"
+    );
+
+    // Idempotence: re-syncing with nothing changed must not grow the map --
+    // an existing node is updated in place (position/dest-size), not
+    // duplicated.
+    state.sync_wallpaper_nodes();
+    assert_eq!(
+        state.wallpaper_node_count(),
+        state.outputs.len(),
+        "a second sync with nothing changed keeps the node count stable"
+    );
+}
+
+/// Task 14, runtime-backed half of `snap_preview_rect_bookkeeping_follows_
+/// the_preview`: with a live scene graph, setting `snap_preview` and
+/// syncing really does create a rect, and clearing it really does remove
+/// it. Needs only `init_graphics` (`add_rect` is root-level, unlike the
+/// wallpaper buffer nodes above, so no output is required at all).
+#[test]
+fn snap_preview_rect_is_created_and_torn_down_against_a_live_scene() {
+    let boot = boot_lock();
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime);
+
+    assert!(state.snap_preview_rect().is_none());
+
+    state.snap_preview = Some(icedtea_contract::Rectangle { x: 10, y: 20, width: 400, height: 600 });
+    state.sync_snap_preview();
+    assert!(state.snap_preview_rect().is_some(), "a preview target must create a rect");
+
+    // Reposition: the same rect id is kept, not recreated.
+    let id = state.snap_preview_rect().unwrap();
+    state.snap_preview = Some(icedtea_contract::Rectangle { x: 30, y: 40, width: 500, height: 700 });
+    state.sync_snap_preview();
+    assert_eq!(state.snap_preview_rect(), Some(id), "a changed target repositions, does not recreate");
+
+    state.snap_preview = None;
+    state.sync_snap_preview();
+    assert!(state.snap_preview_rect().is_none(), "clearing the preview must remove the rect");
+}
+
+/// [HIGH H5] `migrate_windows_from`'s oversized-window clamp guard: when the
+/// migrated window's frame is wider and/or taller than the surviving output,
+/// `(survivor.x + offset).clamp(survivor.x, survivor.x + survivor.width -
+/// geometry.width)` would hand `clamp` a `max` bound below its `min` bound
+/// and panic. The `if geometry.width >= survivor.width { survivor.x } else
+/// { ... }` guard (and its height counterpart) exists to take the window's
+/// origin straight to the survivor's own origin on that axis instead of ever
+/// reaching the clamp -- every other migration test uses a window (300x200)
+/// smaller than its survivor (800x600) on both axes, so this branch has never
+/// run. No runtime needed: `migrate_windows_from` and the model-only window
+/// this test uses (see `windows_migrate_off_a_removed_output` in
+/// `state.rs`'s own unit tests for the identical no-runtime pattern) never
+/// touch `wlr`.
+#[test]
+fn migration_clamps_an_oversized_window_into_the_survivor_without_panicking() {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+
+    // The dead output the oversized window is currently on.
+    state.create_output(1, icedtea_contract::Rectangle { x: 800, y: 0, width: 1000, height: 800 });
+    // The surviving output, smaller on both axes than the window below.
+    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 800, height: 600 });
+
+    let id = state.window_manager.add_window(
+        "app",
+        "t",
+        1,
+        icedtea_contract::Rectangle { x: 800, y: 0, width: 1000, height: 800 },
+    );
+
+    let dead = state.outputs.remove(&1).expect("output 1").geometry;
+    state.migrate_windows_from(dead);
+
+    let survivor = state.outputs[&0].geometry;
+    let geo = state
+        .window_manager
+        .get(id)
+        .expect("the oversized window survives migration without panicking")
+        .geometry;
+    assert_eq!(
+        (geo.x, geo.y),
+        (survivor.x, survivor.y),
+        "a window wider and taller than the survivor must land at the survivor's own origin, got {geo:?}"
+    );
 }

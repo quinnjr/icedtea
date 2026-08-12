@@ -15,6 +15,18 @@ pub struct Window {
     pub minimized: bool,
     pub fullscreen: bool,
     pub focused: bool,
+    /// Whether this window's client currently has a mapped buffer attached.
+    /// `true` from `add_window` (the model row is only ever created on a
+    /// real map) until an `unmapped` (or, for a model-only row, a caller
+    /// through `set_mapped`) says otherwise. Distinct from `minimized`:
+    /// minimizing is a compositor-driven, user-visible state a client never
+    /// sees reflected in its own protocol state, while unmapping is the
+    /// client's own act of detaching its buffer (and can reverse itself by
+    /// mapping again, which is why the row survives rather than being
+    /// removed). Gates visibility (`is_visible`), alt-tab candidacy
+    /// (`alt_tab_entries`), and focus candidacy (`focus`,
+    /// `focus_mru_in_workspace`) the same way `minimized` already does.
+    pub mapped: bool,
     /// Client's negotiated xdg-decoration mode: Some(true) for ClientSide, Some(false) for ServerSide, None if unset.
     pub client_decorations_requested: Option<bool>,
 }
@@ -99,6 +111,7 @@ impl WindowManager {
             minimized: false,
             fullscreen: false,
             focused: false,
+            mapped: true,
             client_decorations_requested: None,
         };
         self.windows.insert(id, window.clone());
@@ -173,6 +186,28 @@ impl WindowManager {
         Some(())
     }
 
+    /// Flip `id`'s mapped state. `None` (no emission) on an unknown id or a
+    /// value that already matches -- the same "no-op on no change" shape
+    /// every other setter here follows. `Some(())` otherwise, having emitted
+    /// exactly one `WindowUpdated` (the milestone's one sanctioned addition
+    /// to the exactly-one-event-per-mutation invariant).
+    ///
+    /// The row itself is never touched otherwise: unlike `remove_window`,
+    /// this leaves geometry, title, and every other field exactly as they
+    /// were, because an unmap is not a destroy (a client can map the same
+    /// toplevel again). What changes is only what `is_visible`,
+    /// `alt_tab_entries`, and `focus`/`focus_mru_in_workspace` are willing to
+    /// do with the row while it's unmapped.
+    pub fn set_mapped(&mut self, id: WindowId, mapped: bool) -> Option<()> {
+        let w = self.windows.get_mut(&id)?;
+        if w.mapped == mapped {
+            return None;
+        }
+        w.mapped = mapped;
+        self.emit(Event::WindowUpdated { id, update: WindowUpdate::default() });
+        Some(())
+    }
+
     pub fn set_workspace(&mut self, id: WindowId, workspace: u32) -> Option<()> {
         if !self.workspace_exists(workspace) {
             return None;
@@ -191,10 +226,16 @@ impl WindowManager {
     }
 
     pub fn focus(&mut self, id: WindowId) -> Option<()> {
-        let (ws, was_focused, was_minimized) = {
+        let (ws, was_focused, was_minimized, mapped) = {
             let w = self.windows.get(&id)?;
-            (w.workspace, w.focused, w.minimized)
+            (w.workspace, w.focused, w.minimized, w.mapped)
         };
+        // An unmapped window has no client to activate and must never be
+        // handed the keyboard: refuse outright rather than remap-safely
+        // no-op (decided -- see the task-14 brief's Step 2).
+        if !mapped {
+            return None;
+        }
         if was_focused {
             // If already focused but minimized, unminimize and emit event.
             if was_minimized {
@@ -232,6 +273,54 @@ impl WindowManager {
         self.focus_mru.retain(|&wid| wid != id);
         self.focus_mru.insert(0, id);
         Some(())
+    }
+
+    /// Drop `id`'s claim on **its own** workspace's focus pointer and hand
+    /// focus to that workspace's next MRU candidate, if it has one.
+    /// Returns the id that took over, or `None` when `id` did not hold the
+    /// pointer or nothing focusable was left behind.
+    ///
+    /// Review finding I2: the unmap path re-picked a successor only when
+    /// the unmapping window was the *active* workspace's focus, so a
+    /// focused window that unmapped while its workspace was in the
+    /// background left its `focused_window` pointer intact on an unmapped
+    /// row. `switch_workspace` re-picks only on `is_none()`, so switching
+    /// back restored a focus pointer aimed at an invisible window: the seat
+    /// correctly refused it (`sync_seat_focus`/`is_visible_id`), leaving the
+    /// keyboard dead, while `apply_action("close"/"maximize"/"fullscreen"/
+    /// "snap")` and the decoration actions all still resolved to it.
+    ///
+    /// The no-successor behavior deliberately matches [`Self::remove_window`]:
+    /// the pointer is cleared either way, so "focused" is never left naming a
+    /// window that cannot be focused. Workspace visibility is irrelevant here
+    /// on purpose -- the workspace this acts on is whichever one `id` is on.
+    pub fn release_focus(&mut self, id: WindowId) -> Option<WindowId> {
+        let ws = self.windows.get(&id)?.workspace;
+        // Indexed through `get_mut`, not `workspace_mut`: this is reachable
+        // straight from a wlroots handler (`State::unmapped`), where the
+        // panic-free policy applies, and a row naming a workspace the
+        // current `workspaces` vec no longer has is exactly the kind of
+        // thing a config reload could in principle leave behind.
+        let slot = self.workspaces.get_mut(ws as usize)?;
+        if slot.focused_window != Some(id) {
+            return None;
+        }
+        slot.focused_window = None;
+        // One event for the one mutation: the flag only flips (and only
+        // emits) when it was actually set, the same "no-op on no change"
+        // shape every setter in this file follows. The successor's own
+        // `focus()` below emits its own `focused: true` and, finding the
+        // pointer already cleared, emits nothing further for `id`.
+        if self.windows.get(&id).is_some_and(|w| w.focused) {
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.focused = false;
+            }
+            self.emit(Event::WindowUpdated {
+                id,
+                update: WindowUpdate { focused: Some(false), ..Default::default() },
+            });
+        }
+        self.focus_mru_in_workspace(ws)
     }
 
     pub fn focused_window(&self) -> Option<&Window> {
@@ -276,10 +365,10 @@ impl WindowManager {
         self.windows().filter(|w| self.is_visible(w)).collect()
     }
 
-    /// Whether `w` belongs to the active workspace and isn't minimized (see
-    /// `visible_windows`).
+    /// Whether `w` belongs to the active workspace, isn't minimized, and is
+    /// mapped (see `visible_windows`).
     pub fn is_visible(&self, w: &Window) -> bool {
-        w.workspace == self.active_workspace && !w.minimized
+        w.workspace == self.active_workspace && !w.minimized && w.mapped
     }
 
     /// Same predicate as `is_visible`, by id (`false` for an unknown id).
@@ -308,7 +397,7 @@ impl WindowManager {
             .focus_mru
             .iter()
             .copied()
-            .find(|id| self.windows.get(id).is_some_and(|w| w.workspace == ws && !w.minimized))?;
+            .find(|id| self.windows.get(id).is_some_and(|w| w.workspace == ws && !w.minimized && w.mapped))?;
         self.focus(candidate)?;
         Some(candidate)
     }
@@ -344,7 +433,7 @@ impl WindowManager {
     pub fn alt_tab_entries(&self) -> Vec<WindowId> {
         self.windows_in_workspace(self.active_workspace)
             .into_iter()
-            .filter(|w| !w.minimized)
+            .filter(|w| !w.minimized && w.mapped)
             .map(|w| w.id)
             .collect()
     }
@@ -591,5 +680,46 @@ mod tests {
         assert!(seqs.len() >= 2);
         assert!(seqs.windows(2).all(|w| w[1] > w[0]), "seqs must strictly increase: {seqs:?}");
         assert_eq!(*seqs.last().unwrap(), m.seq(), "the last queued event carries the current seq");
+    }
+
+    // --- Task 14: the model-level "unmapped" concept ---
+
+    /// Unmapping a window keeps its row (title, geometry, etc. all
+    /// untouched) but pulls it out of visibility and alt-tab candidacy;
+    /// remapping restores both. The value not changing is a no-op.
+    #[test]
+    fn an_unmapped_window_leaves_visibility_and_alt_tab_but_keeps_its_row() {
+        let mut m = WindowManager::new(vec!["1".into()]);
+        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let b = m.add_window("b", "b", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        assert_eq!(m.set_mapped(b, false), Some(()));
+        assert!(!m.get(b).expect("row kept").mapped);
+        assert!(!m.alt_tab_entries().contains(&b));
+        assert!(m.visible_windows().iter().all(|w| w.id != b));
+        assert_eq!(m.set_mapped(b, false), None, "unchanged value is a no-op");
+        assert_eq!(m.set_mapped(b, true), Some(()));
+        assert!(m.alt_tab_entries().contains(&b));
+        let _ = a;
+    }
+
+    /// The milestone's one sanctioned addition to the exactly-one-event-
+    /// per-mutation invariant: `set_mapped` emits exactly one `WindowUpdated`.
+    #[test]
+    fn set_mapped_emits_exactly_one_window_updated() {
+        let mut m = WindowManager::new(vec!["1".into()]);
+        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let before = m.seq();
+        m.set_mapped(a, false);
+        assert_eq!(m.seq(), before + 1, "exactly one emission");
+    }
+
+    /// Step 2's focus-refusal decision: focusing an unmapped window is
+    /// refused outright, not a remap-safe no-op.
+    #[test]
+    fn focus_refuses_an_unmapped_window() {
+        let mut m = WindowManager::new(vec!["1".into()]);
+        let a = m.add_window("a", "a", 1, GEO);
+        m.set_mapped(a, false).unwrap();
+        assert_eq!(m.focus(a), None, "an unmapped window must never gain focus");
     }
 }

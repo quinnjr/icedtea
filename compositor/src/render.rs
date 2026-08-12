@@ -57,6 +57,16 @@ pub fn decoration_strip_geometry(windows: &[&Window]) -> Vec<Rectangle> {
     windows.iter().map(|w| decoration::title_bar_rect(w.geometry)).collect()
 }
 
+/// The buffer-node destination rect for an output: stretch to fill.
+///
+/// Deviation 4 (design spec): there is no scaling-mode field anywhere in the
+/// model or config, so "stretch to fill the output" is the only behaviour
+/// this crate implements -- the destination rect is simply the output's own
+/// rect, unconditionally.
+pub fn wallpaper_dest(output: Rectangle) -> Rectangle {
+    output
+}
+
 /// The solid wallpaper color: `appearance.palette.background` converted to
 /// RGBA. Used as the frame's clear color, and as the fallback until (or
 /// unless) `appearance.wallpaper`'s image has finished decoding.
@@ -159,6 +169,7 @@ mod tests {
             minimized: false,
             fullscreen: false,
             focused: true,
+            mapped: true,
             client_decorations_requested: None,
         }
     }
@@ -193,6 +204,12 @@ mod tests {
     #[test]
     fn decoration_strip_geometry_is_empty_with_no_windows() {
         assert_eq!(decoration_strip_geometry(&[]), Vec::<Rectangle>::new());
+    }
+
+    #[test]
+    fn wallpaper_dest_is_the_full_output() {
+        let out = Rectangle { x: 0, y: 0, width: 1920, height: 1080 };
+        assert_eq!(wallpaper_dest(out), out);
     }
 
     #[test]

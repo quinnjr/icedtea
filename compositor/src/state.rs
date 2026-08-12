@@ -20,7 +20,7 @@ use icedtea_contract::{AltTabState, Event, Rectangle, SeqEvent, WindowId};
 
 use crate::input;
 use crate::layout::{self, SnapZone};
-use crate::render::WallpaperState;
+use crate::render::{self, WallpaperState};
 use crate::window::WindowManager;
 
 /// The model's placeholder toplevel size: staged as both the new window's
@@ -31,9 +31,309 @@ use crate::window::WindowManager;
 /// three/four call sites cannot drift apart from each other.
 pub const PLACEHOLDER_SIZE: (i32, i32) = (640, 400);
 
+/// Sentinel [`LayerEntry::output`] value meaning "no output existed at
+/// all when this surface was announced" (review finding M5). `u32::MAX`
+/// rather than `0`: `next_output_index` starts at `0` and only
+/// increments, so `0` is a real, common output index the very first
+/// hotplugged output takes, while reaching `u32::MAX` real outputs is not
+/// a case this process will ever see -- the same "far outside the real
+/// id space" reasoning [`wlr::LayerSurfaceId::dangling_for_test`] uses
+/// for its own sentinel.
+const NO_OUTPUT: u32 = u32::MAX;
+
 /// Output geometry information (simplified from smithay's `Output`).
 pub struct OutputSurface {
     pub geometry: icedtea_contract::Rectangle,
+    /// `geometry` shrunk by any exclusive-zone layer surfaces anchored to
+    /// this output's edges. Equal to `geometry` when none reserve space.
+    /// Maintained solely by [`State::arrange_layers`]; every placement
+    /// consumer that means "the space windows may occupy" (tiling,
+    /// maximize) reads this instead of `geometry` -- fullscreen is the one
+    /// exception, since it covers panels by definition.
+    pub usable: icedtea_contract::Rectangle,
+}
+
+impl OutputSurface {
+    /// Construct with no exclusive zones yet reserved -- `usable` starts
+    /// equal to `geometry`, exactly as `create_output` documents.
+    pub fn new(geometry: icedtea_contract::Rectangle) -> Self {
+        Self { geometry, usable: geometry }
+    }
+}
+
+/// The model's own record of a wlr-layer-shell surface: everything
+/// [`State::arrange_layers`] and [`State::configure_layer`] need, kept in
+/// the model rather than re-read from the library's `LayerSurface` handle on
+/// every arrangement pass -- the handle only lives for the duration of one
+/// handler call (see [`wlr::LayerSurface`]'s own doc), so anything an
+/// unrelated later call (a different surface's commit, a hotplug) needs has
+/// to be copied out while the handle is live. Updated wholesale on every
+/// `layer_surface_commit`, since wlr-layer-shell clients routinely re-anchor
+/// or resize their exclusive zone after mapping.
+pub struct LayerEntry {
+    /// The model output index (`State::outputs`' key) this surface is
+    /// placed on. Resolved once, at `new_layer_surface`, from
+    /// [`wlr::LayerSurface::output_id`] via `output_ids`, falling back to
+    /// `output_for_pointer` -- see `new_layer_surface`'s own doc. May be
+    /// [`NO_OUTPUT`], a sentinel meaning "no output existed at all when
+    /// this surface was announced" (review finding M5); every reader that
+    /// looks it up in `self.outputs` already treats a miss as "nothing to
+    /// do yet", which is exactly right for the sentinel too, and
+    /// `State::resolve_orphaned_layers` re-homes it the moment any output
+    /// exists.
+    pub output: u32,
+    /// This entry's position in a total, stable order across every layer
+    /// surface this compositor has ever announced -- assigned once, at
+    /// `new_layer_surface`, from `State::next_layer_sequence`.
+    ///
+    /// Exists only for [`State::configure_layer`]'s N6 fix: two
+    /// same-edge, same-output panels must not draw on top of each other,
+    /// which needs a deterministic placement order, and
+    /// [`wlr::LayerSurfaceId`] has no such order exposed (`Hash`/`Eq`
+    /// only, and its inner value is `pub(crate)` to the `wlr` crate, not
+    /// this one) -- so this crate mints its own rather than one it cannot
+    /// read.
+    pub sequence: u64,
+    /// Carried for the model's own record; not consumed by
+    /// [`State::arrange_layers`]/[`State::configure_layer`] -- the crate
+    /// itself reparents this surface's scene node into the right band
+    /// whenever a commit reports a different layer
+    /// (`Runtime::reparent_layer_surface_if_changed`), so nothing here has
+    /// to act on a change to it.
+    pub layer: wlr::Layer,
+    pub anchor: wlr::Anchor,
+    /// The raw value from [`wlr::LayerSurface::exclusive_zone`]: `0` or
+    /// negative means "reserve nothing" (any negative value additionally
+    /// asks not to be moved to avoid occlusion, which this compositor's
+    /// manual placement has no use for); only a positive value reserves
+    /// space in [`State::arrange_layers`].
+    pub exclusive: i32,
+    /// The client's last-requested size (`0` on either axis means "the
+    /// compositor decides" for that axis) -- the input `configure_layer`'s
+    /// placement rule reads, not the size that method actually chose.
+    pub size: (u32, u32),
+    /// Whether this surface currently wants keyboard focus
+    /// ([`wlr::LayerSurface::keyboard_interactive`]). `false` until the
+    /// surface's first commit populates it (see that accessor's own
+    /// timing doc) -- `new_layer_surface` always inserts `false` here.
+    pub interactive: bool,
+    /// Whether this surface is currently mapped (has a buffer and is on
+    /// screen). `false` at `new_layer_surface` (review finding J2: a
+    /// surface that never mapped, or that unmapped and is waiting to
+    /// remap, must not reserve space); flipped by
+    /// `layer_surface_mapped`/`layer_surface_unmapped`.
+    /// [`State::arrange_layers`]'s fold skips every `!mapped` entry.
+    pub mapped: bool,
+    /// The `(width, height, x, y)` [`State::configure_layer`] most
+    /// recently computed for this surface, or `None` before its first
+    /// call. Set just before the runtime-gated
+    /// `configure_layer_surface`/`set_layer_surface_position` calls, not
+    /// only after they run, so this is testable without a live
+    /// `wlr::Runtime` attached (every unit test in this file) -- in
+    /// production a runtime is always attached by the time any handler
+    /// runs, so this never records a placement that was not actually put
+    /// on the wire. Re-review finding Minor-1's storm guard: `configure_layer`
+    /// compares its freshly computed placement against this before doing
+    /// anything else, so calling it again with an unchanged input --
+    /// which `arrange_layers` now does for every mapped panel on every
+    /// pass -- costs one comparison rather than a wire round trip.
+    pub last_configured: Option<(u32, u32, i32, i32)>,
+}
+
+/// Shrink `rect` by one layer entry's positive exclusive zone along
+/// whichever single edge it is anchored to: `top`-anchored (regardless of
+/// whether `left`/`right` are also set -- "single edge or
+/// edge+both-perpendicular" both carve the same way) shrinks the top,
+/// `bottom` the bottom, `left` the left, `right` the right.
+/// `exclusive <= 0` reserves nothing, per wlr-layer-shell's own
+/// definition (see [`LayerEntry::exclusive`]'s doc), and a surface
+/// anchored to both edges of an axis at once (e.g. `top` and `bottom`)
+/// has no single edge to carve into and is left unchanged -- the same
+/// "nothing sane to do" case [`State::configure_layer`]'s placement rule
+/// falls back to centering for.
+///
+/// A free function rather than a method, and shared by
+/// [`State::arrange_layers`] (folding every output's `usable`) and
+/// [`State::usable_before`] (a single panel's own placement base): the
+/// two calls need to compute an identical fold, and a second
+/// hand-written copy of this arithmetic is one more place for them to
+/// drift apart.
+///
+/// H2: every arithmetic op here is saturating. `exclusive` is captured
+/// (clamped) at `new_layer_surface`/`layer_surface_commit` before it ever
+/// reaches this function, but this function has no way to enforce that on
+/// its own -- and it folds over every mapped layer entry on every
+/// `arrange_layers`/`usable_before` pass, so a second, defense-in-depth
+/// guard here costs nothing and turns "two large-exclusive panels overflow
+/// `rect.x`/`rect.y`" from a debug-build panic (release: silent i32
+/// wraparound corruption) into a saturated, still-sane rect.
+fn fold_exclusive_zone(mut rect: Rectangle, anchor: wlr::Anchor, exclusive: i32) -> Rectangle {
+    if exclusive <= 0 {
+        return rect;
+    }
+    if anchor.top != anchor.bottom {
+        if anchor.top {
+            rect.y = rect.y.saturating_add(exclusive);
+        }
+        rect.height = rect.height.saturating_sub(exclusive).max(0);
+    } else if anchor.left != anchor.right {
+        if anchor.left {
+            rect.x = rect.x.saturating_add(exclusive);
+        }
+        rect.width = rect.width.saturating_sub(exclusive).max(0);
+    }
+    rect
+}
+
+/// H2: bound a client-controlled exclusive zone to something sane before it
+/// is stored, so two panels with pathological `exclusive_zone` requests (a
+/// hostile or buggy client can request anything up to `i32::MAX`) cannot
+/// together carve past an output's own extent -- the belt to
+/// `fold_exclusive_zone`'s saturating-arithmetic suspenders. Clamped
+/// against `max(output.width, output.height)`, since a zone only ever
+/// folds a single axis and either axis's whole span is already generous
+/// headroom for a real panel; `None` (no output resolved yet, e.g. the
+/// [`NO_OUTPUT`] sentinel) leaves the value unclamped here and relies
+/// entirely on the saturating fold. `exclusive <= 0` ("reserve nothing",
+/// see [`LayerEntry::exclusive`]'s doc) passes through untouched -- only
+/// the reservation itself is bounded, not the "don't reserve" sentinel
+/// space.
+fn clamp_exclusive_zone(exclusive: i32, output: Option<&OutputSurface>) -> i32 {
+    if exclusive <= 0 {
+        return exclusive;
+    }
+    let bound = output.map(|o| o.geometry.width.max(o.geometry.height)).unwrap_or(i32::MAX);
+    exclusive.min(bound)
+}
+
+/// Whether [`State::sync_seat_focus`] must leave the seat's real keyboard
+/// focus alone because an interactive layer surface still holds it --
+/// review finding J3's guard, extracted as a pure function of `layer_focus`
+/// and `layers` so its exact logic is unit-testable without a live
+/// `wlr::Runtime` (`sync_seat_focus`'s tail, `wayland.keyboard_focus`, is a
+/// no-op with none attached, which would make every branch of the guard
+/// look identical to a test that could only observe side effects on
+/// `wayland`).
+///
+/// `true` only when `layer_focus` names an entry that is still `mapped`:
+/// a stale `layer_focus` (the entry unmapped or was removed without
+/// going through `layer_surface_unmapped`/`destroyed` -- defensively,
+/// should not happen, but this is the one guard standing between that and
+/// a permanently dead keyboard) must not block the model's own focus from
+/// ever being asserted again.
+/// One `lower_*_to_bottom` call [`State::sync_wallpaper_nodes`] issues, in
+/// the order it issues them.
+///
+/// Extracted (with [`wallpaper_lower_plan`]) purely so review finding C1's
+/// ordering contract is *assertable*: `wlr` exposes no scene z-query, and
+/// `BufferId`/`RectId` have no `dangling_for_test` constructor, so neither
+/// the resulting stacking order nor the ids involved can be observed from a
+/// test. What can be pinned is the sequence of lower calls the sync will
+/// make, which is where the whole bug lived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowerStep {
+    /// The freshly created wallpaper node at this index in the caller's
+    /// created-in-this-pass list.
+    Wallpaper(usize),
+    /// The boot-time full-output background rect (`lib.rs::run()`).
+    Background,
+}
+
+/// The order in which [`State::sync_wallpaper_nodes`] must lower the
+/// `created` wallpaper nodes it just made, plus the background rect.
+///
+/// **The contract: the background rect is lowered LAST.** `lower_*_to_bottom`
+/// moves its target to the very bottom of the root's children, so the last
+/// call wins the bottom. Lowering a wallpaper node last (what the code did
+/// before finding C1) buried it under the opaque background rect and the
+/// wallpaper was never visible; lowering the background last leaves it at
+/// the very bottom with the wallpaper immediately above it and everything
+/// else above that.
+///
+/// Empty when nothing was created: an existing node is already correctly
+/// stacked, and re-lowering the background for a pass that changed nothing
+/// would be pure churn.
+fn wallpaper_lower_plan(created: usize, has_background: bool) -> Vec<LowerStep> {
+    if created == 0 {
+        return Vec::new();
+    }
+    let mut plan: Vec<LowerStep> = (0..created).map(LowerStep::Wallpaper).collect();
+    if has_background {
+        plan.push(LowerStep::Background);
+    }
+    plan
+}
+
+/// One axis of a layer surface's placement: its size along that axis and
+/// its position, from the two anchors on that axis, the client's
+/// `desired` size (0 = "compositor decides"), and the usable box's
+/// `origin`/`span` on that axis.
+///
+/// The wlr-layer-shell rule, per axis (review finding I3):
+///
+/// | anchors on the axis | size                        | position                          |
+/// |---------------------|-----------------------------|-----------------------------------|
+/// | both edges          | span the box                | box origin                        |
+/// | exactly one edge    | `desired`, else 30px        | flush against the anchored edge   |
+/// | neither edge        | `desired`, else span the box| centered (origin when it spans)   |
+///
+/// The three fallbacks are each the protocol's own answer to a 0 the
+/// client left for the compositor to choose: an axis anchored to both
+/// edges *must* span it (a 0 there is not merely allowed but expected);
+/// an axis anchored to exactly one edge is a panel's thickness, where 30px
+/// is this compositor's house default; an axis anchored to neither with no
+/// desired size is the protocol's fill case (all-four-anchors and
+/// zero-anchors lockers/launchers alike) and gets the whole usable box
+/// rather than an arbitrary 200px.
+///
+/// Worked examples: a `TOP|LEFT|RIGHT` 800x30 panel gets `(800, box.x)`
+/// horizontally (both edges) and `(30, box.y)` vertically (one edge,
+/// desired honored) -- unchanged from before. A `TOP|RIGHT` 300x100
+/// notification gets `(300, box.x + box.width - 300)` and `(100, box.y)`:
+/// its own size, flush into the corner. A four-edge-anchored 0x0 locker
+/// gets the whole box on both axes.
+fn layer_axis_placement(start: bool, end: bool, desired: u32, origin: i32, span: i32) -> (i32, i32) {
+    // Finding 7, security: `desired` is client-controlled and otherwise
+    // casts straight to `i32` -- a value at or past `i32::MAX` would wrap
+    // negative on the cast, handing a negative "size" into the arithmetic
+    // below. Clamped to the output's own span first: no legitimate panel
+    // needs to claim more than the box it is being placed in.
+    let desired = desired.min(span.max(0) as u32);
+    let size = if start && end {
+        span
+    } else if desired != 0 {
+        desired as i32
+    } else if start || end {
+        30
+    } else {
+        span
+    };
+    let pos = if start || (start == end && size >= span) {
+        origin
+    } else if end {
+        origin + span - size
+    } else {
+        origin + (span - size) / 2
+    };
+    (size, pos)
+}
+
+fn layer_holds_keyboard_focus(
+    layer_focus: Option<wlr::LayerSurfaceId>,
+    layers: &HashMap<wlr::LayerSurfaceId, LayerEntry>,
+) -> bool {
+    layer_focus.is_some_and(|id| layers.get(&id).is_some_and(|entry| entry.mapped))
+}
+
+/// Finding 6, testing: the client's `wlr::Edges` -> `input::ResizeEdges`
+/// mapping [`State::begin_client_resize`] uses, extracted as a pure
+/// field-by-field translation so it is unit-testable without a live
+/// `wlr::Runtime` -- `begin_client_resize`'s own success path (a pointer
+/// actually positioned over the window, `pointer_pressed` true) has no
+/// headless-runtime way to inject a pointer position at all, so this
+/// mapping is what stays testable of it.
+fn resize_edges_from_wlr(edges: wlr::Edges) -> input::ResizeEdges {
+    input::ResizeEdges { top: edges.top, bottom: edges.bottom, left: edges.left, right: edges.right }
 }
 
 /// Translate the compositor library's modifier booleans into the model's
@@ -125,6 +425,11 @@ pub struct State {
     /// by the drag machine (Task 9); this is the geometry hook `render.rs`
     /// consumes.
     pub snap_preview: Option<icedtea_contract::Rectangle>,
+    /// The scene rect node backing `snap_preview`, or `None` when no drag is
+    /// showing one. Reconciled by `sync_snap_preview`, which must run
+    /// immediately after every `snap_preview` assignment -- see that
+    /// method's doc.
+    snap_preview_rect: Option<wlr::RectId>,
     /// Output geometries keyed by output index. Used by fullscreen toggle.
     pub outputs: HashMap<u32, OutputSurface>,
     /// The next index `new_output` hands out. Monotonic, never reused --
@@ -186,6 +491,15 @@ pub struct State {
     /// button-only events (which carry no position of their own) read it
     /// back to build `PointerEvent::Press`/`Release`.
     pub pointer_location: (i32, i32),
+    /// Whether a pointer button is currently held down. Maintained at the
+    /// top of `SeatHandler::pointer_button`, before any routing, so
+    /// `begin_client_move`/`begin_client_resize` can enforce the policy this
+    /// crate substitutes for the seat/serial the library deliberately does
+    /// not forward with `request_move`/`request_resize` (see `wlr::Toplevel
+    /// Handler`'s doc on those methods): honor an interactive move/resize
+    /// request only while a real button-down backs it, never on the
+    /// client's claim alone.
+    pub pointer_pressed: bool,
     /// On-disk location `reload_config_from_disk`/`handle_command`'s
     /// `ReloadConfig` worker thread reads from. `None` (the boot-time
     /// default) means "use `icedtea_config::default_db_path()`" -- this is
@@ -268,6 +582,120 @@ pub struct State {
     /// `drain_wallpaper`'s "likely panicked" warn, before the M4 fix above)
     /// fired every single turn forever, for the rest of the process's life.
     wallpaper_wake: Option<std::os::unix::net::UnixStream>,
+    /// One buffer scene node per output currently showing the decoded
+    /// wallpaper image, keyed by the same model output index `outputs` is.
+    /// Empty whenever `wallpaper.decoded()` is `None` (pre-decode, or a
+    /// decode that failed) -- `sync_wallpaper_nodes` tears every node down
+    /// in that case, leaving the solid `background` rect (`lib.rs::run()`)
+    /// as the only thing on screen. `pub(crate)` so `wallpaper_node_count`
+    /// can read it for test introspection without exposing the map itself.
+    wallpaper_nodes: HashMap<u32, wlr::BufferId>,
+    /// Font enumeration and glyph raster caches for `text::rasterize_title`.
+    ///
+    /// Deviation 5: built lazily, once, and never rebuilt.
+    /// `FontSystem::new` walks every font directory on the machine (tens of
+    /// milliseconds), and `SwashCache` is pure memoization of glyph rasters,
+    /// so both belong to the process rather than to a call. A `OnceCell`
+    /// rather than an eager field because the overwhelming majority of this
+    /// crate's `State`s -- every unit test -- never rasterize anything at
+    /// all, and must not pay for a font scan to construct a model.
+    fonts: std::cell::OnceCell<(cosmic_text::FontSystem, cosmic_text::SwashCache)>,
+    /// Per-window memo of the last title raster: the inputs it was made
+    /// from, the pixels that came out, and the generation that names them.
+    ///
+    /// `sync_window_to_scene` runs on every geometry mutation -- once per
+    /// pointer motion during a drag -- while a title's *pixels* only change
+    /// when the text, the width available for it, or the resolved text color
+    /// changes. This memo is what keeps an unchanged title from being
+    /// re-shaped on every one of those syncs; the `generation` is what keeps
+    /// it from being re-*uploaded* (review finding M2), which is the more
+    /// expensive half: the seam remembers which generation each title node
+    /// currently holds and skips `update_buffer` -- and the scene damage
+    /// that comes with it -- when it already matches. The pixels are
+    /// borrowed across the seam rather than cloned, so a cache hit costs a
+    /// map lookup and nothing else.
+    ///
+    /// `None` on the pixel side is a *cached negative*: this title
+    /// rasterized to nothing (empty, or unshapeable on this machine) and
+    /// must not be retried on every sync. Dropped in `forget_window` and in
+    /// the two teardown paths that bypass it (`apply_config`, and
+    /// `sync_window_to_scene`'s vanished-row arm), so a window's raster
+    /// never outlives it.
+    title_rasters: HashMap<WindowId, TitleRasterEntry>,
+    /// Source of `TitleRasterEntry::generation`. Monotonic and never reused,
+    /// so "the seam holds generation N" can only ever mean one exact set of
+    /// pixels -- across windows as well as within one.
+    next_title_generation: u64,
+    /// Decoration preferences stated by clients that have no model window
+    /// yet, in `Window::client_decorations_requested`'s own three-valued
+    /// spelling.
+    ///
+    /// A client creates its `zxdg_toplevel_decoration_v1` and calls
+    /// `set_mode` on it *before* its initial commit, which is well before
+    /// `mapped` creates the model row -- so the preference arrives with
+    /// nowhere to put it. Parking it here and applying it at `new_toplevel`
+    /// is what keeps an explicit "I draw my own decorations" from being
+    /// silently dropped and the window handed a band it asked not to have.
+    /// Entries are removed when the toplevel is bound (`new_toplevel`) or
+    /// dies unmapped (`forget_toplevel`), so this never outgrows the set of
+    /// unmapped toplevels.
+    pending_decorations: HashMap<crate::wayland::ToplevelKey, Option<bool>>,
+    /// Every live wlr-layer-shell surface's model-side bookkeeping, keyed
+    /// by the library's own id. Populated at `new_layer_surface`, kept
+    /// current on every `layer_surface_commit`, and removed only at
+    /// `layer_surface_destroyed` -- an unmap leaves the entry in place
+    /// (see `layer_surface_unmapped`'s doc, mirroring the toplevel
+    /// unmapped/mapped distinction `Window::mapped` already draws).
+    pub layers: HashMap<wlr::LayerSurfaceId, LayerEntry>,
+    /// The keyboard-interactive layer surface currently holding seat
+    /// keyboard focus, if any. Tracked separately from the model's own
+    /// window focus because a layer surface has no `WindowId` at all --
+    /// this is what `layer_surface_unmapped`/`layer_surface_destroyed`
+    /// check before calling `sync_seat_focus` to hand focus back to
+    /// whatever the model says is focused.
+    layer_focus: Option<wlr::LayerSurfaceId>,
+    /// Source of [`LayerEntry::sequence`]. Monotonic and never reused, the
+    /// same shape as `next_title_generation`.
+    next_layer_sequence: u64,
+}
+
+/// What a cached title raster depends on: the title text, the pixel width
+/// available for it, and the *resolved* foreground color. Anything else
+/// changing -- position, height, workspace -- cannot change the pixels.
+///
+/// The color rather than a `focused` flag (review finding M3): focus is
+/// only one of the two things that pick the text color, the palette being
+/// the other. Keying on the resolved bytes covers both, and covers them
+/// exactly -- a reload that changed some unrelated part of the config
+/// re-uses the raster, while one that changed `palette.foreground`
+/// invalidates it even if the reload someday stops destroying every window.
+type TitleRasterKey = (String, i32, [u8; 4]);
+
+/// A rasterized title's pixels: `(width, height, premultiplied RGBA)`.
+type TitlePixels = (i32, i32, Vec<u8>);
+
+/// One window's memoized title raster.
+struct TitleRasterEntry {
+    /// The inputs these pixels were shaped from; a miss against this is the
+    /// only thing that shapes.
+    key: TitleRasterKey,
+    /// Names this exact set of pixels for the seam's upload check. Bumped
+    /// only when the pixels are re-shaped.
+    generation: u64,
+    /// `None` is a cached negative -- nothing shaped, show the bare band.
+    pixels: Option<TitlePixels>,
+}
+
+/// Left inset of the title text inside the band, in pixels.
+const TITLE_PAD_X: i32 = 8;
+
+/// `color` at `alpha`, premultiplied -- every channel scaled, not just the
+/// alpha one, because the wlroots scene graph composites premultiplied
+/// colors and a rect whose RGB outran its alpha would come out brighter than
+/// the same color opaque.
+fn premultiply(color: [f32; 4], alpha: f32) -> [f32; 4] {
+    let a = (color[3] * alpha).clamp(0.0, 1.0);
+    [color[0] * a, color[1] * a, color[2] * a, a]
 }
 
 impl State {
@@ -285,6 +713,7 @@ impl State {
             start_time: Instant::now(),
             wallpaper: WallpaperState::new(),
             snap_preview: None,
+            snap_preview_rect: None,
             outputs: HashMap::new(),
             next_output_index: 0,
             turns: 0,
@@ -297,6 +726,7 @@ impl State {
             resize: input::ResizeMachine::new(),
             quitting: false,
             pointer_location: (0, 0),
+            pointer_pressed: false,
             config_path: None,
             config_reload_tx: None,
             config_reload_rx: None,
@@ -311,6 +741,14 @@ impl State {
             wallpaper_received: false,
             wallpaper_wake_source: None,
             wallpaper_wake: None,
+            wallpaper_nodes: HashMap::new(),
+            fonts: std::cell::OnceCell::new(),
+            title_rasters: HashMap::new(),
+            next_title_generation: 0,
+            pending_decorations: HashMap::new(),
+            layers: HashMap::new(),
+            layer_focus: None,
+            next_layer_sequence: 0,
         }
     }
 
@@ -357,6 +795,7 @@ impl State {
             Ok(image) => {
                 self.wallpaper.set_decoded(image);
                 self.wallpaper_received = true;
+                self.sync_wallpaper_nodes();
             }
             // Review finding M4: `Disconnected` means two different things
             // depending on `wallpaper_received`. Before a result has ever
@@ -382,6 +821,179 @@ impl State {
         }
     }
 
+    /// How many wallpaper buffer nodes are currently tracked. Introspection
+    /// for tests -- nothing in a real boot needs to count these itself
+    /// (mirrors `Wayland::ssd_rect_count`).
+    pub fn wallpaper_node_count(&self) -> usize {
+        self.wallpaper_nodes.len()
+    }
+
+    /// Creates/updates one wallpaper buffer node per output from the
+    /// decoded image, stretched to fill (`render::wallpaper_dest`); removes
+    /// nodes for outputs that are gone. Idempotent -- calling this again
+    /// with nothing changed just re-sets each node's position/size and
+    /// re-lowers it, which are all no-ops on an already-correct scene.
+    ///
+    /// **Contract (task 7/14): nodes are never pixel-refreshed in place.**
+    /// The existing-node branch below only repositions/resizes; it never
+    /// calls `update_buffer` (or re-creates the node) to show a *different*
+    /// image's pixels under an unchanged output index. That branch was
+    /// unreachable until task 14 gave `apply_reloaded_config` a wallpaper
+    /// swap path -- reachable now, so the contract has to be stated rather
+    /// than left implicit: a wallpaper change must clear first
+    /// (`wallpaper.set_decoded(None)` + a call here to tear every node
+    /// down) before the fresh decode's result calls this again to rebuild
+    /// them. `apply_reloaded_config` enforces exactly that ordering; nothing
+    /// here checks it, so a caller that skips the clear would silently keep
+    /// showing the old image at the old node's size/position rather than
+    /// picking up the new one.
+    ///
+    /// Called whenever either side of the sync could have changed: a fresh
+    /// decode landing (`drain_wallpaper`), or the output set changing
+    /// (`OutputHandler::new_output`/`destroyed`). Not a model mutation --
+    /// these are scene bookkeeping only, so this never touches
+    /// `window_manager` or emits an event (the exactly-one-event-per-mutation
+    /// invariant has nothing to say about a rect existing on screen).
+    ///
+    /// With no runtime attached (every unit test that never calls
+    /// `wayland.attach`), every `wlr` call below is a no-op that returns
+    /// `None`/does nothing, so this degrades to a harmless no-op that also
+    /// never populates `wallpaper_nodes` -- there is no `BufferId` a real
+    /// call could have returned to put in the map.
+    pub fn sync_wallpaper_nodes(&mut self) {
+        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+
+        let Some(img) = self.wallpaper.decoded() else {
+            // No decoded image (pre-decode, or a decode that failed): tear
+            // every node down and fall back to the solid background rect.
+            // `remove_buffer` tolerates a stale id (already gone via its own
+            // toplevel teardown, though wallpaper nodes are root buffers so
+            // that specific race does not apply here) -- just `None`, never
+            // a panic.
+            for (_, node) in self.wallpaper_nodes.drain() {
+                runtime.remove_buffer(node);
+            }
+            return;
+        };
+
+        let width = img.width() as i32;
+        let height = img.height() as i32;
+        // Never panic in handler-reachable code: a zero-dimension decode
+        // (which `image` should never actually produce, but nothing here
+        // proves it can't) skips every output rather than handing wlroots a
+        // buffer `add_buffer`/`update_buffer` would reject anyway.
+        if width == 0 || height == 0 {
+            return;
+        }
+        let rgba = img.as_raw().as_slice();
+
+        // Freshly created nodes, in creation order. Collected rather than
+        // lowered inline because the lowering *order* is the whole
+        // correctness question here -- see `wallpaper_lower_plan`.
+        let mut created: Vec<wlr::BufferId> = Vec::new();
+        for (index, surface) in &self.outputs {
+            let dest = render::wallpaper_dest(surface.geometry);
+            if let Some(&node) = self.wallpaper_nodes.get(index) {
+                runtime.set_buffer_position(node, dest.x, dest.y);
+                runtime.set_buffer_dest_size(node, dest.width, dest.height);
+            } else {
+                match runtime.add_buffer(width, height, rgba) {
+                    Ok(node) => {
+                        runtime.set_buffer_position(node, dest.x, dest.y);
+                        runtime.set_buffer_dest_size(node, dest.width, dest.height);
+                        created.push(node);
+                        self.wallpaper_nodes.insert(*index, node);
+                    }
+                    // Finding 5, errors: the failure used to be silently
+                    // dropped, leaving that output with no wallpaper node
+                    // and no trace of why -- named with the output index so
+                    // a multi-output setup's log points at the one output
+                    // actually missing its wallpaper.
+                    Err(err) => {
+                        tracing::warn!(output = index, ?err, "failed to create wallpaper buffer node for output");
+                    }
+                }
+            }
+        }
+        // Review finding C1: every wallpaper node used to be lowered inline
+        // right here, *after* `lib.rs::run()` had already lowered the
+        // opaque background rect at boot -- and `lower_*_to_bottom` moves
+        // its target to the very bottom of the root's children, so the
+        // most recently lowered node wins the bottom. That put every
+        // wallpaper node *underneath* the full-output opaque rect and the
+        // wallpaper was never visible at all. The background rect goes
+        // last now, which is what actually puts it at the very bottom and
+        // leaves the wallpaper directly above it -- solid color as the
+        // pre-decode/decode-failure fallback, not a permanent occlusion.
+        for step in wallpaper_lower_plan(created.len(), self.background.is_some()) {
+            match step {
+                LowerStep::Wallpaper(i) => {
+                    if let Some(&node) = created.get(i) {
+                        runtime.lower_buffer_to_bottom(node);
+                    }
+                }
+                LowerStep::Background => {
+                    if let Some(bg) = self.background {
+                        runtime.lower_rect_to_bottom(bg);
+                    }
+                }
+            }
+        }
+
+        // Drop nodes for outputs that are gone.
+        let gone: Vec<u32> = self
+            .wallpaper_nodes
+            .keys()
+            .filter(|index| !self.outputs.contains_key(index))
+            .copied()
+            .collect();
+        for index in gone {
+            if let Some(node) = self.wallpaper_nodes.remove(&index) {
+                runtime.remove_buffer(node);
+            }
+        }
+    }
+
+    /// Reconcile the snap-preview scene rect with `self.snap_preview`:
+    /// create it (accent color at 35% alpha, premultiplied) the moment a
+    /// drag starts showing a target, reposition/resize it in place as the
+    /// target changes, and remove it the moment there is no longer one to
+    /// show.
+    ///
+    /// Call this immediately after every assignment to `snap_preview` --
+    /// the two fields are meant to be read as one unit, and nothing else
+    /// keeps them in sync. With no runtime attached (every unit test that
+    /// never calls `wayland.attach`) this is a no-op, the same degradation
+    /// `sync_wallpaper_nodes` documents for the identical reason: there is
+    /// no `RectId` a real call could have returned to put in
+    /// `snap_preview_rect`.
+    pub fn sync_snap_preview(&mut self) {
+        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+        match self.snap_preview {
+            Some(rect) => match self.snap_preview_rect {
+                Some(id) => {
+                    runtime.set_rect_position(id, rect.x, rect.y);
+                    runtime.set_rect_size(id, rect.width, rect.height);
+                }
+                None => {
+                    let color = premultiply(
+                        render::hex_to_rgba(&self.config.appearance.palette.accent),
+                        0.35,
+                    );
+                    if let Ok(id) = runtime.add_rect(rect.width, rect.height, color) {
+                        runtime.set_rect_position(id, rect.x, rect.y);
+                        self.snap_preview_rect = Some(id);
+                    }
+                }
+            },
+            None => {
+                if let Some(id) = self.snap_preview_rect.take() {
+                    runtime.remove_rect(id);
+                }
+            }
+        }
+    }
+
     /// Ask the event loop to stop.
     ///
     /// Sets the same flag `apply_action("quit")` does rather than signalling a
@@ -400,7 +1012,340 @@ impl State {
     /// `snap`, `set_fullscreen_target`, `set_maximized_target` and
     /// `handle_pointer_motion` read.
     pub fn create_output(&mut self, index: u32, geometry: icedtea_contract::Rectangle) {
-        self.outputs.insert(index, OutputSurface { geometry });
+        self.outputs.insert(index, OutputSurface::new(geometry));
+    }
+
+    /// The output whose box contains the pointer; falls back to the lowest
+    /// index. Placement (cascade origin, maximize/fullscreen/snap target)
+    /// uses this instead of the implicit single output, so every one of
+    /// those consumers moves with the pointer once a second output exists.
+    ///
+    /// With no attached runtime (every unit test in this file, and any
+    /// caller ahead of `wayland.attach`), `pointer_position` is unavailable
+    /// -- the fallback path also covers a pointer that landed outside every
+    /// known output's box, which can happen for an instant right after a
+    /// hotplug removes the one it was over.
+    pub fn output_for_pointer(&self) -> Option<u32> {
+        if let Some(runtime) = self.wayland.runtime() {
+            let (px, py) = runtime.pointer_position();
+            let (px, py) = (px as i32, py as i32);
+            let hit = self.outputs.iter().find(|(_, out)| out.geometry.contains(px, py));
+            if let Some((&idx, _)) = hit {
+                return Some(idx);
+            }
+        }
+        self.outputs.keys().min().copied()
+    }
+
+    /// The output whose box contains `geometry`'s frame center, falling
+    /// back to [`Self::output_for_pointer`] (whose own fallback is the
+    /// lowest index) when no output's box contains it.
+    ///
+    /// Review finding J1: `arrange_layers` used to re-home every
+    /// maximized window through `output_for_pointer` alone, which is a
+    /// *pointer*-driven disambiguator every one of its other callers gets
+    /// to use because they all run inside a user-initiated action
+    /// (maximize, snap, drag) where the pointer genuinely names the
+    /// window in question. `arrange_layers` runs from an unrelated
+    /// client's layer-surface commit -- a status bar's clock tick is
+    /// enough -- so the pointer carries no information about which
+    /// maximized window is being re-laid-out, and using it teleported a
+    /// maximized window on output 1 onto output 0's `usable` rect the
+    /// moment a panel on output 1 committed while the pointer merely
+    /// happened to be sitting over output 0. A window's own frame center
+    /// is what actually names its output; mirrors
+    /// `migrate_windows_from`'s identical containment test.
+    fn output_for_window(&self, geometry: Rectangle) -> Option<u32> {
+        let cx = geometry.x + geometry.width / 2;
+        let cy = geometry.y + geometry.height / 2;
+        let hit = self.outputs.iter().find(|(_, out)| out.geometry.contains(cx, cy));
+        if let Some((&idx, _)) = hit {
+            return Some(idx);
+        }
+        self.output_for_pointer()
+    }
+
+    /// Finding 4, maintainability: the `usable` rect of whatever output
+    /// [`Self::output_for_pointer`] names, extracted once rather than
+    /// inlined at each pointer-correct call site (`snap`,
+    /// `handle_pointer_motion`, `new_toplevel`'s cascade placement) --
+    /// those genuinely run inside a user-initiated, pointer-driven action
+    /// (see `output_for_window`'s own doc for the distinction from a
+    /// client-request/D-Bus path, which is not one of these). `None` when
+    /// no output resolves at all.
+    fn usable_geo_for_pointer(&self) -> Option<Rectangle> {
+        self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)
+    }
+
+    /// Recompute every output's `usable` rect from its layer surfaces'
+    /// exclusive zones, then re-sync every maximized window whose target
+    /// rect actually changed so maximize immediately tracks the new
+    /// usable area.
+    ///
+    /// Reset-then-fold: every output's `usable` starts back at `geometry`
+    /// (a panel that shrank its zone, moved output, unmapped, or was
+    /// destroyed must give its space back, not just never claim more of
+    /// it) and each *mapped* (review finding J2 -- an unmapped surface
+    /// reserves nothing, see [`LayerEntry::mapped`]'s doc) layer entry's
+    /// positive exclusive zone shrinks the respective edge via
+    /// [`fold_exclusive_zone`] -- `exclusive <= 0` reserves nothing, per
+    /// wlr-layer-shell's own definition (see [`LayerEntry::exclusive`]'s
+    /// doc).
+    ///
+    /// Fullscreen windows are deliberately never touched here at all --
+    /// not filtered out after the fact, never in the affected set to
+    /// begin with -- because fullscreen geometry is defined to keep
+    /// `geometry`, never `usable` (`set_fullscreen_target`'s own doc), so
+    /// no exclusive-zone change this method makes could ever be relevant
+    /// to one; re-syncing them on every panel commit was pure waste
+    /// (review finding M4).
+    ///
+    /// A maximized window's target is only applied -- `set_geometry` +
+    /// `sync_window_to_scene` -- when it actually differs from the
+    /// window's current geometry (review finding M4): `set_geometry`
+    /// emits `WindowUpdated` unconditionally, so without this guard a
+    /// panel redrawing its clock once a second produced one D-Bus signal
+    /// and one client `configure` per maximized window, per panel frame,
+    /// with byte-identical geometry.
+    ///
+    /// Each maximized window's output is its own frame center's, not a
+    /// single pointer-derived one (review finding J1) -- see
+    /// `output_for_window`'s own doc for the multi-output regression this
+    /// closes.
+    ///
+    /// Windows are collected into a `Vec` before any is synced (review
+    /// pattern this crate already follows elsewhere, e.g.
+    /// `migrate_windows_from`): `sync_window_to_scene` reads `self`
+    /// broadly, so mutating `window_manager` while still mid-iteration
+    /// over it would not borrow-check.
+    pub fn arrange_layers(&mut self) {
+        for output in self.outputs.values_mut() {
+            output.usable = output.geometry;
+        }
+        for entry in self.layers.values() {
+            if !entry.mapped {
+                continue;
+            }
+            let Some(output) = self.outputs.get_mut(&entry.output) else { continue };
+            output.usable = fold_exclusive_zone(output.usable, entry.anchor, entry.exclusive);
+        }
+
+        // Re-review finding Minor-1: the fold above can change a *later*
+        // (higher-`sequence`) mapped panel's own placement input --
+        // `usable_before`'s output -- without that panel ever committing
+        // itself, e.g. an earlier panel growing its zone or unmapping.
+        // Nothing else would ever re-offer it a fresh placement, so it
+        // stayed positioned where it was last configured until its own
+        // next commit happened to come along. Reconfiguring every mapped
+        // panel here closes that, and does not reopen M4's storm class:
+        // `configure_layer` only actually sends when the computed
+        // placement differs from the one it last sent (`LayerEntry::
+        // last_configured`), so an arrange pass that changed nothing for
+        // a given panel costs one comparison, not a wire round trip.
+        let mapped_layers: Vec<wlr::LayerSurfaceId> =
+            self.layers.iter().filter(|(_, e)| e.mapped).map(|(&id, _)| id).collect();
+        for id in mapped_layers {
+            self.configure_layer(id);
+        }
+
+        let gap = self.config.appearance.snap_gap;
+        let affected: Vec<WindowId> = self.window_manager.windows().filter(|w| w.maximized).map(|w| w.id).collect();
+        for id in affected {
+            let Some(w) = self.window_manager.get(id) else { continue };
+            let Some(output_idx) = self.output_for_window(w.geometry) else { continue };
+            let Some(output_geo) = self.outputs.get(&output_idx).map(|o| o.usable) else { continue };
+            let target = layout::maximized_geometry(output_geo, gap);
+            if target == w.geometry {
+                continue;
+            }
+            let _ = self.window_manager.set_geometry(id, target);
+            self.sync_window_to_scene(id);
+        }
+        self.emit_pending();
+    }
+
+    /// The `usable` rect for `output_idx` as every *other*, mapped,
+    /// positive-exclusive-zone entry whose [`LayerEntry::sequence`] is
+    /// strictly less than `before` has already carved it -- `None` if
+    /// `output_idx` names no live output.
+    ///
+    /// This is [`Self::configure_layer`]'s N6 fix: `arrange_layers`'
+    /// `output.usable` already folds *every* entry together (itself
+    /// included), which is right for "how much space is left for
+    /// windows" but wrong as a placement base for an individual panel --
+    /// self-excluding shrinks a panel by its own reservation, and folding
+    /// every other entry with no ordering stacks two same-edge panels on
+    /// top of each other rather than one beside the other. Folding only
+    /// entries ordered strictly before this one gives a deterministic
+    /// stack instead: whichever panel was announced first sits flush
+    /// against the edge, the next stacks outward from it.
+    fn usable_before(&self, output_idx: u32, before: u64) -> Option<Rectangle> {
+        let mut rect = self.outputs.get(&output_idx)?.geometry;
+        for entry in self.layers.values() {
+            if entry.output != output_idx || entry.sequence >= before || !entry.mapped {
+                continue;
+            }
+            rect = fold_exclusive_zone(rect, entry.anchor, entry.exclusive);
+        }
+        Some(rect)
+    }
+
+    /// Choose `id`'s layer surface's size and position for its output box
+    /// (the placement rule from task 20's brief) and answer with
+    /// `configure_layer_surface` + `set_layer_surface_position`.
+    ///
+    /// A no-op, panic-free, if the entry or its output has vanished (a
+    /// commit racing a hotplug-removed output, or the `NO_OUTPUT`
+    /// sentinel -- see [`LayerEntry::output`]'s doc), no runtime is
+    /// attached (every unit test in this file), or the computed placement
+    /// is unchanged from [`LayerEntry::last_configured`] -- see that
+    /// field's own doc (review finding Minor-1): this makes the method
+    /// safe to call unconditionally, which `arrange_layers` now does for
+    /// every mapped panel on every pass.
+    pub fn configure_layer(&mut self, id: wlr::LayerSurfaceId) {
+        let Some(entry) = self.layers.get(&id) else { return };
+        let (output_idx, sequence, a, (desired_w, desired_h)) =
+            (entry.output, entry.sequence, entry.anchor, entry.size);
+        // N6: placed against the space every earlier-announced panel on
+        // this output has already carved, not the raw output box --
+        // otherwise two same-edge exclusive panels draw on top of each
+        // other. See `usable_before`'s own doc.
+        let Some(box_) = self.usable_before(output_idx, sequence) else { return };
+
+        // Placement is per-axis and independent (review finding I3) -- see
+        // `layer_axis_placement`. The rule task 20 shipped keyed on
+        // `a.top != a.bottom` / `a.left != a.right` for the *whole*
+        // placement, which spanned a corner-anchored notification across
+        // the full output width (discarding its desired width outright) and
+        // dropped a four-edge-anchored 0x0 locker into a centered 200x200
+        // box instead of filling the output.
+        let (w, x) = layer_axis_placement(a.left, a.right, desired_w, box_.x, box_.width);
+        let (h, y) = layer_axis_placement(a.top, a.bottom, desired_h, box_.y, box_.height);
+
+        let (w, h) = (w.max(0) as u32, h.max(0) as u32);
+        let placement = (w, h, x, y);
+        // Minor-1's storm guard: unchanged since the last time this was
+        // computed is a no-op. `None` (never computed before) never
+        // matches, so a surface's first `configure_layer` -- from
+        // `new_layer_surface` or its own first commit -- always goes out;
+        // the mandatory-configure contract is unaffected.
+        if self.layers.get(&id).is_some_and(|e| e.last_configured == Some(placement)) {
+            return;
+        }
+        // Recorded before the runtime-gated send below, not after: this
+        // is what `configure_layer` computed and is *treating* as current
+        // regardless of whether a runtime happened to be attached to
+        // actually put it on the wire (every unit test in this file has
+        // none). Production always has one attached by the time any of
+        // this crate's handlers run, so the gap that would open --
+        // recording a placement this method never actually sent -- cannot
+        // happen outside a test.
+        if let Some(entry) = self.layers.get_mut(&id) {
+            entry.last_configured = Some(placement);
+        }
+        let Some(runtime) = self.wayland.runtime() else { return };
+        runtime.configure_layer_surface(id, w, h);
+        runtime.set_layer_surface_position(id, x, y);
+    }
+
+    /// Re-home every [`LayerEntry`] whose `output` no longer names a live
+    /// output (the [`NO_OUTPUT`] sentinel, or an index a since-removed
+    /// output left behind) onto a surviving one -- the layer analogue of
+    /// [`Self::migrate_windows_from`], but pull rather than push: this
+    /// scans every entry rather than only the ones a specific removed
+    /// output owned, so the same sweep also recovers a surface that had
+    /// no output *at all* when it was announced (review finding M5) the
+    /// moment any output exists.
+    ///
+    /// Re-resolution uses [`Self::output_for_pointer`] (itself falling
+    /// back to the lowest surviving index) -- the tail of
+    /// `new_layer_surface`'s own fallback chain, minus the
+    /// `output_id`/`output_ids` legs, which need a live `LayerSurface`
+    /// handle this call site does not have.
+    ///
+    /// A no-op, correctly, when no output exists at all:
+    /// `output_for_pointer` returns `None`, and every orphaned entry is
+    /// left exactly where it was for the next call (the next `new_output`)
+    /// to try again -- which is what makes the "no output at all when
+    /// announced" case self-heal instead of hanging its client forever
+    /// (review finding M5).
+    ///
+    /// Called from both `OutputHandler::new_output` (a fresh or returning
+    /// output may be exactly what an orphaned entry was waiting for) and
+    /// `OutputHandler::destroyed` (an entry the dying output owned needs
+    /// somewhere else to go right away, not just whenever the next output
+    /// happens to appear).
+    fn resolve_orphaned_layers(&mut self) {
+        let orphaned: Vec<wlr::LayerSurfaceId> = self
+            .layers
+            .iter()
+            .filter(|(_, entry)| !self.outputs.contains_key(&entry.output))
+            .map(|(&id, _)| id)
+            .collect();
+        if orphaned.is_empty() {
+            return;
+        }
+        let Some(survivor) = self.output_for_pointer() else { return };
+        for id in &orphaned {
+            if let Some(entry) = self.layers.get_mut(id) {
+                entry.output = survivor;
+            }
+            self.configure_layer(*id);
+        }
+        self.arrange_layers();
+    }
+
+    /// Hot-remove semantics: every window whose frame center sat inside the
+    /// dead output's box (`dead`, captured by the caller before the entry
+    /// left `self.outputs`) is moved onto the surviving output with the
+    /// lowest index (clamped into its box, cascade order preserved) and
+    /// re-synced. Called from `OutputHandler::destroyed`.
+    ///
+    /// With no surviving output, this is a deliberate no-op: there is
+    /// nowhere to move a window to, and leaving geometry alone (rather than
+    /// clamping into an empty rect, which would collapse every affected
+    /// window to a single point) is the only choice that doesn't invent a
+    /// placement nothing asked for.
+    pub fn migrate_windows_from(&mut self, dead: Rectangle) {
+        let Some(survivor_idx) = self.outputs.keys().min().copied() else { return };
+        let Some(survivor) = self.outputs.get(&survivor_idx).map(|o| o.geometry) else { return };
+
+        let affected: Vec<WindowId> = self
+            .window_manager
+            .windows()
+            .filter(|w| {
+                let cx = w.geometry.x + w.geometry.width / 2;
+                let cy = w.geometry.y + w.geometry.height / 2;
+                dead.contains(cx, cy)
+            })
+            .map(|w| w.id)
+            .collect();
+
+        for id in affected {
+            let Some(w) = self.window_manager.get(id) else { continue };
+            let geometry = w.geometry;
+
+            // Preserve the window's offset from the dead output's origin,
+            // clamped so the frame fits inside the survivor's box -- pinned
+            // to the survivor's own origin on that axis when the frame is
+            // wider/taller than the survivor itself (a `max` bound below its
+            // `min` bound would panic `clamp`, so guard it explicitly rather
+            // than trusting every window to be smaller than every output).
+            let new_x = if geometry.width >= survivor.width {
+                survivor.x
+            } else {
+                (survivor.x + (geometry.x - dead.x)).clamp(survivor.x, survivor.x + survivor.width - geometry.width)
+            };
+            let new_y = if geometry.height >= survivor.height {
+                survivor.y
+            } else {
+                (survivor.y + (geometry.y - dead.y)).clamp(survivor.y, survivor.y + survivor.height - geometry.height)
+            };
+
+            self.window_manager.set_geometry(id, Rectangle { x: new_x, y: new_y, ..geometry });
+            self.sync_window_to_scene(id);
+        }
+        self.emit_pending();
     }
 
     /// Drain `window_manager.pending_events` onto `dbus_tx`. Must be called
@@ -479,6 +1424,10 @@ impl State {
             // rather than showing a window nothing tracks.
             self.wayland.set_visible(id, false);
             self.wayland.forget(id);
+            // The other teardown path that bypasses `forget_window`
+            // (review finding M1): the row vanished without going through
+            // it, so the raster it left behind has to be collected here.
+            self.title_rasters.remove(&id);
             return;
         };
         let (geo, fullscreen, maximized, focused) = (w.geometry, w.fullscreen, w.maximized, w.focused);
@@ -488,14 +1437,48 @@ impl State {
         let ssd = crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, fullscreen);
         let content = crate::decoration::content_rect(geo, ssd);
 
-        // Review finding I2: paint (or hide) the SSD title-bar band. `geo`,
+        // Review finding I2: paint (or hide) the SSD decoration. `geo`,
         // not `content` -- `title_bar_rect` is frame-space, same as
         // `content_rect`'s input, and the two are computed from the same
         // `geo` precisely so they can never disagree about where the band
         // ends and the client's content begins.
+        let bar = crate::decoration::title_bar_rect(geo);
         let bar_color = crate::render::hex_to_rgba(&self.config.appearance.palette.background);
-        self.wayland
-            .sync_ssd_rect(id, ssd, visible, crate::decoration::title_bar_rect(geo), bar_color);
+        let button_colors = self.button_colors();
+        // Only rasterize for a window that will actually show a band: a CSD
+        // or fullscreen window's title is never drawn, and shaping it would
+        // be pure waste on the most common client kind there is.
+        let decorated = ssd && visible;
+        if decorated {
+            let title = w.title.clone();
+            self.ensure_title_raster(id, title, bar, focused);
+        }
+        // Field-wise borrow so the seam can read the memo's pixels in place:
+        // the alternative is cloning ~40 KB into an owned `Vec` on every
+        // sync -- i.e. on every pointer motion of a drag -- to hand across a
+        // call that, on a cache hit, will not even look at them (M2).
+        let Self { wayland, title_rasters, .. } = self;
+        let title_px = decorated
+            .then(|| title_rasters.get(&id))
+            .flatten()
+            .and_then(|entry| {
+                entry.pixels.as_ref().map(|(width, height, pixels)| crate::wayland::TitleRaster {
+                    width: *width,
+                    height: *height,
+                    generation: entry.generation,
+                    pixels,
+                })
+            });
+        wayland.sync_ssd(
+            id,
+            ssd,
+            visible,
+            bar,
+            content,
+            bar_color,
+            button_colors,
+            title_px,
+        );
 
         self.wayland.set_visible(id, visible);
         if visible {
@@ -528,6 +1511,91 @@ impl State {
         self.sync_seat_focus();
     }
 
+    /// The three title-bar button colors, in `decoration::button_rects`'
+    /// order: minimize, maximize, close.
+    ///
+    /// Close is the palette's accent -- it is the destructive one and the
+    /// one a user aims at without looking. The other two are the foreground
+    /// color at 40% alpha, which reads as a subdued chip against the band
+    /// whatever the palette is, without inventing two more color names the
+    /// config has no field for.
+    ///
+    /// Premultiplied, like every other color that reaches a scene node: the
+    /// wlroots scene graph composites premultiplied alpha, so scaling only
+    /// the alpha channel and leaving RGB at full strength would paint the
+    /// chips brighter than opaque foreground rather than fainter.
+    fn button_colors(&self) -> [[f32; 4]; 3] {
+        let fg = crate::render::hex_to_rgba(&self.config.appearance.palette.foreground);
+        let accent = crate::render::hex_to_rgba(&self.config.appearance.palette.accent);
+        let chip = premultiply(fg, 0.4);
+        [chip, chip, accent]
+    }
+
+    /// Make sure window `id`'s memoized title raster matches `title`, the
+    /// band `bar` and the focus state -- shaping only when one of those
+    /// actually changed.
+    ///
+    /// Memoized through `title_rasters`: see that field's doc for why a drag
+    /// must not re-shape (or re-upload) the same string sixty times a
+    /// second, and why a negative result is cached too. The caller reads the
+    /// pixels back out of the map rather than taking them from here, which
+    /// is what keeps a cache hit free of any copy at all.
+    ///
+    /// The title node spans the band minus the three buttons, so a long
+    /// title runs out of room before it runs under the close button rather
+    /// than being drawn beneath it.
+    fn ensure_title_raster(&mut self, id: WindowId, title: String, bar: Rectangle, focused: bool) {
+        // Finding 3, security: cap the title before it becomes the cache
+        // key, not just before it reaches `rasterize_title` -- otherwise
+        // two distinct multi-kilobyte titles that agree on their first
+        // `MAX_TITLE_BYTES` bytes would shape identically but still cache
+        // (and compare) as different keys, defeating the point of capping.
+        // `rasterize_title` caps again internally (its own contract, kept
+        // independent of this caller), so this is belt and suspenders on
+        // the same bound, not two different ones.
+        let title = if title.len() > crate::text::MAX_TITLE_BYTES { crate::text::cap_title(&title).to_owned() } else { title };
+        let width = (bar.width - 3 * crate::decoration::BUTTON_WIDTH).max(1);
+        let height = bar.height.max(1);
+
+        // Unfocused windows get the same text at 60% strength rather than a
+        // second palette color: the config has one foreground, and dimming
+        // it is the least surprising way to say "this window is not the
+        // active one" in a title bar that is otherwise identical.
+        //
+        // Dimmed in RGB, not in alpha, and that is not a style choice:
+        // cosmic-text's `SwashCache::with_pixels` builds each mask-glyph
+        // pixel as `coverage << 24 | base.0 & 0xFF_FF_FF` -- it takes the
+        // base color's *channels* and discards its alpha outright (the
+        // upstream source says as much, in a `TODO: blend base alpha?`).
+        // Asking for translucent text by lowering the alpha byte would
+        // therefore change nothing at all on screen.
+        let palette = crate::render::hex_to_rgba(&self.config.appearance.palette.foreground);
+        let dim = if focused { 1.0 } else { 0.6 };
+        let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * dim * 255.0).round() as u8;
+        let fg = [to_u8(palette[0]), to_u8(palette[1]), to_u8(palette[2]), 255];
+
+        let key: TitleRasterKey = (title, width, fg);
+        if self.title_rasters.get(&id).is_some_and(|entry| entry.key == key) {
+            return;
+        }
+
+        self.fonts
+            .get_or_init(|| (cosmic_text::FontSystem::new(), cosmic_text::SwashCache::new()));
+        // `get_mut` cannot miss after `get_or_init`; the `else` is the
+        // panic-free spelling of that, not a case with any behavior of its
+        // own.
+        let Some((fonts, swash)) = self.fonts.get_mut() else { return };
+        let pixels = crate::text::rasterize_title(fonts, swash, &key.0, width, height, TITLE_PAD_X, fg)
+            .map(|pixels| (width, height, pixels));
+        // A fresh generation for fresh pixels: this is what tells the seam
+        // its title node is out of date (M2). Bumped on a negative result
+        // too -- "the title now shapes to nothing" is a change the seam has
+        // to act on, by dropping the node.
+        let generation = self.next_title_generation;
+        self.next_title_generation += 1;
+        self.title_rasters.insert(id, TitleRasterEntry { key, generation, pixels });
+    }
+
     /// The active workspace's focused window id, if any. Callers capture this
     /// *before* a focus-changing mutation and hand it to `sync_focus_change`.
     fn focused_id(&self) -> Option<WindowId> {
@@ -547,11 +1615,61 @@ impl State {
     /// and does nothing when it already matches, so an ordinary geometry sync
     /// does not churn leave/enter pairs at the client.
     fn sync_seat_focus(&mut self) {
+        // Review finding J3: this used to be unconditional, which meant
+        // *any* `sync_window_to_scene`-driven resync -- a drag-motion
+        // frame, a title change, a workspace switch, `arrange_layers`
+        // itself -- silently reasserted the model's toplevel focus over
+        // an interactive layer surface's, because the crate's seat model
+        // has no separate "layer focus" slot: the next call to
+        // `focus_toplevel_keyboard`/`clear_keyboard_focus` (which this
+        // method's tail makes, via `wayland.keyboard_focus`) replaces
+        // whatever `focus_layer_keyboard` last gave a layer surface. So a
+        // keyboard-interactive panel lost the keyboard within one frame
+        // of being given it. While `layer_focus` names a still-mapped
+        // entry, this leaves the seat's real focus alone entirely; only
+        // the paths that actually drop layer focus
+        // (`layer_surface_unmapped`/`destroyed`, plus
+        // `release_layer_focus` -- see re-review finding Important-1)
+        // clear the field first, which is what lets a later call here
+        // reach the toplevel branch again. `layer_holds_keyboard_focus`'s
+        // own unit tests exercise this guard's exact logic directly;
+        // there is no test that observes its effect on a real seat's
+        // keyboard focus end-to-end, for a harness limitation documented
+        // on `arrange_layers_leaves_layer_focus_alone_and_unmap_clears_it`
+        // (this file's `mod tests`).
+        if layer_holds_keyboard_focus(self.layer_focus, &self.layers) {
+            return;
+        }
         let focused = self
             .focused_id()
             .filter(|&id| self.window_manager.is_visible_id(id))
             .filter(|&id| self.wayland.is_backed(id));
         self.wayland.keyboard_focus(focused);
+    }
+
+    /// Drop `layer_focus`, if held, so the next `sync_seat_focus` reaches
+    /// its toplevel branch instead of being blocked by
+    /// `layer_holds_keyboard_focus`'s guard.
+    ///
+    /// Re-review finding Important-1: round 1's `sync_seat_focus` guard
+    /// closed the *passive* leak (`arrange_layers` and any other
+    /// `sync_window_to_scene`-driven resync must never steal focus from a
+    /// mapped interactive layer surface -- that must stay closed, and
+    /// still is: nothing below calls this), but implemented only the
+    /// guard's first clause. Missing was its second: *something* has to
+    /// clear `layer_focus` when a toplevel focus is genuinely,
+    /// user-, D-Bus-, or alt-tab-intentionally being asserted over it,
+    /// or no toplevel can ever take the keyboard again once any
+    /// interactive layer surface has ever mapped. Called at the top of
+    /// every EXPLICIT toplevel-focus assertion -- `handle_pointer_press`
+    /// (click-to-focus), `DbCommand::Focus`, and the `cycle:alt_tab`
+    /// action's per-step focus -- each of which calls
+    /// `sync_focus_change`/`sync_seat_focus` of its own accord shortly
+    /// after, which is what actually pushes the toplevel focus out; this
+    /// method itself makes no seat call; it only clears the field the
+    /// guard reads.
+    fn release_layer_focus(&mut self) {
+        self.layer_focus = None;
     }
 
     /// Reconcile a focus transition all the way out to the clients.
@@ -659,6 +1777,10 @@ impl State {
         self.fullscreen_saved_geometry.remove(&id);
         self.snap_saved_geometry.remove(&id);
         self.maximized_saved_geometry.remove(&id);
+        // The scene nodes went with `wayland.forget` above; this is their
+        // CPU-side memo, and a window's title pixels must not outlive it
+        // (ids are never reused, so a stale entry would simply leak).
+        self.title_rasters.remove(&id);
         if self.window_manager.focused_window().is_none() {
             let active = self.window_manager.active_workspace();
             self.window_manager.focus_mru_in_workspace(active);
@@ -697,7 +1819,16 @@ impl State {
         if w.fullscreen == target {
             return Some(());
         }
-        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        // H1: resolved via the window's own frame center
+        // (`output_for_window`), not the pointer -- this is reached from
+        // client requests and `DbCommand::Fullscreen`, neither of which
+        // correlates the pointer with the target window, so the old
+        // `output_for_pointer` call fullscreened onto whatever output the
+        // mouse happened to be resting on. `w.geometry` is read here,
+        // before the borrow on `w` would otherwise need to outlive the
+        // mutable calls below.
+        let geometry = w.geometry;
+        let output_geo = self.output_for_window(geometry).and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
         self.window_manager.set_fullscreen(id, target)?;
         if target {
             // Save current geometry before entering fullscreen
@@ -730,10 +1861,19 @@ impl State {
     /// `MaximizeWindow` D-Bus method, and the client's own
     /// `xdg_toplevel.set_maximized` were all visual no-ops.
     pub fn set_maximized_target(&mut self, id: WindowId, target: bool) -> Option<()> {
-        if self.window_manager.get(id)?.maximized == target {
+        let w = self.window_manager.get(id)?;
+        if w.maximized == target {
             return Some(());
         }
-        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        // Maximize honors the usable area (panels' exclusive zones carve
+        // into it); fullscreen, just below, deliberately keeps the full
+        // `geometry` instead.
+        //
+        // H1: resolved via the window's own frame center
+        // (`output_for_window`), not the pointer -- see
+        // `set_fullscreen_target`'s identical fix just above for why.
+        let geometry = w.geometry;
+        let output_geo = self.output_for_window(geometry).and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)?;
         self.window_manager.set_maximized(id, target)?;
         if target {
             let current = self.window_manager.get(id)?.geometry;
@@ -756,11 +1896,7 @@ impl State {
     /// answer with a bare configure instead, so the request is never left
     /// unanswered.
     ///
-    /// Unused in this commit: nothing constructs a `ToplevelKey` until task 5
-    /// wires a client-driven maximize/fullscreen request onto this seam.
-    /// Kept now (with the `ToplevelKey` signature already in place) so that
-    /// wiring is a call site, not a rewrite.
-    #[allow(dead_code)]
+    /// Wired to `ToplevelHandler::request_maximize`.
     pub fn reconcile_maximized(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
         let Some(id) = self.wayland.window_for(toplevel) else { return false };
         let changes = self.window_manager.get(id).is_some_and(|w| w.maximized != target);
@@ -768,8 +1904,8 @@ impl State {
     }
 
     /// Fullscreen counterpart of [`Self::reconcile_maximized`]; same
-    /// "did a configure actually go out" contract.
-    #[allow(dead_code)]
+    /// "did a configure actually go out" contract. Wired to
+    /// `ToplevelHandler::request_fullscreen`.
     pub fn reconcile_fullscreen(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
         let Some(id) = self.wayland.window_for(toplevel) else { return false };
         let changes = self.window_manager.get(id).is_some_and(|w| w.fullscreen != target);
@@ -820,6 +1956,11 @@ impl State {
     /// events, for callers (like `reload_config_from_disk`'s test) that want
     /// to inspect what was produced.
     pub fn apply_reloaded_config(&mut self, cfg: Config) -> Vec<Event> {
+        // Captured before `apply_config` overwrites `self.config` -- this is
+        // the only way to tell whether the wallpaper *path* changed rather
+        // than merely being reapplied.
+        let old_wallpaper = self.config.appearance.wallpaper.clone();
+
         let events = self.apply_config(cfg);
         // Review finding I2: these used to be extended onto a separate
         // `pending_config_events` vec that bypassed the sequence counter
@@ -832,6 +1973,38 @@ impl State {
         for ev in &events {
             self.window_manager.push_event(ev.clone());
         }
+
+        // Task 14 gap-close: `apply_config` swaps `self.config` in but never
+        // touched anything downstream of it -- the background rect kept the
+        // old color, a wallpaper path change never re-decoded, and
+        // (already covered above via `apply_config`'s own
+        // `input::warn_about_keybindings` call) keybinding revalidation was
+        // the one piece that already worked.
+        if let Some(bg) = self.background
+            && let Some(runtime) = self.wayland.runtime()
+        {
+            runtime.set_rect_color(bg, render::wallpaper_color(&self.config.appearance));
+        }
+        if self.config.appearance.wallpaper != old_wallpaper {
+            // Carried-forward obligation (task 7 review): clear the decoded
+            // image and tear down every wallpaper node *before* the fresh
+            // decode can land, so `sync_wallpaper_nodes`'s existing-node
+            // branch (which never refreshes pixels in place -- see its own
+            // doc) is never asked to show stale pixels under a new path.
+            self.wallpaper.set_decoded(None);
+            self.sync_wallpaper_nodes();
+            let path = self.config.appearance.wallpaper.clone();
+            self.spawn_wallpaper(path);
+        }
+        // `apply_config` already discarded every window (emitting
+        // `WindowClosed` for each, folded into `events` above), so there is
+        // nothing left to re-sync here in practice -- but this stays
+        // unconditional rather than special-cased on "did anything survive"
+        // so a future reload that stops destroying windows gets the
+        // palette/bar-color re-sync for free instead of silently needing a
+        // second gap-close task.
+        self.sync_scene();
+
         self.emit_pending();
         events
     }
@@ -911,6 +2084,16 @@ impl State {
             DbCommand::Focus(id) => {
                 let previous = self.focused_id();
                 self.window_manager.focus(id)?;
+                // Re-review finding Important-1: an explicit toplevel-focus
+                // assertion -- see `release_layer_focus`'s own doc. Round-2
+                // finding Important-2: after the `?`, not before -- `id`
+                // can name a stale/unknown window (this arm is reachable
+                // from a D-Bus caller with a wire id this compositor never
+                // heard of), and an early return must leave `layer_focus`
+                // exactly as it was, not silently defeat a panel's
+                // keyboard grab for a focus assertion that never actually
+                // happened.
+                self.release_layer_focus();
                 self.sync_focus_change(previous);
             }
             DbCommand::Close(id) => self.request_close(id),
@@ -946,7 +2129,15 @@ impl State {
         if !self.window_manager.set_active_workspace(workspace) {
             return None;
         }
-        if self.window_manager.focused_window().is_none() {
+        // Review finding I2, second half: `is_none()` alone let a focus
+        // pointer that names an *unfocusable* row (unmapped, or minimized --
+        // the same shape, which predates this branch) survive a workspace
+        // switch and go on answering `close`/`maximize`/`snap` while the
+        // seat correctly refused it. `release_focus` on the unmap path is
+        // what stops the unmapped case from arising at all; this is the
+        // belt-and-braces re-pick for anything that still slips through.
+        let current = self.window_manager.focused_window().map(|w| w.id);
+        if current.is_none_or(|id| !self.window_manager.is_visible_id(id)) {
             self.window_manager.focus_mru_in_workspace(workspace);
         }
         self.sync_scene();
@@ -1074,6 +2265,10 @@ impl State {
                 let idx = self.alt_tab.index();
                 let entries = self.alt_tab.entries().to_vec();
                 if let Some(wid) = entries.get(idx).copied() {
+                    // Re-review finding Important-1: an explicit
+                    // toplevel-focus assertion -- see `release_layer_focus`'s
+                    // own doc.
+                    self.release_layer_focus();
                     let previous = self.focused_id();
                     self.window_manager.focus(wid);
                     self.sync_focus_change(previous);
@@ -1188,7 +2383,7 @@ impl State {
         if !self.config.behavior.snap_enabled {
             return None;
         }
-        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        let output_geo = self.usable_geo_for_pointer()?;
         let gap = self.config.appearance.snap_gap;
         let current = self.window_manager.get(id)?.geometry;
         self.snap_saved_geometry.entry(id).or_insert(current);
@@ -1214,6 +2409,28 @@ impl State {
     /// swap in the new config (keybindings/appearance/behavior). Returns the
     /// events the caller should queue (via `apply_reloaded_config`) since
     /// the just-replaced `window_manager` can't carry them.
+    ///
+    /// # KNOWN LIMITATION -- a live reload abandons its clients
+    ///
+    /// **This drops every model row and every client binding; it does not
+    /// close, and cannot close, the clients themselves.** Their scene nodes
+    /// are hidden (review finding I4, in the `forget` loop below), so they
+    /// no longer render over the fresh session -- but the processes stay
+    /// alive, permanently invisible, with no path back into the model:
+    /// `raise_id_floor` guarantees their ids can never be reissued, and
+    /// since a reload is neither an unmap nor a destroy, no wlroots event
+    /// will ever re-announce them. `SUPER+SHIFT+r` and D-Bus `ReloadConfig`
+    /// both reach here, so this is user-reachable.
+    ///
+    /// The real fix is to stop discarding windows at all -- preserve the
+    /// rows across the reload and re-sync them, which tasks 13/14 already
+    /// made safe on the rendering side (palette-keyed raster cache, full
+    /// `sync_scene` re-push). That is a behavior change to this method's
+    /// pinned contract (`apply_config_emits_window_closed_and_floors_id_counter`,
+    /// `apply_config_rebuilds_workspaces`, the `next_id`/`seq` floor
+    /// machinery, and every consumer of the `WindowClosed` burst), so it is
+    /// recorded here as an owned defect rather than smuggled into a fix
+    /// round. Do not treat the hidden-node mitigation as closing it.
     ///
     /// Task 11 review #3: this used to replace `window_manager` with a
     /// brand-new, empty one and return only `WorkspaceList`/`ConfigReloaded`
@@ -1249,6 +2466,20 @@ impl State {
         // which model window.
         let ids: Vec<WindowId> = self.window_manager.windows().map(|w| w.id).collect();
         for id in ids {
+            // Review finding I4: hidden *before* the binding is dropped,
+            // which is the only order that works -- `forget` removes the
+            // `window -> toplevel` mapping every scene call resolves
+            // through, so a `set_visible` after it is a silent no-op.
+            //
+            // Without this the reload orphaned the scene node outright: the
+            // client is still alive (nothing here closes it, and no
+            // `unmapped`/`mapped` will ever fire for it), so its toplevel
+            // kept rendering on top of the fresh session while being
+            // invisible to the model -- unfocusable, un-hit-testable,
+            // unclosable. Hiding is the smallest correct answer to that;
+            // see `apply_config`'s own doc for the residual it does *not*
+            // close.
+            self.wayland.set_visible(id, false);
             self.wayland.forget(id);
         }
         // Stale restore points would otherwise reference ids that can never
@@ -1256,6 +2487,13 @@ impl State {
         self.fullscreen_saved_geometry.clear();
         self.snap_saved_geometry.clear();
         self.maximized_saved_geometry.clear();
+        // Review finding M1: this teardown goes through `wayland.forget`
+        // directly rather than `forget_window`, which is where the per-window
+        // raster purge lives -- so without this line every window's title
+        // pixels (~40 KB for a 400px window) became permanently unreachable
+        // garbage on every reload, since `raise_id_floor` below guarantees
+        // the ids can never come back to collect them.
+        self.title_rasters.clear();
         // Drop any in-flight interaction that referenced the about-to-vanish
         // windows.
         self.drag = input::DragMachine::new();
@@ -1278,6 +2516,7 @@ impl State {
         }
         self.alt_tab = input::AltTabMachine::new();
         self.snap_preview = None;
+        self.sync_snap_preview();
 
         let next_id_floor = self.window_manager.next_id();
         let seq_floor = self.window_manager.seq();
@@ -1328,6 +2567,13 @@ impl State {
     fn handle_pointer_press(&mut self, id: WindowId, pointer: (i32, i32)) -> Option<()> {
         let previous = self.focused_id();
         self.window_manager.focus(id)?;
+        // Re-review finding Important-1: click-to-focus is an explicit
+        // toplevel-focus assertion -- see `release_layer_focus`'s own doc.
+        // Round-2 finding Important-2: after the `?`, not before -- an
+        // early return here (an unknown `id`) must leave `layer_focus`
+        // untouched, not clear it for a focus assertion that never
+        // actually happened.
+        self.release_layer_focus();
         // Focus changes the client's activation state, so it has to reach
         // the client too (C1) -- both ends of the transition, not just the
         // new one (New-1).
@@ -1359,6 +2605,65 @@ impl State {
         Some(())
     }
 
+    /// Honors a client move request (`xdg_toplevel.move`): only when the
+    /// pointer is pressed and currently over `id`'s window; begins the
+    /// existing `DragMachine` grab. A no-op otherwise -- per
+    /// `wlr::ToplevelHandler::request_move`'s doc, an interactive move that
+    /// never starts is legal, not a protocol violation, so there is nothing
+    /// to answer.
+    ///
+    /// Finding 6, testing: the success path (guards pass, `self.drag.begin`
+    /// actually runs) is untested -- it needs a live `wlr::Runtime` to read
+    /// a real `pointer_position()` from, and there is no headless-runtime
+    /// way to inject one in this crate's unit tests, the same gap
+    /// `arrange_layers_leaves_layer_focus_alone_and_unmap_clears_it`
+    /// documents for a live keyboard device.
+    fn begin_client_move(&mut self, id: WindowId) {
+        if !self.pointer_pressed {
+            return;
+        }
+        let Some(rt) = self.wayland.runtime() else { return };
+        let (px, py) = rt.pointer_position();
+        let pointer = (px as i32, py as i32);
+        if self.window_at_point(pointer) != Some(id) {
+            return;
+        }
+        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else { return };
+        // Baseline behavior: an interactive move raises and focuses, the
+        // same as `handle_pointer_press`'s click-to-focus-then-drag path.
+        let previous = self.focused_id();
+        if self.window_manager.focus(id).is_none() {
+            return;
+        }
+        self.sync_focus_change(previous);
+        let grab_offset = (pointer.0 - geo.x, pointer.1 - geo.y);
+        self.drag.begin(id, grab_offset);
+        self.emit_pending();
+    }
+
+    /// Same guards as [`Self::begin_client_move`], for `xdg_toplevel.resize`:
+    /// maps the client's `wlr::Edges` onto `input::ResizeEdges`
+    /// ([`resize_edges_from_wlr`]) and begins the existing `ResizeMachine`
+    /// grab.
+    ///
+    /// Finding 6, testing: same untested-success-path limitation as
+    /// `begin_client_move` -- see its doc. `resize_edges_from_wlr` is
+    /// exactly the part of this method that stays testable without a live
+    /// pointer.
+    fn begin_client_resize(&mut self, id: WindowId, edges: wlr::Edges) {
+        if !self.pointer_pressed {
+            return;
+        }
+        let Some(rt) = self.wayland.runtime() else { return };
+        let (px, py) = rt.pointer_position();
+        let pointer = (px as i32, py as i32);
+        if self.window_at_point(pointer) != Some(id) {
+            return;
+        }
+        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else { return };
+        self.resize.begin(id, resize_edges_from_wlr(edges), geo, pointer);
+    }
+
     /// Pointer motion at `pointer` (output logical coordinates) during an
     /// in-progress drag: updates the snap-zone preview (rendering consumes
     /// `self.snap_preview`).
@@ -1374,13 +2679,14 @@ impl State {
             return Some(());
         }
         self.drag.window_id()?;
-        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        let output_geo = self.usable_geo_for_pointer()?;
         let threshold = self.config.appearance.snap_gap.max(1) * 4;
         // Review finding I3: with snapping disabled the drag machine is
         // never told about zones at all, so no preview is staged *and*
         // `handle_pointer_release` can only ever produce a plain move.
         if !self.config.behavior.snap_enabled {
             self.snap_preview = None;
+            self.sync_snap_preview();
             return Some(());
         }
         self.drag.motion(pointer, output_geo, threshold);
@@ -1388,6 +2694,7 @@ impl State {
             .drag
             .preview_zone()
             .map(|zone| layout::snapped_geometry(output_geo, zone, self.config.appearance.snap_gap));
+        self.sync_snap_preview();
         Some(())
     }
 
@@ -1408,6 +2715,7 @@ impl State {
         let id = self.drag.window_id()?;
         let grab_offset = self.drag.grab_offset();
         self.snap_preview = None;
+        self.sync_snap_preview();
         match self.drag.end() {
             input::DragResult::Snapped(zone) => {
                 self.snap(id, zone)?;
@@ -1442,10 +2750,7 @@ impl State {
             .map(|w| w.geometry)
             .collect();
         let output_geo = self
-            .outputs
-            .values()
-            .next()
-            .map(|o| o.geometry)
+            .usable_geo_for_pointer()
             .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
         // Review finding M7: cascade positions wrap inside the output (and
         // count only this workspace's windows) so the Nth window can't open
@@ -1458,6 +2763,16 @@ impl State {
         let previous = self.focused_id();
         let id = self.window_manager.add_window(app_id, title, pid, geometry);
         self.wayland.bind(id, toplevel);
+        // Any decoration preference this client stated before it had a model
+        // row (the normal ordering -- see `pending_decorations`) lands now.
+        // The client itself was already answered at `initial_commit`, with
+        // this same preference and the app-id both in hand (L1), so there is
+        // nothing to re-negotiate here -- only the model to bring in line
+        // with what the client was told.
+        let requested = self.pending_decorations.remove(&toplevel).flatten();
+        if requested.is_some() {
+            self.window_manager.set_client_decorations_requested(id, requested);
+        }
         // Explicit sync of the new window first (re-review minor 2):
         // `sync_focus_change` also reaches it today, but only because
         // `add_window` autofocuses onto the active workspace.
@@ -1478,6 +2793,10 @@ impl State {
     /// inherent method removes the ambiguity at the source instead of relying
     /// on it being resolved correctly.
     pub fn forget_toplevel(&mut self, toplevel: crate::wayland::ToplevelKey) {
+        // Before the early return: a toplevel that dies without ever
+        // mapping still had a decoration preference parked for it, and
+        // nothing else would ever come to collect it.
+        self.pending_decorations.remove(&toplevel);
         let Some(id) = self.wayland.window_for(toplevel) else { return };
         self.wayland.forget(id);
         self.forget_window(id);
@@ -1485,9 +2804,15 @@ impl State {
     }
 
     /// A client changed its title.
+    ///
+    /// The scene sync is not optional bookkeeping: the title is *drawn* now
+    /// (`sync_ssd`'s buffer node), so a retitle that only updated the model
+    /// would leave the old string on screen until some unrelated geometry
+    /// change happened to re-sync the window.
     pub fn toplevel_title_changed(&mut self, toplevel: crate::wayland::ToplevelKey, title: &str) {
         let Some(id) = self.wayland.window_for(toplevel) else { return };
         if self.window_manager.set_title(id, title.to_string()).is_some() {
+            self.sync_window_to_scene(id);
             self.emit_pending();
         }
     }
@@ -1508,6 +2833,12 @@ impl State {
 
     pub fn background(&self) -> Option<wlr::RectId> {
         self.background
+    }
+
+    /// The scene rect node currently backing `snap_preview`, if any.
+    /// Introspection for tests -- mirrors `background()`.
+    pub fn snap_preview_rect(&self) -> Option<wlr::RectId> {
+        self.snap_preview_rect
     }
 
     pub fn set_shutdown_source(&mut self, id: wlr::SourceId) {
@@ -1595,17 +2926,28 @@ impl wlr::OutputHandler for State {
         }
 
         let (width, height) = output.size();
-        // Single output at (0, 0) for the slice. `next_output_index` is a
-        // monotonic counter, not `outputs.len()` (review finding M2): `len()`
-        // recomputes the same index a just-removed output had the moment a
-        // new one is added, colliding with whatever the model (or a
-        // client-facing consumer) still remembers about the old one. Actual
-        // multi-output *placement* (anything beyond "assign a never-reused
-        // index") is still parity work; this only fixes the collision.
+        // `next_output_index` is a monotonic counter, not `outputs.len()`
+        // (review finding M2): `len()` recomputes the same index a
+        // just-removed output had the moment a new one is added, colliding
+        // with whatever the model (or a client-facing consumer) still
+        // remembers about the old one.
         let index = self.next_output_index;
         self.next_output_index += 1;
-        self.create_output(index, icedtea_contract::Rectangle { x: 0, y: 0, width, height });
+        // The layout box is the output's real position (and, once placed,
+        // its mode-derived size) in the shared multi-output coordinate
+        // space; a `None` -- the output not yet in the layout, or a
+        // 0x0-mode output, see `output_layout_box`'s own doc -- falls back
+        // to the single-output-at-origin behavior this replaced.
+        let geometry = runtime
+            .output_layout_box(output.id())
+            .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
+            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width, height });
+        self.create_output(index, geometry);
         self.output_ids.insert(output.id(), index);
+        // A new output needs its own wallpaper node (if a decode has
+        // already landed) at this output's own size -- nothing else calls
+        // `sync_wallpaper_nodes` when the output set grows.
+        self.sync_wallpaper_nodes();
 
         // The background covers the whole output. Sized here rather than at
         // creation because the mode is not known until now.
@@ -1618,6 +2960,13 @@ impl wlr::OutputHandler for State {
         // is the same code path) need their geometry pushed at the new size.
         self.sync_scene();
         self.emit_pending();
+
+        // Review finding M5b: a layer surface announced before any output
+        // existed (parked under the `NO_OUTPUT` sentinel), or left behind
+        // by an output `destroyed` with no survivor at the time, gets its
+        // first (or next) real home and configure the moment any output
+        // -- this one -- exists.
+        self.resolve_orphaned_layers();
 
         // Review finding I1: nothing else owns the first frame -- it used to
         // arrive only incidentally, whenever the background rect's own
@@ -1643,7 +2992,26 @@ impl wlr::OutputHandler for State {
         // this handler was never told about (see the library's own docs), and
         // a panic here aborts.
         if let Some(index) = self.output_ids.remove(&id) {
-            self.outputs.remove(&index);
+            if let Some(dead) = self.outputs.remove(&index) {
+                // Every window whose frame center sat on the dead output
+                // moves onto the survivor before anything else notices the
+                // output is gone.
+                self.migrate_windows_from(dead.geometry);
+            }
+            // The gone output's wallpaper node (if any) must go with it --
+            // nothing else calls `sync_wallpaper_nodes` when the output set
+            // shrinks, and a stale node would otherwise sit in the scene
+            // pointing at nothing.
+            self.sync_wallpaper_nodes();
+
+            // Review finding M5a: every layer surface `entry.output ==
+            // index` owned is now orphaned exactly like `dead`'s windows
+            // were -- re-home them onto a survivor (or leave them parked,
+            // with no survivor, for `resolve_orphaned_layers`'s own doc's
+            // self-heal via the next `new_output`) so a bar on an
+            // undocked external display keeps being configured instead of
+            // going silent forever.
+            self.resolve_orphaned_layers();
         }
     }
 }
@@ -1723,9 +3091,25 @@ impl wlr::ToplevelHandler for State {
         // `content_rect` here would configure a default (SSD) window's
         // client one `TITLE_BAR_HEIGHT` too tall -- the exact one-frame-late
         // resize this comment already claims not to have.
-        let Some(runtime) = self.wayland.runtime() else { return };
+        let key = crate::wayland::ToplevelKey::new(toplevel.id());
         let app_id = toplevel.app_id().unwrap_or_default();
-        let ssd = crate::decoration::has_ssd(&app_id, None, false);
+        // Review finding L1: this is also the first -- and only -- moment
+        // before the client's first frame at which both halves of the
+        // decoration answer are known: the app-id (from `toplevel`) and any
+        // preference the client stated on its decoration object (parked in
+        // `pending_decorations`, since `set_mode` precedes this commit).
+        // Answering here rather than from `request_decoration_mode` is what
+        // makes the client's *first* decoration configure the correct one:
+        // an earlier `set_decoration_mode` is staged rather than sent, and
+        // staging is last-write-wins, so this overwrites the provisional
+        // answer instead of adding a second configure after it.
+        let requested = self.pending_decorations.get(&key).copied().flatten();
+        let ssd = crate::decoration::has_ssd(&app_id, requested, false);
+        self.wayland.set_decoration_mode(
+            key,
+            if ssd { wlr::DecorationMode::ServerSide } else { wlr::DecorationMode::ClientSide },
+        );
+        let Some(runtime) = self.wayland.runtime() else { return };
         let placeholder = icedtea_contract::Rectangle {
             x: 0,
             y: 0,
@@ -1741,8 +3125,12 @@ impl wlr::ToplevelHandler for State {
         let key = crate::wayland::ToplevelKey::new(id);
         if let Some(window_id) = self.wayland.window_for(key) {
             // Remapped after an unmap: the model row survived, so this is a
-            // visibility change rather than a new window.
+            // visibility change rather than a new window. Task 14: the
+            // model itself now tracks that state, so flip it back before
+            // syncing -- otherwise `is_visible`/`alt_tab_entries` would keep
+            // treating a window the client just remapped as still absent.
             tracing::info!(?id, ?window_id, "toplevel remapped");
+            self.window_manager.set_mapped(window_id, true);
             self.sync_window_to_scene(window_id);
             self.emit_pending();
             return;
@@ -1758,34 +3146,44 @@ impl wlr::ToplevelHandler for State {
         // An unmap is not a destroy: the client may map again with the same
         // id. Hide it, and let the model keep the row.
         //
-        // Note what this deliberately does *not* do: the model itself has no
-        // "unmapped" concept, only workspace visibility and minimization --
-        // `window_manager.get(window)` still returns the row, `is_visible`
-        // and `focused` are whatever they already were, and `is_backed`
-        // stays `true`. `set_visible(window, false)` only reaches the
-        // client's scene node; nothing here clears the model's own focus
-        // *pointer* -- that is left ledgered, deliberately: changing what
-        // the model itself considers "focused" on an unmap would be a model
-        // semantics change, and this task doesn't make one.
+        // Task 14: the model now has its own "unmapped" concept
+        // (`Window::mapped`, `WindowManager::set_mapped`) instead of the
+        // ledgered gap task 11 documented here -- `is_visible` and
+        // `alt_tab_entries` both gate on it, and `focus`/
+        // `focus_mru_in_workspace` refuse an unmapped window as a candidate.
+        // So an unmap that hits the focused window now really does move
+        // focus to the next mapped candidate on the same workspace, the
+        // same way `set_minimized_and_reconcile` already does for
+        // minimizing the focused window; `window_manager.get(window)` still
+        // returns the row (unchanged geometry/title/etc, per `set_mapped`'s
+        // own doc), and `is_backed` stays `true` -- only mapped-ness and
+        // its consequences on visibility/focus change.
         //
-        // What task 11 *does* close is the seat trap this comment used to
-        // describe and leave open: `sync_seat_focus`'s filters (visibility +
-        // `is_backed`) can't tell an unmapped-but-still-"visible"-by-model
-        // window from a mapped one, so without re-deriving the seat's
-        // target here, a focused window's keyboard focus survived its own
-        // unmap pointed at a surface the client just told wlroots to stop
-        // showing. The call below re-runs that derivation right after the
-        // hide: if `window` was the focused one, `keyboard_focus` resolves
-        // it, `Runtime::focus_toplevel_keyboard` refuses it (the surface is
-        // unmapped -- see that method's doc), and its `None` fallback
-        // (`Wayland::keyboard_focus`'s doc, task 11's fix-round item 2)
-        // clears the seat's keyboard focus instead of leaving it pointed at
-        // a hidden surface.
+        // The seat trap task 11 closed still matters here too:
+        // `sync_focus_change` re-derives keyboard focus from the model
+        // (`sync_seat_focus`, at the tail of `sync_window_to_scene` or
+        // directly when nothing is focused), so a focused window unmapping
+        // with nothing to hand focus to still clears the seat rather than
+        // leaving it pointed at a hidden surface.
         tracing::info!(?id, "toplevel unmapped");
         let key = crate::wayland::ToplevelKey::new(id);
         let Some(window) = self.wayland.window_for(key) else { return };
         self.wayland.set_visible(window, false);
-        self.sync_seat_focus();
+        let previous = self.focused_id();
+        self.window_manager.set_mapped(window, false);
+        // Review finding I2: this used to re-pick only when the unmapping
+        // window was the *active* workspace's focus, so an unmap on an
+        // inactive workspace left that workspace's `focused_window` pointing
+        // at the now-unmapped row -- dead to the seat, but still live to
+        // `apply_action("close"/"maximize"/"fullscreen"/"snap")` and the
+        // decoration actions once the user switched back.
+        // `release_focus` resolves the window's *own* workspace, so the
+        // active case behaves exactly as before and the inactive case is
+        // covered too; when no successor exists it clears the pointer,
+        // matching `remove_window`.
+        self.window_manager.release_focus(window);
+        self.sync_focus_change(previous);
+        self.emit_pending();
     }
 
     fn title_changed(&mut self, toplevel: &wlr::Toplevel<'_>) {
@@ -1802,6 +3200,270 @@ impl wlr::ToplevelHandler for State {
         // and returns early on a miss, and never indexes.
         tracing::info!(?id, "toplevel destroyed");
         self.forget_toplevel(crate::wayland::ToplevelKey::new(id));
+    }
+
+    fn request_maximize(&mut self, toplevel: &wlr::Toplevel<'_>, maximize: bool) {
+        let key = crate::wayland::ToplevelKey::new(toplevel.id());
+        if !self.reconcile_maximized(key, maximize) {
+            // The model didn't change (unknown toplevel, no output yet, or
+            // already at the requested state) -- the dispatch layer answers
+            // with a bare configure regardless, so xdg-shell's "every
+            // request gets a configure" contract is honored either way.
+            // Nothing to do here.
+        }
+    }
+
+    fn request_fullscreen(&mut self, toplevel: &wlr::Toplevel<'_>, fullscreen: bool) {
+        let key = crate::wayland::ToplevelKey::new(toplevel.id());
+        if !self.reconcile_fullscreen(key, fullscreen) {
+            // Same contract as `request_maximize` above: dispatch already
+            // answers with a bare configure when the model didn't change.
+        }
+    }
+
+    fn request_move(&mut self, id: wlr::ToplevelId) {
+        let key = crate::wayland::ToplevelKey::new(id);
+        let Some(window_id) = self.wayland.window_for(key) else { return };
+        self.begin_client_move(window_id);
+    }
+
+    fn request_resize(&mut self, id: wlr::ToplevelId, edges: wlr::Edges) {
+        let key = crate::wayland::ToplevelKey::new(id);
+        let Some(window_id) = self.wayland.window_for(key) else { return };
+        self.begin_client_resize(window_id, edges);
+    }
+
+    /// xdg-decoration negotiation, both halves in one place: record what the
+    /// client asked for in the model, then answer with what this compositor
+    /// is actually going to do.
+    ///
+    /// The answer is `decoration::has_ssd`, not an echo of the preference:
+    /// that predicate is already the single definition of "do we draw a
+    /// title bar for this window" (`sync_window_to_scene`, `content_rect`,
+    /// the hit-test), so routing the reply through it is what keeps the
+    /// client's belief and the compositor's own drawing from ever
+    /// disagreeing. A client asking for client-side decorations gets them
+    /// (`is_csd` honors an explicit request); a client asking for
+    /// server-side, or stating no preference at all, gets our band.
+    ///
+    /// A toplevel with no model window yet -- the normal case, since a
+    /// decoration is created before the initial commit and `mapped` has not
+    /// run -- has its preference parked in `pending_decorations` and is
+    /// still answered here, because a request must never be left unanswered
+    /// (the dispatch layer would otherwise impose its own blanket
+    /// server-side default). That answer is made from the preference alone:
+    /// there is no app-id to read from a bare `ToplevelId`. It is only
+    /// provisional, and it is *staged* rather than sent while the surface is
+    /// uninitialized, so `initial_commit` -- which has both the app-id and
+    /// the parked preference -- overwrites it before anything reaches the
+    /// client (review finding L1).
+    fn request_decoration_mode(
+        &mut self,
+        id: wlr::ToplevelId,
+        preference: Option<wlr::DecorationMode>,
+    ) {
+        // `client_decorations_requested` is the model's own spelling of the
+        // same three-valued answer: "the client wants to draw them itself",
+        // "the client wants the server to", "the client did not say".
+        let requested = match preference {
+            Some(wlr::DecorationMode::ClientSide) => Some(true),
+            Some(wlr::DecorationMode::ServerSide) => Some(false),
+            None => None,
+        };
+        let key = crate::wayland::ToplevelKey::new(id);
+        let window = self.wayland.window_for(key);
+        let (app_id, fullscreen) = match window.and_then(|w| self.window_manager.get(w)) {
+            Some(w) => (w.app_id.clone(), w.fullscreen),
+            None => (String::new(), false),
+        };
+        match window {
+            Some(window) => {
+                self.window_manager
+                    .set_client_decorations_requested(window, requested);
+            }
+            None => {
+                self.pending_decorations.insert(key, requested);
+            }
+        }
+
+        let ssd = crate::decoration::has_ssd(&app_id, requested, fullscreen);
+        let mode = if ssd {
+            wlr::DecorationMode::ServerSide
+        } else {
+            wlr::DecorationMode::ClientSide
+        };
+        self.wayland.set_decoration_mode(key, mode);
+
+        // The band may have to appear or vanish, and the client's content
+        // rect changes with it. A window that isn't in the model yet has
+        // nothing to sync -- its first sync comes with `mapped`.
+        if let Some(window) = window {
+            self.sync_window_to_scene(window);
+            self.emit_pending();
+        }
+    }
+
+    /// A client created a wlr-layer-shell surface. Resolve its output --
+    /// what it asked for (`output_id` via `output_ids`), or the output
+    /// under the pointer (which itself falls back to the lowest index) --
+    /// and park it under the [`NO_OUTPUT`] sentinel if neither resolves,
+    /// i.e. no output exists yet at all (review finding M5): the surface
+    /// is *not* dropped, because `State::resolve_orphaned_layers` re-homes
+    /// every `NO_OUTPUT` entry (and configures it) the moment `new_output`
+    /// next fires -- dropping it here left a bar launched before the first
+    /// output settled waiting forever for a configure that would never
+    /// come, even after one did arrive. Always record it and always answer
+    /// -- `configure_layer` is a no-op, correctly, on the sentinel, and is
+    /// otherwise safe even before this surface's first commit
+    /// (`Runtime::configure_layer_surface` stages pre-initial-commit
+    /// answers rather than sending them, see its own doc) -- it is
+    /// mandatory: nothing else in this crate's dispatch layer answers a
+    /// layer surface that no handler ever does.
+    fn new_layer_surface(&mut self, surface: &wlr::LayerSurface<'_>) {
+        let id = surface.id();
+        let output = surface
+            .output_id()
+            .and_then(|oid| self.output_ids.get(&oid).copied())
+            .or_else(|| self.output_for_pointer());
+        let sequence = self.next_layer_sequence;
+        self.next_layer_sequence += 1;
+        // H2: bound the client-controlled exclusive zone at capture time --
+        // see `clamp_exclusive_zone`'s own doc.
+        let exclusive = clamp_exclusive_zone(surface.exclusive_zone(), output.and_then(|idx| self.outputs.get(&idx)));
+        self.layers.insert(
+            id,
+            LayerEntry {
+                output: output.unwrap_or(NO_OUTPUT),
+                sequence,
+                layer: surface.layer(),
+                anchor: surface.anchor(),
+                exclusive,
+                size: surface.desired_size(),
+                // Always `false` here regardless of what the client asked
+                // for -- `keyboard_interactive` reads `current`, which is
+                // entirely zeroed until this surface's first commit (see
+                // that accessor's own doc). `layer_surface_commit` is
+                // where the real value lands.
+                interactive: false,
+                // False until `layer_surface_mapped` (review finding J2):
+                // a surface with no buffer yet must not reserve space.
+                mapped: false,
+                last_configured: None,
+            },
+        );
+        self.configure_layer(id);
+    }
+
+    /// Every commit of an already-announced layer surface: refresh the
+    /// entry from the surface's current request (anchors, exclusive zone
+    /// and size all commonly change after mapping) and answer again --
+    /// `configure_layer` reads the entry it just updated, so a client that
+    /// re-anchors gets reconfigured for its new placement, not its old
+    /// one. Then re-derive every output's usable area, since this
+    /// surface's exclusive zone may have just changed.
+    ///
+    /// A miss on `self.layers` cannot happen for any id this crate ever
+    /// hands a handler -- `new_layer_surface` always inserts an entry now
+    /// (see its own doc on the `NO_OUTPUT` sentinel) -- but the `let …
+    /// else` stays as the defensive, panic-free answer for an id this
+    /// handler was never told about, the same posture every other handler
+    /// in this file takes.
+    fn layer_surface_commit(&mut self, surface: &wlr::LayerSurface<'_>) {
+        let id = surface.id();
+        let Some(output_idx) = self.layers.get(&id).map(|e| e.output) else { return };
+        // H2: bound the client-controlled exclusive zone at capture time --
+        // see `clamp_exclusive_zone`'s own doc. Looked up before the
+        // `entry` borrow below, since both read `self.outputs`.
+        let exclusive = clamp_exclusive_zone(surface.exclusive_zone(), self.outputs.get(&output_idx));
+        let Some(entry) = self.layers.get_mut(&id) else { return };
+        entry.layer = surface.layer();
+        entry.anchor = surface.anchor();
+        entry.exclusive = exclusive;
+        entry.size = surface.desired_size();
+        entry.interactive = surface.keyboard_interactive();
+        self.configure_layer(id);
+        self.arrange_layers();
+    }
+
+    /// The layer surface now has a buffer and is on screen: it starts
+    /// reserving its exclusive zone (review finding J2 -- `mapped = true`
+    /// before `arrange_layers`, which is what makes this a real fold
+    /// rather than the guaranteed no-op it used to be). A
+    /// keyboard-interactive surface then takes seat keyboard focus --
+    /// `focus_layer_keyboard` refuses an unmapped surface (`None` while
+    /// unmapped, per its own doc), which is exactly why this waits for
+    /// `mapped` rather than acting from `layer_surface_commit`, where
+    /// `interactive` first becomes known but the surface may still be
+    /// unmapped.
+    fn layer_surface_mapped(&mut self, id: wlr::LayerSurfaceId) {
+        if let Some(entry) = self.layers.get_mut(&id) {
+            entry.mapped = true;
+        }
+        self.arrange_layers();
+        let Some(entry) = self.layers.get(&id) else { return };
+        if !entry.interactive {
+            return;
+        }
+        let Some(runtime) = self.wayland.runtime() else { return };
+        if runtime.focus_layer_keyboard(id).is_some() {
+            self.layer_focus = Some(id);
+        } else {
+            // Finding 8, errors: an interactive panel that just mapped and
+            // failed to take keyboard focus used to fail silently, leaving
+            // no trace of why an auto-hide launcher/locker never got
+            // keyboard input.
+            tracing::debug!(?id, "interactive layer surface mapped but did not take keyboard focus");
+        }
+    }
+
+    /// The layer surface should no longer be displayed (not a destroy --
+    /// see this method's own trait doc; the entry survives so a remap
+    /// finds it again). Stops reserving its exclusive zone (review finding
+    /// J2 -- `mapped = false` before `arrange_layers`, which is what makes
+    /// this call a real fold instead of a no-op: an unmapped panel used to
+    /// leave a permanent hole in the workspace until it was destroyed
+    /// outright). If it held keyboard focus, hand focus back to whatever
+    /// the model says is focused: `sync_seat_focus` re-derives the seat's
+    /// keyboard target from `window_manager` rather than leaving it
+    /// pointed at a surface that just stopped being shown.
+    fn layer_surface_unmapped(&mut self, id: wlr::LayerSurfaceId) {
+        if let Some(entry) = self.layers.get_mut(&id) {
+            entry.mapped = false;
+            // Review finding I1: wlroots resets the surface's `initialized`
+            // flag on every unmap (documented in wlr 0.20.11's `layer.rs`;
+            // the crate deliberately refuses to synthesize a fallback
+            // configure), so a remap needs a *fresh* mandatory configure --
+            // but the remap commit recomputes the identical placement, and
+            // `configure_layer`'s storm guard would suppress the send
+            // against a surviving `last_configured`. The surface would then
+            // never become `mapped`, which is the only thing
+            // `arrange_layers`' sweep reconfigures, and the client hangs
+            // forever: the auto-hide-panel / toggle-launcher sequence.
+            // Forgetting the placement here is what makes the next
+            // `configure_layer` unconditionally send.
+            entry.last_configured = None;
+        }
+        if self.layer_focus == Some(id) {
+            self.layer_focus = None;
+            self.sync_seat_focus();
+        }
+        self.arrange_layers();
+    }
+
+    /// The layer surface is gone for good. Same focus hand-back as
+    /// `layer_surface_unmapped` (a destroy while mapped and focused is
+    /// legal -- a client can drop its surface without ever unmapping it
+    /// first), plus removing the entry, which `layer_surface_unmapped`
+    /// deliberately does not. Panic-free on an id this handler was never
+    /// told about (the trait's own doc: this can happen) -- both the
+    /// focus check and `HashMap::remove` are no-ops on a miss.
+    fn layer_surface_destroyed(&mut self, id: wlr::LayerSurfaceId) {
+        if self.layer_focus == Some(id) {
+            self.layer_focus = None;
+            self.sync_seat_focus();
+        }
+        self.layers.remove(&id);
+        self.arrange_layers();
     }
 }
 impl wlr::SeatHandler for State {
@@ -1848,6 +3510,28 @@ impl wlr::SeatHandler for State {
     }
 
     fn pointer_button(&mut self, x: f64, y: f64, button: u32, pressed: bool, _time_msec: u32) {
+        // BTN_LEFT only: every decoration interaction this compositor has is
+        // a left-click one, and forwarding the rest to the client unchanged
+        // is the correct behaviour for them. Hoisted above `pointer_pressed`
+        // below (review: state.rs:2050-2056) -- both need it before the
+        // early return this gate gives everything past it.
+        const BTN_LEFT: u32 = 0x110;
+
+        // Set before any routing (Deviation 8): `begin_client_move`/
+        // `begin_client_resize` gate an interactive move/resize on this, and
+        // it must already reflect *this* event by the time anything below
+        // reads it -- including a request that arrives interleaved with the
+        // button event itself. Gated on `BTN_LEFT` -- the same button the
+        // grab/release path below acts on exclusively -- because this is a
+        // single scalar, not a per-button set: an ungated assignment means a
+        // right/middle release while the left button is still held wrongly
+        // clears it (spuriously rejecting a legit move grab), and a lone
+        // right-click press wrongly sets it. "Left button held" is the only
+        // reading that matches the grab semantics throughout this file.
+        if button == BTN_LEFT {
+            self.pointer_pressed = pressed;
+        }
+
         // Recorded before the `BTN_LEFT` gate below, not after: this is the
         // same `pointer_location` `pointer_motion` updates, and a
         // button-only event (which carries no position of its own once
@@ -1859,10 +3543,6 @@ impl wlr::SeatHandler for State {
         let pointer = (x as i32, y as i32);
         self.pointer_location = pointer;
 
-        // BTN_LEFT only: every decoration interaction this compositor has is
-        // a left-click one, and forwarding the rest to the client unchanged
-        // is the correct behaviour for them.
-        const BTN_LEFT: u32 = 0x110;
         if button != BTN_LEFT {
             return;
         }
@@ -1929,7 +3609,7 @@ mod tests {
     fn decoration_action_for_returns_none_for_fullscreen_window() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.window_manager.focus(id).unwrap();
         state.toggle_fullscreen(id).unwrap();
@@ -1958,7 +3638,7 @@ mod tests {
     fn toggle_fullscreen_flips_state_and_geometry() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.toggle_fullscreen(id).unwrap();
         let w = state.window_manager.get(id).unwrap();
@@ -1996,7 +3676,7 @@ mod tests {
     fn apply_action_switches_workspaces_and_snaps() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         state.apply_action("workspace:2").unwrap();
         assert_eq!(state.window_manager.active_workspace(), 1);
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
@@ -2061,7 +3741,7 @@ mod tests {
     fn handle_pointer_drag_moves_window_without_snap() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 640, height: 400 });
         state.window_manager.focus(id).unwrap();
         // Press inside the title bar's move area (not on a button).
@@ -2079,7 +3759,7 @@ mod tests {
     fn handle_pointer_drag_to_edge_snaps() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 640, height: 400 });
         state.window_manager.focus(id).unwrap();
         state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) }).unwrap();
@@ -2154,7 +3834,7 @@ mod tests {
     fn snap_then_fullscreen_then_unfullscreen_then_snap_restore_round_trips() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let original = Rectangle { x: 50, y: 60, width: 300, height: 200 };
         let id = state.window_manager.add_window("app", "t", 1, original);
         state.window_manager.focus(id).unwrap();
@@ -2277,7 +3957,7 @@ mod tests {
     fn apply_config_resets_drag_alt_tab_and_snap_preview() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
 
@@ -2368,7 +4048,7 @@ mod tests {
     fn press_on_unfocused_fullscreen_window_flushes_focus_immediately() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let _b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
         state.window_manager.set_fullscreen(a, true).unwrap();
@@ -2526,7 +4206,7 @@ mod tests {
     fn state_with_output(width: i32, height: i32) -> (State, crossbeam_channel::Receiver<SeqEvent>) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width, height } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width, height }));
         (state, rx)
     }
 
@@ -2583,6 +4263,47 @@ mod tests {
         assert_eq!(state.window_manager.get(id).unwrap().geometry, maximized);
         state.handle_command(crate::dbus::DbCommand::Maximize(id, false)).unwrap();
         assert_eq!(state.window_manager.get(id).unwrap().geometry, original, "the restore point survived the no-op");
+    }
+
+    /// H1: `set_maximized_target` resolves the output via the window's own
+    /// frame center (`output_for_window`), not the pointer -- with two
+    /// outputs and no runtime attached, `output_for_pointer`'s own fallback
+    /// is the *lowest* index (output 0), which is exactly the wrong output
+    /// for a window that lives on output 1. Reached from client requests
+    /// and `DbCommand::Maximize`, neither of which carries any pointer
+    /// correlation with the target window at all.
+    #[test]
+    fn set_maximized_target_resolves_via_the_windows_own_output_not_the_pointer() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.config.appearance.snap_gap = 0;
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 810, y: 10, width: 300, height: 200 });
+        state.set_maximized_target(id, true).unwrap();
+
+        let geo = state.window_manager.get(id).unwrap().geometry;
+        assert_eq!(geo, state.outputs[&1].usable, "must maximize onto output 1's usable rect, not output 0's");
+        assert!(geo.x >= 800, "must not have resolved onto output 0, got {geo:?}");
+    }
+
+    /// H1's fullscreen counterpart: `set_fullscreen_target` resolves via the
+    /// window's own frame center too, and keeps `.geometry` (not `.usable`)
+    /// once it does -- fullscreen covers panels by definition.
+    #[test]
+    fn set_fullscreen_target_resolves_via_the_windows_own_output_not_the_pointer() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 810, y: 10, width: 300, height: 200 });
+        state.set_fullscreen_target(id, true).unwrap();
+
+        let geo = state.window_manager.get(id).unwrap().geometry;
+        assert_eq!(geo, state.outputs[&1].geometry, "must fullscreen onto output 1's geometry, not output 0's");
+        assert!(geo.x >= 800, "must not have resolved onto output 0, got {geo:?}");
     }
 
     /// Re-review Important 1: `DbCommand::Minimize` goes through the same
@@ -2921,5 +4642,1575 @@ mod tests {
         let w = state.window_manager.get(ssd).unwrap();
         assert!(!has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen));
         assert_eq!(content_rect(w.geometry, false), w.geometry);
+    }
+
+    /// Direct `SeatHandler::key` coverage, previously impossible (the M1
+    /// gap): `wlr::KeyEvent::for_test` builds a synthetic press with no live
+    /// keyboard behind it.
+    ///
+    /// `wlr::Modifiers` has no public constructor with flags set (only the
+    /// `logo()`/`ctrl()`/`alt()`/`shift()` accessors), so this can't drive
+    /// the default `quit` binding (super+shift+q) directly -- the fallback
+    /// the task 3 brief calls for is a modifier-free binding inserted into
+    /// the config before `State::new`, exercised with `Modifiers::default()`.
+    /// `apply_action` dispatches on the keybindings map's own key as the
+    /// action name (see its `match base` arms), so the override keeps the
+    /// name `"quit"` and only replaces the combo -- a differently-named
+    /// entry would never reach the `"quit"` arm at all.
+    #[test]
+    fn seat_key_matches_a_binding_and_consumes_the_event() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut config = default_config();
+        config.keybindings.insert(
+            "quit".into(),
+            icedtea_config::KeyCombo { modifiers: vec![], key: "KEY_F12".into() },
+        );
+        let mut state = State::new(config, tx);
+        let keysym = crate::input::key_name_to_keysym("KEY_F12");
+        let ev = wlr::KeyEvent::for_test(keysym, wlr::Modifiers::default(), true, 1);
+
+        let consumed = wlr::SeatHandler::key(&mut state, &ev);
+
+        assert!(consumed, "a bound combo must be consumed, not forwarded");
+        assert!(state.quitting, "the quit action must have run");
+    }
+
+    #[test]
+    fn seat_key_without_a_binding_is_forwarded() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let ev = wlr::KeyEvent::for_test(0x61 /* 'a' */, wlr::Modifiers::default(), true, 1);
+        assert!(!wlr::SeatHandler::key(&mut state, &ev));
+    }
+
+    #[test]
+    fn wallpaper_nodes_track_outputs() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 9, 9, 255]));
+        state.wallpaper.set_decoded(Some(img));
+        state.sync_wallpaper_nodes();
+        // No runtime: node creation returns None, so the map stays empty --
+        // the assertion here is that the call is a clean no-op without a
+        // runtime.
+        assert!(state.wallpaper_nodes.is_empty());
+    }
+
+    /// Task 10: `ToplevelHandler::request_maximize`'s model half --
+    /// `reconcile_maximized` actually mutates the model, and reports whether
+    /// it did so the dispatch layer knows when a bare configure is enough.
+    #[test]
+    fn a_client_maximize_request_reaches_the_model() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 10, y: 10, width: 200, height: 100 });
+        let key = crate::wayland::ToplevelKey::for_test(1);
+        state.wayland.bind(id, key);
+        assert!(state.reconcile_maximized(key, true), "model must change");
+        assert!(state.window_manager.get(id).expect("window").maximized);
+        assert!(!state.reconcile_maximized(key, true), "idempotent request must report no change");
+    }
+
+    /// Task 10 (Deviation 8): a move request that arrives with no button
+    /// held must not start a grab -- the crate deliberately forwards no
+    /// seat/serial with `request_move`, so the compositor enforces its own
+    /// pointer-pressed policy instead of trusting the client's claim.
+    #[test]
+    fn a_move_request_without_a_pressed_pointer_is_ignored() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        state.pointer_pressed = false;
+        state.begin_client_move(id);
+        assert!(state.drag.window_id().is_none(), "no grab without a pressed pointer");
+    }
+
+    /// Review fix (task 10): `pointer_pressed` is a single scalar tracking
+    /// "the left button is held", not a per-button set -- every button's
+    /// `pressed` value used to overwrite it unconditionally, so a
+    /// right-button press or release interleaved with a held left button
+    /// spuriously set or cleared the flag `begin_client_move`/
+    /// `begin_client_resize` gate on. Gating the assignment on `BTN_LEFT`
+    /// fixes it: a right press/release while the left button stays down
+    /// must leave `pointer_pressed` (and so a move grab) untouched.
+    #[test]
+    fn a_right_click_does_not_disturb_a_held_left_button() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        const BTN_LEFT: u32 = 0x110;
+        const BTN_RIGHT: u32 = 0x111;
+
+        wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_LEFT, true, 0);
+        assert!(state.pointer_pressed, "a left press must set pointer_pressed");
+
+        wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_RIGHT, true, 0);
+        assert!(state.pointer_pressed, "a right press must not clear a held left button");
+
+        wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_RIGHT, false, 0);
+        assert!(state.pointer_pressed, "a right release must not clear a held left button");
+    }
+
+    /// Counterpart: a lone right-click (no left button ever pressed) must
+    /// never set `pointer_pressed`, so a `request_move` that happens to
+    /// arrive during it is still ignored.
+    #[test]
+    fn a_lone_right_click_leaves_pointer_pressed_false() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        const BTN_RIGHT: u32 = 0x111;
+
+        wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_RIGHT, true, 0);
+        assert!(!state.pointer_pressed, "a lone right press must not set pointer_pressed");
+
+        state.begin_client_move(id);
+        assert!(state.drag.window_id().is_none(), "request_move must be ignored without a held left button");
+    }
+
+    // --- Task 13: full server-side decorations ---
+
+    /// A left press on the rightmost `BUTTON_WIDTH` of a title bar is a
+    /// close, all the way through the library's own seat entry point --
+    /// `hit_test` maps it to `DecorationAction::Close`, which takes
+    /// `request_close`'s path like every other close in this file.
+    ///
+    /// Deliberately *not* bound to a toplevel: `Wayland::close` reports
+    /// `true` for a bound window (wait for the client's destroy) and `false`
+    /// for an unbacked one (remove the row now), and only the second is
+    /// observable without a live client, so this asserts the row is gone.
+    #[test]
+    fn a_titlebar_close_click_routes_to_request_close() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "t",
+            1,
+            Rectangle { x: 100, y: 100, width: 300, height: 200 },
+        );
+        let frame = state.window_manager.get(id).expect("w").geometry;
+        let bar = crate::decoration::title_bar_rect(frame);
+        // The close button is the rightmost of the three (`button_rects`
+        // orders them minimize, maximize, close).
+        let click = (bar.x + bar.width - 5, bar.y + 5);
+
+        wlr::SeatHandler::pointer_button(&mut state, click.0 as f64, click.1 as f64, 0x110, true, 1);
+
+        assert!(state.window_manager.get(id).is_none(), "close button must close");
+        assert!(
+            rx.try_iter().any(|e| matches!(e.event, icedtea_contract::Event::WindowClosed { .. })),
+            "the close must have been announced"
+        );
+    }
+
+    /// The middle button is maximize and the leftmost is minimize -- the
+    /// same three model command paths D-Bus drives, reached by pointer.
+    #[test]
+    fn titlebar_buttons_hit_the_models_own_command_paths() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "t",
+            1,
+            Rectangle { x: 100, y: 100, width: 300, height: 200 },
+        );
+        let frame = state.window_manager.get(id).expect("w").geometry;
+        let rects = crate::decoration::button_rects(frame);
+
+        let maximize = (rects[1].x + 5, rects[1].y + 5);
+        wlr::SeatHandler::pointer_button(&mut state, maximize.0 as f64, maximize.1 as f64, 0x110, true, 1);
+        assert!(state.window_manager.get(id).expect("w").maximized, "middle button maximizes");
+
+        let minimize = (rects[0].x + 5, rects[0].y + 5);
+        // The window is maximized now, so its frame moved; re-derive.
+        let frame = state.window_manager.get(id).expect("w").geometry;
+        let minimize = if crate::decoration::button_rects(frame)[0].contains(minimize.0, minimize.1) {
+            minimize
+        } else {
+            let r = crate::decoration::button_rects(frame)[0];
+            (r.x + 5, r.y + 5)
+        };
+        wlr::SeatHandler::pointer_button(&mut state, minimize.0 as f64, minimize.1 as f64, 0x110, true, 1);
+        assert!(state.window_manager.get(id).expect("w").minimized, "left button minimizes");
+    }
+
+    /// The negotiation's model half: a client asking to draw its own
+    /// decorations is recorded as such, which is what `has_ssd` then reads.
+    #[test]
+    fn decoration_mode_request_updates_the_model_preference() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        let key = crate::wayland::ToplevelKey::for_test(1);
+        state.wayland.bind(id, key);
+
+        wlr::ToplevelHandler::request_decoration_mode(
+            &mut state,
+            key.0,
+            Some(wlr::DecorationMode::ClientSide),
+        );
+        assert_eq!(state.window_manager.get(id).expect("w").client_decorations_requested, Some(true));
+
+        wlr::ToplevelHandler::request_decoration_mode(
+            &mut state,
+            key.0,
+            Some(wlr::DecorationMode::ServerSide),
+        );
+        assert_eq!(state.window_manager.get(id).expect("w").client_decorations_requested, Some(false));
+
+        wlr::ToplevelHandler::request_decoration_mode(&mut state, key.0, None);
+        assert_eq!(state.window_manager.get(id).expect("w").client_decorations_requested, None);
+    }
+
+    /// The ordering that actually happens on the wire: the client states its
+    /// preference before its initial commit, so there is no model window to
+    /// record it against yet. It must not be lost -- `new_toplevel` collects
+    /// it when the window is finally mapped.
+    #[test]
+    fn a_preference_stated_before_mapping_survives_until_the_window_exists() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let key = crate::wayland::ToplevelKey::for_test(9);
+
+        wlr::ToplevelHandler::request_decoration_mode(
+            &mut state,
+            key.0,
+            Some(wlr::DecorationMode::ClientSide),
+        );
+        assert!(state.window_manager.windows().next().is_none(), "nothing is mapped yet");
+
+        state.new_toplevel(key, "plain.app", "t", 1);
+        let id = state.wayland.window_for(key).expect("bound at map");
+        assert_eq!(
+            state.window_manager.get(id).expect("w").client_decorations_requested,
+            Some(true),
+            "the pre-map preference must reach the model"
+        );
+        assert!(
+            !crate::decoration::has_ssd("plain.app", Some(true), false),
+            "and must suppress the band"
+        );
+    }
+
+    /// A toplevel that dies before mapping takes its parked preference with
+    /// it, rather than leaving an entry nothing will ever collect.
+    #[test]
+    fn a_preference_parked_for_a_toplevel_that_never_maps_is_dropped() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let key = crate::wayland::ToplevelKey::for_test(11);
+
+        wlr::ToplevelHandler::request_decoration_mode(
+            &mut state,
+            key.0,
+            Some(wlr::DecorationMode::ClientSide),
+        );
+        assert_eq!(state.pending_decorations.len(), 1);
+        state.forget_toplevel(key);
+        assert!(state.pending_decorations.is_empty(), "an unmapped toplevel's preference must not leak");
+    }
+
+    /// The title raster is memoized on `(title, width, resolved color)`: the
+    /// same window synced twice shapes once and keeps one generation, and a
+    /// retitle both re-shapes and advances the generation (which is what
+    /// makes the seam re-upload).
+    #[test]
+    fn title_rasters_are_memoized_and_invalidated_by_a_retitle() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "first",
+            1,
+            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+        );
+        let bar = crate::decoration::title_bar_rect(
+            state.window_manager.get(id).expect("w").geometry,
+        );
+        let entry = |state: &State| {
+            let e = state.title_rasters.get(&id).expect("cached");
+            (e.generation, e.pixels.clone())
+        };
+
+        state.ensure_title_raster(id, "first".into(), bar, true);
+        assert_eq!(state.title_rasters.len(), 1, "the raster must be cached");
+        let first = entry(&state);
+
+        state.ensure_title_raster(id, "first".into(), bar, true);
+        assert_eq!(entry(&state), first, "an unchanged title must not re-shape or re-generation");
+
+        state.ensure_title_raster(id, "second".into(), bar, true);
+        let renamed = entry(&state);
+        assert_eq!(state.title_rasters.len(), 1, "one entry per window, replaced not appended");
+        assert_ne!(renamed.1, first.1, "a retitle must produce different pixels");
+        assert!(renamed.0 > first.0, "a retitle must advance the generation");
+
+        // Losing focus changes the resolved color, so it invalidates too.
+        state.ensure_title_raster(id, "second".into(), bar, false);
+        let unfocused = entry(&state);
+        assert!(unfocused.0 > renamed.0, "a focus change must re-shape");
+        assert_ne!(unfocused.1, renamed.1, "unfocused text is dimmer");
+
+        state.forget_window(id);
+        assert!(state.title_rasters.is_empty(), "a closed window's raster must not outlive it");
+    }
+
+    /// M3: the cache key carries the resolved foreground color, so a palette
+    /// change invalidates a raster even for an otherwise identical title on
+    /// an otherwise identical window.
+    #[test]
+    fn a_palette_change_invalidates_a_cached_title_raster() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "same",
+            1,
+            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+        );
+        let bar = crate::decoration::title_bar_rect(
+            state.window_manager.get(id).expect("w").geometry,
+        );
+
+        state.ensure_title_raster(id, "same".into(), bar, true);
+        let before = state.title_rasters.get(&id).expect("cached").pixels.clone();
+
+        // Deliberately *not* through `apply_config`, which destroys every
+        // window: this is the future in which a reload preserves them.
+        state.config.appearance.palette.foreground = "#ff0000".into();
+        state.ensure_title_raster(id, "same".into(), bar, true);
+        let after = state.title_rasters.get(&id).expect("cached").pixels.clone();
+
+        assert_ne!(before, after, "a repainted palette must not serve stale-colored text");
+    }
+
+    /// M1: the reload teardown bypasses `forget_window`, so it has to purge
+    /// the rasters itself -- ids are floored upward, so anything left behind
+    /// is unreachable forever.
+    #[test]
+    fn a_config_reload_purges_every_cached_raster() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "doomed",
+            1,
+            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+        );
+        let bar = crate::decoration::title_bar_rect(
+            state.window_manager.get(id).expect("w").geometry,
+        );
+        state.ensure_title_raster(id, "doomed".into(), bar, true);
+        assert_eq!(state.title_rasters.len(), 1);
+
+        let _ = state.apply_config(default_config());
+        assert!(state.title_rasters.is_empty(), "a reload must not strand title pixels");
+    }
+
+    /// The title node is inset by the three buttons, so a long title runs
+    /// out of room before it runs underneath the close button.
+    #[test]
+    fn the_title_raster_is_narrower_than_the_band_by_the_button_span() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "a very long window title that would otherwise run under the buttons",
+            1,
+            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+        );
+        let bar = crate::decoration::title_bar_rect(
+            state.window_manager.get(id).expect("w").geometry,
+        );
+        let title = state.window_manager.get(id).expect("w").title.clone();
+
+        state.ensure_title_raster(id, title, bar, true);
+        let (w, h, px) = state
+            .title_rasters
+            .get(&id)
+            .expect("cached")
+            .pixels
+            .clone()
+            .expect("pixels");
+        assert_eq!(w, bar.width - 3 * crate::decoration::BUTTON_WIDTH);
+        assert_eq!(h, bar.height);
+        assert_eq!(px.len(), (w * h * 4) as usize);
+    }
+
+    /// Button colors are premultiplied (every channel no greater than the
+    /// alpha), which is what the wlroots scene graph composites.
+    #[test]
+    fn button_colors_are_premultiplied() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let state = State::new(default_config(), tx);
+        for color in state.button_colors() {
+            for channel in &color[..3] {
+                assert!(*channel <= color[3] + f32::EPSILON, "{color:?} is not premultiplied");
+            }
+        }
+    }
+
+    // --- Task 14: snap preview rect, model-level unmapped, reload gap-close ---
+
+    /// Without a runtime attached, `sync_snap_preview` is a seam no-op both
+    /// ways -- but the `Option` field must still mirror `snap_preview`
+    /// exactly (no stale id kept). The runtime-backed version of this test
+    /// lives in `tests/headless_boot.rs`.
+    #[test]
+    fn snap_preview_rect_bookkeeping_follows_the_preview() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.snap_preview = Some(Rectangle { x: 0, y: 0, width: 400, height: 600 });
+        state.sync_snap_preview();
+        state.snap_preview = None;
+        state.sync_snap_preview();
+        assert!(state.snap_preview_rect.is_none());
+    }
+
+    /// Task 14 Step 2: `ToplevelHandler::unmapped` now moves focus to the
+    /// next mapped candidate on the same workspace when it unmaps the
+    /// focused window, the same shape `set_minimized_and_reconcile` already
+    /// gives minimizing the focused window.
+    #[test]
+    fn unmapping_the_focused_window_moves_focus_to_the_next_candidate() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "b", 1, DEFAULT_GEO);
+        let key_b = crate::wayland::ToplevelKey::for_test(2);
+        state.wayland.bind(b, key_b);
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(b));
+
+        wlr::ToplevelHandler::unmapped(&mut state, key_b.0);
+
+        assert_eq!(state.window_manager.get(b).map(|w| w.mapped), Some(false));
+        assert_eq!(
+            state.window_manager.focused_window().map(|w| w.id),
+            Some(a),
+            "focus must fall to the next mapped candidate"
+        );
+    }
+
+    /// Step 2's focus-refusal decision, exercised through the D-Bus surface:
+    /// `Focus` on an unmapped window's id must refuse, not remap-safely
+    /// no-op.
+    #[test]
+    fn handle_command_focus_refuses_an_unmapped_window() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        state.window_manager.set_mapped(a, false).unwrap();
+        assert_eq!(
+            state.handle_command(crate::dbus::DbCommand::Focus(a)),
+            None,
+            "an unmapped window must never be focused via D-Bus either"
+        );
+    }
+
+    /// Baseline DBus surface audit (Step 3): `GetState` had no direct
+    /// `handle_command` test anywhere in the workspace -- the round trip is
+    /// via `reply_tx`, not the model, so nothing else in this file happened
+    /// to cover it.
+    #[test]
+    fn handle_command_get_state_replies_with_a_snapshot() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        assert_eq!(state.handle_command(crate::dbus::DbCommand::GetState(reply_tx)), Some(()));
+        let snapshot = reply_rx.try_recv().expect("GetState must reply synchronously");
+        assert_eq!(snapshot.windows.len(), 1);
+    }
+
+    /// Baseline DBus surface audit (Step 3): `Quit` likewise had no direct
+    /// `handle_command` test -- every existing coverage went through
+    /// `apply_action("quit")` or sent the command on a channel a live loop
+    /// drains, never `handle_command` itself.
+    #[test]
+    fn handle_command_quit_sets_the_quitting_flag() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert_eq!(state.handle_command(crate::dbus::DbCommand::Quit), Some(()));
+        assert!(state.quitting);
+    }
+
+    /// Reload audit (Step 3): a config with a new background color lands
+    /// through the reload path and `state.config` reflects it. This baseline
+    /// already worked before this task (`apply_config` swaps `self.config`
+    /// wholesale) -- documented here rather than left unasserted.
+    #[test]
+    fn reload_applies_appearance_to_live_state() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let mut cfg = default_config();
+        cfg.appearance.palette.background = "#ff0000".into();
+        state.apply_reloaded_config(cfg);
+        assert_eq!(state.config.appearance.palette.background, "#ff0000");
+    }
+
+    /// Reload audit (Step 3): a reloaded config with an unparseable key
+    /// takes the same warn-and-skip path load-time validation uses
+    /// (`input::warn_about_keybindings`, already called from `apply_config`)
+    /// rather than panicking or poisoning the rest of the map.
+    #[test]
+    fn reload_revalidates_keybindings() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let mut cfg = default_config();
+        cfg.keybindings.insert(
+            "broken".into(),
+            icedtea_config::KeyCombo { modifiers: vec![], key: "NoSuchKeysym".into() },
+        );
+        state.apply_reloaded_config(cfg);
+        // Surviving proof: the compositor did not panic and a real binding
+        // still resolves to a real keysym.
+        let combo = &state.config.keybindings["quit"];
+        assert!(crate::input::key_name_to_keysym(&combo.key) != 0);
+    }
+
+    /// Reload gap-close (Step 3): an `appearance.wallpaper` path change
+    /// clears the decoded image so no stale pixels survive under the new
+    /// path -- the fresh decode is spawned but this test doesn't wait on it
+    /// (the point under test is that the *old* image is gone immediately,
+    /// not that the new one has landed yet).
+    #[test]
+    fn reload_swaps_the_wallpaper_when_the_path_changed() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.wallpaper.set_decoded(Some(image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]))));
+        let mut cfg = default_config();
+        cfg.appearance.wallpaper = Some("/nonexistent/new.png".into());
+        state.apply_reloaded_config(cfg);
+        assert!(state.wallpaper.decoded().is_none(), "stale wallpaper must not survive a path change");
+    }
+
+    /// The wallpaper path staying the same across a reload must not tear
+    /// down and respawn the decode worker for no reason.
+    #[test]
+    fn reload_leaves_the_wallpaper_alone_when_the_path_is_unchanged() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([9, 9, 9, 255]));
+        state.wallpaper.set_decoded(Some(image.clone()));
+        let cfg = default_config(); // same (absent) wallpaper as boot
+        state.apply_reloaded_config(cfg);
+        assert_eq!(state.wallpaper.decoded(), Some(&image), "an unrelated reload must not clear the wallpaper");
+    }
+
+    // --- Task 17: multi-output placement and hotplug migration ---
+
+    #[test]
+    fn placement_targets_the_output_under_the_pointer() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        // Without a runtime, pointer_position is unavailable: output_for_pointer
+        // must fall back to the lowest index deterministically.
+        assert_eq!(state.output_for_pointer(), Some(0));
+    }
+
+    #[test]
+    fn windows_migrate_off_a_removed_output() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 900, y: 50, width: 300, height: 200 });
+        let dead = state.outputs.remove(&1).expect("output 1").geometry;
+        state.migrate_windows_from(dead);
+        let w = state.window_manager.get(id).expect("window survives");
+        let survivor = state.outputs[&0].geometry;
+        assert!(
+            w.geometry.x >= survivor.x && w.geometry.x + w.geometry.width <= survivor.x + survivor.width,
+            "window must land inside the surviving output, got {:?}",
+            w.geometry
+        );
+    }
+
+    #[test]
+    fn migration_with_no_surviving_output_keeps_geometry() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 10, y: 10, width: 300, height: 200 });
+        let dead = state.outputs.remove(&0).expect("output 0").geometry;
+        state.migrate_windows_from(dead); // zero outputs left: must not panic, must not move
+        assert_eq!(state.window_manager.get(id).expect("w").geometry.x, 10);
+    }
+
+    /// Review fix: `new_toplevel`'s cascade placement used to read
+    /// `outputs.values().next()` -- arbitrary `HashMap` iteration order, not
+    /// even deterministic -- instead of routing through `output_for_pointer`
+    /// like the other three placement consumers. With no runtime attached
+    /// (the fallback path), `output_for_pointer` always resolves to the
+    /// lowest index, so a two-output state must place a new window inside
+    /// output 0's box every time, and the cascade origin itself must come
+    /// from that box's own `(x, y)` -- not `(0, 0)` -- so this also pins
+    /// down that the placeholder-1920x1080 fallback rect isn't what's
+    /// actually feeding `cascade_point_in` here.
+    #[test]
+    fn new_toplevel_cascades_inside_the_lowest_index_output_without_a_runtime() {
+        use crate::wayland::ToplevelKey;
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 1000, y: 2000, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 1800, y: 2000, width: 800, height: 600 });
+
+        let key = ToplevelKey::for_test(1);
+        state.new_toplevel(key, "app", "t", 1);
+        let id = state.wayland.window_for(key).expect("bound");
+        let geo = state.window_manager.get(id).expect("model row").geometry;
+
+        let output0 = state.outputs[&0].geometry;
+        assert!(
+            geo.x >= output0.x
+                && geo.x + geo.width <= output0.x + output0.width
+                && geo.y >= output0.y
+                && geo.y + geo.height <= output0.y + output0.height,
+            "the new window must cascade inside output 0's box, got {geo:?}, output 0 is {output0:?}"
+        );
+        // The cascade origin for the very first window in a workspace is the
+        // output box's own top-left corner (`cascade_point_in` with no
+        // occupied rects yet) -- pinning that it's `output0`'s `(x, y)`
+        // (1000, 2000), not `(0, 0)`, is what actually distinguishes "used
+        // the real box" from "used the (0,0)-origin fallback rect."
+        assert_eq!((geo.x, geo.y), (output0.x, output0.y), "cascade origin must be the output box's own (x, y)");
+    }
+
+    // --- Task 20: layer-shell arrangement and exclusive zones ---
+
+    #[test]
+    fn an_exclusive_top_panel_shrinks_the_usable_area() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+                exclusive: 30,
+                size: (800, 30),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.arrange_layers();
+        let usable = state.outputs[&0].usable;
+        assert_eq!(usable, Rectangle { x: 0, y: 30, width: 800, height: 570 });
+    }
+
+    /// C1/I5's maximize helper (`maximize_applies_output_geometry_and_restores_it`)
+    /// proves maximize tracks `geometry` when there is no panel; this proves
+    /// it tracks `usable` once one exists, and that fullscreen -- which
+    /// covers panels by definition -- keeps ignoring it.
+    #[test]
+    fn maximize_respects_the_usable_area_but_fullscreen_ignores_it() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        // Snapping/maximize geometry math (`layout::maximized_geometry`)
+        // also insets by `appearance.snap_gap`; zero it here so the
+        // expected numbers below are the panel's carve alone, not a mix of
+        // the carve and an unrelated gap constant.
+        state.config.appearance.snap_gap = 0;
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+                exclusive: 30,
+                size: (800, 30),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.arrange_layers();
+        assert_eq!(state.outputs[&0].usable, Rectangle { x: 0, y: 30, width: 800, height: 570 });
+
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 40, y: 50, width: 300, height: 200 });
+
+        // Maximize via the D-Bus command path (the established pattern):
+        // its geometry must equal `usable`, the panel's zone excluded.
+        state.handle_command(crate::dbus::DbCommand::Maximize(id, true)).unwrap();
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry,
+            state.outputs[&0].usable,
+            "maximize must exclude the panel's exclusive zone"
+        );
+
+        // Unmaximize, then fullscreen: fullscreen covers panels by
+        // definition, so its geometry must equal the *full* output
+        // geometry, not `usable`.
+        state.handle_command(crate::dbus::DbCommand::Maximize(id, false)).unwrap();
+        state.handle_command(crate::dbus::DbCommand::Fullscreen(id, true)).unwrap();
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry,
+            state.outputs[&0].geometry,
+            "fullscreen must ignore the panel's exclusive zone"
+        );
+    }
+
+    // --- Task 20 review: J1, J2, J3, M4, M5 ---
+
+    fn top_panel_entry(exclusive: i32, mapped: bool) -> LayerEntry {
+        LayerEntry {
+            output: 0,
+            sequence: 0,
+            layer: wlr::Layer::Top,
+            anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+            exclusive,
+            size: (800, exclusive as u32),
+            interactive: false,
+            mapped,
+            last_configured: None,
+        }
+    }
+
+    /// J2: an unmapped entry must not reserve; mapping starts reserving;
+    /// unmapping gives the space back. Previously `arrange_layers`' fold had
+    /// no mapped check at all, so an unmapped-but-not-yet-destroyed panel
+    /// left a permanent hole in the workspace.
+    #[test]
+    fn an_unmapped_layer_entry_does_not_reserve_until_mapped() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, false));
+
+        state.arrange_layers();
+        assert_eq!(
+            state.outputs[&0].usable,
+            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            "an unmapped entry must not reserve"
+        );
+
+        state.layers.get_mut(&id).unwrap().mapped = true;
+        state.arrange_layers();
+        assert_eq!(
+            state.outputs[&0].usable,
+            Rectangle { x: 0, y: 30, width: 800, height: 570 },
+            "mapping must start reserving"
+        );
+
+        state.layers.get_mut(&id).unwrap().mapped = false;
+        state.arrange_layers();
+        assert_eq!(
+            state.outputs[&0].usable,
+            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            "unmapping must give the space back"
+        );
+    }
+
+    /// M4: a second `arrange_layers` pass with nothing changed must not
+    /// re-emit for a maximized window -- `WindowManager::set_geometry`
+    /// emits `WindowUpdated` unconditionally, so without the "does the
+    /// target actually differ" guard, a panel redrawing at its own frame
+    /// rate produced one signal (and one client configure) per maximized
+    /// window, per panel frame, with byte-identical geometry.
+    #[test]
+    fn arrange_layers_does_not_resync_a_maximized_window_when_the_target_is_unchanged() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.config.appearance.snap_gap = 0;
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, top_panel_entry(30, true));
+
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        // Maximized before the panel's zone is folded into `usable` (that
+        // only happens inside `arrange_layers`), so the first arrange
+        // below genuinely changes the target and must emit.
+        state.handle_command(crate::dbus::DbCommand::Maximize(id, true)).unwrap();
+        while rx.try_recv().is_ok() {}
+
+        state.arrange_layers();
+        assert!(rx.try_recv().is_ok(), "the first arrange changes the target and must emit");
+        while rx.try_recv().is_ok() {}
+
+        state.arrange_layers();
+        assert!(rx.try_recv().is_err(), "an unchanged maximize target must not re-emit");
+    }
+
+    /// J1: `arrange_layers` re-homes each maximized window through its own
+    /// frame center, not a single pointer-derived output -- otherwise an
+    /// unrelated panel commit on output 1 could teleport a maximized window
+    /// that is actually on output 1 onto output 0's `usable` rect merely
+    /// because the pointer (with no attached runtime, `output_for_pointer`'s
+    /// own fallback: the lowest index) resolved to output 0.
+    #[test]
+    fn arrange_layers_resyncs_a_maximized_window_against_its_own_output_not_the_pointers() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.config.appearance.snap_gap = 0;
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+
+        // Maximized on output 1.
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 810, y: 10, width: 300, height: 200 });
+        state.window_manager.set_geometry(id, Rectangle { x: 800, y: 0, width: 800, height: 600 }).unwrap();
+        state.window_manager.set_maximized(id, true).unwrap();
+
+        // A panel maps on output 1 -- with no runtime attached,
+        // `output_for_pointer`'s fallback is the *lowest* index, output 0,
+        // which is exactly the wrong output for this window.
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            panel_id,
+            LayerEntry {
+                output: 1,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+                exclusive: 30,
+                size: (800, 30),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.arrange_layers();
+
+        let geo = state.window_manager.get(id).unwrap().geometry;
+        assert_eq!(geo, state.outputs[&1].usable, "must track output 1's usable rect, not output 0's");
+        assert!(geo.x >= 800, "must not have teleported onto output 0, got {geo:?}");
+    }
+
+    /// M5: a layer surface with no output at all when the sweep runs is a
+    /// no-op, correctly (left parked for the next call, not dropped); once
+    /// an output exists, the sweep re-homes it.
+    #[test]
+    fn resolve_orphaned_layers_configures_a_layer_surface_parked_with_no_output() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, LayerEntry { output: NO_OUTPUT, ..top_panel_entry(30, false) });
+
+        state.resolve_orphaned_layers();
+        assert_eq!(state.layers[&id].output, NO_OUTPUT, "no output exists yet: must stay parked, not vanish");
+
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.resolve_orphaned_layers();
+        assert_eq!(state.layers[&id].output, 0, "must be re-homed the moment an output exists");
+    }
+
+    /// M5a: an entry orphaned by its output being removed is re-homed onto
+    /// a surviving output -- the layer analogue of `migrate_windows_from`.
+    #[test]
+    fn resolve_orphaned_layers_rehomes_onto_a_surviving_output() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, LayerEntry { output: 1, ..top_panel_entry(30, true) });
+
+        // The caller (`OutputHandler::destroyed`) removes the dead output
+        // from `self.outputs` before this runs.
+        state.outputs.remove(&1);
+        state.resolve_orphaned_layers();
+        assert_eq!(state.layers[&id].output, 0, "must re-home onto the surviving output");
+    }
+
+    /// M5: with no surviving output at all, the sweep is a deliberate
+    /// no-op -- there is nowhere to re-home to, and the entry is left
+    /// exactly where it was for the next call (the next `new_output`) to
+    /// try again, rather than panicking or being dropped.
+    #[test]
+    fn resolve_orphaned_layers_is_a_no_op_with_no_surviving_output() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, true));
+
+        state.outputs.remove(&0);
+        state.resolve_orphaned_layers();
+        assert_eq!(state.layers[&id].output, 0, "left exactly where it was; no survivor to re-home onto");
+    }
+
+    /// J3's guard, exercised directly: `true` only while `layer_focus`
+    /// names an entry that is still mapped. `None`, a dangling id, and an
+    /// unmapped entry must all fall through to the model's own focus.
+    #[test]
+    fn layer_holds_keyboard_focus_only_while_the_entry_is_mapped() {
+        let mut layers: HashMap<wlr::LayerSurfaceId, LayerEntry> = HashMap::new();
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        assert!(!layer_holds_keyboard_focus(None, &layers), "no layer focus at all");
+        assert!(!layer_holds_keyboard_focus(Some(id), &layers), "layer_focus names an entry that does not exist");
+
+        layers.insert(id, top_panel_entry(30, false));
+        assert!(!layer_holds_keyboard_focus(Some(id), &layers), "the entry exists but is unmapped");
+
+        layers.get_mut(&id).unwrap().mapped = true;
+        assert!(layer_holds_keyboard_focus(Some(id), &layers), "a mapped entry must block the model's own focus");
+    }
+
+    /// Finding 6: `resize_edges_from_wlr`'s field-by-field mapping, for
+    /// every single edge and every corner (two edges at once) --
+    /// `begin_client_resize`'s own success path has no headless way to
+    /// exercise (see that method's doc), so this is the pure part of it
+    /// that stays directly testable.
+    #[test]
+    fn resize_edges_from_wlr_maps_every_edge_and_corner() {
+        let none = wlr::Edges::default();
+        assert_eq!(resize_edges_from_wlr(none), input::ResizeEdges { top: false, bottom: false, left: false, right: false });
+
+        let top = wlr::Edges { top: true, ..none };
+        assert_eq!(resize_edges_from_wlr(top), input::ResizeEdges { top: true, bottom: false, left: false, right: false });
+
+        let bottom = wlr::Edges { bottom: true, ..none };
+        assert_eq!(resize_edges_from_wlr(bottom), input::ResizeEdges { top: false, bottom: true, left: false, right: false });
+
+        let left = wlr::Edges { left: true, ..none };
+        assert_eq!(resize_edges_from_wlr(left), input::ResizeEdges { top: false, bottom: false, left: true, right: false });
+
+        let right = wlr::Edges { right: true, ..none };
+        assert_eq!(resize_edges_from_wlr(right), input::ResizeEdges { top: false, bottom: false, left: false, right: true });
+
+        let top_left = wlr::Edges { top: true, left: true, ..none };
+        assert_eq!(resize_edges_from_wlr(top_left), input::ResizeEdges { top: true, bottom: false, left: true, right: false });
+
+        let top_right = wlr::Edges { top: true, right: true, ..none };
+        assert_eq!(resize_edges_from_wlr(top_right), input::ResizeEdges { top: true, bottom: false, left: false, right: true });
+
+        let bottom_left = wlr::Edges { bottom: true, left: true, ..none };
+        assert_eq!(resize_edges_from_wlr(bottom_left), input::ResizeEdges { top: false, bottom: true, left: true, right: false });
+
+        let bottom_right = wlr::Edges { bottom: true, right: true, ..none };
+        assert_eq!(resize_edges_from_wlr(bottom_right), input::ResizeEdges { top: false, bottom: true, left: false, right: true });
+    }
+
+    /// J3's wiring: with an interactive panel holding `layer_focus` and a
+    /// maximized window present (so `arrange_layers` has something to
+    /// re-sync -- the exact path that used to reassert toplevel focus over
+    /// the panel's), `arrange_layers` must leave `layer_focus` alone;
+    /// unmapping the panel is the one path that legitimately clears it.
+    ///
+    /// This cannot observe the seat's *real* keyboard target end-to-end --
+    /// there is no attached `wlr::Runtime` in a unit test, and the wlr crate
+    /// exposes no way to create a virtual keyboard device for a headless
+    /// test harness to bind `wl_seat.get_keyboard` against (confirmed: the
+    /// harness's headless backend advertises no keyboard capability at all,
+    /// so a real client's `get_keyboard` is a protocol error). This is
+    /// `layer_focus`'s bookkeeping wired through the real handler methods,
+    /// paired with `layer_holds_keyboard_focus`'s own direct proof of the
+    /// guard's logic above.
+    #[test]
+    fn arrange_layers_leaves_layer_focus_alone_and_unmap_clears_it() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let win_id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.handle_command(crate::dbus::DbCommand::Maximize(win_id, true)).unwrap();
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        // What `layer_surface_mapped` would have set with a live runtime
+        // attached (see that handler's own doc for why it cannot here).
+        state.layer_focus = Some(panel_id);
+
+        state.arrange_layers();
+        assert_eq!(state.layer_focus, Some(panel_id), "arrange_layers must not clear layer_focus");
+
+        wlr::ToplevelHandler::layer_surface_unmapped(&mut state, panel_id);
+        assert_eq!(state.layer_focus, None, "unmapping must clear layer_focus");
+        assert!(!state.layers[&panel_id].mapped, "unmapping must stop the entry from reserving");
+    }
+
+    /// N6: two top-anchored exclusive panels on the same output must stack
+    /// rather than both drawing at the box's own top edge -- the earlier
+    /// (lower `sequence`) panel's placement base is the raw output box, the
+    /// later one's is the box already shrunk by the earlier panel's own
+    /// zone, so it is placed *below* the first rather than on top of it.
+    #[test]
+    fn usable_before_stacks_two_same_edge_panels_instead_of_overlapping() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let first = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(first, LayerEntry { sequence: 0, ..top_panel_entry(30, true) });
+
+        // `usable_before` for the first panel (nothing precedes it in
+        // sequence order): the raw output box, unshrunk.
+        assert_eq!(
+            state.usable_before(0, 0).unwrap(),
+            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            "the first panel's placement base must be the raw box"
+        );
+
+        // `usable_before` for a second panel (sequence 1, after the
+        // first): shrunk by the first panel's own 30px zone -- this is
+        // what makes `configure_layer` place it flush below the first
+        // instead of drawing over it.
+        assert_eq!(
+            state.usable_before(0, 1).unwrap(),
+            Rectangle { x: 0, y: 30, width: 800, height: 570 },
+            "the second panel's placement base must exclude the first panel's zone"
+        );
+
+        // An unmapped earlier entry must not shrink a later panel's base
+        // either -- mirrors J2's "unmapped reserves nothing" for the
+        // per-surface placement path, not just `arrange_layers`' own fold.
+        state.layers.get_mut(&first).unwrap().mapped = false;
+        assert_eq!(
+            state.usable_before(0, 1).unwrap(),
+            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            "an unmapped earlier entry must not shrink a later panel's placement base"
+        );
+    }
+
+    /// H2: two panels each requesting a pathologically large
+    /// `exclusive_zone` (well past the output's own extent -- what a
+    /// hostile or buggy client can ask for) must not panic
+    /// (`rect.y += exclusive` overflowing `i32` in a debug build) or wrap
+    /// into a corrupted rect in release; `usable` must saturate at a sane,
+    /// non-negative box instead.
+    #[test]
+    fn two_large_exclusive_top_panels_do_not_overflow_or_panic() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+
+        let first = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(first, LayerEntry { sequence: 0, exclusive: i32::MAX, ..top_panel_entry(i32::MAX, true) });
+        let second = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(second, LayerEntry { sequence: 1, exclusive: i32::MAX, ..top_panel_entry(i32::MAX, true) });
+
+        state.arrange_layers();
+
+        let usable = state.outputs[&0].usable;
+        assert!(usable.height >= 0, "height must never go negative, got {usable:?}");
+        assert!(usable.width >= 0, "width must never go negative, got {usable:?}");
+        assert!(usable.y >= 0, "y must stay a sane, saturated value, got {usable:?}");
+    }
+
+    /// H2: the exclusive zone is also clamped where it is captured --
+    /// `new_layer_surface`/`layer_surface_commit` -- not only where it is
+    /// folded, so `LayerEntry::exclusive` itself never holds a
+    /// pathological value in the first place. `clamp_exclusive_zone`'s
+    /// contract directly, since a client-supplied `wlr::LayerSurface` has
+    /// no test constructor for `exclusive_zone()`.
+    #[test]
+    fn clamp_exclusive_zone_bounds_a_positive_value_to_the_outputs_extent() {
+        let output = OutputSurface::new(Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        assert_eq!(clamp_exclusive_zone(i32::MAX, Some(&output)), 800, "clamped to max(width, height)");
+        assert_eq!(clamp_exclusive_zone(30, Some(&output)), 30, "a sane value passes through unchanged");
+        assert_eq!(clamp_exclusive_zone(-5, Some(&output)), -5, "a non-positive sentinel is never touched");
+        assert_eq!(clamp_exclusive_zone(i32::MAX, None), i32::MAX, "no output resolved yet: left to the saturating fold");
+    }
+
+    // --- Task 20 re-review: Important-1, Minor-1 ---
+
+    /// Important-1: click-to-focus is an explicit toplevel-focus assertion
+    /// and must win over an interactive panel's held `layer_focus`, unlike
+    /// the passive resyncs round 1 (correctly) left alone -- see
+    /// `release_layer_focus`'s own doc for the two-clause guard this
+    /// completes.
+    #[test]
+    fn clicking_a_window_releases_layer_focus_for_an_interactive_panel() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 600, height: 400 });
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(panel_id);
+
+        let _ = state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) });
+        assert_eq!(state.layer_focus, None, "clicking a window must release layer_focus");
+        assert!(state.window_manager.get(id).unwrap().focused, "the model's own focus must have won");
+    }
+
+    /// Important-1: `DbCommand::Focus` is the D-Bus-driven counterpart of a
+    /// click and must release `layer_focus` the same way.
+    #[test]
+    fn db_command_focus_releases_layer_focus_for_an_interactive_panel() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let a = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        let _b = state.window_manager.add_window("app2", "t2", 2, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(panel_id);
+
+        state.handle_command(crate::dbus::DbCommand::Focus(a)).unwrap();
+        assert_eq!(state.layer_focus, None, "DbCommand::Focus must release layer_focus");
+        assert!(state.window_manager.get(a).unwrap().focused);
+    }
+
+    /// Round-2 re-review finding Important-2: `release_layer_focus()` ran
+    /// *before* the fallible `window_manager.focus(id)?` in both
+    /// `DbCommand::Focus` and `handle_pointer_press`, so a focus request
+    /// naming a window that cannot actually be focused (unmapped, or --
+    /// `DbCommand::Focus` is reachable straight from a D-Bus caller -- a
+    /// stale wire id) still cleared `layer_focus` on its way to the early
+    /// return, silently defeating an interactive panel's keyboard grab for
+    /// a focus assertion that never happened. `release_layer_focus` now
+    /// runs after the `?` at both sites.
+    #[test]
+    fn a_failing_db_command_focus_does_not_release_layer_focus() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let a = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.window_manager.set_mapped(a, false).unwrap();
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(panel_id);
+
+        assert_eq!(
+            state.handle_command(crate::dbus::DbCommand::Focus(a)),
+            None,
+            "an unmapped window must never be focused via D-Bus"
+        );
+        assert_eq!(state.layer_focus, Some(panel_id), "a failing focus request must not release layer_focus");
+    }
+
+    /// Important-1: alt-tab's per-step focus is the third explicit path
+    /// named in the finding.
+    #[test]
+    fn alt_tab_cycling_releases_layer_focus_for_an_interactive_panel() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let _a = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        let _b = state.window_manager.add_window("app2", "t2", 2, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(panel_id);
+
+        state.apply_action("cycle:alt_tab");
+        assert_eq!(state.layer_focus, None, "alt-tab cycling must release layer_focus");
+    }
+
+    /// Minor-1: `arrange_layers` must reconfigure every mapped panel on
+    /// every pass, not only the one whose own commit triggered it --
+    /// otherwise a panel whose placement input changed for a reason other
+    /// than its own commit (another panel's zone growing or shrinking,
+    /// unmapping, or -- as reproduced here -- the output itself resizing)
+    /// keeps the stale position it was last configured with until its own
+    /// next commit happens to come along.
+    ///
+    /// `wlr::LayerSurfaceId::dangling_for_test()` is the only synthetic id
+    /// this crate exposes, so a unit test cannot hold two distinct live
+    /// `LayerEntry`s at once the way a real two-panel scenario would --
+    /// see `usable_before_stacks_two_same_edge_panels_instead_of_overlapping`,
+    /// which works around the identical limitation the same way. This test
+    /// instead reproduces the single-panel case of the same mechanism: an
+    /// output resize (`create_output` again -- what `OutputHandler::
+    /// new_output` does on a real mode change) moves the panel's placement
+    /// input with no layer-side event, real or simulated, in between, and
+    /// only `arrange_layers`'s own unconditional reconfigure loop notices.
+    #[test]
+    fn arrange_layers_reconfigures_every_mapped_panel_even_without_its_own_commit() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, true));
+
+        state.arrange_layers();
+        let first_placement = state.layers[&id].last_configured;
+        assert_eq!(first_placement, Some((800, 30, 0, 0)), "the initial arrange must record a placement");
+
+        // Nothing calls `configure_layer` or `layer_surface_commit` for
+        // this entry between the two arranges -- an output mode change
+        // (`create_output` again, standing in for `OutputHandler::
+        // new_output` re-recording a resized output's box) moves this
+        // panel's placement input with no layer-side event of any kind,
+        // real or simulated, in between.
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 640, height: 480 });
+        state.arrange_layers();
+        let second_placement = state.layers[&id].last_configured;
+        assert_ne!(second_placement, first_placement, "arrange_layers must reconfigure a panel with no commit of its own");
+        assert_eq!(second_placement, Some((640, 30, 0, 0)));
+    }
+
+    /// Minor-1's other half: an `arrange_layers` pass that changes nothing
+    /// about a panel's placement must not touch `last_configured` at all
+    /// -- this is the M4-storm-class guard `configure_layer` itself now
+    /// provides, proven here at the `arrange_layers` call site rather than
+    /// `configure_layer` directly.
+    #[test]
+    fn arrange_layers_does_not_reconfigure_an_unchanged_panel() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, true));
+
+        state.arrange_layers();
+        let placement = state.layers[&id].last_configured;
+
+        state.arrange_layers();
+        assert_eq!(state.layers[&id].last_configured, placement, "an unchanged panel's placement must not be re-recorded");
+    }
+
+    // --- Final review C1: wallpaper / background lowering order ---
+
+    /// C1's regression guard. The scene's actual stacking order is not
+    /// observable -- `wlr` exposes no z-query, and `BufferId`/`RectId` have
+    /// no synthetic constructor -- so what is pinned is the thing that was
+    /// wrong: the *order* of the lower calls `sync_wallpaper_nodes` issues.
+    /// `lower_*_to_bottom` gives the bottom to whichever node was lowered
+    /// last, so the background rect must come last or it sits on top of the
+    /// wallpaper and the wallpaper is never seen (which is exactly what
+    /// shipped).
+    #[test]
+    fn the_background_rect_is_lowered_after_every_wallpaper_node() {
+        assert_eq!(
+            wallpaper_lower_plan(1, true),
+            vec![LowerStep::Wallpaper(0), LowerStep::Background],
+            "one output: the background must be lowered last"
+        );
+        assert_eq!(
+            wallpaper_lower_plan(3, true),
+            vec![
+                LowerStep::Wallpaper(0),
+                LowerStep::Wallpaper(1),
+                LowerStep::Wallpaper(2),
+                LowerStep::Background,
+            ],
+            "multi-output: still exactly one background lower, still last"
+        );
+        assert_eq!(
+            wallpaper_lower_plan(3, true).last(),
+            Some(&LowerStep::Background),
+            "the contract in one line: last call wins the bottom, and it must be the background"
+        );
+    }
+
+    /// The two degenerate inputs. Nothing created means nothing to restack
+    /// (existing nodes are already correctly ordered, and re-lowering the
+    /// background every idempotent re-sync would be pure churn); no
+    /// background rect at all -- every model-only build, and the window
+    /// between `State::new` and `set_background` -- still lowers the
+    /// wallpaper nodes it made.
+    #[test]
+    fn the_lower_plan_is_empty_when_nothing_was_created() {
+        assert_eq!(wallpaper_lower_plan(0, true), Vec::new());
+        assert_eq!(wallpaper_lower_plan(0, false), Vec::new());
+        assert_eq!(
+            wallpaper_lower_plan(2, false),
+            vec![LowerStep::Wallpaper(0), LowerStep::Wallpaper(1)],
+            "no background rect to lower, but the new nodes still get lowered"
+        );
+    }
+
+    // --- Final review I3: per-axis layer placement ---
+
+    /// The panel case, unchanged by I3: `TOP | LEFT | RIGHT`, desired
+    /// `(800, 30)` -- both horizontal edges anchored so the width spans the
+    /// box, one vertical edge anchored so the height is the client's 30 and
+    /// it sits flush against the top.
+    #[test]
+    fn a_top_anchored_panel_still_spans_the_box_at_its_desired_thickness() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, true));
+        state.configure_layer(id);
+        assert_eq!(state.layers[&id].last_configured, Some((800, 30, 0, 0)));
+    }
+
+    /// I3, first half: a corner-anchored notification (`TOP | RIGHT`,
+    /// 300x100 -- the shape every notification daemon uses) must get *its
+    /// own* width, flush into the top-right corner. The shipped rule keyed
+    /// the whole placement on `a.top != a.bottom` and stretched it across
+    /// the full 800px output width, discarding `desired_size` outright.
+    #[test]
+    fn a_corner_anchored_layer_surface_keeps_its_desired_size() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, right: true, left: false, bottom: false },
+                exclusive: 0,
+                size: (300, 100),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        assert_eq!(
+            state.layers[&id].last_configured,
+            Some((300, 100, 500, 0)),
+            "300x100 flush into the top-right corner (x = 800 - 300), not stretched to 800 wide"
+        );
+    }
+
+    /// I3, second half: a surface anchored to all four edges with a `0x0`
+    /// desired size -- the protocol's fill-the-output case, what lockers
+    /// and fullscreen launchers use -- must get the whole usable box. The
+    /// shipped rule fell through to the `else` arm and handed it a centered
+    /// 200x200. The offset origin proves it used the real box rather than
+    /// a `(0, 0)` fallback.
+    #[test]
+    fn a_four_edge_anchored_layer_surface_fills_the_usable_box() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 100, y: 50, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Overlay,
+                anchor: wlr::Anchor { top: true, bottom: true, left: true, right: true },
+                exclusive: 0,
+                size: (0, 0),
+                interactive: true,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        assert_eq!(
+            state.layers[&id].last_configured,
+            Some((800, 600, 100, 50)),
+            "all four anchors with a 0x0 desired size fills the box, not a centered 200x200"
+        );
+    }
+
+    /// The other fill spelling the protocol allows: *no* anchors and a
+    /// `0x0` desired size. Same answer, and the same arm of
+    /// `layer_axis_placement` (neither edge, no desired -> span).
+    #[test]
+    fn an_unanchored_zero_sized_layer_surface_also_fills_the_usable_box() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Overlay,
+                anchor: wlr::Anchor { top: false, bottom: false, left: false, right: false },
+                exclusive: 0,
+                size: (0, 0),
+                interactive: true,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        assert_eq!(state.layers[&id].last_configured, Some((800, 600, 0, 0)));
+    }
+
+    /// And an unanchored surface that *did* name a size is still centered
+    /// at exactly that size -- the one behavior of the old `else` arm that
+    /// was already right, kept.
+    #[test]
+    fn an_unanchored_sized_layer_surface_is_centered() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Overlay,
+                anchor: wlr::Anchor { top: false, bottom: false, left: false, right: false },
+                exclusive: 0,
+                size: (400, 200),
+                interactive: true,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        assert_eq!(state.layers[&id].last_configured, Some((400, 200, 200, 200)));
+    }
+
+    /// Finding 7, security: a client-supplied `desired` size that dwarfs
+    /// the output (up to `u32::MAX`) must not wrap negative on the `as
+    /// i32` cast -- clamped to the output's own span first, `configure_layer`
+    /// must never hand wlroots a negative width/height.
+    #[test]
+    fn a_pathologically_large_desired_size_is_clamped_to_the_output() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: false, bottom: false, left: false, right: false },
+                exclusive: 0,
+                size: (u32::MAX, u32::MAX),
+                interactive: true,
+                mapped: true,
+                last_configured: None,
+            },
+        );
+        state.configure_layer(id);
+        let (w, h, _, _) = state.layers[&id].last_configured.unwrap();
+        assert_eq!(w, 800, "width must clamp to the output's own span, not wrap negative");
+        assert_eq!(h, 600, "height must clamp to the output's own span, not wrap negative");
+    }
+
+    /// `layer_axis_placement` directly, for the same clamp: `desired` past
+    /// `span` is bounded to `span` before the cast, whichever of `start`/
+    /// `end` is set.
+    #[test]
+    fn layer_axis_placement_clamps_desired_to_the_span() {
+        assert_eq!(layer_axis_placement(false, false, u32::MAX, 0, 800), (800, 0));
+        assert_eq!(layer_axis_placement(true, false, u32::MAX, 0, 800), (800, 0), "flush start, still clamped");
+        assert_eq!(layer_axis_placement(false, true, u32::MAX, 0, 800), (800, 0), "flush end, still clamped");
+    }
+
+    // --- Final review I1: a remapped layer surface must be reconfigured ---
+
+    /// I1 at the model level (the wire-level half lives in
+    /// `client_protocol::a_remapped_layer_panel_is_configured_again`):
+    /// `layer_surface_unmapped` must forget `last_configured`, or
+    /// `configure_layer`'s storm guard suppresses the mandatory configure
+    /// the remap needs -- with an identical placement, which is the normal
+    /// case for an auto-hide panel, the guard matches and the client hangs
+    /// forever.
+    #[test]
+    fn unmapping_a_layer_surface_forgets_its_placement_so_a_remap_reconfigures() {
+        use wlr::ToplevelHandler;
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, true));
+
+        state.configure_layer(id);
+        assert_eq!(state.layers[&id].last_configured, Some((800, 30, 0, 0)));
+
+        state.layer_surface_unmapped(id);
+        assert_eq!(
+            state.layers[&id].last_configured, None,
+            "an unmap must forget the placement -- wlroots resets `initialized`, so the remap needs a fresh configure"
+        );
+
+        // The remap: same output, same anchors, so the recomputed placement
+        // is byte-identical to the one before the unmap. That is precisely
+        // the case the storm guard used to swallow.
+        if let Some(entry) = state.layers.get_mut(&id) {
+            entry.mapped = true;
+        }
+        state.configure_layer(id);
+        assert_eq!(
+            state.layers[&id].last_configured,
+            Some((800, 30, 0, 0)),
+            "the remap must re-send the identical placement, not be suppressed as unchanged"
+        );
+    }
+
+    // --- Final review I2: unmapping on an inactive workspace ---
+
+    /// I2. A window focused on workspace 2 unmaps while workspace 1 is
+    /// active. Before the fix, `unmapped` re-picked only when the unmapping
+    /// window was the *active* workspace's focus, so workspace 2 kept a
+    /// `focused_window` pointer aimed at an unmapped row; switching back
+    /// re-picked only on `is_none()`, so the pointer survived, the seat went
+    /// dead (correctly refusing an invisible window), and `close`/
+    /// `maximize`/`fullscreen`/`snap` all still resolved to it.
+    #[test]
+    fn unmapping_on_an_inactive_workspace_does_not_leave_a_stale_focus_pointer() {
+        use wlr::ToplevelHandler;
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+
+        let key = crate::wayland::ToplevelKey::for_test(1);
+        state.new_toplevel(key, "a", "A", 1);
+        let id = state.wayland.window_for(key).expect("bound");
+
+        // Focus it on workspace 1 (`move_to_workspace` switches there and
+        // focuses it), then leave for workspace 0.
+        state.move_to_workspace(id, 1).expect("moved to workspace 1");
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(id));
+        state.switch_workspace(0).expect("switched away");
+
+        // The unmap happens while workspace 1 is *not* the active one.
+        state.unmapped(wlr::ToplevelId::dangling_nth_for_test(1));
+
+        state.switch_workspace(1).expect("switched back");
+        assert!(
+            state.window_manager.focused_window().is_none(),
+            "workspace 1 must have no focused window: its only candidate is unmapped"
+        );
+        assert!(
+            state.window_manager.get(id).is_some_and(|w| !w.focused),
+            "the unmapped row must not still claim focus"
+        );
+        // The consequence that made the stale pointer actionable rather
+        // than merely untidy: a focus-targeted command must find nothing.
+        assert!(
+            state.apply_action("close").is_none(),
+            "a close action must not resolve to the unmapped window"
+        );
+        assert!(
+            state.apply_action("maximize").is_none(),
+            "a maximize action must not resolve to the unmapped window"
+        );
+    }
+
+    /// The other half of I2's fix: `switch_workspace`'s guard widened from
+    /// `is_none()` to "no focusable focus", which also covers the
+    /// pre-existing minimized case -- switching to a workspace whose focus
+    /// pointer names a minimized window now hands focus to a real
+    /// candidate instead of leaving the seat dead.
+    #[test]
+    fn switching_to_a_workspace_whose_focus_is_minimized_repicks() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+
+        let a = state.window_manager.add_window("a", "A", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        let b = state.window_manager.add_window("b", "B", 2, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        // `b` was added second so it is focused; minimize it and leave.
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(b));
+        state.window_manager.set_minimized(b, true);
+        state.switch_workspace(1).expect("switched away");
+        state.switch_workspace(0).expect("switched back");
+
+        assert_eq!(
+            state.window_manager.focused_window().map(|w| w.id),
+            Some(a),
+            "a minimized focus pointer must be re-picked on switch-back, not kept"
+        );
     }
 }
