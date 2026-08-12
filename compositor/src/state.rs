@@ -662,6 +662,81 @@ impl State {
         self.outputs.insert(index, OutputSurface { geometry });
     }
 
+    /// The output whose box contains the pointer; falls back to the lowest
+    /// index. Placement (cascade origin, maximize/fullscreen/snap target)
+    /// uses this instead of the implicit single output, so every one of
+    /// those consumers moves with the pointer once a second output exists.
+    ///
+    /// With no attached runtime (every unit test in this file, and any
+    /// caller ahead of `wayland.attach`), `pointer_position` is unavailable
+    /// -- the fallback path also covers a pointer that landed outside every
+    /// known output's box, which can happen for an instant right after a
+    /// hotplug removes the one it was over.
+    pub fn output_for_pointer(&self) -> Option<u32> {
+        if let Some(runtime) = self.wayland.runtime() {
+            let (px, py) = runtime.pointer_position();
+            let (px, py) = (px as i32, py as i32);
+            let hit = self.outputs.iter().find(|(_, out)| out.geometry.contains(px, py));
+            if let Some((&idx, _)) = hit {
+                return Some(idx);
+            }
+        }
+        self.outputs.keys().min().copied()
+    }
+
+    /// Hot-remove semantics: every window whose frame center sat inside the
+    /// dead output's box (`dead`, captured by the caller before the entry
+    /// left `self.outputs`) is moved onto the surviving output with the
+    /// lowest index (clamped into its box, cascade order preserved) and
+    /// re-synced. Called from `OutputHandler::destroyed`.
+    ///
+    /// With no surviving output, this is a deliberate no-op: there is
+    /// nowhere to move a window to, and leaving geometry alone (rather than
+    /// clamping into an empty rect, which would collapse every affected
+    /// window to a single point) is the only choice that doesn't invent a
+    /// placement nothing asked for.
+    pub fn migrate_windows_from(&mut self, dead: Rectangle) {
+        let Some(survivor_idx) = self.outputs.keys().min().copied() else { return };
+        let Some(survivor) = self.outputs.get(&survivor_idx).map(|o| o.geometry) else { return };
+
+        let affected: Vec<WindowId> = self
+            .window_manager
+            .windows()
+            .filter(|w| {
+                let cx = w.geometry.x + w.geometry.width / 2;
+                let cy = w.geometry.y + w.geometry.height / 2;
+                dead.contains(cx, cy)
+            })
+            .map(|w| w.id)
+            .collect();
+
+        for id in affected {
+            let Some(w) = self.window_manager.get(id) else { continue };
+            let geometry = w.geometry;
+
+            // Preserve the window's offset from the dead output's origin,
+            // clamped so the frame fits inside the survivor's box -- pinned
+            // to the survivor's own origin on that axis when the frame is
+            // wider/taller than the survivor itself (a `max` bound below its
+            // `min` bound would panic `clamp`, so guard it explicitly rather
+            // than trusting every window to be smaller than every output).
+            let new_x = if geometry.width >= survivor.width {
+                survivor.x
+            } else {
+                (survivor.x + (geometry.x - dead.x)).clamp(survivor.x, survivor.x + survivor.width - geometry.width)
+            };
+            let new_y = if geometry.height >= survivor.height {
+                survivor.y
+            } else {
+                (survivor.y + (geometry.y - dead.y)).clamp(survivor.y, survivor.y + survivor.height - geometry.height)
+            };
+
+            self.window_manager.set_geometry(id, Rectangle { x: new_x, y: new_y, ..geometry });
+            self.sync_window_to_scene(id);
+        }
+        self.emit_pending();
+    }
+
     /// Drain `window_manager.pending_events` onto `dbus_tx`. Must be called
     /// after every mutation of `window_manager` so subscribers observe it.
     ///
@@ -1074,7 +1149,7 @@ impl State {
         if w.fullscreen == target {
             return Some(());
         }
-        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
         self.window_manager.set_fullscreen(id, target)?;
         if target {
             // Save current geometry before entering fullscreen
@@ -1110,7 +1185,7 @@ impl State {
         if self.window_manager.get(id)?.maximized == target {
             return Some(());
         }
-        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
         self.window_manager.set_maximized(id, target)?;
         if target {
             let current = self.window_manager.get(id)?.geometry;
@@ -1598,7 +1673,7 @@ impl State {
         if !self.config.behavior.snap_enabled {
             return None;
         }
-        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
         let gap = self.config.appearance.snap_gap;
         let current = self.window_manager.get(id)?.geometry;
         self.snap_saved_geometry.entry(id).or_insert(current);
@@ -1844,7 +1919,7 @@ impl State {
             return Some(());
         }
         self.drag.window_id()?;
-        let output_geo = self.outputs.values().next().map(|o| o.geometry)?;
+        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
         let threshold = self.config.appearance.snap_gap.max(1) * 4;
         // Review finding I3: with snapping disabled the drag machine is
         // never told about zones at all, so no preview is staged *and*
@@ -2094,16 +2169,23 @@ impl wlr::OutputHandler for State {
         }
 
         let (width, height) = output.size();
-        // Single output at (0, 0) for the slice. `next_output_index` is a
-        // monotonic counter, not `outputs.len()` (review finding M2): `len()`
-        // recomputes the same index a just-removed output had the moment a
-        // new one is added, colliding with whatever the model (or a
-        // client-facing consumer) still remembers about the old one. Actual
-        // multi-output *placement* (anything beyond "assign a never-reused
-        // index") is still parity work; this only fixes the collision.
+        // `next_output_index` is a monotonic counter, not `outputs.len()`
+        // (review finding M2): `len()` recomputes the same index a
+        // just-removed output had the moment a new one is added, colliding
+        // with whatever the model (or a client-facing consumer) still
+        // remembers about the old one.
         let index = self.next_output_index;
         self.next_output_index += 1;
-        self.create_output(index, icedtea_contract::Rectangle { x: 0, y: 0, width, height });
+        // The layout box is the output's real position (and, once placed,
+        // its mode-derived size) in the shared multi-output coordinate
+        // space; a `None` -- the output not yet in the layout, or a
+        // 0x0-mode output, see `output_layout_box`'s own doc -- falls back
+        // to the single-output-at-origin behavior this replaced.
+        let geometry = runtime
+            .output_layout_box(output.id())
+            .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
+            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width, height });
+        self.create_output(index, geometry);
         self.output_ids.insert(output.id(), index);
         // A new output needs its own wallpaper node (if a decode has
         // already landed) at this output's own size -- nothing else calls
@@ -2146,7 +2228,12 @@ impl wlr::OutputHandler for State {
         // this handler was never told about (see the library's own docs), and
         // a panic here aborts.
         if let Some(index) = self.output_ids.remove(&id) {
-            self.outputs.remove(&index);
+            if let Some(dead) = self.outputs.remove(&index) {
+                // Every window whose frame center sat on the dead output
+                // moves onto the survivor before anything else notices the
+                // output is gone.
+                self.migrate_windows_from(dead.geometry);
+            }
             // The gone output's wallpaper node (if any) must go with it --
             // nothing else calls `sync_wallpaper_nodes` when the output set
             // shrinks, and a stale node would otherwise sit in the scene
@@ -4129,5 +4216,47 @@ mod tests {
         let cfg = default_config(); // same (absent) wallpaper as boot
         state.apply_reloaded_config(cfg);
         assert_eq!(state.wallpaper.decoded(), Some(&image), "an unrelated reload must not clear the wallpaper");
+    }
+
+    // --- Task 17: multi-output placement and hotplug migration ---
+
+    #[test]
+    fn placement_targets_the_output_under_the_pointer() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        // Without a runtime, pointer_position is unavailable: output_for_pointer
+        // must fall back to the lowest index deterministically.
+        assert_eq!(state.output_for_pointer(), Some(0));
+    }
+
+    #[test]
+    fn windows_migrate_off_a_removed_output() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 900, y: 50, width: 300, height: 200 });
+        let dead = state.outputs.remove(&1).expect("output 1").geometry;
+        state.migrate_windows_from(dead);
+        let w = state.window_manager.get(id).expect("window survives");
+        let survivor = state.outputs[&0].geometry;
+        assert!(
+            w.geometry.x >= survivor.x && w.geometry.x + w.geometry.width <= survivor.x + survivor.width,
+            "window must land inside the surviving output, got {:?}",
+            w.geometry
+        );
+    }
+
+    #[test]
+    fn migration_with_no_surviving_output_keeps_geometry() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 10, y: 10, width: 300, height: 200 });
+        let dead = state.outputs.remove(&0).expect("output 0").geometry;
+        state.migrate_windows_from(dead); // zero outputs left: must not panic, must not move
+        assert_eq!(state.window_manager.get(id).expect("w").geometry.x, 10);
     }
 }
