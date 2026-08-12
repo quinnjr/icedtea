@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use icedtea_contract::{Rectangle, WindowId};
-use smithay::input::keyboard::xkb;
+use xkbcommon::xkb;
 
 use crate::layout::{snap_zone_for_point, SnapZone};
 
@@ -137,11 +137,66 @@ pub fn match_action(
         if wanted_sym == xkb::keysyms::KEY_NoSymbol {
             continue;
         }
+        // Task 11 re-review #1 (binding on whoever reimplements keysym
+        // resolution against wlr, since the smithay-era `backend.rs` that
+        // documented this is gone): `keysym` here must be resolved
+        // shift/caps-lock-agnostic, preferring a raw/latin keysym and
+        // falling back to the modified one only when the keycode produces
+        // no raw keysym at all. `key_name_to_keysym` above always encodes
+        // the *unshifted* keysym for a binding (`"KEY_q"` is `0x71`), so an
+        // input path that instead feeds this the keyboard's shifted
+        // `modified_sym()` breaks two ways: `SUPER+SHIFT+q` (the default
+        // `quit` binding) reports `0x51` (`XK_Q`) and can never equal
+        // `0x71`, making `quit`/`reload` unreachable; and plain `SUPER+q`
+        // with Caps Lock active reports the same wrong-cased mismatch. The
+        // fix is resolving on the raw/latin keysym first, exactly as this
+        // matcher already assumes.
         if wanted == mods && wanted_sym == keysym {
             return Some(action.clone());
         }
     }
     None
+}
+
+/// The model modifier flags a binding's modifier token list names.
+///
+/// Unlike `match_action`'s "wanted" fold, an unrecognized token here just
+/// contributes nothing rather than a sentinel bit: `validate_keybindings`
+/// already flags an unusable binding, and this helper is used to decide
+/// *which physical modifier keys to watch* (alt-tab's end condition), where
+/// an unrecognized token has no modifier to contribute either way.
+pub fn modifiers_for_tokens(tokens: &[String]) -> Modifiers {
+    tokens.iter().fold(Modifiers::empty(), |acc, t| {
+        acc | match t.as_str() {
+            "SUPER" => Modifiers::SUPER,
+            "CTRL" => Modifiers::CTRL,
+            "ALT" => Modifiers::ALT,
+            "SHIFT" => Modifiers::SHIFT,
+            _ => Modifiers::empty(),
+        }
+    })
+}
+
+/// Whether releasing `keysym` releases one of the physical modifier keys
+/// named by `watched`.
+///
+/// Exists for alt-tab's end condition, which needs to recognize a
+/// modifier's own release *from that release event itself* (see
+/// `state.rs`'s `SeatHandler::key` for why: wlroots emits the key event
+/// before it updates the keyboard's `xkb_state`, so `KeyEvent::modifiers()`
+/// on the modifier's own release event still reports it held — only the
+/// keysym says otherwise). Each of the four tokens this project's bindings
+/// can name covers both the left and right physical key, since a binding
+/// names "SUPER", not "the left Super key" specifically.
+pub fn keysym_is_modifier(watched: Modifiers, keysym: u32) -> bool {
+    (watched.contains(Modifiers::SUPER)
+        && matches!(keysym, xkb::keysyms::KEY_Super_L | xkb::keysyms::KEY_Super_R))
+        || (watched.contains(Modifiers::CTRL)
+            && matches!(keysym, xkb::keysyms::KEY_Control_L | xkb::keysyms::KEY_Control_R))
+        || (watched.contains(Modifiers::ALT)
+            && matches!(keysym, xkb::keysyms::KEY_Alt_L | xkb::keysyms::KEY_Alt_R))
+        || (watched.contains(Modifiers::SHIFT)
+            && matches!(keysym, xkb::keysyms::KEY_Shift_L | xkb::keysyms::KEY_Shift_R))
 }
 
 pub struct AltTabMachine {
@@ -553,5 +608,39 @@ mod tests {
         // just skipped once.
         assert_eq!(m.preview_zone(), None);
         assert!(matches!(m.end(), DragResult::Restored));
+    }
+
+    // --- Task 11 fix round: `modifiers_for_tokens` / `keysym_is_modifier` ---
+
+    #[test]
+    fn modifiers_for_tokens_maps_each_token_and_ignores_unknown_ones() {
+        assert_eq!(modifiers_for_tokens(&["SUPER".into()]), Modifiers::SUPER);
+        assert_eq!(modifiers_for_tokens(&["ALT".into(), "SHIFT".into()]), Modifiers::ALT | Modifiers::SHIFT);
+        assert_eq!(
+            modifiers_for_tokens(&["SUPER".into(), "Sooper".into()]),
+            Modifiers::SUPER,
+            "an unrecognized token contributes nothing rather than aborting the fold"
+        );
+        assert!(modifiers_for_tokens(&[]).is_empty());
+    }
+
+    #[test]
+    fn keysym_is_modifier_matches_either_physical_key_of_a_watched_modifier() {
+        assert!(keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Super_L));
+        assert!(keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Super_R));
+        assert!(!keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Alt_L), "not a watched modifier");
+        assert!(!keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Tab), "not a modifier key at all");
+
+        // A rebound cycle:alt_tab (e.g. ALT+Tab) watches ALT, not SUPER --
+        // releasing Super must not be mistaken for releasing the bound
+        // modifier.
+        assert!(keysym_is_modifier(Modifiers::ALT, xkb::keysyms::KEY_Alt_R));
+        assert!(!keysym_is_modifier(Modifiers::ALT, xkb::keysyms::KEY_Super_L));
+
+        // A multi-modifier binding watches every one of its modifiers.
+        let watched = Modifiers::CTRL | Modifiers::ALT;
+        assert!(keysym_is_modifier(watched, xkb::keysyms::KEY_Control_L));
+        assert!(keysym_is_modifier(watched, xkb::keysyms::KEY_Alt_L));
+        assert!(!keysym_is_modifier(watched, xkb::keysyms::KEY_Shift_L));
     }
 }

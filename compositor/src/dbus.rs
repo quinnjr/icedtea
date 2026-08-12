@@ -1,7 +1,7 @@
 //! The `org.icedtea.WM` D-Bus service.
 //!
 //! Per the binding threading-model ruling from task 7: this runs on its own
-//! dedicated thread and talks to the main calloop loop only by message
+//! dedicated thread and talks to the compositor's own loop only by message
 //! passing -- never touching `State` directly. Two channels cross that
 //! boundary:
 //!
@@ -11,39 +11,20 @@
 //!   [`spawn_service`]. This is the consumer the task-7 handoff comment in
 //!   `main.rs` promised for the previously-undrained `_dbus_rx` channel.
 //! - `cmd_tx` (this thread -> compositor): [`DbCommand`]s produced by
-//!   incoming [`WmInterface`] method calls, drained by `main.rs`'s calloop
-//!   loop and applied to `State` (see `State::handle_command`).
+//!   incoming [`WmInterface`] method calls, applied to `State` by whatever
+//!   drains this channel (see `State::handle_command`).
+//!
+//! The command channel is a `crossbeam_channel::Sender`, drained by the
+//! compositor's own event loop once per turn. It used to be paired with a
+//! dedicated event-source abstraction that woke the loop on a send; with
+//! that library gone the loop polls instead, which is the same latency in
+//! practice because it wakes on every input and frame event anyway.
 //!
 //! ## Deviations from the task-12 brief
 //!
 //! (Standing human ruling: the plan's stated invariants/intended semantics
 //! govern over its verbatim sample code; deviations are documented here.)
 //!
-//! - **`cmd_tx`'s type.** The brief's "Produces" interface line types
-//!   `spawn_service`'s `cmd_tx` parameter as `crossbeam_channel::Sender<DbCommand>`,
-//!   but its own Step-3 prose says to "wire the command channel into the
-//!   compositor's calloop loop via `calloop::channel` ... follow
-//!   `anvil/src/input_handler.rs`'s use of `insert_channel`". Those two
-//!   statements conflict: a bare `crossbeam_channel::Receiver` is not itself
-//!   a calloop event source (unlike `calloop::channel::Channel`, whose whole
-//!   reason to exist -- see `main.rs`'s wallpaper-decode-channel doc comment
-//!   -- is pairing an mpsc-style channel with an eventfd-backed wakeup so
-//!   calloop can dispatch it without polling). Getting a `DbCommand` onto the
-//!   main loop *at all* -- the actual invariant this task cares about --
-//!   therefore requires `calloop::channel::Sender` here, so that's what
-//!   `cmd_tx` is typed as. `DbCommand::GetState`'s reply leg stays a plain
-//!   `crossbeam_channel::Sender<Snapshot>` (matching the brief exactly)
-//!   since it's a one-shot round trip that never needs to wake the calloop
-//!   loop itself -- the loop, having *just* handled the `GetState` message
-//!   that triggers the reply, is already awake.
-//! - **`WmInterface::cmd_tx` is `Mutex`-wrapped.** zbus requires interface
-//!   types to be `Send + Sync` (its `#[interface]` methods take `&self` and
-//!   are dispatched from a shared, possibly-concurrent registration).
-//!   `calloop::channel::Sender` wraps `std::sync::mpsc::Sender`, which is
-//!   `Send` but explicitly *not* `Sync`. Wrapping it in a `std::sync::Mutex`
-//!   (itself `Sync` whenever its contents are `Send`, which `Sender` is)
-//!   is the ordinary, fully-safe fix -- no unsafe code, and it doesn't
-//!   change this task's approved unsafe-block count.
 //! - **Bus name ownership.** The brief's Step-3 sample connects to the
 //!   session bus and registers the interface object but never calls
 //!   `request_name`, so nothing would actually own `org.icedtea.WM` --
@@ -81,18 +62,18 @@
 //!   setting the flag; the join is bounded by the `recv_timeout` tick
 //!   (200ms) it's waiting on, not by traffic on `events_rx`.
 
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use icedtea_contract::{Event, SeqEvent, Snapshot, WindowId, WM_BUS_NAME, WM_PATH};
-use smithay::reexports::calloop;
 use zbus::blocking::Connection;
 use zbus::interface;
 
 /// Commands sent from the D-Bus interface thread to the compositor's main
-/// (calloop) loop. Applied to `State` by `State::handle_command`.
+/// loop. Applied to `State` by `State::handle_command`.
 #[derive(Debug, Clone)]
 pub enum DbCommand {
     Focus(WindowId),
@@ -122,15 +103,22 @@ pub fn event_signal_name(event: &Event) -> &'static str {
 }
 
 /// The registered `org.icedtea.WM` interface object. Every method just
-/// forwards a [`DbCommand`] onto the calloop loop; none of them mutate
-/// compositor state directly (see this module's doc for why).
+/// forwards a [`DbCommand`] onto the compositor's main loop; none of them
+/// mutate compositor state directly (see this module's doc for why).
 pub struct WmInterface {
-    cmd_tx: Mutex<calloop::channel::Sender<DbCommand>>,
+    cmd_tx: crossbeam_channel::Sender<DbCommand>,
+    /// Write half of the loop's D-Bus command wake pipe
+    /// (`backend::wake_source`). `send` nudges it after every command so a
+    /// compositor blocked in `dispatch(-1)` (idle: no damage, no input)
+    /// wakes to drain `cmd_tx`'s receiver instead of waiting for whatever
+    /// unrelated event happens along next.
+    wake: UnixStream,
 }
 
 impl WmInterface {
     fn send(&self, cmd: DbCommand) {
-        let _ = self.cmd_tx.lock().unwrap_or_else(|e| e.into_inner()).send(cmd);
+        let _ = self.cmd_tx.send(cmd);
+        crate::backend::wake(&self.wake);
     }
 }
 
@@ -159,7 +147,7 @@ impl WmInterface {
     }
     fn get_state(&self) -> Snapshot {
         // Synchronous round-trip: ask the compositor for a snapshot. The
-        // calloop loop answers this the moment it drains the `GetState`
+        // main loop answers this the moment it drains the `GetState`
         // command (see `State::handle_command`), so this blocks the
         // zbus dispatch for this connection only as long as one loop
         // iteration takes -- by design, per the brief.
@@ -184,13 +172,18 @@ impl WmInterface {
 /// actually observe `quit_signal` on shutdown (see this module's doc for
 /// why a bare `Connection` return, as the brief's "Produces" line has it,
 /// isn't enough for that).
+///
+/// `cmd_wake` is the write half of a `backend::wake_source` registered by
+/// the caller against the same `Runtime` the loop runs on -- see
+/// `WmInterface::send`'s doc for why a command needs one at all.
 pub fn spawn_service(
     events_rx: Receiver<SeqEvent>,
-    cmd_tx: calloop::channel::Sender<DbCommand>,
+    cmd_tx: crossbeam_channel::Sender<DbCommand>,
     quit_signal: Arc<AtomicBool>,
+    cmd_wake: UnixStream,
 ) -> (Connection, std::thread::JoinHandle<()>) {
     let conn = Connection::session().expect("session bus available");
-    let iface = WmInterface { cmd_tx: Mutex::new(cmd_tx) };
+    let iface = WmInterface { cmd_tx, wake: cmd_wake };
     conn.object_server().at(WM_PATH, iface).expect("register org.icedtea.WM interface");
     conn.request_name(WM_BUS_NAME).unwrap_or_else(|err| {
         panic!(
