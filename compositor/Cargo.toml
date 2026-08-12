@@ -51,3 +51,13 @@ tempfile = "3"
 wlr = "0.20.5"
 crossbeam-channel.workspace = true
 signal-hook = "0.3"
+
+# The client half of `tests/support`: a real wayland client that speaks
+# xdg-shell to the compositor under test over a real socket. Dev-only --
+# nothing in `src/` is a wayland *client*.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+# `memfd_create`/`ftruncate` for the shm buffer the test client attaches.
+# `rustix` is already a normal dependency (features = ["std"]); these extra
+# features are additive and only reach the test binaries.
+rustix = { version = "1", features = ["fs", "mm", "shm"] }
