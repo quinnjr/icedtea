@@ -494,8 +494,14 @@ impl State {
         // `geo` precisely so they can never disagree about where the band
         // ends and the client's content begins.
         let bar_color = crate::render::hex_to_rgba(&self.config.appearance.palette.background);
-        self.wayland
-            .sync_ssd_rect(id, ssd, visible, crate::decoration::title_bar_rect(geo), bar_color);
+        self.wayland.sync_ssd_rect(
+            id,
+            ssd,
+            visible,
+            crate::decoration::title_bar_rect(geo),
+            content,
+            bar_color,
+        );
 
         self.wayland.set_visible(id, visible);
         if visible {
@@ -2921,5 +2927,44 @@ mod tests {
         let w = state.window_manager.get(ssd).unwrap();
         assert!(!has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen));
         assert_eq!(content_rect(w.geometry, false), w.geometry);
+    }
+
+    /// Direct `SeatHandler::key` coverage, previously impossible (the M1
+    /// gap): `wlr::KeyEvent::for_test` builds a synthetic press with no live
+    /// keyboard behind it.
+    ///
+    /// `wlr::Modifiers` has no public constructor with flags set (only the
+    /// `logo()`/`ctrl()`/`alt()`/`shift()` accessors), so this can't drive
+    /// the default `quit` binding (super+shift+q) directly -- the fallback
+    /// the task 3 brief calls for is a modifier-free binding inserted into
+    /// the config before `State::new`, exercised with `Modifiers::default()`.
+    /// `apply_action` dispatches on the keybindings map's own key as the
+    /// action name (see its `match base` arms), so the override keeps the
+    /// name `"quit"` and only replaces the combo -- a differently-named
+    /// entry would never reach the `"quit"` arm at all.
+    #[test]
+    fn seat_key_matches_a_binding_and_consumes_the_event() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut config = default_config();
+        config.keybindings.insert(
+            "quit".into(),
+            icedtea_config::KeyCombo { modifiers: vec![], key: "KEY_F12".into() },
+        );
+        let mut state = State::new(config, tx);
+        let keysym = crate::input::key_name_to_keysym("KEY_F12");
+        let ev = wlr::KeyEvent::for_test(keysym, wlr::Modifiers::default(), true, 1);
+
+        let consumed = wlr::SeatHandler::key(&mut state, &ev);
+
+        assert!(consumed, "a bound combo must be consumed, not forwarded");
+        assert!(state.quitting, "the quit action must have run");
+    }
+
+    #[test]
+    fn seat_key_without_a_binding_is_forwarded() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let ev = wlr::KeyEvent::for_test(0x61 /* 'a' */, wlr::Modifiers::default(), true, 1);
+        assert!(!wlr::SeatHandler::key(&mut state, &ev));
     }
 }

@@ -364,15 +364,29 @@ fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
     );
 }
 
-/// Review finding I2: the SSD title-bar band is painted as a scene rect
-/// (interim, per the spec's own words -- see `Wayland::sync_ssd_rect`'s
-/// doc), tracked one-per-window at the seam the same way toplevel bindings
-/// are. This needs a real `Runtime` with `init_graphics` already run --
-/// `add_rect` errors otherwise -- which is why this lives here rather than
-/// in `wayland.rs`'s own unit tests (which only ever construct a bare,
-/// ungraphics'd `Runtime` or no runtime at all).
+/// Review finding I2: the SSD title-bar band is painted as a scene rect,
+/// tracked one-per-window at the seam the same way toplevel bindings are.
+///
+/// wlr 0.20.5's `Runtime::add_rect_in_toplevel` parents the band into the
+/// *toplevel's own* scene tree (closing the z-order defect structurally --
+/// see `Wayland::sync_ssd_rect`'s doc), which means it needs a live
+/// `ToplevelId` wlroots itself issued, not one of `ToplevelKey::for_test`'s
+/// dangling ids: `dangling_nth_for_test`'s own contract is that *no* live
+/// toplevel, real or fake, can ever have that id, so `add_rect_in_toplevel`
+/// always misses on one by design. This test harness drives handler entry
+/// points directly with no real Wayland client behind them (see every other
+/// test in this file), so it cannot produce a genuine toplevel scene tree to
+/// parent a rect into -- exercising `add_rect_in_toplevel` actually
+/// succeeding needs a real client and is out of reach here. What *is*
+/// reachable, and worth pinning, is that the seam stays a silent no-op
+/// (never panics, never leaves a stale map entry) when asked to paint a band
+/// for a window whose toplevel id doesn't resolve, exactly as every other
+/// by-id `Wayland` method already behaves. The pure position math
+/// `sync_ssd_rect` must feed `add_rect_in_toplevel`/`set_rect_position` is
+/// covered directly in `wayland.rs`'s own unit tests
+/// (`ssd_rect_relative_offset_is_zero_minus_titlebar`).
 #[test]
-fn an_ssd_window_gets_exactly_one_title_bar_rect_and_a_csd_window_gets_none() {
+fn an_ssd_window_with_no_live_toplevel_never_gets_a_rect() {
     use icedtea_compositor::wayland::ToplevelKey;
 
     ensure_headless_env();
@@ -391,35 +405,27 @@ fn an_ssd_window_gets_exactly_one_title_bar_rect_and_a_csd_window_gets_none() {
 
     // Default app id ("term") has no CSD request and doesn't match the
     // `org.gtk*` CSD heuristic, so `decoration::has_ssd` says yes -- exactly
-    // the common case a real terminal or editor hits.
+    // the common case a real terminal or editor hits. Its `ToplevelKey` is
+    // still one of `for_test`'s dangling ids, though, so the rect creation
+    // this would trigger against a real client instead misses cleanly.
     let ssd_key = ToplevelKey::for_test(1);
     state.new_toplevel(ssd_key, "term", "Terminal", 1);
     assert_eq!(
         state.wayland.ssd_rect_count(),
-        1,
-        "mapping an SSD window must create exactly one title-bar rect"
+        0,
+        "a dangling toplevel id can never resolve inside add_rect_in_toplevel"
     );
 
     // `org.gtk`-prefixed app ids are CSD by the same heuristic -- no strip,
-    // no rect.
+    // no rect, independent of whether the toplevel id resolves at all.
     let csd_key = ToplevelKey::for_test(2);
     state.new_toplevel(csd_key, "org.gtk.MyApp", "GTK App", 2);
-    assert_eq!(
-        state.wayland.ssd_rect_count(),
-        1,
-        "a CSD window draws its own decorations and must not get a rect"
-    );
+    assert_eq!(state.wayland.ssd_rect_count(), 0, "a CSD window must not get a rect");
 
-    // Forgetting the SSD window drops its rect bookkeeping; the CSD window
-    // never had any to begin with.
+    // Forgetting either window is still harmless with no rect ever recorded.
     state.forget_toplevel(ssd_key);
-    assert_eq!(
-        state.wayland.ssd_rect_count(),
-        0,
-        "forgetting a window must drop its rect bookkeeping too, not leak it"
-    );
-
     state.forget_toplevel(csd_key);
+    assert_eq!(state.wayland.ssd_rect_count(), 0);
 }
 
 /// The seam turns a library id into a model window and back, and every

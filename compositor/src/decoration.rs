@@ -1,6 +1,6 @@
 use icedtea_contract::Rectangle;
 
-pub const TITLE_BAR_HEIGHT: i32 = 28;
+pub(crate) const TITLE_BAR_HEIGHT: i32 = 28;
 pub const BUTTON_WIDTH: i32 = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -64,8 +64,12 @@ pub struct Wayland {
     /// (no entry) means gone -- no rect exists for that window right now --
     /// the same discipline `toplevel_to_window`/`window_to_toplevel` already
     /// follow. Created lazily by `sync_ssd_rect` the first time a window
-    /// needs a band, and dropped from this map by `remove_ssd_rect` (called
-    /// from `forget`) once the window is gone for good.
+    /// needs a band, parented into that window's own toplevel scene tree
+    /// (`Runtime::add_rect_in_toplevel`) so it rides the toplevel's z-order
+    /// with no separate raise bookkeeping. Dropped from this map both when
+    /// the band becomes hidden (`sync_ssd_rect`, which removes rather than
+    /// merely hides it now) and when the window is gone for good
+    /// (`remove_ssd_rect`, called from `forget`).
     ssd_rects: HashMap<WindowId, wlr::RectId>,
     /// The compositor library's long-lived handle, once boot has created one.
     ///
@@ -262,71 +266,79 @@ impl Wayland {
 
     /// Paint (or update, or hide) window `id`'s SSD title-bar band.
     ///
-    /// Interim fix for review finding I2: `draw_frame` -- and every custom
-    /// render element it built, `Decoration` included -- died with smithay,
-    /// so the 28px band `decoration::content_rect` reserves above every SSD
-    /// window's content has been invisible since the port. The spec's own
-    /// words for the interim state are "SSD strips reuse [rect nodes] at
-    /// parity", so this reuses exactly the rect machinery `run()` already
-    /// uses for the wallpaper background: one more solid-color
-    /// `Runtime::add_rect`, sized and positioned like any other scene node.
-    /// No buttons, no title text -- those need real render elements
-    /// (glyphs, hit-tested sub-rects) that are M2 work, not a rect.
+    /// Fix for review finding I2: `draw_frame` -- and every custom render
+    /// element it built, `Decoration` included -- died with smithay, so the
+    /// 28px band `decoration::content_rect` reserves above every SSD
+    /// window's content has to be painted some other way. This uses
+    /// `Runtime::add_rect_in_toplevel` to parent the band rect into the
+    /// window's own toplevel scene tree, so it rides the toplevel: raising,
+    /// lowering or restacking the window moves the band with it with no
+    /// separate bookkeeping, closing the z-order defect structurally rather
+    /// than by re-raising the rect on every restack. No buttons, no title
+    /// text -- those need real render elements (glyphs, hit-tested
+    /// sub-rects) that are M2 work, not a rect.
     ///
     /// `bar` is frame-space, matching `decoration::title_bar_rect`'s own
-    /// contract; the caller (`State::sync_window_to_scene`) already computes
-    /// it from the same `w.geometry` the content rect is derived from, so
-    /// the two can never drift apart from each other. Hides (rather than
-    /// destroys) the rect when `ssd` is `false` or the window isn't
-    /// currently visible -- see the field doc on `ssd_rects` and this
-    /// method's own note below for why "hide" is `set_rect_size` to zero
-    /// rather than an actual removal.
-    pub fn sync_ssd_rect(&mut self, id: WindowId, ssd: bool, visible: bool, bar: Rectangle, color: [f32; 4]) {
+    /// contract; `content` is `decoration::content_rect`'s output for the
+    /// same frame. Both come from the same `w.geometry` in the caller
+    /// (`State::sync_window_to_scene`), so they can never drift apart from
+    /// each other. `bar.x - content.x, bar.y - content.y` is the band's
+    /// position relative to the toplevel tree's own origin --
+    /// `add_rect_in_toplevel`'s coordinates are relative to that origin, not
+    /// the scene root's, the same origin `set_position` moves via
+    /// `set_toplevel_position`.
+    ///
+    /// Removes (rather than merely hides) the rect when `ssd` is `false` or
+    /// the window isn't currently visible: a hidden band is cheaper to
+    /// recreate than to keep, and unlike the old root-rect scheme there is
+    /// no stacking-order reason to keep it around invisible.
+    pub fn sync_ssd_rect(
+        &mut self,
+        id: WindowId,
+        ssd: bool,
+        visible: bool,
+        bar: Rectangle,
+        content: Rectangle,
+        color: [f32; 4],
+    ) {
         let Some(runtime) = self.runtime.clone() else { return };
         if !ssd || !visible {
-            if let Some(rect) = self.ssd_rects.get(&id) {
-                // No removal-by-id exists in this wlr crate version
-                // (0.20.4; see `RectId`'s own doc in the `wlr` crate) --
-                // shrinking to zero is the documented-in-comment workaround
-                // this task calls for. The entry stays in `ssd_rects` (the
-                // rect itself still exists, just invisible) so a window that
-                // becomes SSD/visible again reuses it instead of leaking a
-                // second one; `remove_ssd_rect` is the one path that drops
-                // the entry, once `id` itself is gone for good.
-                runtime.set_rect_size(*rect, 0, 0);
+            if let Some(rect) = self.ssd_rects.remove(&id) {
+                runtime.remove_rect(rect);
             }
             return;
         }
         let width = bar.width.max(1);
         let height = bar.height.max(1);
+        let (rel_x, rel_y) = (bar.x - content.x, bar.y - content.y);
         let rect = match self.ssd_rects.get(&id) {
             Some(rect) => *rect,
             None => {
-                let Ok(rect) = runtime.add_rect(width, height, color) else { return };
+                let Some(key) = self.toplevel_for(id) else { return };
+                let Some(rect) = runtime.add_rect_in_toplevel(key.0, width, height, color) else {
+                    return;
+                };
                 self.ssd_rects.insert(id, rect);
                 rect
             }
         };
         runtime.set_rect_size(rect, width, height);
-        runtime.set_rect_position(rect, bar.x, bar.y);
+        runtime.set_rect_position(rect, rel_x, rel_y);
         runtime.set_rect_color(rect, color);
     }
 
     /// Drop `id`'s SSD rect for good. Called from `forget` so a window's
     /// rect never outlives the window itself.
     ///
-    /// Same "no removal by id" limitation as `sync_ssd_rect`'s hide path:
-    /// this shrinks the rect to zero (best-effort cleanup of the scene
-    /// node's footprint) and then drops it from `ssd_rects`, so the id is
-    /// free to be reused by an unrelated future window without colliding
-    /// with a rect this window owned. The underlying `wlr_scene_rect` itself
-    /// is not freed -- it lives, invisible, for the rest of the `Runtime`'s
-    /// life, exactly as `RectId`'s doc says a rect does in this crate
-    /// version.
+    /// Tolerates `remove_rect` reporting `None`: the rect may already be
+    /// gone because its parent toplevel died first (a toplevel's tree, and
+    /// every rect parented into it, is freed when the toplevel is torn
+    /// down), which is a normal race between the two teardown paths, not an
+    /// error.
     fn remove_ssd_rect(&mut self, id: WindowId) {
         let Some(rect) = self.ssd_rects.remove(&id) else { return };
         if let Some(runtime) = self.runtime() {
-            runtime.set_rect_size(rect, 0, 0);
+            runtime.remove_rect(rect);
         }
     }
 
@@ -394,5 +406,47 @@ mod tests {
         w.set_position(WindowId(1), 10, 10);
         w.set_visible(WindowId(1), true);
         assert!(!w.close(WindowId(1)));
+    }
+
+    /// The pure coordinate math `sync_ssd_rect` must feed
+    /// `add_rect_in_toplevel`/`set_rect_position`: the band sits flush with
+    /// the toplevel tree's origin horizontally and `TITLE_BAR_HEIGHT` pixels
+    /// above it vertically, since `content_rect` moves the content down by
+    /// exactly that much.
+    #[test]
+    fn ssd_rect_relative_offset_is_zero_minus_titlebar() {
+        // With no runtime attached the seam is a no-op, so this asserts the
+        // pure coordinate math via the helper the impl must use.
+        let frame = Rectangle { x: 100, y: 200, width: 400, height: 300 };
+        let bar = crate::decoration::title_bar_rect(frame);
+        let content = crate::decoration::content_rect(frame, true);
+        assert_eq!(
+            (bar.x - content.x, bar.y - content.y),
+            (0, -crate::decoration::TITLE_BAR_HEIGHT)
+        );
+    }
+
+    /// No runtime attached (every unit test that never calls `attach`) means
+    /// `sync_ssd_rect`/`remove_ssd_rect` are no-ops, matching every other
+    /// outbound method's contract -- and in particular never populate
+    /// `ssd_rects`, since there is no `RectId` a real call could have
+    /// returned.
+    #[test]
+    fn syncing_ssd_rect_with_no_runtime_is_harmless() {
+        let mut w = Wayland::new();
+        let id = WindowId(3);
+        let frame = Rectangle { x: 100, y: 200, width: 400, height: 300 };
+        let bar = crate::decoration::title_bar_rect(frame);
+        let content = crate::decoration::content_rect(frame, true);
+        let color = [1.0, 1.0, 1.0, 1.0];
+
+        w.sync_ssd_rect(id, true, true, bar, content, color);
+        assert_eq!(w.ssd_rect_count(), 0);
+
+        w.sync_ssd_rect(id, false, true, bar, content, color);
+        assert_eq!(w.ssd_rect_count(), 0);
+
+        w.forget(id);
+        assert_eq!(w.ssd_rect_count(), 0);
     }
 }
