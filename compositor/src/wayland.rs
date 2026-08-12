@@ -11,8 +11,11 @@
 //! attached (`attach`): each one resolves `id`/`toplevel` through the
 //! bind/forget maps below and, on a miss (no runtime, no binding, or a
 //! `ToplevelId` gone stale since the `run_all` that announced it returned),
-//! is a silent no-op rather than a panic. `keyboard_focus` is the one
-//! exception, still a guarded no-op until the seat exists — see its doc.
+//! is a silent no-op rather than a panic. `keyboard_focus` follows the same
+//! rule, plus one of its own: `focus_toplevel_keyboard` refuses an unmapped
+//! toplevel, and that refusal is treated as "clear focus instead" rather
+//! than left to point at whatever the seat's focus happened to be — see its
+//! doc.
 
 use std::collections::HashMap;
 
@@ -163,12 +166,33 @@ impl Wayland {
 
     /// Point the seat's keyboard at `id`, or at nothing.
     ///
-    /// A no-op until the seat exists; `sync_seat_focus` calls it
-    /// unconditionally either way, so the model half of focus is already
-    /// correct and only the delivery is pending.
+    /// Both directions matter: `None` really clears the focus rather than
+    /// leaving it where it was. The seat kept pointing at a departed surface
+    /// in the smithay implementation until that was fixed (re-review New-3),
+    /// and the fix belongs here now.
+    ///
+    /// Idempotent -- the library compares against the seat's current focus
+    /// and sends nothing when it already matches -- which is what lets
+    /// `sync_seat_focus` call this on every geometry sync.
+    ///
+    /// LEDGER (task 8): the unmapped handler leaves the model's
+    /// `is_visible`/`focused`/`is_backed` all `true` -- the model has no
+    /// unmapped concept of its own. `focus_toplevel_keyboard` refuses an
+    /// unmapped toplevel and returns `None` in that case; this treats that
+    /// refusal the same as "no binding" and falls back to clearing the
+    /// seat's keyboard focus rather than leaving it pointed at whatever it
+    /// last was (which could be a different, stale surface) or silently
+    /// doing nothing.
     pub fn keyboard_focus(&self, id: Option<WindowId>) {
-        let Some(_runtime) = self.runtime() else { return };
-        let _ = id;
+        let Some(runtime) = self.runtime() else { return };
+        match id.and_then(|id| self.toplevel_for(id)) {
+            Some(key) => {
+                if runtime.focus_toplevel_keyboard(key.0).is_none() {
+                    runtime.clear_keyboard_focus();
+                }
+            }
+            None => runtime.clear_keyboard_focus(),
+        }
     }
 
     /// Ask the client to close. `false` means there is no client, and the

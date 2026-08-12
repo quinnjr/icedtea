@@ -64,6 +64,9 @@ pub fn run() {
     runtime
         .create_xdg_shell(&display, 6)
         .expect("failed to advertise xdg_wm_base");
+    runtime
+        .create_seat(&display, "seat0")
+        .expect("failed to create the seat");
 
     let (dbus_tx, dbus_events_rx) = crossbeam_channel::unbounded::<SeqEvent>();
     let mut state = State::new(config, dbus_tx);

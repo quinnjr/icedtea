@@ -36,6 +36,34 @@ pub struct OutputSurface {
     pub geometry: icedtea_contract::Rectangle,
 }
 
+/// Translate the compositor library's modifier booleans into the model's
+/// bitflags.
+///
+/// A free function taking four `bool`s rather than a method on
+/// `wlr::Modifiers`, because that type belongs to another crate and this
+/// mapping is the compositor's own decision -- and because a pure function is
+/// the only part of the key path that can be unit-tested at all: a
+/// `wlr::KeyEvent` cannot be constructed outside a live seat.
+///
+/// `logo` is the Super / Windows key, which is what this project's `SUPER`
+/// binding token means (`config/src/defaults.rs`).
+pub fn to_model_modifiers(logo: bool, ctrl: bool, alt: bool, shift: bool) -> input::Modifiers {
+    let mut out = input::Modifiers::empty();
+    if logo {
+        out |= input::Modifiers::SUPER;
+    }
+    if ctrl {
+        out |= input::Modifiers::CTRL;
+    }
+    if alt {
+        out |= input::Modifiers::ALT;
+    }
+    if shift {
+        out |= input::Modifiers::SHIFT;
+    }
+    out
+}
+
 /// Input passed to `State::handle_pointer`, in output logical coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerEvent {
@@ -1545,7 +1573,69 @@ impl wlr::ToplevelHandler for State {
         self.forget_toplevel(crate::wayland::ToplevelKey::new(id));
     }
 }
-impl wlr::SeatHandler for State {}
+impl wlr::SeatHandler for State {
+    fn key(&mut self, event: &wlr::KeyEvent<'_>) -> bool {
+        let m = event.modifiers();
+        let mods = to_model_modifiers(m.logo(), m.ctrl(), m.alt(), m.shift());
+
+        // Alt-tab's chosen end condition: the session ends when the held
+        // modifier (SUPER, per the default `cycle:alt_tab` binding) is no
+        // longer down, whichever key this event is for -- which covers
+        // releasing the modifier before or after Tab.
+        if self.alt_tab.is_active() && !m.logo() {
+            self.end_alt_tab();
+            self.emit_pending();
+        }
+
+        // Releases are never consumed: a client that is sent a press but not
+        // its release believes the key is still held forever.
+        if !event.pressed() {
+            return false;
+        }
+
+        let consumed = self.handle_key(mods, event.keysym()).is_some();
+        // `handle_key` -> `apply_action` mutates the model, and every
+        // mutation owes exactly one event; flush here rather than at the
+        // next unrelated sync.
+        self.emit_pending();
+        consumed
+    }
+
+    fn pointer_motion(&mut self, x: f64, y: f64, _time_msec: u32) {
+        // The model works in integer output-logical coordinates; the library
+        // reports scene coordinates, which for the slice's single output at
+        // the layout origin are the same space. `as i32` truncates toward
+        // zero, which is what a pixel index wants.
+        let pointer = (x as i32, y as i32);
+        self.pointer_location = pointer;
+        self.handle_pointer(PointerEvent::Motion { pointer });
+        self.emit_pending();
+    }
+
+    fn pointer_button(&mut self, x: f64, y: f64, button: u32, pressed: bool, _time_msec: u32) {
+        // BTN_LEFT only: every decoration interaction this compositor has is
+        // a left-click one, and forwarding the rest to the client unchanged
+        // is the correct behaviour for them.
+        const BTN_LEFT: u32 = 0x110;
+        if button != BTN_LEFT {
+            return;
+        }
+        let pointer = (x as i32, y as i32);
+        self.pointer_location = pointer;
+
+        if pressed {
+            // The model answers "what is under the pointer", not the scene:
+            // the scene knows nothing about workspaces or minimization, and
+            // `window_at_point` is already MRU-ordered, which is a correct
+            // topmost-first order (review finding I1).
+            let Some(id) = self.window_at_point(pointer) else { return };
+            self.handle_pointer(PointerEvent::Press { id, pointer });
+        } else {
+            self.handle_pointer(PointerEvent::Release { pointer });
+        }
+        self.emit_pending();
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -52,6 +52,7 @@ fn a_headless_compositor_boots_runs_and_stops() {
     let runtime = wlr::Runtime::new().expect("runtime");
     runtime.init_graphics(&display, &backend).expect("graphics");
     runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
 
     // `state` is declared (and so, by ordinary end-of-scope drop order, is
     // dropped) after `display`/`backend`/`runtime`: `attach` below gives
@@ -278,5 +279,105 @@ fn closing_distinguishes_a_real_client_from_a_model_only_window() {
     assert!(
         state.window_manager.get(backed).is_some(),
         "a real client keeps its model row until it destroys its toplevel"
+    );
+}
+
+/// Modifier translation is the seam between the library's four booleans and
+/// the model's bitflags, and it is where a wrong mapping makes every binding
+/// that uses that modifier silently unreachable.
+#[test]
+fn modifier_translation_covers_every_flag_the_model_knows() {
+    use icedtea_compositor::state::to_model_modifiers;
+
+    // A table rather than four asserts: what matters is that each library
+    // flag lands on its own model flag and on no other.
+    for (logo, ctrl, alt, shift, expected) in [
+        (true, false, false, false, icedtea_compositor::input::Modifiers::SUPER),
+        (false, true, false, false, icedtea_compositor::input::Modifiers::CTRL),
+        (false, false, true, false, icedtea_compositor::input::Modifiers::ALT),
+        (false, false, false, true, icedtea_compositor::input::Modifiers::SHIFT),
+    ] {
+        assert_eq!(
+            to_model_modifiers(logo, ctrl, alt, shift),
+            expected,
+            "logo={logo} ctrl={ctrl} alt={alt} shift={shift}"
+        );
+    }
+
+    assert_eq!(
+        to_model_modifiers(true, false, false, true),
+        icedtea_compositor::input::Modifiers::SUPER | icedtea_compositor::input::Modifiers::SHIFT,
+        "combinations are the union, which is what SUPER+SHIFT+q needs"
+    );
+    assert!(to_model_modifiers(false, false, false, false).is_empty());
+}
+
+/// Click-to-focus: pressing an unfocused window focuses it, activates it,
+/// deactivates the one that lost focus, and moves the seat -- all four ends
+/// of the transition the baseline established.
+#[test]
+fn a_press_on_an_unfocused_window_moves_focus_at_both_ends() {
+    use icedtea_compositor::state::PointerEvent;
+    use icedtea_compositor::wayland::ToplevelKey;
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+    let runtime = wlr::Runtime::new().expect("runtime");
+    state.wayland.attach(runtime);
+
+    let first = ToplevelKey::for_test(1);
+    state.new_toplevel(first, "a", "A", 1);
+    let a = state.wayland.window_for(first).expect("a");
+    let second = ToplevelKey::for_test(2);
+    state.new_toplevel(second, "b", "B", 2);
+    let b = state.wayland.window_for(second).expect("b");
+
+    assert!(state.window_manager.get(b).is_some_and(|w| w.focused), "newest is focused");
+
+    // Press inside A's frame, but outside B's: B cascades 24px off A
+    // (`layout::cascade_point_in`, step 24) in both axes, on top of A in
+    // MRU order, so A's *geometric* center (the brief's original point) is
+    // actually covered by B and would hit the wrong window. A's top-left
+    // corner plus a few pixels is inside A's frame and strictly left of/above
+    // B's origin (`geo_a.x + 24`, `geo_a.y + 24`), so it can only ever hit A.
+    // `window_at_point` is the model's own answer to "what is under the
+    // pointer", which is what click-to-focus must use: the scene knows
+    // nothing about workspaces or minimization.
+    let geo_a = state.window_manager.get(a).expect("a").geometry;
+    let point = (geo_a.x + 5, geo_a.y + 5);
+    assert_eq!(state.window_at_point(point), Some(a));
+
+    state.handle_pointer(PointerEvent::Press { id: a, pointer: point });
+
+    assert!(state.window_manager.get(a).is_some_and(|w| w.focused), "A gained focus");
+    assert!(
+        state.window_manager.get(b).is_some_and(|w| !w.focused),
+        "B lost it -- both ends, not just the winner"
+    );
+}
+
+/// A bound key is consumed and does not reach the client; an unbound one is
+/// forwarded. This is the whole of what `SeatHandler::key`'s return value
+/// decides, and getting the polarity backwards would either break every
+/// binding or send every keystroke twice.
+#[test]
+fn a_bound_key_is_consumed_and_an_unbound_one_is_forwarded() {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+
+    // `SUPER+SHIFT+q` is the default `quit` binding, and 0x71 is the
+    // *unshifted* keysym for q -- which is exactly why the library reports
+    // the unshifted symbol.
+    let mods = icedtea_compositor::input::Modifiers::SUPER | icedtea_compositor::input::Modifiers::SHIFT;
+    assert_eq!(state.handle_key(mods, 0x71), Some(()), "the default quit binding matched");
+    assert!(state.quitting, "and it fired");
+
+    let (tx2, _rx2) = crossbeam_channel::unbounded();
+    let mut state2 = State::new(icedtea_config::default_config(), tx2);
+    assert_eq!(
+        state2.handle_key(icedtea_compositor::input::Modifiers::empty(), 0x61),
+        None,
+        "a plain 'a' is nobody's binding and must be forwarded"
     );
 }
