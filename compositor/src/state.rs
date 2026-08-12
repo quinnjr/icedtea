@@ -295,22 +295,32 @@ pub struct State {
     /// crate's `State`s -- every unit test -- never rasterize anything at
     /// all, and must not pay for a font scan to construct a model.
     fonts: std::cell::OnceCell<(cosmic_text::FontSystem, cosmic_text::SwashCache)>,
-    /// Per-window memo of the last title raster: the inputs it was made from
-    /// and the pixels that came out.
+    /// Per-window memo of the last title raster: the inputs it was made
+    /// from, the pixels that came out, and the generation that names them.
     ///
     /// `sync_window_to_scene` runs on every geometry mutation -- once per
     /// pointer motion during a drag -- while a title's *pixels* only change
-    /// when the text, the width available for it, or the focused-ness that
-    /// picks its color changes. Shaping a string is far more expensive than
-    /// copying the pixels it produced, so a hit here re-hands the cached
-    /// buffer to the seam (`sync_ssd` needs owned pixels, and holding them
-    /// here is what lets a miss be the only path that shapes).
+    /// when the text, the width available for it, or the resolved text color
+    /// changes. This memo is what keeps an unchanged title from being
+    /// re-shaped on every one of those syncs; the `generation` is what keeps
+    /// it from being re-*uploaded* (review finding M2), which is the more
+    /// expensive half: the seam remembers which generation each title node
+    /// currently holds and skips `update_buffer` -- and the scene damage
+    /// that comes with it -- when it already matches. The pixels are
+    /// borrowed across the seam rather than cloned, so a cache hit costs a
+    /// map lookup and nothing else.
     ///
     /// `None` on the pixel side is a *cached negative*: this title
     /// rasterized to nothing (empty, or unshapeable on this machine) and
-    /// must not be retried on every sync. Dropped in `forget_window`, so a
-    /// window's raster never outlives it.
-    title_rasters: HashMap<WindowId, (TitleRasterKey, Option<TitleRaster>)>,
+    /// must not be retried on every sync. Dropped in `forget_window` and in
+    /// the two teardown paths that bypass it (`apply_config`, and
+    /// `sync_window_to_scene`'s vanished-row arm), so a window's raster
+    /// never outlives it.
+    title_rasters: HashMap<WindowId, TitleRasterEntry>,
+    /// Source of `TitleRasterEntry::generation`. Monotonic and never reused,
+    /// so "the seam holds generation N" can only ever mean one exact set of
+    /// pixels -- across windows as well as within one.
+    next_title_generation: u64,
     /// Decoration preferences stated by clients that have no model window
     /// yet, in `Window::client_decorations_requested`'s own three-valued
     /// spelling.
@@ -328,14 +338,31 @@ pub struct State {
 }
 
 /// What a cached title raster depends on: the title text, the pixel width
-/// available for it, and whether the window is focused (which picks the
-/// text color). Anything else changing -- position, height, workspace --
-/// cannot change the pixels.
-type TitleRasterKey = (String, i32, bool);
+/// available for it, and the *resolved* foreground color. Anything else
+/// changing -- position, height, workspace -- cannot change the pixels.
+///
+/// The color rather than a `focused` flag (review finding M3): focus is
+/// only one of the two things that pick the text color, the palette being
+/// the other. Keying on the resolved bytes covers both, and covers them
+/// exactly -- a reload that changed some unrelated part of the config
+/// re-uses the raster, while one that changed `palette.foreground`
+/// invalidates it even if the reload someday stops destroying every window.
+type TitleRasterKey = (String, i32, [u8; 4]);
 
-/// A rasterized title: `(width, height, premultiplied RGBA)`, exactly what
-/// `Wayland::sync_ssd` hands to the buffer node.
-type TitleRaster = (i32, i32, Vec<u8>);
+/// A rasterized title's pixels: `(width, height, premultiplied RGBA)`.
+type TitlePixels = (i32, i32, Vec<u8>);
+
+/// One window's memoized title raster.
+struct TitleRasterEntry {
+    /// The inputs these pixels were shaped from; a miss against this is the
+    /// only thing that shapes.
+    key: TitleRasterKey,
+    /// Names this exact set of pixels for the seam's upload check. Bumped
+    /// only when the pixels are re-shaped.
+    generation: u64,
+    /// `None` is a cached negative -- nothing shaped, show the bare band.
+    pixels: Option<TitlePixels>,
+}
 
 /// Left inset of the title text inside the band, in pixels.
 const TITLE_PAD_X: i32 = 8;
@@ -394,6 +421,7 @@ impl State {
             wallpaper_nodes: HashMap::new(),
             fonts: std::cell::OnceCell::new(),
             title_rasters: HashMap::new(),
+            next_title_generation: 0,
             pending_decorations: HashMap::new(),
         }
     }
@@ -650,6 +678,10 @@ impl State {
             // rather than showing a window nothing tracks.
             self.wayland.set_visible(id, false);
             self.wayland.forget(id);
+            // The other teardown path that bypasses `forget_window`
+            // (review finding M1): the row vanished without going through
+            // it, so the raster it left behind has to be collected here.
+            self.title_rasters.remove(&id);
             return;
         };
         let (geo, fullscreen, maximized, focused) = (w.geometry, w.fullscreen, w.maximized, w.focused);
@@ -670,13 +702,28 @@ impl State {
         // Only rasterize for a window that will actually show a band: a CSD
         // or fullscreen window's title is never drawn, and shaping it would
         // be pure waste on the most common client kind there is.
-        let title_px = if ssd && visible {
+        let decorated = ssd && visible;
+        if decorated {
             let title = w.title.clone();
-            self.rasterized_title_for(id, title, bar, focused)
-        } else {
-            None
-        };
-        self.wayland.sync_ssd(
+            self.ensure_title_raster(id, title, bar, focused);
+        }
+        // Field-wise borrow so the seam can read the memo's pixels in place:
+        // the alternative is cloning ~40 KB into an owned `Vec` on every
+        // sync -- i.e. on every pointer motion of a drag -- to hand across a
+        // call that, on a cache hit, will not even look at them (M2).
+        let Self { wayland, title_rasters, .. } = self;
+        let title_px = decorated
+            .then(|| title_rasters.get(&id))
+            .flatten()
+            .and_then(|entry| {
+                entry.pixels.as_ref().map(|(width, height, pixels)| crate::wayland::TitleRaster {
+                    width: *width,
+                    height: *height,
+                    generation: entry.generation,
+                    pixels,
+                })
+            });
+        wayland.sync_ssd(
             id,
             ssd,
             visible,
@@ -738,32 +785,22 @@ impl State {
         [chip, chip, accent]
     }
 
-    /// The title pixels for window `id`'s band, or `None` if there are none
-    /// to draw (an empty title, or a string no font on this machine can
-    /// shape -- `sync_ssd` then shows the plain band).
+    /// Make sure window `id`'s memoized title raster matches `title`, the
+    /// band `bar` and the focus state -- shaping only when one of those
+    /// actually changed.
     ///
-    /// Memoized on `(title, width, focused)` through `title_rasters`: see
-    /// that field's doc for why a drag must not re-shape the same string
-    /// sixty times a second, and why a negative result is cached too.
+    /// Memoized through `title_rasters`: see that field's doc for why a drag
+    /// must not re-shape (or re-upload) the same string sixty times a
+    /// second, and why a negative result is cached too. The caller reads the
+    /// pixels back out of the map rather than taking them from here, which
+    /// is what keeps a cache hit free of any copy at all.
     ///
     /// The title node spans the band minus the three buttons, so a long
     /// title runs out of room before it runs under the close button rather
     /// than being drawn beneath it.
-    fn rasterized_title_for(
-        &mut self,
-        id: WindowId,
-        title: String,
-        bar: Rectangle,
-        focused: bool,
-    ) -> Option<TitleRaster> {
+    fn ensure_title_raster(&mut self, id: WindowId, title: String, bar: Rectangle, focused: bool) {
         let width = (bar.width - 3 * crate::decoration::BUTTON_WIDTH).max(1);
         let height = bar.height.max(1);
-        let key: TitleRasterKey = (title, width, focused);
-        if let Some((cached_key, px)) = self.title_rasters.get(&id)
-            && *cached_key == key
-        {
-            return px.clone();
-        }
 
         // Unfocused windows get the same text at 60% strength rather than a
         // second palette color: the config has one foreground, and dimming
@@ -777,21 +814,31 @@ impl State {
         // upstream source says as much, in a `TODO: blend base alpha?`).
         // Asking for translucent text by lowering the alpha byte would
         // therefore change nothing at all on screen.
-        let fg = crate::render::hex_to_rgba(&self.config.appearance.palette.foreground);
+        let palette = crate::render::hex_to_rgba(&self.config.appearance.palette.foreground);
         let dim = if focused { 1.0 } else { 0.6 };
         let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * dim * 255.0).round() as u8;
-        let fg = [to_u8(fg[0]), to_u8(fg[1]), to_u8(fg[2]), 255];
+        let fg = [to_u8(palette[0]), to_u8(palette[1]), to_u8(palette[2]), 255];
+
+        let key: TitleRasterKey = (title, width, fg);
+        if self.title_rasters.get(&id).is_some_and(|entry| entry.key == key) {
+            return;
+        }
 
         self.fonts
             .get_or_init(|| (cosmic_text::FontSystem::new(), cosmic_text::SwashCache::new()));
-        // `get_mut` cannot miss after `get_or_init`; the `?` is the
+        // `get_mut` cannot miss after `get_or_init`; the `else` is the
         // panic-free spelling of that, not a case with any behavior of its
         // own.
-        let (fonts, swash) = self.fonts.get_mut()?;
-        let px = crate::text::rasterize_title(fonts, swash, &key.0, width, height, TITLE_PAD_X, fg)
-            .map(|px| (width, height, px));
-        self.title_rasters.insert(id, (key, px.clone()));
-        px
+        let Some((fonts, swash)) = self.fonts.get_mut() else { return };
+        let pixels = crate::text::rasterize_title(fonts, swash, &key.0, width, height, TITLE_PAD_X, fg)
+            .map(|pixels| (width, height, pixels));
+        // A fresh generation for fresh pixels: this is what tells the seam
+        // its title node is out of date (M2). Bumped on a negative result
+        // too -- "the title now shapes to nothing" is a change the seam has
+        // to act on, by dropping the node.
+        let generation = self.next_title_generation;
+        self.next_title_generation += 1;
+        self.title_rasters.insert(id, TitleRasterEntry { key, generation, pixels });
     }
 
     /// The active workspace's focused window id, if any. Callers capture this
@@ -1522,6 +1569,13 @@ impl State {
         self.fullscreen_saved_geometry.clear();
         self.snap_saved_geometry.clear();
         self.maximized_saved_geometry.clear();
+        // Review finding M1: this teardown goes through `wayland.forget`
+        // directly rather than `forget_window`, which is where the per-window
+        // raster purge lives -- so without this line every window's title
+        // pixels (~40 KB for a 400px window) became permanently unreachable
+        // garbage on every reload, since `raise_id_floor` below guarantees
+        // the ids can never come back to collect them.
+        self.title_rasters.clear();
         // Drop any in-flight interaction that referenced the about-to-vanish
         // windows.
         self.drag = input::DragMachine::new();
@@ -1777,22 +1831,15 @@ impl State {
         let id = self.window_manager.add_window(app_id, title, pid, geometry);
         self.wayland.bind(id, toplevel);
         // Any decoration preference this client stated before it had a model
-        // row (the normal ordering -- see `pending_decorations`) lands now,
-        // and the negotiation is re-answered with the app-id in hand: the
-        // pre-map answer had to be made from the preference alone, which
-        // gets a GTK-style client that stated no preference the server-side
-        // default even though `has_ssd` will refuse to draw it a band.
-        // Re-answering is a silent no-op for the common client that never
-        // created a decoration object at all.
+        // row (the normal ordering -- see `pending_decorations`) lands now.
+        // The client itself was already answered at `initial_commit`, with
+        // this same preference and the app-id both in hand (L1), so there is
+        // nothing to re-negotiate here -- only the model to bring in line
+        // with what the client was told.
         let requested = self.pending_decorations.remove(&toplevel).flatten();
         if requested.is_some() {
             self.window_manager.set_client_decorations_requested(id, requested);
         }
-        let ssd = crate::decoration::has_ssd(app_id, requested, false);
-        self.wayland.set_decoration_mode(
-            toplevel,
-            if ssd { wlr::DecorationMode::ServerSide } else { wlr::DecorationMode::ClientSide },
-        );
         // Explicit sync of the new window first (re-review minor 2):
         // `sync_focus_change` also reaches it today, but only because
         // `add_window` autofocuses onto the active workspace.
@@ -2077,9 +2124,25 @@ impl wlr::ToplevelHandler for State {
         // `content_rect` here would configure a default (SSD) window's
         // client one `TITLE_BAR_HEIGHT` too tall -- the exact one-frame-late
         // resize this comment already claims not to have.
-        let Some(runtime) = self.wayland.runtime() else { return };
+        let key = crate::wayland::ToplevelKey::new(toplevel.id());
         let app_id = toplevel.app_id().unwrap_or_default();
-        let ssd = crate::decoration::has_ssd(&app_id, None, false);
+        // Review finding L1: this is also the first -- and only -- moment
+        // before the client's first frame at which both halves of the
+        // decoration answer are known: the app-id (from `toplevel`) and any
+        // preference the client stated on its decoration object (parked in
+        // `pending_decorations`, since `set_mode` precedes this commit).
+        // Answering here rather than from `request_decoration_mode` is what
+        // makes the client's *first* decoration configure the correct one:
+        // an earlier `set_decoration_mode` is staged rather than sent, and
+        // staging is last-write-wins, so this overwrites the provisional
+        // answer instead of adding a second configure after it.
+        let requested = self.pending_decorations.get(&key).copied().flatten();
+        let ssd = crate::decoration::has_ssd(&app_id, requested, false);
+        self.wayland.set_decoration_mode(
+            key,
+            if ssd { wlr::DecorationMode::ServerSide } else { wlr::DecorationMode::ClientSide },
+        );
+        let Some(runtime) = self.wayland.runtime() else { return };
         let placeholder = icedtea_contract::Rectangle {
             x: 0,
             y: 0,
@@ -2204,10 +2267,15 @@ impl wlr::ToplevelHandler for State {
     ///
     /// A toplevel with no model window yet -- the normal case, since a
     /// decoration is created before the initial commit and `mapped` has not
-    /// run -- is answered from the preference alone (there is no app-id to
-    /// read without a `Toplevel`, only an id), and its preference is parked
-    /// in `pending_decorations` for `new_toplevel` to apply and re-answer
-    /// with the app-id in hand.
+    /// run -- has its preference parked in `pending_decorations` and is
+    /// still answered here, because a request must never be left unanswered
+    /// (the dispatch layer would otherwise impose its own blanket
+    /// server-side default). That answer is made from the preference alone:
+    /// there is no app-id to read from a bare `ToplevelId`. It is only
+    /// provisional, and it is *staged* rather than sent while the surface is
+    /// uninitialized, so `initial_commit` -- which has both the app-id and
+    /// the parked preference -- overwrites it before anything reaches the
+    /// client (review finding L1).
     fn request_decoration_mode(
         &mut self,
         id: wlr::ToplevelId,
@@ -3662,8 +3730,10 @@ mod tests {
         assert!(state.pending_decorations.is_empty(), "an unmapped toplevel's preference must not leak");
     }
 
-    /// The title raster is memoized on `(title, width, focused)`: the same
-    /// window synced twice shapes once, and a retitle invalidates it.
+    /// The title raster is memoized on `(title, width, resolved color)`: the
+    /// same window synced twice shapes once and keeps one generation, and a
+    /// retitle both re-shapes and advances the generation (which is what
+    /// makes the seam re-upload).
     #[test]
     fn title_rasters_are_memoized_and_invalidated_by_a_retitle() {
         let (tx, _rx) = crossbeam_channel::unbounded();
@@ -3677,21 +3747,84 @@ mod tests {
         let bar = crate::decoration::title_bar_rect(
             state.window_manager.get(id).expect("w").geometry,
         );
+        let entry = |state: &State| {
+            let e = state.title_rasters.get(&id).expect("cached");
+            (e.generation, e.pixels.clone())
+        };
 
-        let first = state.rasterized_title_for(id, "first".into(), bar, true);
+        state.ensure_title_raster(id, "first".into(), bar, true);
         assert_eq!(state.title_rasters.len(), 1, "the raster must be cached");
-        let again = state.rasterized_title_for(id, "first".into(), bar, true);
-        assert_eq!(first, again, "an unchanged title must reuse the cached pixels");
+        let first = entry(&state);
 
-        let renamed = state.rasterized_title_for(id, "second".into(), bar, true);
+        state.ensure_title_raster(id, "first".into(), bar, true);
+        assert_eq!(entry(&state), first, "an unchanged title must not re-shape or re-generation");
+
+        state.ensure_title_raster(id, "second".into(), bar, true);
+        let renamed = entry(&state);
         assert_eq!(state.title_rasters.len(), 1, "one entry per window, replaced not appended");
-        assert_ne!(first, renamed, "a retitle must produce different pixels");
-        // The cache key really is the new title, so the *next* sync of the
-        // old title shapes again rather than returning the new pixels.
-        assert_eq!(state.rasterized_title_for(id, "first".into(), bar, true), first);
+        assert_ne!(renamed.1, first.1, "a retitle must produce different pixels");
+        assert!(renamed.0 > first.0, "a retitle must advance the generation");
+
+        // Losing focus changes the resolved color, so it invalidates too.
+        state.ensure_title_raster(id, "second".into(), bar, false);
+        let unfocused = entry(&state);
+        assert!(unfocused.0 > renamed.0, "a focus change must re-shape");
+        assert_ne!(unfocused.1, renamed.1, "unfocused text is dimmer");
 
         state.forget_window(id);
         assert!(state.title_rasters.is_empty(), "a closed window's raster must not outlive it");
+    }
+
+    /// M3: the cache key carries the resolved foreground color, so a palette
+    /// change invalidates a raster even for an otherwise identical title on
+    /// an otherwise identical window.
+    #[test]
+    fn a_palette_change_invalidates_a_cached_title_raster() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "same",
+            1,
+            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+        );
+        let bar = crate::decoration::title_bar_rect(
+            state.window_manager.get(id).expect("w").geometry,
+        );
+
+        state.ensure_title_raster(id, "same".into(), bar, true);
+        let before = state.title_rasters.get(&id).expect("cached").pixels.clone();
+
+        // Deliberately *not* through `apply_config`, which destroys every
+        // window: this is the future in which a reload preserves them.
+        state.config.appearance.palette.foreground = "#ff0000".into();
+        state.ensure_title_raster(id, "same".into(), bar, true);
+        let after = state.title_rasters.get(&id).expect("cached").pixels.clone();
+
+        assert_ne!(before, after, "a repainted palette must not serve stale-colored text");
+    }
+
+    /// M1: the reload teardown bypasses `forget_window`, so it has to purge
+    /// the rasters itself -- ids are floored upward, so anything left behind
+    /// is unreachable forever.
+    #[test]
+    fn a_config_reload_purges_every_cached_raster() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let id = state.window_manager.add_window(
+            "plain.app",
+            "doomed",
+            1,
+            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+        );
+        let bar = crate::decoration::title_bar_rect(
+            state.window_manager.get(id).expect("w").geometry,
+        );
+        state.ensure_title_raster(id, "doomed".into(), bar, true);
+        assert_eq!(state.title_rasters.len(), 1);
+
+        let _ = state.apply_config(default_config());
+        assert!(state.title_rasters.is_empty(), "a reload must not strand title pixels");
     }
 
     /// The title node is inset by the three buttons, so a long title runs
@@ -3711,7 +3844,14 @@ mod tests {
         );
         let title = state.window_manager.get(id).expect("w").title.clone();
 
-        let (w, h, px) = state.rasterized_title_for(id, title, bar, true).expect("pixels");
+        state.ensure_title_raster(id, title, bar, true);
+        let (w, h, px) = state
+            .title_rasters
+            .get(&id)
+            .expect("cached")
+            .pixels
+            .clone()
+            .expect("pixels");
         assert_eq!(w, bar.width - 3 * crate::decoration::BUTTON_WIDTH);
         assert_eq!(h, bar.height);
         assert_eq!(px.len(), (w * h * 4) as usize);

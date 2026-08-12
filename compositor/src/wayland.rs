@@ -65,9 +65,32 @@ struct SsdVisual {
     band: wlr::RectId,
     /// The rasterized title, sitting over the band's left-hand span.
     title: Option<wlr::BufferId>,
+    /// Which [`TitleRaster::generation`] `title` currently holds, or `None`
+    /// when there is no title node.
+    ///
+    /// This is the whole of the re-upload check (review finding M2):
+    /// `sync_ssd` runs on every geometry mutation, i.e. once per pointer
+    /// motion during a drag, and without this every one of those would
+    /// re-upload byte-identical pixels and damage the scene for them. The
+    /// caller's memo never reuses a generation, so equality here means "the
+    /// exact pixels this node already holds".
+    title_generation: Option<u64>,
     /// Minimize, maximize, close -- `decoration::button_rects`' own order,
     /// left to right, which is also the order `hit_test` maps them in.
     buttons: [Option<wlr::RectId>; 3],
+}
+
+/// A rasterized title, borrowed from the caller's own memo.
+///
+/// Borrowed rather than owned so a sync whose title has not changed costs no
+/// copy at all -- the common case by a wide margin, since a drag re-syncs
+/// per pointer motion. `generation` names these exact pixels; see
+/// [`SsdVisual::title_generation`].
+pub struct TitleRaster<'a> {
+    pub width: i32,
+    pub height: i32,
+    pub generation: u64,
+    pub pixels: &'a [u8],
 }
 
 /// The compositor's Wayland side.
@@ -334,11 +357,13 @@ impl Wayland {
     /// are relative to that origin, not the scene root's, the same origin
     /// `set_position` moves via `set_toplevel_position`.
     ///
-    /// `title_px` is `(width, height, premultiplied RGBA)` from
-    /// `text::rasterize_title`; `None` means the title rasterized to nothing
-    /// (an empty title, or no font on this machine that can shape it) and
-    /// the band is shown bare -- the spec's error-handling rule that a
-    /// decoration degrades rather than failing the window.
+    /// `title_px` borrows the caller's rasterized title; `None` means the
+    /// title rasterized to nothing (an empty title, or no font on this
+    /// machine that can shape it) and the band is shown bare -- the spec's
+    /// error-handling rule that a decoration degrades rather than failing
+    /// the window. Its pixels are uploaded only when its `generation`
+    /// differs from what the title node already holds, so an unchanged title
+    /// costs a comparison rather than a texture upload.
     ///
     /// Removes (rather than merely hides) every node when `ssd` is `false`
     /// or the window isn't currently visible: a hidden decoration is cheaper
@@ -360,7 +385,7 @@ impl Wayland {
         content: Rectangle,
         band_color: [f32; 4],
         button_colors: [[f32; 4]; 3],
-        title_px: Option<(i32, i32, Vec<u8>)>,
+        title_px: Option<TitleRaster<'_>>,
     ) {
         if !ssd || !visible {
             self.remove_ssd(id);
@@ -385,6 +410,7 @@ impl Wayland {
                 SsdVisual {
                     band,
                     title: None,
+                    title_generation: None,
                     buttons: [None; 3],
                 },
             );
@@ -420,22 +446,37 @@ impl Wayland {
         }
 
         match title_px {
-            Some((tw, th, px)) => {
-                // `update_buffer` rather than remove-and-re-add: it exists
-                // for exactly this (a re-titled or resized window), and it
-                // keeps the node's place in the stacking order instead of
-                // re-adding it on top of whatever was added since. A `None`
-                // from it means the id went stale (its parent toplevel was
-                // torn down), so the node is dropped and rebuilt.
-                let updated = visual
-                    .title
-                    .and_then(|buffer| runtime.update_buffer(buffer, tw, th, &px));
-                if updated.is_none() {
-                    if let Some(stale) = visual.title.take() {
-                        runtime.remove_buffer(stale);
+            Some(raster) => {
+                // The upload is skipped outright when this node already
+                // holds these exact pixels (M2); only the node's *position*
+                // is re-set below, which is what a plain move needs.
+                if visual.title.is_none() || visual.title_generation != Some(raster.generation) {
+                    // `update_buffer` rather than remove-and-re-add: it
+                    // exists for exactly this (a re-titled or resized
+                    // window), and it keeps the node's place in the stacking
+                    // order instead of re-adding it on top of whatever was
+                    // added since. A `None` from it means the id went stale
+                    // (its parent toplevel was torn down), so the node is
+                    // dropped and rebuilt.
+                    let updated = visual.title.and_then(|buffer| {
+                        runtime.update_buffer(buffer, raster.width, raster.height, raster.pixels)
+                    });
+                    if updated.is_none() {
+                        if let Some(stale) = visual.title.take() {
+                            runtime.remove_buffer(stale);
+                        }
+                        let Some(key) = key else { return };
+                        visual.title = runtime.add_buffer_in_toplevel(
+                            key.0,
+                            raster.width,
+                            raster.height,
+                            raster.pixels,
+                        );
                     }
-                    let Some(key) = key else { return };
-                    visual.title = runtime.add_buffer_in_toplevel(key.0, tw, th, &px);
+                    // Only claim the generation if a node actually holds it:
+                    // a refused `add_buffer_in_toplevel` must be retried on
+                    // the next sync, not remembered as up to date.
+                    visual.title_generation = visual.title.map(|_| raster.generation);
                 }
                 if let Some(buffer) = visual.title {
                     runtime.set_buffer_position(buffer, rel_x, rel_y);
@@ -445,6 +486,7 @@ impl Wayland {
                 if let Some(buffer) = visual.title.take() {
                     runtime.remove_buffer(buffer);
                 }
+                visual.title_generation = None;
             }
         }
     }
@@ -598,7 +640,12 @@ mod tests {
             content,
             [0.1, 0.1, 0.1, 1.0],
             [[1.0, 0.0, 0.0, 1.0]; 3],
-            Some((bar.width, bar.height, px)),
+            Some(TitleRaster {
+                width: bar.width,
+                height: bar.height,
+                generation: 1,
+                pixels: &px,
+            }),
         );
         assert_eq!(w.ssd_rect_count(), 0);
     }

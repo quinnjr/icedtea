@@ -282,9 +282,12 @@ struct ClientState {
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
-    /// `mode` from the most recent `zxdg_toplevel_decoration_v1.configure`
-    /// (1 = client-side, 2 = server-side), or `None` before the first one.
-    decoration_mode: Option<u32>,
+    /// Every `mode` this client has been sent on its decoration object, in
+    /// arrival order (1 = client-side, 2 = server-side). A `Vec` rather than
+    /// a latest-only field because "the compositor answered *once*, with the
+    /// right mode" is a stronger and more useful claim than "it eventually
+    /// said the right thing", and only the history can express it.
+    decoration_modes: Vec<u32>,
     /// Most recent `xdg_toplevel.configure` size.
     configured: Option<(i32, i32)>,
     /// How many `xdg_surface.configure` events have arrived, ever.
@@ -405,8 +408,10 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for Cli
         // The mode is recorded raw (`1` client-side, `2` server-side) rather
         // than as the generated enum: the assertion a test wants to make is
         // about the value that crossed the wire.
-        if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = event {
-            state.decoration_mode = mode.into_result().ok().map(|mode| mode as u32);
+        if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = event
+            && let Ok(mode) = mode.into_result()
+        {
+            state.decoration_modes.push(mode as u32);
         }
     }
 }
@@ -622,7 +627,12 @@ impl TestClient {
     /// The mode from the most recent decoration `configure`: `1` client-side,
     /// `2` server-side, `None` if none has arrived.
     pub fn decoration_mode(&self) -> Option<u32> {
-        self.state.decoration_mode
+        self.state.decoration_modes.last().copied()
+    }
+
+    /// Every decoration mode this client has been sent, in order.
+    pub fn decoration_modes(&self) -> &[u32] {
+        &self.state.decoration_modes
     }
 
     pub fn set_title(&mut self, title: &str) {

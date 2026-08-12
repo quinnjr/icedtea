@@ -236,6 +236,11 @@ fn ssd_is_negotiated_for_a_client_that_defers() {
         frame
     );
 
+    // Review finding L1: exactly one decoration configure, and it is the
+    // right one. The provisional answer made before the app-id was known is
+    // staged, not sent, so the client never sees a wrong-then-right pair.
+    assert_eq!(client.decoration_modes(), [2], "one configure, server-side");
+
     // Retitling drives `update_buffer` on the live title node: the model
     // must take the new title and the client must survive it.
     client.set_title("renamed");
@@ -264,6 +269,9 @@ fn csd_is_negotiated_for_a_client_that_draws_its_own() {
         client.last_configure(),
         frame
     );
+    // L1 again, and this is the case that used to be wrong-then-right: the
+    // app-id says client-side, and that is the *only* answer sent.
+    assert_eq!(client.decoration_modes(), [1], "one configure, client-side");
 
     client.detach();
 }
