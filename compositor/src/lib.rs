@@ -72,6 +72,12 @@ pub fn run() {
     if let Err(err) = runtime.create_xdg_decoration_manager(&display) {
         tracing::error!(%err, "xdg-decoration negotiation is unavailable");
     }
+    // Same non-fatal tone as the decoration manager just above: without
+    // this global, panels/bars simply cannot bind `zwlr_layer_shell_v1` and
+    // the desktop runs with no shell chrome, which is degraded, not dead.
+    if let Err(err) = runtime.create_layer_shell(&display, 4) {
+        tracing::error!(%err, "layer-shell is unavailable");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");

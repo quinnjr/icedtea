@@ -34,6 +34,55 @@ pub const PLACEHOLDER_SIZE: (i32, i32) = (640, 400);
 /// Output geometry information (simplified from smithay's `Output`).
 pub struct OutputSurface {
     pub geometry: icedtea_contract::Rectangle,
+    /// `geometry` shrunk by any exclusive-zone layer surfaces anchored to
+    /// this output's edges. Equal to `geometry` when none reserve space.
+    /// Maintained solely by [`State::arrange_layers`]; every placement
+    /// consumer that means "the space windows may occupy" (tiling,
+    /// maximize) reads this instead of `geometry` -- fullscreen is the one
+    /// exception, since it covers panels by definition.
+    pub usable: icedtea_contract::Rectangle,
+}
+
+impl OutputSurface {
+    /// Construct with no exclusive zones yet reserved -- `usable` starts
+    /// equal to `geometry`, exactly as `create_output` documents.
+    pub fn new(geometry: icedtea_contract::Rectangle) -> Self {
+        Self { geometry, usable: geometry }
+    }
+}
+
+/// The model's own record of a wlr-layer-shell surface: everything
+/// [`State::arrange_layers`] and [`State::configure_layer`] need, kept in
+/// the model rather than re-read from the library's `LayerSurface` handle on
+/// every arrangement pass -- the handle only lives for the duration of one
+/// handler call (see [`wlr::LayerSurface`]'s own doc), so anything an
+/// unrelated later call (a different surface's commit, a hotplug) needs has
+/// to be copied out while the handle is live. Updated wholesale on every
+/// `layer_surface_commit`, since wlr-layer-shell clients routinely re-anchor
+/// or resize their exclusive zone after mapping.
+pub struct LayerEntry {
+    /// The model output index (`State::outputs`' key) this surface is
+    /// placed on. Resolved once, at `new_layer_surface`, from
+    /// [`wlr::LayerSurface::output_id`] via `output_ids`, falling back to
+    /// `output_for_pointer` -- see `new_layer_surface`'s own doc.
+    pub output: u32,
+    pub layer: wlr::Layer,
+    pub anchor: wlr::Anchor,
+    /// The raw value from [`wlr::LayerSurface::exclusive_zone`]: `0` or
+    /// negative means "reserve nothing" (any negative value additionally
+    /// asks not to be moved to avoid occlusion, which this compositor's
+    /// manual placement has no use for); only a positive value reserves
+    /// space in [`State::arrange_layers`].
+    pub exclusive: i32,
+    /// The client's last-requested size (`0` on either axis means "the
+    /// compositor decides" for that axis) -- the input `configure_layer`'s
+    /// placement rule reads, not the size that method actually chose.
+    pub size: (u32, u32),
+    /// Whether this surface currently wants keyboard focus
+    /// ([`wlr::LayerSurface::keyboard_interactive`]). `false` until the
+    /// surface's first commit populates it (see that accessor's own
+    /// timing doc) -- `new_layer_surface` always inserts `false` here.
+    pub interactive: bool,
 }
 
 /// Translate the compositor library's modifier booleans into the model's
@@ -340,6 +389,20 @@ pub struct State {
     /// dies unmapped (`forget_toplevel`), so this never outgrows the set of
     /// unmapped toplevels.
     pending_decorations: HashMap<crate::wayland::ToplevelKey, Option<bool>>,
+    /// Every live wlr-layer-shell surface's model-side bookkeeping, keyed
+    /// by the library's own id. Populated at `new_layer_surface`, kept
+    /// current on every `layer_surface_commit`, and removed only at
+    /// `layer_surface_destroyed` -- an unmap leaves the entry in place
+    /// (see `layer_surface_unmapped`'s doc, mirroring the toplevel
+    /// unmapped/mapped distinction `Window::mapped` already draws).
+    pub layers: HashMap<wlr::LayerSurfaceId, LayerEntry>,
+    /// The keyboard-interactive layer surface currently holding seat
+    /// keyboard focus, if any. Tracked separately from the model's own
+    /// window focus because a layer surface has no `WindowId` at all --
+    /// this is what `layer_surface_unmapped`/`layer_surface_destroyed`
+    /// check before calling `sync_seat_focus` to hand focus back to
+    /// whatever the model says is focused.
+    layer_focus: Option<wlr::LayerSurfaceId>,
 }
 
 /// What a cached title raster depends on: the title text, the pixel width
@@ -429,6 +492,8 @@ impl State {
             title_rasters: HashMap::new(),
             next_title_generation: 0,
             pending_decorations: HashMap::new(),
+            layers: HashMap::new(),
+            layer_focus: None,
         }
     }
 
@@ -659,7 +724,7 @@ impl State {
     /// `snap`, `set_fullscreen_target`, `set_maximized_target` and
     /// `handle_pointer_motion` read.
     pub fn create_output(&mut self, index: u32, geometry: icedtea_contract::Rectangle) {
-        self.outputs.insert(index, OutputSurface { geometry });
+        self.outputs.insert(index, OutputSurface::new(geometry));
     }
 
     /// The output whose box contains the pointer; falls back to the lowest
@@ -682,6 +747,121 @@ impl State {
             }
         }
         self.outputs.keys().min().copied()
+    }
+
+    /// Recompute every output's `usable` rect from its layer surfaces'
+    /// exclusive zones, then re-sync every maximized/fullscreen window so
+    /// maximize immediately tracks the new usable area.
+    ///
+    /// Reset-then-fold: every output's `usable` starts back at `geometry`
+    /// (a panel that shrank its zone, moved output, or unmapped must give
+    /// its space back, not just never claim more of it) and each live
+    /// layer entry's positive exclusive zone shrinks the respective edge
+    /// -- `exclusive <= 0` reserves nothing, per wlr-layer-shell's own
+    /// definition (see [`LayerEntry::exclusive`]'s doc).
+    ///
+    /// Only a *single* edge anchor's exclusive zone is applied to that
+    /// edge: `top`-anchored (regardless of whether `left`/`right` are also
+    /// set) shrinks the top, `bottom` the bottom, `left` the left, `right`
+    /// the right. A surface anchored to more than one of
+    /// {top,bottom}/{left,right} at once (e.g. both `top` and `bottom`)
+    /// has no single edge to carve into and is skipped -- the same
+    /// "nothing sane to do" case `configure_layer`'s placement rule falls
+    /// back to centering for.
+    ///
+    /// Windows are collected into a `Vec` before any is synced (review
+    /// pattern this crate already follows elsewhere, e.g.
+    /// `migrate_windows_from`): `sync_window_to_scene` reads `self`
+    /// broadly, so mutating `window_manager` while still mid-iteration
+    /// over it would not borrow-check.
+    pub fn arrange_layers(&mut self) {
+        for output in self.outputs.values_mut() {
+            output.usable = output.geometry;
+        }
+        for entry in self.layers.values() {
+            if entry.exclusive <= 0 {
+                continue;
+            }
+            let Some(output) = self.outputs.get_mut(&entry.output) else { continue };
+            let a = entry.anchor;
+            if a.top != a.bottom {
+                if a.top {
+                    output.usable.y += entry.exclusive;
+                }
+                output.usable.height = (output.usable.height - entry.exclusive).max(0);
+            } else if a.left != a.right {
+                if a.left {
+                    output.usable.x += entry.exclusive;
+                }
+                output.usable.width = (output.usable.width - entry.exclusive).max(0);
+            }
+        }
+
+        let gap = self.config.appearance.snap_gap;
+        let affected: Vec<WindowId> = self
+            .window_manager
+            .windows()
+            .filter(|w| w.maximized || w.fullscreen)
+            .map(|w| w.id)
+            .collect();
+        for id in affected {
+            let Some(w) = self.window_manager.get(id) else { continue };
+            if w.maximized {
+                // Fullscreen deliberately keeps the full `geometry`
+                // (`set_fullscreen_target`'s own doc); only maximize
+                // tracks `usable` here.
+                let Some(output_geo) =
+                    self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)
+                else {
+                    continue;
+                };
+                let _ = self.window_manager.set_geometry(id, layout::maximized_geometry(output_geo, gap));
+            }
+            self.sync_window_to_scene(id);
+        }
+        self.emit_pending();
+    }
+
+    /// Choose `id`'s layer surface's size and position for its output box
+    /// (the placement rule from task 20's brief) and answer with
+    /// `configure_layer_surface` + `set_layer_surface_position`.
+    ///
+    /// A no-op, panic-free, if the entry or its output has vanished (a
+    /// commit racing a hotplug-removed output) or no runtime is attached
+    /// (every unit test in this file).
+    pub fn configure_layer(&mut self, id: wlr::LayerSurfaceId) {
+        let Some(entry) = self.layers.get(&id) else { return };
+        let Some(output) = self.outputs.get(&entry.output) else { return };
+        let box_ = output.geometry;
+        let a = entry.anchor;
+        let (desired_w, desired_h) = entry.size;
+
+        // Anchored to exactly one of {top,bottom} (whether or not `left`
+        // and `right` are also set -- "single edge or edge+both
+        // perpendicular" both span the same way): a horizontal panel the
+        // full width of the box, thickness from the client's desired
+        // height or a 30px fallback.
+        let (w, h, x, y) = if a.top != a.bottom {
+            let thickness = if desired_h != 0 { desired_h as i32 } else { 30 };
+            let y = if a.top { box_.y } else { box_.y + box_.height - thickness };
+            (box_.width, thickness, box_.x, y)
+        } else if a.left != a.right {
+            let thickness = if desired_w != 0 { desired_w as i32 } else { 30 };
+            let x = if a.left { box_.x } else { box_.x + box_.width - thickness };
+            (thickness, box_.height, x, box_.y)
+        } else {
+            // Anchored to all four edges, or to none: centered at the
+            // client's desired size, falling back to 200x200 on whichever
+            // axis it left at 0 ("compositor decides").
+            let w = if desired_w != 0 { desired_w as i32 } else { 200 };
+            let h = if desired_h != 0 { desired_h as i32 } else { 200 };
+            (w, h, box_.x + (box_.width - w) / 2, box_.y + (box_.height - h) / 2)
+        };
+
+        let (w, h) = (w.max(0) as u32, h.max(0) as u32);
+        let Some(runtime) = self.wayland.runtime() else { return };
+        runtime.configure_layer_surface(id, w, h);
+        runtime.set_layer_surface_position(id, x, y);
     }
 
     /// Hot-remove semantics: every window whose frame center sat inside the
@@ -1185,7 +1365,10 @@ impl State {
         if self.window_manager.get(id)?.maximized == target {
             return Some(());
         }
-        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
+        // Maximize honors the usable area (panels' exclusive zones carve
+        // into it); fullscreen, just below, deliberately keeps the full
+        // `geometry` instead.
+        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)?;
         self.window_manager.set_maximized(id, target)?;
         if target {
             let current = self.window_manager.get(id)?.geometry;
@@ -1673,7 +1856,7 @@ impl State {
         if !self.config.behavior.snap_enabled {
             return None;
         }
-        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
+        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)?;
         let gap = self.config.appearance.snap_gap;
         let current = self.window_manager.get(id)?.geometry;
         self.snap_saved_geometry.entry(id).or_insert(current);
@@ -1919,7 +2102,7 @@ impl State {
             return Some(());
         }
         self.drag.window_id()?;
-        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
+        let output_geo = self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)?;
         let threshold = self.config.appearance.snap_gap.max(1) * 4;
         // Review finding I3: with snapping disabled the drag machine is
         // never told about zones at all, so no preview is staged *and*
@@ -1992,7 +2175,7 @@ impl State {
         let output_geo = self
             .output_for_pointer()
             .and_then(|idx| self.outputs.get(&idx))
-            .map(|o| o.geometry)
+            .map(|o| o.usable)
             .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
         // Review finding M7: cascade positions wrap inside the output (and
         // count only this workspace's windows) so the Nth window can't open
@@ -2521,6 +2704,115 @@ impl wlr::ToplevelHandler for State {
             self.emit_pending();
         }
     }
+
+    /// A client created a wlr-layer-shell surface. Resolve its output --
+    /// what it asked for (`output_id` via `output_ids`), or the output
+    /// under the pointer (which itself falls back to the lowest index) --
+    /// and ignore the surface entirely if neither resolves, i.e. no output
+    /// exists yet at all: there is nowhere to place it and nothing this
+    /// compositor can answer with. Otherwise record it and answer
+    /// immediately -- `configure_layer` from here is safe even before this
+    /// surface's first commit (`Runtime::configure_layer_surface` stages
+    /// pre-initial-commit answers rather than sending them, see its own
+    /// doc) and is mandatory: nothing else in this crate's dispatch layer
+    /// answers a layer surface that no handler ever does.
+    fn new_layer_surface(&mut self, surface: &wlr::LayerSurface<'_>) {
+        let id = surface.id();
+        let output = surface
+            .output_id()
+            .and_then(|oid| self.output_ids.get(&oid).copied())
+            .or_else(|| self.output_for_pointer());
+        let Some(output) = output else { return };
+        self.layers.insert(
+            id,
+            LayerEntry {
+                output,
+                layer: surface.layer(),
+                anchor: surface.anchor(),
+                exclusive: surface.exclusive_zone(),
+                size: surface.desired_size(),
+                // Always `false` here regardless of what the client asked
+                // for -- `keyboard_interactive` reads `current`, which is
+                // entirely zeroed until this surface's first commit (see
+                // that accessor's own doc). `layer_surface_commit` is
+                // where the real value lands.
+                interactive: false,
+            },
+        );
+        self.configure_layer(id);
+    }
+
+    /// Every commit of an already-announced layer surface: refresh the
+    /// entry from the surface's current request (anchors, exclusive zone
+    /// and size all commonly change after mapping) and answer again --
+    /// `configure_layer` reads the entry it just updated, so a client that
+    /// re-anchors gets reconfigured for its new placement, not its old
+    /// one. Then re-derive every output's usable area, since this
+    /// surface's exclusive zone may have just changed.
+    ///
+    /// A miss on `self.layers` -- no entry from `new_layer_surface` --
+    /// means that handler bailed out for lack of an output; there is
+    /// still nowhere to place this surface, so the commit is ignored the
+    /// same way.
+    fn layer_surface_commit(&mut self, surface: &wlr::LayerSurface<'_>) {
+        let id = surface.id();
+        let Some(entry) = self.layers.get_mut(&id) else { return };
+        entry.layer = surface.layer();
+        entry.anchor = surface.anchor();
+        entry.exclusive = surface.exclusive_zone();
+        entry.size = surface.desired_size();
+        entry.interactive = surface.keyboard_interactive();
+        self.configure_layer(id);
+        self.arrange_layers();
+    }
+
+    /// The layer surface now has a buffer and is on screen. A
+    /// keyboard-interactive one takes seat keyboard focus immediately --
+    /// `focus_layer_keyboard` refuses an unmapped surface (`None` while
+    /// unmapped, per its own doc), which is exactly why this waits for
+    /// `mapped` rather than acting from `layer_surface_commit`, where
+    /// `interactive` first becomes known but the surface may still be
+    /// unmapped.
+    fn layer_surface_mapped(&mut self, id: wlr::LayerSurfaceId) {
+        let Some(entry) = self.layers.get(&id) else { return };
+        if !entry.interactive {
+            return;
+        }
+        let Some(runtime) = self.wayland.runtime() else { return };
+        if runtime.focus_layer_keyboard(id).is_some() {
+            self.layer_focus = Some(id);
+        }
+    }
+
+    /// The layer surface should no longer be displayed (not a destroy --
+    /// see this method's own trait doc; the entry survives so a remap
+    /// finds it again). If it held keyboard focus, hand focus back to
+    /// whatever the model says is focused: `sync_seat_focus` re-derives
+    /// the seat's keyboard target from `window_manager` rather than
+    /// leaving it pointed at a surface that just stopped being shown.
+    fn layer_surface_unmapped(&mut self, id: wlr::LayerSurfaceId) {
+        if self.layer_focus == Some(id) {
+            self.layer_focus = None;
+            self.sync_seat_focus();
+        }
+        self.arrange_layers();
+    }
+
+    /// The layer surface is gone for good. Same focus hand-back as
+    /// `layer_surface_unmapped` (a destroy while mapped and focused is
+    /// legal -- a client can drop its surface without ever unmapping it
+    /// first), plus removing the entry, which `layer_surface_unmapped`
+    /// deliberately does not. Panic-free on an id this handler was never
+    /// told about (the trait's own doc: this can happen) -- both the
+    /// focus check and `HashMap::remove` are no-ops on a miss.
+    fn layer_surface_destroyed(&mut self, id: wlr::LayerSurfaceId) {
+        if self.layer_focus == Some(id) {
+            self.layer_focus = None;
+            self.sync_seat_focus();
+        }
+        self.layers.remove(&id);
+        self.arrange_layers();
+    }
 }
 impl wlr::SeatHandler for State {
     fn key(&mut self, event: &wlr::KeyEvent<'_>) -> bool {
@@ -2665,7 +2957,7 @@ mod tests {
     fn decoration_action_for_returns_none_for_fullscreen_window() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.window_manager.focus(id).unwrap();
         state.toggle_fullscreen(id).unwrap();
@@ -2694,7 +2986,7 @@ mod tests {
     fn toggle_fullscreen_flips_state_and_geometry() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.toggle_fullscreen(id).unwrap();
         let w = state.window_manager.get(id).unwrap();
@@ -2732,7 +3024,7 @@ mod tests {
     fn apply_action_switches_workspaces_and_snaps() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         state.apply_action("workspace:2").unwrap();
         assert_eq!(state.window_manager.active_workspace(), 1);
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
@@ -2797,7 +3089,7 @@ mod tests {
     fn handle_pointer_drag_moves_window_without_snap() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 640, height: 400 });
         state.window_manager.focus(id).unwrap();
         // Press inside the title bar's move area (not on a button).
@@ -2815,7 +3107,7 @@ mod tests {
     fn handle_pointer_drag_to_edge_snaps() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 640, height: 400 });
         state.window_manager.focus(id).unwrap();
         state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) }).unwrap();
@@ -2890,7 +3182,7 @@ mod tests {
     fn snap_then_fullscreen_then_unfullscreen_then_snap_restore_round_trips() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let original = Rectangle { x: 50, y: 60, width: 300, height: 200 };
         let id = state.window_manager.add_window("app", "t", 1, original);
         state.window_manager.focus(id).unwrap();
@@ -3013,7 +3305,7 @@ mod tests {
     fn apply_config_resets_drag_alt_tab_and_snap_preview() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
 
@@ -3104,7 +3396,7 @@ mod tests {
     fn press_on_unfocused_fullscreen_window_flushes_focus_immediately() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1000, height: 800 } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let _b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
         state.window_manager.set_fullscreen(a, true).unwrap();
@@ -3262,7 +3554,7 @@ mod tests {
     fn state_with_output(width: i32, height: i32) -> (State, crossbeam_channel::Receiver<SeqEvent>) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width, height } });
+        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width, height }));
         (state, rx)
     }
 
@@ -4297,5 +4589,79 @@ mod tests {
         // (1000, 2000), not `(0, 0)`, is what actually distinguishes "used
         // the real box" from "used the (0,0)-origin fallback rect."
         assert_eq!((geo.x, geo.y), (output0.x, output0.y), "cascade origin must be the output box's own (x, y)");
+    }
+
+    // --- Task 20: layer-shell arrangement and exclusive zones ---
+
+    #[test]
+    fn an_exclusive_top_panel_shrinks_the_usable_area() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+                exclusive: 30,
+                size: (800, 30),
+                interactive: false,
+            },
+        );
+        state.arrange_layers();
+        let usable = state.outputs[&0].usable;
+        assert_eq!(usable, Rectangle { x: 0, y: 30, width: 800, height: 570 });
+    }
+
+    /// C1/I5's maximize helper (`maximize_applies_output_geometry_and_restores_it`)
+    /// proves maximize tracks `geometry` when there is no panel; this proves
+    /// it tracks `usable` once one exists, and that fullscreen -- which
+    /// covers panels by definition -- keeps ignoring it.
+    #[test]
+    fn maximize_respects_the_usable_area_but_fullscreen_ignores_it() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        // Snapping/maximize geometry math (`layout::maximized_geometry`)
+        // also insets by `appearance.snap_gap`; zero it here so the
+        // expected numbers below are the panel's carve alone, not a mix of
+        // the carve and an unrelated gap constant.
+        state.config.appearance.snap_gap = 0;
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+                exclusive: 30,
+                size: (800, 30),
+                interactive: false,
+            },
+        );
+        state.arrange_layers();
+        assert_eq!(state.outputs[&0].usable, Rectangle { x: 0, y: 30, width: 800, height: 570 });
+
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 40, y: 50, width: 300, height: 200 });
+
+        // Maximize via the D-Bus command path (the established pattern):
+        // its geometry must equal `usable`, the panel's zone excluded.
+        state.handle_command(crate::dbus::DbCommand::Maximize(id, true)).unwrap();
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry,
+            state.outputs[&0].usable,
+            "maximize must exclude the panel's exclusive zone"
+        );
+
+        // Unmaximize, then fullscreen: fullscreen covers panels by
+        // definition, so its geometry must equal the *full* output
+        // geometry, not `usable`.
+        state.handle_command(crate::dbus::DbCommand::Maximize(id, false)).unwrap();
+        state.handle_command(crate::dbus::DbCommand::Fullscreen(id, true)).unwrap();
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry,
+            state.outputs[&0].geometry,
+            "fullscreen must ignore the panel's exclusive zone"
+        );
     }
 }

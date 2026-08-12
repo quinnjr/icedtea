@@ -299,3 +299,38 @@ fn an_unmapping_client_releases_focus_and_alt_tab() {
     first.detach();
     second.detach();
 }
+
+/// Task 20: a real `zwlr_layer_shell_v1` panel gets configured (mandatory --
+/// an unanswered layer surface hangs its client) and its exclusive zone
+/// carves the usable area a maximized toplevel is placed against.
+///
+/// The expected maximized content height below is derived, not guessed:
+/// `tests/support/mod.rs`'s headless backend reports a `1280x720` output
+/// (confirmed against this same harness's `Compositor::spawn` --
+/// `headless_boot.rs`'s own coverage only asserts `width > 0 && height > 0`,
+/// so this comment is this suite's one place that number is pinned) --
+/// `1280x720` minus the panel's `30`px top exclusive zone (usable
+/// `1280x690`), minus `appearance.snap_gap`'s default `8`px inset on both
+/// edges of the maximize rect (`layout::maximized_geometry`, frame
+/// `1264x674`), minus the `28`px SSD title-bar band `harness.tiled` gets
+/// by default (`decoration::TITLE_BAR_HEIGHT`, `content_rect`) since it
+/// does not match the `org.gtk`/`gtk4` CSD carve-out: `674 - 28 = 646`.
+#[test]
+fn a_layer_panel_gets_configured_and_carves_the_workspace() {
+    let comp = Compositor::spawn();
+    let mut panel = TestClient::map_layer_panel(&comp.socket, 30);
+    assert!(panel.wait_until(|c| c.layer_configure().is_some()), "panel must be configured");
+    let (w, h) = panel.layer_configure().expect("size");
+    assert!(w > 0 && h == 30, "panel must span the output's width at its 30px exclusive thickness, got {w}x{h}");
+
+    let mut win = TestClient::map_toplevel(&comp.socket, "harness.tiled", "t");
+    let id = comp.snapshot().windows[0].id;
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(id, true));
+    assert!(
+        win.wait_until(|c| c.last_configure().map(|(_, h)| h) == Some(646)),
+        "maximized height must exclude the panel's zone, last configure: {:?}",
+        win.last_configure()
+    );
+
+    win.detach();
+}

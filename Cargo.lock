@@ -831,6 +831,7 @@ dependencies = [
  "tracing-subscriber",
  "wayland-client",
  "wayland-protocols",
+ "wayland-protocols-wlr",
  "wlr",
  "xkbcommon",
  "zbus",
@@ -2257,6 +2258,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayland-protocols-wlr"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb04e52f7836d7c7976c78ca0250d61e33873c34156a2a1fc9474828ec268234"
+dependencies = [
+ "bitflags 2.13.1",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-scanner",
+]
+
+[[package]]
 name = "wayland-scanner"
 version = "0.31.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2403,9 +2417,9 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wlr"
-version = "0.20.10"
+version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99d193bc389809c51ab2502bf6bb10ae925e905ebd9d0c73b625f0b947d6d304"
+checksum = "fc85c9fbb1cf0aff6fb7dadbc0c1841f11c80516c8948708ff3cfefcfdcd133b"
 dependencies = [
  "wlr-sys",
  "xkbcommon-sys",

@@ -64,7 +64,7 @@ fn action_dispatch_cover_all_default_actions() {
     // flagged this same gap in a sibling test (see
     // `apply_action_switches_workspaces_and_snaps`'s doc comment); a single
     // output at (0, 0) mirrors that fix.
-    state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+    state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
     for action in [
         "close",
         "fullscreen",
@@ -99,7 +99,7 @@ fn action_dispatch_cover_all_default_actions() {
 fn signals_carry_seq_that_orders_against_the_snapshot() {
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut state = State::new(default_config(), tx);
-    state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+    state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
 
     let id = state
         .window_manager
@@ -134,7 +134,7 @@ fn signals_carry_seq_that_orders_against_the_snapshot() {
 fn only_the_active_workspace_is_rendered_and_clickable() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut state = State::new(default_config(), tx);
-    state.outputs.insert(0, OutputSurface { geometry: Rectangle { x: 0, y: 0, width: 1920, height: 1080 } });
+    state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
     let geo = Rectangle { x: 0, y: 0, width: 640, height: 400 };
     let a = state.window_manager.add_window("a", "a", 1, geo);
     let b = state.window_manager.add_window("b", "b", 2, geo);

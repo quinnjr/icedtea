@@ -45,6 +45,7 @@ use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 /// How long any "wait for the compositor to do a thing" helper waits before
 /// declaring the harness broken.
@@ -167,6 +168,11 @@ impl Compositor {
             runtime
                 .create_xdg_decoration_manager(&display)
                 .expect("zxdg_decoration_manager_v1");
+            // Same "harness cannot degrade" tone as the decoration manager
+            // just above: a test that maps a layer panel needs the global
+            // to actually exist, not just for `lib.rs::run()`'s production
+            // boot to log and move on.
+            runtime.create_layer_shell(&display, 4).expect("zwlr_layer_shell_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
 
             // `state` is declared after `display`/`runtime`/`backend` so that
@@ -282,6 +288,7 @@ struct ClientState {
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+    layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     /// Every `mode` this client has been sent on its decoration object, in
     /// arrival order (1 = client-side, 2 = server-side). A `Vec` rather than
     /// a latest-only field because "the compositor answered *once*, with the
@@ -308,6 +315,8 @@ struct ClientState {
     /// `xdg_toplevel` states from the most recent configure.
     states: Vec<u32>,
     closed: bool,
+    /// Most recent `zwlr_layer_surface_v1.configure` size.
+    layer_configured: Option<(u32, u32)>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
@@ -330,6 +339,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zxdg_decoration_manager_v1" => {
                     state.decoration_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwlr_layer_shell_v1" => {
+                    state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
                 }
                 _ => {}
             }
@@ -416,7 +428,27 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for Cli
     }
 }
 
-// wayland-client requires a `Dispatch` impl per bound interface; these five
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Acked right here, the same reasoning `xdg_surface`'s `Dispatch`
+        // impl gives: an unacked configure wedges every later one, and
+        // `map_layer_panel`'s own commit-after-ack sequencing depends on
+        // this having already happened by the time it runs.
+        if let zwlr_layer_surface_v1::Event::Configure { serial, width, height } = event {
+            surface.ack_configure(serial);
+            state.layer_configured = Some((width, height));
+        }
+    }
+}
+
+// wayland-client requires a `Dispatch` impl per bound interface; these six
 // carry nothing the harness asserts on.
 delegate_noop!(ClientState: ignore wl_compositor::WlCompositor);
 delegate_noop!(ClientState: ignore wl_surface::WlSurface);
@@ -424,6 +456,7 @@ delegate_noop!(ClientState: ignore wl_shm::WlShm);
 delegate_noop!(ClientState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(ClientState: ignore wl_buffer::WlBuffer);
 delegate_noop!(ClientState: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
+delegate_noop!(ClientState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 
 /// A real wayland client with exactly one mapped xdg toplevel.
 pub struct TestClient {
@@ -441,6 +474,63 @@ pub struct TestClient {
     queue: EventQueue<ClientState>,
     qh: QueueHandle<ClientState>,
     conn: Connection,
+}
+
+/// Connect to `socket` and bind every global this harness knows about.
+///
+/// Factored out of [`TestClient::map`] so [`LayerPanelClient::spawn`] can
+/// share the identical connect-and-bind sequence -- both clients need the
+/// same registry roundtrip, and a second implementation of it would be one
+/// more place for the "twice: globals, then binds settle" comment below to
+/// drift out of sync with reality.
+fn connect_and_bind(
+    socket: &str,
+) -> (Connection, EventQueue<ClientState>, QueueHandle<ClientState>, ClientState) {
+    let dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR must be set");
+    let path = std::path::Path::new(&dir).join(socket);
+    let stream =
+        UnixStream::connect(&path).unwrap_or_else(|e| panic!("connecting to {}: {e}", path.display()));
+    let conn = Connection::from_socket(stream).expect("wayland connection");
+
+    let mut queue = conn.new_event_queue::<ClientState>();
+    let qh = queue.handle();
+    let mut state = ClientState::default();
+
+    let display = conn.display();
+    let _registry = display.get_registry(&qh, ());
+    // Twice: the first hears the globals, the second lets the binds (and
+    // anything they announce, e.g. `wl_shm.format`) settle.
+    queue.roundtrip(&mut state).expect("registry roundtrip");
+    queue.roundtrip(&mut state).expect("bind roundtrip");
+
+    (conn, queue, qh, state)
+}
+
+/// Build a `w`x`h` shm-backed buffer, solid opaque grey. Shared by
+/// [`TestClient::map`] and [`LayerPanelClient::spawn`] -- both need exactly
+/// this to answer their respective compositor-chosen size with a real
+/// attach.
+fn create_shm_buffer(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<ClientState>,
+    w: i32,
+    h: i32,
+) -> (std::fs::File, wl_shm_pool::WlShmPool, wl_buffer::WlBuffer) {
+    let stride = w * 4;
+    let len = (stride * h) as usize;
+
+    let fd: OwnedFd = rustix::fs::memfd_create("icedtea-harness-shm", rustix::fs::MemfdFlags::CLOEXEC)
+        .expect("memfd_create");
+    rustix::fs::ftruncate(&fd, len as u64).expect("ftruncate");
+    let mut shm_file = std::fs::File::from(fd);
+    // Solid opaque grey. `Xrgb8888` (not `Argb8888`): it is the one format
+    // every wlroots renderer is required to advertise.
+    shm_file.write_all(&vec![0x80u8; len]).expect("write shm");
+    shm_file.flush().expect("flush shm");
+
+    let pool = shm.create_pool(shm_file.as_fd(), len as i32, qh, ());
+    let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Xrgb8888, qh, ());
+    (shm_file, pool, buffer)
 }
 
 impl TestClient {
@@ -468,22 +558,7 @@ impl TestClient {
     }
 
     fn map(socket: &str, app_id: &str, title: &str, decorated: bool) -> TestClient {
-        let dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR must be set");
-        let path = std::path::Path::new(&dir).join(socket);
-        let stream = UnixStream::connect(&path)
-            .unwrap_or_else(|e| panic!("connecting to {}: {e}", path.display()));
-        let conn = Connection::from_socket(stream).expect("wayland connection");
-
-        let mut queue = conn.new_event_queue::<ClientState>();
-        let qh = queue.handle();
-        let mut state = ClientState::default();
-
-        let display = conn.display();
-        let _registry = display.get_registry(&qh, ());
-        // Twice: the first hears the globals, the second lets the binds (and
-        // anything they announce, e.g. `wl_shm.format`) settle.
-        queue.roundtrip(&mut state).expect("registry roundtrip");
-        queue.roundtrip(&mut state).expect("bind roundtrip");
+        let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
 
         let compositor = state.compositor.clone().expect("compositor did not advertise wl_compositor");
         let shm = state.shm.clone().expect("compositor did not advertise wl_shm");
@@ -531,20 +606,7 @@ impl TestClient {
             Some((w, h)) if w > 0 && h > 0 => (w, h),
             _ => FALLBACK_SIZE,
         };
-        let stride = w * 4;
-        let len = (stride * h) as usize;
-
-        let fd: OwnedFd = rustix::fs::memfd_create("icedtea-harness-shm", rustix::fs::MemfdFlags::CLOEXEC)
-            .expect("memfd_create");
-        rustix::fs::ftruncate(&fd, len as u64).expect("ftruncate");
-        let mut shm_file = std::fs::File::from(fd);
-        // Solid opaque grey. `Xrgb8888` (not `Argb8888`): it is the one
-        // format every wlroots renderer is required to advertise.
-        shm_file.write_all(&vec![0x80u8; len]).expect("write shm");
-        shm_file.flush().expect("flush shm");
-
-        let pool = shm.create_pool(shm_file.as_fd(), len as i32, &qh, ());
-        let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Xrgb8888, &qh, ());
+        let (shm_file, pool, buffer) = create_shm_buffer(&shm, &qh, w, h);
 
         surface.attach(Some(&buffer), 0, 0);
         surface.damage_buffer(0, 0, w, h);
@@ -688,5 +750,139 @@ impl TestClient {
         let mut this = self;
         let TestClient { state, queue, .. } = &mut this;
         let _ = queue.roundtrip(state);
+    }
+
+    /// Map a top-anchored `zwlr_layer_shell_v1` panel: `TOP | LEFT | RIGHT`
+    /// anchor, `exclusive` reserved along the top edge, real shm-backed
+    /// attach once the compositor answers with a size. See
+    /// [`LayerPanelClient`] for the returned handle's own API --
+    /// `wait_until`/`layer_configure`, mirroring `TestClient`'s own.
+    pub fn map_layer_panel(socket: &str, exclusive: i32) -> LayerPanelClient {
+        LayerPanelClient::spawn(socket, exclusive)
+    }
+}
+
+/// A real `zwlr_layer_shell_v1` client, mapped as a top-anchored panel.
+///
+/// A separate type from [`TestClient`] rather than an `Option`-ified
+/// generalization of it: a layer surface has no `xdg_toplevel` (no
+/// maximize/fullscreen requests, no decoration, no `states()`), and
+/// threading `Option`s for all of that through every one of `TestClient`'s
+/// existing toplevel-only methods would make every call site (this crate's
+/// whole existing suite) responsible for a case that can never apply to it.
+pub struct LayerPanelClient {
+    surface: wl_surface::WlSurface,
+    layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    // Kept alive for as long as the client is, even though nothing reads
+    // them again after the attach below -- dropping the pool/buffer/file
+    // early would free the backing memory out from under a compositor that
+    // may still be reading it.
+    _buffer: wl_buffer::WlBuffer,
+    _pool: wl_shm_pool::WlShmPool,
+    _shm_file: std::fs::File,
+    state: ClientState,
+    queue: EventQueue<ClientState>,
+    conn: Connection,
+}
+
+impl LayerPanelClient {
+    /// Connect, bind `zwlr_layer_shell_v1`, and map a top-anchored panel
+    /// reserving `exclusive` pixels: `set_anchor(TOP | LEFT | RIGHT)`,
+    /// `set_exclusive_zone(exclusive)`, `set_size(0, exclusive as u32)`,
+    /// commit, wait for `Configure`, ack (inside the `Dispatch` impl), then
+    /// a real shm-backed attach at the compositor-chosen size and a second
+    /// commit -- the same "commit, await configure, ack, attach, commit"
+    /// shape [`TestClient::map`] follows for a toplevel.
+    fn spawn(socket: &str, exclusive: i32) -> LayerPanelClient {
+        let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+
+        let compositor = state.compositor.clone().expect("compositor did not advertise wl_compositor");
+        let shm = state.shm.clone().expect("compositor did not advertise wl_shm");
+        let layer_shell = state
+            .layer_shell
+            .clone()
+            .expect("compositor did not advertise zwlr_layer_shell_v1");
+
+        let surface = compositor.create_surface(&qh, ());
+        let layer_surface = layer_shell.get_layer_surface(
+            &surface,
+            None,
+            zwlr_layer_shell_v1::Layer::Top,
+            "harness-panel".to_string(),
+            &qh,
+            (),
+        );
+        layer_surface.set_anchor(
+            zwlr_layer_surface_v1::Anchor::Top
+                | zwlr_layer_surface_v1::Anchor::Left
+                | zwlr_layer_surface_v1::Anchor::Right,
+        );
+        layer_surface.set_exclusive_zone(exclusive);
+        layer_surface.set_size(0, exclusive as u32);
+        surface.commit();
+        conn.flush().expect("flush");
+
+        let deadline = Instant::now() + TIMEOUT;
+        while state.layer_configured.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "no zwlr_layer_surface_v1.configure within {TIMEOUT:?}"
+            );
+            queue.roundtrip(&mut state).expect("configure roundtrip");
+        }
+
+        let (w, h) = state.layer_configured.expect("just checked above");
+        let (w, h) = if w > 0 && h > 0 { (w as i32, h as i32) } else { FALLBACK_SIZE };
+        let (shm_file, pool, buffer) = create_shm_buffer(&shm, &qh, w, h);
+
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, w, h);
+        surface.commit();
+        conn.flush().expect("flush");
+        queue.roundtrip(&mut state).expect("map roundtrip");
+
+        LayerPanelClient {
+            surface,
+            layer_surface,
+            _buffer: buffer,
+            _pool: pool,
+            _shm_file: shm_file,
+            state,
+            queue,
+            conn,
+        }
+    }
+
+    /// Pump the client queue until `pred(self)` holds or [`TIMEOUT`]
+    /// elapses. Mirrors [`TestClient::wait_until`] exactly.
+    pub fn wait_until(&mut self, pred: impl Fn(&LayerPanelClient) -> bool) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.queue.roundtrip(&mut self.state).expect("roundtrip");
+            if pred(self) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Most recent `zwlr_layer_surface_v1.configure` size.
+    pub fn layer_configure(&self) -> Option<(i32, i32)> {
+        self.state.layer_configured.map(|(w, h)| (w as i32, h as i32))
+    }
+}
+
+impl Drop for LayerPanelClient {
+    fn drop(&mut self) {
+        self.layer_surface.destroy();
+        self.surface.destroy();
+        self.conn.flush().expect("flush");
+        let _ = self.queue.roundtrip(&mut self.state);
     }
 }
