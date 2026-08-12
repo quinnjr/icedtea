@@ -686,7 +686,6 @@ impl TestClient {
         self.state.closed
     }
 
-
     /// The mode from the most recent decoration `configure`: `1` client-side,
     /// `2` server-side, `None` if none has arrived.
     pub fn decoration_mode(&self) -> Option<u32> {

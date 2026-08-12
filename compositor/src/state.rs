@@ -124,6 +124,20 @@ pub struct LayerEntry {
     /// `layer_surface_mapped`/`layer_surface_unmapped`.
     /// [`State::arrange_layers`]'s fold skips every `!mapped` entry.
     pub mapped: bool,
+    /// The `(width, height, x, y)` [`State::configure_layer`] most
+    /// recently computed for this surface, or `None` before its first
+    /// call. Set just before the runtime-gated
+    /// `configure_layer_surface`/`set_layer_surface_position` calls, not
+    /// only after they run, so this is testable without a live
+    /// `wlr::Runtime` attached (every unit test in this file) -- in
+    /// production a runtime is always attached by the time any handler
+    /// runs, so this never records a placement that was not actually put
+    /// on the wire. Re-review finding Minor-1's storm guard: `configure_layer`
+    /// compares its freshly computed placement against this before doing
+    /// anything else, so calling it again with an unchanged input --
+    /// which `arrange_layers` now does for every mapped panel on every
+    /// pass -- costs one comparison rather than a wire round trip.
+    pub last_configured: Option<(u32, u32, i32, i32)>,
 }
 
 /// Shrink `rect` by one layer entry's positive exclusive zone along
@@ -933,6 +947,24 @@ impl State {
             output.usable = fold_exclusive_zone(output.usable, entry.anchor, entry.exclusive);
         }
 
+        // Re-review finding Minor-1: the fold above can change a *later*
+        // (higher-`sequence`) mapped panel's own placement input --
+        // `usable_before`'s output -- without that panel ever committing
+        // itself, e.g. an earlier panel growing its zone or unmapping.
+        // Nothing else would ever re-offer it a fresh placement, so it
+        // stayed positioned where it was last configured until its own
+        // next commit happened to come along. Reconfiguring every mapped
+        // panel here closes that, and does not reopen M4's storm class:
+        // `configure_layer` only actually sends when the computed
+        // placement differs from the one it last sent (`LayerEntry::
+        // last_configured`), so an arrange pass that changed nothing for
+        // a given panel costs one comparison, not a wire round trip.
+        let mapped_layers: Vec<wlr::LayerSurfaceId> =
+            self.layers.iter().filter(|(_, e)| e.mapped).map(|(&id, _)| id).collect();
+        for id in mapped_layers {
+            self.configure_layer(id);
+        }
+
         let gap = self.config.appearance.snap_gap;
         let affected: Vec<WindowId> = self.window_manager.windows().filter(|w| w.maximized).map(|w| w.id).collect();
         for id in affected {
@@ -981,8 +1013,12 @@ impl State {
     ///
     /// A no-op, panic-free, if the entry or its output has vanished (a
     /// commit racing a hotplug-removed output, or the `NO_OUTPUT`
-    /// sentinel -- see [`LayerEntry::output`]'s doc) or no runtime is
-    /// attached (every unit test in this file).
+    /// sentinel -- see [`LayerEntry::output`]'s doc), no runtime is
+    /// attached (every unit test in this file), or the computed placement
+    /// is unchanged from [`LayerEntry::last_configured`] -- see that
+    /// field's own doc (review finding Minor-1): this makes the method
+    /// safe to call unconditionally, which `arrange_layers` now does for
+    /// every mapped panel on every pass.
     pub fn configure_layer(&mut self, id: wlr::LayerSurfaceId) {
         let Some(entry) = self.layers.get(&id) else { return };
         let (output_idx, sequence, a, (desired_w, desired_h)) =
@@ -1016,6 +1052,26 @@ impl State {
         };
 
         let (w, h) = (w.max(0) as u32, h.max(0) as u32);
+        let placement = (w, h, x, y);
+        // Minor-1's storm guard: unchanged since the last time this was
+        // computed is a no-op. `None` (never computed before) never
+        // matches, so a surface's first `configure_layer` -- from
+        // `new_layer_surface` or its own first commit -- always goes out;
+        // the mandatory-configure contract is unaffected.
+        if self.layers.get(&id).is_some_and(|e| e.last_configured == Some(placement)) {
+            return;
+        }
+        // Recorded before the runtime-gated send below, not after: this
+        // is what `configure_layer` computed and is *treating* as current
+        // regardless of whether a runtime happened to be attached to
+        // actually put it on the wire (every unit test in this file has
+        // none). Production always has one attached by the time any of
+        // this crate's handlers run, so the gap that would open --
+        // recording a placement this method never actually sent -- cannot
+        // happen outside a test.
+        if let Some(entry) = self.layers.get_mut(&id) {
+            entry.last_configured = Some(placement);
+        }
         let Some(runtime) = self.wayland.runtime() else { return };
         runtime.configure_layer_surface(id, w, h);
         runtime.set_layer_surface_position(id, x, y);
@@ -1392,9 +1448,15 @@ impl State {
         // of being given it. While `layer_focus` names a still-mapped
         // entry, this leaves the seat's real focus alone entirely; only
         // the paths that actually drop layer focus
-        // (`layer_surface_unmapped`/`destroyed`) clear the field first,
-        // which is what lets a later call here reach the toplevel branch
-        // again.
+        // (`layer_surface_unmapped`/`destroyed`, plus
+        // `release_layer_focus` -- see re-review finding Important-1)
+        // clear the field first, which is what lets a later call here
+        // reach the toplevel branch again. `layer_holds_keyboard_focus`'s
+        // own unit tests exercise this guard's exact logic directly;
+        // there is no test that observes its effect on a real seat's
+        // keyboard focus end-to-end, for a harness limitation documented
+        // on `arrange_layers_leaves_layer_focus_alone_and_unmap_clears_it`
+        // (this file's `mod tests`).
         if layer_holds_keyboard_focus(self.layer_focus, &self.layers) {
             return;
         }
@@ -1403,6 +1465,31 @@ impl State {
             .filter(|&id| self.window_manager.is_visible_id(id))
             .filter(|&id| self.wayland.is_backed(id));
         self.wayland.keyboard_focus(focused);
+    }
+
+    /// Drop `layer_focus`, if held, so the next `sync_seat_focus` reaches
+    /// its toplevel branch instead of being blocked by
+    /// `layer_holds_keyboard_focus`'s guard.
+    ///
+    /// Re-review finding Important-1: round 1's `sync_seat_focus` guard
+    /// closed the *passive* leak (`arrange_layers` and any other
+    /// `sync_window_to_scene`-driven resync must never steal focus from a
+    /// mapped interactive layer surface -- that must stay closed, and
+    /// still is: nothing below calls this), but implemented only the
+    /// guard's first clause. Missing was its second: *something* has to
+    /// clear `layer_focus` when a toplevel focus is genuinely,
+    /// user-, D-Bus-, or alt-tab-intentionally being asserted over it,
+    /// or no toplevel can ever take the keyboard again once any
+    /// interactive layer surface has ever mapped. Called at the top of
+    /// every EXPLICIT toplevel-focus assertion -- `handle_pointer_press`
+    /// (click-to-focus), `DbCommand::Focus`, and the `cycle:alt_tab`
+    /// action's per-step focus -- each of which calls
+    /// `sync_focus_change`/`sync_seat_focus` of its own accord shortly
+    /// after, which is what actually pushes the toplevel focus out; this
+    /// method itself makes no seat call; it only clears the field the
+    /// guard reads.
+    fn release_layer_focus(&mut self) {
+        self.layer_focus = None;
     }
 
     /// Reconcile a focus transition all the way out to the clients.
@@ -1800,6 +1887,9 @@ impl State {
         use crate::dbus::DbCommand;
         match cmd {
             DbCommand::Focus(id) => {
+                // Re-review finding Important-1: an explicit toplevel-focus
+                // assertion -- see `release_layer_focus`'s own doc.
+                self.release_layer_focus();
                 let previous = self.focused_id();
                 self.window_manager.focus(id)?;
                 self.sync_focus_change(previous);
@@ -1965,6 +2055,10 @@ impl State {
                 let idx = self.alt_tab.index();
                 let entries = self.alt_tab.entries().to_vec();
                 if let Some(wid) = entries.get(idx).copied() {
+                    // Re-review finding Important-1: an explicit
+                    // toplevel-focus assertion -- see `release_layer_focus`'s
+                    // own doc.
+                    self.release_layer_focus();
                     let previous = self.focused_id();
                     self.window_manager.focus(wid);
                     self.sync_focus_change(previous);
@@ -2225,6 +2319,9 @@ impl State {
     /// raise a window also be the click that acts on it, matching ordinary
     /// click-to-focus window manager behavior.
     fn handle_pointer_press(&mut self, id: WindowId, pointer: (i32, i32)) -> Option<()> {
+        // Re-review finding Important-1: click-to-focus is an explicit
+        // toplevel-focus assertion -- see `release_layer_focus`'s own doc.
+        self.release_layer_focus();
         let previous = self.focused_id();
         self.window_manager.focus(id)?;
         // Focus changes the client's activation state, so it has to reach
@@ -2986,6 +3083,7 @@ impl wlr::ToplevelHandler for State {
                 // False until `layer_surface_mapped` (review finding J2):
                 // a surface with no buffer yet must not reserve space.
                 mapped: false,
+                last_configured: None,
             },
         );
         self.configure_layer(id);
@@ -4874,6 +4972,7 @@ mod tests {
                 size: (800, 30),
                 interactive: false,
                 mapped: true,
+                last_configured: None,
             },
         );
         state.arrange_layers();
@@ -4906,6 +5005,7 @@ mod tests {
                 size: (800, 30),
                 interactive: false,
                 mapped: true,
+                last_configured: None,
             },
         );
         state.arrange_layers();
@@ -4946,6 +5046,7 @@ mod tests {
             size: (800, exclusive as u32),
             interactive: false,
             mapped,
+            last_configured: None,
         }
     }
 
@@ -5049,6 +5150,7 @@ mod tests {
                 size: (800, 30),
                 interactive: false,
                 mapped: true,
+                last_configured: None,
             },
         );
         state.arrange_layers();
@@ -5205,5 +5307,128 @@ mod tests {
             Rectangle { x: 0, y: 0, width: 800, height: 600 },
             "an unmapped earlier entry must not shrink a later panel's placement base"
         );
+    }
+
+    // --- Task 20 re-review: Important-1, Minor-1 ---
+
+    /// Important-1: click-to-focus is an explicit toplevel-focus assertion
+    /// and must win over an interactive panel's held `layer_focus`, unlike
+    /// the passive resyncs round 1 (correctly) left alone -- see
+    /// `release_layer_focus`'s own doc for the two-clause guard this
+    /// completes.
+    #[test]
+    fn clicking_a_window_releases_layer_focus_for_an_interactive_panel() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 600, height: 400 });
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(panel_id);
+
+        let _ = state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) });
+        assert_eq!(state.layer_focus, None, "clicking a window must release layer_focus");
+        assert!(state.window_manager.get(id).unwrap().focused, "the model's own focus must have won");
+    }
+
+    /// Important-1: `DbCommand::Focus` is the D-Bus-driven counterpart of a
+    /// click and must release `layer_focus` the same way.
+    #[test]
+    fn db_command_focus_releases_layer_focus_for_an_interactive_panel() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let a = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        let _b = state.window_manager.add_window("app2", "t2", 2, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(panel_id);
+
+        state.handle_command(crate::dbus::DbCommand::Focus(a)).unwrap();
+        assert_eq!(state.layer_focus, None, "DbCommand::Focus must release layer_focus");
+        assert!(state.window_manager.get(a).unwrap().focused);
+    }
+
+    /// Important-1: alt-tab's per-step focus is the third explicit path
+    /// named in the finding.
+    #[test]
+    fn alt_tab_cycling_releases_layer_focus_for_an_interactive_panel() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let _a = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        let _b = state.window_manager.add_window("app2", "t2", 2, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(panel_id);
+
+        state.apply_action("cycle:alt_tab");
+        assert_eq!(state.layer_focus, None, "alt-tab cycling must release layer_focus");
+    }
+
+    /// Minor-1: `arrange_layers` must reconfigure every mapped panel on
+    /// every pass, not only the one whose own commit triggered it --
+    /// otherwise a panel whose placement input changed for a reason other
+    /// than its own commit (another panel's zone growing or shrinking,
+    /// unmapping, or -- as reproduced here -- the output itself resizing)
+    /// keeps the stale position it was last configured with until its own
+    /// next commit happens to come along.
+    ///
+    /// `wlr::LayerSurfaceId::dangling_for_test()` is the only synthetic id
+    /// this crate exposes, so a unit test cannot hold two distinct live
+    /// `LayerEntry`s at once the way a real two-panel scenario would --
+    /// see `usable_before_stacks_two_same_edge_panels_instead_of_overlapping`,
+    /// which works around the identical limitation the same way. This test
+    /// instead reproduces the single-panel case of the same mechanism: an
+    /// output resize (`create_output` again -- what `OutputHandler::
+    /// new_output` does on a real mode change) moves the panel's placement
+    /// input with no layer-side event, real or simulated, in between, and
+    /// only `arrange_layers`'s own unconditional reconfigure loop notices.
+    #[test]
+    fn arrange_layers_reconfigures_every_mapped_panel_even_without_its_own_commit() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, true));
+
+        state.arrange_layers();
+        let first_placement = state.layers[&id].last_configured;
+        assert_eq!(first_placement, Some((800, 30, 0, 0)), "the initial arrange must record a placement");
+
+        // Nothing calls `configure_layer` or `layer_surface_commit` for
+        // this entry between the two arranges -- an output mode change
+        // (`create_output` again, standing in for `OutputHandler::
+        // new_output` re-recording a resized output's box) moves this
+        // panel's placement input with no layer-side event of any kind,
+        // real or simulated, in between.
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 640, height: 480 });
+        state.arrange_layers();
+        let second_placement = state.layers[&id].last_configured;
+        assert_ne!(second_placement, first_placement, "arrange_layers must reconfigure a panel with no commit of its own");
+        assert_eq!(second_placement, Some((640, 30, 0, 0)));
+    }
+
+    /// Minor-1's other half: an `arrange_layers` pass that changes nothing
+    /// about a panel's placement must not touch `last_configured` at all
+    /// -- this is the M4-storm-class guard `configure_layer` itself now
+    /// provides, proven here at the `arrange_layers` call site rather than
+    /// `configure_layer` directly.
+    #[test]
+    fn arrange_layers_does_not_reconfigure_an_unchanged_panel() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, true));
+
+        state.arrange_layers();
+        let placement = state.layers[&id].last_configured;
+
+        state.arrange_layers();
+        assert_eq!(state.layers[&id].last_configured, placement, "an unchanged panel's placement must not be re-recorded");
     }
 }

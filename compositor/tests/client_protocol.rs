@@ -334,3 +334,39 @@ fn a_layer_panel_gets_configured_and_carves_the_workspace() {
 
     win.detach();
 }
+
+/// Task 20 review finding J2, end-to-end (re-review Minor-2 wired
+/// `LayerPanelClient::unmap` into a real test rather than leaving it
+/// unused): a panel that unmaps -- without being destroyed -- must give
+/// its exclusive zone back, and a maximized toplevel must track that
+/// immediately with no D-Bus command needed (`layer_surface_unmapped`'s
+/// own `arrange_layers()` call re-syncs it). `646` is
+/// `a_layer_panel_gets_configured_and_carves_the_workspace`'s own derived
+/// carved height; `676` is that same derivation with the panel's 30px
+/// zone removed (`1280x720` minus `snap_gap`'s `8`px both-edges inset,
+/// `1264x704` frame, minus the `28`px SSD title-bar band -> `676`).
+#[test]
+fn unmapping_a_layer_panel_gives_the_usable_area_back() {
+    let comp = Compositor::spawn();
+    let mut panel = TestClient::map_layer_panel(&comp.socket, 30);
+    assert!(panel.wait_until(|c| c.layer_configure().is_some()), "panel must be configured");
+
+    let mut win = TestClient::map_toplevel(&comp.socket, "harness.tiled", "t");
+    let id = comp.snapshot().windows[0].id;
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(id, true));
+    assert!(
+        win.wait_until(|c| c.last_configure().map(|(_, h)| h) == Some(646)),
+        "maximized height must exclude the panel's zone before it unmaps, last configure: {:?}",
+        win.last_configure()
+    );
+
+    let n = win.configure_count();
+    panel.unmap();
+    assert!(
+        win.wait_until(|c| c.configure_count() > n && c.last_configure().map(|(_, h)| h) == Some(676)),
+        "maximized height must exclude nothing once the panel unmaps, last configure: {:?}",
+        win.last_configure()
+    );
+
+    win.detach();
+}
