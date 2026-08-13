@@ -1269,7 +1269,8 @@ dependencies = [
 name = "icedtea-shell"
 version = "0.1.0"
 dependencies = [
- "crossbeam-channel",
+ "async-channel",
+ "futures-util",
  "gtk4",
  "gtk4-layer-shell",
  "icedtea-clipboard",

@@ -9,7 +9,8 @@ icedtea-contract = { path = "../contract" }
 gtk4 = "0.11"
 gtk4-layer-shell = "0.8"
 zbus.workspace = true
-crossbeam-channel.workspace = true
+async-channel = "2"
+futures-util = "0.3"
 tracing.workspace = true
 
 [dev-dependencies]
