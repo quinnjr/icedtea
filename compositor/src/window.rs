@@ -524,10 +524,14 @@ impl WindowManager {
 
         // The active workspace may have been truncated away; clamp it back
         // into range so `workspace_mut`/`focused_window` stay panic-free.
-        // (This clamp is part of the reload's single `WorkspaceList` change,
-        // not a separate mutation.)
+        // This is a real change to `active_workspace`, and `WorkspaceList`
+        // does not carry the active index, so emit the same
+        // `WorkspaceSet{active: true}` every other active-workspace change
+        // emits -- otherwise subscribers keep showing the vanished workspace
+        // until a manual switch.
         if self.active_workspace >= new_len {
             self.active_workspace = 0;
+            self.emit(Event::WorkspaceSet { id: 0, active: true });
         }
     }
 

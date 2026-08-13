@@ -1967,11 +1967,13 @@ impl State {
         // Review finding I2: these used to be extended onto a separate
         // `pending_config_events` vec that bypassed the sequence counter
         // entirely, so the reload's events went out with no seq of their
-        // own. `apply_config` has already replaced `window_manager` (whose
-        // `seq` is floored at the pre-reload high-water mark and whose
-        // pending queue is empty) by the time this runs, so pushing them
-        // through the ordinary queue both preserves their order and gives
-        // each one a real, monotonically increasing seq.
+        // own. `apply_config`'s returned `events` (the summary
+        // `WorkspaceList`/`ConfigReloaded`, plus a terminal `AltTabState` if
+        // a cycle was in flight) are the ones without a seq yet; pushing them
+        // through the ordinary queue gives each a real, monotonically
+        // increasing seq after any per-window events `apply_config` already
+        // queued (e.g. a workspace migration's `WindowUpdated`), preserving
+        // their order.
         for ev in &events {
             self.window_manager.push_event(ev.clone());
         }
@@ -1998,13 +2000,10 @@ impl State {
             let path = self.config.appearance.wallpaper.clone();
             self.spawn_wallpaper(path);
         }
-        // `apply_config` already discarded every window (emitting
-        // `WindowClosed` for each, folded into `events` above), so there is
-        // nothing left to re-sync here in practice -- but this stays
-        // unconditional rather than special-cased on "did anything survive"
-        // so a future reload that stops destroying windows gets the
-        // palette/bar-color re-sync for free instead of silently needing a
-        // second gap-close task.
+        // `apply_config` now preserves every window row across the reload, so
+        // this re-sync repaints the surviving windows against the swapped-in
+        // appearance (palette/bar colors) -- exactly the case this
+        // unconditional call was left in place to cover.
         self.sync_scene();
 
         self.emit_pending();
@@ -3667,6 +3666,36 @@ mod tests {
         assert_eq!(w.workspace, 0, "a window on a removed workspace migrates to 0");
         assert!(!w.focused);
         assert!(!events.iter().any(|e| matches!(e, Event::WindowClosed(_))));
+    }
+
+    /// M1 (review): truncating the workspace list below the active index must
+    /// clamp `active_workspace` back to 0 AND emit exactly one
+    /// `WorkspaceSet{active: true}` -- `WorkspaceList` does not carry the
+    /// active index, so subscribers would otherwise keep showing the vanished
+    /// workspace until a manual switch.
+    #[test]
+    fn apply_config_emits_workspace_set_when_active_workspace_is_truncated() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        // default_config has 4 workspaces; make workspace 3 active.
+        assert!(state.window_manager.set_active_workspace(3));
+        assert_eq!(state.window_manager.active_workspace(), 3);
+        // Drain setup events so we only observe the reload's.
+        state.window_manager.pending_events.clear();
+
+        let mut cfg = icedtea_config::default_config();
+        cfg.workspace_names = vec!["only".into()]; // removes workspaces 1..4
+        let _ = state.apply_config(cfg);
+
+        assert_eq!(state.window_manager.active_workspace(), 0, "active clamps into range");
+        assert!(
+            state
+                .window_manager
+                .pending_events
+                .iter()
+                .any(|se| matches!(se.event, Event::WorkspaceSet { id: 0, active: true })),
+            "clamping the active workspace must emit a WorkspaceSet"
+        );
     }
 
     #[test]
