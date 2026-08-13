@@ -1369,20 +1369,108 @@ impl State {
         if orphaned.is_empty() {
             return;
         }
-        let Some(survivor) = self.output_for_pointer() else { return };
+        // M2/M5: cloned once, not re-borrowed per entry -- `set_layer_surface_output`
+        // below runs inside the loop, alongside a mutable borrow of
+        // `self.layers`, which a live `&wlr::Runtime` borrowed from
+        // `self.wayland` would conflict with. `Runtime` is cheap to clone
+        // (an `Rc`-shaped handle), the same pattern `OutputHandler::new_output`
+        // already uses ahead of its own per-output mutations.
+        let runtime = self.wayland.runtime().cloned();
         for id in &orphaned {
+            // Each entry re-homes to the output its own last-known
+            // placement's frame center actually sits over (mirrors
+            // `migrate_windows_from`'s per-window containment test) --
+            // *not* a single pointer-derived survivor for the whole batch
+            // (M2: an unrelated panel commit elsewhere no longer decides
+            // where a status bar on a hot-removed display ends up). A
+            // surface with no placement yet (`last_configured: None`,
+            // never configured) falls back to the lowest surviving index,
+            // same as `migrate_windows_from`'s own fallback.
+            let geometry = self
+                .layers
+                .get(id)
+                .and_then(|e| e.last_configured)
+                .map(|(w, h, x, y)| Rectangle { x, y, width: w as i32, height: h as i32 });
+            let hit = geometry.and_then(|g| {
+                let cx = g.x + g.width / 2;
+                let cy = g.y + g.height / 2;
+                self.outputs.iter().find(|(_, out)| out.geometry.contains(cx, cy)).map(|(&idx, _)| idx)
+            });
+            let Some(survivor) = hit.or_else(|| self.outputs.keys().min().copied()) else { continue };
             if let Some(entry) = self.layers.get_mut(id) {
                 entry.output = survivor;
+            }
+            if let Some(rt) = &runtime
+                && let Some(output_id) = self.wlr_output_id_for(survivor)
+            {
+                rt.set_layer_surface_output(*id, output_id);
             }
             self.configure_layer(*id);
         }
         self.arrange_layers();
     }
 
+    /// The live `wlr::OutputId` behind this crate's own `u32` index, the
+    /// reverse of `output_ids`' own direction (`wlr::OutputId -> u32`) --
+    /// needed wherever a consumer must call back into the runtime by
+    /// output rather than by this crate's index, e.g.
+    /// `set_layer_surface_output`. `None` if `index` names no live output
+    /// (already removed, or never inserted -- the `NO_OUTPUT` sentinel,
+    /// say). A linear scan over `output_ids`, which stays tiny (one entry
+    /// per live output).
+    fn wlr_output_id_for(&self, index: u32) -> Option<wlr::OutputId> {
+        self.output_ids.iter().find_map(|(&oid, &idx)| (idx == index).then_some(oid))
+    }
+
+    /// N9: react to `entry.interactive` changing on an already-mapped
+    /// surface -- `layer_surface_commit`'s post-map counterpart to
+    /// `layer_surface_mapped`'s at-map take-focus branch, which only ever
+    /// runs once (at map) and so misses a surface that starts
+    /// non-interactive and flips the flag on a later commit while already
+    /// on screen (an auto-hide launcher's menu, say).
+    ///
+    /// Flipping to `true` while mapped and nothing else already holds
+    /// layer focus (`layer_holds_keyboard_focus`, mirroring the guard
+    /// `sync_seat_focus` itself reads) takes it: `layer_focus` is recorded
+    /// unconditionally, the same "record intent, then best-effort the wire
+    /// action" split `configure_layer` already uses for
+    /// `last_configured` -- every unit test in this file runs with no
+    /// `wlr::Runtime` attached, so gating the bookkeeping behind
+    /// `focus_layer_keyboard`'s own `Option` (as `layer_surface_mapped`
+    /// does, where a live runtime is assumed) would make this
+    /// unobservable outside a running compositor.
+    ///
+    /// Flipping to `false` while this surface held focus releases it and
+    /// hands the seat back to whatever the model says is focused
+    /// (`sync_seat_focus`), the same hand-back `layer_surface_unmapped`
+    /// and `layer_surface_destroyed` already perform.
+    fn sync_layer_interactive_focus(&mut self, id: wlr::LayerSurfaceId, was_interactive: bool, now_interactive: bool) {
+        if now_interactive && !was_interactive {
+            let mapped = self.layers.get(&id).is_some_and(|e| e.mapped);
+            if !mapped || layer_holds_keyboard_focus(self.layer_focus, &self.layers) {
+                return;
+            }
+            self.layer_focus = Some(id);
+            if let Some(runtime) = self.wayland.runtime()
+                && runtime.focus_layer_keyboard(id).is_none()
+            {
+                // Finding 8, errors: mirrors `layer_surface_mapped`'s own
+                // trace for the same failure -- a keyboard grab that
+                // silently didn't take used to leave no clue why a
+                // post-map-interactive panel never got input.
+                tracing::debug!(?id, "layer surface became interactive after map but did not take keyboard focus");
+            }
+        } else if !now_interactive && was_interactive && self.layer_focus == Some(id) {
+            self.layer_focus = None;
+            self.sync_seat_focus();
+        }
+    }
+
     /// Hot-remove semantics: every window whose frame center sat inside the
     /// dead output's box (`dead`, captured by the caller before the entry
     /// left `self.outputs`) is moved onto the surviving output with the
-    /// lowest index (clamped into its box, cascade order preserved) and
+    /// lowest index (clamped into its box, or centered if it does not fit
+    /// -- see the centering branch's own comment for F, task 8) and
     /// re-synced. Called from `OutputHandler::destroyed`.
     ///
     /// With no surviving output, this is a deliberate no-op: there is
@@ -1410,18 +1498,23 @@ impl State {
             let geometry = w.geometry;
 
             // Preserve the window's offset from the dead output's origin,
-            // clamped so the frame fits inside the survivor's box -- pinned
-            // to the survivor's own origin on that axis when the frame is
-            // wider/taller than the survivor itself (a `max` bound below its
-            // `min` bound would panic `clamp`, so guard it explicitly rather
-            // than trusting every window to be smaller than every output).
+            // clamped so the frame fits inside the survivor's box. A frame
+            // wider/taller than the survivor itself is centered instead
+            // (task 8, F: a `max` bound below its `min` bound would panic
+            // `clamp`, and pinning it to the survivor's own origin drew it
+            // hard against one corner with all the overflow bleeding off a
+            // single edge -- centering spreads the unavoidable overflow
+            // symmetrically, which is what every other oversized-window
+            // placement in this crate already does). The subtraction below
+            // is total, not `clamp`ed -- an oversized frame legitimately
+            // produces a negative offset, and there is no bound to violate.
             let new_x = if geometry.width >= survivor.width {
-                survivor.x
+                survivor.x + (survivor.width - geometry.width) / 2
             } else {
                 (survivor.x + (geometry.x - dead.x)).clamp(survivor.x, survivor.x + survivor.width - geometry.width)
             };
             let new_y = if geometry.height >= survivor.height {
-                survivor.y
+                survivor.y + (survivor.height - geometry.height) / 2
             } else {
                 (survivor.y + (geometry.y - dead.y)).clamp(survivor.y, survivor.y + survivor.height - geometry.height)
             };
@@ -3349,10 +3442,8 @@ impl wlr::ToplevelHandler for State {
     /// layer surface that no handler ever does.
     fn new_layer_surface(&mut self, surface: &wlr::LayerSurface<'_>) {
         let id = surface.id();
-        let output = surface
-            .output_id()
-            .and_then(|oid| self.output_ids.get(&oid).copied())
-            .or_else(|| self.output_for_pointer());
+        let client_output = surface.output_id().and_then(|oid| self.output_ids.get(&oid).copied());
+        let output = client_output.or_else(|| self.output_for_pointer());
         let sequence = self.next_layer_sequence;
         self.next_layer_sequence += 1;
         // H2: bound the client-controlled exclusive zone at capture time --
@@ -3382,6 +3473,20 @@ impl wlr::ToplevelHandler for State {
                 margin: (0, 0, 0, 0),
             },
         );
+        // The client left the output unset: this crate chose one on its
+        // behalf (`client_output.is_none()`, above), so the raw layer
+        // surface's own `output` field needs to agree with the model --
+        // `set_layer_surface_output` is the 0.20.12 API for that
+        // assignment. A no-op, correctly, with no runtime attached (every
+        // unit test in this file) or no live output to name yet (`output`
+        // is `None`, parked under `NO_OUTPUT`; `resolve_orphaned_layers`
+        // picks this back up the moment one exists).
+        if client_output.is_none()
+            && let (Some(idx), Some(runtime)) = (output, self.wayland.runtime())
+            && let Some(output_id) = self.wlr_output_id_for(idx)
+        {
+            runtime.set_layer_surface_output(id, output_id);
+        }
         self.configure_layer(id);
     }
 
@@ -3411,9 +3516,18 @@ impl wlr::ToplevelHandler for State {
         entry.anchor = surface.anchor();
         entry.exclusive = exclusive;
         entry.size = surface.desired_size();
+        let was_interactive = entry.interactive;
         entry.interactive = surface.keyboard_interactive();
+        let now_interactive = entry.interactive;
         self.configure_layer(id);
         self.arrange_layers();
+        // N9: a surface that only becomes keyboard-interactive *after* it
+        // mapped (a menu that opens with no interactivity, then flips it
+        // on once the user drives it) never passes through
+        // `layer_surface_mapped`'s own take-focus branch, since that only
+        // ever runs once, at map time. See `sync_layer_interactive_focus`'s
+        // own doc for the take/release rule this drives.
+        self.sync_layer_interactive_focus(id, was_interactive, now_interactive);
     }
 
     /// The layer surface now has a buffer and is on screen: it starts
@@ -5485,6 +5599,24 @@ mod tests {
         );
     }
 
+    /// Task 8, F: a window too wide for the survivor used to pin flush to
+    /// the survivor's origin on that axis (`new_x = survivor.x`), bleeding
+    /// all of the overflow off the right/bottom edge. Centering spreads it
+    /// symmetrically instead -- negative on both edges rather than zero on
+    /// one and everything on the other.
+    #[test]
+    fn an_oversized_migrated_window_is_centered_not_corner_pinned() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 900, y: 50, width: 1000, height: 800 });
+        let dead = state.outputs.remove(&1).map(|o| o.geometry).unwrap_or(Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        state.migrate_windows_from(dead);
+        let w = state.window_manager.get(id).expect("window");
+        // centered: x = 0 + (800 - 1000)/2 = -100 (symmetric overflow), not pinned to 0.
+        assert_eq!(w.geometry.x, (800 - 1000) / 2);
+    }
+
     #[test]
     fn migration_with_no_surviving_output_keeps_geometry() {
         let (tx, _rx) = crossbeam_channel::unbounded();
@@ -5782,6 +5914,33 @@ mod tests {
         assert_eq!(state.layers[&id].output, 0, "must re-home onto the surviving output");
     }
 
+    /// Task 8, M5: each orphaned entry re-homes to whichever surviving
+    /// output its own last-known placement's frame center actually sits
+    /// over, not a single survivor picked once for the whole batch (the
+    /// old `output_for_pointer` heuristic this replaces) -- a panel
+    /// already configured onto the far side of a two-output layout must
+    /// land on the output whose box it geometrically overlaps, even when
+    /// the lowest surviving index is the *other* one.
+    #[test]
+    fn resolve_orphaned_layers_rehomes_each_entry_by_its_own_frame_center() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        // Orphaned by a third, now-dead output; its own last-configured
+        // placement sits squarely inside output 1's box, not output 0's
+        // (the lowest index, and what a uniform pointer-derived pick would
+        // have chosen instead).
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(
+            id,
+            LayerEntry { output: 2, last_configured: Some((200, 30, 850, 0)), ..top_panel_entry(30, true) },
+        );
+
+        state.resolve_orphaned_layers();
+        assert_eq!(state.layers[&id].output, 1, "must land on the output its own frame center overlaps");
+    }
+
     /// M5: with no surviving output at all, the sweep is a deliberate
     /// no-op -- there is nowhere to re-home to, and the entry is left
     /// exactly where it was for the next call (the next `new_output`) to
@@ -5886,6 +6045,92 @@ mod tests {
         wlr::ToplevelHandler::layer_surface_unmapped(&mut state, panel_id);
         assert_eq!(state.layer_focus, None, "unmapping must clear layer_focus");
         assert!(!state.layers[&panel_id].mapped, "unmapping must stop the entry from reserving");
+    }
+
+    /// Task 8, N9: a layer surface that becomes keyboard-interactive
+    /// *after* it already mapped -- an auto-hide launcher's menu opening,
+    /// say -- must still take keyboard focus, even though
+    /// `layer_surface_mapped`'s own take-focus branch already ran once (at
+    /// map, while the surface was still non-interactive) and will not run
+    /// again. Driven via `sync_layer_interactive_focus` directly, the
+    /// internal bookkeeping `layer_surface_commit` calls after updating
+    /// `entry.interactive` -- `layer_surface_commit` itself takes a live
+    /// `&wlr::LayerSurface`, which nothing in this harness can fabricate
+    /// (same limitation `arrange_layers_leaves_layer_focus_alone_and_unmap_clears_it`
+    /// documents on its own).
+    #[test]
+    fn a_layer_surface_that_becomes_interactive_after_map_takes_focus() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        // Mapped, not (yet) interactive -- what `layer_surface_mapped` left
+        // behind for a surface that mapped before ever asking for the
+        // keyboard.
+        state.layers.insert(id, top_panel_entry(30, true));
+        assert_eq!(state.layer_focus, None, "must not hold focus before the flip");
+
+        // The commit that flips `keyboard_interactive()` to `true`.
+        state.layers.get_mut(&id).unwrap().interactive = true;
+        state.sync_layer_interactive_focus(id, false, true);
+
+        assert_eq!(state.layer_focus, Some(id), "must take layer focus once it becomes interactive post-map");
+    }
+
+    /// Task 8, N9: the release half -- a mapped, focused surface that
+    /// flips interactive back to `false` (still mapped) must give the
+    /// keyboard back up rather than hold a focus it no longer claims.
+    #[test]
+    fn a_layer_surface_that_stops_being_interactive_releases_focus() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(id);
+
+        state.layers.get_mut(&id).unwrap().interactive = false;
+        state.sync_layer_interactive_focus(id, true, false);
+
+        assert_eq!(state.layer_focus, None, "must release layer focus once it stops being interactive");
+    }
+
+    /// Task 8, N9: a surface that is not mapped yet must never take focus
+    /// through this path, even if the flag flips -- `focus_layer_keyboard`
+    /// refuses an unmapped surface for good reason (see that method's own
+    /// doc), and this guard is what keeps the bookkeeping in step with it.
+    #[test]
+    fn an_unmapped_surface_does_not_take_focus_on_becoming_interactive() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(id, top_panel_entry(30, false));
+
+        state.layers.get_mut(&id).unwrap().interactive = true;
+        state.sync_layer_interactive_focus(id, false, true);
+
+        assert_eq!(state.layer_focus, None, "an unmapped surface must not take layer focus");
+    }
+
+    /// Task 8, N9: something else already holding layer focus must not be
+    /// stolen from just because an unrelated surface also flips
+    /// interactive on.
+    #[test]
+    fn an_already_focused_layer_is_not_stolen_from_by_another_turning_interactive() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let held = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(held, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(held);
+
+        let other = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(other, top_panel_entry(30, true));
+        state.layers.get_mut(&other).unwrap().interactive = true;
+        state.sync_layer_interactive_focus(other, false, true);
+
+        assert_eq!(state.layer_focus, Some(held), "must not steal focus from an already-focused layer surface");
     }
 
     /// N6: two top-anchored exclusive panels on the same output must stack
