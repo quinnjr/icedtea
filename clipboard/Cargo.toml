@@ -1,0 +1,19 @@
+[package]
+name = "icedtea-clipboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+icedtea-contract = { path = "../contract" }
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+zbus = "5"
+crossbeam-channel.workspace = true
+rustix = { version = "1", features = ["event"] }
+tracing.workspace = true
+
+[dev-dependencies]
+icedtea-compositor = { path = "../compositor" }
+icedtea-config = { path = "../config" }
+wlr = "0.20.15"

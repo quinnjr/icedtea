@@ -815,6 +815,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "icedtea-clipboard"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "icedtea-compositor",
+ "icedtea-config",
+ "icedtea-contract",
+ "rustix 1.1.4",
+ "tracing",
+ "wayland-client",
+ "wayland-protocols-wlr",
+ "wlr",
+ "zbus",
+]
+
+[[package]]
 name = "icedtea-compositor"
 version = "0.1.0"
 dependencies = [
