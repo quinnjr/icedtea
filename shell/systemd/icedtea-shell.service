@@ -1,0 +1,14 @@
+[Unit]
+Description=icedtea shell (taskbar + clipboard popover)
+Documentation=https://github.com/quinnjr/icedtea-wm
+PartOf=graphical-session.target
+After=graphical-session.target icedtea-clipboard.service
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/icedtea-shell
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target
