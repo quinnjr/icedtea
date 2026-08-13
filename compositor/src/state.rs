@@ -1856,17 +1856,15 @@ impl State {
         // it is the least surprising way to say "this window is not the
         // active one" in a title bar that is otherwise identical.
         //
-        // Dimmed in RGB, not in alpha, and that is not a style choice:
-        // cosmic-text's `SwashCache::with_pixels` builds each mask-glyph
-        // pixel as `coverage << 24 | base.0 & 0xFF_FF_FF` -- it takes the
-        // base color's *channels* and discards its alpha outright (the
-        // upstream source says as much, in a `TODO: blend base alpha?`).
-        // Asking for translucent text by lowering the alpha byte would
-        // therefore change nothing at all on screen.
+        // Dimmed via `fg`'s alpha byte, not its RGB channels: `text::
+        // rasterize_title` folds `fg[3]` back into the glyph coverage itself
+        // (M3), so a reduced alpha here really does draw a translucent
+        // glyph instead of the RGB-blend approximation M2 needed while that
+        // premultiply ignored `fg[3]`.
         let palette = crate::render::hex_to_rgba(&self.config.appearance.palette.foreground);
-        let dim = if focused { 1.0 } else { 0.6 };
-        let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * dim * 255.0).round() as u8;
-        let fg = [to_u8(palette[0]), to_u8(palette[1]), to_u8(palette[2]), 255];
+        let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let alpha = if focused { 255 } else { (255.0 * 0.6) as u8 };
+        let fg = [to_u8(palette[0]), to_u8(palette[1]), to_u8(palette[2]), alpha];
 
         let key: TitleRasterKey = (title, width, fg);
         if self.title_rasters.get(&id).is_some_and(|entry| entry.key == key) {

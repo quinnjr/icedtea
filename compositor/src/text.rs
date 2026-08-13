@@ -102,7 +102,15 @@ pub fn rasterize_title(
                     if tx < 0 || ty < 0 || tx >= width || ty >= height {
                         continue;
                     }
-                    let a = color.a();
+                    // `color.a()` here is glyph *coverage*, not `fg`'s alpha:
+                    // cosmic-text's `SwashCache::with_pixels` builds each
+                    // mask-glyph pixel as `coverage << 24 | base.0 &
+                    // 0xFF_FF_FF`, discarding the base color's alpha byte
+                    // outright. Folding `fg[3]` back in here -- coverage and
+                    // requested alpha multiplied, not either alone -- is
+                    // what makes a dimmed `fg` actually dim the glyph instead
+                    // of doing nothing.
+                    let a = ((color.a() as u16 * fg[3] as u16) / 255) as u8;
                     if a == 0 {
                         continue;
                     }
@@ -323,6 +331,20 @@ mod tests {
         }
         assert!(!left_opaque, "centered glyph must leave the left quarter clear");
         assert!(!right_opaque, "centered glyph must leave the right quarter clear");
+    }
+
+    /// M3: a title rasterized with a lower-alpha `fg` must produce
+    /// lower-alpha glyph pixels than the same title at full alpha -- the
+    /// alpha-dimming contract `ensure_title_raster` relies on for unfocused
+    /// windows instead of an RGB-blend approximation.
+    #[test]
+    fn a_dimmed_title_has_lower_alpha_than_a_full_title() {
+        let mut fonts = cosmic_text::FontSystem::new();
+        let mut swash = cosmic_text::SwashCache::new();
+        let full = rasterize_title(&mut fonts, &mut swash, "Hi", 200, 28, 8, [255, 255, 255, 255]).expect("full");
+        let dim = rasterize_title(&mut fonts, &mut swash, "Hi", 200, 28, 8, [255, 255, 255, 153]).expect("dim");
+        let max_a = |px: &[u8]| px.chunks_exact(4).map(|p| p[3]).max().unwrap_or(0);
+        assert!(max_a(&dim) < max_a(&full), "a lower-alpha fg yields lower-alpha glyph pixels");
     }
 
     /// Finding 3: an unbounded client title must not reach cosmic-text at
