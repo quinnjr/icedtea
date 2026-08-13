@@ -138,6 +138,19 @@ pub struct LayerEntry {
     /// which `arrange_layers` now does for every mapped panel on every
     /// pass -- costs one comparison rather than a wire round trip.
     pub last_configured: Option<(u32, u32, i32, i32)>,
+    /// The client's requested margin, `(top, right, bottom, left)` --
+    /// wlr-layer-shell's own field order. Always `(0, 0, 0, 0)` for now:
+    /// task 7 (N8) added this field so the rest of the placement plumbing
+    /// has somewhere to read a margin from, but `wlr` 0.20.12's
+    /// `LayerSurface` exposes no accessor to actually capture the
+    /// client's requested value (`anchor`/`exclusive_zone`/`desired_size`/
+    /// `keyboard_interactive` all exist; `margin` does not) -- verified
+    /// against both 0.20.11 and 0.20.12's `layer.rs`. Capturing a real
+    /// value in `layer_surface_commit` and insetting placement/exclusive
+    /// folds by it is deferred until a future `wlr` release adds the
+    /// accessor (tracked as a 0.20.13 additive gap); nothing here may
+    /// synthesize a margin from anything else in the meantime.
+    pub margin: (i32, i32, i32, i32),
 }
 
 /// Shrink `rect` by one layer entry's positive exclusive zone along
@@ -171,15 +184,27 @@ fn fold_exclusive_zone(mut rect: Rectangle, anchor: wlr::Anchor, exclusive: i32)
     if exclusive <= 0 {
         return rect;
     }
-    if anchor.top != anchor.bottom {
-        if anchor.top {
-            rect.y = rect.y.saturating_add(exclusive);
-        }
+    // Task 7 (N8/exclusive-edge): matches wlroots' own
+    // `wlr_layer_surface_v1_get_exclusive_edge` exactly, not merely "single
+    // edge anchored on this axis" -- the two disagree on a corner-anchored
+    // surface (e.g. `TOP | LEFT`, anchored to exactly one edge on *each*
+    // axis, not spanning either): the old `anchor.top != anchor.bottom`
+    // check folded it as if it were a full-width top panel, reserving
+    // space the surface never actually claims edge-to-edge. wlroots only
+    // assigns an exclusive edge when the surface spans *both* edges of one
+    // axis (`left && right`, or `top && bottom`) and is anchored to
+    // exactly one edge of the other axis; anything else -- including a
+    // corner anchor, or all four edges at once -- reserves nothing.
+    let (left, right, top, bottom) = (anchor.left, anchor.right, anchor.top, anchor.bottom);
+    if left && right && top && !bottom {
+        rect.y = rect.y.saturating_add(exclusive);
         rect.height = rect.height.saturating_sub(exclusive).max(0);
-    } else if anchor.left != anchor.right {
-        if anchor.left {
-            rect.x = rect.x.saturating_add(exclusive);
-        }
+    } else if left && right && bottom && !top {
+        rect.height = rect.height.saturating_sub(exclusive).max(0);
+    } else if top && bottom && left && !right {
+        rect.x = rect.x.saturating_add(exclusive);
+        rect.width = rect.width.saturating_sub(exclusive).max(0);
+    } else if top && bottom && right && !left {
         rect.width = rect.width.saturating_sub(exclusive).max(0);
     }
     rect
@@ -1151,7 +1176,23 @@ impl State {
         }
 
         let gap = self.config.appearance.snap_gap;
-        let affected: Vec<WindowId> = self.window_manager.windows().filter(|w| w.maximized).map(|w| w.id).collect();
+        // N11: a maximized window that is minimized, or sitting on a
+        // workspace that is not the active one, is not on screen -- this
+        // sweep re-syncing it anyway did no visible harm by itself (nothing
+        // draws it), but it still emitted a `WindowUpdated` and warped its
+        // stored geometry to whatever `usable` happens to be *right now* on
+        // an output the user cannot see, which is wrong the moment the
+        // window is later shown again (unminimized, or its workspace
+        // switched to) with a panel layout that has since changed underfoot
+        // with no configure of its own. `continue` for both up front, same
+        // "not actually visible" test `windows_in_workspace` already uses.
+        let active_workspace = self.window_manager.active_workspace();
+        let affected: Vec<WindowId> = self
+            .window_manager
+            .windows()
+            .filter(|w| w.maximized && !w.minimized && w.workspace == active_workspace)
+            .map(|w| w.id)
+            .collect();
         for id in affected {
             let Some(w) = self.window_manager.get(id) else { continue };
             let Some(output_idx) = self.output_for_window(w.geometry) else { continue };
@@ -1192,6 +1233,43 @@ impl State {
         Some(rect)
     }
 
+    /// Pure half of `configure_layer` (task 7): choose `id`'s layer
+    /// surface's `(width, height, x, y)` for its output box, the
+    /// placement rule from task 20's brief, without touching
+    /// `last_configured` or sending anything over the wire. Extracted so
+    /// the rule itself -- particularly N7, honoring `desired_size` on
+    /// whichever axis is not anchored to both of its edges -- is directly
+    /// unit-testable without a live `wlr::Runtime`; `configure_layer` is
+    /// now compute-then-send: call this, then decide whether to record
+    /// and answer.
+    ///
+    /// `None`, panic-free, if the entry or its output has vanished (a
+    /// commit racing a hotplug-removed output, or the `NO_OUTPUT`
+    /// sentinel -- see [`LayerEntry::output`]'s doc).
+    pub fn compute_layer_placement(&self, id: wlr::LayerSurfaceId) -> Option<(u32, u32, i32, i32)> {
+        let entry = self.layers.get(&id)?;
+        let (output_idx, sequence, a, (desired_w, desired_h)) =
+            (entry.output, entry.sequence, entry.anchor, entry.size);
+        // N6: placed against the space every earlier-announced panel on
+        // this output has already carved, not the raw output box --
+        // otherwise two same-edge exclusive panels draw on top of each
+        // other. See `usable_before`'s own doc.
+        let box_ = self.usable_before(output_idx, sequence)?;
+
+        // Placement is per-axis and independent (review finding I3) -- see
+        // `layer_axis_placement`. The rule task 20 shipped keyed on
+        // `a.top != a.bottom` / `a.left != a.right` for the *whole*
+        // placement, which spanned a corner-anchored notification across
+        // the full output width (discarding its desired width outright) and
+        // dropped a four-edge-anchored 0x0 locker into a centered 200x200
+        // box instead of filling the output.
+        let (w, x) = layer_axis_placement(a.left, a.right, desired_w, box_.x, box_.width);
+        let (h, y) = layer_axis_placement(a.top, a.bottom, desired_h, box_.y, box_.height);
+
+        let (w, h) = (w.max(0) as u32, h.max(0) as u32);
+        Some((w, h, x, y))
+    }
+
     /// Choose `id`'s layer surface's size and position for its output box
     /// (the placement rule from task 20's brief) and answer with
     /// `configure_layer_surface` + `set_layer_surface_position`.
@@ -1205,27 +1283,8 @@ impl State {
     /// safe to call unconditionally, which `arrange_layers` now does for
     /// every mapped panel on every pass.
     pub fn configure_layer(&mut self, id: wlr::LayerSurfaceId) {
-        let Some(entry) = self.layers.get(&id) else { return };
-        let (output_idx, sequence, a, (desired_w, desired_h)) =
-            (entry.output, entry.sequence, entry.anchor, entry.size);
-        // N6: placed against the space every earlier-announced panel on
-        // this output has already carved, not the raw output box --
-        // otherwise two same-edge exclusive panels draw on top of each
-        // other. See `usable_before`'s own doc.
-        let Some(box_) = self.usable_before(output_idx, sequence) else { return };
-
-        // Placement is per-axis and independent (review finding I3) -- see
-        // `layer_axis_placement`. The rule task 20 shipped keyed on
-        // `a.top != a.bottom` / `a.left != a.right` for the *whole*
-        // placement, which spanned a corner-anchored notification across
-        // the full output width (discarding its desired width outright) and
-        // dropped a four-edge-anchored 0x0 locker into a centered 200x200
-        // box instead of filling the output.
-        let (w, x) = layer_axis_placement(a.left, a.right, desired_w, box_.x, box_.width);
-        let (h, y) = layer_axis_placement(a.top, a.bottom, desired_h, box_.y, box_.height);
-
-        let (w, h) = (w.max(0) as u32, h.max(0) as u32);
-        let placement = (w, h, x, y);
+        let Some(placement) = self.compute_layer_placement(id) else { return };
+        let (w, h, x, y) = placement;
         // Minor-1's storm guard: unchanged since the last time this was
         // computed is a no-op. `None` (never computed before) never
         // matches, so a surface's first `configure_layer` -- from
@@ -3295,6 +3354,9 @@ impl wlr::ToplevelHandler for State {
                 // a surface with no buffer yet must not reserve space.
                 mapped: false,
                 last_configured: None,
+                // N8: no accessor to capture this from -- see
+                // `LayerEntry::margin`'s own doc.
+                margin: (0, 0, 0, 0),
             },
         );
         self.configure_layer(id);
@@ -5470,6 +5532,7 @@ mod tests {
                 interactive: false,
                 mapped: true,
                 last_configured: None,
+                margin: (0, 0, 0, 0),
             },
         );
         state.arrange_layers();
@@ -5503,6 +5566,7 @@ mod tests {
                 interactive: false,
                 mapped: true,
                 last_configured: None,
+                margin: (0, 0, 0, 0),
             },
         );
         state.arrange_layers();
@@ -5544,6 +5608,7 @@ mod tests {
             interactive: false,
             mapped,
             last_configured: None,
+            margin: (0, 0, 0, 0),
         }
     }
 
@@ -5648,6 +5713,7 @@ mod tests {
                 interactive: false,
                 mapped: true,
                 last_configured: None,
+                margin: (0, 0, 0, 0),
             },
         );
         state.arrange_layers();
@@ -6124,6 +6190,7 @@ mod tests {
                 interactive: false,
                 mapped: true,
                 last_configured: None,
+                margin: (0, 0, 0, 0),
             },
         );
         state.configure_layer(id);
@@ -6131,6 +6198,120 @@ mod tests {
             state.layers[&id].last_configured,
             Some((300, 100, 500, 0)),
             "300x100 flush into the top-right corner (x = 800 - 300), not stretched to 800 wide"
+        );
+    }
+
+    // --- Task 7: N7 (`compute_layer_placement`), N8 (margin plumbing),
+    // N11 (skip-hidden maximized re-sync) ---
+
+    /// N7, via the pure function the brief asks for directly: a corner
+    /// anchored panel (`TOP | LEFT`, anchored to exactly one edge on each
+    /// axis, neither one spanning) keeps its own desired width rather than
+    /// spanning the full output -- `compute_layer_placement` answering the
+    /// same as `configure_layer` did, just without a live runtime or a
+    /// `last_configured` side effect.
+    #[test]
+    fn a_corner_anchored_panel_keeps_its_desired_width() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        // top+left anchored (a corner), desired 200x30: width must be 200, not 800.
+        state.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, left: true, right: false, bottom: false },
+                exclusive: 0,
+                size: (200, 30),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+                margin: (0, 0, 0, 0),
+            },
+        );
+        let placed = state.compute_layer_placement(wlr::LayerSurfaceId::dangling_for_test());
+        assert_eq!(placed.map(|(w, _h, _x, _y)| w), Some(200));
+    }
+
+    /// N7/exclusive-edge: tightened `fold_exclusive_zone` against wlroots'
+    /// own `wlr_layer_surface_v1_get_exclusive_edge` -- a corner-anchored
+    /// panel (`TOP | LEFT`, anchored to exactly one edge on *each* axis,
+    /// spanning neither) has no exclusive edge at all per that rule, even
+    /// with a positive `exclusive_zone`. The old `anchor.top !=
+    /// anchor.bottom` check folded it as a full-width top panel regardless
+    /// of `left`/`right`, reserving space the surface never actually spans
+    /// edge-to-edge.
+    #[test]
+    fn a_corner_anchored_exclusive_zone_reserves_nothing() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, left: true, right: false, bottom: false },
+                exclusive: 30,
+                size: (200, 30),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+                margin: (0, 0, 0, 0),
+            },
+        );
+        state.arrange_layers();
+        assert_eq!(
+            state.outputs[&0].usable,
+            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            "a corner anchor spans neither axis, so wlroots' own rule assigns it no exclusive edge at all"
+        );
+    }
+
+    /// N11: `arrange_layers`' maximized re-sync loop must skip a maximized
+    /// window that is minimized, or sitting on a workspace that is not the
+    /// active one -- neither is actually on screen, so warping its stored
+    /// geometry to whatever `usable` happens to be right now (on an output
+    /// the user cannot see) is wrong the moment it is shown again with a
+    /// panel layout that has since changed underfoot with no configure of
+    /// its own.
+    #[test]
+    fn arrange_layers_skips_hidden_maximized_windows_in_the_resync() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.config.appearance.snap_gap = 0;
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+
+        // A maximized, minimized window on the active workspace (0).
+        let minimized_id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.window_manager.set_maximized(minimized_id, true).unwrap();
+        state.window_manager.set_minimized(minimized_id, true).unwrap();
+        let geo_before_min = state.window_manager.get(minimized_id).unwrap().geometry;
+
+        // A maximized window on workspace 1, while workspace 0 stays active.
+        let other_ws_id = state.window_manager.add_window("app2", "t2", 2, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.window_manager.set_workspace(other_ws_id, 1).unwrap();
+        state.window_manager.set_maximized(other_ws_id, true).unwrap();
+        let geo_before_ws = state.window_manager.get(other_ws_id).unwrap().geometry;
+
+        // A panel maps, changing `usable` -- the trigger that would have
+        // re-synced every maximized window before N11.
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, top_panel_entry(30, true));
+        state.arrange_layers();
+
+        assert_eq!(
+            state.window_manager.get(minimized_id).unwrap().geometry,
+            geo_before_min,
+            "a minimized maximized window must not be re-synced while hidden"
+        );
+        assert_eq!(
+            state.window_manager.get(other_ws_id).unwrap().geometry,
+            geo_before_ws,
+            "a maximized window on an inactive workspace must not be re-synced while hidden"
         );
     }
 
@@ -6158,6 +6339,7 @@ mod tests {
                 interactive: true,
                 mapped: true,
                 last_configured: None,
+                margin: (0, 0, 0, 0),
             },
         );
         state.configure_layer(id);
@@ -6189,6 +6371,7 @@ mod tests {
                 interactive: true,
                 mapped: true,
                 last_configured: None,
+                margin: (0, 0, 0, 0),
             },
         );
         state.configure_layer(id);
@@ -6216,6 +6399,7 @@ mod tests {
                 interactive: true,
                 mapped: true,
                 last_configured: None,
+                margin: (0, 0, 0, 0),
             },
         );
         state.configure_layer(id);
@@ -6244,6 +6428,7 @@ mod tests {
                 interactive: true,
                 mapped: true,
                 last_configured: None,
+                margin: (0, 0, 0, 0),
             },
         );
         state.configure_layer(id);
