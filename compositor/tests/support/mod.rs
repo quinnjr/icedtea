@@ -173,6 +173,15 @@ impl Compositor {
             // to actually exist, not just for `lib.rs::run()`'s production
             // boot to log and move on.
             runtime.create_layer_shell(&display, 4).expect("zwlr_layer_shell_v1");
+            // Same "harness cannot degrade" tone: the selection tests bind
+            // these globals directly and would assert against ones that were
+            // never advertised.
+            runtime
+                .create_primary_selection_manager(&display)
+                .expect("zwp_primary_selection_device_manager_v1");
+            runtime
+                .create_data_control_manager(&display)
+                .expect("zwlr_data_control_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
 
             // `state` is declared after `display`/`runtime`/`backend` so that
@@ -326,6 +335,11 @@ struct ClientState {
     /// panel is configured with is byte-identical to the one it had before
     /// it unmapped, so only the counter can see the second one.
     layer_configures: u32,
+    /// Every global the compositor advertised on the registry, in
+    /// `(interface, name)` arrival order. Recorded for every global, not just
+    /// the bound ones, so a test can assert a global *exists* without this
+    /// harness having to bind it.
+    globals: Vec<(String, u32)>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
@@ -338,6 +352,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
         qh: &QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global { name, interface, version } = event {
+            state.globals.push((interface.clone(), name));
             match interface.as_str() {
                 "wl_compositor" => {
                     state.compositor = Some(registry.bind(name, version.min(4), qh, ()));
@@ -514,6 +529,14 @@ fn connect_and_bind(
     queue.roundtrip(&mut state).expect("bind roundtrip");
 
     (conn, queue, qh, state)
+}
+
+/// Connect, complete the registry roundtrip, and return the interface names of
+/// every global the compositor advertised. Lets a test assert a global exists
+/// without the harness having to bind it.
+pub fn advertised_globals(socket: &str) -> Vec<String> {
+    let (_conn, _queue, _qh, state) = connect_and_bind(socket);
+    state.globals.into_iter().map(|(interface, _)| interface).collect()
 }
 
 /// Build a `w`x`h` shm-backed buffer, solid opaque grey. Shared by

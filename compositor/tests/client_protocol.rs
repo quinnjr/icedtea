@@ -15,6 +15,22 @@ use icedtea_contract::Event;
 
 use support::{Compositor, TestClient};
 
+/// The two selection-manager globals M4.1 adds must actually be advertised —
+/// the daemon (M4.6) and any clipboard manager bind them by name.
+#[test]
+fn selection_globals_are_advertised() {
+    let comp = Compositor::spawn();
+    let globals = support::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwp_primary_selection_device_manager_v1"),
+        "primary-selection manager global missing; saw {globals:?}"
+    );
+    assert!(
+        globals.iter().any(|g| g == "zwlr_data_control_manager_v1"),
+        "data-control manager global missing; saw {globals:?}"
+    );
+}
+
 /// The restoration test: a real toplevel maps and shows up in the model,
 /// with the app_id and title the client set, at a real geometry.
 #[test]

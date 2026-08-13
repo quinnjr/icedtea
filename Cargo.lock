@@ -2417,9 +2417,9 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wlr"
-version = "0.20.13"
+version = "0.20.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6735110fd7591e09a05c6748730929b07b8d97fa0d9f6f959095c37f4027fea"
+checksum = "398d90d3233e1b09aa30a62acd33a1860e227e798eb3c7621850d490b7cfa75a"
 dependencies = [
  "wlr-sys",
  "xkbcommon-sys",
