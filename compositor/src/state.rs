@@ -2796,6 +2796,19 @@ impl State {
         // a window on a removed workspace index migrates to workspace 0.
         self.window_manager.set_workspace_names(cfg.workspace_names.clone());
 
+        // Mirrors review finding I6 (`forget_window`'s same guard): a
+        // truncated/clamped active workspace can leave migrated windows
+        // sitting visible with no `focused_window`, since
+        // `set_workspace_names` clears each migrated window's own
+        // `focused` flag but never re-picks a successor. Belt-and-braces --
+        // a no-op when focus is already valid -- picking the MRU candidate
+        // here (rather than a manual seat call) lets the existing
+        // `apply_reloaded_config`/`sync_scene` path carry it to the seat.
+        if self.window_manager.focused_window().is_none() {
+            let active = self.window_manager.active_workspace();
+            self.window_manager.refocus_after_hide(active);
+        }
+
         events.push(Event::WorkspaceList(self.window_manager.workspace_info()));
         events.push(Event::ConfigReloaded(cfg.appearance.clone()));
         self.config = cfg;
@@ -4052,7 +4065,13 @@ mod tests {
 
     /// A reload that removes the workspace a window sits on migrates that
     /// window to workspace 0 rather than dropping it (the decided semantics
-    /// of `WindowManager::set_workspace_names`).
+    /// of `WindowManager::set_workspace_names`). Workspace 0 is also the
+    /// (untouched, default) active workspace here, so `apply_config`'s M-1
+    /// belt-and-braces re-pick (mirroring review finding I6) legitimately
+    /// picks the migrated window back up as `focused_window` -- it is now
+    /// the sole candidate sitting on the active workspace, exactly the
+    /// "migrated window must not be left with a dangling focus pointer"
+    /// case the fix exists for.
     #[test]
     fn apply_config_migrates_windows_off_removed_workspaces_to_zero() {
         let (tx, _rx) = crossbeam_channel::unbounded();
@@ -4068,7 +4087,7 @@ mod tests {
 
         let w = state.window_manager.get(a).expect("window survives, is not closed");
         assert_eq!(w.workspace, 0, "a window on a removed workspace migrates to 0");
-        assert!(!w.focused);
+        assert!(w.focused, "M-1: landing on the active workspace with no focus set must re-pick it");
         assert!(!events.iter().any(|e| matches!(e, Event::WindowClosed(_))));
     }
 
@@ -4100,6 +4119,46 @@ mod tests {
                 .any(|se| matches!(se.event, Event::WorkspaceSet { id: 0, active: true })),
             "clamping the active workspace must emit a WorkspaceSet"
         );
+    }
+
+    /// M-1 (review): truncating the workspace list out from under the
+    /// *active* workspace migrates its window to workspace 0 (clearing that
+    /// window's own `focused` flag, matching `set_workspace_names`'
+    /// documented per-window behavior) but must not leave `focused_window()`
+    /// empty -- `apply_config` has to re-pick a successor on the (now-active)
+    /// workspace 0, the same belt-and-braces guard `forget_window` already
+    /// applies (review finding I6) and `switch_workspace` already applies.
+    /// Without that re-pick, the next close/maximize/snap hotkey silently
+    /// no-ops on a dangling focus pointer until the user clicks or switches
+    /// workspace.
+    #[test]
+    fn apply_config_refocuses_migrated_window_when_active_workspace_is_truncated() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        // default_config has 4 workspaces; park the window on workspace 2
+        // and make that workspace active and the window focused.
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        state.window_manager.set_workspace(a, 2).unwrap();
+        assert!(state.window_manager.set_active_workspace(2));
+        state.window_manager.focus(a).unwrap();
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a));
+
+        let mut cfg = icedtea_config::default_config();
+        cfg.workspace_names = vec!["only".into()]; // removes workspaces 1..4
+        let _ = state.apply_config(cfg);
+
+        // The window migrated to workspace 0, which is now also the active
+        // (clamped) workspace, and it must be the one thing `focused_window`
+        // reports -- not `None`.
+        assert_eq!(state.window_manager.active_workspace(), 0);
+        assert_eq!(state.window_manager.get(a).unwrap().workspace, 0);
+        let focused = state.window_manager.focused_window();
+        assert_eq!(
+            focused.map(|w| w.id),
+            Some(a),
+            "a migrated window must be re-focused, not left with a dangling focus pointer"
+        );
+        assert!(focused.unwrap().focused, "the re-picked window's own focused flag must be set");
     }
 
     /// Review finding: the brief's own sample test for this name is vacuous
