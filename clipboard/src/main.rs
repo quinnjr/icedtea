@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 mod history;
+mod manager;
 
 fn main() {
     // Fleshed out in the service-wiring task.
