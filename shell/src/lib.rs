@@ -2,6 +2,8 @@
 //! panel and drive the pure models directly.
 
 pub mod bridge;
+pub mod clip_client;
+pub mod clipboard;
 pub mod taskbar;
 pub mod wm_client;
 
