@@ -2407,108 +2407,46 @@ impl State {
         Some(())
     }
 
-    /// Rebuild `window_manager`'s workspaces from `cfg.workspace_names` and
-    /// swap in the new config (keybindings/appearance/behavior). Returns the
-    /// events the caller should queue (via `apply_reloaded_config`) since
-    /// the just-replaced `window_manager` can't carry them.
+    /// Apply a new `Config` to a *live* session: swap in the new
+    /// keybindings/appearance/behavior and reconcile the workspace list,
+    /// **without closing any client**. Returns the events the caller should
+    /// queue (via `apply_reloaded_config`).
     ///
-    /// # KNOWN LIMITATION -- a live reload abandons its clients
+    /// Window rows survive the reload untouched -- their `WindowId`, focus,
+    /// focus MRU, workspace assignment, geometry, client bindings, and
+    /// mapped/minimized/maximized/fullscreen state all persist, as do the
+    /// saved restore-geometry maps and title rasters that key off those ids.
+    /// The manager is never rebuilt, so `next_id`/`seq` advance monotonically
+    /// on their own and no id is ever reissued. This is the whole point of
+    /// the M3 rewrite: a `SUPER+SHIFT+r` / D-Bus `ReloadConfig` no longer
+    /// abandons every client to a permanently-invisible, unmodelled limbo.
     ///
-    /// **This drops every model row and every client binding; it does not
-    /// close, and cannot close, the clients themselves.** Their scene nodes
-    /// are hidden (review finding I4, in the `forget` loop below), so they
-    /// no longer render over the fresh session -- but the processes stay
-    /// alive, permanently invisible, with no path back into the model:
-    /// `raise_id_floor` guarantees their ids can never be reissued, and
-    /// since a reload is neither an unmap nor a destroy, no wlroots event
-    /// will ever re-announce them. `SUPER+SHIFT+r` and D-Bus `ReloadConfig`
-    /// both reach here, so this is user-reachable.
+    /// A reload does still cancel *transient* UI state, because it can be
+    /// mid-interaction: `drag`, `resize`, `snap_preview`, and any alt-tab
+    /// session are reset. Resetting an active alt-tab is a state change with
+    /// no natural event, so the terminal `AltTabState{active: false, ..}` is
+    /// appended to `events` (rather than via `end_alt_tab()`, which would
+    /// flush on its own) so a shell overlay rendered from the last
+    /// `active: true` gets its dismiss signal in order with the reload's
+    /// other events.
     ///
-    /// The real fix is to stop discarding windows at all -- preserve the
-    /// rows across the reload and re-sync them, which tasks 13/14 already
-    /// made safe on the rendering side (palette-keyed raster cache, full
-    /// `sync_scene` re-push). That is a behavior change to this method's
-    /// pinned contract (`apply_config_emits_window_closed_and_floors_id_counter`,
-    /// `apply_config_rebuilds_workspaces`, the `next_id`/`seq` floor
-    /// machinery, and every consumer of the `WindowClosed` burst), so it is
-    /// recorded here as an owned defect rather than smuggled into a fix
-    /// round. Do not treat the hidden-node mitigation as closing it.
-    ///
-    /// Task 11 review #3: this used to replace `window_manager` with a
-    /// brand-new, empty one and return only `WorkspaceList`/`ConfigReloaded`
-    /// -- every live window vanished from the model with zero
-    /// `WindowClosed` events (a direct violation of "every state change
-    /// emits"; the shell kept showing windows the compositor no longer
-    /// tracked), and the fresh `WindowManager`'s id counter reset to 1, so
-    /// windows mapped after the reload could collide with ids the shell
-    /// might still remember as live. Fixed here: emit `WindowClosed` for
-    /// every window that's about to disappear, drop their client bindings
-    /// (so a later destroy for one of those toplevels silently no-ops
-    /// instead of resolving to a stale id), and floor the new
-    /// `WindowManager`'s id counter at the old one's high-water mark so no
-    /// id is ever reissued. The plan's actual invariant (workspaces rebuilt
-    /// from config) is preserved unchanged; only the "silently destroy live
-    /// state" part of the sample was a bug.
-    ///
-    /// Task 11 re-review, same reload seam: also resets `drag`, `alt_tab`,
-    /// and `snap_preview` (all of which can be referencing a window id
-    /// that's about to stop existing -- a reload mid-drag would otherwise
-    /// leave a permanently rendered stale `snap_preview`, and a reload
-    /// mid-alt-tab would leave `alt_tab.is_active()` true forever with a
-    /// dead entry list), and floors the fresh `WindowManager`'s `seq`
-    /// counter the same way `next_id` is floored, so `snapshot().seq`
-    /// cannot go backwards across a reload.
+    /// The workspace list is reconciled in place by
+    /// [`WindowManager::set_workspace_names`]: names are renamed/extended/
+    /// truncated, and a window on a now-removed workspace index migrates to
+    /// workspace 0. One `WorkspaceList` (and one `ConfigReloaded`) is emitted.
     pub fn apply_config(&mut self, cfg: Config) -> Vec<Event> {
-        let mut events: Vec<Event> =
-            self.window_manager.windows().map(|w| Event::WindowClosed(w.id)).collect();
+        let mut events: Vec<Event> = Vec::new();
 
-        // Every window about to be discarded loses its client binding too --
-        // `wayland.rs`'s bind/forget replace the old `elements`/
-        // `surface_to_window` maps as the record of which toplevel backs
-        // which model window.
-        let ids: Vec<WindowId> = self.window_manager.windows().map(|w| w.id).collect();
-        for id in ids {
-            // Review finding I4: hidden *before* the binding is dropped,
-            // which is the only order that works -- `forget` removes the
-            // `window -> toplevel` mapping every scene call resolves
-            // through, so a `set_visible` after it is a silent no-op.
-            //
-            // Without this the reload orphaned the scene node outright: the
-            // client is still alive (nothing here closes it, and no
-            // `unmapped`/`mapped` will ever fire for it), so its toplevel
-            // kept rendering on top of the fresh session while being
-            // invisible to the model -- unfocusable, un-hit-testable,
-            // unclosable. Hiding is the smallest correct answer to that;
-            // see `apply_config`'s own doc for the residual it does *not*
-            // close.
-            self.wayland.set_visible(id, false);
-            self.wayland.forget(id);
-        }
-        // Stale restore points would otherwise reference ids that can never
-        // come back (the floor below guarantees that).
-        self.fullscreen_saved_geometry.clear();
-        self.snap_saved_geometry.clear();
-        self.maximized_saved_geometry.clear();
-        // Review finding M1: this teardown goes through `wayland.forget`
-        // directly rather than `forget_window`, which is where the per-window
-        // raster purge lives -- so without this line every window's title
-        // pixels (~40 KB for a 400px window) became permanently unreachable
-        // garbage on every reload, since `raise_id_floor` below guarantees
-        // the ids can never come back to collect them.
-        self.title_rasters.clear();
-        // Drop any in-flight interaction that referenced the about-to-vanish
-        // windows.
+        // A reload can land mid-interaction: drop any in-flight drag/resize
+        // and clear the snap preview. Unlike the old behavior, this does NOT
+        // close the windows those interactions referenced -- the rows stay.
         self.drag = input::DragMachine::new();
         self.resize = input::ResizeMachine::new();
-        // Task 11 re-review round 3 #1: resetting `alt_tab` (below) is a
-        // state change, not an event -- a reload mid-cycle used to leave
-        // whatever shell overlay is rendered from the session's last
-        // `AltTabState{active: true, ..}` with no dismiss signal at all.
-        // The terminal event is appended to `events` here (rather than
-        // calling `end_alt_tab()`, which also calls `self.emit_pending()`
-        // itself) so it drains alongside -- in the same order as -- the
-        // `WindowClosed`/`WorkspaceList`/`ConfigReloaded` events this same
-        // call produces, instead of jumping the queue as a side effect.
+        // Resetting an active alt-tab session is a state change with no
+        // natural event, so emit the terminal `AltTabState{active: false}`
+        // here (appended to `events` so it drains in order with the reload's
+        // `WorkspaceList`/`ConfigReloaded`, instead of `end_alt_tab()`
+        // jumping the queue via its own flush).
         if self.alt_tab.is_active() {
             events.push(Event::AltTabState(AltTabState {
                 active: false,
@@ -2520,18 +2458,15 @@ impl State {
         self.snap_preview = None;
         self.sync_snap_preview();
 
-        let next_id_floor = self.window_manager.next_id();
-        let seq_floor = self.window_manager.seq();
-        // Review finding I4: the reload is the other place a binding can
-        // become unusable, so it's the other place to say so -- once.
+        // Review finding I4: revalidate keybindings against the new config.
         input::warn_about_keybindings(&cfg.keybindings);
-        self.config = cfg.clone();
-        self.window_manager = WindowManager::new(cfg.workspace_names.clone());
-        self.window_manager.raise_id_floor(next_id_floor);
-        self.window_manager.raise_seq_floor(seq_floor);
+        // Reconcile the workspace list in place -- no window row is dropped;
+        // a window on a removed workspace index migrates to workspace 0.
+        self.window_manager.set_workspace_names(cfg.workspace_names.clone());
 
         events.push(Event::WorkspaceList(self.window_manager.workspace_info()));
         events.push(Event::ConfigReloaded(cfg.appearance.clone()));
+        self.config = cfg;
         events
     }
 
@@ -3689,14 +3624,49 @@ mod tests {
     }
 
     #[test]
-    fn apply_config_rebuilds_workspaces() {
+    fn apply_config_reconciles_workspace_names_without_dropping_windows() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
+        // default_config has 4 workspaces; the window stays on workspace 0.
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let mut cfg = icedtea_config::default_config();
         cfg.workspace_names = vec!["A".into(), "B".into()];
         let events = state.apply_config(cfg);
-        assert_eq!(state.window_manager.workspace_info().len(), 2);
+
+        // Workspace list reconciled in place to the new names/count.
+        let info = state.window_manager.workspace_info();
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0].name, "A");
+        assert_eq!(info[1].name, "B");
         assert!(events.iter().any(|e| matches!(e, Event::WorkspaceList(_))));
+
+        // The window on a still-existing workspace index survives with its
+        // assignment intact -- and no WindowClosed was emitted for it.
+        assert!(state.window_manager.get(a).is_some(), "window survives a reload");
+        assert_eq!(state.window_manager.get(a).unwrap().workspace, 0);
+        assert!(!events.iter().any(|e| matches!(e, Event::WindowClosed(_))));
+    }
+
+    /// A reload that removes the workspace a window sits on migrates that
+    /// window to workspace 0 rather than dropping it (the decided semantics
+    /// of `WindowManager::set_workspace_names`).
+    #[test]
+    fn apply_config_migrates_windows_off_removed_workspaces_to_zero() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        // default_config has 4 workspaces; park the window on workspace 2.
+        let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
+        state.window_manager.set_workspace(a, 2).unwrap();
+        assert_eq!(state.window_manager.get(a).unwrap().workspace, 2);
+
+        let mut cfg = icedtea_config::default_config();
+        cfg.workspace_names = vec!["only".into()]; // removes workspaces 1..4
+        let events = state.apply_config(cfg);
+
+        let w = state.window_manager.get(a).expect("window survives, is not closed");
+        assert_eq!(w.workspace, 0, "a window on a removed workspace migrates to 0");
+        assert!(!w.focused);
+        assert!(!events.iter().any(|e| matches!(e, Event::WindowClosed(_))));
     }
 
     #[test]
@@ -3857,39 +3827,38 @@ mod tests {
         assert_eq!(state.window_manager.get(id).unwrap().geometry, original);
     }
 
-    /// Important #3: `apply_config` must emit `WindowClosed` for every
-    /// window it discards, drop its client bindings (no direct accessor,
-    /// so this asserts the externally observable state that depends on it:
-    /// a `toplevel_destroyed`-style removal after reload no longer applies
-    /// to any window in the new manager), and never let a post-reload
-    /// `add_window` reuse an id from before the reload.
+    /// A live reload must PRESERVE every window row and its client -- no
+    /// `WindowClosed` burst -- while still swapping in the new appearance.
+    /// This is the M3 contract that replaced the old "rebuild the manager
+    /// and close everything" behavior.
     #[test]
-    fn apply_config_emits_window_closed_and_floors_id_counter() {
+    fn apply_config_preserves_windows_and_does_not_close_them() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        let a = state.window_manager.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        let b = state.window_manager.add_window("b", "b", 1, Rectangle { x: 10, y: 10, width: 100, height: 100 });
+        let mut cfg = icedtea_config::default_config();
+        cfg.appearance.palette.background = "#123456".into();
+        let events = state.apply_config(cfg);
+        assert!(state.window_manager.get(a).is_some() && state.window_manager.get(b).is_some(),
+                "windows survive a reload");
+        assert!(!events.iter().any(|e| matches!(e, Event::WindowClosed(_))),
+                "no WindowClosed burst on reload");
+        assert_eq!(state.config.appearance.palette.background, "#123456");
+    }
+
+    /// A post-reload `add_window` must never reuse a pre-reload id: because
+    /// the manager is no longer rebuilt, `next_id` advances monotonically on
+    /// its own without any explicit floor.
+    #[test]
+    fn apply_config_keeps_id_counter_monotonic() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
-
-        let mut cfg = icedtea_config::default_config();
-        cfg.workspace_names = vec!["A".into(), "B".into()];
-        let events = state.apply_config(cfg);
-
-        let closed: Vec<WindowId> =
-            events.iter().filter_map(|e| if let Event::WindowClosed(id) = e { Some(*id) } else { None }).collect();
-        assert_eq!(closed.len(), 2, "one WindowClosed per pre-reload window");
-        assert!(closed.contains(&a));
-        assert!(closed.contains(&b));
-        assert!(events.iter().any(|e| matches!(e, Event::WorkspaceList(_))));
-        assert!(events.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
-
-        // The old windows are gone from the (now-empty) manager.
-        assert!(state.window_manager.get(a).is_none());
-        assert!(state.window_manager.get(b).is_none());
-
-        // A window mapped after the reload must never collide with a
-        // pre-reload id the shell might still remember as live.
+        let _ = state.apply_config(icedtea_config::default_config());
         let c = state.window_manager.add_window("c", "c", 3, DEFAULT_GEO);
-        assert!(c.0 > a.0 && c.0 > b.0);
+        assert!(c.0 > a.0 && c.0 > b.0, "ids never regress across a reload");
     }
 
     /// Important #4: `n - 1` on a `u32` action argument must never panic,
@@ -4982,8 +4951,9 @@ mod tests {
         state.ensure_title_raster(id, "same".into(), bar, true);
         let before = state.title_rasters.get(&id).expect("cached").pixels.clone();
 
-        // Deliberately *not* through `apply_config`, which destroys every
-        // window: this is the future in which a reload preserves them.
+        // Repaint the palette directly (rather than through `apply_config`,
+        // which now preserves windows and would need a full appearance
+        // resync to reach here) to isolate the raster cache's color key.
         state.config.appearance.palette.foreground = "#ff0000".into();
         state.ensure_title_raster(id, "same".into(), bar, true);
         let after = state.title_rasters.get(&id).expect("cached").pixels.clone();
@@ -4991,27 +4961,30 @@ mod tests {
         assert_ne!(before, after, "a repainted palette must not serve stale-colored text");
     }
 
-    /// M1: the reload teardown bypasses `forget_window`, so it has to purge
-    /// the rasters itself -- ids are floored upward, so anything left behind
-    /// is unreachable forever.
+    /// M3 preserve contract: a reload keeps every window row, so it must
+    /// also keep those windows' cached title rasters -- purging them would
+    /// force a needless re-shape of text that has not changed. (Palette
+    /// changes are still invalidated by the raster's own color-keyed cache;
+    /// see `a_palette_change_invalidates_a_cached_title_raster`.)
     #[test]
-    fn a_config_reload_purges_every_cached_raster() {
+    fn a_config_reload_preserves_cached_rasters_for_surviving_windows() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         let id = state.window_manager.add_window(
             "plain.app",
-            "doomed",
+            "survivor",
             1,
             Rectangle { x: 0, y: 0, width: 400, height: 300 },
         );
         let bar = crate::decoration::title_bar_rect(
             state.window_manager.get(id).expect("w").geometry,
         );
-        state.ensure_title_raster(id, "doomed".into(), bar, true);
+        state.ensure_title_raster(id, "survivor".into(), bar, true);
         assert_eq!(state.title_rasters.len(), 1);
 
         let _ = state.apply_config(default_config());
-        assert!(state.title_rasters.is_empty(), "a reload must not strand title pixels");
+        assert!(state.window_manager.get(id).is_some(), "the window survives the reload");
+        assert!(state.title_rasters.contains_key(&id), "its cached title raster survives too");
     }
 
     /// The title node is inset by the three buttons, so a long title runs

@@ -473,6 +473,64 @@ impl WindowManager {
         }
     }
 
+    /// Reconcile the workspace list against a new set of `names` *in place*,
+    /// without dropping any window row. Existing workspaces are renamed
+    /// (keyed by index, which is their id, so a surviving window keeps its
+    /// assignment); extra names append fresh empty workspaces; trailing
+    /// workspaces beyond the new list are truncated. Any window still
+    /// assigned to a now-removed index migrates to workspace 0, emitting one
+    /// `WindowUpdated` per migrated row.
+    ///
+    /// This is the config-reload path (`State::apply_config`). It replaces
+    /// the old "rebuild a brand-new `WindowManager`" behavior, which closed
+    /// every client on every reload: here ids, focus MRU, geometry, and all
+    /// per-window state survive.
+    pub fn set_workspace_names(&mut self, names: Vec<String>) {
+        // Match `new`'s guard: never leave a zero-workspace manager, which
+        // would panic `workspace_mut` on the next `add_window`.
+        let names = if names.is_empty() { vec!["1".to_string()] } else { names };
+        let new_len = names.len() as u32;
+
+        // Migrate any window off a workspace index that is about to vanish.
+        // Collect ids first so we don't borrow `windows` while mutating it.
+        if new_len < self.workspaces.len() as u32 {
+            let migrants: Vec<WindowId> =
+                self.windows.values().filter(|w| w.workspace >= new_len).map(|w| w.id).collect();
+            for id in migrants {
+                if let Some(w) = self.windows.get_mut(&id) {
+                    w.workspace = 0;
+                    w.focused = false;
+                }
+                self.emit(Event::WindowUpdated {
+                    id,
+                    update: WindowUpdate {
+                        workspace: Some(0),
+                        focused: Some(false),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+
+        // Rename existing, append new, truncate removed -- all keyed by index
+        // (== workspace id), so surviving windows keep their assignment.
+        self.workspaces.truncate(new_len as usize);
+        for (i, name) in names.into_iter().enumerate() {
+            match self.workspaces.get_mut(i) {
+                Some(ws) => ws.name = name,
+                None => self.workspaces.push(Workspace { id: i as u32, name, focused_window: None }),
+            }
+        }
+
+        // The active workspace may have been truncated away; clamp it back
+        // into range so `workspace_mut`/`focused_window` stay panic-free.
+        // (This clamp is part of the reload's single `WorkspaceList` change,
+        // not a separate mutation.)
+        if self.active_workspace >= new_len {
+            self.active_workspace = 0;
+        }
+    }
+
     fn workspace(&self, id: u32) -> Option<&Workspace> {
         self.workspaces.get(id as usize)
     }
