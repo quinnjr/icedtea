@@ -34,12 +34,13 @@ async fn run(tx: Sender<ClipUpdate>) -> zbus::Result<()> {
     let conn = zbus::Connection::session().await?;
     let proxy = zbus::Proxy::new(&conn, CLIP_BUS_NAME, CLIP_PATH, CLIP_IFACE).await?;
 
-    let seed: Vec<ClipEntry> = proxy.call("get_history", &()).await?;
+    // zbus #[interface] exposes methods in PascalCase: GetHistory, not get_history.
+    let seed: Vec<ClipEntry> = proxy.call("GetHistory", &()).await?;
     let _ = tx.send(ClipUpdate::History(seed)).await;
 
     let mut changed = proxy.receive_signal("history_changed").await?;
     while (changed.next().await).is_some() {
-        if let Ok(history) = proxy.call::<_, _, Vec<ClipEntry>>("get_history", &()).await
+        if let Ok(history) = proxy.call::<_, _, Vec<ClipEntry>>("GetHistory", &()).await
             && tx.send(ClipUpdate::History(history)).await.is_err()
         {
             break; // GTK side gone.
@@ -61,15 +62,15 @@ impl ClipProxy {
 
 impl ClipCommands for ClipProxy {
     fn activate(&self, id: u64) {
-        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "activate", &(id,));
+        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "Activate", &(id,));
     }
     fn pin(&self, id: u64, on: bool) {
-        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "pin", &(id, on));
+        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "Pin", &(id, on));
     }
     fn remove(&self, id: u64) {
-        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "remove", &(id,));
+        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "Remove", &(id,));
     }
     fn clear(&self) {
-        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "clear", &());
+        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "Clear", &());
     }
 }

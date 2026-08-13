@@ -25,6 +25,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
 use crate::history::{Change, History};
 
 /// A request from the zbus service, delivered over the wake pipe.
+#[derive(Debug)]
 pub enum Command {
     Activate(u64),
     Pin(u64, bool),
@@ -62,9 +63,6 @@ struct App {
     offer_mimes: Vec<String>,
     /// Set when a new selection offer arrives; drained by the loop to capture.
     pending_capture: bool,
-    /// One-shot: the next `Selection` echo after we set our own source must not
-    /// be re-captured (it would duplicate the head and could loop).
-    expect_own_selection: bool,
 
     /// The source we set for a re-paste, and the payload it answers `send` with.
     our_source: Option<src::ZwlrDataControlSourceV1>,
@@ -91,29 +89,41 @@ impl App {
         }
     }
 
-    /// Receive the current offer in the best supported mime and push it. Blocks
-    /// on the pipe read until the owning client writes and closes — fine for
-    /// the small text payloads v1 captures.
+    /// Receive the current offer in the best supported mime and push it.
+    ///
+    /// Skips while we own the selection (a re-paste we set): the data is already
+    /// the history head, and `receive()`-ing our own offer would ask this very
+    /// thread to both write and read the same pipe — a self-deadlock. Ownership
+    /// is dropped on the source's `Cancelled` (another client took over).
     fn capture(&mut self, conn: &Connection) {
-        if self.expect_own_selection {
-            // Our own re-paste echoed back; consume the flag, do not capture.
-            self.expect_own_selection = false;
+        if self.our_source.is_some() {
             return;
         }
         let Some(off) = self.offer.clone() else { return };
         let Some(mime) = pick_mime(&self.offer_mimes) else { return };
 
-        let (mut read_end, write_end) = match std::io::pipe() {
+        let (read_end, write_end) = match std::io::pipe() {
             Ok(p) => p,
             Err(_) => return,
         };
         off.receive(mime.clone(), write_end.as_fd());
         let _ = conn.flush();
         drop(write_end); // the compositor dups the write end to the owner
-        let mut bytes = Vec::new();
-        if read_end.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
-            return;
-        }
+
+        // Read on a helper thread with a deadline, so a hung or malicious
+        // selection owner that never writes/closes cannot wedge the loop (and
+        // with it every queued command) forever.
+        let (btx, brx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let mut read_end = read_end;
+            let mut buf = Vec::new();
+            let _ = read_end.read_to_end(&mut buf);
+            let _ = btx.send(buf);
+        });
+        let bytes = match brx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            _ => return, // timed out or empty; the read thread ends on its own
+        };
         if self.history.push(kind_of(&mime), mime, &bytes, None) == Change::Changed {
             self.publish();
         }
@@ -148,9 +158,9 @@ impl App {
         device.set_selection(Some(&source));
         self.our_serve = Some((mime, bytes));
         self.our_source = Some(source);
-        // The compositor will echo a Selection event backed by this source;
-        // skip capturing it. Verified by the Task-5 no-duplicate assertion.
-        self.expect_own_selection = true;
+        // While `our_source` is set, `capture()` skips — so the compositor's
+        // echo of this selection is not re-captured, and we never `receive()`
+        // our own offer. Ownership is dropped on the source's `Cancelled`.
         let _ = conn.flush();
     }
 }
@@ -167,7 +177,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
         if let wl_registry::Event::Global { name, interface, version } = event {
             match interface.as_str() {
                 "zwlr_data_control_manager_v1" => {
-                    state.manager = Some(registry.bind(name, version.min(2), qh, ()));
+                    // Bind v1 deliberately: v2 also delivers primary-selection
+                    // offers, which would race the shared `offer_mimes` against
+                    // clipboard `Selection`s. The daemon only tracks the
+                    // clipboard, so v1 is exactly the surface it needs.
+                    state.manager = Some(registry.bind(name, 1, qh, ()));
                 }
                 "wl_seat" => {
                     state.seat = Some(registry.bind(name, version.min(7), qh, ()));
@@ -191,12 +205,9 @@ impl Dispatch<dev::ZwlrDataControlDeviceV1, ()> for App {
         match event {
             dev::Event::DataOffer { .. } => state.offer_mimes.clear(),
             dev::Event::Selection { id } => {
+                // `pending_capture` stays false on a cleared selection.
                 state.offer = id;
                 state.pending_capture = state.offer.is_some();
-                if state.offer.is_none() {
-                    // Selection cleared; nothing to capture.
-                    state.pending_capture = false;
-                }
             }
             _ => {}
         }
@@ -276,7 +287,6 @@ pub fn run(
         offer: None,
         offer_mimes: Vec::new(),
         pending_capture: false,
-        expect_own_selection: false,
         our_source: None,
         our_serve: None,
         history,

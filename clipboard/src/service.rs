@@ -52,18 +52,18 @@ impl ClipboardService {
 
 /// Register `org.icedtea.Clipboard` and start the `history_changed` emitter.
 /// Returns the connection, which the caller keeps alive for the service's life.
+/// `Err` if the session bus is unavailable or the name is already owned (another
+/// daemon running) — the binary treats that as fatal; a test can skip.
 pub fn spawn(
     snapshot: Arc<Mutex<Vec<ClipEntry>>>,
     commands: Sender<Command>,
     wake: UnixStream,
     changes: Receiver<Change>,
-) -> Connection {
-    let conn = Connection::session().expect("session bus available");
+) -> zbus::Result<Connection> {
+    let conn = Connection::session()?;
     let service = ClipboardService { snapshot, commands, wake };
-    conn.object_server().at(CLIP_PATH, service).expect("register org.icedtea.Clipboard interface");
-    conn.request_name(CLIP_BUS_NAME).unwrap_or_else(|err| {
-        panic!("failed to acquire the {CLIP_BUS_NAME} bus name -- another daemon running? ({err})")
-    });
+    conn.object_server().at(CLIP_PATH, service)?;
+    conn.request_name(CLIP_BUS_NAME)?;
 
     let emitter = conn.clone();
     std::thread::spawn(move || {
@@ -73,5 +73,5 @@ pub fn spawn(
         }
     });
 
-    conn
+    Ok(conn)
 }

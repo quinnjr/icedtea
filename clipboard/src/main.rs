@@ -23,7 +23,8 @@ fn main() {
     let snapshot = Arc::new(Mutex::new(Vec::new()));
 
     // The service keeps the D-Bus connection alive for the process lifetime.
-    let _dbus = service::spawn(snapshot.clone(), cmd_tx, wake_write, chg_rx);
+    let _dbus = service::spawn(snapshot.clone(), cmd_tx, wake_write, chg_rx)
+        .expect("failed to register org.icedtea.Clipboard (session bus? another daemon?)");
 
     // Runs until the Wayland connection dies.
     manager::run(conn, history::History::new(HISTORY_MAX), cmd_rx, chg_tx, wake_read, snapshot);

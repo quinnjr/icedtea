@@ -21,9 +21,11 @@ use icedtea_shell::gtk4::{self, prelude::*, Box as GtkBox, Button, ListBox, Orie
 use icedtea_shell::taskbar::{self, TaskbarModel, WmUpdate};
 use icedtea_shell::wm_client::WmCommands;
 
-/// Point GDK at the harness compositor and init GTK once. `false` means a
-/// headless environment without a usable display — the caller then skips the
-/// behavioural assertions (logged), rather than failing.
+/// Point GDK at the harness compositor and init GTK once. `false` means GTK
+/// could not come up — which is a FAILURE by default (the harness provides a
+/// display, so a failure means something is wrong), not a silent pass. An
+/// operator on a genuinely display-less CI opts out explicitly with
+/// `ICEDTEA_ALLOW_NO_GTK`.
 fn gtk_init_against(comp: &Compositor) -> bool {
     // SAFETY: one GTK test per binary; set before any GDK use.
     unsafe {
@@ -32,6 +34,22 @@ fn gtk_init_against(comp: &Compositor) -> bool {
         std::env::set_var("GSK_RENDERER", "cairo");
     }
     gtk4::init().is_ok()
+}
+
+/// Init GTK or decide what to do about it: return `true` to proceed, `false` to
+/// skip (only when opted out), or panic (the default failure).
+fn require_gtk(comp: &Compositor) -> bool {
+    if gtk_init_against(comp) {
+        return true;
+    }
+    if std::env::var_os("ICEDTEA_ALLOW_NO_GTK").is_some() {
+        eprintln!("SKIP: gtk4::init() unavailable and ICEDTEA_ALLOW_NO_GTK is set");
+        return false;
+    }
+    panic!(
+        "gtk4::init() failed against the harness compositor; \
+         set ICEDTEA_ALLOW_NO_GTK=1 to skip on a display-less CI"
+    );
 }
 
 #[derive(Default)]
@@ -123,8 +141,7 @@ fn win(id: u32, title: &str) -> WindowInfo {
 #[test]
 fn taskbar_renders_windows_and_clicks_reach_the_command_surface() {
     let comp = Compositor::spawn();
-    if !gtk_init_against(&comp) {
-        eprintln!("IGNORE: gtk4::init() unavailable in this environment");
+    if !require_gtk(&comp) {
         return;
     }
 

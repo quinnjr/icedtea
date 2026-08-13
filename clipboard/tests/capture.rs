@@ -19,16 +19,6 @@ fn daemon_connection(socket: &str) -> wayland_client::Connection {
     wayland_client::Connection::from_socket(stream).expect("wayland connection")
 }
 
-fn wait_until(deadline: Duration, mut pred: impl FnMut() -> bool) -> bool {
-    let end = Instant::now() + deadline;
-    while Instant::now() < end {
-        if pred() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    pred()
-}
 
 #[test]
 fn daemon_captures_a_copy_and_repastes_it() {
@@ -47,35 +37,40 @@ fn daemon_captures_a_copy_and_repastes_it() {
         manager::run(dconn, History::new(50), cmd_rx, chg_tx, wake_read, snap);
     });
 
-    // A client copies text.
+    // A client copies two distinct payloads in turn. `app` must keep
+    // dispatching so its data source answers the daemon's `receive` (the
+    // compositor forwards the daemon's request to `app`'s source, on this
+    // thread), so the wait loop pumps it.
     let mut app = TestClient::map_toplevel(&comp.socket, "app.copy", "copier");
     assert!(app.wait_until(|c| c.has_input_serial()), "no keyboard serial");
-    app.set_selection_text("text/plain;charset=utf-8", b"hello-history");
 
-    // The daemon captures it into history. `app` must keep dispatching so its
-    // data source answers the daemon's `receive` (the compositor forwards the
-    // daemon's request to `app`'s source, on this thread).
-    let captured = {
+    let copy_and_wait = |app: &mut TestClient, text: &[u8]| {
+        app.set_selection_text("text/plain;charset=utf-8", text);
+        let preview = String::from_utf8_lossy(text).to_string();
         let end = Instant::now() + Duration::from_secs(5);
         loop {
             app.pump();
-            if snapshot.lock().unwrap().iter().any(|e| e.preview == "hello-history") {
-                break true;
+            if snapshot.lock().unwrap().iter().any(|e| e.preview == preview) {
+                return;
             }
-            if Instant::now() > end {
-                break false;
-            }
+            assert!(Instant::now() < end, "daemon never captured {preview:?}: {:?}", snapshot.lock().unwrap());
             std::thread::sleep(Duration::from_millis(10));
         }
     };
-    assert!(captured, "daemon never captured the copy; history = {:?}", snapshot.lock().unwrap());
-    let (id, len_before) = {
+    copy_and_wait(&mut app, b"first");
+    copy_and_wait(&mut app, b"second");
+
+    // History is now [second, first]; the older entry is the re-paste target,
+    // so a broken self-capture guard would insert a *new* head (or self-
+    // deadlock) rather than leave the two-entry set intact.
+    let (first_id, len_before) = {
         let s = snapshot.lock().unwrap();
-        (s.iter().find(|e| e.preview == "hello-history").unwrap().id, s.len())
+        assert_eq!(s.len(), 2, "expected two distinct entries, got {s:?}");
+        (s.iter().find(|e| e.preview == "first").unwrap().id, s.len())
     };
 
-    // Re-paste it: the daemon takes over the selection with a source it serves.
-    cmd_tx.send(Command::Activate(id)).unwrap();
+    // Re-paste the OLDER entry: the daemon owns the selection with a source it serves.
+    cmd_tx.send(Command::Activate(first_id)).unwrap();
     {
         use std::io::Write as _;
         let mut w = &wake_write;
@@ -87,17 +82,22 @@ fn daemon_captures_a_copy_and_repastes_it() {
     assert!(reader.wait_until(|c| c.has_offer()), "reader saw no data-control offer");
     assert_eq!(
         reader.read_offer_blocking("text/plain;charset=utf-8"),
-        b"hello-history",
-        "re-paste did not serve the stored bytes"
+        b"first",
+        "re-paste did not serve the older entry's bytes"
     );
 
-    // The self-capture guard held: re-pasting did not duplicate the head.
-    assert!(
-        wait_until(Duration::from_secs(2), || snapshot.lock().unwrap().len() == len_before)
-            || snapshot.lock().unwrap().len() == len_before,
-        "re-paste duplicated the history head (self-capture guard failed): {:?}",
-        snapshot.lock().unwrap()
-    );
+    // The self-capture guard held: re-pasting neither duplicated an entry nor
+    // grew the history. Give it a moment in case a stray capture were queued.
+    std::thread::sleep(Duration::from_millis(200));
+    {
+        let s = snapshot.lock().unwrap();
+        assert_eq!(s.len(), len_before, "re-paste changed the history (self-capture guard failed): {s:?}");
+        assert_eq!(
+            s.iter().filter(|e| e.preview == "first").count(),
+            1,
+            "re-paste duplicated the older entry: {s:?}"
+        );
+    }
 
     // Tear the daemon down cleanly (disconnecting it before the compositor).
     drop(reader);

@@ -95,13 +95,15 @@ impl WmProxy {
 }
 
 impl WmCommands for WmProxy {
+    // zbus's #[interface] exposes Rust methods in PascalCase, so the wire
+    // members are FocusWindow/CloseWindow/SetWorkspace (matching GetState).
     fn focus_window(&self, id: u32) {
-        let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "focus_window", &(id,));
+        let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "FocusWindow", &(id,));
     }
     fn close_window(&self, id: u32) {
-        let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "close_window", &(id,));
+        let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "CloseWindow", &(id,));
     }
     fn set_workspace(&self, id: u32) {
-        let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "set_workspace", &(id,));
+        let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "SetWorkspace", &(id,));
     }
 }
