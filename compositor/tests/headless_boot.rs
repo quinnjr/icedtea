@@ -919,21 +919,23 @@ fn snap_preview_rect_is_created_and_torn_down_against_a_live_scene() {
     assert!(state.snap_preview_rect().is_none(), "clearing the preview must remove the rect");
 }
 
-/// [HIGH H5] `migrate_windows_from`'s oversized-window clamp guard: when the
+/// [HIGH H5] `migrate_windows_from`'s oversized-window guard: when the
 /// migrated window's frame is wider and/or taller than the surviving output,
 /// `(survivor.x + offset).clamp(survivor.x, survivor.x + survivor.width -
 /// geometry.width)` would hand `clamp` a `max` bound below its `min` bound
-/// and panic. The `if geometry.width >= survivor.width { survivor.x } else
-/// { ... }` guard (and its height counterpart) exists to take the window's
-/// origin straight to the survivor's own origin on that axis instead of ever
-/// reaching the clamp -- every other migration test uses a window (300x200)
-/// smaller than its survivor (800x600) on both axes, so this branch has never
-/// run. No runtime needed: `migrate_windows_from` and the model-only window
-/// this test uses (see `windows_migrate_off_a_removed_output` in
-/// `state.rs`'s own unit tests for the identical no-runtime pattern) never
-/// touch `wlr`.
+/// and panic. The `if geometry.width >= survivor.width { ... } else { ... }`
+/// guard (and its height counterpart) exists to route around the clamp
+/// entirely on that axis -- every other migration test uses a window
+/// (300x200) smaller than its survivor (800x600) on both axes, so this
+/// branch has never run. Task 8, F: the oversized branch now centers
+/// (`survivor.x + (survivor.width - geometry.width) / 2`) rather than
+/// pinning to the survivor's own origin, spreading the unavoidable overflow
+/// symmetrically instead of bleeding it all off one edge. No runtime
+/// needed: `migrate_windows_from` and the model-only window this test uses
+/// (see `windows_migrate_off_a_removed_output` in `state.rs`'s own unit
+/// tests for the identical no-runtime pattern) never touch `wlr`.
 #[test]
-fn migration_clamps_an_oversized_window_into_the_survivor_without_panicking() {
+fn migration_centers_an_oversized_window_into_the_survivor_without_panicking() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut state = State::new(icedtea_config::default_config(), tx);
 
@@ -960,7 +962,7 @@ fn migration_clamps_an_oversized_window_into_the_survivor_without_panicking() {
         .geometry;
     assert_eq!(
         (geo.x, geo.y),
-        (survivor.x, survivor.y),
-        "a window wider and taller than the survivor must land at the survivor's own origin, got {geo:?}"
+        (survivor.x + (survivor.width - geo.width) / 2, survivor.y + (survivor.height - geo.height) / 2),
+        "a window wider and taller than the survivor must be centered on it, not pinned to its origin, got {geo:?}"
     );
 }

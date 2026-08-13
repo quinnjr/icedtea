@@ -241,6 +241,11 @@ fn ssd_is_negotiated_for_a_client_that_defers() {
     // staged, not sent, so the client never sees a wrong-then-right pair.
     assert_eq!(client.decoration_modes(), [2], "one configure, server-side");
 
+    // Task 9: the decoration-mode negotiation itself is now observable over
+    // D-Bus -- `set_client_decorations_requested` emits a `WindowUpdated`
+    // signaling "re-fetch via GetState" once the mode settles.
+    comp.wait_event(|e| matches!(e, Event::WindowUpdated { .. }));
+
     // Retitling drives `update_buffer` on the live title node: the model
     // must take the new title and the client must survive it.
     client.set_title("renamed");
@@ -295,6 +300,11 @@ fn an_unmapping_client_releases_focus_and_alt_tab() {
     );
     let snap = comp.snapshot();
     assert!(snap.windows.iter().any(|w| w.title == "goes"), "row survives the unmap");
+
+    // Task 9: the unmap's `WindowUpdated` must carry `mapped: Some(false)`
+    // so a D-Bus subscriber can observe the transition without polling
+    // `GetState`.
+    comp.wait_event(|e| matches!(e, Event::WindowUpdated { update, .. } if update.mapped == Some(false)));
 
     first.detach();
     second.detach();

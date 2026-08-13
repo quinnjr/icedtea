@@ -182,7 +182,11 @@ impl WindowManager {
 
     pub fn set_client_decorations_requested(&mut self, id: WindowId, value: Option<bool>) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
+        if w.client_decorations_requested == value {
+            return None;
+        }
         w.client_decorations_requested = value;
+        self.emit(Event::WindowUpdated { id, update: WindowUpdate::default() });
         Some(())
     }
 
@@ -204,7 +208,7 @@ impl WindowManager {
             return None;
         }
         w.mapped = mapped;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate::default() });
+        self.emit(Event::WindowUpdated { id, update: WindowUpdate { mapped: Some(mapped), ..Default::default() } });
         Some(())
     }
 
@@ -383,23 +387,70 @@ impl WindowManager {
         self.visible_windows().into_iter().find(|w| w.geometry.contains(point.0, point.1))
     }
 
+    /// Focus the most-recently-focused non-minimized, mapped window on `ws`,
+    /// if any; when nothing qualifies, clear `ws`'s focus pointer instead of
+    /// leaving it aimed at a window that just became hidden (minimized,
+    /// unmapped, closed, or moved off the workspace). Mirrors
+    /// `remove_window`'s no-successor clear, so "focused" never goes on
+    /// naming a window nothing can act on. Returns the id that took over, or
+    /// `None`.
+    ///
+    /// Every hide path -- minimize, toplevel unmap, close, and a workspace
+    /// switch landing on a stale/invisible pointer -- routes through this
+    /// rather than discarding `focus_mru_in_workspace`'s (this function's
+    /// former name and still its candidate-picking half) result, which is
+    /// what let a hidden window remain `focused_window()` when it was the
+    /// workspace's last visible one.
+    pub fn refocus_after_hide(&mut self, ws: u32) -> Option<WindowId> {
+        let candidate = self
+            .focus_mru
+            .iter()
+            .copied()
+            .find(|id| self.windows.get(id).is_some_and(|w| w.workspace == ws && !w.minimized && w.mapped));
+        match candidate {
+            Some(id) => {
+                self.focus(id)?;
+                Some(id)
+            }
+            None => {
+                let cleared = self.workspaces.get_mut(ws as usize).and_then(|slot| slot.focused_window.take());
+                // The pointer is only half the story: the hidden window's own
+                // `focused` field (what `to_info`/`snapshot` report to IPC
+                // clients, e.g. the taskbar) must drop too, with exactly one
+                // `WindowUpdated{focused:false}` for it -- mirrors how the
+                // successful-candidate arm above (via `focus`) and
+                // `remove_window`'s no-successor clear both handle the flag
+                // and its emission. Guarded on `w.focused` so this stays a
+                // no-op-on-no-change like every other setter here (the
+                // pointer and the flag can already disagree, e.g. a window
+                // unmapped without ever having been re-focused).
+                if let Some(prev_id) = cleared.filter(|id| self.windows.get(id).is_some_and(|w| w.focused)) {
+                    if let Some(w) = self.windows.get_mut(&prev_id) {
+                        w.focused = false;
+                    }
+                    self.emit(Event::WindowUpdated {
+                        id: prev_id,
+                        update: WindowUpdate { focused: Some(false), ..Default::default() },
+                    });
+                }
+                None
+            }
+        }
+    }
+
     /// Focus the most-recently-focused non-minimized window on `ws`, if any.
-    /// Returns the id focused, or `None` when the workspace has nothing
-    /// focusable (in which case its focus pointer is left cleared).
     ///
     /// Review finding I6: `set_workspace` cleared the *origin* workspace's
     /// focus pointer but never gave the destination one, so
     /// `MoveToWorkspace` (which then switches to that workspace) left
     /// `focused_window()` as `None` and the very next `close`/`fullscreen`/
     /// `snap` action silently no-opped.
+    ///
+    /// Thin alias kept for call sites that only care about the picked
+    /// candidate; see [`Self::refocus_after_hide`] for the no-candidate
+    /// behavior (it now also clears the pointer on `None`).
     pub fn focus_mru_in_workspace(&mut self, ws: u32) -> Option<WindowId> {
-        let candidate = self
-            .focus_mru
-            .iter()
-            .copied()
-            .find(|id| self.windows.get(id).is_some_and(|w| w.workspace == ws && !w.minimized && w.mapped))?;
-        self.focus(candidate)?;
-        Some(candidate)
+        self.refocus_after_hide(ws)
     }
 
     pub fn to_info(&self, w: &Window) -> WindowInfo {
@@ -470,6 +521,68 @@ impl WindowManager {
     pub fn raise_seq_floor(&mut self, min_seq: u64) {
         if min_seq > self.seq {
             self.seq = min_seq;
+        }
+    }
+
+    /// Reconcile the workspace list against a new set of `names` *in place*,
+    /// without dropping any window row. Existing workspaces are renamed
+    /// (keyed by index, which is their id, so a surviving window keeps its
+    /// assignment); extra names append fresh empty workspaces; trailing
+    /// workspaces beyond the new list are truncated. Any window still
+    /// assigned to a now-removed index migrates to workspace 0, emitting one
+    /// `WindowUpdated` per migrated row.
+    ///
+    /// This is the config-reload path (`State::apply_config`). It replaces
+    /// the old "rebuild a brand-new `WindowManager`" behavior, which closed
+    /// every client on every reload: here ids, focus MRU, geometry, and all
+    /// per-window state survive.
+    pub fn set_workspace_names(&mut self, names: Vec<String>) {
+        // Match `new`'s guard: never leave a zero-workspace manager, which
+        // would panic `workspace_mut` on the next `add_window`.
+        let names = if names.is_empty() { vec!["1".to_string()] } else { names };
+        let new_len = names.len() as u32;
+
+        // Migrate any window off a workspace index that is about to vanish.
+        // Collect ids first so we don't borrow `windows` while mutating it.
+        if new_len < self.workspaces.len() as u32 {
+            let migrants: Vec<WindowId> =
+                self.windows.values().filter(|w| w.workspace >= new_len).map(|w| w.id).collect();
+            for id in migrants {
+                if let Some(w) = self.windows.get_mut(&id) {
+                    w.workspace = 0;
+                    w.focused = false;
+                }
+                self.emit(Event::WindowUpdated {
+                    id,
+                    update: WindowUpdate {
+                        workspace: Some(0),
+                        focused: Some(false),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+
+        // Rename existing, append new, truncate removed -- all keyed by index
+        // (== workspace id), so surviving windows keep their assignment.
+        self.workspaces.truncate(new_len as usize);
+        for (i, name) in names.into_iter().enumerate() {
+            match self.workspaces.get_mut(i) {
+                Some(ws) => ws.name = name,
+                None => self.workspaces.push(Workspace { id: i as u32, name, focused_window: None }),
+            }
+        }
+
+        // The active workspace may have been truncated away; clamp it back
+        // into range so `workspace_mut`/`focused_window` stay panic-free.
+        // This is a real change to `active_workspace`, and `WorkspaceList`
+        // does not carry the active index, so emit the same
+        // `WorkspaceSet{active: true}` every other active-workspace change
+        // emits -- otherwise subscribers keep showing the vanished workspace
+        // until a manual switch.
+        if self.active_workspace >= new_len {
+            self.active_workspace = 0;
+            self.emit(Event::WorkspaceSet { id: 0, active: true });
         }
     }
 
@@ -650,6 +763,31 @@ mod tests {
         assert!(m.window_at((10_000, 10_000)).is_none());
     }
 
+    /// Task 6: minimizing (or otherwise hiding) the sole window on a
+    /// workspace must not leave `focused_window()` still naming it -- the
+    /// model must never report a hidden window as focused.
+    #[test]
+    fn hiding_the_sole_window_clears_the_focus_pointer() {
+        let mut m = WindowManager::new(vec!["1".into()]);
+        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        assert_eq!(m.focused_window().map(|w| w.id), Some(a));
+        m.set_minimized(a, true);
+        let seq_before = m.seq();
+        assert_eq!(m.refocus_after_hide(m.active_workspace()), None);
+        assert!(m.focused_window().is_none(), "no hidden window may remain focused");
+        // The reporting boundary must agree: `a`'s own `focused` field --
+        // what `to_info`/`snapshot` hand IPC clients like the taskbar -- has
+        // to drop too, with exactly one `WindowUpdated{focused:false}`
+        // emitted for it, not just the workspace pointer clearing.
+        assert!(!m.get(a).unwrap().focused, "the hidden window's own focused flag must clear too");
+        let emitted_unfocus = m
+            .pending_events
+            .iter()
+            .filter(|e| e.seq > seq_before)
+            .any(|e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.focused == Some(false)));
+        assert!(emitted_unfocus, "must emit exactly one WindowUpdated{{focused:false}} for the hidden window");
+    }
+
     /// I6: after a window is moved away, the workspace it lands on has a
     /// focusable head that the next action can act on.
     #[test]
@@ -721,5 +859,35 @@ mod tests {
         let a = m.add_window("a", "a", 1, GEO);
         m.set_mapped(a, false).unwrap();
         assert_eq!(m.focus(a), None, "an unmapped window must never gain focus");
+    }
+
+    // --- Task 9: D-Bus observability of mapped state + decoration mode ---
+
+    /// A decoration-mode change is a new sanctioned `WindowUpdated` emission:
+    /// exactly one on an actual value change, none on a no-op repeat.
+    #[test]
+    fn set_client_decorations_requested_emits_one_window_updated() {
+        let mut m = WindowManager::new(vec!["1".into()]);
+        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let before = m.seq();
+        m.set_client_decorations_requested(a, Some(true));
+        assert_eq!(m.seq(), before + 1, "exactly one emission");
+        // and a no-op (unchanged value) emits nothing:
+        let mid = m.seq();
+        m.set_client_decorations_requested(a, Some(true));
+        assert_eq!(m.seq(), mid, "unchanged value is silent");
+    }
+
+    /// `set_mapped`'s existing emission now carries the new `mapped` field.
+    #[test]
+    fn set_mapped_payload_carries_mapped() {
+        let mut m = WindowManager::new(vec!["1".into()]);
+        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        m.pending_events.clear(); // clear the add's events
+        m.set_mapped(a, false);
+        let carried = m.pending_events.iter().any(
+            |e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.mapped == Some(false)),
+        );
+        assert!(carried, "set_mapped's emission must carry update.mapped == Some(false)");
     }
 }

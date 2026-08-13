@@ -78,6 +78,20 @@ struct SsdVisual {
     /// Minimize, maximize, close -- `decoration::button_rects`' own order,
     /// left to right, which is also the order `hit_test` maps them in.
     buttons: [Option<wlr::RectId>; 3],
+    /// The rasterized glyph (en-dash / square / x) drawn over each button
+    /// rect, same order as `buttons`. `None` per-slot for the same two
+    /// reasons `title` can be `None`: the glyph rasterized to nothing, or
+    /// wlroots refused the buffer node.
+    button_glyphs: [Option<wlr::BufferId>; 3],
+    /// Which `(width, height, fg)` each `button_glyphs` slot currently holds
+    /// pixels for -- the glyph analogue of `title_generation`. A button
+    /// rect's size never changes without a full frame geometry change (it is
+    /// always `BUTTON_WIDTH x TITLE_BAR_HEIGHT`), and a glyph's `fg` only
+    /// changes with the palette, so this key changes far less often than
+    /// `sync_ssd` runs -- comparing it, like the title generation, turns a
+    /// drag's per-motion re-sync back into a cheap position-only update
+    /// instead of a re-upload of byte-identical pixels every frame.
+    button_glyph_keys: [Option<(i32, i32, [u8; 4])>; 3],
 }
 
 /// A rasterized title, borrowed from the caller's own memo.
@@ -91,6 +105,45 @@ pub struct TitleRaster<'a> {
     pub height: i32,
     pub generation: u64,
     pub pixels: &'a [u8],
+}
+
+/// A rasterized button glyph, borrowed from the caller's own memo -- the
+/// glyph analogue of [`TitleRaster`]. `width`/`height`/`fg` double as the
+/// cache key `sync_ssd` compares against [`SsdVisual::button_glyph_keys`];
+/// there is no separate generation counter because, unlike a title, a
+/// glyph's pixels are a pure function of that triple, so the triple itself
+/// is all the "has this changed" check needs.
+pub struct GlyphRaster<'a> {
+    pub width: i32,
+    pub height: i32,
+    pub fg: [u8; 4],
+    pub pixels: &'a [u8],
+}
+
+/// Whether a title-bar button is being hovered or actively pressed, so
+/// `sync_ssd` can shift its color for feedback. Hover and press are
+/// mutually exclusive at any instant (a press implies the pointer is over
+/// the button, but the caller only ever reports the stronger of the two),
+/// so a single `Option<(usize, ButtonState)>` -- not two separate optional
+/// indices -- is `sync_ssd`'s whole contract for this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonState {
+    Hover,
+    Pressed,
+}
+
+/// Shifts a premultiplied button color for hover/press feedback: brighter
+/// (and more opaque) on hover, darker on press. Both scale every channel
+/// uniformly, which keeps the result premultiplied (still `rgb <= a`) without
+/// needing to unpremultiply first -- scaling all four channels by the same
+/// factor preserves that invariant exactly.
+fn shift_button_color(base: [f32; 4], state: ButtonState) -> [f32; 4] {
+    let factor: f32 = match state {
+        ButtonState::Hover => 1.35,
+        ButtonState::Pressed => 0.6,
+    };
+    let scale = |c: f32| (c * factor).clamp(0.0, 1.0);
+    [scale(base[0]), scale(base[1]), scale(base[2]), scale(base[3])]
 }
 
 /// The compositor's Wayland side.
@@ -365,15 +418,29 @@ impl Wayland {
     /// differs from what the title node already holds, so an unchanged title
     /// costs a comparison rather than a texture upload.
     ///
+    /// `button_glyph_px`, same order as `button_colors`: each slot's
+    /// rasterized icon (or `None`, degrading that one button to a bare
+    /// color chip -- the same per-node degrade rule `title_px` follows).
+    /// Uploaded only when the `(width, height, fg)` it carries differs from
+    /// what that button's node already holds
+    /// (`SsdVisual::button_glyph_keys`).
+    ///
+    /// `active_button` names the one button, if any, currently hovered or
+    /// pressed (`decoration`'s own hit-test order: 0 minimize, 1 maximize, 2
+    /// close) and shifts only that button's color -- brighter on hover,
+    /// darker on press ([`shift_button_color`]) -- leaving the glyph node
+    /// itself untouched, since color is a rect property and the glyph
+    /// buffer just rides on top of it.
+    ///
     /// Removes (rather than merely hides) every node when `ssd` is `false`
     /// or the window isn't currently visible: a hidden decoration is cheaper
     /// to recreate than to keep, and unlike the old root-rect scheme there is
     /// no stacking-order reason to keep it around invisible.
-    // Nine arguments, deliberately: every one of them is a fact the caller
+    // Eleven arguments, deliberately: every one of them is a fact the caller
     // (`State::sync_window_to_scene`) already has and this seam must not
-    // re-derive -- the model's geometry, its palette, and its title pixels.
-    // Bundling them into a struct would only move the same nine fields one
-    // line up at the single call site, while making the "no model types
+    // re-derive -- the model's geometry, its palette, and its title/glyph
+    // pixels. Bundling them into a struct would only move the same fields
+    // one line up at the single call site, while making the "no model types
     // below this seam" rule harder to keep.
     #[allow(clippy::too_many_arguments)]
     pub fn sync_ssd(
@@ -386,6 +453,8 @@ impl Wayland {
         band_color: [f32; 4],
         button_colors: [[f32; 4]; 3],
         title_px: Option<TitleRaster<'_>>,
+        button_glyph_px: [Option<GlyphRaster<'_>>; 3],
+        active_button: Option<(usize, ButtonState)>,
     ) {
         if !ssd || !visible {
             self.remove_ssd(id);
@@ -412,6 +481,8 @@ impl Wayland {
                     title: None,
                     title_generation: None,
                     buttons: [None; 3],
+                    button_glyphs: [None; 3],
+                    button_glyph_keys: [None; 3],
                 },
             );
         }
@@ -429,20 +500,54 @@ impl Wayland {
         // near-duplicate rectangle argument.
         let rects = crate::decoration::button_rects(bar);
         for (i, r) in rects.iter().enumerate() {
+            let color = match active_button {
+                Some((hi, state)) if hi == i => shift_button_color(button_colors[i], state),
+                _ => button_colors[i],
+            };
             let slot = &mut visual.buttons[i];
             if slot.is_none() {
                 let Some(key) = key else { continue };
-                *slot = runtime.add_rect_in_toplevel(
-                    key.0,
-                    r.width.max(1),
-                    r.height.max(1),
-                    button_colors[i],
-                );
+                *slot = runtime.add_rect_in_toplevel(key.0, r.width.max(1), r.height.max(1), color);
             }
             let Some(rect) = *slot else { continue };
             runtime.set_rect_size(rect, r.width.max(1), r.height.max(1));
             runtime.set_rect_position(rect, r.x - content.x, r.y - content.y);
-            runtime.set_rect_color(rect, button_colors[i]);
+            runtime.set_rect_color(rect, color);
+
+            match &button_glyph_px[i] {
+                Some(raster) => {
+                    let raster_key = (raster.width, raster.height, raster.fg);
+                    if visual.button_glyphs[i].is_none() || visual.button_glyph_keys[i] != Some(raster_key) {
+                        let updated = visual.button_glyphs[i].and_then(|buffer| {
+                            runtime.update_buffer(buffer, raster.width, raster.height, raster.pixels)
+                        });
+                        if updated.is_none() {
+                            if let Some(stale) = visual.button_glyphs[i].take() {
+                                runtime.remove_buffer(stale);
+                            }
+                            if let Some(key) = key {
+                                visual.button_glyphs[i] = runtime.add_buffer_in_toplevel(
+                                    key.0,
+                                    raster.width,
+                                    raster.height,
+                                    raster.pixels,
+                                );
+                            }
+                        }
+                        visual.button_glyph_keys[i] =
+                            if visual.button_glyphs[i].is_some() { Some(raster_key) } else { None };
+                    }
+                    if let Some(buffer) = visual.button_glyphs[i] {
+                        runtime.set_buffer_position(buffer, r.x - content.x, r.y - content.y);
+                    }
+                }
+                None => {
+                    if let Some(buffer) = visual.button_glyphs[i].take() {
+                        runtime.remove_buffer(buffer);
+                    }
+                    visual.button_glyph_keys[i] = None;
+                }
+            }
         }
 
         match title_px {
@@ -508,6 +613,9 @@ impl Wayland {
         }
         for rect in visual.buttons.into_iter().flatten() {
             runtime.remove_rect(rect);
+        }
+        for buffer in visual.button_glyphs.into_iter().flatten() {
+            runtime.remove_buffer(buffer);
         }
     }
 
@@ -609,10 +717,10 @@ mod tests {
         let content = crate::decoration::content_rect(frame, true);
         let color = [1.0, 1.0, 1.0, 1.0];
 
-        w.sync_ssd(id, true, true, bar, content, color, [[0.0; 4]; 3], None);
+        w.sync_ssd(id, true, true, bar, content, color, [[0.0; 4]; 3], None, [None, None, None], None);
         assert_eq!(w.ssd_rect_count(), 0);
 
-        w.sync_ssd(id, false, true, bar, content, color, [[0.0; 4]; 3], None);
+        w.sync_ssd(id, false, true, bar, content, color, [[0.0; 4]; 3], None, [None, None, None], None);
         assert_eq!(w.ssd_rect_count(), 0);
 
         w.forget(id);
@@ -646,6 +754,8 @@ mod tests {
                 generation: 1,
                 pixels: &px,
             }),
+            [None, None, None],
+            Some((2, ButtonState::Hover)),
         );
         assert_eq!(w.ssd_rect_count(), 0);
     }

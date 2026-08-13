@@ -20,6 +20,20 @@ pub fn button_rects(geometry: Rectangle) -> [Rectangle; 3] {
     ]
 }
 
+/// Which title-bar button, if any, `local` lands on -- `button_rects`' own
+/// index (0 minimize, 1 maximize, 2 close), the same order `hit_test` maps
+/// to `Minimize`/`Maximize`/`Close`. Pointer-motion hover tracking needs the
+/// index itself (to pick which of `sync_ssd`'s three button colors to
+/// shift), where `hit_test`'s `DecorationAction` is enough for a click but
+/// throws the index away.
+pub fn button_at(geometry: Rectangle, local: (i32, i32)) -> Option<usize> {
+    let bar = title_bar_rect(geometry);
+    if !bar.contains(local.0, local.1) {
+        return None;
+    }
+    button_rects(geometry).iter().position(|r| r.contains(local.0, local.1))
+}
+
 pub fn hit_test(geometry: Rectangle, local: (i32, i32)) -> DecorationAction {
     let bar = title_bar_rect(geometry);
     if !bar.contains(local.0, local.1) {
@@ -106,6 +120,16 @@ mod tests {
         let inside_close = (rects[2].x + 1, rects[2].y + 1);
         assert_eq!(hit_test(GEO, inside_close), DecorationAction::Close);
         assert_eq!(hit_test(GEO, (100, 55)), DecorationAction::Move);
+    }
+
+    #[test]
+    fn button_at_maps_to_button_rects_index() {
+        let rects = button_rects(GEO);
+        assert_eq!(button_at(GEO, (rects[0].x + 1, rects[0].y + 1)), Some(0));
+        assert_eq!(button_at(GEO, (rects[1].x + 1, rects[1].y + 1)), Some(1));
+        assert_eq!(button_at(GEO, (rects[2].x + 1, rects[2].y + 1)), Some(2));
+        assert_eq!(button_at(GEO, (100, 55)), None, "move area is not a button");
+        assert_eq!(button_at(GEO, (100, 200)), None, "below the bar is not a button");
     }
 
     #[test]
