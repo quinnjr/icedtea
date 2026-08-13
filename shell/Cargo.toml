@@ -16,4 +16,5 @@ tracing.workspace = true
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }
 icedtea-clipboard = { path = "../clipboard" }
+icedtea-contract = { path = "../contract" }
 wayland-client = "0.31"

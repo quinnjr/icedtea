@@ -74,6 +74,14 @@ async fn run(tx: Sender<WmUpdate>) -> zbus::Result<()> {
     Ok(())
 }
 
+/// The taskbar's command surface — abstracted so a test can inject a recording
+/// mock in place of the real D-Bus proxy.
+pub trait WmCommands {
+    fn focus_window(&self, id: u32);
+    fn close_window(&self, id: u32);
+    fn set_workspace(&self, id: u32);
+}
+
 /// Issues `org.icedtea.WM` commands from the GTK thread. Method calls are
 /// no-reply and sub-millisecond, so a blocking connection here is fine.
 pub struct WmProxy {
@@ -84,14 +92,16 @@ impl WmProxy {
     pub fn new() -> zbus::Result<Self> {
         Ok(WmProxy { conn: zbus::blocking::Connection::session()? })
     }
+}
 
-    pub fn focus_window(&self, id: u32) {
+impl WmCommands for WmProxy {
+    fn focus_window(&self, id: u32) {
         let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "focus_window", &(id,));
     }
-    pub fn close_window(&self, id: u32) {
+    fn close_window(&self, id: u32) {
         let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "close_window", &(id,));
     }
-    pub fn set_workspace(&self, id: u32) {
+    fn set_workspace(&self, id: u32) {
         let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "set_workspace", &(id,));
     }
 }

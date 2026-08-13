@@ -11,7 +11,7 @@ use gtk4::{Application, ApplicationWindow, Box as GtkBox, CssProvider, Orientati
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
 use icedtea_shell::taskbar::{self, TaskbarModel};
-use icedtea_shell::wm_client::{self, WmProxy};
+use icedtea_shell::wm_client::{self, WmCommands, WmProxy};
 use icedtea_shell::bridge;
 
 const APP_ID: &str = "org.icedtea.Shell";
@@ -52,7 +52,7 @@ fn build_panel(app: &Application) {
 
     // The taskbar: a shared model + a WM command proxy, re-rendered on every
     // update the worker forwards to this (the GTK main) thread.
-    let wm = match WmProxy::new() {
+    let wm: Rc<dyn WmCommands> = match WmProxy::new() {
         Ok(wm) => Rc::new(wm),
         Err(err) => {
             tracing::error!(%err, "no session bus; taskbar commands disabled");

@@ -8,7 +8,7 @@ use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, GestureClick, Orientation};
 use icedtea_contract::{Snapshot, WindowInfo, WindowUpdate, WorkspaceInfo};
 
-use crate::wm_client::WmProxy;
+use crate::wm_client::WmCommands;
 
 #[derive(Default, Debug)]
 pub struct TaskbarModel {
@@ -86,7 +86,7 @@ fn merge(w: &mut WindowInfo, u: WindowUpdate) {
 /// small window counts a taskbar shows; a diffing pass is a later refinement.
 /// Layout: a `#workspaces` box then a `#windows` box, so tests (and CSS) can
 /// address each half.
-pub fn render(model: &TaskbarModel, container: &GtkBox, wm: &Rc<WmProxy>) {
+pub fn render(model: &TaskbarModel, container: &GtkBox, wm: &Rc<dyn WmCommands>) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
