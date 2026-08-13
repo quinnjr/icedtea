@@ -60,6 +60,11 @@ wlr = "0.20.15"
 crossbeam-channel.workspace = true
 signal-hook = "0.3"
 
+# The shared client-driven harness (extracted from what used to be
+# tests/support). `client_protocol.rs` drives it; the clipboard/shell crates
+# reuse the same harness in their own tests.
+icedtea-harness = { path = "../harness" }
+
 # The client half of `tests/support`: a real wayland client that speaks
 # xdg-shell to the compositor under test over a real socket. Dev-only --
 # nothing in `src/` is a wayland *client*.

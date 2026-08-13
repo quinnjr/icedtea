@@ -1,0 +1,21 @@
+[package]
+name = "icedtea-shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+icedtea-contract = { path = "../contract" }
+gtk4 = "0.11"
+gtk4-layer-shell = "0.8"
+zbus.workspace = true
+async-channel = "2"
+futures-util = "0.3"
+tracing.workspace = true
+
+[dev-dependencies]
+icedtea-harness = { path = "../harness" }
+icedtea-clipboard = { path = "../clipboard" }
+icedtea-contract = { path = "../contract" }
+wayland-client = "0.31"
+crossbeam-channel = "0.5"

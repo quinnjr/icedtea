@@ -1,0 +1,24 @@
+[package]
+name = "icedtea-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# A dev/test-only helper crate: boots the production compositor headless and
+# drives it with real Wayland clients. Shared by the compositor's own
+# integration tests and by icedtea-clipboard / icedtea-shell tests. The
+# dependency edge back to icedtea-compositor is a normal dep here; the crates
+# that consume this one depend on it only as a dev-dependency, so the resulting
+# cycle goes through a dev edge, which Cargo permits.
+
+[dependencies]
+icedtea-compositor = { path = "../compositor" }
+icedtea-config = { path = "../config" }
+icedtea-contract = { path = "../contract" }
+wlr = "0.20.15"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+rustix = { version = "1", features = ["fs"] }
+crossbeam-channel.workspace = true

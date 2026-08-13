@@ -1586,6 +1586,39 @@ impl DataControlClient {
         self.state.source_sends
     }
 
+    /// Read the current data-control selection when the owner services `send`
+    /// on its OWN thread (e.g. the `icedtea-clipboard` daemon re-pasting). We
+    /// only need to send the receive and read; a spawned thread does the
+    /// blocking read so a broken owner fails on the deadline instead of
+    /// hanging the test.
+    pub fn read_offer_blocking(&mut self, mime: &str) -> Vec<u8> {
+        let offer = self
+            .state
+            .data_control_offer
+            .clone()
+            .expect("no data-control offer delivered");
+        let (read_end, write_end) = std::io::pipe().expect("pipe");
+        offer.receive(mime.to_string(), write_end.as_fd());
+        self.conn.flush().expect("flush receive");
+        drop(write_end);
+
+        let handle = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let mut read_end = read_end;
+            let _ = read_end.read_to_end(&mut buf);
+            buf
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if handle.is_finished() {
+                return handle.join().expect("read thread panicked");
+            }
+            assert!(Instant::now() < deadline, "self-served selection read timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Read the current data-control selection when the owner is a *regular*
     /// `wl_data_device` client (an ordinary app that copied). This is the
     /// direction the M4.6 clipboard daemon relies on: an app copies, the
