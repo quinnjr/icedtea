@@ -705,6 +705,28 @@ pub struct State {
     /// Source of [`LayerEntry::sequence`]. Monotonic and never reused, the
     /// same shape as `next_title_generation`.
     next_layer_sequence: u64,
+    /// Rasterized button-glyph pixels, keyed by `(button index, width,
+    /// height, fg)`. Unlike `title_rasters` this needs no per-window entry
+    /// or generation counter: a glyph's pixels are a pure function of that
+    /// key (the text for each index is fixed, the cell size is always
+    /// `BUTTON_WIDTH x TITLE_BAR_HEIGHT`, and `fg` never varies with the
+    /// window), so in practice this map holds exactly three entries for the
+    /// whole process's life -- one rasterization per button, ever. `None` is
+    /// a cached negative, the same convention `title_rasters` uses.
+    button_glyph_cache: HashMap<ButtonGlyphKey, Option<Vec<u8>>>,
+    /// The title-bar button, if any, the pointer currently sits over --
+    /// `(window, button index)`, `decoration::button_at`'s own index order.
+    /// Recomputed on every pointer motion (`update_ssd_hover`); scene-only
+    /// state, so changing it re-syncs the affected window(s)'s decoration
+    /// but never emits a `contract::Event` -- there is no model mutation
+    /// here, only a color the seam draws.
+    ssd_hover: Option<(WindowId, usize)>,
+    /// The title-bar button, if any, currently held down -- set for the
+    /// span of `handle_pointer_press`'s own button-action branch, so the
+    /// pressed color is what that press's `sync_window_to_scene` call sees
+    /// before the action it triggers (close/maximize/minimize) runs. Same
+    /// "scene-only, no `Event`" rule as `ssd_hover`.
+    ssd_press: Option<(WindowId, usize)>,
 }
 
 /// What a cached title raster depends on: the title text, the pixel width
@@ -722,6 +744,12 @@ type TitleRasterKey = (String, i32, [u8; 4]);
 /// A rasterized title's pixels: `(width, height, premultiplied RGBA)`.
 type TitlePixels = (i32, i32, Vec<u8>);
 
+/// What a cached button-glyph raster depends on: which button
+/// (`decoration::button_rects`' index), the cell it was shaped into, and the
+/// (constant) glyph color -- see `button_glyph_cache`'s own doc for why that
+/// is the whole key, with no per-window component.
+type ButtonGlyphKey = (usize, i32, i32, [u8; 4]);
+
 /// One window's memoized title raster.
 struct TitleRasterEntry {
     /// The inputs these pixels were shaped from; a miss against this is the
@@ -736,6 +764,22 @@ struct TitleRasterEntry {
 
 /// Left inset of the title text inside the band, in pixels.
 const TITLE_PAD_X: i32 = 8;
+
+/// The three button glyphs, `decoration::button_rects`' own order: an
+/// en-dash for minimize (the universal "make this go away downward" mark),
+/// a hollow square for maximize (an unfilled window outline), and a
+/// multiplication-x for close. Plain Unicode rather than an icon font or an
+/// embedded bitmap -- the same reasoning `rasterize_title` already commits
+/// to for text -- so `cosmic-text`'s ordinary font-fallback path draws them,
+/// with no new asset for this crate to ship or a machine to be missing.
+const BUTTON_GLYPHS: [&str; 3] = ["\u{2013}", "\u{25A1}", "\u{2715}"];
+
+/// The glyph color painted into every button, regardless of which button or
+/// which window: white reads against both the semi-transparent foreground
+/// chip (minimize/maximize) and the opaque accent close button, for every
+/// palette this config format can express -- one fewer color the config
+/// would otherwise need a field for.
+const BUTTON_GLYPH_FG: [u8; 4] = [255, 255, 255, 255];
 
 /// `color` at `alpha`, premultiplied -- every channel scaled, not just the
 /// alpha one, because the wlroots scene graph composites premultiplied
@@ -797,6 +841,9 @@ impl State {
             layers: HashMap::new(),
             layer_focus: None,
             next_layer_sequence: 0,
+            button_glyph_cache: HashMap::new(),
+            ssd_hover: None,
+            ssd_press: None,
         }
     }
 
@@ -1637,6 +1684,12 @@ impl State {
             // (review finding M1): the row vanished without going through
             // it, so the raster it left behind has to be collected here.
             self.title_rasters.remove(&id);
+            if self.ssd_hover.is_some_and(|(hid, _)| hid == id) {
+                self.ssd_hover = None;
+            }
+            if self.ssd_press.is_some_and(|(hid, _)| hid == id) {
+                self.ssd_press = None;
+            }
             return;
         };
         let (geo, fullscreen, maximized, focused) = (w.geometry, w.fullscreen, w.maximized, w.focused);
@@ -1658,15 +1711,35 @@ impl State {
         // or fullscreen window's title is never drawn, and shaping it would
         // be pure waste on the most common client kind there is.
         let decorated = ssd && visible;
+        // All three button rects share one size (`BUTTON_WIDTH x
+        // TITLE_BAR_HEIGHT`); index 0 stands in for the cell every glyph is
+        // rasterized into.
+        let button_cell = crate::decoration::button_rects(bar)[0];
+        let (gw, gh) = (button_cell.width.max(1), button_cell.height.max(1));
         if decorated {
             let title = w.title.clone();
             self.ensure_title_raster(id, title, bar, focused);
+            self.ensure_button_glyphs(gw, gh);
         }
-        // Field-wise borrow so the seam can read the memo's pixels in place:
-        // the alternative is cloning ~40 KB into an owned `Vec` on every
-        // sync -- i.e. on every pointer motion of a drag -- to hand across a
-        // call that, on a cache hit, will not even look at them (M2).
-        let Self { wayland, title_rasters, .. } = self;
+        // Whichever button this window currently shows pressed, or failing
+        // that hovered -- a press implies the pointer is over that same
+        // button, so it always takes precedence when both happen to be set.
+        let pressed = self.ssd_press.filter(|(hid, _)| *hid == id);
+        let active_button = pressed
+            .or_else(|| self.ssd_hover.filter(|(hid, _)| *hid == id))
+            .map(|(_, idx)| {
+                let state = if pressed.is_some() {
+                    crate::wayland::ButtonState::Pressed
+                } else {
+                    crate::wayland::ButtonState::Hover
+                };
+                (idx, state)
+            });
+        // Field-wise borrow so the seam can read the memos' pixels in place:
+        // the alternative is cloning them into owned buffers on every sync
+        // -- i.e. on every pointer motion of a drag -- to hand across a call
+        // that, on a cache hit, will not even look at them (M2).
+        let Self { wayland, title_rasters, button_glyph_cache, .. } = self;
         let title_px = decorated
             .then(|| title_rasters.get(&id))
             .flatten()
@@ -1678,6 +1751,16 @@ impl State {
                     pixels,
                 })
             });
+        let button_glyph_px: [Option<crate::wayland::GlyphRaster<'_>>; 3] = std::array::from_fn(|i| {
+            if !decorated {
+                return None;
+            }
+            let key = (i, gw, gh, BUTTON_GLYPH_FG);
+            button_glyph_cache
+                .get(&key)
+                .and_then(|entry| entry.as_ref())
+                .map(|pixels| crate::wayland::GlyphRaster { width: gw, height: gh, fg: BUTTON_GLYPH_FG, pixels })
+        });
         wayland.sync_ssd(
             id,
             ssd,
@@ -1687,6 +1770,8 @@ impl State {
             bar_color,
             button_colors,
             title_px,
+            button_glyph_px,
+            active_button,
         );
 
         self.wayland.set_visible(id, visible);
@@ -1803,6 +1888,31 @@ impl State {
         let generation = self.next_title_generation;
         self.next_title_generation += 1;
         self.title_rasters.insert(id, TitleRasterEntry { key, generation, pixels });
+    }
+
+    /// Make sure every `BUTTON_GLYPHS` entry has a rasterized `width x
+    /// height` @ `BUTTON_GLYPH_FG` entry in `button_glyph_cache`, shaping
+    /// only the ones that are missing.
+    ///
+    /// No per-window key, unlike `ensure_title_raster`: a button glyph's
+    /// pixels depend only on its index, the cell size, and the (constant)
+    /// glyph color, none of which vary per window -- so the cache this fills
+    /// is shared by every decorated window in the compositor, and steady
+    /// -state calls here are a `contains_key` check per index, not a shape.
+    fn ensure_button_glyphs(&mut self, width: i32, height: i32) {
+        for (i, glyph) in BUTTON_GLYPHS.iter().enumerate() {
+            let key = (i, width, height, BUTTON_GLYPH_FG);
+            if self.button_glyph_cache.contains_key(&key) {
+                continue;
+            }
+            self.fonts
+                .get_or_init(|| (cosmic_text::FontSystem::new(), cosmic_text::SwashCache::new()));
+            // Same panic-free spelling as `ensure_title_raster`'s: `get_mut`
+            // cannot miss right after `get_or_init`.
+            let Some((fonts, swash)) = self.fonts.get_mut() else { return };
+            let pixels = crate::text::rasterize_glyph(fonts, swash, glyph, width, height, BUTTON_GLYPH_FG);
+            self.button_glyph_cache.insert(key, pixels);
+        }
     }
 
     /// The active workspace's focused window id, if any. Callers capture this
@@ -2000,6 +2110,14 @@ impl State {
         // CPU-side memo, and a window's title pixels must not outlive it
         // (ids are never reused, so a stale entry would simply leak).
         self.title_rasters.remove(&id);
+        // Same reasoning: a hover/press pointed at a window that no longer
+        // exists must not linger to be read by some later window's sync.
+        if self.ssd_hover.is_some_and(|(hid, _)| hid == id) {
+            self.ssd_hover = None;
+        }
+        if self.ssd_press.is_some_and(|(hid, _)| hid == id) {
+            self.ssd_press = None;
+        }
         if self.window_manager.focused_window().is_none() {
             let active = self.window_manager.active_workspace();
             self.window_manager.refocus_after_hide(active);
@@ -2752,10 +2870,51 @@ impl State {
             let grab_offset = (pointer.0 - geo.x, pointer.1 - geo.y);
             self.drag.begin(id, grab_offset);
         } else {
+            // A button action: give it its pressed color for the span of
+            // applying it. Not a model mutation -- `ssd_press` is scene-only
+            // state, so this costs one extra `sync_window_to_scene` call and
+            // no additional `contract::Event`.
+            if let Some(idx) = crate::decoration::button_at(geo, pointer) {
+                self.ssd_press = Some((id, idx));
+                self.sync_window_to_scene(id);
+            }
             self.apply_decoration_action(id, action);
+            // The action already ran (close/maximize/minimize); nothing is
+            // still "held down." Clearing before this function's own
+            // `sync_window_to_scene` (below `apply_decoration_action`'s own,
+            // via e.g. `toggle_maximized`) keeps a window that outlives the
+            // click (maximize) from being left with a stuck pressed tint.
+            self.ssd_press = None;
+            self.sync_window_to_scene(id);
         }
         self.emit_pending();
         Some(())
+    }
+
+    /// Recompute which title-bar button, if any, `pointer` (output logical
+    /// coordinates) sits over, and re-sync whichever window(s) that changes
+    /// -- the one that lost the hover, the one that gained it, or both.
+    ///
+    /// Scene-only state (`ssd_hover`'s own doc): no `contract::Event` is
+    /// ever queued from here, only a `sync_window_to_scene` push to the
+    /// seam.
+    fn update_ssd_hover(&mut self, pointer: (i32, i32)) {
+        let hovered = self.window_at_point(pointer).and_then(|id| {
+            let geo = self.window_manager.get(id)?.geometry;
+            crate::decoration::button_at(geo, pointer).map(|idx| (id, idx))
+        });
+        if hovered == self.ssd_hover {
+            return;
+        }
+        let old_id = self.ssd_hover.map(|(id, _)| id);
+        let new_id = hovered.map(|(id, _)| id);
+        self.ssd_hover = hovered;
+        if let Some(id) = old_id {
+            self.sync_window_to_scene(id);
+        }
+        if let Some(id) = new_id.filter(|id| Some(*id) != old_id) {
+            self.sync_window_to_scene(id);
+        }
     }
 
     /// Honors a client move request (`xdg_toplevel.move`): only when the
@@ -2821,6 +2980,12 @@ impl State {
     /// in-progress drag: updates the snap-zone preview (rendering consumes
     /// `self.snap_preview`).
     fn handle_pointer_motion(&mut self, pointer: (i32, i32)) -> Option<()> {
+        // Hover feedback tracks the pointer independently of drag/resize --
+        // it must run even on every one of the early returns below, since
+        // e.g. `self.drag.window_id()?` failing (no drag in progress, the
+        // ordinary case whenever the pointer merely moves over a title bar)
+        // must not skip it.
+        self.update_ssd_hover(pointer);
         // An interactive resize (started by the client's `resize_request`)
         // takes precedence: it owns the pointer until the button is
         // released.

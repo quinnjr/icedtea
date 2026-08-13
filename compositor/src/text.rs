@@ -129,6 +129,83 @@ pub fn rasterize_title(
     if drew { Some(px) } else { None }
 }
 
+/// Rasterizes a single short `glyph` (a button icon -- an en-dash, a
+/// square, an "x") centered in a `width * height` cell: the button rect
+/// itself, unlike [`rasterize_title`]'s left-aligned band. Same contract
+/// otherwise -- premultiplied RGBA8888, exactly `width * height * 4` bytes,
+/// `None` on a degenerate cell or a glyph that shapes to nothing (no font on
+/// this machine has it) -- because this feeds the same buffer-node seam
+/// (`Wayland::sync_ssd`) and that seam already knows how to degrade a `None`
+/// into "no node," the same way it degrades a title that didn't shape.
+///
+/// Centering, both axes: `cosmic-text`'s own line-level `Align::Center`
+/// handles the horizontal axis (set on the buffer's one line before
+/// shaping, same as any other paragraph alignment), and the vertical axis
+/// falls out of the same trick `rasterize_title` uses -- a `Metrics` line
+/// height equal to the *whole* cell centers a single line inside it with no
+/// extra bookkeeping.
+pub fn rasterize_glyph(
+    fonts: &mut cosmic_text::FontSystem,
+    swash: &mut cosmic_text::SwashCache,
+    glyph: &str,
+    width: i32,
+    height: i32,
+    fg: [u8; 4],
+) -> Option<Vec<u8>> {
+    if width < 1 || height < 1 {
+        return None;
+    }
+    use cosmic_text::{Align, Attrs, Buffer, Family, Metrics, Shaping};
+
+    // A button glyph reads best a bit larger, proportionally, than title
+    // text does -- there's no surrounding word to give it scale -- so this
+    // uses a higher fraction of the cell than `rasterize_title`'s 0.55.
+    let font_px = (height as f32 * 0.6).max(8.0);
+    let metrics = Metrics::new(font_px, height as f32);
+    let mut buffer = Buffer::new(fonts, metrics);
+    let mut buffer = buffer.borrow_with(fonts);
+    buffer.set_size(Some(width as f32), Some(height as f32));
+    buffer.set_text(glyph, &Attrs::new().family(Family::SansSerif), Shaping::Advanced);
+    for line in buffer.lines.iter_mut() {
+        line.set_align(Some(Align::Center));
+    }
+    buffer.shape_until_scroll(true);
+
+    let mut px = vec![0u8; (width as usize) * (height as usize) * 4];
+    let mut drew = false;
+    buffer.draw(
+        swash,
+        cosmic_text::Color::rgba(fg[0], fg[1], fg[2], fg[3]),
+        |x, y, w, h, color| {
+            for dy in 0..h as i32 {
+                for dx in 0..w as i32 {
+                    let (tx, ty) = (x + dx, y + dy);
+                    if tx < 0 || ty < 0 || tx >= width || ty >= height {
+                        continue;
+                    }
+                    let a = color.a();
+                    if a == 0 {
+                        continue;
+                    }
+                    let i = ((ty * width + tx) * 4) as usize;
+                    // Same coverage-max rationale as `rasterize_title`.
+                    if a <= px[i + 3] {
+                        continue;
+                    }
+                    drew = true;
+                    let scale = |c: u8| ((c as u16 * a as u16) / 255) as u8;
+                    px[i] = scale(color.r());
+                    px[i + 1] = scale(color.g());
+                    px[i + 2] = scale(color.b());
+                    px[i + 3] = a;
+                }
+            }
+        },
+    );
+
+    if drew { Some(px) } else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +271,58 @@ mod tests {
         let mut fonts = cosmic_text::FontSystem::new();
         let mut swash = cosmic_text::SwashCache::new();
         assert!(rasterize_title(&mut fonts, &mut swash, "", 200, 28, 8, [255; 4]).is_none());
+    }
+
+    #[test]
+    fn a_button_glyph_rasterizes_centered_nonempty() {
+        let mut fonts = cosmic_text::FontSystem::new();
+        let mut swash = cosmic_text::SwashCache::new();
+        let px = rasterize_glyph(&mut fonts, &mut swash, "\u{2715}", 40, 28, [255, 255, 255, 255]).expect("glyph");
+        assert_eq!(px.len(), 40 * 28 * 4);
+        assert!(px.chunks_exact(4).any(|p| p[3] != 0), "glyph has opaque pixels");
+    }
+
+    #[test]
+    fn glyph_degenerate_sizes_are_none_not_panic() {
+        let mut fonts = cosmic_text::FontSystem::new();
+        let mut swash = cosmic_text::SwashCache::new();
+        assert!(rasterize_glyph(&mut fonts, &mut swash, "\u{2715}", 0, 28, [255; 4]).is_none());
+        assert!(rasterize_glyph(&mut fonts, &mut swash, "\u{2715}", 40, 0, [255; 4]).is_none());
+    }
+
+    #[test]
+    fn an_empty_glyph_draws_nothing() {
+        let mut fonts = cosmic_text::FontSystem::new();
+        let mut swash = cosmic_text::SwashCache::new();
+        assert!(rasterize_glyph(&mut fonts, &mut swash, "", 40, 28, [255; 4]).is_none());
+    }
+
+    /// The glyph is centered, not left-aligned like a title: a narrow glyph
+    /// in a wide cell must leave both margins clear, not just the right one.
+    #[test]
+    fn glyph_pixels_are_centered_not_left_aligned() {
+        let mut fonts = cosmic_text::FontSystem::new();
+        let mut swash = cosmic_text::SwashCache::new();
+        let width = 80;
+        let px = rasterize_glyph(&mut fonts, &mut swash, "\u{2715}", width, 28, [255, 255, 255, 255])
+            .expect("glyph");
+        let row_stride = width as usize * 4;
+        let mut left_opaque = false;
+        let mut right_opaque = false;
+        for row in px.chunks_exact(row_stride) {
+            for (x, p) in row.chunks_exact(4).enumerate() {
+                if p[3] != 0 {
+                    if x < width as usize / 4 {
+                        left_opaque = true;
+                    }
+                    if x >= width as usize * 3 / 4 {
+                        right_opaque = true;
+                    }
+                }
+            }
+        }
+        assert!(!left_opaque, "centered glyph must leave the left quarter clear");
+        assert!(!right_opaque, "centered glyph must leave the right quarter clear");
     }
 
     /// Finding 3: an unbounded client title must not reach cosmic-text at
