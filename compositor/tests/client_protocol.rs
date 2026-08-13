@@ -9,11 +9,10 @@
 //! here because a client actually mapped a surface, and the compositor
 //! actually ran the `mapped` path against a live toplevel.
 
-mod support;
 
 use icedtea_contract::Event;
 
-use support::{Compositor, DataControlClient, TestClient, VirtualKeyboardClient};
+use icedtea_harness::{Compositor, DataControlClient, TestClient, VirtualKeyboardClient};
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
 /// client as an offer — the delivery path a clipboard manager's re-paste uses.
@@ -28,7 +27,7 @@ fn data_control_set_reaches_a_focused_wl_data_device_client() {
         b.wait_until(|c| c.has_selection_offer()),
         "focused wl_data_device client never received the data-control-set selection"
     );
-    let got = support::read_selection_from_data_control(&mut b, &mut mgr, "text/plain;charset=utf-8");
+    let got = icedtea_harness::read_selection_from_data_control(&mut b, &mut mgr, "text/plain;charset=utf-8");
     assert_eq!(got, b"via-data-control");
 }
 
@@ -98,7 +97,7 @@ fn data_control_reads_the_current_selection() {
 #[test]
 fn selection_globals_are_advertised() {
     let comp = Compositor::spawn();
-    let globals = support::advertised_globals(&comp.socket);
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
     assert!(
         globals.iter().any(|g| g == "zwp_primary_selection_device_manager_v1"),
         "primary-selection manager global missing; saw {globals:?}"
@@ -142,7 +141,7 @@ fn clipboard_transfers_between_two_clients() {
         b.wait_until(|c| c.has_selection_offer()),
         "B never received a data offer"
     );
-    let got = support::read_selection(&mut b, &mut a, "text/plain;charset=utf-8");
+    let got = icedtea_harness::read_selection(&mut b, &mut a, "text/plain;charset=utf-8");
     assert_eq!(got, b"hello-clipboard");
 
     a.detach();
@@ -167,7 +166,7 @@ fn primary_selection_transfers_between_two_clients() {
         "B never received a primary offer"
     );
     assert_eq!(
-        support::read_primary(&mut b, &mut a, "text/plain;charset=utf-8"),
+        icedtea_harness::read_primary(&mut b, &mut a, "text/plain;charset=utf-8"),
         b"primary-payload"
     );
 

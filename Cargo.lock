@@ -839,6 +839,7 @@ dependencies = [
  "crossbeam-channel",
  "icedtea-config",
  "icedtea-contract",
+ "icedtea-harness",
  "image",
  "rustix 1.1.4",
  "signal-hook",
@@ -873,6 +874,22 @@ dependencies = [
  "serde",
  "serde_json",
  "zvariant",
+]
+
+[[package]]
+name = "icedtea-harness"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "icedtea-compositor",
+ "icedtea-config",
+ "icedtea-contract",
+ "rustix 1.1.4",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "wlr",
 ]
 
 [[package]]
