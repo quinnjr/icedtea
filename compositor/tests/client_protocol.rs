@@ -31,6 +31,15 @@ fn selection_globals_are_advertised() {
     );
 }
 
+/// The harness can bind the data-device machinery and create a device from
+/// the seat — the foundation the clipboard round-trip stands on.
+#[test]
+fn a_mapped_client_has_a_data_device() {
+    let comp = Compositor::spawn();
+    let client = TestClient::map_toplevel(&comp.socket, "dd.app", "dd");
+    assert!(client.has_data_device(), "data device created from manager + seat");
+}
+
 /// The restoration test: a real toplevel maps and shows up in the model,
 /// with the app_id and title the client set, at a real geometry.
 #[test]

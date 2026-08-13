@@ -38,7 +38,8 @@ use icedtea_compositor::dbus::DbCommand;
 use icedtea_contract::{Event, SeqEvent, Snapshot};
 
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
+    wl_data_source, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
 use wayland_protocols::xdg::decoration::zv1::client::{
@@ -340,6 +341,33 @@ struct ClientState {
     /// the bound ones, so a test can assert a global *exists* without this
     /// harness having to bind it.
     globals: Vec<(String, u32)>,
+
+    // --- selection (M4.1) ---
+    seat: Option<wl_seat::WlSeat>,
+    data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
+    /// This client's data device, created from the manager + seat during
+    /// connect so it is listening before the client is ever focused.
+    data_device: Option<wl_data_device::WlDataDevice>,
+    /// The source this client last offered, kept alive so it can answer
+    /// `send` for as long as it owns the selection.
+    data_source: Option<wl_data_source::WlDataSource>,
+    /// The most recent selection `wl_data_offer` the compositor delivered (the
+    /// clipboard this client would paste from), or `None` if the selection was
+    /// cleared.
+    current_offer: Option<wl_data_offer::WlDataOffer>,
+    /// Mimes advertised on the in-flight offer, reset when a new offer is
+    /// introduced. One selection at a time, so a single vec suffices.
+    offer_mimes: Vec<String>,
+    /// The last input-event serial this client saw (keyboard enter/key). `None`
+    /// on a headless seat with no keyboard capability — `set_selection` then
+    /// passes 0.
+    last_serial: Option<u32>,
+    /// What this client's own data source answers `send` with.
+    offered_mime: String,
+    offered_payload: Vec<u8>,
+    /// How many `wl_data_source.send` requests this client has serviced — the
+    /// signal a reader uses to know the owner has written the payload.
+    source_sends: u32,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
@@ -366,6 +394,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zwlr_layer_shell_v1" => {
                     state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
+                }
+                "wl_seat" => {
+                    state.seat = Some(registry.bind(name, version.min(7), qh, ()));
+                }
+                "wl_data_device_manager" => {
+                    state.data_device_manager = Some(registry.bind(name, version.min(3), qh, ()));
                 }
                 _ => {}
             }
@@ -473,8 +507,68 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for ClientState {
     }
 }
 
-// wayland-client requires a `Dispatch` impl per bound interface; these six
-// carry nothing the harness asserts on.
+impl Dispatch<wl_data_device::WlDataDevice, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            // A new offer is being introduced; its `offer(mime)` events follow
+            // before the `selection` that names it. Reset the mime list so it
+            // reflects only this offer.
+            wl_data_device::Event::DataOffer { .. } => state.offer_mimes.clear(),
+            // The clipboard this client would paste from (or `None` if cleared).
+            wl_data_device::Event::Selection { id } => state.current_offer = id,
+            // Enter/Leave/Motion/Drop are drag-and-drop (M4.2), not selection.
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_data_offer::WlDataOffer, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &wl_data_offer::WlDataOffer,
+        event: wl_data_offer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_data_offer::Event::Offer { mime_type } = event {
+            state.offer_mimes.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<wl_data_source::WlDataSource, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // The paste side asked for the data on `fd`: write our payload and drop
+        // the fd (close), so the reader sees EOF after the bytes.
+        if let wl_data_source::Event::Send { mime_type, fd } = event {
+            if mime_type == state.offered_mime {
+                let mut f = std::fs::File::from(fd);
+                let _ = f.write_all(&state.offered_payload);
+                state.source_sends = state.source_sends.saturating_add(1);
+            }
+        }
+    }
+}
+
+// wayland-client requires a `Dispatch` impl per bound interface; these carry
+// nothing the harness asserts on.
+delegate_noop!(ClientState: ignore wl_seat::WlSeat);
+delegate_noop!(ClientState: ignore wl_data_device_manager::WlDataDeviceManager);
 delegate_noop!(ClientState: ignore wl_compositor::WlCompositor);
 delegate_noop!(ClientState: ignore wl_surface::WlSurface);
 delegate_noop!(ClientState: ignore wl_shm::WlShm);
@@ -528,6 +622,14 @@ fn connect_and_bind(
     queue.roundtrip(&mut state).expect("registry roundtrip");
     queue.roundtrip(&mut state).expect("bind roundtrip");
 
+    // Create this client's data device now — before it is ever focused — so it
+    // is already listening when the compositor delivers the selection offer on
+    // keyboard-enter. Harmless for clients that never touch the clipboard.
+    if let (Some(mgr), Some(seat)) = (state.data_device_manager.as_ref(), state.seat.as_ref()) {
+        state.data_device = Some(mgr.get_data_device(seat, &qh, ()));
+    }
+    queue.roundtrip(&mut state).expect("data-device roundtrip");
+
     (conn, queue, qh, state)
 }
 
@@ -537,6 +639,48 @@ fn connect_and_bind(
 pub fn advertised_globals(socket: &str) -> Vec<String> {
     let (_conn, _queue, _qh, state) = connect_and_bind(socket);
     state.globals.into_iter().map(|(interface, _)| interface).collect()
+}
+
+/// Read the current clipboard selection that `reader` has been offered, in
+/// `mime`, driving `owner` (whose `wl_data_source` supplies the bytes) until it
+/// has answered. Returns the transferred bytes.
+///
+/// The transfer is inherently two-sided: `reader.receive` hands the compositor
+/// an fd it forwards to `owner`'s data source as a `send`; `owner` must be
+/// pumped for its `Dispatch` to write the payload and close its copy, at which
+/// point `reader` sees EOF. A free function rather than a method because it
+/// needs both clients at once.
+pub fn read_selection(reader: &mut TestClient, owner: &mut TestClient, mime: &str) -> Vec<u8> {
+    let offer = reader
+        .state
+        .current_offer
+        .clone()
+        .expect("no wl_data_offer was delivered to the reader (is it focused?)");
+    let (read_end, write_end) = std::io::pipe().expect("pipe");
+    offer.receive(mime.to_string(), write_end.as_fd());
+    reader.conn.flush().expect("flush receive");
+    // The compositor dups the write end into `owner`'s `send`; drop ours so the
+    // owner's copy is the only writer left and EOF is reachable.
+    drop(write_end);
+
+    // Drive the owner until its data source has serviced the send (wrote the
+    // payload and dropped its fd). Deadline-guarded so a wedged transfer fails
+    // rather than hangs.
+    let before = owner.state.source_sends;
+    let deadline = Instant::now() + TIMEOUT;
+    while owner.state.source_sends == before {
+        assert!(
+            Instant::now() < deadline,
+            "the selection owner never serviced a data_source.send within {TIMEOUT:?}"
+        );
+        owner.pump();
+        reader.pump();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read selection");
+    buf
 }
 
 /// Build a `w`x`h` shm-backed buffer, solid opaque grey. Shared by
@@ -783,6 +927,44 @@ impl TestClient {
         let mut this = self;
         let TestClient { state, queue, .. } = &mut this;
         let _ = queue.roundtrip(state);
+    }
+
+    /// Own the clipboard: create a `wl_data_source` advertising `mime` with
+    /// `payload`, and `set_selection` it with the last input serial this client
+    /// saw (0 on a headless seat with no keyboard). The client must currently
+    /// hold keyboard focus for the compositor to honor it.
+    pub fn set_selection_text(&mut self, mime: &str, payload: &[u8]) {
+        let manager = self
+            .state
+            .data_device_manager
+            .clone()
+            .expect("compositor did not advertise wl_data_device_manager");
+        let device = self.state.data_device.clone().expect("no data device");
+        self.state.offered_mime = mime.to_string();
+        self.state.offered_payload = payload.to_vec();
+        let source = manager.create_data_source(&self.qh, ());
+        source.offer(mime.to_string());
+        device.set_selection(Some(&source), self.state.last_serial.unwrap_or(0));
+        self.state.data_source = Some(source);
+        self.conn.flush().expect("flush set_selection");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Whether this client created its `wl_data_device` (manager + seat both
+    /// advertised).
+    pub fn has_data_device(&self) -> bool {
+        self.state.data_device.is_some()
+    }
+
+    /// Whether a selection `wl_data_offer` has been delivered to this client.
+    pub fn has_selection_offer(&self) -> bool {
+        self.state.current_offer.is_some()
+    }
+
+    /// One `roundtrip`, exposed so a transfer helper can drive an owner client
+    /// whose data source must answer `send`.
+    pub fn pump(&mut self) {
+        let _ = self.queue.roundtrip(&mut self.state);
     }
 
     /// Map a top-anchored `zwlr_layer_shell_v1` panel: `TOP | LEFT | RIGHT`
