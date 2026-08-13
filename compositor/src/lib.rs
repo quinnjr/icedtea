@@ -78,6 +78,22 @@ pub fn run() {
     if let Err(err) = runtime.create_layer_shell(&display, 4) {
         tracing::error!(%err, "layer-shell is unavailable");
     }
+    // Same non-fatal tone: without these, middle-click paste and
+    // clipboard-manager access are simply absent, which is degraded, not
+    // dead. Regular clipboard (`wl_data_device`) already came up in
+    // `init_graphics`; the seat's selection request events are wired in the
+    // backend regardless.
+    if let Err(err) = runtime.create_primary_selection_manager(&display) {
+        tracing::error!(%err, "primary selection (middle-click paste) is unavailable");
+    }
+    if let Err(err) = runtime.create_data_control_manager(&display) {
+        tracing::error!(%err, "data-control (clipboard manager access) is unavailable");
+    }
+    // Lets on-screen keyboards, remote-input bridges, and IME helpers inject a
+    // keyboard. Non-fatal: without it those tools simply cannot attach.
+    if let Err(err) = runtime.create_virtual_keyboard_manager(&display) {
+        tracing::error!(%err, "virtual-keyboard input is unavailable");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");
