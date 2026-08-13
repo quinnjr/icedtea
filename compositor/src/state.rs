@@ -3698,18 +3698,65 @@ mod tests {
         );
     }
 
+    /// Review finding: the brief's own sample test for this name is vacuous
+    /// in a plain unit-test harness -- `sync_window_to_scene` early-returns
+    /// on `!is_backed(id)`, and nothing in the sample binds the window to a
+    /// toplevel, so `apply_reloaded_config`'s recolor/resync block is a
+    /// guaranteed no-op regardless of whether it exists (confirmed by
+    /// deleting that block and rerunning: the sample still passed).
+    ///
+    /// This version closes that gap the way the harness actually allows:
+    /// `wayland::ToplevelKey::for_test` + `Wayland::bind` make the window
+    /// `is_backed` without needing a real `wlr::Runtime` (only the
+    /// scene-graph painting inside `sync_ssd` needs one -- see its own
+    /// `let Some(runtime) = ... else { return }` guard -- but
+    /// `ensure_title_raster` runs *before* that guard, so the raster cache,
+    /// this crate's palette-keyed memo, still gets driven for a backed
+    /// window even in a runtime-less unit test). Seeding a cached raster
+    /// under the *old* palette and asserting its pixels differ after a
+    /// reload with a *new* palette is a genuine regression guard: deleting
+    /// `apply_reloaded_config`'s `self.sync_scene()` call (which is what
+    /// reaches `sync_window_to_scene` -> `ensure_title_raster` for every
+    /// surviving window) leaves the pre-reload pixels in place and fails
+    /// this test.
     #[test]
     fn reload_rethemes_surviving_windows_and_recolors_background() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
+        // "app" is not GTK-style, so `decoration::has_ssd` gives it a
+        // server-side title bar -- `sync_window_to_scene` only rasterizes a
+        // title for a decorated, visible window.
         let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.wayland.bind(id, crate::wayland::ToplevelKey::for_test(1));
+
+        // Drive one sync under the *old* palette to seed the cache, then
+        // capture its pixels.
+        state.sync_scene();
+        let before = state
+            .title_rasters
+            .get(&id)
+            .expect("a decorated, backed window must have a cached title raster")
+            .pixels
+            .clone();
+
         let mut cfg = icedtea_config::default_config();
         cfg.appearance.palette.background = "#abcdef".into();
+        cfg.appearance.palette.foreground = "#123456".into();
         state.apply_reloaded_config(cfg);
+
         assert!(state.window_manager.get(id).is_some(), "window survived");
         assert_eq!(state.config.appearance.palette.background, "#abcdef");
-        // title raster cache invalidated for the new foreground (palette-keyed):
-        // a re-sync must have been driven -- assert the window is still backed/tracked.
+        let after = state
+            .title_rasters
+            .get(&id)
+            .expect("the raster survives the reload (Task 4 preserve contract)")
+            .pixels
+            .clone();
+        assert_ne!(
+            before, after,
+            "a reload with a new foreground must have re-driven sync_window_to_scene, \
+             re-rasterizing the title against the new palette-resolved color"
+        );
     }
 
     #[test]
@@ -3721,6 +3768,31 @@ mod tests {
         cfg.appearance.wallpaper = Some("/nonexistent/x.png".into());
         state.apply_reloaded_config(cfg);
         assert!(state.wallpaper.decoded().is_none(), "path change clears the stale wallpaper before redecode");
+    }
+
+    /// The negative counterpart the review flagged as missing: reloading
+    /// with the *same* wallpaper path (including the default `None`) must
+    /// leave the already-decoded image in place rather than clearing it and
+    /// re-spawning a decode for nothing.
+    #[test]
+    fn reload_leaves_wallpaper_untouched_when_the_path_is_unchanged() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([7, 7, 7, 255]));
+        state.wallpaper.set_decoded(Some(img.clone()));
+
+        // Same wallpaper path as `default_config()` (`None`), only an
+        // unrelated field changes.
+        let mut cfg = icedtea_config::default_config();
+        cfg.appearance.palette.background = "#abcdef".into();
+        assert_eq!(cfg.appearance.wallpaper, state.config.appearance.wallpaper, "path unchanged");
+        state.apply_reloaded_config(cfg);
+
+        assert_eq!(
+            state.wallpaper.decoded(),
+            Some(&img),
+            "an unchanged wallpaper path must not clear the already-decoded image"
+        );
     }
 
     #[test]
