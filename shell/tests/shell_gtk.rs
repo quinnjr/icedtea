@@ -11,9 +11,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use icedtea_contract::{Rectangle, Snapshot, WindowId, WindowInfo, WorkspaceInfo};
+use icedtea_contract::{
+    ClipEntry, ClipKind, Rectangle, Snapshot, WindowId, WindowInfo, WorkspaceInfo,
+};
 use icedtea_harness::Compositor;
-use icedtea_shell::gtk4::{self, prelude::*, Box as GtkBox, Button, Orientation, Widget};
+use icedtea_shell::clip_client::ClipCommands;
+use icedtea_shell::clipboard::{self, ClipUpdate, ClipboardModel};
+use icedtea_shell::gtk4::{self, prelude::*, Box as GtkBox, Button, ListBox, Orientation, Widget};
 use icedtea_shell::taskbar::{self, TaskbarModel, WmUpdate};
 use icedtea_shell::wm_client::WmCommands;
 
@@ -43,6 +47,36 @@ impl WmCommands for MockWm {
     }
     fn set_workspace(&self, id: u32) {
         self.calls.borrow_mut().push(("workspace".into(), id));
+    }
+}
+
+#[derive(Default)]
+struct MockClip {
+    calls: RefCell<Vec<(String, u64)>>,
+}
+impl ClipCommands for MockClip {
+    fn activate(&self, id: u64) {
+        self.calls.borrow_mut().push(("activate".into(), id));
+    }
+    fn pin(&self, id: u64, _on: bool) {
+        self.calls.borrow_mut().push(("pin".into(), id));
+    }
+    fn remove(&self, id: u64) {
+        self.calls.borrow_mut().push(("remove".into(), id));
+    }
+    fn clear(&self) {
+        self.calls.borrow_mut().push(("clear".into(), 0));
+    }
+}
+
+fn clip_entry(id: u64, preview: &str) -> ClipEntry {
+    ClipEntry {
+        id,
+        kind: ClipKind::Text,
+        preview: preview.into(),
+        mime: "text/plain".into(),
+        pinned: false,
+        source_app: None,
     }
 }
 
@@ -137,4 +171,35 @@ fn taskbar_renders_windows_and_clicks_reach_the_command_surface() {
         mock.calls.borrow().iter().any(|(k, _)| k == "workspace"),
         "workspace switch not recorded"
     );
+
+    // --- clipboard popover ---
+    let clip_mock = Rc::new(MockClip::default());
+    let clip: Rc<dyn ClipCommands> = clip_mock.clone();
+    let clip_model = Rc::new(RefCell::new(ClipboardModel::default()));
+    let list = ListBox::new();
+    clipboard::connect_activation(&list, clip.clone(), clip_model.clone());
+
+    clip_model.borrow_mut().apply(ClipUpdate::History(vec![
+        clip_entry(10, "copied text"),
+        clip_entry(11, "second entry"),
+    ]));
+    clipboard::render(&clip_model.borrow(), &list, &clip);
+
+    // The #history list has one row per entry.
+    let rows = children(&list);
+    assert_eq!(rows.len(), 2, "expected two history rows");
+
+    // Activating the first row re-pastes it (activate(10)).
+    let row = list.row_at_index(0).expect("row 0");
+    list.emit_by_name::<()>("row-activated", &[&row]);
+    assert!(
+        clip_mock.calls.borrow().iter().any(|(k, id)| k == "activate" && *id == 10),
+        "activate(10) not recorded; calls = {:?}",
+        clip_mock.calls.borrow()
+    );
+
+    // A history update replaces the rows.
+    clip_model.borrow_mut().apply(ClipUpdate::History(vec![clip_entry(12, "only")]));
+    clipboard::render(&clip_model.borrow(), &list, &clip);
+    assert_eq!(children(&list).len(), 1, "history update did not replace rows");
 }
