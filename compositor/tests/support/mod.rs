@@ -39,13 +39,26 @@ use icedtea_contract::{Event, SeqEvent, Snapshot};
 
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_data_source, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
+use wayland_client::{
+    Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop, event_created_child,
+};
+use wayland_protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
+    zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
+};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
+};
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols_wlr::data_control::v1::client::{
+    zwlr_data_control_device_v1, zwlr_data_control_manager_v1, zwlr_data_control_offer_v1,
+    zwlr_data_control_source_v1,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 /// How long any "wait for the compositor to do a thing" helper waits before
@@ -183,6 +196,9 @@ impl Compositor {
             runtime
                 .create_data_control_manager(&display)
                 .expect("zwlr_data_control_manager_v1");
+            runtime
+                .create_virtual_keyboard_manager(&display)
+                .expect("zwp_virtual_keyboard_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
 
             // `state` is declared after `display`/`runtime`/`backend` so that
@@ -344,6 +360,11 @@ struct ClientState {
 
     // --- selection (M4.1) ---
     seat: Option<wl_seat::WlSeat>,
+    /// This client's keyboard, created when the seat advertises the keyboard
+    /// capability — the source of the input serial `set_selection` needs.
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    virtual_keyboard_manager:
+        Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
     data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     /// This client's data device, created from the manager + seat during
     /// connect so it is listening before the client is ever focused.
@@ -366,8 +387,28 @@ struct ClientState {
     offered_mime: String,
     offered_payload: Vec<u8>,
     /// How many `wl_data_source.send` requests this client has serviced — the
-    /// signal a reader uses to know the owner has written the payload.
+    /// signal a reader uses to know the owner has written the payload. Shared
+    /// by the `wl_data_source` and `zwlr_data_control_source_v1` send handlers,
+    /// since a client owns the selection through one or the other, never both.
     source_sends: u32,
+
+    // --- data-control (M4.1) ---
+    data_control_manager: Option<zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
+    data_control_device: Option<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1>,
+    /// The source a data-control client last set, kept alive to answer `send`.
+    data_control_source: Option<zwlr_data_control_source_v1::ZwlrDataControlSourceV1>,
+    /// The current data-control selection offer (the clipboard a manager reads).
+    data_control_offer: Option<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1>,
+    /// Mimes advertised on the in-flight data-control offer, reset per offer.
+    data_control_mimes: Vec<String>,
+
+    // --- primary selection (M4.1) ---
+    primary_manager:
+        Option<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1>,
+    primary_device: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
+    primary_source: Option<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1>,
+    primary_offer: Option<zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1>,
+    primary_mimes: Vec<String>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
@@ -400,6 +441,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "wl_data_device_manager" => {
                     state.data_device_manager = Some(registry.bind(name, version.min(3), qh, ()));
+                }
+                "zwlr_data_control_manager_v1" => {
+                    state.data_control_manager = Some(registry.bind(name, version.min(2), qh, ()));
+                }
+                "zwp_virtual_keyboard_manager_v1" => {
+                    state.virtual_keyboard_manager =
+                        Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_primary_selection_device_manager_v1" => {
+                    state.primary_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -527,6 +578,11 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for ClientState {
             _ => {}
         }
     }
+
+    // `data_offer` (opcode 0) introduces a server-created wl_data_offer.
+    event_created_child!(ClientState, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
 }
 
 impl Dispatch<wl_data_offer::WlDataOffer, ()> for ClientState {
@@ -555,20 +611,179 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for ClientState {
     ) {
         // The paste side asked for the data on `fd`: write our payload and drop
         // the fd (close), so the reader sees EOF after the bytes.
-        if let wl_data_source::Event::Send { mime_type, fd } = event {
-            if mime_type == state.offered_mime {
-                let mut f = std::fs::File::from(fd);
-                let _ = f.write_all(&state.offered_payload);
-                state.source_sends = state.source_sends.saturating_add(1);
-            }
+        if let wl_data_source::Event::Send { mime_type, fd } = event
+            && mime_type == state.offered_mime
+        {
+            let mut f = std::fs::File::from(fd);
+            let _ = f.write_all(&state.offered_payload);
+            state.source_sends = state.source_sends.saturating_add(1);
+        }
+    }
+}
+
+impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwlr_data_control_device_v1::ZwlrDataControlDeviceV1,
+        event: zwlr_data_control_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_data_control_device_v1::Event::DataOffer { .. } => state.data_control_mimes.clear(),
+            zwlr_data_control_device_v1::Event::Selection { id } => state.data_control_offer = id,
+            // PrimarySelection / Finished not needed for the clipboard read.
+            _ => {}
+        }
+    }
+
+    // `data_offer` (opcode 0) introduces a server-created data-control offer.
+    event_created_child!(ClientState, zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, [
+        zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()),
+    ]);
+}
+
+impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwlr_data_control_offer_v1::ZwlrDataControlOfferV1,
+        event: zwlr_data_control_offer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
+            state.data_control_mimes.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwlr_data_control_source_v1::ZwlrDataControlSourceV1,
+        event: zwlr_data_control_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Same payload-write shape as the `wl_data_source` handler; shares the
+        // offered payload + send counter (a client owns via one protocol only).
+        if let zwlr_data_control_source_v1::Event::Send { mime_type, fd } = event
+            && mime_type == state.offered_mime
+        {
+            let mut f = std::fs::File::from(fd);
+            let _ = f.write_all(&state.offered_payload);
+            state.source_sends = state.source_sends.saturating_add(1);
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        // Create a keyboard the moment the seat advertises the capability, so
+        // that on focus this client receives `wl_keyboard.enter` — the input
+        // serial `set_selection` is validated against.
+        if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event
+            && caps.contains(wl_seat::Capability::Keyboard)
+            && state.keyboard.is_none()
+        {
+            state.keyboard = Some(seat.get_keyboard(qh, ()));
+        }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Any serial-bearing keyboard event is a valid serial for set_selection;
+        // `enter` (on focus) is the one this harness relies on. The `keymap`
+        // event's fd is dropped with the event.
+        match event {
+            wl_keyboard::Event::Enter { serial, .. } => state.last_serial = Some(serial),
+            wl_keyboard::Event::Key { serial, .. } => state.last_serial = Some(serial),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        event: zwp_primary_selection_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_primary_selection_device_v1::Event::DataOffer { .. } => state.primary_mimes.clear(),
+            zwp_primary_selection_device_v1::Event::Selection { id } => state.primary_offer = id,
+            _ => {}
+        }
+    }
+
+    // `data_offer` (opcode 0) introduces a server-created primary offer.
+    event_created_child!(ClientState, zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, [
+        zwp_primary_selection_device_v1::EVT_DATA_OFFER_OPCODE => (zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1, ()),
+    ]);
+}
+
+impl Dispatch<zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
+        event: zwp_primary_selection_offer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_primary_selection_offer_v1::Event::Offer { mime_type } = event {
+            state.primary_mimes.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+        event: zwp_primary_selection_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_primary_selection_source_v1::Event::Send { mime_type, fd } = event
+            && mime_type == state.offered_mime
+        {
+            let mut f = std::fs::File::from(fd);
+            let _ = f.write_all(&state.offered_payload);
+            state.source_sends = state.source_sends.saturating_add(1);
         }
     }
 }
 
 // wayland-client requires a `Dispatch` impl per bound interface; these carry
 // nothing the harness asserts on.
-delegate_noop!(ClientState: ignore wl_seat::WlSeat);
 delegate_noop!(ClientState: ignore wl_data_device_manager::WlDataDeviceManager);
+delegate_noop!(ClientState: ignore zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1);
+delegate_noop!(ClientState: ignore zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1);
+delegate_noop!(ClientState: ignore zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
+delegate_noop!(ClientState: ignore zwlr_data_control_manager_v1::ZwlrDataControlManagerV1);
 delegate_noop!(ClientState: ignore wl_compositor::WlCompositor);
 delegate_noop!(ClientState: ignore wl_surface::WlSurface);
 delegate_noop!(ClientState: ignore wl_shm::WlShm);
@@ -628,6 +843,15 @@ fn connect_and_bind(
     if let (Some(mgr), Some(seat)) = (state.data_device_manager.as_ref(), state.seat.as_ref()) {
         state.data_device = Some(mgr.get_data_device(seat, &qh, ()));
     }
+    // Likewise the data-control device: a clipboard manager observes the seat
+    // selection without ever being focused, so it must be listening from
+    // connect. Harmless for clients that never read the clipboard.
+    if let (Some(mgr), Some(seat)) = (state.data_control_manager.as_ref(), state.seat.as_ref()) {
+        state.data_control_device = Some(mgr.get_data_device(seat, &qh, ()));
+    }
+    if let (Some(mgr), Some(seat)) = (state.primary_manager.as_ref(), state.seat.as_ref()) {
+        state.primary_device = Some(mgr.get_device(seat, &qh, ()));
+    }
     queue.roundtrip(&mut state).expect("data-device roundtrip");
 
     (conn, queue, qh, state)
@@ -678,6 +902,69 @@ pub fn read_selection(reader: &mut TestClient, owner: &mut TestClient, mime: &st
         std::thread::sleep(Duration::from_millis(5));
     }
 
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read selection");
+    buf
+}
+
+/// As [`read_selection`], but over the primary (middle-click) selection: the
+/// reader reads its primary offer, the owner's primary source supplies bytes.
+pub fn read_primary(reader: &mut TestClient, owner: &mut TestClient, mime: &str) -> Vec<u8> {
+    let offer = reader
+        .state
+        .primary_offer
+        .clone()
+        .expect("no primary offer delivered to the reader");
+    let (read_end, write_end) = std::io::pipe().expect("pipe");
+    offer.receive(mime.to_string(), write_end.as_fd());
+    reader.conn.flush().expect("flush receive");
+    drop(write_end);
+
+    let before = owner.state.source_sends;
+    let deadline = Instant::now() + TIMEOUT;
+    while owner.state.source_sends == before {
+        assert!(
+            Instant::now() < deadline,
+            "the primary owner never serviced a send within {TIMEOUT:?}"
+        );
+        owner.pump();
+        reader.pump();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read primary selection");
+    buf
+}
+
+/// As [`read_selection`], but the selection owner is a data-control client
+/// (whose `zwlr_data_control_source_v1` supplies the bytes). The reader is a
+/// focused `wl_data_device` client.
+pub fn read_selection_from_data_control(
+    reader: &mut TestClient,
+    owner: &mut DataControlClient,
+    mime: &str,
+) -> Vec<u8> {
+    let offer = reader
+        .state
+        .current_offer
+        .clone()
+        .expect("no wl_data_offer was delivered to the reader");
+    let (read_end, write_end) = std::io::pipe().expect("pipe");
+    offer.receive(mime.to_string(), write_end.as_fd());
+    reader.conn.flush().expect("flush receive");
+    drop(write_end);
+
+    let before = owner.source_sends();
+    let deadline = Instant::now() + TIMEOUT;
+    while owner.source_sends() == before {
+        assert!(
+            Instant::now() < deadline,
+            "the data-control owner never serviced a send within {TIMEOUT:?}"
+        );
+        owner.pump();
+        reader.pump();
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read selection");
     buf
@@ -961,6 +1248,34 @@ impl TestClient {
         self.state.current_offer.is_some()
     }
 
+    /// Own the primary (middle-click) selection with `payload` under `mime`.
+    /// Like [`set_selection_text`](Self::set_selection_text), needs an input
+    /// serial and keyboard focus.
+    pub fn set_primary_text(&mut self, mime: &str, payload: &[u8]) {
+        let manager = self.state.primary_manager.clone().expect("no primary manager");
+        let device = self.state.primary_device.clone().expect("no primary device");
+        self.state.offered_mime = mime.to_string();
+        self.state.offered_payload = payload.to_vec();
+        let source = manager.create_source(&self.qh, ());
+        source.offer(mime.to_string());
+        device.set_selection(Some(&source), self.state.last_serial.unwrap_or(0));
+        self.state.primary_source = Some(source);
+        self.conn.flush().expect("flush set_primary");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Whether a primary-selection offer has been delivered to this client.
+    pub fn has_primary_offer(&self) -> bool {
+        self.state.primary_offer.is_some()
+    }
+
+    /// Whether this client has captured an input serial (via `wl_keyboard`),
+    /// which `set_selection` needs. Requires a keyboard on the seat (e.g. an
+    /// injected virtual keyboard) and this client to hold focus.
+    pub fn has_input_serial(&self) -> bool {
+        self.state.last_serial.is_some()
+    }
+
     /// One `roundtrip`, exposed so a transfer helper can drive an owner client
     /// whose data source must answer `send`.
     pub fn pump(&mut self) {
@@ -1149,5 +1464,145 @@ impl Drop for LayerPanelClient {
         self.surface.destroy();
         self.conn.flush().expect("flush");
         let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+/// Injects a virtual keyboard so the seat gains keyboard capability, which is
+/// what lets other clients receive `wl_keyboard.enter` and mint the input
+/// serial `wl_data_device.set_selection` requires. The headless backend has no
+/// physical input device, so without this the seat advertises no keyboard and
+/// `set_selection` can never be validated. Kept alive for the test's duration;
+/// dropping it destroys the virtual keyboard and the capability with it.
+pub struct VirtualKeyboardClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    state: ClientState,
+    _vk: zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+}
+
+impl VirtualKeyboardClient {
+    /// Connect, create a virtual keyboard on the seat, and settle. Panics if
+    /// the compositor did not advertise `zwp_virtual_keyboard_manager_v1`.
+    pub fn spawn(socket: &str) -> VirtualKeyboardClient {
+        let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+        let manager = state
+            .virtual_keyboard_manager
+            .clone()
+            .expect("compositor did not advertise zwp_virtual_keyboard_manager_v1");
+        let seat = state.seat.clone().expect("no seat");
+        let vk = manager.create_virtual_keyboard(&seat, &qh, ());
+        conn.flush().expect("flush vk create");
+        // Two roundtrips so the compositor processes new_virtual_keyboard and
+        // the seat's capability change is on the wire before callers connect.
+        queue.roundtrip(&mut state).expect("vk roundtrip");
+        queue.roundtrip(&mut state).expect("vk settle");
+        VirtualKeyboardClient { conn, queue, state, _vk: vk }
+    }
+
+    /// One roundtrip, to keep the injector responsive during a test.
+    pub fn pump(&mut self) {
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+/// A `zwlr_data_control_manager_v1` client — a clipboard manager. It never maps
+/// a surface and never holds focus, yet can both set the selection (no input
+/// serial required, unlike `wl_data_device`) and read it. This is what makes
+/// the selection stack testable on a headless seat that has no input device to
+/// mint the serial `wl_data_device.set_selection` would need.
+pub struct DataControlClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    qh: QueueHandle<ClientState>,
+    state: ClientState,
+}
+
+impl DataControlClient {
+    /// Connect and bind; the data-control device is created inside
+    /// [`connect_and_bind`]. Panics if the compositor did not advertise
+    /// `zwlr_data_control_manager_v1`.
+    pub fn spawn(socket: &str) -> DataControlClient {
+        let (conn, queue, qh, state) = connect_and_bind(socket);
+        assert!(
+            state.data_control_device.is_some(),
+            "compositor did not advertise zwlr_data_control_manager_v1"
+        );
+        DataControlClient { conn, queue, qh, state }
+    }
+
+    /// Own the clipboard with `payload` under `mime`. No serial: data-control
+    /// is designed for focus-less clipboard managers.
+    pub fn set_clipboard(&mut self, mime: &str, payload: &[u8]) {
+        let manager = self.state.data_control_manager.clone().expect("no data-control manager");
+        let device = self.state.data_control_device.clone().expect("no data-control device");
+        self.state.offered_mime = mime.to_string();
+        self.state.offered_payload = payload.to_vec();
+        let source = manager.create_data_source(&self.qh, ());
+        source.offer(mime.to_string());
+        device.set_selection(Some(&source));
+        self.state.data_control_source = Some(source);
+        self.conn.flush().expect("flush data-control set");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Whether a data-control selection offer has been delivered.
+    pub fn has_offer(&self) -> bool {
+        self.state.data_control_offer.is_some()
+    }
+
+    /// Pump the queue until `pred` holds or [`TIMEOUT`] elapses.
+    pub fn wait_until(&mut self, pred: impl Fn(&DataControlClient) -> bool) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// One roundtrip, so a transfer helper can drive this client as the owner.
+    pub fn pump(&mut self) {
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// How many `send` requests this client's source has serviced — lets a
+    /// transfer helper know the owner has written the payload.
+    pub fn source_sends(&self) -> u32 {
+        self.state.source_sends
+    }
+
+    /// Read the current data-control selection in `mime`, driving `owner`
+    /// (whose source supplies the bytes) until it answers. Mirrors
+    /// [`read_selection`] but the reader side is a data-control device.
+    pub fn read_selection(&mut self, owner: &mut DataControlClient, mime: &str) -> Vec<u8> {
+        let offer = self
+            .state
+            .data_control_offer
+            .clone()
+            .expect("no data-control offer delivered");
+        let (read_end, write_end) = std::io::pipe().expect("pipe");
+        offer.receive(mime.to_string(), write_end.as_fd());
+        self.conn.flush().expect("flush receive");
+        drop(write_end);
+
+        let before = owner.state.source_sends;
+        let deadline = Instant::now() + TIMEOUT;
+        while owner.state.source_sends == before {
+            assert!(
+                Instant::now() < deadline,
+                "the data-control owner never serviced a send within {TIMEOUT:?}"
+            );
+            owner.pump();
+            self.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read data-control selection");
+        buf
     }
 }

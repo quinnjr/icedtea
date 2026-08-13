@@ -13,7 +13,65 @@ mod support;
 
 use icedtea_contract::Event;
 
-use support::{Compositor, TestClient};
+use support::{Compositor, DataControlClient, TestClient, VirtualKeyboardClient};
+
+/// A data-control client's set (no serial) reaches a focused wl_data_device
+/// client as an offer — the delivery path a clipboard manager's re-paste uses.
+#[test]
+fn data_control_set_reaches_a_focused_wl_data_device_client() {
+    let comp = Compositor::spawn();
+    let mut b = TestClient::map_toplevel(&comp.socket, "reader.app", "reader");
+    assert!(b.wait_until(|c| c.last_configure().is_some()));
+    let mut mgr = DataControlClient::spawn(&comp.socket);
+    mgr.set_clipboard("text/plain;charset=utf-8", b"via-data-control");
+    assert!(
+        b.wait_until(|c| c.has_selection_offer()),
+        "focused wl_data_device client never received the data-control-set selection"
+    );
+    let got = support::read_selection_from_data_control(&mut b, &mut mgr, "text/plain;charset=utf-8");
+    assert_eq!(got, b"via-data-control");
+}
+
+/// The focus/serial gate: with no keyboard on the seat, a mapped client has no
+/// input serial, so its `wl_data_device.set_selection` is rejected by wlroots
+/// and the existing clipboard is untouched. This is the mechanism that stops an
+/// unfocused client hijacking the selection (an unfocused client likewise has
+/// no serial).
+#[test]
+fn set_selection_without_an_input_serial_is_rejected() {
+    let comp = Compositor::spawn(); // deliberately NO virtual keyboard -> no serials
+
+    // Baseline: a data-control client owns the clipboard.
+    let mut owner = DataControlClient::spawn(&comp.socket);
+    owner.set_clipboard("text/plain", b"baseline");
+
+    // A maps and is focused, but the seat has no keyboard, so A has no serial.
+    let mut a = TestClient::map_toplevel(&comp.socket, "hijack.app", "hijack");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+    assert!(!a.has_input_serial(), "no keyboard on the seat means no input serial");
+    a.set_selection_text("text/plain", b"hijack"); // serial 0 -> rejected
+
+    // The clipboard is unchanged: a fresh reader still sees the baseline.
+    let mut reader = DataControlClient::spawn(&comp.socket);
+    assert!(reader.wait_until(|c| c.has_offer()), "no data-control offer");
+    assert_eq!(reader.read_selection(&mut owner, "text/plain"), b"baseline");
+}
+
+/// A data-control client reads a selection another data-control client set —
+/// the round-trip the M4.6 clipboard daemon depends on.
+#[test]
+fn data_control_reads_the_current_selection() {
+    let comp = Compositor::spawn();
+    let mut owner = DataControlClient::spawn(&comp.socket);
+    owner.set_clipboard("text/plain;charset=utf-8", b"seen-by-manager");
+
+    let mut reader = DataControlClient::spawn(&comp.socket);
+    assert!(reader.wait_until(|c| c.has_offer()), "no data-control offer");
+    assert_eq!(
+        reader.read_selection(&mut owner, "text/plain;charset=utf-8"),
+        b"seen-by-manager"
+    );
+}
 
 /// The two selection-manager globals M4.1 adds must actually be advertised —
 /// the daemon (M4.6) and any clipboard manager bind them by name.
@@ -38,6 +96,63 @@ fn a_mapped_client_has_a_data_device() {
     let comp = Compositor::spawn();
     let client = TestClient::map_toplevel(&comp.socket, "dd.app", "dd");
     assert!(client.has_data_device(), "data device created from manager + seat");
+}
+
+/// The core interop claim: a text payload one client copies via `wl_data_device`
+/// is readable, byte for byte, by another client after focus moves to it. A
+/// virtual keyboard is injected first so the setter can obtain the input serial
+/// wlroots requires for `set_selection`.
+#[test]
+fn clipboard_transfers_between_two_clients() {
+    let comp = Compositor::spawn();
+    // Give the seat a keyboard so focused clients receive an input serial.
+    let mut _vk = VirtualKeyboardClient::spawn(&comp.socket);
+
+    // A maps (gains focus + a keyboard-enter serial) and owns the clipboard.
+    let mut a = TestClient::map_toplevel(&comp.socket, "owner.app", "owner");
+    assert!(
+        a.wait_until(|c| c.has_input_serial()),
+        "owner never received a keyboard-enter serial"
+    );
+    a.set_selection_text("text/plain;charset=utf-8", b"hello-clipboard");
+
+    // B maps (focus moves to B) and reads the current selection.
+    let mut b = TestClient::map_toplevel(&comp.socket, "reader.app", "reader");
+    assert!(
+        b.wait_until(|c| c.has_selection_offer()),
+        "B never received a data offer"
+    );
+    let got = support::read_selection(&mut b, &mut a, "text/plain;charset=utf-8");
+    assert_eq!(got, b"hello-clipboard");
+
+    a.detach();
+    b.detach();
+}
+
+/// The primary (middle-click) selection round-trip: one client sets it, another
+/// reads it byte for byte after focus moves. Needs the injected keyboard's
+/// serial, exactly as the clipboard does.
+#[test]
+fn primary_selection_transfers_between_two_clients() {
+    let comp = Compositor::spawn();
+    let mut _vk = VirtualKeyboardClient::spawn(&comp.socket);
+
+    let mut a = TestClient::map_toplevel(&comp.socket, "owner.app", "owner");
+    assert!(a.wait_until(|c| c.has_input_serial()), "owner got no serial");
+    a.set_primary_text("text/plain;charset=utf-8", b"primary-payload");
+
+    let mut b = TestClient::map_toplevel(&comp.socket, "reader.app", "reader");
+    assert!(
+        b.wait_until(|c| c.has_primary_offer()),
+        "B never received a primary offer"
+    );
+    assert_eq!(
+        support::read_primary(&mut b, &mut a, "text/plain;charset=utf-8"),
+        b"primary-payload"
+    );
+
+    a.detach();
+    b.detach();
 }
 
 /// The restoration test: a real toplevel maps and shows up in the model,
@@ -469,3 +584,4 @@ fn a_remapped_layer_panel_is_configured_again_and_re_carves_the_workspace() {
 
     win.detach();
 }
+

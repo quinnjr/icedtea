@@ -89,6 +89,11 @@ pub fn run() {
     if let Err(err) = runtime.create_data_control_manager(&display) {
         tracing::error!(%err, "data-control (clipboard manager access) is unavailable");
     }
+    // Lets on-screen keyboards, remote-input bridges, and IME helpers inject a
+    // keyboard. Non-fatal: without it those tools simply cannot attach.
+    if let Err(err) = runtime.create_virtual_keyboard_manager(&display) {
+        tracing::error!(%err, "virtual-keyboard input is unavailable");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");
