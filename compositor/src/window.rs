@@ -383,23 +383,53 @@ impl WindowManager {
         self.visible_windows().into_iter().find(|w| w.geometry.contains(point.0, point.1))
     }
 
+    /// Focus the most-recently-focused non-minimized, mapped window on `ws`,
+    /// if any; when nothing qualifies, clear `ws`'s focus pointer instead of
+    /// leaving it aimed at a window that just became hidden (minimized,
+    /// unmapped, closed, or moved off the workspace). Mirrors
+    /// `remove_window`'s no-successor clear, so "focused" never goes on
+    /// naming a window nothing can act on. Returns the id that took over, or
+    /// `None`.
+    ///
+    /// Every hide path -- minimize, toplevel unmap, close, and a workspace
+    /// switch landing on a stale/invisible pointer -- routes through this
+    /// rather than discarding `focus_mru_in_workspace`'s (this function's
+    /// former name and still its candidate-picking half) result, which is
+    /// what let a hidden window remain `focused_window()` when it was the
+    /// workspace's last visible one.
+    pub fn refocus_after_hide(&mut self, ws: u32) -> Option<WindowId> {
+        let candidate = self
+            .focus_mru
+            .iter()
+            .copied()
+            .find(|id| self.windows.get(id).is_some_and(|w| w.workspace == ws && !w.minimized && w.mapped));
+        match candidate {
+            Some(id) => {
+                self.focus(id)?;
+                Some(id)
+            }
+            None => {
+                if let Some(slot) = self.workspaces.get_mut(ws as usize) {
+                    slot.focused_window = None;
+                }
+                None
+            }
+        }
+    }
+
     /// Focus the most-recently-focused non-minimized window on `ws`, if any.
-    /// Returns the id focused, or `None` when the workspace has nothing
-    /// focusable (in which case its focus pointer is left cleared).
     ///
     /// Review finding I6: `set_workspace` cleared the *origin* workspace's
     /// focus pointer but never gave the destination one, so
     /// `MoveToWorkspace` (which then switches to that workspace) left
     /// `focused_window()` as `None` and the very next `close`/`fullscreen`/
     /// `snap` action silently no-opped.
+    ///
+    /// Thin alias kept for call sites that only care about the picked
+    /// candidate; see [`Self::refocus_after_hide`] for the no-candidate
+    /// behavior (it now also clears the pointer on `None`).
     pub fn focus_mru_in_workspace(&mut self, ws: u32) -> Option<WindowId> {
-        let candidate = self
-            .focus_mru
-            .iter()
-            .copied()
-            .find(|id| self.windows.get(id).is_some_and(|w| w.workspace == ws && !w.minimized && w.mapped))?;
-        self.focus(candidate)?;
-        Some(candidate)
+        self.refocus_after_hide(ws)
     }
 
     pub fn to_info(&self, w: &Window) -> WindowInfo {
@@ -710,6 +740,19 @@ mod tests {
         m.set_minimized(a, true).unwrap();
         assert!(m.window_at((10, 10)).is_none());
         assert!(m.window_at((10_000, 10_000)).is_none());
+    }
+
+    /// Task 6: minimizing (or otherwise hiding) the sole window on a
+    /// workspace must not leave `focused_window()` still naming it -- the
+    /// model must never report a hidden window as focused.
+    #[test]
+    fn hiding_the_sole_window_clears_the_focus_pointer() {
+        let mut m = WindowManager::new(vec!["1".into()]);
+        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        assert_eq!(m.focused_window().map(|w| w.id), Some(a));
+        m.set_minimized(a, true);
+        assert_eq!(m.refocus_after_hide(m.active_workspace()), None);
+        assert!(m.focused_window().is_none(), "no hidden window may remain focused");
     }
 
     /// I6: after a window is moved away, the workspace it lands on has a

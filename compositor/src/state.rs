@@ -1723,10 +1723,20 @@ impl State {
     /// handlers' pattern.
     fn set_minimized_and_reconcile(&mut self, id: WindowId, value: bool) -> Option<()> {
         let previous = self.focused_id();
+        let target = self.window_manager.get(id)?;
+        let workspace = target.workspace;
+        let was_focused_on_own_workspace = target.focused;
         self.window_manager.set_minimized(id, value)?;
-        if value && previous == Some(id) {
-            let active = self.window_manager.active_workspace();
-            self.window_manager.focus_mru_in_workspace(active);
+        if value && was_focused_on_own_workspace {
+            // Task 6: resolve `id`'s *own* workspace, not whichever one is
+            // currently active -- `DbCommand::Minimize` can target a window
+            // on an inactive workspace, and `focused_id()`/`previous` above
+            // only ever reflects the active one. `refocus_after_hide` clears
+            // the pointer outright when nothing qualifies, so a minimized
+            // window can never linger as that workspace's `focused_window`
+            // (masked only at the seat by `sync_seat_focus`'s visibility
+            // filter until now).
+            self.window_manager.refocus_after_hide(workspace);
         }
         // `id` itself always needs a sync (its visibility just changed),
         // even when it wasn't the focused window; `sync_focus_change` then
@@ -1785,7 +1795,7 @@ impl State {
         self.title_rasters.remove(&id);
         if self.window_manager.focused_window().is_none() {
             let active = self.window_manager.active_workspace();
-            self.window_manager.focus_mru_in_workspace(active);
+            self.window_manager.refocus_after_hide(active);
         }
         // Re-review finding New-2: picking a successor in the model was only
         // half the job -- it also has to reach the client (`Activated`) and
@@ -2139,7 +2149,7 @@ impl State {
         // belt-and-braces re-pick for anything that still slips through.
         let current = self.window_manager.focused_window().map(|w| w.id);
         if current.is_none_or(|id| !self.window_manager.is_visible_id(id)) {
-            self.window_manager.focus_mru_in_workspace(workspace);
+            self.window_manager.refocus_after_hide(workspace);
         }
         self.sync_scene();
         Some(())
@@ -2156,7 +2166,7 @@ impl State {
         let origin = self.window_manager.get(id)?.workspace;
         self.window_manager.set_workspace(id, workspace)?;
         if origin != workspace {
-            self.window_manager.focus_mru_in_workspace(origin);
+            self.window_manager.refocus_after_hide(origin);
         }
         if !self.window_manager.set_active_workspace(workspace) {
             return None;
@@ -4699,14 +4709,36 @@ mod tests {
         assert_eq!(state.focused_id(), Some(a));
 
         state.apply_decoration_action(a, crate::decoration::DecorationAction::Minimize);
-        // With no successor the model leaves its focus pointer on `a` (that
-        // is pre-existing `focus_mru_in_workspace` behaviour: it clears
-        // nothing when it finds nothing). What must *not* happen is the
-        // seat -- were there a real one -- going on delivering keys to a
-        // window the user can no longer see: `sync_seat_focus` gates on
-        // `is_visible_id`, so an invisible focus is the same as no focus as
-        // far as the keyboard is concerned.
+        // Task 6: with no successor, `refocus_after_hide` clears the focus
+        // pointer outright rather than leaving it on the now-hidden `a` --
+        // the model itself must never report a hidden window as focused, not
+        // just have the seat mask it via `sync_seat_focus`'s `is_visible_id`
+        // filter.
+        assert_eq!(state.focused_id(), None);
         assert!(!state.window_manager.is_visible_id(a));
+    }
+
+    /// Task 6: `DbCommand::Minimize` (`set_minimized_and_reconcile`) must
+    /// resolve the minimized window's *own* workspace, not whichever one is
+    /// currently active -- `focused_id()` only ever reflects the active
+    /// workspace, so minimizing a focused window on an inactive one used to
+    /// skip the refocus branch entirely and could leave that workspace's
+    /// pointer stale once something did populate it.
+    #[test]
+    fn minimizing_the_focused_window_on_an_inactive_workspace_leaves_no_stale_focus() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let a = state.window_manager.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        // move focus/window to ws 2, switch away to ws 1, minimize a, switch back
+        state.window_manager.set_workspace(a, 2);
+        state.window_manager.set_active_workspace(1);
+        state.set_minimized_and_reconcile(a, true);
+        state.window_manager.set_active_workspace(2);
+        assert!(
+            state.window_manager.focused_window().is_none()
+                || state.window_manager.focused_window().map(|w| !w.minimized).unwrap_or(true),
+            "a minimized window must not remain the workspace's focus"
+        );
     }
 
     /// New-4: the inset the sync path applies is the shared
