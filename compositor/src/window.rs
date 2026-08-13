@@ -409,8 +409,25 @@ impl WindowManager {
                 Some(id)
             }
             None => {
-                if let Some(slot) = self.workspaces.get_mut(ws as usize) {
-                    slot.focused_window = None;
+                let cleared = self.workspaces.get_mut(ws as usize).and_then(|slot| slot.focused_window.take());
+                // The pointer is only half the story: the hidden window's own
+                // `focused` field (what `to_info`/`snapshot` report to IPC
+                // clients, e.g. the taskbar) must drop too, with exactly one
+                // `WindowUpdated{focused:false}` for it -- mirrors how the
+                // successful-candidate arm above (via `focus`) and
+                // `remove_window`'s no-successor clear both handle the flag
+                // and its emission. Guarded on `w.focused` so this stays a
+                // no-op-on-no-change like every other setter here (the
+                // pointer and the flag can already disagree, e.g. a window
+                // unmapped without ever having been re-focused).
+                if let Some(prev_id) = cleared.filter(|id| self.windows.get(id).is_some_and(|w| w.focused)) {
+                    if let Some(w) = self.windows.get_mut(&prev_id) {
+                        w.focused = false;
+                    }
+                    self.emit(Event::WindowUpdated {
+                        id: prev_id,
+                        update: WindowUpdate { focused: Some(false), ..Default::default() },
+                    });
                 }
                 None
             }
@@ -751,8 +768,20 @@ mod tests {
         let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
         assert_eq!(m.focused_window().map(|w| w.id), Some(a));
         m.set_minimized(a, true);
+        let seq_before = m.seq();
         assert_eq!(m.refocus_after_hide(m.active_workspace()), None);
         assert!(m.focused_window().is_none(), "no hidden window may remain focused");
+        // The reporting boundary must agree: `a`'s own `focused` field --
+        // what `to_info`/`snapshot` hand IPC clients like the taskbar -- has
+        // to drop too, with exactly one `WindowUpdated{focused:false}`
+        // emitted for it, not just the workspace pointer clearing.
+        assert!(!m.get(a).unwrap().focused, "the hidden window's own focused flag must clear too");
+        let emitted_unfocus = m
+            .pending_events
+            .iter()
+            .filter(|e| e.seq > seq_before)
+            .any(|e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.focused == Some(false)));
+        assert!(emitted_unfocus, "must emit exactly one WindowUpdated{{focused:false}} for the hidden window");
     }
 
     /// I6: after a window is moved away, the workspace it lands on has a

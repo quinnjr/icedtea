@@ -4728,9 +4728,17 @@ mod tests {
     fn minimizing_the_focused_window_on_an_inactive_workspace_leaves_no_stale_focus() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
+        // Make `a` workspace 2's *genuinely* focused window via the real
+        // focus path (`add_window` focuses on the currently-active
+        // workspace), not a raw `set_workspace` -- that unconditionally
+        // clears `.focused` and never sets the destination's pointer, so a
+        // test built on it would pass even with the old, unfixed guard.
+        state.window_manager.set_active_workspace(2);
         let a = state.window_manager.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
-        // move focus/window to ws 2, switch away to ws 1, minimize a, switch back
-        state.window_manager.set_workspace(a, 2);
+        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a));
+        assert!(state.window_manager.get(a).unwrap().focused);
+        // Switch away to ws 1 (now inactive workspace 2 still points at `a`),
+        // minimize `a`, then switch back.
         state.window_manager.set_active_workspace(1);
         state.set_minimized_and_reconcile(a, true);
         state.window_manager.set_active_workspace(2);
@@ -4739,6 +4747,7 @@ mod tests {
                 || state.window_manager.focused_window().map(|w| !w.minimized).unwrap_or(true),
             "a minimized window must not remain the workspace's focus"
         );
+        assert!(!state.window_manager.get(a).unwrap().focused, "the hidden window's own focused flag must clear too");
     }
 
     /// New-4: the inset the sync path applies is the shared
