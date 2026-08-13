@@ -11,9 +11,10 @@
 use std::io::Read as _;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender};
-use icedtea_contract::ClipKind;
+use icedtea_contract::{ClipEntry, ClipKind};
 use wayland_client::protocol::{wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, QueueHandle, event_created_child};
 use wayland_protocols_wlr::data_control::v1::client::{
@@ -68,9 +69,17 @@ struct App {
 
     history: History,
     changes: Sender<Change>,
+    /// The current history, mirrored for the zbus `get_history` reader.
+    snapshot: Arc<Mutex<Vec<ClipEntry>>>,
 }
 
 impl App {
+    /// Refresh the shared snapshot and signal that the history changed.
+    fn publish(&self) {
+        *self.snapshot.lock().unwrap() = self.history.snapshot();
+        let _ = self.changes.send(Change::Changed);
+    }
+
     fn ensure_device(&mut self, qh: &QueueHandle<App>) {
         if self.device.is_none()
             && let (Some(m), Some(s)) = (self.manager.as_ref(), self.seat.as_ref())
@@ -103,7 +112,7 @@ impl App {
             return;
         }
         if self.history.push(kind_of(&mime), mime, &bytes, None) == Change::Changed {
-            let _ = self.changes.send(Change::Changed);
+            self.publish();
         }
     }
 
@@ -120,7 +129,7 @@ impl App {
             Command::Clear => self.history.clear(),
         };
         if change == Change::Changed {
-            let _ = self.changes.send(Change::Changed);
+            self.publish();
         }
     }
 
@@ -249,6 +258,7 @@ pub fn run(
     commands: Receiver<Command>,
     changes: Sender<Change>,
     wake_read: UnixStream,
+    snapshot: Arc<Mutex<Vec<ClipEntry>>>,
 ) {
     let mut queue = conn.new_event_queue::<App>();
     let qh = queue.handle();
@@ -266,6 +276,7 @@ pub fn run(
         our_serve: None,
         history,
         changes,
+        snapshot,
     };
 
     // Settle the registry + device.

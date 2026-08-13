@@ -8,7 +8,7 @@ rust-version.workspace = true
 icedtea-contract = { path = "../contract" }
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-zbus = "5"
+zbus.workspace = true
 crossbeam-channel.workspace = true
 rustix = { version = "1", features = ["event"] }
 tracing.workspace = true
