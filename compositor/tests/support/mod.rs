@@ -869,6 +869,11 @@ pub fn advertised_globals(socket: &str) -> Vec<String> {
 /// `mime`, driving `owner` (whose `wl_data_source` supplies the bytes) until it
 /// has answered. Returns the transferred bytes.
 ///
+/// The owner writes its whole payload inside one `send` dispatch, before the
+/// reader drains the pipe, so the payload must fit the pipe buffer (~64 KiB on
+/// Linux). Every selection payload in this suite is a short string; a larger
+/// one would need a concurrent read instead of this write-then-read shape.
+///
 /// The transfer is inherently two-sided: `reader.receive` hands the compositor
 /// an fd it forwards to `owner`'s data source as a `send`; `owner` must be
 /// pumped for its `Dispatch` to write the payload and close its copy, at which
@@ -1282,6 +1287,11 @@ impl TestClient {
         let _ = self.queue.roundtrip(&mut self.state);
     }
 
+    /// How many `send` requests this client's source(s) have serviced.
+    pub fn source_sends(&self) -> u32 {
+        self.state.source_sends
+    }
+
     /// Map a top-anchored `zwlr_layer_shell_v1` panel: `TOP | LEFT | RIGHT`
     /// anchor, `exclusive` reserved along the top edge, real shm-backed
     /// attach once the compositor answers with a size. See
@@ -1574,6 +1584,41 @@ impl DataControlClient {
     /// transfer helper know the owner has written the payload.
     pub fn source_sends(&self) -> u32 {
         self.state.source_sends
+    }
+
+    /// Read the current data-control selection when the owner is a *regular*
+    /// `wl_data_device` client (an ordinary app that copied). This is the
+    /// direction the M4.6 clipboard daemon relies on: an app copies, the
+    /// manager observes it. `owner`'s `wl_data_source` supplies the bytes.
+    pub fn read_from_wl_data_device_owner(
+        &mut self,
+        owner: &mut TestClient,
+        mime: &str,
+    ) -> Vec<u8> {
+        let offer = self
+            .state
+            .data_control_offer
+            .clone()
+            .expect("no data-control offer delivered");
+        let (read_end, write_end) = std::io::pipe().expect("pipe");
+        offer.receive(mime.to_string(), write_end.as_fd());
+        self.conn.flush().expect("flush receive");
+        drop(write_end);
+
+        let before = owner.source_sends();
+        let deadline = Instant::now() + TIMEOUT;
+        while owner.source_sends() == before {
+            assert!(
+                Instant::now() < deadline,
+                "the wl_data_device owner never serviced a send within {TIMEOUT:?}"
+            );
+            owner.pump();
+            self.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read data-control selection");
+        buf
     }
 
     /// Read the current data-control selection in `mime`, driving `owner`

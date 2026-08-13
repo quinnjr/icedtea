@@ -32,6 +32,26 @@ fn data_control_set_reaches_a_focused_wl_data_device_client() {
     assert_eq!(got, b"via-data-control");
 }
 
+/// The M4.6 daemon's actual path: a regular app copies via `wl_data_device`
+/// and a data-control client (a clipboard manager) sees the same bytes. The
+/// setter needs the injected keyboard's serial.
+#[test]
+fn a_wl_data_device_copy_is_seen_by_a_data_control_reader() {
+    let comp = Compositor::spawn();
+    let mut _vk = VirtualKeyboardClient::spawn(&comp.socket);
+
+    let mut app = TestClient::map_toplevel(&comp.socket, "app", "app");
+    assert!(app.wait_until(|c| c.has_input_serial()), "app got no serial");
+    app.set_selection_text("text/plain;charset=utf-8", b"copied-by-app");
+
+    let mut manager = DataControlClient::spawn(&comp.socket);
+    assert!(manager.wait_until(|c| c.has_offer()), "manager saw no offer");
+    assert_eq!(
+        manager.read_from_wl_data_device_owner(&mut app, "text/plain;charset=utf-8"),
+        b"copied-by-app"
+    );
+}
+
 /// The focus/serial gate: with no keyboard on the seat, a mapped client has no
 /// input serial, so its `wl_data_device.set_selection` is rejected by wlroots
 /// and the existing clipboard is untouched. This is the mechanism that stops an
