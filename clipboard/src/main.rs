@@ -5,13 +5,10 @@
 //! like the compositor's D-Bus service: the Wayland event loop runs on the main
 //! thread and the zbus service on its own, message-passing only.
 
-mod history;
-mod manager;
-mod service;
-
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
+use icedtea_clipboard::{history, manager, service};
 use wayland_client::Connection;
 
 /// Max unpinned history entries kept.

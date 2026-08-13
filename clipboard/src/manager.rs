@@ -30,6 +30,9 @@ pub enum Command {
     Pin(u64, bool),
     Remove(u64),
     Clear,
+    /// Stop the loop and disconnect cleanly (used by tests to tear the daemon
+    /// down before the compositor).
+    Quit,
 }
 
 /// Mimes we capture, most-preferred first.
@@ -127,6 +130,8 @@ impl App {
             Command::Pin(id, on) => self.history.pin(id, on),
             Command::Remove(id) => self.history.remove(id),
             Command::Clear => self.history.clear(),
+            // Intercepted by the run loop before reaching here.
+            Command::Quit => Change::Unchanged,
         };
         if change == Change::Changed {
             self.publish();
@@ -322,6 +327,10 @@ pub fn run(
             // Drain the wake byte(s) and every queued command.
             drain_wake(&wake_read);
             while let Ok(cmd) = commands.try_recv() {
+                if matches!(cmd, Command::Quit) {
+                    let _ = conn.flush();
+                    return;
+                }
                 app.handle(cmd, &qh, &conn);
             }
         }

@@ -14,6 +14,6 @@ rustix = { version = "1", features = ["event"] }
 tracing.workspace = true
 
 [dev-dependencies]
-icedtea-compositor = { path = "../compositor" }
-icedtea-config = { path = "../config" }
-wlr = "0.20.15"
+icedtea-harness = { path = "../harness" }
+wayland-client = "0.31"
+crossbeam-channel.workspace = true
