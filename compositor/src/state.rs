@@ -1341,18 +1341,22 @@ impl State {
     /// no output *at all* when it was announced (review finding M5) the
     /// moment any output exists.
     ///
-    /// Re-resolution uses [`Self::output_for_pointer`] (itself falling
-    /// back to the lowest surviving index) -- the tail of
-    /// `new_layer_surface`'s own fallback chain, minus the
-    /// `output_id`/`output_ids` legs, which need a live `LayerSurface`
-    /// handle this call site does not have.
+    /// Re-resolution is per-entry (task 8, M2): each orphaned entry's own
+    /// last-configured placement's frame center is tested against every
+    /// surviving output's box, falling back to the lowest surviving index
+    /// only when the entry has no placement yet (`last_configured: None`)
+    /// or its center hits none of them -- not a single
+    /// `output_for_pointer`-derived survivor applied to the whole batch,
+    /// which let an unrelated commit's pointer position decide where every
+    /// orphaned surface (however placed) landed.
     ///
-    /// A no-op, correctly, when no output exists at all:
-    /// `output_for_pointer` returns `None`, and every orphaned entry is
-    /// left exactly where it was for the next call (the next `new_output`)
-    /// to try again -- which is what makes the "no output at all when
-    /// announced" case self-heal instead of hanging its client forever
-    /// (review finding M5).
+    /// A no-op, correctly, when no output exists at all: every entry's
+    /// resolution falls through to the lowest-index fallback, which itself
+    /// yields nothing, and every orphaned entry is left exactly where it
+    /// was for the next call (the next `new_output`) to try again --
+    /// which is what makes the "no output at all when announced" case
+    /// self-heal instead of hanging its client forever (review finding
+    /// M5).
     ///
     /// Called from both `OutputHandler::new_output` (a fresh or returning
     /// output may be exactly what an orphaned entry was waiting for) and
@@ -1432,12 +1436,20 @@ impl State {
     /// Flipping to `true` while mapped and nothing else already holds
     /// layer focus (`layer_holds_keyboard_focus`, mirroring the guard
     /// `sync_seat_focus` itself reads) takes it: `layer_focus` is recorded
-    /// unconditionally, the same "record intent, then best-effort the wire
-    /// action" split `configure_layer` already uses for
-    /// `last_configured` -- every unit test in this file runs with no
-    /// `wlr::Runtime` attached, so gating the bookkeeping behind
-    /// `focus_layer_keyboard`'s own `Option` (as `layer_surface_mapped`
-    /// does, where a live runtime is assumed) would make this
+    /// success-gated on the actual grab, exactly like
+    /// `layer_surface_mapped`'s own take-focus branch -- an unconditional
+    /// record ahead of the runtime call (this method's first cut) is the
+    /// J3/Important-1 split-brain class reopened: a legitimate
+    /// `focus_layer_keyboard` miss (no seat, a stale id, a null surface,
+    /// or wlroots' own surface-mapped flag disagreeing with
+    /// `LayerEntry::mapped` at commit time) would leave `layer_focus`
+    /// claiming a focus the seat never actually held, and
+    /// `sync_seat_focus`'s guard would then refuse every toplevel the
+    /// keyboard with no self-heal until this id unmapped, was destroyed,
+    /// or flipped `interactive` back off. With no `wlr::Runtime` attached
+    /// (every unit test in this file), the grab is treated as taken --
+    /// gating on `focus_layer_keyboard`'s own `Option` unconditionally (as
+    /// if a live runtime were always present) would make this
     /// unobservable outside a running compositor.
     ///
     /// Flipping to `false` while this surface held focus releases it and
@@ -1450,10 +1462,30 @@ impl State {
             if !mapped || layer_holds_keyboard_focus(self.layer_focus, &self.layers) {
                 return;
             }
-            self.layer_focus = Some(id);
-            if let Some(runtime) = self.wayland.runtime()
-                && runtime.focus_layer_keyboard(id).is_none()
-            {
+            // Review finding HIGH (task 8 re-review): `layer_focus` used to
+            // be recorded unconditionally, ahead of the runtime call --
+            // when `focus_layer_keyboard` legitimately misses (no seat, a
+            // stale id, a null surface, or wlroots' own surface-mapped
+            // flag disagreeing with `LayerEntry::mapped` at commit time),
+            // the seat's *real* keyboard focus never moved, but
+            // `layer_focus` claimed it had. `layer_holds_keyboard_focus`
+            // then reported `true` and `sync_seat_focus`'s guard refused
+            // every toplevel the keyboard, with no self-heal until this id
+            // unmapped, was destroyed, or flipped `interactive` back off
+            // -- the same split-brain class J3/Important-1 already closed
+            // for map/unmap, reopened here. Success-gated exactly like
+            // `layer_surface_mapped`'s own take-focus branch: with no
+            // runtime attached (every unit test in this file), `took` is
+            // `true` so the bookkeeping stays observable without a live
+            // `wlr::Runtime`; with one attached, only an actual grab
+            // records the claim.
+            let took = match self.wayland.runtime() {
+                Some(rt) => rt.focus_layer_keyboard(id).is_some(),
+                None => true,
+            };
+            if took {
+                self.layer_focus = Some(id);
+            } else {
                 // Finding 8, errors: mirrors `layer_surface_mapped`'s own
                 // trace for the same failure -- a keyboard grab that
                 // silently didn't take used to leave no clue why a
