@@ -3,9 +3,16 @@
 //! `org.icedtea.Clipboard`. All widgets live on the GTK main thread; D-Bus runs
 //! on a worker, bridged by a glib channel.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Box as GtkBox, CssProvider, Orientation};
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
+
+use icedtea_shell::taskbar::{self, TaskbarModel};
+use icedtea_shell::wm_client::{self, WmProxy};
+use icedtea_shell::bridge;
 
 const APP_ID: &str = "org.icedtea.Shell";
 
@@ -42,5 +49,29 @@ fn build_panel(app: &Application) {
     let bar = GtkBox::new(Orientation::Horizontal, 6);
     bar.set_widget_name("bar");
     window.set_child(Some(&bar));
+
+    // The taskbar: a shared model + a WM command proxy, re-rendered on every
+    // update the worker forwards to this (the GTK main) thread.
+    let wm = match WmProxy::new() {
+        Ok(wm) => Rc::new(wm),
+        Err(err) => {
+            tracing::error!(%err, "no session bus; taskbar commands disabled");
+            window.present();
+            return;
+        }
+    };
+    let model = Rc::new(RefCell::new(TaskbarModel::default()));
+
+    let tx = {
+        let bar = bar.clone();
+        let wm = wm.clone();
+        let model = model.clone();
+        bridge::channel(move |update| {
+            model.borrow_mut().apply(update);
+            taskbar::render(&model.borrow(), &bar, &wm);
+        })
+    };
+    wm_client::spawn(tx);
+
     window.present();
 }
