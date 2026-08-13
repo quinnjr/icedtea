@@ -184,27 +184,50 @@ fn fold_exclusive_zone(mut rect: Rectangle, anchor: wlr::Anchor, exclusive: i32)
     if exclusive <= 0 {
         return rect;
     }
-    // Task 7 (N8/exclusive-edge): matches wlroots' own
-    // `wlr_layer_surface_v1_get_exclusive_edge` exactly, not merely "single
-    // edge anchored on this axis" -- the two disagree on a corner-anchored
-    // surface (e.g. `TOP | LEFT`, anchored to exactly one edge on *each*
-    // axis, not spanning either): the old `anchor.top != anchor.bottom`
-    // check folded it as if it were a full-width top panel, reserving
-    // space the surface never actually claims edge-to-edge. wlroots only
-    // assigns an exclusive edge when the surface spans *both* edges of one
-    // axis (`left && right`, or `top && bottom`) and is anchored to
-    // exactly one edge of the other axis; anything else -- including a
-    // corner anchor, or all four edges at once -- reserves nothing.
+    // Task 7 (N8/exclusive-edge), corrected post-review (2f04984's Major
+    // finding): matches wlroots' own `wlr_layer_surface_v1_get_exclusive_
+    // edge`, which is the protocol spec's own rule
+    // (`wlr-layer-shell-unstable-v1.xml`'s `set_exclusive_zone` doc,
+    // conformance-tested by WLCS's `is_positioned_to_accommodate_other_
+    // surfaces_exclusive_zone`): a positive exclusive zone is only
+    // meaningful -- reserves space at all -- for exactly two anchor
+    // shapes per axis: anchored to **one edge alone** (e.g. `ANCHOR_TOP`
+    // with no `left`/`right`), or anchored to **that edge plus both
+    // perpendicular edges** (e.g. `TOP | LEFT | RIGHT`, spanning the
+    // other axis). Anchored to only two perpendicular edges (a corner,
+    // e.g. `TOP | LEFT`), only two parallel edges (e.g. `LEFT | RIGHT`
+    // with neither `top` nor `bottom`), or all four edges: reserves
+    // nothing, same as the protocol's own "treated the same as zero"
+    // wording.
+    //
+    // `left == right` below means "both set, or both unset" -- i.e.
+    // either the perpendicular axis fully spans (the second legal shape)
+    // or is not anchored at all (the first legal shape); a corner like
+    // `TOP | LEFT` has `left=true, right=false`, `left == right` is
+    // `false`, and correctly falls through to no reservation.
+    //
+    // 2f04984 first tightened this from the pre-task-7 rule
+    // (`anchor.top != anchor.bottom`, which correctly matched single-edge
+    // but *also* wrongly matched corners) straight to requiring both
+    // perpendicular edges unconditionally -- fixing the corner
+    // over-reservation but silently dropping the single-edge-alone case
+    // to zero reservation, a real regression for the single most common
+    // panel shape (a bar anchored to one edge, spanning nothing else).
+    // No test caught it: every exclusive-zone test until this fix used
+    // `TOP | LEFT | RIGHT` (`top_panel_entry`). See
+    // `a_single_edge_only_anchor_still_reserves_its_exclusive_zone` and
+    // `a_corner_anchored_exclusive_zone_reserves_nothing`, which now both
+    // pass against this rule.
     let (left, right, top, bottom) = (anchor.left, anchor.right, anchor.top, anchor.bottom);
-    if left && right && top && !bottom {
+    if top && !bottom && (left == right) {
         rect.y = rect.y.saturating_add(exclusive);
         rect.height = rect.height.saturating_sub(exclusive).max(0);
-    } else if left && right && bottom && !top {
+    } else if bottom && !top && (left == right) {
         rect.height = rect.height.saturating_sub(exclusive).max(0);
-    } else if top && bottom && left && !right {
+    } else if left && !right && (top == bottom) {
         rect.x = rect.x.saturating_add(exclusive);
         rect.width = rect.width.saturating_sub(exclusive).max(0);
-    } else if top && bottom && right && !left {
+    } else if right && !left && (top == bottom) {
         rect.width = rect.width.saturating_sub(exclusive).max(0);
     }
     rect
@@ -6268,6 +6291,123 @@ mod tests {
             state.outputs[&0].usable,
             Rectangle { x: 0, y: 0, width: 800, height: 600 },
             "a corner anchor spans neither axis, so wlroots' own rule assigns it no exclusive edge at all"
+        );
+    }
+
+    /// Review fix (post-2f04984, Major finding): a single-edge-only anchor
+    /// -- e.g. `ANCHOR_TOP` alone, no `left`/`right` at all -- is a
+    /// distinct, spec-legal shape from both the corner case above and the
+    /// edge-plus-both-perpendicular case `top_panel_entry` already covers.
+    /// The wlr-layer-shell spec (`set_exclusive_zone`) is explicit that a
+    /// positive exclusive zone is meaningful for "one edge" *or* "an edge
+    /// and both perpendicular edges" -- both must reserve. WLCS's own
+    /// conformance test (`is_positioned_to_accommodate_other_surfaces_
+    /// exclusive_zone`) anchors `ANCHOR_TOP` alone with `exclusive_zone =
+    /// 12` and asserts the reservation happens. The realignment toward
+    /// wlroots' `get_exclusive_edge` in this same commit over-corrected:
+    /// every arm of the rewritten `fold_exclusive_zone` required *both*
+    /// perpendicular edges, so this single-edge shape fell through every
+    /// `if`/`else if` and reserved nothing -- a real, silent regression
+    /// (the corner test above and every pre-existing exclusive-zone test
+    /// use `TOP | LEFT | RIGHT`, so none of them caught it).
+    #[test]
+    fn a_single_edge_only_anchor_still_reserves_its_exclusive_zone() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        let mut top = State::new(icedtea_config::default_config(), tx.clone());
+        top.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        top.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: true, left: false, right: false, bottom: false },
+                exclusive: 12,
+                size: (0, 12),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+                margin: (0, 0, 0, 0),
+            },
+        );
+        top.arrange_layers();
+        assert_eq!(
+            top.outputs[&0].usable,
+            Rectangle { x: 0, y: 12, width: 800, height: 588 },
+            "ANCHOR_TOP alone with a positive exclusive_zone must reserve at the top (WLCS conformance shape)"
+        );
+
+        let mut bottom = State::new(icedtea_config::default_config(), tx.clone());
+        bottom.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        bottom.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: false, left: false, right: false, bottom: true },
+                exclusive: 12,
+                size: (0, 12),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+                margin: (0, 0, 0, 0),
+            },
+        );
+        bottom.arrange_layers();
+        assert_eq!(
+            bottom.outputs[&0].usable,
+            Rectangle { x: 0, y: 0, width: 800, height: 588 },
+            "ANCHOR_BOTTOM alone with a positive exclusive_zone must reserve at the bottom"
+        );
+
+        let mut left = State::new(icedtea_config::default_config(), tx.clone());
+        left.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        left.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: false, left: true, right: false, bottom: false },
+                exclusive: 12,
+                size: (12, 0),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+                margin: (0, 0, 0, 0),
+            },
+        );
+        left.arrange_layers();
+        assert_eq!(
+            left.outputs[&0].usable,
+            Rectangle { x: 12, y: 0, width: 788, height: 600 },
+            "ANCHOR_LEFT alone with a positive exclusive_zone must reserve at the left"
+        );
+
+        let mut right = State::new(icedtea_config::default_config(), tx);
+        right.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        right.layers.insert(
+            wlr::LayerSurfaceId::dangling_for_test(),
+            LayerEntry {
+                output: 0,
+                sequence: 0,
+                layer: wlr::Layer::Top,
+                anchor: wlr::Anchor { top: false, left: false, right: true, bottom: false },
+                exclusive: 12,
+                size: (12, 0),
+                interactive: false,
+                mapped: true,
+                last_configured: None,
+                margin: (0, 0, 0, 0),
+            },
+        );
+        right.arrange_layers();
+        assert_eq!(
+            right.outputs[&0].usable,
+            Rectangle { x: 0, y: 0, width: 788, height: 600 },
+            "ANCHOR_RIGHT alone with a positive exclusive_zone must reserve at the right"
         );
     }
 
