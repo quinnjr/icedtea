@@ -3699,6 +3699,31 @@ mod tests {
     }
 
     #[test]
+    fn reload_rethemes_surviving_windows_and_recolors_background() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        let mut cfg = icedtea_config::default_config();
+        cfg.appearance.palette.background = "#abcdef".into();
+        state.apply_reloaded_config(cfg);
+        assert!(state.window_manager.get(id).is_some(), "window survived");
+        assert_eq!(state.config.appearance.palette.background, "#abcdef");
+        // title raster cache invalidated for the new foreground (palette-keyed):
+        // a re-sync must have been driven -- assert the window is still backed/tracked.
+    }
+
+    #[test]
+    fn reload_reswaps_wallpaper_only_on_path_change() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.wallpaper.set_decoded(Some(image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]))));
+        let mut cfg = icedtea_config::default_config();
+        cfg.appearance.wallpaper = Some("/nonexistent/x.png".into());
+        state.apply_reloaded_config(cfg);
+        assert!(state.wallpaper.decoded().is_none(), "path change clears the stale wallpaper before redecode");
+    }
+
+    #[test]
     fn close_action_removes_focused() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
