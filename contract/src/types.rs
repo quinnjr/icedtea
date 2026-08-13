@@ -57,6 +57,7 @@ pub struct WindowUpdate {
     pub minimized: Option<bool>,
     pub fullscreen: Option<bool>,
     pub focused: Option<bool>,
+    pub mapped: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -124,7 +125,7 @@ mod tests {
     #[test]
     fn wire_signatures_are_locked() {
         use zvariant::Type;
-        assert_eq!(WindowUpdate::SIGNATURE.to_string(), "(asa(iiii)auabababab)");
+        assert_eq!(WindowUpdate::SIGNATURE.to_string(), "(asa(iiii)auababababab)");
         assert_eq!(Appearance::SIGNATURE.to_string(), "(siii(sss)as)");
         assert_eq!(WindowId::SIGNATURE.to_string(), "u");
         assert_eq!(Rectangle::SIGNATURE.to_string(), "(iiii)");
@@ -158,6 +159,7 @@ mod tests {
         assert!(u.title.is_none() && u.geometry.is_none() && u.workspace.is_none());
         assert!(u.maximized.is_none() && u.minimized.is_none() && u.fullscreen.is_none());
         assert!(u.focused.is_none());
+        assert!(u.mapped.is_none());
     }
 
     #[test]
@@ -171,6 +173,7 @@ mod tests {
             minimized: Some(false),
             fullscreen: Some(true),
             focused: Some(false),
+            mapped: Some(true),
         };
         let none = WindowUpdate::default();
 

@@ -182,7 +182,11 @@ impl WindowManager {
 
     pub fn set_client_decorations_requested(&mut self, id: WindowId, value: Option<bool>) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
+        if w.client_decorations_requested == value {
+            return None;
+        }
         w.client_decorations_requested = value;
+        self.emit(Event::WindowUpdated { id, update: WindowUpdate::default() });
         Some(())
     }
 
@@ -204,7 +208,7 @@ impl WindowManager {
             return None;
         }
         w.mapped = mapped;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate::default() });
+        self.emit(Event::WindowUpdated { id, update: WindowUpdate { mapped: Some(mapped), ..Default::default() } });
         Some(())
     }
 
@@ -855,5 +859,35 @@ mod tests {
         let a = m.add_window("a", "a", 1, GEO);
         m.set_mapped(a, false).unwrap();
         assert_eq!(m.focus(a), None, "an unmapped window must never gain focus");
+    }
+
+    // --- Task 9: D-Bus observability of mapped state + decoration mode ---
+
+    /// A decoration-mode change is a new sanctioned `WindowUpdated` emission:
+    /// exactly one on an actual value change, none on a no-op repeat.
+    #[test]
+    fn set_client_decorations_requested_emits_one_window_updated() {
+        let mut m = WindowManager::new(vec!["1".into()]);
+        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let before = m.seq();
+        m.set_client_decorations_requested(a, Some(true));
+        assert_eq!(m.seq(), before + 1, "exactly one emission");
+        // and a no-op (unchanged value) emits nothing:
+        let mid = m.seq();
+        m.set_client_decorations_requested(a, Some(true));
+        assert_eq!(m.seq(), mid, "unchanged value is silent");
+    }
+
+    /// `set_mapped`'s existing emission now carries the new `mapped` field.
+    #[test]
+    fn set_mapped_payload_carries_mapped() {
+        let mut m = WindowManager::new(vec!["1".into()]);
+        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        m.pending_events.clear(); // clear the add's events
+        m.set_mapped(a, false);
+        let carried = m.pending_events.iter().any(
+            |e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.mapped == Some(false)),
+        );
+        assert!(carried, "set_mapped's emission must carry update.mapped == Some(false)");
     }
 }
