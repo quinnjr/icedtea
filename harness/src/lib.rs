@@ -39,7 +39,7 @@ use icedtea_contract::{Event, SeqEvent, Snapshot};
 
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop, event_created_child,
@@ -60,6 +60,9 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_source_v1,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::virtual_pointer::v1::client::{
+    zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
+};
 
 /// How long any "wait for the compositor to do a thing" helper waits before
 /// declaring the harness broken.
@@ -370,6 +373,11 @@ struct ClientState {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     virtual_keyboard_manager:
         Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
+    /// Lets a test spawn a [`VirtualPointerClient`] and mint pointer motion
+    /// and button events without a real input device — the M4.2 drag-and-drop
+    /// grab serial's source.
+    virtual_pointer_manager:
+        Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
     data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     /// This client's data device, created from the manager + seat during
     /// connect so it is listening before the client is ever focused.
@@ -453,6 +461,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 "zwp_virtual_keyboard_manager_v1" => {
                     state.virtual_keyboard_manager =
                         Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwlr_virtual_pointer_manager_v1" => {
+                    state.virtual_pointer_manager =
+                        Some(registry.bind(name, version.min(2), qh, ()));
                 }
                 "zwp_primary_selection_device_manager_v1" => {
                     state.primary_manager = Some(registry.bind(name, version.min(1), qh, ()));
@@ -788,6 +800,8 @@ delegate_noop!(ClientState: ignore wl_data_device_manager::WlDataDeviceManager);
 delegate_noop!(ClientState: ignore zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1);
 delegate_noop!(ClientState: ignore zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1);
 delegate_noop!(ClientState: ignore zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
+delegate_noop!(ClientState: ignore zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1);
+delegate_noop!(ClientState: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
 delegate_noop!(ClientState: ignore zwlr_data_control_manager_v1::ZwlrDataControlManagerV1);
 delegate_noop!(ClientState: ignore wl_compositor::WlCompositor);
 delegate_noop!(ClientState: ignore wl_surface::WlSurface);
@@ -1512,6 +1526,76 @@ impl VirtualKeyboardClient {
         queue.roundtrip(&mut state).expect("vk roundtrip");
         queue.roundtrip(&mut state).expect("vk settle");
         VirtualKeyboardClient { conn, queue, state, _vk: vk }
+    }
+
+    /// One roundtrip, to keep the injector responsive during a test.
+    pub fn pump(&mut self) {
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+/// A `zwlr_virtual_pointer_manager_v1` client — an on-screen-keyboard-style
+/// pointer injector. It mints the pointer motion and button events (and thus
+/// the serial) a drag-and-drop grab needs on a headless seat that has no real
+/// pointer device.
+pub struct VirtualPointerClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    state: ClientState,
+    vp: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+    /// Monotonic millisecond timestamp handed to every request; the
+    /// compositor only cares that it does not go backwards, so a simple
+    /// incrementing counter is fine for tests.
+    time: u32,
+}
+
+impl VirtualPointerClient {
+    /// Connect, create a virtual pointer on the seat, and settle. Panics if
+    /// the compositor did not advertise `zwlr_virtual_pointer_manager_v1`.
+    pub fn spawn(socket: &str) -> VirtualPointerClient {
+        let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+        let manager = state
+            .virtual_pointer_manager
+            .clone()
+            .expect("compositor did not advertise zwlr_virtual_pointer_manager_v1");
+        let seat = state.seat.clone();
+        let vp = manager.create_virtual_pointer(seat.as_ref(), &qh, ());
+        conn.flush().expect("flush vp create");
+        // Two roundtrips so the compositor processes new_virtual_pointer and
+        // the seat's capability change is on the wire before callers connect.
+        queue.roundtrip(&mut state).expect("vp roundtrip");
+        queue.roundtrip(&mut state).expect("vp settle");
+        VirtualPointerClient { conn, queue, state, vp, time: 0 }
+    }
+
+    /// Next monotonic timestamp for a request.
+    fn next_time(&mut self) -> u32 {
+        self.time = self.time.saturating_add(1);
+        self.time
+    }
+
+    /// Move the pointer to an absolute position in a `x_extent` by `y_extent`
+    /// coordinate space + flush.
+    pub fn motion_absolute(&mut self, x: f64, y: f64, x_extent: u32, y_extent: u32) {
+        let time = self.next_time();
+        self.vp.motion_absolute(time, x as u32, y as u32, x_extent, y_extent);
+        self.conn.flush().expect("flush motion_absolute");
+    }
+
+    /// Press or release a button (Linux input-event code, e.g. `0x110` for
+    /// left) + flush.
+    pub fn button(&mut self, button: u32, pressed: bool) {
+        let time = self.next_time();
+        let state =
+            if pressed { wl_pointer::ButtonState::Pressed } else { wl_pointer::ButtonState::Released };
+        self.vp.button(time, button, state);
+        self.conn.flush().expect("flush button");
+    }
+
+    /// End the current event sequence + flush.
+    pub fn frame(&mut self) {
+        self.vp.frame();
+        self.conn.flush().expect("flush frame");
     }
 
     /// One roundtrip, to keep the injector responsive during a test.

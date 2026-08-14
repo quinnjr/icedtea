@@ -12,7 +12,9 @@
 
 use icedtea_contract::Event;
 
-use icedtea_harness::{Compositor, DataControlClient, TestClient, VirtualKeyboardClient};
+use icedtea_harness::{
+    Compositor, DataControlClient, TestClient, VirtualKeyboardClient, VirtualPointerClient,
+};
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
 /// client as an offer — the delivery path a clipboard manager's re-paste uses.
@@ -118,6 +120,22 @@ fn virtual_pointer_manager_global_is_advertised() {
         globals.iter().any(|g| g == "zwlr_virtual_pointer_manager_v1"),
         "virtual-pointer manager global missing; saw {globals:?}"
     );
+}
+
+/// A client can bind `zwlr_virtual_pointer_manager_v1` and create a virtual
+/// pointer, then inject motion/button/frame requests without a protocol
+/// error — the M4.2 drag-and-drop grab serial's source. Full drag coverage
+/// (Task 7) builds on this.
+#[test]
+fn a_client_can_bind_the_virtual_pointer() {
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    vp.motion_absolute(10.0, 10.0, 200, 200);
+    vp.button(0x110, true);
+    vp.frame();
+    vp.button(0x110, false);
+    vp.frame();
+    vp.pump();
 }
 
 /// The harness can bind the data-device machinery and create a device from
