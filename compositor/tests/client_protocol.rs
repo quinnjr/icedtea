@@ -796,3 +796,131 @@ fn a_touch_drag_transfers_between_two_clients() {
     b.detach();
 }
 
+/// Negative counterpart to [`a_pointer_drag_transfers_between_two_clients`]:
+/// the exact same setup (A maps, is briefly maximized to discover the
+/// output extent, unmaximizes, and mints a REAL grab serial by pressing
+/// over its own surface), but `start_drag` is called with a bogus serial
+/// the compositor never issued. Task 2's
+/// `wlr_seat_validate_pointer_grab_serial` gate must refuse it, so B --
+/// mapped and positioned under the pointer exactly as in the positive
+/// test, i.e. just as drag-capable as a destination that *would* receive
+/// the transfer -- must receive neither `wl_data_device.enter` nor
+/// `.drop`. Because everything but the serial matches the positive test,
+/// "no drag" here isolates the serial gate as the cause rather than a
+/// broken setup.
+///
+/// The bogus serial is the real one plus a large offset rather than a bare
+/// `0`: this compositor hands out serials from the same `wl_display`
+/// counter already ticked past 0 by surface/xdg_surface ids and prior
+/// configures before this test's press even happens, so `0` is not
+/// guaranteed unissued. `real_serial + 1_000_000` is -- the counter cannot
+/// advance that far within one test run.
+///
+/// wlroots 0.20's actual behavior for an invalid `start_drag` serial,
+/// determined empirically (a probe build logged the post-request
+/// roundtrip's `Result` and `Connection::protocol_error()`): it silently
+/// no-ops rather than raising a client protocol error. The roundtrip
+/// inside [`TestClient::start_drag_text`] returns `Ok`, `protocol_error()`
+/// stays `None`, and A's connection survives -- so A is detached
+/// normally at the end of this test, same as the positive test. Either
+/// outcome (silent no-op or a connection-killing protocol error) would
+/// have satisfied the gate this test pins; what it requires
+/// unconditionally is that B -- fully set up to receive the drag -- gets
+/// nothing, which is the only way to avoid a false pass from a client
+/// that merely fell over.
+#[test]
+fn a_drag_with_an_invalid_grab_serial_is_refused() {
+    /// `xdg_toplevel.state.maximized`.
+    const MAXIMIZED: u32 = 1;
+    /// `BTN_LEFT` from `linux/input-event-codes.h`.
+    const BTN_LEFT: u32 = 0x110;
+    /// Offset added to a real, freshly-minted serial to produce one the
+    /// compositor provably never issued.
+    const BOGUS_SERIAL_OFFSET: u32 = 1_000_000;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+
+    // A maps; this is both the drag source and how the output's size gets
+    // discovered (see the function doc).
+    let mut a = TestClient::map_toplevel(&comp.socket, "src.app", "src");
+    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "src.app"));
+    let Event::WindowOpened(a_info) = opened else { unreachable!() };
+
+    let configures = a.configure_count();
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, true));
+    assert!(
+        a.wait_until(|c| c.configure_count() > configures && c.states().contains(&MAXIMIZED)),
+        "A never maximized"
+    );
+    let output = comp.snapshot().windows[0].geometry;
+    let (x_extent, y_extent) = (output.width as u32, output.height as u32);
+    assert!(x_extent > 0 && y_extent > 0, "output geometry must be real, got {output:?}");
+
+    let configures = a.configure_count();
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, false));
+    assert!(
+        a.wait_until(|c| c.configure_count() > configures && !c.states().contains(&MAXIMIZED)),
+        "A never unmaximized"
+    );
+
+    // A's real (unmaximized) geometry -- a point inside it is the press
+    // target.
+    let a_geo = comp.snapshot().windows[0].geometry;
+    let (ax, ay) = (
+        (a_geo.x + a_geo.width / 2) as f64,
+        (a_geo.y + a_geo.height / 2) as f64,
+    );
+
+    // Move the pointer over A and press to mint a REAL grab serial for A --
+    // proof the setup is otherwise sound, since this same serial is exactly
+    // what the positive test uses to succeed.
+    vp.motion_absolute(ax, ay, x_extent, y_extent);
+    vp.frame();
+    vp.button(BTN_LEFT, true);
+    vp.frame();
+    assert!(a.wait_until(|c| c.last_pointer_serial().is_some()), "A never got a pointer serial");
+
+    let real_serial = a.last_pointer_serial().expect("just asserted this is Some");
+    let bogus_serial = real_serial + BOGUS_SERIAL_OFFSET;
+    a.start_drag_text("text/plain;charset=utf-8", b"dragged", bogus_serial);
+
+    // B maps after the (refused) drag attempt -- same ordering as the
+    // positive test, so B is exactly as reachable as it would be had the
+    // drag actually succeeded.
+    let mut b = TestClient::map_toplevel(&comp.socket, "dst.app", "dst");
+    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+    let b_geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == "dst.app")
+        .expect("B must be in the model once mapped")
+        .geometry;
+    let (bx, by) = (
+        (b_geo.x + b_geo.width / 2) as f64,
+        (b_geo.y + b_geo.height / 2) as f64,
+    );
+
+    // Move over B and release -- the identical motion+release the positive
+    // test uses to complete a drop. If the serial gate had done nothing,
+    // this is the drop that would land.
+    vp.motion_absolute(bx, by, x_extent, y_extent);
+    vp.frame();
+    assert!(
+        !b.wait_until(|c| c.has_drag_offer()),
+        "the serial gate must refuse the drag, but B received a drag enter anyway"
+    );
+    b.pump();
+    vp.button(BTN_LEFT, false);
+    vp.frame();
+    assert!(
+        !b.wait_until(|c| c.got_drop()),
+        "the serial gate must refuse the drag, but B received a drop anyway"
+    );
+
+    a.detach();
+    b.detach();
+}
+
