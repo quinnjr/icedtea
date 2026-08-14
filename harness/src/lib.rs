@@ -199,6 +199,11 @@ impl Compositor {
             runtime
                 .create_virtual_keyboard_manager(&display)
                 .expect("zwp_virtual_keyboard_manager_v1");
+            // Same "harness cannot degrade" tone: the DnD tests inject
+            // pointer motion/buttons and would have no manager to bind.
+            runtime
+                .create_virtual_pointer_manager(&display)
+                .expect("zwlr_virtual_pointer_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
 
             // `state` is declared after `display`/`runtime`/`backend` so that

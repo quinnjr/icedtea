@@ -108,6 +108,18 @@ fn selection_globals_are_advertised() {
     );
 }
 
+/// M4.2 adds the virtual-pointer manager global so DnD test harnesses (and
+/// on-screen-keyboard-style input bridges) can inject pointer motion/buttons.
+#[test]
+fn virtual_pointer_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwlr_virtual_pointer_manager_v1"),
+        "virtual-pointer manager global missing; saw {globals:?}"
+    );
+}
+
 /// The harness can bind the data-device machinery and create a device from
 /// the seat — the foundation the clipboard round-trip stands on.
 #[test]
