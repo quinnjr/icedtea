@@ -40,6 +40,7 @@ use icedtea_contract::{Event, SeqEvent, Snapshot};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
     wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_touch,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop, event_created_child,
@@ -208,6 +209,16 @@ impl Compositor {
                 .create_virtual_pointer_manager(&display)
                 .expect("zwlr_virtual_pointer_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
+            // Test-only: makes the seat advertise the touch capability so
+            // headless clients can bind `wl_touch` and injected touch
+            // points are accepted. Harness-only -- the real
+            // `compositor/src/lib.rs` boot must NOT call this. Must come
+            // AFTER `create_seat`: that call does not itself trigger a
+            // capability recompute, so calling this before the seat exists
+            // sets the flag but its own immediate recompute is a no-op (no
+            // seat yet) and nothing re-triggers one afterward -- the seat
+            // would never actually advertise touch.
+            runtime.enable_test_touch();
 
             // `state` is declared after `display`/`runtime`/`backend` so that
             // ordinary end-of-scope drop order drops it first: `attach` hands
@@ -267,6 +278,33 @@ impl Compositor {
         reply_rx
             .recv_timeout(TIMEOUT)
             .expect("compositor never answered GetState")
+    }
+
+    /// Synthesize a touch-down at `(x, y)` for touch point `id` on the
+    /// compositor thread, via `wlr::Runtime::inject_touch_down`. Returns the
+    /// grab serial it minted, or `None` if there was no seat or no surface
+    /// under the point. Blocks on the reply so the injection has actually
+    /// run before this returns -- see `DbCommand::InjectTouchDown`'s doc.
+    pub fn inject_touch_down(&self, x: f64, y: f64, id: i32, time_msec: u32) -> Option<u32> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InjectTouchDown { x, y, id, time_msec, reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchDown")
+    }
+
+    /// Synthesize a touch-motion to `(x, y)` for touch point `id`. Blocks on
+    /// the reply -- see [`Self::inject_touch_down`]'s doc.
+    pub fn inject_touch_motion(&self, x: f64, y: f64, id: i32, time_msec: u32) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InjectTouchMotion { x, y, id, time_msec, reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchMotion");
+    }
+
+    /// Synthesize a touch-up for touch point `id`. Blocks on the reply --
+    /// see [`Self::inject_touch_down`]'s doc.
+    pub fn inject_touch_up(&self, id: i32, time_msec: u32) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InjectTouchUp { id, time_msec, reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchUp");
     }
 
     /// Block until an event matching `pred` arrives; panics on timeout.
@@ -439,6 +477,16 @@ struct ClientState {
     dnd_offer: Option<wl_data_offer::WlDataOffer>,
     /// Whether `wl_data_device.drop` has arrived for the current drag.
     dropped: bool,
+
+    // --- touch drag-and-drop (M4.2) ---
+    /// This client's touch object, created when the seat advertises the
+    /// touch capability -- mirrors `pointer`/`keyboard` above. The
+    /// destination side of a touch drag learns about it entirely through
+    /// `wl_data_device`, never through this, so its events are unused
+    /// (`delegate_noop!` below); it only needs to exist so `get_touch` is
+    /// gated on the capability rather than called unconditionally, which
+    /// is a fatal protocol error on a seat that has not advertised touch.
+    touch: Option<wl_touch::WlTouch>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
@@ -772,9 +820,17 @@ impl Dispatch<wl_seat::WlSeat, ()> for ClientState {
             if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
                 state.pointer = Some(seat.get_pointer(qh, ()));
             }
+            // Gated the same way -- an unconditional `get_touch` is a fatal
+            // `wl_seat.get_touch called when no touch capability` protocol
+            // error on a seat that has not (yet) advertised touch.
+            if caps.contains(wl_seat::Capability::Touch) && state.touch.is_none() {
+                state.touch = Some(seat.get_touch(qh, ()));
+            }
         }
     }
 }
+
+delegate_noop!(ClientState: ignore wl_touch::WlTouch);
 
 impl Dispatch<wl_pointer::WlPointer, ()> for ClientState {
     fn event(

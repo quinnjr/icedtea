@@ -736,3 +736,63 @@ fn a_pointer_drag_transfers_between_two_clients() {
     b.detach();
 }
 
+/// Same keystone as [`a_pointer_drag_transfers_between_two_clients`], driven
+/// by touch instead: `wlr::Runtime::inject_touch_down` (via
+/// [`Compositor::inject_touch_down`]) mints the grab serial directly --
+/// there is no client-side touch listener to read a serial off of, unlike
+/// the pointer path's `wl_pointer::Event::Button`.
+///
+/// Coordinates are real scene coordinates (not a normalized extent like the
+/// virtual-pointer protocol's `motion_absolute`), so no maximize-then-read
+/// dance is needed to discover the output size -- each window's own mapped
+/// geometry from `comp.snapshot()` is enough.
+#[test]
+fn a_touch_drag_transfers_between_two_clients() {
+    let comp = Compositor::spawn();
+
+    // A maps; this is both the drag source and where the touch-down lands.
+    let mut a = TestClient::map_toplevel(&comp.socket, "src.app", "src");
+    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "src.app"));
+    let Event::WindowOpened(_a_info) = opened else { unreachable!() };
+
+    let a_geo = comp.snapshot().windows[0].geometry;
+    let (ax, ay) = ((a_geo.x + a_geo.width / 2) as f64, (a_geo.y + a_geo.height / 2) as f64);
+
+    // Touch down over A mints the touch grab serial directly.
+    let serial = comp.inject_touch_down(ax, ay, 0, 1);
+    assert!(serial.is_some(), "touch-down over A never minted a grab serial");
+    a.start_drag_text("text/plain;charset=utf-8", b"dragged", serial.unwrap());
+
+    // B maps after the drag has started -- same ordering as the pointer test.
+    let mut b = TestClient::map_toplevel(&comp.socket, "dst.app", "dst");
+    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+    let b_geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == "dst.app")
+        .expect("B must be in the model once mapped")
+        .geometry;
+    let (bx, by) = ((b_geo.x + b_geo.width / 2) as f64, (b_geo.y + b_geo.height / 2) as f64);
+
+    // Move the touch point over B and lift to drop.
+    comp.inject_touch_motion(bx, by, 0, 2);
+    assert!(b.wait_until(|c| c.has_drag_offer()), "destination never got the drag enter");
+    // Same flush gotcha as the pointer test: `wait_until` can return right
+    // after dispatching the event whose handler just queued B's
+    // `accept`/`set_actions` requests -- pump once more so those flush
+    // before the touch-up ends the drag.
+    b.pump();
+    comp.inject_touch_up(0, 3);
+    assert!(b.wait_until(|c| c.got_drop()), "destination never got the drop");
+
+    assert_eq!(
+        icedtea_harness::read_drag_offer(&mut b, &mut a, "text/plain;charset=utf-8"),
+        b"dragged"
+    );
+
+    a.detach();
+    b.detach();
+}
+
