@@ -634,3 +634,105 @@ fn a_remapped_layer_panel_is_configured_again_and_re_carves_the_workspace() {
     win.detach();
 }
 
+/// The M4.2 keystone: a pointer-driven drag transfers a `text/plain` payload
+/// from one client to another, byte for byte, entirely through an injected
+/// virtual pointer -- no shortcut through `set_selection`.
+///
+/// Coordinates are resolved empirically rather than assumed: the virtual
+/// pointer's `motion_absolute` extent is the *output's* size, which this
+/// headless backend never publishes directly, so A is briefly maximized to
+/// read it off `comp.snapshot()` (maximize sets a window's geometry to
+/// exactly the output geometry -- `state.rs`'s own maximize tests assert
+/// this), then unmaximized back to its normal placement before the drag
+/// starts. Both windows' click points come from their real snapshot
+/// geometry, not a guessed constant.
+#[test]
+fn a_pointer_drag_transfers_between_two_clients() {
+    /// `xdg_toplevel.state.maximized`.
+    const MAXIMIZED: u32 = 1;
+    /// `BTN_LEFT` from `linux/input-event-codes.h`.
+    const BTN_LEFT: u32 = 0x110;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+
+    // A maps; this is both the drag source and how the output's size gets
+    // discovered (see the function doc).
+    let mut a = TestClient::map_toplevel(&comp.socket, "src.app", "src");
+    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "src.app"));
+    let Event::WindowOpened(a_info) = opened else { unreachable!() };
+
+    let configures = a.configure_count();
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, true));
+    assert!(
+        a.wait_until(|c| c.configure_count() > configures && c.states().contains(&MAXIMIZED)),
+        "A never maximized"
+    );
+    let output = comp.snapshot().windows[0].geometry;
+    let (x_extent, y_extent) = (output.width as u32, output.height as u32);
+    assert!(x_extent > 0 && y_extent > 0, "output geometry must be real, got {output:?}");
+
+    let configures = a.configure_count();
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, false));
+    assert!(
+        a.wait_until(|c| c.configure_count() > configures && !c.states().contains(&MAXIMIZED)),
+        "A never unmaximized"
+    );
+
+    // A's real (unmaximized) geometry -- a point inside it is the press
+    // target.
+    let a_geo = comp.snapshot().windows[0].geometry;
+    let (ax, ay) = (
+        (a_geo.x + a_geo.width / 2) as f64,
+        (a_geo.y + a_geo.height / 2) as f64,
+    );
+
+    // Move the pointer over A and press to mint a grab serial for A.
+    vp.motion_absolute(ax, ay, x_extent, y_extent);
+    vp.frame();
+    vp.button(BTN_LEFT, true);
+    vp.frame();
+    assert!(a.wait_until(|c| c.last_pointer_serial().is_some()), "A never got a pointer serial");
+
+    let serial = a.last_pointer_serial().expect("just asserted this is Some");
+    a.start_drag_text("text/plain;charset=utf-8", b"dragged", serial);
+
+    // B maps after the drag has started -- exactly the skeleton's ordering.
+    let mut b = TestClient::map_toplevel(&comp.socket, "dst.app", "dst");
+    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+    let b_geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == "dst.app")
+        .expect("B must be in the model once mapped")
+        .geometry;
+    let (bx, by) = (
+        (b_geo.x + b_geo.width / 2) as f64,
+        (b_geo.y + b_geo.height / 2) as f64,
+    );
+
+    // Move over B and release to drop.
+    vp.motion_absolute(bx, by, x_extent, y_extent);
+    vp.frame();
+    assert!(b.wait_until(|c| c.has_drag_offer()), "destination never got the drag enter");
+    // `wait_until` returns the moment its predicate holds, which can be
+    // right after dispatching the very event whose handler just queued
+    // B's `accept`/`set_actions` requests -- those sit unflushed until the
+    // next flush. One more pump sends them and confirms the compositor has
+    // seen them before the button release ends the drag.
+    b.pump();
+    vp.button(BTN_LEFT, false);
+    vp.frame();
+    assert!(b.wait_until(|c| c.got_drop()), "destination never got the drop");
+
+    assert_eq!(
+        icedtea_harness::read_drag_offer(&mut b, &mut a, "text/plain;charset=utf-8"),
+        b"dragged"
+    );
+
+    a.detach();
+    b.detach();
+}
+
