@@ -12,6 +12,7 @@ zbus.workspace = true
 async-channel = "2"
 futures-util = "0.3"
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }

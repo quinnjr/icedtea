@@ -1278,6 +1278,7 @@ dependencies = [
  "icedtea-contract",
  "icedtea-harness",
  "tracing",
+ "tracing-subscriber",
  "wayland-client",
  "zbus",
 ]

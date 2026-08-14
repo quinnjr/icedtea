@@ -22,6 +22,12 @@ use icedtea_shell::wm_client::{self, WmCommands, WmProxy};
 const APP_ID: &str = "org.icedtea.Shell";
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| load_css());
     app.connect_activate(build_panel);
@@ -47,13 +53,22 @@ fn build_panel(app: &Application) {
     window.init_layer_shell();
     window.set_layer(Layer::Top);
     window.auto_exclusive_zone_enable();
-    for edge in [Edge::Left, Edge::Right, Edge::Bottom] {
+    // Anchored to the top edge (plus left/right for full width). Top rather
+    // than bottom because a bottom bar lands below the visible area on displays
+    // whose viewport is shorter than the reported output (e.g. a VM console).
+    for edge in [Edge::Left, Edge::Right, Edge::Top] {
         window.set_anchor(edge, true);
     }
 
     let bar = GtkBox::new(Orientation::Horizontal, 6);
     bar.set_widget_name("bar");
+    // A layer surface anchored left/right/top takes its width from the
+    // compositor but its height from content; force a definite, visible height
+    // and initial size so it commits a real buffer (a 0-height surface never
+    // renders).
+    bar.set_size_request(-1, 28);
     window.set_child(Some(&bar));
+    window.set_default_size(800, 28);
 
     // The taskbar lives in its own box: `taskbar::render` clears and rebuilds
     // its container, so it must not own the whole bar (the clipboard button is
