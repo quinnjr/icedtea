@@ -883,7 +883,9 @@ fn a_drag_with_an_invalid_grab_serial_is_refused() {
     assert!(a.wait_until(|c| c.last_pointer_serial().is_some()), "A never got a pointer serial");
 
     let real_serial = a.last_pointer_serial().expect("just asserted this is Some");
-    let bogus_serial = real_serial + BOGUS_SERIAL_OFFSET;
+    // wrapping_add: a fresh test compositor's serial counter is nowhere near
+    // u32::MAX, but this keeps the bogus value unconditionally overflow-safe.
+    let bogus_serial = real_serial.wrapping_add(BOGUS_SERIAL_OFFSET);
     a.start_drag_text("text/plain;charset=utf-8", b"dragged", bogus_serial);
 
     // B maps after the (refused) drag attempt -- same ordering as the
