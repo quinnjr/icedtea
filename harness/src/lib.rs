@@ -39,7 +39,8 @@ use icedtea_contract::{Event, SeqEvent, Snapshot};
 
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_touch,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop, event_created_child,
@@ -60,6 +61,9 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_source_v1,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::virtual_pointer::v1::client::{
+    zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
+};
 
 /// How long any "wait for the compositor to do a thing" helper waits before
 /// declaring the harness broken.
@@ -199,7 +203,22 @@ impl Compositor {
             runtime
                 .create_virtual_keyboard_manager(&display)
                 .expect("zwp_virtual_keyboard_manager_v1");
+            // Same "harness cannot degrade" tone: the DnD tests inject
+            // pointer motion/buttons and would have no manager to bind.
+            runtime
+                .create_virtual_pointer_manager(&display)
+                .expect("zwlr_virtual_pointer_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
+            // Test-only: makes the seat advertise the touch capability so
+            // headless clients can bind `wl_touch` and injected touch
+            // points are accepted. Harness-only -- the real
+            // `compositor/src/lib.rs` boot must NOT call this. Must come
+            // AFTER `create_seat`: that call does not itself trigger a
+            // capability recompute, so calling this before the seat exists
+            // sets the flag but its own immediate recompute is a no-op (no
+            // seat yet) and nothing re-triggers one afterward -- the seat
+            // would never actually advertise touch.
+            runtime.enable_test_touch();
 
             // `state` is declared after `display`/`runtime`/`backend` so that
             // ordinary end-of-scope drop order drops it first: `attach` hands
@@ -259,6 +278,33 @@ impl Compositor {
         reply_rx
             .recv_timeout(TIMEOUT)
             .expect("compositor never answered GetState")
+    }
+
+    /// Synthesize a touch-down at `(x, y)` for touch point `id` on the
+    /// compositor thread, via `wlr::Runtime::inject_touch_down`. Returns the
+    /// grab serial it minted, or `None` if there was no seat or no surface
+    /// under the point. Blocks on the reply so the injection has actually
+    /// run before this returns -- see `DbCommand::InjectTouchDown`'s doc.
+    pub fn inject_touch_down(&self, x: f64, y: f64, id: i32, time_msec: u32) -> Option<u32> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InjectTouchDown { x, y, id, time_msec, reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchDown")
+    }
+
+    /// Synthesize a touch-motion to `(x, y)` for touch point `id`. Blocks on
+    /// the reply -- see [`Self::inject_touch_down`]'s doc.
+    pub fn inject_touch_motion(&self, x: f64, y: f64, id: i32, time_msec: u32) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InjectTouchMotion { x, y, id, time_msec, reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchMotion");
+    }
+
+    /// Synthesize a touch-up for touch point `id`. Blocks on the reply --
+    /// see [`Self::inject_touch_down`]'s doc.
+    pub fn inject_touch_up(&self, id: i32, time_msec: u32) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InjectTouchUp { id, time_msec, reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchUp");
     }
 
     /// Block until an event matching `pred` arrives; panics on timeout.
@@ -365,6 +411,11 @@ struct ClientState {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     virtual_keyboard_manager:
         Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
+    /// Lets a test spawn a [`VirtualPointerClient`] and mint pointer motion
+    /// and button events without a real input device — the M4.2 drag-and-drop
+    /// grab serial's source.
+    virtual_pointer_manager:
+        Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
     data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     /// This client's data device, created from the manager + seat during
     /// connect so it is listening before the client is ever focused.
@@ -409,6 +460,33 @@ struct ClientState {
     primary_source: Option<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1>,
     primary_offer: Option<zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1>,
     primary_mimes: Vec<String>,
+
+    // --- pointer + drag-and-drop (M4.2) ---
+    /// This client's pointer, created when the seat advertises the pointer
+    /// capability -- the source of the implicit-grab serial `start_drag`
+    /// needs. Mirrors `keyboard` above.
+    pointer: Option<wl_pointer::WlPointer>,
+    /// The last serial this client saw on `wl_pointer` (enter or button).
+    /// `start_drag`'s serial must be the *button* press that grabbed the
+    /// surface, and `button` always arrives after `enter`, so the latest
+    /// value here is always the right one to pass.
+    last_pointer_serial: Option<u32>,
+    /// The drag offer delivered on `wl_data_device.enter` while this client
+    /// is a drag-and-drop destination, or `None` before a drag has entered
+    /// (or after it has left).
+    dnd_offer: Option<wl_data_offer::WlDataOffer>,
+    /// Whether `wl_data_device.drop` has arrived for the current drag.
+    dropped: bool,
+
+    // --- touch drag-and-drop (M4.2) ---
+    /// This client's touch object, created when the seat advertises the
+    /// touch capability -- mirrors `pointer`/`keyboard` above. The
+    /// destination side of a touch drag learns about it entirely through
+    /// `wl_data_device`, never through this, so its events are unused
+    /// (`delegate_noop!` below); it only needs to exist so `get_touch` is
+    /// gated on the capability rather than called unconditionally, which
+    /// is a fatal protocol error on a seat that has not advertised touch.
+    touch: Option<wl_touch::WlTouch>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
@@ -448,6 +526,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 "zwp_virtual_keyboard_manager_v1" => {
                     state.virtual_keyboard_manager =
                         Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwlr_virtual_pointer_manager_v1" => {
+                    state.virtual_pointer_manager =
+                        Some(registry.bind(name, version.min(2), qh, ()));
                 }
                 "zwp_primary_selection_device_manager_v1" => {
                     state.primary_manager = Some(registry.bind(name, version.min(1), qh, ()));
@@ -569,12 +651,47 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for ClientState {
     ) {
         match event {
             // A new offer is being introduced; its `offer(mime)` events follow
-            // before the `selection` that names it. Reset the mime list so it
-            // reflects only this offer.
+            // before the `selection`/`enter` that names it. Reset the mime
+            // list so it reflects only this offer.
             wl_data_device::Event::DataOffer { .. } => state.offer_mimes.clear(),
             // The clipboard this client would paste from (or `None` if cleared).
             wl_data_device::Event::Selection { id } => state.current_offer = id,
-            // Enter/Leave/Motion/Drop are drag-and-drop (M4.2), not selection.
+            // A drag entered a surface owned by this client. `offer_mimes`
+            // was already populated by the `data_offer`/`offer` events that
+            // preceded this one on the wire (same dispatch pass, in order),
+            // so accepting the single mime our test sources ever offer is
+            // safe here. Real destination clients do the same accept +
+            // set_actions dance before the compositor will deliver `drop`.
+            wl_data_device::Event::Enter { serial, id, .. } => {
+                state.dropped = false;
+                if let Some(offer) = id {
+                    if let Some(mime) = state.offer_mimes.first().cloned() {
+                        offer.accept(serial, Some(mime));
+                    }
+                    offer.set_actions(
+                        wl_data_device_manager::DndAction::Copy,
+                        wl_data_device_manager::DndAction::Copy,
+                    );
+                    state.dnd_offer = Some(offer);
+                }
+            }
+            // The drag session ended (successfully); `read_drag_offer` drives
+            // the actual byte transfer from here.
+            wl_data_device::Event::Drop => state.dropped = true,
+            // wlroots sends `leave` immediately after a successful `drop`
+            // too (not only for a drag that left without dropping), so this
+            // must not blindly drop the offer: `Drop` is always dispatched
+            // first (same wire order, same dispatch pass) and sets
+            // `dropped`, so by the time this runs the flag already
+            // distinguishes the two cases. Only a "left without dropping"
+            // leave invalidates the offer here -- a successful drop's offer
+            // stays live for `read_drag_offer`'s `receive`/`finish`.
+            wl_data_device::Event::Leave => {
+                if !state.dropped {
+                    state.dnd_offer = None;
+                }
+            }
+            wl_data_device::Event::Motion { .. } => {}
             _ => {}
         }
     }
@@ -692,11 +809,45 @@ impl Dispatch<wl_seat::WlSeat, ()> for ClientState {
         // Create a keyboard the moment the seat advertises the capability, so
         // that on focus this client receives `wl_keyboard.enter` — the input
         // serial `set_selection` is validated against.
-        if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event
-            && caps.contains(wl_seat::Capability::Keyboard)
-            && state.keyboard.is_none()
-        {
-            state.keyboard = Some(seat.get_keyboard(qh, ()));
+        if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event {
+            if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
+                state.keyboard = Some(seat.get_keyboard(qh, ()));
+            }
+            // Same reasoning as the keyboard above: created the moment the
+            // capability appears, so this client is already listening for
+            // `enter`/`button` by the time a virtual pointer moves over it —
+            // the source of the implicit-grab serial `start_drag` needs.
+            if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
+                state.pointer = Some(seat.get_pointer(qh, ()));
+            }
+            // Gated the same way -- an unconditional `get_touch` is a fatal
+            // `wl_seat.get_touch called when no touch capability` protocol
+            // error on a seat that has not (yet) advertised touch.
+            if caps.contains(wl_seat::Capability::Touch) && state.touch.is_none() {
+                state.touch = Some(seat.get_touch(qh, ()));
+            }
+        }
+    }
+}
+
+delegate_noop!(ClientState: ignore wl_touch::WlTouch);
+
+impl Dispatch<wl_pointer::WlPointer, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Any serial-bearing pointer event is a valid serial; `button` (the
+        // implicit grab `start_drag` validates against) always arrives after
+        // `enter`, so the latest one recorded is always the right one.
+        match event {
+            wl_pointer::Event::Enter { serial, .. } => state.last_pointer_serial = Some(serial),
+            wl_pointer::Event::Button { serial, .. } => state.last_pointer_serial = Some(serial),
+            _ => {}
         }
     }
 }
@@ -783,6 +934,8 @@ delegate_noop!(ClientState: ignore wl_data_device_manager::WlDataDeviceManager);
 delegate_noop!(ClientState: ignore zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1);
 delegate_noop!(ClientState: ignore zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1);
 delegate_noop!(ClientState: ignore zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
+delegate_noop!(ClientState: ignore zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1);
+delegate_noop!(ClientState: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
 delegate_noop!(ClientState: ignore zwlr_data_control_manager_v1::ZwlrDataControlManagerV1);
 delegate_noop!(ClientState: ignore wl_compositor::WlCompositor);
 delegate_noop!(ClientState: ignore wl_surface::WlSurface);
@@ -909,6 +1062,45 @@ pub fn read_selection(reader: &mut TestClient, owner: &mut TestClient, mime: &st
 
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read selection");
+    buf
+}
+
+/// As [`read_selection`], but reads the drag offer delivered to `dst` on
+/// `wl_data_device.enter` (M4.2 drag-and-drop) rather than the selection
+/// offer, and `finish`es it afterward -- the same "tell the compositor the
+/// transfer completed" step a real DnD destination performs once it has
+/// successfully received the data. `src` is the drag's origin client, whose
+/// `wl_data_source` supplies the bytes exactly as the selection owner's does.
+pub fn read_drag_offer(dst: &mut TestClient, src: &mut TestClient, mime: &str) -> Vec<u8> {
+    let offer = dst
+        .state
+        .dnd_offer
+        .clone()
+        .expect("no drag offer was delivered to the destination (did the drag ever enter it?)");
+    let (read_end, write_end) = std::io::pipe().expect("pipe");
+    offer.receive(mime.to_string(), write_end.as_fd());
+    dst.conn.flush().expect("flush receive");
+    drop(write_end);
+
+    let before = src.state.source_sends;
+    let deadline = Instant::now() + TIMEOUT;
+    while src.state.source_sends == before {
+        assert!(
+            Instant::now() < deadline,
+            "the drag source never serviced a data_source.send within {TIMEOUT:?}"
+        );
+        src.pump();
+        dst.pump();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read drag offer");
+
+    offer.finish();
+    dst.conn.flush().expect("flush finish");
+    let _ = dst.queue.roundtrip(&mut dst.state);
+
     buf
 }
 
@@ -1248,6 +1440,50 @@ impl TestClient {
         self.state.data_device.is_some()
     }
 
+    /// Start a drag-and-drop session from this client's own surface: create a
+    /// `wl_data_source` advertising `mime` with `payload`, declare it
+    /// supports the `copy` action, and `start_drag` it with `serial` -- the
+    /// implicit-grab serial of the `wl_pointer.button` press that began the
+    /// drag ([`TestClient::last_pointer_serial`]). No icon: this harness
+    /// passes `None`, so the icon path is not exercised here.
+    pub fn start_drag_text(&mut self, mime: &str, payload: &[u8], serial: u32) {
+        let manager = self
+            .state
+            .data_device_manager
+            .clone()
+            .expect("compositor did not advertise wl_data_device_manager");
+        let device = self.state.data_device.clone().expect("no data device");
+        self.state.offered_mime = mime.to_string();
+        self.state.offered_payload = payload.to_vec();
+        let source = manager.create_data_source(&self.qh, ());
+        source.offer(mime.to_string());
+        source.set_actions(wl_data_device_manager::DndAction::Copy);
+        device.start_drag(Some(&source), &self.surface, None, serial);
+        self.state.data_source = Some(source);
+        self.conn.flush().expect("flush start_drag");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// The last serial this client saw on `wl_pointer` (enter or button) --
+    /// the implicit-grab serial [`TestClient::start_drag_text`] needs. `None`
+    /// if the seat has no pointer capability or the pointer never entered
+    /// this client's surface.
+    pub fn last_pointer_serial(&self) -> Option<u32> {
+        self.state.last_pointer_serial
+    }
+
+    /// Whether `wl_data_device.drop` has arrived for the drag currently
+    /// entering this client's surface.
+    pub fn got_drop(&self) -> bool {
+        self.state.dropped
+    }
+
+    /// Whether a drag offer has been delivered to this client via
+    /// `wl_data_device.enter`.
+    pub fn has_drag_offer(&self) -> bool {
+        self.state.dnd_offer.is_some()
+    }
+
     /// Whether a selection `wl_data_offer` has been delivered to this client.
     pub fn has_selection_offer(&self) -> bool {
         self.state.current_offer.is_some()
@@ -1507,6 +1743,76 @@ impl VirtualKeyboardClient {
         queue.roundtrip(&mut state).expect("vk roundtrip");
         queue.roundtrip(&mut state).expect("vk settle");
         VirtualKeyboardClient { conn, queue, state, _vk: vk }
+    }
+
+    /// One roundtrip, to keep the injector responsive during a test.
+    pub fn pump(&mut self) {
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+/// A `zwlr_virtual_pointer_manager_v1` client — an on-screen-keyboard-style
+/// pointer injector. It mints the pointer motion and button events (and thus
+/// the serial) a drag-and-drop grab needs on a headless seat that has no real
+/// pointer device.
+pub struct VirtualPointerClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    state: ClientState,
+    vp: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+    /// Monotonic millisecond timestamp handed to every request; the
+    /// compositor only cares that it does not go backwards, so a simple
+    /// incrementing counter is fine for tests.
+    time: u32,
+}
+
+impl VirtualPointerClient {
+    /// Connect, create a virtual pointer on the seat, and settle. Panics if
+    /// the compositor did not advertise `zwlr_virtual_pointer_manager_v1`.
+    pub fn spawn(socket: &str) -> VirtualPointerClient {
+        let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+        let manager = state
+            .virtual_pointer_manager
+            .clone()
+            .expect("compositor did not advertise zwlr_virtual_pointer_manager_v1");
+        let seat = state.seat.clone();
+        let vp = manager.create_virtual_pointer(seat.as_ref(), &qh, ());
+        conn.flush().expect("flush vp create");
+        // Two roundtrips so the compositor processes new_virtual_pointer and
+        // the seat's capability change is on the wire before callers connect.
+        queue.roundtrip(&mut state).expect("vp roundtrip");
+        queue.roundtrip(&mut state).expect("vp settle");
+        VirtualPointerClient { conn, queue, state, vp, time: 0 }
+    }
+
+    /// Next monotonic timestamp for a request.
+    fn next_time(&mut self) -> u32 {
+        self.time = self.time.saturating_add(1);
+        self.time
+    }
+
+    /// Move the pointer to an absolute position in a `x_extent` by `y_extent`
+    /// coordinate space + flush.
+    pub fn motion_absolute(&mut self, x: f64, y: f64, x_extent: u32, y_extent: u32) {
+        let time = self.next_time();
+        self.vp.motion_absolute(time, x as u32, y as u32, x_extent, y_extent);
+        self.conn.flush().expect("flush motion_absolute");
+    }
+
+    /// Press or release a button (Linux input-event code, e.g. `0x110` for
+    /// left) + flush.
+    pub fn button(&mut self, button: u32, pressed: bool) {
+        let time = self.next_time();
+        let state =
+            if pressed { wl_pointer::ButtonState::Pressed } else { wl_pointer::ButtonState::Released };
+        self.vp.button(time, button, state);
+        self.conn.flush().expect("flush button");
+    }
+
+    /// End the current event sequence + flush.
+    pub fn frame(&mut self) {
+        self.vp.frame();
+        self.conn.flush().expect("flush frame");
     }
 
     /// One roundtrip, to keep the injector responsive during a test.

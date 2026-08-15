@@ -86,6 +86,22 @@ pub enum DbCommand {
     ReloadConfig,
     Quit,
     GetState(Sender<Snapshot>),
+    /// Test-only: synthesize a touch-down at `(x, y)` for touch point `id`
+    /// via `wlr::Runtime::inject_touch_down`, replying with the grab serial
+    /// it mints (`None` if there is no seat or no surface under the point).
+    /// Not reachable from `WmInterface` -- only the test harness sends
+    /// this, directly onto `cmd_tx`, since injecting synthetic touch input
+    /// makes no sense as a D-Bus-exposed production operation.
+    InjectTouchDown { x: f64, y: f64, id: i32, time_msec: u32, reply: Sender<Option<u32>> },
+    /// Test-only: synthesize a touch-motion to `(x, y)` for touch point
+    /// `id` via `wlr::Runtime::inject_touch_motion`. `reply` is purely a
+    /// synchronization ack -- see `InjectTouchDown`'s doc -- so the harness
+    /// call blocks until the injection has actually run on the compositor
+    /// thread instead of racing ahead of it.
+    InjectTouchMotion { x: f64, y: f64, id: i32, time_msec: u32, reply: Sender<()> },
+    /// Test-only: synthesize a touch-up for touch point `id` via
+    /// `wlr::Runtime::inject_touch_up`. See `InjectTouchDown`'s doc.
+    InjectTouchUp { id: i32, time_msec: u32, reply: Sender<()> },
 }
 
 /// Map a `contract::Event` to its D-Bus signal name, so the emitter thread

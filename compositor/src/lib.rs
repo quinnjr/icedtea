@@ -94,6 +94,12 @@ pub fn run() {
     if let Err(err) = runtime.create_virtual_keyboard_manager(&display) {
         tracing::error!(%err, "virtual-keyboard input is unavailable");
     }
+    // Lets on-screen keyboards' pointer counterparts, remote-input bridges,
+    // and DnD test harnesses inject pointer motion/buttons. Non-fatal: same
+    // reasoning as the virtual-keyboard manager just above.
+    if let Err(err) = runtime.create_virtual_pointer_manager(&display) {
+        tracing::error!(%err, "virtual-pointer input is unavailable");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");

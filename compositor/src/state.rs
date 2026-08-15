@@ -2451,6 +2451,25 @@ impl State {
                 return Some(());
             }
             DbCommand::Quit => self.quitting = true,
+            DbCommand::InjectTouchDown { x, y, id, time_msec, reply } => {
+                let serial = self.wayland.runtime().and_then(|rt| rt.inject_touch_down(x, y, id, time_msec));
+                let _ = reply.send(serial);
+                return Some(());
+            }
+            DbCommand::InjectTouchMotion { x, y, id, time_msec, reply } => {
+                if let Some(rt) = self.wayland.runtime() {
+                    rt.inject_touch_motion(x, y, id, time_msec);
+                }
+                let _ = reply.send(());
+                return Some(());
+            }
+            DbCommand::InjectTouchUp { id, time_msec, reply } => {
+                if let Some(rt) = self.wayland.runtime() {
+                    rt.inject_touch_up(id, time_msec);
+                }
+                let _ = reply.send(());
+                return Some(());
+            }
         }
         self.emit_pending();
         Some(())
