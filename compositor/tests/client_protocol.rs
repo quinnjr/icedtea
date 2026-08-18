@@ -1248,3 +1248,45 @@ fn screencopy_of_empty_output_is_the_wallpaper_color() {
     assert!((pg as i32 - eg).abs() <= 2, "G {pg} vs {eg}");
     assert!((pb as i32 - eb).abs() <= 2, "B {pb} vs {eb}");
 }
+
+/// M4.3 Success Criterion 3: a capture taken with a mapped toplevel reflects
+/// the toplevel's content — the image is no longer uniform and the toplevel's
+/// grey (0x80 from the harness shm buffer) appears in it.
+#[test]
+fn screencopy_reflects_a_mapped_toplevel() {
+    let comp = Compositor::spawn();
+    let mut client = TestClient::map_toplevel(&comp.socket, "shot.app", "shot");
+    assert!(client.wait_until(|c| c.last_configure().is_some()));
+
+    let mut sc = icedtea_harness::ScreencopyClient::spawn(&comp.socket);
+    let frame = sc.capture();
+
+    // IMPORTANT: Task 4 discovered the headless (pixman software) renderer
+    // hands screencopy back `Bgr888` — 3 tightly-packed bytes/pixel, NOT the
+    // 4-byte Xrgb8888 the original plan assumed. Derive `bpp` from the
+    // reported format exactly as `screencopy_of_empty_output_is_the_wallpaper_color`
+    // does. Grey (0x80,0x80,0x80) is channel-symmetric, so byte ORDER does not
+    // matter for detecting it — but `bpp` MUST be correct or the per-pixel
+    // offset misreads the buffer.
+    let bpp = match frame.format {
+        wayland_client::protocol::wl_shm::Format::Xrgb8888
+        | wayland_client::protocol::wl_shm::Format::Argb8888 => 4usize,
+        wayland_client::protocol::wl_shm::Format::Bgr888 => 3usize,
+        other => panic!("unexpected screencopy shm format {other:?}"),
+    };
+    let mut saw_grey = false;
+    let mut saw_non_grey = false;
+    for y in 0..frame.height as usize {
+        for x in 0..frame.width as usize {
+            let o = y * frame.stride as usize + x * bpp;
+            let (c0, c1, c2) = (frame.bytes[o], frame.bytes[o + 1], frame.bytes[o + 2]);
+            // Grey is symmetric across channels, so order-independent.
+            let grey = (c0 as i32 - 0x80).abs() <= 2
+                && (c1 as i32 - 0x80).abs() <= 2
+                && (c2 as i32 - 0x80).abs() <= 2;
+            if grey { saw_grey = true } else { saw_non_grey = true }
+        }
+    }
+    assert!(saw_grey, "toplevel grey (0x80) not present in the capture");
+    assert!(saw_non_grey, "capture is uniform; toplevel not composited over wallpaper");
+}
