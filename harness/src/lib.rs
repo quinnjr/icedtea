@@ -369,6 +369,25 @@ impl Compositor {
         reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered SessionLocked")
     }
 
+    /// Give the compositor a bounded window to finish processing something
+    /// this side of the socket can't directly observe -- most notably a
+    /// client's disconnect, which the event loop only notices on its own
+    /// next dispatch. Deliberately NOT a "poll `pred` until true" loop: that
+    /// shape can pass vacuously (or hide a state flapping back and forth)
+    /// when the caller's real intent is "make sure whatever the disconnect
+    /// triggers has actually landed" before taking a single, final reading.
+    /// Instead this forces a fixed number of full round trips through the
+    /// command channel -- each `snapshot()` wakes the loop via the same wake
+    /// pipe a real socket-readable event would use and blocks until it has
+    /// replied, so by the last iteration the loop has been given many
+    /// dispatch cycles with real pauses between them.
+    pub fn settle(&self) {
+        for _ in 0..20 {
+            let _ = self.snapshot();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Block until an event matching `pred` arrives; panics on timeout.
     ///
     /// The predicate sees the inner [`Event`]; the `seq` wrapper is dropped

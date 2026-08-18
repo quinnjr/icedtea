@@ -1391,3 +1391,48 @@ fn session_lock_locks_isolates_input_and_unlocks() {
         "unlock did not restore keyboard delivery to the app"
     );
 }
+
+/// M4.4 Criterion 3 (security): a locker that dies WITHOUT unlocking leaves the
+/// session locked -- the screen must not silently unlock when the locker
+/// crashes.
+///
+/// Non-vacuous in two independent ways. If the crate wrongly cleared
+/// `session_locked` when the dead locker's `ext_session_lock_v1` was
+/// destroyed on disconnect (exactly the bug the design forbids), the first
+/// `assert!(comp.session_locked(), ...)` below would observe `false` and
+/// fail. If takeover of an already-locked-but-lockerless session were
+/// broken, `locker2.wait_locked()` would time out and fail. Both directions
+/// of this invariant are exercised by a single test.
+#[test]
+fn a_dead_locker_leaves_the_session_locked() {
+    let comp = Compositor::spawn();
+    let mut _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut app = TestClient::map_toplevel(&comp.socket, "app", "app");
+    assert!(app.wait_until(|c| c.has_input_serial()));
+
+    {
+        let mut locker = SessionLockClient::spawn(&comp.socket);
+        locker.lock();
+        assert!(locker.wait_locked(), "never locked");
+        assert!(comp.session_locked());
+        // `locker` drops here WITHOUT calling `unlock()`, closing its
+        // Wayland connection out from under the compositor -- simulating
+        // the locker process crashing while the screen is locked.
+    }
+    // Give the compositor a bounded window to notice and process the
+    // disconnect (see `Compositor::settle`'s doc for why this is a fixed
+    // number of round trips rather than a poll-until-true loop).
+    comp.settle();
+
+    assert!(
+        comp.session_locked(),
+        "SECURITY: session unlocked itself when the locker died"
+    );
+
+    // A fresh locker can still take over the still-locked session -- this
+    // is the legitimate takeover path (the prior lock is gone), distinct
+    // from a second *live* lock attempt being rejected.
+    let mut locker2 = SessionLockClient::spawn(&comp.socket);
+    locker2.lock();
+    assert!(locker2.wait_locked(), "a fresh locker could not take over");
+}
