@@ -100,6 +100,12 @@ pub fn run() {
     if let Err(err) = runtime.create_virtual_pointer_manager(&display) {
         tracing::error!(%err, "virtual-pointer input is unavailable");
     }
+    // Lets clients capture output contents (grim, wf-recorder, and the
+    // xdg-desktop-portal-wlr screen-share path). Non-fatal: a compositor that
+    // fails to create the manager simply offers no screen capture.
+    if let Err(err) = runtime.create_screencopy_manager(&display) {
+        tracing::error!(%err, "screen capture is unavailable");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");

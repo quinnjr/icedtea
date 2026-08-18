@@ -122,6 +122,18 @@ fn virtual_pointer_manager_global_is_advertised() {
     );
 }
 
+/// M4.3 adds the screencopy manager global so screenshot tools (grim,
+/// wf-recorder) and the screen-share portal can capture output contents.
+#[test]
+fn screencopy_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwlr_screencopy_manager_v1"),
+        "screencopy manager global missing; saw {globals:?}"
+    );
+}
+
 /// A client can bind `zwlr_virtual_pointer_manager_v1` and create a virtual
 /// pointer, then inject motion/button/frame requests without a protocol
 /// error — the M4.2 drag-and-drop grab serial's source. Full drag coverage
@@ -1160,4 +1172,121 @@ fn a_pointer_drag_renders_and_follows_its_icon() {
     vp.pump();
 
     a.detach();
+}
+
+/// A screencopy client can capture the headless output: the frame reaches
+/// `ready` and returns a full-size buffer.
+#[test]
+fn screencopy_captures_the_output() {
+    let comp = Compositor::spawn();
+    let mut sc = icedtea_harness::ScreencopyClient::spawn(&comp.socket);
+    let frame = sc.capture();
+    assert!(frame.width > 0 && frame.height > 0, "empty capture geometry");
+    assert_eq!(frame.bytes.len(), (frame.stride * frame.height) as usize);
+}
+
+/// M4.3 Success Criterion 2 (load-bearing): a capture of the empty output is
+/// a uniform image of the configured wallpaper color — proving the bytes are
+/// the output's real composited content, not a cleared or garbage buffer.
+///
+/// Expected and actual share one config source: `Compositor::spawn` (harness
+/// boot, `harness/src/lib.rs`) constructs its `State` from
+/// `icedtea_config::default_config()`, exactly the same call used below to
+/// derive the expected color, so this assertion can never be vacuously right.
+#[test]
+fn screencopy_of_empty_output_is_the_wallpaper_color() {
+    let comp = Compositor::spawn();
+    let mut sc = icedtea_harness::ScreencopyClient::spawn(&comp.socket);
+    let frame = sc.capture();
+
+    // Expected color: the wallpaper rgba mapped to the reported format's
+    // actual memory byte order. Xrgb8888/Argb8888 are little-endian 4
+    // bytes/pixel B,G,R,X (verified elsewhere in this suite, e.g.
+    // `create_shm_buffer`'s fill). The headless backend's software (pixman)
+    // renderer instead hands screencopy back Bgr888 -- 3 tightly packed
+    // bytes/pixel, no pad byte -- and despite the name, its memory layout is
+    // R,G,B (byte0=R): the wl_shm/DRM fourcc convention names 24bpp formats
+    // by the bit-range each channel occupies when the pixel is read as one
+    // little-endian integer ("[23:0] B:G:R little endian" = R in the low
+    // byte), which is the reverse convention from the 32-bit Xrgb/Argb
+    // formats' byte-address-order naming. Confirmed empirically against
+    // this backend's actual capture bytes (R and B were swapped until this
+    // was corrected) -- see the byte order test in the accompanying report.
+    let (bpp, byte_order) = match frame.format {
+        wayland_client::protocol::wl_shm::Format::Xrgb8888
+        | wayland_client::protocol::wl_shm::Format::Argb8888 => (4usize, [2, 1, 0]),
+        wayland_client::protocol::wl_shm::Format::Bgr888 => (3usize, [0, 1, 2]),
+        other => panic!("unexpected screencopy shm format {other:?}; byte order assumption may not hold"),
+    };
+
+    let [r, g, b, _a] =
+        icedtea_compositor::render::wallpaper_color(&icedtea_config::default_config().appearance);
+    let expect = |c: f32| (c * 255.0).round() as i32;
+    let (er, eg, eb) = (expect(r), expect(g), expect(b));
+
+    // Every pixel must be identical (uniform) and within ±2 of the expected
+    // color per channel (absorbs any renderer color-space/rounding delta).
+    let (mut first, mut uniform) = (None, true);
+    for y in 0..frame.height as usize {
+        for x in 0..frame.width as usize {
+            let o = y * frame.stride as usize + x * bpp;
+            let px = (
+                frame.bytes[o + byte_order[0]],
+                frame.bytes[o + byte_order[1]],
+                frame.bytes[o + byte_order[2]],
+            );
+            match first {
+                None => first = Some(px),
+                Some(f) if f != px => uniform = false,
+                _ => {}
+            }
+        }
+    }
+    assert!(uniform, "capture is not a uniform color; a cleared/garbage buffer");
+    let (pr, pg, pb) = first.expect("no pixels");
+    assert!((pr as i32 - er).abs() <= 2, "R {pr} vs {er}");
+    assert!((pg as i32 - eg).abs() <= 2, "G {pg} vs {eg}");
+    assert!((pb as i32 - eb).abs() <= 2, "B {pb} vs {eb}");
+}
+
+/// M4.3 Success Criterion 3: a capture taken with a mapped toplevel reflects
+/// the toplevel's content — the image is no longer uniform and the toplevel's
+/// grey (0x80 from the harness shm buffer) appears in it.
+#[test]
+fn screencopy_reflects_a_mapped_toplevel() {
+    let comp = Compositor::spawn();
+    let mut client = TestClient::map_toplevel(&comp.socket, "shot.app", "shot");
+    assert!(client.wait_until(|c| c.last_configure().is_some()));
+
+    let mut sc = icedtea_harness::ScreencopyClient::spawn(&comp.socket);
+    let frame = sc.capture();
+
+    // IMPORTANT: Task 4 discovered the headless (pixman software) renderer
+    // hands screencopy back `Bgr888` — 3 tightly-packed bytes/pixel, NOT the
+    // 4-byte Xrgb8888 the original plan assumed. Derive `bpp` from the
+    // reported format exactly as `screencopy_of_empty_output_is_the_wallpaper_color`
+    // does. Grey (0x80,0x80,0x80) is channel-symmetric, so byte ORDER does not
+    // matter for detecting it — but `bpp` MUST be correct or the per-pixel
+    // offset misreads the buffer.
+    let bpp = match frame.format {
+        wayland_client::protocol::wl_shm::Format::Xrgb8888
+        | wayland_client::protocol::wl_shm::Format::Argb8888 => 4usize,
+        wayland_client::protocol::wl_shm::Format::Bgr888 => 3usize,
+        other => panic!("unexpected screencopy shm format {other:?}"),
+    };
+    let mut saw_grey = false;
+    let mut saw_non_grey = false;
+    for y in 0..frame.height as usize {
+        for x in 0..frame.width as usize {
+            let o = y * frame.stride as usize + x * bpp;
+            let (c0, c1, c2) = (frame.bytes[o], frame.bytes[o + 1], frame.bytes[o + 2]);
+            // Grey is symmetric across channels, so order-independent.
+            let grey = (c0 as i32 - 0x80).abs() <= 2
+                && (c1 as i32 - 0x80).abs() <= 2
+                && (c2 as i32 - 0x80).abs() <= 2;
+            if grey { saw_grey = true } else { saw_non_grey = true }
+        }
+    }
+    assert!(saw_grey, "toplevel grey (0x80) not present in the capture");
+    assert!(saw_non_grey, "capture is uniform; toplevel not composited over wallpaper");
 }

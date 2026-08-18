@@ -5,7 +5,7 @@
 //! * [`Compositor`] boots the production compositor — the same
 //!   `Display`/`Runtime`/`Backend`/`State` wiring `lib.rs::run()` does, minus
 //!   the pieces a test has no use for (D-Bus service, wallpaper worker,
-//!   config-reload pipe, background rect, signal source) — on a thread of its
+//!   config-reload pipe, signal source) — on a thread of its
 //!   own, against the headless backend, and hands back its socket name plus
 //!   the two production channels a test observes and drives it through: the
 //!   `SeqEvent` stream and the `DbCommand` queue.
@@ -61,9 +61,14 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_source_v1,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::screencopy::v1::client::{
+    zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
+    zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
+};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
 };
+use wayland_client::protocol::wl_output::{self, WlOutput};
 
 /// How long any "wait for the compositor to do a thing" helper waits before
 /// declaring the harness broken.
@@ -208,6 +213,12 @@ impl Compositor {
             runtime
                 .create_virtual_pointer_manager(&display)
                 .expect("zwlr_virtual_pointer_manager_v1");
+            // Same "harness cannot degrade" tone: the screencopy test binds
+            // this global directly and would assert against one that was
+            // never advertised.
+            runtime
+                .create_screencopy_manager(&display)
+                .expect("zwlr_screencopy_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
             // Test-only: makes the seat advertise the touch capability so
             // headless clients can bind `wl_touch` and injected touch
@@ -226,6 +237,22 @@ impl Compositor {
             let mut state =
                 icedtea_compositor::state::State::new(icedtea_config::default_config(), event_tx);
             state.wayland.attach(runtime.clone());
+
+            // Same "harness cannot degrade" tone as the globals above, and
+            // required for M4.3's screencopy tests specifically: without
+            // this, the scene is empty and a capture reads back whatever the
+            // renderer's clear color is rather than the configured wallpaper
+            // color, which is exactly what `screencopy_of_empty_output_is_
+            // the_wallpaper_color` asserts on. Same boot-order and sizing
+            // contract as `lib.rs::run()` (sized to nothing until an output
+            // with a mode arrives; `new_output` resizes it) and the same
+            // "lowered now so nothing later has to remember to" reasoning.
+            let background = runtime
+                .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+                .expect("background rect");
+            runtime.lower_rect_to_bottom(background);
+            state.set_background(background);
+
             state.set_command_receiver(cmd_rx);
 
             let (cmd_wake_write, cmd_wake_id) =
@@ -497,6 +524,20 @@ struct ClientState {
     /// gated on the capability rather than called unconditionally, which
     /// is a fatal protocol error on a seat that has not advertised touch.
     touch: Option<wl_touch::WlTouch>,
+
+    // --- screencopy (M4.3) ---
+    output: Option<WlOutput>,
+    screencopy_manager: Option<ZwlrScreencopyManagerV1>,
+    /// Screencopy frame bookkeeping, filled by the frame's event dispatch.
+    screencopy_frame: ScreencopyFrameState,
+}
+
+#[derive(Default)]
+struct ScreencopyFrameState {
+    /// `(format, width, height, stride)` from the `buffer` event.
+    params: Option<(wl_shm::Format, u32, u32, u32)>,
+    ready: bool,
+    failed: bool,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
@@ -543,6 +584,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zwp_primary_selection_device_manager_v1" => {
                     state.primary_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "wl_output" => {
+                    state.output = Some(registry.bind(name, version.min(4), qh, ()));
+                }
+                "zwlr_screencopy_manager_v1" => {
+                    state.screencopy_manager = Some(registry.bind(name, version.min(3), qh, ()));
                 }
                 _ => {}
             }
@@ -954,6 +1001,36 @@ delegate_noop!(ClientState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(ClientState: ignore wl_buffer::WlBuffer);
 delegate_noop!(ClientState: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 delegate_noop!(ClientState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+delegate_noop!(ClientState: ignore wl_output::WlOutput);
+delegate_noop!(ClientState: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1);
+
+impl Dispatch<ZwlrScreencopyFrameV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _frame: &ZwlrScreencopyFrameV1,
+        event: zwlr_screencopy_frame_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            // `format` is a WEnum<wl_shm::Format>; keep the shm path only.
+            zwlr_screencopy_frame_v1::Event::Buffer {
+                format: wayland_client::WEnum::Value(fmt),
+                width,
+                height,
+                stride,
+            } => {
+                state.screencopy_frame.params = Some((fmt, width, height, stride));
+            }
+            zwlr_screencopy_frame_v1::Event::Ready { .. } => state.screencopy_frame.ready = true,
+            zwlr_screencopy_frame_v1::Event::Failed => state.screencopy_frame.failed = true,
+            // `Flags`, `Damage`, `LinuxDmabuf`, `BufferDone` need no bookkeeping
+            // here: the capture loop copies after it has seen `Buffer`.
+            _ => {}
+        }
+    }
+}
 
 /// A real wayland client with exactly one mapped xdg toplevel.
 pub struct TestClient {
@@ -1212,6 +1289,119 @@ fn create_shm_buffer(
     let pool = shm.create_pool(shm_file.as_fd(), len as i32, qh, ());
     let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Xrgb8888, qh, ());
     (shm_file, pool, buffer)
+}
+
+/// As [`create_shm_buffer`], but honors a caller-supplied format/stride
+/// rather than hardcoding `Xrgb8888` -- the screencopy path must match
+/// whatever format/stride the compositor reported on the frame's `buffer`
+/// event. Zero-filled rather than pre-painted: the compositor's `copy`
+/// overwrites every byte the frame actually captures.
+fn create_shm_buffer_format(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<ClientState>,
+    w: i32,
+    h: i32,
+    stride: i32,
+    format: wl_shm::Format,
+) -> (std::fs::File, wl_shm_pool::WlShmPool, wl_buffer::WlBuffer) {
+    let len = (stride * h) as usize;
+    let fd: OwnedFd =
+        rustix::fs::memfd_create("icedtea-harness-shm", rustix::fs::MemfdFlags::CLOEXEC)
+            .expect("memfd_create");
+    rustix::fs::ftruncate(&fd, len as u64).expect("ftruncate");
+    let shm_file = std::fs::File::from(fd);
+    let pool = shm.create_pool(shm_file.as_fd(), len as i32, qh, ());
+    let buffer = pool.create_buffer(0, w, h, stride, format, qh, ());
+    (shm_file, pool, buffer)
+}
+
+/// A read-back screencopy capture: raw pixel bytes plus the geometry and
+/// format wlroots reported for the frame.
+pub struct CapturedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: wl_shm::Format,
+    pub bytes: Vec<u8>,
+}
+
+/// A `zwlr_screencopy_manager_v1` client that captures the first advertised
+/// `wl_output` into a `wl_shm` buffer and reads the pixels back.
+pub struct ScreencopyClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    qh: QueueHandle<ClientState>,
+    state: ClientState,
+}
+
+impl ScreencopyClient {
+    /// Connect and bind. Panics if the compositor advertised neither the
+    /// screencopy manager nor a `wl_output`.
+    pub fn spawn(socket: &str) -> ScreencopyClient {
+        let (conn, queue, qh, state) = connect_and_bind(socket);
+        assert!(
+            state.screencopy_manager.is_some(),
+            "compositor did not advertise zwlr_screencopy_manager_v1"
+        );
+        assert!(state.output.is_some(), "compositor advertised no wl_output");
+        ScreencopyClient { conn, queue, qh, state }
+    }
+
+    /// Capture the output into a `wl_shm` buffer and return its pixels.
+    /// Panics on `failed`, on a missing `buffer` event, or on timeout.
+    pub fn capture(&mut self) -> CapturedFrame {
+        let manager = self.state.screencopy_manager.clone().unwrap();
+        let output = self.state.output.clone().unwrap();
+        self.state.screencopy_frame = ScreencopyFrameState::default();
+
+        // overlay_cursor = 0: do not composite the cursor into the capture.
+        let frame = manager.capture_output(0, &output, &self.qh, ());
+        self.conn.flush().expect("flush capture_output");
+
+        // Pump until the `buffer` event lands (geometry/format), bounded.
+        for _ in 0..500 {
+            self.queue.roundtrip(&mut self.state).expect("roundtrip buffer");
+            if self.state.screencopy_frame.params.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let (format, width, height, stride) = self
+            .state
+            .screencopy_frame
+            .params
+            .expect("screencopy sent no buffer event");
+
+        // Allocate a matching shm buffer, zero-filled, and request the copy.
+        let (mmap_file, _pool, buffer) = create_shm_buffer_format(
+            self.state.shm.as_ref().unwrap(),
+            &self.qh,
+            width as i32,
+            height as i32,
+            stride as i32,
+            format,
+        );
+        frame.copy(&buffer);
+        self.conn.flush().expect("flush copy");
+
+        for _ in 0..500 {
+            self.queue.roundtrip(&mut self.state).expect("roundtrip ready");
+            if self.state.screencopy_frame.ready || self.state.screencopy_frame.failed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!self.state.screencopy_frame.failed, "screencopy frame failed");
+        assert!(self.state.screencopy_frame.ready, "screencopy never became ready");
+
+        // Read the pixels back out of the shared file.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = mmap_file;
+        file.seek(SeekFrom::Start(0)).expect("seek shm");
+        let mut bytes = vec![0u8; (stride * height) as usize];
+        file.read_exact(&mut bytes).expect("read shm pixels");
+        CapturedFrame { width, height, stride, format, bytes }
+    }
 }
 
 impl TestClient {
