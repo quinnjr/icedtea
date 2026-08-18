@@ -122,6 +122,18 @@ fn virtual_pointer_manager_global_is_advertised() {
     );
 }
 
+/// M4.3 adds the screencopy manager global so screenshot tools (grim,
+/// wf-recorder) and the screen-share portal can capture output contents.
+#[test]
+fn screencopy_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwlr_screencopy_manager_v1"),
+        "screencopy manager global missing; saw {globals:?}"
+    );
+}
+
 /// A client can bind `zwlr_virtual_pointer_manager_v1` and create a virtual
 /// pointer, then inject motion/button/frame requests without a protocol
 /// error — the M4.2 drag-and-drop grab serial's source. Full drag coverage

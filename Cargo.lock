@@ -2967,9 +2967,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wlr"
-version = "0.20.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18e9bcd2c272625558b54db4950c024b907fa25686581654170334cbbe530920"
+version = "0.20.19"
 dependencies = [
  "wlr-sys",
  "xkbcommon-sys",
@@ -2978,8 +2976,6 @@ dependencies = [
 [[package]]
 name = "wlr-sys"
 version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d58e1af4e1914be64ce81d54547ab1814c58d1d3523ee1ccfe2ac5803ab6871"
 dependencies = [
  "bindgen 0.72.1",
  "input-sys",

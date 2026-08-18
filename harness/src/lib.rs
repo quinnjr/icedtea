@@ -208,6 +208,12 @@ impl Compositor {
             runtime
                 .create_virtual_pointer_manager(&display)
                 .expect("zwlr_virtual_pointer_manager_v1");
+            // Same "harness cannot degrade" tone: the screencopy test binds
+            // this global directly and would assert against one that was
+            // never advertised.
+            runtime
+                .create_screencopy_manager(&display)
+                .expect("zwlr_screencopy_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
             // Test-only: makes the seat advertise the touch capability so
             // headless clients can bind `wl_touch` and injected touch

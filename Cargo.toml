@@ -7,6 +7,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 
+[patch.crates-io]
+wlr = { path = "../wlroots-sys/crates/wlr" }
+
 [workspace.dependencies]
 zbus = "5"
 redb = "3"
