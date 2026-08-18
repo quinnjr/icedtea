@@ -45,8 +45,12 @@ use wayland_client::protocol::{
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop, event_created_child,
 };
+use wayland_protocols::ext::idle_notify::v1::client::{ext_idle_notification_v1, ext_idle_notifier_v1};
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
+};
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
 };
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
@@ -592,6 +596,17 @@ struct ClientState {
     /// does the whole ack/attach/commit dance itself (it has both `state`
     /// and `qh` in hand), so nothing outside `Dispatch` needs to drive it.
     lock_surfaces: Vec<LockSurfaceEntry>,
+
+    // --- idle-notify / idle-inhibit (M4.4) ---
+    idle_notifier: Option<ext_idle_notifier_v1::ExtIdleNotifierV1>,
+    idle_inhibit_manager: Option<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1>,
+    /// Set true on the active `ext_idle_notification_v1`'s `idled` event;
+    /// reset whenever [`IdleNotifyClient::notification`] requests a fresh
+    /// notification object, so a stale flag from a previous request can
+    /// never be mistaken for a fresh one.
+    idle_idled: bool,
+    /// As `idle_idled`, for `resumed`.
+    idle_resumed: bool,
 }
 
 /// One lock surface this client has created via `get_lock_surface`, plus the
@@ -666,6 +681,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "ext_session_lock_manager_v1" => {
                     state.session_lock_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "ext_idle_notifier_v1" => {
+                    state.idle_notifier = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_idle_inhibit_manager_v1" => {
+                    state.idle_inhibit_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -1161,6 +1182,28 @@ impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ()> for Clie
         entry._buffer_keepalive = Some((file, pool, buffer));
     }
 }
+
+delegate_noop!(ClientState: ignore ext_idle_notifier_v1::ExtIdleNotifierV1);
+
+impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ext_idle_notification_v1::ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => state.idle_idled = true,
+            ext_idle_notification_v1::Event::Resumed => state.idle_resumed = true,
+            _ => {}
+        }
+    }
+}
+
+delegate_noop!(ClientState: ignore zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1);
+delegate_noop!(ClientState: ignore zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1);
 
 /// A real wayland client with exactly one mapped xdg toplevel.
 pub struct TestClient {
@@ -2573,6 +2616,150 @@ impl SessionLockClient {
             entry.wl_surface.destroy();
         }
         self.conn.flush().expect("flush unlock");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+/// An `ext_idle_notifier_v1` client -- requests idle notifications on its own
+/// seat and observes `idled`/`resumed`. M4.4 criterion 4's driver.
+pub struct IdleNotifyClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    qh: QueueHandle<ClientState>,
+    state: ClientState,
+    /// The notification object [`Self::notification`] last created, kept
+    /// alive so it keeps delivering events and so a later call can destroy
+    /// it before replacing it.
+    notification: Option<ext_idle_notification_v1::ExtIdleNotificationV1>,
+}
+
+impl IdleNotifyClient {
+    /// Connect and bind. Panics if the compositor did not advertise
+    /// `ext_idle_notifier_v1` or a `wl_seat`.
+    pub fn spawn(socket: &str) -> IdleNotifyClient {
+        let (conn, queue, qh, state) = connect_and_bind(socket);
+        assert!(
+            state.idle_notifier.is_some(),
+            "compositor did not advertise ext_idle_notifier_v1"
+        );
+        assert!(state.seat.is_some(), "compositor advertised no wl_seat");
+        IdleNotifyClient { conn, queue, qh, state, notification: None }
+    }
+
+    /// Request a fresh `ext_idle_notification_v1` with `timeout_ms`, on this
+    /// client's seat. Destroys and replaces any previous notification object
+    /// and resets the `idled`/`resumed` flags, so a stale event from an
+    /// earlier notification can never be mistaken for one on this fresh
+    /// request -- exactly what letting the idle-inhibit test re-request a
+    /// notification after destroying its inhibitor needs.
+    pub fn notification(&mut self, timeout_ms: u32) {
+        let notifier = self.state.idle_notifier.clone().expect("no ext_idle_notifier_v1");
+        let seat = self.state.seat.clone().expect("no wl_seat");
+        if let Some(old) = self.notification.take() {
+            old.destroy();
+        }
+        self.state.idle_idled = false;
+        self.state.idle_resumed = false;
+        let notification = notifier.get_idle_notification(timeout_ms, &seat, &self.qh, ());
+        self.notification = Some(notification);
+        self.conn.flush().expect("flush get_idle_notification");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Pump bounded by [`TIMEOUT`] (5s -- generous relative to the short
+    /// timeouts these tests request) until `idled` arrives. Returns whether
+    /// it did.
+    pub fn wait_idled(&mut self) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.state.idle_idled {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// As [`Self::wait_idled`], for `resumed`.
+    pub fn wait_resumed(&mut self) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.state.idle_resumed {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Pump for up to `ms` and report whether `idled` fired during that
+    /// window -- used to assert idle did *not* fire within a bound
+    /// comfortably longer than the requested timeout (an active inhibitor
+    /// suppressing it), which `wait_idled`'s "wait until it happens" shape
+    /// cannot express.
+    pub fn idled_within(&mut self, ms: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        loop {
+            let _ = self.queue.roundtrip(&mut self.state);
+            if self.state.idle_idled {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// A `zwp_idle_inhibit_manager_v1` client -- creates an idle inhibitor on a
+/// surface of its own and can destroy it again. M4.4 criterion 5's driver.
+/// The inhibited-or-not state it controls is process-wide (any live
+/// inhibitor gates every notifier's idle timer, per
+/// `Runtime::refresh_idle_inhibited`), so the inhibiting surface need not be
+/// mapped, focused, or otherwise visible -- a bare `wl_surface` suffices.
+pub struct IdleInhibitClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    qh: QueueHandle<ClientState>,
+    state: ClientState,
+    surface: wl_surface::WlSurface,
+    inhibitor: Option<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1>,
+}
+
+impl IdleInhibitClient {
+    /// Connect, bind, and create the surface `create_inhibitor` will attach
+    /// an inhibitor to. Panics if the compositor did not advertise
+    /// `zwp_idle_inhibit_manager_v1`.
+    pub fn spawn(socket: &str) -> IdleInhibitClient {
+        let (conn, queue, qh, state) = connect_and_bind(socket);
+        assert!(
+            state.idle_inhibit_manager.is_some(),
+            "compositor did not advertise zwp_idle_inhibit_manager_v1"
+        );
+        let compositor = state.compositor.clone().expect("no wl_compositor");
+        let surface = compositor.create_surface(&qh, ());
+        IdleInhibitClient { conn, queue, qh, state, surface, inhibitor: None }
+    }
+
+    /// Create an inhibitor on this client's surface. Panics if one is
+    /// already active -- callers destroy before creating another.
+    pub fn create_inhibitor(&mut self) {
+        assert!(self.inhibitor.is_none(), "an inhibitor is already active");
+        let manager = self.state.idle_inhibit_manager.clone().expect("no zwp_idle_inhibit_manager_v1");
+        let inhibitor = manager.create_inhibitor(&self.surface, &self.qh, ());
+        self.inhibitor = Some(inhibitor);
+        self.conn.flush().expect("flush create_inhibitor");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Destroy the active inhibitor. Panics if none is active.
+    pub fn destroy_inhibitor(&mut self) {
+        let inhibitor = self.inhibitor.take().expect("no active inhibitor to destroy");
+        inhibitor.destroy();
+        self.conn.flush().expect("flush destroy_inhibitor");
         let _ = self.queue.roundtrip(&mut self.state);
     }
 }
