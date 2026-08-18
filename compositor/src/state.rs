@@ -2470,6 +2470,11 @@ impl State {
                 let _ = reply.send(());
                 return Some(());
             }
+            DbCommand::DragIconPosition { reply } => {
+                let pos = self.wayland.runtime().and_then(|rt| rt.drag_icon_position());
+                let _ = reply.send(pos);
+                return Some(());
+            }
         }
         self.emit_pending();
         Some(())

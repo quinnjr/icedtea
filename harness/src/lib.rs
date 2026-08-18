@@ -307,6 +307,16 @@ impl Compositor {
         reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchUp");
     }
 
+    /// The drag icon's current scene layout position, via
+    /// `wlr::Runtime::drag_icon_position`. `None` if no drag with a visible
+    /// icon is in progress. Blocks on the reply -- see
+    /// [`Self::inject_touch_down`]'s doc.
+    pub fn drag_icon_position(&self) -> Option<(i32, i32)> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::DragIconPosition { reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered DragIconPosition")
+    }
+
     /// Block until an event matching `pred` arrives; panics on timeout.
     ///
     /// The predicate sees the inner [`Event`]; the `seq` wrapper is dropped
@@ -957,6 +967,16 @@ pub struct TestClient {
     surface: wl_surface::WlSurface,
     /// The shm file stays open for as long as the pool refers to it.
     shm_file: std::fs::File,
+    /// The drag-icon surface + its shm backing, created by
+    /// [`TestClient::start_drag_text_with_icon`] and held here for the rest
+    /// of this client's lifetime so it isn't dropped (and its role revoked)
+    /// mid-drag. `None` until that method has been called once.
+    icon: Option<(
+        wl_surface::WlSurface,
+        wl_buffer::WlBuffer,
+        wl_shm_pool::WlShmPool,
+        std::fs::File,
+    )>,
     state: ClientState,
     queue: EventQueue<ClientState>,
     qh: QueueHandle<ClientState>,
@@ -1283,6 +1303,7 @@ impl TestClient {
             xdg_surface,
             surface,
             shm_file,
+            icon: None,
             state,
             queue,
             qh,
@@ -1462,6 +1483,69 @@ impl TestClient {
         self.state.data_source = Some(source);
         self.conn.flush().expect("flush start_drag");
         let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// As [`TestClient::start_drag_text`], but with a visible drag icon: a
+    /// second `wl_surface` sized `icon_w`x`icon_h`, backed by the same
+    /// solid-grey shm buffer machinery [`TestClient::map`] uses for the
+    /// toplevel.
+    ///
+    /// Order matters here, and was resolved empirically:
+    /// `wl_data_device.start_drag` must be the request that assigns
+    /// the icon surface its `drag_icon` role *first* -- the icon surface is
+    /// created with no buffer attached, handed to `start_drag`, and only
+    /// *after* that request is sent does this attach the buffer and commit.
+    /// Attaching/committing before `start_drag` (i.e. giving the surface
+    /// committed content before it has the drag-icon role) leaves the scene
+    /// with no mapped drag-icon node -- `wlr::Runtime::drag_icon_position`
+    /// then reads back `None` for the whole drag.
+    ///
+    /// The icon surface is stashed in `self.icon` so it survives for the
+    /// rest of this client's lifetime -- dropping it mid-drag would destroy
+    /// the wl_surface object and, with it, the drag_icon role.
+    pub fn start_drag_text_with_icon(
+        &mut self,
+        mime: &str,
+        payload: &[u8],
+        serial: u32,
+        icon_w: i32,
+        icon_h: i32,
+    ) {
+        let manager = self
+            .state
+            .data_device_manager
+            .clone()
+            .expect("compositor did not advertise wl_data_device_manager");
+        let device = self.state.data_device.clone().expect("no data device");
+        let compositor = self.state.compositor.clone().expect("no wl_compositor");
+        let shm = self.state.shm.clone().expect("no wl_shm");
+
+        self.state.offered_mime = mime.to_string();
+        self.state.offered_payload = payload.to_vec();
+        let source = manager.create_data_source(&self.qh, ());
+        source.offer(mime.to_string());
+        source.set_actions(wl_data_device_manager::DndAction::Copy);
+
+        let icon_surface = compositor.create_surface(&self.qh, ());
+
+        // Assign the drag_icon role first, with no buffer on the surface
+        // yet -- see this method's doc for why the order is load-bearing.
+        device.start_drag(Some(&source), &self.surface, Some(&icon_surface), serial);
+        self.state.data_source = Some(source);
+        self.conn.flush().expect("flush start_drag");
+        let _ = self.queue.roundtrip(&mut self.state);
+
+        // Now that the surface has the drag_icon role, attach and commit a
+        // real buffer -- the scene node only gets live layout coordinates
+        // once the icon surface has committed content.
+        let (icon_shm_file, icon_pool, icon_buffer) = create_shm_buffer(&shm, &self.qh, icon_w, icon_h);
+        icon_surface.attach(Some(&icon_buffer), 0, 0);
+        icon_surface.damage_buffer(0, 0, icon_w, icon_h);
+        icon_surface.commit();
+        self.conn.flush().expect("flush icon commit");
+        let _ = self.queue.roundtrip(&mut self.state);
+
+        self.icon = Some((icon_surface, icon_buffer, icon_pool, icon_shm_file));
     }
 
     /// The last serial this client saw on `wl_pointer` (enter or button) --

@@ -926,3 +926,238 @@ fn a_drag_with_an_invalid_grab_serial_is_refused() {
     b.detach();
 }
 
+/// M4.2 Success Criterion 4: the drag icon actually **renders** as a scene
+/// node, and **follows** the input, not merely that the protocol handshake
+/// (`start_drag` with a non-null icon surface) went through without error.
+///
+/// Setup mirrors [`a_pointer_drag_transfers_between_two_clients`] up through
+/// minting the grab serial (maximize-then-snapshot to discover the output
+/// extent, unmaximize, position the virtual pointer over A, press). From
+/// there this diverges: [`TestClient::start_drag_text_with_icon`] attaches a
+/// real icon surface, and instead of a second client receiving the drop,
+/// this asserts directly against `wlr::Runtime::drag_icon_position` (via
+/// [`Compositor::drag_icon_position`]):
+///
+/// 1. **Renders**: once the drag has started and the icon surface has
+///    committed a buffer, `drag_icon_position()` must return `Some` -- a
+///    live scene node exists for the icon.
+/// 2. **Follows**: two motions *after* the icon exists, to two known points
+///    `M1`/`M2` inside A's own geometry, must produce two icon positions
+///    `p1`/`p2` whose delta matches `M2 - M1`.
+///
+/// The tree the icon lives in is created at `(0, 0)` by
+/// `wlr_scene_drag_icon_create` and is repositioned only by a *subsequent*
+/// pointer/touch motion (`wlr::Runtime`'s `on_pointer_motion*` handlers call
+/// `wlr_scene_node_set_position` with the live cursor layout coordinates) --
+/// there is no motion baked into `start_drag` itself. So `p1` must be read
+/// after a real motion event has fired post-`start_drag`, not compared
+/// against the pre-drag press point: the press that minted the grab serial
+/// happened *before* the icon tree existed, so it never repositioned
+/// anything.
+#[test]
+fn a_pointer_drag_renders_and_follows_its_icon() {
+    /// `xdg_toplevel.state.maximized`.
+    const MAXIMIZED: u32 = 1;
+    /// `BTN_LEFT` from `linux/input-event-codes.h`.
+    const BTN_LEFT: u32 = 0x110;
+    /// Drag icon size (`w`x`h`), arbitrary but non-trivial.
+    const ICON_SIZE: i32 = 32;
+    /// The headless backend's real output pixel size -- pinned, not
+    /// guessed: see `unmapping_a_layer_panel_gives_the_usable_area_back`'s
+    /// own doc comment above, this suite's one other place this number is
+    /// asserted against `tests/support/mod.rs`. Used as the virtual
+    /// pointer's `x_extent`/`y_extent` instead of a *maximized window's*
+    /// geometry (what the sibling drag tests use for that, and what an
+    /// earlier revision of this test used too): `zwlr_virtual_pointer_v1`
+    /// maps `x`/`y` to a fraction of `x_extent`/`y_extent` and then
+    /// `wlr_cursor_warp_absolute` maps that fraction onto the *real* output
+    /// pixel box, not onto whatever extent the client happened to pass. A
+    /// maximized window's geometry is inset from the real output by
+    /// `snap_gap`/the panel exclusive zone, so using it as the extent here
+    /// scaled every landed position by a small constant factor (empirically:
+    /// exactly `1280/1264` in `x`, `720/704` in `y`, for this harness's
+    /// default config) -- harmless for the sibling tests (they only need to
+    /// land *somewhere inside* a window), fatal here, where Criterion 4b
+    /// compares an exact pixel delta.
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+    /// Wall-clock budget for `drag_icon_position()` to observe the scene
+    /// node reflecting a given motion -- the compositor processes the
+    /// motion and this query on its own loop tick, which can trail the
+    /// client-side calls that produced them by a beat.
+    const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Poll `comp.drag_icon_position()` until it satisfies `pred`, or panic
+    /// after [`POLL_TIMEOUT`]. Needed for both the initial render and each
+    /// post-motion follow check: the compositor's own event loop tick that
+    /// would produce the new position is not synchronized with this thread.
+    fn poll_drag_icon_position(
+        comp: &Compositor,
+        pred: impl Fn(Option<(i32, i32)>) -> bool,
+    ) -> Option<(i32, i32)> {
+        let deadline = std::time::Instant::now() + POLL_TIMEOUT;
+        loop {
+            let pos = comp.drag_icon_position();
+            if pred(pos) {
+                return pos;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drag_icon_position() never satisfied the predicate within {POLL_TIMEOUT:?} \
+                 (last read: {pos:?})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// As [`poll_drag_icon_position`], but returns only once the reading has
+    /// *settled*: two consecutive reads, 10ms apart, come back identical and
+    /// `Some`, and different from `since`. A single "it changed" reading is
+    /// not enough on its own in general -- this compositor's motion handler
+    /// could in principle update the position more than once in quick
+    /// succession while a single `vp.motion_absolute` + `vp.frame()` is
+    /// still being processed, and grabbing the first post-`since` value
+    /// would risk capturing a transient rather than where the icon actually
+    /// ends up. Kept as defense-in-depth even though this test's own
+    /// investigation traced its one observed flavor of "wrong value" to a
+    /// coordinate-space mismatch (fixed by [`OUTPUT_W`]/[`OUTPUT_H`]), not
+    /// to an unsettled reading.
+    fn poll_settled_drag_icon_position(comp: &Compositor, since: Option<(i32, i32)>) -> (i32, i32) {
+        let deadline = std::time::Instant::now() + POLL_TIMEOUT;
+        loop {
+            let first = comp.drag_icon_position();
+            if let Some(value) = first
+                && first != since
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let second = comp.drag_icon_position();
+                if second == first {
+                    return value;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drag_icon_position() never settled to a new value within {POLL_TIMEOUT:?} \
+                 (since={since:?}, last read: {first:?})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+
+    // A maps; briefly maximized-then-restored exactly like the sibling drag
+    // tests, purely to discover A's real (unmaximized) geometry from the
+    // model -- unlike those tests, the *extent* passed to `motion_absolute`
+    // below is [`OUTPUT_W`]/[`OUTPUT_H`], not derived from this maximized
+    // query (see that constant's own doc for why).
+    let mut a = TestClient::map_toplevel(&comp.socket, "src.app", "src");
+    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "src.app"));
+    let Event::WindowOpened(a_info) = opened else { unreachable!() };
+
+    let configures = a.configure_count();
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, true));
+    assert!(
+        a.wait_until(|c| c.configure_count() > configures && c.states().contains(&MAXIMIZED)),
+        "A never maximized"
+    );
+
+    let configures = a.configure_count();
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, false));
+    assert!(
+        a.wait_until(|c| c.configure_count() > configures && !c.states().contains(&MAXIMIZED)),
+        "A never unmaximized"
+    );
+
+    // A's real (unmaximized) geometry -- a point inside it is the press
+    // target, exactly the positive drag test's setup.
+    let a_geo = comp.snapshot().windows[0].geometry;
+    let (ax, ay) = (
+        (a_geo.x + a_geo.width / 2) as f64,
+        (a_geo.y + a_geo.height / 2) as f64,
+    );
+
+    // Move the pointer over A and press to mint a grab serial for A.
+    vp.motion_absolute(ax, ay, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.button(BTN_LEFT, true);
+    vp.frame();
+    vp.pump();
+    assert!(a.wait_until(|c| c.last_pointer_serial().is_some()), "A never got a pointer serial");
+
+    let serial = a.last_pointer_serial().expect("just asserted this is Some");
+    a.start_drag_text_with_icon("text/plain;charset=utf-8", b"dragged", serial, ICON_SIZE, ICON_SIZE);
+
+    // Criterion 4a -- RENDERS: the icon's committed buffer must have
+    // produced a live scene node with real layout coordinates. At this
+    // point the tree exists but has not yet been repositioned by any
+    // motion -- `wlr_scene_drag_icon_create` leaves it at its `(0, 0)`
+    // creation default -- so this only checks `Some`, not a particular
+    // value.
+    let p0 = poll_drag_icon_position(&comp, |pos| pos.is_some());
+    assert!(p0.is_some(), "the drag icon never rendered a scene node");
+
+    // Two points strictly inside A's own geometry, not just anywhere in the
+    // output. `enter_surface_under_cursor` (wlr crate `backend.rs`) only
+    // calls `wlr_seat_pointer_notify_motion` when `leaf_surface_at` finds a
+    // surface under the cursor; over empty output space (no second client
+    // mapped in this test) it calls `wlr_seat_pointer_notify_clear_focus`
+    // instead, which never reaches `on_pointer_motion`'s repositioning
+    // call -- so a move to empty space would never move the icon at all.
+    // Both M1 and M2 stay inside A to rule that out.
+    let (m1x, m1y) = (
+        (a_geo.x + a_geo.width / 4) as f64,
+        (a_geo.y + a_geo.height / 4) as f64,
+    );
+    let (m2x, m2y) = (
+        (a_geo.x + 3 * a_geo.width / 4) as f64,
+        (a_geo.y + 3 * a_geo.height / 4) as f64,
+    );
+    assert!((m2x - m1x).abs() > 1.0 || (m2y - m1y).abs() > 1.0, "M1 -> M2 must have a real delta");
+
+    // First post-drag motion, to M1. `wlr::Runtime`'s `on_pointer_motion*`
+    // sets the icon tree's scene position to the live cursor layout
+    // coordinates on every motion, so once this lands, `drag_icon_position`
+    // must read back *something other than* `p0` (the pre-motion reading) --
+    // polled for rather than asserted immediately, since the compositor
+    // processes the motion (and this query) on its own loop tick, not
+    // synchronously with `vp.frame()`/`vp.pump()` returning. This does not
+    // assert the exact value equals M1: `wlr::Runtime::reposition_drag_icon`
+    // positions the *outer* tree at the raw cursor, while the icon surface's
+    // own hotspot offset (from wlroots' internal `surface_tree` commit
+    // handler) is applied as a separate, constant child offset -- so the
+    // absolute reading legitimately differs from M1 by that fixed amount.
+    // That offset is constant across both motions, so it cancels out of the
+    // *delta* Criterion 4b checks below.
+    vp.motion_absolute(m1x, m1y, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+    let p1 = poll_settled_drag_icon_position(&comp, p0);
+
+    // Second post-drag motion, to M2.
+    vp.motion_absolute(m2x, m2y, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+    let p2 = poll_settled_drag_icon_position(&comp, Some(p1));
+
+    // Criterion 4b -- FOLLOWS: the icon's position moved between the two
+    // post-drag motions, by (within 1px rounding) exactly the pointer's own
+    // delta between those same two motions.
+    assert_ne!(p2, p1, "the drag icon never moved between M1 and M2 -- it is not following the pointer");
+
+    let observed_delta = (p2.0 - p1.0, p2.1 - p1.1);
+    let expected_delta = ((m2x - m1x).round() as i32, (m2y - m1y).round() as i32);
+    assert!(
+        (observed_delta.0 - expected_delta.0).abs() <= 1 && (observed_delta.1 - expected_delta.1).abs() <= 1,
+        "icon delta {observed_delta:?} does not match pointer delta {expected_delta:?} \
+         (p1={p1:?}, p2={p2:?}, M1=({m1x},{m1y}), M2=({m2x},{m2y}))"
+    );
+
+    vp.button(BTN_LEFT, false);
+    vp.frame();
+    vp.pump();
+
+    a.detach();
+}
