@@ -1184,3 +1184,67 @@ fn screencopy_captures_the_output() {
     assert!(frame.width > 0 && frame.height > 0, "empty capture geometry");
     assert_eq!(frame.bytes.len(), (frame.stride * frame.height) as usize);
 }
+
+/// M4.3 Success Criterion 2 (load-bearing): a capture of the empty output is
+/// a uniform image of the configured wallpaper color — proving the bytes are
+/// the output's real composited content, not a cleared or garbage buffer.
+///
+/// Expected and actual share one config source: `Compositor::spawn` (harness
+/// boot, `harness/src/lib.rs`) constructs its `State` from
+/// `icedtea_config::default_config()`, exactly the same call used below to
+/// derive the expected color, so this assertion can never be vacuously right.
+#[test]
+fn screencopy_of_empty_output_is_the_wallpaper_color() {
+    let comp = Compositor::spawn();
+    let mut sc = icedtea_harness::ScreencopyClient::spawn(&comp.socket);
+    let frame = sc.capture();
+
+    // Expected color: the wallpaper rgba mapped to the reported format's
+    // actual memory byte order. Xrgb8888/Argb8888 are little-endian 4
+    // bytes/pixel B,G,R,X (verified elsewhere in this suite, e.g.
+    // `create_shm_buffer`'s fill). The headless backend's software (pixman)
+    // renderer instead hands screencopy back Bgr888 -- 3 tightly packed
+    // bytes/pixel, no pad byte -- and despite the name, its memory layout is
+    // R,G,B (byte0=R): the wl_shm/DRM fourcc convention names 24bpp formats
+    // by the bit-range each channel occupies when the pixel is read as one
+    // little-endian integer ("[23:0] B:G:R little endian" = R in the low
+    // byte), which is the reverse convention from the 32-bit Xrgb/Argb
+    // formats' byte-address-order naming. Confirmed empirically against
+    // this backend's actual capture bytes (R and B were swapped until this
+    // was corrected) -- see the byte order test in the accompanying report.
+    let (bpp, byte_order) = match frame.format {
+        wayland_client::protocol::wl_shm::Format::Xrgb8888
+        | wayland_client::protocol::wl_shm::Format::Argb8888 => (4usize, [2, 1, 0]),
+        wayland_client::protocol::wl_shm::Format::Bgr888 => (3usize, [0, 1, 2]),
+        other => panic!("unexpected screencopy shm format {other:?}; byte order assumption may not hold"),
+    };
+
+    let [r, g, b, _a] =
+        icedtea_compositor::render::wallpaper_color(&icedtea_config::default_config().appearance);
+    let expect = |c: f32| (c * 255.0).round() as i32;
+    let (er, eg, eb) = (expect(r), expect(g), expect(b));
+
+    // Every pixel must be identical (uniform) and within ±2 of the expected
+    // color per channel (absorbs any renderer color-space/rounding delta).
+    let (mut first, mut uniform) = (None, true);
+    for y in 0..frame.height as usize {
+        for x in 0..frame.width as usize {
+            let o = y * frame.stride as usize + x * bpp;
+            let px = (
+                frame.bytes[o + byte_order[0]],
+                frame.bytes[o + byte_order[1]],
+                frame.bytes[o + byte_order[2]],
+            );
+            match first {
+                None => first = Some(px),
+                Some(f) if f != px => uniform = false,
+                _ => {}
+            }
+        }
+    }
+    assert!(uniform, "capture is not a uniform color; a cleared/garbage buffer");
+    let (pr, pg, pb) = first.expect("no pixels");
+    assert!((pr as i32 - er).abs() <= 2, "R {pr} vs {er}");
+    assert!((pg as i32 - eg).abs() <= 2, "G {pg} vs {eg}");
+    assert!((pb as i32 - eb).abs() <= 2, "B {pb} vs {eb}");
+}

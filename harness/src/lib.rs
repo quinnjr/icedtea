@@ -5,7 +5,7 @@
 //! * [`Compositor`] boots the production compositor — the same
 //!   `Display`/`Runtime`/`Backend`/`State` wiring `lib.rs::run()` does, minus
 //!   the pieces a test has no use for (D-Bus service, wallpaper worker,
-//!   config-reload pipe, background rect, signal source) — on a thread of its
+//!   config-reload pipe, signal source) — on a thread of its
 //!   own, against the headless backend, and hands back its socket name plus
 //!   the two production channels a test observes and drives it through: the
 //!   `SeqEvent` stream and the `DbCommand` queue.
@@ -237,6 +237,22 @@ impl Compositor {
             let mut state =
                 icedtea_compositor::state::State::new(icedtea_config::default_config(), event_tx);
             state.wayland.attach(runtime.clone());
+
+            // Same "harness cannot degrade" tone as the globals above, and
+            // required for M4.3's screencopy tests specifically: without
+            // this, the scene is empty and a capture reads back whatever the
+            // renderer's clear color is rather than the configured wallpaper
+            // color, which is exactly what `screencopy_of_empty_output_is_
+            // the_wallpaper_color` asserts on. Same boot-order and sizing
+            // contract as `lib.rs::run()` (sized to nothing until an output
+            // with a mode arrives; `new_output` resizes it) and the same
+            // "lowered now so nothing later has to remember to" reasoning.
+            let background = runtime
+                .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+                .expect("background rect");
+            runtime.lower_rect_to_bottom(background);
+            state.set_background(background);
+
             state.set_command_receiver(cmd_rx);
 
             let (cmd_wake_write, cmd_wake_id) =
