@@ -102,6 +102,12 @@ pub enum DbCommand {
     /// Test-only: synthesize a touch-up for touch point `id` via
     /// `wlr::Runtime::inject_touch_up`. See `InjectTouchDown`'s doc.
     InjectTouchUp { id: i32, time_msec: u32, reply: Sender<()> },
+    /// Test-only: read the drag icon's current scene layout position via
+    /// `wlr::Runtime::drag_icon_position`, replying with `None` if no drag
+    /// with a visible icon is in progress. Not reachable from
+    /// `WmInterface` -- only the test harness sends this, same reasoning
+    /// as `InjectTouchDown`.
+    DragIconPosition { reply: Sender<Option<(i32, i32)>> },
 }
 
 /// Map a `contract::Event` to its D-Bus signal name, so the emitter thread
