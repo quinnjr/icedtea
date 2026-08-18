@@ -106,6 +106,18 @@ pub fn run() {
     if let Err(err) = runtime.create_screencopy_manager(&display) {
         tracing::error!(%err, "screen capture is unavailable");
     }
+    // Secure screen locking (loginctl lock-session, swaylock, etc.).
+    // Non-fatal: the crate enforces the security invariants internally, so a
+    // failure here just means no client can lock this session.
+    if let Err(err) = runtime.create_session_lock_manager(&display) {
+        tracing::error!(%err, "session locking is unavailable");
+    }
+    if let Err(err) = runtime.create_idle_notifier(&display) {
+        tracing::error!(%err, "idle notification is unavailable");
+    }
+    if let Err(err) = runtime.create_idle_inhibit_manager(&display) {
+        tracing::error!(%err, "idle inhibition is unavailable");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");

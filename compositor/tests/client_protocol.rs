@@ -134,6 +134,42 @@ fn screencopy_manager_global_is_advertised() {
     );
 }
 
+/// M4.4 adds secure screen locking: `ext_session_lock_manager_v1` lets a
+/// locker (swaylock, gtk4-lock-screen, ...) take the session lock.
+#[test]
+fn session_lock_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "ext_session_lock_manager_v1"),
+        "session lock manager global missing; saw {globals:?}"
+    );
+}
+
+/// M4.4 adds idle notification: `ext_idle_notifier_v1` lets a client (e.g.
+/// swayidle) learn when the seat has been idle for a timeout.
+#[test]
+fn idle_notifier_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "ext_idle_notifier_v1"),
+        "idle notifier global missing; saw {globals:?}"
+    );
+}
+
+/// M4.4 adds idle inhibition: `zwp_idle_inhibit_manager_v1` lets a client
+/// (e.g. a video player) suppress idle notification while active.
+#[test]
+fn idle_inhibit_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwp_idle_inhibit_manager_v1"),
+        "idle inhibit manager global missing; saw {globals:?}"
+    );
+}
+
 /// A client can bind `zwlr_virtual_pointer_manager_v1` and create a virtual
 /// pointer, then inject motion/button/frame requests without a protocol
 /// error — the M4.2 drag-and-drop grab serial's source. Full drag coverage

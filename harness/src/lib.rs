@@ -219,6 +219,18 @@ impl Compositor {
             runtime
                 .create_screencopy_manager(&display)
                 .expect("zwlr_screencopy_manager_v1");
+            // Same "harness cannot degrade" tone: the session-lock and idle
+            // tests bind these globals directly and would assert against
+            // ones that were never advertised.
+            runtime
+                .create_session_lock_manager(&display)
+                .expect("ext_session_lock_manager_v1");
+            runtime
+                .create_idle_notifier(&display)
+                .expect("ext_idle_notifier_v1");
+            runtime
+                .create_idle_inhibit_manager(&display)
+                .expect("zwp_idle_inhibit_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
             // Test-only: makes the seat advertise the touch capability so
             // headless clients can bind `wl_touch` and injected touch
