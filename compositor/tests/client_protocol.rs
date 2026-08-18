@@ -1173,3 +1173,14 @@ fn a_pointer_drag_renders_and_follows_its_icon() {
 
     a.detach();
 }
+
+/// A screencopy client can capture the headless output: the frame reaches
+/// `ready` and returns a full-size buffer.
+#[test]
+fn screencopy_captures_the_output() {
+    let comp = Compositor::spawn();
+    let mut sc = icedtea_harness::ScreencopyClient::spawn(&comp.socket);
+    let frame = sc.capture();
+    assert!(frame.width > 0 && frame.height > 0, "empty capture geometry");
+    assert_eq!(frame.bytes.len(), (frame.stride * frame.height) as usize);
+}
