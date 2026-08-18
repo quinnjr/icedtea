@@ -1476,16 +1476,13 @@ fn idle_notify_fires_idled_then_resumed_on_activity() {
 /// from the inhibitor rather than from a notifier that is simply broken and
 /// never fires: with the inhibitor gone, `idled` must positively arrive.
 ///
-/// IGNORED (M4.4 task 8): the first half (suppression) is logically correct
-/// and was confirmed by temporarily running this test un-ignored, but any
-/// destruction whatsoever of a live `zwp_idle_inhibitor_v1` resource --
-/// this test's own explicit `destroy_inhibitor()` below, an implicit
-/// destroy from the client disconnecting, or the resource cleanup that
-/// runs when this harness's `Compositor` tears its `wl_display` down at
-/// end of test -- aborts the whole compositor process (SIGABRT, same
-/// address space as this test binary), which would take every other test
-/// queued after it down too. Confirmed under gdb: the abort is
-/// `types/wlr_idle_inhibit_v1.c:37: idle_inhibitor_v1_destroy: Assertion
+/// PREVIOUSLY BLOCKED, NOW FIXED (M4.4 task 8): destroying a live
+/// `zwp_idle_inhibitor_v1` resource -- this test's own explicit
+/// `destroy_inhibitor()` below, an implicit destroy from the client
+/// disconnecting, or the resource cleanup that runs when this harness's
+/// `Compositor` tears its `wl_display` down at end of test -- used to abort
+/// the whole compositor process. Confirmed under gdb at the time: the abort
+/// was `types/wlr_idle_inhibit_v1.c:37: idle_inhibitor_v1_destroy: Assertion
 /// 'wl_list_empty(&inhibitor->events.destroy.listener_list)' failed`.
 ///
 /// Root cause (traced, not guessed): wlroots' own
@@ -1494,27 +1491,16 @@ fn idle_notify_fires_idled_then_resumed_on_activity() {
 /// (`wl_signal_emit_mutable(&inhibitor->events.destroy, inhibitor->surface)`
 /// in `types/wlr_idle_inhibit_v1.c`). The vendored crate's
 /// `on_idle_inhibitor_destroy` (`wlroots-sys/crates/wlr/src/backend.rs`)
-/// assumes the opposite -- its own doc comment claims "`data` is the same
-/// `*mut wlr_idle_inhibitor_v1` `on_new_idle_inhibitor` linked against" --
-/// and uses that `data` pointer as the `Session::idle_inhibitors` map key
-/// to find and drop the per-inhibitor `Registration` (which is what
-/// unlinks the listener). Because the key it computes is actually the
-/// surface's address, the lookup always misses, the `Registration` is
-/// never dropped, the listener stays linked, and wlroots' own assertion
-/// (added specifically to catch exactly this class of bug) fires. This is
-/// a real, unconditional bug: not a test-harness timing issue, and not
-/// specific to headless/injected input -- any real client releasing (or
-/// disconnecting while holding) an idle inhibitor would crash a production
-/// compositor the same way. Per this task's constraints this harness may
-/// not modify the sibling `wlroots-sys` repo, so the fix (keying
-/// `Session::idle_inhibitors` by the listener's own address, e.g. via
-/// `Registration::listener_addr`, rather than by the signal's `data`) is
-/// out of scope here. Un-ignore once that lands upstream.
+/// used to assume the opposite and key its `Session::idle_inhibitors`
+/// removal lookup by that `data` pointer -- which, being the surface's
+/// address rather than the inhibitor's, always missed, leaving the
+/// listener linked and tripping wlroots' own assertion. Fixed upstream in
+/// `wlroots-sys` commit `f9e533b` ("key idle-inhibitor destroy listener by
+/// its own addr, not data"): the map is now keyed by the destroy
+/// listener's own address (`Registration::listener_addr`), which is stable
+/// regardless of what the signal hands back as `data`. This test is now
+/// active and both halves below are exercised for real.
 #[test]
-#[ignore = "wlroots-sys on_idle_inhibitor_destroy uses the wrong signal-data \
-            pointer as its removal key (see doc comment above), so ANY \
-            zwp_idle_inhibitor_v1 destroy -- explicit or via disconnect/ \
-            teardown -- aborts the whole process; not fixable from this repo"]
 fn idle_inhibit_suppresses_idle_until_destroyed() {
     let comp = Compositor::spawn();
     let mut inhibit = IdleInhibitClient::spawn(&comp.socket);
