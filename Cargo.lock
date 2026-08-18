@@ -1263,6 +1263,7 @@ dependencies = [
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
  "wlr",
+ "xkbcommon",
 ]
 
 [[package]]

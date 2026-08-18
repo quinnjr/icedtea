@@ -13,7 +13,8 @@
 use icedtea_contract::Event;
 
 use icedtea_harness::{
-    Compositor, DataControlClient, TestClient, VirtualKeyboardClient, VirtualPointerClient,
+    Compositor, DataControlClient, SessionLockClient, TestClient, VirtualKeyboardClient,
+    VirtualPointerClient,
 };
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
@@ -1325,4 +1326,68 @@ fn screencopy_reflects_a_mapped_toplevel() {
     }
     assert!(saw_grey, "toplevel grey (0x80) not present in the capture");
     assert!(saw_non_grey, "capture is uniform; toplevel not composited over wallpaper");
+}
+
+/// M4.4 Criterion 2: a session lock reaches `locked`, isolates input from
+/// normal clients while locked, and restores on unlock.
+///
+/// The load-bearing assertion is the middle one: a key injected via the
+/// virtual keyboard while locked must NOT advance `app`'s
+/// `wl_keyboard.key` count. A *pre-lock* key press first proves this
+/// harness's injector and observable actually work end to end (`app`'s
+/// count does advance) -- without that baseline, a broken injector would
+/// make the isolation assertion pass vacuously. If the crate's input
+/// isolation were broken (the lock did not stop keyboard delivery to a
+/// normal focused toplevel), the post-lock key would still reach `app` and
+/// its count would advance past the pre-lock baseline, failing the
+/// assertion.
+#[test]
+fn session_lock_locks_isolates_input_and_unlocks() {
+    let comp = Compositor::spawn();
+    let mut vk = VirtualKeyboardClient::spawn(&comp.socket);
+    // A normal toplevel, focused before the lock.
+    let mut app = TestClient::map_toplevel(&comp.socket, "app", "app");
+    assert!(app.wait_until(|c| c.has_input_serial()), "app focused pre-lock");
+
+    // Baseline: prove key delivery actually works before the lock exists,
+    // so the later "no delivery while locked" assertion cannot be vacuous.
+    vk.key_press(30); // KEY_A
+    assert!(
+        app.wait_until(|c| c.key_events() >= 1),
+        "app never received a keyboard key pre-lock; the injector/observable \
+         itself is broken, which would make the isolation check meaningless"
+    );
+    let pre_lock_keys = app.key_events();
+
+    let mut locker = SessionLockClient::spawn(&comp.socket);
+    locker.lock();
+    assert!(locker.wait_locked(), "session never reported locked");
+    assert!(comp.session_locked(), "compositor is_session_locked() is false");
+
+    // While locked, inject another key. The normal app must not receive it:
+    // pump the app's queue for a bounded window and assert its key count
+    // never moved past the pre-lock baseline.
+    vk.key_press(31); // KEY_S
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        vk.pump();
+        app.pump();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        app.key_events(),
+        pre_lock_keys,
+        "app received a keyboard key while the session was locked -- \
+         input isolation broken"
+    );
+
+    locker.unlock();
+    assert!(!comp.session_locked(), "still locked after unlock");
+
+    // Unlock restores focus: a fresh key now reaches the app again.
+    vk.key_press(32); // KEY_D
+    assert!(
+        app.wait_until(|c| c.key_events() > pre_lock_keys),
+        "unlock did not restore keyboard delivery to the app"
+    );
 }

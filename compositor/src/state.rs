@@ -2500,6 +2500,11 @@ impl State {
                 let _ = reply.send(pos);
                 return Some(());
             }
+            DbCommand::SessionLocked { reply } => {
+                let locked = self.wayland.runtime().map(|rt| rt.is_session_locked()).unwrap_or(false);
+                let _ = reply.send(locked);
+                return Some(());
+            }
         }
         self.emit_pending();
         Some(())
