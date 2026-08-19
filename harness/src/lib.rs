@@ -45,6 +45,13 @@ use wayland_client::protocol::{
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop, event_created_child,
 };
+use wayland_protocols::ext::idle_notify::v1::client::{ext_idle_notification_v1, ext_idle_notifier_v1};
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
+};
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
+};
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
     zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
@@ -69,6 +76,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
 };
 use wayland_client::protocol::wl_output::{self, WlOutput};
+use xkbcommon::xkb;
 
 /// How long any "wait for the compositor to do a thing" helper waits before
 /// declaring the harness broken.
@@ -219,6 +227,18 @@ impl Compositor {
             runtime
                 .create_screencopy_manager(&display)
                 .expect("zwlr_screencopy_manager_v1");
+            // Same "harness cannot degrade" tone: the session-lock and idle
+            // tests bind these globals directly and would assert against
+            // ones that were never advertised.
+            runtime
+                .create_session_lock_manager(&display)
+                .expect("ext_session_lock_manager_v1");
+            runtime
+                .create_idle_notifier(&display)
+                .expect("ext_idle_notifier_v1");
+            runtime
+                .create_idle_inhibit_manager(&display)
+                .expect("zwp_idle_inhibit_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
             // Test-only: makes the seat advertise the touch capability so
             // headless clients can bind `wl_touch` and injected touch
@@ -342,6 +362,34 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::DragIconPosition { reply: reply_tx });
         reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered DragIconPosition")
+    }
+
+    /// Whether the session is currently locked, via
+    /// `wlr::Runtime::is_session_locked`. Blocks on the reply -- see
+    /// [`Self::inject_touch_down`]'s doc.
+    pub fn session_locked(&self) -> bool {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::SessionLocked { reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered SessionLocked")
+    }
+
+    /// Give the compositor a bounded window to finish processing something
+    /// this side of the socket can't directly observe -- most notably a
+    /// client's disconnect, which the event loop only notices on its own
+    /// next dispatch. Deliberately NOT a "poll `pred` until true" loop: that
+    /// shape can pass vacuously (or hide a state flapping back and forth)
+    /// when the caller's real intent is "make sure whatever the disconnect
+    /// triggers has actually landed" before taking a single, final reading.
+    /// Instead this forces a fixed number of full round trips through the
+    /// command channel -- each `snapshot()` wakes the loop via the same wake
+    /// pipe a real socket-readable event would use and blocks until it has
+    /// replied, so by the last iteration the loop has been given many
+    /// dispatch cycles with real pauses between them.
+    pub fn settle(&self) {
+        for _ in 0..20 {
+            let _ = self.snapshot();
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Block until an event matching `pred` arrives; panics on timeout.
@@ -471,6 +519,11 @@ struct ClientState {
     /// on a headless seat with no keyboard capability — `set_selection` then
     /// passes 0.
     last_serial: Option<u32>,
+    /// How many `wl_keyboard.key` events this client has received, ever —
+    /// unlike `last_serial` (which `enter` also sets), this only advances on
+    /// an actual key press/release delivered to this client, which is exactly
+    /// what M4.4's lock-isolation test needs to observe.
+    key_events: u32,
     /// What this client's own data source answers `send` with.
     offered_mime: String,
     offered_payload: Vec<u8>,
@@ -530,6 +583,41 @@ struct ClientState {
     screencopy_manager: Option<ZwlrScreencopyManagerV1>,
     /// Screencopy frame bookkeeping, filled by the frame's event dispatch.
     screencopy_frame: ScreencopyFrameState,
+
+    // --- session lock (M4.4) ---
+    session_lock_manager: Option<ext_session_lock_manager_v1::ExtSessionLockManagerV1>,
+    /// Set true on the active lock's `locked` event.
+    session_locked: bool,
+    /// Set true on the active lock's `finished` event.
+    session_finished: bool,
+    /// One entry per `ext_session_lock_surface_v1` this client has created,
+    /// keyed by identity so the surface's own `configure` dispatch can find
+    /// its matching `wl_surface` + shm keepalives. The `configure` handler
+    /// does the whole ack/attach/commit dance itself (it has both `state`
+    /// and `qh` in hand), so nothing outside `Dispatch` needs to drive it.
+    lock_surfaces: Vec<LockSurfaceEntry>,
+
+    // --- idle-notify / idle-inhibit (M4.4) ---
+    idle_notifier: Option<ext_idle_notifier_v1::ExtIdleNotifierV1>,
+    idle_inhibit_manager: Option<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1>,
+    /// Set true on the active `ext_idle_notification_v1`'s `idled` event;
+    /// reset whenever [`IdleNotifyClient::notification`] requests a fresh
+    /// notification object, so a stale flag from a previous request can
+    /// never be mistaken for a fresh one.
+    idle_idled: bool,
+    /// As `idle_idled`, for `resumed`.
+    idle_resumed: bool,
+}
+
+/// One lock surface this client has created via `get_lock_surface`, plus the
+/// shm buffer keepalives its `configure` handler attaches. See
+/// `ClientState::lock_surfaces`'s doc.
+struct LockSurfaceEntry {
+    lock_surface: ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+    wl_surface: wl_surface::WlSurface,
+    /// Kept alive only so the shm file/pool/buffer survive as long as the
+    /// compositor may still read them -- their contents are never inspected.
+    _buffer_keepalive: Option<(std::fs::File, wl_shm_pool::WlShmPool, wl_buffer::WlBuffer)>,
 }
 
 #[derive(Default)]
@@ -590,6 +678,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zwlr_screencopy_manager_v1" => {
                     state.screencopy_manager = Some(registry.bind(name, version.min(3), qh, ()));
+                }
+                "ext_session_lock_manager_v1" => {
+                    state.session_lock_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "ext_idle_notifier_v1" => {
+                    state.idle_notifier = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_idle_inhibit_manager_v1" => {
+                    state.idle_inhibit_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -923,7 +1020,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for ClientState {
         // event's fd is dropped with the event.
         match event {
             wl_keyboard::Event::Enter { serial, .. } => state.last_serial = Some(serial),
-            wl_keyboard::Event::Key { serial, .. } => state.last_serial = Some(serial),
+            wl_keyboard::Event::Key { serial, .. } => {
+                state.last_serial = Some(serial);
+                state.key_events = state.key_events.saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -1031,6 +1131,79 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for ClientState {
         }
     }
 }
+
+delegate_noop!(ClientState: ignore ext_session_lock_manager_v1::ExtSessionLockManagerV1);
+
+impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ext_session_lock_v1::ExtSessionLockV1,
+        event: ext_session_lock_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_v1::Event::Locked => state.session_locked = true,
+            ext_session_lock_v1::Event::Finished => state.session_finished = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ()> for ClientState {
+    /// Per the protocol's own doc on `ext_session_lock_surface_v1`: on
+    /// `configure`, `ack_configure` then attach an shm buffer of the
+    /// configured size and commit -- only then can the compositor consider
+    /// this output covered and send `locked`. Done right here, synchronously,
+    /// since this handler already has both `state` (for `shm`) and `qh` (to
+    /// create the buffer) in hand; nothing outside `Dispatch` needs to drive
+    /// it.
+    fn event(
+        state: &mut Self,
+        surface: &ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+        event: ext_session_lock_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        let ext_session_lock_surface_v1::Event::Configure { serial, width, height } = event else {
+            return;
+        };
+        surface.ack_configure(serial);
+        let Some(entry) = state.lock_surfaces.iter_mut().find(|e| &e.lock_surface == surface) else {
+            return;
+        };
+        let shm = state.shm.clone().expect("compositor did not advertise wl_shm");
+        let (w, h) = (width.max(1) as i32, height.max(1) as i32);
+        let (file, pool, buffer) = create_shm_buffer(&shm, qh, w, h);
+        entry.wl_surface.attach(Some(&buffer), 0, 0);
+        entry.wl_surface.commit();
+        entry._buffer_keepalive = Some((file, pool, buffer));
+    }
+}
+
+delegate_noop!(ClientState: ignore ext_idle_notifier_v1::ExtIdleNotifierV1);
+
+impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ext_idle_notification_v1::ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => state.idle_idled = true,
+            ext_idle_notification_v1::Event::Resumed => state.idle_resumed = true,
+            _ => {}
+        }
+    }
+}
+
+delegate_noop!(ClientState: ignore zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1);
+delegate_noop!(ClientState: ignore zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1);
 
 /// A real wayland client with exactly one mapped xdg toplevel.
 pub struct TestClient {
@@ -1791,6 +1964,14 @@ impl TestClient {
         self.state.last_serial.is_some()
     }
 
+    /// How many `wl_keyboard.key` events this client has received, ever. The
+    /// M4.4 lock-isolation test's load-bearing observable: a key injected via
+    /// the virtual keyboard advances this when (and only when) the compositor
+    /// actually delivers it to this client's keyboard.
+    pub fn key_events(&self) -> u32 {
+        self.state.key_events
+    }
+
     /// One `roundtrip`, exposed so a transfer helper can drive an owner client
     /// whose data source must answer `send`.
     pub fn pump(&mut self) {
@@ -1997,12 +2178,29 @@ pub struct VirtualKeyboardClient {
     conn: Connection,
     queue: EventQueue<ClientState>,
     state: ClientState,
-    _vk: zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+    vk: zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+    /// Monotonic millisecond timestamp handed to every `key` request; mirrors
+    /// `VirtualPointerClient::time` -- the compositor only cares that it does
+    /// not go backwards.
+    time: u32,
 }
 
+/// `wl_keyboard`'s `keymap_format` enum value for `XKB_V1` -- the virtual
+/// keyboard protocol's `keymap.format` arg carries this same value (its own
+/// xml declares no enum of its own, but reuses `wl_keyboard`'s).
+const KEYMAP_FORMAT_XKB_V1: u32 = 1;
+
+/// `wl_keyboard`'s `key_state` enum values -- likewise reused by
+/// `zwp_virtual_keyboard_v1.key`'s plain-`uint` `state` arg.
+const KEY_STATE_RELEASED: u32 = 0;
+const KEY_STATE_PRESSED: u32 = 1;
+
 impl VirtualKeyboardClient {
-    /// Connect, create a virtual keyboard on the seat, and settle. Panics if
-    /// the compositor did not advertise `zwp_virtual_keyboard_manager_v1`.
+    /// Connect, create a virtual keyboard on the seat, hand it a minimal
+    /// valid "us" xkb keymap (required before any `key` request -- wlroots
+    /// refuses `key` with a protocol error until a keymap has been set), and
+    /// settle. Panics if the compositor did not advertise
+    /// `zwp_virtual_keyboard_manager_v1`.
     pub fn spawn(socket: &str) -> VirtualKeyboardClient {
         let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
         let manager = state
@@ -2011,12 +2209,59 @@ impl VirtualKeyboardClient {
             .expect("compositor did not advertise zwp_virtual_keyboard_manager_v1");
         let seat = state.seat.clone().expect("no seat");
         let vk = manager.create_virtual_keyboard(&seat, &qh, ());
+
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("compile a minimal us xkb keymap");
+        // Null-terminated, per `wl_keyboard.keymap`'s own contract for the
+        // XKB_V1 text format -- `size` below includes that terminator.
+        let mut keymap_str = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1).into_bytes();
+        keymap_str.push(0);
+        let fd: OwnedFd = rustix::fs::memfd_create(
+            "icedtea-harness-keymap",
+            rustix::fs::MemfdFlags::CLOEXEC,
+        )
+        .expect("memfd_create");
+        rustix::fs::ftruncate(&fd, keymap_str.len() as u64).expect("ftruncate keymap");
+        let mut keymap_file = std::fs::File::from(fd);
+        keymap_file.write_all(&keymap_str).expect("write keymap");
+        keymap_file.flush().expect("flush keymap");
+        vk.keymap(KEYMAP_FORMAT_XKB_V1, keymap_file.as_fd(), keymap_str.len() as u32);
+        // The fd is dup'd across the wire by the connection's own send path
+        // (wayland-client dups on `flush`), so the client's copy can close
+        // right after -- drop it explicitly for clarity.
+        drop(keymap_file);
+
         conn.flush().expect("flush vk create");
         // Two roundtrips so the compositor processes new_virtual_keyboard and
         // the seat's capability change is on the wire before callers connect.
         queue.roundtrip(&mut state).expect("vk roundtrip");
         queue.roundtrip(&mut state).expect("vk settle");
-        VirtualKeyboardClient { conn, queue, state, _vk: vk }
+        VirtualKeyboardClient { conn, queue, state, vk, time: 0 }
+    }
+
+    /// Next monotonic timestamp for a request.
+    fn next_time(&mut self) -> u32 {
+        self.time = self.time.saturating_add(1);
+        self.time
+    }
+
+    /// Press then release `key` (a Linux input-event keycode, e.g. `30` for
+    /// `KEY_A`) + flush. Requires the keymap `spawn` already set.
+    pub fn key_press(&mut self, key: u32) {
+        let time = self.next_time();
+        self.vk.key(time, key, KEY_STATE_PRESSED);
+        let time = self.next_time();
+        self.vk.key(time, key, KEY_STATE_RELEASED);
+        self.conn.flush().expect("flush key_press");
     }
 
     /// One roundtrip, to keep the injector responsive during a test.
@@ -2262,5 +2507,259 @@ impl DataControlClient {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read data-control selection");
         buf
+    }
+}
+
+/// An `ext_session_lock_manager_v1` client: takes a session lock, covers
+/// every advertised `wl_output` with a lock surface (the protocol's own
+/// precondition for the compositor to send `locked` -- see
+/// `ext_session_lock_surface_v1`'s Dispatch impl, which does the per-surface
+/// ack/attach/commit dance), and can unlock again.
+pub struct SessionLockClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    qh: QueueHandle<ClientState>,
+    state: ClientState,
+    lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
+}
+
+impl SessionLockClient {
+    /// Connect and bind. Panics if the compositor did not advertise
+    /// `ext_session_lock_manager_v1` or a `wl_output`.
+    pub fn spawn(socket: &str) -> SessionLockClient {
+        let (conn, queue, qh, state) = connect_and_bind(socket);
+        assert!(
+            state.session_lock_manager.is_some(),
+            "compositor did not advertise ext_session_lock_manager_v1"
+        );
+        assert!(state.output.is_some(), "compositor advertised no wl_output");
+        SessionLockClient { conn, queue, qh, state, lock: None }
+    }
+
+    /// Take the lock (`ext_session_lock_manager_v1.lock`), then immediately
+    /// create + cover a lock surface for every known `wl_output`, per the
+    /// protocol's own recommendation ("Clients should immediately create
+    /// lock surfaces for all outputs ... to make this possible"). Each lock
+    /// surface's `configure` handler (in `Dispatch`) acks, attaches an shm
+    /// buffer, and commits on its own -- this only has to pump the queue
+    /// until that has happened.
+    pub fn lock(&mut self) {
+        let manager = self.state.session_lock_manager.clone().expect("no ext_session_lock_manager_v1");
+        let compositor = self.state.compositor.clone().expect("no wl_compositor");
+        let output = self.state.output.clone().expect("no wl_output");
+
+        let lock = manager.lock(&self.qh, ());
+        let wl_surface = compositor.create_surface(&self.qh, ());
+        let lock_surface = lock.get_lock_surface(&wl_surface, &output, &self.qh, ());
+        self.state.lock_surfaces.push(LockSurfaceEntry {
+            lock_surface,
+            wl_surface,
+            _buffer_keepalive: None,
+        });
+        self.lock = Some(lock);
+        self.conn.flush().expect("flush lock");
+
+        // Pump until the lock surface's configure has round-tripped through
+        // (ack + attach + commit happen inside its own Dispatch handler).
+        let deadline = Instant::now() + TIMEOUT;
+        while self.state.lock_surfaces.iter().all(|e| e._buffer_keepalive.is_none()) {
+            assert!(Instant::now() < deadline, "lock surface never configured");
+            let _ = self.queue.roundtrip(&mut self.state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Pump until the `locked` event arrives, bounded by [`TIMEOUT`]. Returns
+    /// whether it did.
+    pub fn wait_locked(&mut self) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.state.session_locked {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Whether `finished` has arrived on the active lock.
+    pub fn is_finished(&self) -> bool {
+        self.state.session_finished
+    }
+
+    /// Unlock: `unlock_and_destroy` on the active lock (per protocol, valid
+    /// only after `locked` was received -- exactly [`Self::lock`] + the
+    /// [`Self::wait_locked`] precondition every caller is expected to honor).
+    /// Per the protocol's own doc on `unlock_and_destroy`, lock surfaces
+    /// created through this object should now be destroyed by the client too.
+    ///
+    /// NOTE (M4.4 task 6): destroying an `ext_session_lock_surface_v1` --
+    /// whether via this explicit request, or implicitly via a client
+    /// disconnect -- currently aborts the compositor process inside
+    /// wlroots' own `lock_surface_destroy` (`types/wlr_session_lock_v1.c:37`,
+    /// `Assertion 'wl_list_empty(&lock_surface->events.destroy.listener_list)'
+    /// failed`). Reproduces with nothing more than one `get_lock_surface` +
+    /// any destruction of it, with or without a commit ever happening; see
+    /// the task report for the full isolation. This looks like a listener
+    /// bookkeeping bug in the vendored `wlr` crate's
+    /// `on_session_lock_new_surface`/`on_session_lock_surface_destroy` (in
+    /// `wlroots-sys/crates/wlr/src/backend.rs`), which this harness is not
+    /// authorized to modify -- so the destroy calls below are the
+    /// protocol-correct thing to do and are kept for when that crate bug is
+    /// fixed, even though invoking them currently crashes the test process.
+    pub fn unlock(&mut self) {
+        let lock = self.lock.take().expect("unlock called without an active lock");
+        lock.unlock_and_destroy();
+        for entry in self.state.lock_surfaces.drain(..) {
+            entry.lock_surface.destroy();
+            entry.wl_surface.destroy();
+        }
+        self.conn.flush().expect("flush unlock");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+/// An `ext_idle_notifier_v1` client -- requests idle notifications on its own
+/// seat and observes `idled`/`resumed`. M4.4 criterion 4's driver.
+pub struct IdleNotifyClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    qh: QueueHandle<ClientState>,
+    state: ClientState,
+    /// The notification object [`Self::notification`] last created, kept
+    /// alive so it keeps delivering events and so a later call can destroy
+    /// it before replacing it.
+    notification: Option<ext_idle_notification_v1::ExtIdleNotificationV1>,
+}
+
+impl IdleNotifyClient {
+    /// Connect and bind. Panics if the compositor did not advertise
+    /// `ext_idle_notifier_v1` or a `wl_seat`.
+    pub fn spawn(socket: &str) -> IdleNotifyClient {
+        let (conn, queue, qh, state) = connect_and_bind(socket);
+        assert!(
+            state.idle_notifier.is_some(),
+            "compositor did not advertise ext_idle_notifier_v1"
+        );
+        assert!(state.seat.is_some(), "compositor advertised no wl_seat");
+        IdleNotifyClient { conn, queue, qh, state, notification: None }
+    }
+
+    /// Request a fresh `ext_idle_notification_v1` with `timeout_ms`, on this
+    /// client's seat. Destroys and replaces any previous notification object
+    /// and resets the `idled`/`resumed` flags, so a stale event from an
+    /// earlier notification can never be mistaken for one on this fresh
+    /// request -- exactly what letting the idle-inhibit test re-request a
+    /// notification after destroying its inhibitor needs.
+    pub fn notification(&mut self, timeout_ms: u32) {
+        let notifier = self.state.idle_notifier.clone().expect("no ext_idle_notifier_v1");
+        let seat = self.state.seat.clone().expect("no wl_seat");
+        if let Some(old) = self.notification.take() {
+            old.destroy();
+        }
+        self.state.idle_idled = false;
+        self.state.idle_resumed = false;
+        let notification = notifier.get_idle_notification(timeout_ms, &seat, &self.qh, ());
+        self.notification = Some(notification);
+        self.conn.flush().expect("flush get_idle_notification");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Pump bounded by [`TIMEOUT`] (5s -- generous relative to the short
+    /// timeouts these tests request) until `idled` arrives. Returns whether
+    /// it did.
+    pub fn wait_idled(&mut self) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.state.idle_idled {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// As [`Self::wait_idled`], for `resumed`.
+    pub fn wait_resumed(&mut self) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.state.idle_resumed {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Pump for up to `ms` and report whether `idled` fired during that
+    /// window -- used to assert idle did *not* fire within a bound
+    /// comfortably longer than the requested timeout (an active inhibitor
+    /// suppressing it), which `wait_idled`'s "wait until it happens" shape
+    /// cannot express.
+    pub fn idled_within(&mut self, ms: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        loop {
+            let _ = self.queue.roundtrip(&mut self.state);
+            if self.state.idle_idled {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// A `zwp_idle_inhibit_manager_v1` client -- creates an idle inhibitor on a
+/// surface of its own and can destroy it again. M4.4 criterion 5's driver.
+/// The inhibited-or-not state it controls is process-wide (any live
+/// inhibitor gates every notifier's idle timer, per
+/// `Runtime::refresh_idle_inhibited`), so the inhibiting surface need not be
+/// mapped, focused, or otherwise visible -- a bare `wl_surface` suffices.
+pub struct IdleInhibitClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    qh: QueueHandle<ClientState>,
+    state: ClientState,
+    surface: wl_surface::WlSurface,
+    inhibitor: Option<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1>,
+}
+
+impl IdleInhibitClient {
+    /// Connect, bind, and create the surface `create_inhibitor` will attach
+    /// an inhibitor to. Panics if the compositor did not advertise
+    /// `zwp_idle_inhibit_manager_v1`.
+    pub fn spawn(socket: &str) -> IdleInhibitClient {
+        let (conn, queue, qh, state) = connect_and_bind(socket);
+        assert!(
+            state.idle_inhibit_manager.is_some(),
+            "compositor did not advertise zwp_idle_inhibit_manager_v1"
+        );
+        let compositor = state.compositor.clone().expect("no wl_compositor");
+        let surface = compositor.create_surface(&qh, ());
+        IdleInhibitClient { conn, queue, qh, state, surface, inhibitor: None }
+    }
+
+    /// Create an inhibitor on this client's surface. Panics if one is
+    /// already active -- callers destroy before creating another.
+    pub fn create_inhibitor(&mut self) {
+        assert!(self.inhibitor.is_none(), "an inhibitor is already active");
+        let manager = self.state.idle_inhibit_manager.clone().expect("no zwp_idle_inhibit_manager_v1");
+        let inhibitor = manager.create_inhibitor(&self.surface, &self.qh, ());
+        self.inhibitor = Some(inhibitor);
+        self.conn.flush().expect("flush create_inhibitor");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Destroy the active inhibitor. Panics if none is active.
+    pub fn destroy_inhibitor(&mut self) {
+        let inhibitor = self.inhibitor.take().expect("no active inhibitor to destroy");
+        inhibitor.destroy();
+        self.conn.flush().expect("flush destroy_inhibitor");
+        let _ = self.queue.roundtrip(&mut self.state);
     }
 }

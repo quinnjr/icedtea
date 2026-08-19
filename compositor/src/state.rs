@@ -534,6 +534,18 @@ pub struct State {
     /// Set by `apply_action("quit")`; the event loop (task 5 reintroduces
     /// one) checks this each iteration and calls `stop()` once true.
     pub quitting: bool,
+    /// Set by [`SeatHandler::session_lock_changed`] while an
+    /// `ext-session-lock-v1` client holds the session locked. The crate
+    /// already refuses normal keyboard/pointer focus in this state (see
+    /// `wlr::Runtime::is_session_locked`); this flag exists only so this
+    /// model stops *fighting* that refusal -- without it, every geometry or
+    /// focus mutation still queued behind the lock (a workspace switch, a
+    /// close, a drag settling) would call `sync_window_to_scene`/
+    /// `sync_seat_focus` and try to reassert toplevel keyboard focus the
+    /// crate is silently dropping, which is at best wasted work and at
+    /// worst a race the moment the lock is released. `session_lock_changed`
+    /// clears it and restores focus to the MRU toplevel.
+    pub session_locked: bool,
     /// Last known pointer position in output logical coordinates. Task 5's
     /// input plumbing updates this on every pointer-motion event;
     /// button-only events (which carry no position of their own) read it
@@ -817,6 +829,7 @@ impl State {
             drag: input::DragMachine::new(),
             resize: input::ResizeMachine::new(),
             quitting: false,
+            session_locked: false,
             pointer_location: (0, 0),
             pointer_pressed: false,
             config_path: None,
@@ -1671,6 +1684,13 @@ impl State {
     /// `forget_window` calls `sync_focus_change(None)` explicitly for exactly
     /// that reason.
     pub fn sync_window_to_scene(&mut self, id: WindowId) {
+        // While the session is locked, the crate already refuses normal
+        // toplevel focus and routes input to lock surfaces only (see
+        // `session_locked`'s doc); suspend this model's own layout/focus
+        // reconciliation entirely rather than race that refusal.
+        if self.session_locked {
+            return;
+        }
         if !self.wayland.is_backed(id) {
             return;
         }
@@ -1932,6 +1952,11 @@ impl State {
     /// and does nothing when it already matches, so an ordinary geometry sync
     /// does not churn leave/enter pairs at the client.
     fn sync_seat_focus(&mut self) {
+        // See `session_locked`'s doc: don't reassert toplevel/layer keyboard
+        // focus the crate is already refusing while locked.
+        if self.session_locked {
+            return;
+        }
         // Review finding J3: this used to be unconditional, which meant
         // *any* `sync_window_to_scene`-driven resync -- a drag-motion
         // frame, a title change, a workspace switch, `arrange_layers`
@@ -2473,6 +2498,11 @@ impl State {
             DbCommand::DragIconPosition { reply } => {
                 let pos = self.wayland.runtime().and_then(|rt| rt.drag_icon_position());
                 let _ = reply.send(pos);
+                return Some(());
+            }
+            DbCommand::SessionLocked { reply } => {
+                let locked = self.wayland.runtime().map(|rt| rt.is_session_locked()).unwrap_or(false);
+                let _ = reply.send(locked);
                 return Some(());
             }
         }
@@ -3935,6 +3965,27 @@ impl wlr::SeatHandler for State {
             self.handle_pointer(PointerEvent::Release { pointer });
         }
         self.emit_pending();
+    }
+
+    /// Track `wlr::Runtime::is_session_locked` locally so this model stops
+    /// fighting the crate's own focus refusal while locked (see
+    /// `session_locked`'s doc on the struct field). On `locked = true`,
+    /// normal layout/focus reconciliation is suspended from here on --
+    /// `sync_window_to_scene`/`sync_seat_focus` both early-return. On
+    /// `locked = false` (a genuine unlock; the crate never calls this with
+    /// `false` after a locker dies without unlocking -- that is the
+    /// stay-locked security invariant), clear the flag and push the
+    /// model's current focus (the MRU/last toplevel; nothing here can have
+    /// changed it while locked, since the crate refused it) back out to
+    /// the seat and scene in one go.
+    fn session_lock_changed(&mut self, locked: bool) {
+        self.session_locked = locked;
+        if !locked {
+            match self.focused_id() {
+                Some(id) => self.sync_window_to_scene(id),
+                None => self.sync_seat_focus(),
+            }
+        }
     }
 }
 

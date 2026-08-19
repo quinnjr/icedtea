@@ -15,10 +15,11 @@ rust-version.workspace = true
 icedtea-compositor = { path = "../compositor" }
 icedtea-config = { path = "../config" }
 icedtea-contract = { path = "../contract" }
-wlr = "0.20.19"
+wlr = "0.20.20"
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 rustix = { version = "1", features = ["fs"] }
 crossbeam-channel.workspace = true
+xkbcommon = "0.8"

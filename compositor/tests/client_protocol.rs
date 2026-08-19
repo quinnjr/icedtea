@@ -13,7 +13,8 @@
 use icedtea_contract::Event;
 
 use icedtea_harness::{
-    Compositor, DataControlClient, TestClient, VirtualKeyboardClient, VirtualPointerClient,
+    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, SessionLockClient,
+    TestClient, VirtualKeyboardClient, VirtualPointerClient,
 };
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
@@ -131,6 +132,42 @@ fn screencopy_manager_global_is_advertised() {
     assert!(
         globals.iter().any(|g| g == "zwlr_screencopy_manager_v1"),
         "screencopy manager global missing; saw {globals:?}"
+    );
+}
+
+/// M4.4 adds secure screen locking: `ext_session_lock_manager_v1` lets a
+/// locker (swaylock, gtk4-lock-screen, ...) take the session lock.
+#[test]
+fn session_lock_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "ext_session_lock_manager_v1"),
+        "session lock manager global missing; saw {globals:?}"
+    );
+}
+
+/// M4.4 adds idle notification: `ext_idle_notifier_v1` lets a client (e.g.
+/// swayidle) learn when the seat has been idle for a timeout.
+#[test]
+fn idle_notifier_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "ext_idle_notifier_v1"),
+        "idle notifier global missing; saw {globals:?}"
+    );
+}
+
+/// M4.4 adds idle inhibition: `zwp_idle_inhibit_manager_v1` lets a client
+/// (e.g. a video player) suppress idle notification while active.
+#[test]
+fn idle_inhibit_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwp_idle_inhibit_manager_v1"),
+        "idle inhibit manager global missing; saw {globals:?}"
     );
 }
 
@@ -1289,4 +1326,189 @@ fn screencopy_reflects_a_mapped_toplevel() {
     }
     assert!(saw_grey, "toplevel grey (0x80) not present in the capture");
     assert!(saw_non_grey, "capture is uniform; toplevel not composited over wallpaper");
+}
+
+/// M4.4 Criterion 2: a session lock reaches `locked`, isolates input from
+/// normal clients while locked, and restores on unlock.
+///
+/// The load-bearing assertion is the middle one: a key injected via the
+/// virtual keyboard while locked must NOT advance `app`'s
+/// `wl_keyboard.key` count. A *pre-lock* key press first proves this
+/// harness's injector and observable actually work end to end (`app`'s
+/// count does advance) -- without that baseline, a broken injector would
+/// make the isolation assertion pass vacuously. If the crate's input
+/// isolation were broken (the lock did not stop keyboard delivery to a
+/// normal focused toplevel), the post-lock key would still reach `app` and
+/// its count would advance past the pre-lock baseline, failing the
+/// assertion.
+#[test]
+fn session_lock_locks_isolates_input_and_unlocks() {
+    let comp = Compositor::spawn();
+    let mut vk = VirtualKeyboardClient::spawn(&comp.socket);
+    // A normal toplevel, focused before the lock.
+    let mut app = TestClient::map_toplevel(&comp.socket, "app", "app");
+    assert!(app.wait_until(|c| c.has_input_serial()), "app focused pre-lock");
+
+    // Baseline: prove key delivery actually works before the lock exists,
+    // so the later "no delivery while locked" assertion cannot be vacuous.
+    vk.key_press(30); // KEY_A
+    assert!(
+        app.wait_until(|c| c.key_events() >= 1),
+        "app never received a keyboard key pre-lock; the injector/observable \
+         itself is broken, which would make the isolation check meaningless"
+    );
+    let pre_lock_keys = app.key_events();
+
+    let mut locker = SessionLockClient::spawn(&comp.socket);
+    locker.lock();
+    assert!(locker.wait_locked(), "session never reported locked");
+    assert!(comp.session_locked(), "compositor is_session_locked() is false");
+
+    // While locked, inject another key. The normal app must not receive it:
+    // pump the app's queue for a bounded window and assert its key count
+    // never moved past the pre-lock baseline.
+    vk.key_press(31); // KEY_S
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        vk.pump();
+        app.pump();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        app.key_events(),
+        pre_lock_keys,
+        "app received a keyboard key while the session was locked -- \
+         input isolation broken"
+    );
+
+    locker.unlock();
+    assert!(!comp.session_locked(), "still locked after unlock");
+
+    // Unlock restores focus: a fresh key now reaches the app again.
+    vk.key_press(32); // KEY_D
+    assert!(
+        app.wait_until(|c| c.key_events() > pre_lock_keys),
+        "unlock did not restore keyboard delivery to the app"
+    );
+}
+
+/// M4.4 Criterion 3 (security): a locker that dies WITHOUT unlocking leaves the
+/// session locked -- the screen must not silently unlock when the locker
+/// crashes.
+///
+/// Non-vacuous in two independent ways. If the crate wrongly cleared
+/// `session_locked` when the dead locker's `ext_session_lock_v1` was
+/// destroyed on disconnect (exactly the bug the design forbids), the first
+/// `assert!(comp.session_locked(), ...)` below would observe `false` and
+/// fail. If takeover of an already-locked-but-lockerless session were
+/// broken, `locker2.wait_locked()` would time out and fail. Both directions
+/// of this invariant are exercised by a single test.
+#[test]
+fn a_dead_locker_leaves_the_session_locked() {
+    let comp = Compositor::spawn();
+    let mut _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut app = TestClient::map_toplevel(&comp.socket, "app", "app");
+    assert!(app.wait_until(|c| c.has_input_serial()));
+
+    {
+        let mut locker = SessionLockClient::spawn(&comp.socket);
+        locker.lock();
+        assert!(locker.wait_locked(), "never locked");
+        assert!(comp.session_locked());
+        // `locker` drops here WITHOUT calling `unlock()`, closing its
+        // Wayland connection out from under the compositor -- simulating
+        // the locker process crashing while the screen is locked.
+    }
+    // Give the compositor a bounded window to notice and process the
+    // disconnect (see `Compositor::settle`'s doc for why this is a fixed
+    // number of round trips rather than a poll-until-true loop).
+    comp.settle();
+
+    assert!(
+        comp.session_locked(),
+        "SECURITY: session unlocked itself when the locker died"
+    );
+
+    // A fresh locker can still take over the still-locked session -- this
+    // is the legitimate takeover path (the prior lock is gone), distinct
+    // from a second *live* lock attempt being rejected.
+    let mut locker2 = SessionLockClient::spawn(&comp.socket);
+    locker2.lock();
+    assert!(locker2.wait_locked(), "a fresh locker could not take over");
+}
+
+/// M4.4 Criterion 4: `ext_idle_notifier_v1` fires `idled` after the
+/// requested timeout elapses with no seat activity, and `resumed` once
+/// activity is injected.
+///
+/// Non-vacuous in both directions: `idled` must actually arrive (a broken
+/// notifier that never fires would fail the first assertion, not pass it
+/// vacuously), and the pointer motion is injected only *after* `idled` has
+/// been observed, so the `resumed` that follows can only be a reaction to
+/// that injection -- not a stray event that happened to arrive first.
+///
+/// Timing: a 50ms notification timeout against a 5s (`TIMEOUT`) bounded
+/// pump gives a 100x margin over the time-based event this test waits on,
+/// which is generous enough to absorb scheduling jitter under load without
+/// masking a compositor that fires `idled` too early or not at all.
+#[test]
+fn idle_notify_fires_idled_then_resumed_on_activity() {
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut idle = IdleNotifyClient::spawn(&comp.socket);
+    idle.notification(50); // 50ms timeout, generous margins below
+    assert!(idle.wait_idled(), "never went idle");
+    // Inject activity; the notifier should send `resumed`.
+    vp.motion_absolute(5.0, 5.0, 100, 100);
+    vp.frame();
+    vp.pump();
+    assert!(idle.wait_resumed(), "activity did not resume idle");
+}
+
+/// M4.4 Criterion 5: a live `zwp_idle_inhibitor_v1` suppresses `idled` on
+/// every notification while it is active; destroying it lets idle resume.
+///
+/// Non-vacuous in both directions: the "no `idled` while inhibited" window
+/// (300ms) is 6x the 50ms notification timeout, so an inhibitor that failed
+/// to suppress idle would have six timeout-lengths in which to fire and
+/// fail the assertion -- this is not "checked so briefly it could not have
+/// fired anyway". And the second half proves the suppression really came
+/// from the inhibitor rather than from a notifier that is simply broken and
+/// never fires: with the inhibitor gone, `idled` must positively arrive.
+///
+/// PREVIOUSLY BLOCKED, NOW FIXED (M4.4 task 8): destroying a live
+/// `zwp_idle_inhibitor_v1` resource -- this test's own explicit
+/// `destroy_inhibitor()` below, an implicit destroy from the client
+/// disconnecting, or the resource cleanup that runs when this harness's
+/// `Compositor` tears its `wl_display` down at end of test -- used to abort
+/// the whole compositor process. Confirmed under gdb at the time: the abort
+/// was `types/wlr_idle_inhibit_v1.c:37: idle_inhibitor_v1_destroy: Assertion
+/// 'wl_list_empty(&inhibitor->events.destroy.listener_list)' failed`.
+///
+/// Root cause (traced, not guessed): wlroots' own
+/// `idle_inhibitor_v1_destroy` emits the inhibitor's `events.destroy` with
+/// `inhibitor->surface` as the signal data -- *not* the inhibitor itself
+/// (`wl_signal_emit_mutable(&inhibitor->events.destroy, inhibitor->surface)`
+/// in `types/wlr_idle_inhibit_v1.c`). The vendored crate's
+/// `on_idle_inhibitor_destroy` (`wlroots-sys/crates/wlr/src/backend.rs`)
+/// used to assume the opposite and key its `Session::idle_inhibitors`
+/// removal lookup by that `data` pointer -- which, being the surface's
+/// address rather than the inhibitor's, always missed, leaving the
+/// listener linked and tripping wlroots' own assertion. Fixed upstream in
+/// `wlroots-sys` commit `f9e533b` ("key idle-inhibitor destroy listener by
+/// its own addr, not data"): the map is now keyed by the destroy
+/// listener's own address (`Registration::listener_addr`), which is stable
+/// regardless of what the signal hands back as `data`. This test is now
+/// active and both halves below are exercised for real.
+#[test]
+fn idle_inhibit_suppresses_idle_until_destroyed() {
+    let comp = Compositor::spawn();
+    let mut inhibit = IdleInhibitClient::spawn(&comp.socket);
+    inhibit.create_inhibitor();
+    let mut idle = IdleNotifyClient::spawn(&comp.socket);
+    idle.notification(50);
+    assert!(!idle.idled_within(300), "idled despite an active inhibitor");
+    inhibit.destroy_inhibitor();
+    idle.notification(50);
+    assert!(idle.wait_idled(), "idle did not resume after inhibitor destroyed");
 }

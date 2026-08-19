@@ -108,6 +108,10 @@ pub enum DbCommand {
     /// `WmInterface` -- only the test harness sends this, same reasoning
     /// as `InjectTouchDown`.
     DragIconPosition { reply: Sender<Option<(i32, i32)>> },
+    /// Test-only: read `wlr::Runtime::is_session_locked` via `wayland`'s
+    /// runtime handle. Not reachable from `WmInterface` -- only the test
+    /// harness sends this, same reasoning as `DragIconPosition`.
+    SessionLocked { reply: Sender<bool> },
 }
 
 /// Map a `contract::Event` to its D-Bus signal name, so the emitter thread
