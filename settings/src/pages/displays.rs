@@ -141,6 +141,11 @@ fn set_dropdown(dd: &DropDown, labels: &[String], selected: usize) {
 pub fn build() -> gtk4::Widget {
     let state = Rc::new(RefCell::new(DisplaysState::new()));
     let populating = Rc::new(Cell::new(false));
+    // Which kind of submission is in flight: `true` after **Test**, `false`
+    // after **Apply**. Both share `succeeded`/`failed` on the wire, so the
+    // result arms consult this to avoid a *test* clearing dirty or claiming
+    // the config was applied.
+    let last_was_test = Rc::new(Cell::new(false));
 
     let root = GtkBox::new(Orientation::Vertical, 8);
     root.set_margin_top(12);
@@ -605,10 +610,14 @@ pub fn build() -> gtk4::Widget {
                 let state = state.clone();
                 let client = client.clone();
                 let status = status.clone();
+                let last_was_test = last_was_test.clone();
                 test_btn.connect_clicked(move |_| {
                     let edits = state.borrow().edits.clone();
                     match client.test_configuration(&edits) {
-                        Ok(()) => status.set_text("Testing\u{2026}"),
+                        Ok(()) => {
+                            last_was_test.set(true);
+                            status.set_text("Testing\u{2026}");
+                        }
                         Err(err) => status.set_text(&format!("Test failed: {err}")),
                     }
                 });
@@ -617,10 +626,14 @@ pub fn build() -> gtk4::Widget {
                 let state = state.clone();
                 let client = client.clone();
                 let status = status.clone();
+                let last_was_test = last_was_test.clone();
                 apply_btn.connect_clicked(move |_| {
                     let edits = state.borrow().edits.clone();
                     match client.build_and_send_configuration(&edits) {
-                        Ok(()) => status.set_text("Applying\u{2026}"),
+                        Ok(()) => {
+                            last_was_test.set(false);
+                            status.set_text("Applying\u{2026}");
+                        }
                         Err(err) => status.set_text(&format!("Apply failed: {err}")),
                     }
                 });
@@ -651,16 +664,28 @@ pub fn build() -> gtk4::Widget {
                             status.set_text("");
                         }
                         OutputsMsg::ApplySucceeded => {
-                            state.borrow_mut().dirty = false;
-                            update_footer();
-                            status.set_text("Applied");
+                            if last_was_test.get() {
+                                // A preview succeeded: keep the edits (and the
+                                // Apply button) live so the user can commit them.
+                                status.set_text("Test succeeded");
+                            } else {
+                                state.borrow_mut().dirty = false;
+                                update_footer();
+                                status.set_text("Applied");
+                            }
                         }
                         OutputsMsg::ApplyFailed => {
-                            reset_edits();
-                            refresh_controls();
-                            update_footer();
-                            canvas.queue_draw();
-                            status.set_text("Configuration rejected by the compositor");
+                            if last_was_test.get() {
+                                // A preview was rejected: leave the pending edits
+                                // intact so the user can adjust and retry.
+                                status.set_text("Test rejected by the compositor");
+                            } else {
+                                reset_edits();
+                                refresh_controls();
+                                update_footer();
+                                canvas.queue_draw();
+                                status.set_text("Configuration rejected by the compositor");
+                            }
                         }
                         OutputsMsg::ApplyCancelled => {
                             status.set_text("Configuration superseded \u{2014} re-reading");
