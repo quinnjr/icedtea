@@ -3499,14 +3499,36 @@ impl wlr::OutputHandler for State {
                         tracing::error!(?err, "could not enable output");
                         return;
                     }
+                    // A partial apply may have committed a scale/transform
+                    // before the failing setter; reset both to the identity so
+                    // the preferred-mode fallback is a clean default state
+                    // rather than a mix of persisted and preferred values.
+                    if let Err(err) = output.set_scale(1.0) {
+                        tracing::warn!(?err, %name, "could not reset scale on fallback");
+                    }
+                    if let Err(err) = output.set_transform(wlr::Transform::Normal) {
+                        tracing::warn!(?err, %name, "could not reset transform on fallback");
+                    }
                 }
             }
             Some(_) => {
-                // Persisted as disabled: honor it. A failed disable is
+                // Persisted as disabled: honor it and stop. A failed disable is
                 // logged but not fatal -- the output simply stays enabled.
+                //
+                // Crucially, a disabled output is modeless (`size()` is 0x0 and
+                // `output_layout_box` is `None`), so it must NOT fall through to
+                // the create_output/geometry/scene block below: inserting a 0x0
+                // phantom into `self.outputs` would make it a survivor
+                // candidate for `outputs.keys().min()` and collapse new-window
+                // placement to the origin. Mirror `output_configuration_applied`'s
+                // disabled branch, which likewise keeps disabled heads out of
+                // the active set. Still re-advertise so bound managers see the
+                // new (disabled) head.
                 if let Err(err) = output.disable() {
                     tracing::error!(?err, %name, "could not disable output per persisted config");
                 }
+                runtime.update_output_manager_state();
+                return;
             }
             None => {
                 if let Err(err) = output.enable_with_preferred_mode() {
