@@ -133,15 +133,30 @@ pub fn combo_from_keysym(keysym: u32, modifiers: CaptureMods) -> Option<KeyCombo
     Some(KeyCombo { modifiers: mods, key })
 }
 
+/// The order-independent identity of a combo: its key name plus its modifier
+/// tokens as a *set* (sorted, deduplicated). The compositor's matcher folds a
+/// binding's modifier tokens into a `Modifiers` bitflag set
+/// (`compositor/src/input.rs`), so `[SUPER, SHIFT]` and `[SHIFT, SUPER]` fire
+/// the *same* binding. Grouping duplicates by this key — rather than by
+/// `KeyCombo`'s order-sensitive derived `PartialEq` — matches that semantics,
+/// so a hand-edited config with reordered modifiers is still caught as a
+/// conflict.
+fn combo_identity(combo: &KeyCombo) -> (String, Vec<String>) {
+    let mut mods = combo.modifiers.clone();
+    mods.sort();
+    mods.dedup();
+    (combo.key.clone(), mods)
+}
+
 /// Every `KeyCombo` in `cfg.keybindings` bound to more than one action,
-/// paired with the actions that share it. Two bindings only count as the
-/// same combo if they're equal by `KeyCombo`'s derived `PartialEq` --
-/// same key name and modifiers in the same order -- matching how the
-/// compositor's own matcher compares them.
+/// paired with the actions that share it. Two bindings count as the same
+/// combo when they name the same key and the same *set* of modifiers
+/// (order-independent), matching how the compositor's matcher compares them —
+/// see [`combo_identity`].
 pub fn duplicate_bindings(cfg: &Config) -> Vec<(KeyCombo, Vec<String>)> {
     let mut groups: Vec<(KeyCombo, Vec<String>)> = Vec::new();
     for (action, combo) in &cfg.keybindings {
-        match groups.iter_mut().find(|(c, _)| c == combo) {
+        match groups.iter_mut().find(|(c, _)| combo_identity(c) == combo_identity(combo)) {
             Some((_, actions)) => actions.push(action.clone()),
             None => groups.push((combo.clone(), vec![action.clone()])),
         }
@@ -252,6 +267,27 @@ mod tests {
     fn duplicate_bindings_is_empty_for_defaults() {
         let cfg = icedtea_config::default_config();
         assert!(duplicate_bindings(&cfg).is_empty(), "default keybindings must not collide");
+    }
+
+    #[test]
+    fn duplicate_bindings_catches_reordered_modifiers() {
+        // The compositor matches modifiers as an order-independent set, so
+        // these two bindings fire the same combo and MUST be reported as a
+        // conflict even though their modifier order (and thus derived
+        // `PartialEq`) differs.
+        let mut cfg = icedtea_config::default_config();
+        cfg.keybindings.insert(
+            "a".to_string(),
+            KeyCombo { modifiers: vec!["SUPER".into(), "SHIFT".into()], key: "KEY_z".into() },
+        );
+        cfg.keybindings.insert(
+            "b".to_string(),
+            KeyCombo { modifiers: vec!["SHIFT".into(), "SUPER".into()], key: "KEY_z".into() },
+        );
+        let dupes = duplicate_bindings(&cfg);
+        assert_eq!(dupes.len(), 1, "reordered-modifier duplicate must be caught");
+        let (_, actions) = &dupes[0];
+        assert_eq!(actions.len(), 2);
     }
 
     #[test]
