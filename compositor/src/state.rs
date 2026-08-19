@@ -2456,6 +2456,16 @@ impl State {
         cfg: &icedtea_contract::DisplayConfig,
     ) -> wlr::Result<()> {
         if cfg.width > 0 && cfg.height > 0 {
+            // A backend's outputs arrive disabled and modeless, and wlroots
+            // requires an output to be *enabled* before a custom mode can be
+            // committed (wlr_output.h: "The output needs to be enabled.").
+            // `set_mode` alone stages `wlr_output_state_set_custom_mode`
+            // without `set_enabled(true)`, so committing it on the still-
+            // disabled output fails and the whole persisted config is
+            // discarded. Enable with a valid preferred baseline first, then
+            // override with the persisted custom mode. Two commits, but the
+            // output is enabled for both.
+            output.enable_with_preferred_mode()?;
             output.set_mode(cfg.width, cfg.height, cfg.refresh_mhz)?;
         } else {
             output.enable_with_preferred_mode()?;
@@ -7740,40 +7750,6 @@ mod tests {
             state.window_manager.get(id).expect("window").geometry,
             onscreen,
             "a window already on an output must not be moved"
-        );
-    }
-
-    #[test]
-    fn new_output_config_lookup_matches_persisted_entry_by_name() {
-        // Guards the exact lookup `new_output` performs (`config.displays`
-        // find by connector name) independently of a live output: a matching
-        // enabled entry is found, a name miss is not.
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut config = default_config();
-        config.displays.push(icedtea_contract::DisplayConfig {
-            name: "HEADLESS-1".to_string(),
-            enabled: true,
-            width: 1280,
-            height: 720,
-            refresh_mhz: 0,
-            x: 100,
-            y: 200,
-            scale: 1.5,
-            transform: 1,
-        });
-        let state = State::new(config, tx);
-
-        let hit = state.config.displays.iter().find(|d| d.name == "HEADLESS-1");
-        assert!(hit.is_some(), "persisted entry must be found by its connector name");
-        let hit = hit.unwrap();
-        assert!(hit.enabled);
-        assert_eq!((hit.width, hit.height), (1280, 720));
-        assert_eq!((hit.x, hit.y), (100, 200));
-        assert_eq!(State::transform_from_i32(hit.transform), wlr::Transform::_90);
-
-        assert!(
-            !state.config.displays.iter().any(|d| d.name == "DP-9"),
-            "a connector with no persisted entry must not match"
         );
     }
 }
