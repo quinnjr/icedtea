@@ -534,7 +534,7 @@ pub struct State {
     /// Set by `apply_action("quit")`; the event loop (task 5 reintroduces
     /// one) checks this each iteration and calls `stop()` once true.
     pub quitting: bool,
-    /// Set by [`SessionLockHandler::session_lock_changed`] while an
+    /// Set by [`SeatHandler::session_lock_changed`] while an
     /// `ext-session-lock-v1` client holds the session locked. The crate
     /// already refuses normal keyboard/pointer focus in this state (see
     /// `wlr::Runtime::is_session_locked`); this flag exists only so this
@@ -3966,9 +3966,7 @@ impl wlr::SeatHandler for State {
         }
         self.emit_pending();
     }
-}
 
-impl wlr::SessionLockHandler for State {
     /// Track `wlr::Runtime::is_session_locked` locally so this model stops
     /// fighting the crate's own focus refusal while locked (see
     /// `session_locked`'s doc on the struct field). On `locked = true`,
