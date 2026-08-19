@@ -13,8 +13,8 @@
 use icedtea_contract::Event;
 
 use icedtea_harness::{
-    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, SessionLockClient,
-    TestClient, VirtualKeyboardClient, VirtualPointerClient,
+    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, PointerConstraintsClient,
+    SessionLockClient, TestClient, VirtualKeyboardClient, VirtualPointerClient,
 };
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
@@ -210,6 +210,49 @@ fn a_client_can_bind_the_virtual_pointer() {
     vp.button(0x110, false);
     vp.frame();
     vp.pump();
+}
+
+/// A `PointerConstraintsClient` can spawn (map a toplevel, bind both M4.5
+/// globals, create a `zwp_relative_pointer_v1`), then create a locked
+/// pointer and a confined pointer, all without a protocol error — the
+/// smoke test the T6/T7 behavioral tests build on.
+#[test]
+fn pointer_constraints_client_can_lock_and_confine_without_a_protocol_error() {
+    let comp = Compositor::spawn();
+    // A headless seat advertises the pointer capability only once a device
+    // exists on it -- exactly as the keyboard capability needs a
+    // `VirtualKeyboardClient` first. See `VirtualPointerClient::spawn`'s own
+    // "two roundtrips" comment: it settles the capability change onto the
+    // wire before this returns, so `PointerConstraintsClient::spawn` (which
+    // needs `wl_pointer` to exist) is guaranteed to see it.
+    let _vp = VirtualPointerClient::spawn(&comp.socket);
+
+    // A lock and a confinement from the same wl_pointer are mutually
+    // exclusive on one surface (`already_constrained`), so exercise them on
+    // separate clients -- each still proves the same "no protocol error"
+    // claim on its own surface.
+    let mut locker = PointerConstraintsClient::spawn(&comp.socket);
+    assert_eq!(locker.relative_motion_events(), 0, "no motion injected yet");
+    locker.lock_pointer();
+    locker.pump();
+    // Every request above flushed with `.expect(...)`: a protocol error
+    // (which wlroots answers by killing the connection) would already have
+    // panicked one of those flushes rather than reaching here.
+    assert_eq!(locker.relative_delta(), (0.0, 0.0), "no motion injected, so no accumulated delta");
+
+    let mut confiner = PointerConstraintsClient::spawn(&comp.socket);
+    confiner.confine_pointer(0, 0, 50, 50);
+    confiner.pump();
+    confiner.set_confine_region(10, 10, 30, 30);
+    confiner.pump();
+
+    // A two-rect region (the T7 regression shape) round-trips too -- on its
+    // own surface, since a second `confine_pointer` on the same surface +
+    // wl_pointer while a confinement is already active is itself
+    // `already_constrained`.
+    let mut confiner2 = PointerConstraintsClient::spawn(&comp.socket);
+    confiner2.confine_pointer_rects(&[(0, 0, 10, 10), (20, 20, 10, 10)]);
+    confiner2.pump();
 }
 
 /// The harness can bind the data-device machinery and create a device from
