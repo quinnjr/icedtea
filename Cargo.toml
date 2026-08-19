@@ -16,3 +16,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
 image = "0.25"
+
+# TEMPORARY: pointer-constraints + relative-pointer support (wlr 0.20.21)
+# consumed from wlroots-sys before publish. Remove once 0.20.21 ships.
+[patch.crates-io]
+wlr = { path = "../wlroots-sys/crates/wlr" }

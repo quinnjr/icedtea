@@ -239,6 +239,15 @@ impl Compositor {
             runtime
                 .create_idle_inhibit_manager(&display)
                 .expect("zwp_idle_inhibit_manager_v1");
+            // Same "harness cannot degrade" tone: the pointer-constraints
+            // tests bind these globals directly and would assert against
+            // ones that were never advertised.
+            runtime
+                .create_pointer_constraints_manager(&display)
+                .expect("zwp_pointer_constraints_v1");
+            runtime
+                .create_relative_pointer_manager(&display)
+                .expect("zwp_relative_pointer_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
             // Test-only: makes the seat advertise the touch capability so
             // headless clients can bind `wl_touch` and injected touch
@@ -371,6 +380,14 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::SessionLocked { reply: reply_tx });
         reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered SessionLocked")
+    }
+
+    /// The pointer's current position, via `wlr::Runtime::cursor_position`.
+    /// Blocks on the reply -- see [`Self::inject_touch_down`]'s doc.
+    pub fn cursor_position(&self) -> (f64, f64) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::CursorPosition { reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered CursorPosition")
     }
 
     /// Give the compositor a bounded window to finish processing something

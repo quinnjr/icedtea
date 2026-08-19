@@ -112,6 +112,10 @@ pub enum DbCommand {
     /// runtime handle. Not reachable from `WmInterface` -- only the test
     /// harness sends this, same reasoning as `DragIconPosition`.
     SessionLocked { reply: Sender<bool> },
+    /// Test-only: read `wlr::Runtime::cursor_position` via `wayland`'s
+    /// runtime handle. Not reachable from `WmInterface` -- only the test
+    /// harness sends this, same reasoning as `SessionLocked`.
+    CursorPosition { reply: Sender<(f64, f64)> },
 }
 
 /// Map a `contract::Event` to its D-Bus signal name, so the emitter thread

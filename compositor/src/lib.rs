@@ -118,6 +118,16 @@ pub fn run() {
     if let Err(err) = runtime.create_idle_inhibit_manager(&display) {
         tracing::error!(%err, "idle inhibition is unavailable");
     }
+    // Lets clients (games, remote-desktop viewers, drawing tools) confine or
+    // lock the pointer and read unaccelerated relative motion. Non-fatal:
+    // without these, pointer-constraint clients simply fall back to normal
+    // absolute pointer behavior.
+    if let Err(err) = runtime.create_pointer_constraints_manager(&display) {
+        tracing::error!(%err, "pointer constraints are unavailable");
+    }
+    if let Err(err) = runtime.create_relative_pointer_manager(&display) {
+        tracing::error!(%err, "relative pointer motion is unavailable");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");

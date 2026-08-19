@@ -2505,6 +2505,11 @@ impl State {
                 let _ = reply.send(locked);
                 return Some(());
             }
+            DbCommand::CursorPosition { reply } => {
+                let pos = self.wayland.runtime().map(|rt| rt.cursor_position()).unwrap_or((0.0, 0.0));
+                let _ = reply.send(pos);
+                return Some(());
+            }
         }
         self.emit_pending();
         Some(())

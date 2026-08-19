@@ -171,6 +171,31 @@ fn idle_inhibit_manager_global_is_advertised() {
     );
 }
 
+/// M4.5 adds pointer constraints: `zwp_pointer_constraints_v1` lets a
+/// client (games, drawing tools) confine or lock the pointer.
+#[test]
+fn pointer_constraints_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwp_pointer_constraints_v1"),
+        "pointer constraints manager global missing; saw {globals:?}"
+    );
+}
+
+/// M4.5 adds relative pointer motion: `zwp_relative_pointer_manager_v1`
+/// lets a client (games, remote-desktop viewers) read unaccelerated
+/// relative pointer motion.
+#[test]
+fn relative_pointer_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwp_relative_pointer_manager_v1"),
+        "relative pointer manager global missing; saw {globals:?}"
+    );
+}
+
 /// A client can bind `zwlr_virtual_pointer_manager_v1` and create a virtual
 /// pointer, then inject motion/button/frame requests without a protocol
 /// error — the M4.2 drag-and-drop grab serial's source. Full drag coverage
