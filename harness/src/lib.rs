@@ -39,8 +39,8 @@ use icedtea_contract::{Event, SeqEvent, Snapshot};
 
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
-    wl_touch,
+    wl_data_source, wl_keyboard, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm,
+    wl_shm_pool, wl_surface, wl_touch,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop, event_created_child,
@@ -52,9 +52,15 @@ use wayland_protocols::ext::session_lock::v1::client::{
 use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
 };
+use wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_confined_pointer_v1, zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
+};
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
     zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
+};
+use wayland_protocols::wp::relative_pointer::zv1::client::{
+    zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
@@ -239,6 +245,15 @@ impl Compositor {
             runtime
                 .create_idle_inhibit_manager(&display)
                 .expect("zwp_idle_inhibit_manager_v1");
+            // Same "harness cannot degrade" tone: the pointer-constraints
+            // tests bind these globals directly and would assert against
+            // ones that were never advertised.
+            runtime
+                .create_pointer_constraints_manager(&display)
+                .expect("zwp_pointer_constraints_v1");
+            runtime
+                .create_relative_pointer_manager(&display)
+                .expect("zwp_relative_pointer_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
             // Test-only: makes the seat advertise the touch capability so
             // headless clients can bind `wl_touch` and injected touch
@@ -371,6 +386,14 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::SessionLocked { reply: reply_tx });
         reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered SessionLocked")
+    }
+
+    /// The pointer's current position, via `wlr::Runtime::cursor_position`.
+    /// Blocks on the reply -- see [`Self::inject_touch_down`]'s doc.
+    pub fn cursor_position(&self) -> (f64, f64) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::CursorPosition { reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered CursorPosition")
     }
 
     /// Give the compositor a bounded window to finish processing something
@@ -607,6 +630,18 @@ struct ClientState {
     idle_idled: bool,
     /// As `idle_idled`, for `resumed`.
     idle_resumed: bool,
+
+    // --- pointer-constraints (M4.5) ---
+    pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
+    relative_pointer_manager:
+        Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
+    /// Running sum of every `zwp_relative_pointer_v1.relative_motion` event's
+    /// (accelerated) `dx`/`dy` this client has received.
+    relative_delta: (f64, f64),
+    /// How many `relative_motion` events have arrived, ever -- the "did any
+    /// relative motion arrive at all" signal `relative_delta` alone cannot
+    /// give (a delta that nets to exactly zero looks identical to "none").
+    relative_motion_events: u32,
 }
 
 /// One lock surface this client has created via `get_lock_surface`, plus the
@@ -687,6 +722,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zwp_idle_inhibit_manager_v1" => {
                     state.idle_inhibit_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_pointer_constraints_v1" => {
+                    state.pointer_constraints = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_relative_pointer_manager_v1" => {
+                    state.relative_pointer_manager =
+                        Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -1204,6 +1246,36 @@ impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for ClientSta
 
 delegate_noop!(ClientState: ignore zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1);
 delegate_noop!(ClientState: ignore zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1);
+
+// --- pointer-constraints (M4.5) ---
+delegate_noop!(ClientState: ignore wl_region::WlRegion);
+delegate_noop!(ClientState: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
+delegate_noop!(ClientState: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
+// `locked`/`unlocked` and `confined`/`unconfined` carry no data this harness
+// asserts on directly -- what matters for T6/T7 is the cursor position
+// (`Compositor::cursor_position`) and the relative-motion deltas below, both
+// observed independently of these two objects' own events.
+delegate_noop!(ClientState: ignore zwp_locked_pointer_v1::ZwpLockedPointerV1);
+delegate_noop!(ClientState: ignore zwp_confined_pointer_v1::ZwpConfinedPointerV1);
+
+impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        event: zwp_relative_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // `dx`/`dy` are the accelerated deltas (vs. `dx_unaccel`/`dy_unaccel`)
+        // -- see this module's `PointerConstraintsClient::relative_delta` doc.
+        if let zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } = event {
+            state.relative_delta.0 += dx;
+            state.relative_delta.1 += dy;
+            state.relative_motion_events = state.relative_motion_events.saturating_add(1);
+        }
+    }
+}
 
 /// A real wayland client with exactly one mapped xdg toplevel.
 pub struct TestClient {
@@ -2318,6 +2390,16 @@ impl VirtualPointerClient {
         self.conn.flush().expect("flush motion_absolute");
     }
 
+    /// Move the pointer by a relative `(dx, dy)` amount, in the global
+    /// compositor coordinate space + flush. M4.5's T6/T7 driver: constraint
+    /// activation and enforcement both key off relative motion events, not
+    /// `motion_absolute`.
+    pub fn motion(&mut self, dx: f64, dy: f64) {
+        let time = self.next_time();
+        self.vp.motion(time, dx, dy);
+        self.conn.flush().expect("flush motion");
+    }
+
     /// Press or release a button (Linux input-event code, e.g. `0x110` for
     /// left) + flush.
     pub fn button(&mut self, button: u32, pressed: bool) {
@@ -2761,5 +2843,165 @@ impl IdleInhibitClient {
         inhibitor.destroy();
         self.conn.flush().expect("flush destroy_inhibitor");
         let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+/// A `zwp_pointer_constraints_v1` + `zwp_relative_pointer_manager_v1` client:
+/// maps one mapped toplevel (via [`TestClient`], so it can hold pointer
+/// focus -- constraints only ever activate on the currently focused
+/// surface), creates a `zwp_relative_pointer_v1` on the seat's `wl_pointer`,
+/// and can lock or confine the pointer to its surface. M4.5's T6/T7 driver.
+pub struct PointerConstraintsClient {
+    client: TestClient,
+    pointer_constraints: zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
+    /// Kept alive for the client's whole lifetime -- dropping it would stop
+    /// relative-motion delivery.
+    _relative_pointer: zwp_relative_pointer_v1::ZwpRelativePointerV1,
+    /// The active lock, if [`Self::lock_pointer`] has been called. Not
+    /// currently read back (no test yet needs to unlock explicitly), but
+    /// kept alive: dropping it destroys the object and ends the lock.
+    locked_pointer: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
+    /// The active confinement, if [`Self::confine_pointer`] has been called
+    /// -- kept so [`Self::set_confine_region`] can update its region.
+    confined_pointer: Option<zwp_confined_pointer_v1::ZwpConfinedPointerV1>,
+}
+
+impl PointerConstraintsClient {
+    /// Connect, map a toplevel, and create the relative pointer on this
+    /// client's `wl_pointer`. Panics if the compositor did not advertise
+    /// `zwp_pointer_constraints_v1`, `zwp_relative_pointer_manager_v1`, or
+    /// the pointer capability.
+    pub fn spawn(socket: &str) -> PointerConstraintsClient {
+        let client = TestClient::map_toplevel(
+            socket,
+            "icedtea-harness-pointer-constraints",
+            "pointer-constraints",
+        );
+        let pointer_constraints = client
+            .state
+            .pointer_constraints
+            .clone()
+            .expect("compositor did not advertise zwp_pointer_constraints_v1");
+        let relative_pointer_manager = client
+            .state
+            .relative_pointer_manager
+            .clone()
+            .expect("compositor did not advertise zwp_relative_pointer_manager_v1");
+        let pointer =
+            client.state.pointer.clone().expect("compositor advertised no pointer capability");
+        let relative_pointer = relative_pointer_manager.get_relative_pointer(&pointer, &client.qh, ());
+        client.conn.flush().expect("flush get_relative_pointer");
+
+        let mut this = PointerConstraintsClient {
+            client,
+            pointer_constraints,
+            _relative_pointer: relative_pointer,
+            locked_pointer: None,
+            confined_pointer: None,
+        };
+        this.pump();
+        this
+    }
+
+    /// Lock the pointer to its current position on this client's surface
+    /// (`Persistent` lifetime -- a lock/confinement this harness drives
+    /// across several injected motions should keep working after any
+    /// incidental enter/leave rather than going defunct after one). Per the
+    /// protocol, a constraint created while the surface is already focused
+    /// only activates on the *next* pointer motion, not at creation -- see
+    /// the M4.5 design's activation-ordering note, and this module's T6 test.
+    pub fn lock_pointer(&mut self) {
+        let pointer =
+            self.client.state.pointer.clone().expect("compositor advertised no pointer capability");
+        let locked = self.pointer_constraints.lock_pointer(
+            &self.client.surface,
+            &pointer,
+            None,
+            zwp_pointer_constraints_v1::Lifetime::Persistent,
+            &self.client.qh,
+            (),
+        );
+        self.locked_pointer = Some(locked);
+        self.client.conn.flush().expect("flush lock_pointer");
+    }
+
+    /// Confine the pointer to a single `x,y,w,h` region, in surface-local
+    /// coordinates (`Persistent` lifetime -- see [`Self::lock_pointer`]'s
+    /// doc). Keeps the returned `zwp_confined_pointer_v1` so
+    /// [`Self::set_confine_region`] can later update its region.
+    pub fn confine_pointer(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        self.confine_pointer_rects(&[(x, y, w, h)]);
+    }
+
+    /// As [`Self::confine_pointer`], but the region is built from one or more
+    /// (possibly disjoint) rectangles -- the T7 two-rectangle regression
+    /// test's shape, which pins the compositor to re-anchoring into one of
+    /// the rectangles rather than into the region's bounding-box extents.
+    pub fn confine_pointer_rects(&mut self, rects: &[(i32, i32, i32, i32)]) {
+        let compositor = self.client.state.compositor.clone().expect("no wl_compositor");
+        let pointer =
+            self.client.state.pointer.clone().expect("compositor advertised no pointer capability");
+        let region = compositor.create_region(&self.client.qh, ());
+        for &(x, y, w, h) in rects {
+            region.add(x, y, w, h);
+        }
+        let confined = self.pointer_constraints.confine_pointer(
+            &self.client.surface,
+            &pointer,
+            Some(&region),
+            zwp_pointer_constraints_v1::Lifetime::Persistent,
+            &self.client.qh,
+            (),
+        );
+        region.destroy();
+        self.confined_pointer = Some(confined);
+        self.client.conn.flush().expect("flush confine_pointer");
+    }
+
+    /// Replace the active confinement's region with a fresh single-rect one
+    /// and commit the surface -- the T7 re-anchor regression test's driver
+    /// (a region move that no longer contains the cursor must re-anchor it
+    /// inside the new region). Panics if no confinement is active.
+    pub fn set_confine_region(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        self.set_confine_region_rects(&[(x, y, w, h)]);
+    }
+
+    /// As [`Self::set_confine_region`], but the replacement region is built
+    /// from one or more rectangles -- see [`Self::confine_pointer_rects`].
+    pub fn set_confine_region_rects(&mut self, rects: &[(i32, i32, i32, i32)]) {
+        let compositor = self.client.state.compositor.clone().expect("no wl_compositor");
+        let confined = self
+            .confined_pointer
+            .as_ref()
+            .expect("set_confine_region called without an active confinement")
+            .clone();
+        let region = compositor.create_region(&self.client.qh, ());
+        for &(x, y, w, h) in rects {
+            region.add(x, y, w, h);
+        }
+        confined.set_region(Some(&region));
+        region.destroy();
+        self.client.surface.commit();
+        self.client.conn.flush().expect("flush set_confine_region");
+    }
+
+    /// The accumulated `zwp_relative_pointer_v1.relative_motion` deltas
+    /// (the accelerated `dx`/`dy`, not `dx_unaccel`/`dy_unaccel`), summed
+    /// across every event this client has received so far.
+    pub fn relative_delta(&self) -> (f64, f64) {
+        self.client.state.relative_delta
+    }
+
+    /// How many `relative_motion` events this client has received, ever --
+    /// the "did any relative motion arrive at all" signal, since a delta
+    /// that nets to exactly zero is indistinguishable from "none" by
+    /// [`Self::relative_delta`] alone.
+    pub fn relative_motion_events(&self) -> u32 {
+        self.client.state.relative_motion_events
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        let _ = self.client.queue.roundtrip(&mut self.client.state);
     }
 }

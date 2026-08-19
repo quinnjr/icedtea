@@ -10,11 +10,11 @@
 //! actually ran the `mapped` path against a live toplevel.
 
 
-use icedtea_contract::Event;
+use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
-    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, SessionLockClient,
-    TestClient, VirtualKeyboardClient, VirtualPointerClient,
+    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, PointerConstraintsClient,
+    SessionLockClient, TestClient, VirtualKeyboardClient, VirtualPointerClient,
 };
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
@@ -171,6 +171,31 @@ fn idle_inhibit_manager_global_is_advertised() {
     );
 }
 
+/// M4.5 adds pointer constraints: `zwp_pointer_constraints_v1` lets a
+/// client (games, drawing tools) confine or lock the pointer.
+#[test]
+fn pointer_constraints_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwp_pointer_constraints_v1"),
+        "pointer constraints manager global missing; saw {globals:?}"
+    );
+}
+
+/// M4.5 adds relative pointer motion: `zwp_relative_pointer_manager_v1`
+/// lets a client (games, remote-desktop viewers) read unaccelerated
+/// relative pointer motion.
+#[test]
+fn relative_pointer_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwp_relative_pointer_manager_v1"),
+        "relative pointer manager global missing; saw {globals:?}"
+    );
+}
+
 /// A client can bind `zwlr_virtual_pointer_manager_v1` and create a virtual
 /// pointer, then inject motion/button/frame requests without a protocol
 /// error — the M4.2 drag-and-drop grab serial's source. Full drag coverage
@@ -185,6 +210,49 @@ fn a_client_can_bind_the_virtual_pointer() {
     vp.button(0x110, false);
     vp.frame();
     vp.pump();
+}
+
+/// A `PointerConstraintsClient` can spawn (map a toplevel, bind both M4.5
+/// globals, create a `zwp_relative_pointer_v1`), then create a locked
+/// pointer and a confined pointer, all without a protocol error — the
+/// smoke test the T6/T7 behavioral tests build on.
+#[test]
+fn pointer_constraints_client_can_lock_and_confine_without_a_protocol_error() {
+    let comp = Compositor::spawn();
+    // A headless seat advertises the pointer capability only once a device
+    // exists on it -- exactly as the keyboard capability needs a
+    // `VirtualKeyboardClient` first. See `VirtualPointerClient::spawn`'s own
+    // "two roundtrips" comment: it settles the capability change onto the
+    // wire before this returns, so `PointerConstraintsClient::spawn` (which
+    // needs `wl_pointer` to exist) is guaranteed to see it.
+    let _vp = VirtualPointerClient::spawn(&comp.socket);
+
+    // A lock and a confinement from the same wl_pointer are mutually
+    // exclusive on one surface (`already_constrained`), so exercise them on
+    // separate clients -- each still proves the same "no protocol error"
+    // claim on its own surface.
+    let mut locker = PointerConstraintsClient::spawn(&comp.socket);
+    assert_eq!(locker.relative_motion_events(), 0, "no motion injected yet");
+    locker.lock_pointer();
+    locker.pump();
+    // Every request above flushed with `.expect(...)`: a protocol error
+    // (which wlroots answers by killing the connection) would already have
+    // panicked one of those flushes rather than reaching here.
+    assert_eq!(locker.relative_delta(), (0.0, 0.0), "no motion injected, so no accumulated delta");
+
+    let mut confiner = PointerConstraintsClient::spawn(&comp.socket);
+    confiner.confine_pointer(0, 0, 50, 50);
+    confiner.pump();
+    confiner.set_confine_region(10, 10, 30, 30);
+    confiner.pump();
+
+    // A two-rect region (the T7 regression shape) round-trips too -- on its
+    // own surface, since a second `confine_pointer` on the same surface +
+    // wl_pointer while a confinement is already active is itself
+    // `already_constrained`.
+    let mut confiner2 = PointerConstraintsClient::spawn(&comp.socket);
+    confiner2.confine_pointer_rects(&[(0, 0, 10, 10), (20, 20, 10, 10)]);
+    confiner2.pump();
 }
 
 /// The harness can bind the data-device machinery and create a device from
@@ -1511,4 +1579,485 @@ fn idle_inhibit_suppresses_idle_until_destroyed() {
     inhibit.destroy_inhibitor();
     idle.notification(50);
     assert!(idle.wait_idled(), "idle did not resume after inhibitor destroyed");
+}
+
+/// M4.5 Criterion 2: a locked pointer freezes the cursor and the client
+/// receives relative-motion deltas equal to the injected motion.
+///
+/// Non-vacuity: the baseline `assert_ne!` before the lock proves the
+/// injector really moves the cursor when unconstrained, so the frozen
+/// assertion afterward cannot pass trivially against a broken injector or a
+/// no-op lock.
+///
+/// Activation ordering (T3 design): a constraint on an already-focused
+/// surface only activates on the *next* motion after it is created, not at
+/// creation -- the freeze check reads `active_constraint` before the cursor
+/// move, but activation itself happens in `enter_surface_under_cursor`
+/// after the move. So the first motion after `lock_pointer()` still moves
+/// the cursor (and is what activates the constraint); only from the second
+/// motion on is the cursor frozen. The priming motion below is that first,
+/// still-moving motion.
+#[test]
+fn a_locked_pointer_freezes_the_cursor_and_delivers_relative_motion() {
+    /// The headless backend's real output pixel size -- pinned, not
+    /// guessed. See the drag-icon test's own `OUTPUT_W`/`OUTPUT_H` doc in
+    /// this file: `motion_absolute` maps onto the *real* output pixel box,
+    /// not onto a maximized window's (inset) geometry.
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut pc = PointerConstraintsClient::spawn(&comp.socket);
+
+    let opened = comp.wait_event(
+        |e| matches!(e, Event::WindowOpened(w) if w.app_id == "icedtea-harness-pointer-constraints"),
+    );
+    let Event::WindowOpened(pc_info) = opened else { unreachable!() };
+    let pc_geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.id == pc_info.id)
+        .expect("pc must be in the model once mapped")
+        .geometry;
+    let (px, py) = (
+        (pc_geo.x + pc_geo.width / 2) as f64,
+        (pc_geo.y + pc_geo.height / 2) as f64,
+    );
+
+    // Move the pointer over pc's surface so it holds pointer focus.
+    vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+
+    // Baseline (non-vacuity): an unconstrained motion moves the cursor.
+    let before = comp.cursor_position();
+    vp.motion(20.0, 20.0);
+    vp.frame();
+    vp.pump();
+    assert_ne!(comp.cursor_position(), before, "baseline: cursor should move unconstrained");
+
+    // Lock, then PRIME activation (see this test's own doc), then measure.
+    pc.lock_pointer();
+    pc.pump();
+    vp.motion(5.0, 5.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    let locked_pos = comp.cursor_position();
+    let events_before_freeze = pc.relative_motion_events();
+    // Capture the accumulated delta BEFORE the frozen motion. `relative_delta`
+    // accumulates over the client's whole life (the pre-lock baseline and the
+    // priming motion already made it non-zero), so only the *change* across
+    // the frozen motion below is attributable to it — a bare `!= 0` check on
+    // the total would be dead (always true here).
+    let delta_before_freeze = pc.relative_delta();
+
+    // Now the constraint is active: this motion must be frozen, yet the
+    // client must still see it as a relative-motion event.
+    vp.motion(20.0, 20.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    assert_eq!(comp.cursor_position(), locked_pos, "locked: cursor must not move once active");
+    assert!(
+        pc.relative_motion_events() > events_before_freeze,
+        "locked: client received no relative motion event while frozen"
+    );
+    // ...and the delta itself advanced across the frozen motion (not just the
+    // event count) — scoped to the freeze window, so this genuinely detects a
+    // dropped relative delta during the freeze.
+    assert_ne!(
+        pc.relative_delta(),
+        delta_before_freeze,
+        "locked: relative delta did not advance across the frozen motion"
+    );
+}
+
+/// M4.5 Criterion 4: a constraint only activates once its surface holds
+/// pointer focus. Locking a pointer whose surface is NOT focused leaves the
+/// cursor free to move; once the pointer enters the surface (activating the
+/// constraint on that entering motion -- see the sibling freeze test's doc
+/// on activation ordering) the next motion is frozen.
+#[test]
+fn a_locked_pointer_only_activates_once_its_surface_has_focus() {
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut pc = PointerConstraintsClient::spawn(&comp.socket);
+
+    let opened = comp.wait_event(
+        |e| matches!(e, Event::WindowOpened(w) if w.app_id == "icedtea-harness-pointer-constraints"),
+    );
+    let Event::WindowOpened(pc_info) = opened else { unreachable!() };
+    let pc_geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.id == pc_info.id)
+        .expect("pc must be in the model once mapped")
+        .geometry;
+    let (px, py) = (
+        (pc_geo.x + pc_geo.width / 2) as f64,
+        (pc_geo.y + pc_geo.height / 2) as f64,
+    );
+
+    // A point in the far bottom-right corner of the output, well outside
+    // pc's (default-cascaded, near-top-left) window -- verified below
+    // rather than assumed.
+    let (off_x, off_y) = ((OUTPUT_W - 50) as i32, (OUTPUT_H - 50) as i32);
+    assert!(
+        !pc_geo.contains(off_x, off_y),
+        "test point ({off_x}, {off_y}) must fall outside pc's geometry {pc_geo:?}"
+    );
+    let (off_x, off_y) = (off_x as f64, off_y as f64);
+
+    // Move the pointer off pc's surface -- it holds no pointer focus here.
+    vp.motion_absolute(off_x, off_y, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+
+    // Lock while unfocused: the constraint exists but is not active.
+    pc.lock_pointer();
+    pc.pump();
+
+    // Unfocused + locked: the cursor still moves freely.
+    let before = comp.cursor_position();
+    vp.motion(15.0, 15.0);
+    vp.frame();
+    vp.pump();
+    assert_ne!(comp.cursor_position(), before, "unfocused lock must not freeze the cursor");
+
+    // Move onto pc's surface: this both moves the cursor there (activation
+    // happens *after* the move, per the freeze test's activation-ordering
+    // doc) and primes the now-focused constraint for the next motion.
+    vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    let locked_pos = comp.cursor_position();
+    let events_before_freeze = pc.relative_motion_events();
+
+    // Now the constraint is active: this motion must be frozen.
+    vp.motion(20.0, 20.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    assert_eq!(comp.cursor_position(), locked_pos, "focused+active: cursor must not move");
+    assert!(
+        pc.relative_motion_events() > events_before_freeze,
+        "focused+active: client received no relative motion while frozen"
+    );
+}
+
+/// Fetches pc's window geometry (in layout coords) once it has mapped --
+/// shared by the three confine tests below.
+fn pc_window_geometry(comp: &Compositor) -> Rectangle {
+    let opened = comp.wait_event(
+        |e| matches!(e, Event::WindowOpened(w) if w.app_id == "icedtea-harness-pointer-constraints"),
+    );
+    let Event::WindowOpened(pc_info) = opened else { unreachable!() };
+    comp.snapshot()
+        .windows
+        .iter()
+        .find(|w| w.id == pc_info.id)
+        .expect("pc must be in the model once mapped")
+        .geometry
+}
+
+/// A tolerant point-in-rect check (+/-1px) for boundary/re-anchor
+/// assertions -- the exact clamp point wlroots picks for a nearest-point
+/// snap can legitimately land on a rect's inclusive edge, which
+/// `Rectangle::contains`'s strict `< x + width` would reject by a hair.
+fn near_contains(r: Rectangle, x: f64, y: f64) -> bool {
+    x >= r.x as f64 - 1.0
+        && x <= (r.x + r.width) as f64 + 1.0
+        && y >= r.y as f64 - 1.0
+        && y <= (r.y + r.height) as f64 + 1.0
+}
+
+/// A `motion_absolute` target guaranteed to land on pc's actual clickable
+/// surface, not on any server-side-decoration title bar painted above it.
+///
+/// `PointerConstraintsClient`'s app id does not match
+/// `icedtea_compositor::decoration::is_csd`'s GTK allowlist, so this
+/// window gets SSD, and `wlr_seat`'s pointer-focus hit-testing (which
+/// pointer-constraint activation is keyed off, per the freeze test's
+/// activation-ordering doc) is scene-based: a target within
+/// `TITLE_BAR_HEIGHT` of the frame's top edge lands on the title-bar scene
+/// node instead of the client surface, so the constraint's `surface ==
+/// focused` activation check never matches and it silently never
+/// activates (found the hard way: a confine region whose center sat only
+/// a few pixels below the frame's `y` never clamped anything).
+///
+/// This is a *focus* hazard only -- `confine_pointer` / `set_confine_region`'s
+/// own region coordinates are unaffected and stay relative to the frame's
+/// `(x, y)` (`pc_geo`) everywhere else in these tests, matched against the
+/// compositor's own region-to-layout math confirmed empirically while
+/// building this test (see the report). Callers should keep their region
+/// `y` origins at or beyond `TITLE_BAR_HEIGHT` regardless, so a region's
+/// own center clears this hazard on its own; this helper exists for the
+/// rare case (the region-hole test) that needs a *different* motion target
+/// than the region's arithmetic center.
+fn pc_focus_target(pc_geo: Rectangle, local_x: i32, local_y: i32) -> (f64, f64) {
+    let safe_y = local_y.max(icedtea_compositor::decoration::TITLE_BAR_HEIGHT);
+    ((pc_geo.x + local_x) as f64, (pc_geo.y + safe_y) as f64)
+}
+
+/// M4.5 Criterion 3: a confined pointer clamps the cursor to its region --
+/// motion aimed past the region's right edge must not carry the cursor out
+/// of it.
+///
+/// Non-vacuity: the baseline motion below (the same delta, injected before
+/// any confinement exists) moves the cursor the full delta, proving the
+/// injector really does move the cursor that far when unconstrained. A
+/// broken clamp (cursor escapes) would fail the boundary assertion; a
+/// no-op injector would already fail the baseline assertion.
+///
+/// Activation ordering (see the freeze test's doc above): the confinement
+/// activates on the *next* motion after `confine_pointer`, not at
+/// creation, so a small priming motion runs first.
+#[test]
+fn a_confined_pointer_clamps_the_cursor_to_its_region() {
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut pc = PointerConstraintsClient::spawn(&comp.socket);
+
+    let pc_geo = pc_window_geometry(&comp);
+
+    // A small confine region well inside the surface, in surface-local
+    // coordinates, sized off the surface's own geometry rather than a
+    // hardcoded guess.
+    let (rx, ry, rw, rh) =
+        (pc_geo.width / 10, pc_geo.height / 10, pc_geo.width / 5, pc_geo.height / 5);
+    let region_right = (pc_geo.x + rx + rw) as f64;
+
+    // Pointer starts at the region's center.
+    let (px, py) = pc_focus_target(pc_geo, rx + rw / 2, ry + rh / 2);
+    vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+
+    // Baseline (non-vacuity): the same large motion, unconfined, moves the
+    // cursor the full delta.
+    let before = comp.cursor_position();
+    vp.motion(500.0, 0.0);
+    vp.frame();
+    vp.pump();
+    let baseline_after = comp.cursor_position();
+    assert!(
+        (baseline_after.0 - before.0 - 500.0).abs() < 1.0,
+        "baseline: unconfined motion should move the cursor the full delta \
+         (before={before:?}, after={baseline_after:?})"
+    );
+
+    // Re-center, then confine.
+    vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+    pc.confine_pointer(rx, ry, rw, rh);
+    pc.pump();
+
+    // Prime activation: a small motion that stays well inside the region.
+    vp.motion(1.0, 1.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    let before_clamp = comp.cursor_position();
+
+    // Now confined: a large motion aimed past the region's right edge must
+    // leave the cursor inside the region.
+    vp.motion(500.0, 0.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    let (cx, _cy) = comp.cursor_position();
+
+    assert!(
+        cx <= region_right + 1.0,
+        "confined: cursor escaped the region (cx={cx}, boundary={region_right})"
+    );
+    assert!(
+        cx - before_clamp.0 < 500.0,
+        "confined: cursor should have moved less than the injected delta \
+         (before={before_clamp:?}, cx={cx})"
+    );
+}
+
+/// M4.5: updating a confine region away from the cursor re-anchors it
+/// rather than wedging the cursor forever (a client-triggerable input
+/// freeze the M5 session flagged).
+///
+/// Non-vacuity: without the re-anchor fix, the cursor stays outside region
+/// B after `set_confine_region`, and every subsequent motion hits
+/// `wlr_region_confine`'s false arm -- the final `assert_ne!` below (motion
+/// still moves the cursor) is what catches that permanent freeze.
+#[test]
+fn a_confined_pointer_reanchors_when_the_region_moves_off_the_cursor() {
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut pc = PointerConstraintsClient::spawn(&comp.socket);
+
+    let pc_geo = pc_window_geometry(&comp);
+
+    // Region A (around the cursor) in the surface's top-left quadrant;
+    // region B (away from the cursor) in the bottom-right -- both sized
+    // and positioned off the surface's own geometry so neither overlaps
+    // nor spills outside it.
+    let (ax, ay, aw, ah) =
+        (pc_geo.width / 10, pc_geo.height / 10, pc_geo.width / 5, pc_geo.height / 5);
+    let (bx, by, bw, bh) =
+        (pc_geo.width * 6 / 10, pc_geo.height * 6 / 10, pc_geo.width / 5, pc_geo.height / 5);
+    let region_b_layout =
+        Rectangle { x: pc_geo.x + bx, y: pc_geo.y + by, width: bw, height: bh };
+
+    let (px, py) = pc_focus_target(pc_geo, ax + aw / 2, ay + ah / 2);
+    vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+
+    pc.confine_pointer(ax, ay, aw, ah);
+    pc.pump();
+
+    // Prime activation.
+    vp.motion(1.0, 1.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+
+    // Move the region to B, which does NOT contain the current cursor.
+    pc.set_confine_region(bx, by, bw, bh);
+    pc.pump();
+
+    let after_reanchor = comp.cursor_position();
+    assert!(
+        near_contains(region_b_layout, after_reanchor.0, after_reanchor.1),
+        "cursor not re-anchored into the new region (pos={after_reanchor:?}, \
+         region_b={region_b_layout:?})"
+    );
+
+    // And motion still works (not wedged): a further injected small
+    // motion within B changes the cursor.
+    let before = comp.cursor_position();
+    vp.motion(3.0, 3.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    assert_ne!(comp.cursor_position(), before, "cursor wedged after region moved (confine freeze)");
+}
+
+/// M4.5: a two-rectangle confine region with a gap between the rects,
+/// positioned so the cursor sits in the gap (inside the region's
+/// bounding-box extents but outside both rects), must re-anchor into one
+/// of the two rects rather than into the extents' bounding box (whose
+/// gap-center is still outside both rects).
+///
+/// Non-vacuity: a single-rect region's extents *is* the rect, so a
+/// re-anchor-to-extents implementation would already pass the sibling
+/// test above. Only a two-rect region with a real gap pins the
+/// `rectangles[0]`-fallback bug: if re-anchor clamped to extents alone,
+/// the cursor would land back in the gap and the closing motion would hit
+/// the same wedged-freeze failure mode as the sibling test.
+///
+/// Drives the re-anchor via `set_confine_region_rects` (like the sibling
+/// test's `set_confine_region`) rather than via a fresh
+/// `confine_pointer_rects` created with the cursor already in the gap:
+/// activation is keyed off pointer *focus* entering the surface, which
+/// happens on the *first* motion after a constraint is created (per the
+/// activation-ordering doc) -- before that motion's own move is subject
+/// to enforcement. A constraint created with the cursor already outside
+/// its region therefore does not reliably clamp/re-anchor until a later
+/// motion, which is timing-fragile to assert on. `set_region` against an
+/// *already-active* constraint is the deterministic trigger instead
+/// (`on_pointer_constraint_set_region` re-anchors unconditionally the
+/// moment the active constraint's region changes).
+#[test]
+fn a_confined_pointer_reanchors_out_of_a_region_hole() {
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut pc = PointerConstraintsClient::spawn(&comp.socket);
+
+    let pc_geo = pc_window_geometry(&comp);
+
+    // Two disjoint 50x50 rects with a 50px gap between them (surface-local
+    // small integers, per the brief, so the in-region assertion is exact),
+    // with a `y` origin past `TITLE_BAR_HEIGHT` so the region's own center
+    // (which is also where the priming motion below lands) clears the
+    // focus hazard `pc_focus_target` documents, no clamping needed.
+    let rect_a = (0, 5, 50, 50);
+    let rect_b = (100, 5, 50, 50);
+    let rect_a_layout =
+        Rectangle { x: pc_geo.x + rect_a.0, y: pc_geo.y + rect_a.1, width: rect_a.2, height: rect_a.3 };
+    let rect_b_layout =
+        Rectangle { x: pc_geo.x + rect_b.0, y: pc_geo.y + rect_b.1, width: rect_b.2, height: rect_b.3 };
+
+    // The gap's center: inside the extents bounding box (0,5,150,50) but
+    // outside both rects.
+    let (gap_x, gap_y) = (75, 30);
+    let (gx, gy) = (pc_geo.x + gap_x, pc_geo.y + gap_y);
+    assert!(
+        !rect_a_layout.contains(gx, gy) && !rect_b_layout.contains(gx, gy),
+        "test point must actually sit in the gap between the two rects"
+    );
+
+    // Establish a normally-activating confinement first, in a region
+    // centered on the eventual gap point -- the same activation pattern
+    // the sibling tests use (confine while focused, prime), which
+    // reliably brings the constraint to "active" before its region is
+    // ever swapped out from under it.
+    let (init_x, init_y, init_w, init_h) = (gap_x - 50, gap_y - 25, 100, 50);
+    let (px, py) = pc_focus_target(pc_geo, init_x + init_w / 2, init_y + init_h / 2);
+    vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+
+    pc.confine_pointer(init_x, init_y, init_w, init_h);
+    pc.pump();
+
+    // Prime activation: a small motion that stays inside the initial
+    // (and still gap-adjacent) region.
+    vp.motion(1.0, 0.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+
+    // Swap the region to the two-rect, gap-containing shape via
+    // `set_confine_region_rects` -- the deterministic re-anchor path
+    // (`on_pointer_constraint_set_region`) proven by the sibling test
+    // above, which unconditionally restores the confine invariant for the
+    // *active* constraint the moment its region changes. The gap sits
+    // under the cursor's current position, so this pins the two-rect
+    // fallback: an extents-only re-anchor would leave the cursor right
+    // where it already is, in the gap.
+    pc.set_confine_region_rects(&[rect_a, rect_b]);
+    pc.pump();
+
+    let after_reanchor = comp.cursor_position();
+    assert!(
+        near_contains(rect_a_layout, after_reanchor.0, after_reanchor.1)
+            || near_contains(rect_b_layout, after_reanchor.0, after_reanchor.1),
+        "cursor not re-anchored into either rect (pos={after_reanchor:?}, \
+         a={rect_a_layout:?}, b={rect_b_layout:?})"
+    );
+
+    // Not wedged: a further small motion still moves the cursor.
+    let before = comp.cursor_position();
+    vp.motion(2.0, 2.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    assert_ne!(comp.cursor_position(), before, "cursor wedged in the region hole (confine freeze)");
 }
