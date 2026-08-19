@@ -1580,3 +1580,164 @@ fn idle_inhibit_suppresses_idle_until_destroyed() {
     idle.notification(50);
     assert!(idle.wait_idled(), "idle did not resume after inhibitor destroyed");
 }
+
+/// M4.5 Criterion 2: a locked pointer freezes the cursor and the client
+/// receives relative-motion deltas equal to the injected motion.
+///
+/// Non-vacuity: the baseline `assert_ne!` before the lock proves the
+/// injector really moves the cursor when unconstrained, so the frozen
+/// assertion afterward cannot pass trivially against a broken injector or a
+/// no-op lock.
+///
+/// Activation ordering (T3 design): a constraint on an already-focused
+/// surface only activates on the *next* motion after it is created, not at
+/// creation -- the freeze check reads `active_constraint` before the cursor
+/// move, but activation itself happens in `enter_surface_under_cursor`
+/// after the move. So the first motion after `lock_pointer()` still moves
+/// the cursor (and is what activates the constraint); only from the second
+/// motion on is the cursor frozen. The priming motion below is that first,
+/// still-moving motion.
+#[test]
+fn a_locked_pointer_freezes_the_cursor_and_delivers_relative_motion() {
+    /// The headless backend's real output pixel size -- pinned, not
+    /// guessed. See the drag-icon test's own `OUTPUT_W`/`OUTPUT_H` doc in
+    /// this file: `motion_absolute` maps onto the *real* output pixel box,
+    /// not onto a maximized window's (inset) geometry.
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut pc = PointerConstraintsClient::spawn(&comp.socket);
+
+    let opened = comp.wait_event(
+        |e| matches!(e, Event::WindowOpened(w) if w.app_id == "icedtea-harness-pointer-constraints"),
+    );
+    let Event::WindowOpened(pc_info) = opened else { unreachable!() };
+    let pc_geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.id == pc_info.id)
+        .expect("pc must be in the model once mapped")
+        .geometry;
+    let (px, py) = (
+        (pc_geo.x + pc_geo.width / 2) as f64,
+        (pc_geo.y + pc_geo.height / 2) as f64,
+    );
+
+    // Move the pointer over pc's surface so it holds pointer focus.
+    vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+
+    // Baseline (non-vacuity): an unconstrained motion moves the cursor.
+    let before = comp.cursor_position();
+    vp.motion(20.0, 20.0);
+    vp.frame();
+    vp.pump();
+    assert_ne!(comp.cursor_position(), before, "baseline: cursor should move unconstrained");
+
+    // Lock, then PRIME activation (see this test's own doc), then measure.
+    pc.lock_pointer();
+    pc.pump();
+    vp.motion(5.0, 5.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    let locked_pos = comp.cursor_position();
+    let events_before_freeze = pc.relative_motion_events();
+
+    // Now the constraint is active: this motion must be frozen, yet the
+    // client must still see it as a relative-motion event.
+    vp.motion(20.0, 20.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    assert_eq!(comp.cursor_position(), locked_pos, "locked: cursor must not move once active");
+    assert!(
+        pc.relative_motion_events() > events_before_freeze,
+        "locked: client received no relative motion while frozen"
+    );
+    let (rdx, rdy) = pc.relative_delta();
+    assert!(rdx != 0.0 || rdy != 0.0, "locked: client received no relative motion at all");
+}
+
+/// M4.5 Criterion 4: a constraint only activates once its surface holds
+/// pointer focus. Locking a pointer whose surface is NOT focused leaves the
+/// cursor free to move; once the pointer enters the surface (activating the
+/// constraint on that entering motion -- see the sibling freeze test's doc
+/// on activation ordering) the next motion is frozen.
+#[test]
+fn a_locked_pointer_only_activates_once_its_surface_has_focus() {
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut pc = PointerConstraintsClient::spawn(&comp.socket);
+
+    let opened = comp.wait_event(
+        |e| matches!(e, Event::WindowOpened(w) if w.app_id == "icedtea-harness-pointer-constraints"),
+    );
+    let Event::WindowOpened(pc_info) = opened else { unreachable!() };
+    let pc_geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.id == pc_info.id)
+        .expect("pc must be in the model once mapped")
+        .geometry;
+    let (px, py) = (
+        (pc_geo.x + pc_geo.width / 2) as f64,
+        (pc_geo.y + pc_geo.height / 2) as f64,
+    );
+
+    // A point in the far bottom-right corner of the output, well outside
+    // pc's (default-cascaded, near-top-left) window -- verified below
+    // rather than assumed.
+    let (off_x, off_y) = ((OUTPUT_W - 50) as i32, (OUTPUT_H - 50) as i32);
+    assert!(
+        !pc_geo.contains(off_x, off_y),
+        "test point ({off_x}, {off_y}) must fall outside pc's geometry {pc_geo:?}"
+    );
+    let (off_x, off_y) = (off_x as f64, off_y as f64);
+
+    // Move the pointer off pc's surface -- it holds no pointer focus here.
+    vp.motion_absolute(off_x, off_y, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+
+    // Lock while unfocused: the constraint exists but is not active.
+    pc.lock_pointer();
+    pc.pump();
+
+    // Unfocused + locked: the cursor still moves freely.
+    let before = comp.cursor_position();
+    vp.motion(15.0, 15.0);
+    vp.frame();
+    vp.pump();
+    assert_ne!(comp.cursor_position(), before, "unfocused lock must not freeze the cursor");
+
+    // Move onto pc's surface: this both moves the cursor there (activation
+    // happens *after* the move, per the freeze test's activation-ordering
+    // doc) and primes the now-focused constraint for the next motion.
+    vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    let locked_pos = comp.cursor_position();
+    let events_before_freeze = pc.relative_motion_events();
+
+    // Now the constraint is active: this motion must be frozen.
+    vp.motion(20.0, 20.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    assert_eq!(comp.cursor_position(), locked_pos, "focused+active: cursor must not move");
+    assert!(
+        pc.relative_motion_events() > events_before_freeze,
+        "focused+active: client received no relative motion while frozen"
+    );
+}

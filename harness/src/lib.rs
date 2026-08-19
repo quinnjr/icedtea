@@ -2390,6 +2390,16 @@ impl VirtualPointerClient {
         self.conn.flush().expect("flush motion_absolute");
     }
 
+    /// Move the pointer by a relative `(dx, dy)` amount, in the global
+    /// compositor coordinate space + flush. M4.5's T6/T7 driver: constraint
+    /// activation and enforcement both key off relative motion events, not
+    /// `motion_absolute`.
+    pub fn motion(&mut self, dx: f64, dy: f64) {
+        let time = self.next_time();
+        self.vp.motion(time, dx, dy);
+        self.conn.flush().expect("flush motion");
+    }
+
     /// Press or release a button (Linux input-event code, e.g. `0x110` for
     /// left) + flush.
     pub fn button(&mut self, button: u32, pressed: bool) {
