@@ -10,6 +10,9 @@
 //! here can never leak into `headless_boot.rs`'s tests (or vice versa).
 
 use icedtea_compositor::state::State;
+// `output_configuration_applied` is a `wlr::OutputHandler` method; the trait
+// must be in scope to call it on `State`.
+use wlr::OutputHandler;
 
 /// Set the headless-backend environment (two outputs, this file's own
 /// concern) exactly once, no matter which of this binary's `#[test]`s
@@ -179,4 +182,108 @@ fn sync_wallpaper_nodes_removes_a_node_for_an_output_that_is_gone() {
         1,
         "the node for the removed output must be torn down on the next sync"
     );
+}
+
+/// A minimal [`wlr::AppliedHead`] naming `name` with the given enabled state --
+/// the fields `output_configuration_applied`'s enable/disable/rehydrate
+/// branches actually read here. Width/height are populated for the enabled
+/// case so the head-reported geometry fallback is available even if the layout
+/// box lookup returns `None`.
+fn applied_head(name: &str, enabled: bool) -> wlr::AppliedHead {
+    wlr::AppliedHead {
+        name: Some(name.to_string()),
+        enabled,
+        width: if enabled { 1920 } else { 0 },
+        height: if enabled { 1080 } else { 0 },
+        refresh_mhz: 0,
+        x: 0,
+        y: 0,
+        scale: 1.0,
+        transform: wlr::Transform::Normal,
+    }
+}
+
+/// T5 display-config fix (defect 2): an output DISABLED via
+/// `output_configuration_applied` leaves the active set (`state.outputs`) but
+/// stays tracked by connector name -> `wlr::OutputId` in `disabled_outputs`, so
+/// a later RE-ENABLE of the same connector rehydrates it back into the active
+/// set (a fresh index + surface, its id re-mapped) instead of being left
+/// enabled-but-untracked and rendering nothing until restart.
+///
+/// Drives the handler directly with owned `AppliedHead`s. The full
+/// zwlr_output_manager_v1 client round-trip is T6/T7; this exercises exactly
+/// the handler code the fix changed, with a live runtime so
+/// `output_layout_box`/`create_output` run for real. Distinguishes the fix
+/// from the pre-fix `continue`, which left `outputs.len()` stuck at 1 on
+/// re-enable.
+#[test]
+fn a_disabled_output_can_be_re_enabled_within_a_session() {
+    let boot = boot_lock();
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
+
+    // Declared (dropped) after display/backend/runtime, as every test here.
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime.clone());
+
+    // Isolate the off-loop redb persist `output_configuration_applied` kicks
+    // off; without this it would write to the real XDG database path.
+    let tmp = std::env::temp_dir().join(format!("icedtea-disp-{}.redb", std::process::id()));
+    state.config_path = Some(tmp.clone());
+
+    let background = runtime
+        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .expect("background rect");
+    runtime.lower_rect_to_bottom(background);
+    state.set_background(background);
+
+    // Bounded backstop: give both headless outputs time to arrive before the
+    // loop stops -- identical to the other tests in this file.
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let _ = cmd_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&cmd_wake_write);
+    });
+
+    backend
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
+        .expect("run_all");
+
+    assert_eq!(state.outputs.len(), 2, "both headless outputs must have reached the model");
+
+    // The connector name of one output -- the stable key the disable/re-enable
+    // round-trip matches against.
+    let victim_index = *state.outputs.keys().min().expect("an output");
+    let victim_name = state.outputs.get(&victim_index).expect("victim surface").name.clone();
+    assert!(!victim_name.is_empty(), "headless outputs are named");
+
+    // DISABLE: drops it from the active set but records name -> id.
+    state.output_configuration_applied(vec![applied_head(&victim_name, false)]);
+    assert_eq!(state.outputs.len(), 1, "the disabled output left the active set");
+    assert!(
+        state.outputs.values().all(|o| o.name != victim_name),
+        "no active surface still carries the disabled connector's name"
+    );
+
+    // RE-ENABLE the same connector: rehydrate must add it back under its own
+    // name. Pre-fix this hit the `continue` and `outputs.len()` stayed at 1.
+    state.output_configuration_applied(vec![applied_head(&victim_name, true)]);
+    assert_eq!(state.outputs.len(), 2, "the re-enabled output rejoined the active set");
+    assert_eq!(
+        state.outputs.values().filter(|o| o.name == victim_name).count(),
+        1,
+        "exactly one active surface carries the re-enabled connector's name"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
 }

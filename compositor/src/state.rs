@@ -594,6 +594,18 @@ pub struct State {
     /// Kept because `OutputHandler::destroyed` is given only an id, and the
     /// model's geometry map is keyed by index.
     output_ids: HashMap<wlr::OutputId, u32>,
+    /// Connector name -> the live `wlr::OutputId` of an output that is
+    /// currently *disabled* and therefore has NO entry in `self.outputs` /
+    /// `self.output_ids`. Populated both by `new_output`'s persisted-disabled
+    /// branch (an output that boots disabled is never inserted into the active
+    /// set) and by `output_configuration_applied`'s disable branch. It exists
+    /// solely so a later re-enable can recover the id: the applied-config
+    /// handler is handed only `Vec<AppliedHead>` (owned name + geometry, no
+    /// id/handle), so without this map a re-enabled head could not be mapped
+    /// back to a `wlr::OutputId` and would be left enabled-but-untracked
+    /// (rendering nothing until restart). `destroyed` prunes it (a disabled
+    /// output can be unplugged).
+    disabled_outputs: HashMap<String, wlr::OutputId>,
     /// The scene rect painted behind everything, once boot has made one.
     background: Option<wlr::RectId>,
     /// The fd source SIGINT/SIGTERM write to. Compared in `fd_ready` so that
@@ -846,6 +858,7 @@ impl State {
             config_reload_tx: None,
             config_reload_rx: None,
             output_ids: HashMap::new(),
+            disabled_outputs: HashMap::new(),
             background: None,
             shutdown_source: None,
             cmd_rx: None,
@@ -3537,6 +3550,12 @@ impl wlr::OutputHandler for State {
                 if let Err(err) = output.disable() {
                     tracing::error!(?err, %name, "could not disable output per persisted config");
                 }
+                // Record the id under its connector name so a later re-enable
+                // (`output_configuration_applied`, which is handed no id) can
+                // recover it and rehydrate the output into the active set. Do
+                // NOT create a surface / add to `self.outputs` -- it stays out
+                // of the active set exactly as the doc above requires.
+                self.disabled_outputs.insert(name.clone(), output.id());
                 runtime.update_output_manager_state();
                 return;
             }
@@ -3623,6 +3642,12 @@ impl wlr::OutputHandler for State {
     }
 
     fn destroyed(&mut self, id: wlr::OutputId) {
+        // A disabled output (tracked only in `disabled_outputs`, never in
+        // `output_ids`/`outputs`) can be unplugged too. `destroyed` gets only
+        // the id, so scan by value and drop any entry naming it -- otherwise a
+        // stale name->id mapping would outlive the physical output and a
+        // reconnected connector reusing the name could rehydrate a dead id.
+        self.disabled_outputs.retain(|_, v| *v != id);
         // `remove` on an unknown id, not indexing: this can name an output
         // this handler was never told about (see the library's own docs), and
         // a panic here aborts.
@@ -3668,10 +3693,43 @@ impl wlr::OutputHandler for State {
         for head in &heads {
             let Some(head_name) = head.name.as_deref() else { continue };
             // name -> our output index (via the name recorded in `new_output`).
-            let Some(index) =
-                self.outputs.iter().find(|(_, o)| o.name == head_name).map(|(i, _)| *i)
-            else {
-                continue;
+            let index = match self.outputs.iter().find(|(_, o)| o.name == head_name).map(|(i, _)| *i)
+            {
+                Some(index) => index,
+                None => {
+                    // Not in the active set. If this head is being ENABLED and
+                    // we still track it as a disabled output (by name -> id),
+                    // rehydrate it: a fresh index + surface, its id re-mapped,
+                    // and drop it from `disabled_outputs`. It then rides the
+                    // geometry/arrange/scene sequence after this loop like any
+                    // enabled head. If the name is in neither map there is
+                    // nothing we can do without an id -- skip it.
+                    if head.enabled
+                        && let Some(oid) = self.disabled_outputs.get(head_name).copied()
+                    {
+                        let index = self.next_output_index;
+                        self.next_output_index += 1;
+                        let geometry = runtime
+                            .output_layout_box(oid)
+                            .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
+                            .or_else(|| {
+                                (head.width > 0 && head.height > 0).then_some(icedtea_contract::Rectangle {
+                                    x: head.x,
+                                    y: head.y,
+                                    width: head.width,
+                                    height: head.height,
+                                })
+                            })
+                            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+                        self.create_output(index, geometry);
+                        if let Some(surface) = self.outputs.get_mut(&index) {
+                            surface.name = head_name.to_string();
+                        }
+                        self.output_ids.insert(oid, index);
+                        self.disabled_outputs.remove(head_name);
+                    }
+                    continue;
+                }
             };
 
             let old_geometry = self.outputs.get(&index).map(|o| o.geometry);
@@ -3705,11 +3763,16 @@ impl wlr::OutputHandler for State {
                 self.reclaim_offscreen_windows();
             } else {
                 // Disabled: drop it from the active set (mirroring
-                // `destroyed`) and migrate its windows onto a survivor.
+                // `destroyed`) and migrate its windows onto a survivor. Before
+                // dropping the id, record it under this head's name in
+                // `disabled_outputs` so a later re-enable (handed no id) can
+                // rehydrate it -- see that map's doc and the enable branch
+                // above.
                 self.outputs.remove(&index);
                 if let Some(oid) =
                     self.output_ids.iter().find(|(_, i)| **i == index).map(|(id, _)| *id)
                 {
+                    self.disabled_outputs.insert(head_name.to_string(), oid);
                     self.output_ids.remove(&oid);
                 }
                 if let Some(old) = old_geometry {
@@ -3717,6 +3780,14 @@ impl wlr::OutputHandler for State {
                 }
             }
         }
+
+        // Recompute panel exclusive zones and maximized-window rects against
+        // the re-derived geometry. `resolve_orphaned_layers` below early-returns
+        // when nothing was orphaned, so a pure reposition/resize (which orphans
+        // no layer) would otherwise leave `usable` stuck at the full box and
+        // exclusive zones / maximized windows stale. Mirrors the
+        // create_output -> arrange_layers -> sync sequence `new_output` runs.
+        self.arrange_layers();
 
         // Re-run the scene sequence a hotplug runs, so windows and layers
         // settle onto the re-derived geometry.
