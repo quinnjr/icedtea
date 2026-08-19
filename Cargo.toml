@@ -2,11 +2,6 @@
 resolver = "2"
 members = ["contract", "config", "compositor", "clipboard", "harness", "shell"]
 
-# TEMPORARY (M4.4 dev cycle): pin against the local wlr crate on
-# feature/wlr-m4.4 until wlr 0.20.20 is published. Drop this after publish.
-[patch.crates-io]
-wlr = { path = "../wlroots-sys/crates/wlr" }
-
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
