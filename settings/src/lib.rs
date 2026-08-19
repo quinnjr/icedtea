@@ -4,4 +4,6 @@
 //! translation, and validation -- consumed by the (GTK) view built on top of
 //! it in later tasks.
 
+pub mod bridge;
 pub mod model;
+pub mod wm_reload;
