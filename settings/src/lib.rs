@@ -5,5 +5,6 @@
 //! and `main.rs`.
 
 pub mod model;
+pub mod outputs;
 pub mod pages;
 pub mod wm_reload;
