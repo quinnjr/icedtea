@@ -1648,6 +1648,12 @@ fn a_locked_pointer_freezes_the_cursor_and_delivers_relative_motion() {
     pc.pump();
     let locked_pos = comp.cursor_position();
     let events_before_freeze = pc.relative_motion_events();
+    // Capture the accumulated delta BEFORE the frozen motion. `relative_delta`
+    // accumulates over the client's whole life (the pre-lock baseline and the
+    // priming motion already made it non-zero), so only the *change* across
+    // the frozen motion below is attributable to it — a bare `!= 0` check on
+    // the total would be dead (always true here).
+    let delta_before_freeze = pc.relative_delta();
 
     // Now the constraint is active: this motion must be frozen, yet the
     // client must still see it as a relative-motion event.
@@ -1658,10 +1664,16 @@ fn a_locked_pointer_freezes_the_cursor_and_delivers_relative_motion() {
     assert_eq!(comp.cursor_position(), locked_pos, "locked: cursor must not move once active");
     assert!(
         pc.relative_motion_events() > events_before_freeze,
-        "locked: client received no relative motion while frozen"
+        "locked: client received no relative motion event while frozen"
     );
-    let (rdx, rdy) = pc.relative_delta();
-    assert!(rdx != 0.0 || rdy != 0.0, "locked: client received no relative motion at all");
+    // ...and the delta itself advanced across the frozen motion (not just the
+    // event count) — scoped to the freeze window, so this genuinely detects a
+    // dropped relative delta during the freeze.
+    assert_ne!(
+        pc.relative_delta(),
+        delta_before_freeze,
+        "locked: relative delta did not advance across the frozen motion"
+    );
 }
 
 /// M4.5 Criterion 4: a constraint only activates once its surface holds
