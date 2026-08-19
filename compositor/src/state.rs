@@ -51,13 +51,23 @@ pub struct OutputSurface {
     /// maximize) reads this instead of `geometry` -- fullscreen is the one
     /// exception, since it covers panels by definition.
     pub usable: icedtea_contract::Rectangle,
+    /// The output's connector name (`wlr::Output::name()`), the stable key a
+    /// persisted [`icedtea_contract::DisplayConfig`] is matched against on
+    /// connect/hotplug and the reverse lookup
+    /// `OutputHandler::output_configuration_applied` uses to map an
+    /// [`wlr::AppliedHead`]'s name back to an output index. Empty for the
+    /// unit-test outputs built straight through [`Self::new`], and for the
+    /// rare wlroots output not yet named.
+    pub name: String,
 }
 
 impl OutputSurface {
     /// Construct with no exclusive zones yet reserved -- `usable` starts
-    /// equal to `geometry`, exactly as `create_output` documents.
+    /// equal to `geometry`, exactly as `create_output` documents. The name is
+    /// empty; `new_output` records the real connector name on the live output
+    /// once one exists (see the field doc).
     pub fn new(geometry: icedtea_contract::Rectangle) -> Self {
-        Self { geometry, usable: geometry }
+        Self { geometry, usable: geometry, name: String::new() }
     }
 }
 
@@ -2397,6 +2407,168 @@ impl State {
         });
     }
 
+    /// Persist `self.config` to the redb file off the render loop, the write
+    /// sibling of [`Self::spawn_config_reload`]. Called from
+    /// `OutputHandler::output_configuration_applied` after it has upserted the
+    /// applied heads into `config.displays`: the handler runs on the render
+    /// thread underneath a wlroots `extern "C"` frame, so it must never block
+    /// on redb I/O. A cloned `Config` and the db path move onto a worker
+    /// thread that opens the database and writes; failures are logged, never
+    /// propagated (a persist failure must not take down the compositor).
+    ///
+    /// Unlike the reload path this needs no channel back: nothing on the
+    /// render loop consumes the result. `config_path` `None` (the default
+    /// boot) resolves to `icedtea_config::default_db_path`, exactly as
+    /// `spawn_config_reload` does.
+    fn spawn_config_save(&self) {
+        let config = self.config.clone();
+        let path = self.config_path.clone().unwrap_or_else(icedtea_config::default_db_path);
+        std::thread::spawn(move || Self::save_config_to(&config, &path));
+    }
+
+    /// The synchronous body [`Self::spawn_config_save`] runs on its worker
+    /// thread: open the redb file and write `config`. Failures are logged,
+    /// never propagated -- a persist failure must not take the compositor
+    /// down. Split out so it can be exercised deterministically in a test
+    /// (redb permits only one `Database` handle per file per process, so a
+    /// test that polled the detached thread by re-opening the file would race
+    /// the writer's own open; calling this directly does not).
+    fn save_config_to(config: &Config, path: &std::path::Path) {
+        match icedtea_config::open(path) {
+            Ok(db) => {
+                if let Err(err) = config.save(&db) {
+                    tracing::error!(%err, "failed to persist display config");
+                }
+            }
+            Err(err) => tracing::error!(%err, "could not open config db to persist displays"),
+        }
+    }
+
+    /// Apply a persisted [`icedtea_contract::DisplayConfig`] to a live output,
+    /// committing mode, scale, transform, and layout position. Any wlroots
+    /// rejection short-circuits with `?` so `new_output`'s caller can fall
+    /// back to the preferred mode rather than leave the output dark. A config
+    /// with a zero width or height means "no explicit mode" -- take the
+    /// preferred one but still honor scale/transform/position.
+    fn apply_display_config(
+        runtime: &wlr::Runtime,
+        output: &wlr::Output<'_>,
+        cfg: &icedtea_contract::DisplayConfig,
+    ) -> wlr::Result<()> {
+        if cfg.width > 0 && cfg.height > 0 {
+            output.set_mode(cfg.width, cfg.height, cfg.refresh_mhz)?;
+        } else {
+            output.enable_with_preferred_mode()?;
+        }
+        output.set_scale(cfg.scale as f32)?;
+        output.set_transform(Self::transform_from_i32(cfg.transform))?;
+        // `set_output_position` returns `None` on a stale output id; map that
+        // to an error so the caller's fallback engages rather than silently
+        // leaving the output at the wrong layout coordinate.
+        runtime
+            .set_output_position(output.id(), cfg.x, cfg.y)
+            .ok_or(wlr::Error::Operation("set_output_position"))
+    }
+
+    /// Map a persisted `DisplayConfig::transform` (the `wl_output_transform`
+    /// integer, 0-7) to a [`wlr::Transform`]. Any out-of-range value falls
+    /// back to `Normal`, matching wlroots' own read-back behavior.
+    fn transform_from_i32(value: i32) -> wlr::Transform {
+        match value {
+            1 => wlr::Transform::_90,
+            2 => wlr::Transform::_180,
+            3 => wlr::Transform::_270,
+            4 => wlr::Transform::Flipped,
+            5 => wlr::Transform::Flipped90,
+            6 => wlr::Transform::Flipped180,
+            7 => wlr::Transform::Flipped270,
+            _ => wlr::Transform::Normal,
+        }
+    }
+
+    /// The inverse of [`Self::transform_from_i32`]: a committed
+    /// [`wlr::Transform`] back to the `wl_output_transform` integer stored in
+    /// a `DisplayConfig`.
+    fn transform_to_i32(transform: wlr::Transform) -> i32 {
+        match transform {
+            wlr::Transform::Normal => 0,
+            wlr::Transform::_90 => 1,
+            wlr::Transform::_180 => 2,
+            wlr::Transform::_270 => 3,
+            wlr::Transform::Flipped => 4,
+            wlr::Transform::Flipped90 => 5,
+            wlr::Transform::Flipped180 => 6,
+            wlr::Transform::Flipped270 => 7,
+        }
+    }
+
+    /// Upsert each named [`wlr::AppliedHead`] into `self.config.displays`,
+    /// keyed by connector name: an existing entry with the same name is
+    /// replaced in place (preserving order), an unseen name is appended. This
+    /// is the in-memory half of persistence; [`Self::spawn_config_save`]
+    /// writes the result to redb. Heads with no name are skipped -- there is
+    /// no stable key to store them under.
+    fn upsert_displays_from_heads(&mut self, heads: &[wlr::AppliedHead]) {
+        for head in heads {
+            let Some(name) = head.name.as_deref() else { continue };
+            let entry = icedtea_contract::DisplayConfig {
+                name: name.to_string(),
+                enabled: head.enabled,
+                width: head.width,
+                height: head.height,
+                refresh_mhz: head.refresh_mhz,
+                x: head.x,
+                y: head.y,
+                scale: head.scale as f64,
+                transform: Self::transform_to_i32(head.transform),
+            };
+            if let Some(existing) = self.config.displays.iter_mut().find(|d| d.name == name) {
+                *existing = entry;
+            } else {
+                self.config.displays.push(entry);
+            }
+        }
+    }
+
+    /// Re-home any window whose frame center now sits outside every output's
+    /// box -- the aftermath of an output shrinking under an applied
+    /// output-management config. Each stranded window is clamped into the
+    /// lowest-index (survivor) output, mirroring
+    /// [`Self::migrate_windows_from`]'s placement. A no-op with no outputs.
+    fn reclaim_offscreen_windows(&mut self) {
+        let Some(survivor_idx) = self.outputs.keys().min().copied() else { return };
+        let Some(survivor) = self.outputs.get(&survivor_idx).map(|o| o.geometry) else { return };
+
+        let stranded: Vec<WindowId> = self
+            .window_manager
+            .windows()
+            .filter(|w| {
+                let cx = w.geometry.x + w.geometry.width / 2;
+                let cy = w.geometry.y + w.geometry.height / 2;
+                !self.outputs.values().any(|o| o.geometry.contains(cx, cy))
+            })
+            .map(|w| w.id)
+            .collect();
+
+        for id in stranded {
+            let Some(w) = self.window_manager.get(id) else { continue };
+            let geometry = w.geometry;
+            let new_x = if geometry.width >= survivor.width {
+                survivor.x + (survivor.width - geometry.width) / 2
+            } else {
+                geometry.x.clamp(survivor.x, survivor.x + survivor.width - geometry.width)
+            };
+            let new_y = if geometry.height >= survivor.height {
+                survivor.y + (survivor.height - geometry.height) / 2
+            } else {
+                geometry.y.clamp(survivor.y, survivor.y + survivor.height - geometry.height)
+            };
+            self.window_manager.set_geometry(id, Rectangle { x: new_x, y: new_y, ..geometry });
+            self.sync_window_to_scene(id);
+        }
+        self.emit_pending();
+    }
+
     /// Spawn the wallpaper decode worker and wire up the receiving end of
     /// its result channel. The one and only caller in a real boot is
     /// `run()`; tests that want to exercise the exact wake-pipe path a real
@@ -3308,9 +3480,40 @@ impl wlr::OutputHandler for State {
             tracing::error!(?err, "could not give output a renderer");
             return;
         }
-        if let Err(err) = output.enable_with_preferred_mode() {
-            tracing::error!(?err, "could not enable output");
-            return;
+
+        // Apply any persisted `DisplayConfig` for this connector before the
+        // geometry/scene sequence below reads the output's resulting box.
+        // The name (`wlr::Output::name()`) is the stable key the settings
+        // client and this lookup share; `None` (an unnamed output) matches
+        // no persisted entry and takes the default preferred-mode path.
+        let name = output.name().unwrap_or_default();
+        let display_cfg = self.config.displays.iter().find(|d| d.name == name).cloned();
+        match &display_cfg {
+            Some(cfg) if cfg.enabled => {
+                // On ANY setter error the output must not be left dark:
+                // fall back to the preferred mode with wlroots' own auto
+                // layout position, exactly the no-config path.
+                if let Err(err) = Self::apply_display_config(&runtime, output, cfg) {
+                    tracing::error!(?err, %name, "persisted display config failed; using preferred mode");
+                    if let Err(err) = output.enable_with_preferred_mode() {
+                        tracing::error!(?err, "could not enable output");
+                        return;
+                    }
+                }
+            }
+            Some(_) => {
+                // Persisted as disabled: honor it. A failed disable is
+                // logged but not fatal -- the output simply stays enabled.
+                if let Err(err) = output.disable() {
+                    tracing::error!(?err, %name, "could not disable output per persisted config");
+                }
+            }
+            None => {
+                if let Err(err) = output.enable_with_preferred_mode() {
+                    tracing::error!(?err, "could not enable output");
+                    return;
+                }
+            }
         }
 
         let (width, height) = output.size();
@@ -3331,6 +3534,12 @@ impl wlr::OutputHandler for State {
             .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
             .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width, height });
         self.create_output(index, geometry);
+        // Record the connector name so the applied-config handler can map an
+        // `AppliedHead` back to this index and `destroyed`/persist can look
+        // it up (see `OutputSurface::name`).
+        if let Some(surface) = self.outputs.get_mut(&index) {
+            surface.name = name;
+        }
         self.output_ids.insert(output.id(), index);
         // A new output needs its own wallpaper node (if a decode has
         // already landed) at this output's own size -- nothing else calls
@@ -3363,6 +3572,12 @@ impl wlr::OutputHandler for State {
         // output on its own, so a freshly enabled output that draws nothing
         // still gets a `frame` callback and a first commit.
         output.schedule_frame();
+
+        // Re-advertise the manager state so every bound
+        // `zwlr_output_manager_v1` client sees the new head (and any layout
+        // shift the connect caused) with a bumped serial. A no-op when no
+        // manager was created (`lib.rs::run` degrades gracefully).
+        runtime.update_output_manager_state();
     }
 
     fn frame(&mut self, output: &wlr::Output<'_>) {
@@ -3401,6 +3616,91 @@ impl wlr::OutputHandler for State {
             // going silent forever.
             self.resolve_orphaned_layers();
         }
+        // Re-advertise even when the id was unknown-to-us: the output is gone
+        // from wlroots' layout regardless, and a bound manager client must
+        // see the shrunk head set. A no-op when no manager exists.
+        if let Some(runtime) = self.wayland.runtime() {
+            runtime.update_output_manager_state();
+        }
+    }
+
+    fn output_configuration_applied(&mut self, heads: Vec<wlr::AppliedHead>) {
+        // The crate has already committed each head and applied its layout
+        // position by the time this runs (see the trait doc); our job is to
+        // re-derive geometry from the new layout, migrate any window off an
+        // output that shrank or went dark, persist the result, and
+        // re-advertise. Never block on redb here -- `spawn_config_save` does
+        // the write off-loop.
+        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+
+        for head in &heads {
+            let Some(head_name) = head.name.as_deref() else { continue };
+            // name -> our output index (via the name recorded in `new_output`).
+            let Some(index) =
+                self.outputs.iter().find(|(_, o)| o.name == head_name).map(|(i, _)| *i)
+            else {
+                continue;
+            };
+
+            let old_geometry = self.outputs.get(&index).map(|o| o.geometry);
+
+            if head.enabled {
+                // Re-derive from the layout box wlroots just committed; fall
+                // back to the head's own reported mode/position, then to the
+                // prior box, so the output is never collapsed to nothing.
+                let oid = self.output_ids.iter().find(|(_, i)| **i == index).map(|(id, _)| *id);
+                let geometry = oid
+                    .and_then(|oid| runtime.output_layout_box(oid))
+                    .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
+                    .or_else(|| {
+                        (head.width > 0 && head.height > 0).then_some(icedtea_contract::Rectangle {
+                            x: head.x,
+                            y: head.y,
+                            width: head.width,
+                            height: head.height,
+                        })
+                    })
+                    .or(old_geometry);
+                if let (Some(surface), Some(geometry)) = (self.outputs.get_mut(&index), geometry) {
+                    surface.geometry = geometry;
+                    // `arrange_layers`/exclusive zones recompute `usable`;
+                    // reset it to the full box for now, exactly as a fresh
+                    // `create_output` does.
+                    surface.usable = geometry;
+                }
+                // A shrunken output can strand windows whose center now sits
+                // outside every output's box -- re-home them.
+                self.reclaim_offscreen_windows();
+            } else {
+                // Disabled: drop it from the active set (mirroring
+                // `destroyed`) and migrate its windows onto a survivor.
+                self.outputs.remove(&index);
+                if let Some(oid) =
+                    self.output_ids.iter().find(|(_, i)| **i == index).map(|(id, _)| *id)
+                {
+                    self.output_ids.remove(&oid);
+                }
+                if let Some(old) = old_geometry {
+                    self.migrate_windows_from(old);
+                }
+            }
+        }
+
+        // Re-run the scene sequence a hotplug runs, so windows and layers
+        // settle onto the re-derived geometry.
+        self.sync_wallpaper_nodes();
+        self.sync_scene();
+        self.emit_pending();
+        self.resolve_orphaned_layers();
+
+        // Persist: upsert each applied head into `config.displays`, then
+        // write off-loop.
+        self.upsert_displays_from_heads(&heads);
+        self.spawn_config_save();
+
+        // The trait doc REQUIRES this once the layout is settled and
+        // persisted, so other bound managers see the fresh state + serial.
+        runtime.update_output_manager_state();
     }
 }
 
@@ -7282,6 +7582,176 @@ mod tests {
             state.window_manager.focused_window().map(|w| w.id),
             Some(a),
             "a minimized focus pointer must be re-picked on switch-back, not kept"
+        );
+    }
+
+    // -- T5: output-management (persisted display config) ----------------
+    //
+    // These cover the runtime-independent halves of Task 5: the persisted
+    // config lookup/round-trip, the `AppliedHead` -> `DisplayConfig` upsert,
+    // the transform integer mapping, and the offscreen-window reclaim a
+    // shrinking apply triggers. The live-output halves -- `new_output`
+    // committing mode/scale/transform/position on a real `wlr::Output`, and
+    // `output_configuration_applied` re-deriving geometry through
+    // `output_layout_box` -- need an attached `wlr::Runtime` (both handlers
+    // early-return without one), so they are exercised end-to-end by the
+    // protocol round-trip in T6/T7 rather than here. See the task notes.
+
+    fn head(name: &str, enabled: bool) -> wlr::AppliedHead {
+        wlr::AppliedHead {
+            name: Some(name.to_string()),
+            enabled,
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60_000,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            transform: wlr::Transform::Normal,
+        }
+    }
+
+    #[test]
+    fn transform_integer_mapping_round_trips_every_variant() {
+        for value in 0..=7 {
+            let t = State::transform_from_i32(value);
+            assert_eq!(State::transform_to_i32(t), value, "transform {value} must round-trip");
+        }
+        // Out-of-range falls back to Normal (0), not a panic.
+        assert_eq!(State::transform_from_i32(99), wlr::Transform::Normal);
+    }
+
+    #[test]
+    fn upsert_displays_inserts_new_and_replaces_by_name() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert!(state.config.displays.is_empty());
+
+        // Two distinct outputs -> two appended entries.
+        state.upsert_displays_from_heads(&[head("DP-1", true), head("HDMI-A-1", true)]);
+        assert_eq!(state.config.displays.len(), 2);
+        assert_eq!(state.config.displays[0].name, "DP-1");
+        assert_eq!(state.config.displays[1].name, "HDMI-A-1");
+
+        // Re-applying DP-1 disabled must REPLACE in place (still 2 entries,
+        // order preserved), not append a duplicate.
+        let mut disabled = head("DP-1", false);
+        disabled.width = 2560;
+        disabled.height = 1440;
+        disabled.transform = wlr::Transform::_270;
+        disabled.scale = 2.0;
+        state.upsert_displays_from_heads(&[disabled]);
+        assert_eq!(state.config.displays.len(), 2, "same name must not append a duplicate");
+        let dp1 = &state.config.displays[0];
+        assert_eq!(dp1.name, "DP-1");
+        assert!(!dp1.enabled);
+        assert_eq!(dp1.width, 2560);
+        assert_eq!(dp1.height, 1440);
+        assert_eq!(dp1.transform, 3, "wlr::Transform::_270 persists as 3");
+        assert_eq!(dp1.scale, 2.0);
+    }
+
+    #[test]
+    fn upsert_displays_skips_unnamed_head() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let mut anon = head("ignored", true);
+        anon.name = None;
+        state.upsert_displays_from_heads(&[anon]);
+        assert!(state.config.displays.is_empty(), "an unnamed head has no key to store");
+    }
+
+    #[test]
+    fn save_config_to_persists_displays_to_redb() {
+        // Exercises the exact synchronous body `spawn_config_save` runs on
+        // its worker thread (see `save_config_to`'s doc for why the detached
+        // thread itself is not what the test drives). The upserted displays
+        // must survive a real `load_or_default` round-trip.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.redb");
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.config_path = Some(path.clone());
+        state.upsert_displays_from_heads(&[head("DP-1", true)]);
+
+        State::save_config_to(&state.config, &path);
+
+        let loaded = icedtea_config::load_or_default(&path);
+        assert_eq!(loaded.displays.len(), 1, "save_config_to must persist the displays");
+        assert_eq!(loaded.displays[0].name, "DP-1");
+        assert_eq!(loaded.displays[0].width, 1920);
+        assert_eq!(loaded.displays[0].refresh_mhz, 60_000);
+    }
+
+    #[test]
+    fn reclaim_offscreen_windows_clamps_stranded_window_onto_survivor() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        // Single 800x600 output at origin: a window centered at (1400,300)
+        // sits entirely off it (simulating the output it lived on shrinking
+        // away under an applied config).
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id =
+            state.window_manager.add_window("a", "A", 1, Rectangle { x: 1350, y: 250, width: 100, height: 100 });
+
+        state.reclaim_offscreen_windows();
+
+        let geo = state.window_manager.get(id).expect("window").geometry;
+        assert!(
+            geo.x >= 0 && geo.x + geo.width <= 800 && geo.y >= 0 && geo.y + geo.height <= 600,
+            "stranded window must be clamped inside the survivor output, got {geo:?}"
+        );
+    }
+
+    #[test]
+    fn reclaim_offscreen_windows_leaves_onscreen_window_untouched() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let onscreen = Rectangle { x: 100, y: 100, width: 200, height: 150 };
+        let id = state.window_manager.add_window("a", "A", 1, onscreen);
+
+        state.reclaim_offscreen_windows();
+
+        assert_eq!(
+            state.window_manager.get(id).expect("window").geometry,
+            onscreen,
+            "a window already on an output must not be moved"
+        );
+    }
+
+    #[test]
+    fn new_output_config_lookup_matches_persisted_entry_by_name() {
+        // Guards the exact lookup `new_output` performs (`config.displays`
+        // find by connector name) independently of a live output: a matching
+        // enabled entry is found, a name miss is not.
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut config = default_config();
+        config.displays.push(icedtea_contract::DisplayConfig {
+            name: "HEADLESS-1".to_string(),
+            enabled: true,
+            width: 1280,
+            height: 720,
+            refresh_mhz: 0,
+            x: 100,
+            y: 200,
+            scale: 1.5,
+            transform: 1,
+        });
+        let state = State::new(config, tx);
+
+        let hit = state.config.displays.iter().find(|d| d.name == "HEADLESS-1");
+        assert!(hit.is_some(), "persisted entry must be found by its connector name");
+        let hit = hit.unwrap();
+        assert!(hit.enabled);
+        assert_eq!((hit.width, hit.height), (1280, 720));
+        assert_eq!((hit.x, hit.y), (100, 200));
+        assert_eq!(State::transform_from_i32(hit.transform), wlr::Transform::_90);
+
+        assert!(
+            !state.config.displays.iter().any(|d| d.name == "DP-9"),
+            "a connector with no persisted entry must not match"
         );
     }
 }
