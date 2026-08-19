@@ -1238,6 +1238,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "xkbcommon",
 ]
 
 [[package]]

@@ -6,9 +6,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub mod defaults;
+pub mod keys;
 pub mod schema;
 
 use schema::*;
+
+pub use keys::{key_name_to_keysym, keysym_to_key_name, MODIFIER_TOKENS};
 
 /// Written into `DB_META` on every `Config::save`, for the future settings
 /// crate (the plan's single config writer) to use for migrations. It is
