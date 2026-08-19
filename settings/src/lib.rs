@@ -1,9 +1,10 @@
 //! `icedtea-settings`: GTK config editor for icedtea-wm.
 //!
 //! [`model`] is the GTK-free core -- working-copy state, keybinding-capture
-//! translation, and validation -- consumed by the (GTK) view built on top of
-//! it in later tasks.
+//! translation, and validation -- consumed by the (GTK) view in [`pages`]
+//! and `main.rs`.
 
 pub mod bridge;
 pub mod model;
+pub mod pages;
 pub mod wm_reload;
