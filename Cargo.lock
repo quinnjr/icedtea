@@ -1268,6 +1268,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "icedtea-settings"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "gtk4",
+ "icedtea-config",
+ "icedtea-contract",
+ "icedtea-harness",
+ "redb",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
 name = "icedtea-shell"
 version = "0.1.0"
 dependencies = [

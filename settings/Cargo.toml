@@ -1,0 +1,23 @@
+[package]
+name = "icedtea-settings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "icedtea-settings"
+path = "src/main.rs"
+
+[dependencies]
+icedtea-config = { path = "../config" }
+icedtea-contract = { path = "../contract" }
+gtk4 = "0.11"
+zbus.workspace = true
+async-channel = "2"
+redb.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+icedtea-harness = { path = "../harness" }
+tempfile = "3"
