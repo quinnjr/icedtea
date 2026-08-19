@@ -254,6 +254,12 @@ impl Compositor {
             runtime
                 .create_relative_pointer_manager(&display)
                 .expect("zwp_relative_pointer_manager_v1");
+            // Same "harness cannot degrade" tone: the output-management test
+            // binds `zwlr_output_manager_v1` directly and would assert against
+            // one that was never advertised.
+            runtime
+                .create_output_manager(&display)
+                .expect("zwlr_output_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
             // Test-only: makes the seat advertise the touch capability so
             // headless clients can bind `wl_touch` and injected touch
