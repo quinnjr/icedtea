@@ -11,7 +11,7 @@ use gtk4::{Application, ApplicationWindow, Box as GtkBox, Button, Label, Orienta
 
 use icedtea_config::default_db_path;
 use icedtea_settings::model::Model;
-use icedtea_settings::pages::{appearance, behavior, keybindings, workspaces, Ctx, Page};
+use icedtea_settings::pages::{appearance, behavior, displays, keybindings, workspaces, Ctx, Page};
 use icedtea_settings::wm_reload::{apply_and_reload, ReloadClient, ReloadOutcome};
 
 const APP_ID: &str = "org.icedtea.Settings";
@@ -112,10 +112,16 @@ fn build_window(app: &Application) {
     let keybindings_root = keybindings_page.root.clone();
     *keybindings_page_slot.borrow_mut() = Some(keybindings_page);
 
+    // The Displays page is protocol-driven (talks to the compositor over
+    // `zwlr_output_management_v1` and has its own Test/Apply/Revert), so it is
+    // not part of the shared model footer / revert wiring below.
+    let displays_root = displays::build();
+
     stack.add_titled(&appearance_page.root, Some("appearance"), "Appearance");
     stack.add_titled(&behavior_page.root, Some("behavior"), "Behavior");
     stack.add_titled(&workspaces_page.root, Some("workspaces"), "Workspaces");
     stack.add_titled(&keybindings_root, Some("keybindings"), "Keybindings");
+    stack.add_titled(&displays_root, Some("displays"), "Displays");
 
     update_footer();
 

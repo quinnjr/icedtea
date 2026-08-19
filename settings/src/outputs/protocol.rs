@@ -96,6 +96,10 @@ pub enum OutputsMsg {
     /// A submitted configuration was cancelled (superseded by a change the
     /// compositor made meanwhile); the client should re-read and retry.
     ApplyCancelled,
+    /// The second wayland connection died (compositor exited, socket error).
+    /// The glib source detaches after emitting this; the page should treat
+    /// output management as gone.
+    Disconnected,
 }
 
 /// Why building/sending a configuration could not even be attempted.
@@ -317,15 +321,30 @@ impl OutputsConnection {
     /// Read whatever is ready on the socket, then dispatch it — the second half
     /// of the glib callback, run only when `dispatch_pending` found nothing.
     /// Never blocks: `prepare_read` yields `None` if another reader raced in,
-    /// in which case the events are already ours to dispatch.
+    /// in which case the events are already ours to dispatch. A `WouldBlock`
+    /// from the read is benign (the fd woke us but was already drained) and is
+    /// reported as "nothing dispatched" rather than a dispatch error, so it
+    /// never spuriously warns.
     pub fn read_and_dispatch(&mut self) -> Result<usize, wayland_client::DispatchError> {
         if let Some(guard) = self.queue.prepare_read() {
-            // A read error here is reported as a dispatch error to the caller.
-            guard
-                .read()
-                .map_err(wayland_client::DispatchError::Backend)?;
+            match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    return Ok(0);
+                }
+                Err(e) => return Err(wayland_client::DispatchError::Backend(e)),
+            }
         }
         self.queue.dispatch_pending(&mut self.state)
+    }
+
+    /// Notify the view that the connection is gone. Called by the glib source
+    /// when a dispatch/read errors so the page can drop into its
+    /// unavailable state instead of the source busy-looping on a dead fd.
+    pub fn notify_disconnected(&self) {
+        self.state.emit(OutputsMsg::Disconnected);
     }
 
     /// Flush queued requests out to the compositor.

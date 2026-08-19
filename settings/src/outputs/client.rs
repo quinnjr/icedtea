@@ -6,7 +6,7 @@
 //! and attach a source that wakes on `IN`. The callback drains the queue
 //! non-blockingly. All `unsafe` stays inside `rustix`/`gio`/`glib`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
 
@@ -20,6 +20,9 @@ use super::protocol::{Head, HeadEdit, OutputsConnection, OutputsError, OutputsMs
 pub struct OutputsClient {
     conn: Rc<RefCell<OutputsConnection>>,
     source_id: Option<glib::SourceId>,
+    /// Set by the source callback when it returns `Break` (connection lost),
+    /// so `Drop` doesn't try to remove an already-detached source.
+    detached: Rc<Cell<bool>>,
 }
 
 impl OutputsClient {
@@ -51,7 +54,9 @@ impl OutputsClient {
         let socket = gio::Socket::from_fd(owned).expect("gio::Socket from wayland queue fd");
 
         let conn = Rc::new(RefCell::new(conn));
+        let detached = Rc::new(Cell::new(false));
         let cb_conn = conn.clone();
+        let cb_detached = detached.clone();
         let source = gio::prelude::SocketExtManual::create_source(
             &socket,
             glib::IOCondition::IN,
@@ -62,16 +67,24 @@ impl OutputsClient {
                 let mut c = cb_conn.borrow_mut();
                 // Drain what is already buffered; only touch the socket if that
                 // came up empty, and never block.
-                match c.dispatch_pending() {
-                    Ok(0) => {
-                        let _ = c.read_and_dispatch();
-                    }
-                    Ok(_) => {}
+                let result = match c.dispatch_pending() {
+                    Ok(0) => c.read_and_dispatch(),
+                    other => other,
+                };
+                match result {
+                    Ok(_) => ControlFlow::Continue,
                     Err(err) => {
-                        tracing::warn!(%err, "output-management dispatch failed");
+                        // A dispatch/read error means the connection is gone
+                        // (compositor exited, socket broke). Detaching the
+                        // source is the only sane move — otherwise glib wakes
+                        // us on the dead fd forever and we warn-spam. Tell the
+                        // page so it drops into its unavailable state.
+                        tracing::warn!(%err, "output-management connection lost; detaching source");
+                        c.notify_disconnected();
+                        cb_detached.set(true);
+                        ControlFlow::Break
                     }
                 }
-                ControlFlow::Continue
             },
         );
         let source_id = source.attach(Some(main_context));
@@ -79,6 +92,7 @@ impl OutputsClient {
         OutputsClient {
             conn,
             source_id: Some(source_id),
+            detached,
         }
     }
 
@@ -106,7 +120,13 @@ impl OutputsClient {
 
 impl Drop for OutputsClient {
     fn drop(&mut self) {
-        if let Some(id) = self.source_id.take() {
+        // If the callback already returned `Break`, glib has destroyed the
+        // source; removing it again would log a GLib-CRITICAL. `SourceId` does
+        // not auto-remove on drop, so simply letting it fall out of scope is
+        // the right no-op in that case.
+        if let Some(id) = self.source_id.take()
+            && !self.detached.get()
+        {
             id.remove();
         }
     }

@@ -11,6 +11,8 @@ use crate::model::Model;
 
 pub mod appearance;
 pub mod behavior;
+pub mod displays;
+pub mod displays_canvas;
 pub mod keybindings;
 pub mod workspaces;
 
