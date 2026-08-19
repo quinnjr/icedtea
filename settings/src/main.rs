@@ -11,7 +11,7 @@ use gtk4::{Application, ApplicationWindow, Box as GtkBox, Button, Label, Orienta
 
 use icedtea_config::default_db_path;
 use icedtea_settings::model::Model;
-use icedtea_settings::pages::{appearance, behavior, Ctx, Page};
+use icedtea_settings::pages::{appearance, behavior, keybindings, workspaces, Ctx, Page};
 use icedtea_settings::wm_reload::{apply_and_reload, ReloadClient, ReloadOutcome};
 
 const APP_ID: &str = "org.icedtea.Settings";
@@ -90,8 +90,32 @@ fn build_window(app: &Application) {
 
     let appearance_page: Page = appearance::build(ctx.clone());
     let behavior_page: Page = behavior::build(ctx.clone());
+
+    // Adding/removing a workspace on the Workspaces page changes the set of
+    // generated `workspace:N`/`move_to_workspace:N` rows the Keybindings
+    // page shows, so the Workspaces page needs to be able to trigger a
+    // refresh there. The Keybindings page doesn't exist yet at the point
+    // `workspaces::build` needs the callback, so it's routed through this
+    // slot and filled in right after `keybindings::build` runs.
+    let keybindings_page_slot: Rc<RefCell<Option<Page>>> = Rc::new(RefCell::new(None));
+    let on_workspaces_changed: Rc<dyn Fn()> = {
+        let slot = keybindings_page_slot.clone();
+        Rc::new(move || {
+            if let Some(page) = slot.borrow().as_ref() {
+                page.refresh();
+            }
+        })
+    };
+
+    let workspaces_page: Page = workspaces::build(ctx.clone(), on_workspaces_changed);
+    let keybindings_page: Page = keybindings::build(ctx.clone());
+    let keybindings_root = keybindings_page.root.clone();
+    *keybindings_page_slot.borrow_mut() = Some(keybindings_page);
+
     stack.add_titled(&appearance_page.root, Some("appearance"), "Appearance");
     stack.add_titled(&behavior_page.root, Some("behavior"), "Behavior");
+    stack.add_titled(&workspaces_page.root, Some("workspaces"), "Workspaces");
+    stack.add_titled(&keybindings_root, Some("keybindings"), "Keybindings");
 
     update_footer();
 
@@ -129,10 +153,15 @@ fn build_window(app: &Application) {
         let model = model.clone();
         let db_path = db_path.clone();
         let update_footer = update_footer.clone();
+        let keybindings_page_slot = keybindings_page_slot.clone();
         revert_button.connect_clicked(move |_| {
             model.borrow_mut().revert(&db_path);
             appearance_page.refresh();
             behavior_page.refresh();
+            workspaces_page.refresh();
+            if let Some(page) = keybindings_page_slot.borrow().as_ref() {
+                page.refresh();
+            }
             update_footer();
         });
     }

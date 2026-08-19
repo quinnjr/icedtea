@@ -11,6 +11,8 @@ use crate::model::Model;
 
 pub mod appearance;
 pub mod behavior;
+pub mod keybindings;
+pub mod workspaces;
 
 /// Everything a page's widget handlers need: the shared working-copy model,
 /// the app window (used as a transient-for parent by `FileDialog`), a
