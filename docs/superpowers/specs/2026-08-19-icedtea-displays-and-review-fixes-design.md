@@ -88,8 +88,11 @@ pub displays: Vec<DisplayConfig>,   // default: empty
 - New redb table `DB_DISPLAYS`, `serde_json`-encoded, same per-section pattern
   as `DB_APPEARANCE` et al. (`schema.rs`, `Config::save`, `load_or_default`).
 - `default_config()` → `displays: Vec::new()`.
-- Bump `SCHEMA_VERSION`; missing table loads as empty vec (older DBs upgrade
-  transparently).
+- **No `SCHEMA_VERSION` bump / no migration** — `SCHEMA_VERSION` is write-only
+  (never read by `load_or_default`), and every section already falls back
+  per-field when its table is absent, so an older DB with no `DB_DISPLAYS`
+  loads as an empty vec (= today's behavior) for free. Mirror the existing
+  `if let Ok(table) = open_table(..) && let Some(v) = read_json(..)` chain.
 
 ### A3. `wlr` crate additions (→ `wlroots-sys`, publish `wlr` 0.20.22)
 
