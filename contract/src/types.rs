@@ -84,6 +84,19 @@ pub struct Appearance {
     pub wallpaper: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplayConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub width: i32,
+    pub height: i32,
+    pub refresh_mhz: i32,
+    pub x: i32,
+    pub y: i32,
+    pub scale: f64,
+    pub transform: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

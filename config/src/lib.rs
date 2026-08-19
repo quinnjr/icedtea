@@ -23,6 +23,7 @@ pub const SCHEMA_VERSION: u64 = 1;
 
 pub use defaults::default_config;
 pub use contract::Appearance;
+pub use contract::DisplayConfig;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyCombo {
@@ -43,6 +44,7 @@ pub struct Config {
     pub appearance: Appearance,
     pub behavior: Behavior,
     pub workspace_names: Vec<String>,
+    pub displays: Vec<DisplayConfig>,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -191,6 +193,11 @@ pub fn load_or_default(db_path: &Path) -> Config {
         {
             cfg.workspace_names = names;
         }
+        if let Ok(displays_table) = read_txn.open_table(DB_DISPLAYS)
+            && let Some(displays) = read_json::<Vec<DisplayConfig>>(&displays_table, KEY_DISPLAYS)
+        {
+            cfg.displays = displays;
+        }
         if let Ok(kb_table) = read_txn.open_table(DB_KEYBINDINGS)
             && read_json::<u64>(&kb_table, KEY_ACTION_COUNT).unwrap_or(0) > 0
         {
@@ -241,6 +248,9 @@ impl Config {
             let mut workspaces = write_txn.open_table(DB_WORKSPACES)?;
             let workspace_bytes = serde_json::to_vec(&self.workspace_names).unwrap();
             workspaces.insert(KEY_WORKSPACES, workspace_bytes.as_slice())?;
+            let mut displays = write_txn.open_table(DB_DISPLAYS)?;
+            let displays_bytes = serde_json::to_vec(&self.displays).unwrap();
+            displays.insert(KEY_DISPLAYS, displays_bytes.as_slice())?;
             let mut keybindings = write_txn.open_table(DB_KEYBINDINGS)?;
             let count = serde_json::to_vec(&(self.keybindings.len() as u64)).unwrap();
             keybindings.insert(KEY_ACTION_COUNT, count.as_slice())?;
@@ -286,6 +296,75 @@ mod tests {
         let path = dir.path().join("nope.redb");
         let cfg = load_or_default(&path);
         assert_eq!(cfg, default_config());
+    }
+
+    #[test]
+    fn default_displays_is_empty() {
+        let cfg = default_config();
+        assert!(cfg.displays.is_empty());
+    }
+
+    fn sample_displays() -> Vec<DisplayConfig> {
+        vec![
+            DisplayConfig {
+                name: "DP-1".into(),
+                enabled: true,
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60000,
+                x: 0,
+                y: 0,
+                scale: 1.0,
+                transform: 0,
+            },
+            DisplayConfig {
+                name: "HDMI-A-1".into(),
+                enabled: false,
+                width: 2560,
+                height: 1440,
+                refresh_mhz: 144000,
+                x: 1920,
+                y: 0,
+                scale: 1.5,
+                transform: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn save_then_load_round_trips_displays() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let db = open(&path).unwrap();
+        let mut cfg = default_config();
+        cfg.displays = sample_displays();
+        cfg.save(&db).unwrap();
+        drop(db);
+
+        let loaded = load_or_default(&path);
+        assert_eq!(loaded.displays, sample_displays());
+    }
+
+    #[test]
+    fn missing_displays_table_loads_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let db = open(&path).unwrap();
+        {
+            // Write an "old-format" DB that has appearance/behavior/workspaces
+            // but never touched DB_DISPLAYS, simulating a file saved before
+            // this field existed.
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(DB_APPEARANCE).unwrap();
+                let bytes = serde_json::to_vec(&default_config().appearance).unwrap();
+                table.insert(KEY_APPEARANCE, bytes.as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        drop(db);
+        let cfg = load_or_default(&path);
+        assert_eq!(cfg.displays, Vec::<DisplayConfig>::new());
     }
 
     #[test]

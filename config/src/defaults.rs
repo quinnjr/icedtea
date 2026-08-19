@@ -51,5 +51,6 @@ pub fn default_config() -> Config {
             snap_enabled: true,
         },
         workspace_names: vec!["1".into(), "2".into(), "3".into(), "4".into()],
+        displays: vec![],
     }
 }
