@@ -93,6 +93,29 @@ fn sync_rows(rows: &[Row], cfg: &icedtea_config::Config) {
     }
 }
 
+/// Resolve the group-0/level-0 keysym for a captured hardware `keycode` --
+/// the layout-agnostic, un-shifted keysym the compositor's own matcher
+/// compares against (`compositor/src/input.rs` matches on the keysym as
+/// delivered with *no* level/group adjustment applied by us -- it relies on
+/// bindings being stored in their base form). `EventControllerKey`'s
+/// `keyval` is *already* shift/caps-adjusted by GDK (e.g. Shift+q ->
+/// `KEY_Q`, Shift+1 -> `KEY_exclam`), so capturing straight from `keyval`
+/// would silently store a binding that never matches a real, unshifted key
+/// press. Asking the display to translate the same `keycode` with an empty
+/// modifier state and group 0 gives back the level-0 keysym regardless of
+/// what Shift/Caps-Lock/group was actually active during capture.
+///
+/// Falls back to `fallback_keysym` (the raw event `keyval`) if the display
+/// or its keymap can't translate the keycode -- should not happen for a
+/// real key-press event, but keeps capture panic-free against an exotic or
+/// absent keymap.
+pub fn unshifted_keysym(keycode: u32, fallback_keysym: u32) -> u32 {
+    gdk::Display::default()
+        .and_then(|display| display.translate_key(keycode, gdk::ModifierType::empty(), 0))
+        .map(|(key, _group, _level, _consumed)| key.into_glib())
+        .unwrap_or(fallback_keysym)
+}
+
 /// Install the CSS provider for [`CONFLICT_CSS_CLASS`] on the default
 /// display, once. Purely advisory styling (a red label) -- see the brief's
 /// Step 4: conflicts never block Apply.
@@ -131,7 +154,7 @@ pub fn build(ctx: Ctx) -> Page {
         let ctx = ctx.clone();
         let rows = rows.clone();
         let capturing = capturing.clone();
-        key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
+        key_controller.connect_key_pressed(move |_controller, keyval, keycode, state| {
             let Some(action) = capturing.borrow().clone() else {
                 return glib::Propagation::Proceed;
             };
@@ -154,7 +177,8 @@ pub fn build(ctx: Ctx) -> Page {
             // If `combo_from_keysym` returns `None` (a lone modifier press),
             // fall through leaving `capturing` set -- stay in capture mode
             // and wait for the "real" key.
-            if let Some(combo) = combo_from_keysym(keyval.into_glib(), mods) {
+            let keysym = unshifted_keysym(keycode, keyval.into_glib());
+            if let Some(combo) = combo_from_keysym(keysym, mods) {
                 ctx.model.borrow_mut().working.keybindings.insert(action.clone(), combo);
                 ctx.mark_dirty();
                 *capturing.borrow_mut() = None;
@@ -208,9 +232,19 @@ pub fn build(ctx: Ctx) -> Page {
 
                 {
                     let capturing = capturing.clone();
+                    let rows = rows.clone();
                     let action = action.clone();
                     set_button.connect_clicked(move |button| {
-                        *capturing.borrow_mut() = Some(action.clone());
+                        // Starting a new capture supersedes any row already
+                        // pending -- reset its Set button back to "Set" so
+                        // it doesn't stay stuck on "Press a key..." forever
+                        // once this row steals capture focus.
+                        if let Some(previous) = capturing.borrow_mut().replace(action.clone())
+                            && previous != action
+                            && let Some(row) = rows.borrow().iter().find(|r| r.action == previous)
+                        {
+                            row.set_button.set_label("Set");
+                        }
                         button.set_label("Press a key…");
                         button.grab_focus();
                     });

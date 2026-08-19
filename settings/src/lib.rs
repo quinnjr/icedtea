@@ -4,7 +4,6 @@
 //! translation, and validation -- consumed by the (GTK) view in [`pages`]
 //! and `main.rs`.
 
-pub mod bridge;
 pub mod model;
 pub mod pages;
 pub mod wm_reload;

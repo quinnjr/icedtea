@@ -211,11 +211,21 @@ mod tests {
         assert_eq!(loaded, cfg);
     }
 
-    /// The load-bearing proof: whatever `combo_from_keysym` serializes as
-    /// `KeyCombo::key` must resolve back to the *same* keysym through
-    /// `key_name_to_keysym` -- the exact function the compositor's own
-    /// matcher uses -- or a binding captured in this app could silently
-    /// mean a different key at runtime than the one the user pressed.
+    /// Proof that `combo_from_keysym` preserves whatever keysym it's
+    /// *given*: whatever it serializes as `KeyCombo::key` must resolve back
+    /// to the *same* keysym through `key_name_to_keysym` -- the exact
+    /// function the compositor's own matcher uses.
+    ///
+    /// This is deliberately scoped to `combo_from_keysym` alone -- it feeds
+    /// in an already-unshifted keysym (as every one of these `KEY_*` names
+    /// is), so it says nothing about whether the *caller* handed in the
+    /// right keysym in the first place. That's a separate concern this
+    /// module can't cover: shift/caps-lock normalization needs a live GDK
+    /// keymap, which is exactly why this crate is GTK-free (see the module
+    /// doc). The actual non-vacuous proof that a Shift-held capture still
+    /// resolves to the unshifted key lives in
+    /// `pages::keybindings::tests::unshifted_keysym_normalizes_shift_and_capslock_to_the_base_key`,
+    /// which drives a real `gdk::Display` against a harness compositor.
     #[test]
     fn combo_round_trips_to_the_compositor_format() {
         let mods = CaptureMods { ctrl: true, alt: false, shift: true, logo: true };

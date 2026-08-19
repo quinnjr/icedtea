@@ -13,7 +13,6 @@ icedtea-config = { path = "../config" }
 icedtea-contract = { path = "../contract" }
 gtk4 = { version = "0.11", features = ["v4_10"] }
 zbus.workspace = true
-async-channel = "2"
 redb.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

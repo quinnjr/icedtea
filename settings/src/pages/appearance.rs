@@ -56,6 +56,9 @@ pub fn build(ctx: Ctx) -> Page {
     {
         let ctx = ctx.clone();
         bar_position.connect_selected_notify(move |dd| {
+            if ctx.populating.get() {
+                return;
+            }
             if let Some(pos) = BAR_POSITIONS.get(dd.selected() as usize) {
                 ctx.model.borrow_mut().working.appearance.bar_position = pos.to_string();
             }
@@ -69,6 +72,9 @@ pub fn build(ctx: Ctx) -> Page {
     {
         let ctx = ctx.clone();
         bar_height.connect_value_changed(move |sb| {
+            if ctx.populating.get() {
+                return;
+            }
             ctx.model.borrow_mut().working.appearance.bar_height = sb.value() as i32;
             ctx.mark_dirty();
         });
@@ -80,6 +86,9 @@ pub fn build(ctx: Ctx) -> Page {
     {
         let ctx = ctx.clone();
         corner_radius.connect_value_changed(move |sb| {
+            if ctx.populating.get() {
+                return;
+            }
             ctx.model.borrow_mut().working.appearance.corner_radius = sb.value() as i32;
             ctx.mark_dirty();
         });
@@ -91,6 +100,9 @@ pub fn build(ctx: Ctx) -> Page {
     {
         let ctx = ctx.clone();
         snap_gap.connect_value_changed(move |sb| {
+            if ctx.populating.get() {
+                return;
+            }
             ctx.model.borrow_mut().working.appearance.snap_gap = sb.value() as i32;
             ctx.mark_dirty();
         });
@@ -102,6 +114,9 @@ pub fn build(ctx: Ctx) -> Page {
     {
         let ctx = ctx.clone();
         background.connect_rgba_notify(move |btn| {
+            if ctx.populating.get() {
+                return;
+            }
             ctx.model.borrow_mut().working.appearance.palette.background = rgba_to_hex(&btn.rgba());
             ctx.mark_dirty();
         });
@@ -113,6 +128,9 @@ pub fn build(ctx: Ctx) -> Page {
     {
         let ctx = ctx.clone();
         foreground.connect_rgba_notify(move |btn| {
+            if ctx.populating.get() {
+                return;
+            }
             ctx.model.borrow_mut().working.appearance.palette.foreground = rgba_to_hex(&btn.rgba());
             ctx.mark_dirty();
         });
@@ -124,6 +142,9 @@ pub fn build(ctx: Ctx) -> Page {
     {
         let ctx = ctx.clone();
         accent.connect_rgba_notify(move |btn| {
+            if ctx.populating.get() {
+                return;
+            }
             ctx.model.borrow_mut().working.appearance.palette.accent = rgba_to_hex(&btn.rgba());
             ctx.mark_dirty();
         });
