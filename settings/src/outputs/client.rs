@@ -46,15 +46,34 @@ impl OutputsClient {
     /// tests can build a connection against a private harness socket and still
     /// exercise the glib source if they want to.
     pub fn attach(main_context: &glib::MainContext, conn: OutputsConnection) -> OutputsClient {
-        // Duplicate the queue's readiness fd so glib owns its own copy; the
-        // original stays with the EventQueue. `rustix::io::dup` keeps the one
-        // unsafe syscall inside rustix.
-        let owned: OwnedFd = rustix::io::dup(conn.queue().as_fd())
-            .expect("dup of wayland queue fd");
-        let socket = gio::Socket::from_fd(owned).expect("gio::Socket from wayland queue fd");
-
         let conn = Rc::new(RefCell::new(conn));
         let detached = Rc::new(Cell::new(false));
+
+        // Duplicate the queue's readiness fd so glib owns its own copy; the
+        // original stays with the EventQueue. `rustix::io::dup` keeps the one
+        // unsafe syscall inside rustix. Both this dup and the `gio::Socket`
+        // wrap can fail under fd exhaustion — degrade to the same
+        // "output management unavailable" state the page shows when the manager
+        // global is missing, rather than panicking the whole GTK app. Without a
+        // source the queue is never pumped, so emit `Disconnected` (which the
+        // page treats as unavailable) and return an inert, already-detached
+        // handle.
+        let socket = {
+            let c = conn.borrow();
+            rustix::io::dup(c.queue().as_fd())
+                .map_err(|e| e.to_string())
+                .and_then(|owned: OwnedFd| gio::Socket::from_fd(owned).map_err(|e| e.to_string()))
+        };
+        let socket = match socket {
+            Ok(socket) => socket,
+            Err(err) => {
+                tracing::warn!(%err, "could not hook the outputs queue into glib; treating output management as unavailable");
+                conn.borrow().notify_disconnected();
+                detached.set(true);
+                return OutputsClient { conn, source_id: None, detached };
+            }
+        };
+
         let cb_conn = conn.clone();
         let cb_detached = detached.clone();
         let source = gio::prelude::SocketExtManual::create_source(
