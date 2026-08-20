@@ -2550,9 +2550,9 @@ impl State {
     /// back to `Normal`, matching wlroots' own read-back behavior.
     fn transform_from_i32(value: i32) -> wlr::Transform {
         match value {
-            1 => wlr::Transform::_90,
-            2 => wlr::Transform::_180,
-            3 => wlr::Transform::_270,
+            1 => wlr::Transform::R90,
+            2 => wlr::Transform::R180,
+            3 => wlr::Transform::R270,
             4 => wlr::Transform::Flipped,
             5 => wlr::Transform::Flipped90,
             6 => wlr::Transform::Flipped180,
@@ -2567,13 +2567,16 @@ impl State {
     fn transform_to_i32(transform: wlr::Transform) -> i32 {
         match transform {
             wlr::Transform::Normal => 0,
-            wlr::Transform::_90 => 1,
-            wlr::Transform::_180 => 2,
-            wlr::Transform::_270 => 3,
+            wlr::Transform::R90 => 1,
+            wlr::Transform::R180 => 2,
+            wlr::Transform::R270 => 3,
             wlr::Transform::Flipped => 4,
             wlr::Transform::Flipped90 => 5,
             wlr::Transform::Flipped180 => 6,
             wlr::Transform::Flipped270 => 7,
+            // `wlr::Transform` (M5's `geom::Transform`) is `#[non_exhaustive]`;
+            // any future variant maps to Normal (0) rather than blocking the build.
+            _ => 0,
         }
     }
 
@@ -7894,7 +7897,7 @@ mod tests {
         let mut disabled = head("DP-1", false);
         disabled.width = 2560;
         disabled.height = 1440;
-        disabled.transform = wlr::Transform::_270;
+        disabled.transform = wlr::Transform::R270;
         disabled.scale = 2.0;
         state.upsert_displays_from_heads(&[disabled]);
         assert_eq!(state.config.displays.len(), 2, "same name must not append a duplicate");
@@ -7903,7 +7906,7 @@ mod tests {
         assert!(!dp1.enabled);
         assert_eq!(dp1.width, 2560);
         assert_eq!(dp1.height, 1440);
-        assert_eq!(dp1.transform, 3, "wlr::Transform::_270 persists as 3");
+        assert_eq!(dp1.transform, 3, "wlr::Transform::R270 persists as 3");
         assert_eq!(dp1.scale, 2.0);
     }
 
