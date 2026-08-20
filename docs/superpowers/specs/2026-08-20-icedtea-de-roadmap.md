@@ -183,10 +183,62 @@ then the B-track indicators/pages consume them.
 - Making icedtea a general-purpose third-party toolkit (the UI toolkit is scoped
   to icedtea's own apps first).
 
+## Track-A sub-project specs
+
+Designed out (2026-08-20) into per-sub-project specs alongside this roadmap:
+`icedtea-xwayland-design.md` (A1), `icedtea-compat-protocols-design.md` (A2),
+`icedtea-logind-session-design.md` (A3), `icedtea-notifications-daemon-design.md`
+(A4), `icedtea-xdg-portal-design.md` (A5), `icedtea-input-methods-design.md`
+(A6), `icedtea-wm-extensions-design.md` (A7), and the cross-cutting
+`icedtea-system-backends-design.md`. Notable: **XWayland's FFI is already bound
+in `wlr-sys`** (default-on `xwayland` subsystem; `wlr_xwayland`/`wlr_xwm` tracked
+as unwrapped in the coverage ledger), so A1 is a safe-wrapper + integration job,
+not a bindgen expedition — a real de-risker.
+
+## Cross-cutting coordination (from the design review)
+
+The seven specs are individually coherent, but three coordination constraints
+bind them and MUST be honored when they become issues/plans:
+
+1. **`wlr` version numbers are allocated at publish time, not fixed in specs.**
+   A1, A2, and A6 each illustratively claim `0.20.23`/`.24`/`.25`, but every
+   publish is a strictly-sequential additive `0.20.x` and the parallel wlr-port
+   M5 scene work publishes into the same space — so at most one lands on any
+   given number. **Strike hard-coded versions from issues; keep a single
+   version-allocation ledger and claim-in-order at publish time.**
+2. **The `contract` crate needs a single coordinated signature bump, not three
+   parallel edits.** A2 (window attention/urgent bit → `WindowInfo`/
+   `WindowUpdate`), A3 (`Event::SessionLockChanged`), and A7 (per-output fields
+   on `WorkspaceInfo`/`WorkspaceSet`/`Snapshot` — a **wire-breaking** change) all
+   touch `contract/src/{types.rs,event.rs}` and the single
+   `wire_signatures_are_locked` test; run in parallel they conflict every time.
+   Land the contract changes in one coordinated bump (or a strict order:
+   A7 wire-break first, then A2/A3 additive).
+3. **Shared `login1` proxy.** A3 (session) and the system-backends brightness
+   domain both open an `org.freedesktop.login1` proxy — factor a shared
+   login1-client helper rather than hand-rolling it twice.
+
+## Gaps the review surfaced (need owners)
+
+- **A8 (polkit agent + secret-service/keyring) has no spec yet**, but A3 and
+  system-backends both depend on it (saved-Wi-Fi secrets, interactive BlueZ
+  pairing, privilege prompts). Needs its own design before those features
+  complete.
+- **XDG autostart** (roadmap plumbing row) is designed by none of the seven —
+  today only icedtea's own daemons start (systemd user units); third-party
+  `.desktop` autostart has no runner.
+- **Low-battery / device-connected notification wiring** is unowned:
+  system-backends assumes A4 consumes `org.icedtea.System` `Changed` signals, but
+  A4 doesn't mention it. Assign this bridge to a milestone (recommend A4
+  consuming the system backend).
+
 ## Next steps
 
 1. Refine this roadmap.
-2. Create the epic + tiered issues (Track A / B / cross-cutting) on
+2. Create the epic + tiered issues (Track A sub-projects + the coordination
+   constraints + the A8/autostart/notification-bridge gaps) on
    `quinnjr/icedtea-wm`.
-3. Immediate parallel starts: **A1 XWayland spike**, push **Track C → M3**,
-   **A4 notification daemon**, **A3 logind session**.
+3. Immediate parallel starts (respecting the coordination constraints above):
+   **A1 XWayland spike**, **A4 notification daemon**, **A3 logind session**,
+   and **A2 Batch-1** (passive/scene-internal protocols — highest leverage,
+   lowest risk).
