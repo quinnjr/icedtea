@@ -792,6 +792,23 @@ pub struct State {
     /// before the action it triggers (close/maximize/minimize) runs. Same
     /// "scene-only, no `Event`" rule as `ssd_hover`.
     ssd_press: Option<(WindowId, usize)>,
+    /// Which model window each mapped **managed** X11 (Xwayland) surface backs.
+    ///
+    /// The M1 spike's minimal parallel binding: xdg toplevels ride
+    /// `wayland::Wayland`'s `ToplevelKey`↔`WindowId` maps and the
+    /// `ToplevelId`-keyed scene seam, but an `XwaylandSurfaceId` has no
+    /// `ToplevelId`, so a managed X11 window enters the same `WindowManager`
+    /// model through this side-table instead of that seam. It proves one X11
+    /// window reaches the model end-to-end; the fuller `SurfaceKey`
+    /// generalization that folds both onto one focus/stacking/SSD path is a
+    /// later milestone (M2). Override-redirect surfaces are never entered here.
+    xwayland_windows: HashMap<wlr::XwaylandSurfaceId, WindowId>,
+    /// The `DISPLAY` name (`:N`) Xwayland last advertised, captured on
+    /// `xwayland_ready`. `None` until Xwayland is up (or on a build/host with no
+    /// Xwayland at all). Read back by the test-only `DbCommand::XwaylandDisplay`
+    /// accessor, and the value exported into the environment session children
+    /// inherit.
+    xwayland_display: Option<String>,
 }
 
 /// What a cached title raster depends on: the title text, the pixel width
@@ -912,6 +929,8 @@ impl State {
             button_glyph_cache: HashMap::new(),
             ssd_hover: None,
             ssd_press: None,
+            xwayland_windows: HashMap::new(),
+            xwayland_display: None,
         }
     }
 
@@ -2210,6 +2229,20 @@ impl State {
         self.sync_focus_change(None);
     }
 
+    /// Remove the managed X11 (Xwayland) window backing surface `id`, if any.
+    ///
+    /// The Xwayland counterpart of the xdg `forget_toplevel` path: drops the
+    /// side-table binding and takes the model row down through the shared
+    /// `forget_window` (which reseats focus and cleans up rasters/SSD/scene
+    /// memos). Idempotent -- a miss on the side-table returns without touching
+    /// the model -- so an unmap followed by a destroy (both fire for the same
+    /// surface) and an id we were never told about are each harmless.
+    fn remove_xwayland_window(&mut self, id: wlr::XwaylandSurfaceId) {
+        let Some(window_id) = self.xwayland_windows.remove(&id) else { return };
+        self.forget_window(window_id);
+        self.emit_pending();
+    }
+
     /// Toggle fullscreen state for a window. When entering fullscreen, saves the
     /// current geometry and sets geometry to the output rect. When exiting, restores
     /// the saved geometry. Emits WindowUpdated event.
@@ -2918,6 +2951,18 @@ impl State {
             DbCommand::CursorPosition { reply } => {
                 let pos = self.wayland.runtime().map(|rt| rt.cursor_position()).unwrap_or((0.0, 0.0));
                 let _ = reply.send(pos);
+                return Some(());
+            }
+            DbCommand::XwaylandDisplay { reply } => {
+                // Read live from the runtime rather than the `xwayland_display`
+                // field: with lazy start the manager reserves its display
+                // socket (and sets `display_name`) at `create_xwayland` time,
+                // well before `ready` fires -- so this answers before the
+                // stored-on-`ready` field would, which is what lets the test
+                // read `DISPLAY` and connect the very client whose connection
+                // triggers the lazy `Xwayland` start.
+                let name = self.wayland.runtime().and_then(|rt| rt.xwayland_display_name());
+                let _ = reply.send(name);
                 return Some(());
             }
         }
@@ -4597,6 +4642,127 @@ impl wlr::ToplevelHandler for State {
         }
         self.layers.remove(&id);
         self.arrange_layers();
+    }
+
+    // --- Xwayland (X11) ------------------------------------------------------
+    //
+    // The M1 spike's minimal end-to-end path: a *managed* (non-override-
+    // redirect) X11 window enters the same `WindowManager` model an xdg
+    // toplevel does, so a `Window` row appears on `map` and is removed on
+    // `unmap`/`destroy`. Unlike xdg toplevels it rides the `xwayland_windows`
+    // side-table rather than `wayland`'s `ToplevelKey` maps (an
+    // `XwaylandSurfaceId` has no `ToplevelId`), and the crate -- not this seam
+    // -- owns its scene node (built on `associate`). Override-redirect surfaces,
+    // SSD/move/resize/maximize parity, and the `SurfaceKey` generalization that
+    // folds both kinds onto one path are later milestones (M2/M3); the spike
+    // proves one X11 window reaches the model.
+
+    fn xwayland_ready(&mut self, display_name: Option<&str>) {
+        tracing::info!(?display_name, "Xwayland ready");
+        // The crate has already pointed Xwayland at this runtime's seat by now
+        // (so the clipboard/primary/DND bridge is live); our job is only to
+        // publish `DISPLAY` for the session children that inherit this
+        // process's environment.
+        self.xwayland_display = display_name.map(str::to_owned);
+        if let Some(name) = display_name {
+            // SAFETY (icedtea unsafe exception (c), with the spec's DISPLAY/env
+            // caveat): `set_var` mutates the process-global environment, which
+            // is only sound while nothing else is reading or writing it. Unlike
+            // the boot-time `WAYLAND_DISPLAY` write, this runs from inside
+            // `run_all` -- after the D-Bus and wallpaper threads exist -- so it
+            // is not guaranteed race-free the way that one is. It is kept
+            // because A1's session children read `DISPLAY` from the compositor's
+            // environment and none of them touch it concurrently in practice;
+            // the harness's X11 test does not depend on it (it reads `DISPLAY`
+            // through `DbCommand::XwaylandDisplay` and passes it to the client
+            // explicitly). The robust child-spawn-env plumbing is a follow-up.
+            unsafe {
+                std::env::set_var("DISPLAY", name);
+            }
+        }
+    }
+
+    fn xwayland_surface_mapped(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        let sid = surface.id();
+        if let Some(&window_id) = self.xwayland_windows.get(&sid) {
+            // Remapped after an unmap while the row survived. The spike removes
+            // the row on unmap, so this is only reachable if a future change
+            // starts keeping it; treat it as a visibility change, matching the
+            // xdg `mapped` remap arm.
+            self.window_manager.set_mapped(window_id, true);
+            self.sync_window_to_scene(window_id);
+            self.emit_pending();
+            return;
+        }
+        if surface.override_redirect() {
+            // Override-redirect surfaces (menus, tooltips, drag icons) bypass
+            // the managed model entirely -- the unmanaged pop-up path is M3.
+            // The crate still renders them from their own scene node; the spike
+            // simply does not model them.
+            tracing::info!(?sid, "override-redirect X11 surface mapped (unmanaged; not modelled in M1)");
+            return;
+        }
+        let app_id = surface.class().or_else(|| surface.instance()).unwrap_or_default();
+        let title = surface.title().unwrap_or_default();
+        let pid = surface.pid().unwrap_or(0);
+        // X11 clients self-position, but for a managed window the WM places it,
+        // exactly as `new_toplevel` cascades native toplevels. Honour the
+        // client's requested size when it has one; fall back to the model
+        // placeholder otherwise.
+        let g = surface.geometry();
+        let (width, height) = if g.width > 0 && g.height > 0 {
+            (g.width, g.height)
+        } else {
+            (PLACEHOLDER_SIZE.0, PLACEHOLDER_SIZE.1)
+        };
+        let occupied: Vec<icedtea_contract::Rectangle> = self
+            .window_manager
+            .windows_in_workspace(self.window_manager.active_workspace())
+            .iter()
+            .map(|w| w.geometry)
+            .collect();
+        let output_geo = self
+            .usable_geo_for_pointer()
+            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+        let (x, y) = layout::cascade_point_in(&occupied, (width, height), 24, output_geo);
+        let geometry = icedtea_contract::Rectangle { x, y, width, height };
+        tracing::info!(?sid, %app_id, %title, pid, ?geometry, "managed X11 window mapped");
+        let previous = self.focused_id();
+        let window_id = self.window_manager.add_window(&app_id, &title, pid, geometry);
+        self.xwayland_windows.insert(sid, window_id);
+        // Tell the X11 client the geometry it was granted and focus it in. The
+        // crate's seat keyboard-enter routes the actual keystrokes; this X11
+        // activate is the client-visible focus-in half.
+        if let Some(rt) = self.wayland.runtime() {
+            rt.configure_xwayland_surface(sid, wlr::Box2D::new(x, y, width, height));
+            rt.activate_xwayland_surface(sid, true);
+        }
+        self.sync_focus_change(previous);
+        self.emit_pending();
+    }
+
+    fn xwayland_surface_unmapped(&mut self, id: wlr::XwaylandSurfaceId) {
+        // Spike minimum: an X11 unmap removes the model row (parity with the
+        // richer xdg unmap -- hide, keep the row -- is M2). Idempotent against
+        // an id we do not know (a surface that never mapped, or a double
+        // unmap/destroy): the take-or-return guard makes it a no-op.
+        self.remove_xwayland_window(id);
+    }
+
+    fn xwayland_surface_destroyed(&mut self, id: wlr::XwaylandSurfaceId) {
+        // Same removal as unmap, and equally safe against an unknown id (the
+        // trait documents that `destroyed` may name one we were never told
+        // about).
+        self.remove_xwayland_window(id);
+    }
+
+    fn xwayland_title_changed(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        let Some(&window_id) = self.xwayland_windows.get(&surface.id()) else { return };
+        let title = surface.title().unwrap_or_default();
+        if self.window_manager.set_title(window_id, title).is_some() {
+            self.sync_window_to_scene(window_id);
+            self.emit_pending();
+        }
     }
 }
 impl wlr::SeatHandler for State {

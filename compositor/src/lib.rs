@@ -139,6 +139,17 @@ pub fn run() {
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");
+    // X11 application support via Xwayland. Non-fatal, matching every other
+    // `create_*` above and the spec's boot note: a host without the `Xwayland`
+    // binary simply runs Wayland-only, exactly as it did before A1. `lazy` is
+    // `true`, so the `Xwayland` process is only spawned when the first X11
+    // client connects to the advertised `DISPLAY`; the crate points Xwayland at
+    // this runtime's seat itself on `ready` (so the clipboard/primary/DND bridge
+    // comes up), and `State`'s `xwayland_ready` publishes `DISPLAY` for session
+    // children. Must come after `create_seat`, whose seat the bridge needs.
+    if let Err(err) = runtime.create_xwayland(&display, true) {
+        tracing::error!(%err, "Xwayland (X11 application support) is unavailable");
+    }
 
     let (dbus_tx, dbus_events_rx) = crossbeam_channel::unbounded::<SeqEvent>();
     let mut state = State::new(config, dbus_tx);

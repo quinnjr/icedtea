@@ -261,6 +261,18 @@ impl Compositor {
                 .create_output_manager(&display)
                 .expect("zwlr_output_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
+            // X11 application support. Non-fatal here, unlike the globals
+            // above: a host with no `Xwayland` binary is a legitimate CI
+            // configuration, and the X11 end-to-end test skips cleanly when
+            // `DbCommand::XwaylandDisplay` comes back `None`. `lazy` is `true`,
+            // so no `Xwayland` process is spawned for the non-X11 tests -- the
+            // manager only reserves a display socket, and nothing connects to
+            // it unless a test asks for `DISPLAY` and drives an X11 client.
+            // Must come after `create_seat`, whose seat the clipboard/DND
+            // bridge needs.
+            if let Err(err) = runtime.create_xwayland(&display, true) {
+                eprintln!("harness: Xwayland unavailable ({err}); X11 tests will skip");
+            }
             // Test-only: makes the seat advertise the touch capability so
             // headless clients can bind `wl_touch` and injected touch
             // points are accepted. Harness-only -- the real
@@ -346,6 +358,19 @@ impl Compositor {
         reply_rx
             .recv_timeout(TIMEOUT)
             .expect("compositor never answered GetState")
+    }
+
+    /// The `DISPLAY` name (`:N`) Xwayland advertises, or `None` when no
+    /// Xwayland was created (the `Xwayland` binary is absent). Available with
+    /// lazy start as soon as the manager reserves its display socket -- before
+    /// any `Xwayland` process is spawned -- so an X11 test reads this, connects
+    /// a client to it, and that connection is what triggers the lazy start.
+    pub fn xwayland_display(&self) -> Option<String> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::XwaylandDisplay { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered XwaylandDisplay")
     }
 
     /// Synthesize a touch-down at `(x, y)` for touch point `id` on the

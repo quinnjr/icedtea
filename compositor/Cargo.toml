@@ -82,3 +82,9 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # features are additive and only reach the test binaries.
 rustix = { version = "1", features = ["fs", "mm", "shm"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+# The X11 client half of the Xwayland (A1) spike's end-to-end test: a real
+# X11 client that connects to the compositor's Xwayland `DISPLAY`, creates and
+# maps one top-level, and lets the test assert the compositor's window model
+# gains it. Dev-only -- nothing in `src/` is an X11 client. The test skips
+# cleanly when `Xwayland` is absent.
+x11rb = "0.13"

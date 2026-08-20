@@ -116,6 +116,15 @@ pub enum DbCommand {
     /// runtime handle. Not reachable from `WmInterface` -- only the test
     /// harness sends this, same reasoning as `SessionLocked`.
     CursorPosition { reply: Sender<(f64, f64)> },
+    /// Test-only: read the `DISPLAY` name (`:N`) Xwayland advertises, via
+    /// `wlr::Runtime::xwayland_display_name`. `None` when no Xwayland was
+    /// created (the `Xwayland` binary is absent), so the X11 end-to-end test
+    /// can skip cleanly. Available as soon as the manager reserves its display
+    /// socket -- before the lazy `Xwayland` start -- which is exactly what lets
+    /// the test read `DISPLAY`, connect an X11 client, and *trigger* that lazy
+    /// start. Not reachable from `WmInterface` -- only the test harness sends
+    /// this, same reasoning as `SessionLocked`.
+    XwaylandDisplay { reply: Sender<Option<String>> },
 }
 
 /// Map a `contract::Event` to its D-Bus signal name, so the emitter thread
