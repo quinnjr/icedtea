@@ -1271,14 +1271,20 @@ dependencies = [
 name = "icedtea-settings"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
+ "gio",
+ "glib",
  "gtk4",
  "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
  "redb",
+ "rustix 1.1.4",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols-wlr",
  "zbus",
 ]
 
@@ -2984,10 +2990,11 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wlr"
-version = "0.20.21"
+version = "0.20.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da3801e0e158d69f84c3cf6be38284ec07d6a9622e44a4f198781c5ceb7c551e"
+checksum = "6ac19b2209bc69de098ad10ce153a13755be0e74919c063b017129598b20149d"
 dependencies = [
+ "pkg-config",
  "wlr-sys",
  "xkbcommon-sys",
 ]
