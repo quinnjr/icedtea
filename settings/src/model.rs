@@ -7,8 +7,7 @@
 
 use std::path::Path;
 
-use icedtea_config::{keysym_to_key_name, load_or_default, Config, KeyCombo, MODIFIER_TOKENS};
-use redb::Database;
+use icedtea_config::{keysym_to_key_name, load_or_default, open, Config, KeyCombo, MODIFIER_TOKENS};
 
 /// The working-copy state the settings UI edits: `working` is what the
 /// widgets are bound to, `saved` is a snapshot of what's actually on disk
@@ -47,8 +46,29 @@ impl Model {
 /// Persist `cfg` to `db_path`. On success the caller is expected to snapshot
 /// `saved = working` (this function only writes -- it doesn't own `Model`,
 /// so it can't do that itself).
+///
+/// The store is opened through [`icedtea_config::open`] (not
+/// `redb::Database::create` directly) so its `catch_unwind` guard + parent
+/// `create_dir_all` apply: a corrupt config file returns `Err` here ("Failed
+/// to save") instead of tripping an internal redb `assert!` and panicking the
+/// GTK app.
+///
+/// `cfg.displays` is deliberately **not** written from the caller's working
+/// copy. The Displays page never routes through this working-copy `Config`:
+/// it applies layouts out-of-band over `zwlr_output_management_v1`, and the
+/// compositor persists them to the `displays` table on its own side. The
+/// `Config` the settings app loaded at startup carries a snapshot of `displays`
+/// that is already stale the moment the compositor writes a new layout, so
+/// saving the whole working copy here would clobber the compositor-owned
+/// layout on any unrelated Apply (an accent-color change, say). To keep the
+/// persisted displays authoritative we reload the current on-disk `displays`
+/// immediately before saving and write those, leaving every other section to
+/// the caller's edits.
 pub fn apply(cfg: &Config, db_path: &Path) -> Result<(), redb::Error> {
-    let db = Database::create(db_path)?;
+    let on_disk = load_or_default(db_path);
+    let mut cfg = cfg.clone();
+    cfg.displays = on_disk.displays;
+    let db = open(db_path)?;
     cfg.save(&db)
 }
 
@@ -320,6 +340,54 @@ mod tests {
         assert!(BAR_POSITIONS.contains(&"top"));
         assert!(BAR_POSITIONS.contains(&"bottom"));
         assert!(!BAR_POSITIONS.contains(&"left"));
+    }
+
+    /// A non-display Apply (here: an accent-color edit) must never clobber the
+    /// displays the compositor persisted out-of-band. `apply` reloads the
+    /// on-disk `displays` and writes those, so the layout on disk survives even
+    /// though the caller's working copy carried a stale (empty) `displays`.
+    #[test]
+    fn apply_preserves_on_disk_displays() {
+        use icedtea_config::DisplayConfig;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("displays-cfg.redb");
+
+        // The compositor persisted a layout on its side.
+        let persisted = vec![DisplayConfig {
+            name: "DP-1".into(),
+            enabled: true,
+            width: 2560,
+            height: 1440,
+            refresh_mhz: 144000,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            transform: 0,
+        }];
+        // The compositor persists displays through its own `Config::save`, not
+        // through `model::apply` (which never writes displays), so seed the
+        // store that way.
+        let mut on_disk = icedtea_config::default_config();
+        on_disk.displays = persisted.clone();
+        {
+            let db = open(&path).unwrap();
+            on_disk.save(&db).unwrap();
+        }
+
+        // The settings app loaded its Config at startup, then edits a
+        // non-display field. Simulate a *stale* working copy whose displays no
+        // longer match disk (here: empty, as a fresh default would be).
+        let mut working = icedtea_config::default_config();
+        working.displays.clear();
+        working.appearance.palette.accent = "#ff00aa".to_string();
+        apply(&working, &path).unwrap();
+
+        // The non-display edit landed, but the compositor-owned displays are
+        // intact -- not overwritten by the working copy's stale empty list.
+        let reloaded = load_or_default(&path);
+        assert_eq!(reloaded.appearance.palette.accent, "#ff00aa");
+        assert_eq!(reloaded.displays, persisted, "Apply must not clobber persisted displays");
     }
 
     #[test]

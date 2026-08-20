@@ -17,5 +17,5 @@ pub mod protocol;
 
 pub use client::OutputsClient;
 pub use protocol::{
-    Head, HeadEdit, Mode, ModeRequest, OutputsConnection, OutputsError, OutputsMsg,
+    ConfigData, Head, HeadEdit, Mode, ModeRequest, OutputsConnection, OutputsError, OutputsMsg,
 };

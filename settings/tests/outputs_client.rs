@@ -79,8 +79,11 @@ fn enumerates_heads_and_applies_a_configuration() {
         client.roundtrip().expect("roundtrip");
         for msg in drain(&rx) {
             match msg {
-                OutputsMsg::ApplySucceeded => result = Some(Ok(())),
-                OutputsMsg::ApplyFailed => result = Some(Err("failed")),
+                OutputsMsg::ApplySucceeded { is_test } => {
+                    assert!(!is_test, "build_and_send_configuration is an apply, not a test");
+                    result = Some(Ok(()));
+                }
+                OutputsMsg::ApplyFailed { .. } => result = Some(Err("failed")),
                 OutputsMsg::ApplyCancelled => result = Some(Err("cancelled")),
                 _ => {}
             }

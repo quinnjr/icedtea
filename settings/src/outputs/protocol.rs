@@ -81,6 +81,16 @@ pub struct HeadEdit {
     pub transform: Option<i32>,
 }
 
+/// Per-configuration `Dispatch` user-data: which kind of submission this
+/// `ZwlrOutputConfigurationV1` was. Attached at `create_configuration` time so
+/// the terminal event (`succeeded`/`failed`) can be matched back to the exact
+/// request that produced it, rather than a process-wide "last was test" flag a
+/// concurrent request would clobber.
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigData {
+    pub is_test: bool,
+}
+
 /// Messages the client pushes to the view over its async-channel sender.
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutputsMsg {
@@ -89,10 +99,16 @@ pub enum OutputsMsg {
     HeadsChanged(Vec<Head>),
     /// The compositor is not advertising `zwlr_output_manager_v1`.
     ManagerUnavailable,
-    /// A submitted configuration was applied successfully.
-    ApplySucceeded,
-    /// A submitted configuration was rejected.
-    ApplyFailed,
+    /// A submitted configuration completed successfully. `is_test` is `true`
+    /// when it came from [`OutputsConnection::test_configuration`] (a preview
+    /// that changed nothing) and `false` for a real apply. It is carried per
+    /// reply — tagged onto the configuration object itself (see [`ConfigData`])
+    /// — rather than read from a shared flag, so an overlapped Test/Apply pair
+    /// can never have one reply interpreted with the other's meaning.
+    ApplySucceeded { is_test: bool },
+    /// A submitted configuration was rejected. `is_test` as in
+    /// [`OutputsMsg::ApplySucceeded`].
+    ApplyFailed { is_test: bool },
     /// A submitted configuration was cancelled (superseded by a change the
     /// compositor made meanwhile); the client should re-read and retry.
     ApplyCancelled,
@@ -163,6 +179,31 @@ impl HeadEntry {
             modes: Vec::new(),
             current_mode: None,
         }
+    }
+
+    /// A sensible mode to commit when a head is being enabled but the edit
+    /// names no explicit mode: the head's current mode if it has one, else its
+    /// preferred advertised mode, else the first mode it advertises. Returns
+    /// `None` only for a head that advertises no modes at all (a headless/
+    /// nested output), where the caller commits no `set_mode` and lets the
+    /// compositor pick. Enabling a head with a mode chosen this way is what
+    /// keeps a re-enabled, previously-disabled output from committing with no
+    /// mode set and failing on real DRM.
+    fn default_mode(&self) -> Option<ModeRequest> {
+        let pick = |m: &ModeEntry| ModeRequest {
+            width: m.width,
+            height: m.height,
+            refresh_mhz: m.refresh_mhz,
+        };
+        if let Some(id) = &self.current_mode
+            && let Some(m) = self.modes.iter().find(|m| &m.id == id)
+        {
+            return Some(pick(m));
+        }
+        if let Some(m) = self.modes.iter().find(|m| m.preferred) {
+            return Some(pick(m));
+        }
+        self.modes.first().map(pick)
     }
 
     fn snapshot(&self) -> Head {
@@ -379,29 +420,38 @@ impl OutputsConnection {
             .clone()
             .ok_or(OutputsError::ManagerUnavailable)?;
 
-        // Resolve every edit to a live head first so a bad name aborts before
-        // any request is sent (no half-built configuration left dangling).
-        let mut resolved: Vec<(&HeadEdit, usize)> = Vec::with_capacity(edits.len());
-        for edit in edits {
-            let idx = self
-                .state
-                .heads
-                .iter()
-                .position(|h| h.name == edit.name)
-                .ok_or_else(|| OutputsError::UnknownHead(edit.name.clone()))?;
-            resolved.push((edit, idx));
-        }
-
-        let config = manager.create_configuration(self.state.serial, &self.qh, ());
-        for (edit, idx) in resolved {
-            let head = &self.state.heads[idx];
+        // Build the configuration from the CURRENT live head set, not from the
+        // edit list. `zwlr_output_configuration_v1` requires that every head
+        // the client currently knows about be configured (enabled or disabled);
+        // omitting one it has already learned about — a head hotplugged after
+        // the page last rebuilt its edit list, say — makes the compositor
+        // answer `unconfigured_head` and kill the connection. So we iterate the
+        // live heads and layer any pending edit (matched by connector name) on
+        // top, falling back to the head's current state for anything the edit
+        // does not override (and for heads with no edit at all). An edit naming
+        // a head that is no longer present is simply skipped — there is nothing
+        // live to configure it against.
+        let config =
+            manager.create_configuration(self.state.serial, &self.qh, ConfigData { is_test: !apply });
+        for head in &self.state.heads {
+            let edit = edits.iter().find(|e| e.name == head.name);
             let head_proxy = head.proxy.clone();
-            if !edit.enabled {
+
+            let enabled = edit.map(|e| e.enabled).unwrap_or(head.enabled);
+            if !enabled {
                 config.disable_head(&head_proxy);
                 continue;
             }
+
             let config_head = config.enable_head(&head_proxy, &self.qh, ());
-            if let Some(req) = edit.mode {
+
+            // A head being enabled must commit a concrete mode or a real DRM
+            // output rejects it. Prefer the edit's chosen mode; if it named
+            // none (e.g. the enable toggle flipped a previously-disabled head
+            // on without touching resolution), fall back to the head's own
+            // current/preferred/first advertised mode.
+            let req = edit.and_then(|e| e.mode).or_else(|| head.default_mode());
+            if let Some(req) = req {
                 match head.modes.iter().find(|m| {
                     m.width == req.width
                         && m.height == req.height
@@ -411,15 +461,17 @@ impl OutputsConnection {
                     None => config_head.set_custom_mode(req.width, req.height, req.refresh_mhz),
                 }
             }
-            if let Some((x, y)) = edit.position {
-                config_head.set_position(x, y);
-            }
-            if let Some(scale) = edit.scale {
-                config_head.set_scale(scale);
-            }
-            if let Some(t) = edit.transform {
-                config_head.set_transform(transform_from_i32(t));
-            }
+
+            // Position/scale/transform: the edit's value when it set one, else
+            // the head's current value, so a head carried in only because it is
+            // live keeps its existing placement rather than snapping to the
+            // compositor's default.
+            let (x, y) = edit.and_then(|e| e.position).unwrap_or((head.x, head.y));
+            config_head.set_position(x, y);
+            let scale = edit.and_then(|e| e.scale).unwrap_or(head.scale);
+            config_head.set_scale(scale);
+            let transform = edit.and_then(|e| e.transform).unwrap_or(head.transform);
+            config_head.set_transform(transform_from_i32(transform));
         }
 
         if apply {
@@ -427,7 +479,14 @@ impl OutputsConnection {
         } else {
             config.test();
         }
-        self.flush().map_err(OutputsError::Protocol)?;
+        // A flush failure after apply()/test() would otherwise leak the
+        // configuration object: no terminal event ever arrives for it, so the
+        // page would hang in its "Applying…" state forever. Destroy it and
+        // surface the error so the caller leaves that state.
+        if let Err(err) = self.flush() {
+            config.destroy();
+            return Err(OutputsError::Protocol(err));
+        }
         Ok(())
     }
 }
@@ -594,23 +653,23 @@ impl Dispatch<ZwlrOutputModeV1, ()> for OutputsState {
     }
 }
 
-impl Dispatch<ZwlrOutputConfigurationV1, ()> for OutputsState {
+impl Dispatch<ZwlrOutputConfigurationV1, ConfigData> for OutputsState {
     fn event(
         state: &mut Self,
         config: &ZwlrOutputConfigurationV1,
         event: zwlr_output_configuration_v1::Event,
-        _data: &(),
+        data: &ConfigData,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
         match event {
             zwlr_output_configuration_v1::Event::Succeeded => {
                 config.destroy();
-                state.emit(OutputsMsg::ApplySucceeded);
+                state.emit(OutputsMsg::ApplySucceeded { is_test: data.is_test });
             }
             zwlr_output_configuration_v1::Event::Failed => {
                 config.destroy();
-                state.emit(OutputsMsg::ApplyFailed);
+                state.emit(OutputsMsg::ApplyFailed { is_test: data.is_test });
             }
             zwlr_output_configuration_v1::Event::Cancelled => {
                 config.destroy();

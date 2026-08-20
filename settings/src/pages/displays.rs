@@ -78,6 +78,76 @@ fn baseline_edit(h: &Head) -> HeadEdit {
     }
 }
 
+/// Whether two head snapshots describe the same set of connectors (same names,
+/// order-independent). When this holds across a `HeadsChanged`, the change is a
+/// property update on the same monitors (a mode list refresh, an unrelated
+/// client's `done`, ...) rather than a hotplug, so the user's pending edits and
+/// selection can be carried over instead of reset.
+fn same_connector_set(a: &[Head], b: &[Head]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut an: Vec<&str> = a.iter().map(|h| h.name.as_str()).collect();
+    let mut bn: Vec<&str> = b.iter().map(|h| h.name.as_str()).collect();
+    an.sort_unstable();
+    bn.sort_unstable();
+    an == bn
+}
+
+/// The result of reconciling a fresh head snapshot against the page's cached
+/// heads + pending edits.
+struct Reconciled {
+    /// Edits parallel to the new head snapshot.
+    edits: Vec<HeadEdit>,
+    /// Selection index into the new snapshot.
+    selected: Option<usize>,
+    /// Whether the connector set was unchanged (edits/selection preserved).
+    compatible: bool,
+    /// Whether pending, unapplied edits had to be discarded because the set
+    /// changed — used to surface a brief status to the user.
+    dropped: bool,
+}
+
+/// Reconcile a `HeadsChanged` snapshot against the current state.
+///
+/// When the connector set is unchanged the caller's pending edits are carried
+/// over (matched by connector name, since `edits`/`old_heads` are index-
+/// parallel but the new snapshot may reorder), and the selected connector is
+/// preserved by name. When the set actually changed (a hotplug/unplug) every
+/// head falls back to its baseline and selection resets, and `dropped` reports
+/// whether that discarded any unapplied work (`dirty`).
+fn reconcile(
+    old_heads: &[Head],
+    old_edits: &[HeadEdit],
+    old_selected: Option<usize>,
+    dirty: bool,
+    new_heads: &[Head],
+) -> Reconciled {
+    let compatible = same_connector_set(old_heads, new_heads);
+    let selected_name =
+        old_selected.and_then(|i| old_heads.get(i)).map(|h| h.name.as_str());
+    let selected = selected_name
+        .and_then(|name| new_heads.iter().position(|h| h.name == name))
+        .or(if new_heads.is_empty() { None } else { Some(0) });
+
+    if compatible {
+        let edits = new_heads
+            .iter()
+            .map(|h| {
+                old_edits
+                    .iter()
+                    .find(|e| e.name == h.name)
+                    .cloned()
+                    .unwrap_or_else(|| baseline_edit(h))
+            })
+            .collect();
+        Reconciled { edits, selected, compatible, dropped: false }
+    } else {
+        let edits = new_heads.iter().map(baseline_edit).collect();
+        Reconciled { edits, selected, compatible, dropped: dirty }
+    }
+}
+
 /// Distinct `(w, h)` resolutions a head advertises, largest area first.
 fn distinct_resolutions(modes: &[Mode]) -> Vec<(i32, i32)> {
     let mut out: Vec<(i32, i32)> = Vec::new();
@@ -141,11 +211,15 @@ fn set_dropdown(dd: &DropDown, labels: &[String], selected: usize) {
 pub fn build() -> gtk4::Widget {
     let state = Rc::new(RefCell::new(DisplaysState::new()));
     let populating = Rc::new(Cell::new(false));
-    // Which kind of submission is in flight: `true` after **Test**, `false`
-    // after **Apply**. Both share `succeeded`/`failed` on the wire, so the
-    // result arms consult this to avoid a *test* clearing dirty or claiming
-    // the config was applied.
-    let last_was_test = Rc::new(Cell::new(false));
+    // Whether a Test/Apply submission is currently outstanding. While it is,
+    // both buttons are disabled so a second request can't overlap the first;
+    // the terminal reply (`ApplySucceeded`/`ApplyFailed`/`ApplyCancelled`, or a
+    // superseding `HeadsChanged`) clears it and re-enables them. Which kind of
+    // request a given reply answers is no longer inferred from shared state —
+    // it rides on the reply itself as `is_test` (tagged onto the configuration
+    // object), so even a reply that arrives after the flag was cleared is read
+    // with the meaning of the request that made it.
+    let in_flight = Rc::new(Cell::new(false));
 
     let root = GtkBox::new(Orientation::Vertical, 8);
     root.set_margin_top(12);
@@ -365,23 +439,38 @@ pub fn build() -> gtk4::Widget {
         })
     };
 
-    // Rebuild everything from a fresh head snapshot (HeadsChanged).
-    let rebuild: Rc<dyn Fn(Vec<Head>)> = {
+    // Reconcile a fresh head snapshot (HeadsChanged / initial enumerate) into
+    // the page state, preserving pending edits + selection when the connector
+    // set is unchanged and hard-resetting only on an actual hotplug/unplug.
+    // Returns whether unapplied edits were discarded, so the caller can say so.
+    let rebuild: Rc<dyn Fn(Vec<Head>) -> bool> = {
         let state = state.clone();
-        let reset_edits = reset_edits.clone();
         let refresh_controls = refresh_controls.clone();
         let update_footer = update_footer.clone();
         let canvas = canvas.clone();
-        Rc::new(move |heads: Vec<Head>| {
-            {
+        Rc::new(move |heads: Vec<Head>| -> bool {
+            let dropped = {
                 let mut st = state.borrow_mut();
+                let r = reconcile(&st.heads, &st.edits, st.selected, st.dirty, &heads);
                 st.heads = heads;
-                st.selected = if st.heads.is_empty() { None } else { Some(0) };
-            }
-            reset_edits();
+                st.edits = r.edits;
+                st.selected = r.selected;
+                // Any in-flight drag was indexed against the *old* head list;
+                // the new list may be shorter or reordered, so the cached index
+                // is no longer valid. Drop it so drag_update can't dereference a
+                // stale index. (#2)
+                st.drag = None;
+                if !r.compatible {
+                    // A genuine set change resets to the fresh baseline, so
+                    // there is nothing unsaved left.
+                    st.dirty = false;
+                }
+                r.dropped
+            };
             refresh_controls();
             update_footer();
             canvas.queue_draw();
+            dropped
         })
     };
 
@@ -539,6 +628,13 @@ pub fn build() -> gtk4::Widget {
             let Some((head_idx, start_x, start_y)) = st.drag else {
                 return;
             };
+            // A HeadsChanged mid-drag replaces `edits`/`heads` and clears
+            // `drag`, but guard the cached index anyway: if it no longer refers
+            // to a live head, the drag is stale — bail rather than index OOB. (#2)
+            if head_idx >= st.edits.len() {
+                st.drag = None;
+                return;
+            }
             let view = st.view;
             let (dx, dy) = view.canvas_delta_to_layout(ox, oy);
             let moved = Rect::new(start_x as f64 + dx, start_y as f64 + dy, 0.0, 0.0);
@@ -605,17 +701,26 @@ pub fn build() -> gtk4::Widget {
                 set_available(false);
             }
 
-            // Test / Apply ship the current edit set down the protocol.
+            // Test / Apply ship the current edit set down the protocol. On a
+            // successful submit both buttons go insensitive until the terminal
+            // reply re-enables them (#7), so no second request can overlap.
             {
                 let state = state.clone();
                 let client = client.clone();
                 let status = status.clone();
-                let last_was_test = last_was_test.clone();
+                let in_flight = in_flight.clone();
+                let test_btn_w = test_btn.clone();
+                let apply_btn_w = apply_btn.clone();
                 test_btn.connect_clicked(move |_| {
+                    if in_flight.get() {
+                        return;
+                    }
                     let edits = state.borrow().edits.clone();
                     match client.test_configuration(&edits) {
                         Ok(()) => {
-                            last_was_test.set(true);
+                            in_flight.set(true);
+                            test_btn_w.set_sensitive(false);
+                            apply_btn_w.set_sensitive(false);
                             status.set_text("Testing\u{2026}");
                         }
                         Err(err) => status.set_text(&format!("Test failed: {err}")),
@@ -626,12 +731,19 @@ pub fn build() -> gtk4::Widget {
                 let state = state.clone();
                 let client = client.clone();
                 let status = status.clone();
-                let last_was_test = last_was_test.clone();
+                let in_flight = in_flight.clone();
+                let test_btn_w = test_btn.clone();
+                let apply_btn_w = apply_btn.clone();
                 apply_btn.connect_clicked(move |_| {
+                    if in_flight.get() {
+                        return;
+                    }
                     let edits = state.borrow().edits.clone();
                     match client.build_and_send_configuration(&edits) {
                         Ok(()) => {
-                            last_was_test.set(false);
+                            in_flight.set(true);
+                            test_btn_w.set_sensitive(false);
+                            apply_btn_w.set_sensitive(false);
                             status.set_text("Applying\u{2026}");
                         }
                         Err(err) => status.set_text(&format!("Apply failed: {err}")),
@@ -655,16 +767,42 @@ pub fn build() -> gtk4::Widget {
 
             // Drain outputs messages on the glib main loop.
             let status = status.clone();
+            let in_flight = in_flight.clone();
+            let test_btn = test_btn.clone();
             glib::spawn_future_local(async move {
+                // Clear the in-flight latch on a terminal reply and re-enable
+                // the buttons: Test is available whenever the manager is (which
+                // it is on any of these replies), and Apply follows the dirty
+                // flag via `update_footer`.
+                let end_request = {
+                    let in_flight = in_flight.clone();
+                    let test_btn = test_btn.clone();
+                    let update_footer = update_footer.clone();
+                    move || {
+                        in_flight.set(false);
+                        test_btn.set_sensitive(true);
+                        update_footer();
+                    }
+                };
                 while let Ok(msg) = rx.recv().await {
                     match msg {
                         OutputsMsg::HeadsChanged(heads) => {
                             set_available(true);
-                            rebuild(heads);
-                            status.set_text("");
+                            // A fresh snapshot supersedes any outstanding
+                            // request; drop the in-flight latch too.
+                            in_flight.set(false);
+                            let dropped = rebuild(heads);
+                            if dropped {
+                                status.set_text(
+                                    "Displays changed \u{2014} pending edits discarded",
+                                );
+                            } else {
+                                status.set_text("");
+                            }
                         }
-                        OutputsMsg::ApplySucceeded => {
-                            if last_was_test.get() {
+                        OutputsMsg::ApplySucceeded { is_test } => {
+                            end_request();
+                            if is_test {
                                 // A preview succeeded: keep the edits (and the
                                 // Apply button) live so the user can commit them.
                                 status.set_text("Test succeeded");
@@ -674,8 +812,9 @@ pub fn build() -> gtk4::Widget {
                                 status.set_text("Applied");
                             }
                         }
-                        OutputsMsg::ApplyFailed => {
-                            if last_was_test.get() {
+                        OutputsMsg::ApplyFailed { is_test } => {
+                            end_request();
+                            if is_test {
                                 // A preview was rejected: leave the pending edits
                                 // intact so the user can adjust and retry.
                                 status.set_text("Test rejected by the compositor");
@@ -688,9 +827,11 @@ pub fn build() -> gtk4::Widget {
                             }
                         }
                         OutputsMsg::ApplyCancelled => {
+                            end_request();
                             status.set_text("Configuration superseded \u{2014} re-reading");
                         }
                         OutputsMsg::ManagerUnavailable | OutputsMsg::Disconnected => {
+                            in_flight.set(false);
                             set_available(false);
                             status.set_text("");
                         }
@@ -770,5 +911,83 @@ mod tests {
         assert_eq!(e.position, Some((10, 20)));
         assert_eq!(e.scale, Some(1.5));
         assert_eq!(e.transform, Some(2));
+    }
+
+    fn head(name: &str) -> Head {
+        Head {
+            name: name.into(),
+            description: name.into(),
+            enabled: true,
+            modes: vec![mode(1920, 1080, 60000, true)],
+            current_mode: Some(mode(1920, 1080, 60000, true)),
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            transform: 0,
+        }
+    }
+
+    #[test]
+    fn same_connector_set_is_order_independent() {
+        let a = [head("DP-1"), head("HDMI-A-1")];
+        let b = [head("HDMI-A-1"), head("DP-1")];
+        assert!(same_connector_set(&a, &b));
+        assert!(!same_connector_set(&a, &[head("DP-1")]));
+        assert!(!same_connector_set(&a, &[head("DP-1"), head("DP-2")]));
+    }
+
+    #[test]
+    fn reconcile_preserves_edits_when_the_set_is_unchanged() {
+        // Two heads with a pending, unapplied edit on the second.
+        let old_heads = vec![head("DP-1"), head("HDMI-A-1")];
+        let mut edits: Vec<HeadEdit> = old_heads.iter().map(baseline_edit).collect();
+        edits[1].position = Some((500, 600)); // user dragged HDMI-A-1
+        edits[1].enabled = false; // and disabled it
+
+        // A HeadsChanged for the SAME connectors, but reordered and with a
+        // refreshed mode list (a property update, not a hotplug).
+        let mut hdmi = head("HDMI-A-1");
+        hdmi.modes.push(mode(1280, 720, 60000, false));
+        let new_heads = vec![hdmi, head("DP-1")];
+
+        let r = reconcile(&old_heads, &edits, Some(1), true, &new_heads);
+        assert!(r.compatible);
+        assert!(!r.dropped);
+        // Selection followed HDMI-A-1 to its new index 0.
+        assert_eq!(r.selected, Some(0));
+        // The pending edit for HDMI-A-1 survived, matched by name to new idx 0.
+        assert_eq!(r.edits[0].name, "HDMI-A-1");
+        assert_eq!(r.edits[0].position, Some((500, 600)));
+        assert!(!r.edits[0].enabled);
+    }
+
+    #[test]
+    fn reconcile_resets_and_reports_dropped_on_a_set_change() {
+        let old_heads = vec![head("DP-1"), head("HDMI-A-1")];
+        let mut edits: Vec<HeadEdit> = old_heads.iter().map(baseline_edit).collect();
+        edits[0].position = Some((123, 456)); // unapplied work
+
+        // HDMI-A-1 was unplugged: the connector set changed.
+        let new_heads = vec![head("DP-1")];
+
+        let r = reconcile(&old_heads, &edits, Some(1), true, &new_heads);
+        assert!(!r.compatible);
+        assert!(r.dropped, "unapplied edits were discarded, so dropped must be set");
+        // Everything falls back to baseline for the surviving head.
+        assert_eq!(r.edits, vec![baseline_edit(&head("DP-1"))]);
+        // Selection was on the now-gone head, so it resets to the first head.
+        assert_eq!(r.selected, Some(0));
+    }
+
+    #[test]
+    fn reconcile_set_change_without_pending_edits_is_not_dropped() {
+        let old_heads = vec![head("DP-1")];
+        let edits: Vec<HeadEdit> = old_heads.iter().map(baseline_edit).collect();
+        // A clean hotplug (no unapplied work) must not claim edits were dropped.
+        let new_heads = vec![head("DP-1"), head("DP-2")];
+        let r = reconcile(&old_heads, &edits, Some(0), false, &new_heads);
+        assert!(!r.compatible);
+        assert!(!r.dropped);
+        assert_eq!(r.edits.len(), 2);
     }
 }
