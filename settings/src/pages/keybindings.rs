@@ -13,7 +13,10 @@ use std::rc::Rc;
 
 use gtk4::glib::translate::IntoGlib;
 use gtk4::prelude::*;
-use gtk4::{gdk, glib, Box as GtkBox, Button, EventControllerKey, Label, Orientation, PropagationPhase, ScrolledWindow};
+use gtk4::{
+    gdk, glib, Box as GtkBox, Button, EventControllerFocus, EventControllerKey, Label, Orientation,
+    PropagationPhase, ScrolledWindow,
+};
 
 use icedtea_config::KeyCombo;
 
@@ -93,6 +96,36 @@ fn sync_rows(rows: &[Row], cfg: &icedtea_config::Config) {
     }
 }
 
+/// Whether the shared window key controller should consume a key press as a
+/// binding capture. The controller lives on the *window* in the capture phase,
+/// so it fires for keystrokes typed on *any* Stack page; it must only act when
+/// the Keybindings page is the visible child (`page_visible`) AND a capture is
+/// actually armed (`capturing`). Extracted so the gate is unit-testable without
+/// a live GTK display. (#4)
+fn should_capture(page_visible: bool, capturing: bool) -> bool {
+    page_visible && capturing
+}
+
+/// Clear an armed capture and report which action's row must have its Set
+/// button restored (`None` when nothing was armed). Pure so the reset decision
+/// is unit-testable; the caller performs the widget label restore. (#4)
+fn take_capture_reset(capturing: &mut Option<String>) -> Option<String> {
+    capturing.take()
+}
+
+/// Cancel any armed capture and restore the mid-capture row's Set button label.
+/// Wired to leaving the Keybindings page (root `unmap`, i.e. the Stack switching
+/// to another child) and to focus leaving the page, so an armed capture can
+/// never survive a page switch and hijack keystrokes typed elsewhere. (#4)
+fn reset_capture(capturing: &Rc<RefCell<Option<String>>>, rows: &Rc<RefCell<Vec<Row>>>) {
+    let reset = take_capture_reset(&mut capturing.borrow_mut());
+    if let Some(action) = reset
+        && let Some(row) = rows.borrow().iter().find(|r| r.action == action)
+    {
+        row.set_button.set_label("Set");
+    }
+}
+
 /// Resolve the group-0/level-0 keysym for a captured hardware `keycode` --
 /// the layout-agnostic, un-shifted keysym the compositor's own matcher
 /// compares against (`compositor/src/input.rs` matches on the keysym as
@@ -151,10 +184,25 @@ pub fn build(ctx: Ctx) -> Page {
     let key_controller = EventControllerKey::new();
     key_controller.set_propagation_phase(PropagationPhase::Capture);
     {
-        let ctx = ctx.clone();
+        // Capture only the pieces of `Ctx` the handler actually needs (the
+        // shared model + the dirty plumbing) rather than the whole `Ctx`, whose
+        // `window` field is the very window this controller is attached to.
+        // Cloning `Ctx` here would form a window -> controller -> Ctx -> window
+        // strong reference cycle that leaks the window; these `Rc`s never point
+        // back at the window, so the cycle is broken. (#4)
+        let model = ctx.model.clone();
+        let on_dirty = ctx.on_dirty.clone();
+        let populating = ctx.populating.clone();
         let rows = rows.clone();
         let capturing = capturing.clone();
+        let scroller = scroller.clone();
         key_controller.connect_key_pressed(move |_controller, keyval, keycode, state| {
+            // The controller is window-scoped in the capture phase, so gate on
+            // the page being visible: never touch keystrokes typed on another
+            // Stack page even if a capture was somehow left armed. (#4)
+            if !should_capture(scroller.is_mapped(), capturing.borrow().is_some()) {
+                return glib::Propagation::Proceed;
+            }
             let Some(action) = capturing.borrow().clone() else {
                 return glib::Propagation::Proceed;
             };
@@ -179,19 +227,40 @@ pub fn build(ctx: Ctx) -> Page {
             // and wait for the "real" key.
             let keysym = unshifted_keysym(keycode, keyval.into_glib());
             if let Some(combo) = combo_from_keysym(keysym, mods) {
-                ctx.model.borrow_mut().working.keybindings.insert(action.clone(), combo);
-                ctx.mark_dirty();
+                model.borrow_mut().working.keybindings.insert(action.clone(), combo);
+                if !populating.get() {
+                    (on_dirty)();
+                }
                 *capturing.borrow_mut() = None;
                 let rows_ref = rows.borrow();
                 if let Some(row) = rows_ref.iter().find(|r| r.action == action) {
                     row.set_button.set_label("Set");
                 }
-                sync_rows(&rows_ref, &ctx.model.borrow().working);
+                sync_rows(&rows_ref, &model.borrow().working);
             }
             glib::Propagation::Stop
         });
     }
     ctx.window.add_controller(key_controller);
+
+    // Cancel an armed capture whenever the page stops being the visible Stack
+    // child (GtkStack unmaps the non-visible child, so the root's `unmap` fires
+    // on a page switch away) or when focus leaves the page entirely. Without
+    // this, a capture armed here would stay armed across a page switch and the
+    // window-scoped controller would silently rebind + swallow keys typed on
+    // another page. (#4)
+    {
+        let capturing = capturing.clone();
+        let rows = rows.clone();
+        scroller.connect_unmap(move |_| reset_capture(&capturing, &rows));
+    }
+    {
+        let focus = EventControllerFocus::new();
+        let capturing = capturing.clone();
+        let rows = rows.clone();
+        focus.connect_leave(move |_| reset_capture(&capturing, &rows));
+        scroller.add_controller(focus);
+    }
 
     // `rebuild` tears down and recreates every row from
     // `ctx.model.working` -- used both for the initial populate and for
@@ -324,5 +393,24 @@ mod tests {
     fn format_combo_with_no_modifiers() {
         let combo = KeyCombo { modifiers: vec![], key: "KEY_F5".to_string() };
         assert_eq!(format_combo(&combo), "F5");
+    }
+
+    #[test]
+    fn should_capture_only_when_page_visible_and_armed() {
+        // Both conditions required: an armed capture on a hidden page (the user
+        // switched away without completing) must NOT consume keystrokes.
+        assert!(should_capture(true, true));
+        assert!(!should_capture(false, true), "armed but page hidden: must not hijack");
+        assert!(!should_capture(true, false), "visible but nothing armed: pass through");
+        assert!(!should_capture(false, false));
+    }
+
+    #[test]
+    fn take_capture_reset_reports_and_clears_the_armed_action() {
+        let mut armed = Some("close".to_string());
+        assert_eq!(take_capture_reset(&mut armed), Some("close".to_string()));
+        assert_eq!(armed, None, "capture must be cleared after a reset");
+        // A second reset is a no-op once nothing is armed.
+        assert_eq!(take_capture_reset(&mut armed), None);
     }
 }

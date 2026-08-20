@@ -26,9 +26,21 @@ const CANVAS_MARGIN: f64 = 16.0;
 /// How close (layout px) a dragged edge must come before it snaps.
 const SNAP_THRESHOLD: f64 = 40.0;
 
-/// The four transform choices the UI exposes (raw `wl_output.transform`).
-const TRANSFORM_LABELS: [&str; 4] = ["Normal", "90\u{b0}", "180\u{b0}", "270\u{b0}"];
-const TRANSFORM_VALUES: [i32; 4] = [0, 1, 2, 3];
+/// The eight transform choices the UI exposes (raw `wl_output.transform`,
+/// 0-7). The upper four are the flipped (mirrored) variants; exposing them all
+/// means a head that arrives already flipped (raw 4-7) shows its true transform
+/// and an unrelated edit does not silently drop the flip back to Normal. (#8)
+const TRANSFORM_LABELS: [&str; 8] = [
+    "Normal",
+    "90\u{b0}",
+    "180\u{b0}",
+    "270\u{b0}",
+    "Flipped",
+    "Flipped 90\u{b0}",
+    "Flipped 180\u{b0}",
+    "Flipped 270\u{b0}",
+];
+const TRANSFORM_VALUES: [i32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
 /// Everything the page mutates as the user drags and edits. `heads` is the
 /// last snapshot the compositor sent; `edits` is parallel to it (same index)
@@ -76,6 +88,20 @@ fn baseline_edit(h: &Head) -> HeadEdit {
         scale: Some(h.scale),
         transform: Some(h.transform),
     }
+}
+
+/// A sensible mode to adopt when a head gains a concrete mode but the edit
+/// names none: the head's current mode, else its preferred advertised mode,
+/// else the first mode it advertises. `None` only for a head that advertises no
+/// modes at all (a headless/nested output, where the compositor picks). Used to
+/// give a mode-less head a `ModeRequest` the moment it is enabled or the user
+/// picks a refresh, so it becomes placeable on the canvas and those edits
+/// actually take effect. (#9, #14)
+fn default_mode_for(head: &Head) -> Option<ModeRequest> {
+    head.current_mode
+        .or_else(|| head.modes.iter().find(|m| m.preferred).copied())
+        .or_else(|| head.modes.first().copied())
+        .map(|m| ModeRequest { width: m.width, height: m.height, refresh_mhz: m.refresh_mhz })
 }
 
 /// Whether two head snapshots describe the same set of connectors (same names,
@@ -131,14 +157,23 @@ fn reconcile(
         .or(if new_heads.is_empty() { None } else { Some(0) });
 
     if compatible {
+        // Carry a pending edit forward ONLY for heads the user actually touched
+        // (whose cached edit diverges from the baseline of its cached head).
+        // Untouched heads re-baseline from the fresh snapshot, so an external
+        // change to another head is reflected here rather than being reverted on
+        // the next Apply. (#11)
         let edits = new_heads
             .iter()
             .map(|h| {
-                old_edits
+                let touched = old_edits
                     .iter()
-                    .find(|e| e.name == h.name)
-                    .cloned()
-                    .unwrap_or_else(|| baseline_edit(h))
+                    .zip(old_heads.iter())
+                    .find(|(e, oh)| e.name == h.name && oh.name == h.name)
+                    .filter(|(e, oh)| **e != baseline_edit(oh));
+                match touched {
+                    Some((e, _)) => e.clone(),
+                    None => baseline_edit(h),
+                }
             })
             .collect();
         Reconciled { edits, selected, compatible, dropped: false }
@@ -196,6 +231,40 @@ fn enabled_rects(st: &DisplaysState) -> (Vec<usize>, Vec<Rect>) {
         rects.push(head_rect(w, h, scale, transform, x, y));
     }
     (idxs, rects)
+}
+
+/// Every head's layout rect for drawing and hit-testing, tagged with whether
+/// the head is enabled. Unlike [`enabled_rects`] this includes DISABLED heads
+/// (and mode-less ones), sized from the edit's mode, else the head's current or
+/// first advertised mode, else a 1920×1080 fallback, so a disabled monitor
+/// stays visible on the canvas and can be re-selected to switch it back on. The
+/// caller greys out entries whose flag is `false`. (#10)
+fn all_rects(st: &DisplaysState) -> (Vec<usize>, Vec<Rect>, Vec<bool>) {
+    let mut idxs = Vec::new();
+    let mut rects = Vec::new();
+    let mut enabled = Vec::new();
+    for (i, e) in st.edits.iter().enumerate() {
+        let head = st.heads.get(i);
+        let (mut w, mut h) = e
+            .mode
+            .map(|m| (m.width, m.height))
+            .or_else(|| head.and_then(|hd| hd.current_mode.map(|m| (m.width, m.height))))
+            .or_else(|| head.and_then(|hd| hd.modes.first().map(|m| (m.width, m.height))))
+            .unwrap_or((0, 0));
+        if w == 0 || h == 0 {
+            // No mode information at all — still draw a placeholder so the head
+            // is selectable.
+            w = 1920;
+            h = 1080;
+        }
+        let scale = e.scale.unwrap_or(1.0);
+        let transform = e.transform.unwrap_or(0);
+        let (x, y) = e.position.unwrap_or((0, 0));
+        idxs.push(i);
+        rects.push(head_rect(w, h, scale, transform, x, y));
+        enabled.push(e.enabled);
+    }
+    (idxs, rects, enabled)
 }
 
 /// Replace a dropdown's contents and select `selected`.
@@ -301,31 +370,46 @@ pub fn build() -> gtk4::Widget {
             cr.rectangle(0.0, 0.0, width as f64, height as f64);
             let _ = cr.fill();
 
-            let (idxs, rects) = enabled_rects(&st);
+            // Draw every head (enabled and disabled) so a disabled monitor stays
+            // visible and selectable; disabled ones are drawn greyed. (#10)
+            let (idxs, rects, enabled) = all_rects(&st);
             let view = compute_view(&rects, width as f64, height as f64, CANVAS_MARGIN);
             st.view = view;
 
             cr.set_font_size(11.0);
             for (slot, rect) in rects.iter().enumerate() {
                 let head_idx = idxs[slot];
+                let is_enabled = enabled[slot];
                 let c = view.to_canvas(rect);
                 let selected = st.selected == Some(head_idx);
-                // Monitor body.
-                cr.set_source_rgb(0.26, 0.28, 0.36);
+                // Monitor body — dimmed when the head is disabled.
+                if is_enabled {
+                    cr.set_source_rgb(0.26, 0.28, 0.36);
+                } else {
+                    cr.set_source_rgb(0.17, 0.18, 0.22);
+                }
                 cr.rectangle(c.x, c.y, c.w, c.h);
                 let _ = cr.fill();
                 // Border — accent when selected.
                 if selected {
                     cr.set_source_rgb(0.54, 0.71, 0.98);
                     cr.set_line_width(2.5);
-                } else {
+                } else if is_enabled {
                     cr.set_source_rgb(0.45, 0.47, 0.55);
+                    cr.set_line_width(1.0);
+                } else {
+                    cr.set_source_rgb(0.34, 0.35, 0.42);
                     cr.set_line_width(1.0);
                 }
                 cr.rectangle(c.x, c.y, c.w, c.h);
                 let _ = cr.stroke();
-                // Labels: connector name, then resolution.
-                cr.set_source_rgb(0.90, 0.91, 0.95);
+                // Labels: connector name, then resolution (or "off" when the
+                // head is disabled).
+                if is_enabled {
+                    cr.set_source_rgb(0.90, 0.91, 0.95);
+                } else {
+                    cr.set_source_rgb(0.60, 0.61, 0.66);
+                }
                 let name = &st.heads[head_idx].name;
                 let e = &st.edits[head_idx];
                 let (w, h) = e
@@ -335,7 +419,11 @@ pub fn build() -> gtk4::Widget {
                 cr.move_to(c.x + 6.0, c.y + 16.0);
                 let _ = cr.show_text(name);
                 cr.move_to(c.x + 6.0, c.y + 30.0);
-                let _ = cr.show_text(&format!("{w}\u{d7}{h}"));
+                if is_enabled {
+                    let _ = cr.show_text(&format!("{w}\u{d7}{h}"));
+                } else {
+                    let _ = cr.show_text("off");
+                }
             }
         });
     }
@@ -414,15 +502,18 @@ pub fn build() -> gtk4::Widget {
         })
     };
 
-    // Recompute the footer sensitivity from the dirty flag.
+    // Recompute the footer sensitivity from the dirty flag. Apply is held
+    // insensitive while a Test/Apply is outstanding so a HeadsChanged-driven
+    // repopulate can't re-enable it under an in-flight request. (#15)
     let update_footer: Rc<dyn Fn()> = {
         let state = state.clone();
+        let in_flight = in_flight.clone();
         let revert_btn = revert_btn.clone();
         let apply_btn = apply_btn.clone();
         Rc::new(move || {
             let dirty = state.borrow().dirty;
             revert_btn.set_sensitive(dirty);
-            apply_btn.set_sensitive(dirty);
+            apply_btn.set_sensitive(dirty && !in_flight.get());
         })
     };
 
@@ -478,18 +569,31 @@ pub fn build() -> gtk4::Widget {
     {
         let state = state.clone();
         let populating = populating.clone();
+        let refresh_controls = refresh_controls.clone();
         let update_footer = update_footer.clone();
         let canvas = canvas.clone();
         enabled_switch.connect_active_notify(move |sw| {
             if populating.get() {
                 return;
             }
+            let active = sw.is_active();
             let mut st = state.borrow_mut();
             if let Some(idx) = st.selected {
-                st.edits[idx].enabled = sw.is_active();
+                st.edits[idx].enabled = active;
+                // Enabling a mode-less head with no explicit mode would leave it
+                // unplaceable on the canvas and applied at a mode the user never
+                // saw; give it a concrete mode from the head's default so it is
+                // visible and its mode/refresh edits take effect. (#9)
+                if active && st.edits[idx].mode.is_none() {
+                    let default_mode = st.heads.get(idx).and_then(default_mode_for);
+                    if default_mode.is_some() {
+                        st.edits[idx].mode = default_mode;
+                    }
+                }
                 st.dirty = true;
             }
             drop(st);
+            refresh_controls();
             update_footer();
             canvas.queue_draw();
         });
@@ -536,21 +640,41 @@ pub fn build() -> gtk4::Widget {
     {
         let state = state.clone();
         let populating = populating.clone();
+        let refresh_controls = refresh_controls.clone();
         let update_footer = update_footer.clone();
+        let canvas = canvas.clone();
         refresh_dd.connect_selected_notify(move |dd| {
             if populating.get() {
                 return;
             }
             let sel = dd.selected() as usize;
-            let mut st = state.borrow_mut();
-            if let Some(idx) = st.selected
-                && let Some(&r) = st.refresh_options.get(sel)
-                && let Some(mode) = st.edits[idx].mode.as_mut()
+            let mut created = false;
             {
-                mode.refresh_mhz = r;
-                st.dirty = true;
+                let mut st = state.borrow_mut();
+                if let Some(idx) = st.selected
+                    && let Some(&r) = st.refresh_options.get(sel)
+                {
+                    if let Some(mode) = st.edits[idx].mode.as_mut() {
+                        mode.refresh_mhz = r;
+                        st.dirty = true;
+                    } else if let Some(&(w, h)) = st.res_options.first() {
+                        // Mode-less head: the refresh list was built for the
+                        // first resolution, so synthesize a full mode from it so
+                        // the pick actually takes effect rather than being
+                        // dropped for want of an existing mode. (#14)
+                        st.edits[idx].mode =
+                            Some(ModeRequest { width: w, height: h, refresh_mhz: r });
+                        st.dirty = true;
+                        created = true;
+                    }
+                }
             }
-            drop(st);
+            // Repopulate so a freshly-created mode is reflected in the controls
+            // and the canvas (it is now placeable).
+            if created {
+                refresh_controls();
+                canvas.queue_draw();
+            }
             update_footer();
         });
     }
@@ -603,7 +727,9 @@ pub fn build() -> gtk4::Widget {
         let canvas = canvas.clone();
         drag.connect_drag_begin(move |_g, x, y| {
             let mut st = state.borrow_mut();
-            let (idxs, rects) = enabled_rects(&st);
+            // Hit-test against ALL heads (including disabled) so a disabled
+            // monitor can be re-selected and switched back on. (#10)
+            let (idxs, rects, _enabled) = all_rects(&st);
             let view = st.view;
             if let Some(slot) = hit_test(&rects, &view, x, y) {
                 let head_idx = idxs[slot];
@@ -638,16 +764,19 @@ pub fn build() -> gtk4::Widget {
             let view = st.view;
             let (dx, dy) = view.canvas_delta_to_layout(ox, oy);
             let moved = Rect::new(start_x as f64 + dx, start_y as f64 + dy, 0.0, 0.0);
-            // Snap against the *other* enabled heads and the origin.
-            let (idxs, rects) = enabled_rects(&st);
-            let dragged_rect = idxs
+            // The dragged head's own geometry comes from the full set (it may be
+            // disabled); snap targets are the *other* enabled heads plus the
+            // origin.
+            let (aidxs, arects, _enabled) = all_rects(&st);
+            let dragged_rect = aidxs
                 .iter()
                 .position(|&i| i == head_idx)
-                .map(|slot| rects[slot])
+                .map(|slot| arects[slot])
                 .unwrap_or(moved);
-            let others: Vec<Rect> = idxs
+            let (eidxs, erects) = enabled_rects(&st);
+            let others: Vec<Rect> = eidxs
                 .iter()
-                .zip(rects.iter())
+                .zip(erects.iter())
                 .filter(|&(&i, _)| i != head_idx)
                 .map(|(_, r)| *r)
                 .collect();
@@ -677,13 +806,17 @@ pub fn build() -> gtk4::Widget {
     let set_available: Rc<dyn Fn(bool)> = {
         let content = content.clone();
         let unavailable = unavailable.clone();
+        let in_flight = in_flight.clone();
         let test_btn = test_btn.clone();
         let revert_btn = revert_btn.clone();
         let apply_btn = apply_btn.clone();
         Rc::new(move |available: bool| {
             content.set_visible(available);
             unavailable.set_visible(!available);
-            test_btn.set_sensitive(available);
+            // Don't re-enable Test while a request is still outstanding — an
+            // unrelated HeadsChanged calls set_available(true) but must not open
+            // a second, overlapping submission. (#15)
+            test_btn.set_sensitive(available && !in_flight.get());
             if !available {
                 revert_btn.set_sensitive(false);
                 apply_btn.set_sensitive(false);
@@ -787,10 +920,14 @@ pub fn build() -> gtk4::Widget {
                 while let Ok(msg) = rx.recv().await {
                     match msg {
                         OutputsMsg::HeadsChanged(heads) => {
+                            // A HeadsChanged is NOT a terminal reply for an
+                            // outstanding Test/Apply — the compositor still owes
+                            // a Succeeded/Failed/Cancelled for that request. Leave
+                            // `in_flight` set so an unrelated head-property update
+                            // can't re-enable the buttons and let a second request
+                            // overlap the first; only the terminal reply (below)
+                            // clears it. (#15)
                             set_available(true);
-                            // A fresh snapshot supersedes any outstanding
-                            // request; drop the in-flight latch too.
-                            in_flight.set(false);
                             let dropped = rebuild(heads);
                             if dropped {
                                 status.set_text(
@@ -977,6 +1114,117 @@ mod tests {
         assert_eq!(r.edits, vec![baseline_edit(&head("DP-1"))]);
         // Selection was on the now-gone head, so it resets to the first head.
         assert_eq!(r.selected, Some(0));
+    }
+
+    #[test]
+    fn reconcile_rebaselines_untouched_heads_from_external_changes() {
+        // Two heads; the user touched only DP-1. HDMI-A-1 is left untouched.
+        let old_heads = vec![head("DP-1"), head("HDMI-A-1")];
+        let mut edits: Vec<HeadEdit> = old_heads.iter().map(baseline_edit).collect();
+        edits[0].position = Some((100, 200)); // user dragged DP-1 (touched)
+
+        // A compatible HeadsChanged where an *external* actor moved and rescaled
+        // HDMI-A-1 (the head the user never touched).
+        let mut hdmi = head("HDMI-A-1");
+        hdmi.x = 4321;
+        hdmi.y = 8765;
+        hdmi.scale = 2.0;
+        let new_heads = vec![head("DP-1"), hdmi.clone()];
+
+        let r = reconcile(&old_heads, &edits, Some(0), true, &new_heads);
+        assert!(r.compatible);
+        assert!(!r.dropped);
+        // DP-1 was touched: its pending edit is preserved, NOT reverted.
+        assert_eq!(r.edits[0].name, "DP-1");
+        assert_eq!(r.edits[0].position, Some((100, 200)));
+        // HDMI-A-1 was untouched: it re-baselines to the fresh external state
+        // instead of carrying the stale cached baseline forward. (#11)
+        assert_eq!(r.edits[1], baseline_edit(&hdmi));
+        assert_eq!(r.edits[1].position, Some((4321, 8765)));
+        assert_eq!(r.edits[1].scale, Some(2.0));
+    }
+
+    #[test]
+    fn default_mode_for_prefers_current_then_preferred_then_first() {
+        // current_mode wins.
+        let mut h = head("DP-1");
+        h.modes = vec![mode(1920, 1080, 60000, true), mode(1280, 720, 60000, false)];
+        h.current_mode = Some(mode(1280, 720, 60000, false));
+        assert_eq!(
+            default_mode_for(&h),
+            Some(ModeRequest { width: 1280, height: 720, refresh_mhz: 60000 })
+        );
+
+        // No current_mode: the preferred advertised mode wins over the first.
+        let mut h = head("DP-1");
+        h.modes = vec![mode(1280, 720, 60000, false), mode(1920, 1080, 60000, true)];
+        h.current_mode = None;
+        assert_eq!(
+            default_mode_for(&h),
+            Some(ModeRequest { width: 1920, height: 1080, refresh_mhz: 60000 })
+        );
+
+        // No current and none preferred: the first advertised mode.
+        let mut h = head("DP-1");
+        h.modes = vec![mode(1600, 900, 60000, false), mode(1920, 1080, 60000, false)];
+        h.current_mode = None;
+        assert_eq!(
+            default_mode_for(&h),
+            Some(ModeRequest { width: 1600, height: 900, refresh_mhz: 60000 })
+        );
+
+        // A truly mode-less head (headless/nested) yields None.
+        let mut h = head("HEADLESS-1");
+        h.modes = vec![];
+        h.current_mode = None;
+        assert_eq!(default_mode_for(&h), None);
+    }
+
+    #[test]
+    fn all_rects_includes_disabled_heads_for_selection() {
+        // A disabled head must still produce a rect so it stays visible and
+        // selectable on the canvas. (#10)
+        let mut st = DisplaysState::new();
+        st.heads = vec![head("DP-1"), head("HDMI-A-1")];
+        st.edits = st.heads.iter().map(baseline_edit).collect();
+        st.edits[1].enabled = false;
+
+        let (idxs, rects, enabled) = all_rects(&st);
+        assert_eq!(idxs, vec![0, 1]);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(enabled, vec![true, false]);
+        // enabled_rects, by contrast, drops the disabled head.
+        let (en_idxs, _) = enabled_rects(&st);
+        assert_eq!(en_idxs, vec![0]);
+    }
+
+    #[test]
+    fn all_rects_sizes_a_mode_less_head_with_a_fallback() {
+        // A head with no mode info at all still gets a non-zero placeholder rect
+        // so it can be hit-tested and selected.
+        let mut st = DisplaysState::new();
+        let mut h = head("HEADLESS-1");
+        h.modes = vec![];
+        h.current_mode = None;
+        st.heads = vec![h];
+        st.edits = st.heads.iter().map(baseline_edit).collect();
+
+        let (idxs, rects, _enabled) = all_rects(&st);
+        assert_eq!(idxs, vec![0]);
+        assert!(rects[0].w > 0.0 && rects[0].h > 0.0, "fallback rect must be non-empty");
+    }
+
+    #[test]
+    fn transform_dropdown_exposes_all_eight_variants() {
+        // Every raw wl_output.transform value 0-7 must be selectable and
+        // round-trip, so a flipped head (4-7) is neither mislabeled Normal nor
+        // silently un-flipped. (#8)
+        assert_eq!(TRANSFORM_VALUES.len(), 8);
+        assert_eq!(TRANSFORM_LABELS.len(), 8);
+        for t in 0..8 {
+            let sel = TRANSFORM_VALUES.iter().position(|&v| v == t);
+            assert_eq!(sel, Some(t as usize), "transform {t} must be present at its index");
+        }
     }
 
     #[test]
