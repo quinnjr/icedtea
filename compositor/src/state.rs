@@ -3727,6 +3727,22 @@ impl wlr::OutputHandler for State {
                         }
                         self.output_ids.insert(oid, index);
                         self.disabled_outputs.remove(head_name);
+                        // FOLLOW-UP (first-frame parity with `new_output`):
+                        // `new_output` calls `output.schedule_frame()` (review
+                        // finding I1) so a freshly enabled output that draws
+                        // nothing still gets a `frame` callback and a first
+                        // commit. This rehydrate branch has no `Output` handle
+                        // -- only the re-mapped `oid` -- and the wlr crate
+                        // exposes `schedule_frame` solely on `Output` (keyed by
+                        // the raw `wlr_output`), with no `OutputId`-keyed
+                        // Runtime entry point and no way to resolve an
+                        // `OutputId` back to an `Output` here. So a re-enabled
+                        // output currently relies on the same incidental damage
+                        // (the wallpaper/background sync below) that I1 removed
+                        // for the new-output path. Closing this needs a new wlr
+                        // API (e.g. `Runtime::schedule_frame(OutputId)`), which
+                        // is deliberately out of scope for this fix; add it and
+                        // call it here when it lands.
                     }
                     continue;
                 }
