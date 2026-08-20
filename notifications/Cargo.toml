@@ -1,0 +1,12 @@
+[package]
+name = "icedtea-notifications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+icedtea-contract = { path = "../contract" }
+zbus.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+tracing.workspace = true

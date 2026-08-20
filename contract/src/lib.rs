@@ -1,5 +1,6 @@
 pub mod clipboard;
 pub mod event;
+pub mod notifications;
 pub mod types;
 
 pub const WM_BUS_NAME: &str = "org.icedtea.WM";
@@ -7,4 +8,8 @@ pub const WM_PATH: &str = "/org/icedtea/WM";
 
 pub use clipboard::{ClipEntry, ClipKind, CLIP_BUS_NAME, CLIP_PATH};
 pub use event::{Event, SeqEvent};
+pub use notifications::{
+    CloseReason, IconSource, Notification, NotificationAction, Urgency, NOTIF_BUS_NAME,
+    NOTIF_PATH,
+};
 pub use types::*;

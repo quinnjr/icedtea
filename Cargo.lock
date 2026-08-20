@@ -1268,6 +1268,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "icedtea-notifications"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "icedtea-contract",
+ "serde",
+ "tracing",
+ "zbus",
+]
+
+[[package]]
 name = "icedtea-settings"
 version = "0.1.0"
 dependencies = [
