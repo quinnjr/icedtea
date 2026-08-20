@@ -38,7 +38,16 @@ GNOME toolkit, not to purge every native dependency.
    Servo's crates (the Stylo/Firefox lineage) are the pure-Rust standard.
 7. **Widget toolkit: clean-room**, built directly on `taffy` + `skia-rs` + the
    GTK-CSS engine from day one (no reuse-evaluation detour).
-8. **First build: a thin vertical proving slice**, not a breadth-first
+8. **Windowing: no Smithay.** The apps are Wayland *clients* (wlroots/`wlr` is
+   the compositor/server side and cannot be linked by a client). Use the
+   battle-tested lower-level path — **`wayland-client` (wayland-rs) +
+   `wayland-protocols` / `wayland-protocols-wlr`** — the same stack that consumes
+   the wlr `layer-shell` protocol client-side and that this repo already ships
+   (the settings outputs client, the clipboard). No `smithay-client-toolkit`, no
+   `calloop`; the seat/output/shm-pool/layer-shell glue sctk would provide is
+   hand-rolled on `wayland-client` (as the repo already does), and the event loop
+   is a simple poll loop matching the compositor's self-pipe style.
+9. **First build: a thin vertical proving slice**, not a breadth-first
    foundation — prove the whole pipeline through one widget before scaling.
 
 ## Why theme-file compatibility forces a bespoke widget layer
@@ -57,7 +66,7 @@ below it is reused crates.**
 
 | Layer | Crate(s) | Replaces | Build vs reuse |
 |---|---|---|---|
-| Wayland + layer-shell | `smithay-client-toolkit`, `wayland-protocols-wlr`, `calloop` | GDK + Gio Wayland backend | reuse |
+| Wayland + layer-shell | `wayland-client` (wayland-rs) + `wayland-protocols` / `wayland-protocols-wlr` — **no Smithay** (no sctk/calloop); event loop is a simple poll loop | GDK + Gio Wayland backend | reuse |
 | 2D paint | **`skia-rs`** (owned) | Cairo | reuse |
 | Text | `cosmic-text` (shape/layout) rasterized via Skia — Skia can also shape via HarfBuzz, so this may collapse (resolved in M1) | Pango | reuse |
 | Layout | `taffy` (flex/grid/block), wrapped to express GTK's measure→allocate box model | GTK layout managers | reuse |
@@ -103,15 +112,16 @@ exercised before we scale breadth. It front-loads the two riskiest unknowns:
 Skia-on-`wl_shm` paint a themed widget crisply.
 
 **New crate** `ui/` (e.g. `icedtea-ui`), added to the workspace, pulling:
-`smithay-client-toolkit`, `skia-rs`, `cosmic-text`, `taffy`, `cssparser`,
-`selectors`, `calloop`.
+`wayland-client`, `wayland-protocols`, `wayland-protocols-wlr`, `skia-rs`,
+`cosmic-text`, `taffy`, `cssparser`, `selectors`. (No Smithay crates.)
 
 ### The narrow path
 
-1. **Window** — an sctk `wlr-layer-shell` surface (a small overlay), a `wl_shm`
-   buffer in a `BGRA8888`/`Argb8888` format, damage/commit driven by `calloop`.
-   Reuses the project's existing sctk / `wayland-protocols-wlr` experience
-   (clipboard, harness).
+1. **Window** — a `wlr-layer-shell` surface (a small overlay) via `wayland-client`
+   + `wayland-protocols-wlr` (client), a `wl_shm` buffer in a `BGRA8888`/
+   `Argb8888` format, damage/commit driven by a simple poll loop over the Wayland
+   fd. Reuses the project's existing `wayland-client` + `wayland-protocols-wlr`
+   client code (the settings outputs client, the clipboard) — no Smithay.
 2. **Skia surface** — an `SkSurface` (raster) backed by the shm buffer's pixel
    memory; paint into it, then commit the buffer. Establishes the Skia↔`wl_shm`
    seam (stride, format, premultiplied alpha).
