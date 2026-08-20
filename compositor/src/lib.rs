@@ -128,6 +128,14 @@ pub fn run() {
     if let Err(err) = runtime.create_relative_pointer_manager(&display) {
         tracing::error!(%err, "relative pointer motion is unavailable");
     }
+    // Non-fatal, matching the other `create_*_manager` calls above: a
+    // compositor that cannot advertise output-management still runs, it just
+    // cannot be reconfigured by a settings client. `new_output`/`destroyed`
+    // guard every `update_output_manager_state` on the runtime, so a missing
+    // manager degrades to "no persisted layout applied", never a crash.
+    if let Err(err) = runtime.create_output_manager(&display) {
+        tracing::error!(%err, "output-management unavailable");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");

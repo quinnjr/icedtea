@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=icedtea Settings
+GenericName=Compositor Settings
+Comment=Configure the icedtea Wayland compositor
+Exec=icedtea-settings
+Icon=org.icedtea.Settings
+Terminal=false
+Categories=Settings;DesktopSettings;GTK;
+Keywords=compositor;wayland;wm;appearance;keybindings;display;monitor;
+StartupNotify=true
+StartupWMClass=org.icedtea.Settings

@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use icedtea_config::Config;
@@ -51,13 +52,23 @@ pub struct OutputSurface {
     /// maximize) reads this instead of `geometry` -- fullscreen is the one
     /// exception, since it covers panels by definition.
     pub usable: icedtea_contract::Rectangle,
+    /// The output's connector name (`wlr::Output::name()`), the stable key a
+    /// persisted [`icedtea_contract::DisplayConfig`] is matched against on
+    /// connect/hotplug and the reverse lookup
+    /// `OutputHandler::output_configuration_applied` uses to map an
+    /// [`wlr::AppliedHead`]'s name back to an output index. Empty for the
+    /// unit-test outputs built straight through [`Self::new`], and for the
+    /// rare wlroots output not yet named.
+    pub name: String,
 }
 
 impl OutputSurface {
     /// Construct with no exclusive zones yet reserved -- `usable` starts
-    /// equal to `geometry`, exactly as `create_output` documents.
+    /// equal to `geometry`, exactly as `create_output` documents. The name is
+    /// empty; `new_output` records the real connector name on the live output
+    /// once one exists (see the field doc).
     pub fn new(geometry: icedtea_contract::Rectangle) -> Self {
-        Self { geometry, usable: geometry }
+        Self { geometry, usable: geometry, name: String::new() }
     }
 }
 
@@ -285,6 +296,19 @@ enum LowerStep {
     Wallpaper(usize),
     /// The boot-time full-output background rect (`lib.rs::run()`).
     Background,
+}
+
+/// Verdict of [`State::resolve_unique_disabled`] -- the name->id lookup a
+/// re-enable performs against `disabled_outputs` (review finding #13).
+enum DisabledLookup<K> {
+    /// No disabled output carries this connector name.
+    None,
+    /// Exactly one does -- safe to rehydrate to this id.
+    Unique(K),
+    /// Two or more share the name (empty `""` names, or a genuine duplicate):
+    /// rehydrating an arbitrary one could map the head to the WRONG output, so
+    /// the caller refuses rather than guess.
+    Ambiguous,
 }
 
 /// The order in which [`State::sync_wallpaper_nodes`] must lower the
@@ -584,6 +608,35 @@ pub struct State {
     /// Kept because `OutputHandler::destroyed` is given only an id, and the
     /// model's geometry map is keyed by index.
     output_ids: HashMap<wlr::OutputId, u32>,
+    /// Connector name -> the live `wlr::OutputId` of an output that is
+    /// currently *disabled* and therefore has NO entry in `self.outputs` /
+    /// `self.output_ids`. Populated both by `new_output`'s persisted-disabled
+    /// branch (an output that boots disabled is never inserted into the active
+    /// set) and by `output_configuration_applied`'s disable branch. It exists
+    /// solely so a later re-enable can recover the id: the applied-config
+    /// handler is handed only `Vec<AppliedHead>` (owned name + geometry, no
+    /// id/handle), so without this map a re-enabled head could not be mapped
+    /// back to a `wlr::OutputId` and would be left enabled-but-untracked
+    /// (rendering nothing until restart). `destroyed` prunes it (a disabled
+    /// output can be unplugged).
+    ///
+    /// Review finding #15: keyed by the always-unique [`wlr::OutputId`] (the
+    /// value carries the connector name for the re-enable name->id match)
+    /// rather than by name. Two unnamed disabled outputs both key under `""`
+    /// under the old name-keyed map, so the second insert dropped the first
+    /// id and it could never be rehydrated; a unique id key keeps both.
+    disabled_outputs: HashMap<wlr::OutputId, String>,
+    /// Serializes every worker-thread redb OPEN (both
+    /// [`Self::spawn_config_save`]'s writer and
+    /// [`Self::spawn_config_reload`]'s reader) so the two never hold a handle
+    /// to the same file at once. redb permits only one `Database` per file
+    /// per process; without this a save racing a reload hits
+    /// `DatabaseAlreadyOpen`, and `load_or_default` then falls back to
+    /// `default_config()` -- silently WIPING the live appearance/keybindings/
+    /// workspaces (or dropping the display write) that were on disk (review
+    /// finding #3). Each worker holds this lock across its whole open + use +
+    /// drop, so the next open never begins until the previous handle is gone.
+    config_db_lock: Arc<Mutex<()>>,
     /// The scene rect painted behind everything, once boot has made one.
     background: Option<wlr::RectId>,
     /// The fd source SIGINT/SIGTERM write to. Compared in `fd_ready` so that
@@ -836,6 +889,8 @@ impl State {
             config_reload_tx: None,
             config_reload_rx: None,
             output_ids: HashMap::new(),
+            disabled_outputs: HashMap::new(),
+            config_db_lock: Arc::new(Mutex::new(())),
             background: None,
             shutdown_source: None,
             cmd_rx: None,
@@ -2388,13 +2443,368 @@ impl State {
         // remains the only way the result is ever picked up -- exactly the
         // pre-wake-pipe behavior, not a regression.
         let wake = self.config_reload_wake.as_ref().and_then(|w| w.try_clone().ok());
+        let lock = Arc::clone(&self.config_db_lock);
         std::thread::spawn(move || {
-            let cfg = icedtea_config::load_or_default(&path);
-            let _ = tx.send(cfg);
-            if let Some(wake) = wake {
-                crate::backend::wake(&wake);
+            // `None` == persistently locked by another handle: send nothing so
+            // the render loop keeps its current `self.config` untouched (review
+            // finding #2), and skip the wake (nothing to drain). Only a real
+            // load result is shipped and woken on.
+            if let Some(cfg) = Self::load_config_locked(&lock, &path) {
+                let _ = tx.send(cfg);
+                if let Some(wake) = wake {
+                    crate::backend::wake(&wake);
+                }
             }
         });
+    }
+
+    /// Load the config from `path`, holding `lock` across the whole
+    /// open+read+drop so no concurrent [`Self::save_config_to`] can have the
+    /// same redb file open at the same moment (review finding #3). The lock is
+    /// the ONLY thing serializing this process's two worker threads' opens; see
+    /// `config_db_lock`'s doc.
+    ///
+    /// Returns `None` when the file is *persistently* locked by some OTHER
+    /// handle -- the settings app, in production -- so the caller must KEEP its
+    /// current `self.config` rather than adopt defaults (review finding #2). The
+    /// intra-process `lock` cannot serialize against a different process, so a
+    /// cross-process collision surfaces here as `LoadOutcome::Locked`; we retry
+    /// a few times with a brief backoff (the settings app is documented to hold
+    /// the DB open only momentarily) and only give up -- returning `None` -- if
+    /// it stays locked. A genuinely missing/corrupt file is `Loaded(defaults)`,
+    /// never `Locked`, so this only ever declines to load on a true lock, never
+    /// masking real corruption.
+    fn load_config_locked(lock: &Mutex<()>, path: &std::path::Path) -> Option<Config> {
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 4 tries * 25ms = up to ~75ms of backoff before giving up and keeping
+        // the current config. Brief enough not to stall the reload worker
+        // noticeably, long enough to ride out a momentary settings-app write.
+        const ATTEMPTS: u32 = 4;
+        const BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+        for attempt in 0..ATTEMPTS {
+            match icedtea_config::try_load(path) {
+                icedtea_config::LoadOutcome::Loaded(cfg) => return Some(cfg),
+                icedtea_config::LoadOutcome::Locked => {
+                    if attempt + 1 < ATTEMPTS {
+                        std::thread::sleep(BACKOFF);
+                    }
+                }
+            }
+        }
+        tracing::warn!(
+            "config db stayed locked across {ATTEMPTS} attempts; keeping current config (no default wipe)"
+        );
+        None
+    }
+
+    /// Persist `self.config` to the redb file off the render loop, the write
+    /// sibling of [`Self::spawn_config_reload`]. Called from
+    /// `OutputHandler::output_configuration_applied` after it has upserted the
+    /// applied heads into `config.displays`: the handler runs on the render
+    /// thread underneath a wlroots `extern "C"` frame, so it must never block
+    /// on redb I/O. A cloned `Config` and the db path move onto a worker
+    /// thread that opens the database and writes; failures are logged, never
+    /// propagated (a persist failure must not take down the compositor).
+    ///
+    /// Unlike the reload path this needs no channel back: nothing on the
+    /// render loop consumes the result. `config_path` `None` (the default
+    /// boot) resolves to `icedtea_config::default_db_path`, exactly as
+    /// `spawn_config_reload` does.
+    fn spawn_config_save(&self) {
+        let config = self.config.clone();
+        let path = self.config_path.clone().unwrap_or_else(icedtea_config::default_db_path);
+        let lock = Arc::clone(&self.config_db_lock);
+        std::thread::spawn(move || Self::save_config_to(&lock, &config, &path));
+    }
+
+    /// The synchronous body [`Self::spawn_config_save`] runs on its worker
+    /// thread: open the redb file and write `config`. Failures are logged,
+    /// never propagated -- a persist failure must not take the compositor
+    /// down. Split out so it can be exercised deterministically in a test
+    /// (redb permits only one `Database` handle per file per process, so a
+    /// test that polled the detached thread by re-opening the file would race
+    /// the writer's own open; calling this directly does not).
+    fn save_config_to(lock: &Mutex<()>, config: &Config, path: &std::path::Path) {
+        // Hold the shared open-lock across the whole open + write + drop so a
+        // concurrent `spawn_config_reload` worker cannot have this same redb
+        // file open at the same moment (review finding #3): a second open of a
+        // file redb already has open is `DatabaseAlreadyOpen`, which would turn
+        // one of the two paths into a no-op (a dropped write) or a
+        // default-config wipe (a failed load). See `config_db_lock`'s doc.
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        match icedtea_config::open(path) {
+            Ok(db) => {
+                // Scoped save (review findings #2/#5): the compositor writes ONLY
+                // the displays table, never the appearance/keybindings/workspaces
+                // sections the settings app owns. `Config::save` would rewrite the
+                // whole file and revert a concurrent settings-app edit to those
+                // sections with the compositor's stale in-memory copy.
+                if let Err(err) = config.save_displays(&db) {
+                    tracing::error!(%err, "failed to persist display config");
+                }
+            }
+            Err(err) => tracing::error!(%err, "could not open config db to persist displays"),
+        }
+    }
+
+    /// Apply a persisted [`icedtea_contract::DisplayConfig`] to a live output,
+    /// committing mode, scale, transform, and layout position INDEPENDENTLY
+    /// (review finding #7).
+    ///
+    /// Enabling is the one hard prerequisite -- an output that cannot be enabled
+    /// cannot come up at all -- so its failure is the only one that propagates
+    /// (via `?`), letting `new_output`'s caller fall back rather than leave the
+    /// output dark. The mode, scale, transform, and position are each applied on
+    /// their own and merely logged on failure: a persisted mode wlroots can no
+    /// longer honor (a panel swapped, a link that renegotiated a different set
+    /// of modes) must NOT throw away the still-valid scale/transform/position by
+    /// short-circuiting the whole apply. A config with a zero width or height
+    /// means "no explicit mode" -- keep the preferred one but still honor
+    /// scale/transform/position.
+    fn apply_display_config(
+        runtime: &wlr::Runtime,
+        output: &wlr::Output<'_>,
+        cfg: &icedtea_contract::DisplayConfig,
+    ) -> wlr::Result<()> {
+        // A backend's outputs arrive disabled and modeless, and wlroots
+        // requires an output to be *enabled* before a custom mode can be
+        // committed (wlr_output.h: "The output needs to be enabled."). Enable
+        // with a valid preferred baseline first, then override with the
+        // persisted custom mode below. Two commits, but the output is enabled
+        // for both. This is the only setter allowed to abort the apply.
+        output.enable_with_preferred_mode()?;
+        let name = output.name().unwrap_or_default();
+        if cfg.width > 0
+            && cfg.height > 0
+            && let Err(err) = output.set_mode(cfg.width, cfg.height, cfg.refresh_mhz)
+        {
+            tracing::warn!(?err, %name, "persisted mode rejected; keeping preferred mode, still applying scale/transform/position");
+        }
+        // Guard the persisted/echoed-back scale exactly as the settings
+        // head_rect path does (review finding #12): a `scale <= 0` or
+        // non-finite value would otherwise reach wlroots and yield degenerate
+        // geometry. Fall back to 1.0 for any unusable value.
+        if let Err(err) = output.set_scale(Self::guarded_scale(cfg.scale)) {
+            tracing::warn!(?err, %name, "persisted scale rejected");
+        }
+        if let Err(err) = output.set_transform(Self::transform_from_i32(cfg.transform)) {
+            tracing::warn!(?err, %name, "persisted transform rejected");
+        }
+        // `set_output_position` returns `None` on a stale output id; log it and
+        // move on rather than discarding the mode/scale/transform we just
+        // applied.
+        if runtime.set_output_position(output.id(), cfg.x, cfg.y).is_none() {
+            tracing::warn!(%name, "persisted layout position rejected (stale output id)");
+        }
+        Ok(())
+    }
+
+    /// Clamp a persisted/echoed-back display scale to something wlroots can
+    /// use (review finding #12). A `DisplayConfig.scale` that is `<= 0` or
+    /// non-finite (NaN/inf) would produce degenerate output geometry or push
+    /// the whole apply into its error fallback; any such value falls back to
+    /// `1.0`. Mirrors the identical guard the settings `head_rect` path uses.
+    fn guarded_scale(scale: f64) -> f32 {
+        if scale.is_finite() && scale > 0.0 { scale as f32 } else { 1.0 }
+    }
+
+    /// Map a persisted `DisplayConfig::transform` (the `wl_output_transform`
+    /// integer, 0-7) to a [`wlr::Transform`]. Any out-of-range value falls
+    /// back to `Normal`, matching wlroots' own read-back behavior.
+    fn transform_from_i32(value: i32) -> wlr::Transform {
+        match value {
+            1 => wlr::Transform::R90,
+            2 => wlr::Transform::R180,
+            3 => wlr::Transform::R270,
+            4 => wlr::Transform::Flipped,
+            5 => wlr::Transform::Flipped90,
+            6 => wlr::Transform::Flipped180,
+            7 => wlr::Transform::Flipped270,
+            _ => wlr::Transform::Normal,
+        }
+    }
+
+    /// The inverse of [`Self::transform_from_i32`]: a committed
+    /// [`wlr::Transform`] back to the `wl_output_transform` integer stored in
+    /// a `DisplayConfig`.
+    fn transform_to_i32(transform: wlr::Transform) -> i32 {
+        match transform {
+            wlr::Transform::Normal => 0,
+            wlr::Transform::R90 => 1,
+            wlr::Transform::R180 => 2,
+            wlr::Transform::R270 => 3,
+            wlr::Transform::Flipped => 4,
+            wlr::Transform::Flipped90 => 5,
+            wlr::Transform::Flipped180 => 6,
+            wlr::Transform::Flipped270 => 7,
+            // `wlr::Transform` (M5's `geom::Transform`) is `#[non_exhaustive]`;
+            // any future variant maps to Normal (0) rather than blocking the build.
+            _ => 0,
+        }
+    }
+
+    /// Whether `new_output` honoring the currently-booting output's persisted
+    /// "disabled" would strand the session at zero active outputs -- keyed off
+    /// LIVE outputs, never the persisted enabled bools (review findings #1/#5).
+    ///
+    /// The earlier version of this guard read the persisted config
+    /// (`config.displays.iter().any(|d| d.enabled)`). That is finding #1's bug:
+    /// a persisted-enabled connector that is physically ABSENT (undocked laptop,
+    /// unplugged external) still counted as "something else is enabled", so the
+    /// only PRESENT output -- persisted disabled -- got honored and disabled,
+    /// leaving zero active outputs and a black screen with no recovery. `self.
+    /// outputs` is the set that has actually come up active this boot; if it is
+    /// non-empty, another PRESENT output is already live and honoring the
+    /// disable is safe. If it is empty, disabling would strand the session, so
+    /// `new_output` force-enables this output instead.
+    ///
+    /// RESIDUAL LIMITATION: wlroots delivers `new_output` per connector during
+    /// boot with no "enumeration complete" signal, and the backend exposes no
+    /// list of present-but-not-yet-arrived outputs. So if a persisted-disabled
+    /// connector enumerates BEFORE its persisted-enabled peer has come up,
+    /// `self.outputs` is momentarily empty and this returns `true` -- the
+    /// disabled output boots active. That is self-correcting: once the peer is
+    /// live, an output-management apply can disable this one via
+    /// `output_configuration_applied`'s own last-output guard. The invariant
+    /// held unconditionally is the one that matters -- the compositor never
+    /// lands at zero active outputs.
+    fn boot_disable_would_strand(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    /// Whether disabling the active output at `index` right now would strand
+    /// the session at zero active outputs (review finding #5): true when no
+    /// OTHER output is currently active AND no head in the same atomic apply
+    /// (`batch_enables`) is enabling to replace it. `output_configuration_applied`'s
+    /// disable branch refuses the disable when this returns true, keeping at
+    /// least one output live.
+    fn disable_would_strand_session(&self, index: u32, batch_enables: bool) -> bool {
+        !batch_enables && !self.outputs.keys().any(|i| *i != index)
+    }
+
+    /// Remove and return the [`wlr::OutputId`] of the currently-disabled
+    /// output whose connector `name` matches, if the match is UNAMBIGUOUS
+    /// (review findings #13/#15). `disabled_outputs` is keyed by the unique id
+    /// with the name as its value, so this is the name->id reverse lookup the
+    /// re-enable path in `output_configuration_applied` needs. Keying by id (not
+    /// name) is what keeps two unnamed disabled outputs -- both named `""` --
+    /// from colliding under a single key and dropping one id permanently
+    /// (finding #15, the write side).
+    ///
+    /// Finding #13 is the read side of that same hazard: if two disabled
+    /// outputs share a connector name (both `""`, or a genuine duplicate), a
+    /// plain `find` would rehydrate an ARBITRARY one -- `HashMap` iteration
+    /// order is unspecified -- and could map the re-enabled head to the WRONG
+    /// `OutputId`. So we require exactly one match: on two or more we refuse,
+    /// log, and return `None` rather than guess.
+    ///
+    /// RESIDUAL LIMITATION: while two identically-named disabled outputs
+    /// coexist, neither can be re-enabled through this name-keyed path (an
+    /// `AppliedHead` carries only a name, no id). This is inherent -- there is
+    /// no other key to disambiguate on -- and self-clears once one of them is
+    /// unplugged (`destroyed` prunes it) or renamed. The output simply stays in
+    /// `disabled_outputs` until then; it is never lost.
+    fn take_disabled_output(&mut self, name: &str) -> Option<wlr::OutputId> {
+        match Self::resolve_unique_disabled(&self.disabled_outputs, name) {
+            DisabledLookup::Unique(oid) => {
+                self.disabled_outputs.remove(&oid);
+                Some(oid)
+            }
+            DisabledLookup::Ambiguous => {
+                tracing::warn!(
+                    name,
+                    "ambiguous re-enable: multiple disabled outputs share this connector name; refusing to rehydrate to avoid mapping the wrong output id"
+                );
+                None
+            }
+            DisabledLookup::None => None,
+        }
+    }
+
+    /// Pure name->id resolution behind [`Self::take_disabled_output`] (review
+    /// finding #13): return the SOLE id whose stored name equals `name`, or a
+    /// non-`Unique` verdict when there is no match or the match is ambiguous
+    /// (two+ ids share the name). Generic over the id type so it can be unit
+    /// tested without a [`wlr::OutputId`], which cannot be constructed outside
+    /// the wlr crate.
+    fn resolve_unique_disabled<K: Copy>(
+        disabled: &HashMap<K, String>,
+        name: &str,
+    ) -> DisabledLookup<K> {
+        let mut matches = disabled.iter().filter(|(_, n)| n.as_str() == name).map(|(id, _)| *id);
+        let Some(first) = matches.next() else { return DisabledLookup::None };
+        if matches.next().is_some() {
+            DisabledLookup::Ambiguous
+        } else {
+            DisabledLookup::Unique(first)
+        }
+    }
+
+    /// Upsert each named [`wlr::AppliedHead`] into `self.config.displays`,
+    /// keyed by connector name: an existing entry with the same name is
+    /// replaced in place (preserving order), an unseen name is appended. This
+    /// is the in-memory half of persistence; [`Self::spawn_config_save`]
+    /// writes the result to redb. Heads with no name are skipped -- there is
+    /// no stable key to store them under.
+    fn upsert_displays_from_heads(&mut self, heads: &[wlr::AppliedHead]) {
+        for head in heads {
+            let Some(name) = head.name.as_deref() else { continue };
+            let entry = icedtea_contract::DisplayConfig {
+                name: name.to_string(),
+                enabled: head.enabled,
+                width: head.width,
+                height: head.height,
+                refresh_mhz: head.refresh_mhz,
+                x: head.x,
+                y: head.y,
+                scale: head.scale as f64,
+                transform: Self::transform_to_i32(head.transform),
+            };
+            if let Some(existing) = self.config.displays.iter_mut().find(|d| d.name == name) {
+                *existing = entry;
+            } else {
+                self.config.displays.push(entry);
+            }
+        }
+    }
+
+    /// Re-home any window whose frame center now sits outside every output's
+    /// box -- the aftermath of an output shrinking under an applied
+    /// output-management config. Each stranded window is clamped into the
+    /// lowest-index (survivor) output, mirroring
+    /// [`Self::migrate_windows_from`]'s placement. A no-op with no outputs.
+    fn reclaim_offscreen_windows(&mut self) {
+        let Some(survivor_idx) = self.outputs.keys().min().copied() else { return };
+        let Some(survivor) = self.outputs.get(&survivor_idx).map(|o| o.geometry) else { return };
+
+        let stranded: Vec<WindowId> = self
+            .window_manager
+            .windows()
+            .filter(|w| {
+                let cx = w.geometry.x + w.geometry.width / 2;
+                let cy = w.geometry.y + w.geometry.height / 2;
+                !self.outputs.values().any(|o| o.geometry.contains(cx, cy))
+            })
+            .map(|w| w.id)
+            .collect();
+
+        for id in stranded {
+            let Some(w) = self.window_manager.get(id) else { continue };
+            let geometry = w.geometry;
+            let new_x = if geometry.width >= survivor.width {
+                survivor.x + (survivor.width - geometry.width) / 2
+            } else {
+                geometry.x.clamp(survivor.x, survivor.x + survivor.width - geometry.width)
+            };
+            let new_y = if geometry.height >= survivor.height {
+                survivor.y + (survivor.height - geometry.height) / 2
+            } else {
+                geometry.y.clamp(survivor.y, survivor.y + survivor.height - geometry.height)
+            };
+            self.window_manager.set_geometry(id, Rectangle { x: new_x, y: new_y, ..geometry });
+            self.sync_window_to_scene(id);
+        }
+        self.emit_pending();
     }
 
     /// Spawn the wallpaper decode worker and wire up the receiving end of
@@ -3308,9 +3718,106 @@ impl wlr::OutputHandler for State {
             tracing::error!(?err, "could not give output a renderer");
             return;
         }
-        if let Err(err) = output.enable_with_preferred_mode() {
-            tracing::error!(?err, "could not enable output");
-            return;
+
+        // Apply any persisted `DisplayConfig` for this connector before the
+        // geometry/scene sequence below reads the output's resulting box.
+        // The name (`wlr::Output::name()`) is the stable key the settings
+        // client and this lookup share; `None` (an unnamed output) matches
+        // no persisted entry and takes the default preferred-mode path.
+        let name = output.name().unwrap_or_default();
+        let display_cfg = self.config.displays.iter().find(|d| d.name == name).cloned();
+        match &display_cfg {
+            Some(cfg) if cfg.enabled => {
+                // On ANY setter error the output must not be left dark:
+                // fall back to the preferred mode with wlroots' own auto
+                // layout position, exactly the no-config path.
+                if let Err(err) = Self::apply_display_config(&runtime, output, cfg) {
+                    tracing::error!(?err, %name, "persisted display config failed; using preferred mode");
+                    if let Err(err) = output.enable_with_preferred_mode() {
+                        tracing::error!(?err, "could not enable output");
+                        return;
+                    }
+                    // A partial apply may have committed a scale/transform
+                    // before the failing setter; reset both to the identity so
+                    // the preferred-mode fallback is a clean default state
+                    // rather than a mix of persisted and preferred values.
+                    if let Err(err) = output.set_scale(1.0) {
+                        tracing::warn!(?err, %name, "could not reset scale on fallback");
+                    }
+                    if let Err(err) = output.set_transform(wlr::Transform::Normal) {
+                        tracing::warn!(?err, %name, "could not reset transform on fallback");
+                    }
+                }
+            }
+            Some(_) if !self.boot_disable_would_strand() => {
+                // Persisted as disabled AND at least one other output is already
+                // LIVE this boot (review finding #1: keyed off `self.outputs`,
+                // not persisted enabled bools), so honoring this cannot strand
+                // the session at zero outputs: honor it and stop.
+                //
+                // Crucially, a disabled output is modeless (`size()` is 0x0 and
+                // `output_layout_box` is `None`), so it must NOT fall through to
+                // the create_output/geometry/scene block below: inserting a 0x0
+                // phantom into `self.outputs` would make it a survivor
+                // candidate for `outputs.keys().min()` and collapse new-window
+                // placement to the origin. Mirror `output_configuration_applied`'s
+                // disabled branch, which likewise keeps disabled heads out of
+                // the active set. Still re-advertise so bound managers see the
+                // new (disabled) head.
+                if let Err(err) = output.disable() {
+                    // Review finding #12: the disable FAILED, so the output is
+                    // physically still enabled. Recording it disabled and
+                    // returning surfaceless would leave an enabled-but-untracked
+                    // output rendering nothing. Instead, give it a valid mode and
+                    // fall through to the geometry/scene block below, tracking it
+                    // as the live output it actually is. Do NOT insert it into
+                    // `disabled_outputs`.
+                    tracing::error!(?err, %name, "could not disable output per persisted config; keeping it live");
+                    if let Err(err) = output.enable_with_preferred_mode() {
+                        tracing::error!(?err, "could not enable output after failed disable");
+                        return;
+                    }
+                    // fall through (no return): treat as an enabled output.
+                } else {
+                    // Record the id (keyed by the unique `OutputId`, value = its
+                    // connector name) so a later re-enable
+                    // (`output_configuration_applied`, which is handed no id) can
+                    // recover it and rehydrate the output into the active set. Do
+                    // NOT create a surface / add to `self.outputs` -- it stays out
+                    // of the active set exactly as the doc above requires.
+                    self.disabled_outputs.insert(output.id(), name.clone());
+                    runtime.update_output_manager_state();
+                    return;
+                }
+            }
+            Some(_) => {
+                // Persisted as disabled, but honoring it would leave ZERO active
+                // outputs (`self.outputs` is empty -> `outputs.keys().min()` is
+                // `None` -> window placement/migrate/reclaim early-return -> a
+                // black screen with no way to recover, review findings #1/#5).
+                // This fires for an all-disabled persisted config AND for the
+                // undocked-laptop case where the only present connector is the
+                // persisted-disabled one and the persisted-enabled peer is
+                // absent. Treat it as a config that cannot be honored and enable
+                // this output with its preferred mode instead, falling through to
+                // the geometry/scene block below like the `None` arm.
+                // `output_configuration_applied`'s interactive path has its own
+                // last-output guard for the live-reconfigure case.
+                tracing::warn!(
+                    %name,
+                    "honoring persisted disable would leave zero active outputs; enabling this output to avoid a black screen with no recovery"
+                );
+                if let Err(err) = output.enable_with_preferred_mode() {
+                    tracing::error!(?err, "could not enable output");
+                    return;
+                }
+            }
+            None => {
+                if let Err(err) = output.enable_with_preferred_mode() {
+                    tracing::error!(?err, "could not enable output");
+                    return;
+                }
+            }
         }
 
         let (width, height) = output.size();
@@ -3331,6 +3838,12 @@ impl wlr::OutputHandler for State {
             .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
             .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width, height });
         self.create_output(index, geometry);
+        // Record the connector name so the applied-config handler can map an
+        // `AppliedHead` back to this index and `destroyed`/persist can look
+        // it up (see `OutputSurface::name`).
+        if let Some(surface) = self.outputs.get_mut(&index) {
+            surface.name = name;
+        }
         self.output_ids.insert(output.id(), index);
         // A new output needs its own wallpaper node (if a decode has
         // already landed) at this output's own size -- nothing else calls
@@ -3363,6 +3876,12 @@ impl wlr::OutputHandler for State {
         // output on its own, so a freshly enabled output that draws nothing
         // still gets a `frame` callback and a first commit.
         output.schedule_frame();
+
+        // Re-advertise the manager state so every bound
+        // `zwlr_output_manager_v1` client sees the new head (and any layout
+        // shift the connect caused) with a bumped serial. A no-op when no
+        // manager was created (`lib.rs::run` degrades gracefully).
+        runtime.update_output_manager_state();
     }
 
     fn frame(&mut self, output: &wlr::Output<'_>) {
@@ -3376,6 +3895,13 @@ impl wlr::OutputHandler for State {
     }
 
     fn destroyed(&mut self, id: wlr::OutputId) {
+        // A disabled output (tracked only in `disabled_outputs`, never in
+        // `output_ids`/`outputs`) can be unplugged too. `destroyed` gets only
+        // the id; the map is keyed by that id now (review finding #15), so a
+        // single `remove` drops the entry -- otherwise a stale id mapping would
+        // outlive the physical output and a reconnected connector reusing the
+        // name could rehydrate a dead id.
+        self.disabled_outputs.remove(&id);
         // `remove` on an unknown id, not indexing: this can name an output
         // this handler was never told about (see the library's own docs), and
         // a panic here aborts.
@@ -3401,6 +3927,201 @@ impl wlr::OutputHandler for State {
             // going silent forever.
             self.resolve_orphaned_layers();
         }
+        // Re-advertise even when the id was unknown-to-us: the output is gone
+        // from wlroots' layout regardless, and a bound manager client must
+        // see the shrunk head set. A no-op when no manager exists.
+        if let Some(runtime) = self.wayland.runtime() {
+            runtime.update_output_manager_state();
+        }
+    }
+
+    fn output_configuration_applied(&mut self, heads: Vec<wlr::AppliedHead>) {
+        // The crate has already committed each head and applied its layout
+        // position by the time this runs (see the trait doc); our job is to
+        // re-derive geometry from the new layout, migrate any window off an
+        // output that shrank or went dark, persist the result, and
+        // re-advertise. Never block on redb here -- `spawn_config_save` does
+        // the write off-loop.
+        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+
+        // Review finding #5 (interactive guard): whether any head in THIS
+        // batch is being enabled. A disable that would empty `self.outputs` is
+        // only safe to honor when some other head in the same atomic apply is
+        // enabling to replace it; otherwise refusing the disable is the only
+        // thing standing between the session and an unrecoverable black screen.
+        let batch_enables = heads.iter().any(|h| h.enabled);
+
+        // Review finding #6: connector names whose disable we REFUSED below
+        // (kept the output live). Their `AppliedHead` reports enabled=false with
+        // a 0x0 mode, so persisting it would both flip the record to disabled
+        // and wipe the saved mode/scale/transform/position. We skip them in the
+        // upsert instead, leaving their existing (enabled, full-mode) persisted
+        // entry untouched.
+        let mut refused_disables: Vec<String> = Vec::new();
+
+        for head in &heads {
+            let Some(head_name) = head.name.as_deref() else { continue };
+            // name -> our output index (via the name recorded in `new_output`).
+            let index = match self.outputs.iter().find(|(_, o)| o.name == head_name).map(|(i, _)| *i)
+            {
+                Some(index) => index,
+                None => {
+                    // Not in the active set. If this head is being ENABLED and
+                    // we still track it as a disabled output (found by name ->
+                    // its unique id), rehydrate it: a fresh index + surface,
+                    // its id re-mapped, and drop it from `disabled_outputs`. It
+                    // then rides the geometry/arrange/scene sequence after this
+                    // loop like any enabled head. If the name is in neither map
+                    // there is nothing we can do without an id -- skip it.
+                    if head.enabled
+                        && let Some(oid) = self.take_disabled_output(head_name)
+                    {
+                        let index = self.next_output_index;
+                        self.next_output_index += 1;
+                        let geometry = runtime
+                            .output_layout_box(oid)
+                            .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
+                            .or_else(|| {
+                                (head.width > 0 && head.height > 0).then_some(icedtea_contract::Rectangle {
+                                    x: head.x,
+                                    y: head.y,
+                                    width: head.width,
+                                    height: head.height,
+                                })
+                            })
+                            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+                        self.create_output(index, geometry);
+                        if let Some(surface) = self.outputs.get_mut(&index) {
+                            surface.name = head_name.to_string();
+                        }
+                        self.output_ids.insert(oid, index);
+                        // First-frame parity with `new_output` (review finding
+                        // #13): `new_output` calls `output.schedule_frame()`
+                        // (review finding I1) so a freshly enabled output that
+                        // draws nothing still gets a `frame` callback and a
+                        // first commit. This rehydrate branch has only the
+                        // re-mapped `oid`, so use the id-keyed
+                        // `Runtime::schedule_frame` sibling to give the
+                        // re-enabled output the same one-time kick rather than
+                        // leaving it blank until some incidental damage repaints
+                        // it.
+                        let _ = runtime.schedule_frame(oid);
+                    }
+                    continue;
+                }
+            };
+
+            let old_geometry = self.outputs.get(&index).map(|o| o.geometry);
+
+            if head.enabled {
+                // Re-derive from the layout box wlroots just committed; fall
+                // back to the head's own reported mode/position, then to the
+                // prior box, so the output is never collapsed to nothing.
+                let oid = self.output_ids.iter().find(|(_, i)| **i == index).map(|(id, _)| *id);
+                let geometry = oid
+                    .and_then(|oid| runtime.output_layout_box(oid))
+                    .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
+                    .or_else(|| {
+                        (head.width > 0 && head.height > 0).then_some(icedtea_contract::Rectangle {
+                            x: head.x,
+                            y: head.y,
+                            width: head.width,
+                            height: head.height,
+                        })
+                    })
+                    .or(old_geometry);
+                if let (Some(surface), Some(geometry)) = (self.outputs.get_mut(&index), geometry) {
+                    surface.geometry = geometry;
+                    // `arrange_layers`/exclusive zones recompute `usable`;
+                    // reset it to the full box for now, exactly as a fresh
+                    // `create_output` does.
+                    surface.usable = geometry;
+                }
+                // A shrunken output can strand windows -- but `reclaim` judges
+                // containment against `self.outputs`, whose LATER heads still
+                // hold their pre-apply geometry until this loop reaches them
+                // (review finding #10). So it runs exactly once, after the
+                // whole batch has been re-derived, not per enabled head here.
+            } else {
+                // Disabled. Guard (review finding #5): never let a config
+                // empty the active set. Refuse this disable when it would drop
+                // `self.outputs` to zero AND no other head in this atomic
+                // apply is enabling to replace it -- an empty `self.outputs`
+                // collapses window placement/migrate/reclaim to an early return
+                // and leaves a black screen with no way to recover. The head
+                // simply stays active; the persisted (disabled) record is
+                // caught again by `new_output`'s all-disabled boot guard.
+                if self.disable_would_strand_session(index, batch_enables) {
+                    tracing::warn!(
+                        %head_name,
+                        "refusing to disable the last active output; keeping >=1 enabled to avoid a black screen"
+                    );
+                    // Review finding #6: mark it so the persist step below does
+                    // not record enabled=false (0x0 mode) for the output we just
+                    // kept live -- that would lose its saved mode/scale/
+                    // transform/position on the next boot.
+                    refused_disables.push(head_name.to_string());
+                    continue;
+                }
+                // Drop it from the active set (mirroring `destroyed`) and
+                // migrate its windows onto a survivor. Before dropping the id,
+                // record it keyed by that id (value = this head's name) in
+                // `disabled_outputs` so a later re-enable (handed no id) can
+                // rehydrate it -- see that map's doc and the enable branch
+                // above.
+                self.outputs.remove(&index);
+                if let Some(oid) =
+                    self.output_ids.iter().find(|(_, i)| **i == index).map(|(id, _)| *id)
+                {
+                    self.disabled_outputs.insert(oid, head_name.to_string());
+                    self.output_ids.remove(&oid);
+                }
+                if let Some(old) = old_geometry {
+                    self.migrate_windows_from(old);
+                }
+            }
+        }
+
+        // Now that EVERY head has been re-derived (review finding #10), re-home
+        // windows stranded off every output's box exactly once, judging
+        // containment against the fully-updated `self.outputs` rather than a
+        // half-updated one. Running it per enabled head inside the loop judged
+        // against later heads' stale pre-apply geometry.
+        self.reclaim_offscreen_windows();
+
+        // Recompute panel exclusive zones and maximized-window rects against
+        // the re-derived geometry. `resolve_orphaned_layers` below early-returns
+        // when nothing was orphaned, so a pure reposition/resize (which orphans
+        // no layer) would otherwise leave `usable` stuck at the full box and
+        // exclusive zones / maximized windows stale. Mirrors the
+        // create_output -> arrange_layers -> sync sequence `new_output` runs.
+        self.arrange_layers();
+
+        // Re-run the scene sequence a hotplug runs, so windows and layers
+        // settle onto the re-derived geometry.
+        self.sync_wallpaper_nodes();
+        self.sync_scene();
+        self.emit_pending();
+        self.resolve_orphaned_layers();
+
+        // Persist: upsert each applied head into `config.displays`, then
+        // write off-loop. Review finding #6: skip any head whose disable we
+        // refused -- persisting its enabled=false/0x0 record would corrupt the
+        // saved config; its existing (enabled, full-mode) entry is left intact.
+        let heads_to_persist: Vec<wlr::AppliedHead> = heads
+            .iter()
+            .filter(|h| match h.name.as_deref() {
+                Some(name) => !refused_disables.iter().any(|r| r == name),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        self.upsert_displays_from_heads(&heads_to_persist);
+        self.spawn_config_save();
+
+        // The trait doc REQUIRES this once the layout is settled and
+        // persisted, so other bound managers see the fresh state + serial.
+        runtime.update_output_manager_state();
     }
 }
 
@@ -7282,6 +8003,370 @@ mod tests {
             state.window_manager.focused_window().map(|w| w.id),
             Some(a),
             "a minimized focus pointer must be re-picked on switch-back, not kept"
+        );
+    }
+
+    // -- T5: output-management (persisted display config) ----------------
+    //
+    // These cover the runtime-independent halves of Task 5: the persisted
+    // config lookup/round-trip, the `AppliedHead` -> `DisplayConfig` upsert,
+    // the transform integer mapping, and the offscreen-window reclaim a
+    // shrinking apply triggers. The live-output halves -- `new_output`
+    // committing mode/scale/transform/position on a real `wlr::Output`, and
+    // `output_configuration_applied` re-deriving geometry through
+    // `output_layout_box` -- need an attached `wlr::Runtime` (both handlers
+    // early-return without one), so they are exercised end-to-end by the
+    // protocol round-trip in T6/T7 rather than here. See the task notes.
+
+    fn head(name: &str, enabled: bool) -> wlr::AppliedHead {
+        wlr::AppliedHead {
+            name: Some(name.to_string()),
+            enabled,
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60_000,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            transform: wlr::Transform::Normal,
+        }
+    }
+
+    #[test]
+    fn transform_integer_mapping_round_trips_every_variant() {
+        for value in 0..=7 {
+            let t = State::transform_from_i32(value);
+            assert_eq!(State::transform_to_i32(t), value, "transform {value} must round-trip");
+        }
+        // Out-of-range falls back to Normal (0), not a panic.
+        assert_eq!(State::transform_from_i32(99), wlr::Transform::Normal);
+    }
+
+    #[test]
+    fn upsert_displays_inserts_new_and_replaces_by_name() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert!(state.config.displays.is_empty());
+
+        // Two distinct outputs -> two appended entries.
+        state.upsert_displays_from_heads(&[head("DP-1", true), head("HDMI-A-1", true)]);
+        assert_eq!(state.config.displays.len(), 2);
+        assert_eq!(state.config.displays[0].name, "DP-1");
+        assert_eq!(state.config.displays[1].name, "HDMI-A-1");
+
+        // Re-applying DP-1 disabled must REPLACE in place (still 2 entries,
+        // order preserved), not append a duplicate.
+        let mut disabled = head("DP-1", false);
+        disabled.width = 2560;
+        disabled.height = 1440;
+        disabled.transform = wlr::Transform::R270;
+        disabled.scale = 2.0;
+        state.upsert_displays_from_heads(&[disabled]);
+        assert_eq!(state.config.displays.len(), 2, "same name must not append a duplicate");
+        let dp1 = &state.config.displays[0];
+        assert_eq!(dp1.name, "DP-1");
+        assert!(!dp1.enabled);
+        assert_eq!(dp1.width, 2560);
+        assert_eq!(dp1.height, 1440);
+        assert_eq!(dp1.transform, 3, "wlr::Transform::R270 persists as 3");
+        assert_eq!(dp1.scale, 2.0);
+    }
+
+    #[test]
+    fn upsert_displays_skips_unnamed_head() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let mut anon = head("ignored", true);
+        anon.name = None;
+        state.upsert_displays_from_heads(&[anon]);
+        assert!(state.config.displays.is_empty(), "an unnamed head has no key to store");
+    }
+
+    #[test]
+    fn save_config_to_persists_displays_to_redb() {
+        // Exercises the exact synchronous body `spawn_config_save` runs on
+        // its worker thread (see `save_config_to`'s doc for why the detached
+        // thread itself is not what the test drives). The upserted displays
+        // must survive a real `load_or_default` round-trip.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.redb");
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.config_path = Some(path.clone());
+        state.upsert_displays_from_heads(&[head("DP-1", true)]);
+
+        State::save_config_to(&state.config_db_lock, &state.config, &path);
+
+        let loaded = icedtea_config::load_or_default(&path);
+        assert_eq!(loaded.displays.len(), 1, "save_config_to must persist the displays");
+        assert_eq!(loaded.displays[0].name, "DP-1");
+        assert_eq!(loaded.displays[0].width, 1920);
+        assert_eq!(loaded.displays[0].refresh_mhz, 60_000);
+    }
+
+    #[test]
+    fn racing_save_and_reload_never_wipes_live_config() {
+        // Review finding #3: `spawn_config_save` and `spawn_config_reload`
+        // each open a fresh redb `Database` on a detached worker thread, but
+        // redb permits only ONE handle per file per process. Without the
+        // shared open-lock a save racing a reload hits `DatabaseAlreadyOpen`;
+        // `load_or_default` then silently returns `default_config()`, WIPING
+        // the live appearance/keybindings/workspaces on disk. The lock (held
+        // by each worker across its whole open+use+drop) serializes the two
+        // opens so neither ever observes a file the other still has open. This
+        // hammers both real code paths (`save_config_to` /
+        // `load_config_locked`) through one shared lock and asserts no reload
+        // ever surfaced a wipe. Remove the lock and DatabaseAlreadyOpen makes
+        // this fail.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.redb");
+
+        // Seed a NON-default config so a wipe is observable: a load that comes
+        // back with the default workspace names is a wipe; one that sees these
+        // custom names is a real read.
+        let mut seeded = default_config();
+        seeded.workspace_names = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        assert_ne!(seeded.workspace_names, default_config().workspace_names);
+        {
+            let db = icedtea_config::open(&path).expect("seed open");
+            seeded.save(&db).expect("seed save");
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        let wiped = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        // Writers: persist the seeded (non-default) config repeatedly.
+        for _ in 0..8 {
+            let lock = Arc::clone(&lock);
+            let cfg = seeded.clone();
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..12 {
+                    State::save_config_to(&lock, &cfg, &path);
+                }
+            }));
+        }
+        // Readers: load through the same lock and flag any default wipe.
+        for _ in 0..8 {
+            let lock = Arc::clone(&lock);
+            let path = path.clone();
+            let wiped = Arc::clone(&wiped);
+            let default_names = default_config().workspace_names;
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..12 {
+                    // `None` == kept current (a persistent lock), never a wipe.
+                    // A `Some` whose workspaces went default IS the wipe we guard
+                    // against.
+                    if let Some(cfg) = State::load_config_locked(&lock, &path)
+                        && cfg.workspace_names == default_names
+                    {
+                        wiped.store(true, Ordering::SeqCst);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        assert!(
+            !wiped.load(Ordering::SeqCst),
+            "a save/reload race surfaced default_config() -- the live config was wiped"
+        );
+        // The file still holds the seeded config after all the racing opens.
+        let final_cfg = icedtea_config::load_or_default(&path);
+        assert_eq!(final_cfg.workspace_names, seeded.workspace_names);
+    }
+
+    #[test]
+    fn load_config_locked_keeps_current_on_persistent_lock() {
+        // Review finding #2: a cross-process open collision (the settings app
+        // holding the DB) must NEVER downgrade the live config to defaults.
+        // `load_config_locked` returns `None` (== keep `self.config`) when the
+        // file stays locked, rather than `Some(default_config())`. Simulate the
+        // collision by holding a live redb handle across the call: redb's
+        // whole-file lock rejects the second opener within this process too, so
+        // every retry sees `LoadOutcome::Locked` and the method gives up with
+        // `None`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.redb");
+
+        let mut seeded = default_config();
+        seeded.workspace_names = vec!["keepme".into()];
+        {
+            let db = icedtea_config::open(&path).expect("seed open");
+            seeded.save(&db).expect("seed save");
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        // Hold the DB open for the whole load attempt so it stays locked.
+        let _held = icedtea_config::open(&path).expect("hold open");
+        assert!(
+            State::load_config_locked(&lock, &path).is_none(),
+            "a persistently locked db must return None (keep current), never a default wipe"
+        );
+    }
+
+    #[test]
+    fn guarded_scale_rejects_nonpositive_and_nonfinite() {
+        // Review finding #12: a persisted/echoed-back `DisplayConfig.scale`
+        // that is <= 0 or non-finite must not reach wlroots.
+        assert_eq!(State::guarded_scale(1.0), 1.0);
+        assert_eq!(State::guarded_scale(2.5), 2.5);
+        assert_eq!(State::guarded_scale(0.0), 1.0, "zero scale falls back to 1.0");
+        assert_eq!(State::guarded_scale(-2.0), 1.0, "negative scale falls back to 1.0");
+        assert_eq!(State::guarded_scale(f64::NAN), 1.0, "NaN scale falls back to 1.0");
+        assert_eq!(State::guarded_scale(f64::INFINITY), 1.0, "inf scale falls back to 1.0");
+        assert_eq!(State::guarded_scale(f64::NEG_INFINITY), 1.0, "-inf scale falls back to 1.0");
+    }
+
+    #[test]
+    fn boot_disable_would_strand_keys_off_live_outputs_not_persisted_bools() {
+        // Review finding #1 (undock scenario): the boot guard must key off LIVE
+        // outputs, never the persisted enabled bools. A persisted-enabled but
+        // physically-ABSENT connector must NOT make `new_output` honor the
+        // disable of the only PRESENT output and go dark.
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+
+        // Undock: eDP-1 (present) persisted disabled; DP-1 (persisted enabled)
+        // is unplugged, so it never comes up. With NO live outputs yet,
+        // honoring eDP-1's disable would strand the session at zero -> the guard
+        // must report "would strand" so `new_output` force-enables it. The old
+        // persisted-bool guard (`any_display_enabled`) returned "safe to
+        // disable" here BECAUSE DP-1 is persisted enabled -- exactly the bug.
+        state.config.displays = vec![
+            icedtea_contract::DisplayConfig {
+                name: "eDP-1".into(),
+                enabled: false,
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60_000,
+                x: 0,
+                y: 0,
+                scale: 1.0,
+                transform: 0,
+            },
+            icedtea_contract::DisplayConfig {
+                name: "DP-1".into(),
+                enabled: true,
+                width: 2560,
+                height: 1440,
+                refresh_mhz: 144_000,
+                x: 0,
+                y: 0,
+                scale: 1.0,
+                transform: 0,
+            },
+        ];
+        assert!(
+            state.boot_disable_would_strand(),
+            "no LIVE output yet -> honoring a disable would strand at zero, even though a persisted-enabled connector exists (it is absent)"
+        );
+
+        // Once some present output is actually live, honoring another output's
+        // persisted disable is safe.
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 2560, height: 1440 });
+        assert!(
+            !state.boot_disable_would_strand(),
+            "a live output exists -> honoring a disable no longer strands the session"
+        );
+    }
+
+    #[test]
+    fn resolve_unique_disabled_refuses_ambiguous_names() {
+        // Review finding #13: the re-enable name->id lookup must not silently
+        // rehydrate an arbitrary id when two disabled outputs share a name.
+        // Exercised through a plain `HashMap<u64, String>` stand-in because
+        // `wlr::OutputId` cannot be constructed outside the wlr crate.
+        let mut disabled: HashMap<u64, String> = HashMap::new();
+        disabled.insert(1, "DP-1".into());
+        disabled.insert(2, "DP-2".into());
+
+        // Unambiguous name -> its id.
+        assert!(matches!(
+            State::resolve_unique_disabled(&disabled, "DP-1"),
+            DisabledLookup::Unique(1)
+        ));
+        // Missing name -> None.
+        assert!(matches!(
+            State::resolve_unique_disabled(&disabled, "HDMI-A-1"),
+            DisabledLookup::None
+        ));
+
+        // Two disabled outputs share the empty name (the exact #15 write-side
+        // collision, now on the read side): the lookup must report Ambiguous,
+        // never guess an id.
+        disabled.insert(3, String::new());
+        disabled.insert(4, String::new());
+        assert!(matches!(
+            State::resolve_unique_disabled(&disabled, ""),
+            DisabledLookup::Ambiguous
+        ));
+
+        // A single empty-named output is still unambiguous.
+        let mut one_empty: HashMap<u64, String> = HashMap::new();
+        one_empty.insert(9, String::new());
+        assert!(matches!(
+            State::resolve_unique_disabled(&one_empty, ""),
+            DisabledLookup::Unique(9)
+        ));
+    }
+
+    #[test]
+    fn disable_would_strand_session_guards_the_last_output() {
+        // Review finding #5 (interactive guard): refuse to disable the last
+        // active output unless the same atomic apply enables another.
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        // Only output 0 active, nothing else enabling -> disabling it strands.
+        assert!(state.disable_would_strand_session(0, false));
+        // A head in the same batch is enabling -> safe to disable index 0.
+        assert!(!state.disable_would_strand_session(0, true));
+        // A second active output survives the disable -> safe.
+        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        assert!(!state.disable_would_strand_session(0, false));
+    }
+
+    #[test]
+    fn reclaim_offscreen_windows_clamps_stranded_window_onto_survivor() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        // Single 800x600 output at origin: a window centered at (1400,300)
+        // sits entirely off it (simulating the output it lived on shrinking
+        // away under an applied config).
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let id =
+            state.window_manager.add_window("a", "A", 1, Rectangle { x: 1350, y: 250, width: 100, height: 100 });
+
+        state.reclaim_offscreen_windows();
+
+        let geo = state.window_manager.get(id).expect("window").geometry;
+        assert!(
+            geo.x >= 0 && geo.x + geo.width <= 800 && geo.y >= 0 && geo.y + geo.height <= 600,
+            "stranded window must be clamped inside the survivor output, got {geo:?}"
+        );
+    }
+
+    #[test]
+    fn reclaim_offscreen_windows_leaves_onscreen_window_untouched() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let onscreen = Rectangle { x: 100, y: 100, width: 200, height: 150 };
+        let id = state.window_manager.add_window("a", "A", 1, onscreen);
+
+        state.reclaim_offscreen_windows();
+
+        assert_eq!(
+            state.window_manager.get(id).expect("window").geometry,
+            onscreen,
+            "a window already on an output must not be moved"
         );
     }
 }

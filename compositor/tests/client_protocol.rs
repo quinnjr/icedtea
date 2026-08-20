@@ -196,6 +196,20 @@ fn relative_pointer_manager_global_is_advertised() {
     );
 }
 
+/// The Displays feature adds output management: `zwlr_output_manager_v1` lets a
+/// client (a settings app, kanshi, wlr-randr) enumerate output heads and
+/// request an atomic reconfiguration — resolution, position, scale, transform,
+/// enabled.
+#[test]
+fn output_manager_global_is_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwlr_output_manager_v1"),
+        "output manager global missing; saw {globals:?}"
+    );
+}
+
 /// A client can bind `zwlr_virtual_pointer_manager_v1` and create a virtual
 /// pointer, then inject motion/button/frame requests without a protocol
 /// error — the M4.2 drag-and-drop grab serial's source. Full drag coverage
