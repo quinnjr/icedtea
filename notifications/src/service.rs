@@ -70,16 +70,31 @@ fn pair_actions(flat: Vec<String>) -> Vec<NotificationAction> {
     actions
 }
 
+/// Take a scalar hint out of the map by key, converting it to `T` and
+/// dropping it whether or not the conversion succeeds. Removing (rather than
+/// cloning) means a large value — notably `image-data`'s pixel buffer — is
+/// never duplicated. Returns `None` when the key is absent or the sender sent
+/// the wrong D-Bus type, so every hint degrades to its default instead of
+/// erroring the whole `Notify` call.
+fn hint<T>(hints: &mut HashMap<String, OwnedValue>, key: &str) -> Option<T>
+where
+    T: TryFrom<OwnedValue>,
+{
+    hints.remove(key).and_then(|v| T::try_from(v).ok())
+}
+
 /// The `image-data` hint (and its deprecated `icon_data` alias)'s wire shape
 /// is `(iiibiiay)`: width, height, rowstride, has-alpha, bits-per-sample,
 /// channels, raw row-major pixel bytes. A sender that gets this wrong --
 /// the hint absent, the wrong D-Bus type entirely, or a tuple with a
 /// mismatched field count/arity -- degrades to `None` (falling back to the
-/// `app_icon` argument) rather than breaking `Notify` for every other app.
-/// See the design spec's hint-robustness risk and N3's hardening pass.
-fn parse_image_data_hint(hints: &HashMap<String, OwnedValue>) -> Option<IconSource> {
-    let raw = hints.get("image-data").or_else(|| hints.get("icon_data"))?;
-    let value: Value = raw.clone().into();
+/// `image-path` hint / `app_icon` argument) rather than breaking `Notify` for
+/// every other app. See the design spec's hint-robustness risk and N3's
+/// hardening pass. Takes the value out of the map by ownership so the (large)
+/// pixel buffer is moved, never cloned.
+fn parse_image_data_hint(hints: &mut HashMap<String, OwnedValue>) -> Option<IconSource> {
+    let raw = hints.remove("image-data").or_else(|| hints.remove("icon_data"))?;
+    let value: Value = raw.into();
     let structure = Structure::try_from(value).ok()?;
     let fields = structure.into_fields();
     let [width, height, rowstride, has_alpha, bits_per_sample, channels, data]: [Value; 7] =
@@ -117,6 +132,18 @@ impl Shared {
             let _ = self.ticks.send(Tick::Deadline(id, Instant::now() + delay));
         }
     }
+
+    /// Cancel `id`'s pending expiry tick and close it with `reason`, emitting
+    /// the resulting `Change` if it was live. Shared by `CloseNotification`,
+    /// `DismissAll`, and the non-resident-action removal path so all three
+    /// treat "cancel timer + close + emit" identically. The caller passes the
+    /// already-locked store guard.
+    fn cancel_and_close(&self, store: &mut Store, id: u32, reason: CloseReason) {
+        let _ = self.ticks.send(Tick::Cancel(id));
+        if let Some(change) = store.close(id, reason) {
+            let _ = self.changes.send(change);
+        }
+    }
 }
 
 pub struct StdInterface(Arc<Shared>);
@@ -133,24 +160,24 @@ impl StdInterface {
         summary: String,
         body: String,
         actions: Vec<String>,
-        hints: HashMap<String, OwnedValue>,
+        mut hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
-        // `image-data`/`icon_data` hint (raw pixels) takes priority over the
-        // `app_icon` argument (a themed name or path), matching the
-        // freedesktop spec's own precedence; a malformed/absent hint falls
-        // back to `app_icon`.
-        let icon = parse_image_data_hint(&hints)
+        // Icon precedence per the freedesktop spec: raw pixels
+        // (`image-data`/`icon_data`) win, then the `image-path` hint (a themed
+        // name or filesystem path), then the `app_icon` argument, then
+        // nothing. See `contract::notifications::IconSource`.
+        let icon = parse_image_data_hint(&mut hints)
+            .or_else(|| hint::<String>(&mut hints, "image-path").filter(|p| !p.is_empty()).map(IconSource::Named))
             .unwrap_or(if app_icon.is_empty() { IconSource::None } else { IconSource::Named(app_icon) });
         let actions = pair_actions(actions);
-        let urgency_byte = hints.get("urgency").and_then(|v| u8::try_from(v.clone()).ok());
-        let urgency = parse_urgency(urgency_byte);
-        let category = hints.get("category").and_then(|v| String::try_from(v.clone()).ok());
-        let resident = hints.get("resident").and_then(|v| bool::try_from(v.clone()).ok()).unwrap_or(false);
-        let transient = hints.get("transient").and_then(|v| bool::try_from(v.clone()).ok()).unwrap_or(false);
+        let urgency = parse_urgency(hint::<u8>(&mut hints, "urgency"));
+        let category = hint::<String>(&mut hints, "category");
+        let resident = hint::<bool>(&mut hints, "resident").unwrap_or(false);
+        let transient = hint::<bool>(&mut hints, "transient").unwrap_or(false);
         let now = now_ms();
 
-        let (id, change, expire_at_ms) = {
+        let (id, suppressed, expire_at_ms) = {
             let mut store = self.0.store.lock().unwrap();
             store.notify(
                 app_name,
@@ -168,16 +195,25 @@ impl StdInterface {
             )
         };
 
-        self.0.reschedule(id, expire_at_ms, now);
-        let _ = self.0.changes.send(change);
+        if suppressed {
+            // DND-hidden: do not announce it as Added and do not arm expiry
+            // (a hidden notification must not count down and vanish). Still
+            // cancel any prior tick in case this was a replace-in-place of a
+            // notification that used to be visible.
+            self.0.reschedule(id, None, now);
+        } else {
+            // #7: push Added BEFORE arming expiry, so on a single ordered
+            // change stream Added always precedes any Closed for this id
+            // (even a 1ms timeout can't emit Closed first).
+            let _ = self.0.changes.send(Change::Added(id));
+            self.0.reschedule(id, expire_at_ms, now);
+        }
         id
     }
 
     fn close_notification(&self, id: u32) {
-        let _ = self.0.ticks.send(Tick::Cancel(id));
-        if let Some(change) = self.0.store.lock().unwrap().close(id, CloseReason::ClosedByRequest) {
-            let _ = self.0.changes.send(change);
-        }
+        let mut store = self.0.store.lock().unwrap();
+        self.0.cancel_and_close(&mut store, id, CloseReason::ClosedByRequest);
     }
 
     fn get_capabilities(&self) -> Vec<String> {
@@ -201,24 +237,46 @@ impl IcedteaInterface {
 
     fn dismiss_all(&self) {
         let mut store = self.0.store.lock().unwrap();
-        let ids: Vec<u32> = store.active().iter().map(|n| n.id).collect();
-        for id in ids {
-            let _ = self.0.ticks.send(Tick::Cancel(id));
-            if let Some(change) = store.close(id, CloseReason::Dismissed) {
-                let _ = self.0.changes.send(change);
-            }
+        // Iterate *all* live notifications (`live_ids`), not just `active()`:
+        // "clear everything" must also clear DND-suppressed ones, which
+        // `active()` hides.
+        for id in store.live_ids() {
+            self.0.cancel_and_close(&mut store, id, CloseReason::Dismissed);
         }
     }
 
     fn invoke_action(&self, id: u32, key: String) {
-        if let Some(change) = self.0.store.lock().unwrap().invoke_action(id, &key) {
-            let _ = self.0.changes.send(change);
+        let mut store = self.0.store.lock().unwrap();
+        let Some(change) = store.invoke_action(id, &key) else {
+            return;
+        };
+        let _ = self.0.changes.send(change);
+        // `resident == false` (the default): the notification is removed once
+        // an action is invoked. `resident == true` keeps it up. See the spec.
+        if store.is_resident(id) == Some(false) {
+            self.0.cancel_and_close(&mut store, id, CloseReason::Dismissed);
         }
     }
 
     fn set_do_not_disturb(&self, on: bool) {
-        if let Some(change) = self.0.store.lock().unwrap().set_dnd(on) {
-            let _ = self.0.changes.send(change);
+        let now = now_ms();
+        let dnd_change = { self.0.store.lock().unwrap().set_dnd(on, now) };
+        let Some(dc) = dnd_change else {
+            return;
+        };
+        let _ = self.0.changes.send(Change::DndChanged(dc.on));
+        // Notifications that just became hidden: cancel their expiry (a
+        // hidden notification must not count down) and emit a removal so a
+        // UI tracking add/remove stays consistent with GetActive.
+        for id in dc.newly_suppressed {
+            let _ = self.0.ticks.send(Tick::Cancel(id));
+            let _ = self.0.changes.send(Change::Suppressed(id));
+        }
+        // Notifications that just became visible: announce them and (re-)arm
+        // their fresh countdown. Added is emitted before arming (#7 ordering).
+        for (id, expire_at_ms) in dc.newly_visible {
+            let _ = self.0.changes.send(Change::Added(id));
+            self.0.reschedule(id, expire_at_ms, now);
         }
     }
 
@@ -227,18 +285,58 @@ impl IcedteaInterface {
     }
 }
 
+/// Why [`spawn`] failed. Distinguished so `main` can exit *cleanly* (never
+/// restarted by systemd) on a bus-name conflict — the expected "another
+/// daemon is running" case — while a genuine D-Bus fault still exits with a
+/// failure code so systemd's `Restart=on-failure` can retry.
+#[derive(Debug)]
+pub enum SpawnError {
+    /// Another daemon already owns `org.freedesktop.Notifications`. Fatal but
+    /// expected: log loudly and exit cleanly, never steal the name.
+    NameTaken(String),
+    /// A genuine D-Bus error (no session bus, registration failure, ...).
+    Bus(zbus::Error),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::NameTaken(msg) => write!(f, "{msg}"),
+            SpawnError::Bus(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {}
+
+impl From<zbus::Error> for SpawnError {
+    fn from(err: zbus::Error) -> Self {
+        SpawnError::Bus(err)
+    }
+}
+
 /// Register both interfaces at [`NOTIF_PATH`], claim [`NOTIF_BUS_NAME`], and
-/// start the emitter thread that drains `changes` and turns each `Change`
-/// into the right signal(s). Requests the name with `DoNotQueue` only (no
+/// start the emitter thread that drains `changes_rx` and turns each `Change`
+/// into the right signal(s). `changes_tx` is the send half the interface
+/// methods push onto; the expiry worker holds a clone of the *same* sender,
+/// so every `Change` — whether produced synchronously by a method call or
+/// asynchronously by an expiry — flows through one ordered channel (no
+/// `Select` racing two channels, which could otherwise emit a Closed before
+/// its own Added; see #7). Requests the name with `DoNotQueue` only (no
 /// `AllowReplacement`/`ReplaceExisting`): if another daemon already owns the
-/// name, this returns `Err` and the caller (`main`) treats that as fatal;
-/// this daemon itself is never replaceable, so it can't silently lose the
-/// name to a later process either — see the design spec's Decision 6.
-pub fn spawn(store: Arc<Mutex<Store>>, changes: Receiver<Change>, ticks: Sender<Tick>) -> zbus::Result<Connection> {
+/// name, this returns [`SpawnError::NameTaken`] and the caller (`main`)
+/// treats that as fatal-but-clean; this daemon itself is never replaceable,
+/// so it can't silently lose the name to a later process either — see the
+/// design spec's Decision 6.
+pub fn spawn(
+    store: Arc<Mutex<Store>>,
+    changes_tx: Sender<Change>,
+    changes_rx: Receiver<Change>,
+    ticks: Sender<Tick>,
+) -> Result<Connection, SpawnError> {
     let conn = Connection::session()?;
 
-    let (svc_tx, svc_rx) = crossbeam_channel::unbounded();
-    let shared = Arc::new(Shared { store, changes: svc_tx, ticks });
+    let shared = Arc::new(Shared { store, changes: changes_tx, ticks });
 
     conn.object_server().at(NOTIF_PATH, StdInterface(shared.clone()))?;
     conn.object_server().at(NOTIF_PATH, IcedteaInterface(shared))?;
@@ -250,43 +348,30 @@ pub fn spawn(store: Arc<Mutex<Store>>, changes: Receiver<Change>, ticks: Sender<
     // alone (no `AllowReplacement`/`ReplaceExisting`) is what the design
     // spec's Decision 6 actually calls for: fail loudly if anyone else owns
     // the name, and never let anyone take it from us.
-    let reply =
-        conn.request_name_with_flags(NOTIF_BUS_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into())?;
-    if reply != zbus::fdo::RequestNameReply::PrimaryOwner {
-        // Another notification daemon already owns the name (`DoNotQueue`
-        // yields `Exists` rather than queuing). Return an error so `main`'s
-        // friendly message surfaces; never steal the name (Decision 6:
-        // fatal + loud, never replace).
-        return Err(zbus::Error::Failure(format!(
-            "another notification daemon already owns {NOTIF_BUS_NAME} (got {reply:?})"
-        )));
+    let name_taken =
+        || SpawnError::NameTaken(format!("another notification daemon already owns {NOTIF_BUS_NAME}"));
+    // A conflict surfaces two ways depending on the bus: as `Err(NameTaken)`
+    // from `request_name_with_flags` itself, or as an `Ok(_)` reply that
+    // isn't `PrimaryOwner` (`DoNotQueue` yields `Exists` rather than queuing).
+    // Both mean "someone else owns it" and both must exit cleanly (Decision 6:
+    // fatal + loud, never steal the name), so map both to `NameTaken` — never
+    // the generic `Bus` variant that `main` would treat as a restartable
+    // failure and crash-loop on.
+    match conn.request_name_with_flags(NOTIF_BUS_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into()) {
+        Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {}
+        Ok(_) => return Err(name_taken()),
+        Err(zbus::Error::NameTaken) => return Err(name_taken()),
+        Err(err) => return Err(SpawnError::Bus(err)),
     }
 
     let emitter = conn.clone();
     std::thread::spawn(move || {
         let dest: Option<&str> = None;
-        // Two sources feed one signal stream: `svc_rx` carries changes
-        // produced synchronously by an interface method call (`Notify`,
-        // `CloseNotification`, `DismissAll`, `InvokeAction`,
-        // `SetDoNotDisturb`); `changes` (the `Receiver<Change>` passed in
-        // from `main`) carries changes produced asynchronously by the
-        // expiry worker (`Change::Closed(_, Expired)`). `Select` merges
-        // them into one ordered emitter loop rather than needing two
-        // separate emitter threads racing to emit on the same connection.
-        let mut sel = crossbeam_channel::Select::new();
-        let svc_idx = sel.recv(&svc_rx);
-        let ext_idx = sel.recv(&changes);
-        loop {
-            let op = sel.select();
-            let change = match op.index() {
-                i if i == svc_idx => op.recv(&svc_rx),
-                i if i == ext_idx => op.recv(&changes),
-                _ => unreachable!(),
-            };
-            let change = match change {
-                Ok(change) => change,
-                Err(_) => break,
-            };
+        // One ordered change stream feeds the emitter: interface methods and
+        // the expiry worker both send on clones of `changes_tx`, so ordering
+        // between an Added and a later Closed for the same id is preserved by
+        // the channel's FIFO (no `Select` to reorder them).
+        while let Ok(change) = changes_rx.recv() {
             emit(&emitter, dest, change);
         }
     });
@@ -309,6 +394,15 @@ fn emit(conn: &Connection, dest: Option<&str>, change: Change) {
         }
         Change::DndChanged(on) => {
             conn.emit_signal(dest, NOTIF_PATH, ICEDTEA_INTERFACE, "DoNotDisturbChanged", &(on,))
+        }
+        // A DND-suppressed notification is *hidden*, not closed: emit only the
+        // icedtea `NotificationRemoved` (so a popup UI drops the card and
+        // stays consistent with GetActive), never the standard
+        // `NotificationClosed` (the sender must not think its notification
+        // went away). `Undefined` marks "removed from the active view without
+        // a real close reason".
+        Change::Suppressed(id) => {
+            conn.emit_signal(dest, NOTIF_PATH, ICEDTEA_INTERFACE, "NotificationRemoved", &(id, CloseReason::Undefined))
         }
     };
     if let Err(err) = result {

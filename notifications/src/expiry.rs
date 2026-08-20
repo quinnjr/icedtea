@@ -7,12 +7,17 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use icedtea_contract::CloseReason;
 
 use crate::store::{Change, Store};
+
+/// Wall-clock unix epoch in ms — matches the clock `Store` stores
+/// `expire_at_ms` in, so [`Store::close_if_due`] compares like against like.
+fn epoch_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
 
 /// A message from the D-Bus service thread to the expiry worker.
 #[derive(Debug, Clone, Copy)]
@@ -51,14 +56,27 @@ pub fn run(store: Arc<Mutex<Store>>, ticks: Receiver<Tick>, changes: Sender<Chan
             Err(RecvTimeoutError::Disconnected) => return,
         }
 
+        // Collect every heap entry whose (monotonic) deadline has passed,
+        // then drain the batch under a single store lock (not one lock per
+        // id). Each id is closed only if the store's *current* deadline is
+        // genuinely due — `close_if_due` guards against a stale entry whose
+        // notification was replaced/extended/suppressed after scheduling.
         let now = Instant::now();
+        let mut due: Vec<u32> = Vec::new();
         while let Some(&Reverse((deadline, id))) = heap.peek() {
             if deadline > now {
                 break;
             }
             heap.pop();
-            if let Some(change) = store.lock().unwrap().close(id, CloseReason::Expired) {
-                let _ = changes.send(change);
+            due.push(id);
+        }
+        if !due.is_empty() {
+            let now_ms = epoch_ms();
+            let mut store = store.lock().unwrap();
+            for id in due {
+                if let Some(change) = store.close_if_due(id, now_ms) {
+                    let _ = changes.send(change);
+                }
             }
         }
     }
@@ -67,7 +85,7 @@ pub fn run(store: Arc<Mutex<Store>>, ticks: Receiver<Tick>, changes: Sender<Chan
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icedtea_contract::{IconSource, Urgency};
+    use icedtea_contract::{CloseReason, IconSource, Urgency};
     use std::thread;
 
     fn store() -> Arc<Mutex<Store>> {

@@ -161,6 +161,15 @@ fn notify(
     )
 }
 
+/// `Notify` with an explicit `resident` hint (and a never-expire timeout, so
+/// only an action or DND — not a timer — can affect it).
+fn notify_resident(conn: &zbus::blocking::Connection, app_name: &str, actions: Vec<String>, resident: bool) -> u32 {
+    let mut hints: HashMap<String, Value> = HashMap::new();
+    hints.insert("urgency".into(), Value::U8(1));
+    hints.insert("resident".into(), Value::Bool(resident));
+    call_std(conn, "Notify", &(app_name, 0u32, "", "summary", "body", actions, hints, 0i32))
+}
+
 #[test]
 fn full_notify_lifecycle_over_the_real_bus() {
     let probe = match zbus::blocking::Connection::session() {
@@ -281,4 +290,110 @@ fn full_notify_lifecycle_over_the_real_bus() {
     let (invoked_id, key) = action_rx.recv_timeout(SIGNAL_TIMEOUT).expect("ActionInvoked never fired");
     assert_eq!(invoked_id, action_id);
     assert_eq!(key, "default");
+
+    // --- #3 resident hint: a non-resident notification is removed once an
+    // action is invoked; a resident one stays. ---
+    let non_resident = notify_resident(&conn, "app-nonres", vec!["default".into(), "Open".into()], false);
+    let () = conn
+        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "InvokeAction", &(non_resident, "default"))
+        .expect("InvokeAction call failed")
+        .body()
+        .deserialize()
+        .unwrap_or(());
+    // The action fires, then the non-resident notification auto-closes as Dismissed (2).
+    let (_, _) = action_rx.recv_timeout(SIGNAL_TIMEOUT).expect("ActionInvoked (non-resident) never fired");
+    let closed = wait_for_closed(&closed_rx, non_resident, SIGNAL_TIMEOUT);
+    assert_eq!(closed, Some(2), "non-resident notification must auto-close (Dismissed=2) after its action");
+    let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
+    assert!(!active.iter().any(|n| n.id == non_resident), "non-resident must leave GetActive after its action");
+
+    let resident = notify_resident(&conn, "app-res", vec!["default".into(), "Open".into()], true);
+    let () = conn
+        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "InvokeAction", &(resident, "default"))
+        .expect("InvokeAction call failed")
+        .body()
+        .deserialize()
+        .unwrap_or(());
+    let (_, _) = action_rx.recv_timeout(SIGNAL_TIMEOUT).expect("ActionInvoked (resident) never fired");
+    let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
+    assert!(active.iter().any(|n| n.id == resident), "resident notification must remain in GetActive after its action");
+
+    // --- #4 DND<->expiry: a Normal notification with a short timeout posted
+    // under DND must not silently expire while hidden; it reappears (fresh
+    // countdown) when DND lifts. ---
+    let added_rx: mpsc::Receiver<(u32,)> = subscribe(ICEDTEA_IFACE, "NotificationAdded");
+    set_dnd(&conn, true);
+    let short = notify(&conn, "app-dnd-short", 0, vec![], 1, 150);
+    // #6: a suppressed notification is NOT announced as Added.
+    assert!(
+        !drain_added(&added_rx, short, Duration::from_millis(400)),
+        "a DND-suppressed notification must not emit NotificationAdded"
+    );
+    // Well past its 150ms timeout: it must still be alive (not expired while hidden).
+    let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
+    assert!(!active.iter().any(|n| n.id == short), "short notification stays suppressed under DND");
+    set_dnd(&conn, false);
+    // #6: becoming visible emits NotificationAdded.
+    assert!(drain_added(&added_rx, short, SIGNAL_TIMEOUT), "un-suppressing must emit NotificationAdded");
+    let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
+    assert!(
+        active.iter().any(|n| n.id == short),
+        "notification posted under DND with a short timeout must reappear (fresh countdown) once DND lifts, not be silently gone"
+    );
+    // And with its fresh countdown it eventually expires on its own.
+    let closed = wait_for_closed(&closed_rx, short, Duration::from_secs(3));
+    assert_eq!(closed, Some(1), "after DND lifts, the fresh countdown eventually expires it (Expired=1)");
+
+    // --- #2 DismissAll clears DND-suppressed notifications too. ---
+    set_dnd(&conn, true);
+    let hidden = notify(&conn, "app-dnd-hidden", 0, vec![], 1, 0);
+    let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
+    assert!(!active.iter().any(|n| n.id == hidden), "hidden under DND, absent from GetActive");
+    let () = conn
+        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "DismissAll", &())
+        .expect("DismissAll call failed")
+        .body()
+        .deserialize()
+        .unwrap_or(());
+    let closed = wait_for_closed(&closed_rx, hidden, SIGNAL_TIMEOUT);
+    assert_eq!(closed, Some(2), "DismissAll must dismiss (2) even a DND-suppressed notification");
+    set_dnd(&conn, false);
+}
+
+/// Call `SetDoNotDisturb(on)` and block until it returns.
+fn set_dnd(conn: &zbus::blocking::Connection, on: bool) {
+    let () = conn
+        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "SetDoNotDisturb", &(on,))
+        .expect("SetDoNotDisturb call failed")
+        .body()
+        .deserialize()
+        .unwrap_or(());
+}
+
+/// Drain `NotificationClosed` signals up to `timeout`, returning the reason
+/// code for `id` if it closes within the window (ignoring unrelated ids).
+fn wait_for_closed(rx: &mpsc::Receiver<(u32, u32)>, id: u32, timeout: Duration) -> Option<u32> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok((closed_id, reason)) = rx.recv_timeout(Duration::from_millis(100))
+            && closed_id == id
+        {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// Watch `NotificationAdded` for `window`, returning whether `id` was
+/// announced (ignoring unrelated ids).
+fn drain_added(rx: &mpsc::Receiver<(u32,)>, id: u32, window: Duration) -> bool {
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline {
+        if let Ok((added_id,)) = rx.recv_timeout(Duration::from_millis(100))
+            && added_id == id
+        {
+            return true;
+        }
+    }
+    false
 }

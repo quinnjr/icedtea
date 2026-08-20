@@ -13,6 +13,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use icedtea_contract::NOTIF_BUS_NAME;
+use icedtea_notifications::service::SpawnError;
 use icedtea_notifications::{expiry, service, store::Store};
 
 /// Bound on the closed-history ring (see `store::HISTORY_MAX`'s doc).
@@ -25,14 +27,32 @@ fn main() {
 
     std::thread::spawn({
         let store = store.clone();
+        let chg_tx = chg_tx.clone();
         move || expiry::run(store, tick_rx, chg_tx)
     });
 
-    let _dbus = service::spawn(store, chg_rx, tick_tx).expect(
-        "failed to register org.freedesktop.Notifications -- another notification daemon \
-         (mako, dunst, a stray previous instance) is already running; disable it before \
-         starting icedtea-notifications",
-    );
+    let _dbus = match service::spawn(store, chg_tx, chg_rx, tick_tx) {
+        Ok(conn) => conn,
+        Err(SpawnError::NameTaken(msg)) => {
+            // Decision 6: a bus-name conflict is fatal and loud — but NOT a
+            // crash. Exiting cleanly (code 0) with `Restart=on-failure` in the
+            // unit means systemd does NOT respawn us into a crash-loop against
+            // an already-running mako/dunst; we simply, quietly, stay out of
+            // the way. Never steal the name.
+            eprintln!("icedtea-notifications: {msg}");
+            eprintln!(
+                "Another notification daemon (mako, dunst, or a stray previous instance) already \
+                 owns {NOTIF_BUS_NAME}. Disable it before starting icedtea-notifications. Exiting."
+            );
+            std::process::exit(0);
+        }
+        Err(SpawnError::Bus(err)) => {
+            // A genuine D-Bus fault (no session bus, registration failure).
+            // Exit non-zero so `Restart=on-failure` can retry a transient one.
+            eprintln!("icedtea-notifications: fatal D-Bus error: {err}");
+            std::process::exit(1);
+        }
+    };
 
     // No Wayland loop to drive; park the main thread for the process's
     // life. Not a busy spin -- `park()` blocks until unparked, which

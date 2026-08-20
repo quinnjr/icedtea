@@ -55,7 +55,7 @@ pub enum IconSource {
 /// field is always present (zero/empty when the active variant doesn't use
 /// it). `IconSource` converts to/from it by hand below so the public Rust
 /// type keeps the exact variant shapes the model calls for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 struct IconSourceWire {
     tag: u32,
     name: String,
@@ -75,32 +75,13 @@ const ICON_TAG_PIXELS: u32 = 2;
 impl From<&IconSource> for IconSourceWire {
     fn from(src: &IconSource) -> Self {
         match src {
-            IconSource::None => IconSourceWire {
-                tag: ICON_TAG_NONE,
-                name: String::new(),
-                width: 0,
-                height: 0,
-                rowstride: 0,
-                has_alpha: false,
-                bits_per_sample: 0,
-                channels: 0,
-                data: Vec::new(),
-            },
-            IconSource::Named(name) => IconSourceWire {
-                tag: ICON_TAG_NAMED,
-                name: name.clone(),
-                width: 0,
-                height: 0,
-                rowstride: 0,
-                has_alpha: false,
-                bits_per_sample: 0,
-                channels: 0,
-                data: Vec::new(),
-            },
+            IconSource::None => IconSourceWire { tag: ICON_TAG_NONE, ..Default::default() },
+            IconSource::Named(name) => {
+                IconSourceWire { tag: ICON_TAG_NAMED, name: name.clone(), ..Default::default() }
+            }
             IconSource::Pixels { width, height, rowstride, has_alpha, bits_per_sample, channels, data } => {
                 IconSourceWire {
                     tag: ICON_TAG_PIXELS,
-                    name: String::new(),
                     width: *width,
                     height: *height,
                     rowstride: *rowstride,
@@ -108,6 +89,7 @@ impl From<&IconSource> for IconSourceWire {
                     bits_per_sample: *bits_per_sample,
                     channels: *channels,
                     data: data.clone(),
+                    ..Default::default()
                 }
             }
         }

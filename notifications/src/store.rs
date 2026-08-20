@@ -20,6 +20,29 @@ pub enum Change {
     Closed(u32, CloseReason),
     ActionInvoked(u32, String),
     DndChanged(bool),
+    /// A live notification became DND-suppressed (hidden from the active
+    /// list) without being closed — the service turns this into an
+    /// `org.icedtea.Notifications` `NotificationRemoved` only (no standard
+    /// `NotificationClosed`, since the notification is not actually closed),
+    /// so a popup UI tracking add/remove stays consistent with `GetActive`.
+    Suppressed(u32),
+}
+
+/// What `Store::set_dnd` changed: the new toggle value plus which live
+/// notifications crossed the visibility boundary, so the service can cancel
+/// or (re-)arm expiry and emit the matching add/remove signals (see the
+/// design spec's DND<->expiry coordination).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DndChange {
+    pub on: bool,
+    /// Ids that became suppressed (were visible, now hidden): cancel their
+    /// expiry tick and emit a removal.
+    pub newly_suppressed: Vec<u32>,
+    /// Ids that became visible (were hidden, now shown), each paired with a
+    /// freshly-recomputed `expire_at_ms` (a full countdown from "now", so a
+    /// notification that sat out DND isn't instantly expired): re-arm expiry
+    /// and emit an add.
+    pub newly_visible: Vec<(u32, Option<u64>)>,
 }
 
 /// Resolve the freedesktop `expire_timeout` argument (`-1`/`0`/`>0`) to a
@@ -74,19 +97,32 @@ impl Store {
         loop {
             let id = self.next_id;
             self.next_id = if self.next_id == u32::MAX { 1 } else { self.next_id + 1 };
-            if id != 0 && !self.items.iter().any(|n| n.id == id) {
+            // Skip 0 (spec requires nonzero), any still-live id, and any id
+            // still in closed_history — after a `u32::MAX` wrap a reused id
+            // that collided with a closed-history entry would let two
+            // distinct notifications share an id in the same session.
+            if id != 0
+                && !self.items.iter().any(|n| n.id == id)
+                && !self.closed_history.iter().any(|n| n.id == id)
+            {
                 return id;
             }
         }
     }
 
     /// `replaces_id != 0` updates that entry in place (same id, spec
-    /// semantics) and reports `Change::Added(id)` again — the standard
-    /// re-notify path (e.g. a download-progress notification updating its
-    /// percentage) — rather than removing+re-adding, so identity is stable
-    /// for the popup UI's animation state. If `replaces_id` doesn't match a
-    /// live notification (already closed, or never existed), a fresh one is
-    /// allocated instead — matching the D-Bus spec's own fallback.
+    /// semantics) — the standard re-notify path (e.g. a download-progress
+    /// notification updating its percentage) — rather than removing+re-adding,
+    /// so identity is stable for the popup UI's animation state. If
+    /// `replaces_id` doesn't match a live notification (already closed, or
+    /// never existed), a fresh one is allocated instead — matching the D-Bus
+    /// spec's own fallback.
+    ///
+    /// Returns `(id, suppressed, expire_at_ms)`: `suppressed` tells the
+    /// service whether the notification is currently DND-hidden (so it must
+    /// *not* emit `NotificationAdded` nor arm expiry — a suppressed
+    /// notification neither shows nor counts down while hidden), and
+    /// `expire_at_ms` is the deadline to arm when it *is* visible.
     #[allow(clippy::too_many_arguments)]
     pub fn notify(
         &mut self,
@@ -102,7 +138,7 @@ impl Store {
         transient: bool,
         expire_timeout: i32,
         now_ms: u64,
-    ) -> (u32, Change, Option<u64>) {
+    ) -> (u32, bool, Option<u64>) {
         let expire_at_ms = compute_expire_at(urgency, expire_timeout, now_ms);
         let suppressed = self.dnd && urgency != Urgency::Critical;
 
@@ -122,7 +158,7 @@ impl Store {
             existing.expire_at_ms = expire_at_ms;
             existing.suppressed = suppressed;
             let id = existing.id;
-            return (id, Change::Added(id), expire_at_ms);
+            return (id, suppressed, expire_at_ms);
         }
 
         let id = self.alloc_id();
@@ -142,7 +178,7 @@ impl Store {
             suppressed,
         };
         self.items.push(notification);
-        (id, Change::Added(id), expire_at_ms)
+        (id, suppressed, expire_at_ms)
     }
 
     /// Close a live notification. A no-op (`None`) if `id` isn't live —
@@ -163,6 +199,26 @@ impl Store {
         Some(Change::Closed(id, reason))
     }
 
+    /// Expire a notification **only if** its *current* stored deadline is
+    /// actually due at `now_ms` — the expiry worker calls this instead of
+    /// `close(id, Expired)` on a popped heap entry so a stale deadline can't
+    /// wrongly close a notification whose deadline changed after the entry
+    /// was scheduled. Skips closing when the notification: is no longer live
+    /// (already closed — the entry is simply gone, no wrong-reason close);
+    /// was replaced to never-expire (`expire_at_ms == None`); was extended
+    /// (`expire_at_ms > now_ms`, a later heap entry will handle it); or is
+    /// currently DND-suppressed (a hidden notification must not expire —
+    /// its countdown is re-armed fresh when DND lifts).
+    pub fn close_if_due(&mut self, id: u32, now_ms: u64) -> Option<Change> {
+        let n = self.items.iter().find(|n| n.id == id)?;
+        match n.expire_at_ms {
+            Some(deadline) if !n.suppressed && deadline <= now_ms => {
+                self.close(id, CloseReason::Expired)
+            }
+            _ => None,
+        }
+    }
+
     /// Record that an action was invoked on a still-live notification.
     /// `None` if `id` isn't live.
     pub fn invoke_action(&mut self, id: u32, key: &str) -> Option<Change> {
@@ -170,18 +226,62 @@ impl Store {
         Some(Change::ActionInvoked(id, key.to_string()))
     }
 
+    /// The `resident` hint of a live notification, or `None` if `id` isn't
+    /// live. `resident == false` means the notification is removed once one
+    /// of its actions is invoked; `true` keeps it up.
+    pub fn is_resident(&self, id: u32) -> Option<bool> {
+        self.items.iter().find(|n| n.id == id).map(|n| n.resident)
+    }
+
+    /// Every live notification's id, **including DND-suppressed ones** —
+    /// unlike [`active`](Self::active), which hides suppressed entries. Used
+    /// by `DismissAll` so a "clear everything" also clears notifications
+    /// hidden behind do-not-disturb.
+    pub fn live_ids(&self) -> Vec<u32> {
+        self.items.iter().map(|n| n.id).collect()
+    }
+
     /// Toggle do-not-disturb and recompute every live notification's
-    /// `suppressed` flag. `None` if `on` matches the current state (no real
-    /// change, so the service layer shouldn't emit `DndChanged`).
-    pub fn set_dnd(&mut self, on: bool) -> Option<Change> {
+    /// `suppressed` flag, reporting which notifications crossed the
+    /// visibility boundary so the service can cancel/re-arm expiry and emit
+    /// the matching signals. `None` if `on` matches the current state (no
+    /// real change, so the service layer shouldn't emit anything).
+    ///
+    /// A notification that *becomes visible* (DND turned off) gets a **fresh
+    /// countdown**: its `expire_at_ms` is recomputed as `now_ms + original
+    /// timeout` (and `created_at_ms` reset to `now_ms`, keeping the timeout
+    /// stable across repeated toggles), so a Normal notification posted under
+    /// DND with a short timeout isn't instantly expired the moment it
+    /// surfaces — it counts down from when the user could first see it.
+    pub fn set_dnd(&mut self, on: bool, now_ms: u64) -> Option<DndChange> {
         if self.dnd == on {
             return None;
         }
         self.dnd = on;
+        let dnd = self.dnd;
+        let mut newly_suppressed = Vec::new();
+        let mut newly_visible = Vec::new();
         for n in &mut self.items {
-            n.suppressed = self.dnd && n.urgency != Urgency::Critical;
+            let want_suppressed = dnd && n.urgency != Urgency::Critical;
+            if want_suppressed == n.suppressed {
+                continue;
+            }
+            if want_suppressed {
+                n.suppressed = true;
+                newly_suppressed.push(n.id);
+            } else {
+                n.suppressed = false;
+                // Fresh countdown from now for a timed notification that sat
+                // out DND; a never-expire one (`None`) stays never-expire.
+                if let Some(deadline) = n.expire_at_ms {
+                    let timeout = deadline.saturating_sub(n.created_at_ms);
+                    n.created_at_ms = now_ms;
+                    n.expire_at_ms = Some(now_ms.saturating_add(timeout));
+                }
+                newly_visible.push((n.id, n.expire_at_ms));
+            }
         }
-        Some(Change::DndChanged(on))
+        Some(DndChange { on, newly_suppressed, newly_visible })
     }
 
     pub fn dnd(&self) -> bool {
@@ -284,7 +384,7 @@ mod tests {
     fn notify_replace_in_place_keeps_same_id_and_refires_added() {
         let mut s = store();
         let id = push(&mut s, Urgency::Normal, 0);
-        let (replaced_id, change, _) = s.notify(
+        let (replaced_id, suppressed, _) = s.notify(
             "app".into(),
             id,
             IconSource::None,
@@ -299,7 +399,7 @@ mod tests {
             10,
         );
         assert_eq!(replaced_id, id, "replace keeps the same id");
-        assert_eq!(change, Change::Added(id), "replace re-fires Added");
+        assert!(!suppressed, "not DND-suppressed");
         assert_eq!(s.active().len(), 1, "still exactly one live notification");
         assert_eq!(s.active()[0].summary, "updated summary");
     }
@@ -307,7 +407,7 @@ mod tests {
     #[test]
     fn notify_replaces_id_not_live_allocates_fresh() {
         let mut s = store();
-        let (id, change, _) = s.notify(
+        let (id, suppressed, _) = s.notify(
             "app".into(),
             999, // nothing has this id yet
             IconSource::None,
@@ -322,7 +422,20 @@ mod tests {
             0,
         );
         assert_ne!(id, 0);
-        assert_eq!(change, Change::Added(id));
+        assert!(!suppressed);
+    }
+
+    #[test]
+    fn alloc_id_skips_ids_still_in_closed_history() {
+        // Simulate a `u32::MAX` wrap landing next_id on an id that is closed
+        // but still in the history ring: it must be skipped, not reused.
+        let mut s = store();
+        let closed = push(&mut s, Urgency::Normal, 0);
+        s.close(closed, CloseReason::Dismissed);
+        assert!(s.history().iter().any(|n| n.id == closed), "still in history");
+        s.next_id = closed; // force the collision
+        let fresh = push(&mut s, Urgency::Normal, 0);
+        assert_ne!(fresh, closed, "must not reuse an id still held in closed_history");
     }
 
     #[test]
@@ -340,7 +453,7 @@ mod tests {
     #[test]
     fn dnd_suppresses_normal_and_low_but_never_critical() {
         let mut s = store();
-        s.set_dnd(true);
+        s.set_dnd(true, 0);
         let low = push(&mut s, Urgency::Low, 0);
         let normal = push(&mut s, Urgency::Normal, 0);
         let critical = push(&mut s, Urgency::Critical, 0);
@@ -353,10 +466,14 @@ mod tests {
     #[test]
     fn dnd_toggle_off_unsuppresses_without_readding() {
         let mut s = store();
-        s.set_dnd(true);
+        s.set_dnd(true, 0);
         let id = push(&mut s, Urgency::Normal, 0);
         assert!(s.active().is_empty());
-        assert_eq!(s.set_dnd(false), Some(Change::DndChanged(false)));
+        let dc = s.set_dnd(false, 100).expect("state changed");
+        assert!(!dc.on);
+        assert!(dc.newly_suppressed.is_empty());
+        assert_eq!(dc.newly_visible.len(), 1);
+        assert_eq!(dc.newly_visible[0].0, id, "the suppressed one became visible");
         let active = s.active();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, id, "same id, not a new notification");
@@ -365,9 +482,53 @@ mod tests {
     #[test]
     fn set_dnd_to_current_state_is_a_noop() {
         let mut s = store();
-        assert_eq!(s.set_dnd(false), None, "already off");
-        s.set_dnd(true);
-        assert_eq!(s.set_dnd(true), None, "already on");
+        assert!(s.set_dnd(false, 0).is_none(), "already off");
+        s.set_dnd(true, 0);
+        assert!(s.set_dnd(true, 0).is_none(), "already on");
+    }
+
+    #[test]
+    fn dnd_off_gives_a_fresh_countdown_from_now_not_the_stale_deadline() {
+        // Posted under DND at t=0 with a 5s server-default timeout: its
+        // deadline is 5000. Lift DND far later (t=1_000_000): the notification
+        // must not be already-past-due; its countdown restarts from now.
+        let mut s = store();
+        s.set_dnd(true, 0);
+        let id = push(&mut s, Urgency::Normal, 0); // expire_at_ms == 5000
+        let dc = s.set_dnd(false, 1_000_000).expect("state changed");
+        let (vid, new_deadline) = dc.newly_visible[0];
+        assert_eq!(vid, id);
+        assert_eq!(
+            new_deadline,
+            Some(1_000_000 + SERVER_DEFAULT_EXPIRE_MS),
+            "fresh countdown from the un-suppress moment, not the stale t=0 deadline"
+        );
+        // And the stored deadline is not in the past relative to un-suppress.
+        assert!(s.active()[0].expire_at_ms.unwrap() > 1_000_000);
+    }
+
+    #[test]
+    fn dnd_off_keeps_never_expire_as_never_expire() {
+        let mut s = store();
+        s.set_dnd(true, 0);
+        // expire_timeout 0 => never expires
+        let (id, _, _) = s.notify(
+            "app".into(), 0, IconSource::None, "s".into(), "b".into(), vec![],
+            Urgency::Normal, None, false, false, 0, 0,
+        );
+        let dc = s.set_dnd(false, 500).expect("changed");
+        assert_eq!(dc.newly_visible, vec![(id, None)], "never-expire stays never-expire");
+    }
+
+    #[test]
+    fn dnd_on_reports_newly_suppressed_ids() {
+        let mut s = store();
+        let normal = push(&mut s, Urgency::Normal, 0);
+        let critical = push(&mut s, Urgency::Critical, 0);
+        let dc = s.set_dnd(true, 0).expect("changed");
+        assert_eq!(dc.newly_suppressed, vec![normal], "only the normal one is hidden");
+        assert!(dc.newly_visible.is_empty());
+        assert!(s.active().iter().any(|n| n.id == critical), "critical stays visible");
     }
 
     // --- close ---
@@ -454,5 +615,91 @@ mod tests {
     fn invoke_action_on_missing_id_is_none() {
         let mut s = store();
         assert_eq!(s.invoke_action(12345, "key1"), None);
+    }
+
+    // --- close_if_due (stale-deadline guard) ---
+
+    #[test]
+    fn close_if_due_closes_a_genuinely_due_notification() {
+        let mut s = store();
+        let id = push(&mut s, Urgency::Normal, 0); // expire_at_ms == 5000
+        assert_eq!(
+            s.close_if_due(id, 5000),
+            Some(Change::Closed(id, CloseReason::Expired)),
+            "deadline reached => Expired"
+        );
+        assert!(s.active().is_empty());
+    }
+
+    #[test]
+    fn close_if_due_skips_when_deadline_extended_by_replace() {
+        // Stale heap entry pops at the old deadline, but a replace-in-place
+        // pushed the deadline out — the old entry must not expire it.
+        let mut s = store();
+        let id = push(&mut s, Urgency::Normal, 0); // expire_at_ms == 5000
+        // Replace with a much longer timeout; new deadline 10 + 60_000.
+        s.notify(
+            "app".into(), id, IconSource::None, "s".into(), "b".into(), vec![],
+            Urgency::Normal, None, false, false, 60_000, 10,
+        );
+        assert_eq!(s.close_if_due(id, 5000), None, "extended deadline not yet due");
+        assert!(s.active().iter().any(|n| n.id == id), "still live");
+    }
+
+    #[test]
+    fn close_if_due_skips_when_replaced_to_never_expire() {
+        let mut s = store();
+        let id = push(&mut s, Urgency::Normal, 0); // expire_at_ms == 5000
+        s.notify(
+            "app".into(), id, IconSource::None, "s".into(), "b".into(), vec![],
+            Urgency::Normal, None, false, false, 0 /* never */, 10,
+        );
+        assert_eq!(s.close_if_due(id, 1_000_000), None, "never-expire is never due");
+        assert!(s.active().iter().any(|n| n.id == id));
+    }
+
+    #[test]
+    fn close_if_due_on_already_closed_id_is_a_noop() {
+        let mut s = store();
+        let id = push(&mut s, Urgency::Normal, 0);
+        s.close(id, CloseReason::Dismissed);
+        assert_eq!(s.close_if_due(id, 1_000_000), None, "already gone, no wrong-reason close");
+    }
+
+    #[test]
+    fn close_if_due_skips_a_suppressed_notification() {
+        // A hidden (DND-suppressed) notification must not expire while hidden.
+        let mut s = store();
+        s.set_dnd(true, 0);
+        let id = push(&mut s, Urgency::Normal, 0); // suppressed, expire_at_ms == 5000
+        assert_eq!(s.close_if_due(id, 1_000_000), None, "suppressed never expires while hidden");
+        assert!(s.live_ids().contains(&id), "still live");
+    }
+
+    // --- live_ids / is_resident ---
+
+    #[test]
+    fn live_ids_includes_dnd_suppressed_entries() {
+        let mut s = store();
+        s.set_dnd(true, 0);
+        let hidden = push(&mut s, Urgency::Normal, 0);
+        let critical = push(&mut s, Urgency::Critical, 0);
+        assert!(s.active().iter().all(|n| n.id != hidden), "hidden from active()");
+        let ids = s.live_ids();
+        assert!(ids.contains(&hidden), "but present in live_ids()");
+        assert!(ids.contains(&critical));
+    }
+
+    #[test]
+    fn is_resident_reports_the_hint() {
+        let mut s = store();
+        let (resident_id, _, _) = s.notify(
+            "app".into(), 0, IconSource::None, "s".into(), "b".into(), vec![],
+            Urgency::Normal, None, true /* resident */, false, -1, 0,
+        );
+        let non_resident = push(&mut s, Urgency::Normal, 0);
+        assert_eq!(s.is_resident(resident_id), Some(true));
+        assert_eq!(s.is_resident(non_resident), Some(false));
+        assert_eq!(s.is_resident(999), None, "unknown id");
     }
 }
