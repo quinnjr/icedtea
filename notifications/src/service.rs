@@ -23,7 +23,7 @@ use crossbeam_channel::{Receiver, Sender};
 use icedtea_contract::{CloseReason, IconSource, Notification, NotificationAction, NOTIF_BUS_NAME, NOTIF_PATH};
 use zbus::blocking::Connection;
 use zbus::interface;
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedValue, Structure, Value};
 
 use crate::expiry::Tick;
 use crate::store::{parse_urgency, Change, Store};
@@ -70,6 +70,31 @@ fn pair_actions(flat: Vec<String>) -> Vec<NotificationAction> {
     actions
 }
 
+/// The `image-data` hint (and its deprecated `icon_data` alias)'s wire shape
+/// is `(iiibiiay)`: width, height, rowstride, has-alpha, bits-per-sample,
+/// channels, raw row-major pixel bytes. A sender that gets this wrong --
+/// the hint absent, the wrong D-Bus type entirely, or a tuple with a
+/// mismatched field count/arity -- degrades to `None` (falling back to the
+/// `app_icon` argument) rather than breaking `Notify` for every other app.
+/// See the design spec's hint-robustness risk and N3's hardening pass.
+fn parse_image_data_hint(hints: &HashMap<String, OwnedValue>) -> Option<IconSource> {
+    let raw = hints.get("image-data").or_else(|| hints.get("icon_data"))?;
+    let value: Value = raw.clone().into();
+    let structure = Structure::try_from(value).ok()?;
+    let fields = structure.into_fields();
+    let [width, height, rowstride, has_alpha, bits_per_sample, channels, data]: [Value; 7] =
+        fields.try_into().ok()?;
+    Some(IconSource::Pixels {
+        width: i32::try_from(width).ok()?,
+        height: i32::try_from(height).ok()?,
+        rowstride: i32::try_from(rowstride).ok()?,
+        has_alpha: bool::try_from(has_alpha).ok()?,
+        bits_per_sample: i32::try_from(bits_per_sample).ok()?,
+        channels: i32::try_from(channels).ok()?,
+        data: Vec::<u8>::try_from(data).ok()?,
+    })
+}
+
 /// State shared by both interface wrappers.
 struct Shared {
     store: Arc<Mutex<Store>>,
@@ -111,7 +136,12 @@ impl StdInterface {
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
-        let icon = if app_icon.is_empty() { IconSource::None } else { IconSource::Named(app_icon) };
+        // `image-data`/`icon_data` hint (raw pixels) takes priority over the
+        // `app_icon` argument (a themed name or path), matching the
+        // freedesktop spec's own precedence; a malformed/absent hint falls
+        // back to `app_icon`.
+        let icon = parse_image_data_hint(&hints)
+            .unwrap_or(if app_icon.is_empty() { IconSource::None } else { IconSource::Named(app_icon) });
         let actions = pair_actions(actions);
         let urgency_byte = hints.get("urgency").and_then(|v| u8::try_from(v.clone()).ok());
         let urgency = parse_urgency(urgency_byte);
