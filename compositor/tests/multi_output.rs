@@ -347,6 +347,24 @@ fn disabling_every_output_keeps_at_least_one_active() {
     state.output_configuration_applied(vec![applied_head(&name_a, false)]);
     assert_eq!(state.outputs.len(), 1, "disabling one of two outputs is honored");
 
+    // Review finding #6: seed a SAVED config for the last output with a real
+    // custom mode/scale/transform/position, so we can prove that a REFUSED
+    // disable does not corrupt it. The refused head reports enabled=false with a
+    // 0x0 mode; persisting that would flip the record to disabled and wipe the
+    // saved mode -- which the next boot would then force-enable at preferred,
+    // losing everything.
+    state.config.displays.push(icedtea_config::DisplayConfig {
+        name: name_b.clone(),
+        enabled: true,
+        width: 2560,
+        height: 1440,
+        refresh_mhz: 144_000,
+        x: 100,
+        y: 0,
+        scale: 1.5,
+        transform: 3,
+    });
+
     // Disable the last remaining one, alone: the guard must refuse it so the
     // session is never left with zero active outputs.
     state.output_configuration_applied(vec![applied_head(&name_b, false)]);
@@ -356,6 +374,22 @@ fn disabling_every_output_keeps_at_least_one_active() {
         "the last active output must not be disabled -- >=1 output stays live"
     );
     assert!(state.outputs.keys().min().is_some(), "an active survivor output remains for placement");
+
+    // Review finding #6: the refused disable must NOT have corrupted name_b's
+    // persisted entry. It stays enabled=true with its saved mode intact.
+    let saved = state
+        .config
+        .displays
+        .iter()
+        .find(|d| d.name == name_b)
+        .expect("the refused output's saved config entry must survive");
+    assert!(saved.enabled, "a refused disable must keep the output enabled=true in persisted config");
+    assert_eq!(saved.width, 2560, "the saved mode width must not be wiped to 0 by a refused disable");
+    assert_eq!(saved.height, 1440, "the saved mode height must survive a refused disable");
+    assert_eq!(saved.refresh_mhz, 144_000, "the saved refresh must survive a refused disable");
+    assert_eq!(saved.scale, 1.5, "the saved scale must survive a refused disable");
+    assert_eq!(saved.transform, 3, "the saved transform must survive a refused disable");
+    assert_eq!(saved.x, 100, "the saved position must survive a refused disable");
 
     let _ = std::fs::remove_file(&tmp);
 }
