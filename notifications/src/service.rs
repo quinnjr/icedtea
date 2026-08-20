@@ -122,7 +122,7 @@ impl StdInterface {
 
         let (id, change, expire_at_ms) = {
             let mut store = self.0.store.lock().unwrap();
-            let (id, change) = store.notify(
+            store.notify(
                 app_name,
                 replaces_id,
                 icon,
@@ -135,9 +135,7 @@ impl StdInterface {
                 transient,
                 expire_timeout,
                 now,
-            );
-            let expire_at_ms = store.history().iter().find(|n| n.id == id).and_then(|n| n.expire_at_ms);
-            (id, change, expire_at_ms)
+            )
         };
 
         self.0.reschedule(id, expire_at_ms, now);
@@ -201,10 +199,11 @@ impl IcedteaInterface {
 
 /// Register both interfaces at [`NOTIF_PATH`], claim [`NOTIF_BUS_NAME`], and
 /// start the emitter thread that drains `changes` and turns each `Change`
-/// into the right signal(s). `request_name` uses default (non-replacing)
-/// zbus semantics: if another daemon already owns the name, this returns
-/// `Err` and the caller (`main`) treats that as fatal — see the design
-/// spec's Decision 6.
+/// into the right signal(s). Requests the name with `DoNotQueue` only (no
+/// `AllowReplacement`/`ReplaceExisting`): if another daemon already owns the
+/// name, this returns `Err` and the caller (`main`) treats that as fatal;
+/// this daemon itself is never replaceable, so it can't silently lose the
+/// name to a later process either — see the design spec's Decision 6.
 pub fn spawn(store: Arc<Mutex<Store>>, changes: Receiver<Change>, ticks: Sender<Tick>) -> zbus::Result<Connection> {
     let conn = Connection::session()?;
 
@@ -213,7 +212,21 @@ pub fn spawn(store: Arc<Mutex<Store>>, changes: Receiver<Change>, ticks: Sender<
 
     conn.object_server().at(NOTIF_PATH, StdInterface(shared.clone()))?;
     conn.object_server().at(NOTIF_PATH, IcedteaInterface(shared))?;
-    conn.request_name(NOTIF_BUS_NAME)?;
+    // `request_name`'s default flags are `AllowReplacement | ReplaceExisting
+    // | DoNotQueue` (see zbus's own fdo/dbus.rs test), which would let us
+    // steal the name from a replacement-allowing owner and would mark
+    // *this* daemon replaceable so a later process could silently steal it
+    // back — the opposite of "fatal+loud" on name conflict. `DoNotQueue`
+    // alone (no `AllowReplacement`/`ReplaceExisting`) is what the design
+    // spec's Decision 6 actually calls for: fail loudly if anyone else owns
+    // the name, and never let anyone take it from us.
+    let reply =
+        conn.request_name_with_flags(NOTIF_BUS_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into())?;
+    assert_eq!(
+        reply,
+        zbus::fdo::RequestNameReply::PrimaryOwner,
+        "expected exclusive ownership of {NOTIF_BUS_NAME}, got {reply:?}"
+    );
 
     let emitter = conn.clone();
     std::thread::spawn(move || {

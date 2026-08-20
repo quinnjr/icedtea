@@ -102,7 +102,7 @@ impl Store {
         transient: bool,
         expire_timeout: i32,
         now_ms: u64,
-    ) -> (u32, Change) {
+    ) -> (u32, Change, Option<u64>) {
         let expire_at_ms = compute_expire_at(urgency, expire_timeout, now_ms);
         let suppressed = self.dnd && urgency != Urgency::Critical;
 
@@ -122,7 +122,7 @@ impl Store {
             existing.expire_at_ms = expire_at_ms;
             existing.suppressed = suppressed;
             let id = existing.id;
-            return (id, Change::Added(id));
+            return (id, Change::Added(id), expire_at_ms);
         }
 
         let id = self.alloc_id();
@@ -142,7 +142,7 @@ impl Store {
             suppressed,
         };
         self.items.push(notification);
-        (id, Change::Added(id))
+        (id, Change::Added(id), expire_at_ms)
     }
 
     /// Close a live notification. A no-op (`None`) if `id` isn't live —
@@ -284,7 +284,7 @@ mod tests {
     fn notify_replace_in_place_keeps_same_id_and_refires_added() {
         let mut s = store();
         let id = push(&mut s, Urgency::Normal, 0);
-        let (replaced_id, change) = s.notify(
+        let (replaced_id, change, _) = s.notify(
             "app".into(),
             id,
             IconSource::None,
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn notify_replaces_id_not_live_allocates_fresh() {
         let mut s = store();
-        let (id, change) = s.notify(
+        let (id, change, _) = s.notify(
             "app".into(),
             999, // nothing has this id yet
             IconSource::None,
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn close_skips_history_for_transient_notifications() {
         let mut s = store();
-        let (id, _) = s.notify(
+        let (id, _, _) = s.notify(
             "app".into(),
             0,
             IconSource::None,
