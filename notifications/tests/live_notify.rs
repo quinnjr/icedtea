@@ -231,11 +231,11 @@ fn full_notify_lifecycle_over_the_real_bus() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut found = None;
     while Instant::now() < deadline {
-        if let Ok((closed_id, reason)) = closed_rx.recv_timeout(Duration::from_millis(200)) {
-            if closed_id == expiring_id {
-                found = Some(reason);
-                break;
-            }
+        if let Ok((closed_id, reason)) = closed_rx.recv_timeout(Duration::from_millis(200))
+            && closed_id == expiring_id
+        {
+            found = Some(reason);
+            break;
         }
     }
     assert_eq!(found, Some(1), "expire_timeout=50 must self-close with reason 1 (Expired) promptly");

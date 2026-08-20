@@ -252,11 +252,15 @@ pub fn spawn(store: Arc<Mutex<Store>>, changes: Receiver<Change>, ticks: Sender<
     // the name, and never let anyone take it from us.
     let reply =
         conn.request_name_with_flags(NOTIF_BUS_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into())?;
-    assert_eq!(
-        reply,
-        zbus::fdo::RequestNameReply::PrimaryOwner,
-        "expected exclusive ownership of {NOTIF_BUS_NAME}, got {reply:?}"
-    );
+    if reply != zbus::fdo::RequestNameReply::PrimaryOwner {
+        // Another notification daemon already owns the name (`DoNotQueue`
+        // yields `Exists` rather than queuing). Return an error so `main`'s
+        // friendly message surfaces; never steal the name (Decision 6:
+        // fatal + loud, never replace).
+        return Err(zbus::Error::Failure(format!(
+            "another notification daemon already owns {NOTIF_BUS_NAME} (got {reply:?})"
+        )));
+    }
 
     let emitter = conn.clone();
     std::thread::spawn(move || {
