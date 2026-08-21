@@ -344,6 +344,25 @@ impl Wayland {
         }
     }
 
+    /// Reflect the model's minimized state back to the client.
+    ///
+    /// xdg-shell has no minimized toplevel state to push (a client requests
+    /// minimize; the WM just hides the window), so this is a no-op for an xdg
+    /// toplevel — hiding is already carried by [`Self::set_visible`]. X11 is
+    /// different: `_NET_WM_STATE_HIDDEN` is a real window property an ICCCM/
+    /// EWMH client reads to know it has been iconified, so a WM-initiated
+    /// minimize must reach the surface through `set_xwayland_surface_minimized`
+    /// (which the xwm turns into the `_NET_WM_STATE_HIDDEN` atom) or an X11 app
+    /// never learns it was minimized. Silent no-op on a miss, like every other
+    /// seam here.
+    pub fn set_minimized(&self, id: WindowId, minimized: bool) {
+        let Some((runtime, key)) = self.resolve(id) else { return };
+        match key {
+            SurfaceKey::Xdg(_) => {}
+            SurfaceKey::X11(sid) => runtime.set_xwayland_surface_minimized(sid, minimized),
+        }
+    }
+
     /// Raise the window above its siblings.
     ///
     /// Separate from `set_position` because `behavior.raise_on_focus` decides

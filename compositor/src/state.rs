@@ -1787,6 +1787,7 @@ impl State {
             return;
         };
         let (geo, fullscreen, maximized, focused) = (w.geometry, w.fullscreen, w.maximized, w.focused);
+        let minimized = w.minimized;
         let visible = self.window_manager.is_visible(w);
         // Re-review finding New-4: the model's geometry is the *frame*; an
         // SSD window's client owns only the band below the title bar.
@@ -1869,6 +1870,11 @@ impl State {
         );
 
         self.wayland.set_visible(id, visible);
+        // Reflect the minimized flag to the client (X11 `_NET_WM_STATE_HIDDEN`;
+        // a no-op for xdg, whose hide is carried entirely by `set_visible`), so
+        // a WM-initiated minimize is observable to an X11 app, not just a scene
+        // hide the client never learns about.
+        self.wayland.set_minimized(id, minimized);
         if visible {
             self.wayland.set_position(id, content.x, content.y);
             // Ledger item 28 / recommendation 4: `behavior.raise_on_focus`
