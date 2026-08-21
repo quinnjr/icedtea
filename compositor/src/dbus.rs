@@ -125,6 +125,33 @@ pub enum DbCommand {
     /// start. Not reachable from `WmInterface` -- only the test harness sends
     /// this, same reasoning as `SessionLocked`.
     XwaylandDisplay { reply: Sender<Option<String>> },
+    /// Test-only: probe every mapped override-redirect (OR) X11 pop-up the
+    /// compositor is tracking in its M3 side-table, reading each one's *real*
+    /// scene state — node position, whether it is parented in the band above
+    /// managed toplevels, and whether it holds the seat keyboard — via the
+    /// `wlr::Runtime` xwayland scene accessors. Lets the OR end-to-end test
+    /// assert placement/stacking/focus without the OR surface ever entering the
+    /// `Window` model (which is the whole point of the OR path). Not reachable
+    /// from `WmInterface` -- only the test harness sends this, same reasoning as
+    /// `SessionLocked`.
+    XwaylandOverrideRedirect { reply: Sender<Vec<OverrideRedirectProbe>> },
+}
+
+/// One mapped override-redirect X11 pop-up, as the test-only
+/// [`DbCommand::XwaylandOverrideRedirect`] probe reports it — read straight off
+/// the live scene, not the compositor's own bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverrideRedirectProbe {
+    /// The pop-up scene node's position, in layout coordinates — the proof it
+    /// landed at its client-requested absolute coordinates.
+    pub position: (i32, i32),
+    /// Whether the node is parented in `Band::Top`, i.e. the band **above**
+    /// every managed toplevel (`Band::Toplevel`) — the proof it stacks over
+    /// managed windows.
+    pub above_toplevel: bool,
+    /// Whether the seat keyboard is currently pointed at this pop-up — the
+    /// proof a focus-taking menu is navigable.
+    pub keyboard_focused: bool,
 }
 
 /// Map a `contract::Event` to its D-Bus signal name, so the emitter thread

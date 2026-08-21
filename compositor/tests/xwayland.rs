@@ -36,8 +36,8 @@ use icedtea_contract::WindowId;
 use icedtea_harness::{Compositor, VirtualPointerClient};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
-    EventMask, PropMode, WindowClass,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
+    ConnectionExt as _, CreateWindowAux, EventMask, PropMode, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
@@ -793,6 +793,321 @@ fn live_title_and_class_updates_reach_the_model() {
 
     conn.destroy_window(win).expect("destroy X11 window");
     conn.flush().expect("flush destroy");
+}
+
+/// M3 — override-redirect pop-up. An OR X11 window maps at its own client
+/// coordinates as an *unmanaged* pop-up: it is placed at exactly those coords,
+/// is **not** entered into the `Window` model (so it wears no SSD and is no
+/// alt-tab/focus candidate), its scene node stacks in the band **above** a
+/// mapped managed toplevel, and — being a focus-taking OR window (wlroots'
+/// heuristic hands a plain OR window the keyboard) — it holds the seat keyboard.
+/// Skips visibly when Xwayland is absent, like every other test here.
+#[test]
+fn override_redirect_popup_is_an_unmanaged_placed_focused_pop_up() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed on this host; the OR pop-up test cannot run");
+        return;
+    }
+
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    let (conn, screen_num) = connect_with_retry(&display);
+    let screen = &conn.setup().roots[screen_num];
+
+    // A managed toplevel first, so there is a real managed window in the
+    // `Band::Toplevel` band for the OR pop-up to stack above.
+    let managed = map_managed_x11(&conn, screen, 400, 300);
+    let base = poll_for_window(&comp, Duration::from_secs(15))
+        .expect("the managed X11 window never entered the model");
+    assert_eq!(base.app_id, WINDOW_CLASS);
+
+    // Now an override-redirect pop-up at chosen absolute coordinates.
+    const OR_X: i16 = 320;
+    const OR_Y: i16 = 240;
+    const OR_W: u16 = 160;
+    const OR_H: u16 = 90;
+    let popup = map_override_redirect_x11(&conn, screen, OR_X, OR_Y, OR_W, OR_H);
+
+    // The compositor tracks exactly one OR pop-up, placed at the client coords,
+    // in the band above managed toplevels, holding the keyboard.
+    let probe = poll_or(&comp, Duration::from_secs(15), |ps| ps.len() == 1)
+        .expect("the OR pop-up never appeared in the compositor's OR side-table");
+    let p = probe[0];
+    assert_eq!(
+        p.position,
+        (OR_X as i32, OR_Y as i32),
+        "the OR pop-up was not placed at its client-requested coordinates"
+    );
+    assert!(p.above_toplevel, "the OR pop-up did not stack above managed toplevels");
+    assert!(
+        p.keyboard_focused,
+        "the focus-taking OR pop-up did not receive the seat keyboard"
+    );
+
+    // It is NOT in the `Window` model — the managed window is still the only
+    // row, so the pop-up is no alt-tab/focus candidate and wears no SSD.
+    let snap = comp.snapshot();
+    assert_eq!(
+        snap.windows.len(),
+        1,
+        "the OR pop-up must not enter the Window model, got {:?}",
+        snap.windows
+    );
+    assert!(snap.windows.iter().all(|w| w.id == base.id));
+
+    // Non-vacuous "no SSD": a managed window is configured to a content rect one
+    // title-bar shorter than its frame; an OR pop-up keeps its full requested
+    // size, because the compositor never insets or reconfigures it.
+    let full_size = poll_x_geometry(&conn, popup, Duration::from_secs(10), |g| {
+        g.width == OR_W && g.height == OR_H
+    });
+    assert!(full_size, "the OR pop-up was resized/decorated; it must keep its client size");
+
+    // Dismissing the pop-up (unmap) removes it from the side-table and hands the
+    // keyboard back to the managed window.
+    conn.unmap_window(popup).expect("unmap OR pop-up");
+    conn.flush().expect("flush unmap");
+    assert!(
+        poll_or(&comp, Duration::from_secs(15), |ps| ps.is_empty()).is_some(),
+        "the OR pop-up was not removed from the side-table on unmap"
+    );
+
+    conn.destroy_window(popup).expect("destroy OR pop-up");
+    conn.destroy_window(managed).expect("destroy managed window");
+    conn.flush().expect("flush destroy");
+}
+
+/// M3 — window-type placement. A managed transient dialog (`WM_TRANSIENT_FOR` a
+/// parent, `_NET_WM_WINDOW_TYPE_DIALOG`) is centered over its parent's frame,
+/// rather than being cascade-placed like an ordinary top-level. Asserts against
+/// the real model geometry of both windows. Skips visibly when Xwayland absent.
+#[test]
+fn managed_transient_dialog_is_centered_over_its_parent() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed on this host; the dialog placement test cannot run");
+        return;
+    }
+
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    let (conn, screen_num) = connect_with_retry(&display);
+    let screen = &conn.setup().roots[screen_num];
+
+    // The parent, mapped and placed by the WM.
+    let parent = map_managed_x11(&conn, screen, 600, 500);
+    let parent_win = poll_for_window(&comp, Duration::from_secs(15))
+        .expect("the parent X11 window never entered the model");
+    let parent_geo = parent_win.geometry;
+
+    // The dialog: transient for the parent, typed as a dialog, distinct title so
+    // it is identifiable in the model. Properties set before map so the xwm has
+    // them by the time the map event fires.
+    const DIALOG_W: u16 = 240;
+    const DIALOG_H: u16 = 160;
+    const DIALOG_TITLE: &str = "Icedtea Dialog";
+    let dialog = conn.generate_id().expect("generate dialog id");
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        dialog,
+        screen.root,
+        0,
+        0,
+        DIALOG_W,
+        DIALOG_H,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new().background_pixel(screen.white_pixel),
+    )
+    .expect("create dialog window");
+    let wm_class = format!("{WINDOW_INSTANCE}\0{WINDOW_CLASS}\0");
+    conn.change_property8(PropMode::REPLACE, dialog, AtomEnum::WM_CLASS, AtomEnum::STRING, wm_class.as_bytes())
+        .expect("set dialog WM_CLASS");
+    conn.change_property8(PropMode::REPLACE, dialog, AtomEnum::WM_NAME, AtomEnum::STRING, DIALOG_TITLE.as_bytes())
+        .expect("set dialog WM_NAME");
+    conn.change_property32(PropMode::REPLACE, dialog, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, &[parent])
+        .expect("set WM_TRANSIENT_FOR");
+    let wt_atom = intern(&conn, b"_NET_WM_WINDOW_TYPE");
+    let dialog_atom = intern(&conn, b"_NET_WM_WINDOW_TYPE_DIALOG");
+    conn.change_property32(PropMode::REPLACE, dialog, wt_atom, AtomEnum::ATOM, &[dialog_atom])
+        .expect("set _NET_WM_WINDOW_TYPE");
+    conn.map_window(dialog).expect("map dialog");
+    conn.flush().expect("flush dialog");
+
+    // Wait until the dialog is in the model (two windows), then read its frame.
+    let dialog_win = poll_named_window(&comp, DIALOG_TITLE, Duration::from_secs(15))
+        .expect("the dialog never entered the model");
+    let dg = dialog_win.geometry;
+
+    // Centered over the parent frame: top-left = parent center − dialog half.
+    let expect_x = parent_geo.x + (parent_geo.width - dg.width) / 2;
+    let expect_y = parent_geo.y + (parent_geo.height - dg.height) / 2;
+    assert_eq!(
+        (dg.x, dg.y),
+        (expect_x, expect_y),
+        "dialog frame {:?} is not centered over parent frame {:?}",
+        dg,
+        parent_geo
+    );
+
+    conn.destroy_window(dialog).expect("destroy dialog");
+    conn.destroy_window(parent).expect("destroy parent");
+    conn.flush().expect("flush destroy");
+}
+
+/// M3 — runtime override-redirect flip. A live managed window that flips its
+/// override-redirect attribute migrates out of the `Window` model into the OR
+/// side-table (and back), with no leak and no double-track. Asserts against the
+/// real model and OR-scene state on each transition. Skips visibly when absent.
+#[test]
+fn runtime_override_redirect_flip_migrates_between_managed_and_or() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed on this host; the OR flip test cannot run");
+        return;
+    }
+
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    let (conn, screen_num) = connect_with_retry(&display);
+    let screen = &conn.setup().roots[screen_num];
+
+    // Start managed.
+    let win = map_managed_x11(&conn, screen, 300, 200);
+    let modelled = poll_for_window(&comp, Duration::from_secs(15))
+        .expect("the window never entered the model as managed");
+    assert_eq!(comp.snapshot().windows.len(), 1);
+    assert!(comp.xwayland_override_redirect().is_empty(), "not OR yet");
+    let _ = modelled;
+
+    // Flip to override-redirect *while mapped*, then nudge it so the xwm sees a
+    // ConfigureNotify carrying the new flag and emits set_override_redirect —
+    // this drives the `xwayland_override_redirect_changed` migration handler.
+    conn.change_window_attributes(win, &ChangeWindowAttributesAux::new().override_redirect(1))
+        .expect("set override_redirect = 1");
+    conn.configure_window(win, &ConfigureWindowAux::new().x(360).y(300))
+        .expect("nudge to force ConfigureNotify");
+    conn.flush().expect("flush flip to OR");
+
+    // It leaves the model and becomes a tracked OR pop-up — the managed→OR
+    // runtime migration, with no model leak.
+    assert!(
+        poll_until(&comp, Duration::from_secs(15), |s| s.windows.is_empty()),
+        "the window did not leave the Window model when it became override-redirect"
+    );
+    assert!(
+        poll_or(&comp, Duration::from_secs(15), |ps| ps.len() == 1).is_some(),
+        "the window did not enter the OR side-table when it became override-redirect"
+    );
+
+    // Flip back to managed. An already-mapped window is only *adopted* into
+    // management at map time (the xwm intercepts a MapRequest, which a live
+    // window does not re-issue), so the realistic OR→managed migration is
+    // unmap → clear the flag → remap. On the remap the surface is no longer
+    // override-redirect, so it re-enters the managed model through the shared
+    // path — proving the reverse migration with no OR side-table leak.
+    conn.unmap_window(win).expect("unmap before adopting back");
+    conn.change_window_attributes(win, &ChangeWindowAttributesAux::new().override_redirect(0))
+        .expect("set override_redirect = 0");
+    conn.flush().expect("flush unmap+clear");
+    assert!(
+        poll_or(&comp, Duration::from_secs(15), |ps| ps.is_empty()).is_some(),
+        "the OR side-table still held the window after it unmapped"
+    );
+    conn.map_window(win).expect("remap as managed");
+    conn.flush().expect("flush remap");
+
+    // It re-enters the model and the OR side-table stays empty — no double-track.
+    assert!(
+        poll_until(&comp, Duration::from_secs(15), |s| s.windows.len() == 1),
+        "the window did not re-enter the Window model when it became managed again"
+    );
+    assert!(
+        comp.xwayland_override_redirect().is_empty(),
+        "the OR side-table still held the window after it became managed again"
+    );
+
+    conn.destroy_window(win).expect("destroy window");
+    conn.flush().expect("flush destroy");
+}
+
+/// Create and map one override-redirect X11 window of `w`x`h` at root
+/// coordinates `(x, y)` — an unmanaged pop-up (menu/tooltip/combo). The
+/// `override_redirect` attribute is what tells the xwm to leave it unmanaged.
+fn map_override_redirect_x11(
+    conn: &impl Connection,
+    screen: &x11rb::protocol::xproto::Screen,
+    x: i16,
+    y: i16,
+    w: u16,
+    h: u16,
+) -> u32 {
+    let win = conn.generate_id().expect("generate OR window id");
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        win,
+        screen.root,
+        x,
+        y,
+        w,
+        h,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new()
+            .background_pixel(screen.white_pixel)
+            .override_redirect(1),
+    )
+    .expect("create OR window");
+    conn.map_window(win).expect("map OR window");
+    conn.flush().expect("flush OR map");
+    win
+}
+
+/// Poll the OR side-table probe until `pred` holds over the reported pop-ups,
+/// returning the probe snapshot that satisfied it.
+fn poll_or(
+    comp: &Compositor,
+    timeout: Duration,
+    pred: impl Fn(&[icedtea_compositor::dbus::OverrideRedirectProbe]) -> bool,
+) -> Option<Vec<icedtea_compositor::dbus::OverrideRedirectProbe>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let ps = comp.xwayland_override_redirect();
+        if pred(&ps) {
+            return Some(ps);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    None
+}
+
+/// Poll the snapshot until a window with the given `title` appears, returning
+/// it — used to pick a specific one out when several share a class.
+fn poll_named_window(
+    comp: &Compositor,
+    title: &str,
+    timeout: Duration,
+) -> Option<icedtea_contract::WindowInfo> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(w) = comp.snapshot().windows.into_iter().find(|w| w.title == title) {
+            return Some(w);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    None
 }
 
 /// Poll the X server's own record of `win`'s geometry (updated by the xwm when

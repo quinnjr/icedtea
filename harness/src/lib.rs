@@ -373,6 +373,18 @@ impl Compositor {
             .expect("compositor never answered XwaylandDisplay")
     }
 
+    /// Probe every mapped override-redirect (OR) X11 pop-up the compositor is
+    /// tracking, reading each one's real scene state (position, whether it is in
+    /// the band above managed toplevels, and whether it holds the keyboard).
+    /// Blocks on the reply -- see [`Self::inject_touch_down`]'s doc.
+    pub fn xwayland_override_redirect(&self) -> Vec<icedtea_compositor::dbus::OverrideRedirectProbe> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::XwaylandOverrideRedirect { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered XwaylandOverrideRedirect")
+    }
+
     /// Synthesize a touch-down at `(x, y)` for touch point `id` on the
     /// compositor thread, via `wlr::Runtime::inject_touch_down`. Returns the
     /// grab serial it minted, or `None` if there was no seat or no surface

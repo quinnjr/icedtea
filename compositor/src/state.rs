@@ -478,6 +478,24 @@ pub enum PointerEvent {
     Release { pointer: (i32, i32) },
 }
 
+/// One mapped override-redirect (OR) X11 surface — an unmanaged pop-up (menu,
+/// tooltip, combo/dropdown list, drag icon) tracked entirely outside the
+/// `WindowManager` model (XWayland design Decision 4, M3).
+///
+/// An OR surface is never a `Window` row: it is placed at its own
+/// client-requested coordinates, wears no server-side decoration, is not an
+/// alt-tab or focus-MRU candidate, and stacks in the band **above** managed
+/// toplevels. All the compositor keeps for it is where it goes and whether it
+/// takes the keyboard; the scene node itself is the `wlr` crate's, built on
+/// `associate` and reparented above `Band::Toplevel` on map.
+#[derive(Debug, Clone, Copy)]
+struct OverrideRedirectSurface {
+    /// The pop-up's client-requested absolute geometry, refreshed on every
+    /// `request_configure`. `x`/`y` drive the scene-node placement; the size is
+    /// kept so a later reposition can be re-clamped if needed.
+    geometry: Rectangle,
+}
+
 pub struct State {
     pub window_manager: WindowManager,
     pub config: Config,
@@ -803,6 +821,24 @@ pub struct State {
     /// generalization that folds both onto one focus/stacking/SSD path is a
     /// later milestone (M2). Override-redirect surfaces are never entered here.
     xwayland_windows: HashMap<wlr::XwaylandSurfaceId, WindowId>,
+    /// Every mapped override-redirect (OR) X11 surface, keyed by
+    /// `XwaylandSurfaceId` — the M3 unmanaged-pop-up side-table (XWayland design
+    /// Decision 4). Deliberately **not** the `WindowManager` model: an OR
+    /// surface is a menu/tooltip/combo popup positioned at its own coordinates,
+    /// above managed toplevels, with no SSD and no place in alt-tab/MRU. Entries
+    /// are added on `xwayland_surface_mapped` (and on a managed→OR runtime flip),
+    /// repositioned on `request_configure`, and removed on unmap/destroy (or on
+    /// an OR→managed flip).
+    override_redirect: HashMap<wlr::XwaylandSurfaceId, OverrideRedirectSurface>,
+    /// The OR surface currently holding the seat keyboard, if any — the
+    /// override-redirect analogue of [`layer_focus`](Self::layer_focus).
+    ///
+    /// A focus-taking OR pop-up (a keyboard-navigable menu) is handed the
+    /// keyboard on map; while it holds it, `sync_seat_focus` must not reassert
+    /// the model's toplevel focus over it (exactly the churn `layer_focus`
+    /// guards against). Cleared — and the model's focus restored — when that
+    /// surface unmaps, is destroyed, or flips back to managed.
+    or_keyboard_focus: Option<wlr::XwaylandSurfaceId>,
     /// The `DISPLAY` name (`:N`) Xwayland last advertised, captured on
     /// `xwayland_ready`. `None` until Xwayland is up (or on a build/host with no
     /// Xwayland at all). Read back by the test-only `DbCommand::XwaylandDisplay`
@@ -930,6 +966,8 @@ impl State {
             ssd_hover: None,
             ssd_press: None,
             xwayland_windows: HashMap::new(),
+            override_redirect: HashMap::new(),
+            or_keyboard_focus: None,
             xwayland_display: None,
         }
     }
@@ -2062,6 +2100,16 @@ impl State {
         if layer_holds_keyboard_focus(self.layer_focus, &self.layers) {
             return;
         }
+        // An override-redirect pop-up that took the keyboard (a keyboard-
+        // navigable X11 menu) keeps it while mapped, for the same reason a
+        // layer surface does: the crate's seat has one keyboard-focus slot, so
+        // reasserting the model's toplevel focus here would yank the keyboard
+        // out from under the menu within a frame. The OR unmap/destroy/flip
+        // paths clear `or_keyboard_focus` and then call this, which is what
+        // lets the model's focus be restored.
+        if self.or_keyboard_focus.is_some_and(|id| self.override_redirect.contains_key(&id)) {
+            return;
+        }
         let focused = self
             .focused_id()
             .filter(|&id| self.window_manager.is_visible_id(id))
@@ -2247,6 +2295,160 @@ impl State {
         let Some(window_id) = self.xwayland_windows.remove(&id) else { return };
         self.forget_window(window_id);
         self.emit_pending();
+    }
+
+    /// Add a first-mapping managed (non-override-redirect) X11 surface to the
+    /// `WindowManager` model and drive it out to the client through the shared
+    /// path. Shared by the ordinary map and the OR→managed runtime flip.
+    ///
+    /// `add_window` autofocuses, so the outgoing focus is captured first, then
+    /// `sync_window_to_scene` builds the SSD, positions the scene node,
+    /// configures the client to the SSD content rect, activates it and reseats
+    /// keyboard focus — exactly as it does for an xdg toplevel. Placement comes
+    /// from [`place_managed_x11`](Self::place_managed_x11) (window-type / modal /
+    /// transient-parent aware), not the plain cascade.
+    fn add_managed_x11(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        let sid = surface.id();
+        let app_id = surface.class().or_else(|| surface.instance()).unwrap_or_default();
+        let title = surface.title().unwrap_or_default();
+        let pid = surface.pid().unwrap_or(0);
+        // X11 clients self-position, but a managed window is placed by the WM.
+        // The client's requested geometry is treated as the *frame* (the model's
+        // geometry is always the frame; `sync_window_to_scene` insets the SSD
+        // content rect and configures the client to that), so honour its
+        // requested size when it has one and fall back to the placeholder.
+        let g = surface.geometry();
+        let (width, height) = if g.width > 0 && g.height > 0 {
+            (g.width, g.height)
+        } else {
+            (PLACEHOLDER_SIZE.0, PLACEHOLDER_SIZE.1)
+        };
+        let geometry = self.place_managed_x11(surface, width, height);
+        tracing::info!(?sid, %app_id, %title, pid, ?geometry, "managed X11 window mapped");
+        let previous = self.focused_id();
+        let window_id = self.window_manager.add_window(&app_id, &title, pid, geometry);
+        self.xwayland_windows.insert(sid, window_id);
+        self.wayland.bind_x11(window_id, sid);
+        self.sync_window_to_scene(window_id);
+        self.sync_focus_change(previous);
+        self.emit_pending();
+    }
+
+    /// Choose a managed X11 window's initial frame placement from its
+    /// `_NET_WM_WINDOW_TYPE`, modal hint and transient parent (M3, task 4).
+    ///
+    /// A dialog — or any window carrying the modal hint — is centered over its
+    /// transient parent when it has one that is mapped on the active workspace,
+    /// so a "Save changes?" dialog lands over the document it belongs to; with
+    /// no such parent it centers on the output. A splash screen centers on the
+    /// output. Everything else (normal, utility, toolbar, …) cascades, exactly
+    /// as a native xdg toplevel does. The returned rectangle is the *frame*,
+    /// clamped so its top-left keeps the window on the output.
+    fn place_managed_x11(
+        &self,
+        surface: &wlr::XwaylandSurface<'_>,
+        width: i32,
+        height: i32,
+    ) -> Rectangle {
+        let output_geo = self
+            .usable_geo_for_pointer()
+            .unwrap_or(Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+        let centered_in = |area: Rectangle| -> (i32, i32) {
+            let x = area.x + (area.width - width) / 2;
+            let y = area.y + (area.height - height) / 2;
+            // Keep the frame's top-left on the output. `.max(output_geo.x/y)`
+            // guards the degenerate case of a window wider/taller than the
+            // output, where the upper clamp bound would fall below the lower.
+            let max_x = (output_geo.x + output_geo.width - width).max(output_geo.x);
+            let max_y = (output_geo.y + output_geo.height - height).max(output_geo.y);
+            (x.clamp(output_geo.x, max_x), y.clamp(output_geo.y, max_y))
+        };
+        // The transient parent's frame, if it is a managed X11 window mapped on
+        // the active, visible workspace — the anchor a dialog centers over.
+        let parent_geo = self
+            .wayland
+            .runtime()
+            .and_then(|rt| rt.xwayland_surface_parent(surface.id()))
+            .and_then(|pid| self.xwayland_windows.get(&pid).copied())
+            .and_then(|wid| self.window_manager.get(wid))
+            .filter(|w| {
+                w.workspace == self.window_manager.active_workspace() && !w.minimized
+            })
+            .map(|w| w.geometry);
+        let (x, y) = match surface.window_type() {
+            wlr::XwaylandWindowType::Dialog => {
+                centered_in(parent_geo.unwrap_or(output_geo))
+            }
+            wlr::XwaylandWindowType::Splash => centered_in(output_geo),
+            _ if surface.is_modal() => centered_in(parent_geo.unwrap_or(output_geo)),
+            _ => {
+                let occupied: Vec<Rectangle> = self
+                    .window_manager
+                    .windows_in_workspace(self.window_manager.active_workspace())
+                    .iter()
+                    .map(|w| w.geometry)
+                    .collect();
+                layout::cascade_point_in(&occupied, (width, height), 24, output_geo)
+            }
+        };
+        Rectangle { x, y, width, height }
+    }
+
+    /// Track and place a mapped override-redirect pop-up (M3). Shared by the
+    /// ordinary OR map and the managed→OR runtime flip.
+    ///
+    /// The pop-up's scene node — built by the crate on `associate` in
+    /// `Band::Toplevel` — is lifted into `Band::Top` (above every managed
+    /// toplevel, below the lock/overlay bands), positioned at the client's own
+    /// coordinates, and raised so a newer pop-up sits over an older one. No SSD
+    /// is ever attached. A focus-taking pop-up (a keyboard-navigable menu) is
+    /// then handed the seat keyboard.
+    fn map_override_redirect(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        let sid = surface.id();
+        let g = surface.geometry();
+        let geometry = Rectangle {
+            x: g.x,
+            y: g.y,
+            width: g.width.max(1),
+            height: g.height.max(1),
+        };
+        let wants_focus = surface.override_redirect_wants_focus();
+        tracing::info!(?sid, ?geometry, wants_focus, "override-redirect X11 surface mapped");
+        if let Some(rt) = self.wayland.runtime() {
+            rt.reparent_xwayland_surface_to_band(sid, wlr::Band::Top);
+            rt.set_xwayland_surface_position(sid, geometry.x, geometry.y);
+            rt.raise_xwayland_surface(sid);
+        }
+        self.override_redirect.insert(sid, OverrideRedirectSurface { geometry });
+        if wants_focus {
+            self.focus_override_redirect(sid);
+        }
+    }
+
+    /// Hand the seat keyboard to a focus-taking OR pop-up and remember it holds
+    /// it, so `sync_seat_focus` leaves it alone until it goes away.
+    fn focus_override_redirect(&mut self, sid: wlr::XwaylandSurfaceId) {
+        let Some(rt) = self.wayland.runtime() else { return };
+        rt.activate_xwayland_surface(sid, true);
+        if rt.focus_xwayland_surface_keyboard(sid).is_some() {
+            self.or_keyboard_focus = Some(sid);
+        }
+    }
+
+    /// Drop a mapped OR pop-up from the side-table, if present, and — when it
+    /// was the one holding the keyboard — restore focus to the model. Idempotent
+    /// against an id that was never an OR surface (a managed window, or one we
+    /// were never told about), so the unmap/destroy paths can call it blindly.
+    fn remove_override_redirect(&mut self, sid: wlr::XwaylandSurfaceId) {
+        if self.override_redirect.remove(&sid).is_none() {
+            return;
+        }
+        if self.or_keyboard_focus == Some(sid) {
+            self.or_keyboard_focus = None;
+            // The guard in `sync_seat_focus` now falls through to the model's
+            // focused window (or clears the seat if there is none).
+            self.sync_seat_focus();
+        }
     }
 
     /// Toggle fullscreen state for a window. When entering fullscreen, saves the
@@ -2969,6 +3171,30 @@ impl State {
                 // triggers the lazy `Xwayland` start.
                 let name = self.wayland.runtime().and_then(|rt| rt.xwayland_display_name());
                 let _ = reply.send(name);
+                return Some(());
+            }
+            DbCommand::XwaylandOverrideRedirect { reply } => {
+                // Report each tracked OR pop-up's *real* scene state, so the
+                // test asserts against the live scene rather than the
+                // compositor's own bookkeeping.
+                let mut out = Vec::new();
+                if let Some(rt) = self.wayland.runtime() {
+                    for &sid in self.override_redirect.keys() {
+                        let position = rt
+                            .xwayland_surface_scene_position(sid)
+                            .unwrap_or((i32::MIN, i32::MIN));
+                        let above_toplevel =
+                            rt.xwayland_surface_scene_parent_band(sid) == Some(wlr::Band::Top);
+                        let keyboard_focused =
+                            rt.xwayland_surface_has_keyboard_focus(sid).unwrap_or(false);
+                        out.push(crate::dbus::OverrideRedirectProbe {
+                            position,
+                            above_toplevel,
+                            keyboard_focused,
+                        });
+                    }
+                }
+                let _ = reply.send(out);
                 return Some(());
             }
         }
@@ -4694,6 +4920,14 @@ impl wlr::ToplevelHandler for State {
 
     fn xwayland_surface_mapped(&mut self, surface: &wlr::XwaylandSurface<'_>) {
         let sid = surface.id();
+        if surface.override_redirect() {
+            // Override-redirect pop-ups (menus, tooltips, combo/dropdown lists,
+            // drag icons) are unmanaged: placed at their own client coordinates,
+            // in the band above managed toplevels, with no SSD, tracked in the
+            // OR side-table rather than the `Window` model (M3, Decision 4).
+            self.map_override_redirect(surface);
+            return;
+        }
         if let Some(&window_id) = self.xwayland_windows.get(&sid) {
             // Remapped after an unmap while the row survived (an X11 window can
             // unmap and map again keeping its id). Treat it as a visibility
@@ -4703,53 +4937,7 @@ impl wlr::ToplevelHandler for State {
             self.emit_pending();
             return;
         }
-        if surface.override_redirect() {
-            // Override-redirect surfaces (menus, tooltips, drag icons) bypass
-            // the managed model entirely -- the unmanaged pop-up path is M3.
-            // The crate still renders them from their own scene node; M2 simply
-            // does not model them.
-            tracing::info!(?sid, "override-redirect X11 surface mapped (unmanaged; M3)");
-            return;
-        }
-        let app_id = surface.class().or_else(|| surface.instance()).unwrap_or_default();
-        let title = surface.title().unwrap_or_default();
-        let pid = surface.pid().unwrap_or(0);
-        // X11 clients self-position, but a managed window is placed by the WM,
-        // exactly as `new_toplevel` cascades native toplevels. The client's
-        // requested geometry is treated as the *frame* (the model's geometry is
-        // always the frame; `sync_window_to_scene` insets the SSD content rect
-        // and configures the client to that), so honour its requested size when
-        // it has one and fall back to the model placeholder otherwise.
-        let g = surface.geometry();
-        let (width, height) = if g.width > 0 && g.height > 0 {
-            (g.width, g.height)
-        } else {
-            (PLACEHOLDER_SIZE.0, PLACEHOLDER_SIZE.1)
-        };
-        let occupied: Vec<icedtea_contract::Rectangle> = self
-            .window_manager
-            .windows_in_workspace(self.window_manager.active_workspace())
-            .iter()
-            .map(|w| w.geometry)
-            .collect();
-        let output_geo = self
-            .usable_geo_for_pointer()
-            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
-        let (x, y) = layout::cascade_point_in(&occupied, (width, height), 24, output_geo);
-        let geometry = icedtea_contract::Rectangle { x, y, width, height };
-        tracing::info!(?sid, %app_id, %title, pid, ?geometry, "managed X11 window mapped");
-        // `add_window` autofocuses, so capture the outgoing focus first, then
-        // bind the surface and drive it entirely through the shared path:
-        // `sync_window_to_scene` builds the SSD, positions the scene node,
-        // configures the client to the content rect, activates it and reseats
-        // keyboard focus, exactly as it does for an xdg toplevel.
-        let previous = self.focused_id();
-        let window_id = self.window_manager.add_window(&app_id, &title, pid, geometry);
-        self.xwayland_windows.insert(sid, window_id);
-        self.wayland.bind_x11(window_id, sid);
-        self.sync_window_to_scene(window_id);
-        self.sync_focus_change(previous);
-        self.emit_pending();
+        self.add_managed_x11(surface);
     }
 
     fn xwayland_surface_unmapped(&mut self, id: wlr::XwaylandSurfaceId) {
@@ -4758,8 +4946,11 @@ impl wlr::ToplevelHandler for State {
         // the take-or-return guard makes it a no-op. (Parity note: xdg keeps
         // the row on unmap and hides it; X11 windows are removed because a
         // re-map mints a fresh model row, which is simpler and correct for the
-        // less common X11 remap case.)
+        // less common X11 remap case.) The id is *either* a managed window or an
+        // OR pop-up, never both, so both removals are tried — each is a no-op on
+        // the wrong table. An OR menu's unmap is exactly how it is dismissed.
         self.remove_xwayland_window(id);
+        self.remove_override_redirect(id);
     }
 
     fn xwayland_surface_destroyed(&mut self, id: wlr::XwaylandSurfaceId) {
@@ -4767,6 +4958,7 @@ impl wlr::ToplevelHandler for State {
         // trait documents that `destroyed` may name one we were never told
         // about).
         self.remove_xwayland_window(id);
+        self.remove_override_redirect(id);
     }
 
     fn xwayland_title_changed(&mut self, surface: &wlr::XwaylandSurface<'_>) {
@@ -4797,14 +4989,31 @@ impl wlr::ToplevelHandler for State {
         id: wlr::XwaylandSurfaceId,
         geometry: wlr::Box2D,
     ) {
+        // An override-redirect pop-up self-positioning: honour it verbatim —
+        // an OR surface owns its own coordinates (a menu that follows its
+        // anchor, a tooltip that repositions). Move the scene node to the new
+        // client coordinates and keep the side-table's geometry in step, so a
+        // later probe/reposition reads the truth. No SSD, no model row.
+        if let Some(or) = self.override_redirect.get_mut(&id) {
+            or.geometry = Rectangle {
+                x: geometry.x,
+                y: geometry.y,
+                width: geometry.width.max(1),
+                height: geometry.height.max(1),
+            };
+            let (x, y) = (or.geometry.x, or.geometry.y);
+            if let Some(rt) = self.wayland.runtime() {
+                rt.set_xwayland_surface_position(id, x, y);
+            }
+            return;
+        }
         // A managed X11 client self-positioning/resizing. icedtea is a floating
         // WM, so honour it — but the request is in *content* terms (the client
         // knows nothing of the SSD strip), and the model's geometry is the
         // frame, so add the title bar back on for a decorated window before
-        // storing it, then let the shared path re-inset and re-configure. An
-        // unmanaged/override-redirect surface has no model row and is left to
-        // the crate. Skip a resize while an interactive grab owns the window,
-        // so a client configure cannot fight a drag/resize in progress.
+        // storing it, then let the shared path re-inset and re-configure. Skip
+        // a resize while an interactive grab owns the window, so a client
+        // configure cannot fight a drag/resize in progress.
         let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
         if self.drag.window_id() == Some(window_id) || self.resize.window_id() == Some(window_id) {
             return;
@@ -4890,21 +5099,41 @@ impl wlr::ToplevelHandler for State {
         }
     }
 
-    fn xwayland_override_redirect_changed(
-        &mut self,
-        id: wlr::XwaylandSurfaceId,
-        override_redirect: bool,
-    ) {
-        // A surface can flip override-redirect at runtime. A window that
-        // becomes override-redirect must leave the managed model (the crate
-        // keeps rendering it from its own scene node); a window that becomes
-        // managed is picked up on its next map. Migrating a *mapped* managed
-        // window out to the unmanaged path — and the reverse — is M3; for M2
-        // the load-bearing half is not regressing OR: if a modelled window
-        // flips to OR, drop it from the model so it is no longer an alt-tab /
-        // focus candidate wearing an SSD it should not have.
-        if override_redirect {
-            self.remove_xwayland_window(id);
+    fn xwayland_override_redirect_changed(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        // A live surface can flip its override-redirect flag; the compositor
+        // migrates it between the managed `Window` model and the unmanaged OR
+        // side-table in both directions, with no leak and no double-track (M3,
+        // task 3). The surface handle carries the new flag *and* the identity
+        // needed to re-model it on the path it is moving to.
+        let sid = surface.id();
+        if surface.override_redirect() {
+            // managed → OR. Drop the model row first (this also tears down its
+            // SSD and reseats focus), then re-add it as an unmanaged pop-up.
+            // `map_override_redirect` reparents the still-live scene node up into
+            // `Band::Top` and places it at the client's own coordinates.
+            // Idempotent if it was somehow already OR: `remove_xwayland_window`
+            // no-ops and `map_override_redirect` overwrites the same entry.
+            self.remove_xwayland_window(sid);
+            self.map_override_redirect(surface);
+        } else {
+            // OR → managed. Only meaningful if it was actually an OR surface;
+            // for anything else (already managed, or unknown) there is nothing
+            // to migrate.
+            if self.override_redirect.remove(&sid).is_some() {
+                // Drop the keyboard-hold flag without restoring model focus
+                // here — `add_managed_x11` below reseats focus itself, so a
+                // `sync_seat_focus` now would only churn.
+                if self.or_keyboard_focus == Some(sid) {
+                    self.or_keyboard_focus = None;
+                }
+                // Reparent the scene node back down into the toplevel band, then
+                // model it through the shared managed path (SSD, window-type
+                // placement, focus), exactly like a fresh managed map.
+                if let Some(rt) = self.wayland.runtime() {
+                    rt.reparent_xwayland_surface_to_band(sid, wlr::Band::Toplevel);
+                }
+                self.add_managed_x11(surface);
+            }
         }
     }
 }
