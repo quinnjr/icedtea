@@ -608,6 +608,14 @@ struct ClientState {
     data_control_offer: Option<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1>,
     /// Mimes advertised on the in-flight data-control offer, reset per offer.
     data_control_mimes: Vec<String>,
+    /// The current data-control *primary* selection offer (data-control v2
+    /// bridges the middle-click/primary selection focus-lessly, exactly as it
+    /// does the clipboard). Distinct from `data_control_offer` so a test can
+    /// assert the two selections independently.
+    data_control_primary_offer: Option<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1>,
+    /// The primary source a data-control client last set, kept alive to answer
+    /// `send` -- the primary counterpart of `data_control_source`.
+    data_control_primary_source: Option<zwlr_data_control_source_v1::ZwlrDataControlSourceV1>,
 
     // --- primary selection (M4.1) ---
     primary_manager:
@@ -989,7 +997,12 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clie
         match event {
             zwlr_data_control_device_v1::Event::DataOffer { .. } => state.data_control_mimes.clear(),
             zwlr_data_control_device_v1::Event::Selection { id } => state.data_control_offer = id,
-            // PrimarySelection / Finished not needed for the clipboard read.
+            // data-control v2's primary (middle-click) selection, delivered the
+            // same focus-less way the clipboard `Selection` is. Stored so the
+            // X11<->primary bridge can be read without a focused Wayland client.
+            zwlr_data_control_device_v1::Event::PrimarySelection { id } => {
+                state.data_control_primary_offer = id
+            }
             _ => {}
         }
     }
@@ -2508,6 +2521,58 @@ impl DataControlClient {
     /// Whether a data-control selection offer has been delivered.
     pub fn has_offer(&self) -> bool {
         self.state.data_control_offer.is_some()
+    }
+
+    /// Own the *primary* (middle-click) selection with `payload` under `mime`,
+    /// focus-lessly, via data-control v2. The primary counterpart of
+    /// [`set_clipboard`](Self::set_clipboard).
+    pub fn set_primary(&mut self, mime: &str, payload: &[u8]) {
+        let manager = self.state.data_control_manager.clone().expect("no data-control manager");
+        let device = self.state.data_control_device.clone().expect("no data-control device");
+        self.state.offered_mime = mime.to_string();
+        self.state.offered_payload = payload.to_vec();
+        let source = manager.create_data_source(&self.qh, ());
+        source.offer(mime.to_string());
+        device.set_primary_selection(Some(&source));
+        self.state.data_control_primary_source = Some(source);
+        self.conn.flush().expect("flush data-control set_primary");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Whether a data-control *primary* selection offer has been delivered.
+    pub fn has_primary_offer(&self) -> bool {
+        self.state.data_control_primary_offer.is_some()
+    }
+
+    /// Read the current data-control *primary* selection when the owner services
+    /// `send` on its own thread (e.g. the X11 selection owner's event loop). The
+    /// primary counterpart of [`read_offer_blocking`](Self::read_offer_blocking).
+    pub fn read_primary_offer_blocking(&mut self, mime: &str) -> Vec<u8> {
+        let offer = self
+            .state
+            .data_control_primary_offer
+            .clone()
+            .expect("no data-control primary offer delivered");
+        let (read_end, write_end) = std::io::pipe().expect("pipe");
+        offer.receive(mime.to_string(), write_end.as_fd());
+        self.conn.flush().expect("flush primary receive");
+        drop(write_end);
+
+        let handle = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let mut read_end = read_end;
+            let _ = read_end.read_to_end(&mut buf);
+            buf
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if handle.is_finished() {
+                return handle.join().expect("read thread panicked");
+            }
+            assert!(Instant::now() < deadline, "primary selection read timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Pump the queue until `pred` holds or [`TIMEOUT`] elapses.

@@ -4915,6 +4915,34 @@ impl wlr::ToplevelHandler for State {
             unsafe {
                 std::env::set_var("DISPLAY", name);
             }
+            // Cursor robustness (M4): X11 toolkits load their pointer theme from
+            // `XCURSOR_THEME`/`XCURSOR_SIZE`, so a session child launched under
+            // the compositor's environment gets the same cursor a Wayland client
+            // would. Both are published here -- alongside `DISPLAY`, and before
+            // any child that reads them is spawned -- rather than at boot,
+            // because they are only meaningful once an X server exists. Any value
+            // the session already inherited is respected (a user's chosen theme
+            // must win); only the *absent* ones are given a sane default so X11
+            // apps never fall back to the tiny bitmap core-X cursor.
+            // `XCURSOR_SIZE` defaults to 24 -- the conventional logical cursor
+            // size; the scene renders X11 surfaces at the output's integer scale
+            // the same way it does Wayland ones, so the pointer geometry rides
+            // that path. A per-output/HiDPI-scaled cursor size and a
+            // compositor-chosen theme name are a configuration follow-up,
+            // deliberately not invented here.
+            //
+            // SAFETY (icedtea unsafe exception (c), same DISPLAY/env caveat as
+            // the `set_var("DISPLAY", ...)` above): mutates the process-global
+            // environment from inside `run_all`. Sound in practice because A1's
+            // session children read these once at spawn and nothing writes them
+            // concurrently; the robust child-spawn-env plumbing is the same
+            // documented follow-up the `DISPLAY` export carries.
+            if std::env::var_os("XCURSOR_THEME").is_none() {
+                unsafe { std::env::set_var("XCURSOR_THEME", "default") };
+            }
+            if std::env::var_os("XCURSOR_SIZE").is_none() {
+                unsafe { std::env::set_var("XCURSOR_SIZE", "24") };
+            }
         }
     }
 

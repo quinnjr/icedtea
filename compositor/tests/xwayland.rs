@@ -14,7 +14,8 @@
 //! `None`, and this test **skips visibly** rather than failing — so the
 //! workspace test gate stays green on machines (and CI images) without it.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Serializes the real-Xwayland end-to-end tests. Each one boots a full
@@ -33,14 +34,16 @@ fn x11_test_guard() -> MutexGuard<'static, ()> {
 
 use icedtea_compositor::dbus::DbCommand;
 use icedtea_contract::WindowId;
-use icedtea_harness::{Compositor, VirtualPointerClient};
+use icedtea_harness::{advertised_globals, Compositor, DataControlClient, VirtualPointerClient};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
-    ConnectionExt as _, CreateWindowAux, EventMask, PropMode, WindowClass,
+    ConnectionExt as _, CreateWindowAux, EventMask, PropMode, SelectionNotifyEvent, WindowClass,
+    SELECTION_NOTIFY_EVENT,
 };
+use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as _;
-use x11rb::COPY_DEPTH_FROM_PARENT;
+use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME, NONE};
 
 /// `BTN_LEFT` from `linux/input-event-codes.h`.
 const BTN_LEFT: u32 = 0x110;
@@ -1151,6 +1154,37 @@ fn poll_snapshot_window(
     None
 }
 
+/// Connect an X11 client *and* wait until the compositor has finished bringing
+/// Xwayland up -- specifically past the crate's `set_xwayland_seat`, which is
+/// what arms the clipboard/primary/DND bridge. The compositor runs
+/// `State::xwayland_ready` (which republishes `DISPLAY` into the process
+/// environment) *after* `set_xwayland_seat`, so an observed `DISPLAY == display`
+/// is a sound "bridge is armed" signal. Any `DISPLAY` a previous serialized test
+/// left behind is cleared first, so the wait can only be satisfied by *this*
+/// compositor's `ready`, never a stale value (display numbers can be reused
+/// across teardowns). Without this gate an X11 client that grabs a selection
+/// before the seat is wired is silently dropped by the xwm.
+fn wait_for_xwayland_ready(display: &str) -> (x11rb::rust_connection::RustConnection, usize) {
+    // SAFETY: the X11 e2e tests are serialized by `X11_TEST_LOCK`, so no other
+    // test mutates the environment concurrently; the compositor thread only
+    // *writes* `DISPLAY` (never reads it), so a concurrent clear cannot mislead
+    // it. This mirrors the env discipline the compositor's own `set_var` uses.
+    unsafe { std::env::remove_var("DISPLAY") };
+    // Connecting execs the lazy Xwayland, whose `ready` drives `set_xwayland_seat`
+    // and then the `DISPLAY` republish we wait on.
+    let pair = connect_with_retry(display);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::env::var("DISPLAY").ok().as_deref() != Some(display) {
+        assert!(
+            Instant::now() < deadline,
+            "Xwayland never signalled ready (DISPLAY {display} was not republished); \
+             the selection/DND bridge would not be armed"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    pair
+}
+
 /// Connect an X11 client to `display`, retrying briefly to absorb the lazy
 /// `Xwayland` exec. Panics with a clear message if it never comes up.
 fn connect_with_retry(
@@ -1352,4 +1386,509 @@ fn wait_for_wm_delete(
         std::thread::sleep(Duration::from_millis(50));
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// M4 — clipboard / primary / DnD bridge + DISPLAY / cursor robustness.
+//
+// These prove, end-to-end against a real Xwayland, that wlroots' `xwm`
+// automatically bridges the X11 CLIPBOARD/PRIMARY selections to the compositor's
+// `wlr_seat` selections once `wlr_xwayland_set_seat` is set (which the crate does
+// on `ready`). The compositor writes no selection code of its own -- the M4 job
+// is to *verify* the bridge, which is exactly what these tests do: an X11 client
+// and a Wayland `data-control` client exchange a text/plain payload across the
+// boundary, both directions, for both selections, and the actual bytes are
+// asserted to round-trip. The data-control device is the Wayland reader because
+// it is focus-less (like a real clipboard manager) -- the X11 tests map no
+// Wayland toplevel to take focus, so a `wl_data_device`/`zwp_primary_selection`
+// reader would never be offered the selection.
+
+/// The Wayland mime `wlr_xwm` maps the X11 `UTF8_STRING` selection target to
+/// (and back). Both directions of every selection test use it, so the assertion
+/// is on the mapped-mime path the bridge really takes, not a raw atom.
+const SELECTION_MIME: &str = "text/plain;charset=utf-8";
+
+/// A distinctive clipboard payload (with non-ASCII, so a botched charset
+/// mapping would corrupt it) proving the CLIPBOARD bridge round-trips bytes.
+const X11_CLIPBOARD_PAYLOAD: &[u8] = "icedtea⇄x11 CLIPBOARD ✂".as_bytes();
+/// The clipboard payload for the Wayland→X11 direction.
+const WL_CLIPBOARD_PAYLOAD: &[u8] = "wayland⇄icedtea CLIPBOARD 📋".as_bytes();
+/// The PRIMARY payload set by the X11 side.
+const X11_PRIMARY_PAYLOAD: &[u8] = "icedtea⇄x11 PRIMARY ⌗".as_bytes();
+/// The PRIMARY payload set by the Wayland side.
+const WL_PRIMARY_PAYLOAD: &[u8] = "wayland⇄icedtea PRIMARY ⎘".as_bytes();
+
+/// M4 — CLIPBOARD, X11 → Wayland. An X11 client owns the CLIPBOARD selection and
+/// serves a UTF-8 payload; a focus-less Wayland `data-control` client is offered
+/// the bridged selection and reads the exact bytes back. Non-vacuous: the bytes
+/// are compared for equality, and the payload carries non-ASCII, so neither a
+/// missing bridge (no offer) nor a charset mismatch could pass. Skips visibly
+/// when Xwayland is absent.
+#[test]
+fn x11_clipboard_selection_bridges_to_a_wayland_reader() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed; the X11→Wayland clipboard bridge test cannot run");
+        return;
+    }
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    // Gate on the bridge being armed (`set_seat` done) before the owner takes
+    // the selection -- an owner that grabs it earlier is dropped by the xwm.
+    let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+
+    let mut manager = DataControlClient::spawn(&comp.socket);
+    // The X11 owner runs its own event loop on a second connection, servicing
+    // the xwm's TARGETS/data requests as a real X app would.
+    let _owner = X11SelectionOwner::spawn(display.clone(), "CLIPBOARD", X11_CLIPBOARD_PAYLOAD.to_vec());
+
+    assert!(
+        manager.wait_until(|c| c.has_offer()),
+        "the X11 CLIPBOARD selection never reached the Wayland seat as a data-control offer"
+    );
+    let got = manager.read_offer_blocking(SELECTION_MIME);
+    assert_eq!(
+        got, X11_CLIPBOARD_PAYLOAD,
+        "the CLIPBOARD bytes did not round-trip X11 -> Wayland (got {:?})",
+        String::from_utf8_lossy(&got)
+    );
+    drop(conn);
+}
+
+/// M4 — CLIPBOARD, Wayland → X11. A focus-less `data-control` client owns the
+/// clipboard; an X11 client converts the CLIPBOARD selection and reads the exact
+/// bytes. Non-vacuous: byte-equality on a non-ASCII payload, and the X reader
+/// returns `None` (fails) if the bridge never made the xwm the CLIPBOARD owner.
+/// Skips visibly when Xwayland is absent.
+#[test]
+fn wayland_clipboard_selection_bridges_to_an_x11_reader() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed; the Wayland→X11 clipboard bridge test cannot run");
+        return;
+    }
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    let (conn, screen_num) = wait_for_xwayland_ready(&display);
+    let screen = conn.setup().roots[screen_num].clone();
+    // wlroots refuses to serve a Wayland-owned selection to X unless a focused
+    // Xwayland surface is asking, so map one that the compositor auto-focuses.
+    let focused = map_focused_managed_x11(&comp, &conn, &screen);
+
+    let mut manager = DataControlClient::spawn(&comp.socket);
+    manager.set_clipboard(SELECTION_MIME, WL_CLIPBOARD_PAYLOAD);
+
+    // The X reader converts CLIPBOARD and reads the property; the data-control
+    // owner must be pumped meanwhile so its source services the `send` the xwm
+    // forwards (owner and reader are both on this thread).
+    let got = x11_read_selection(&conn, &screen, "CLIPBOARD", Duration::from_secs(15), || {
+        manager.pump()
+    });
+    assert_eq!(
+        got.as_deref(),
+        Some(WL_CLIPBOARD_PAYLOAD),
+        "the CLIPBOARD bytes did not round-trip Wayland -> X11 (got {:?})",
+        got.as_ref().map(|b| String::from_utf8_lossy(b))
+    );
+    conn.destroy_window(focused).expect("destroy focused window");
+}
+
+/// M4 — PRIMARY, X11 → Wayland. As the CLIPBOARD X11→Wayland test, but over the
+/// PRIMARY (middle-click) selection, read through data-control v2's focus-less
+/// primary offer. Proves the second selection the xwm bridges. Skips visibly
+/// when Xwayland is absent.
+#[test]
+fn x11_primary_selection_bridges_to_a_wayland_reader() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed; the X11→Wayland primary bridge test cannot run");
+        return;
+    }
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+
+    let mut manager = DataControlClient::spawn(&comp.socket);
+    let _owner = X11SelectionOwner::spawn(display.clone(), "PRIMARY", X11_PRIMARY_PAYLOAD.to_vec());
+
+    assert!(
+        manager.wait_until(|c| c.has_primary_offer()),
+        "the X11 PRIMARY selection never reached the Wayland seat as a data-control primary offer"
+    );
+    let got = manager.read_primary_offer_blocking(SELECTION_MIME);
+    assert_eq!(
+        got, X11_PRIMARY_PAYLOAD,
+        "the PRIMARY bytes did not round-trip X11 -> Wayland (got {:?})",
+        String::from_utf8_lossy(&got)
+    );
+    drop(conn);
+}
+
+/// M4 — PRIMARY, Wayland → X11. A `data-control` client owns the primary
+/// selection focus-lessly; an X11 client converts PRIMARY and reads the exact
+/// bytes. Skips visibly when Xwayland is absent.
+#[test]
+fn wayland_primary_selection_bridges_to_an_x11_reader() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed; the Wayland→X11 primary bridge test cannot run");
+        return;
+    }
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    let (conn, screen_num) = wait_for_xwayland_ready(&display);
+    let screen = conn.setup().roots[screen_num].clone();
+    let focused = map_focused_managed_x11(&comp, &conn, &screen);
+
+    let mut manager = DataControlClient::spawn(&comp.socket);
+    manager.set_primary(SELECTION_MIME, WL_PRIMARY_PAYLOAD);
+
+    let got = x11_read_selection(&conn, &screen, "PRIMARY", Duration::from_secs(15), || {
+        manager.pump()
+    });
+    assert_eq!(
+        got.as_deref(),
+        Some(WL_PRIMARY_PAYLOAD),
+        "the PRIMARY bytes did not round-trip Wayland -> X11 (got {:?})",
+        got.as_ref().map(|b| String::from_utf8_lossy(b))
+    );
+    conn.destroy_window(focused).expect("destroy focused window");
+}
+
+/// M4 — XDND / `wl_data_device` bridge wiring. A full cross-boundary drag gesture
+/// is impractical to drive in the headless harness (it needs a live pointer grab
+/// crossing an X11 surface and a Wayland drop target in lockstep), so per the
+/// spec's "verify not build" this asserts the *wiring* the bridge rides on and
+/// documents what is proven by construction:
+///
+///   * `wl_data_device_manager` is advertised, so a Wayland client has a data
+///     device to receive an X11-originated drag offer (and to originate one).
+///   * The `wlr_xwm` XDND bridge and the clipboard/primary bridges are the *same
+///     mechanism* on the *same* `wlr_seat` -- all four come up together the
+///     instant `wlr_xwayland_set_seat` runs on `ready`. The four selection tests
+///     above prove that seat wiring is live end-to-end; XDND cannot be wired
+///     differently, because it is not wired separately. Hence: selection bridge
+///     proven end-to-end ⇒ the DnD data-device path is in place by construction.
+///
+/// This test fails only if the data-device manager global regresses; the deeper
+/// guarantee is carried by the selection round-trips. Skips visibly when
+/// Xwayland is absent (the seat/bridge only exists once Xwayland is ready).
+#[test]
+fn xdnd_data_device_bridge_is_wired() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed; the XDND wiring test cannot run");
+        return;
+    }
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    // Bring Xwayland up so the seat bridge (which carries XDND) is armed.
+    let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+
+    let globals = advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "wl_data_device_manager"),
+        "wl_data_device_manager (the XDND<->Wayland drag target) global is missing; saw {globals:?}"
+    );
+
+    // The bridge shares the seat the selection tests exercise; prove that seat's
+    // clipboard bridge is live here too, so this test also stands as the
+    // construction proof for XDND without relying on the others having run.
+    let mut manager = DataControlClient::spawn(&comp.socket);
+    let _owner =
+        X11SelectionOwner::spawn(display.clone(), "CLIPBOARD", X11_CLIPBOARD_PAYLOAD.to_vec());
+    assert!(
+        manager.wait_until(|c| c.has_offer()),
+        "the shared seat's selection bridge is not live -- XDND rides this same seat"
+    );
+    drop(conn);
+}
+
+/// M4 — DISPLAY + cursor environment robustness. Once Xwayland is `ready`, the
+/// compositor publishes a valid `DISPLAY` (`:N`) and the `XCURSOR_THEME`/
+/// `XCURSOR_SIZE` cursor hints into its own environment, so session children
+/// spawned *after* the lazy start inherit the right X server and pointer theme
+/// -- concretely resolving the M1 DISPLAY-ordering caveat (the export happens in
+/// the `ready` handler, before any post-ready spawn). The compositor runs in this
+/// test's own process, so the exported vars are observable here directly. Skips
+/// visibly when Xwayland is absent.
+#[test]
+fn xwayland_publishes_display_and_cursor_env_on_ready() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed; the DISPLAY/cursor env test cannot run");
+        return;
+    }
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    // A valid `:N` display string (optionally `:N.S`).
+    assert!(is_valid_display_name(&display), "advertised DISPLAY {display:?} is not a valid :N name");
+
+    // The env exports fire in `xwayland_ready`, which is lazy: force it by
+    // connecting a client, then poll the process environment.
+    let (conn, _screen_num) = connect_with_retry(&display);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let display_env = std::env::var("DISPLAY").ok();
+        let theme = std::env::var("XCURSOR_THEME").ok();
+        let size = std::env::var("XCURSOR_SIZE").ok();
+        if display_env.as_deref() == Some(display.as_str())
+            && theme.is_some()
+            && size.as_deref().is_some_and(|s| s.parse::<u32>().is_ok())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "DISPLAY/cursor env never published after ready (DISPLAY={display_env:?} \
+             XCURSOR_THEME={theme:?} XCURSOR_SIZE={size:?})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(conn);
+}
+
+/// A minimal X11 selection owner running its own event loop on a dedicated
+/// connection: it maps a managed top-level (which the compositor auto-focuses --
+/// wlroots refuses to bridge a CLIPBOARD/PRIMARY selection to Wayland unless a
+/// focused Xwayland surface owns it, exactly as a real X11 app has a window),
+/// takes ownership of a named selection (`CLIPBOARD`/`PRIMARY`), and answers
+/// `TARGETS` and `UTF8_STRING`/`STRING`/`TEXT` conversion requests with a fixed
+/// UTF-8 payload, exactly as a real X11 app that "copied" would. The loop runs
+/// continuously because the `wlr_xwm` requests `TARGETS` (to build the Wayland
+/// offer) and later the data (when a Wayland reader pulls) at times the test's
+/// main thread cannot predict, and it re-asserts ownership for a short while so
+/// the bridge is (re-)armed the moment the mapped window actually gains focus.
+struct X11SelectionOwner {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl X11SelectionOwner {
+    /// Take ownership of `selection` on `display` and serve `payload` until
+    /// dropped. Blocks (briefly) until ownership is confirmed, so a caller can
+    /// immediately expect the bridge to observe it.
+    fn spawn(display: String, selection: &'static str, payload: Vec<u8>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let (conn, screen_num) = connect_with_retry(&display);
+            let screen = conn.setup().roots[screen_num].clone();
+            // A managed (non-OR) top-level the compositor will auto-focus -- the
+            // focused Xwayland surface wlroots requires before it will bridge
+            // this client's selection.
+            let win = map_managed_x11(&conn, &screen, 200, 150);
+
+            let sel = intern(&conn, selection.as_bytes());
+            let targets = intern(&conn, b"TARGETS");
+            let utf8 = intern(&conn, b"UTF8_STRING");
+            let text = intern(&conn, b"TEXT");
+            let string_atom: Atom = AtomEnum::STRING.into();
+
+            conn.set_selection_owner(win, sel, CURRENT_TIME).expect("set_selection_owner");
+            conn.flush().expect("flush set_selection_owner");
+            // Confirm we actually hold it before signalling ready.
+            let owner = conn
+                .get_selection_owner(sel)
+                .expect("get_selection_owner request")
+                .reply()
+                .expect("get_selection_owner reply")
+                .owner;
+            assert_eq!(owner, win, "failed to take ownership of {selection}");
+            let _ = ready_tx.send(());
+
+            // Re-assert ownership a handful of times over the first few seconds:
+            // the initial grab can land before the just-mapped window has gained
+            // focus (wlroots then denies the bridge "no xwayland surface
+            // focused"), and each fresh SetSelectionOwner re-fires XFIXES so the
+            // xwm re-evaluates once focus is established.
+            let mut reasserts_left = 12u32;
+            let mut next_reassert = Instant::now() + Duration::from_millis(250);
+            while !stop_thread.load(Ordering::Relaxed) {
+                if reasserts_left > 0 && Instant::now() >= next_reassert {
+                    conn.set_selection_owner(win, sel, CURRENT_TIME).expect("re-set_selection_owner");
+                    conn.flush().expect("flush re-set_selection_owner");
+                    reasserts_left -= 1;
+                    next_reassert = Instant::now() + Duration::from_millis(250);
+                }
+                while let Ok(Some(event)) = conn.poll_for_event() {
+                    if let Event::SelectionRequest(req) = event {
+                        let mut property = req.property;
+                        if req.target == targets {
+                            let list = [utf8, string_atom, text];
+                            conn.change_property32(
+                                PropMode::REPLACE,
+                                req.requestor,
+                                req.property,
+                                AtomEnum::ATOM,
+                                &list,
+                            )
+                            .expect("write TARGETS");
+                        } else if req.target == utf8
+                            || req.target == string_atom
+                            || req.target == text
+                        {
+                            conn.change_property8(
+                                PropMode::REPLACE,
+                                req.requestor,
+                                req.property,
+                                req.target,
+                                &payload,
+                            )
+                            .expect("write selection payload");
+                        } else {
+                            // Unsupported target: refuse per ICCCM (property None).
+                            property = NONE;
+                        }
+                        let notify = SelectionNotifyEvent {
+                            response_type: SELECTION_NOTIFY_EVENT,
+                            sequence: 0,
+                            time: req.time,
+                            requestor: req.requestor,
+                            selection: req.selection,
+                            target: req.target,
+                            property,
+                        };
+                        conn.send_event(false, req.requestor, EventMask::NO_EVENT, notify)
+                            .expect("send SelectionNotify");
+                        conn.flush().expect("flush SelectionNotify");
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        // Wait for ownership to be confirmed (or fail fast if the thread died).
+        ready_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the X11 selection owner never took ownership");
+        X11SelectionOwner { stop, handle: Some(handle) }
+    }
+}
+
+impl Drop for X11SelectionOwner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Convert `selection` (`CLIPBOARD`/`PRIMARY`) to `UTF8_STRING` on a fresh
+/// requestor window and read the resulting property, returning the bytes once
+/// the owner (here the `wlr_xwm`, proxying a Wayland source) answers. `pump` is
+/// called each poll iteration so a same-thread Wayland selection owner services
+/// the `send` the xwm forwards. `None` if no answer arrives before `timeout`.
+fn x11_read_selection(
+    conn: &impl Connection,
+    screen: &x11rb::protocol::xproto::Screen,
+    selection: &str,
+    timeout: Duration,
+    mut pump: impl FnMut(),
+) -> Option<Vec<u8>> {
+    let win = conn.generate_id().expect("requestor window id");
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        win,
+        screen.root,
+        -100,
+        -100,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new()
+            .override_redirect(1)
+            .event_mask(EventMask::PROPERTY_CHANGE),
+    )
+    .expect("create requestor window");
+
+    let sel = intern(conn, selection.as_bytes());
+    let target = intern(conn, b"UTF8_STRING");
+    let property = intern(conn, b"ICEDTEA_SELECTION_IN");
+
+    let deadline = Instant::now() + timeout;
+    // Re-issue the conversion periodically: the xwm may not yet own the X
+    // selection the instant the Wayland side set it, so an early convert can
+    // come back refused (property == None).
+    let mut next_convert = Instant::now();
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if Instant::now() >= next_convert {
+            let _ = conn.delete_property(win, property);
+            conn.convert_selection(win, sel, target, property, CURRENT_TIME)
+                .expect("convert_selection");
+            conn.flush().expect("flush convert_selection");
+            next_convert = Instant::now() + Duration::from_millis(500);
+        }
+        pump();
+        while let Ok(Some(event)) = conn.poll_for_event() {
+            if let Event::SelectionNotify(n) = event {
+                if n.property == NONE {
+                    // Refused; fall through to the next re-convert.
+                    break;
+                }
+                let reply = conn
+                    .get_property(true, win, property, AtomEnum::ANY, 0, u32::MAX)
+                    .expect("get_property request")
+                    .reply()
+                    .expect("get_property reply");
+                if !reply.value.is_empty() {
+                    return Some(reply.value);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Map a managed X11 top-level and wait until the compositor has given it
+/// keyboard focus, returning its X id. wlroots gates *both* directions of the
+/// selection bridge on "a focused Xwayland surface", so a Wayland→X11 read needs
+/// some focused X window in the session even though the requestor is a separate
+/// unmapped window.
+fn map_focused_managed_x11(
+    comp: &Compositor,
+    conn: &impl Connection,
+    screen: &x11rb::protocol::xproto::Screen,
+) -> u32 {
+    let win = map_managed_x11(conn, screen, 200, 150);
+    let window = poll_for_window(comp, Duration::from_secs(15))
+        .expect("the focus-holding managed X11 window never entered the model");
+    assert!(
+        poll_snapshot_window(comp, window.id, Duration::from_secs(10), |w| w.focused).is_some(),
+        "the focus-holding managed X11 window never became focused"
+    );
+    win
+}
+
+/// Whether `name` is a well-formed X11 `DISPLAY` (`:N` or `:N.S`, host part
+/// empty for the local Xwayland socket).
+fn is_valid_display_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(':') else { return false };
+    let digits = rest.split('.').next().unwrap_or("");
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
