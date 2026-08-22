@@ -135,6 +135,16 @@ pub enum DbCommand {
     /// from `WmInterface` -- only the test harness sends this, same reasoning as
     /// `SessionLocked`.
     XwaylandOverrideRedirect { reply: Sender<Vec<OverrideRedirectProbe>> },
+    /// Test-only: override the primary output's recorded scale and, if Xwayland
+    /// is already up, re-publish the X11 HiDPI hint (`Xft.dpi` in the root
+    /// `RESOURCE_MANAGER`) for it. Lets the M4 HiDPI end-to-end test exercise a
+    /// scaled output without persisting a `DisplayConfig` or driving the
+    /// output-management protocol — it sets scale 2 and asserts the compositor
+    /// published `Xft.dpi: 192`. `reply` is a synchronization ack (the harness
+    /// call blocks until the scale has actually been recorded on the compositor
+    /// thread). Not reachable from `WmInterface` -- only the test harness sends
+    /// this, same reasoning as `SessionLocked`.
+    SetOutputScaleForTest { scale: f64, reply: Sender<()> },
 }
 
 /// One mapped override-redirect X11 pop-up, as the test-only

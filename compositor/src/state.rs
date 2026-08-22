@@ -60,15 +60,22 @@ pub struct OutputSurface {
     /// unit-test outputs built straight through [`Self::new`], and for the
     /// rare wlroots output not yet named.
     pub name: String,
+    /// The output's committed scale (`wlr::Output::set_scale`), mirrored here
+    /// because wlroots exposes no getter and the value is needed off the live
+    /// handler — specifically by [`State::primary_output_scale`], which the M4
+    /// HiDPI DPI-hint export reads to pick `Xft.dpi = 96 * integer_scale`.
+    /// Defaults to `1.0` for the unit-test outputs built through [`Self::new`];
+    /// `new_output` records the real applied scale on a live output.
+    pub scale: f64,
 }
 
 impl OutputSurface {
     /// Construct with no exclusive zones yet reserved -- `usable` starts
     /// equal to `geometry`, exactly as `create_output` documents. The name is
     /// empty; `new_output` records the real connector name on the live output
-    /// once one exists (see the field doc).
+    /// once one exists (see the field doc). Scale starts at the `1.0` identity.
     pub fn new(geometry: icedtea_contract::Rectangle) -> Self {
-        Self { geometry, usable: geometry, name: String::new() }
+        Self { geometry, usable: geometry, name: String::new(), scale: 1.0 }
     }
 }
 
@@ -3088,6 +3095,91 @@ impl State {
     /// is what actually calls `apply_reloaded_config` once the load
     /// finishes. If `config_reload_tx` hasn't been wired yet, this is a
     /// no-op.
+    /// The integer scale of the primary output (the lowest model index — the
+    /// same output `outputs.keys().min()` picks for single-output placement),
+    /// clamped to at least `1`. This is the scale the M4 HiDPI export applies to
+    /// X11 uniformly: X11 has no per-window scale, so the compositor targets the
+    /// single global (primary-output) scale, exactly as the design's HiDPI
+    /// decision spells out. A fractional committed scale is rounded up to the
+    /// next integer, since Xwayland is single-integer-scale. `1` when no output
+    /// exists yet (nothing to size against).
+    pub fn primary_output_scale(&self) -> i32 {
+        self.outputs
+            .keys()
+            .min()
+            .and_then(|idx| self.outputs.get(idx))
+            .map(|o| o.scale.ceil().max(1.0) as i32)
+            .unwrap_or(1)
+    }
+
+    /// Publish the X11 HiDPI hint: set `Xft.dpi = 96 * scale` in the root
+    /// window's `RESOURCE_MANAGER` property on the compositor's own Xwayland, so
+    /// X11 toolkits (GTK/Qt read this the way `xrdb` merges it) size fonts and
+    /// UI for the output scale. wlroots' `xwm` does not set `RESOURCE_MANAGER`
+    /// and there is no `wlr` API for it, so — like a real desktop session — the
+    /// compositor connects to its own X server as an ordinary client and sets
+    /// the property itself.
+    ///
+    /// Best-effort and fire-and-forget on a detached thread: a slow or refused
+    /// X connection must never block the compositor loop, and a failure only
+    /// costs X11 apps a correct DPI (they fall back to 96), never correctness of
+    /// the Wayland session. `display` is the `:N` just made valid by `ready`.
+    ///
+    /// HiDPI scope (design "HiDPI is fundamentally limited for X11"): this DPI
+    /// hint is how DPI-aware X11 toolkits scale under the single global integer
+    /// scale. Buffer-upscaling a *DPI-unaware* X11 client's surface to the
+    /// output scale would need scene-node scaling of a `wlr_scene_tree`, which
+    /// wlroots' scene graph does not offer for surface trees (only
+    /// `wlr_scene_buffer` dest-size), so it is a documented follow-up, not done
+    /// here. Mixed-DPI multi-monitor for X11 is the same known wlroots limit.
+    fn export_x11_dpi(display_name: String, scale: i32) {
+        let dpi = 96 * scale.max(1);
+        std::thread::spawn(move || {
+            use x11rb::connection::Connection as _;
+            use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+            use x11rb::wrapper::ConnectionExt as _;
+
+            let (conn, screen_num) = match x11rb::connect(Some(&display_name)) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    tracing::warn!(?err, name = %display_name, "could not connect to Xwayland to set Xft.dpi");
+                    return;
+                }
+            };
+            let root = conn.setup().roots[screen_num].root;
+            // `RESOURCE_MANAGER` is the conventional xrdb database, a `STRING`
+            // property of xrdb-style `name:\tvalue\n` lines on the root window.
+            let value = format!("Xft.dpi:\t{dpi}\n");
+            if let Err(err) = conn.change_property8(
+                PropMode::REPLACE,
+                root,
+                AtomEnum::RESOURCE_MANAGER,
+                AtomEnum::STRING,
+                value.as_bytes(),
+            ) {
+                tracing::warn!(?err, "could not set RESOURCE_MANAGER Xft.dpi on the X root");
+                return;
+            }
+            // A synchronous round-trip (rather than a bare `flush`) before the
+            // connection is dropped: the change request must be fully processed
+            // by the X server before this client disconnects, or the server can
+            // discard the still-buffered request when the socket closes. Reading
+            // back the input focus is a cheap request whose reply cannot arrive
+            // until everything queued ahead of it — the property change — has
+            // been handled.
+            match conn.get_input_focus() {
+                Ok(cookie) => {
+                    if let Err(err) = cookie.reply() {
+                        tracing::warn!(?err, "RESOURCE_MANAGER change may not have reached Xwayland");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "could not sync the RESOURCE_MANAGER change to Xwayland");
+                }
+            }
+        });
+    }
+
     pub fn handle_command(&mut self, cmd: crate::dbus::DbCommand) -> Option<()> {
         use crate::dbus::DbCommand;
         match cmd {
@@ -3195,6 +3287,24 @@ impl State {
                     }
                 }
                 let _ = reply.send(out);
+                return Some(());
+            }
+            DbCommand::SetOutputScaleForTest { scale, reply } => {
+                // Record the scale on the primary output (the lowest model
+                // index, the one `primary_output_scale` reads). If Xwayland is
+                // already `ready`, re-publish the DPI hint immediately so a test
+                // that raises the scale after boot observes the new `Xft.dpi`;
+                // a test that raises it before the first X connection instead
+                // has `ready` pick it up. A no-op if no output exists yet.
+                if let Some(&idx) = self.outputs.keys().min()
+                    && let Some(surface) = self.outputs.get_mut(&idx)
+                {
+                    surface.scale = scale;
+                }
+                if let Some(display) = self.xwayland_display.clone() {
+                    Self::export_x11_dpi(display, self.primary_output_scale());
+                }
+                let _ = reply.send(());
                 return Some(());
             }
         }
@@ -4003,6 +4113,12 @@ impl wlr::OutputHandler for State {
         // no persisted entry and takes the default preferred-mode path.
         let name = output.name().unwrap_or_default();
         let display_cfg = self.config.displays.iter().find(|d| d.name == name).cloned();
+        // The scale actually committed on this output, mirrored into
+        // `OutputSurface::scale` below so the M4 HiDPI DPI-hint export can read
+        // it off the model without a live handler. Every arm that ends in the
+        // preferred-mode default leaves this at the `1.0` identity; only a
+        // successfully-applied persisted config raises it.
+        let mut applied_scale = 1.0f64;
         match &display_cfg {
             Some(cfg) if cfg.enabled => {
                 // On ANY setter error the output must not be left dark:
@@ -4024,6 +4140,11 @@ impl wlr::OutputHandler for State {
                     if let Err(err) = output.set_transform(wlr::Transform::Normal) {
                         tracing::warn!(?err, %name, "could not reset transform on fallback");
                     }
+                } else {
+                    // The persisted config committed cleanly, so the scale it
+                    // asked for (guarded the same way `apply_display_config`
+                    // guards it) is what is now live on the output.
+                    applied_scale = Self::guarded_scale(cfg.scale) as f64;
                 }
             }
             Some(_) if !self.boot_disable_would_strand() => {
@@ -4117,9 +4238,11 @@ impl wlr::OutputHandler for State {
         self.create_output(index, geometry);
         // Record the connector name so the applied-config handler can map an
         // `AppliedHead` back to this index and `destroyed`/persist can look
-        // it up (see `OutputSurface::name`).
+        // it up (see `OutputSurface::name`), and the committed scale so the M4
+        // HiDPI DPI-hint export can read it (see `OutputSurface::scale`).
         if let Some(surface) = self.outputs.get_mut(&index) {
             surface.name = name;
+            surface.scale = applied_scale;
         }
         self.output_ids.insert(output.id(), index);
         // A new output needs its own wallpaper node (if a decode has
@@ -4924,12 +5047,10 @@ impl wlr::ToplevelHandler for State {
             // the session already inherited is respected (a user's chosen theme
             // must win); only the *absent* ones are given a sane default so X11
             // apps never fall back to the tiny bitmap core-X cursor.
-            // `XCURSOR_SIZE` defaults to 24 -- the conventional logical cursor
-            // size; the scene renders X11 surfaces at the output's integer scale
-            // the same way it does Wayland ones, so the pointer geometry rides
-            // that path. A per-output/HiDPI-scaled cursor size and a
-            // compositor-chosen theme name are a configuration follow-up,
-            // deliberately not invented here.
+            // `XCURSOR_SIZE` defaults to `24 * scale` -- 24 is the conventional
+            // logical cursor size, multiplied by the primary output's integer
+            // scale so the pointer is not tiny on a HiDPI output (X11 sizes the
+            // cursor in device pixels, not logical ones).
             //
             // SAFETY (icedtea unsafe exception (c), same DISPLAY/env caveat as
             // the `set_var("DISPLAY", ...)` above): mutates the process-global
@@ -4937,12 +5058,16 @@ impl wlr::ToplevelHandler for State {
             // session children read these once at spawn and nothing writes them
             // concurrently; the robust child-spawn-env plumbing is the same
             // documented follow-up the `DISPLAY` export carries.
+            let scale = self.primary_output_scale();
             if std::env::var_os("XCURSOR_THEME").is_none() {
                 unsafe { std::env::set_var("XCURSOR_THEME", "default") };
             }
             if std::env::var_os("XCURSOR_SIZE").is_none() {
-                unsafe { std::env::set_var("XCURSOR_SIZE", "24") };
+                unsafe { std::env::set_var("XCURSOR_SIZE", (24 * scale.max(1)).to_string()) };
             }
+            // Publish the X11 HiDPI hint (`Xft.dpi` in the root
+            // `RESOURCE_MANAGER`) so X11 toolkits size for the output scale.
+            Self::export_x11_dpi(name.to_owned(), scale);
         }
     }
 

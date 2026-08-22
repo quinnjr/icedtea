@@ -54,6 +54,16 @@ signal-hook = "0.3"
 # in a File.
 rustix = { version = "1", features = ["std"] }
 
+# X11 client used ONLY to publish the HiDPI hint (`Xft.dpi` in the root
+# `RESOURCE_MANAGER`) to the compositor's own Xwayland once it is `ready`
+# (M4). wlroots' `xwm` does not set `RESOURCE_MANAGER`, and there is no `wlr`
+# API for it, so the compositor sets it the way a real session does: by
+# connecting to its own X server as an ordinary client and changing the root
+# property. Best-effort, on a detached thread, so a slow/absent X server never
+# blocks the compositor loop. No-op on a build without Xwayland (`ready` never
+# fires). Same crate the X11 end-to-end tests already use.
+x11rb = "0.13"
+
 [dev-dependencies]
 tempfile = "3"
 wlr = "0.20.22"

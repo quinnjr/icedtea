@@ -373,6 +373,18 @@ impl Compositor {
             .expect("compositor never answered XwaylandDisplay")
     }
 
+    /// Override the primary output's recorded scale (and re-publish the X11
+    /// `Xft.dpi` hint if Xwayland is already up), for the M4 HiDPI test. Blocks
+    /// on the ack -- see [`Self::inject_touch_down`]'s doc -- so the scale has
+    /// actually been recorded before this returns.
+    pub fn set_output_scale_for_test(&self, scale: f64) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::SetOutputScaleForTest { scale, reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered SetOutputScaleForTest");
+    }
+
     /// Probe every mapped override-redirect (OR) X11 pop-up the compositor is
     /// tracking, reading each one's real scene state (position, whether it is in
     /// the band above managed toplevels, and whether it holds the keyboard).

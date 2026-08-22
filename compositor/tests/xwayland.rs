@@ -20,13 +20,37 @@ use std::time::{Duration, Instant};
 
 /// Serializes the real-Xwayland end-to-end tests. Each one boots a full
 /// headless compositor *and* a lazily-spawned `Xwayland` process (plus, in some
-/// cases, extra Wayland clients); running eight of those concurrently under the
+/// cases, extra Wayland clients); running many of those concurrently under the
 /// default multi-threaded test runner starves the slower boots and a window can
 /// miss its poll deadline. These tests are inherently heavyweight and
 /// integration-shaped, so serialize them here rather than relying on the caller
-/// passing `--test-threads=1`. Poisoning is ignored: a panicking test must not
-/// cascade into spurious failures of the rest.
+/// passing `--test-threads=1`: **every** test body takes this guard as its first
+/// act (after the cheap `Xwayland`-on-`PATH` skip check, which touches no
+/// compositor), so at most one compositor+Xwayland is ever live at a time
+/// regardless of how many test threads the harness spawns. The guard is dropped
+/// last (declared first), after each test's `Compositor` has been dropped and its
+/// thread joined, so there is no teardown overlap between consecutive tests.
+///
+/// This makes the suite reliable under the stated gate
+/// `cargo test -p icedtea-compositor --test xwayland` at any `--test-threads`.
+/// The remaining sensitivity is to *cross-binary* CPU contention (a full
+/// `cargo test -p icedtea-compositor` runs this binary alongside the others),
+/// which only slows a boot, never corrupts one; the generous [`MAP_TIMEOUT`]
+/// below absorbs that. Poisoning is ignored: a panicking test must not cascade
+/// into spurious failures of the rest.
 static X11_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// The deadline the heavyweight tests give a freshly-mapped X11 window to reach
+/// the compositor's model. Deliberately generous (well past the ~1s a warm boot
+/// needs): a real-Xwayland boot under cross-binary CPU contention — the other
+/// `icedtea-compositor` test binaries running alongside this one during a
+/// package-wide `cargo test` — can take several seconds, and a too-tight
+/// deadline here is exactly what turned that slowness into the flaky
+/// "the managed X11 window never entered the model" failures. Since the tests
+/// are serialized (see [`X11_TEST_LOCK`]) only one boot is ever in flight, so a
+/// long ceiling costs nothing on the happy path — a mapped window is observed in
+/// well under a second — and only ever bites a genuinely stuck one.
+const MAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn x11_test_guard() -> MutexGuard<'static, ()> {
     X11_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -165,7 +189,7 @@ fn one_managed_x11_window_maps_into_the_window_model() {
     conn.flush().expect("flush X11 requests");
 
     // Poll the model until the managed X11 window shows up, then assert on it.
-    let window = poll_for_window(&comp, Duration::from_secs(15))
+    let window = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the compositor's window model");
 
     assert_eq!(window.app_id, WINDOW_CLASS, "app_id should be the WM_CLASS class");
@@ -245,7 +269,7 @@ fn managed_x11_window_is_first_class() {
     conn.flush().expect("flush");
 
     // (1) It enters the model as one managed window with the right identity.
-    let window = poll_for_window(&comp, Duration::from_secs(15))
+    let window = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the compositor's window model");
     assert_eq!(window.app_id, WINDOW_CLASS, "app_id is the WM_CLASS class");
     assert_eq!(window.title, WINDOW_TITLE, "title is the X11 window name");
@@ -362,7 +386,7 @@ fn fullscreen_x11_window_fills_the_output_without_ssd() {
     const FRAME_W: u16 = 400;
     const FRAME_H: u16 = 300;
     let win = map_managed_x11(&conn, &screen, FRAME_W, FRAME_H);
-    let window = poll_for_window(&comp, Duration::from_secs(15))
+    let window = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the model");
     let id = window.id;
     // Baseline: decorated, so the client sits in the SSD content rect.
@@ -452,7 +476,7 @@ fn minimize_x11_window_hides_it_and_reaches_the_surface() {
     let screen = conn.setup().roots[screen_num].clone();
 
     let win = map_managed_x11(&conn, &screen, 400, 300);
-    let window = poll_for_window(&comp, Duration::from_secs(15))
+    let window = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the model");
     let id = window.id;
     // It starts focused (freshly mapped, autofocused).
@@ -520,7 +544,7 @@ fn interactive_move_via_net_wm_moveresize_moves_the_window() {
     let screen = conn.setup().roots[screen_num].clone();
 
     let win = map_managed_x11(&conn, &screen, 400, 300);
-    let window = poll_for_window(&comp, Duration::from_secs(15))
+    let window = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the model");
     let id = window.id;
 
@@ -616,7 +640,7 @@ fn raising_a_managed_x11_window_restacks_it_above_the_other() {
 
     // A maps first and is the only window.
     let win_a = map_managed_x11(&conn, &screen, 300, 200);
-    let a = poll_for_window(&comp, Duration::from_secs(15))
+    let a = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("window A never entered the model");
     let a_id = a.id;
 
@@ -717,7 +741,7 @@ fn wm_initiated_close_reaches_the_x11_client() {
     conn.map_window(win).expect("map X11 window");
     conn.flush().expect("flush");
 
-    let window = poll_for_window(&comp, Duration::from_secs(15))
+    let window = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the model");
     let id = window.id;
 
@@ -760,7 +784,7 @@ fn live_title_and_class_updates_reach_the_model() {
     let screen = conn.setup().roots[screen_num].clone();
 
     let win = map_managed_x11(&conn, &screen, 400, 300);
-    let window = poll_for_window(&comp, Duration::from_secs(15))
+    let window = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the model");
     let id = window.id;
     assert_eq!(window.app_id, WINDOW_CLASS, "baseline app_id");
@@ -824,7 +848,7 @@ fn override_redirect_popup_is_an_unmanaged_placed_focused_pop_up() {
     // A managed toplevel first, so there is a real managed window in the
     // `Band::Toplevel` band for the OR pop-up to stack above.
     let managed = map_managed_x11(&conn, screen, 400, 300);
-    let base = poll_for_window(&comp, Duration::from_secs(15))
+    let base = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the model");
     assert_eq!(base.app_id, WINDOW_CLASS);
 
@@ -906,7 +930,7 @@ fn managed_transient_dialog_is_centered_over_its_parent() {
 
     // The parent, mapped and placed by the WM.
     let parent = map_managed_x11(&conn, screen, 600, 500);
-    let parent_win = poll_for_window(&comp, Duration::from_secs(15))
+    let parent_win = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the parent X11 window never entered the model");
     let parent_geo = parent_win.geometry;
 
@@ -988,7 +1012,7 @@ fn runtime_override_redirect_flip_migrates_between_managed_and_or() {
 
     // Start managed.
     let win = map_managed_x11(&conn, screen, 300, 200);
-    let modelled = poll_for_window(&comp, Duration::from_secs(15))
+    let modelled = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the window never entered the model as managed");
     assert_eq!(comp.snapshot().windows.len(), 1);
     assert!(comp.xwayland_override_redirect().is_empty(), "not OR yet");
@@ -1620,12 +1644,19 @@ fn xdnd_data_device_bridge_is_wired() {
 }
 
 /// M4 — DISPLAY + cursor environment robustness. Once Xwayland is `ready`, the
-/// compositor publishes a valid `DISPLAY` (`:N`) and the `XCURSOR_THEME`/
-/// `XCURSOR_SIZE` cursor hints into its own environment, so session children
-/// spawned *after* the lazy start inherit the right X server and pointer theme
-/// -- concretely resolving the M1 DISPLAY-ordering caveat (the export happens in
-/// the `ready` handler, before any post-ready spawn). The compositor runs in this
-/// test's own process, so the exported vars are observable here directly. Skips
+/// compositor publishes a valid `DISPLAY` (`:N`) and, *when they are absent*, the
+/// `XCURSOR_THEME`/`XCURSOR_SIZE` cursor hints into its own environment, so
+/// session children spawned *after* the lazy start inherit the right X server and
+/// pointer theme -- concretely resolving the M1 DISPLAY-ordering caveat (the
+/// export happens in the `ready` handler, before any post-ready spawn). The
+/// compositor runs in this test's own process, so the exported vars are
+/// observable here directly.
+///
+/// Non-vacuous, unlike the earlier version that read whatever ambient
+/// `XCURSOR_*` this runner already exports: the cursor vars are *cleared* before
+/// the compositor boots, so a passing assertion can only come from the
+/// compositor's own export. Both branches of the export are covered -- publish a
+/// default when absent, and *respect* a value the session already chose. Skips
 /// visibly when Xwayland is absent.
 #[test]
 fn xwayland_publishes_display_and_cursor_env_on_ready() {
@@ -1634,36 +1665,217 @@ fn xwayland_publishes_display_and_cursor_env_on_ready() {
         eprintln!("SKIP: Xwayland is not installed; the DISPLAY/cursor env test cannot run");
         return;
     }
+
+    // Save whatever this runner exported so the process env is left as we found
+    // it (these tests share one process; be a good neighbour).
+    let saved_theme = std::env::var_os("XCURSOR_THEME");
+    let saved_size = std::env::var_os("XCURSOR_SIZE");
+
+    // --- Branch 1: absent -> the compositor publishes the sane defaults. ---
+    // SAFETY: the X11 e2e tests are serialized by `X11_TEST_LOCK`, so no other
+    // test mutates the environment concurrently; the compositor thread only
+    // *writes* these (never reads back what it wrote), so a concurrent clear
+    // cannot mislead it. Same env discipline as `wait_for_xwayland_ready`.
+    unsafe {
+        std::env::remove_var("XCURSOR_THEME");
+        std::env::remove_var("XCURSOR_SIZE");
+    }
     let comp = Compositor::spawn();
     let Some(display) = comp.xwayland_display() else {
         eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        // Restore before the early return.
+        restore_cursor_env(saved_theme, saved_size);
         return;
     };
-    // A valid `:N` display string (optionally `:N.S`).
     assert!(is_valid_display_name(&display), "advertised DISPLAY {display:?} is not a valid :N name");
-
     // The env exports fire in `xwayland_ready`, which is lazy: force it by
-    // connecting a client, then poll the process environment.
+    // connecting a client, then poll the process environment for the defaults.
     let (conn, _screen_num) = connect_with_retry(&display);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let display_env = std::env::var("DISPLAY").ok();
         let theme = std::env::var("XCURSOR_THEME").ok();
         let size = std::env::var("XCURSOR_SIZE").ok();
+        // Default theme is "default"; default size is `24 * scale` = 24 at the
+        // harness's scale-1 output.
         if display_env.as_deref() == Some(display.as_str())
-            && theme.is_some()
-            && size.as_deref().is_some_and(|s| s.parse::<u32>().is_ok())
+            && theme.as_deref() == Some("default")
+            && size.as_deref() == Some("24")
         {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "DISPLAY/cursor env never published after ready (DISPLAY={display_env:?} \
-             XCURSOR_THEME={theme:?} XCURSOR_SIZE={size:?})"
+            "DISPLAY/cursor env defaults never published after ready (DISPLAY={display_env:?} \
+             XCURSOR_THEME={theme:?} XCURSOR_SIZE={size:?}); expected theme=default size=24"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(conn);
+    drop(comp);
+
+    // --- Branch 2: already set -> the compositor respects the session's choice. ---
+    const SENTINEL_THEME: &str = "IcedteaSentinelCursors";
+    const SENTINEL_SIZE: &str = "99";
+    // SAFETY: as Branch 1.
+    unsafe {
+        std::env::set_var("XCURSOR_THEME", SENTINEL_THEME);
+        std::env::set_var("XCURSOR_SIZE", SENTINEL_SIZE);
+    }
+    let comp = Compositor::spawn();
+    if let Some(display) = comp.xwayland_display() {
+        // `wait_for_xwayland_ready` guarantees `ready` actually ran (DISPLAY was
+        // republished), so "the sentinel survived" is a real assertion about the
+        // respect-existing branch, not a vacuous "nothing touched it yet".
+        let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+        assert_eq!(
+            std::env::var("XCURSOR_THEME").ok().as_deref(),
+            Some(SENTINEL_THEME),
+            "the compositor overwrote an already-set XCURSOR_THEME"
+        );
+        assert_eq!(
+            std::env::var("XCURSOR_SIZE").ok().as_deref(),
+            Some(SENTINEL_SIZE),
+            "the compositor overwrote an already-set XCURSOR_SIZE"
+        );
+        drop(conn);
+    }
+    drop(comp);
+
+    restore_cursor_env(saved_theme, saved_size);
+}
+
+/// Restore (or clear) the `XCURSOR_*` env to the values saved before the cursor
+/// test mutated them, so the shared test process is left as it was found.
+fn restore_cursor_env(theme: Option<std::ffi::OsString>, size: Option<std::ffi::OsString>) {
+    // SAFETY: serialized by `X11_TEST_LOCK`; see the cursor test's own note.
+    unsafe {
+        match theme {
+            Some(v) => std::env::set_var("XCURSOR_THEME", v),
+            None => std::env::remove_var("XCURSOR_THEME"),
+        }
+        match size {
+            Some(v) => std::env::set_var("XCURSOR_SIZE", v),
+            None => std::env::remove_var("XCURSOR_SIZE"),
+        }
+    }
+}
+
+/// M4 — DISPLAY child-spawn inheritance (Goal #3, resolving the M1 caveat
+/// concretely). After Xwayland is `ready`, a child process spawned from the
+/// compositor's environment inherits the right `DISPLAY=:N`. This is the
+/// end-to-end proof of "children spawned after xwayland ready see the right :N":
+/// the compositor exported `DISPLAY` into its own process env in the `ready`
+/// handler, and this test spawns a trivial child *after* ready and reads back the
+/// `DISPLAY` it actually observed. Skips visibly when Xwayland is absent.
+#[test]
+fn a_child_spawned_after_ready_inherits_the_display() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed; the DISPLAY-inheritance test cannot run");
+        return;
+    }
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+    // Gate on `ready` having actually republished DISPLAY into the process env.
+    let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+
+    // A child spawned now inherits the compositor's environment; it should see
+    // exactly the DISPLAY the compositor advertised.
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("printf %s \"$DISPLAY\"")
+        .output()
+        .expect("spawn a child to read DISPLAY");
+    let child_display = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        child_display, display,
+        "a child spawned after ready saw DISPLAY={child_display:?}, expected {display:?}"
+    );
+    drop(conn);
+}
+
+/// M4 — HiDPI DPI hint on a scaled output (Goal #2). With the primary output at
+/// integer scale 2, the compositor publishes `Xft.dpi = 96 * 2 = 192` into the X
+/// root window's `RESOURCE_MANAGER` property, so X11 toolkits size fonts/UI for
+/// the HiDPI output. Asserted off the *real* root property an X11 client reads,
+/// exactly as GTK/Qt would (via xrdb), which is the concrete, drivable half of
+/// the design's HiDPI decision.
+///
+/// Non-vacuous: the scale is set to 2 before Xwayland comes up, the payload
+/// carries the computed 192 (not a fixed 96), and the property is read straight
+/// off the X server. Scene-node *buffer* upscaling of DPI-unaware X11 clients is
+/// a documented wlroots-scene limitation (no `wlr_scene_tree` scale; only
+/// `wlr_scene_buffer` dest-size) and is not asserted here -- the DPI hint is the
+/// mechanism DPI-aware X11 toolkits actually use under the single global integer
+/// scale. Skips visibly when Xwayland is absent.
+#[test]
+fn hidpi_dpi_hint_is_published_for_a_scaled_output() {
+    let _x11_guard = x11_test_guard();
+    if !xwayland_on_path() {
+        eprintln!("SKIP: Xwayland is not installed; the HiDPI DPI-hint test cannot run");
+        return;
+    }
+    let comp = Compositor::spawn();
+    let Some(display) = comp.xwayland_display() else {
+        eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
+        return;
+    };
+
+    // Raise the primary output to integer scale 2 *before* the first X client
+    // connection triggers the lazy start, so `xwayland_ready` reads scale 2 and
+    // publishes Xft.dpi=192 on the spot. (Blocks until recorded.)
+    comp.set_output_scale_for_test(2.0);
+
+    // Connecting execs Xwayland and drives `ready` -> the DPI export.
+    let (conn, screen_num) = wait_for_xwayland_ready(&display);
+    let root = conn.setup().roots[screen_num].root;
+
+    let resource_manager = intern(&conn, b"RESOURCE_MANAGER");
+    let matched = poll_x_resource_manager(&conn, root, resource_manager, Duration::from_secs(15), |rm| {
+        rm.contains("Xft.dpi:\t192")
+    });
+    assert!(
+        matched,
+        "the compositor never published Xft.dpi=192 in RESOURCE_MANAGER for a scale-2 output; \
+         last saw {:?}",
+        read_x_resource_manager(&conn, root, resource_manager)
+    );
+    drop(conn);
+}
+
+/// Read the X root window's `RESOURCE_MANAGER` (the xrdb database) as a string,
+/// empty on any miss (the property is absent until the compositor first writes
+/// it).
+fn read_x_resource_manager(conn: &impl Connection, root: u32, resource_manager: Atom) -> String {
+    conn.get_property(false, root, resource_manager, AtomEnum::ANY, 0, 4096)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|reply| String::from_utf8_lossy(&reply.value).into_owned())
+        .unwrap_or_default()
+}
+
+/// Poll the X root window's `RESOURCE_MANAGER` until `pred` holds over its string
+/// value or the timeout elapses. The compositor's DPI export runs on a detached
+/// thread, so this polls rather than reading once.
+fn poll_x_resource_manager(
+    conn: &impl Connection,
+    root: u32,
+    resource_manager: Atom,
+    timeout: Duration,
+    pred: impl Fn(&str) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if pred(&read_x_resource_manager(conn, root, resource_manager)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 /// A minimal X11 selection owner running its own event loop on a dedicated
@@ -1876,7 +2088,7 @@ fn map_focused_managed_x11(
     screen: &x11rb::protocol::xproto::Screen,
 ) -> u32 {
     let win = map_managed_x11(conn, screen, 200, 150);
-    let window = poll_for_window(comp, Duration::from_secs(15))
+    let window = poll_for_window(comp, MAP_TIMEOUT)
         .expect("the focus-holding managed X11 window never entered the model");
     assert!(
         poll_snapshot_window(comp, window.id, Duration::from_secs(10), |w| w.focused).is_some(),
