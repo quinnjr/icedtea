@@ -1315,54 +1315,6 @@ impl State {
         self.output_for_pointer()
     }
 
-    /// Push `id`'s client the current fractional scale of the output it is
-    /// on, via `wp_fractional_scale_v1.preferred_scale`.
-    ///
-    /// wlroots' scene already documents this as automatic
-    /// (`wlr_scene_surface_create`'s own behavior -- see
-    /// `wlr::Runtime::notify_fractional_scale`'s doc), computed from the
-    /// *live* `wlr_output.scale`. That field is only ever set on the real
-    /// output object by the persisted-display-config apply path
-    /// (`apply_display_config`, reached from `OutputHandler::new_output`);
-    /// nothing else in this compositor calls `wlr::Output::set_scale`, so a
-    /// scale this compositor's own model believes (`OutputSurface::scale`,
-    /// e.g. after `DbCommand::SetOutputScaleForTest`, or in principle any
-    /// future live output-manager scale change) but never pushed to the
-    /// live output would leave a freshly-mapped client's auto-sent
-    /// `preferred_scale` stale. The model (`self.outputs`) is the single
-    /// source of truth for "what scale does this compositor believe this
-    /// output is at" (`primary_output_scale`'s own DPI-hint export already
-    /// treats it that way), so this re-derives from there and pushes it
-    /// explicitly -- harmless if it agrees with what the scene already
-    /// auto-sent, per `notify_fractional_scale`'s own doc.
-    ///
-    /// Called on every toplevel map/remap. The model tracks no scene
-    /// `NodeId` of its own for a window's content surface (there is no
-    /// per-window handle to look one up by), so this recovers one the same
-    /// way pointer input does: a scene hit-test (`node_at`) at the window's
-    /// own content-rect center, which `sync_window_to_scene` has just
-    /// positioned in the scene. A window with no output yet, not visible,
-    /// or whose content the hit-test cannot resolve is silently skipped --
-    /// there is nothing incorrect to notify in any of those cases, and the
-    /// scene's own auto-send remains the fallback.
-    fn notify_fractional_scale_for_window(&self, id: WindowId) {
-        let Some(w) = self.window_manager.get(id) else { return };
-        if !self.window_manager.is_visible(w) {
-            return;
-        }
-        let Some(rt) = self.wayland.runtime() else { return };
-        let Some(out_idx) = self.output_for_window(w.geometry) else { return };
-        let Some(out) = self.outputs.get(&out_idx) else { return };
-        let scale = Self::guarded_scale(out.scale) as f64;
-        let ssd = crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen);
-        let content = crate::decoration::content_rect(w.geometry, ssd);
-        let cx = (content.x + content.width / 2) as f64;
-        let cy = (content.y + content.height / 2) as f64;
-        if let Some((node, _, _)) = rt.node_at(cx, cy) {
-            rt.with_scene_surface(node, |surface| rt.notify_fractional_scale(surface, scale));
-        }
-    }
-
     /// Finding 4, maintainability: the `usable` rect of whatever output
     /// [`Self::output_for_pointer`] names, extracted once rather than
     /// inlined at each pointer-correct call site (`snap`,
@@ -4279,7 +4231,6 @@ impl State {
         // `sync_focus_change` also reaches it today, but only because
         // `add_window` autofocuses onto the active workspace.
         self.sync_window_to_scene(id);
-        self.notify_fractional_scale_for_window(id);
         self.sync_focus_change(previous);
         self.emit_pending();
     }
@@ -4971,7 +4922,6 @@ impl wlr::ToplevelHandler for State {
             tracing::info!(?id, ?window_id, "toplevel remapped");
             self.window_manager.set_mapped(window_id, true);
             self.sync_window_to_scene(window_id);
-            self.notify_fractional_scale_for_window(window_id);
             self.emit_pending();
             return;
         }

@@ -45,14 +45,17 @@ fn a2_batch1_globals_are_advertised() {
 /// event equal to `round(1.5 * 120) = 180` -- the protocol encodes the scale
 /// as the numerator of a fraction over a denominator of 120.
 ///
-/// wlroots' scene documents this as automatic (`wlr_scene_surface_create`'s
-/// own behavior -- see the `wlr::Runtime::notify_fractional_scale` doc in
-/// the `wlr` crate this compositor is built on): every scene surface reports
-/// its preferred fractional scale without the compositor calling anything.
-/// This test is what actually proves that reaches a real client rather than
-/// leaving it an assumption -- and it does: no `runtime.notify_fractional_scale`
-/// call was needed in `compositor/src/state.rs` to make this pass. See the
-/// task-7-9 report for the record of that finding.
+/// wlroots' scene sends this automatically (`wlr_scene_surface_create`'s own
+/// behavior): every scene surface reports its preferred fractional scale from
+/// the *live* `wlr_output.scale`, with no explicit compositor call. The
+/// compositor therefore does not wire up `wlr::Runtime::notify_fractional_scale`
+/// at all -- the one thing it must do is push a scale change onto the real
+/// `wlr::Output` so the scene reads the new value: `set_output_scale_for_test`
+/// does exactly that via `State`'s `pending_test_output_scale` deferral (the
+/// scale is applied to the live output in the next `OutputHandler::frame`, not
+/// just mirrored in the model). This test proves the auto-sent `preferred_scale`
+/// actually reaches a real client at the right value rather than leaving it an
+/// assumption.
 #[test]
 fn fractional_scale_preferred_scale_matches_output_scale() {
     let comp = Compositor::spawn();
