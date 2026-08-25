@@ -2458,9 +2458,11 @@ impl TestClient {
     /// advertise `wp_cursor_shape_manager_v1`, or if the seat never gave
     /// this client a pointer (no pointer capability).
     ///
-    /// The device object is created fresh per call and dropped with the
-    /// returned value's scope; it holds no state the compositor reads back,
-    /// and `set_shape` has already been flushed by the time this returns.
+    /// The device object is created fresh per call and explicitly destroyed
+    /// before this returns -- it holds no state the compositor reads back,
+    /// and leaking one per call would pile up server-side objects across a
+    /// test that sets a shape more than once. `set_shape` (and the
+    /// `destroy` after it) have been flushed by the time this returns.
     pub fn set_cursor_shape(&mut self, serial: u32, shape: wp_cursor_shape_device_v1::Shape) {
         let mgr = self
             .state
@@ -2474,6 +2476,7 @@ impl TestClient {
             .expect("the seat never advertised a pointer capability to this client");
         let device = mgr.get_pointer(&pointer, &self.qh, ());
         device.set_shape(serial, shape);
+        device.destroy();
         self.conn.flush().expect("flush set_shape");
         let _ = self.queue.roundtrip(&mut self.state);
     }
@@ -3726,6 +3729,12 @@ impl GammaControlClient {
         let mut file = std::fs::File::from(fd);
         file.write_all(&bytes).expect("write gamma ramp");
         file.flush().expect("flush gamma ramp");
+        // Rewind before handing the fd over: wlroots `read(2)`s the ramp
+        // from the descriptor's *current* offset, which `write_all` has
+        // just left at EOF. Without this the compositor reads zero bytes
+        // and answers `failed`, and the test would be asserting on an
+        // error path it never meant to exercise.
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).expect("rewind gamma ramp");
         self.control.set_gamma(file.as_fd());
         self.conn.flush().expect("flush set_gamma");
         let _ = self.queue.roundtrip(&mut self.state);
