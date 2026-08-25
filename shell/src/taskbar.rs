@@ -1,5 +1,5 @@
 //! The pure taskbar model: the window list, workspaces, and active workspace,
-//! folded from `org.icedtea.WM` traffic. No GTK — the render half (Task 9)
+//! folded from `org.icedtea.Compositor` traffic. No GTK — the render half (Task 9)
 //! diffs this into widgets.
 
 use std::rc::Rc;
@@ -8,7 +8,7 @@ use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, GestureClick, Orientation};
 use icedtea_contract::{Snapshot, WindowInfo, WindowUpdate, WorkspaceInfo};
 
-use crate::wm_client::WmCommands;
+use crate::compositor_client::CompositorCommands;
 
 #[derive(Default, Debug)]
 pub struct TaskbarModel {
@@ -17,10 +17,10 @@ pub struct TaskbarModel {
     pub active_workspace: u32,
 }
 
-/// The subset of `org.icedtea.WM` traffic the taskbar folds in. The worker
-/// (`wm_client`) translates D-Bus signals + the seed snapshot into these.
+/// The subset of `org.icedtea.Compositor` traffic the taskbar folds in. The worker
+/// (`compositor_client`) translates D-Bus signals + the seed snapshot into these.
 #[derive(Debug)]
-pub enum WmUpdate {
+pub enum CompositorUpdate {
     Snapshot(Snapshot),
     Opened(WindowInfo),
     Closed(u32),
@@ -30,29 +30,29 @@ pub enum WmUpdate {
 }
 
 impl TaskbarModel {
-    pub fn apply(&mut self, u: WmUpdate) {
+    pub fn apply(&mut self, u: CompositorUpdate) {
         match u {
-            WmUpdate::Snapshot(s) => {
+            CompositorUpdate::Snapshot(s) => {
                 self.windows = s.windows;
                 self.workspaces = s.workspaces;
                 self.active_workspace = s.active_workspace;
             }
-            WmUpdate::Opened(w) => match self.windows.iter_mut().find(|x| x.id == w.id) {
+            CompositorUpdate::Opened(w) => match self.windows.iter_mut().find(|x| x.id == w.id) {
                 Some(existing) => *existing = w,
                 None => self.windows.push(w),
             },
-            WmUpdate::Closed(id) => self.windows.retain(|w| w.id.0 != id),
-            WmUpdate::Updated { id, update } => {
+            CompositorUpdate::Closed(id) => self.windows.retain(|w| w.id.0 != id),
+            CompositorUpdate::Updated { id, update } => {
                 if let Some(w) = self.windows.iter_mut().find(|x| x.id.0 == id) {
                     merge(w, update);
                 }
             }
-            WmUpdate::WorkspaceSet { id, active } => {
+            CompositorUpdate::WorkspaceSet { id, active } => {
                 if active {
                     self.active_workspace = id;
                 }
             }
-            WmUpdate::WorkspaceList(ws) => self.workspaces = ws,
+            CompositorUpdate::WorkspaceList(ws) => self.workspaces = ws,
         }
     }
 }
@@ -86,7 +86,7 @@ fn merge(w: &mut WindowInfo, u: WindowUpdate) {
 /// small window counts a taskbar shows; a diffing pass is a later refinement.
 /// Layout: a `#workspaces` box then a `#windows` box, so tests (and CSS) can
 /// address each half.
-pub fn render(model: &TaskbarModel, container: &GtkBox, wm: &Rc<dyn WmCommands>) {
+pub fn render(model: &TaskbarModel, container: &GtkBox, wm: &Rc<dyn CompositorCommands>) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
@@ -156,18 +156,18 @@ mod tests {
     #[test]
     fn opened_then_closed_tracks_the_window_set() {
         let mut m = TaskbarModel::default();
-        m.apply(WmUpdate::Opened(win(1, "a")));
-        m.apply(WmUpdate::Opened(win(2, "b")));
+        m.apply(CompositorUpdate::Opened(win(1, "a")));
+        m.apply(CompositorUpdate::Opened(win(2, "b")));
         assert_eq!(m.windows.len(), 2);
-        m.apply(WmUpdate::Closed(1));
+        m.apply(CompositorUpdate::Closed(1));
         assert_eq!(m.windows.iter().map(|w| w.id.0).collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]
     fn opened_with_a_known_id_replaces_rather_than_duplicates() {
         let mut m = TaskbarModel::default();
-        m.apply(WmUpdate::Opened(win(1, "a")));
-        m.apply(WmUpdate::Opened(win(1, "a-again")));
+        m.apply(CompositorUpdate::Opened(win(1, "a")));
+        m.apply(CompositorUpdate::Opened(win(1, "a-again")));
         assert_eq!(m.windows.len(), 1);
         assert_eq!(m.windows[0].app_id, "a-again");
     }
@@ -175,17 +175,17 @@ mod tests {
     #[test]
     fn updated_merges_title() {
         let mut m = TaskbarModel::default();
-        m.apply(WmUpdate::Opened(win(1, "a")));
-        m.apply(WmUpdate::Updated { id: 1, update: title_update("renamed") });
+        m.apply(CompositorUpdate::Opened(win(1, "a")));
+        m.apply(CompositorUpdate::Updated { id: 1, update: title_update("renamed") });
         assert_eq!(m.windows[0].title, "renamed");
     }
 
     #[test]
     fn workspace_set_tracks_active_only_when_active() {
         let mut m = TaskbarModel::default();
-        m.apply(WmUpdate::WorkspaceSet { id: 3, active: true });
+        m.apply(CompositorUpdate::WorkspaceSet { id: 3, active: true });
         assert_eq!(m.active_workspace, 3);
-        m.apply(WmUpdate::WorkspaceSet { id: 5, active: false });
+        m.apply(CompositorUpdate::WorkspaceSet { id: 5, active: false });
         assert_eq!(m.active_workspace, 3, "an inactive set must not move the active workspace");
     }
 }

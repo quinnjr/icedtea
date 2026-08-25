@@ -165,7 +165,7 @@ pub struct Compositor {
     /// the D-Bus emitter thread would consume.
     pub events: crossbeam_channel::Receiver<SeqEvent>,
     /// The production command queue (`State::set_command_receiver`), exactly
-    /// what `dbus::WmInterface` would push onto. Prefer [`Compositor::send`],
+    /// what `dbus::CompositorInterface` would push onto. Prefer [`Compositor::send`],
     /// which also nudges the wake pipe.
     pub commands: crossbeam_channel::Sender<DbCommand>,
     /// Write half of the command wake pipe, so a send reaches a loop blocked
@@ -354,7 +354,7 @@ impl Compositor {
         std::path::Path::new(&dir).join(&self.socket)
     }
 
-    /// Send a command the way `dbus::WmInterface::send` does: onto the
+    /// Send a command the way `dbus::CompositorInterface::send` does: onto the
     /// channel, then a nudge on the wake pipe.
     pub fn send(&self, cmd: DbCommand) {
         self.commands.send(cmd).expect("compositor command channel closed");

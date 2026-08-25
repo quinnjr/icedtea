@@ -671,7 +671,7 @@ pub struct State {
     /// `fd_ready`'s `cmd_wake_source` arm, and as a backstop by
     /// `should_stop`).
     cmd_rx: Option<crossbeam_channel::Receiver<crate::dbus::DbCommand>>,
-    /// The fd source `WmInterface::send` (`dbus.rs`) nudges after every
+    /// The fd source `CompositorInterface::send` (`dbus.rs`) nudges after every
     /// command it forwards onto `cmd_rx`. Compared in `fd_ready` the same
     /// way `shutdown_source` is; without it a command sent while the loop is
     /// blocked in `dispatch(-1)` would sit undrained until some unrelated

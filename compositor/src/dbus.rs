@@ -1,4 +1,4 @@
-//! The `org.icedtea.WM` D-Bus service.
+//! The `org.icedtea.Compositor` D-Bus service.
 //!
 //! Per the binding threading-model ruling from task 7: this runs on its own
 //! dedicated thread and talks to the compositor's own loop only by message
@@ -11,7 +11,7 @@
 //!   [`spawn_service`]. This is the consumer the task-7 handoff comment in
 //!   `main.rs` promised for the previously-undrained `_dbus_rx` channel.
 //! - `cmd_tx` (this thread -> compositor): [`DbCommand`]s produced by
-//!   incoming [`WmInterface`] method calls, applied to `State` by whatever
+//!   incoming [`CompositorInterface`] method calls, applied to `State` by whatever
 //!   drains this channel (see `State::handle_command`).
 //!
 //! The command channel is a `crossbeam_channel::Sender`, drained by the
@@ -27,13 +27,13 @@
 //!
 //! - **Bus name ownership.** The brief's Step-3 sample connects to the
 //!   session bus and registers the interface object but never calls
-//!   `request_name`, so nothing would actually own `org.icedtea.WM` --
+//!   `request_name`, so nothing would actually own `org.icedtea.Compositor` --
 //!   the brief's own Step-5 manual verification
-//!   (`gdbus --dest org.icedtea.WM ...`) would fail with "name has no
+//!   (`gdbus --dest org.icedtea.Compositor ...`) would fail with "name has no
 //!   owner" as written. Added below, after the interface is registered
 //!   (so the object already exists by the time anyone can observe the name
 //!   becoming owned).
-//! - **`WmInterface::conn` field dropped.** The brief's sample struct
+//! - **`CompositorInterface::conn` field dropped.** The brief's sample struct
 //!   carries a `conn: Connection` field that no `#[interface]` method ever
 //!   reads (every method just forwards onto `cmd_tx`); an unread field is a
 //!   `dead_code` warning under this workspace's `-D warnings` gate. Nothing
@@ -68,7 +68,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use icedtea_contract::{Event, SeqEvent, Snapshot, WindowId, WM_BUS_NAME, WM_PATH};
+use icedtea_contract::{Event, SeqEvent, Snapshot, WindowId, COMPOSITOR_BUS_NAME, COMPOSITOR_PATH};
 use zbus::blocking::Connection;
 use zbus::interface;
 
@@ -89,7 +89,7 @@ pub enum DbCommand {
     /// Test-only: synthesize a touch-down at `(x, y)` for touch point `id`
     /// via `wlr::Runtime::inject_touch_down`, replying with the grab serial
     /// it mints (`None` if there is no seat or no surface under the point).
-    /// Not reachable from `WmInterface` -- only the test harness sends
+    /// Not reachable from `CompositorInterface` -- only the test harness sends
     /// this, directly onto `cmd_tx`, since injecting synthetic touch input
     /// makes no sense as a D-Bus-exposed production operation.
     InjectTouchDown { x: f64, y: f64, id: i32, time_msec: u32, reply: Sender<Option<u32>> },
@@ -105,15 +105,15 @@ pub enum DbCommand {
     /// Test-only: read the drag icon's current scene layout position via
     /// `wlr::Runtime::drag_icon_position`, replying with `None` if no drag
     /// with a visible icon is in progress. Not reachable from
-    /// `WmInterface` -- only the test harness sends this, same reasoning
+    /// `CompositorInterface` -- only the test harness sends this, same reasoning
     /// as `InjectTouchDown`.
     DragIconPosition { reply: Sender<Option<(i32, i32)>> },
     /// Test-only: read `wlr::Runtime::is_session_locked` via `wayland`'s
-    /// runtime handle. Not reachable from `WmInterface` -- only the test
+    /// runtime handle. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `DragIconPosition`.
     SessionLocked { reply: Sender<bool> },
     /// Test-only: read `wlr::Runtime::cursor_position` via `wayland`'s
-    /// runtime handle. Not reachable from `WmInterface` -- only the test
+    /// runtime handle. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `SessionLocked`.
     CursorPosition { reply: Sender<(f64, f64)> },
     /// Test-only: read the `DISPLAY` name (`:N`) Xwayland advertises, via
@@ -122,7 +122,7 @@ pub enum DbCommand {
     /// can skip cleanly. Available as soon as the manager reserves its display
     /// socket -- before the lazy `Xwayland` start -- which is exactly what lets
     /// the test read `DISPLAY`, connect an X11 client, and *trigger* that lazy
-    /// start. Not reachable from `WmInterface` -- only the test harness sends
+    /// start. Not reachable from `CompositorInterface` -- only the test harness sends
     /// this, same reasoning as `SessionLocked`.
     XwaylandDisplay { reply: Sender<Option<String>> },
     /// Test-only: report whether `xwayland_ready` has fired — i.e. the lazy
@@ -132,7 +132,7 @@ pub enum DbCommand {
     /// start): a selection/DND test connects using `XwaylandDisplay`, then waits
     /// on this for the bridge to be live. Replaces the old
     /// republish-`DISPLAY`-on-ready barrier, which relied on a `set_var` from
-    /// inside `run_all` (review finding #5). Not reachable from `WmInterface` --
+    /// inside `run_all` (review finding #5). Not reachable from `CompositorInterface` --
     /// only the test harness sends this, same reasoning as `SessionLocked`.
     XwaylandReady { reply: Sender<bool> },
     /// Test-only: probe every mapped override-redirect (OR) X11 pop-up the
@@ -142,7 +142,7 @@ pub enum DbCommand {
     /// `wlr::Runtime` xwayland scene accessors. Lets the OR end-to-end test
     /// assert placement/stacking/focus without the OR surface ever entering the
     /// `Window` model (which is the whole point of the OR path). Not reachable
-    /// from `WmInterface` -- only the test harness sends this, same reasoning as
+    /// from `CompositorInterface` -- only the test harness sends this, same reasoning as
     /// `SessionLocked`.
     XwaylandOverrideRedirect { reply: Sender<Vec<OverrideRedirectProbe>> },
     /// Test-only: record the primary output's scale. The reply is `true` only
@@ -186,10 +186,10 @@ pub fn event_signal_name(event: &Event) -> &'static str {
     }
 }
 
-/// The registered `org.icedtea.WM` interface object. Every method just
+/// The registered `org.icedtea.Compositor` interface object. Every method just
 /// forwards a [`DbCommand`] onto the compositor's main loop; none of them
 /// mutate compositor state directly (see this module's doc for why).
-pub struct WmInterface {
+pub struct CompositorInterface {
     cmd_tx: crossbeam_channel::Sender<DbCommand>,
     /// Write half of the loop's D-Bus command wake pipe
     /// (`backend::wake_source`). `send` nudges it after every command so a
@@ -199,15 +199,15 @@ pub struct WmInterface {
     wake: UnixStream,
 }
 
-impl WmInterface {
+impl CompositorInterface {
     fn send(&self, cmd: DbCommand) {
         let _ = self.cmd_tx.send(cmd);
         crate::backend::wake(&self.wake);
     }
 }
 
-#[interface(name = "org.icedtea.WM")]
-impl WmInterface {
+#[interface(name = "org.icedtea.Compositor")]
+impl CompositorInterface {
     fn focus_window(&self, id: u32) {
         self.send(DbCommand::Focus(WindowId(id)));
     }
@@ -248,7 +248,7 @@ impl WmInterface {
 }
 
 /// Spawn the D-Bus service: connects to the session bus, registers
-/// [`WmInterface`] at [`WM_PATH`], claims [`WM_BUS_NAME`], and starts a
+/// [`CompositorInterface`] at [`COMPOSITOR_PATH`], claims [`COMPOSITOR_BUS_NAME`], and starts a
 /// dedicated emitter thread that turns every `contract::Event` received on
 /// `events_rx` into a D-Bus signal. Returns the shared connection (kept
 /// alive by the caller for as long as the service should stay registered)
@@ -259,7 +259,7 @@ impl WmInterface {
 ///
 /// `cmd_wake` is the write half of a `backend::wake_source` registered by
 /// the caller against the same `Runtime` the loop runs on -- see
-/// `WmInterface::send`'s doc for why a command needs one at all.
+/// `CompositorInterface::send`'s doc for why a command needs one at all.
 pub fn spawn_service(
     events_rx: Receiver<SeqEvent>,
     cmd_tx: crossbeam_channel::Sender<DbCommand>,
@@ -267,11 +267,11 @@ pub fn spawn_service(
     cmd_wake: UnixStream,
 ) -> (Connection, std::thread::JoinHandle<()>) {
     let conn = Connection::session().expect("session bus available");
-    let iface = WmInterface { cmd_tx, wake: cmd_wake };
-    conn.object_server().at(WM_PATH, iface).expect("register org.icedtea.WM interface");
-    conn.request_name(WM_BUS_NAME).unwrap_or_else(|err| {
+    let iface = CompositorInterface { cmd_tx, wake: cmd_wake };
+    conn.object_server().at(COMPOSITOR_PATH, iface).expect("register org.icedtea.Compositor interface");
+    conn.request_name(COMPOSITOR_BUS_NAME).unwrap_or_else(|err| {
         panic!(
-            "failed to acquire the {WM_BUS_NAME} bus name -- is another icedtea-compositor \
+            "failed to acquire the {COMPOSITOR_BUS_NAME} bus name -- is another icedtea-compositor \
              instance (or a stale connection holding the name) already running? ({err})"
         )
     });
@@ -303,21 +303,21 @@ pub fn spawn_service(
             //   ConfigReloaded t(siii(sss)as)
             let result = match &event {
                 Event::WindowOpened(info) => {
-                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, info.clone()))
+                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, info.clone()))
                 }
-                Event::WindowClosed(id) => emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, id.0)),
+                Event::WindowClosed(id) => emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, id.0)),
                 Event::WindowUpdated { id, update } => {
-                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, id.0, update.clone()))
+                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, id.0, update.clone()))
                 }
                 Event::WorkspaceSet { id, active } => {
-                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, *id, *active))
+                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, *id, *active))
                 }
                 Event::WorkspaceList(ws) => {
-                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, ws.clone()))
+                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, ws.clone()))
                 }
-                Event::AltTabState(s) => emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, s.clone())),
+                Event::AltTabState(s) => emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, s.clone())),
                 Event::ConfigReloaded(a) => {
-                    emitter_conn.emit_signal(dest, WM_PATH, WM_BUS_NAME, name, &(seq, a.clone()))
+                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, a.clone()))
                 }
             };
             if let Err(err) = result {

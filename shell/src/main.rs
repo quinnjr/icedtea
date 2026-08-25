@@ -1,5 +1,5 @@
 //! `icedtea-shell` — a GTK4 layer-shell panel: a window/workspace taskbar
-//! driven by `org.icedtea.WM`, and a clipboard popover driven by
+//! driven by `org.icedtea.Compositor`, and a clipboard popover driven by
 //! `org.icedtea.Clipboard`. All widgets live on the GTK main thread; D-Bus runs
 //! on a worker, bridged by a glib channel.
 
@@ -17,7 +17,7 @@ use icedtea_shell::bridge;
 use icedtea_shell::clip_client::{self, ClipCommands, ClipProxy};
 use icedtea_shell::clipboard::{self, ClipboardModel};
 use icedtea_shell::taskbar::{self, TaskbarModel};
-use icedtea_shell::wm_client::{self, WmCommands, WmProxy};
+use icedtea_shell::compositor_client::{self, CompositorCommands, CompositorProxy};
 
 const APP_ID: &str = "org.icedtea.Shell";
 
@@ -84,7 +84,7 @@ fn build_panel(app: &Application) {
 }
 
 fn wire_taskbar(container: &GtkBox) {
-    let wm: Rc<dyn WmCommands> = match WmProxy::new() {
+    let wm: Rc<dyn CompositorCommands> = match CompositorProxy::new() {
         Ok(wm) => Rc::new(wm),
         Err(err) => {
             tracing::error!(%err, "no session bus; taskbar disabled");
@@ -101,7 +101,7 @@ fn wire_taskbar(container: &GtkBox) {
             taskbar::render(&model.borrow(), &container, &wm);
         })
     };
-    wm_client::spawn(tx);
+    compositor_client::spawn(tx);
 }
 
 fn wire_clipboard(bar: &GtkBox) {

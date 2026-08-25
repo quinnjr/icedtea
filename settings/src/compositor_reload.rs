@@ -1,4 +1,4 @@
-//! Best-effort `org.icedtea.WM` reload client. After a config edit is
+//! Best-effort `org.icedtea.Compositor` reload client. After a config edit is
 //! written to the redb store, the settings app asks the running compositor
 //! to re-read it via `ReloadConfig`. If no compositor is running (bus or
 //! service absent), that's fine -- the write already landed on disk and
@@ -7,12 +7,12 @@
 use std::path::Path;
 
 use icedtea_config::Config;
-use icedtea_contract::{WM_BUS_NAME, WM_PATH};
+use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_PATH};
 
 // zbus's #[interface] exposes Rust methods in PascalCase, so the wire
 // member is ReloadConfig (matching FocusWindow/CloseWindow/SetWorkspace in
-// shell/src/wm_client.rs).
-const WM_IFACE: &str = "org.icedtea.WM";
+// shell/src/compositor_client.rs).
+const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 
 /// The outcome of a [`ReloadClient::reload`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,9 +24,9 @@ pub enum ReloadOutcome {
     CompositorAbsent,
 }
 
-/// Issues `org.icedtea.WM`'s `ReloadConfig` from the GTK thread. Method
+/// Issues `org.icedtea.Compositor`'s `ReloadConfig` from the GTK thread. Method
 /// calls are no-reply and sub-millisecond, so a blocking connection here is
-/// fine (mirrors `shell::wm_client::WmProxy`).
+/// fine (mirrors `shell::compositor_client::CompositorProxy`).
 pub struct ReloadClient {
     conn: Option<zbus::blocking::Connection>,
 }
@@ -44,7 +44,7 @@ impl ReloadClient {
     /// already happened; the change applies on next compositor start).
     pub fn reload(&self) -> ReloadOutcome {
         let Some(conn) = &self.conn else { return ReloadOutcome::CompositorAbsent };
-        match conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "ReloadConfig", &()) {
+        match conn.call_method(Some(COMPOSITOR_BUS_NAME), COMPOSITOR_PATH, Some(COMPOSITOR_IFACE), "ReloadConfig", &()) {
             Ok(_) => ReloadOutcome::Reloaded,
             Err(_) => ReloadOutcome::CompositorAbsent,
         }

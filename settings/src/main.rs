@@ -1,7 +1,7 @@
 //! `icedtea-settings` — a GTK4 config editor for icedtea-wm: an Appearance
 //! page and a Behavior page over a shared working-copy [`Model`], with
 //! Apply/Revert wired to the on-disk redb store and (best-effort) a running
-//! compositor via `org.icedtea.WM`'s `ReloadConfig`.
+//! compositor via `org.icedtea.Compositor`'s `ReloadConfig`.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -12,7 +12,7 @@ use gtk4::{Application, ApplicationWindow, Box as GtkBox, Button, Label, Orienta
 use icedtea_config::default_db_path;
 use icedtea_settings::model::Model;
 use icedtea_settings::pages::{appearance, behavior, displays, keybindings, workspaces, Ctx, Page};
-use icedtea_settings::wm_reload::{apply_and_reload, ReloadClient, ReloadOutcome};
+use icedtea_settings::compositor_reload::{apply_and_reload, ReloadClient, ReloadOutcome};
 
 const APP_ID: &str = "org.icedtea.Settings";
 

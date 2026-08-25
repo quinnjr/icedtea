@@ -418,7 +418,7 @@ fn fullscreen_x11_window_fills_the_output_without_ssd() {
     let net_wm_state = intern(&conn, b"_NET_WM_STATE");
     let fullscreen_atom = intern(&conn, b"_NET_WM_STATE_FULLSCREEN");
 
-    // Fullscreen via the same D-Bus command `org.icedtea.WM.FullscreenWindow`
+    // Fullscreen via the same D-Bus command `org.icedtea.Compositor.FullscreenWindow`
     // forwards.
     comp.send(DbCommand::Fullscreen(id, true));
     let fs = poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| w.fullscreen)
@@ -765,7 +765,7 @@ fn wm_initiated_close_reaches_the_x11_client() {
         .expect("the managed X11 window never entered the model");
     let id = window.id;
 
-    // WM asks it to close (the `org.icedtea.WM.CloseWindow` path).
+    // WM asks it to close (the `org.icedtea.Compositor.CloseWindow` path).
     comp.send(DbCommand::Close(id));
     assert!(
         wait_for_wm_delete(&conn, wm_protocols, wm_delete, Duration::from_secs(10)),

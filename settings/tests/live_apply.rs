@@ -1,9 +1,9 @@
 //! A live D-Bus round-trip proving the settings app's write path actually
 //! reaches a running compositor: edit the on-disk config, ask the real
-//! `org.icedtea.WM` service to reload it, and observe the resulting
+//! `org.icedtea.Compositor` service to reload it, and observe the resulting
 //! `ConfigReloaded` signal carry the *new* value. Mirrors
 //! `shell/tests/live_dbus.rs` (M4.6), but exercises
-//! `settings::model::apply` and `settings::wm_reload::ReloadClient` against
+//! `settings::model::apply` and `settings::compositor_reload::ReloadClient` against
 //! a real compositor instead of the clipboard client against a real
 //! clipboard daemon.
 //!
@@ -27,18 +27,18 @@
 //! `icedtea-settings` instance would talk to a real running compositor.
 //!
 //! Skipped (visibly) only when the session bus is unavailable or
-//! `org.icedtea.WM` is already owned (a real compositor instance is
+//! `org.icedtea.Compositor` is already owned (a real compositor instance is
 //! running) -- same posture as `shell/tests/live_dbus.rs`.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use icedtea_contract::{Appearance, WM_BUS_NAME, WM_PATH};
+use icedtea_contract::{Appearance, COMPOSITOR_BUS_NAME, COMPOSITOR_PATH};
 use icedtea_settings::model;
-use icedtea_settings::wm_reload::{ReloadClient, ReloadOutcome};
+use icedtea_settings::compositor_reload::{ReloadClient, ReloadOutcome};
 
-const WM_IFACE: &str = "org.icedtea.WM";
+const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 const NEW_ACCENT: &str = "#ff00aa";
 /// How long to wait for the subprocess compositor to boot and claim the bus
 /// name -- generous because a debug build under test-suite load can be slow
@@ -49,7 +49,7 @@ const SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Kills the child compositor process when dropped -- including on a test
 /// panic, via unwind -- so a failing assertion never leaks a headless
-/// compositor holding `org.icedtea.WM` into the next test run.
+/// compositor holding `org.icedtea.Compositor` into the next test run.
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -126,8 +126,8 @@ fn apply_reloads_the_running_compositor() {
     };
     // Non-blocking check (1ms budget): skip visibly rather than fight a
     // real compositor (or a leaked prior run) for the bus name.
-    if wait_for_name_owner(&probe, WM_BUS_NAME, Duration::from_millis(1)) {
-        eprintln!("SKIP: {WM_BUS_NAME} is already owned -- a real compositor is running");
+    if wait_for_name_owner(&probe, COMPOSITOR_BUS_NAME, Duration::from_millis(1)) {
+        eprintln!("SKIP: {COMPOSITOR_BUS_NAME} is already owned -- a real compositor is running");
         return;
     }
 
@@ -150,19 +150,19 @@ fn apply_reloads_the_running_compositor() {
     let _guard = ChildGuard(child);
 
     assert!(
-        wait_for_name_owner(&probe, WM_BUS_NAME, BOOT_TIMEOUT),
-        "icedtea-compositor never registered {WM_BUS_NAME} within {BOOT_TIMEOUT:?}"
+        wait_for_name_owner(&probe, COMPOSITOR_BUS_NAME, BOOT_TIMEOUT),
+        "icedtea-compositor never registered {COMPOSITOR_BUS_NAME} within {BOOT_TIMEOUT:?}"
     );
 
-    // subscribe to org.icedtea.WM ConfigReloaded (mirrors
-    // shell/src/wm_client.rs's signal subscription, blocking-style) before
+    // subscribe to org.icedtea.Compositor ConfigReloaded (mirrors
+    // shell/src/compositor_client.rs's signal subscription, blocking-style) before
     // triggering the reload, so the signal can't race ahead of us.
     let sub_conn = zbus::blocking::Connection::session().expect("session bus");
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
-        .interface(WM_IFACE)
+        .interface(COMPOSITOR_IFACE)
         .expect("interface")
-        .path(WM_PATH)
+        .path(COMPOSITOR_PATH)
         .expect("path")
         .member("ConfigReloaded")
         .expect("member")

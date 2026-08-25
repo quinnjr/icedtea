@@ -220,7 +220,7 @@ fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
     state.set_cmd_wake_source(wake_id);
 
     // From another thread, exactly like the real producers
-    // (`dbus::WmInterface::send`, `State::spawn_config_reload`): send onto
+    // (`dbus::CompositorInterface::send`, `State::spawn_config_reload`): send onto
     // the channel, then nudge the wake pipe.
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(50));

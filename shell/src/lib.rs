@@ -5,7 +5,7 @@ pub mod bridge;
 pub mod clip_client;
 pub mod clipboard;
 pub mod taskbar;
-pub mod wm_client;
+pub mod compositor_client;
 
 // Re-exported so integration tests can drive real widgets without a second
 // gtk4 dependency edge.

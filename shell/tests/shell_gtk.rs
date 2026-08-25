@@ -5,7 +5,7 @@
 //! The command surface is a recording mock rather than the live D-Bus proxy:
 //! this keeps the test hermetic (no session-bus name to claim, no cross-test
 //! races) while still asserting that a real GTK click reaches the taskbar's
-//! command surface with the right window id. The `WmProxy` D-Bus path itself is
+//! command surface with the right window id. The `CompositorProxy` D-Bus path itself is
 //! three thin `call_method` lines.
 
 use std::cell::RefCell;
@@ -18,8 +18,8 @@ use icedtea_harness::Compositor;
 use icedtea_shell::clip_client::ClipCommands;
 use icedtea_shell::clipboard::{self, ClipUpdate, ClipboardModel};
 use icedtea_shell::gtk4::{self, prelude::*, Box as GtkBox, Button, ListBox, Orientation, Widget};
-use icedtea_shell::taskbar::{self, TaskbarModel, WmUpdate};
-use icedtea_shell::wm_client::WmCommands;
+use icedtea_shell::taskbar::{self, TaskbarModel, CompositorUpdate};
+use icedtea_shell::compositor_client::CompositorCommands;
 
 /// Point GDK at the harness compositor and init GTK once. `false` means GTK
 /// could not come up — which is a FAILURE by default (the harness provides a
@@ -56,7 +56,7 @@ fn require_gtk(comp: &Compositor) -> bool {
 struct MockWm {
     calls: RefCell<Vec<(String, u32)>>,
 }
-impl WmCommands for MockWm {
+impl CompositorCommands for MockWm {
     fn focus_window(&self, id: u32) {
         self.calls.borrow_mut().push(("focus".into(), id));
     }
@@ -147,11 +147,11 @@ fn taskbar_renders_windows_and_clicks_reach_the_command_surface() {
 
     let bar = GtkBox::new(Orientation::Horizontal, 6);
     let mock = Rc::new(MockWm::default());
-    let wm: Rc<dyn WmCommands> = mock.clone();
+    let wm: Rc<dyn CompositorCommands> = mock.clone();
     let mut model = TaskbarModel::default();
 
     // Seed with two mapped windows and render.
-    model.apply(WmUpdate::Snapshot(Snapshot {
+    model.apply(CompositorUpdate::Snapshot(Snapshot {
         seq: 1,
         windows: vec![win(1, "One"), win(2, "Two")],
         workspaces: vec![WorkspaceInfo { id: 0, name: String::new() }],
@@ -176,7 +176,7 @@ fn taskbar_renders_windows_and_clicks_reach_the_command_surface() {
     );
 
     // A Closed update drops the button on the next render.
-    model.apply(WmUpdate::Closed(1));
+    model.apply(CompositorUpdate::Closed(1));
     taskbar::render(&model, &bar, &wm);
     let windows_box = named(&bar, "windows").expect("#windows box");
     assert_eq!(labels(&windows_box), vec!["Two".to_string()]);

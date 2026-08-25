@@ -1,43 +1,43 @@
-//! The `org.icedtea.WM` client. A worker thread receives the compositor's
-//! signals (seeded by a `GetState` snapshot) and pushes [`WmUpdate`]s to the
-//! GTK thread; [`WmProxy`] issues commands (focus/close/workspace) with a
+//! The `org.icedtea.Compositor` client. A worker thread receives the compositor's
+//! signals (seeded by a `GetState` snapshot) and pushes [`CompositorUpdate`]s to the
+//! GTK thread; [`CompositorProxy`] issues commands (focus/close/workspace) with a
 //! separate blocking connection.
 
 use async_channel::Sender;
 use futures_util::StreamExt as _;
 use icedtea_contract::{
-    Snapshot, WindowInfo, WindowUpdate, WorkspaceInfo, WM_BUS_NAME, WM_PATH,
+    Snapshot, WindowInfo, WindowUpdate, WorkspaceInfo, COMPOSITOR_BUS_NAME, COMPOSITOR_PATH,
 };
 
-use crate::taskbar::WmUpdate;
+use crate::taskbar::CompositorUpdate;
 
-const WM_IFACE: &str = "org.icedtea.WM";
+const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 
 /// Spawn the signal worker. It seeds with `GetState`, then forwards every
-/// `org.icedtea.WM` signal as a [`WmUpdate`] until the bus drops.
-pub fn spawn(tx: Sender<WmUpdate>) {
+/// `org.icedtea.Compositor` signal as a [`CompositorUpdate`] until the bus drops.
+pub fn spawn(tx: Sender<CompositorUpdate>) {
     std::thread::spawn(move || {
         zbus::block_on(async move {
             if let Err(err) = run(tx).await {
-                tracing::error!(%err, "org.icedtea.WM client stopped");
+                tracing::error!(%err, "org.icedtea.Compositor client stopped");
             }
         });
     });
 }
 
-async fn run(tx: Sender<WmUpdate>) -> zbus::Result<()> {
+async fn run(tx: Sender<CompositorUpdate>) -> zbus::Result<()> {
     let conn = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(&conn, WM_BUS_NAME, WM_PATH, WM_IFACE).await?;
+    let proxy = zbus::Proxy::new(&conn, COMPOSITOR_BUS_NAME, COMPOSITOR_PATH, COMPOSITOR_IFACE).await?;
 
     // Seed from the current snapshot before watching deltas.
     let snapshot: Snapshot = proxy.call("GetState", &()).await?;
-    let _ = tx.send(WmUpdate::Snapshot(snapshot)).await;
+    let _ = tx.send(CompositorUpdate::Snapshot(snapshot)).await;
 
-    // One stream for every org.icedtea.WM signal, dispatched by member name.
+    // One stream for every org.icedtea.Compositor signal, dispatched by member name.
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
-        .interface(WM_IFACE)?
-        .path(WM_PATH)?
+        .interface(COMPOSITOR_IFACE)?
+        .path(COMPOSITOR_PATH)?
         .build();
     let mut stream = zbus::MessageStream::for_match_rule(rule, &conn, None).await?;
 
@@ -46,23 +46,23 @@ async fn run(tx: Sender<WmUpdate>) -> zbus::Result<()> {
         let body = msg.body();
         let update = match member.as_deref() {
             Some("WindowOpened") => {
-                body.deserialize::<(u64, WindowInfo)>().ok().map(|(_, w)| WmUpdate::Opened(w))
+                body.deserialize::<(u64, WindowInfo)>().ok().map(|(_, w)| CompositorUpdate::Opened(w))
             }
             Some("WindowClosed") => {
-                body.deserialize::<(u64, u32)>().ok().map(|(_, id)| WmUpdate::Closed(id))
+                body.deserialize::<(u64, u32)>().ok().map(|(_, id)| CompositorUpdate::Closed(id))
             }
             Some("WindowUpdated") => body
                 .deserialize::<(u64, u32, WindowUpdate)>()
                 .ok()
-                .map(|(_, id, update)| WmUpdate::Updated { id, update }),
+                .map(|(_, id, update)| CompositorUpdate::Updated { id, update }),
             Some("WorkspaceSet") => body
                 .deserialize::<(u64, u32, bool)>()
                 .ok()
-                .map(|(_, id, active)| WmUpdate::WorkspaceSet { id, active }),
+                .map(|(_, id, active)| CompositorUpdate::WorkspaceSet { id, active }),
             Some("WorkspaceList") => body
                 .deserialize::<(u64, Vec<WorkspaceInfo>)>()
                 .ok()
-                .map(|(_, ws)| WmUpdate::WorkspaceList(ws)),
+                .map(|(_, ws)| CompositorUpdate::WorkspaceList(ws)),
             _ => None,
         };
         if let Some(update) = update
@@ -76,34 +76,34 @@ async fn run(tx: Sender<WmUpdate>) -> zbus::Result<()> {
 
 /// The taskbar's command surface — abstracted so a test can inject a recording
 /// mock in place of the real D-Bus proxy.
-pub trait WmCommands {
+pub trait CompositorCommands {
     fn focus_window(&self, id: u32);
     fn close_window(&self, id: u32);
     fn set_workspace(&self, id: u32);
 }
 
-/// Issues `org.icedtea.WM` commands from the GTK thread. Method calls are
+/// Issues `org.icedtea.Compositor` commands from the GTK thread. Method calls are
 /// no-reply and sub-millisecond, so a blocking connection here is fine.
-pub struct WmProxy {
+pub struct CompositorProxy {
     conn: zbus::blocking::Connection,
 }
 
-impl WmProxy {
+impl CompositorProxy {
     pub fn new() -> zbus::Result<Self> {
-        Ok(WmProxy { conn: zbus::blocking::Connection::session()? })
+        Ok(CompositorProxy { conn: zbus::blocking::Connection::session()? })
     }
 }
 
-impl WmCommands for WmProxy {
+impl CompositorCommands for CompositorProxy {
     // zbus's #[interface] exposes Rust methods in PascalCase, so the wire
     // members are FocusWindow/CloseWindow/SetWorkspace (matching GetState).
     fn focus_window(&self, id: u32) {
-        let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "FocusWindow", &(id,));
+        let _ = self.conn.call_method(Some(COMPOSITOR_BUS_NAME), COMPOSITOR_PATH, Some(COMPOSITOR_IFACE), "FocusWindow", &(id,));
     }
     fn close_window(&self, id: u32) {
-        let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "CloseWindow", &(id,));
+        let _ = self.conn.call_method(Some(COMPOSITOR_BUS_NAME), COMPOSITOR_PATH, Some(COMPOSITOR_IFACE), "CloseWindow", &(id,));
     }
     fn set_workspace(&self, id: u32) {
-        let _ = self.conn.call_method(Some(WM_BUS_NAME), WM_PATH, Some(WM_IFACE), "SetWorkspace", &(id,));
+        let _ = self.conn.call_method(Some(COMPOSITOR_BUS_NAME), COMPOSITOR_PATH, Some(COMPOSITOR_IFACE), "SetWorkspace", &(id,));
     }
 }
