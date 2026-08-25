@@ -2228,7 +2228,6 @@ impl State {
         // keyboard.
         self.sync_window_to_scene(id);
         self.sync_focus_change(previous);
-        //TEMPTEST
         // Drain the queued `WindowUpdated { minimized }` (and any focus-change
         // events) to D-Bus here, exactly as `set_maximized_target`/
         // `set_fullscreen_target` do. `DbCommand::Minimize` also flushes via
@@ -2285,12 +2284,11 @@ impl State {
     /// and off-workspace windows are skipped — raising a hidden window would
     /// churn its X restack for no visible effect.
     fn stacking_order_bottom_to_top(&self) -> Vec<WindowId> {
-        let mut ids: Vec<WindowId> = self
-            .window_manager
-            .windows()
-            .filter(|w| self.window_manager.is_visible(w))
-            .map(|w| w.id)
-            .collect();
+        // Reuse the one visibility+ordering predicate (`visible_windows`, which
+        // exists so this filter lives in exactly one place — review finding I1);
+        // it yields MRU order (top first), so reverse for bottom-to-top.
+        let mut ids: Vec<WindowId> =
+            self.window_manager.visible_windows().iter().map(|w| w.id).collect();
         ids.reverse();
         ids
     }
@@ -2411,22 +2409,32 @@ impl State {
     /// self-configuring X11 client cannot drive its only drag handle off-screen.
     /// A frame already fully on its output is returned unchanged.
     fn clamp_frame_onto_output(&self, frame: Rectangle) -> Rectangle {
-        let output_geo = self
+        // Clamp to the *usable* area, not the full output geometry: map-time
+        // placement (`center_in_area`) and the whole placement convention keep a
+        // window's frame — its SSD title bar included — clear of panels'
+        // exclusive zones, so a self-configuring X11 client must land in the same
+        // area or its only drag handle ends up under a top panel (review finding
+        // #9's own goal). Output chosen by the frame's center, falling back to the
+        // pointer's usable area and finally a default.
+        let clamp_geo = self
             .output_for_window(frame)
             .and_then(|idx| self.outputs.get(&idx))
-            .map(|o| o.geometry)
+            .map(|o| o.usable)
             .or_else(|| self.usable_geo_for_pointer())
             .unwrap_or(Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
-        // `.max(output.x/y)` guards the degenerate case of a window larger than
-        // the output, where the upper clamp bound would fall below the lower --
-        // exactly the guard `place_managed_x11::centered_in` uses.
-        let max_x = (output_geo.x + output_geo.width - frame.width).max(output_geo.x);
-        let max_y = (output_geo.y + output_geo.height - frame.height).max(output_geo.y);
-        Rectangle {
-            x: frame.x.clamp(output_geo.x, max_x),
-            y: frame.y.clamp(output_geo.y, max_y),
-            ..frame
-        }
+        let (x, y) = Self::clamp_top_left(frame.x, frame.y, frame.width, frame.height, clamp_geo);
+        Rectangle { x, y, ..frame }
+    }
+
+    /// Clamp a `width`×`height` box's top-left corner so the box stays within
+    /// `clamp_geo`. The `.max(clamp_geo.x/y)` guards the degenerate case of a box
+    /// larger than the area, where the upper clamp bound would otherwise fall
+    /// below the lower. Shared by [`clamp_frame_onto_output`](Self::clamp_frame_onto_output)
+    /// and [`center_in_area`](Self::center_in_area) so the two can never disagree.
+    fn clamp_top_left(x: i32, y: i32, width: i32, height: i32, clamp_geo: Rectangle) -> (i32, i32) {
+        let max_x = (clamp_geo.x + clamp_geo.width - width).max(clamp_geo.x);
+        let max_y = (clamp_geo.y + clamp_geo.height - height).max(clamp_geo.y);
+        (x.clamp(clamp_geo.x, max_x), y.clamp(clamp_geo.y, max_y))
     }
 
     /// Center a `width`×`height` frame inside `area`, then clamp its top-left so
@@ -2443,12 +2451,7 @@ impl State {
             .unwrap_or(fallback);
         let x = area.x + (area.width - width) / 2;
         let y = area.y + (area.height - height) / 2;
-        // `.max(clamp_geo.x/y)` guards the degenerate case of a window
-        // wider/taller than the output, where the upper clamp bound would
-        // fall below the lower.
-        let max_x = (clamp_geo.x + clamp_geo.width - width).max(clamp_geo.x);
-        let max_y = (clamp_geo.y + clamp_geo.height - height).max(clamp_geo.y);
-        (x.clamp(clamp_geo.x, max_x), y.clamp(clamp_geo.y, max_y))
+        Self::clamp_top_left(x, y, width, height, clamp_geo)
     }
 
     /// Choose a managed X11 window's initial frame placement from its
@@ -3279,12 +3282,14 @@ impl State {
     /// at `create_xwayland` time, so `display_name` is already known here, well
     /// before the first client triggers the actual Xwayland start.
     ///
-    /// A theme/size the session already exported is respected; only the absent
-    /// ones get a sane default (`default` / `24`) so X11 apps never fall back to
-    /// the tiny bitmap core-X cursor. The output scale is not yet known at boot,
-    /// so `XCURSOR_SIZE` is the conventional logical `24`; chasing the HiDPI
-    /// multiple is inherently racy for a value X clients read once at their own
-    /// startup, so it is deliberately left at the logical size.
+    /// A theme the session already exported is respected; an absent one gets a
+    /// sane `default` so X11 apps never fall back to the tiny bitmap core-X
+    /// cursor. `XCURSOR_SIZE` is deliberately *not* forced here: the output scale
+    /// is unknown at boot, and forcing a fixed `24` would both lose HiDPI sizing
+    /// and (since the env var outranks the X resource in Xcursor's lookup)
+    /// override the scale-aware `Xcursor.size` that [`export_x11_dpi`] writes to
+    /// the root `RESOURCE_MANAGER` once the scale is known. A session that
+    /// explicitly exported `XCURSOR_SIZE` still wins, exactly as intended.
     pub fn publish_xwayland_env(display_name: Option<&str>) {
         let Some(name) = display_name else { return };
         // SAFETY (icedtea unsafe exception (c)): every caller runs in the
@@ -3298,9 +3303,6 @@ impl State {
         if std::env::var_os("XCURSOR_THEME").is_none() {
             unsafe { std::env::set_var("XCURSOR_THEME", "default") };
         }
-        if std::env::var_os("XCURSOR_SIZE").is_none() {
-            unsafe { std::env::set_var("XCURSOR_SIZE", "24") };
-        }
     }
 
     fn export_x11_dpi(display_name: String, scale: i32) {
@@ -3309,21 +3311,48 @@ impl State {
         // overflow it (review finding #8) — the dev/test profile builds with
         // overflow-checks on, where a plain `96 * scale` would panic in this
         // detached thread and silently drop the DPI publish.
-        let dpi = 96i32.saturating_mul(scale.max(1));
+        let scale = scale.max(1);
+        let dpi = 96i32.saturating_mul(scale);
+        // The X11 cursor size that scales with the output (review finding #4):
+        // the conventional logical 24 times the integer scale, published as the
+        // `Xcursor.size` resource rather than the `XCURSOR_SIZE` env var so it is
+        // an X-property write with no getenv/setenv race, and so a session's own
+        // `XCURSOR_SIZE` (which outranks the resource in Xcursor's lookup) still
+        // wins where it was set.
+        let cursor_size = 24i32.saturating_mul(scale);
+        // Stamp this export with a dispatch-order generation. `export_x11_dpi` is
+        // only ever called from the compositor thread (`xwayland_ready` and the
+        // test-only scale command, both on the event loop), so `fetch_add` here
+        // orders exports by the order their scales were set — which the detached
+        // threads below then race for the lock in *some* order (review finding
+        // #5). Serializing the writes is not enough: a Mutex makes each publish
+        // atomic but does not stop an older scale's thread from acquiring the lock
+        // last and clobbering a newer one. The generation lets the loser skip.
+        static NEXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let generation = NEXT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
             use x11rb::connection::Connection as _;
             use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
             use x11rb::wrapper::ConnectionExt as _;
 
             // Serialize the connect→write→sync→disconnect against any other
-            // in-flight DPI export (review finding #11): each export runs on its
-            // own detached thread with its own X connection, and without this
-            // two overlapping publishes could land on the server in an order
-            // unrelated to the order the scales were set. The lock keeps each
-            // publish atomic; the last one to acquire it wins, which is the last
-            // one dispatched.
+            // in-flight DPI export: each export runs on its own detached thread
+            // with its own X connection, and without this two overlapping
+            // publishes could interleave on the server. The lock keeps each
+            // publish atomic; the generation below keeps the *last dispatched*
+            // scale winning regardless of lock-acquisition order.
             static DPI_EXPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // The highest generation that has committed a write; a thread whose
+            // generation is older than this arrives after a newer scale already
+            // won and must not overwrite it with stale values.
+            static LAST_WRITTEN_GEN: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let _serialized = DPI_EXPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // `generation + 1` so a genuine gen 0 can still clear the initial 0.
+            if generation + 1 < LAST_WRITTEN_GEN.load(Ordering::Relaxed) {
+                return;
+            }
 
             let (conn, screen_num) = match x11rb::connect(Some(&display_name)) {
                 Ok(pair) => pair,
@@ -3335,7 +3364,10 @@ impl State {
             let root = conn.setup().roots[screen_num].root;
             // `RESOURCE_MANAGER` is the conventional xrdb database, a `STRING`
             // property of xrdb-style `name:\tvalue\n` lines on the root window.
-            let value = format!("Xft.dpi:\t{dpi}\n");
+            // Both hints scale with the output: `Xft.dpi` for fonts/UI, and
+            // `Xcursor.size` so an Xcursor-reading X11 app draws its pointer at
+            // the right device size on a HiDPI monitor (review finding #4).
+            let value = format!("Xft.dpi:\t{dpi}\nXcursor.size:\t{cursor_size}\n");
             if let Err(err) = conn.change_property8(
                 PropMode::REPLACE,
                 root,
@@ -3346,6 +3378,9 @@ impl State {
                 tracing::warn!(?err, "could not set RESOURCE_MANAGER Xft.dpi on the X root");
                 return;
             }
+            // The write landed: record this generation so any older in-flight
+            // export skips rather than clobbering it (review finding #5).
+            LAST_WRITTEN_GEN.fetch_max(generation + 1, Ordering::Relaxed);
             // A synchronous round-trip (rather than a bare `flush`) before the
             // connection is dropped: the change request must be fully processed
             // by the X server before this client disconnects, or the server can
@@ -5444,6 +5479,9 @@ impl wlr::ToplevelHandler for State {
             // for anything else (already managed, or unknown) there is nothing
             // to migrate.
             if self.override_redirect.remove(&sid).is_some() {
+                // Whether the surface flipping to managed was the OR keyboard
+                // holder (top of the stack) matters below.
+                let was_holder = self.or_keyboard_stack.last() == Some(&sid);
                 // Drop it from the keyboard stack without restoring model focus
                 // here — `add_managed_x11` below reseats focus itself, so a
                 // `sync_seat_focus` now would only churn.
@@ -5455,6 +5493,18 @@ impl wlr::ToplevelHandler for State {
                     rt.reparent_xwayland_surface_to_band(sid, wlr::Band::Toplevel);
                 }
                 self.add_managed_x11(surface);
+                // If the promoted surface had held the keyboard as a pop-up, it
+                // must keep it now that it is a managed toplevel. `add_managed_x11`
+                // focuses it in the model, but its `sync_seat_focus` is blocked by
+                // any parent menu still on the OR stack (the guard keeps the
+                // keyboard on an OR holder), so the new window would be focused yet
+                // keyboard-dead. Assert the seat directly. When `sid` was *not* the
+                // holder, a parent menu legitimately keeps the keyboard and we
+                // leave the seat alone.
+                if was_holder && let Some(&wid) = self.xwayland_windows.get(&sid) {
+                    self.window_manager.focus(wid);
+                    self.wayland.keyboard_focus(Some(wid));
+                }
             }
         }
     }

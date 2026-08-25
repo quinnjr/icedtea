@@ -1062,8 +1062,7 @@ fn runtime_override_redirect_flip_migrates_between_managed_and_or() {
         ps.len() == 1 && ps[0].above_toplevel && ps[0].position == (360, 300)
     })
     .expect("the flipped window did not migrate into the OR band at its client coordinates");
-    assert_eq!(migrated[0].position, (360, 300), "OR pop-up not at its post-flip client coords");
-    assert!(migrated[0].above_toplevel, "migrated OR pop-up did not stack above managed toplevels");
+    let _ = migrated;
 
     // Flip back to managed. An already-mapped window is only *adopted* into
     // management at map time (the xwm intercepts a MapRequest, which a live
@@ -1681,21 +1680,23 @@ fn xdnd_data_device_bridge_is_wired() {
     drop(conn);
 }
 
-/// M4 — DISPLAY + cursor environment robustness. Once Xwayland is `ready`, the
-/// compositor publishes a valid `DISPLAY` (`:N`) and, *when they are absent*, the
-/// `XCURSOR_THEME`/`XCURSOR_SIZE` cursor hints into its own environment, so
-/// session children spawned *after* the lazy start inherit the right X server and
-/// pointer theme -- concretely resolving the M1 DISPLAY-ordering caveat (the
-/// export happens in the `ready` handler, before any post-ready spawn). The
-/// compositor runs in this test's own process, so the exported vars are
-/// observable here directly.
+/// M4 — DISPLAY + cursor environment robustness. The compositor publishes a
+/// valid `DISPLAY` (`:N`) and, *when it is absent*, a default `XCURSOR_THEME`
+/// into its own environment, so session children spawned after the lazy start
+/// inherit the right X server and pointer theme -- concretely resolving the M1
+/// DISPLAY-ordering caveat. The scale-aware cursor *size* is published as the
+/// `Xcursor.size` X resource rather than `XCURSOR_SIZE` (review finding #4): the
+/// env var would outrank the resource in Xcursor's lookup and pin a fixed logical
+/// 24, losing HiDPI sizing, so `XCURSOR_SIZE` is left unset (and a session's own
+/// value respected). The compositor runs in this test's own process, so the
+/// exported vars are observable here directly.
 ///
 /// Non-vacuous, unlike the earlier version that read whatever ambient
 /// `XCURSOR_*` this runner already exports: the cursor vars are *cleared* before
 /// the compositor boots, so a passing assertion can only come from the
-/// compositor's own export. Both branches of the export are covered -- publish a
-/// default when absent, and *respect* a value the session already chose. Skips
-/// visibly when Xwayland is absent.
+/// compositor's own export. Both branches are covered -- publish a default theme
+/// (and the scale-aware `Xcursor.size` resource) when absent, and *respect* a
+/// value the session already chose. Skips visibly when Xwayland is absent.
 #[test]
 fn xwayland_publishes_display_and_cursor_env_on_ready() {
     let _x11_guard = x11_test_guard();
@@ -1726,29 +1727,45 @@ fn xwayland_publishes_display_and_cursor_env_on_ready() {
         return;
     };
     assert!(is_valid_display_name(&display), "advertised DISPLAY {display:?} is not a valid :N name");
-    // The env exports fire in `xwayland_ready`, which is lazy: force it by
-    // connecting a client, then poll the process environment for the defaults.
-    let (conn, _screen_num) = connect_with_retry(&display);
+    // The env exports fire at boot; the `Xft.dpi`/`Xcursor.size` resource fires in
+    // `xwayland_ready`, which is lazy — force it by connecting a client, then poll
+    // the process environment for the defaults.
+    let (conn, screen_num) = connect_with_retry(&display);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let display_env = std::env::var("DISPLAY").ok();
         let theme = std::env::var("XCURSOR_THEME").ok();
         let size = std::env::var("XCURSOR_SIZE").ok();
-        // Default theme is "default"; default size is `24 * scale` = 24 at the
-        // harness's scale-1 output.
+        // Default theme is "default". `XCURSOR_SIZE` is deliberately *not* forced
+        // into the env (it would override the scale-aware `Xcursor.size` resource
+        // and lose HiDPI sizing), so it must stay absent when the session left it
+        // unset — the scale-aware size is asserted via the X resource below.
         if display_env.as_deref() == Some(display.as_str())
             && theme.as_deref() == Some("default")
-            && size.as_deref() == Some("24")
+            && size.is_none()
         {
             break;
         }
         assert!(
             Instant::now() < deadline,
             "DISPLAY/cursor env defaults never published after ready (DISPLAY={display_env:?} \
-             XCURSOR_THEME={theme:?} XCURSOR_SIZE={size:?}); expected theme=default size=24"
+             XCURSOR_THEME={theme:?} XCURSOR_SIZE={size:?}); expected theme=default, size unset"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The scale-aware cursor size rides the root `RESOURCE_MANAGER` (`Xcursor.size`),
+    // not the env: at the harness's scale-1 output it is the logical `24 * 1`.
+    let root = conn.setup().roots[screen_num].root;
+    let resource_manager = intern(&conn, b"RESOURCE_MANAGER");
+    let matched = poll_x_resource_manager(&conn, root, resource_manager, Duration::from_secs(10), |rm| {
+        rm.contains("Xcursor.size:\t24")
+    });
+    assert!(
+        matched,
+        "the compositor never published Xcursor.size=24 in RESOURCE_MANAGER for the scale-1 output; \
+         RESOURCE_MANAGER was {:?}",
+        read_x_resource_manager(&conn, root, resource_manager)
+    );
     drop(conn);
     drop(comp);
 

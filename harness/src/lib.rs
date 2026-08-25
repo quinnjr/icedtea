@@ -1243,10 +1243,10 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()> 
         _: &QueueHandle<Self>,
     ) {
         if let zwp_primary_selection_source_v1::Event::Send { mime_type, fd } = event
-            && mime_type == state.offered_mime
+            && mime_type == state.offered_primary_mime
         {
             let mut f = std::fs::File::from(fd);
-            let _ = f.write_all(&state.offered_payload);
+            let _ = f.write_all(&state.offered_primary_payload);
             state.source_sends = state.source_sends.saturating_add(1);
         }
     }
@@ -2139,8 +2139,12 @@ impl TestClient {
     pub fn set_primary_text(&mut self, mime: &str, payload: &[u8]) {
         let manager = self.state.primary_manager.clone().expect("no primary manager");
         let device = self.state.primary_device.clone().expect("no primary device");
-        self.state.offered_mime = mime.to_string();
-        self.state.offered_payload = payload.to_vec();
+        // The native PRIMARY source has its own offer storage, distinct from the
+        // native CLIPBOARD's `offered_mime`/`offered_payload` (review finding #13,
+        // applied to the native pair too): a single client that owns both with
+        // different payloads must feed each reader its own bytes, not the other's.
+        self.state.offered_primary_mime = mime.to_string();
+        self.state.offered_primary_payload = payload.to_vec();
         let source = manager.create_source(&self.qh, ());
         source.offer(mime.to_string());
         device.set_selection(Some(&source), self.state.last_serial.unwrap_or(0));

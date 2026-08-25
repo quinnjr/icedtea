@@ -158,6 +158,32 @@ fn shift_button_color(base: [f32; 4], state: ButtonState) -> [f32; 4] {
     [scale(base[0]), scale(base[1]), scale(base[2]), scale(base[3])]
 }
 
+/// The `_NET_WM_STATE`-bearing attributes last pushed to a managed X11 window.
+///
+/// `sync_window_to_scene` re-pushes a window's full client state on every sync —
+/// including every pointer-motion frame of an interactive move/resize — and each
+/// wlroots `wlr_xwayland_surface_set_*` writes its atom and schedules an xwm
+/// flush unconditionally, so without a memo a single drag issues dozens of
+/// identical property writes per second (review finding #6). This is that memo:
+/// the seam skips a state atom whose value has not changed since it was last
+/// pushed. Geometry (position/size) is deliberately *not* memoized here — it
+/// legitimately changes on the very frames the drag produces — so it stays an
+/// unconditional configure. `activated`/`maximized`/`fullscreen` are owned by
+/// [`configure`](Wayland::configure); `minimized` by
+/// [`set_minimized`](Wayland::set_minimized).
+///
+/// The memo tracks the *last value pushed*, not the surface's live atom state,
+/// so any future path that changes one of these on the surface outside these two
+/// seams must invalidate the window's entry (drop it) or the next matching sync
+/// will be suppressed as a redundant no-op.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct X11PushedState {
+    minimized: bool,
+    activated: bool,
+    maximized: bool,
+    fullscreen: bool,
+}
+
 /// The compositor's Wayland side.
 #[derive(Default)]
 pub struct Wayland {
@@ -177,16 +203,13 @@ pub struct Wayland {
     /// window) is not needed here — `state.rs`'s Xwayland handlers keep their
     /// own `XwaylandSurfaceId → WindowId` side-table for that direction.
     window_to_x11: HashMap<WindowId, wlr::XwaylandSurfaceId>,
-    /// The `minimized` value last pushed to each managed X11 window, so
-    /// [`set_minimized`](Wayland::set_minimized) can skip a redundant
-    /// `_NET_WM_STATE_HIDDEN` write. `sync_window_to_scene` calls `set_minimized`
-    /// on every sync — including every pointer-motion frame of an interactive
-    /// move/resize — and wlroots' `wlr_xwayland_surface_set_minimized` writes the
-    /// atom and schedules an xwm flush unconditionally, so without this cache a
-    /// single drag issues dozens of identical property writes per second.
-    /// Keyed by `WindowId` (never reused, and a remap mints a fresh row), and
-    /// dropped in [`forget`](Wayland::forget) with the rest of the window's state.
-    x11_minimized: HashMap<WindowId, bool>,
+    /// The `_NET_WM_STATE`-bearing attributes last pushed to each managed X11
+    /// window (see [`X11PushedState`]), so [`set_minimized`](Wayland::set_minimized)
+    /// and [`configure`](Wayland::configure) can each skip a redundant atom write
+    /// and xwm flush. Keyed by `WindowId` (never reused, and a remap mints a
+    /// fresh row), and dropped in [`forget`](Wayland::forget) with the rest of
+    /// the window's state.
+    x11_pushed: HashMap<WindowId, X11PushedState>,
     /// One [`SsdVisual`] per window currently wearing server-side
     /// decorations, keyed the same way the toplevel maps are (review finding
     /// I2). `None` (no entry) means gone -- nothing is painted for that
@@ -246,7 +269,7 @@ impl Wayland {
             self.toplevel_to_window.remove(&key);
         }
         self.window_to_x11.remove(&id);
-        self.x11_minimized.remove(&id);
+        self.x11_pushed.remove(&id);
         self.remove_ssd(id);
     }
 
@@ -296,7 +319,7 @@ impl Wayland {
     /// geometry change and an activation change reach the client together
     /// rather than as two round trips.
     pub fn configure(
-        &self,
+        &mut self,
         id: WindowId,
         content: Rectangle,
         activated: bool,
@@ -316,13 +339,30 @@ impl Wayland {
                 // (position *and* size), not just a size: xdg clients do not
                 // know where they are, but X11 clients place themselves and
                 // must be told the geometry the WM granted, inside the SSD.
+                // Geometry is always sent — it is exactly what changes on a drag
+                // frame — but the `_NET_WM_STATE` atoms are memoized so an
+                // unchanged one costs no atom write + xwm flush (review finding
+                // #6). `None` (never pushed) forces the first sync to send all.
+                let prev = self.x11_pushed.get(&id).copied();
                 runtime.configure_xwayland_surface(
                     sid,
                     wlr::Box2D::new(content.x, content.y, content.width, content.height),
                 );
-                runtime.activate_xwayland_surface(sid, activated);
-                runtime.set_xwayland_surface_maximized(sid, maximized);
-                runtime.set_xwayland_surface_fullscreen(sid, fullscreen);
+                if prev.map(|p| p.activated) != Some(activated) {
+                    runtime.activate_xwayland_surface(sid, activated);
+                }
+                if prev.map(|p| p.maximized) != Some(maximized) {
+                    runtime.set_xwayland_surface_maximized(sid, maximized);
+                }
+                if prev.map(|p| p.fullscreen) != Some(fullscreen) {
+                    runtime.set_xwayland_surface_fullscreen(sid, fullscreen);
+                }
+                // `runtime`'s borrow ends above; record what we pushed, leaving
+                // `minimized` (owned by `set_minimized`) untouched.
+                let entry = self.x11_pushed.entry(id).or_default();
+                entry.activated = activated;
+                entry.maximized = maximized;
+                entry.fullscreen = fullscreen;
             }
         }
     }
@@ -372,12 +412,12 @@ impl Wayland {
             SurfaceKey::Xdg(_) => {}
             SurfaceKey::X11(sid) => {
                 // Skip the atom write + xwm flush when the value is unchanged
-                // from what this window last received (see `x11_minimized`).
-                if self.x11_minimized.get(&id) == Some(&minimized) {
+                // from what this window last received (see `x11_pushed`).
+                if self.x11_pushed.get(&id).map(|p| p.minimized) == Some(minimized) {
                     return;
                 }
                 runtime.set_xwayland_surface_minimized(sid, minimized);
-                self.x11_minimized.insert(id, minimized);
+                self.x11_pushed.entry(id).or_default().minimized = minimized;
             }
         }
     }
