@@ -473,6 +473,31 @@ pub fn alt_tab_should_end(watched: input::Modifiers, mods: input::Modifiers, pre
     modifier_released_this_event || !mods.contains(watched)
 }
 
+/// This compositor's `xdg-activation-v1` focus-steal policy, as a decision
+/// over plain values so it can be table-tested: the decision needs a live
+/// `State` and its toplevel map to reach otherwise, and neither is something
+/// a unit test can stand up.
+///
+/// An activation may take the keyboard only when *both* halves hold:
+///
+/// - `has_seat`: the client tied the token to a seat + serial, which wlroots
+///   validated against that seat before ever emitting the request. Without
+///   it the token carries no evidence of a user action at all -- the usual
+///   shape of a token minted for some other process to redeem later.
+/// - `requester == focused`: the token was requested by the window the user
+///   is *currently* working in. A seat serial only proves some interaction
+///   happened at some point; the window still holding focus is the only
+///   "recent enough" this compositor can actually vouch for, and it is what
+///   makes the honored case exactly the intended one (the app you are using
+///   handing you off to another of its windows).
+///
+/// Everything else is refused -- not dropped: the caller marks the target
+/// with an attention hint instead, so the shell can surface it without the
+/// keyboard moving out from under the user.
+fn activation_may_steal_focus(has_seat: bool, requester: Option<WindowId>, focused: Option<WindowId>) -> bool {
+    has_seat && requester.is_some() && requester == focused
+}
+
 /// Input passed to `State::handle_pointer`, in output logical coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerEvent {
@@ -5749,6 +5774,58 @@ impl wlr::SeatHandler for State {
         }
         self.apply_cursor_shape(shape);
     }
+
+    /// A client asked, via `xdg-activation-v1`, that a surface be focused.
+    ///
+    /// The decision itself is `activation_may_steal_focus` (see its doc for
+    /// why those are the two conditions); this only maps ids and applies the
+    /// outcome:
+    ///
+    /// - honored -> the ordinary explicit-focus path, the same one
+    ///   `DbCommand::Focus`, click-to-focus and `xwayland_request_activate`
+    ///   take: `WindowManager::focus` (which emits), `release_layer_focus`
+    ///   after it succeeds, then `sync_focus_change`. The raise comes free
+    ///   with that -- `sync_window_to_scene` raises the focused window when
+    ///   `behavior.raise_on_focus` is set -- so there is no new focus or
+    ///   stacking machinery here.
+    /// - refused -> `set_attention(target, true)`, a shell-facing hint the
+    ///   next focus clears. A target that is *already* focused gets neither:
+    ///   there is nothing to raise and nothing to flag.
+    fn request_activate(&mut self, target: Option<wlr::ToplevelId>, token: wlr::ActivationToken) {
+        let Some(target) = target else {
+            tracing::debug!(?token, "ignoring activation request for a surface with no toplevel");
+            return;
+        };
+        let Some(target_window) = self.wayland.window_for(crate::wayland::ToplevelKey::new(target)) else {
+            tracing::debug!(?target, ?token, "ignoring activation request for an untracked toplevel");
+            return;
+        };
+        let focused = self.focused_id();
+        if focused == Some(target_window) {
+            return;
+        }
+        let requester =
+            token.requesting_toplevel.and_then(|id| self.wayland.window_for(crate::wayland::ToplevelKey::new(id)));
+        if activation_may_steal_focus(token.has_seat, requester, focused) {
+            tracing::debug!(?target_window, ?requester, "honoring xdg-activation focus request");
+            if self.window_manager.focus(target_window).is_some() {
+                // Same ordering as every other explicit focus assertion: only
+                // after `focus` actually succeeded, so a refused focus leaves
+                // a layer surface's keyboard grab alone.
+                self.release_layer_focus();
+                self.sync_focus_change(focused);
+            }
+        } else {
+            tracing::debug!(
+                ?target_window,
+                ?requester,
+                has_seat = token.has_seat,
+                "refusing xdg-activation focus steal; flagging attention instead"
+            );
+            self.window_manager.set_attention(target_window, true);
+        }
+        self.emit_pending();
+    }
 }
 
 #[cfg(test)]
@@ -9594,5 +9671,33 @@ mod tests {
             onscreen,
             "a window already on an output must not be moved"
         );
+    }
+
+    /// A2 task 8: the xdg-activation focus-steal policy, isolated from the
+    /// handler so the table below can exercise every combination.
+    #[test]
+    fn activation_may_steal_focus_only_for_a_seat_backed_request_from_the_focused_window() {
+        let a = WindowId(1);
+        let b = WindowId(2);
+        let cases = [
+            // (has_seat, requester, focused, expected)
+            (true, Some(a), Some(a), true),
+            // No seat: wlroots could not tie the token to any user action.
+            (false, Some(a), Some(a), false),
+            // Seat-backed, but the requester is not the focused window.
+            (true, Some(b), Some(a), false),
+            // Token named no (live) requesting toplevel.
+            (true, None, Some(a), false),
+            // Nothing focused at all: there is no interaction to vouch for.
+            (true, Some(a), None, false),
+            (false, None, None, false),
+        ];
+        for (has_seat, requester, focused, expected) in cases {
+            assert_eq!(
+                activation_may_steal_focus(has_seat, requester, focused),
+                expected,
+                "has_seat={has_seat} requester={requester:?} focused={focused:?}"
+            );
+        }
     }
 }
