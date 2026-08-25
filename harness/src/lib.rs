@@ -316,6 +316,16 @@ impl Compositor {
             // Deliberately no `set_var("WAYLAND_DISPLAY", ...)`: see the
             // module doc. The handshake is the only way out of this thread —
             // everything above is `!Send`.
+            //
+            // DISPLAY + the X11 cursor hints ARE published, though, and here —
+            // *before* the boot handshake below (review finding #5). Publishing
+            // before `boot_tx.send` means the writes happen-before the test
+            // thread resumes from `Compositor::spawn`, so a test that reads the
+            // process env (the DISPLAY/cursor-env test) is ordered after them
+            // rather than racing the old `xwayland_ready` write on this thread.
+            icedtea_compositor::state::State::publish_xwayland_env(
+                runtime.xwayland_display_name().as_deref(),
+            );
             boot_tx.send((socket, cmd_wake_write)).expect("boot handshake");
             drop(boot_tx);
             drop(boot_guard);
@@ -373,16 +383,45 @@ impl Compositor {
             .expect("compositor never answered XwaylandDisplay")
     }
 
+    /// Whether the lazy Xwayland has started and `xwayland_ready` has fired (the
+    /// seat is wired, so the clipboard/primary/DND bridge is armed). A test that
+    /// needs the bridge live polls this after connecting the client that
+    /// triggers the lazy start — the readiness barrier that used to be inferred
+    /// from `DISPLAY` being republished on ready (review finding #5).
+    pub fn xwayland_ready(&self) -> bool {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::XwaylandReady { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered XwaylandReady")
+    }
+
     /// Override the primary output's recorded scale (and re-publish the X11
     /// `Xft.dpi` hint if Xwayland is already up), for the M4 HiDPI test. Blocks
     /// on the ack -- see [`Self::inject_touch_down`]'s doc -- so the scale has
     /// actually been recorded before this returns.
     pub fn set_output_scale_for_test(&self, scale: f64) {
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        self.send(DbCommand::SetOutputScaleForTest { scale, reply: reply_tx });
-        reply_rx
-            .recv_timeout(TIMEOUT)
-            .expect("compositor never answered SetOutputScaleForTest");
+        // `spawn` returns at the boot handshake, before `run_all` creates the
+        // headless output, so the very first attempt can land before any output
+        // exists. Poll until the compositor reports it actually recorded the
+        // scale (review finding #11) rather than acking a silent no-op, so the
+        // caller is guaranteed the scale is live before it proceeds.
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            self.send(DbCommand::SetOutputScaleForTest { scale, reply: reply_tx });
+            let recorded = reply_rx
+                .recv_timeout(TIMEOUT)
+                .expect("compositor never answered SetOutputScaleForTest");
+            if recorded {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no output ever existed to record the test scale on"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Probe every mapped override-redirect (OR) X11 pop-up the compositor is
@@ -602,9 +641,18 @@ struct ClientState {
     /// an actual key press/release delivered to this client, which is exactly
     /// what M4.4's lock-isolation test needs to observe.
     key_events: u32,
-    /// What this client's own data source answers `send` with.
+    /// What this client's own clipboard data source answers `send` with. The
+    /// `wl_data_source` and clipboard `zwlr_data_control_source_v1` handlers read
+    /// these; the *primary* data-control source has its own pair below so one
+    /// client can legitimately own CLIPBOARD and PRIMARY at once, each answered
+    /// from its own payload (review finding #13).
     offered_mime: String,
     offered_payload: Vec<u8>,
+    /// The primary (middle-click) data-control source's `send` payload, kept
+    /// separate from the clipboard pair above so a client owning both selections
+    /// does not cross-feed one into the other's reader.
+    offered_primary_mime: String,
+    offered_primary_payload: Vec<u8>,
     /// How many `wl_data_source.send` requests this client has serviced — the
     /// signal a reader uses to know the owner has written the payload. Shared
     /// by the `wl_data_source` and `zwlr_data_control_source_v1` send handlers,
@@ -1043,20 +1091,29 @@ impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for Client
 impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for ClientState {
     fn event(
         state: &mut Self,
-        _: &zwlr_data_control_source_v1::ZwlrDataControlSourceV1,
+        source: &zwlr_data_control_source_v1::ZwlrDataControlSourceV1,
         event: zwlr_data_control_source_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // Same payload-write shape as the `wl_data_source` handler; shares the
-        // offered payload + send counter (a client owns via one protocol only).
-        if let zwlr_data_control_source_v1::Event::Send { mime_type, fd } = event
-            && mime_type == state.offered_mime
-        {
-            let mut f = std::fs::File::from(fd);
-            let _ = f.write_all(&state.offered_payload);
-            state.source_sends = state.source_sends.saturating_add(1);
+        // A client may own CLIPBOARD and PRIMARY at once via data-control, each
+        // with its own source object. Route the `send` to the matching payload
+        // by which source fired it (review finding #13) — the primary source
+        // answers from `offered_primary_*`, everything else from the clipboard
+        // pair — so neither reader ever gets the other's bytes.
+        if let zwlr_data_control_source_v1::Event::Send { mime_type, fd } = event {
+            let is_primary = state.data_control_primary_source.as_ref() == Some(source);
+            let (want_mime, payload) = if is_primary {
+                (&state.offered_primary_mime, &state.offered_primary_payload)
+            } else {
+                (&state.offered_mime, &state.offered_payload)
+            };
+            if &mime_type == want_mime {
+                let mut f = std::fs::File::from(fd);
+                let _ = f.write_all(payload);
+                state.source_sends = state.source_sends.saturating_add(1);
+            }
         }
     }
 }
@@ -2541,8 +2598,10 @@ impl DataControlClient {
     pub fn set_primary(&mut self, mime: &str, payload: &[u8]) {
         let manager = self.state.data_control_manager.clone().expect("no data-control manager");
         let device = self.state.data_control_device.clone().expect("no data-control device");
-        self.state.offered_mime = mime.to_string();
-        self.state.offered_payload = payload.to_vec();
+        // The primary selection's own payload pair, not the clipboard's, so a
+        // client that owns both feeds each reader the right bytes (finding #13).
+        self.state.offered_primary_mime = mime.to_string();
+        self.state.offered_primary_payload = payload.to_vec();
         let source = manager.create_data_source(&self.qh, ());
         source.offer(mime.to_string());
         device.set_primary_selection(Some(&source));

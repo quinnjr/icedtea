@@ -177,6 +177,16 @@ pub struct Wayland {
     /// window) is not needed here — `state.rs`'s Xwayland handlers keep their
     /// own `XwaylandSurfaceId → WindowId` side-table for that direction.
     window_to_x11: HashMap<WindowId, wlr::XwaylandSurfaceId>,
+    /// The `minimized` value last pushed to each managed X11 window, so
+    /// [`set_minimized`](Wayland::set_minimized) can skip a redundant
+    /// `_NET_WM_STATE_HIDDEN` write. `sync_window_to_scene` calls `set_minimized`
+    /// on every sync — including every pointer-motion frame of an interactive
+    /// move/resize — and wlroots' `wlr_xwayland_surface_set_minimized` writes the
+    /// atom and schedules an xwm flush unconditionally, so without this cache a
+    /// single drag issues dozens of identical property writes per second.
+    /// Keyed by `WindowId` (never reused, and a remap mints a fresh row), and
+    /// dropped in [`forget`](Wayland::forget) with the rest of the window's state.
+    x11_minimized: HashMap<WindowId, bool>,
     /// One [`SsdVisual`] per window currently wearing server-side
     /// decorations, keyed the same way the toplevel maps are (review finding
     /// I2). `None` (no entry) means gone -- nothing is painted for that
@@ -236,6 +246,7 @@ impl Wayland {
             self.toplevel_to_window.remove(&key);
         }
         self.window_to_x11.remove(&id);
+        self.x11_minimized.remove(&id);
         self.remove_ssd(id);
     }
 
@@ -355,11 +366,19 @@ impl Wayland {
     /// (which the xwm turns into the `_NET_WM_STATE_HIDDEN` atom) or an X11 app
     /// never learns it was minimized. Silent no-op on a miss, like every other
     /// seam here.
-    pub fn set_minimized(&self, id: WindowId, minimized: bool) {
+    pub fn set_minimized(&mut self, id: WindowId, minimized: bool) {
         let Some((runtime, key)) = self.resolve(id) else { return };
         match key {
             SurfaceKey::Xdg(_) => {}
-            SurfaceKey::X11(sid) => runtime.set_xwayland_surface_minimized(sid, minimized),
+            SurfaceKey::X11(sid) => {
+                // Skip the atom write + xwm flush when the value is unchanged
+                // from what this window last received (see `x11_minimized`).
+                if self.x11_minimized.get(&id) == Some(&minimized) {
+                    return;
+                }
+                runtime.set_xwayland_surface_minimized(sid, minimized);
+                self.x11_minimized.insert(id, minimized);
+            }
         }
     }
 

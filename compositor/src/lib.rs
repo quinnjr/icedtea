@@ -217,6 +217,13 @@ pub fn run() {
     unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &socket);
     }
+    // Publish DISPLAY + the X11 cursor hints in the SAME pre-thread window
+    // (review finding #5): the lazy `create_xwayland` above already reserved the
+    // display socket, so the name is known now, and doing this here — rather than
+    // from `xwayland_ready` inside `run_all` — keeps every process-env mutation
+    // before the D-Bus and wallpaper threads spawn, where it cannot race a
+    // concurrent getenv.
+    State::publish_xwayland_env(runtime.xwayland_display_name().as_deref());
     tracing::info!(%socket, "listening on wayland socket");
 
     let dbus_quit_signal = Arc::new(AtomicBool::new(false));

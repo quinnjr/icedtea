@@ -93,11 +93,24 @@ const WINDOW_TITLE: &str = "Icedtea Spike Window";
 /// compositor never advertises a display anyway, but checking `PATH` first
 /// gives a clearer skip message.
 fn xwayland_on_path() -> bool {
-    std::env::var_os("PATH")
+    let present = std::env::var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path).any(|dir| dir.join("Xwayland").is_file())
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // Review finding #10: every test in this file returns early (reported as a
+    // green PASS) when the `Xwayland` binary is absent, so on a runner without
+    // it the whole suite is a silent no-op that verifies none of the feature.
+    // Set `REQUIRE_XWAYLAND=1` (in CI, where Xwayland IS installed) to turn that
+    // silent skip into a loud failure, so a broken provisioning step can never
+    // masquerade as a passing X11 suite.
+    if !present && std::env::var_os("REQUIRE_XWAYLAND").is_some() {
+        panic!(
+            "REQUIRE_XWAYLAND is set but the `Xwayland` binary is not on PATH; \
+             the X11 end-to-end suite cannot run and must not be reported as passing"
+        );
+    }
+    present
 }
 
 #[test]
@@ -239,10 +252,13 @@ fn managed_x11_window_is_first_class() {
     let (conn, screen_num) = connect_with_retry(&display);
     let screen = &conn.setup().roots[screen_num];
 
-    // The requested size is treated by the WM as the *frame*; a decorated
-    // window's client is then configured to the content rect inside the SSD.
-    const FRAME_W: u16 = 400;
-    const FRAME_H: u16 = 300;
+    // The size an X11 client asks for is its *content* (it has no notion of the
+    // WM's decorations). A decorated window keeps that content size and the WM
+    // wraps it in a frame one title-bar taller (review finding #2) — so the
+    // client is never squished, and the model frame is REQUESTED + the strip.
+    const REQUESTED_W: u16 = 400;
+    const REQUESTED_H: u16 = 300;
+    const FRAME_H: i32 = REQUESTED_H as i32 + TITLE_BAR_HEIGHT as i32;
 
     let win = conn.generate_id().expect("generate X11 window id");
     conn.create_window(
@@ -251,8 +267,8 @@ fn managed_x11_window_is_first_class() {
         screen.root,
         0,
         0,
-        FRAME_W,
-        FRAME_H,
+        REQUESTED_W,
+        REQUESTED_H,
         0,
         WindowClass::INPUT_OUTPUT,
         screen.root_visual,
@@ -275,21 +291,22 @@ fn managed_x11_window_is_first_class() {
     assert_eq!(window.title, WINDOW_TITLE, "title is the X11 window name");
     let id = window.id;
 
-    // (2) SSD parity — the client is configured to a content rect exactly one
-    // title-bar shorter than the frame. This is the end-to-end proof the X11
-    // window is decorated: the model reserved the strip and the configure
-    // reached the X server.
-    let content_h = poll_x_geometry(&conn, win, Duration::from_secs(10), |g| {
-        g.width == FRAME_W && g.height == FRAME_H - TITLE_BAR_HEIGHT
+    // (2) SSD parity — the client keeps the exact content size it asked for
+    // (never squished, review finding #2), and the model reserved the strip
+    // above it. This is the end-to-end proof the X11 window is decorated: the
+    // configure reached the X server at the requested content size.
+    let content_ok = poll_x_geometry(&conn, win, Duration::from_secs(10), |g| {
+        g.width == REQUESTED_W && g.height == REQUESTED_H
     });
     assert!(
-        content_h,
-        "the X11 client was never configured to the SSD content rect (expected {}x{})",
-        FRAME_W,
-        FRAME_H - TITLE_BAR_HEIGHT
+        content_ok,
+        "the X11 client was never configured to its requested content rect (expected {REQUESTED_W}x{REQUESTED_H})"
     );
-    assert_eq!(window.geometry.width, FRAME_W as i32, "model geometry is the frame width");
-    assert_eq!(window.geometry.height, FRAME_H as i32, "model geometry is the frame height");
+    assert_eq!(window.geometry.width, REQUESTED_W as i32, "model geometry is the frame width");
+    assert_eq!(
+        window.geometry.height, FRAME_H,
+        "model frame is the requested content plus the SSD title-bar strip"
+    );
 
     // (3) Focus — a freshly mapped managed window is focused (add_window
     // autofocuses, and the shared path activated it and gave it the seat).
@@ -320,9 +337,9 @@ fn managed_x11_window_is_first_class() {
     comp.send(DbCommand::Maximize(id, true));
     let maxed = poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| w.maximized)
         .expect("the window never maximized in the model");
-    // It grew far past its 400px frame to fill the output.
+    // It grew far past its requested frame to fill the output.
     assert!(
-        maxed.geometry.width > FRAME_W as i32 && maxed.geometry.height > FRAME_H as i32,
+        maxed.geometry.width > REQUESTED_W as i32 && maxed.geometry.height > FRAME_H,
         "maximized geometry {:?} did not grow to fill the output",
         maxed.geometry
     );
@@ -383,15 +400,18 @@ fn fullscreen_x11_window_fills_the_output_without_ssd() {
     let (conn, screen_num) = connect_with_retry(&display);
     let screen = conn.setup().roots[screen_num].clone();
 
-    const FRAME_W: u16 = 400;
-    const FRAME_H: u16 = 300;
-    let win = map_managed_x11(&conn, &screen, FRAME_W, FRAME_H);
+    // Requested = the client's content size; the decorated frame is one strip
+    // taller (review finding #2).
+    const REQUESTED_W: u16 = 400;
+    const REQUESTED_H: u16 = 300;
+    const FRAME_H: i32 = REQUESTED_H as i32 + TITLE_BAR_HEIGHT as i32;
+    let win = map_managed_x11(&conn, &screen, REQUESTED_W, REQUESTED_H);
     let window = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the model");
     let id = window.id;
-    // Baseline: decorated, so the client sits in the SSD content rect.
+    // Baseline: decorated, so the client keeps its requested content size.
     assert!(
-        poll_x_geometry(&conn, win, Duration::from_secs(10), |g| g.height == FRAME_H - TITLE_BAR_HEIGHT),
+        poll_x_geometry(&conn, win, Duration::from_secs(10), |g| g.height == REQUESTED_H),
         "the X11 window was never decorated to begin with"
     );
 
@@ -405,7 +425,7 @@ fn fullscreen_x11_window_fills_the_output_without_ssd() {
         .expect("the window never fullscreened in the model");
     // The model frame grew to fill the output.
     assert!(
-        fs.geometry.width > FRAME_W as i32 && fs.geometry.height > FRAME_H as i32,
+        fs.geometry.width > REQUESTED_W as i32 && fs.geometry.height > FRAME_H,
         "fullscreen geometry {:?} did not grow to fill the output",
         fs.geometry
     );
@@ -432,11 +452,11 @@ fn fullscreen_x11_window_fills_the_output_without_ssd() {
     comp.send(DbCommand::Fullscreen(id, false));
     let restored = poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| !w.fullscreen)
         .expect("the window never left fullscreen");
-    assert_eq!(restored.geometry.width, FRAME_W as i32, "frame width not restored");
-    assert_eq!(restored.geometry.height, FRAME_H as i32, "frame height not restored");
+    assert_eq!(restored.geometry.width, REQUESTED_W as i32, "frame width not restored");
+    assert_eq!(restored.geometry.height, FRAME_H, "frame height not restored");
     assert!(
         poll_x_geometry(&conn, win, Duration::from_secs(10), |g| {
-            g.width == FRAME_W && g.height == FRAME_H - TITLE_BAR_HEIGHT
+            g.width == REQUESTED_W && g.height == REQUESTED_H
         }),
         "the SSD content rect was not restored after un-fullscreen"
     );
@@ -1033,10 +1053,17 @@ fn runtime_override_redirect_flip_migrates_between_managed_and_or() {
         poll_until(&comp, Duration::from_secs(15), |s| s.windows.is_empty()),
         "the window did not leave the Window model when it became override-redirect"
     );
-    assert!(
-        poll_or(&comp, Duration::from_secs(15), |ps| ps.len() == 1).is_some(),
-        "the window did not enter the OR side-table when it became override-redirect"
-    );
+    // Assert the migrated pop-up's *real scene state*, not just the side-table
+    // count (review finding #14): the still-live scene node must be reparented
+    // into the band above managed toplevels and repositioned at the client
+    // coordinates the flip's ConfigureNotify carried (360, 300) — a bookkeeping
+    // count of 1 would pass even if the reparent/reposition silently failed.
+    let migrated = poll_or(&comp, Duration::from_secs(15), |ps| {
+        ps.len() == 1 && ps[0].above_toplevel && ps[0].position == (360, 300)
+    })
+    .expect("the flipped window did not migrate into the OR band at its client coordinates");
+    assert_eq!(migrated[0].position, (360, 300), "OR pop-up not at its post-flip client coords");
+    assert!(migrated[0].above_toplevel, "migrated OR pop-up did not stack above managed toplevels");
 
     // Flip back to managed. An already-mapped window is only *adopted* into
     // management at map time (the xwm intercepts a MapRequest, which a live
@@ -1180,29 +1207,24 @@ fn poll_snapshot_window(
 
 /// Connect an X11 client *and* wait until the compositor has finished bringing
 /// Xwayland up -- specifically past the crate's `set_xwayland_seat`, which is
-/// what arms the clipboard/primary/DND bridge. The compositor runs
-/// `State::xwayland_ready` (which republishes `DISPLAY` into the process
-/// environment) *after* `set_xwayland_seat`, so an observed `DISPLAY == display`
-/// is a sound "bridge is armed" signal. Any `DISPLAY` a previous serialized test
-/// left behind is cleared first, so the wait can only be satisfied by *this*
-/// compositor's `ready`, never a stale value (display numbers can be reused
-/// across teardowns). Without this gate an X11 client that grabs a selection
-/// before the seat is wired is silently dropped by the xwm.
-fn wait_for_xwayland_ready(display: &str) -> (x11rb::rust_connection::RustConnection, usize) {
-    // SAFETY: the X11 e2e tests are serialized by `X11_TEST_LOCK`, so no other
-    // test mutates the environment concurrently; the compositor thread only
-    // *writes* `DISPLAY` (never reads it), so a concurrent clear cannot mislead
-    // it. This mirrors the env discipline the compositor's own `set_var` uses.
-    unsafe { std::env::remove_var("DISPLAY") };
-    // Connecting execs the lazy Xwayland, whose `ready` drives `set_xwayland_seat`
-    // and then the `DISPLAY` republish we wait on.
+/// what arms the clipboard/primary/DND bridge. `set_xwayland_seat` runs inside
+/// `State::xwayland_ready`, so once the compositor reports ready
+/// (`Compositor::xwayland_ready`, backed by `DbCommand::XwaylandReady`) the seat
+/// is wired and the bridge armed. Without this gate an X11 client that grabs a
+/// selection before the seat is wired is silently dropped by the xwm.
+///
+/// (This used to infer readiness from `DISPLAY` being republished into the
+/// process environment on `ready`; that republish was a `set_var` from inside
+/// `run_all` and is gone — DISPLAY is now published once, at boot. See review
+/// finding #5.)
+fn wait_for_xwayland_ready(comp: &Compositor, display: &str) -> (x11rb::rust_connection::RustConnection, usize) {
+    // Connecting execs the lazy Xwayland, whose `ready` drives `set_xwayland_seat`.
     let pair = connect_with_retry(display);
     let deadline = Instant::now() + Duration::from_secs(15);
-    while std::env::var("DISPLAY").ok().as_deref() != Some(display) {
+    while !comp.xwayland_ready() {
         assert!(
             Instant::now() < deadline,
-            "Xwayland never signalled ready (DISPLAY {display} was not republished); \
-             the selection/DND bridge would not be armed"
+            "Xwayland never signalled ready; the selection/DND bridge would not be armed"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -1462,7 +1484,7 @@ fn x11_clipboard_selection_bridges_to_a_wayland_reader() {
     };
     // Gate on the bridge being armed (`set_seat` done) before the owner takes
     // the selection -- an owner that grabs it earlier is dropped by the xwm.
-    let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+    let (conn, _screen_num) = wait_for_xwayland_ready(&comp, &display);
 
     let mut manager = DataControlClient::spawn(&comp.socket);
     // The X11 owner runs its own event loop on a second connection, servicing
@@ -1499,7 +1521,7 @@ fn wayland_clipboard_selection_bridges_to_an_x11_reader() {
         eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
         return;
     };
-    let (conn, screen_num) = wait_for_xwayland_ready(&display);
+    let (conn, screen_num) = wait_for_xwayland_ready(&comp, &display);
     let screen = conn.setup().roots[screen_num].clone();
     // wlroots refuses to serve a Wayland-owned selection to X unless a focused
     // Xwayland surface is asking, so map one that the compositor auto-focuses.
@@ -1539,7 +1561,7 @@ fn x11_primary_selection_bridges_to_a_wayland_reader() {
         eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
         return;
     };
-    let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+    let (conn, _screen_num) = wait_for_xwayland_ready(&comp, &display);
 
     let mut manager = DataControlClient::spawn(&comp.socket);
     let _owner = X11SelectionOwner::spawn(display.clone(), "PRIMARY", X11_PRIMARY_PAYLOAD.to_vec());
@@ -1572,7 +1594,7 @@ fn wayland_primary_selection_bridges_to_an_x11_reader() {
         eprintln!("SKIP: the compositor advertised no Xwayland DISPLAY (Xwayland unavailable)");
         return;
     };
-    let (conn, screen_num) = wait_for_xwayland_ready(&display);
+    let (conn, screen_num) = wait_for_xwayland_ready(&comp, &display);
     let screen = conn.setup().roots[screen_num].clone();
     let focused = map_focused_managed_x11(&comp, &conn, &screen);
 
@@ -1606,9 +1628,14 @@ fn wayland_primary_selection_bridges_to_an_x11_reader() {
 ///     differently, because it is not wired separately. Hence: selection bridge
 ///     proven end-to-end ⇒ the DnD data-device path is in place by construction.
 ///
-/// This test fails only if the data-device manager global regresses; the deeper
-/// guarantee is carried by the selection round-trips. Skips visibly when
-/// Xwayland is absent (the seat/bridge only exists once Xwayland is ready).
+/// Concretely this drives a full X11→Wayland data-device transfer (an X11
+/// selection owner's bytes read back through a Wayland client), so it fails if
+/// either the manager global regresses OR the shared data-device transfer path
+/// stops carrying data — not a tautology. The one thing still NOT exercised is a
+/// live XdndEnter/Position/Status/Drop pointer-grab drag gesture; that needs an
+/// X11 drag source and a Wayland drop target moving in lockstep and is a tracked
+/// follow-up. Skips visibly when Xwayland is absent (the seat/bridge only exists
+/// once Xwayland is ready).
 #[test]
 fn xdnd_data_device_bridge_is_wired() {
     let _x11_guard = x11_test_guard();
@@ -1622,7 +1649,7 @@ fn xdnd_data_device_bridge_is_wired() {
         return;
     };
     // Bring Xwayland up so the seat bridge (which carries XDND) is armed.
-    let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+    let (conn, _screen_num) = wait_for_xwayland_ready(&comp, &display);
 
     let globals = advertised_globals(&comp.socket);
     assert!(
@@ -1631,14 +1658,25 @@ fn xdnd_data_device_bridge_is_wired() {
     );
 
     // The bridge shares the seat the selection tests exercise; prove that seat's
-    // clipboard bridge is live here too, so this test also stands as the
-    // construction proof for XDND without relying on the others having run.
+    // data-device transfer path is live end-to-end here too — an X11 owner's
+    // bytes actually crossing into a Wayland reader — so this test stands as a
+    // real construction proof (review finding #12), not a tautological "the
+    // unconditional manager global exists". A full read, not just `has_offer`:
+    // the same `wl_data_device`/`wlr_seat` machinery an X11-originated *drag*
+    // offer would traverse is shown to carry data across the boundary intact.
     let mut manager = DataControlClient::spawn(&comp.socket);
     let _owner =
         X11SelectionOwner::spawn(display.clone(), "CLIPBOARD", X11_CLIPBOARD_PAYLOAD.to_vec());
     assert!(
         manager.wait_until(|c| c.has_offer()),
-        "the shared seat's selection bridge is not live -- XDND rides this same seat"
+        "the X11 selection never reached the Wayland seat as a data-control offer -- \
+         XDND rides this same seat"
+    );
+    let got = manager.read_offer_blocking(SELECTION_MIME);
+    assert_eq!(
+        got, X11_CLIPBOARD_PAYLOAD,
+        "the shared seat's data-device transfer path did not carry the X11 payload across -- \
+         XDND rides this same path"
     );
     drop(conn);
 }
@@ -1724,10 +1762,12 @@ fn xwayland_publishes_display_and_cursor_env_on_ready() {
     }
     let comp = Compositor::spawn();
     if let Some(display) = comp.xwayland_display() {
-        // `wait_for_xwayland_ready` guarantees `ready` actually ran (DISPLAY was
-        // republished), so "the sentinel survived" is a real assertion about the
-        // respect-existing branch, not a vacuous "nothing touched it yet".
-        let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+        // The cursor env is published at boot (before `Compositor::spawn`
+        // returned), so the sentinel-respecting decision has already been made by
+        // the time we read it here; `wait_for_xwayland_ready` additionally drives
+        // the seat wiring so the whole ready path ran, keeping this a real
+        // assertion about the respect-existing branch.
+        let (conn, _screen_num) = wait_for_xwayland_ready(&comp, &display);
         assert_eq!(
             std::env::var("XCURSOR_THEME").ok().as_deref(),
             Some(SENTINEL_THEME),
@@ -1781,7 +1821,7 @@ fn a_child_spawned_after_ready_inherits_the_display() {
         return;
     };
     // Gate on `ready` having actually republished DISPLAY into the process env.
-    let (conn, _screen_num) = wait_for_xwayland_ready(&display);
+    let (conn, _screen_num) = wait_for_xwayland_ready(&comp, &display);
 
     // A child spawned now inherits the compositor's environment; it should see
     // exactly the DISPLAY the compositor advertised.
@@ -1831,7 +1871,7 @@ fn hidpi_dpi_hint_is_published_for_a_scaled_output() {
     comp.set_output_scale_for_test(2.0);
 
     // Connecting execs Xwayland and drives `ready` -> the DPI export.
-    let (conn, screen_num) = wait_for_xwayland_ready(&display);
+    let (conn, screen_num) = wait_for_xwayland_ready(&comp, &display);
     let root = conn.setup().roots[screen_num].root;
 
     let resource_manager = intern(&conn, b"RESOURCE_MANAGER");
