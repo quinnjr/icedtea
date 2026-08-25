@@ -115,10 +115,12 @@
 
 ### Task 9: compositor — gamma-control handler
 
-**Files:** `compositor/src/state.rs`.
+**Files:** `compositor/src/lib.rs`, `compositor/src/state.rs`.
 
-- [ ] **Step 1:** Implement `set_gamma`: stash the ramp for the named output; apply it in that output's next `OutputHandler::frame`/commit via the wlr `Output::set_gamma` path (mirror the `pending_test_output_scale` deferral already there for a live-output write). On commit failure, fire the failed signal. Drop the ramp when the controlling client goes away.
-- [ ] **Step 2:** Existing suite + clippy. Commit `feat(compositor): gamma-control applies the LUT on output commit`.
+> **Ruling (Task 1-3 review, wlr 0.20.25 as published):** wlroots 0.20 has NO `wlr_output_state_set_gamma_lut`; `Runtime::create_gamma_control_manager` wires `wlr_scene_set_gamma_control_manager_v1(scene, mgr)`, and the scene applies ramps (fitted to `wlr_output_get_gamma_size`) on its own output commits and sends `failed` on a rejected commit. There is no `Output::set_gamma` and `OutputHandler::gamma_control_changed(OutputId)` is NOTIFICATION-ONLY. The manager requires `init_graphics` to have run (it has — `lib.rs` calls it before the globals block).
+
+- [ ] **Step 1:** Create the manager at boot beside the Batch-1 globals (non-fatal, house `tracing::error!` style). Implement `gamma_control_changed` as a `tracing::debug!` trace of the output — no stash, no apply, no commit-path change (the scene owns all of that).
+- [ ] **Step 2:** Existing suite + clippy. Commit `feat(compositor): gamma-control via scene integration` (may be folded into Task 7's boot-globals commit).
 
 ### Task 10: harness + tests
 
@@ -127,7 +129,7 @@
 - [ ] **Step 1:** Advertised-globals assertions for `wp_cursor_shape_manager_v1`, `xdg_activation_v1`, `zwlr_gamma_control_manager_v1` (mirror Batch 1).
 - [ ] **Step 2:** cursor-shape: a client with pointer focus calls `set_shape`; assert the seat's active cursor became the mapped named cursor and reverts when focus leaves (guards the background-client case). Add whatever harness accessor reads the current seat cursor name.
 - [ ] **Step 3:** xdg-activation (both branches, non-vacuous): activation carrying a fresh interaction serial ⇒ target gains focus; a stale/token-less activation ⇒ target does NOT steal focus but its `attention` bit is set (assert via the `org.icedtea.Compositor` snapshot/WindowUpdate the test reads).
-- [ ] **Step 4:** gamma-control: a client sets a ramp of the output's advertised gamma size; assert the output's next commit applied a gamma LUT (and a wrong-size ramp triggers `failed`).
+- [ ] **Step 4:** gamma-control (scene-applied, headless): the headless output reports `gamma_size == 0`, so a client's `get_gamma_control` on it must receive a protocol-conformant `failed` (wlroots sends it when the size is 0) — assert that event arrives (not a hang / not `gamma_size`). Reconcile against the actual wlroots behavior observed in the test; if headless instead advertises a size, set a ramp of that size and assert the control stays alive (no `failed`) through a subsequent frame.
 - [ ] **Step 5:** `cargo test -p icedtea-compositor --test compat_protocols` + clippy. Commit `test(compositor): A2 batch-2 cursor-shape/xdg-activation/gamma`.
 
 ### Task 11: final review + merge window — HARD-STOP
