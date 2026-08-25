@@ -116,6 +116,60 @@ pub enum DbCommand {
     /// runtime handle. Not reachable from `WmInterface` -- only the test
     /// harness sends this, same reasoning as `SessionLocked`.
     CursorPosition { reply: Sender<(f64, f64)> },
+    /// Test-only: read the `DISPLAY` name (`:N`) Xwayland advertises, via
+    /// `wlr::Runtime::xwayland_display_name`. `None` when no Xwayland was
+    /// created (the `Xwayland` binary is absent), so the X11 end-to-end test
+    /// can skip cleanly. Available as soon as the manager reserves its display
+    /// socket -- before the lazy `Xwayland` start -- which is exactly what lets
+    /// the test read `DISPLAY`, connect an X11 client, and *trigger* that lazy
+    /// start. Not reachable from `WmInterface` -- only the test harness sends
+    /// this, same reasoning as `SessionLocked`.
+    XwaylandDisplay { reply: Sender<Option<String>> },
+    /// Test-only: report whether `xwayland_ready` has fired — i.e. the lazy
+    /// `Xwayland` has actually started and the crate has wired its seat (arming
+    /// the clipboard/primary/DND bridge). Distinct from `XwaylandDisplay`, which
+    /// answers as soon as the display socket is *reserved* (before the lazy
+    /// start): a selection/DND test connects using `XwaylandDisplay`, then waits
+    /// on this for the bridge to be live. Replaces the old
+    /// republish-`DISPLAY`-on-ready barrier, which relied on a `set_var` from
+    /// inside `run_all` (review finding #5). Not reachable from `WmInterface` --
+    /// only the test harness sends this, same reasoning as `SessionLocked`.
+    XwaylandReady { reply: Sender<bool> },
+    /// Test-only: probe every mapped override-redirect (OR) X11 pop-up the
+    /// compositor is tracking in its M3 side-table, reading each one's *real*
+    /// scene state — node position, whether it is parented in the band above
+    /// managed toplevels, and whether it holds the seat keyboard — via the
+    /// `wlr::Runtime` xwayland scene accessors. Lets the OR end-to-end test
+    /// assert placement/stacking/focus without the OR surface ever entering the
+    /// `Window` model (which is the whole point of the OR path). Not reachable
+    /// from `WmInterface` -- only the test harness sends this, same reasoning as
+    /// `SessionLocked`.
+    XwaylandOverrideRedirect { reply: Sender<Vec<OverrideRedirectProbe>> },
+    /// Test-only: record the primary output's scale. The reply is `true` only
+    /// when an output actually existed to record it on — `spawn` returns at the
+    /// boot handshake, *before* `run_all` creates the headless output, so a scale
+    /// set too early would otherwise be silently dropped yet still acked
+    /// "recorded" (review finding #11). The harness helper polls on this `bool`
+    /// until the output exists, making the ordering deterministic instead of a
+    /// flaky red.
+    SetOutputScaleForTest { scale: f64, reply: Sender<bool> },
+}
+
+/// One mapped override-redirect X11 pop-up, as the test-only
+/// [`DbCommand::XwaylandOverrideRedirect`] probe reports it — read straight off
+/// the live scene, not the compositor's own bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverrideRedirectProbe {
+    /// The pop-up scene node's position, in layout coordinates — the proof it
+    /// landed at its client-requested absolute coordinates.
+    pub position: (i32, i32),
+    /// Whether the node is parented in `Band::Top`, i.e. the band **above**
+    /// every managed toplevel (`Band::Toplevel`) — the proof it stacks over
+    /// managed windows.
+    pub above_toplevel: bool,
+    /// Whether the seat keyboard is currently pointed at this pop-up — the
+    /// proof a focus-taking menu is navigable.
+    pub keyboard_focused: bool,
 }
 
 /// Map a `contract::Event` to its D-Bus signal name, so the emitter thread

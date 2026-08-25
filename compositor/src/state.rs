@@ -60,15 +60,22 @@ pub struct OutputSurface {
     /// unit-test outputs built straight through [`Self::new`], and for the
     /// rare wlroots output not yet named.
     pub name: String,
+    /// The output's committed scale (`wlr::Output::set_scale`), mirrored here
+    /// because wlroots exposes no getter and the value is needed off the live
+    /// handler — specifically by [`State::primary_output_scale`], which the M4
+    /// HiDPI DPI-hint export reads to pick `Xft.dpi = 96 * integer_scale`.
+    /// Defaults to `1.0` for the unit-test outputs built through [`Self::new`];
+    /// `new_output` records the real applied scale on a live output.
+    pub scale: f64,
 }
 
 impl OutputSurface {
     /// Construct with no exclusive zones yet reserved -- `usable` starts
     /// equal to `geometry`, exactly as `create_output` documents. The name is
     /// empty; `new_output` records the real connector name on the live output
-    /// once one exists (see the field doc).
+    /// once one exists (see the field doc). Scale starts at the `1.0` identity.
     pub fn new(geometry: icedtea_contract::Rectangle) -> Self {
-        Self { geometry, usable: geometry, name: String::new() }
+        Self { geometry, usable: geometry, name: String::new(), scale: 1.0 }
     }
 }
 
@@ -478,6 +485,24 @@ pub enum PointerEvent {
     Release { pointer: (i32, i32) },
 }
 
+/// One mapped override-redirect (OR) X11 surface — an unmanaged pop-up (menu,
+/// tooltip, combo/dropdown list, drag icon) tracked entirely outside the
+/// `WindowManager` model (XWayland design Decision 4, M3).
+///
+/// An OR surface is never a `Window` row: it is placed at its own
+/// client-requested coordinates, wears no server-side decoration, is not an
+/// alt-tab or focus-MRU candidate, and stacks in the band **above** managed
+/// toplevels. All the compositor keeps for it is where it goes and whether it
+/// takes the keyboard; the scene node itself is the `wlr` crate's, built on
+/// `associate` and reparented above `Band::Toplevel` on map.
+#[derive(Debug, Clone, Copy)]
+struct OverrideRedirectSurface {
+    /// The pop-up's client-requested absolute geometry, refreshed on every
+    /// `request_configure`. `x`/`y` drive the scene-node placement; the size is
+    /// kept so a later reposition can be re-clamped if needed.
+    geometry: Rectangle,
+}
+
 pub struct State {
     pub window_manager: WindowManager,
     pub config: Config,
@@ -792,6 +817,47 @@ pub struct State {
     /// before the action it triggers (close/maximize/minimize) runs. Same
     /// "scene-only, no `Event`" rule as `ssd_hover`.
     ssd_press: Option<(WindowId, usize)>,
+    /// Which model window each mapped **managed** X11 (Xwayland) surface backs.
+    ///
+    /// The M1 spike's minimal parallel binding: xdg toplevels ride
+    /// `wayland::Wayland`'s `ToplevelKey`↔`WindowId` maps and the
+    /// `ToplevelId`-keyed scene seam, but an `XwaylandSurfaceId` has no
+    /// `ToplevelId`, so a managed X11 window enters the same `WindowManager`
+    /// model through this side-table instead of that seam. It proves one X11
+    /// window reaches the model end-to-end; the fuller `SurfaceKey`
+    /// generalization that folds both onto one focus/stacking/SSD path is a
+    /// later milestone (M2). Override-redirect surfaces are never entered here.
+    xwayland_windows: HashMap<wlr::XwaylandSurfaceId, WindowId>,
+    /// Every mapped override-redirect (OR) X11 surface, keyed by
+    /// `XwaylandSurfaceId` — the M3 unmanaged-pop-up side-table (XWayland design
+    /// Decision 4). Deliberately **not** the `WindowManager` model: an OR
+    /// surface is a menu/tooltip/combo popup positioned at its own coordinates,
+    /// above managed toplevels, with no SSD and no place in alt-tab/MRU. Entries
+    /// are added on `xwayland_surface_mapped` (and on a managed→OR runtime flip),
+    /// repositioned on `request_configure`, and removed on unmap/destroy (or on
+    /// an OR→managed flip).
+    override_redirect: HashMap<wlr::XwaylandSurfaceId, OverrideRedirectSurface>,
+    /// The stack of focus-taking OR pop-ups that hold the seat keyboard, oldest
+    /// first — the override-redirect analogue of [`layer_focus`](Self::layer_focus),
+    /// but a stack rather than a single slot so nested menus nest correctly
+    /// (review finding #7).
+    ///
+    /// A focus-taking OR pop-up (a keyboard-navigable menu) is handed the
+    /// keyboard on map and pushed here; a submenu that opens over it is pushed on
+    /// top. While the stack is non-empty, `sync_seat_focus` must not reassert the
+    /// model's toplevel focus over the top entry (exactly the churn `layer_focus`
+    /// guards against). When the top pop-up unmaps, is destroyed, or flips back
+    /// to managed, it is popped and the keyboard returns to the *parent* menu
+    /// still beneath it — only when the stack empties does the model's toplevel
+    /// focus come back. A middle entry closing is simply spliced out, leaving the
+    /// current holder untouched.
+    or_keyboard_stack: Vec<wlr::XwaylandSurfaceId>,
+    /// The `DISPLAY` name (`:N`) Xwayland last advertised, captured on
+    /// `xwayland_ready`. `None` until Xwayland is up (or on a build/host with no
+    /// Xwayland at all). Read back by the test-only `DbCommand::XwaylandDisplay`
+    /// accessor, and the value exported into the environment session children
+    /// inherit.
+    xwayland_display: Option<String>,
 }
 
 /// What a cached title raster depends on: the title text, the pixel width
@@ -912,6 +978,10 @@ impl State {
             button_glyph_cache: HashMap::new(),
             ssd_hover: None,
             ssd_press: None,
+            xwayland_windows: HashMap::new(),
+            override_redirect: HashMap::new(),
+            or_keyboard_stack: Vec::new(),
+            xwayland_display: None,
         }
     }
 
@@ -1768,6 +1838,7 @@ impl State {
             return;
         };
         let (geo, fullscreen, maximized, focused) = (w.geometry, w.fullscreen, w.maximized, w.focused);
+        let minimized = w.minimized;
         let visible = self.window_manager.is_visible(w);
         // Re-review finding New-4: the model's geometry is the *frame*; an
         // SSD window's client owns only the band below the title bar.
@@ -1850,6 +1921,11 @@ impl State {
         );
 
         self.wayland.set_visible(id, visible);
+        // Reflect the minimized flag to the client (X11 `_NET_WM_STATE_HIDDEN`;
+        // a no-op for xdg, whose hide is carried entirely by `set_visible`), so
+        // a WM-initiated minimize is observable to an X11 app, not just a scene
+        // hide the client never learns about.
+        self.wayland.set_minimized(id, minimized);
         if visible {
             self.wayland.set_position(id, content.x, content.y);
             // Ledger item 28 / recommendation 4: `behavior.raise_on_focus`
@@ -2037,6 +2113,17 @@ impl State {
         if layer_holds_keyboard_focus(self.layer_focus, &self.layers) {
             return;
         }
+        // An override-redirect pop-up that took the keyboard (a keyboard-
+        // navigable X11 menu) keeps it while mapped, for the same reason a
+        // layer surface does: the crate's seat has one keyboard-focus slot, so
+        // reasserting the model's toplevel focus here would yank the keyboard
+        // out from under the menu within a frame. The top of the OR keyboard
+        // stack is the current holder; the OR unmap/destroy/flip paths pop it
+        // (handing the keyboard to the parent menu beneath, or, when the stack
+        // empties, calling this so the model's focus is restored).
+        if self.or_keyboard_stack.last().is_some_and(|id| self.override_redirect.contains_key(id)) {
+            return;
+        }
         let focused = self
             .focused_id()
             .filter(|&id| self.window_manager.is_visible_id(id))
@@ -2141,6 +2228,15 @@ impl State {
         // keyboard.
         self.sync_window_to_scene(id);
         self.sync_focus_change(previous);
+        // Drain the queued `WindowUpdated { minimized }` (and any focus-change
+        // events) to D-Bus here, exactly as `set_maximized_target`/
+        // `set_fullscreen_target` do. `DbCommand::Minimize` also flushes via
+        // `handle_command`'s tail (a harmless second drain), but the
+        // `wlr::XwaylandHandler::xwayland_request_minimize` caller does *not*
+        // flow through `handle_command`, so without this an X11 app's
+        // self-minimize would update the model, scene and `_NET_WM_STATE_HIDDEN`
+        // yet never tell a subscribed taskbar/panel the window minimized.
+        self.emit_pending();
         Some(())
     }
 
@@ -2155,10 +2251,46 @@ impl State {
     /// possibly nothing to iterate, the loop body may never run.
     pub fn sync_scene(&mut self) {
         let ids: Vec<WindowId> = self.window_manager.windows().map(|w| w.id).collect();
-        for id in ids {
-            self.sync_window_to_scene(id);
+        for id in &ids {
+            self.sync_window_to_scene(*id);
+        }
+        // Review finding #1: a managed X11 window's SSD nodes are `Band::Toplevel`
+        // siblings that `sync_ssd` rebuilds at the *top* of the band on every
+        // sync (unlike an xdg toplevel, whose decoration rides its own per-window
+        // scene tree). Re-syncing every window therefore leaves whichever window
+        // was synced last with its title bar above the others — including above
+        // the focused window, whose own sync ran earlier in MRU order. Restack
+        // the band to the model's stacking order once all nodes exist: raise each
+        // visible window bottom-to-top (reverse MRU), which lifts its content and
+        // decoration nodes together, so the focused window (MRU top) ends up on
+        // top with its decoration intact and no window's title bar floats over a
+        // neighbour. Gated on `raise_on_focus`: with restack-on-focus disabled
+        // the user has asked us not to reorder the stack, so the band is left as
+        // is (fully decoupling X11 SSD from stacking order in that non-default
+        // mode is the per-window-subtree follow-up).
+        if self.config.behavior.raise_on_focus {
+            for id in self.stacking_order_bottom_to_top() {
+                self.wayland.raise(id);
+            }
         }
         self.sync_seat_focus();
+    }
+
+    /// The visible windows in bottom-to-top stacking order — reverse focus-MRU,
+    /// since [`WindowManager::windows`] yields most-recently-focused first (the
+    /// top of the stack). This is the order [`sync_scene`](Self::sync_scene)
+    /// re-raises them in so each window's content and SSD nodes end up stacked in
+    /// MRU order, with the focused window on top (review finding #1). Minimized
+    /// and off-workspace windows are skipped — raising a hidden window would
+    /// churn its X restack for no visible effect.
+    fn stacking_order_bottom_to_top(&self) -> Vec<WindowId> {
+        // Reuse the one visibility+ordering predicate (`visible_windows`, which
+        // exists so this filter lives in exactly one place — review finding I1);
+        // it yields MRU order (top first), so reverse for bottom-to-top.
+        let mut ids: Vec<WindowId> =
+            self.window_manager.visible_windows().iter().map(|w| w.id).collect();
+        ids.reverse();
+        ids
     }
 
     /// Ask window `id` to close.
@@ -2208,6 +2340,243 @@ impl State {
         // already out of the model by this point, so there is nothing left
         // to sync on the losing end.
         self.sync_focus_change(None);
+    }
+
+    /// Remove the managed X11 (Xwayland) window backing surface `id`, if any.
+    ///
+    /// The Xwayland counterpart of the xdg `forget_toplevel` path: drops the
+    /// side-table binding and takes the model row down through the shared
+    /// `forget_window` (which reseats focus and cleans up rasters/SSD/scene
+    /// memos). Idempotent -- a miss on the side-table returns without touching
+    /// the model -- so an unmap followed by a destroy (both fire for the same
+    /// surface) and an id we were never told about are each harmless.
+    fn remove_xwayland_window(&mut self, id: wlr::XwaylandSurfaceId) {
+        let Some(window_id) = self.xwayland_windows.remove(&id) else { return };
+        self.forget_window(window_id);
+        self.emit_pending();
+    }
+
+    /// Add a first-mapping managed (non-override-redirect) X11 surface to the
+    /// `WindowManager` model and drive it out to the client through the shared
+    /// path. Shared by the ordinary map and the OR→managed runtime flip.
+    ///
+    /// `add_window` autofocuses, so the outgoing focus is captured first, then
+    /// `sync_window_to_scene` builds the SSD, positions the scene node,
+    /// configures the client to the SSD content rect, activates it and reseats
+    /// keyboard focus — exactly as it does for an xdg toplevel. Placement comes
+    /// from [`place_managed_x11`](Self::place_managed_x11) (window-type / modal /
+    /// transient-parent aware), not the plain cascade.
+    fn add_managed_x11(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        let sid = surface.id();
+        let app_id = surface.class().or_else(|| surface.instance()).unwrap_or_default();
+        let title = surface.title().unwrap_or_default();
+        let pid = surface.pid().unwrap_or(0);
+        // X11 clients self-position, but a managed window is placed by the WM.
+        // The client's requested size is its *content* (an X11 window has no
+        // decorations), so convert it to a frame — reserving the SSD strip — via
+        // the shared `frame_rect` inverse before placing, exactly as a later
+        // self-configure does (review finding #2). Without this the frame was
+        // set to the requested size and `sync_window_to_scene` then inset the
+        // client 28px shorter than it asked, and the window jumped taller on its
+        // first `ConfigureRequest`. Falls back to the placeholder content size.
+        let g = surface.geometry();
+        let (content_w, content_h) = if g.width > 0 && g.height > 0 {
+            (g.width, g.height)
+        } else {
+            (PLACEHOLDER_SIZE.0, PLACEHOLDER_SIZE.1)
+        };
+        // Decorations are decided the same way `sync_window_to_scene` will for
+        // this window (a fresh row has no client-decoration request yet, and a
+        // just-mapped window is not fullscreen).
+        let ssd = crate::decoration::has_ssd(&app_id, None, false);
+        let content = Rectangle { x: 0, y: 0, width: content_w, height: content_h };
+        let frame_dims = crate::decoration::frame_rect(content, ssd);
+        let geometry = self.place_managed_x11(surface, frame_dims.width, frame_dims.height);
+        tracing::info!(?sid, %app_id, %title, pid, ?geometry, "managed X11 window mapped");
+        let previous = self.focused_id();
+        let window_id = self.window_manager.add_window(&app_id, &title, pid, geometry);
+        self.xwayland_windows.insert(sid, window_id);
+        self.wayland.bind_x11(window_id, sid);
+        self.sync_window_to_scene(window_id);
+        self.sync_focus_change(previous);
+        self.emit_pending();
+    }
+
+    /// Clamp a frame's top-left so the window — its SSD title bar included —
+    /// stays reachable on an output, mirroring the map-time placement clamp
+    /// (review finding #9). The output is the one the frame's own center falls
+    /// on, falling back to the pointer's output and finally a default, so a
+    /// self-configuring X11 client cannot drive its only drag handle off-screen.
+    /// A frame already fully on its output is returned unchanged.
+    fn clamp_frame_onto_output(&self, frame: Rectangle) -> Rectangle {
+        // Clamp to the *usable* area, not the full output geometry: map-time
+        // placement (`center_in_area`) and the whole placement convention keep a
+        // window's frame — its SSD title bar included — clear of panels'
+        // exclusive zones, so a self-configuring X11 client must land in the same
+        // area or its only drag handle ends up under a top panel (review finding
+        // #9's own goal). Output chosen by the frame's center, falling back to the
+        // pointer's usable area and finally a default.
+        let clamp_geo = self
+            .output_for_window(frame)
+            .and_then(|idx| self.outputs.get(&idx))
+            .map(|o| o.usable)
+            .or_else(|| self.usable_geo_for_pointer())
+            .unwrap_or(Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+        let (x, y) = Self::clamp_top_left(frame.x, frame.y, frame.width, frame.height, clamp_geo);
+        Rectangle { x, y, ..frame }
+    }
+
+    /// Clamp a `width`×`height` box's top-left corner so the box stays within
+    /// `clamp_geo`. The `.max(clamp_geo.x/y)` guards the degenerate case of a box
+    /// larger than the area, where the upper clamp bound would otherwise fall
+    /// below the lower. Shared by [`clamp_frame_onto_output`](Self::clamp_frame_onto_output)
+    /// and [`center_in_area`](Self::center_in_area) so the two can never disagree.
+    fn clamp_top_left(x: i32, y: i32, width: i32, height: i32, clamp_geo: Rectangle) -> (i32, i32) {
+        let max_x = (clamp_geo.x + clamp_geo.width - width).max(clamp_geo.x);
+        let max_y = (clamp_geo.y + clamp_geo.height - height).max(clamp_geo.y);
+        (x.clamp(clamp_geo.x, max_x), y.clamp(clamp_geo.y, max_y))
+    }
+
+    /// Center a `width`×`height` frame inside `area`, then clamp its top-left so
+    /// it stays on the *output that `area` sits on* — not the pointer's (review
+    /// finding #6). Centering a dialog over a transient parent on another monitor
+    /// must keep it on the parent's monitor; the old pointer-output clamp dragged
+    /// it onto whichever screen the mouse happened to rest on. `fallback` (the
+    /// pointer's usable area) is used only when `area`'s output cannot be found.
+    fn center_in_area(&self, area: Rectangle, width: i32, height: i32, fallback: Rectangle) -> (i32, i32) {
+        let clamp_geo = self
+            .output_for_window(area)
+            .and_then(|idx| self.outputs.get(&idx))
+            .map(|o| o.usable)
+            .unwrap_or(fallback);
+        let x = area.x + (area.width - width) / 2;
+        let y = area.y + (area.height - height) / 2;
+        Self::clamp_top_left(x, y, width, height, clamp_geo)
+    }
+
+    /// Choose a managed X11 window's initial frame placement from its
+    /// `_NET_WM_WINDOW_TYPE`, modal hint and transient parent (M3, task 4).
+    ///
+    /// A dialog — or any window carrying the modal hint — is centered over its
+    /// transient parent when it has one that is mapped on the active workspace,
+    /// so a "Save changes?" dialog lands over the document it belongs to; with
+    /// no such parent it centers on the output. A splash screen centers on the
+    /// output. Everything else (normal, utility, toolbar, …) cascades, exactly
+    /// as a native xdg toplevel does. The returned rectangle is the *frame*,
+    /// clamped so its top-left keeps the window on the output.
+    fn place_managed_x11(
+        &self,
+        surface: &wlr::XwaylandSurface<'_>,
+        width: i32,
+        height: i32,
+    ) -> Rectangle {
+        let output_geo = self
+            .usable_geo_for_pointer()
+            .unwrap_or(Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+        let centered_in = |area: Rectangle| self.center_in_area(area, width, height, output_geo);
+        // The transient parent's frame, if it is a managed X11 window mapped on
+        // the active, visible workspace — the anchor a dialog centers over.
+        let parent_geo = self
+            .wayland
+            .runtime()
+            .and_then(|rt| rt.xwayland_surface_parent(surface.id()))
+            .and_then(|pid| self.xwayland_windows.get(&pid).copied())
+            .and_then(|wid| self.window_manager.get(wid))
+            .filter(|w| {
+                w.workspace == self.window_manager.active_workspace() && !w.minimized
+            })
+            .map(|w| w.geometry);
+        let (x, y) = match surface.window_type() {
+            wlr::XwaylandWindowType::Dialog => {
+                centered_in(parent_geo.unwrap_or(output_geo))
+            }
+            wlr::XwaylandWindowType::Splash => centered_in(output_geo),
+            _ if surface.is_modal() => centered_in(parent_geo.unwrap_or(output_geo)),
+            _ => {
+                let occupied: Vec<Rectangle> = self
+                    .window_manager
+                    .windows_in_workspace(self.window_manager.active_workspace())
+                    .iter()
+                    .map(|w| w.geometry)
+                    .collect();
+                layout::cascade_point_in(&occupied, (width, height), 24, output_geo)
+            }
+        };
+        Rectangle { x, y, width, height }
+    }
+
+    /// Track and place a mapped override-redirect pop-up (M3). Shared by the
+    /// ordinary OR map and the managed→OR runtime flip.
+    ///
+    /// The pop-up's scene node — built by the crate on `associate` in
+    /// `Band::Toplevel` — is lifted into `Band::Top` (above every managed
+    /// toplevel, below the lock/overlay bands), positioned at the client's own
+    /// coordinates, and raised so a newer pop-up sits over an older one. No SSD
+    /// is ever attached. A focus-taking pop-up (a keyboard-navigable menu) is
+    /// then handed the seat keyboard.
+    fn map_override_redirect(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        let sid = surface.id();
+        let g = surface.geometry();
+        let geometry = Rectangle {
+            x: g.x,
+            y: g.y,
+            width: g.width.max(1),
+            height: g.height.max(1),
+        };
+        let wants_focus = surface.override_redirect_wants_focus();
+        tracing::info!(?sid, ?geometry, wants_focus, "override-redirect X11 surface mapped");
+        if let Some(rt) = self.wayland.runtime() {
+            rt.reparent_xwayland_surface_to_band(sid, wlr::Band::Top);
+            rt.set_xwayland_surface_position(sid, geometry.x, geometry.y);
+            rt.raise_xwayland_surface(sid);
+        }
+        self.override_redirect.insert(sid, OverrideRedirectSurface { geometry });
+        if wants_focus {
+            self.focus_override_redirect(sid);
+        }
+    }
+
+    /// Hand the seat keyboard to a focus-taking OR pop-up and remember it holds
+    /// it, so `sync_seat_focus` leaves it alone until it goes away.
+    fn focus_override_redirect(&mut self, sid: wlr::XwaylandSurfaceId) {
+        let Some(rt) = self.wayland.runtime() else { return };
+        rt.activate_xwayland_surface(sid, true);
+        if rt.focus_xwayland_surface_keyboard(sid).is_some() {
+            // Push onto the keyboard stack as the new top holder; move it up if
+            // it was already present (a re-focus), so the stack never grows a
+            // duplicate and `last()` always names the true current holder.
+            self.or_keyboard_stack.retain(|&id| id != sid);
+            self.or_keyboard_stack.push(sid);
+        }
+    }
+
+    /// Drop a mapped OR pop-up from the side-table, if present, and reconcile the
+    /// keyboard stack (review finding #7). Idempotent against an id that was never
+    /// an OR surface (a managed window, or one we were never told about), so the
+    /// unmap/destroy paths can call it blindly.
+    ///
+    /// If the closing pop-up was the current keyboard holder (the top of the
+    /// stack), the keyboard returns to the parent menu still beneath it; only
+    /// when the stack empties does `sync_seat_focus` fall through to the model's
+    /// focused window. A pop-up closing from the *middle* of the stack (a parent
+    /// dismissed while its submenu is still open) is simply spliced out, leaving
+    /// the current holder untouched.
+    fn remove_override_redirect(&mut self, sid: wlr::XwaylandSurfaceId) {
+        if self.override_redirect.remove(&sid).is_none() {
+            return;
+        }
+        let was_holder = self.or_keyboard_stack.last() == Some(&sid);
+        self.or_keyboard_stack.retain(|&id| id != sid);
+        if was_holder {
+            if let Some(&parent) = self.or_keyboard_stack.last() {
+                // Hand the keyboard back to the still-open parent menu.
+                self.focus_override_redirect(parent);
+            } else {
+                // Stack empty: the guard in `sync_seat_focus` now falls through
+                // to the model's focused window (or clears the seat if none).
+                self.sync_seat_focus();
+            }
+        }
     }
 
     /// Toggle fullscreen state for a window. When entering fullscreen, saves the
@@ -2599,13 +2968,27 @@ impl State {
         Ok(())
     }
 
+    /// The largest output scale the compositor will honour. Real HiDPI outputs
+    /// top out around 3×; 16 is a generous ceiling that still keeps every
+    /// derived quantity — notably `96 * scale` in [`export_x11_dpi`] and
+    /// wlroots' scale-driven buffer sizing — far from any integer overflow, so a
+    /// corrupted persisted `DisplayConfig.scale` or a hostile test value cannot
+    /// blow up the DPI publish (review finding #8).
+    const MAX_OUTPUT_SCALE: f64 = 16.0;
+
     /// Clamp a persisted/echoed-back display scale to something wlroots can
     /// use (review finding #12). A `DisplayConfig.scale` that is `<= 0` or
     /// non-finite (NaN/inf) would produce degenerate output geometry or push
     /// the whole apply into its error fallback; any such value falls back to
-    /// `1.0`. Mirrors the identical guard the settings `head_rect` path uses.
+    /// `1.0`. An absurdly large but finite value (review finding #8) is capped
+    /// at [`MAX_OUTPUT_SCALE`] rather than allowed to overflow downstream integer
+    /// math. Mirrors the identical guard the settings `head_rect` path uses.
     fn guarded_scale(scale: f64) -> f32 {
-        if scale.is_finite() && scale > 0.0 { scale as f32 } else { 1.0 }
+        if scale.is_finite() && scale > 0.0 {
+            scale.min(Self::MAX_OUTPUT_SCALE) as f32
+        } else {
+            1.0
+        }
     }
 
     /// Map a persisted `DisplayConfig::transform` (the `wl_output_transform`
@@ -2847,6 +3230,177 @@ impl State {
     /// is what actually calls `apply_reloaded_config` once the load
     /// finishes. If `config_reload_tx` hasn't been wired yet, this is a
     /// no-op.
+    /// The integer scale of the primary output (the lowest model index — the
+    /// same output `outputs.keys().min()` picks for single-output placement),
+    /// clamped to at least `1`. This is the scale the M4 HiDPI export applies to
+    /// X11 uniformly: X11 has no per-window scale, so the compositor targets the
+    /// single global (primary-output) scale, exactly as the design's HiDPI
+    /// decision spells out. A fractional committed scale is rounded up to the
+    /// next integer, since Xwayland is single-integer-scale. `1` when no output
+    /// exists yet (nothing to size against).
+    pub fn primary_output_scale(&self) -> i32 {
+        self.outputs
+            .keys()
+            .min()
+            .and_then(|idx| self.outputs.get(idx))
+            // Normalise through `guarded_scale` before the `as i32` cast: a
+            // non-finite, non-positive, or absurdly large `surface.scale` (a
+            // corrupted persisted value, or a hostile test scale) would
+            // otherwise saturate the cast to `i32::MAX` and overflow
+            // `96 * scale` in `export_x11_dpi` (review finding #8). The guard
+            // yields a finite value in `[1, MAX_OUTPUT_SCALE]`.
+            .map(|o| (Self::guarded_scale(o.scale) as f64).ceil().max(1.0) as i32)
+            .unwrap_or(1)
+    }
+
+    /// Publish the X11 HiDPI hint: set `Xft.dpi = 96 * scale` in the root
+    /// window's `RESOURCE_MANAGER` property on the compositor's own Xwayland, so
+    /// X11 toolkits (GTK/Qt read this the way `xrdb` merges it) size fonts and
+    /// UI for the output scale. wlroots' `xwm` does not set `RESOURCE_MANAGER`
+    /// and there is no `wlr` API for it, so — like a real desktop session — the
+    /// compositor connects to its own X server as an ordinary client and sets
+    /// the property itself.
+    ///
+    /// Best-effort and fire-and-forget on a detached thread: a slow or refused
+    /// X connection must never block the compositor loop, and a failure only
+    /// costs X11 apps a correct DPI (they fall back to 96), never correctness of
+    /// the Wayland session. `display` is the `:N` just made valid by `ready`.
+    ///
+    /// HiDPI scope (design "HiDPI is fundamentally limited for X11"): this DPI
+    /// hint is how DPI-aware X11 toolkits scale under the single global integer
+    /// scale. Buffer-upscaling a *DPI-unaware* X11 client's surface to the
+    /// output scale would need scene-node scaling of a `wlr_scene_tree`, which
+    /// wlroots' scene graph does not offer for surface trees (only
+    /// `wlr_scene_buffer` dest-size), so it is a documented follow-up, not done
+    /// here. Mixed-DPI multi-monitor for X11 is the same known wlroots limit.
+    /// Publish `DISPLAY` and the X11 cursor hints into the process environment,
+    /// for session children (real or test-spawned) that inherit it. Called once,
+    /// from the *pre-thread* boot window — in production before the D-Bus and
+    /// wallpaper threads spawn, and in the harness before its boot handshake —
+    /// so the `set_var`s never race a concurrent `getenv` on another thread
+    /// (review finding #5). The lazy Xwayland manager reserves its display socket
+    /// at `create_xwayland` time, so `display_name` is already known here, well
+    /// before the first client triggers the actual Xwayland start.
+    ///
+    /// A theme the session already exported is respected; an absent one gets a
+    /// sane `default` so X11 apps never fall back to the tiny bitmap core-X
+    /// cursor. `XCURSOR_SIZE` is deliberately *not* forced here: the output scale
+    /// is unknown at boot, and forcing a fixed `24` would both lose HiDPI sizing
+    /// and (since the env var outranks the X resource in Xcursor's lookup)
+    /// override the scale-aware `Xcursor.size` that [`export_x11_dpi`] writes to
+    /// the root `RESOURCE_MANAGER` once the scale is known. A session that
+    /// explicitly exported `XCURSOR_SIZE` still wins, exactly as intended.
+    pub fn publish_xwayland_env(display_name: Option<&str>) {
+        let Some(name) = display_name else { return };
+        // SAFETY (icedtea unsafe exception (c)): every caller runs in the
+        // pre-thread boot window (production `run`) or before the harness boot
+        // handshake, so nothing else in the process is reading or writing the
+        // environment concurrently — the same guarantee the `WAYLAND_DISPLAY`
+        // write next to the production call site relies on.
+        unsafe {
+            std::env::set_var("DISPLAY", name);
+        }
+        if std::env::var_os("XCURSOR_THEME").is_none() {
+            unsafe { std::env::set_var("XCURSOR_THEME", "default") };
+        }
+    }
+
+    fn export_x11_dpi(display_name: String, scale: i32) {
+        // `scale` arrives already clamped from `primary_output_scale`, but keep
+        // the multiply saturating as defense in depth so no future caller can
+        // overflow it (review finding #8) — the dev/test profile builds with
+        // overflow-checks on, where a plain `96 * scale` would panic in this
+        // detached thread and silently drop the DPI publish.
+        let scale = scale.max(1);
+        let dpi = 96i32.saturating_mul(scale);
+        // The X11 cursor size that scales with the output (review finding #4):
+        // the conventional logical 24 times the integer scale, published as the
+        // `Xcursor.size` resource rather than the `XCURSOR_SIZE` env var so it is
+        // an X-property write with no getenv/setenv race, and so a session's own
+        // `XCURSOR_SIZE` (which outranks the resource in Xcursor's lookup) still
+        // wins where it was set.
+        let cursor_size = 24i32.saturating_mul(scale);
+        // Stamp this export with a dispatch-order generation. `export_x11_dpi` is
+        // only ever called from the compositor thread (`xwayland_ready` and the
+        // test-only scale command, both on the event loop), so `fetch_add` here
+        // orders exports by the order their scales were set — which the detached
+        // threads below then race for the lock in *some* order (review finding
+        // #5). Serializing the writes is not enough: a Mutex makes each publish
+        // atomic but does not stop an older scale's thread from acquiring the lock
+        // last and clobbering a newer one. The generation lets the loser skip.
+        static NEXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let generation = NEXT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            use x11rb::connection::Connection as _;
+            use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+            use x11rb::wrapper::ConnectionExt as _;
+
+            // Serialize the connect→write→sync→disconnect against any other
+            // in-flight DPI export: each export runs on its own detached thread
+            // with its own X connection, and without this two overlapping
+            // publishes could interleave on the server. The lock keeps each
+            // publish atomic; the generation below keeps the *last dispatched*
+            // scale winning regardless of lock-acquisition order.
+            static DPI_EXPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // The highest generation that has committed a write; a thread whose
+            // generation is older than this arrives after a newer scale already
+            // won and must not overwrite it with stale values.
+            static LAST_WRITTEN_GEN: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let _serialized = DPI_EXPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // `generation + 1` so a genuine gen 0 can still clear the initial 0.
+            if generation + 1 < LAST_WRITTEN_GEN.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let (conn, screen_num) = match x11rb::connect(Some(&display_name)) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    tracing::warn!(?err, name = %display_name, "could not connect to Xwayland to set Xft.dpi");
+                    return;
+                }
+            };
+            let root = conn.setup().roots[screen_num].root;
+            // `RESOURCE_MANAGER` is the conventional xrdb database, a `STRING`
+            // property of xrdb-style `name:\tvalue\n` lines on the root window.
+            // Both hints scale with the output: `Xft.dpi` for fonts/UI, and
+            // `Xcursor.size` so an Xcursor-reading X11 app draws its pointer at
+            // the right device size on a HiDPI monitor (review finding #4).
+            let value = format!("Xft.dpi:\t{dpi}\nXcursor.size:\t{cursor_size}\n");
+            if let Err(err) = conn.change_property8(
+                PropMode::REPLACE,
+                root,
+                AtomEnum::RESOURCE_MANAGER,
+                AtomEnum::STRING,
+                value.as_bytes(),
+            ) {
+                tracing::warn!(?err, "could not set RESOURCE_MANAGER Xft.dpi on the X root");
+                return;
+            }
+            // The write landed: record this generation so any older in-flight
+            // export skips rather than clobbering it (review finding #5).
+            LAST_WRITTEN_GEN.fetch_max(generation + 1, Ordering::Relaxed);
+            // A synchronous round-trip (rather than a bare `flush`) before the
+            // connection is dropped: the change request must be fully processed
+            // by the X server before this client disconnects, or the server can
+            // discard the still-buffered request when the socket closes. Reading
+            // back the input focus is a cheap request whose reply cannot arrive
+            // until everything queued ahead of it — the property change — has
+            // been handled.
+            match conn.get_input_focus() {
+                Ok(cookie) => {
+                    if let Err(err) = cookie.reply() {
+                        tracing::warn!(?err, "RESOURCE_MANAGER change may not have reached Xwayland");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "could not sync the RESOURCE_MANAGER change to Xwayland");
+                }
+            }
+        });
+    }
+
     pub fn handle_command(&mut self, cmd: crate::dbus::DbCommand) -> Option<()> {
         use crate::dbus::DbCommand;
         match cmd {
@@ -2918,6 +3472,77 @@ impl State {
             DbCommand::CursorPosition { reply } => {
                 let pos = self.wayland.runtime().map(|rt| rt.cursor_position()).unwrap_or((0.0, 0.0));
                 let _ = reply.send(pos);
+                return Some(());
+            }
+            DbCommand::XwaylandDisplay { reply } => {
+                // Read live from the runtime rather than the `xwayland_display`
+                // field: with lazy start the manager reserves its display
+                // socket (and sets `display_name`) at `create_xwayland` time,
+                // well before `ready` fires -- so this answers before the
+                // stored-on-`ready` field would, which is what lets the test
+                // read `DISPLAY` and connect the very client whose connection
+                // triggers the lazy `Xwayland` start.
+                let name = self.wayland.runtime().and_then(|rt| rt.xwayland_display_name());
+                let _ = reply.send(name);
+                return Some(());
+            }
+            DbCommand::XwaylandReady { reply } => {
+                // `xwayland_display` is set only in `xwayland_ready`, so its
+                // presence is the readiness signal — the crate has started the
+                // lazy Xwayland and wired the seat (selection/DND bridge armed).
+                let _ = reply.send(self.xwayland_display.is_some());
+                return Some(());
+            }
+            DbCommand::XwaylandOverrideRedirect { reply } => {
+                // Report each tracked OR pop-up's *real* scene state, so the
+                // test asserts against the live scene rather than the
+                // compositor's own bookkeeping.
+                let mut out = Vec::new();
+                if let Some(rt) = self.wayland.runtime() {
+                    for &sid in self.override_redirect.keys() {
+                        let position = rt
+                            .xwayland_surface_scene_position(sid)
+                            .unwrap_or((i32::MIN, i32::MIN));
+                        let above_toplevel =
+                            rt.xwayland_surface_scene_parent_band(sid) == Some(wlr::Band::Top);
+                        let keyboard_focused =
+                            rt.xwayland_surface_has_keyboard_focus(sid).unwrap_or(false);
+                        out.push(crate::dbus::OverrideRedirectProbe {
+                            position,
+                            above_toplevel,
+                            keyboard_focused,
+                        });
+                    }
+                }
+                let _ = reply.send(out);
+                return Some(());
+            }
+            DbCommand::SetOutputScaleForTest { scale, reply } => {
+                // Record the scale on the primary output (the lowest model
+                // index, the one `primary_output_scale` reads). If Xwayland is
+                // already `ready`, re-publish the DPI hint immediately so a test
+                // that raises the scale after boot observes the new `Xft.dpi`;
+                // a test that raises it before the first X connection instead
+                // has `ready` pick it up. `recorded` is `false` when no output
+                // exists yet (review finding #11): the reply lets the harness
+                // poll until one does, rather than silently dropping the scale
+                // but acking success.
+                let recorded = if let Some(&idx) = self.outputs.keys().min()
+                    && let Some(surface) = self.outputs.get_mut(&idx)
+                {
+                    // Guard the stored scale exactly as the production
+                    // config-apply path does (review finding #8): a non-finite,
+                    // non-positive, or absurdly large test value is normalised
+                    // rather than stored raw and left to overflow the DPI math.
+                    surface.scale = Self::guarded_scale(scale) as f64;
+                    true
+                } else {
+                    false
+                };
+                if recorded && let Some(display) = self.xwayland_display.clone() {
+                    Self::export_x11_dpi(display, self.primary_output_scale());
+                }
+                let _ = reply.send(recorded);
                 return Some(());
             }
         }
@@ -3726,6 +4351,12 @@ impl wlr::OutputHandler for State {
         // no persisted entry and takes the default preferred-mode path.
         let name = output.name().unwrap_or_default();
         let display_cfg = self.config.displays.iter().find(|d| d.name == name).cloned();
+        // The scale actually committed on this output, mirrored into
+        // `OutputSurface::scale` below so the M4 HiDPI DPI-hint export can read
+        // it off the model without a live handler. Every arm that ends in the
+        // preferred-mode default leaves this at the `1.0` identity; only a
+        // successfully-applied persisted config raises it.
+        let mut applied_scale = 1.0f64;
         match &display_cfg {
             Some(cfg) if cfg.enabled => {
                 // On ANY setter error the output must not be left dark:
@@ -3747,6 +4378,11 @@ impl wlr::OutputHandler for State {
                     if let Err(err) = output.set_transform(wlr::Transform::Normal) {
                         tracing::warn!(?err, %name, "could not reset transform on fallback");
                     }
+                } else {
+                    // The persisted config committed cleanly, so the scale it
+                    // asked for (guarded the same way `apply_display_config`
+                    // guards it) is what is now live on the output.
+                    applied_scale = Self::guarded_scale(cfg.scale) as f64;
                 }
             }
             Some(_) if !self.boot_disable_would_strand() => {
@@ -3840,9 +4476,11 @@ impl wlr::OutputHandler for State {
         self.create_output(index, geometry);
         // Record the connector name so the applied-config handler can map an
         // `AppliedHead` back to this index and `destroyed`/persist can look
-        // it up (see `OutputSurface::name`).
+        // it up (see `OutputSurface::name`), and the committed scale so the M4
+        // HiDPI DPI-hint export can read it (see `OutputSurface::scale`).
         if let Some(surface) = self.outputs.get_mut(&index) {
             surface.name = name;
+            surface.scale = applied_scale;
         }
         self.output_ids.insert(output.id(), index);
         // A new output needs its own wallpaper node (if a decode has
@@ -4597,6 +5235,278 @@ impl wlr::ToplevelHandler for State {
         }
         self.layers.remove(&id);
         self.arrange_layers();
+    }
+
+    // --- Xwayland (X11) ------------------------------------------------------
+    //
+    // M2 — managed-window parity. A *managed* (non-override-redirect) X11
+    // window is first-class alongside xdg toplevels: it enters the same
+    // `WindowManager` model and is driven through the same
+    // `sync_window_to_scene` path, so SSD, focus/activation, interactive and
+    // client-initiated move/resize, maximize/fullscreen/minimize, workspaces,
+    // snap, cascade, alt-tab and MRU focus all work through one code path. The
+    // only Xwayland-specific bookkeeping here is the `XwaylandSurfaceId ->
+    // WindowId` side-table (`xwayland_windows`), the reverse of the
+    // `wayland::bind_x11` binding the outbound seam dispatches on; the WM logic
+    // itself is never re-implemented per surface kind. State is pushed back to
+    // the X11 surface through the `wayland` seam's `SurfaceKey::X11` arms
+    // (configure to the SSD content rect, activate, set maximized/fullscreen,
+    // scene position/visibility/raise). Override-redirect surfaces stay
+    // unmanaged (M3); the crate renders them from their own scene node.
+
+    fn xwayland_ready(&mut self, display_name: Option<&str>) {
+        tracing::info!(?display_name, "Xwayland ready");
+        // The crate has already pointed Xwayland at this runtime's seat by now
+        // (so the clipboard/primary/DND bridge is live). `DISPLAY` and the X11
+        // cursor hints are published at *boot* (see `publish_xwayland_env`),
+        // where the lazy manager has already reserved the display socket and no
+        // other thread yet exists — the only work left for `ready`, once the X
+        // server is actually running, is the `Xft.dpi` hint (an X property
+        // write, not a process-env mutation, so it has no getenv/setenv race).
+        self.xwayland_display = display_name.map(str::to_owned);
+        if let Some(name) = display_name {
+            // Publish the X11 HiDPI hint (`Xft.dpi` in the root
+            // `RESOURCE_MANAGER`) so X11 toolkits size for the output scale.
+            Self::export_x11_dpi(name.to_owned(), self.primary_output_scale());
+        }
+    }
+
+    fn xwayland_surface_mapped(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        let sid = surface.id();
+        if surface.override_redirect() {
+            // Override-redirect pop-ups (menus, tooltips, combo/dropdown lists,
+            // drag icons) are unmanaged: placed at their own client coordinates,
+            // in the band above managed toplevels, with no SSD, tracked in the
+            // OR side-table rather than the `Window` model (M3, Decision 4).
+            self.map_override_redirect(surface);
+            return;
+        }
+        if let Some(&window_id) = self.xwayland_windows.get(&sid) {
+            // Remapped after an unmap while the row survived (an X11 window can
+            // unmap and map again keeping its id). Treat it as a visibility
+            // change, matching the xdg `mapped` remap arm.
+            self.window_manager.set_mapped(window_id, true);
+            self.sync_window_to_scene(window_id);
+            self.emit_pending();
+            return;
+        }
+        self.add_managed_x11(surface);
+    }
+
+    fn xwayland_surface_unmapped(&mut self, id: wlr::XwaylandSurfaceId) {
+        // An X11 unmap removes the model row. Idempotent against an id we do
+        // not know (a surface that never mapped, or a double unmap/destroy):
+        // the take-or-return guard makes it a no-op. (Parity note: xdg keeps
+        // the row on unmap and hides it; X11 windows are removed because a
+        // re-map mints a fresh model row, which is simpler and correct for the
+        // less common X11 remap case.) The id is *either* a managed window or an
+        // OR pop-up, never both, so both removals are tried — each is a no-op on
+        // the wrong table. An OR menu's unmap is exactly how it is dismissed.
+        self.remove_xwayland_window(id);
+        self.remove_override_redirect(id);
+    }
+
+    fn xwayland_surface_destroyed(&mut self, id: wlr::XwaylandSurfaceId) {
+        // Same removal as unmap, and equally safe against an unknown id (the
+        // trait documents that `destroyed` may name one we were never told
+        // about).
+        self.remove_xwayland_window(id);
+        self.remove_override_redirect(id);
+    }
+
+    fn xwayland_title_changed(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        let Some(&window_id) = self.xwayland_windows.get(&surface.id()) else { return };
+        let title = surface.title().unwrap_or_default();
+        if self.window_manager.set_title(window_id, title).is_some() {
+            self.sync_window_to_scene(window_id);
+            self.emit_pending();
+        }
+    }
+
+    fn xwayland_class_changed(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        let Some(&window_id) = self.xwayland_windows.get(&surface.id()) else { return };
+        let app_id = surface.class().or_else(|| surface.instance()).unwrap_or_default();
+        // `app_id` drives `decoration::has_ssd`, so a class change can flip a
+        // window between decorated and undecorated; resync when it actually
+        // changed (`set_app_id` returns `None` on a no-op, and emits nothing —
+        // the contract has no `app_id` update field, but a snapshot reads the
+        // model fresh).
+        if self.window_manager.set_app_id(window_id, app_id).is_some() {
+            self.sync_window_to_scene(window_id);
+            self.emit_pending();
+        }
+    }
+
+    fn xwayland_request_configure(
+        &mut self,
+        id: wlr::XwaylandSurfaceId,
+        geometry: wlr::Box2D,
+    ) {
+        // An override-redirect pop-up self-positioning: honour it verbatim —
+        // an OR surface owns its own coordinates (a menu that follows its
+        // anchor, a tooltip that repositions). Move the scene node to the new
+        // client coordinates and keep the side-table's geometry in step, so a
+        // later probe/reposition reads the truth. No SSD, no model row.
+        if let Some(or) = self.override_redirect.get_mut(&id) {
+            or.geometry = Rectangle {
+                x: geometry.x,
+                y: geometry.y,
+                width: geometry.width.max(1),
+                height: geometry.height.max(1),
+            };
+            let (x, y) = (or.geometry.x, or.geometry.y);
+            if let Some(rt) = self.wayland.runtime() {
+                rt.set_xwayland_surface_position(id, x, y);
+            }
+            return;
+        }
+        // A managed X11 client self-positioning/resizing. icedtea is a floating
+        // WM, so honour it — but the request is in *content* terms (the client
+        // knows nothing of the SSD strip), and the model's geometry is the
+        // frame, so add the title bar back on for a decorated window before
+        // storing it, then let the shared path re-inset and re-configure. Skip
+        // a resize while an interactive grab owns the window, so a client
+        // configure cannot fight a drag/resize in progress.
+        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        if self.drag.window_id() == Some(window_id) || self.resize.window_id() == Some(window_id) {
+            return;
+        }
+        let Some(w) = self.window_manager.get(window_id) else { return };
+        let ssd = crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen);
+        // A maximized/fullscreen window's geometry is WM-owned; ignore a
+        // client's attempt to move out of it, matching how xdg toplevels are
+        // pinned in those states.
+        if w.maximized || w.fullscreen {
+            return;
+        }
+        // The client's request is in *content* terms (an X11 window knows
+        // nothing of the SSD strip); convert it to a frame the same way
+        // `add_managed_x11` does, through the shared `frame_rect` inverse, so
+        // the two never disagree by a title bar (review finding #2).
+        let content = icedtea_contract::Rectangle {
+            x: geometry.x,
+            y: geometry.y,
+            width: geometry.width,
+            height: geometry.height,
+        };
+        // Clamp so a self-positioning client cannot push its title bar (its only
+        // drag handle and window buttons) off the top/edge of the output, the
+        // same clamp map-time placement applies (review finding #9).
+        let frame = self.clamp_frame_onto_output(crate::decoration::frame_rect(content, ssd));
+        if self.window_manager.set_geometry(window_id, frame).is_some() {
+            self.sync_window_to_scene(window_id);
+            self.emit_pending();
+        }
+    }
+
+    fn xwayland_request_move(&mut self, id: wlr::XwaylandSurfaceId) {
+        // `_NET_WM_MOVERESIZE` move: drive the same interactive grab an xdg
+        // `xdg_toplevel.move` does (`begin_client_move` is WindowId-keyed and
+        // gates on the pointer being pressed), which writes geometry back
+        // through the shared `sync_window_to_scene` path.
+        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        self.begin_client_move(window_id);
+    }
+
+    fn xwayland_request_resize(&mut self, id: wlr::XwaylandSurfaceId, edges: wlr::Edges) {
+        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        self.begin_client_resize(window_id, edges);
+    }
+
+    fn xwayland_request_maximize(&mut self, id: wlr::XwaylandSurfaceId, maximized: bool) {
+        // The same WM state machine xdg `request_maximize` drives — geometry,
+        // restore slot and the reflect-back configure all come from
+        // `set_maximized_target` -> `sync_window_to_scene`, whose seam pushes
+        // `set_xwayland_surface_maximized` back to the client.
+        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        self.set_maximized_target(window_id, maximized);
+    }
+
+    fn xwayland_request_fullscreen(&mut self, id: wlr::XwaylandSurfaceId, fullscreen: bool) {
+        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        self.set_fullscreen_target(window_id, fullscreen);
+    }
+
+    fn xwayland_request_minimize(&mut self, id: wlr::XwaylandSurfaceId, minimized: bool) {
+        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        self.set_minimized_and_reconcile(window_id, minimized);
+    }
+
+    fn xwayland_request_activate(&mut self, id: wlr::XwaylandSurfaceId) {
+        // Focus-steal request (`_NET_ACTIVE_WINDOW`). A1 policy is
+        // honour-or-mark-urgent; icedtea has no urgency hint surface yet, so
+        // honour it — but only for a mapped, non-minimized window on the active
+        // workspace, so a background app cannot yank focus across a workspace
+        // switch. A real focus-steal policy ties into xdg-activation (A2).
+        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        let Some(w) = self.window_manager.get(window_id) else { return };
+        if w.minimized || w.workspace != self.window_manager.active_workspace() {
+            return;
+        }
+        let previous = self.focused_id();
+        if self.window_manager.focus(window_id).is_some() {
+            // Explicit toplevel-focus assertion must release any keyboard-
+            // interactive layer surface's grab first (review finding #3), exactly
+            // as `DbCommand::Focus`, alt-tab and a pointer press do — otherwise
+            // `sync_seat_focus`'s `layer_holds_keyboard_focus` guard short-circuits
+            // and the X11 window looks focused while the keyboard stays on the
+            // layer surface. After the successful `focus`, never before: a focus
+            // that did not happen must leave `layer_focus` untouched.
+            self.release_layer_focus();
+            self.sync_focus_change(previous);
+            self.emit_pending();
+        }
+    }
+
+    fn xwayland_override_redirect_changed(&mut self, surface: &wlr::XwaylandSurface<'_>) {
+        // A live surface can flip its override-redirect flag; the compositor
+        // migrates it between the managed `Window` model and the unmanaged OR
+        // side-table in both directions, with no leak and no double-track (M3,
+        // task 3). The surface handle carries the new flag *and* the identity
+        // needed to re-model it on the path it is moving to.
+        let sid = surface.id();
+        if surface.override_redirect() {
+            // managed → OR. Drop the model row first (this also tears down its
+            // SSD and reseats focus), then re-add it as an unmanaged pop-up.
+            // `map_override_redirect` reparents the still-live scene node up into
+            // `Band::Top` and places it at the client's own coordinates.
+            // Idempotent if it was somehow already OR: `remove_xwayland_window`
+            // no-ops and `map_override_redirect` overwrites the same entry.
+            self.remove_xwayland_window(sid);
+            self.map_override_redirect(surface);
+        } else {
+            // OR → managed. Only meaningful if it was actually an OR surface;
+            // for anything else (already managed, or unknown) there is nothing
+            // to migrate.
+            if self.override_redirect.remove(&sid).is_some() {
+                // Whether the surface flipping to managed was the OR keyboard
+                // holder (top of the stack) matters below.
+                let was_holder = self.or_keyboard_stack.last() == Some(&sid);
+                // Drop it from the keyboard stack without restoring model focus
+                // here — `add_managed_x11` below reseats focus itself, so a
+                // `sync_seat_focus` now would only churn.
+                self.or_keyboard_stack.retain(|&id| id != sid);
+                // Reparent the scene node back down into the toplevel band, then
+                // model it through the shared managed path (SSD, window-type
+                // placement, focus), exactly like a fresh managed map.
+                if let Some(rt) = self.wayland.runtime() {
+                    rt.reparent_xwayland_surface_to_band(sid, wlr::Band::Toplevel);
+                }
+                self.add_managed_x11(surface);
+                // If the promoted surface had held the keyboard as a pop-up, it
+                // must keep it now that it is a managed toplevel. `add_managed_x11`
+                // focuses it in the model, but its `sync_seat_focus` is blocked by
+                // any parent menu still on the OR stack (the guard keeps the
+                // keyboard on an OR holder), so the new window would be focused yet
+                // keyboard-dead. Assert the seat directly. When `sid` was *not* the
+                // holder, a parent menu legitimately keeps the keyboard and we
+                // leave the seat alone.
+                if was_holder && let Some(&wid) = self.xwayland_windows.get(&sid) {
+                    self.window_manager.focus(wid);
+                    self.wayland.keyboard_focus(Some(wid));
+                }
+            }
+        }
     }
 }
 impl wlr::SeatHandler for State {
@@ -5687,6 +6597,144 @@ mod tests {
             Some(a),
             "focus handed to the MRU successor, matching the title-bar button"
         );
+    }
+
+    /// Review B#1: `set_minimized_and_reconcile` drains its queued
+    /// `WindowUpdated { minimized }` to D-Bus itself, so the
+    /// `xwayland_request_minimize` trait path (an X11 app self-minimizing) --
+    /// which does not flow through `handle_command`'s `emit_pending` tail --
+    /// still notifies a subscribed taskbar. Driving the shared reconcile
+    /// method directly reproduces that path without a live Xwayland.
+    #[test]
+    fn self_minimize_emits_the_window_update_to_dbus() {
+        let (mut state, rx) = state_with_output(1000, 800);
+        let geo = Rectangle { x: 10, y: 10, width: 300, height: 200 };
+        let id = state.window_manager.add_window("app", "a", 1, geo);
+        state.window_manager.focus(id).unwrap();
+        state.emit_pending();
+        while rx.try_recv().is_ok() {} // drain the open/focus events
+
+        // The trait handler calls this directly (no `handle_command` tail).
+        state.set_minimized_and_reconcile(id, true).unwrap();
+
+        let saw_minimized = std::iter::from_fn(|| rx.try_recv().ok()).any(|e| {
+            matches!(
+                e.event,
+                Event::WindowUpdated { id: wid, update }
+                    if wid == id && update.minimized == Some(true)
+            )
+        });
+        assert!(
+            saw_minimized,
+            "a self-minimize must emit WindowUpdated{{minimized:true}} to D-Bus"
+        );
+    }
+
+    /// Review finding #1: `sync_scene` must re-raise windows bottom-to-top in
+    /// reverse focus-MRU so the focused window (and its SSD) ends up on top after
+    /// every window's decoration was rebuilt at the top of the band. The order is
+    /// the visible windows, least-recently-focused first; a minimized window is
+    /// excluded so it is never restacked while hidden.
+    #[test]
+    fn stacking_order_is_visible_windows_bottom_to_top() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let geo = Rectangle { x: 0, y: 0, width: 200, height: 150 };
+        let a = state.window_manager.add_window("app", "a", 1, geo);
+        let b = state.window_manager.add_window("app", "b", 2, geo);
+        let c = state.window_manager.add_window("app", "c", 3, geo);
+        // Focus order a, b, c -> MRU is [c, b, a] (c on top), so bottom-to-top is
+        // [a, b, c] with the focused c raised last (ending on top).
+        state.window_manager.focus(a).unwrap();
+        state.window_manager.focus(b).unwrap();
+        state.window_manager.focus(c).unwrap();
+        assert_eq!(state.stacking_order_bottom_to_top(), vec![a, b, c]);
+
+        // A minimized window drops out (never restacked while hidden).
+        state.window_manager.set_minimized(b, true).unwrap();
+        assert_eq!(state.stacking_order_bottom_to_top(), vec![a, c]);
+    }
+
+    /// Review finding #7: closing a keyboard-holding OR submenu returns the
+    /// keyboard to its still-open parent menu (the next entry down the stack),
+    /// not the model toplevel. A single-slot design stole the keyboard from the
+    /// parent; the stack keeps it.
+    #[test]
+    fn closing_a_submenu_returns_keyboard_to_its_parent_menu() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        let geo = Rectangle { x: 0, y: 0, width: 100, height: 100 };
+        let menu1 = wlr::XwaylandSurfaceId::dangling_nth_for_test(1);
+        let menu2 = wlr::XwaylandSurfaceId::dangling_nth_for_test(2);
+        state.override_redirect.insert(menu1, OverrideRedirectSurface { geometry: geo });
+        state.override_redirect.insert(menu2, OverrideRedirectSurface { geometry: geo });
+        // menu1 is the parent, menu2 the submenu currently holding the keyboard.
+        state.or_keyboard_stack = vec![menu1, menu2];
+
+        // Submenu closes: keyboard must return to the parent, not the model.
+        state.remove_override_redirect(menu2);
+        assert_eq!(
+            state.or_keyboard_stack.last(),
+            Some(&menu1),
+            "closing the submenu must hand the keyboard back to its parent menu"
+        );
+
+        // A middle entry closing (parent dismissed while submenu still open)
+        // leaves the current holder untouched.
+        state.override_redirect.insert(menu2, OverrideRedirectSurface { geometry: geo });
+        state.or_keyboard_stack = vec![menu1, menu2];
+        state.remove_override_redirect(menu1);
+        assert_eq!(
+            state.or_keyboard_stack,
+            vec![menu2],
+            "closing the parent must splice it out and leave the submenu holding the keyboard"
+        );
+
+        // Closing the last pop-up empties the stack (model focus restored).
+        state.remove_override_redirect(menu2);
+        assert!(
+            state.or_keyboard_stack.is_empty(),
+            "closing the last OR pop-up must empty the keyboard stack"
+        );
+    }
+
+    /// Review finding #6: a dialog centered over a transient parent that lives
+    /// on a different monitor than the pointer must be clamped to the *parent's*
+    /// output, not the pointer's — otherwise it is dragged onto the wrong
+    /// screen. `center_in_area` clamps to the output the centering `area` sits on.
+    #[test]
+    fn center_in_area_clamps_to_the_areas_own_output_not_the_fallback() {
+        let (mut state, _rx) = state_with_output(1000, 800); // output A: x in 0..1000
+        state.create_output(1, Rectangle { x: 1000, y: 0, width: 1000, height: 800 }); // output B
+        // Parent frame sits on output B; the pointer's usable area (fallback) is A.
+        let parent_on_b = Rectangle { x: 1200, y: 300, width: 400, height: 300 };
+        let fallback_a = Rectangle { x: 0, y: 0, width: 1000, height: 800 };
+        let (x, y) = state.center_in_area(parent_on_b, 200, 150, fallback_a);
+        // Centered over the parent: x = 1200 + (400-200)/2 = 1300, on output B.
+        assert_eq!((x, y), (1300, 375), "dialog centers over its parent on B");
+        assert!(x >= 1000, "the dialog must land on the parent's output B, not the pointer's A");
+    }
+
+    /// Review finding #9: a frame whose SSD title bar would sit above the top
+    /// of the output (a self-positioning X11 client requesting content at y=0,
+    /// so the 28px bar spans y=-28..0) is clamped back on-screen so its only
+    /// drag handle and window buttons stay reachable. A frame already fully on
+    /// its output is returned unchanged.
+    #[test]
+    fn clamp_frame_onto_output_pulls_an_offscreen_title_bar_back() {
+        let (state, _rx) = state_with_output(1000, 800);
+        // Title bar above the top edge -> clamped so y >= output top (0).
+        let off_top = Rectangle { x: 100, y: -28, width: 300, height: 228 };
+        let fixed = state.clamp_frame_onto_output(off_top);
+        assert_eq!(fixed.y, 0, "the title bar must not sit above the output");
+        assert_eq!(fixed.x, 100, "x was already on-screen and must be left alone");
+        assert_eq!((fixed.width, fixed.height), (300, 228), "size is never changed");
+        // Off the right/bottom -> clamped so the frame stays fully on-output.
+        let off_corner = Rectangle { x: 950, y: 790, width: 300, height: 228 };
+        let fixed = state.clamp_frame_onto_output(off_corner);
+        assert_eq!(fixed.x, 1000 - 300, "clamped to keep the right edge on-output");
+        assert_eq!(fixed.y, 800 - 228, "clamped to keep the bottom edge on-output");
+        // A frame already fully on-screen is untouched.
+        let on = Rectangle { x: 200, y: 200, width: 300, height: 228 };
+        assert_eq!(state.clamp_frame_onto_output(on), on);
     }
 
     /// I3: `behavior.snap_enabled` is actually consumed -- with snapping
@@ -7359,6 +8407,31 @@ mod tests {
         assert_eq!(state.layer_focus, None, "alt-tab cycling must release layer_focus");
     }
 
+    /// Review finding #3: an X11 client's `_NET_ACTIVE_WINDOW`
+    /// (`xwayland_request_activate`) is an explicit focus assertion and must
+    /// release an interactive layer surface's keyboard grab too, or the X11
+    /// window would look focused while the keyboard stays stuck on the panel.
+    #[test]
+    fn xwayland_activate_releases_layer_focus_for_an_interactive_panel() {
+        use wlr::ToplevelHandler as _;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let win = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        let sid = wlr::XwaylandSurfaceId::dangling_for_test();
+        state.xwayland_windows.insert(sid, win);
+
+        let panel_id = wlr::LayerSurfaceId::dangling_for_test();
+        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layer_focus = Some(panel_id);
+
+        state.xwayland_request_activate(sid);
+        assert_eq!(
+            state.layer_focus, None,
+            "an X11 activate request must release the interactive layer surface's grab"
+        );
+    }
+
     /// Minor-1: `arrange_layers` must reconfigure every mapped panel on
     /// every pass, not only the one whose own commit triggered it --
     /// otherwise a panel whose placement input changed for a reason other
@@ -8222,6 +9295,33 @@ mod tests {
         assert_eq!(State::guarded_scale(f64::NAN), 1.0, "NaN scale falls back to 1.0");
         assert_eq!(State::guarded_scale(f64::INFINITY), 1.0, "inf scale falls back to 1.0");
         assert_eq!(State::guarded_scale(f64::NEG_INFINITY), 1.0, "-inf scale falls back to 1.0");
+        // Review finding #8: an absurdly large but finite scale is capped, not
+        // passed through to overflow `96 * scale` downstream.
+        assert_eq!(
+            State::guarded_scale(1.0e9),
+            State::MAX_OUTPUT_SCALE as f32,
+            "a huge finite scale is capped at MAX_OUTPUT_SCALE"
+        );
+    }
+
+    /// Review finding #8: `primary_output_scale` never returns a value that
+    /// overflows the `96 * scale` DPI computation, even when the stored output
+    /// scale is non-finite or absurdly large (a corrupted persisted value or a
+    /// hostile `SetOutputScaleForTest`). The cast is clamped to
+    /// `[1, MAX_OUTPUT_SCALE]` so `export_x11_dpi` stays well within `i32`.
+    #[test]
+    fn primary_output_scale_is_clamped_against_overflow() {
+        let (mut state, _rx) = state_with_output(1000, 800);
+        for bad in [f64::INFINITY, f64::NAN, 1.0e12, -5.0, 0.0] {
+            state.outputs.get_mut(&0).unwrap().scale = bad;
+            let s = state.primary_output_scale();
+            assert!(
+                (1..=State::MAX_OUTPUT_SCALE as i32).contains(&s),
+                "scale {bad} produced out-of-range {s}"
+            );
+            // The exact multiplication `export_x11_dpi` performs must not overflow.
+            assert!(96i32.checked_mul(s.max(1)).is_some(), "96 * {s} overflowed");
+        }
     }
 
     #[test]

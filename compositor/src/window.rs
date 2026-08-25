@@ -144,6 +144,23 @@ impl WindowManager {
         Some(())
     }
 
+    /// Update a window's `app_id` — the X11 `WM_CLASS` for a managed Xwayland
+    /// window whose class arrives (or changes) after it maps. There is no
+    /// `WindowUpdate` field for `app_id` in the contract, so this emits
+    /// nothing; the change is still observable through the model (a `GetState`
+    /// snapshot reads the field fresh) and, more importantly, keeps
+    /// `decoration::has_ssd` — which is keyed on `app_id` — in step with the
+    /// window's real class. Returns `Some(())` only when the value actually
+    /// changed, so the caller can skip a redundant scene resync.
+    pub fn set_app_id(&mut self, id: WindowId, app_id: String) -> Option<()> {
+        let w = self.windows.get_mut(&id)?;
+        if w.app_id == app_id {
+            return None;
+        }
+        w.app_id = app_id;
+        Some(())
+    }
+
     pub fn set_geometry(&mut self, id: WindowId, geometry: Rectangle) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         w.geometry = geometry;

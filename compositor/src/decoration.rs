@@ -96,11 +96,55 @@ pub fn content_rect(geometry: Rectangle, ssd: bool) -> Rectangle {
     }
 }
 
+/// The frame geometry that wraps a client `content` rect — the exact inverse of
+/// [`content_rect`], so `content_rect(frame_rect(c, ssd), ssd) == c` for any
+/// sane `c`.
+///
+/// An X11 window has no notion of decorations: the size a client asks for (at
+/// map, and in every later `ConfigureRequest`) is its *content*. The WM wraps
+/// that in a frame by reserving a `TITLE_BAR_HEIGHT` strip above it. Both the
+/// initial placement (`add_managed_x11`) and a client's self-configure
+/// (`xwayland_request_configure`) must convert content→frame the same way, or
+/// the window opens at one size and jumps to another on its first self-configure
+/// (review finding #2). Routing both through this one helper removes that
+/// disagreement by construction. `ssd == false` returns the content rect
+/// unchanged — a CSD or fullscreen window's content already *is* its frame.
+pub fn frame_rect(content: Rectangle, ssd: bool) -> Rectangle {
+    if !ssd {
+        return Rectangle {
+            width: content.width.max(1),
+            height: content.height.max(1),
+            ..content
+        };
+    }
+    Rectangle {
+        x: content.x,
+        y: content.y - TITLE_BAR_HEIGHT,
+        width: content.width.max(1),
+        height: content.height.max(1) + TITLE_BAR_HEIGHT,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const GEO: Rectangle = Rectangle { x: 50, y: 50, width: 600, height: 400 };
+
+    #[test]
+    fn frame_rect_is_the_inverse_of_content_rect() {
+        // Review finding #2: the two conversions must round-trip so the map-time
+        // placement and a client's self-configure never disagree by 28px.
+        let content = Rectangle { x: 50, y: 78, width: 600, height: 372 };
+        // ssd: frame is one bar taller and starts one bar higher; re-insetting
+        // recovers the original content exactly.
+        let frame = frame_rect(content, true);
+        assert_eq!(frame, Rectangle { x: 50, y: 50, width: 600, height: 400 });
+        assert_eq!(content_rect(frame, true), content);
+        // Non-ssd: content already is the frame, unchanged both ways.
+        assert_eq!(frame_rect(content, false).height, content.height);
+        assert_eq!(content_rect(frame_rect(content, false), false), content);
+    }
 
     #[test]
     fn bar_is_top_strip() {

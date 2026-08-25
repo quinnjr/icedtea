@@ -33,7 +33,7 @@ xkbcommon = "0.8"
 # the API this crate uses — never a path or git dependency (a path dep would
 # put an unpublished wlr-sys in the graph, and `links = "wlroots"` makes that
 # unresolvable the moment anything else pulls the published one).
-wlr = "0.20.22"
+wlr = "0.20.23"
 
 # Title-bar text shaping and glyph rasterization for server-side
 # decorations (`text.rs`). Chosen over a bare rasterizer because SSD titles
@@ -54,9 +54,19 @@ signal-hook = "0.3"
 # in a File.
 rustix = { version = "1", features = ["std"] }
 
+# X11 client used ONLY to publish the HiDPI hint (`Xft.dpi` in the root
+# `RESOURCE_MANAGER`) to the compositor's own Xwayland once it is `ready`
+# (M4). wlroots' `xwm` does not set `RESOURCE_MANAGER`, and there is no `wlr`
+# API for it, so the compositor sets it the way a real session does: by
+# connecting to its own X server as an ordinary client and changing the root
+# property. Best-effort, on a detached thread, so a slow/absent X server never
+# blocks the compositor loop. No-op on a build without Xwayland (`ready` never
+# fires). Same crate the X11 end-to-end tests already use.
+x11rb = "0.13"
+
 [dev-dependencies]
 tempfile = "3"
-wlr = "0.20.22"
+wlr = "0.20.23"
 crossbeam-channel.workspace = true
 signal-hook = "0.3"
 
@@ -82,3 +92,9 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # features are additive and only reach the test binaries.
 rustix = { version = "1", features = ["fs", "mm", "shm"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+# The X11 client half of the Xwayland (A1) spike's end-to-end test: a real
+# X11 client that connects to the compositor's Xwayland `DISPLAY`, creates and
+# maps one top-level, and lets the test assert the compositor's window model
+# gains it. Dev-only -- nothing in `src/` is an X11 client. The test skips
+# cleanly when `Xwayland` is absent.
+x11rb = "0.13"

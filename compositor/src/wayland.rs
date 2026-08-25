@@ -49,6 +49,18 @@ impl ToplevelKey {
     }
 }
 
+/// Which kind of client surface backs a model window — the one focus/
+/// stacking/SSD/geometry path serves both, and every outbound seam method
+/// dispatches on this (M2, XWayland design Decision 2). `Xdg` is a native
+/// wlr xdg toplevel; `X11` is a managed (non-override-redirect) Xwayland
+/// surface. Override-redirect X11 surfaces are never modelled and so never
+/// carry a `SurfaceKey`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceKey {
+    Xdg(ToplevelKey),
+    X11(wlr::XwaylandSurfaceId),
+}
+
 /// Every scene node one server-side-decorated window's title bar is made
 /// of, all parented into that window's own toplevel tree.
 ///
@@ -146,6 +158,32 @@ fn shift_button_color(base: [f32; 4], state: ButtonState) -> [f32; 4] {
     [scale(base[0]), scale(base[1]), scale(base[2]), scale(base[3])]
 }
 
+/// The `_NET_WM_STATE`-bearing attributes last pushed to a managed X11 window.
+///
+/// `sync_window_to_scene` re-pushes a window's full client state on every sync —
+/// including every pointer-motion frame of an interactive move/resize — and each
+/// wlroots `wlr_xwayland_surface_set_*` writes its atom and schedules an xwm
+/// flush unconditionally, so without a memo a single drag issues dozens of
+/// identical property writes per second (review finding #6). This is that memo:
+/// the seam skips a state atom whose value has not changed since it was last
+/// pushed. Geometry (position/size) is deliberately *not* memoized here — it
+/// legitimately changes on the very frames the drag produces — so it stays an
+/// unconditional configure. `activated`/`maximized`/`fullscreen` are owned by
+/// [`configure`](Wayland::configure); `minimized` by
+/// [`set_minimized`](Wayland::set_minimized).
+///
+/// The memo tracks the *last value pushed*, not the surface's live atom state,
+/// so any future path that changes one of these on the surface outside these two
+/// seams must invalidate the window's entry (drop it) or the next matching sync
+/// will be suppressed as a redundant no-op.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct X11PushedState {
+    minimized: bool,
+    activated: bool,
+    maximized: bool,
+    fullscreen: bool,
+}
+
 /// The compositor's Wayland side.
 #[derive(Default)]
 pub struct Wayland {
@@ -156,6 +194,22 @@ pub struct Wayland {
     /// toplevel → model, so both directions are hot.
     toplevel_to_window: HashMap<ToplevelKey, WindowId>,
     window_to_toplevel: HashMap<WindowId, ToplevelKey>,
+    /// Which model window each managed X11 (Xwayland) surface backs — the
+    /// second half of the [`SurfaceKey`] generalization (M2). A model
+    /// `WindowId` is backed by *either* an xdg toplevel (the maps above) or a
+    /// managed X11 surface (this map), never both, so every outbound seam
+    /// method below dispatches on which of the two a window resolves through
+    /// and pushes state to the matching `wlr` setter. The reverse (surface →
+    /// window) is not needed here — `state.rs`'s Xwayland handlers keep their
+    /// own `XwaylandSurfaceId → WindowId` side-table for that direction.
+    window_to_x11: HashMap<WindowId, wlr::XwaylandSurfaceId>,
+    /// The `_NET_WM_STATE`-bearing attributes last pushed to each managed X11
+    /// window (see [`X11PushedState`]), so [`set_minimized`](Wayland::set_minimized)
+    /// and [`configure`](Wayland::configure) can each skip a redundant atom write
+    /// and xwm flush. Keyed by `WindowId` (never reused, and a remap mints a
+    /// fresh row), and dropped in [`forget`](Wayland::forget) with the rest of
+    /// the window's state.
+    x11_pushed: HashMap<WindowId, X11PushedState>,
     /// One [`SsdVisual`] per window currently wearing server-side
     /// decorations, keyed the same way the toplevel maps are (review finding
     /// I2). `None` (no entry) means gone -- nothing is painted for that
@@ -199,6 +253,13 @@ impl Wayland {
         self.window_to_toplevel.insert(id, toplevel);
     }
 
+    /// Record that managed X11 surface `surface` backs model window `id` — the
+    /// Xwayland counterpart of [`bind`](Wayland::bind) (M2). A window is bound
+    /// through exactly one of the two.
+    pub fn bind_x11(&mut self, id: WindowId, surface: wlr::XwaylandSurfaceId) {
+        self.window_to_x11.insert(id, surface);
+    }
+
     /// Drop every trace of model window `id`.
     ///
     /// Idempotent: forgetting a window that was never bound is normal, since
@@ -207,6 +268,8 @@ impl Wayland {
         if let Some(key) = self.window_to_toplevel.remove(&id) {
             self.toplevel_to_window.remove(&key);
         }
+        self.window_to_x11.remove(&id);
+        self.x11_pushed.remove(&id);
         self.remove_ssd(id);
     }
 
@@ -218,19 +281,30 @@ impl Wayland {
         self.window_to_toplevel.get(&id).copied()
     }
 
-    /// Whether `id` has a client behind it. `false` for model-only windows.
-    pub fn is_backed(&self, id: WindowId) -> bool {
-        self.window_to_toplevel.contains_key(&id)
+    /// Which client surface backs `id`, or `None` for a model-only window
+    /// (every window in a test that never bound one). This is the dispatch
+    /// point every outbound method below runs through.
+    fn surface_key(&self, id: WindowId) -> Option<SurfaceKey> {
+        if let Some(key) = self.window_to_toplevel.get(&id) {
+            return Some(SurfaceKey::Xdg(*key));
+        }
+        self.window_to_x11.get(&id).copied().map(SurfaceKey::X11)
     }
 
-    /// Resolve `id` to the runtime handle and toplevel key needed to act on
+    /// Whether `id` has a client behind it — xdg or X11. `false` for
+    /// model-only windows.
+    pub fn is_backed(&self, id: WindowId) -> bool {
+        self.window_to_toplevel.contains_key(&id) || self.window_to_x11.contains_key(&id)
+    }
+
+    /// Resolve `id` to the runtime handle and surface key needed to act on
     /// it, or `None` if either is missing.
     ///
     /// `None` means gone, not error: a model-only build has no runtime, and
-    /// a window with no bound toplevel is normal (see `forget`). Callers
+    /// a window with no bound surface is normal (see `forget`). Callers
     /// treat either case as a silent no-op.
-    fn resolve(&self, id: WindowId) -> Option<(&wlr::Runtime, ToplevelKey)> {
-        let (Some(runtime), Some(key)) = (self.runtime(), self.toplevel_for(id)) else {
+    fn resolve(&self, id: WindowId) -> Option<(&wlr::Runtime, SurfaceKey)> {
+        let (Some(runtime), Some(key)) = (self.runtime(), self.surface_key(id)) else {
             return None;
         };
         Some((runtime, key))
@@ -245,7 +319,7 @@ impl Wayland {
     /// geometry change and an activation change reach the client together
     /// rather than as two round trips.
     pub fn configure(
-        &self,
+        &mut self,
         id: WindowId,
         content: Rectangle,
         activated: bool,
@@ -253,16 +327,55 @@ impl Wayland {
         fullscreen: bool,
     ) {
         let Some((runtime, key)) = self.resolve(id) else { return };
-        runtime.set_toplevel_size(key.0, content.width, content.height);
-        runtime.set_toplevel_activated(key.0, activated);
-        runtime.set_toplevel_maximized(key.0, maximized);
-        runtime.set_toplevel_fullscreen(key.0, fullscreen);
+        match key {
+            SurfaceKey::Xdg(key) => {
+                runtime.set_toplevel_size(key.0, content.width, content.height);
+                runtime.set_toplevel_activated(key.0, activated);
+                runtime.set_toplevel_maximized(key.0, maximized);
+                runtime.set_toplevel_fullscreen(key.0, fullscreen);
+            }
+            SurfaceKey::X11(sid) => {
+                // An X11 window is configured to the whole **content** rect
+                // (position *and* size), not just a size: xdg clients do not
+                // know where they are, but X11 clients place themselves and
+                // must be told the geometry the WM granted, inside the SSD.
+                // Geometry is always sent — it is exactly what changes on a drag
+                // frame — but the `_NET_WM_STATE` atoms are memoized so an
+                // unchanged one costs no atom write + xwm flush (review finding
+                // #6). `None` (never pushed) forces the first sync to send all.
+                let prev = self.x11_pushed.get(&id).copied();
+                runtime.configure_xwayland_surface(
+                    sid,
+                    wlr::Box2D::new(content.x, content.y, content.width, content.height),
+                );
+                if prev.map(|p| p.activated) != Some(activated) {
+                    runtime.activate_xwayland_surface(sid, activated);
+                }
+                if prev.map(|p| p.maximized) != Some(maximized) {
+                    runtime.set_xwayland_surface_maximized(sid, maximized);
+                }
+                if prev.map(|p| p.fullscreen) != Some(fullscreen) {
+                    runtime.set_xwayland_surface_fullscreen(sid, fullscreen);
+                }
+                // `runtime`'s borrow ends above; record what we pushed, leaving
+                // `minimized` (owned by `set_minimized`) untouched.
+                let entry = self.x11_pushed.entry(id).or_default();
+                entry.activated = activated;
+                entry.maximized = maximized;
+                entry.fullscreen = fullscreen;
+            }
+        }
     }
 
     /// Move the window's scene node. `x`/`y` are **content**-space.
     pub fn set_position(&self, id: WindowId, x: i32, y: i32) {
         let Some((runtime, key)) = self.resolve(id) else { return };
-        runtime.set_toplevel_position(key.0, x, y);
+        match key {
+            SurfaceKey::Xdg(key) => {
+                runtime.set_toplevel_position(key.0, x, y);
+            }
+            SurfaceKey::X11(sid) => runtime.set_xwayland_surface_position(sid, x, y),
+        }
     }
 
     /// Show or hide the window's scene node.
@@ -274,7 +387,39 @@ impl Wayland {
     /// re-render from nothing.
     pub fn set_visible(&self, id: WindowId, visible: bool) {
         let Some((runtime, key)) = self.resolve(id) else { return };
-        runtime.set_toplevel_visible(key.0, visible);
+        match key {
+            SurfaceKey::Xdg(key) => {
+                runtime.set_toplevel_visible(key.0, visible);
+            }
+            SurfaceKey::X11(sid) => runtime.set_xwayland_surface_visible(sid, visible),
+        }
+    }
+
+    /// Reflect the model's minimized state back to the client.
+    ///
+    /// xdg-shell has no minimized toplevel state to push (a client requests
+    /// minimize; the WM just hides the window), so this is a no-op for an xdg
+    /// toplevel — hiding is already carried by [`Self::set_visible`]. X11 is
+    /// different: `_NET_WM_STATE_HIDDEN` is a real window property an ICCCM/
+    /// EWMH client reads to know it has been iconified, so a WM-initiated
+    /// minimize must reach the surface through `set_xwayland_surface_minimized`
+    /// (which the xwm turns into the `_NET_WM_STATE_HIDDEN` atom) or an X11 app
+    /// never learns it was minimized. Silent no-op on a miss, like every other
+    /// seam here.
+    pub fn set_minimized(&mut self, id: WindowId, minimized: bool) {
+        let Some((runtime, key)) = self.resolve(id) else { return };
+        match key {
+            SurfaceKey::Xdg(_) => {}
+            SurfaceKey::X11(sid) => {
+                // Skip the atom write + xwm flush when the value is unchanged
+                // from what this window last received (see `x11_pushed`).
+                if self.x11_pushed.get(&id).map(|p| p.minimized) == Some(minimized) {
+                    return;
+                }
+                runtime.set_xwayland_surface_minimized(sid, minimized);
+                self.x11_pushed.entry(id).or_default().minimized = minimized;
+            }
+        }
     }
 
     /// Raise the window above its siblings.
@@ -285,7 +430,34 @@ impl Wayland {
     /// its place in the stack.
     pub fn raise(&self, id: WindowId) {
         let Some((runtime, key)) = self.resolve(id) else { return };
-        runtime.raise_toplevel(key.0);
+        match key {
+            SurfaceKey::Xdg(key) => {
+                runtime.raise_toplevel(key.0);
+            }
+            SurfaceKey::X11(sid) => {
+                // An xdg toplevel's SSD rides its own scene tree, so one
+                // `raise_toplevel` lifts the whole window. An X11 window's
+                // scene node lives directly in the toplevel band and its SSD
+                // nodes are band siblings, so raising the window means raising
+                // the surface node *and* each decoration node above the other
+                // windows in the band, then restacking the X11 window itself
+                // for stacking parity with X11-native clients.
+                runtime.raise_xwayland_surface(sid);
+                if let Some(visual) = self.ssd.get(&id) {
+                    runtime.raise_rect(visual.band);
+                    for rect in visual.buttons.into_iter().flatten() {
+                        runtime.raise_rect(rect);
+                    }
+                    if let Some(title) = visual.title {
+                        runtime.raise_buffer(title);
+                    }
+                    for glyph in visual.button_glyphs.into_iter().flatten() {
+                        runtime.raise_buffer(glyph);
+                    }
+                }
+                runtime.restack_xwayland_surface(sid, None, true);
+            }
+        }
     }
 
     /// Point the seat's keyboard at `id`, or at nothing.
@@ -309,9 +481,14 @@ impl Wayland {
     /// doing nothing.
     pub fn keyboard_focus(&self, id: Option<WindowId>) {
         let Some(runtime) = self.runtime() else { return };
-        match id.and_then(|id| self.toplevel_for(id)) {
-            Some(key) => {
+        match id.and_then(|id| self.surface_key(id)) {
+            Some(SurfaceKey::Xdg(key)) => {
                 if runtime.focus_toplevel_keyboard(key.0).is_none() {
+                    runtime.clear_keyboard_focus();
+                }
+            }
+            Some(SurfaceKey::X11(sid)) => {
+                if runtime.focus_xwayland_surface_keyboard(sid).is_none() {
                     runtime.clear_keyboard_focus();
                 }
             }
@@ -355,9 +532,14 @@ impl Wayland {
     /// it only happens across two separate `run_all` calls, which is outside
     /// what a single close request can detect or a headless test can set up.
     pub fn close(&self, id: WindowId) -> bool {
-        let Some(key) = self.toplevel_for(id) else { return false };
+        let Some(key) = self.surface_key(id) else { return false };
         if let Some(runtime) = self.runtime() {
-            runtime.close_toplevel(key.0);
+            match key {
+                SurfaceKey::Xdg(key) => {
+                    runtime.close_toplevel(key.0);
+                }
+                SurfaceKey::X11(sid) => runtime.close_xwayland_surface(sid),
+            }
         }
         true
     }
@@ -461,17 +643,50 @@ impl Wayland {
             return;
         }
         let Some(runtime) = self.runtime.clone() else { return };
+        // Which client backs this window decides both where the decoration
+        // nodes are parented and what origin their coordinates are relative
+        // to. An xdg toplevel's SSD lives inside its own toplevel tree, so its
+        // nodes are positioned relative to the content origin
+        // (`set_toplevel_position` moves that tree). An X11 window's scene
+        // node lives directly in `Band::Toplevel`, so its decoration nodes are
+        // band siblings positioned in absolute scene coordinates (origin
+        // `(0, 0)`), riding the window's z-order via `raise` instead of a
+        // parent tree.
+        let Some(sk) = self.surface_key(id) else { return };
+        let (ox, oy) = match sk {
+            SurfaceKey::Xdg(_) => (content.x, content.y),
+            SurfaceKey::X11(_) => (0, 0),
+        };
+        // Node factories that hide the xdg-tree vs. toplevel-band split so the
+        // decoration-building logic below is one path for both surface kinds.
+        let make_rect = |w: i32, h: i32, color: [f32; 4]| -> Option<wlr::RectId> {
+            match sk {
+                SurfaceKey::Xdg(key) => runtime.add_rect_in_toplevel(key.0, w, h, color),
+                SurfaceKey::X11(_) => runtime.add_rect_in_band(wlr::Band::Toplevel, w, h, color).ok(),
+            }
+        };
+        let make_buffer = |w: i32, h: i32, px: &[u8]| -> Option<wlr::BufferId> {
+            match sk {
+                SurfaceKey::Xdg(key) => runtime.add_buffer_in_toplevel(key.0, w, h, px),
+                SurfaceKey::X11(_) => runtime.add_buffer_in_band(wlr::Band::Toplevel, w, h, px),
+            }
+        };
         let width = bar.width.max(1);
         let height = bar.height.max(1);
-        let (rel_x, rel_y) = (bar.x - content.x, bar.y - content.y);
+        let (rel_x, rel_y) = (bar.x - ox, bar.y - oy);
 
         // The band is the entry: no band, no decoration. It is also created
         // first so that every node added below lands above it in the
-        // toplevel tree's own stacking order -- buttons and title over the
-        // band, never under it.
+        // tree's own stacking order -- buttons and title over the band, never
+        // under it.
+        //
+        // Not the `entry` API the `map_entry` lint suggests: the value is
+        // fallible to build (`make_rect` can return `None`, on which this must
+        // early-return having inserted nothing), which `or_insert_with` cannot
+        // express.
+        #[allow(clippy::map_entry)]
         if !self.ssd.contains_key(&id) {
-            let Some(key) = self.toplevel_for(id) else { return };
-            let Some(band) = runtime.add_rect_in_toplevel(key.0, width, height, band_color) else {
+            let Some(band) = make_rect(width, height, band_color) else {
                 return;
             };
             self.ssd.insert(
@@ -486,7 +701,6 @@ impl Wayland {
                 },
             );
         }
-        let key = self.toplevel_for(id);
         let Some(visual) = self.ssd.get_mut(&id) else { return };
 
         runtime.set_rect_size(visual.band, width, height);
@@ -506,12 +720,11 @@ impl Wayland {
             };
             let slot = &mut visual.buttons[i];
             if slot.is_none() {
-                let Some(key) = key else { continue };
-                *slot = runtime.add_rect_in_toplevel(key.0, r.width.max(1), r.height.max(1), color);
+                *slot = make_rect(r.width.max(1), r.height.max(1), color);
             }
             let Some(rect) = *slot else { continue };
             runtime.set_rect_size(rect, r.width.max(1), r.height.max(1));
-            runtime.set_rect_position(rect, r.x - content.x, r.y - content.y);
+            runtime.set_rect_position(rect, r.x - ox, r.y - oy);
             runtime.set_rect_color(rect, color);
 
             match &button_glyph_px[i] {
@@ -525,20 +738,14 @@ impl Wayland {
                             if let Some(stale) = visual.button_glyphs[i].take() {
                                 runtime.remove_buffer(stale);
                             }
-                            if let Some(key) = key {
-                                visual.button_glyphs[i] = runtime.add_buffer_in_toplevel(
-                                    key.0,
-                                    raster.width,
-                                    raster.height,
-                                    raster.pixels,
-                                );
-                            }
+                            visual.button_glyphs[i] =
+                                make_buffer(raster.width, raster.height, raster.pixels);
                         }
                         visual.button_glyph_keys[i] =
                             if visual.button_glyphs[i].is_some() { Some(raster_key) } else { None };
                     }
                     if let Some(buffer) = visual.button_glyphs[i] {
-                        runtime.set_buffer_position(buffer, r.x - content.x, r.y - content.y);
+                        runtime.set_buffer_position(buffer, r.x - ox, r.y - oy);
                     }
                 }
                 None => {
@@ -570,13 +777,7 @@ impl Wayland {
                         if let Some(stale) = visual.title.take() {
                             runtime.remove_buffer(stale);
                         }
-                        let Some(key) = key else { return };
-                        visual.title = runtime.add_buffer_in_toplevel(
-                            key.0,
-                            raster.width,
-                            raster.height,
-                            raster.pixels,
-                        );
+                        visual.title = make_buffer(raster.width, raster.height, raster.pixels);
                     }
                     // Only claim the generation if a node actually holds it:
                     // a refused `add_buffer_in_toplevel` must be retried on

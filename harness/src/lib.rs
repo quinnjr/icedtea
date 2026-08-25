@@ -261,6 +261,18 @@ impl Compositor {
                 .create_output_manager(&display)
                 .expect("zwlr_output_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
+            // X11 application support. Non-fatal here, unlike the globals
+            // above: a host with no `Xwayland` binary is a legitimate CI
+            // configuration, and the X11 end-to-end test skips cleanly when
+            // `DbCommand::XwaylandDisplay` comes back `None`. `lazy` is `true`,
+            // so no `Xwayland` process is spawned for the non-X11 tests -- the
+            // manager only reserves a display socket, and nothing connects to
+            // it unless a test asks for `DISPLAY` and drives an X11 client.
+            // Must come after `create_seat`, whose seat the clipboard/DND
+            // bridge needs.
+            if let Err(err) = runtime.create_xwayland(&display, true) {
+                eprintln!("harness: Xwayland unavailable ({err}); X11 tests will skip");
+            }
             // Test-only: makes the seat advertise the touch capability so
             // headless clients can bind `wl_touch` and injected touch
             // points are accepted. Harness-only -- the real
@@ -304,6 +316,16 @@ impl Compositor {
             // Deliberately no `set_var("WAYLAND_DISPLAY", ...)`: see the
             // module doc. The handshake is the only way out of this thread —
             // everything above is `!Send`.
+            //
+            // DISPLAY + the X11 cursor hints ARE published, though, and here —
+            // *before* the boot handshake below (review finding #5). Publishing
+            // before `boot_tx.send` means the writes happen-before the test
+            // thread resumes from `Compositor::spawn`, so a test that reads the
+            // process env (the DISPLAY/cursor-env test) is ordered after them
+            // rather than racing the old `xwayland_ready` write on this thread.
+            icedtea_compositor::state::State::publish_xwayland_env(
+                runtime.xwayland_display_name().as_deref(),
+            );
             boot_tx.send((socket, cmd_wake_write)).expect("boot handshake");
             drop(boot_tx);
             drop(boot_guard);
@@ -346,6 +368,72 @@ impl Compositor {
         reply_rx
             .recv_timeout(TIMEOUT)
             .expect("compositor never answered GetState")
+    }
+
+    /// The `DISPLAY` name (`:N`) Xwayland advertises, or `None` when no
+    /// Xwayland was created (the `Xwayland` binary is absent). Available with
+    /// lazy start as soon as the manager reserves its display socket -- before
+    /// any `Xwayland` process is spawned -- so an X11 test reads this, connects
+    /// a client to it, and that connection is what triggers the lazy start.
+    pub fn xwayland_display(&self) -> Option<String> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::XwaylandDisplay { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered XwaylandDisplay")
+    }
+
+    /// Whether the lazy Xwayland has started and `xwayland_ready` has fired (the
+    /// seat is wired, so the clipboard/primary/DND bridge is armed). A test that
+    /// needs the bridge live polls this after connecting the client that
+    /// triggers the lazy start — the readiness barrier that used to be inferred
+    /// from `DISPLAY` being republished on ready (review finding #5).
+    pub fn xwayland_ready(&self) -> bool {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::XwaylandReady { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered XwaylandReady")
+    }
+
+    /// Override the primary output's recorded scale (and re-publish the X11
+    /// `Xft.dpi` hint if Xwayland is already up), for the M4 HiDPI test. Blocks
+    /// on the ack -- see [`Self::inject_touch_down`]'s doc -- so the scale has
+    /// actually been recorded before this returns.
+    pub fn set_output_scale_for_test(&self, scale: f64) {
+        // `spawn` returns at the boot handshake, before `run_all` creates the
+        // headless output, so the very first attempt can land before any output
+        // exists. Poll until the compositor reports it actually recorded the
+        // scale (review finding #11) rather than acking a silent no-op, so the
+        // caller is guaranteed the scale is live before it proceeds.
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            self.send(DbCommand::SetOutputScaleForTest { scale, reply: reply_tx });
+            let recorded = reply_rx
+                .recv_timeout(TIMEOUT)
+                .expect("compositor never answered SetOutputScaleForTest");
+            if recorded {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no output ever existed to record the test scale on"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Probe every mapped override-redirect (OR) X11 pop-up the compositor is
+    /// tracking, reading each one's real scene state (position, whether it is in
+    /// the band above managed toplevels, and whether it holds the keyboard).
+    /// Blocks on the reply -- see [`Self::inject_touch_down`]'s doc.
+    pub fn xwayland_override_redirect(&self) -> Vec<icedtea_compositor::dbus::OverrideRedirectProbe> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::XwaylandOverrideRedirect { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered XwaylandOverrideRedirect")
     }
 
     /// Synthesize a touch-down at `(x, y)` for touch point `id` on the
@@ -553,9 +641,18 @@ struct ClientState {
     /// an actual key press/release delivered to this client, which is exactly
     /// what M4.4's lock-isolation test needs to observe.
     key_events: u32,
-    /// What this client's own data source answers `send` with.
+    /// What this client's own clipboard data source answers `send` with. The
+    /// `wl_data_source` and clipboard `zwlr_data_control_source_v1` handlers read
+    /// these; the *primary* data-control source has its own pair below so one
+    /// client can legitimately own CLIPBOARD and PRIMARY at once, each answered
+    /// from its own payload (review finding #13).
     offered_mime: String,
     offered_payload: Vec<u8>,
+    /// The primary (middle-click) data-control source's `send` payload, kept
+    /// separate from the clipboard pair above so a client owning both selections
+    /// does not cross-feed one into the other's reader.
+    offered_primary_mime: String,
+    offered_primary_payload: Vec<u8>,
     /// How many `wl_data_source.send` requests this client has serviced — the
     /// signal a reader uses to know the owner has written the payload. Shared
     /// by the `wl_data_source` and `zwlr_data_control_source_v1` send handlers,
@@ -571,6 +668,14 @@ struct ClientState {
     data_control_offer: Option<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1>,
     /// Mimes advertised on the in-flight data-control offer, reset per offer.
     data_control_mimes: Vec<String>,
+    /// The current data-control *primary* selection offer (data-control v2
+    /// bridges the middle-click/primary selection focus-lessly, exactly as it
+    /// does the clipboard). Distinct from `data_control_offer` so a test can
+    /// assert the two selections independently.
+    data_control_primary_offer: Option<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1>,
+    /// The primary source a data-control client last set, kept alive to answer
+    /// `send` -- the primary counterpart of `data_control_source`.
+    data_control_primary_source: Option<zwlr_data_control_source_v1::ZwlrDataControlSourceV1>,
 
     // --- primary selection (M4.1) ---
     primary_manager:
@@ -952,7 +1057,12 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clie
         match event {
             zwlr_data_control_device_v1::Event::DataOffer { .. } => state.data_control_mimes.clear(),
             zwlr_data_control_device_v1::Event::Selection { id } => state.data_control_offer = id,
-            // PrimarySelection / Finished not needed for the clipboard read.
+            // data-control v2's primary (middle-click) selection, delivered the
+            // same focus-less way the clipboard `Selection` is. Stored so the
+            // X11<->primary bridge can be read without a focused Wayland client.
+            zwlr_data_control_device_v1::Event::PrimarySelection { id } => {
+                state.data_control_primary_offer = id
+            }
             _ => {}
         }
     }
@@ -981,20 +1091,29 @@ impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for Client
 impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for ClientState {
     fn event(
         state: &mut Self,
-        _: &zwlr_data_control_source_v1::ZwlrDataControlSourceV1,
+        source: &zwlr_data_control_source_v1::ZwlrDataControlSourceV1,
         event: zwlr_data_control_source_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // Same payload-write shape as the `wl_data_source` handler; shares the
-        // offered payload + send counter (a client owns via one protocol only).
-        if let zwlr_data_control_source_v1::Event::Send { mime_type, fd } = event
-            && mime_type == state.offered_mime
-        {
-            let mut f = std::fs::File::from(fd);
-            let _ = f.write_all(&state.offered_payload);
-            state.source_sends = state.source_sends.saturating_add(1);
+        // A client may own CLIPBOARD and PRIMARY at once via data-control, each
+        // with its own source object. Route the `send` to the matching payload
+        // by which source fired it (review finding #13) — the primary source
+        // answers from `offered_primary_*`, everything else from the clipboard
+        // pair — so neither reader ever gets the other's bytes.
+        if let zwlr_data_control_source_v1::Event::Send { mime_type, fd } = event {
+            let is_primary = state.data_control_primary_source.as_ref() == Some(source);
+            let (want_mime, payload) = if is_primary {
+                (&state.offered_primary_mime, &state.offered_primary_payload)
+            } else {
+                (&state.offered_mime, &state.offered_payload)
+            };
+            if &mime_type == want_mime {
+                let mut f = std::fs::File::from(fd);
+                let _ = f.write_all(payload);
+                state.source_sends = state.source_sends.saturating_add(1);
+            }
         }
     }
 }
@@ -1124,10 +1243,10 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()> 
         _: &QueueHandle<Self>,
     ) {
         if let zwp_primary_selection_source_v1::Event::Send { mime_type, fd } = event
-            && mime_type == state.offered_mime
+            && mime_type == state.offered_primary_mime
         {
             let mut f = std::fs::File::from(fd);
-            let _ = f.write_all(&state.offered_payload);
+            let _ = f.write_all(&state.offered_primary_payload);
             state.source_sends = state.source_sends.saturating_add(1);
         }
     }
@@ -2020,8 +2139,12 @@ impl TestClient {
     pub fn set_primary_text(&mut self, mime: &str, payload: &[u8]) {
         let manager = self.state.primary_manager.clone().expect("no primary manager");
         let device = self.state.primary_device.clone().expect("no primary device");
-        self.state.offered_mime = mime.to_string();
-        self.state.offered_payload = payload.to_vec();
+        // The native PRIMARY source has its own offer storage, distinct from the
+        // native CLIPBOARD's `offered_mime`/`offered_payload` (review finding #13,
+        // applied to the native pair too): a single client that owns both with
+        // different payloads must feed each reader its own bytes, not the other's.
+        self.state.offered_primary_mime = mime.to_string();
+        self.state.offered_primary_payload = payload.to_vec();
         let source = manager.create_source(&self.qh, ());
         source.offer(mime.to_string());
         device.set_selection(Some(&source), self.state.last_serial.unwrap_or(0));
@@ -2471,6 +2594,60 @@ impl DataControlClient {
     /// Whether a data-control selection offer has been delivered.
     pub fn has_offer(&self) -> bool {
         self.state.data_control_offer.is_some()
+    }
+
+    /// Own the *primary* (middle-click) selection with `payload` under `mime`,
+    /// focus-lessly, via data-control v2. The primary counterpart of
+    /// [`set_clipboard`](Self::set_clipboard).
+    pub fn set_primary(&mut self, mime: &str, payload: &[u8]) {
+        let manager = self.state.data_control_manager.clone().expect("no data-control manager");
+        let device = self.state.data_control_device.clone().expect("no data-control device");
+        // The primary selection's own payload pair, not the clipboard's, so a
+        // client that owns both feeds each reader the right bytes (finding #13).
+        self.state.offered_primary_mime = mime.to_string();
+        self.state.offered_primary_payload = payload.to_vec();
+        let source = manager.create_data_source(&self.qh, ());
+        source.offer(mime.to_string());
+        device.set_primary_selection(Some(&source));
+        self.state.data_control_primary_source = Some(source);
+        self.conn.flush().expect("flush data-control set_primary");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Whether a data-control *primary* selection offer has been delivered.
+    pub fn has_primary_offer(&self) -> bool {
+        self.state.data_control_primary_offer.is_some()
+    }
+
+    /// Read the current data-control *primary* selection when the owner services
+    /// `send` on its own thread (e.g. the X11 selection owner's event loop). The
+    /// primary counterpart of [`read_offer_blocking`](Self::read_offer_blocking).
+    pub fn read_primary_offer_blocking(&mut self, mime: &str) -> Vec<u8> {
+        let offer = self
+            .state
+            .data_control_primary_offer
+            .clone()
+            .expect("no data-control primary offer delivered");
+        let (read_end, write_end) = std::io::pipe().expect("pipe");
+        offer.receive(mime.to_string(), write_end.as_fd());
+        self.conn.flush().expect("flush primary receive");
+        drop(write_end);
+
+        let handle = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let mut read_end = read_end;
+            let _ = read_end.read_to_end(&mut buf);
+            buf
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if handle.is_finished() {
+                return handle.join().expect("read thread panicked");
+            }
+            assert!(Instant::now() < deadline, "primary selection read timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Pump the queue until `pred` holds or [`TIMEOUT`] elapses.
