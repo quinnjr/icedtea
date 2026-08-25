@@ -16,7 +16,7 @@
 //! * Task 9 -- a client that requests `wp_presentation` feedback on a real
 //!   commit receives a terminal event.
 
-use icedtea_harness::{Compositor, TestClient};
+use icedtea_harness::{Compositor, PresentationOutcome, TestClient};
 
 /// The six A2 batch-1 globals must all be advertised -- the daemon-free
 /// baseline every other test in this file assumes.
@@ -235,4 +235,55 @@ fn frame_contains_color(frame: &icedtea_harness::CapturedFrame, color: u32) -> b
         }
     }
     false
+}
+
+/// Task 9: a client commits a frame with a `wp_presentation` feedback
+/// request and receives a terminal feedback event after the output actually
+/// commits.
+///
+/// The headless backend has no real display hardware, so it never emits a
+/// page-flip/vblank "present" event for wlroots' presentation-time tracking
+/// to time a `presented` event against -- there is no clock to wait on. Per
+/// the task brief, this test instead forces the OTHER terminal event the
+/// protocol defines: `discarded`, sent when "the associated content update
+/// was replaced by a newer one before it was ever displayed" (the XML's own
+/// wording). A second, genuinely new content submission on the same surface
+/// -- committed before the compositor could ever have displayed the
+/// first -- is exactly that supersession, and it is deterministic on any
+/// backend, real or headless. The assertion still accepts EITHER terminal
+/// event (`matches!` below), so a future/real-hardware backend that manages
+/// to race a real `presented` in first passes too -- what this test rules
+/// out is neither ever arriving, i.e. a client's feedback object silently
+/// dropped, which is the real regression `set_scene_presentation` (Task 6)
+/// guards against.
+#[test]
+fn presentation_feedback_arrives_on_commit() {
+    let comp = Compositor::spawn();
+    let mut client = TestClient::map_toplevel(&comp.socket, "presentation.app", "presentation");
+    assert!(client.wait_until(|c| c.last_configure().is_some()));
+    let (w, h) = client.last_configure().filter(|&(w, h)| w > 0 && h > 0).unwrap_or((200, 100));
+
+    // Ties the feedback object to whatever is the surface's current content
+    // submission (the map's own initial buffer) -- the plain `commit()`
+    // reaffirms it as a fresh double-buffered submission the request can
+    // answer against, the same contract `wp_viewport.set_source`/
+    // `set_destination` follow.
+    let _feedback = client.request_presentation_feedback();
+    client.commit();
+    // Immediately supersede that submission with a genuinely new one, before
+    // the compositor could ever have displayed the first -- see this test's
+    // own doc for why that deterministically forces `discarded`.
+    client.attach_pattern_buffer(w, h, |_, _| 0x0040_4040);
+    client.commit();
+
+    assert!(
+        client.wait_until(|c| c.presentation_outcome().is_some()),
+        "no wp_presentation_feedback terminal event (presented or discarded) arrived \
+         after superseding the tracked content submission"
+    );
+    let outcome = client.presentation_outcome().unwrap();
+    assert!(
+        matches!(outcome, PresentationOutcome::Presented | PresentationOutcome::Discarded),
+        "unreachable: presentation_outcome() only ever stores one of these two variants"
+    );
 }
