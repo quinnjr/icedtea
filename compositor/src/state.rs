@@ -625,14 +625,32 @@ pub struct State {
     /// button-only events (which carry no position of their own) read it
     /// back to build `PointerEvent::Press`/`Release`.
     pub pointer_location: (i32, i32),
-    /// The shape most recently applied via `wlr::Runtime::set_cursor_shape`
-    /// (initially `Default`, matching the seat's own default cursor image
-    /// before any `cursor-shape-v1` request has ever arrived). Updated only
-    /// by `Self::apply_cursor_shape`, which is the single call site for
-    /// `set_cursor_shape` -- test-only observability for the A2 batch-2
+    /// What the seat cursor's image *actually is* right now, as far as this
+    /// compositor can account for it (initially `Default`, matching the
+    /// seat's own default cursor image before any `cursor-shape-v1` request
+    /// has ever arrived). Test-only observability for the A2 batch-2
     /// cursor-shape handler, exposed through `DbCommand::CursorShape` the
     /// same way `cursor_position` exposes `wlr::Runtime::cursor_position`.
+    ///
+    /// Two writers, and both are needed for this to stay *truthful* rather
+    /// than merely optimistic:
+    ///
+    /// - `Self::apply_cursor_shape`, the single call site for
+    ///   `wlr::Runtime::set_cursor_shape`.
+    /// - the pointer callbacks, which record wlroots' own unconditional
+    ///   reset back to the arrow before re-asserting -- see
+    ///   `Self::reassert_cursor_shape_after_wlroots_stomp`.
     pub cursor_shape: wlr::CursorShape,
+    /// The shape the client that currently owns the pointer named through
+    /// `cursor-shape-v1`, or `Default` when none has (or when the pointer
+    /// has since left that client's surface, which drops the request --
+    /// see `pointer_over_window`).
+    ///
+    /// Distinct from `cursor_shape` on purpose: `cursor_shape` is what the
+    /// seat cursor *shows*, this is what it is *supposed to* show. wlroots
+    /// resets the former behind this compositor's back on every pointer
+    /// event, and this field is what the re-assertion puts back.
+    pointer_shape_request: wlr::CursorShape,
     /// The window last seen under the pointer, updated at the top of
     /// `SeatHandler::pointer_motion`. Its only job is detecting a
     /// pointer-focus change (a transition to a *different* window, or to no
@@ -1007,6 +1025,7 @@ impl State {
             session_locked: false,
             pointer_location: (0, 0),
             cursor_shape: wlr::CursorShape::Default,
+            pointer_shape_request: wlr::CursorShape::Default,
             pointer_over_window: None,
             pointer_pressed: false,
             config_path: None,
@@ -4413,6 +4432,32 @@ impl State {
         }
         self.cursor_shape = shape;
     }
+
+    /// Put back the pointer owner's named cursor shape after wlroots has
+    /// silently thrown it away. Called from every pointer callback that runs
+    /// downstream of that reset.
+    ///
+    /// The `wlr` crate's `Runtime::ensure_cursor_image` calls
+    /// `wlr_cursor_set_xcursor(cursor, xcursor, "left_ptr")`
+    /// *unconditionally*, and `backend.rs` calls it from the pointer
+    /// motion, absolute-motion and button callbacks **before** the event is
+    /// emitted to this handler. So by the time any of `pointer_motion` /
+    /// `pointer_button` runs, the on-screen cursor is already back to the
+    /// platform arrow no matter what a `cursor-shape-v1` client asked for.
+    /// Without this re-assertion the very next pointer motion inside the
+    /// same window reverts a client's `Text` (or resize, or grab) cursor to
+    /// an arrow -- a permanent, one-motion-long cursor shape.
+    ///
+    /// The `cursor_shape` write is not bookkeeping padding: it makes the
+    /// mirror match the stomp that already happened, so the field means
+    /// "what the cursor shows" rather than "the last shape we hoped for".
+    /// Deleting the re-assert below then genuinely reads back `Default`.
+    fn reassert_cursor_shape_after_wlroots_stomp(&mut self) {
+        self.cursor_shape = wlr::CursorShape::Default;
+        if self.pointer_shape_request != wlr::CursorShape::Default {
+            self.apply_cursor_shape(self.pointer_shape_request);
+        }
+    }
 }
 
 // --- Compositor library handlers ---
@@ -5674,7 +5719,13 @@ impl wlr::SeatHandler for State {
         let over = self.window_at_point(pointer);
         if over != self.pointer_over_window {
             self.pointer_over_window = over;
+            self.pointer_shape_request = wlr::CursorShape::Default;
             self.apply_cursor_shape(wlr::CursorShape::Default);
+        } else {
+            // Same window, so nobody's shape ownership ended -- but wlroots
+            // has already reset the image to `left_ptr` behind our back on
+            // the way into this callback. Put it back.
+            self.reassert_cursor_shape_after_wlroots_stomp();
         }
 
         self.handle_pointer(PointerEvent::Motion { pointer });
@@ -5714,6 +5765,12 @@ impl wlr::SeatHandler for State {
         // next.
         let pointer = (x as i32, y as i32);
         self.pointer_location = pointer;
+
+        // Same wlroots reset as in `pointer_motion`: the button callback
+        // runs `ensure_cursor_image` too, before this handler sees the
+        // event. Above the `BTN_LEFT` gate because the reset is not
+        // button-specific.
+        self.reassert_cursor_shape_after_wlroots_stomp();
 
         if button != BTN_LEFT {
             return;
@@ -5772,6 +5829,11 @@ impl wlr::SeatHandler for State {
             tracing::debug!(?device, serial, ?shape, "ignoring cursor-shape request from a non-pointer device");
             return;
         }
+        // Recorded as well as applied: wlroots resets the cursor image to
+        // the arrow on the way into every pointer callback, so the request
+        // has to be re-applied from here on -- see
+        // `reassert_cursor_shape_after_wlroots_stomp`.
+        self.pointer_shape_request = shape;
         self.apply_cursor_shape(shape);
     }
 

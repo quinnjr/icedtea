@@ -382,6 +382,12 @@ fn wait_for_cursor_shape(comp: &Compositor, want: &str) -> String {
 ///    shared cursor forever. Moving the pointer to genuinely empty desktop
 ///    -- asserted to be outside every mapped window, not assumed -- is the
 ///    leave this compositor can observe.
+/// 3. The re-assertion in `State::reassert_cursor_shape_after_wlroots_stomp`:
+///    wlroots resets the cursor image to `left_ptr` on its own, before
+///    every pointer callback reaches this compositor, so a named shape has
+///    to be put back on each one or it survives exactly one pointer event.
+///    Deleting the re-assert makes the within-window assertion below read
+///    `Default`.
 ///
 /// The serial passed to `set_shape` is a real one the seat issued to this
 /// client (its `wl_pointer.enter`), read back off the client, not invented.
@@ -415,6 +421,31 @@ fn cursor_shape_set_by_the_pointer_owner_applies_and_reverts_on_leave() {
         wait_for_cursor_shape(&comp, "Text"),
         "Text",
         "the seat cursor never became the shape the pointer's own client named"
+    );
+
+    // Third claim, and the one a model-mirror-only test would miss: a shape
+    // must SURVIVE further pointer motion inside the same window. wlroots
+    // resets the cursor image itself -- the `wlr` crate's
+    // `Runtime::ensure_cursor_image` calls `wlr_cursor_set_xcursor(cursor,
+    // xcursor, "left_ptr")` unconditionally, from the motion,
+    // absolute-motion and button callbacks in `backend.rs`, *before* the
+    // event reaches the compositor -- so without
+    // `State::reassert_cursor_shape_after_wlroots_stomp` the client's shape
+    // lasts exactly until the pointer twitches. A few pixels, deliberately
+    // still well inside the same window, so this is not the revert-on-leave
+    // branch below wearing a disguise.
+    let (inner_x, inner_y) = (geo.x + geo.width / 2 + 3, geo.y + geo.height / 2 + 3);
+    assert!(
+        inner_x >= geo.x && inner_x < geo.x + geo.width && inner_y >= geo.y && inner_y < geo.y + geo.height,
+        "({inner_x}, {inner_y}) must still be inside {geo:?} for this to test within-window motion"
+    );
+    vp.motion_absolute(inner_x as f64, inner_y as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert_eq!(
+        wait_for_cursor_shape(&comp, "Text"),
+        "Text",
+        "a pointer motion inside the very same window dropped the client's named cursor shape \
+         (wlroots reset it to left_ptr and nothing put it back)"
     );
 
     // Empty desktop: proven empty against the live model rather than
