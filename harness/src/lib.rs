@@ -49,6 +49,9 @@ use wayland_protocols::ext::idle_notify::v1::client::{ext_idle_notification_v1, 
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
 };
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
@@ -70,6 +73,9 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
 };
+use wayland_protocols::xdg::activation::v1::client::{
+    xdg_activation_token_v1, xdg_activation_v1,
+};
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
@@ -77,6 +83,9 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1, zwlr_data_control_manager_v1, zwlr_data_control_offer_v1,
     zwlr_data_control_source_v1,
+};
+use wayland_protocols_wlr::gamma_control::v1::client::{
+    zwlr_gamma_control_manager_v1, zwlr_gamma_control_v1,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_protocols_wlr::screencopy::v1::client::{
@@ -88,6 +97,11 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 };
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use xkbcommon::xkb;
+
+/// The named cursor images `wp_cursor_shape_device_v1.set_shape` accepts,
+/// re-exported so a test can name one without depending on
+/// `wayland-protocols` itself.
+pub use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape as CursorShape;
 
 /// How long any "wait for the compositor to do a thing" helper waits before
 /// declaring the harness broken.
@@ -289,6 +303,19 @@ impl Compositor {
                 .expect("zxdg_output_manager_v1");
             runtime.create_presentation(&display, &backend).expect("wp_presentation");
             runtime.set_scene_presentation().expect("scene presentation wiring");
+            // Same "harness cannot degrade" tone: the A2 batch-2
+            // compat_protocols tests bind all three of these directly.
+            // `create_gamma_control_manager` wires the manager into the
+            // scene, so it needs `init_graphics` above (already true here).
+            runtime
+                .create_cursor_shape_manager(&display)
+                .expect("wp_cursor_shape_manager_v1");
+            runtime
+                .create_xdg_activation_manager(&display)
+                .expect("xdg_activation_v1");
+            runtime
+                .create_gamma_control_manager(&display)
+                .expect("zwlr_gamma_control_manager_v1");
             runtime.create_seat(&display, "seat0").expect("seat0");
             // X11 application support. Non-fatal here, unlike the globals
             // above: a host with no `Xwayland` binary is a legitimate CI
@@ -811,6 +838,26 @@ struct ClientState {
     /// recent `wp_presentation_feedback` object has received, if any. See
     /// [`PresentationOutcome`]'s own doc for why both count as terminal.
     presentation_outcome: Option<PresentationOutcome>,
+
+    // --- A2 batch-2 request-handled protocols (Task 7-10) ---
+    /// Bound whenever advertised; used by [`TestClient::set_cursor_shape`].
+    cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
+    /// Bound whenever advertised; used by
+    /// [`TestClient::create_activation_token`] / [`TestClient::activate_self`].
+    activation: Option<xdg_activation_v1::XdgActivationV1>,
+    /// The token string the most recent `xdg_activation_token_v1.done`
+    /// carried, or `None` before one has arrived. Reset by
+    /// [`TestClient::create_activation_token`] so a stale token from an
+    /// earlier request can never be mistaken for a fresh one.
+    activation_token: Option<String>,
+    /// Bound whenever advertised; used by [`GammaControlClient`].
+    gamma_control_manager: Option<zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1>,
+    /// The `gamma_size` the compositor reported for this client's
+    /// `zwlr_gamma_control_v1`, if it sent one.
+    gamma_size: Option<u32>,
+    /// Set true on the gamma control's `failed` event -- what wlroots sends
+    /// instead of `gamma_size` for an output whose gamma LUT size is 0.
+    gamma_failed: bool,
 }
 
 /// The two terminal `wp_presentation_feedback` events. Task 9's brief: the
@@ -918,6 +965,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "wp_presentation" => {
                     state.presentation = Some(registry.bind(name, version.min(2), qh, ()));
+                }
+                "wp_cursor_shape_manager_v1" => {
+                    state.cursor_shape_manager = Some(registry.bind(name, version.min(2), qh, ()));
+                }
+                "xdg_activation_v1" => {
+                    state.activation = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwlr_gamma_control_manager_v1" => {
+                    state.gamma_control_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -1522,6 +1578,54 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for ClientSt
             wp_presentation_feedback::Event::Discarded => {
                 state.presentation_outcome = Some(PresentationOutcome::Discarded);
             }
+            _ => {}
+        }
+    }
+}
+
+// Neither manager has any event at all, and a cursor-shape device is
+// request-only too -- the compositor answers `set_shape` by repainting the
+// seat cursor, which a client cannot see. `Compositor::cursor_shape` is how
+// the test observes it instead.
+delegate_noop!(ClientState: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
+delegate_noop!(ClientState: ignore wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
+delegate_noop!(ClientState: ignore xdg_activation_v1::XdgActivationV1);
+delegate_noop!(ClientState: ignore zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1);
+
+impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &xdg_activation_token_v1::XdgActivationTokenV1,
+        event: xdg_activation_token_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // `done` is the token object's only event and its destructor: the
+        // opaque string it carries is the whole point of the handshake, and
+        // is what a client hands to whoever should redeem it.
+        if let xdg_activation_token_v1::Event::Done { token } = event {
+            state.activation_token = Some(token);
+        }
+    }
+}
+
+impl Dispatch<zwlr_gamma_control_v1::ZwlrGammaControlV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwlr_gamma_control_v1::ZwlrGammaControlV1,
+        event: zwlr_gamma_control_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Exactly one of these two arrives per control object: `gamma_size`
+        // with the output's LUT size, or `failed` (the object's destructor)
+        // when the compositor cannot hand out gamma control for that output
+        // at all -- which for wlroots includes an output whose LUT size is 0.
+        match event {
+            zwlr_gamma_control_v1::Event::GammaSize { size } => state.gamma_size = Some(size),
+            zwlr_gamma_control_v1::Event::Failed => state.gamma_failed = true,
             _ => {}
         }
     }
@@ -2344,6 +2448,96 @@ impl TestClient {
         self.state.presentation_outcome
     }
 
+    /// Name a cursor image for this client's pointer via
+    /// `wp_cursor_shape_device_v1.set_shape` -- task 10's cursor-shape test.
+    ///
+    /// `serial` must be one the seat issued to this client's `wl_pointer`
+    /// (its `enter`, or a `button`): read it off
+    /// [`TestClient::last_pointer_serial`] after moving a virtual pointer
+    /// over this client's surface. Panics if the compositor did not
+    /// advertise `wp_cursor_shape_manager_v1`, or if the seat never gave
+    /// this client a pointer (no pointer capability).
+    ///
+    /// The device object is created fresh per call and dropped with the
+    /// returned value's scope; it holds no state the compositor reads back,
+    /// and `set_shape` has already been flushed by the time this returns.
+    pub fn set_cursor_shape(&mut self, serial: u32, shape: wp_cursor_shape_device_v1::Shape) {
+        let mgr = self
+            .state
+            .cursor_shape_manager
+            .clone()
+            .expect("compositor did not advertise wp_cursor_shape_manager_v1");
+        let pointer = self
+            .state
+            .pointer
+            .clone()
+            .expect("the seat never advertised a pointer capability to this client");
+        let device = mgr.get_pointer(&pointer, &self.qh, ());
+        device.set_shape(serial, shape);
+        self.conn.flush().expect("flush set_shape");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Mint an `xdg_activation_v1` token from this client and return the
+    /// opaque string the compositor answered `done` with -- task 10's
+    /// xdg-activation test.
+    ///
+    /// * `serial`: `Some(s)` calls `set_serial(s, seat)`, which is what makes
+    ///   [`wlr::ActivationToken::has_seat`] true on the compositor side --
+    ///   the token's only evidence of a real user interaction. `None` leaves
+    ///   the token seat-less, the shape a launcher uses when minting a token
+    ///   for some other process to redeem later.
+    /// * `own_surface`: whether to call `set_surface(this client's surface)`,
+    ///   which is what fills the compositor's
+    ///   `ActivationToken::requesting_toplevel`.
+    ///
+    /// Panics if the compositor did not advertise `xdg_activation_v1` or
+    /// never answered `done`.
+    pub fn create_activation_token(&mut self, serial: Option<u32>, own_surface: bool) -> String {
+        let activation = self
+            .state
+            .activation
+            .clone()
+            .expect("compositor did not advertise xdg_activation_v1");
+        // Cleared first so the wait below cannot succeed on a token left
+        // over from an earlier call.
+        self.state.activation_token = None;
+        let token = activation.get_activation_token(&self.qh, ());
+        if let Some(serial) = serial {
+            let seat = self.state.seat.clone().expect("compositor did not advertise wl_seat");
+            token.set_serial(serial, &seat);
+        }
+        if own_surface {
+            token.set_surface(&self.surface);
+        }
+        token.commit();
+        self.conn.flush().expect("flush token commit");
+        assert!(
+            self.wait_until(|c| c.state.activation_token.is_some()),
+            "no xdg_activation_token_v1.done arrived within {TIMEOUT:?}"
+        );
+        self.state.activation_token.clone().expect("just asserted this is Some")
+    }
+
+    /// Redeem `token` against *this* client's own surface, via
+    /// `xdg_activation_v1.activate`.
+    ///
+    /// Deliberately only ever this client's own surface: a `wl_surface` is a
+    /// per-connection object, so no client can name another's. Handing the
+    /// token string across is exactly how the protocol is meant to be used
+    /// (the requester mints, the target redeems), and it is what makes the
+    /// compositor's requester-vs-target policy testable at all.
+    pub fn activate_self(&mut self, token: &str) {
+        let activation = self
+            .state
+            .activation
+            .clone()
+            .expect("compositor did not advertise xdg_activation_v1");
+        activation.activate(token.to_string(), &self.surface);
+        self.conn.flush().expect("flush activate");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
     /// The last serial this client saw on `wl_pointer` (enter or button) --
     /// the implicit-grab serial [`TestClient::start_drag_text`] needs. `None`
     /// if the seat has no pointer capability or the pointer never entered
@@ -2399,6 +2593,15 @@ impl TestClient {
     /// injected virtual keyboard) and this client to hold focus.
     pub fn has_input_serial(&self) -> bool {
         self.state.last_serial.is_some()
+    }
+
+    /// The last serial this client saw on `wl_keyboard` (`enter` or `key`) --
+    /// the same value [`TestClient::has_input_serial`] reports the presence
+    /// of, exposed for the callers that must actually *pass* it back
+    /// (`xdg_activation_token_v1.set_serial`). `None` until the seat has
+    /// given this client a keyboard and focused it.
+    pub fn last_input_serial(&self) -> Option<u32> {
+        self.state.last_serial
     }
 
     /// How many `wl_keyboard.key` events this client has received, ever. The
@@ -3422,5 +3625,109 @@ impl PointerConstraintsClient {
     /// One roundtrip.
     pub fn pump(&mut self) {
         let _ = self.client.queue.roundtrip(&mut self.client.state);
+    }
+}
+
+/// A `zwlr_gamma_control_manager_v1` client -- the shape a night-light/
+/// redshift daemon takes: it never maps a surface, it just claims the
+/// output's gamma LUT.
+///
+/// Its own connection rather than a [`TestClient`] method because that is
+/// what the real thing is (a background daemon, no surface at all), and
+/// because `get_gamma_control` is exclusive per output: a second control on
+/// an output that already has one makes the compositor destroy the first,
+/// which would silently poison an unrelated test's client.
+pub struct GammaControlClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    state: ClientState,
+    control: zwlr_gamma_control_v1::ZwlrGammaControlV1,
+}
+
+impl GammaControlClient {
+    /// Connect and claim gamma control of the compositor's output. Panics if
+    /// the compositor did not advertise `zwlr_gamma_control_manager_v1` or
+    /// `wl_output`.
+    pub fn spawn(socket: &str) -> GammaControlClient {
+        let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+        let manager = state
+            .gamma_control_manager
+            .clone()
+            .expect("compositor did not advertise zwlr_gamma_control_manager_v1");
+        let output = state.output.clone().expect("compositor did not advertise wl_output");
+        let control = manager.get_gamma_control(&output, &qh, ());
+        conn.flush().expect("flush get_gamma_control");
+        queue.roundtrip(&mut state).expect("gamma roundtrip");
+        GammaControlClient { conn, queue, state, control }
+    }
+
+    /// Pump until `pred` holds or [`TIMEOUT`] elapses; returns whether it
+    /// ever held. A bounded `roundtrip` loop for the same reason
+    /// [`TestClient::wait_until`] is one -- the deadline stays honest even
+    /// against a compositor that has nothing to say.
+    pub fn wait_until(&mut self, pred: impl Fn(&GammaControlClient) -> bool) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.queue.roundtrip(&mut self.state).expect("roundtrip");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The `gamma_size` the compositor reported for the output, if it sent
+    /// one at all.
+    pub fn gamma_size(&self) -> Option<u32> {
+        self.state.gamma_size
+    }
+
+    /// Whether the compositor sent `failed` -- the control object's
+    /// destructor event.
+    pub fn failed(&self) -> bool {
+        self.state.gamma_failed
+    }
+
+    /// One roundtrip, so a `failed` the compositor sent after some other
+    /// action lands before it is read.
+    pub fn pump(&mut self) {
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Upload an identity ramp of `size` entries per channel via
+    /// `set_gamma(fd)`. The protocol's payload is three consecutive
+    /// `uint16` tables (red, green, blue) of `size` entries each, so
+    /// `3 * size * 2` bytes; identity means entry `i` maps to
+    /// `i * 65535 / (size - 1)`.
+    ///
+    /// Only reachable on a backend that actually reported a `gamma_size` --
+    /// see the gamma test's own doc for why the headless one does not.
+    pub fn set_identity_gamma(&mut self, size: u32) {
+        let entries = size as usize;
+        let mut bytes = Vec::with_capacity(entries * 3 * 2);
+        for _ in 0..3 {
+            for i in 0..entries {
+                let v = if entries <= 1 {
+                    0u16
+                } else {
+                    ((i as u32 * 65535) / (entries as u32 - 1)) as u16
+                };
+                bytes.extend_from_slice(&v.to_ne_bytes());
+            }
+        }
+        let fd: OwnedFd = rustix::fs::memfd_create(
+            "icedtea-harness-gamma",
+            rustix::fs::MemfdFlags::CLOEXEC,
+        )
+        .expect("memfd_create");
+        let mut file = std::fs::File::from(fd);
+        file.write_all(&bytes).expect("write gamma ramp");
+        file.flush().expect("flush gamma ramp");
+        self.control.set_gamma(file.as_fd());
+        self.conn.flush().expect("flush set_gamma");
+        let _ = self.queue.roundtrip(&mut self.state);
     }
 }
