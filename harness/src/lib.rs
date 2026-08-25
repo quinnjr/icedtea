@@ -260,6 +260,30 @@ impl Compositor {
             runtime
                 .create_output_manager(&display)
                 .expect("zwlr_output_manager_v1");
+            // Same "harness cannot degrade" tone: the A2 batch-1
+            // compat_protocols tests bind these directly (viewporter,
+            // fractional-scale, presentation) or assert their advertisement
+            // (single-pixel-buffer, content-type, xdg-output) and would fail
+            // against globals that were never there. `create_xdg_output_manager`
+            // needs the scene's output layout, so it comes after
+            // `init_graphics` above (already true here); `create_presentation`
+            // needs the backend, and `set_scene_presentation` enforces it must
+            // follow both `init_graphics` and `create_presentation`.
+            runtime.create_viewporter(&display).expect("wp_viewporter");
+            runtime
+                .create_fractional_scale_manager(&display)
+                .expect("wp_fractional_scale_manager_v1");
+            runtime
+                .create_single_pixel_buffer_manager(&display)
+                .expect("wp_single_pixel_buffer_manager_v1");
+            runtime
+                .create_content_type_manager(&display)
+                .expect("wp_content_type_manager_v1");
+            runtime
+                .create_xdg_output_manager(&display)
+                .expect("zxdg_output_manager_v1");
+            runtime.create_presentation(&display, &backend).expect("wp_presentation");
+            runtime.set_scene_presentation().expect("scene presentation wiring");
             runtime.create_seat(&display, "seat0").expect("seat0");
             // X11 application support. Non-fatal here, unlike the globals
             // above: a host with no `Xwayland` binary is a legitimate CI
