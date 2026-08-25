@@ -136,6 +136,41 @@ pub fn run() {
     if let Err(err) = runtime.create_output_manager(&display) {
         tracing::error!(%err, "output-management unavailable");
     }
+    // A2 batch-1 passive protocols: none of these change client-visible
+    // behavior on their own, they just let clients discover/opt into finer
+    // scaling, buffer, and geometry hints. Non-fatal, same tone as every
+    // `create_*` above -- a missing global just means the fallback path
+    // (unscaled buffers, integer scale, no logical geometry, etc.) stays in
+    // effect.
+    if let Err(err) = runtime.create_viewporter(&display) {
+        tracing::error!(%err, "viewporter unavailable; clients fall back to unscaled buffers");
+    }
+    if let Err(err) = runtime.create_fractional_scale_manager(&display) {
+        tracing::error!(
+            %err,
+            "fractional-scale unavailable; HiDPI clients render at integer scale"
+        );
+    }
+    if let Err(err) = runtime.create_single_pixel_buffer_manager(&display) {
+        tracing::error!(%err, "single-pixel-buffer unavailable");
+    }
+    if let Err(err) = runtime.create_content_type_manager(&display) {
+        tracing::error!(%err, "content-type manager unavailable");
+    }
+    if let Err(err) = runtime.create_xdg_output_manager(&display) {
+        tracing::error!(
+            %err,
+            "xdg-output unavailable; some panels/tools lose logical geometry"
+        );
+    }
+    // Needs the backend and the scene graph, so it can only run after
+    // `init_graphics` above created both; `set_scene_presentation` wires the
+    // scene side and the crate enforces that ordering internally.
+    if let Err(err) = runtime.create_presentation(&display, &backend) {
+        tracing::error!(%err, "presentation-time unavailable; clients get no presentation feedback");
+    } else if let Err(err) = runtime.set_scene_presentation() {
+        tracing::error!(%err, "presentation created but scene wiring failed");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");
