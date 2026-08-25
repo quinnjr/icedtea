@@ -15,6 +15,13 @@
 //!   go well past "the global exists" -- see each test's own doc.
 //! * Task 9 -- a client that requests `wp_presentation` feedback on a real
 //!   commit receives a terminal event.
+//!
+//! A2 batch-2 (task 10) continues in the same three tiers, for the three
+//! globals `2901de0` wired up (cursor-shape, xdg-activation, gamma-control):
+//! the advertisement baseline, then load-bearing proof for each -- a client
+//! that owns the pointer repaints the seat cursor and loses it again on
+//! leave, both branches of the xdg-activation focus-steal policy, and a real
+//! `zwlr_gamma_control_v1` claim answered rather than left hanging.
 
 use icedtea_harness::{Compositor, PresentationOutcome, TestClient};
 
@@ -289,4 +296,369 @@ fn presentation_feedback_arrives_on_commit() {
         matches!(outcome, PresentationOutcome::Presented | PresentationOutcome::Discarded),
         "unreachable: presentation_outcome() only ever stores one of these two variants"
     );
+}
+
+/// The three A2 batch-2 globals must all be advertised -- the baseline the
+/// three load-bearing batch-2 tests below assume, and the batch-2 twin of
+/// [`a2_batch1_globals_are_advertised`].
+#[test]
+fn a2_batch2_globals_are_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    for iface in ["wp_cursor_shape_manager_v1", "xdg_activation_v1", "zwlr_gamma_control_manager_v1"] {
+        assert!(
+            globals.iter().any(|g| g == iface),
+            "{iface} global missing; saw {globals:?}"
+        );
+    }
+}
+
+/// The output's size, discovered the only way this headless backend offers
+/// it: maximize a mapped window (which sets its geometry to exactly the
+/// output geometry -- `state.rs`'s own maximize tests assert this), read it
+/// off the snapshot, then unmaximize back. Same dance
+/// `a_pointer_drag_transfers_between_two_clients` (`client_protocol.rs`)
+/// does, and for the same reason: `zwlr_virtual_pointer_v1.motion_absolute`
+/// needs the output's extent to address a scene coordinate.
+fn output_size(comp: &Compositor, client: &mut TestClient, id: icedtea_contract::WindowId) -> (i32, i32) {
+    /// `xdg_toplevel.state.maximized`.
+    const MAXIMIZED: u32 = 1;
+
+    let configures = client.configure_count();
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(id, true));
+    assert!(
+        client.wait_until(|c| c.configure_count() > configures && c.states().contains(&MAXIMIZED)),
+        "window never maximized"
+    );
+    let geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.id == id)
+        .expect("the maximized window must still be in the model")
+        .geometry;
+
+    let configures = client.configure_count();
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(id, false));
+    assert!(
+        client.wait_until(|c| c.configure_count() > configures && !c.states().contains(&MAXIMIZED)),
+        "window never unmaximized"
+    );
+    assert!(geo.width > 0 && geo.height > 0, "output geometry must be real, got {geo:?}");
+    (geo.width, geo.height)
+}
+
+/// Poll [`Compositor::cursor_shape`] until it reads `want`, bounded. Returns
+/// the last value seen, so a failed assertion can report what it actually
+/// was. A poll rather than a sleep because the request travels client ->
+/// compositor thread -> `State`, and nothing on the test's side of the
+/// socket signals when that has landed.
+fn wait_for_cursor_shape(comp: &Compositor, want: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got = comp.cursor_shape();
+        if got == want || std::time::Instant::now() >= deadline {
+            return got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Task 10 (load-bearing): a client that owns the pointer names a cursor
+/// image through `cursor-shape-v1` and the seat's cursor actually becomes
+/// it -- then reverts to the platform default once the pointer leaves that
+/// client's surface.
+///
+/// Both halves are real claims about `State`, not about the protocol object
+/// existing:
+///
+/// 1. `SeatHandler::request_set_shape` -> `State::apply_cursor_shape` ->
+///    `wlr::Runtime::set_cursor_shape`. Deleting that call leaves the
+///    request accepted and silently ignored, and this assertion is what
+///    notices.
+/// 2. The revert-on-leave in `pointer_motion` (see `pointer_over_window`'s
+///    field doc): the request carries no seat-client identity, so without
+///    it a *background* client's `set_shape` would keep repainting the
+///    shared cursor forever. Moving the pointer to genuinely empty desktop
+///    -- asserted to be outside every mapped window, not assumed -- is the
+///    leave this compositor can observe.
+///
+/// The serial passed to `set_shape` is a real one the seat issued to this
+/// client (its `wl_pointer.enter`), read back off the client, not invented.
+#[test]
+fn cursor_shape_set_by_the_pointer_owner_applies_and_reverts_on_leave() {
+    let comp = Compositor::spawn();
+    let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
+
+    let mut client = TestClient::map_toplevel(&comp.socket, "cursor.app", "cursor");
+    assert!(client.wait_until(|c| c.last_configure().is_some()), "client never configured");
+    let info = comp.snapshot().windows.into_iter().next().expect("the mapped window must be in the model");
+    let (ow, oh) = output_size(&comp, &mut client, info.id);
+
+    let geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.id == info.id)
+        .expect("still mapped")
+        .geometry;
+
+    // Over the window: the client receives `wl_pointer.enter`, whose serial
+    // is what `set_shape` must carry.
+    vp.motion_absolute((geo.x + geo.width / 2) as f64, (geo.y + geo.height / 2) as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert!(client.wait_until(|c| c.last_pointer_serial().is_some()), "client never got a pointer serial");
+    let enter_serial = client.last_pointer_serial().expect("just asserted this is Some");
+
+    client.set_cursor_shape(enter_serial, icedtea_harness::CursorShape::Text);
+    assert_eq!(
+        wait_for_cursor_shape(&comp, "Text"),
+        "Text",
+        "the seat cursor never became the shape the pointer's own client named"
+    );
+
+    // Empty desktop: proven empty against the live model rather than
+    // assumed, so a future default layout that fills the output cannot turn
+    // this half of the test vacuous (it would fail loudly here instead).
+    let (empty_x, empty_y) = (ow - 5, oh - 5);
+    for w in comp.snapshot().windows {
+        let g = w.geometry;
+        assert!(
+            empty_x < g.x
+                || empty_x >= g.x + g.width
+                || empty_y < g.y
+                || empty_y >= g.y + g.height,
+            "({empty_x}, {empty_y}) is not empty desktop -- window {:?} covers it",
+            w.id
+        );
+    }
+    vp.motion_absolute(empty_x as f64, empty_y as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert_eq!(
+        wait_for_cursor_shape(&comp, "Default"),
+        "Default",
+        "the seat cursor kept the shape a client named after the pointer left that client's surface"
+    );
+
+    client.detach();
+}
+
+/// Task 10 (load-bearing): the *refused* half of the xdg-activation policy.
+///
+/// B mints a token that carries no evidence of a user interaction at all --
+/// no `set_serial` (so `ActivationToken::has_seat` is false) and no
+/// `set_surface` (so `requesting_toplevel` is `None`) -- and redeems it
+/// against its own surface while A holds the keyboard. Per
+/// `activation_may_steal_focus` this must not move focus; instead B gets the
+/// model's `attention` bit, which the shell surfaces without yanking the
+/// keyboard out from under the user.
+///
+/// Non-vacuous in both directions: A is asserted to still be focused *and*
+/// B's attention bit is asserted to have flipped, both through the real
+/// `org.icedtea.Compositor` surface (the `WindowUpdated` event first, then
+/// the snapshot). A policy that simply dropped the request would pass the
+/// focus half and fail the attention half; one that honored everything
+/// fails the focus half.
+#[test]
+fn xdg_activation_without_a_seat_serial_flags_attention_instead_of_stealing_focus() {
+    let comp = Compositor::spawn();
+
+    let mut a = TestClient::map_toplevel(&comp.socket, "activation-a.app", "A");
+    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    let mut b = TestClient::map_toplevel(&comp.socket, "activation-b.app", "B");
+    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+
+    let (a_id, b_id) = window_ids(&comp);
+
+    // B mapped last, so it holds focus; hand it to A explicitly so the
+    // refusal has something to protect.
+    comp.send(icedtea_compositor::dbus::DbCommand::Focus(a_id));
+    comp.settle();
+    assert!(focused_id(&comp) == Some(a_id), "A must hold focus before the activation request");
+
+    let token = b.create_activation_token(None, false);
+    b.activate_self(&token);
+
+    comp.wait_event(|e| {
+        matches!(e, icedtea_contract::Event::WindowUpdated { id, update }
+            if *id == b_id && update.attention == Some(true))
+    });
+
+    comp.settle();
+    let snapshot = comp.snapshot();
+    let a_info = snapshot.windows.iter().find(|w| w.id == a_id).expect("A still mapped");
+    let b_info = snapshot.windows.iter().find(|w| w.id == b_id).expect("B still mapped");
+    assert!(a_info.focused, "a seat-less activation moved the keyboard off A anyway");
+    assert!(!b_info.focused, "a seat-less activation stole focus for B");
+    assert!(b_info.attention, "the refused activation left no attention hint on B");
+
+    // Focusing B afterwards clears the hint -- the other half of the
+    // contract `set_attention` establishes (the flag is a "look at me until
+    // the user does", not a sticky property).
+    comp.send(icedtea_compositor::dbus::DbCommand::Focus(b_id));
+    comp.wait_event(|e| {
+        matches!(e, icedtea_contract::Event::WindowUpdated { id, update }
+            if *id == b_id && update.attention == Some(false))
+    });
+    comp.settle();
+    assert!(
+        !comp.snapshot().windows.iter().find(|w| w.id == b_id).expect("B still mapped").attention,
+        "focusing B did not clear its attention hint"
+    );
+
+    a.detach();
+    b.detach();
+}
+
+/// Task 10 (load-bearing): the *honored* half of the xdg-activation policy.
+///
+/// A holds the keyboard and mints a token the proper way -- `set_serial`
+/// with a serial the seat genuinely issued to A (its `wl_keyboard.enter`,
+/// which is what makes wlroots record a seat on the token) plus
+/// `set_surface(A)` -- then hands the opaque token string to B, which
+/// redeems it against its own surface. That is exactly
+/// `activation_may_steal_focus`'s intended case (the app you are using
+/// handing you off to another window), so focus must actually move.
+///
+/// The token string crosses between the two clients by value because that is
+/// the only way it *can*: a `wl_surface` is a per-connection object, so no
+/// client can name another's, and the protocol is designed around the
+/// requester minting and the target redeeming.
+///
+/// A `VirtualKeyboardClient` exists only to give the headless seat a
+/// keyboard capability at all -- without it no client is ever sent
+/// `wl_keyboard.enter` and there is no seat-issued serial to pass.
+#[test]
+fn xdg_activation_from_the_focused_window_moves_focus() {
+    let comp = Compositor::spawn();
+    // Spawned before either client connects so the seat already advertises
+    // the keyboard capability when they bind it -- a client only calls
+    // `get_keyboard` on the capability it saw.
+    let _vk = icedtea_harness::VirtualKeyboardClient::spawn(&comp.socket);
+
+    let mut a = TestClient::map_toplevel(&comp.socket, "activation-a.app", "A");
+    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    let mut b = TestClient::map_toplevel(&comp.socket, "activation-b.app", "B");
+    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+
+    let (a_id, b_id) = window_ids(&comp);
+
+    comp.send(icedtea_compositor::dbus::DbCommand::Focus(a_id));
+    assert!(a.wait_until(|c| c.has_input_serial()), "A never received wl_keyboard.enter");
+    assert!(focused_id(&comp) == Some(a_id), "A must hold focus before minting the token");
+    let serial = a.last_input_serial().expect("just asserted this is Some");
+
+    let token = a.create_activation_token(Some(serial), true);
+    b.activate_self(&token);
+
+    // A bounded poll of the live model rather than `wait_event`: every
+    // `WindowUpdated { focused: Some(true) }` this test could match on has
+    // already been emitted once by B's own map and again by the explicit
+    // `Focus(a_id)` above, so an event-stream match would pass on a stale
+    // one and say nothing about the activation.
+    assert!(
+        wait_for_focus(&comp, b_id),
+        "an activation from the focused window did not move focus to its target"
+    );
+
+    comp.settle();
+    let snapshot = comp.snapshot();
+    let a_info = snapshot.windows.iter().find(|w| w.id == a_id).expect("A still mapped");
+    let b_info = snapshot.windows.iter().find(|w| w.id == b_id).expect("B still mapped");
+    assert!(b_info.focused, "an activation from the focused window did not move focus to its target");
+    assert!(!a_info.focused, "focus must have left A");
+    assert!(
+        !b_info.attention,
+        "an honored activation must move focus, not fall back to the attention hint"
+    );
+
+    a.detach();
+    b.detach();
+}
+
+/// The `(A, B)` window ids of the two-client activation tests, resolved by
+/// `app_id` off the live model rather than by index (the snapshot's order is
+/// the stacking/MRU order, which the very thing under test changes).
+fn window_ids(comp: &Compositor) -> (icedtea_contract::WindowId, icedtea_contract::WindowId) {
+    let snapshot = comp.snapshot();
+    let find = |app_id: &str| {
+        snapshot
+            .windows
+            .iter()
+            .find(|w| w.app_id == app_id)
+            .unwrap_or_else(|| panic!("{app_id} must be in the model once mapped"))
+            .id
+    };
+    (find("activation-a.app"), find("activation-b.app"))
+}
+
+/// Poll the live model until `id` holds focus, bounded. Returns whether it
+/// ever did.
+fn wait_for_focus(comp: &Compositor, id: icedtea_contract::WindowId) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if focused_id(comp) == Some(id) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The currently focused window in the live model, if any.
+fn focused_id(comp: &Compositor) -> Option<icedtea_contract::WindowId> {
+    comp.snapshot().windows.iter().find(|w| w.focused).map(|w| w.id)
+}
+
+/// Task 10: a `zwlr_gamma_control_manager_v1` client claims gamma control of
+/// the compositor's output and gets a protocol-conformant answer -- not a
+/// hang, and not silence.
+///
+/// The manager is scene-integrated
+/// (`wlr_scene_set_gamma_control_manager_v1`), so the compositor itself
+/// never answers this request: wlroots does, off the output's own gamma LUT
+/// size. The headless backend has no CRTC and therefore no LUT, so its
+/// `gamma_size` is 0 and wlroots' `zwlr_gamma_control_v1` sends `failed`
+/// instead of a size -- the documented behavior for an output it cannot
+/// hand out gamma control for.
+///
+/// The assertion accepts either protocol-legal outcome and pins the shape of
+/// each, rather than only the one this backend happens to take: `failed`, or
+/// a real `gamma_size` followed by an accepted identity ramp of exactly that
+/// size that does *not* then fail. What it rules out is the regression that
+/// matters -- neither event ever arriving, i.e. the manager never created
+/// and the client left waiting forever.
+#[test]
+fn gamma_control_answers_a_claim_on_the_headless_output() {
+    let comp = Compositor::spawn();
+    let mut gamma = icedtea_harness::GammaControlClient::spawn(&comp.socket);
+
+    assert!(
+        gamma.wait_until(|g| g.failed() || g.gamma_size().is_some()),
+        "zwlr_gamma_control_v1 sent neither gamma_size nor failed -- the client would hang"
+    );
+
+    match gamma.gamma_size() {
+        None => assert!(gamma.failed(), "unreachable: the wait above requires one or the other"),
+        Some(0) => panic!(
+            "gamma_size 0 is not a legal answer -- wlroots sends `failed` for an output with no LUT"
+        ),
+        Some(size) => {
+            // Not this backend's path (see the doc above), but a real one on
+            // a DRM backend: a control that reported a size must accept a
+            // ramp of exactly that size and stay alive afterwards.
+            gamma.set_identity_gamma(size);
+            // Past the output commit that would apply the ramp: `failed` is
+            // what a rejection looks like, and it would be on the wire by
+            // the time these round trips are done.
+            comp.settle();
+            gamma.pump();
+            assert!(
+                !gamma.failed(),
+                "the compositor rejected an identity gamma ramp of the size it asked for ({size})"
+            );
+        }
+    }
 }
