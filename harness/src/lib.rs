@@ -49,12 +49,16 @@ use wayland_protocols::ext::idle_notify::v1::client::{ext_idle_notification_v1, 
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
 };
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
 use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
 };
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_confined_pointer_v1, zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
 };
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
     zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
@@ -62,6 +66,7 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
 use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
 };
@@ -777,6 +782,35 @@ struct ClientState {
     /// relative motion arrive at all" signal `relative_delta` alone cannot
     /// give (a delta that nets to exactly zero looks identical to "none").
     relative_motion_events: u32,
+
+    // --- A2 batch-1 passive protocols (Task 7-9) ---
+    /// Bound only by the [`TestClient::get_viewport`] path (task 8's
+    /// crop/scale test).
+    viewporter: Option<wp_viewporter::WpViewporter>,
+    /// Bound only by the [`TestClient::get_fractional_scale`] path (task
+    /// 8's preferred-scale test).
+    fractional_scale_manager: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
+    /// The latest `preferred_scale` this client's `wp_fractional_scale_v1`
+    /// object has received (the numerator of a fraction over 120), or
+    /// `None` before the compositor has sent one.
+    preferred_scale: Option<u32>,
+    /// Bound only by the [`TestClient::request_presentation_feedback`] path
+    /// (task 9's feedback test).
+    presentation: Option<wp_presentation::WpPresentation>,
+    /// The terminal event (`presented` or `discarded`) this client's most
+    /// recent `wp_presentation_feedback` object has received, if any. See
+    /// [`PresentationOutcome`]'s own doc for why both count as terminal.
+    presentation_outcome: Option<PresentationOutcome>,
+}
+
+/// The two terminal `wp_presentation_feedback` events. Task 9's brief: the
+/// headless backend may have no presentation clock, so a real client has to
+/// accept either as proof presentation feedback actually arrived, not just
+/// `presented`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationOutcome {
+    Presented,
+    Discarded,
 }
 
 /// One lock surface this client has created via `get_lock_surface`, plus the
@@ -864,6 +898,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 "zwp_relative_pointer_manager_v1" => {
                     state.relative_pointer_manager =
                         Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "wp_viewporter" => {
+                    state.viewporter = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "wp_fractional_scale_manager_v1" => {
+                    state.fractional_scale_manager =
+                        Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "wp_presentation" => {
+                    state.presentation = Some(registry.bind(name, version.min(2), qh, ()));
                 }
                 _ => {}
             }
@@ -1422,6 +1466,53 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for ClientState
             state.relative_delta.0 += dx;
             state.relative_delta.1 += dy;
             state.relative_motion_events = state.relative_motion_events.saturating_add(1);
+        }
+    }
+}
+
+// --- A2 batch-1 passive protocols (Task 7-9) ---
+delegate_noop!(ClientState: ignore wp_viewporter::WpViewporter);
+delegate_noop!(ClientState: ignore wp_viewport::WpViewport);
+delegate_noop!(ClientState: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
+// `clock_id` carries no data this harness asserts on -- the presentation
+// clock domain is irrelevant to "did a terminal feedback event arrive".
+delegate_noop!(ClientState: ignore wp_presentation::WpPresentation);
+
+impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &wp_fractional_scale_v1::WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            state.preferred_scale = Some(scale);
+        }
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // `sync_output` is informational (which output presentation was
+        // synced to); only the two destructor events are terminal -- see
+        // [`PresentationOutcome`]'s own doc.
+        match event {
+            wp_presentation_feedback::Event::Presented { .. } => {
+                state.presentation_outcome = Some(PresentationOutcome::Presented);
+            }
+            wp_presentation_feedback::Event::Discarded => {
+                state.presentation_outcome = Some(PresentationOutcome::Discarded);
+            }
+            _ => {}
         }
     }
 }
@@ -2130,6 +2221,117 @@ impl TestClient {
         let _ = self.queue.roundtrip(&mut self.state);
 
         self.icon = Some((icon_surface, icon_buffer, icon_pool, icon_shm_file));
+    }
+
+    /// Commit this client's surface -- the trailing half of the
+    /// double-buffered `wp_viewport` / `wl_surface` state dance: a queued
+    /// `set_source`/`set_destination` (or a fresh `attach_pattern_buffer`)
+    /// only takes effect on the next commit.
+    pub fn commit(&mut self) {
+        self.surface.commit();
+        self.conn.flush().expect("flush commit");
+    }
+
+    /// Bind `wp_fractional_scale_v1` for this client's surface -- task 8's
+    /// preferred-scale test. Panics if the compositor did not advertise
+    /// `wp_fractional_scale_manager_v1`.
+    pub fn get_fractional_scale(&mut self) -> wp_fractional_scale_v1::WpFractionalScaleV1 {
+        let mgr = self
+            .state
+            .fractional_scale_manager
+            .clone()
+            .expect("compositor did not advertise wp_fractional_scale_manager_v1");
+        let obj = mgr.get_fractional_scale(&self.surface, &self.qh, ());
+        self.conn.flush().expect("flush get_fractional_scale");
+        obj
+    }
+
+    /// The latest `preferred_scale` this client has received (the numerator
+    /// of a fraction over 120), or `None` before one has arrived.
+    pub fn preferred_scale(&self) -> Option<u32> {
+        self.state.preferred_scale
+    }
+
+    /// Bind `wp_viewport` for this client's surface -- task 8's crop/scale
+    /// test. Panics if the compositor did not advertise `wp_viewporter`.
+    pub fn get_viewport(&mut self) -> wp_viewport::WpViewport {
+        let viewporter = self
+            .state
+            .viewporter
+            .clone()
+            .expect("compositor did not advertise wp_viewporter");
+        let obj = viewporter.get_viewport(&self.surface, &self.qh, ());
+        self.conn.flush().expect("flush get_viewport");
+        obj
+    }
+
+    /// Replace this client's surface content with a fresh `w`x`h`
+    /// `Xrgb8888` buffer painted per-pixel by `paint(x, y) -> 0x00RRGGBB`,
+    /// attach and damage it, but do **not** commit -- a caller that also
+    /// needs to queue `wp_viewport` crop/scale state before the compositor
+    /// observes the new content calls [`TestClient::commit`] itself once
+    /// that state is set too (both are double-buffered surface state,
+    /// applied together on the next commit).
+    pub fn attach_pattern_buffer(&mut self, w: i32, h: i32, paint: impl Fn(i32, i32) -> u32) {
+        let shm = self.state.shm.clone().expect("compositor did not advertise wl_shm");
+        let stride = w * 4;
+        let len = (stride * h) as usize;
+        let fd: OwnedFd = rustix::fs::memfd_create(
+            "icedtea-harness-shm-pattern",
+            rustix::fs::MemfdFlags::CLOEXEC,
+        )
+        .expect("memfd_create");
+        rustix::fs::ftruncate(&fd, len as u64).expect("ftruncate");
+        let mut shm_file = std::fs::File::from(fd);
+        let mut bytes = vec![0u8; len];
+        for y in 0..h {
+            for x in 0..w {
+                let color = paint(x, y);
+                let o = (y * stride + x * 4) as usize;
+                // Xrgb8888 is little-endian bytes B,G,R,X (see
+                // `create_shm_buffer`'s own doc).
+                bytes[o] = (color & 0xFF) as u8;
+                bytes[o + 1] = ((color >> 8) & 0xFF) as u8;
+                bytes[o + 2] = ((color >> 16) & 0xFF) as u8;
+                bytes[o + 3] = 0;
+            }
+        }
+        shm_file.write_all(&bytes).expect("write pattern shm");
+        shm_file.flush().expect("flush pattern shm");
+        let pool = shm.create_pool(shm_file.as_fd(), len as i32, &self.qh, ());
+        let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Xrgb8888, &self.qh, ());
+        self.surface.attach(Some(&buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, w, h);
+        self.conn.flush().expect("flush attach_pattern_buffer");
+        // Replace the keepalives so the previous buffer's shm backing can be
+        // dropped once wl_buffer.release confirms the compositor is done
+        // with it -- same lifetime contract `TestClient::map` establishes.
+        self.buffer = buffer;
+        self.pool = pool;
+        self.shm_file = shm_file;
+    }
+
+    /// Bind `wp_presentation` feedback for this client's surface's current
+    /// content submission -- task 9's presentation-feedback test. Panics if
+    /// the compositor did not advertise `wp_presentation`.
+    pub fn request_presentation_feedback(
+        &mut self,
+    ) -> wp_presentation_feedback::WpPresentationFeedback {
+        let presentation = self
+            .state
+            .presentation
+            .clone()
+            .expect("compositor did not advertise wp_presentation");
+        let obj = presentation.feedback(&self.surface, &self.qh, ());
+        self.conn.flush().expect("flush presentation feedback");
+        obj
+    }
+
+    /// The terminal `wp_presentation_feedback` event this client's most
+    /// recent feedback request has received (`presented` or `discarded`),
+    /// or `None` before either has arrived.
+    pub fn presentation_outcome(&self) -> Option<PresentationOutcome> {
+        self.state.presentation_outcome
     }
 
     /// The last serial this client saw on `wl_pointer` (enter or button) --
