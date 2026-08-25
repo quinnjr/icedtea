@@ -281,11 +281,31 @@ impl WindowManager {
             return None;
         }
         if was_focused {
-            // If already focused but minimized, unminimize and emit event.
-            if was_minimized {
-                let w = self.windows.get_mut(&id)?;
-                w.minimized = false;
-                self.emit(Event::WindowUpdated { id, update: WindowUpdate { minimized: Some(false), ..Default::default() } });
+            // Already focused: there is no focus *transition* to emit, but
+            // the two side effects a focus carries still apply.
+            //
+            // The attention clear is not theoretical. `State::request_activate`
+            // compares its target against the *active* workspace's focused
+            // window (`State::focused_id`), so a window that is the focused
+            // window of some INACTIVE workspace is not "already focused" by
+            // that test and can be flagged; `switch_workspace` then leaves
+            // that workspace's focus pointer alone, so when the user comes
+            // back and clicks the window, focus lands right here. Clearing
+            // only on the not-yet-focused path below left such a hint stuck
+            // on forever.
+            let w = self.windows.get_mut(&id)?;
+            w.minimized = false;
+            let cleared_attention = std::mem::take(&mut w.attention);
+            // One combined event, and only when something actually changed.
+            if was_minimized || cleared_attention {
+                self.emit(Event::WindowUpdated {
+                    id,
+                    update: WindowUpdate {
+                        minimized: was_minimized.then_some(false),
+                        attention: cleared_attention.then_some(false),
+                        ..Default::default()
+                    },
+                });
             }
             return Some(());
         }
@@ -994,6 +1014,49 @@ mod tests {
         assert_eq!(updates[0].focused, Some(true));
         assert_eq!(updates[0].attention, Some(false), "the focused update must clear attention");
         assert!(!m.get(b).unwrap().focused);
+    }
+
+    /// Final-review finding 2: attention must also clear on the
+    /// *already-focused* path. A window that holds its own workspace's
+    /// focus pointer can still be flagged (`State::request_activate` tests
+    /// only the ACTIVE workspace's focused window), and the user's eventual
+    /// click on it takes `focus`'s `was_focused` early return -- which used
+    /// to leave the hint set forever.
+    #[test]
+    fn focus_of_an_already_focused_window_still_clears_attention() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        assert!(m.get(a).unwrap().focused, "the only window in its workspace holds focus");
+        m.set_attention(a, true).unwrap();
+        assert!(m.get(a).unwrap().attention);
+        m.pending_events.clear();
+
+        m.focus(a).unwrap();
+
+        assert!(!m.get(a).unwrap().attention, "re-focusing an already-focused window must clear attention");
+        let updates: Vec<_> = m
+            .pending_events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::WindowUpdated { id, update } if *id == a => Some(update),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates.len(), 1, "the clear owes exactly one update, got {updates:?}");
+        assert_eq!(updates[0].attention, Some(false), "the update must carry the attention clear");
+        let info = m.snapshot().windows.into_iter().find(|w| w.id == a).unwrap();
+        assert!(!info.attention, "snapshot must show the cleared flag");
+    }
+
+    /// The already-focused path stays silent when there is nothing to
+    /// clear: no attention, not minimized, no event.
+    #[test]
+    fn focus_of_an_already_focused_clean_window_emits_nothing() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        m.pending_events.clear();
+        m.focus(a).unwrap();
+        assert!(m.pending_events.is_empty(), "a no-op focus must not emit, got {:?}", m.pending_events);
     }
 
     /// Focusing a window that had no attention set must not advertise a

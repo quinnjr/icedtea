@@ -478,24 +478,40 @@ pub fn alt_tab_should_end(watched: input::Modifiers, mods: input::Modifiers, pre
 /// `State` and its toplevel map to reach otherwise, and neither is something
 /// a unit test can stand up.
 ///
-/// An activation may take the keyboard only when *both* halves hold:
+/// An activation may take the keyboard only when *all* of these hold:
 ///
-/// - `has_seat`: the client tied the token to a seat + serial, which wlroots
-///   validated against that seat before ever emitting the request. Without
-///   it the token carries no evidence of a user action at all -- the usual
-///   shape of a token minted for some other process to redeem later.
 /// - `requester == focused`: the token was requested by the window the user
-///   is *currently* working in. A seat serial only proves some interaction
-///   happened at some point; the window still holding focus is the only
-///   "recent enough" this compositor can actually vouch for, and it is what
-///   makes the honored case exactly the intended one (the app you are using
-///   handing you off to another of its windows).
+///   is *currently* working in. This is the load-bearing condition -- the
+///   one actually standing between a background process and the keyboard.
+///   A window still holding focus is the only "a real user is interacting
+///   with this client, right now" that this compositor can vouch for by
+///   itself, and it makes the honored case exactly the intended one (the
+///   app you are using handing you off to another of its windows).
+/// - `target_activatable`: the target is mapped, not minimized, and on the
+///   *active* workspace. A client's activation request never switches
+///   workspaces or unminimizes here (owner ruling): honoring one that
+///   cannot actually be focused where the user is looking would be a silent
+///   no-op, so those cases take the refused path and raise an attention
+///   hint the shell can show instead.
+/// - `has_seat`: the client called `set_serial(serial, seat)` when minting
+///   the token. **This is weaker than it looks and is not a security
+///   check.** wlroots does *not* validate the serial against the seat: it
+///   records whatever number the client passed, verbatim, and `has_seat`
+///   only means "a seat was named at all". A token minted for another
+///   process to redeem later usually lacks it, which is the whole of its
+///   value here -- it filters out the sloppy case, not a determined one.
+///   `requester == focused` is what carries the actual weight.
 ///
 /// Everything else is refused -- not dropped: the caller marks the target
 /// with an attention hint instead, so the shell can surface it without the
 /// keyboard moving out from under the user.
-fn activation_may_steal_focus(has_seat: bool, requester: Option<WindowId>, focused: Option<WindowId>) -> bool {
-    has_seat && requester.is_some() && requester == focused
+fn activation_may_steal_focus(
+    has_seat: bool,
+    target_activatable: bool,
+    requester: Option<WindowId>,
+    focused: Option<WindowId>,
+) -> bool {
+    has_seat && target_activatable && requester.is_some() && requester == focused
 }
 
 /// Input passed to `State::handle_pointer`, in output logical coordinates.
@@ -5599,6 +5615,14 @@ impl wlr::ToplevelHandler for State {
         let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
         let Some(w) = self.window_manager.get(window_id) else { return };
         if w.minimized || w.workspace != self.window_manager.active_workspace() {
+            // Declining is not the same as ignoring: an X11 client asking to
+            // be activated from off the active workspace (or while
+            // minimized) wants to be *noticed*, and `request_activate` gives
+            // exactly that case an attention hint. Both protocols share the
+            // fallback so the shell does not have to care which one a
+            // window speaks.
+            self.window_manager.set_attention(window_id, true);
+            self.emit_pending();
             return;
         }
         let previous = self.focused_id();
@@ -5853,6 +5877,12 @@ impl wlr::SeatHandler for State {
     /// - refused -> `set_attention(target, true)`, a shell-facing hint the
     ///   next focus clears. A target that is *already* focused gets neither:
     ///   there is nothing to raise and nothing to flag.
+    ///
+    /// The honored branch also requires an *activatable* target -- mapped,
+    /// not minimized, on the active workspace -- because this compositor
+    /// will not switch workspaces or unminimize on a client's say-so.
+    /// A request aimed anywhere else is refused (and so flagged), rather
+    /// than honored into a no-op.
     fn request_activate(&mut self, target: Option<wlr::ToplevelId>, token: wlr::ActivationToken) {
         let Some(target) = target else {
             tracing::debug!(?token, "ignoring activation request for a surface with no toplevel");
@@ -5868,7 +5898,17 @@ impl wlr::SeatHandler for State {
         }
         let requester =
             token.requesting_toplevel.and_then(|id| self.wayland.window_for(crate::wayland::ToplevelKey::new(id)));
-        if activation_may_steal_focus(token.has_seat, requester, focused) {
+        // Owner ruling: a client's activation request never switches
+        // workspaces and never unminimizes. Honoring one aimed at a target
+        // the focus could not actually land on where the user is looking
+        // would be a silent no-op; those fall through to the attention
+        // branch, which is exactly the signal the shell wants for them.
+        let active_workspace = self.window_manager.active_workspace();
+        let target_activatable = self
+            .window_manager
+            .get(target_window)
+            .is_some_and(|w| w.mapped && !w.minimized && w.workspace == active_workspace);
+        if activation_may_steal_focus(token.has_seat, target_activatable, requester, focused) {
             tracing::debug!(?target_window, ?requester, "honoring xdg-activation focus request");
             if self.window_manager.focus(target_window).is_some() {
                 // Same ordering as every other explicit focus assertion: only
@@ -5882,6 +5922,7 @@ impl wlr::SeatHandler for State {
                 ?target_window,
                 ?requester,
                 has_seat = token.has_seat,
+                target_activatable,
                 "refusing xdg-activation focus steal; flagging attention instead"
             );
             self.window_manager.set_attention(target_window, true);
@@ -9742,23 +9783,31 @@ mod tests {
         let a = WindowId(1);
         let b = WindowId(2);
         let cases = [
-            // (has_seat, requester, focused, expected)
-            (true, Some(a), Some(a), true),
-            // No seat: wlroots could not tie the token to any user action.
-            (false, Some(a), Some(a), false),
+            // (has_seat, target_activatable, requester, focused, expected)
+            (true, true, Some(a), Some(a), true),
+            // No seat: the token names no seat at all, the shape a launcher
+            // mints for another process to redeem later.
+            (false, true, Some(a), Some(a), false),
             // Seat-backed, but the requester is not the focused window.
-            (true, Some(b), Some(a), false),
+            (true, true, Some(b), Some(a), false),
             // Token named no (live) requesting toplevel.
-            (true, None, Some(a), false),
+            (true, true, None, Some(a), false),
             // Nothing focused at all: there is no interaction to vouch for.
-            (true, Some(a), None, false),
-            (false, None, None, false),
+            (true, true, Some(a), None, false),
+            (false, true, None, None, false),
+            // Otherwise-perfect request, but the target is not somewhere
+            // focus can land without moving the user (off the active
+            // workspace, minimized, or unmapped): refused, so it is flagged
+            // instead of honored into a silent no-op.
+            (true, false, Some(a), Some(a), false),
+            (false, false, Some(b), Some(a), false),
         ];
-        for (has_seat, requester, focused, expected) in cases {
+        for (has_seat, target_activatable, requester, focused, expected) in cases {
             assert_eq!(
-                activation_may_steal_focus(has_seat, requester, focused),
+                activation_may_steal_focus(has_seat, target_activatable, requester, focused),
                 expected,
-                "has_seat={has_seat} requester={requester:?} focused={focused:?}"
+                "has_seat={has_seat} target_activatable={target_activatable} \
+                 requester={requester:?} focused={focused:?}"
             );
         }
     }
