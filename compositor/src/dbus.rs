@@ -116,6 +116,11 @@ pub enum DbCommand {
     /// runtime handle. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `SessionLocked`.
     CursorPosition { reply: Sender<(f64, f64)> },
+    /// Test-only: read `State::cursor_shape` (the shape last applied via
+    /// `wlr::Runtime::set_cursor_shape` by the A2 batch-2 cursor-shape
+    /// handler), as its `Debug` name. Not reachable from `CompositorInterface` --
+    /// only the test harness sends this, same reasoning as `SessionLocked`.
+    CursorShape { reply: Sender<String> },
     /// Test-only: read the `DISPLAY` name (`:N`) Xwayland advertises, via
     /// `wlr::Runtime::xwayland_display_name`. `None` when no Xwayland was
     /// created (the `Xwayland` binary is absent), so the X11 end-to-end test

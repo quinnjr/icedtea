@@ -519,6 +519,16 @@ impl Compositor {
         reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered CursorPosition")
     }
 
+    /// The `Debug` name of the shape last applied via
+    /// `wlr::Runtime::set_cursor_shape` (e.g. `"Default"`, `"Text"`),
+    /// via `State::cursor_shape`. Blocks on the reply -- see
+    /// [`Self::inject_touch_down`]'s doc.
+    pub fn cursor_shape(&self) -> String {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::CursorShape { reply: reply_tx });
+        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered CursorShape")
+    }
+
     /// Give the compositor a bounded window to finish processing something
     /// this side of the socket can't directly observe -- most notably a
     /// client's disconnect, which the event loop only notices on its own

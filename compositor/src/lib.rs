@@ -171,6 +171,25 @@ pub fn run() {
     } else if let Err(err) = runtime.set_scene_presentation() {
         tracing::error!(%err, "presentation created but scene wiring failed");
     }
+    // A2 batch-2 passive/request-handled protocols: same non-fatal tone as
+    // the batch-1 block above. `create_cursor_shape_manager` and
+    // `create_xdg_activation_manager` only let clients *ask* for a named
+    // cursor or activation -- the crate does not apply either itself, so
+    // `SeatHandler::request_set_shape`/`request_activate` below are what
+    // make them do anything. `create_gamma_control_manager` needs
+    // `init_graphics` (already run above) because it wires the manager
+    // straight into this runtime's scene (`wlr_scene_set_gamma_control_manager_v1`),
+    // which applies gamma ramps on its own commit path with no handler
+    // involvement.
+    if let Err(err) = runtime.create_cursor_shape_manager(&display) {
+        tracing::error!(%err, "cursor-shape unavailable; clients cannot name a cursor image");
+    }
+    if let Err(err) = runtime.create_xdg_activation_manager(&display) {
+        tracing::error!(%err, "xdg-activation unavailable; clients cannot request focus-raise");
+    }
+    if let Err(err) = runtime.create_gamma_control_manager(&display) {
+        tracing::error!(%err, "gamma-control unavailable; clients cannot set a display gamma ramp");
+    }
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");

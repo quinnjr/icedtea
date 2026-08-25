@@ -600,6 +600,23 @@ pub struct State {
     /// button-only events (which carry no position of their own) read it
     /// back to build `PointerEvent::Press`/`Release`.
     pub pointer_location: (i32, i32),
+    /// The shape most recently applied via `wlr::Runtime::set_cursor_shape`
+    /// (initially `Default`, matching the seat's own default cursor image
+    /// before any `cursor-shape-v1` request has ever arrived). Updated only
+    /// by `Self::apply_cursor_shape`, which is the single call site for
+    /// `set_cursor_shape` -- test-only observability for the A2 batch-2
+    /// cursor-shape handler, exposed through `DbCommand::CursorShape` the
+    /// same way `cursor_position` exposes `wlr::Runtime::cursor_position`.
+    pub cursor_shape: wlr::CursorShape,
+    /// The window last seen under the pointer, updated at the top of
+    /// `SeatHandler::pointer_motion`. Its only job is detecting a
+    /// pointer-focus change (a transition to a *different* window, or to no
+    /// window at all): the crate does not expose a pointer-focus-changed
+    /// hook or query (`cursor-shape-v1` requests carry no seat-client
+    /// identity either), so this model-level "what's under the pointer"
+    /// tracking is the only place this compositor can notice a focus leave
+    /// and revert a client's `request_set_shape` back to `Default`.
+    pointer_over_window: Option<WindowId>,
     /// Whether a pointer button is currently held down. Maintained at the
     /// top of `SeatHandler::pointer_button`, before any routing, so
     /// `begin_client_move`/`begin_client_resize` can enforce the policy this
@@ -964,6 +981,8 @@ impl State {
             quitting: false,
             session_locked: false,
             pointer_location: (0, 0),
+            cursor_shape: wlr::CursorShape::Default,
+            pointer_over_window: None,
             pointer_pressed: false,
             config_path: None,
             config_reload_tx: None,
@@ -3489,6 +3508,10 @@ impl State {
                 let _ = reply.send(pos);
                 return Some(());
             }
+            DbCommand::CursorShape { reply } => {
+                let _ = reply.send(format!("{:?}", self.cursor_shape));
+                return Some(());
+            }
             DbCommand::XwaylandDisplay { reply } => {
                 // Read live from the runtime rather than the `xwayland_display`
                 // field: with lazy start the manager reserves its display
@@ -4353,6 +4376,18 @@ impl State {
             self.handle_command(cmd);
         }
     }
+
+    /// The single call site for `wlr::Runtime::set_cursor_shape`: applies
+    /// `shape` to the seat cursor (a no-op if there is no seat cursor yet --
+    /// see the crate's own doc) and mirrors it into `self.cursor_shape` so
+    /// the test-only `DbCommand::CursorShape` channel can observe what was
+    /// last applied without a live handler.
+    fn apply_cursor_shape(&mut self, shape: wlr::CursorShape) {
+        if let Some(rt) = self.wayland.runtime() {
+            rt.set_cursor_shape(shape);
+        }
+        self.cursor_shape = shape;
+    }
 }
 
 // --- Compositor library handlers ---
@@ -4803,6 +4838,16 @@ impl wlr::OutputHandler for State {
         // The trait doc REQUIRES this once the layout is settled and
         // persisted, so other bound managers see the fresh state + serial.
         runtime.update_output_manager_state();
+    }
+
+    /// A `gamma-control-v1` client set (or wlroots otherwise changed) this
+    /// output's gamma ramp. Notification-only (see the trait doc):
+    /// `Runtime::create_gamma_control_manager` wires the manager straight
+    /// into the scene, which applies the ramp (or rejects it) on its own
+    /// commit path before this ever runs -- there is nothing to stash or
+    /// apply here, only a trace for anyone reading logs.
+    fn gamma_control_changed(&mut self, output: wlr::OutputId) {
+        tracing::debug!(?output, "gamma ramp changed");
     }
 }
 
@@ -5591,6 +5636,22 @@ impl wlr::SeatHandler for State {
         // zero, which is what a pixel index wants.
         let pointer = (x as i32, y as i32);
         self.pointer_location = pointer;
+
+        // Revert-on-leave for `cursor-shape-v1` (`request_set_shape`'s own
+        // doc): a `wp_cursor_shape_device_v1.set_shape` request carries no
+        // seat-client identity and the crate exposes no pointer-focus query
+        // or changed-hook, so this model's own "what's under the pointer"
+        // tracking is what stands in for a pointer-focus-leave signal here.
+        // Any change -- to a different window, or to none at all -- means
+        // whichever client last named a shape may no longer own the
+        // pointer, so the seat cursor is reset to the platform default; a
+        // still-focused client that wants something else re-requests it.
+        let over = self.window_at_point(pointer);
+        if over != self.pointer_over_window {
+            self.pointer_over_window = over;
+            self.apply_cursor_shape(wlr::CursorShape::Default);
+        }
+
         self.handle_pointer(PointerEvent::Motion { pointer });
         self.emit_pending();
     }
@@ -5665,6 +5726,28 @@ impl wlr::SeatHandler for State {
                 None => self.sync_seat_focus(),
             }
         }
+    }
+
+    /// A client asked, via `cursor-shape-v1`, to name the seat cursor.
+    /// wlroots does not apply this itself (see `request_set_shape`'s own
+    /// doc), so this handler is what makes the request do anything.
+    ///
+    /// `TabletTool` requests are ignored (logged at debug): a stray
+    /// background tablet-tool client should not repaint the shared cursor
+    /// image ahead of whatever the pointer is doing. `Pointer` requests are
+    /// honored unconditionally -- the event carries no seat-client identity
+    /// to check against (`device`/`serial` name only the *kind* of device
+    /// and a wire serial, not which client raised it), and the crate
+    /// exposes no pointer-focus query this handler could consult instead
+    /// (see `pointer_over_window`'s field doc, which is what `pointer_motion`
+    /// uses to revert this back to `Default` once the pointer actually
+    /// leaves whatever surface last named a shape).
+    fn request_set_shape(&mut self, device: wlr::CursorShapeDevice, serial: u32, shape: wlr::CursorShape) {
+        if device != wlr::CursorShapeDevice::Pointer {
+            tracing::debug!(?device, serial, ?shape, "ignoring cursor-shape request from a non-pointer device");
+            return;
+        }
+        self.apply_cursor_shape(shape);
     }
 }
 
