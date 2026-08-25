@@ -633,6 +633,20 @@ pub struct State {
     /// Kept because `OutputHandler::destroyed` is given only an id, and the
     /// model's geometry map is keyed by index.
     output_ids: HashMap<wlr::OutputId, u32>,
+    /// A scale `DbCommand::SetOutputScaleForTest` wants pushed onto the
+    /// *live* `wlr::Output` (not just this model's `OutputSurface::scale`
+    /// mirror) the next time `OutputHandler::frame` hands one back for that
+    /// output id -- the only place after boot this crate has a live
+    /// `&wlr::Output` to call `wlr::Output::set_scale` on (there is no
+    /// `Runtime` method that reaches an output by id outside a handler
+    /// callback). The reply is answered from `frame`, once the live output
+    /// has actually adopted the scale, not from the `DbCommand` handler
+    /// itself -- anything that reads the *live* `wlr_output.scale` (the
+    /// fractional-scale protocol's auto-sent `preferred_scale`, notably)
+    /// needs the real thing, and this crate's own `primary_output_scale`
+    /// mirror was never a substitute for it. `None` when no test scale
+    /// override is outstanding, which is true almost all the time.
+    pending_test_output_scale: Option<(wlr::OutputId, f32, crossbeam_channel::Sender<bool>)>,
     /// Connector name -> the live `wlr::OutputId` of an output that is
     /// currently *disabled* and therefore has NO entry in `self.outputs` /
     /// `self.output_ids`. Populated both by `new_output`'s persisted-disabled
@@ -955,6 +969,7 @@ impl State {
             config_reload_tx: None,
             config_reload_rx: None,
             output_ids: HashMap::new(),
+            pending_test_output_scale: None,
             disabled_outputs: HashMap::new(),
             config_db_lock: Arc::new(Mutex::new(())),
             background: None,
@@ -1298,6 +1313,54 @@ impl State {
             return Some(idx);
         }
         self.output_for_pointer()
+    }
+
+    /// Push `id`'s client the current fractional scale of the output it is
+    /// on, via `wp_fractional_scale_v1.preferred_scale`.
+    ///
+    /// wlroots' scene already documents this as automatic
+    /// (`wlr_scene_surface_create`'s own behavior -- see
+    /// `wlr::Runtime::notify_fractional_scale`'s doc), computed from the
+    /// *live* `wlr_output.scale`. That field is only ever set on the real
+    /// output object by the persisted-display-config apply path
+    /// (`apply_display_config`, reached from `OutputHandler::new_output`);
+    /// nothing else in this compositor calls `wlr::Output::set_scale`, so a
+    /// scale this compositor's own model believes (`OutputSurface::scale`,
+    /// e.g. after `DbCommand::SetOutputScaleForTest`, or in principle any
+    /// future live output-manager scale change) but never pushed to the
+    /// live output would leave a freshly-mapped client's auto-sent
+    /// `preferred_scale` stale. The model (`self.outputs`) is the single
+    /// source of truth for "what scale does this compositor believe this
+    /// output is at" (`primary_output_scale`'s own DPI-hint export already
+    /// treats it that way), so this re-derives from there and pushes it
+    /// explicitly -- harmless if it agrees with what the scene already
+    /// auto-sent, per `notify_fractional_scale`'s own doc.
+    ///
+    /// Called on every toplevel map/remap. The model tracks no scene
+    /// `NodeId` of its own for a window's content surface (there is no
+    /// per-window handle to look one up by), so this recovers one the same
+    /// way pointer input does: a scene hit-test (`node_at`) at the window's
+    /// own content-rect center, which `sync_window_to_scene` has just
+    /// positioned in the scene. A window with no output yet, not visible,
+    /// or whose content the hit-test cannot resolve is silently skipped --
+    /// there is nothing incorrect to notify in any of those cases, and the
+    /// scene's own auto-send remains the fallback.
+    fn notify_fractional_scale_for_window(&self, id: WindowId) {
+        let Some(w) = self.window_manager.get(id) else { return };
+        if !self.window_manager.is_visible(w) {
+            return;
+        }
+        let Some(rt) = self.wayland.runtime() else { return };
+        let Some(out_idx) = self.output_for_window(w.geometry) else { return };
+        let Some(out) = self.outputs.get(&out_idx) else { return };
+        let scale = Self::guarded_scale(out.scale) as f64;
+        let ssd = crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen);
+        let content = crate::decoration::content_rect(w.geometry, ssd);
+        let cx = (content.x + content.width / 2) as f64;
+        let cy = (content.y + content.height / 2) as f64;
+        if let Some((node, _, _)) = rt.node_at(cx, cy) {
+            rt.with_scene_surface(node, |surface| rt.notify_fractional_scale(surface, scale));
+        }
     }
 
     /// Finding 4, maintainability: the `usable` rect of whatever output
@@ -3519,30 +3582,46 @@ impl State {
             }
             DbCommand::SetOutputScaleForTest { scale, reply } => {
                 // Record the scale on the primary output (the lowest model
-                // index, the one `primary_output_scale` reads). If Xwayland is
-                // already `ready`, re-publish the DPI hint immediately so a test
-                // that raises the scale after boot observes the new `Xft.dpi`;
-                // a test that raises it before the first X connection instead
-                // has `ready` pick it up. `recorded` is `false` when no output
-                // exists yet (review finding #11): the reply lets the harness
-                // poll until one does, rather than silently dropping the scale
-                // but acking success.
-                let recorded = if let Some(&idx) = self.outputs.keys().min()
-                    && let Some(surface) = self.outputs.get_mut(&idx)
-                {
-                    // Guard the stored scale exactly as the production
-                    // config-apply path does (review finding #8): a non-finite,
-                    // non-positive, or absurdly large test value is normalised
-                    // rather than stored raw and left to overflow the DPI math.
-                    surface.scale = Self::guarded_scale(scale) as f64;
-                    true
-                } else {
-                    false
+                // index, the one `primary_output_scale` reads). `recorded` is
+                // `false` when no output exists yet (review finding #11): the
+                // reply lets the harness poll until one does, rather than
+                // silently dropping the scale but acking success.
+                let Some(&idx) = self.outputs.keys().min() else {
+                    let _ = reply.send(false);
+                    return Some(());
                 };
-                if recorded && let Some(display) = self.xwayland_display.clone() {
+                // Guard the stored scale exactly as the production
+                // config-apply path does (review finding #8): a non-finite,
+                // non-positive, or absurdly large test value is normalised
+                // rather than stored raw and left to overflow the DPI math.
+                let guarded = Self::guarded_scale(scale);
+                if let Some(surface) = self.outputs.get_mut(&idx) {
+                    surface.scale = guarded as f64;
+                }
+                // If Xwayland is already `ready`, re-publish the DPI hint
+                // immediately so a test that raises the scale after boot
+                // observes the new `Xft.dpi`; a test that raises it before the
+                // first X connection instead has `ready` pick it up.
+                if let Some(display) = self.xwayland_display.clone() {
                     Self::export_x11_dpi(display, self.primary_output_scale());
                 }
-                let _ = reply.send(recorded);
+                match self.wlr_output_id_for(idx) {
+                    // A live output backs this index: defer the ack to
+                    // `frame` (see `pending_test_output_scale`'s doc), which
+                    // pushes `guarded` onto the *real* `wlr::Output` -- the
+                    // model mirror this branch just wrote is not itself what
+                    // the fractional-scale protocol's auto-sent
+                    // `preferred_scale` reads from.
+                    Some(oid) => self.pending_test_output_scale = Some((oid, guarded, reply)),
+                    // No live output backs this index -- a `State` built
+                    // straight through `State::new` with no `wlr::Runtime`
+                    // attached, as unit tests do. Nothing to defer onto, so
+                    // ack immediately exactly as before this deferred path
+                    // existed.
+                    None => {
+                        let _ = reply.send(true);
+                    }
+                }
                 return Some(());
             }
         }
@@ -4200,6 +4279,7 @@ impl State {
         // `sync_focus_change` also reaches it today, but only because
         // `add_window` autofocuses onto the active workspace.
         self.sync_window_to_scene(id);
+        self.notify_fractional_scale_for_window(id);
         self.sync_focus_change(previous);
         self.emit_pending();
     }
@@ -4524,6 +4604,18 @@ impl wlr::OutputHandler for State {
 
     fn frame(&mut self, output: &wlr::Output<'_>) {
         self.frames += 1;
+        // See `pending_test_output_scale`'s own doc: this is the only place
+        // after boot with a live `&wlr::Output` to push a
+        // `DbCommand::SetOutputScaleForTest` scale onto. `take` first so a
+        // rejected `set_scale` still consumes the pending entry rather than
+        // retrying forever against every future frame of every output.
+        if self.pending_test_output_scale.as_ref().is_some_and(|(oid, ..)| *oid == output.id()) {
+            let (_, scale, reply) = self.pending_test_output_scale.take().unwrap();
+            if let Err(err) = output.set_scale(scale) {
+                tracing::warn!(?err, "SetOutputScaleForTest: live scale rejected");
+            }
+            let _ = reply.send(true);
+        }
         let Some(runtime) = self.wayland.runtime() else { return };
         // A rejected commit is routine — wlroots rejects one when nothing
         // changed — so it is logged at debug and never escalated.
@@ -4879,6 +4971,7 @@ impl wlr::ToplevelHandler for State {
             tracing::info!(?id, ?window_id, "toplevel remapped");
             self.window_manager.set_mapped(window_id, true);
             self.sync_window_to_scene(window_id);
+            self.notify_fractional_scale_for_window(window_id);
             self.emit_pending();
             return;
         }
