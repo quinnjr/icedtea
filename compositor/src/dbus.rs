@@ -369,6 +369,7 @@ mod tests {
             minimized: false,
             fullscreen: false,
             focused: true,
+            attention: false,
         }
     }
     fn default_appearance() -> Appearance {

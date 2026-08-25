@@ -32,6 +32,7 @@ pub struct WindowInfo {
     pub minimized: bool,
     pub fullscreen: bool,
     pub focused: bool,
+    pub attention: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -58,6 +59,7 @@ pub struct WindowUpdate {
     pub fullscreen: Option<bool>,
     pub focused: Option<bool>,
     pub mapped: Option<bool>,
+    pub attention: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -113,6 +115,7 @@ mod tests {
             minimized: false,
             fullscreen: false,
             focused: true,
+            attention: false,
         }
     }
 
@@ -138,13 +141,13 @@ mod tests {
     #[test]
     fn wire_signatures_are_locked() {
         use zvariant::Type;
-        assert_eq!(WindowUpdate::SIGNATURE.to_string(), "(asa(iiii)auababababab)");
+        assert_eq!(WindowUpdate::SIGNATURE.to_string(), "(asa(iiii)auabababababab)");
         assert_eq!(Appearance::SIGNATURE.to_string(), "(siii(sss)as)");
         assert_eq!(WindowId::SIGNATURE.to_string(), "u");
         assert_eq!(Rectangle::SIGNATURE.to_string(), "(iiii)");
-        assert_eq!(WindowInfo::SIGNATURE.to_string(), "(ussuu(iiii)bbbb)");
+        assert_eq!(WindowInfo::SIGNATURE.to_string(), "(ussuu(iiii)bbbbb)");
         assert_eq!(WorkspaceInfo::SIGNATURE.to_string(), "(us)");
-        assert_eq!(Snapshot::SIGNATURE.to_string(), "(ta(ussuu(iiii)bbbb)a(us)u)");
+        assert_eq!(Snapshot::SIGNATURE.to_string(), "(ta(ussuu(iiii)bbbbb)a(us)u)");
         // `index: usize` marshals as `t` (u64) on 64-bit targets.
         assert_eq!(AltTabState::SIGNATURE.to_string(), "(baut)");
     }
@@ -173,6 +176,7 @@ mod tests {
         assert!(u.maximized.is_none() && u.minimized.is_none() && u.fullscreen.is_none());
         assert!(u.focused.is_none());
         assert!(u.mapped.is_none());
+        assert!(u.attention.is_none());
     }
 
     #[test]
@@ -187,6 +191,7 @@ mod tests {
             fullscreen: Some(true),
             focused: Some(false),
             mapped: Some(true),
+            attention: Some(true),
         };
         let none = WindowUpdate::default();
 

@@ -135,6 +135,7 @@ fn win(id: u32, title: &str) -> WindowInfo {
         minimized: false,
         fullscreen: false,
         focused: false,
+        attention: false,
     }
 }
 

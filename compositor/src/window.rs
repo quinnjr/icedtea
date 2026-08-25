@@ -482,6 +482,7 @@ impl WindowManager {
             minimized: w.minimized,
             fullscreen: w.fullscreen,
             focused: w.focused,
+            attention: false,
         }
     }
 

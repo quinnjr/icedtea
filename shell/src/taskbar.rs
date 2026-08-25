@@ -146,6 +146,7 @@ mod tests {
             minimized: false,
             fullscreen: false,
             focused: false,
+            attention: false,
         }
     }
 
