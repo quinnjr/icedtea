@@ -46,6 +46,13 @@ fn pixel_at(frame: &CapturedFrame, x: u32, y: u32) -> Option<(u8, u8, u8)> {
     ))
 }
 
+// 12 is a ceiling, not a comfortable margin: at this tolerance the accent
+// (0x35, 0x84, 0xE4) and hover (0x1C, 0x6F, 0xD4) bands already overlap on
+// green (diff 21) and blue (diff 16) -- only red (diff 25) still separates
+// them, and only by exactly one unit (25 vs. the 24 the two ±12 windows can
+// span before touching). Raising this constant makes `matches_accent` and
+// `matches_hover` mutually satisfiable, so no pixel could tell the two
+// states apart.
 fn close(a: u8, b: u8) -> bool {
     i32::from(a).abs_diff(i32::from(b)) <= 12
 }
@@ -89,7 +96,7 @@ fn themed_button_paints_accent_blue_on_a_layer_surface() {
     let mut frame = sc.capture();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut accent = count_accent_pixels(&frame);
-    while accent == 0 && Instant::now() < deadline {
+    while accent <= 100 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
         frame = sc.capture();
         accent = count_accent_pixels(&frame);

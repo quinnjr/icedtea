@@ -212,9 +212,14 @@ fn suggested_action_button_is_adwaitas_accent_blue() {
     assert_eq!(style.border_color, Color(0xFF15_539E));
 
     let allocation = button.allocation();
-    let surface = render(&button, &fonts);
     // Same padding-gutter sampling as the gate test: the button's centre
     // column is covered by the (white) label.
+    assert!(
+        allocation.label_x > 4.0,
+        "sampling column 4 is not clear of the label, which starts at {}",
+        allocation.label_x
+    );
+    let surface = render(&button, &fonts);
     let center = pixel(&surface, 4, (allocation.height / 2.0) as i32);
     // Both stops are within 9/5/1 per channel of `@accent_color` #3584E4,
     // so any point on the gradient is close to it.
