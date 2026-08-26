@@ -1,7 +1,7 @@
 # Pure-Rust, GTK-themed Desktop UI — Design
 
 **Date:** 2026-08-20
-**Status:** proposed — awaiting user review
+**Status:** M1 implemented (see `docs/superpowers/plans/2026-08-25-pure-rust-gtk-m1-proving-slice.md`); M2–M6 proposed
 **Branch:** `rebuild/pure-rust-gtk`
 
 ## Goal
@@ -188,13 +188,18 @@ layer to prove the seam.
 
 ## Risks
 
-- **`selectors`/`cssparser` fit to GTK's node model** — GTK CSS differs from web
-  CSS in its node tree and `-gtk-*` extensions. M1's button spike resolves
-  whether Servo's matcher adapts cleanly or needs a shim.
-- **`skia-rs` build/linking** (C++ Skia) — build-system and packaging cost;
-  validate the build early in M1.
-- **Text stack decision** — `cosmic-text` shaping + Skia raster vs Skia's own
-  HarfBuzz shaping; M1 picks one and the rest follows.
+- ~~**`selectors`/`cssparser` fit to GTK's node model**~~ — **resolved in
+  M1: no shim needed.** GTK CSS's node tree (`window`, `headerbar`, `button`,
+  classes, `:hover`/`:active`) maps onto Servo's `Element` trait unmodified;
+  the button spike's `CssNode` implements it directly.
+- ~~**`skia-rs` build/linking**~~ — **resolved in M1: not a risk.**
+  `skia-rs` is a pure-Rust reimplementation, not a binding; there is no C++
+  build and no linking step.
+- ~~**Text stack decision**~~ — **resolved in M1: `skia-rs-text`.** It loads
+  a TTF/OTF from raw bytes, shapes via `rustybuzz` with real `hmtx`
+  advances, and rasterizes glyph outlines through `Canvas::draw_text_blob`,
+  so the whole load/shape/measure/draw path is one crate. `cosmic-text` is
+  not used.
 - **GTK CSS is a moving target** — broad fidelity is iterative; M2 defines the
   coverage bar and tracks against specific GTK releases.
 - **Parity gaps** — input methods, drag-and-drop, fractional scale, cursor
