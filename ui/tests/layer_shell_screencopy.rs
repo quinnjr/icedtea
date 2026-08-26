@@ -20,11 +20,6 @@ const CLASSES: &str = "suggested-action";
 /// The label the pixel assertions below are pinned to.
 const LABEL: &str = "Click me";
 
-/// The headless harness output, which the pointer's absolute motion is
-/// expressed against.
-const OUTPUT_W: u32 = 1280;
-const OUTPUT_H: u32 = 720;
-
 /// Where on the output the button's background can be sampled.
 ///
 /// The button is anchored top-left with margin 0, so its border box starts
@@ -192,6 +187,10 @@ fn themed_button_paints_accent_blue_on_a_layer_surface() {
 fn hovering_the_button_repaints_it_in_the_themes_hover_color() {
     let sample = Sample::derive();
     let comp = Compositor::spawn();
+    // The headless harness output, which the pointer's absolute motion is
+    // expressed against.
+    let (w, h) = comp.output_size();
+    let (output_w, output_h) = (w as u32, h as u32);
     let _child = spawn_themed_button(&comp.socket, LABEL, CLASSES);
 
     // Wait for the unhovered button to be on screen before injecting, so a
@@ -208,7 +207,7 @@ fn hovering_the_button_repaints_it_in_the_themes_hover_color() {
 
     let mut pointer = VirtualPointerClient::spawn(&comp.socket);
     let (cx, cy) = sample.centre();
-    pointer.motion_absolute(cx, cy, OUTPUT_W, OUTPUT_H);
+    pointer.motion_absolute(cx, cy, output_w, output_h);
     pointer.frame();
     pointer.pump();
 
@@ -231,6 +230,8 @@ fn hovering_the_button_repaints_it_in_the_themes_hover_color() {
 fn dragging_off_and_back_while_held_re_arms_active() {
     let sample = Sample::derive();
     let comp = Compositor::spawn();
+    let (w, h) = comp.output_size();
+    let (output_w, output_h) = (w as u32, h as u32);
     let _child = spawn_themed_button(&comp.socket, LABEL, CLASSES);
 
     let mut sc = ScreencopyClient::spawn(&comp.socket);
@@ -242,7 +243,7 @@ fn dragging_off_and_back_while_held_re_arms_active() {
 
     let mut pointer = VirtualPointerClient::spawn(&comp.socket);
     let (cx, cy) = sample.centre();
-    pointer.motion_absolute(cx, cy, OUTPUT_W, OUTPUT_H);
+    pointer.motion_absolute(cx, cy, output_w, output_h);
     pointer.frame();
     pointer.pump();
     // Wait for `:hover` on screen before pressing: that is the proof the
@@ -266,7 +267,7 @@ fn dragging_off_and_back_while_held_re_arms_active() {
 
     // Drag off the button, still held: `:active` must drop.
     let (ox, oy) = sample.outside();
-    pointer.motion_absolute(ox, oy, OUTPUT_W, OUTPUT_H);
+    pointer.motion_absolute(ox, oy, output_w, output_h);
     pointer.frame();
     pointer.pump();
     let away = capture_until(&mut sc, Some(&mut pointer), &sample, |px| {
@@ -278,7 +279,7 @@ fn dragging_off_and_back_while_held_re_arms_active() {
     );
 
     // Drag back on, still held: `:active` must come back.
-    pointer.motion_absolute(cx, cy, OUTPUT_W, OUTPUT_H);
+    pointer.motion_absolute(cx, cy, output_w, output_h);
     pointer.frame();
     pointer.pump();
     let again = capture_until(&mut sc, Some(&mut pointer), &sample, matches_active);

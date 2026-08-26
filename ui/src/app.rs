@@ -7,7 +7,6 @@
 //! the base theme's rules first, the user override's rules after, so a
 //! declaration in the override beats an equally-specific one in the theme.
 
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::BUNDLED_ADWAITA_LIGHT;
@@ -141,36 +140,6 @@ impl ThemeEnv {
     pub fn user_override_path(&self) -> Option<PathBuf> {
         self.config_dir()
             .map(|dir| dir.join(GTK4_DIR).join("gtk.css"))
-    }
-}
-
-/// Read the CSS for `source`, falling back to the bundled copy.
-///
-/// Borrowed for the bundled theme: it is a 147 KB `&'static str`, and
-/// copying it per call bought nothing.
-///
-/// This reads **one** file. The layered theme stack is
-/// [`load_layered_stylesheet`].
-#[must_use]
-pub fn load_theme(source: &ThemeSource) -> Cow<'static, str> {
-    match source {
-        ThemeSource::Bundled => Cow::Borrowed(BUNDLED_ADWAITA_LIGHT),
-        ThemeSource::File(path) => match std::fs::read_to_string(path) {
-            Ok(css) => Cow::Owned(css),
-            Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "cannot read theme; using bundled Adwaita");
-                Cow::Borrowed(BUNDLED_ADWAITA_LIGHT)
-            }
-        },
-        ThemeSource::UserPreferred => {
-            let env = ThemeEnv::from_env();
-            for candidate in env.base_theme_candidates() {
-                if let Ok(css) = std::fs::read_to_string(&candidate) {
-                    return Cow::Owned(css);
-                }
-            }
-            Cow::Borrowed(BUNDLED_ADWAITA_LIGHT)
-        }
     }
 }
 

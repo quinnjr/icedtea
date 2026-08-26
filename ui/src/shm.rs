@@ -279,7 +279,10 @@ impl BufferPool {
     ) -> io::Result<Self> {
         let mut pool = Self {
             buffers: Vec::with_capacity(POOL_MAX_BUFFERS),
-            slots: SlotPool::new(0, POOL_MAX_BUFFERS),
+            // `SlotPool::new` already starts every slot free; growing
+            // `buffers` to match keeps that invariant in one place instead
+            // of reaching into the pool's private bookkeeping here too.
+            slots: SlotPool::new(POOL_INITIAL_BUFFERS, POOL_MAX_BUFFERS),
             width,
             height,
         };
@@ -287,7 +290,6 @@ impl BufferPool {
             let slot = BufferSlot(pool.buffers.len());
             pool.buffers
                 .push(ShmBuffer::new(shm, qh, width, height, slot)?);
-            pool.slots.busy.push(false);
         }
         Ok(pool)
     }
@@ -357,6 +359,28 @@ impl BufferPool {
     #[must_use]
     pub fn slots(&self) -> &SlotPool {
         &self.slots
+    }
+
+    /// Mutable access to the release/acquire bookkeeping.
+    ///
+    /// `wayland::repaint` drains its queued releases and decides whether a
+    /// frame can proceed through this, rather than [`Self::acquire`],
+    /// specifically because that decision needs no `shm`/`qh` and so is
+    /// unit-testable without a live Wayland connection; see
+    /// `wayland::select_paint_slot`.
+    pub(crate) fn slots_mut(&mut self) -> &mut SlotPool {
+        &mut self.slots
+    }
+
+    /// Install a buffer freshly allocated for a [`Slot::New`] decision
+    /// already taken from [`Self::slots_mut`].
+    ///
+    /// # Panics
+    ///
+    /// If `index` is not the next index the pool would grow into.
+    pub(crate) fn install(&mut self, index: usize, buffer: ShmBuffer) {
+        debug_assert_eq!(self.buffers.len(), index, "buffer installed out of order");
+        self.buffers.push(buffer);
     }
 }
 

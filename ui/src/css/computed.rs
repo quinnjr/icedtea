@@ -410,12 +410,6 @@ impl ComputedStyle {
 /// lose its 5px radius to a `100%` this engine has no percentage context
 /// for -- so the next declaration in cascade order is used instead. The
 /// divergence is logged.
-///
-/// Known consequence, both directions: an unparseable *winner* does not
-/// leave the property at its initial value, it leaves it at whatever an
-/// earlier rule declared. `background: nosuch(1)` layered over a working
-/// `background-image`, or Adwaita:640's `cross-fade(...)`, keeps painting
-/// the older background instead of falling back to none.
 /// Resolve a colour value, mapping `currentColor` onto `current`.
 fn resolve_color(value: &str, colors: &ColorTable, current: Color) -> Option<Color> {
     match parse_color_ref(value, colors)? {
@@ -424,6 +418,11 @@ fn resolve_color(value: &str, colors: &ColorTable, current: Color) -> Option<Col
     }
 }
 
+/// Known consequence, both directions: an unparseable *winner* does not
+/// leave the property at its initial value, it leaves it at whatever an
+/// earlier rule declared. `background: nosuch(1)` layered over a working
+/// `background-image`, or Adwaita:640's `cross-fade(...)`, keeps painting
+/// the older background instead of falling back to none.
 fn pick<T>(
     values: &CascadedValues,
     name: &str,

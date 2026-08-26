@@ -22,7 +22,7 @@ use skia_rs_safe::core::Color;
 
 use crate::css::cascade::CompiledSheet;
 use crate::css::select::PseudoStates;
-use crate::shm::{BufferPool, BufferSlot};
+use crate::shm::{BufferPool, BufferSlot, ShmBuffer, Slot, SlotPool};
 use crate::text::FontStack;
 use crate::widget::button::Button;
 
@@ -397,20 +397,24 @@ impl LayerWindow {
     /// frame is *deferred*: `dirty` stays set and the next release wakes the
     /// dispatch loop, which repaints then.
     fn repaint(&mut self) -> Result<(), LayerWindowError> {
-        for slot in std::mem::take(&mut self.state.released) {
-            self.buffers.release(slot);
-        }
-        let Some(index) = self
-            .buffers
-            .acquire(&self.shm, &self.qh)
-            .map_err(LayerWindowError::Shm)?
-        else {
-            tracing::debug!(
-                buffers = self.buffers.slots().len(),
-                "every shm buffer is still held by the compositor; deferring the frame"
-            );
-            self.state.dirty = true;
-            return Ok(());
+        let index = match select_paint_slot(&mut self.state.released, self.buffers.slots_mut()) {
+            Some(Slot::Existing(index)) => index,
+            Some(Slot::New(index)) => {
+                tracing::debug!(index, "every shm buffer was busy; growing the pool");
+                let (width, height) = self.buffers.size();
+                let buffer = ShmBuffer::new(&self.shm, &self.qh, width, height, BufferSlot(index))
+                    .map_err(LayerWindowError::Shm)?;
+                self.buffers.install(index, buffer);
+                index
+            }
+            None => {
+                tracing::debug!(
+                    buffers = self.buffers.slots().len(),
+                    "every shm buffer is still held by the compositor; deferring the frame"
+                );
+                self.state.dirty = true;
+                return Ok(());
+            }
         };
 
         let (width, height) = self.buffers.size();
@@ -464,6 +468,23 @@ impl Drop for LayerWindow {
         self.surface.destroy();
         let _ = self.conn.flush();
     }
+}
+
+/// The release→repaint decision `repaint` makes before it touches Wayland
+/// at all: drain the buffers the compositor released since the last frame
+/// into `slots`, then report what to do with the result --
+/// `Some(Slot::Existing(_))` to write straight into that buffer,
+/// `Some(Slot::New(_))` to grow the pool (which does need the live
+/// `shm`/`qh`, so `repaint` handles that arm itself), or `None` to defer
+/// the frame with `dirty` left set.
+///
+/// Pure -- no Wayland objects -- so the wiring is unit-testable without a
+/// live connection, unlike `repaint` itself.
+fn select_paint_slot(released: &mut Vec<BufferSlot>, slots: &mut SlotPool) -> Option<Slot> {
+    for slot in released.drain(..) {
+        slots.release(slot.0);
+    }
+    slots.acquire()
 }
 
 /// `Connection::flush`/`read` report a `WaylandError`, which is `io::Error`
@@ -629,10 +650,13 @@ delegate_noop!(AppState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, BTN_LEFT, CONFIGURE_TIMEOUT, LayerWindowError, wait_bounded};
+    use super::{
+        AppState, BTN_LEFT, CONFIGURE_TIMEOUT, LayerWindowError, select_paint_slot, wait_bounded,
+    };
     use crate::BUNDLED_ADWAITA_LIGHT;
     use crate::css::cascade::CompiledSheet;
     use crate::css::select::{CssNode, PseudoStates};
+    use crate::shm::{BufferSlot, Slot, SlotPool};
     use crate::text::FontStack;
     use crate::widget::button::Button;
     use std::error::Error;
@@ -808,6 +832,39 @@ mod tests {
         assert!(!state.button.states().hover);
         assert!(!state.button.states().active);
         assert!(state.dirty, "clearing hover must schedule a repaint");
+    }
+
+    #[test]
+    fn select_paint_slot_defers_while_every_buffer_is_busy_and_proceeds_once_one_is_released() {
+        // The release->repaint wiring: `repaint` must leave `dirty` set and
+        // write nothing while every buffer is still held, then proceed as
+        // soon as a queued release is drained in. Exercised here as the
+        // pure fragment `repaint` calls, since `repaint` itself needs a
+        // live Wayland connection.
+        let mut slots = SlotPool::new(2, 2);
+        assert_eq!(slots.acquire(), Some(Slot::Existing(0)));
+        assert_eq!(slots.acquire(), Some(Slot::Existing(1)));
+
+        let mut released = Vec::new();
+        assert_eq!(
+            select_paint_slot(&mut released, &mut slots),
+            None,
+            "every buffer is busy and the pool is already at its maximum: \
+             repaint must defer, not reuse or grow"
+        );
+
+        // The compositor releases buffer 1; `repaint`'s caller queues that
+        // up in `released` for the next repaint to drain.
+        released.push(BufferSlot(1));
+        assert_eq!(
+            select_paint_slot(&mut released, &mut slots),
+            Some(Slot::Existing(1)),
+            "a released slot must free up the very next repaint"
+        );
+        assert!(
+            released.is_empty(),
+            "the drained release must not be handed out again"
+        );
     }
 
     #[test]

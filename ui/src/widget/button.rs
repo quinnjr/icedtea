@@ -28,9 +28,26 @@ pub struct Button {
     shaped: Option<ShapedText>,
     /// The font size `shaped` was shaped at.
     shaped_size: f32,
-    /// The window's computed style: fixed for this widget's lifetime.
+    /// Identity of the [`FontStack`] `shaped` was shaped with (its address,
+    /// as `usize`), so a swapped font stack invalidates the shaping cache
+    /// even if the label and font size happen to match.
+    shaped_font: Option<usize>,
+    /// The window's computed style: fixed for this widget's lifetime, as
+    /// long as the sheet it was cascaded from doesn't change.
     parent_style: Option<ComputedStyle>,
+    /// Identity of the [`CompiledSheet`] `parent_style` was cascaded from
+    /// (its address, as `usize`). A cheap key, not a hash: it only needs to
+    /// notice *some other sheet is now in play*, which a swapped
+    /// `CompiledSheet` (e.g. a live theme reload) always is.
+    parent_style_sheet: Option<usize>,
     layout: ButtonLayout,
+}
+
+/// The identity key stored alongside a per-sheet or per-font-stack cache:
+/// the referent's address. Cheap, and sufficient to detect "a different
+/// sheet/stack is now in play" — the only thing these caches need to know.
+fn identity<T>(value: &T) -> usize {
+    std::ptr::from_ref(value) as usize
 }
 
 impl Button {
@@ -52,22 +69,27 @@ impl Button {
             },
             shaped: None,
             shaped_size: f32::NAN,
+            shaped_font: None,
             parent_style: None,
+            parent_style_sheet: None,
             layout: ButtonLayout::new(),
         }
     }
 
     /// Re-run cascade, measurement and layout for the current state.
     pub fn restyle(&mut self, sheet: &CompiledSheet, fonts: &FontStack) {
-        if self.parent_style.is_none() {
+        let sheet_id = identity(sheet);
+        if self.parent_style.is_none() || self.parent_style_sheet != Some(sheet_id) {
             // The ancestors' own cascade cannot change while this widget
-            // lives, so resolve the chain once and thread it in from here.
+            // lives *and the sheet stays the same*, so resolve the chain
+            // once per sheet and thread it in from here.
             self.parent_style = Some(
                 self.node
                     .parent()
                     .map(|parent| ComputedStyle::resolve(sheet, &parent))
                     .unwrap_or_default(),
             );
+            self.parent_style_sheet = Some(sheet_id);
         }
         self.style =
             ComputedStyle::resolve_with_parent(sheet, &self.node, self.parent_style.as_ref());
@@ -75,10 +97,15 @@ impl Button {
         // `!=` rather than an epsilon: the only thing that ever writes this
         // is a previous shape at exactly this size, and NAN != NAN makes the
         // first call always shape.
+        let font_id = identity(fonts);
         #[allow(clippy::float_cmp)]
-        if self.shaped.is_none() || self.shaped_size != self.style.font_size {
+        if self.shaped.is_none()
+            || self.shaped_size != self.style.font_size
+            || self.shaped_font != Some(font_id)
+        {
             self.shaped = Some(fonts.shape(&self.label, self.style.font_size));
             self.shaped_size = self.style.font_size;
+            self.shaped_font = Some(font_id);
         }
         let metrics = self.shaped.as_ref().expect("just shaped").metrics;
         self.allocation = self.layout.compute(&self.style, &metrics);
@@ -233,5 +260,33 @@ mod tests {
             "inheritance was lost once the parent style came from the cache"
         );
         assert_eq!(button.style().border_width, 3.0);
+    }
+
+    #[test]
+    fn a_different_sheet_re_derives_the_cached_parent_style() {
+        // The parent-style cache used to key on nothing but "have we ever
+        // computed it", so swapping in a new `CompiledSheet` (a live theme
+        // reload) reused the old ancestor cascade. Key it on the sheet's
+        // identity instead: a border painted with `currentColor` must pick
+        // up the new sheet's `window { color: ... }`.
+        let red_css = "window { color: red }\nbutton { border-color: currentColor }";
+        let blue_css = "window { color: blue }\nbutton { border-color: currentColor }";
+        let red_sheet = CompiledSheet::compile(red_css);
+        let blue_sheet = CompiledSheet::compile(blue_css);
+        let fonts = FontStack::system().expect("system font");
+
+        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
+        let mut button = Button::new("x", &[], window);
+
+        button.restyle(&red_sheet, &fonts);
+        let red_border = button.style().border_color;
+
+        button.restyle(&blue_sheet, &fonts);
+        let blue_border = button.style().border_color;
+
+        assert_ne!(
+            red_border, blue_border,
+            "the cached parent style survived a sheet swap"
+        );
     }
 }
