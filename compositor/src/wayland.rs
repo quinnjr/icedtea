@@ -155,7 +155,12 @@ fn shift_button_color(base: [f32; 4], state: ButtonState) -> [f32; 4] {
         ButtonState::Pressed => 0.6,
     };
     let scale = |c: f32| (c * factor).clamp(0.0, 1.0);
-    [scale(base[0]), scale(base[1]), scale(base[2]), scale(base[3])]
+    [
+        scale(base[0]),
+        scale(base[1]),
+        scale(base[2]),
+        scale(base[3]),
+    ]
 }
 
 /// The `_NET_WM_STATE`-bearing attributes last pushed to a managed X11 window.
@@ -326,7 +331,9 @@ impl Wayland {
         maximized: bool,
         fullscreen: bool,
     ) {
-        let Some((runtime, key)) = self.resolve(id) else { return };
+        let Some((runtime, key)) = self.resolve(id) else {
+            return;
+        };
         match key {
             SurfaceKey::Xdg(key) => {
                 runtime.set_toplevel_size(key.0, content.width, content.height);
@@ -369,7 +376,9 @@ impl Wayland {
 
     /// Move the window's scene node. `x`/`y` are **content**-space.
     pub fn set_position(&self, id: WindowId, x: i32, y: i32) {
-        let Some((runtime, key)) = self.resolve(id) else { return };
+        let Some((runtime, key)) = self.resolve(id) else {
+            return;
+        };
         match key {
             SurfaceKey::Xdg(key) => {
                 runtime.set_toplevel_position(key.0, x, y);
@@ -386,7 +395,9 @@ impl Wayland {
     /// drawn, so returning to that workspace does not make the client
     /// re-render from nothing.
     pub fn set_visible(&self, id: WindowId, visible: bool) {
-        let Some((runtime, key)) = self.resolve(id) else { return };
+        let Some((runtime, key)) = self.resolve(id) else {
+            return;
+        };
         match key {
             SurfaceKey::Xdg(key) => {
                 runtime.set_toplevel_visible(key.0, visible);
@@ -407,7 +418,9 @@ impl Wayland {
     /// never learns it was minimized. Silent no-op on a miss, like every other
     /// seam here.
     pub fn set_minimized(&mut self, id: WindowId, minimized: bool) {
-        let Some((runtime, key)) = self.resolve(id) else { return };
+        let Some((runtime, key)) = self.resolve(id) else {
+            return;
+        };
         match key {
             SurfaceKey::Xdg(_) => {}
             SurfaceKey::X11(sid) => {
@@ -429,7 +442,9 @@ impl Wayland {
     /// off, a focused window is still activated and configured, it just keeps
     /// its place in the stack.
     pub fn raise(&self, id: WindowId) {
-        let Some((runtime, key)) = self.resolve(id) else { return };
+        let Some((runtime, key)) = self.resolve(id) else {
+            return;
+        };
         match key {
             SurfaceKey::Xdg(key) => {
                 runtime.raise_toplevel(key.0);
@@ -480,7 +495,9 @@ impl Wayland {
     /// last was (which could be a different, stale surface) or silently
     /// doing nothing.
     pub fn keyboard_focus(&self, id: Option<WindowId>) {
-        let Some(runtime) = self.runtime() else { return };
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
         match id.and_then(|id| self.surface_key(id)) {
             Some(SurfaceKey::Xdg(key)) => {
                 if runtime.focus_toplevel_keyboard(key.0).is_none() {
@@ -532,7 +549,9 @@ impl Wayland {
     /// it only happens across two separate `run_all` calls, which is outside
     /// what a single close request can detect or a headless test can set up.
     pub fn close(&self, id: WindowId) -> bool {
-        let Some(key) = self.surface_key(id) else { return false };
+        let Some(key) = self.surface_key(id) else {
+            return false;
+        };
         if let Some(runtime) = self.runtime() {
             match key {
                 SurfaceKey::Xdg(key) => {
@@ -558,7 +577,9 @@ impl Wayland {
     /// `zxdg_decoration_manager_v1` at all) each report `None`, and none of
     /// them is an error.
     pub fn set_decoration_mode(&self, toplevel: ToplevelKey, mode: wlr::DecorationMode) {
-        let Some(runtime) = self.runtime() else { return };
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
         runtime.set_decoration_mode(toplevel.0, mode);
     }
 
@@ -642,7 +663,9 @@ impl Wayland {
             self.remove_ssd(id);
             return;
         }
-        let Some(runtime) = self.runtime.clone() else { return };
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
         // Which client backs this window decides both where the decoration
         // nodes are parented and what origin their coordinates are relative
         // to. An xdg toplevel's SSD lives inside its own toplevel tree, so its
@@ -652,7 +675,9 @@ impl Wayland {
         // band siblings positioned in absolute scene coordinates (origin
         // `(0, 0)`), riding the window's z-order via `raise` instead of a
         // parent tree.
-        let Some(sk) = self.surface_key(id) else { return };
+        let Some(sk) = self.surface_key(id) else {
+            return;
+        };
         let (ox, oy) = match sk {
             SurfaceKey::Xdg(_) => (content.x, content.y),
             SurfaceKey::X11(_) => (0, 0),
@@ -662,7 +687,9 @@ impl Wayland {
         let make_rect = |w: i32, h: i32, color: [f32; 4]| -> Option<wlr::RectId> {
             match sk {
                 SurfaceKey::Xdg(key) => runtime.add_rect_in_toplevel(key.0, w, h, color),
-                SurfaceKey::X11(_) => runtime.add_rect_in_band(wlr::Band::Toplevel, w, h, color).ok(),
+                SurfaceKey::X11(_) => runtime
+                    .add_rect_in_band(wlr::Band::Toplevel, w, h, color)
+                    .ok(),
             }
         };
         let make_buffer = |w: i32, h: i32, px: &[u8]| -> Option<wlr::BufferId> {
@@ -701,7 +728,9 @@ impl Wayland {
                 },
             );
         }
-        let Some(visual) = self.ssd.get_mut(&id) else { return };
+        let Some(visual) = self.ssd.get_mut(&id) else {
+            return;
+        };
 
         runtime.set_rect_size(visual.band, width, height);
         runtime.set_rect_position(visual.band, rel_x, rel_y);
@@ -730,9 +759,16 @@ impl Wayland {
             match &button_glyph_px[i] {
                 Some(raster) => {
                     let raster_key = (raster.width, raster.height, raster.fg);
-                    if visual.button_glyphs[i].is_none() || visual.button_glyph_keys[i] != Some(raster_key) {
+                    if visual.button_glyphs[i].is_none()
+                        || visual.button_glyph_keys[i] != Some(raster_key)
+                    {
                         let updated = visual.button_glyphs[i].and_then(|buffer| {
-                            runtime.update_buffer(buffer, raster.width, raster.height, raster.pixels)
+                            runtime.update_buffer(
+                                buffer,
+                                raster.width,
+                                raster.height,
+                                raster.pixels,
+                            )
                         });
                         if updated.is_none() {
                             if let Some(stale) = visual.button_glyphs[i].take() {
@@ -741,8 +777,11 @@ impl Wayland {
                             visual.button_glyphs[i] =
                                 make_buffer(raster.width, raster.height, raster.pixels);
                         }
-                        visual.button_glyph_keys[i] =
-                            if visual.button_glyphs[i].is_some() { Some(raster_key) } else { None };
+                        visual.button_glyph_keys[i] = if visual.button_glyphs[i].is_some() {
+                            Some(raster_key)
+                        } else {
+                            None
+                        };
                     }
                     if let Some(buffer) = visual.button_glyphs[i] {
                         runtime.set_buffer_position(buffer, r.x - ox, r.y - oy);
@@ -806,8 +845,12 @@ impl Wayland {
     /// down), which is a normal race between the two teardown paths, not an
     /// error.
     fn remove_ssd(&mut self, id: WindowId) {
-        let Some(visual) = self.ssd.remove(&id) else { return };
-        let Some(runtime) = self.runtime() else { return };
+        let Some(visual) = self.ssd.remove(&id) else {
+            return;
+        };
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
         runtime.remove_rect(visual.band);
         if let Some(buffer) = visual.title {
             runtime.remove_buffer(buffer);
@@ -845,7 +888,11 @@ mod tests {
         assert!(w.is_backed(id));
 
         w.forget(id);
-        assert_eq!(w.window_for(key), None, "the reverse map must be cleared too");
+        assert_eq!(
+            w.window_for(key),
+            None,
+            "the reverse map must be cleared too"
+        );
         assert_eq!(w.toplevel_for(id), None);
         assert!(!w.is_backed(id));
     }
@@ -896,7 +943,12 @@ mod tests {
     fn ssd_rect_relative_offset_is_zero_minus_titlebar() {
         // With no runtime attached the seam is a no-op, so this asserts the
         // pure coordinate math via the helper the impl must use.
-        let frame = Rectangle { x: 100, y: 200, width: 400, height: 300 };
+        let frame = Rectangle {
+            x: 100,
+            y: 200,
+            width: 400,
+            height: 300,
+        };
         let bar = crate::decoration::title_bar_rect(frame);
         let content = crate::decoration::content_rect(frame, true);
         assert_eq!(
@@ -913,15 +965,42 @@ mod tests {
     fn syncing_ssd_with_no_runtime_is_harmless() {
         let mut w = Wayland::new();
         let id = WindowId(3);
-        let frame = Rectangle { x: 100, y: 200, width: 400, height: 300 };
+        let frame = Rectangle {
+            x: 100,
+            y: 200,
+            width: 400,
+            height: 300,
+        };
         let bar = crate::decoration::title_bar_rect(frame);
         let content = crate::decoration::content_rect(frame, true);
         let color = [1.0, 1.0, 1.0, 1.0];
 
-        w.sync_ssd(id, true, true, bar, content, color, [[0.0; 4]; 3], None, [None, None, None], None);
+        w.sync_ssd(
+            id,
+            true,
+            true,
+            bar,
+            content,
+            color,
+            [[0.0; 4]; 3],
+            None,
+            [None, None, None],
+            None,
+        );
         assert_eq!(w.ssd_rect_count(), 0);
 
-        w.sync_ssd(id, false, true, bar, content, color, [[0.0; 4]; 3], None, [None, None, None], None);
+        w.sync_ssd(
+            id,
+            false,
+            true,
+            bar,
+            content,
+            color,
+            [[0.0; 4]; 3],
+            None,
+            [None, None, None],
+            None,
+        );
         assert_eq!(w.ssd_rect_count(), 0);
 
         w.forget(id);
@@ -936,7 +1015,12 @@ mod tests {
     fn syncing_ssd_with_title_pixels_and_no_runtime_is_harmless() {
         let mut w = Wayland::new();
         let id = WindowId(4);
-        let frame = Rectangle { x: 0, y: 0, width: 400, height: 300 };
+        let frame = Rectangle {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 300,
+        };
         let bar = crate::decoration::title_bar_rect(frame);
         let content = crate::decoration::content_rect(frame, true);
         let px = vec![0u8; (bar.width as usize) * (bar.height as usize) * 4];
@@ -967,7 +1051,12 @@ mod tests {
     /// frame while the scene nodes are placed from the bar.
     #[test]
     fn button_rects_agree_whether_derived_from_the_frame_or_the_bar() {
-        let frame = Rectangle { x: 100, y: 200, width: 400, height: 300 };
+        let frame = Rectangle {
+            x: 100,
+            y: 200,
+            width: 400,
+            height: 300,
+        };
         let bar = crate::decoration::title_bar_rect(frame);
         assert_eq!(
             crate::decoration::button_rects(bar),

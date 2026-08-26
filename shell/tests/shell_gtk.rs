@@ -17,9 +17,9 @@ use icedtea_contract::{
 use icedtea_harness::Compositor;
 use icedtea_shell::clip_client::ClipCommands;
 use icedtea_shell::clipboard::{self, ClipUpdate, ClipboardModel};
-use icedtea_shell::gtk4::{self, prelude::*, Box as GtkBox, Button, ListBox, Orientation, Widget};
-use icedtea_shell::taskbar::{self, TaskbarModel, CompositorUpdate};
 use icedtea_shell::compositor_client::CompositorCommands;
+use icedtea_shell::gtk4::{self, Box as GtkBox, Button, ListBox, Orientation, Widget, prelude::*};
+use icedtea_shell::taskbar::{self, CompositorUpdate, TaskbarModel};
 
 /// Point GDK at the harness compositor and init GTK once. `false` means GTK
 /// could not come up — which is a FAILURE by default (the harness provides a
@@ -109,11 +109,16 @@ fn children(w: &impl IsA<Widget>) -> Vec<Widget> {
 }
 
 fn named(parent: &impl IsA<Widget>, name: &str) -> Option<Widget> {
-    children(parent).into_iter().find(|c| c.widget_name() == name)
+    children(parent)
+        .into_iter()
+        .find(|c| c.widget_name() == name)
 }
 
 fn buttons(container: &Widget) -> Vec<Button> {
-    children(container).into_iter().filter_map(|c| c.downcast::<Button>().ok()).collect()
+    children(container)
+        .into_iter()
+        .filter_map(|c| c.downcast::<Button>().ok())
+        .collect()
 }
 
 fn labels(container: &Widget) -> Vec<String> {
@@ -130,7 +135,12 @@ fn win(id: u32, title: &str) -> WindowInfo {
         title: title.into(),
         pid: 0,
         workspace: 0,
-        geometry: Rectangle { x: 0, y: 0, width: 1, height: 1 },
+        geometry: Rectangle {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
         maximized: false,
         minimized: false,
         fullscreen: false,
@@ -155,14 +165,20 @@ fn taskbar_renders_windows_and_clicks_reach_the_command_surface() {
     model.apply(CompositorUpdate::Snapshot(Snapshot {
         seq: 1,
         windows: vec![win(1, "One"), win(2, "Two")],
-        workspaces: vec![WorkspaceInfo { id: 0, name: String::new() }],
+        workspaces: vec![WorkspaceInfo {
+            id: 0,
+            name: String::new(),
+        }],
         active_workspace: 0,
     }));
     taskbar::render(&model, &bar, &wm);
 
     // Widget tree: exactly the two window buttons, labelled by title.
     let windows_box = named(&bar, "windows").expect("#windows box");
-    assert_eq!(labels(&windows_box), vec!["One".to_string(), "Two".to_string()]);
+    assert_eq!(
+        labels(&windows_box),
+        vec!["One".to_string(), "Two".to_string()]
+    );
 
     // A real GTK click on "One" reaches the command surface as focus_window(1).
     let one = buttons(&windows_box)
@@ -171,7 +187,10 @@ fn taskbar_renders_windows_and_clicks_reach_the_command_surface() {
         .expect("One button");
     one.emit_clicked();
     assert!(
-        mock.calls.borrow().iter().any(|(k, id)| k == "focus" && *id == 1),
+        mock.calls
+            .borrow()
+            .iter()
+            .any(|(k, id)| k == "focus" && *id == 1),
         "focus_window(1) not recorded; calls = {:?}",
         mock.calls.borrow()
     );
@@ -211,13 +230,23 @@ fn taskbar_renders_windows_and_clicks_reach_the_command_surface() {
     let row = list.row_at_index(0).expect("row 0");
     list.emit_by_name::<()>("row-activated", &[&row]);
     assert!(
-        clip_mock.calls.borrow().iter().any(|(k, id)| k == "activate" && *id == 10),
+        clip_mock
+            .calls
+            .borrow()
+            .iter()
+            .any(|(k, id)| k == "activate" && *id == 10),
         "activate(10) not recorded; calls = {:?}",
         clip_mock.calls.borrow()
     );
 
     // A history update replaces the rows.
-    clip_model.borrow_mut().apply(ClipUpdate::History(vec![clip_entry(12, "only")]));
+    clip_model
+        .borrow_mut()
+        .apply(ClipUpdate::History(vec![clip_entry(12, "only")]));
     clipboard::render(&clip_model.borrow(), &list, &clip);
-    assert_eq!(children(&list).len(), 1, "history update did not replace rows");
+    assert_eq!(
+        children(&list).len(),
+        1,
+        "history update did not replace rows"
+    );
 }

@@ -59,7 +59,11 @@ pub fn render(model: &ClipboardModel, list: &ListBox, clip: &Rc<dyn ClipCommands
 }
 
 /// Wire `list` row activation to re-paste (`activate`). Called once at build.
-pub fn connect_activation(list: &ListBox, clip: Rc<dyn ClipCommands>, model: Rc<std::cell::RefCell<ClipboardModel>>) {
+pub fn connect_activation(
+    list: &ListBox,
+    clip: Rc<dyn ClipCommands>,
+    model: Rc<std::cell::RefCell<ClipboardModel>>,
+) {
     list.connect_row_activated(move |_, row| {
         let idx = row.index();
         if idx >= 0

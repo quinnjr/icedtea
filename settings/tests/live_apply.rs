@@ -35,8 +35,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use icedtea_contract::{Appearance, COMPOSITOR_BUS_NAME, COMPOSITOR_PATH};
-use icedtea_settings::model;
 use icedtea_settings::compositor_reload::{ReloadClient, ReloadOutcome};
+use icedtea_settings::model;
 
 const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 const NEW_ACCENT: &str = "#ff00aa";
@@ -197,7 +197,10 @@ fn apply_reloads_the_running_compositor() {
         .recv_timeout(SIGNAL_TIMEOUT)
         .unwrap_or_else(|_| panic!("no ConfigReloaded signal arrived within {SIGNAL_TIMEOUT:?}"))
         .expect("ConfigReloaded body did not deserialize as (u64, Appearance)");
-    assert!(seq > 0, "seq should be a real post-boot sequence number, got {seq}");
+    assert!(
+        seq > 0,
+        "seq should be a real post-boot sequence number, got {seq}"
+    );
     assert_eq!(
         appearance.palette.accent, NEW_ACCENT,
         "ConfigReloaded must carry the NEW accent, not the default -- a no-op reload or a \

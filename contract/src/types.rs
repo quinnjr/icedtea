@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use zvariant::Type;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Type)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Type,
+)]
 #[zvariant(signature = "u")]
 pub struct WindowId(pub u32);
 
@@ -110,7 +112,12 @@ mod tests {
             title: "Calculator".into(),
             pid: 1234,
             workspace: 0,
-            geometry: Rectangle { x: 100, y: 100, width: 400, height: 300 },
+            geometry: Rectangle {
+                x: 100,
+                y: 100,
+                width: 400,
+                height: 300,
+            },
             maximized: false,
             minimized: false,
             fullscreen: false,
@@ -124,8 +131,14 @@ mod tests {
             seq: 7,
             windows: vec![sample_window()],
             workspaces: vec![
-                WorkspaceInfo { id: 0, name: "1".into() },
-                WorkspaceInfo { id: 1, name: "2".into() },
+                WorkspaceInfo {
+                    id: 0,
+                    name: "1".into(),
+                },
+                WorkspaceInfo {
+                    id: 1,
+                    name: "2".into(),
+                },
             ],
             active_workspace: 0,
         }
@@ -141,13 +154,19 @@ mod tests {
     #[test]
     fn wire_signatures_are_locked() {
         use zvariant::Type;
-        assert_eq!(WindowUpdate::SIGNATURE.to_string(), "(asa(iiii)auabababababab)");
+        assert_eq!(
+            WindowUpdate::SIGNATURE.to_string(),
+            "(asa(iiii)auabababababab)"
+        );
         assert_eq!(Appearance::SIGNATURE.to_string(), "(siii(sss)as)");
         assert_eq!(WindowId::SIGNATURE.to_string(), "u");
         assert_eq!(Rectangle::SIGNATURE.to_string(), "(iiii)");
         assert_eq!(WindowInfo::SIGNATURE.to_string(), "(ussuu(iiii)bbbbb)");
         assert_eq!(WorkspaceInfo::SIGNATURE.to_string(), "(us)");
-        assert_eq!(Snapshot::SIGNATURE.to_string(), "(ta(ussuu(iiii)bbbbb)a(us)u)");
+        assert_eq!(
+            Snapshot::SIGNATURE.to_string(),
+            "(ta(ussuu(iiii)bbbbb)a(us)u)"
+        );
         // `index: usize` marshals as `t` (u64) on 64-bit targets.
         assert_eq!(AltTabState::SIGNATURE.to_string(), "(baut)");
     }
@@ -184,7 +203,12 @@ mod tests {
         let ctxt = zvariant::serialized::Context::new_dbus(zvariant::LE, 0);
         let some = WindowUpdate {
             title: Some("New title".into()),
-            geometry: Some(Rectangle { x: 0, y: 0, width: 100, height: 80 }),
+            geometry: Some(Rectangle {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            }),
             workspace: Some(2),
             maximized: Some(true),
             minimized: Some(false),

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use contract::Appearance;
 use crate::{Behavior, Config, KeyCombo};
+use contract::Appearance;
 
 pub fn default_config() -> Config {
     let mut keybindings = HashMap::new();
@@ -24,11 +24,26 @@ pub fn default_config() -> Config {
     insert(&mut keybindings, "snap:right", &["SUPER"], "KEY_Right");
     insert(&mut keybindings, "snap:up", &["SUPER"], "KEY_Up");
     insert(&mut keybindings, "snap:down", &["SUPER"], "KEY_Down");
-    insert(&mut keybindings, "snap:restore", &["SUPER", "SHIFT"], "KEY_Left");
+    insert(
+        &mut keybindings,
+        "snap:restore",
+        &["SUPER", "SHIFT"],
+        "KEY_Left",
+    );
     for n in 1..=9u32 {
         let key = format!("KEY_{n}");
-        insert(&mut keybindings, &format!("workspace:{n}"), &["SUPER"], &key);
-        insert(&mut keybindings, &format!("move_to_workspace:{n}"), &["SUPER", "CTRL"], &key);
+        insert(
+            &mut keybindings,
+            &format!("workspace:{n}"),
+            &["SUPER"],
+            &key,
+        );
+        insert(
+            &mut keybindings,
+            &format!("move_to_workspace:{n}"),
+            &["SUPER", "CTRL"],
+            &key,
+        );
     }
 
     Config {

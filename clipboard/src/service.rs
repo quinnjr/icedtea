@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender};
-use icedtea_contract::{ClipEntry, CLIP_BUS_NAME, CLIP_PATH};
+use icedtea_contract::{CLIP_BUS_NAME, CLIP_PATH, ClipEntry};
 use zbus::blocking::Connection;
 use zbus::interface;
 
@@ -61,7 +61,11 @@ pub fn spawn(
     changes: Receiver<Change>,
 ) -> zbus::Result<Connection> {
     let conn = Connection::session()?;
-    let service = ClipboardService { snapshot, commands, wake };
+    let service = ClipboardService {
+        snapshot,
+        commands,
+        wake,
+    };
     conn.object_server().at(CLIP_PATH, service)?;
     conn.request_name(CLIP_BUS_NAME)?;
 

@@ -125,7 +125,11 @@ fn viewporter_crop_and_scale_render_only_the_cropped_region() {
     let buf_w = content_w * 2;
     let buf_h = content_h * 2;
     let half = buf_w / 2;
-    client.attach_pattern_buffer(buf_w, buf_h, move |x, _y| if x < half { KEEP } else { DISCARD });
+    client.attach_pattern_buffer(
+        buf_w,
+        buf_h,
+        move |x, _y| if x < half { KEEP } else { DISCARD },
+    );
 
     let viewport = client.get_viewport();
     // Source crop, in buffer coordinates: only the KEEP half.
@@ -194,7 +198,10 @@ fn viewporter_crop_and_scale_render_only_the_cropped_region() {
         "the cropped-out (DISCARD) half of the buffer rendered anyway -- the viewport \
          source-crop was not honored"
     );
-    assert!(keep_pixels > 0, "the cropped-in (KEEP) half never rendered at all");
+    assert!(
+        keep_pixels > 0,
+        "the cropped-in (KEEP) half never rendered at all"
+    );
 
     // The scaled destination footprint should be close to content_w *
     // content_h pixels -- not the buffer's native 2x resolution
@@ -271,7 +278,10 @@ fn presentation_feedback_arrives_on_commit() {
     let comp = Compositor::spawn();
     let mut client = TestClient::map_toplevel(&comp.socket, "presentation.app", "presentation");
     assert!(client.wait_until(|c| c.last_configure().is_some()));
-    let (w, h) = client.last_configure().filter(|&(w, h)| w > 0 && h > 0).unwrap_or((200, 100));
+    let (w, h) = client
+        .last_configure()
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .unwrap_or((200, 100));
 
     // Ties the feedback object to whatever is the surface's current content
     // submission (the map's own initial buffer) -- the plain `commit()`
@@ -293,7 +303,10 @@ fn presentation_feedback_arrives_on_commit() {
     );
     let outcome = client.presentation_outcome().unwrap();
     assert!(
-        matches!(outcome, PresentationOutcome::Presented | PresentationOutcome::Discarded),
+        matches!(
+            outcome,
+            PresentationOutcome::Presented | PresentationOutcome::Discarded
+        ),
         "unreachable: presentation_outcome() only ever stores one of these two variants"
     );
 }
@@ -305,7 +318,11 @@ fn presentation_feedback_arrives_on_commit() {
 fn a2_batch2_globals_are_advertised() {
     let comp = Compositor::spawn();
     let globals = icedtea_harness::advertised_globals(&comp.socket);
-    for iface in ["wp_cursor_shape_manager_v1", "xdg_activation_v1", "zwlr_gamma_control_manager_v1"] {
+    for iface in [
+        "wp_cursor_shape_manager_v1",
+        "xdg_activation_v1",
+        "zwlr_gamma_control_manager_v1",
+    ] {
         assert!(
             globals.iter().any(|g| g == iface),
             "{iface} global missing; saw {globals:?}"
@@ -361,8 +378,16 @@ fn cursor_shape_set_by_the_pointer_owner_applies_and_reverts_on_leave() {
     let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
 
     let mut client = TestClient::map_toplevel(&comp.socket, "cursor.app", "cursor");
-    assert!(client.wait_until(|c| c.last_configure().is_some()), "client never configured");
-    let info = comp.snapshot().windows.into_iter().next().expect("the mapped window must be in the model");
+    assert!(
+        client.wait_until(|c| c.last_configure().is_some()),
+        "client never configured"
+    );
+    let info = comp
+        .snapshot()
+        .windows
+        .into_iter()
+        .next()
+        .expect("the mapped window must be in the model");
     // Finding F11: the output's real geometry, straight off the model --
     // not the snap-gap-inset rect a maximized window lands on.
     let (ow, oh) = comp.output_size();
@@ -377,10 +402,20 @@ fn cursor_shape_set_by_the_pointer_owner_applies_and_reverts_on_leave() {
 
     // Over the window: the client receives `wl_pointer.enter`, whose serial
     // is what `set_shape` must carry.
-    vp.motion_absolute((geo.x + geo.width / 2) as f64, (geo.y + geo.height / 2) as f64, ow as u32, oh as u32);
+    vp.motion_absolute(
+        (geo.x + geo.width / 2) as f64,
+        (geo.y + geo.height / 2) as f64,
+        ow as u32,
+        oh as u32,
+    );
     vp.frame();
-    assert!(client.wait_until(|c| c.last_pointer_serial().is_some()), "client never got a pointer serial");
-    let enter_serial = client.last_pointer_serial().expect("just asserted this is Some");
+    assert!(
+        client.wait_until(|c| c.last_pointer_serial().is_some()),
+        "client never got a pointer serial"
+    );
+    let enter_serial = client
+        .last_pointer_serial()
+        .expect("just asserted this is Some");
 
     client.set_cursor_shape(enter_serial, icedtea_harness::CursorShape::Text);
     assert_eq!(
@@ -402,7 +437,10 @@ fn cursor_shape_set_by_the_pointer_owner_applies_and_reverts_on_leave() {
     // branch below wearing a disguise.
     let (inner_x, inner_y) = (geo.x + geo.width / 2 + 3, geo.y + geo.height / 2 + 3);
     assert!(
-        inner_x >= geo.x && inner_x < geo.x + geo.width && inner_y >= geo.y && inner_y < geo.y + geo.height,
+        inner_x >= geo.x
+            && inner_x < geo.x + geo.width
+            && inner_y >= geo.y
+            && inner_y < geo.y + geo.height,
         "({inner_x}, {inner_y}) must still be inside {geo:?} for this to test within-window motion"
     );
     vp.motion_absolute(inner_x as f64, inner_y as f64, ow as u32, oh as u32);
@@ -492,9 +530,15 @@ fn a_client_without_pointer_focus_cannot_name_the_cursor() {
     // this the pointer would land on B and there would be no unfocused
     // client left to test.
     let mut b = TestClient::map_toplevel(&comp.socket, "background.app", "background");
-    assert!(b.wait_until(|c| c.last_configure().is_some()), "client B never configured");
+    assert!(
+        b.wait_until(|c| c.last_configure().is_some()),
+        "client B never configured"
+    );
     let mut a = TestClient::map_toplevel(&comp.socket, "focused.app", "focused");
-    assert!(a.wait_until(|c| c.last_configure().is_some()), "client A never configured");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "client A never configured"
+    );
 
     let (ow, oh) = comp.output_size();
     let windows = comp.snapshot().windows;
@@ -505,9 +549,17 @@ fn a_client_without_pointer_focus_cannot_name_the_cursor() {
         .geometry;
 
     // Put the pointer inside A, and take the enter serial off A itself.
-    vp.motion_absolute((a_geo.x + a_geo.width / 2) as f64, (a_geo.y + a_geo.height / 2) as f64, ow as u32, oh as u32);
+    vp.motion_absolute(
+        (a_geo.x + a_geo.width / 2) as f64,
+        (a_geo.y + a_geo.height / 2) as f64,
+        ow as u32,
+        oh as u32,
+    );
     vp.frame();
-    assert!(a.wait_until(|c| c.last_pointer_serial().is_some()), "A never got a pointer serial");
+    assert!(
+        a.wait_until(|c| c.last_pointer_serial().is_some()),
+        "A never got a pointer serial"
+    );
     let enter_serial = a.last_pointer_serial().expect("just asserted this is Some");
 
     a.set_cursor_shape(enter_serial, icedtea_harness::CursorShape::Text);
@@ -554,14 +606,33 @@ fn engaging_the_session_lock_drops_a_client_named_cursor() {
     let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
 
     let mut client = TestClient::map_toplevel(&comp.socket, "locktest.app", "locktest");
-    assert!(client.wait_until(|c| c.last_configure().is_some()), "client never configured");
+    assert!(
+        client.wait_until(|c| c.last_configure().is_some()),
+        "client never configured"
+    );
     let (ow, oh) = comp.output_size();
-    let geo = comp.snapshot().windows.into_iter().next().expect("mapped window in the model").geometry;
+    let geo = comp
+        .snapshot()
+        .windows
+        .into_iter()
+        .next()
+        .expect("mapped window in the model")
+        .geometry;
 
-    vp.motion_absolute((geo.x + geo.width / 2) as f64, (geo.y + geo.height / 2) as f64, ow as u32, oh as u32);
+    vp.motion_absolute(
+        (geo.x + geo.width / 2) as f64,
+        (geo.y + geo.height / 2) as f64,
+        ow as u32,
+        oh as u32,
+    );
     vp.frame();
-    assert!(client.wait_until(|c| c.last_pointer_serial().is_some()), "client never got a pointer serial");
-    let enter_serial = client.last_pointer_serial().expect("just asserted this is Some");
+    assert!(
+        client.wait_until(|c| c.last_pointer_serial().is_some()),
+        "client never got a pointer serial"
+    );
+    let enter_serial = client
+        .last_pointer_serial()
+        .expect("just asserted this is Some");
     client.set_cursor_shape(enter_serial, icedtea_harness::CursorShape::Text);
     assert_eq!(
         wait_for_cursor_shape(&comp, "Text"),
@@ -574,7 +645,10 @@ fn engaging_the_session_lock_drops_a_client_named_cursor() {
     let mut locker = SessionLockClient::spawn(&comp.socket);
     locker.lock();
     assert!(locker.wait_locked(), "session never reported locked");
-    assert!(comp.session_locked(), "compositor is_session_locked() is false");
+    assert!(
+        comp.session_locked(),
+        "compositor is_session_locked() is false"
+    );
 
     assert_eq!(
         wait_for_cursor_shape(&comp, "Default"),
@@ -608,9 +682,15 @@ fn xdg_activation_without_a_seat_serial_flags_attention_instead_of_stealing_focu
     let comp = Compositor::spawn();
 
     let mut a = TestClient::map_toplevel(&comp.socket, "activation-a.app", "A");
-    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "A never configured"
+    );
     let mut b = TestClient::map_toplevel(&comp.socket, "activation-b.app", "B");
-    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+    assert!(
+        b.wait_until(|c| c.last_configure().is_some()),
+        "B never configured"
+    );
 
     let (a_id, b_id) = window_ids(&comp);
 
@@ -618,7 +698,10 @@ fn xdg_activation_without_a_seat_serial_flags_attention_instead_of_stealing_focu
     // refusal has something to protect.
     comp.send(icedtea_compositor::dbus::DbCommand::Focus(a_id));
     comp.settle();
-    assert!(focused_id(&comp) == Some(a_id), "A must hold focus before the activation request");
+    assert!(
+        focused_id(&comp) == Some(a_id),
+        "A must hold focus before the activation request"
+    );
 
     let token = b.create_activation_token(None, false);
     b.activate_self(&token);
@@ -630,11 +713,25 @@ fn xdg_activation_without_a_seat_serial_flags_attention_instead_of_stealing_focu
 
     comp.settle();
     let snapshot = comp.snapshot();
-    let a_info = snapshot.windows.iter().find(|w| w.id == a_id).expect("A still mapped");
-    let b_info = snapshot.windows.iter().find(|w| w.id == b_id).expect("B still mapped");
-    assert!(a_info.focused, "a seat-less activation moved the keyboard off A anyway");
+    let a_info = snapshot
+        .windows
+        .iter()
+        .find(|w| w.id == a_id)
+        .expect("A still mapped");
+    let b_info = snapshot
+        .windows
+        .iter()
+        .find(|w| w.id == b_id)
+        .expect("B still mapped");
+    assert!(
+        a_info.focused,
+        "a seat-less activation moved the keyboard off A anyway"
+    );
     assert!(!b_info.focused, "a seat-less activation stole focus for B");
-    assert!(b_info.attention, "the refused activation left no attention hint on B");
+    assert!(
+        b_info.attention,
+        "the refused activation left no attention hint on B"
+    );
 
     // Focusing B afterwards clears the hint -- the other half of the
     // contract `set_attention` establishes (the flag is a "look at me until
@@ -646,7 +743,13 @@ fn xdg_activation_without_a_seat_serial_flags_attention_instead_of_stealing_focu
     });
     comp.settle();
     assert!(
-        !comp.snapshot().windows.iter().find(|w| w.id == b_id).expect("B still mapped").attention,
+        !comp
+            .snapshot()
+            .windows
+            .iter()
+            .find(|w| w.id == b_id)
+            .expect("B still mapped")
+            .attention,
         "focusing B did not clear its attention hint"
     );
 
@@ -677,9 +780,15 @@ fn a_seat_backed_activation_from_a_non_focused_window_is_still_refused() {
     let _vk = icedtea_harness::VirtualKeyboardClient::spawn(&comp.socket);
 
     let mut a = TestClient::map_toplevel(&comp.socket, "activation-a.app", "A");
-    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "A never configured"
+    );
     let mut b = TestClient::map_toplevel(&comp.socket, "activation-b.app", "B");
-    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+    assert!(
+        b.wait_until(|c| c.last_configure().is_some()),
+        "B never configured"
+    );
 
     let (a_id, b_id) = window_ids(&comp);
 
@@ -689,7 +798,10 @@ fn a_seat_backed_activation_from_a_non_focused_window_is_still_refused() {
     // validates `set_serial`'s serial against the seat client that was given
     // it, and a token minted from a client the seat has since left is not a
     // token this test could rely on being accepted at all.
-    assert!(b.wait_until(|c| c.has_input_serial()), "B never received wl_keyboard.enter");
+    assert!(
+        b.wait_until(|c| c.has_input_serial()),
+        "B never received wl_keyboard.enter"
+    );
     let b_serial = b.last_input_serial().expect("just asserted this is Some");
     let token = b.create_activation_token(Some(b_serial), true);
 
@@ -699,7 +811,10 @@ fn a_seat_backed_activation_from_a_non_focused_window_is_still_refused() {
     // Redeeming a token after focus moved on is also exactly the real
     // scenario the policy exists for.
     comp.send(icedtea_compositor::dbus::DbCommand::Focus(a_id));
-    assert!(wait_for_focus(&comp, a_id), "A must hold focus before the refusal has anything to protect");
+    assert!(
+        wait_for_focus(&comp, a_id),
+        "A must hold focus before the refusal has anything to protect"
+    );
 
     b.activate_self(&token);
 
@@ -710,15 +825,29 @@ fn a_seat_backed_activation_from_a_non_focused_window_is_still_refused() {
 
     comp.settle();
     let snapshot = comp.snapshot();
-    let a_info = snapshot.windows.iter().find(|w| w.id == a_id).expect("A still mapped");
-    let b_info = snapshot.windows.iter().find(|w| w.id == b_id).expect("B still mapped");
+    let a_info = snapshot
+        .windows
+        .iter()
+        .find(|w| w.id == a_id)
+        .expect("A still mapped");
+    let b_info = snapshot
+        .windows
+        .iter()
+        .find(|w| w.id == b_id)
+        .expect("B still mapped");
     assert!(
         a_info.focused,
         "a seat-backed activation from a NON-focused client moved the keyboard off A -- \
          the policy is checking has_seat alone, not requester == focused"
     );
-    assert!(!b_info.focused, "a seat-backed activation from a non-focused client stole focus for B");
-    assert!(b_info.attention, "the refused activation left no attention hint on B");
+    assert!(
+        !b_info.focused,
+        "a seat-backed activation from a non-focused client stole focus for B"
+    );
+    assert!(
+        b_info.attention,
+        "the refused activation left no attention hint on B"
+    );
 
     a.detach();
     b.detach();
@@ -751,9 +880,15 @@ fn xdg_activation_from_the_focused_window_moves_focus() {
     let _vk = icedtea_harness::VirtualKeyboardClient::spawn(&comp.socket);
 
     let mut a = TestClient::map_toplevel(&comp.socket, "activation-a.app", "A");
-    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "A never configured"
+    );
     let mut b = TestClient::map_toplevel(&comp.socket, "activation-b.app", "B");
-    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+    assert!(
+        b.wait_until(|c| c.last_configure().is_some()),
+        "B never configured"
+    );
 
     let (a_id, b_id) = window_ids(&comp);
 
@@ -766,8 +901,14 @@ fn xdg_activation_from_the_focused_window_moves_focus() {
     // refocus actually produces.
     a.clear_input_serial();
     comp.send(icedtea_compositor::dbus::DbCommand::Focus(a_id));
-    assert!(a.wait_until(|c| c.has_input_serial()), "A never received wl_keyboard.enter after refocus");
-    assert!(focused_id(&comp) == Some(a_id), "A must hold focus before minting the token");
+    assert!(
+        a.wait_until(|c| c.has_input_serial()),
+        "A never received wl_keyboard.enter after refocus"
+    );
+    assert!(
+        focused_id(&comp) == Some(a_id),
+        "A must hold focus before minting the token"
+    );
     let serial = a.last_input_serial().expect("just asserted this is Some");
 
     let token = a.create_activation_token(Some(serial), true);
@@ -785,9 +926,20 @@ fn xdg_activation_from_the_focused_window_moves_focus() {
 
     comp.settle();
     let snapshot = comp.snapshot();
-    let a_info = snapshot.windows.iter().find(|w| w.id == a_id).expect("A still mapped");
-    let b_info = snapshot.windows.iter().find(|w| w.id == b_id).expect("B still mapped");
-    assert!(b_info.focused, "an activation from the focused window did not move focus to its target");
+    let a_info = snapshot
+        .windows
+        .iter()
+        .find(|w| w.id == a_id)
+        .expect("A still mapped");
+    let b_info = snapshot
+        .windows
+        .iter()
+        .find(|w| w.id == b_id)
+        .expect("B still mapped");
+    assert!(
+        b_info.focused,
+        "an activation from the focused window did not move focus to its target"
+    );
     assert!(!a_info.focused, "focus must have left A");
     assert!(
         !b_info.attention,
@@ -839,7 +991,11 @@ fn wait_for_focus(comp: &Compositor, id: icedtea_contract::WindowId) -> bool {
 /// A test that spreads windows across workspaces must compare against
 /// `Snapshot::active_workspace` itself rather than reuse this.
 fn focused_id(comp: &Compositor) -> Option<icedtea_contract::WindowId> {
-    comp.snapshot().windows.iter().find(|w| w.focused).map(|w| w.id)
+    comp.snapshot()
+        .windows
+        .iter()
+        .find(|w| w.focused)
+        .map(|w| w.id)
 }
 
 /// Task 10: a `zwlr_gamma_control_manager_v1` client claims gamma control of
@@ -871,7 +1027,10 @@ fn gamma_control_answers_a_claim_on_the_headless_output() {
     );
 
     match gamma.gamma_size() {
-        None => assert!(gamma.failed(), "unreachable: the wait above requires one or the other"),
+        None => assert!(
+            gamma.failed(),
+            "unreachable: the wait above requires one or the other"
+        ),
         Some(0) => panic!(
             "gamma_size 0 is not a legal answer -- wlroots sends `failed` for an output with no LUT"
         ),
@@ -898,7 +1057,6 @@ fn gamma_control_answers_a_claim_on_the_headless_output() {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // A2 batch-2 follow-ups

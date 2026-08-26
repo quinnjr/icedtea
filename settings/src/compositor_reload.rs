@@ -36,15 +36,25 @@ impl ReloadClient {
     /// absence of a bus (e.g. in a headless test) just leaves `conn: None`,
     /// so every subsequent `reload()` reports `CompositorAbsent`.
     pub fn new() -> Self {
-        ReloadClient { conn: zbus::blocking::Connection::session().ok() }
+        ReloadClient {
+            conn: zbus::blocking::Connection::session().ok(),
+        }
     }
 
     /// Ask the running compositor to re-read config. Best-effort: if the bus
     /// or the WM service is absent, report `CompositorAbsent` (the redb write
     /// already happened; the change applies on next compositor start).
     pub fn reload(&self) -> ReloadOutcome {
-        let Some(conn) = &self.conn else { return ReloadOutcome::CompositorAbsent };
-        match conn.call_method(Some(COMPOSITOR_BUS_NAME), COMPOSITOR_PATH, Some(COMPOSITOR_IFACE), "ReloadConfig", &()) {
+        let Some(conn) = &self.conn else {
+            return ReloadOutcome::CompositorAbsent;
+        };
+        match conn.call_method(
+            Some(COMPOSITOR_BUS_NAME),
+            COMPOSITOR_PATH,
+            Some(COMPOSITOR_IFACE),
+            "ReloadConfig",
+            &(),
+        ) {
             Ok(_) => ReloadOutcome::Reloaded,
             Err(_) => ReloadOutcome::CompositorAbsent,
         }

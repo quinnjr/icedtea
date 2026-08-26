@@ -9,7 +9,6 @@
 //! here because a client actually mapped a surface, and the compositor
 //! actually ran the `mapped` path against a live toplevel.
 
-
 use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
@@ -30,7 +29,11 @@ fn data_control_set_reaches_a_focused_wl_data_device_client() {
         b.wait_until(|c| c.has_selection_offer()),
         "focused wl_data_device client never received the data-control-set selection"
     );
-    let got = icedtea_harness::read_selection_from_data_control(&mut b, &mut mgr, "text/plain;charset=utf-8");
+    let got = icedtea_harness::read_selection_from_data_control(
+        &mut b,
+        &mut mgr,
+        "text/plain;charset=utf-8",
+    );
     assert_eq!(got, b"via-data-control");
 }
 
@@ -43,11 +46,17 @@ fn a_wl_data_device_copy_is_seen_by_a_data_control_reader() {
     let mut _vk = VirtualKeyboardClient::spawn(&comp.socket);
 
     let mut app = TestClient::map_toplevel(&comp.socket, "app", "app");
-    assert!(app.wait_until(|c| c.has_input_serial()), "app got no serial");
+    assert!(
+        app.wait_until(|c| c.has_input_serial()),
+        "app got no serial"
+    );
     app.set_selection_text("text/plain;charset=utf-8", b"copied-by-app");
 
     let mut manager = DataControlClient::spawn(&comp.socket);
-    assert!(manager.wait_until(|c| c.has_offer()), "manager saw no offer");
+    assert!(
+        manager.wait_until(|c| c.has_offer()),
+        "manager saw no offer"
+    );
     assert_eq!(
         manager.read_from_wl_data_device_owner(&mut app, "text/plain;charset=utf-8"),
         b"copied-by-app"
@@ -70,12 +79,18 @@ fn set_selection_without_an_input_serial_is_rejected() {
     // A maps and is focused, but the seat has no keyboard, so A has no serial.
     let mut a = TestClient::map_toplevel(&comp.socket, "hijack.app", "hijack");
     assert!(a.wait_until(|c| c.last_configure().is_some()));
-    assert!(!a.has_input_serial(), "no keyboard on the seat means no input serial");
+    assert!(
+        !a.has_input_serial(),
+        "no keyboard on the seat means no input serial"
+    );
     a.set_selection_text("text/plain", b"hijack"); // serial 0 -> rejected
 
     // The clipboard is unchanged: a fresh reader still sees the baseline.
     let mut reader = DataControlClient::spawn(&comp.socket);
-    assert!(reader.wait_until(|c| c.has_offer()), "no data-control offer");
+    assert!(
+        reader.wait_until(|c| c.has_offer()),
+        "no data-control offer"
+    );
     assert_eq!(reader.read_selection(&mut owner, "text/plain"), b"baseline");
 }
 
@@ -88,7 +103,10 @@ fn data_control_reads_the_current_selection() {
     owner.set_clipboard("text/plain;charset=utf-8", b"seen-by-manager");
 
     let mut reader = DataControlClient::spawn(&comp.socket);
-    assert!(reader.wait_until(|c| c.has_offer()), "no data-control offer");
+    assert!(
+        reader.wait_until(|c| c.has_offer()),
+        "no data-control offer"
+    );
     assert_eq!(
         reader.read_selection(&mut owner, "text/plain;charset=utf-8"),
         b"seen-by-manager"
@@ -102,7 +120,9 @@ fn selection_globals_are_advertised() {
     let comp = Compositor::spawn();
     let globals = icedtea_harness::advertised_globals(&comp.socket);
     assert!(
-        globals.iter().any(|g| g == "zwp_primary_selection_device_manager_v1"),
+        globals
+            .iter()
+            .any(|g| g == "zwp_primary_selection_device_manager_v1"),
         "primary-selection manager global missing; saw {globals:?}"
     );
     assert!(
@@ -118,7 +138,9 @@ fn virtual_pointer_manager_global_is_advertised() {
     let comp = Compositor::spawn();
     let globals = icedtea_harness::advertised_globals(&comp.socket);
     assert!(
-        globals.iter().any(|g| g == "zwlr_virtual_pointer_manager_v1"),
+        globals
+            .iter()
+            .any(|g| g == "zwlr_virtual_pointer_manager_v1"),
         "virtual-pointer manager global missing; saw {globals:?}"
     );
 }
@@ -191,7 +213,9 @@ fn relative_pointer_manager_global_is_advertised() {
     let comp = Compositor::spawn();
     let globals = icedtea_harness::advertised_globals(&comp.socket);
     assert!(
-        globals.iter().any(|g| g == "zwp_relative_pointer_manager_v1"),
+        globals
+            .iter()
+            .any(|g| g == "zwp_relative_pointer_manager_v1"),
         "relative pointer manager global missing; saw {globals:?}"
     );
 }
@@ -252,7 +276,11 @@ fn pointer_constraints_client_can_lock_and_confine_without_a_protocol_error() {
     // Every request above flushed with `.expect(...)`: a protocol error
     // (which wlroots answers by killing the connection) would already have
     // panicked one of those flushes rather than reaching here.
-    assert_eq!(locker.relative_delta(), (0.0, 0.0), "no motion injected, so no accumulated delta");
+    assert_eq!(
+        locker.relative_delta(),
+        (0.0, 0.0),
+        "no motion injected, so no accumulated delta"
+    );
 
     let mut confiner = PointerConstraintsClient::spawn(&comp.socket);
     confiner.confine_pointer(0, 0, 50, 50);
@@ -275,7 +303,10 @@ fn pointer_constraints_client_can_lock_and_confine_without_a_protocol_error() {
 fn a_mapped_client_has_a_data_device() {
     let comp = Compositor::spawn();
     let client = TestClient::map_toplevel(&comp.socket, "dd.app", "dd");
-    assert!(client.has_data_device(), "data device created from manager + seat");
+    assert!(
+        client.has_data_device(),
+        "data device created from manager + seat"
+    );
 }
 
 /// The core interop claim: a text payload one client copies via `wl_data_device`
@@ -318,7 +349,10 @@ fn primary_selection_transfers_between_two_clients() {
     let mut _vk = VirtualKeyboardClient::spawn(&comp.socket);
 
     let mut a = TestClient::map_toplevel(&comp.socket, "owner.app", "owner");
-    assert!(a.wait_until(|c| c.has_input_serial()), "owner got no serial");
+    assert!(
+        a.wait_until(|c| c.has_input_serial()),
+        "owner got no serial"
+    );
     a.set_primary_text("text/plain;charset=utf-8", b"primary-payload");
 
     let mut b = TestClient::map_toplevel(&comp.socket, "reader.app", "reader");
@@ -346,8 +380,11 @@ fn a_real_client_maps_and_appears_in_the_model() {
         "no configure arrived"
     );
 
-    let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.app"));
-    let Event::WindowOpened(info) = opened else { unreachable!() };
+    let opened =
+        comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.app"));
+    let Event::WindowOpened(info) = opened else {
+        unreachable!()
+    };
     assert_eq!(info.title, "first window");
 
     let snapshot = comp.snapshot();
@@ -373,7 +410,9 @@ fn closing_from_the_model_reaches_the_client() {
     let mut client = TestClient::map_toplevel(&comp.socket, "harness.close", "doomed");
 
     let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(_)));
-    let Event::WindowOpened(info) = opened else { unreachable!() };
+    let Event::WindowOpened(info) = opened else {
+        unreachable!()
+    };
 
     comp.send(icedtea_compositor::dbus::DbCommand::Close(info.id));
     assert!(
@@ -387,7 +426,9 @@ fn closing_from_the_model_reaches_the_client() {
     // that decides.
     client.detach();
     let closed = comp.wait_event(|e| matches!(e, Event::WindowClosed(id) if *id == info.id));
-    let Event::WindowClosed(_) = closed else { unreachable!() };
+    let Event::WindowClosed(_) = closed else {
+        unreachable!()
+    };
     assert!(comp.snapshot().windows.is_empty());
 }
 
@@ -397,8 +438,11 @@ fn closing_from_the_model_reaches_the_client() {
 fn a_title_change_from_the_client_reaches_the_model() {
     let comp = Compositor::spawn();
     let mut client = TestClient::map_toplevel(&comp.socket, "harness.title", "before");
-    let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.title"));
-    let Event::WindowOpened(info) = opened else { unreachable!() };
+    let opened =
+        comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.title"));
+    let Event::WindowOpened(info) = opened else {
+        unreachable!()
+    };
     assert_eq!(info.title, "before");
 
     client.set_title("after");
@@ -406,7 +450,9 @@ fn a_title_change_from_the_client_reaches_the_model() {
         matches!(e, Event::WindowUpdated { id, update }
             if *id == info.id && update.title.as_deref() == Some("after"))
     });
-    let Event::WindowUpdated { .. } = updated else { unreachable!() };
+    let Event::WindowUpdated { .. } = updated else {
+        unreachable!()
+    };
 
     let snapshot = comp.snapshot();
     assert_eq!(snapshot.windows.len(), 1);
@@ -426,8 +472,11 @@ fn a_model_side_maximize_reaches_the_client_as_a_configure_state() {
 
     let comp = Compositor::spawn();
     let mut client = TestClient::map_toplevel(&comp.socket, "harness.max", "maximize me");
-    let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.max"));
-    let Event::WindowOpened(info) = opened else { unreachable!() };
+    let opened =
+        comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.max"));
+    let Event::WindowOpened(info) = opened else {
+        unreachable!()
+    };
     assert!(
         !client.states().contains(&MAXIMIZED),
         "a freshly mapped window is not maximized"
@@ -453,7 +502,9 @@ fn a_model_side_maximize_reaches_the_client_as_a_configure_state() {
         "the model must record the maximize it configured the client with"
     );
 
-    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(info.id, false));
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(
+        info.id, false,
+    ));
     assert!(
         client.wait_until(|c| !c.states().contains(&MAXIMIZED)),
         "client never got a configure clearing the maximized state"
@@ -469,22 +520,34 @@ fn a_model_side_maximize_reaches_the_client_as_a_configure_state() {
 fn destroying_one_of_two_clients_leaves_the_other() {
     let comp = Compositor::spawn();
     let first = TestClient::map_toplevel(&comp.socket, "harness.one", "one");
-    let opened_one = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.one"));
-    let Event::WindowOpened(one) = opened_one else { unreachable!() };
+    let opened_one =
+        comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.one"));
+    let Event::WindowOpened(one) = opened_one else {
+        unreachable!()
+    };
 
     let second = TestClient::map_toplevel(&comp.socket, "harness.two", "two");
-    let opened_two = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.two"));
-    let Event::WindowOpened(two) = opened_two else { unreachable!() };
+    let opened_two =
+        comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "harness.two"));
+    let Event::WindowOpened(two) = opened_two else {
+        unreachable!()
+    };
     assert_ne!(one.id, two.id);
 
     assert_eq!(comp.snapshot().windows.len(), 2);
 
     first.detach();
     let closed = comp.wait_event(|e| matches!(e, Event::WindowClosed(id) if *id == one.id));
-    let Event::WindowClosed(_) = closed else { unreachable!() };
+    let Event::WindowClosed(_) = closed else {
+        unreachable!()
+    };
 
     let snapshot = comp.snapshot();
-    assert_eq!(snapshot.windows.len(), 1, "only the destroyed window went away");
+    assert_eq!(
+        snapshot.windows.len(),
+        1,
+        "only the destroyed window went away"
+    );
     assert_eq!(snapshot.windows[0].id, two.id);
 
     second.detach();
@@ -501,7 +564,10 @@ fn a_client_maximize_request_round_trips_through_the_compositor() {
     let mut client = TestClient::map_toplevel(&comp.socket, "harness.max", "maxi");
     client.request_maximize(true);
     // xdg_toplevel state 1 == maximized (xdg-shell spec numeric value).
-    assert!(client.wait_until(|c| c.states().contains(&1)), "client never saw the maximized state in a configure");
+    assert!(
+        client.wait_until(|c| c.states().contains(&1)),
+        "client never saw the maximized state in a configure"
+    );
     let snap = comp.snapshot();
     assert!(snap.windows.iter().any(|w| w.maximized), "model must agree");
     client.detach();
@@ -519,10 +585,16 @@ fn an_unhonored_request_still_gets_a_configure() {
     let comp = Compositor::spawn();
     let mut client = TestClient::map_toplevel(&comp.socket, "harness.fs", "fs");
     client.request_fullscreen(true);
-    assert!(client.wait_until(|c| c.states().contains(&2)), "fullscreen state expected"); // 2 == fullscreen
+    assert!(
+        client.wait_until(|c| c.states().contains(&2)),
+        "fullscreen state expected"
+    ); // 2 == fullscreen
     let before = client.configure_count();
     client.request_fullscreen(true); // redundant: already fullscreen
-    assert!(client.wait_until(|c| c.configure_count() > before), "no answer to the redundant request");
+    assert!(
+        client.wait_until(|c| c.configure_count() > before),
+        "no answer to the redundant request"
+    );
     client.detach();
 }
 
@@ -543,7 +615,10 @@ fn ssd_is_negotiated_for_a_client_that_defers() {
     let comp = Compositor::spawn();
     let mut client = TestClient::map_decorated_toplevel(&comp.socket, "harness.ssd", "decorated");
     // 2 == server_side in zxdg_toplevel_decoration_v1.
-    assert!(client.wait_until(|c| c.decoration_mode() == Some(2)), "server-side expected");
+    assert!(
+        client.wait_until(|c| c.decoration_mode() == Some(2)),
+        "server-side expected"
+    );
 
     // And the band is really reserved: an SSD window's client is configured
     // at the frame height minus the title bar, never at the whole frame.
@@ -570,7 +645,10 @@ fn ssd_is_negotiated_for_a_client_that_defers() {
     // must take the new title and the client must survive it.
     client.set_title("renamed");
     comp.wait_event(|e| matches!(e, Event::WindowUpdated { update, .. } if update.title.as_deref() == Some("renamed")));
-    assert!(client.wait_until(|c| !c.closed()), "the client must still be alive");
+    assert!(
+        client.wait_until(|c| !c.closed()),
+        "the client must still be alive"
+    );
 
     client.detach();
 }
@@ -582,9 +660,13 @@ fn ssd_is_negotiated_for_a_client_that_defers() {
 #[test]
 fn csd_is_negotiated_for_a_client_that_draws_its_own() {
     let comp = Compositor::spawn();
-    let mut client = TestClient::map_decorated_toplevel(&comp.socket, "org.gtk.Harness", "own frame");
+    let mut client =
+        TestClient::map_decorated_toplevel(&comp.socket, "org.gtk.Harness", "own frame");
     // 1 == client_side.
-    assert!(client.wait_until(|c| c.decoration_mode() == Some(1)), "client-side expected");
+    assert!(
+        client.wait_until(|c| c.decoration_mode() == Some(1)),
+        "client-side expected"
+    );
 
     let snap = comp.snapshot();
     let frame = snap.windows.first().expect("one mapped window").geometry;
@@ -619,12 +701,17 @@ fn an_unmapping_client_releases_focus_and_alt_tab() {
         "focus must return to the surviving client"
     );
     let snap = comp.snapshot();
-    assert!(snap.windows.iter().any(|w| w.title == "goes"), "row survives the unmap");
+    assert!(
+        snap.windows.iter().any(|w| w.title == "goes"),
+        "row survives the unmap"
+    );
 
     // Task 9: the unmap's `WindowUpdated` must carry `mapped: Some(false)`
     // so a D-Bus subscriber can observe the transition without polling
     // `GetState`.
-    comp.wait_event(|e| matches!(e, Event::WindowUpdated { update, .. } if update.mapped == Some(false)));
+    comp.wait_event(
+        |e| matches!(e, Event::WindowUpdated { update, .. } if update.mapped == Some(false)),
+    );
 
     first.detach();
     second.detach();
@@ -649,9 +736,15 @@ fn an_unmapping_client_releases_focus_and_alt_tab() {
 fn a_layer_panel_gets_configured_and_carves_the_workspace() {
     let comp = Compositor::spawn();
     let mut panel = TestClient::map_layer_panel(&comp.socket, 30);
-    assert!(panel.wait_until(|c| c.layer_configure().is_some()), "panel must be configured");
+    assert!(
+        panel.wait_until(|c| c.layer_configure().is_some()),
+        "panel must be configured"
+    );
     let (w, h) = panel.layer_configure().expect("size");
-    assert!(w > 0 && h == 30, "panel must span the output's width at its 30px exclusive thickness, got {w}x{h}");
+    assert!(
+        w > 0 && h == 30,
+        "panel must span the output's width at its 30px exclusive thickness, got {w}x{h}"
+    );
 
     let mut win = TestClient::map_toplevel(&comp.socket, "harness.tiled", "t");
     let id = comp.snapshot().windows[0].id;
@@ -679,7 +772,10 @@ fn a_layer_panel_gets_configured_and_carves_the_workspace() {
 fn unmapping_a_layer_panel_gives_the_usable_area_back() {
     let comp = Compositor::spawn();
     let mut panel = TestClient::map_layer_panel(&comp.socket, 30);
-    assert!(panel.wait_until(|c| c.layer_configure().is_some()), "panel must be configured");
+    assert!(
+        panel.wait_until(|c| c.layer_configure().is_some()),
+        "panel must be configured"
+    );
 
     let mut win = TestClient::map_toplevel(&comp.socket, "harness.tiled", "t");
     let id = comp.snapshot().windows[0].id;
@@ -693,7 +789,9 @@ fn unmapping_a_layer_panel_gives_the_usable_area_back() {
     let n = win.configure_count();
     panel.unmap();
     assert!(
-        win.wait_until(|c| c.configure_count() > n && c.last_configure().map(|(_, h)| h) == Some(676)),
+        win.wait_until(
+            |c| c.configure_count() > n && c.last_configure().map(|(_, h)| h) == Some(676)
+        ),
         "maximized height must exclude nothing once the panel unmaps, last configure: {:?}",
         win.last_configure()
     );
@@ -725,7 +823,10 @@ fn unmapping_a_layer_panel_gives_the_usable_area_back() {
 fn a_remapped_layer_panel_is_configured_again_and_re_carves_the_workspace() {
     let comp = Compositor::spawn();
     let mut panel = TestClient::map_layer_panel(&comp.socket, 30);
-    assert!(panel.wait_until(|c| c.layer_configure().is_some()), "panel must be configured");
+    assert!(
+        panel.wait_until(|c| c.layer_configure().is_some()),
+        "panel must be configured"
+    );
 
     let mut win = TestClient::map_toplevel(&comp.socket, "harness.tiled", "t");
     let id = comp.snapshot().windows[0].id;
@@ -739,7 +840,9 @@ fn a_remapped_layer_panel_is_configured_again_and_re_carves_the_workspace() {
     let n = win.configure_count();
     panel.unmap();
     assert!(
-        win.wait_until(|c| c.configure_count() > n && c.last_configure().map(|(_, h)| h) == Some(676)),
+        win.wait_until(
+            |c| c.configure_count() > n && c.last_configure().map(|(_, h)| h) == Some(676)
+        ),
         "the unmap must give the zone back first, last configure: {:?}",
         win.last_configure()
     );
@@ -757,7 +860,9 @@ fn a_remapped_layer_panel_is_configured_again_and_re_carves_the_workspace() {
 
     let n = win.configure_count();
     assert!(
-        win.wait_until(|c| c.configure_count() > n && c.last_configure().map(|(_, h)| h) == Some(646)),
+        win.wait_until(
+            |c| c.configure_count() > n && c.last_configure().map(|(_, h)| h) == Some(646)
+        ),
         "the remapped panel must carve its zone again, last configure: {:?}",
         win.last_configure()
     );
@@ -790,22 +895,34 @@ fn a_pointer_drag_transfers_between_two_clients() {
     // A maps; this is both the drag source and how the output's size gets
     // discovered (see the function doc).
     let mut a = TestClient::map_toplevel(&comp.socket, "src.app", "src");
-    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "A never configured"
+    );
     let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "src.app"));
-    let Event::WindowOpened(a_info) = opened else { unreachable!() };
+    let Event::WindowOpened(a_info) = opened else {
+        unreachable!()
+    };
 
     let configures = a.configure_count();
-    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, true));
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(
+        a_info.id, true,
+    ));
     assert!(
         a.wait_until(|c| c.configure_count() > configures && c.states().contains(&MAXIMIZED)),
         "A never maximized"
     );
     let output = comp.snapshot().windows[0].geometry;
     let (x_extent, y_extent) = (output.width as u32, output.height as u32);
-    assert!(x_extent > 0 && y_extent > 0, "output geometry must be real, got {output:?}");
+    assert!(
+        x_extent > 0 && y_extent > 0,
+        "output geometry must be real, got {output:?}"
+    );
 
     let configures = a.configure_count();
-    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, false));
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(
+        a_info.id, false,
+    ));
     assert!(
         a.wait_until(|c| c.configure_count() > configures && !c.states().contains(&MAXIMIZED)),
         "A never unmaximized"
@@ -824,14 +941,20 @@ fn a_pointer_drag_transfers_between_two_clients() {
     vp.frame();
     vp.button(BTN_LEFT, true);
     vp.frame();
-    assert!(a.wait_until(|c| c.last_pointer_serial().is_some()), "A never got a pointer serial");
+    assert!(
+        a.wait_until(|c| c.last_pointer_serial().is_some()),
+        "A never got a pointer serial"
+    );
 
     let serial = a.last_pointer_serial().expect("just asserted this is Some");
     a.start_drag_text("text/plain;charset=utf-8", b"dragged", serial);
 
     // B maps after the drag has started -- exactly the skeleton's ordering.
     let mut b = TestClient::map_toplevel(&comp.socket, "dst.app", "dst");
-    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+    assert!(
+        b.wait_until(|c| c.last_configure().is_some()),
+        "B never configured"
+    );
     let b_geo = comp
         .snapshot()
         .windows
@@ -847,7 +970,10 @@ fn a_pointer_drag_transfers_between_two_clients() {
     // Move over B and release to drop.
     vp.motion_absolute(bx, by, x_extent, y_extent);
     vp.frame();
-    assert!(b.wait_until(|c| c.has_drag_offer()), "destination never got the drag enter");
+    assert!(
+        b.wait_until(|c| c.has_drag_offer()),
+        "destination never got the drag enter"
+    );
     // `wait_until` returns the moment its predicate holds, which can be
     // right after dispatching the very event whose handler just queued
     // B's `accept`/`set_actions` requests -- those sit unflushed until the
@@ -856,7 +982,10 @@ fn a_pointer_drag_transfers_between_two_clients() {
     b.pump();
     vp.button(BTN_LEFT, false);
     vp.frame();
-    assert!(b.wait_until(|c| c.got_drop()), "destination never got the drop");
+    assert!(
+        b.wait_until(|c| c.got_drop()),
+        "destination never got the drop"
+    );
 
     assert_eq!(
         icedtea_harness::read_drag_offer(&mut b, &mut a, "text/plain;charset=utf-8"),
@@ -883,21 +1012,35 @@ fn a_touch_drag_transfers_between_two_clients() {
 
     // A maps; this is both the drag source and where the touch-down lands.
     let mut a = TestClient::map_toplevel(&comp.socket, "src.app", "src");
-    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "A never configured"
+    );
     let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "src.app"));
-    let Event::WindowOpened(_a_info) = opened else { unreachable!() };
+    let Event::WindowOpened(_a_info) = opened else {
+        unreachable!()
+    };
 
     let a_geo = comp.snapshot().windows[0].geometry;
-    let (ax, ay) = ((a_geo.x + a_geo.width / 2) as f64, (a_geo.y + a_geo.height / 2) as f64);
+    let (ax, ay) = (
+        (a_geo.x + a_geo.width / 2) as f64,
+        (a_geo.y + a_geo.height / 2) as f64,
+    );
 
     // Touch down over A mints the touch grab serial directly.
     let serial = comp.inject_touch_down(ax, ay, 0, 1);
-    assert!(serial.is_some(), "touch-down over A never minted a grab serial");
+    assert!(
+        serial.is_some(),
+        "touch-down over A never minted a grab serial"
+    );
     a.start_drag_text("text/plain;charset=utf-8", b"dragged", serial.unwrap());
 
     // B maps after the drag has started -- same ordering as the pointer test.
     let mut b = TestClient::map_toplevel(&comp.socket, "dst.app", "dst");
-    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+    assert!(
+        b.wait_until(|c| c.last_configure().is_some()),
+        "B never configured"
+    );
     let b_geo = comp
         .snapshot()
         .windows
@@ -905,18 +1048,27 @@ fn a_touch_drag_transfers_between_two_clients() {
         .find(|w| w.app_id == "dst.app")
         .expect("B must be in the model once mapped")
         .geometry;
-    let (bx, by) = ((b_geo.x + b_geo.width / 2) as f64, (b_geo.y + b_geo.height / 2) as f64);
+    let (bx, by) = (
+        (b_geo.x + b_geo.width / 2) as f64,
+        (b_geo.y + b_geo.height / 2) as f64,
+    );
 
     // Move the touch point over B and lift to drop.
     comp.inject_touch_motion(bx, by, 0, 2);
-    assert!(b.wait_until(|c| c.has_drag_offer()), "destination never got the drag enter");
+    assert!(
+        b.wait_until(|c| c.has_drag_offer()),
+        "destination never got the drag enter"
+    );
     // Same flush gotcha as the pointer test: `wait_until` can return right
     // after dispatching the event whose handler just queued B's
     // `accept`/`set_actions` requests -- pump once more so those flush
     // before the touch-up ends the drag.
     b.pump();
     comp.inject_touch_up(0, 3);
-    assert!(b.wait_until(|c| c.got_drop()), "destination never got the drop");
+    assert!(
+        b.wait_until(|c| c.got_drop()),
+        "destination never got the drop"
+    );
 
     assert_eq!(
         icedtea_harness::read_drag_offer(&mut b, &mut a, "text/plain;charset=utf-8"),
@@ -975,22 +1127,34 @@ fn a_drag_with_an_invalid_grab_serial_is_refused() {
     // A maps; this is both the drag source and how the output's size gets
     // discovered (see the function doc).
     let mut a = TestClient::map_toplevel(&comp.socket, "src.app", "src");
-    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "A never configured"
+    );
     let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "src.app"));
-    let Event::WindowOpened(a_info) = opened else { unreachable!() };
+    let Event::WindowOpened(a_info) = opened else {
+        unreachable!()
+    };
 
     let configures = a.configure_count();
-    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, true));
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(
+        a_info.id, true,
+    ));
     assert!(
         a.wait_until(|c| c.configure_count() > configures && c.states().contains(&MAXIMIZED)),
         "A never maximized"
     );
     let output = comp.snapshot().windows[0].geometry;
     let (x_extent, y_extent) = (output.width as u32, output.height as u32);
-    assert!(x_extent > 0 && y_extent > 0, "output geometry must be real, got {output:?}");
+    assert!(
+        x_extent > 0 && y_extent > 0,
+        "output geometry must be real, got {output:?}"
+    );
 
     let configures = a.configure_count();
-    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, false));
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(
+        a_info.id, false,
+    ));
     assert!(
         a.wait_until(|c| c.configure_count() > configures && !c.states().contains(&MAXIMIZED)),
         "A never unmaximized"
@@ -1011,7 +1175,10 @@ fn a_drag_with_an_invalid_grab_serial_is_refused() {
     vp.frame();
     vp.button(BTN_LEFT, true);
     vp.frame();
-    assert!(a.wait_until(|c| c.last_pointer_serial().is_some()), "A never got a pointer serial");
+    assert!(
+        a.wait_until(|c| c.last_pointer_serial().is_some()),
+        "A never got a pointer serial"
+    );
 
     let real_serial = a.last_pointer_serial().expect("just asserted this is Some");
     // wrapping_add: a fresh test compositor's serial counter is nowhere near
@@ -1023,7 +1190,10 @@ fn a_drag_with_an_invalid_grab_serial_is_refused() {
     // positive test, so B is exactly as reachable as it would be had the
     // drag actually succeeded.
     let mut b = TestClient::map_toplevel(&comp.socket, "dst.app", "dst");
-    assert!(b.wait_until(|c| c.last_configure().is_some()), "B never configured");
+    assert!(
+        b.wait_until(|c| c.last_configure().is_some()),
+        "B never configured"
+    );
     let b_geo = comp
         .snapshot()
         .windows
@@ -1184,19 +1354,28 @@ fn a_pointer_drag_renders_and_follows_its_icon() {
     // below is [`OUTPUT_W`]/[`OUTPUT_H`], not derived from this maximized
     // query (see that constant's own doc for why).
     let mut a = TestClient::map_toplevel(&comp.socket, "src.app", "src");
-    assert!(a.wait_until(|c| c.last_configure().is_some()), "A never configured");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "A never configured"
+    );
     let opened = comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "src.app"));
-    let Event::WindowOpened(a_info) = opened else { unreachable!() };
+    let Event::WindowOpened(a_info) = opened else {
+        unreachable!()
+    };
 
     let configures = a.configure_count();
-    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, true));
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(
+        a_info.id, true,
+    ));
     assert!(
         a.wait_until(|c| c.configure_count() > configures && c.states().contains(&MAXIMIZED)),
         "A never maximized"
     );
 
     let configures = a.configure_count();
-    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(a_info.id, false));
+    comp.send(icedtea_compositor::dbus::DbCommand::Maximize(
+        a_info.id, false,
+    ));
     assert!(
         a.wait_until(|c| c.configure_count() > configures && !c.states().contains(&MAXIMIZED)),
         "A never unmaximized"
@@ -1216,10 +1395,19 @@ fn a_pointer_drag_renders_and_follows_its_icon() {
     vp.button(BTN_LEFT, true);
     vp.frame();
     vp.pump();
-    assert!(a.wait_until(|c| c.last_pointer_serial().is_some()), "A never got a pointer serial");
+    assert!(
+        a.wait_until(|c| c.last_pointer_serial().is_some()),
+        "A never got a pointer serial"
+    );
 
     let serial = a.last_pointer_serial().expect("just asserted this is Some");
-    a.start_drag_text_with_icon("text/plain;charset=utf-8", b"dragged", serial, ICON_SIZE, ICON_SIZE);
+    a.start_drag_text_with_icon(
+        "text/plain;charset=utf-8",
+        b"dragged",
+        serial,
+        ICON_SIZE,
+        ICON_SIZE,
+    );
 
     // Criterion 4a -- RENDERS: the icon's committed buffer must have
     // produced a live scene node with real layout coordinates. At this
@@ -1246,7 +1434,10 @@ fn a_pointer_drag_renders_and_follows_its_icon() {
         (a_geo.x + 3 * a_geo.width / 4) as f64,
         (a_geo.y + 3 * a_geo.height / 4) as f64,
     );
-    assert!((m2x - m1x).abs() > 1.0 || (m2y - m1y).abs() > 1.0, "M1 -> M2 must have a real delta");
+    assert!(
+        (m2x - m1x).abs() > 1.0 || (m2y - m1y).abs() > 1.0,
+        "M1 -> M2 must have a real delta"
+    );
 
     // First post-drag motion, to M1. `wlr::Runtime`'s `on_pointer_motion*`
     // sets the icon tree's scene position to the live cursor layout
@@ -1276,12 +1467,16 @@ fn a_pointer_drag_renders_and_follows_its_icon() {
     // Criterion 4b -- FOLLOWS: the icon's position moved between the two
     // post-drag motions, by (within 1px rounding) exactly the pointer's own
     // delta between those same two motions.
-    assert_ne!(p2, p1, "the drag icon never moved between M1 and M2 -- it is not following the pointer");
+    assert_ne!(
+        p2, p1,
+        "the drag icon never moved between M1 and M2 -- it is not following the pointer"
+    );
 
     let observed_delta = (p2.0 - p1.0, p2.1 - p1.1);
     let expected_delta = ((m2x - m1x).round() as i32, (m2y - m1y).round() as i32);
     assert!(
-        (observed_delta.0 - expected_delta.0).abs() <= 1 && (observed_delta.1 - expected_delta.1).abs() <= 1,
+        (observed_delta.0 - expected_delta.0).abs() <= 1
+            && (observed_delta.1 - expected_delta.1).abs() <= 1,
         "icon delta {observed_delta:?} does not match pointer delta {expected_delta:?} \
          (p1={p1:?}, p2={p2:?}, M1=({m1x},{m1y}), M2=({m2x},{m2y}))"
     );
@@ -1300,7 +1495,10 @@ fn screencopy_captures_the_output() {
     let comp = Compositor::spawn();
     let mut sc = icedtea_harness::ScreencopyClient::spawn(&comp.socket);
     let frame = sc.capture();
-    assert!(frame.width > 0 && frame.height > 0, "empty capture geometry");
+    assert!(
+        frame.width > 0 && frame.height > 0,
+        "empty capture geometry"
+    );
     assert_eq!(frame.bytes.len(), (frame.stride * frame.height) as usize);
 }
 
@@ -1335,7 +1533,9 @@ fn screencopy_of_empty_output_is_the_wallpaper_color() {
         wayland_client::protocol::wl_shm::Format::Xrgb8888
         | wayland_client::protocol::wl_shm::Format::Argb8888 => (4usize, [2, 1, 0]),
         wayland_client::protocol::wl_shm::Format::Bgr888 => (3usize, [0, 1, 2]),
-        other => panic!("unexpected screencopy shm format {other:?}; byte order assumption may not hold"),
+        other => {
+            panic!("unexpected screencopy shm format {other:?}; byte order assumption may not hold")
+        }
     };
 
     let [r, g, b, _a] =
@@ -1361,7 +1561,10 @@ fn screencopy_of_empty_output_is_the_wallpaper_color() {
             }
         }
     }
-    assert!(uniform, "capture is not a uniform color; a cleared/garbage buffer");
+    assert!(
+        uniform,
+        "capture is not a uniform color; a cleared/garbage buffer"
+    );
     let (pr, pg, pb) = first.expect("no pixels");
     assert!((pr as i32 - er).abs() <= 2, "R {pr} vs {er}");
     assert!((pg as i32 - eg).abs() <= 2, "G {pg} vs {eg}");
@@ -1403,11 +1606,18 @@ fn screencopy_reflects_a_mapped_toplevel() {
             let grey = (c0 as i32 - 0x80).abs() <= 2
                 && (c1 as i32 - 0x80).abs() <= 2
                 && (c2 as i32 - 0x80).abs() <= 2;
-            if grey { saw_grey = true } else { saw_non_grey = true }
+            if grey {
+                saw_grey = true
+            } else {
+                saw_non_grey = true
+            }
         }
     }
     assert!(saw_grey, "toplevel grey (0x80) not present in the capture");
-    assert!(saw_non_grey, "capture is uniform; toplevel not composited over wallpaper");
+    assert!(
+        saw_non_grey,
+        "capture is uniform; toplevel not composited over wallpaper"
+    );
 }
 
 /// M4.4 Criterion 2: a session lock reaches `locked`, isolates input from
@@ -1429,7 +1639,10 @@ fn session_lock_locks_isolates_input_and_unlocks() {
     let mut vk = VirtualKeyboardClient::spawn(&comp.socket);
     // A normal toplevel, focused before the lock.
     let mut app = TestClient::map_toplevel(&comp.socket, "app", "app");
-    assert!(app.wait_until(|c| c.has_input_serial()), "app focused pre-lock");
+    assert!(
+        app.wait_until(|c| c.has_input_serial()),
+        "app focused pre-lock"
+    );
 
     // Baseline: prove key delivery actually works before the lock exists,
     // so the later "no delivery while locked" assertion cannot be vacuous.
@@ -1444,7 +1657,10 @@ fn session_lock_locks_isolates_input_and_unlocks() {
     let mut locker = SessionLockClient::spawn(&comp.socket);
     locker.lock();
     assert!(locker.wait_locked(), "session never reported locked");
-    assert!(comp.session_locked(), "compositor is_session_locked() is false");
+    assert!(
+        comp.session_locked(),
+        "compositor is_session_locked() is false"
+    );
 
     // While locked, inject another key. The normal app must not receive it:
     // pump the app's queue for a bounded window and assert its key count
@@ -1592,7 +1808,10 @@ fn idle_inhibit_suppresses_idle_until_destroyed() {
     assert!(!idle.idled_within(300), "idled despite an active inhibitor");
     inhibit.destroy_inhibitor();
     idle.notification(50);
-    assert!(idle.wait_idled(), "idle did not resume after inhibitor destroyed");
+    assert!(
+        idle.wait_idled(),
+        "idle did not resume after inhibitor destroyed"
+    );
 }
 
 /// M4.5 Criterion 2: a locked pointer freezes the cursor and the client
@@ -1627,7 +1846,9 @@ fn a_locked_pointer_freezes_the_cursor_and_delivers_relative_motion() {
     let opened = comp.wait_event(
         |e| matches!(e, Event::WindowOpened(w) if w.app_id == "icedtea-harness-pointer-constraints"),
     );
-    let Event::WindowOpened(pc_info) = opened else { unreachable!() };
+    let Event::WindowOpened(pc_info) = opened else {
+        unreachable!()
+    };
     let pc_geo = comp
         .snapshot()
         .windows
@@ -1651,7 +1872,11 @@ fn a_locked_pointer_freezes_the_cursor_and_delivers_relative_motion() {
     vp.motion(20.0, 20.0);
     vp.frame();
     vp.pump();
-    assert_ne!(comp.cursor_position(), before, "baseline: cursor should move unconstrained");
+    assert_ne!(
+        comp.cursor_position(),
+        before,
+        "baseline: cursor should move unconstrained"
+    );
 
     // Lock, then PRIME activation (see this test's own doc), then measure.
     pc.lock_pointer();
@@ -1675,7 +1900,11 @@ fn a_locked_pointer_freezes_the_cursor_and_delivers_relative_motion() {
     vp.frame();
     vp.pump();
     pc.pump();
-    assert_eq!(comp.cursor_position(), locked_pos, "locked: cursor must not move once active");
+    assert_eq!(
+        comp.cursor_position(),
+        locked_pos,
+        "locked: cursor must not move once active"
+    );
     assert!(
         pc.relative_motion_events() > events_before_freeze,
         "locked: client received no relative motion event while frozen"
@@ -1707,7 +1936,9 @@ fn a_locked_pointer_only_activates_once_its_surface_has_focus() {
     let opened = comp.wait_event(
         |e| matches!(e, Event::WindowOpened(w) if w.app_id == "icedtea-harness-pointer-constraints"),
     );
-    let Event::WindowOpened(pc_info) = opened else { unreachable!() };
+    let Event::WindowOpened(pc_info) = opened else {
+        unreachable!()
+    };
     let pc_geo = comp
         .snapshot()
         .windows
@@ -1744,7 +1975,11 @@ fn a_locked_pointer_only_activates_once_its_surface_has_focus() {
     vp.motion(15.0, 15.0);
     vp.frame();
     vp.pump();
-    assert_ne!(comp.cursor_position(), before, "unfocused lock must not freeze the cursor");
+    assert_ne!(
+        comp.cursor_position(),
+        before,
+        "unfocused lock must not freeze the cursor"
+    );
 
     // Move onto pc's surface: this both moves the cursor there (activation
     // happens *after* the move, per the freeze test's activation-ordering
@@ -1761,7 +1996,11 @@ fn a_locked_pointer_only_activates_once_its_surface_has_focus() {
     vp.frame();
     vp.pump();
     pc.pump();
-    assert_eq!(comp.cursor_position(), locked_pos, "focused+active: cursor must not move");
+    assert_eq!(
+        comp.cursor_position(),
+        locked_pos,
+        "focused+active: cursor must not move"
+    );
     assert!(
         pc.relative_motion_events() > events_before_freeze,
         "focused+active: client received no relative motion while frozen"
@@ -1774,7 +2013,9 @@ fn pc_window_geometry(comp: &Compositor) -> Rectangle {
     let opened = comp.wait_event(
         |e| matches!(e, Event::WindowOpened(w) if w.app_id == "icedtea-harness-pointer-constraints"),
     );
-    let Event::WindowOpened(pc_info) = opened else { unreachable!() };
+    let Event::WindowOpened(pc_info) = opened else {
+        unreachable!()
+    };
     comp.snapshot()
         .windows
         .iter()
@@ -1849,8 +2090,12 @@ fn a_confined_pointer_clamps_the_cursor_to_its_region() {
     // A small confine region well inside the surface, in surface-local
     // coordinates, sized off the surface's own geometry rather than a
     // hardcoded guess.
-    let (rx, ry, rw, rh) =
-        (pc_geo.width / 10, pc_geo.height / 10, pc_geo.width / 5, pc_geo.height / 5);
+    let (rx, ry, rw, rh) = (
+        pc_geo.width / 10,
+        pc_geo.height / 10,
+        pc_geo.width / 5,
+        pc_geo.height / 5,
+    );
     let region_right = (pc_geo.x + rx + rw) as f64;
 
     // Pointer starts at the region's center.
@@ -1928,12 +2173,24 @@ fn a_confined_pointer_reanchors_when_the_region_moves_off_the_cursor() {
     // region B (away from the cursor) in the bottom-right -- both sized
     // and positioned off the surface's own geometry so neither overlaps
     // nor spills outside it.
-    let (ax, ay, aw, ah) =
-        (pc_geo.width / 10, pc_geo.height / 10, pc_geo.width / 5, pc_geo.height / 5);
-    let (bx, by, bw, bh) =
-        (pc_geo.width * 6 / 10, pc_geo.height * 6 / 10, pc_geo.width / 5, pc_geo.height / 5);
-    let region_b_layout =
-        Rectangle { x: pc_geo.x + bx, y: pc_geo.y + by, width: bw, height: bh };
+    let (ax, ay, aw, ah) = (
+        pc_geo.width / 10,
+        pc_geo.height / 10,
+        pc_geo.width / 5,
+        pc_geo.height / 5,
+    );
+    let (bx, by, bw, bh) = (
+        pc_geo.width * 6 / 10,
+        pc_geo.height * 6 / 10,
+        pc_geo.width / 5,
+        pc_geo.height / 5,
+    );
+    let region_b_layout = Rectangle {
+        x: pc_geo.x + bx,
+        y: pc_geo.y + by,
+        width: bw,
+        height: bh,
+    };
 
     let (px, py) = pc_focus_target(pc_geo, ax + aw / 2, ay + ah / 2);
     vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
@@ -1967,7 +2224,11 @@ fn a_confined_pointer_reanchors_when_the_region_moves_off_the_cursor() {
     vp.frame();
     vp.pump();
     pc.pump();
-    assert_ne!(comp.cursor_position(), before, "cursor wedged after region moved (confine freeze)");
+    assert_ne!(
+        comp.cursor_position(),
+        before,
+        "cursor wedged after region moved (confine freeze)"
+    );
 }
 
 /// M4.5: a two-rectangle confine region with a gap between the rects,
@@ -2013,10 +2274,18 @@ fn a_confined_pointer_reanchors_out_of_a_region_hole() {
     // focus hazard `pc_focus_target` documents, no clamping needed.
     let rect_a = (0, 5, 50, 50);
     let rect_b = (100, 5, 50, 50);
-    let rect_a_layout =
-        Rectangle { x: pc_geo.x + rect_a.0, y: pc_geo.y + rect_a.1, width: rect_a.2, height: rect_a.3 };
-    let rect_b_layout =
-        Rectangle { x: pc_geo.x + rect_b.0, y: pc_geo.y + rect_b.1, width: rect_b.2, height: rect_b.3 };
+    let rect_a_layout = Rectangle {
+        x: pc_geo.x + rect_a.0,
+        y: pc_geo.y + rect_a.1,
+        width: rect_a.2,
+        height: rect_a.3,
+    };
+    let rect_b_layout = Rectangle {
+        x: pc_geo.x + rect_b.0,
+        y: pc_geo.y + rect_b.1,
+        width: rect_b.2,
+        height: rect_b.3,
+    };
 
     // The gap's center: inside the extents bounding box (0,5,150,50) but
     // outside both rects.
@@ -2073,5 +2342,9 @@ fn a_confined_pointer_reanchors_out_of_a_region_hole() {
     vp.frame();
     vp.pump();
     pc.pump();
-    assert_ne!(comp.cursor_position(), before, "cursor wedged in the region hole (confine freeze)");
+    assert_ne!(
+        comp.cursor_position(),
+        before,
+        "cursor wedged in the region hole (confine freeze)"
+    );
 }

@@ -28,7 +28,11 @@ pub struct History {
 
 impl History {
     pub fn new(max: usize) -> Self {
-        History { items: Vec::new(), max, next_id: 1 }
+        History {
+            items: Vec::new(),
+            max,
+            next_id: 1,
+        }
     }
 
     /// Record a fresh capture. A byte-identical repeat of the newest unpinned
@@ -59,7 +63,14 @@ impl History {
         };
         // Insert at the front of the unpinned block (just after the pinned one).
         let insert_at = self.items.iter().take_while(|i| i.entry.pinned).count();
-        self.items.insert(insert_at, Item { entry, mime, bytes: bytes.to_vec() });
+        self.items.insert(
+            insert_at,
+            Item {
+                entry,
+                mime,
+                bytes: bytes.to_vec(),
+            },
+        );
         self.evict();
         Change::Changed
     }
@@ -116,7 +127,10 @@ impl History {
 
     /// The stored `(mime, payload)` for a re-paste, or `None` if `id` is gone.
     pub fn bytes_for(&self, id: u64) -> Option<(String, Vec<u8>)> {
-        self.items.iter().find(|i| i.entry.id == id).map(|i| (i.mime.clone(), i.bytes.clone()))
+        self.items
+            .iter()
+            .find(|i| i.entry.id == id)
+            .map(|i| (i.mime.clone(), i.bytes.clone()))
     }
 }
 
@@ -142,8 +156,14 @@ mod tests {
     #[test]
     fn push_dedupes_the_current_head() {
         let mut h = h();
-        assert_eq!(h.push(ClipKind::Text, "text/plain".into(), b"a", None), Change::Changed);
-        assert_eq!(h.push(ClipKind::Text, "text/plain".into(), b"a", None), Change::Unchanged);
+        assert_eq!(
+            h.push(ClipKind::Text, "text/plain".into(), b"a", None),
+            Change::Changed
+        );
+        assert_eq!(
+            h.push(ClipKind::Text, "text/plain".into(), b"a", None),
+            Change::Unchanged
+        );
         assert_eq!(h.snapshot().len(), 1);
     }
 
@@ -168,15 +188,27 @@ mod tests {
         for b in [b"x".as_slice(), b"y", b"z", b"w"] {
             h.push(ClipKind::Text, "text/plain".into(), b, None);
         }
-        assert!(h.snapshot().iter().any(|e| e.id == id && e.pinned), "pinned kept past eviction");
+        assert!(
+            h.snapshot().iter().any(|e| e.id == id && e.pinned),
+            "pinned kept past eviction"
+        );
         h.clear();
-        assert_eq!(h.snapshot().iter().filter(|e| e.id == id).count(), 1, "clear keeps pinned");
+        assert_eq!(
+            h.snapshot().iter().filter(|e| e.id == id).count(),
+            1,
+            "clear keeps pinned"
+        );
     }
 
     #[test]
     fn bytes_for_returns_the_stored_payload() {
         let mut h = h();
-        h.push(ClipKind::Text, "text/plain;charset=utf-8".into(), b"payload", None);
+        h.push(
+            ClipKind::Text,
+            "text/plain;charset=utf-8".into(),
+            b"payload",
+            None,
+        );
         let id = h.snapshot()[0].id;
         assert_eq!(
             h.bytes_for(id),

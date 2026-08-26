@@ -9,7 +9,8 @@ fn garbage_bytes_file_returns_defaults() {
     let path = dir.path().join("garbage.redb");
     let mut f = fs::File::create(&path).unwrap();
     for _ in 0..512 {
-        f.write_all(b"this is not a redb database, just garbage bytes\x00\xff\x01").unwrap();
+        f.write_all(b"this is not a redb database, just garbage bytes\x00\xff\x01")
+            .unwrap();
     }
     f.sync_all().unwrap();
     drop(f);
@@ -27,7 +28,12 @@ fn truncated_redb_file_returns_defaults() {
     drop(db);
 
     let full_len = fs::metadata(&path).unwrap().len();
-    fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(full_len / 4).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(full_len / 4)
+        .unwrap();
 
     let cfg = load_or_default(&path);
     assert_eq!(cfg, default_config());
@@ -60,7 +66,11 @@ fn mid_file_corruption_never_panics() {
     drop(db);
 
     let full_len = fs::metadata(&path).unwrap().len();
-    let mut file = fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
     let start = full_len / 2;
     let len = (full_len / 4).max(64).min(full_len.saturating_sub(start));
     let garbage = vec![0xA5u8; len as usize];

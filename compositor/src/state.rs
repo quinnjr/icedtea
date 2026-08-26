@@ -75,7 +75,12 @@ impl OutputSurface {
     /// empty; `new_output` records the real connector name on the live output
     /// once one exists (see the field doc). Scale starts at the `1.0` identity.
     pub fn new(geometry: icedtea_contract::Rectangle) -> Self {
-        Self { geometry, usable: geometry, name: String::new(), scale: 1.0 }
+        Self {
+            geometry,
+            usable: geometry,
+            name: String::new(),
+            scale: 1.0,
+        }
     }
 }
 
@@ -268,7 +273,9 @@ fn clamp_exclusive_zone(exclusive: i32, output: Option<&OutputSurface>) -> i32 {
     if exclusive <= 0 {
         return exclusive;
     }
-    let bound = output.map(|o| o.geometry.width.max(o.geometry.height)).unwrap_or(i32::MAX);
+    let bound = output
+        .map(|o| o.geometry.width.max(o.geometry.height))
+        .unwrap_or(i32::MAX);
     exclusive.min(bound)
 }
 
@@ -371,7 +378,13 @@ fn wallpaper_lower_plan(created: usize, has_background: bool) -> Vec<LowerStep> 
 /// notification gets `(300, box.x + box.width - 300)` and `(100, box.y)`:
 /// its own size, flush into the corner. A four-edge-anchored 0x0 locker
 /// gets the whole box on both axes.
-fn layer_axis_placement(start: bool, end: bool, desired: u32, origin: i32, span: i32) -> (i32, i32) {
+fn layer_axis_placement(
+    start: bool,
+    end: bool,
+    desired: u32,
+    origin: i32,
+    span: i32,
+) -> (i32, i32) {
     // Finding 7, security: `desired` is client-controlled and otherwise
     // casts straight to `i32` -- a value at or past `i32::MAX` would wrap
     // negative on the cast, handing a negative "size" into the arithmetic
@@ -412,7 +425,12 @@ fn layer_holds_keyboard_focus(
 /// headless-runtime way to inject a pointer position at all, so this
 /// mapping is what stays testable of it.
 fn resize_edges_from_wlr(edges: wlr::Edges) -> input::ResizeEdges {
-    input::ResizeEdges { top: edges.top, bottom: edges.bottom, left: edges.left, right: edges.right }
+    input::ResizeEdges {
+        top: edges.top,
+        bottom: edges.bottom,
+        left: edges.left,
+        right: edges.right,
+    }
 }
 
 /// Translate the compositor library's modifier booleans into the model's
@@ -468,7 +486,12 @@ pub fn to_model_modifiers(logo: bool, ctrl: bool, alt: bool, shift: bool) -> inp
 /// same reason `to_model_modifiers` is one: `wlr::KeyEvent::new` is
 /// `pub(crate)` to the `wlr` crate, so no test outside it can construct a
 /// real one, and this is the only shape of the decision a test *can* drive.
-pub fn alt_tab_should_end(watched: input::Modifiers, mods: input::Modifiers, pressed: bool, keysym: u32) -> bool {
+pub fn alt_tab_should_end(
+    watched: input::Modifiers,
+    mods: input::Modifiers,
+    pressed: bool,
+    keysym: u32,
+) -> bool {
     let modifier_released_this_event = !pressed && input::keysym_is_modifier(watched, keysym);
     modifier_released_this_event || !mods.contains(watched)
 }
@@ -1062,7 +1085,9 @@ impl State {
     /// Called once per event-loop turn. Non-blocking: `try_recv` on an empty
     /// channel is the overwhelmingly common case and must cost nothing.
     pub fn drain_config_reload(&mut self) {
-        let Some(rx) = self.config_reload_rx.as_ref() else { return };
+        let Some(rx) = self.config_reload_rx.as_ref() else {
+            return;
+        };
         let pending: Vec<Config> = rx.try_iter().collect();
         for cfg in pending {
             let _ = self.apply_reloaded_config(cfg);
@@ -1079,7 +1104,9 @@ impl State {
     /// thread has either not sent yet, sent once, or panicked, and none of
     /// those is a reason for this handler to abort the process.
     pub fn drain_wallpaper(&mut self) {
-        let Some(rx) = self.wallpaper_rx.as_ref() else { return };
+        let Some(rx) = self.wallpaper_rx.as_ref() else {
+            return;
+        };
         match rx.try_recv() {
             Ok(image) => {
                 self.wallpaper.set_decoded(image);
@@ -1150,7 +1177,9 @@ impl State {
     /// never populates `wallpaper_nodes` -- there is no `BufferId` a real
     /// call could have returned to put in the map.
     pub fn sync_wallpaper_nodes(&mut self) {
-        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+        let Some(runtime) = self.wayland.runtime().cloned() else {
+            return;
+        };
 
         let Some(img) = self.wallpaper.decoded() else {
             // No decoded image (pre-decode, or a decode that failed): tear
@@ -1199,7 +1228,11 @@ impl State {
                     // a multi-output setup's log points at the one output
                     // actually missing its wallpaper.
                     Err(err) => {
-                        tracing::warn!(output = index, ?err, "failed to create wallpaper buffer node for output");
+                        tracing::warn!(
+                            output = index,
+                            ?err,
+                            "failed to create wallpaper buffer node for output"
+                        );
                     }
                 }
             }
@@ -1257,7 +1290,9 @@ impl State {
     /// no `RectId` a real call could have returned to put in
     /// `snap_preview_rect`.
     pub fn sync_snap_preview(&mut self) {
-        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+        let Some(runtime) = self.wayland.runtime().cloned() else {
+            return;
+        };
         match self.snap_preview {
             Some(rect) => match self.snap_preview_rect {
                 Some(id) => {
@@ -1320,7 +1355,10 @@ impl State {
         if let Some(runtime) = self.wayland.runtime() {
             let (px, py) = runtime.pointer_position();
             let (px, py) = (px as i32, py as i32);
-            let hit = self.outputs.iter().find(|(_, out)| out.geometry.contains(px, py));
+            let hit = self
+                .outputs
+                .iter()
+                .find(|(_, out)| out.geometry.contains(px, py));
             if let Some((&idx, _)) = hit {
                 return Some(idx);
             }
@@ -1349,7 +1387,10 @@ impl State {
     fn output_for_window(&self, geometry: Rectangle) -> Option<u32> {
         let cx = geometry.x + geometry.width / 2;
         let cy = geometry.y + geometry.height / 2;
-        let hit = self.outputs.iter().find(|(_, out)| out.geometry.contains(cx, cy));
+        let hit = self
+            .outputs
+            .iter()
+            .find(|(_, out)| out.geometry.contains(cx, cy));
         if let Some((&idx, _)) = hit {
             return Some(idx);
         }
@@ -1365,7 +1406,9 @@ impl State {
     /// client-request/D-Bus path, which is not one of these). `None` when
     /// no output resolves at all.
     fn usable_geo_for_pointer(&self) -> Option<Rectangle> {
-        self.output_for_pointer().and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)
+        self.output_for_pointer()
+            .and_then(|idx| self.outputs.get(&idx))
+            .map(|o| o.usable)
     }
 
     /// Recompute every output's `usable` rect from its layer surfaces'
@@ -1417,7 +1460,9 @@ impl State {
             if !entry.mapped {
                 continue;
             }
-            let Some(output) = self.outputs.get_mut(&entry.output) else { continue };
+            let Some(output) = self.outputs.get_mut(&entry.output) else {
+                continue;
+            };
             output.usable = fold_exclusive_zone(output.usable, entry.anchor, entry.exclusive);
         }
 
@@ -1433,8 +1478,12 @@ impl State {
         // placement differs from the one it last sent (`LayerEntry::
         // last_configured`), so an arrange pass that changed nothing for
         // a given panel costs one comparison, not a wire round trip.
-        let mapped_layers: Vec<wlr::LayerSurfaceId> =
-            self.layers.iter().filter(|(_, e)| e.mapped).map(|(&id, _)| id).collect();
+        let mapped_layers: Vec<wlr::LayerSurfaceId> = self
+            .layers
+            .iter()
+            .filter(|(_, e)| e.mapped)
+            .map(|(&id, _)| id)
+            .collect();
         for id in mapped_layers {
             self.configure_layer(id);
         }
@@ -1458,9 +1507,15 @@ impl State {
             .map(|w| w.id)
             .collect();
         for id in affected {
-            let Some(w) = self.window_manager.get(id) else { continue };
-            let Some(output_idx) = self.output_for_window(w.geometry) else { continue };
-            let Some(output_geo) = self.outputs.get(&output_idx).map(|o| o.usable) else { continue };
+            let Some(w) = self.window_manager.get(id) else {
+                continue;
+            };
+            let Some(output_idx) = self.output_for_window(w.geometry) else {
+                continue;
+            };
+            let Some(output_geo) = self.outputs.get(&output_idx).map(|o| o.usable) else {
+                continue;
+            };
             let target = layout::maximized_geometry(output_geo, gap);
             if target == w.geometry {
                 continue;
@@ -1547,14 +1602,20 @@ impl State {
     /// safe to call unconditionally, which `arrange_layers` now does for
     /// every mapped panel on every pass.
     pub fn configure_layer(&mut self, id: wlr::LayerSurfaceId) {
-        let Some(placement) = self.compute_layer_placement(id) else { return };
+        let Some(placement) = self.compute_layer_placement(id) else {
+            return;
+        };
         let (w, h, x, y) = placement;
         // Minor-1's storm guard: unchanged since the last time this was
         // computed is a no-op. `None` (never computed before) never
         // matches, so a surface's first `configure_layer` -- from
         // `new_layer_surface` or its own first commit -- always goes out;
         // the mandatory-configure contract is unaffected.
-        if self.layers.get(&id).is_some_and(|e| e.last_configured == Some(placement)) {
+        if self
+            .layers
+            .get(&id)
+            .is_some_and(|e| e.last_configured == Some(placement))
+        {
             return;
         }
         // Recorded before the runtime-gated send below, not after: this
@@ -1568,7 +1629,9 @@ impl State {
         if let Some(entry) = self.layers.get_mut(&id) {
             entry.last_configured = Some(placement);
         }
-        let Some(runtime) = self.wayland.runtime() else { return };
+        let Some(runtime) = self.wayland.runtime() else {
+            return;
+        };
         runtime.configure_layer_surface(id, w, h);
         runtime.set_layer_surface_position(id, x, y);
     }
@@ -1631,17 +1694,27 @@ impl State {
             // surface with no placement yet (`last_configured: None`,
             // never configured) falls back to the lowest surviving index,
             // same as `migrate_windows_from`'s own fallback.
-            let geometry = self
-                .layers
-                .get(id)
-                .and_then(|e| e.last_configured)
-                .map(|(w, h, x, y)| Rectangle { x, y, width: w as i32, height: h as i32 });
+            let geometry =
+                self.layers
+                    .get(id)
+                    .and_then(|e| e.last_configured)
+                    .map(|(w, h, x, y)| Rectangle {
+                        x,
+                        y,
+                        width: w as i32,
+                        height: h as i32,
+                    });
             let hit = geometry.and_then(|g| {
                 let cx = g.x + g.width / 2;
                 let cy = g.y + g.height / 2;
-                self.outputs.iter().find(|(_, out)| out.geometry.contains(cx, cy)).map(|(&idx, _)| idx)
+                self.outputs
+                    .iter()
+                    .find(|(_, out)| out.geometry.contains(cx, cy))
+                    .map(|(&idx, _)| idx)
             });
-            let Some(survivor) = hit.or_else(|| self.outputs.keys().min().copied()) else { continue };
+            let Some(survivor) = hit.or_else(|| self.outputs.keys().min().copied()) else {
+                continue;
+            };
             if let Some(entry) = self.layers.get_mut(id) {
                 entry.output = survivor;
             }
@@ -1664,7 +1737,9 @@ impl State {
     /// say). A linear scan over `output_ids`, which stays tiny (one entry
     /// per live output).
     fn wlr_output_id_for(&self, index: u32) -> Option<wlr::OutputId> {
-        self.output_ids.iter().find_map(|(&oid, &idx)| (idx == index).then_some(oid))
+        self.output_ids
+            .iter()
+            .find_map(|(&oid, &idx)| (idx == index).then_some(oid))
     }
 
     /// N9: react to `entry.interactive` changing on an already-mapped
@@ -1697,7 +1772,12 @@ impl State {
     /// hands the seat back to whatever the model says is focused
     /// (`sync_seat_focus`), the same hand-back `layer_surface_unmapped`
     /// and `layer_surface_destroyed` already perform.
-    fn sync_layer_interactive_focus(&mut self, id: wlr::LayerSurfaceId, was_interactive: bool, now_interactive: bool) {
+    fn sync_layer_interactive_focus(
+        &mut self,
+        id: wlr::LayerSurfaceId,
+        was_interactive: bool,
+        now_interactive: bool,
+    ) {
         if now_interactive && !was_interactive {
             let mapped = self.layers.get(&id).is_some_and(|e| e.mapped);
             if !mapped || layer_holds_keyboard_focus(self.layer_focus, &self.layers) {
@@ -1731,7 +1811,10 @@ impl State {
                 // trace for the same failure -- a keyboard grab that
                 // silently didn't take used to leave no clue why a
                 // post-map-interactive panel never got input.
-                tracing::debug!(?id, "layer surface became interactive after map but did not take keyboard focus");
+                tracing::debug!(
+                    ?id,
+                    "layer surface became interactive after map but did not take keyboard focus"
+                );
             }
         } else if !now_interactive && was_interactive && self.layer_focus == Some(id) {
             self.layer_focus = None;
@@ -1752,8 +1835,12 @@ impl State {
     /// window to a single point) is the only choice that doesn't invent a
     /// placement nothing asked for.
     pub fn migrate_windows_from(&mut self, dead: Rectangle) {
-        let Some(survivor_idx) = self.outputs.keys().min().copied() else { return };
-        let Some(survivor) = self.outputs.get(&survivor_idx).map(|o| o.geometry) else { return };
+        let Some(survivor_idx) = self.outputs.keys().min().copied() else {
+            return;
+        };
+        let Some(survivor) = self.outputs.get(&survivor_idx).map(|o| o.geometry) else {
+            return;
+        };
 
         let affected: Vec<WindowId> = self
             .window_manager
@@ -1767,7 +1854,9 @@ impl State {
             .collect();
 
         for id in affected {
-            let Some(w) = self.window_manager.get(id) else { continue };
+            let Some(w) = self.window_manager.get(id) else {
+                continue;
+            };
             let geometry = w.geometry;
 
             // Preserve the window's offset from the dead output's origin,
@@ -1784,15 +1873,24 @@ impl State {
             let new_x = if geometry.width >= survivor.width {
                 survivor.x + (survivor.width - geometry.width) / 2
             } else {
-                (survivor.x + (geometry.x - dead.x)).clamp(survivor.x, survivor.x + survivor.width - geometry.width)
+                (survivor.x + (geometry.x - dead.x))
+                    .clamp(survivor.x, survivor.x + survivor.width - geometry.width)
             };
             let new_y = if geometry.height >= survivor.height {
                 survivor.y + (survivor.height - geometry.height) / 2
             } else {
-                (survivor.y + (geometry.y - dead.y)).clamp(survivor.y, survivor.y + survivor.height - geometry.height)
+                (survivor.y + (geometry.y - dead.y))
+                    .clamp(survivor.y, survivor.y + survivor.height - geometry.height)
             };
 
-            self.window_manager.set_geometry(id, Rectangle { x: new_x, y: new_y, ..geometry });
+            self.window_manager.set_geometry(
+                id,
+                Rectangle {
+                    x: new_x,
+                    y: new_y,
+                    ..geometry
+                },
+            );
             self.sync_window_to_scene(id);
         }
         self.emit_pending();
@@ -1893,7 +1991,8 @@ impl State {
             }
             return;
         };
-        let (geo, fullscreen, maximized, focused) = (w.geometry, w.fullscreen, w.maximized, w.focused);
+        let (geo, fullscreen, maximized, focused) =
+            (w.geometry, w.fullscreen, w.maximized, w.focused);
         let minimized = w.minimized;
         let visible = self.window_manager.is_visible(w);
         // Re-review finding New-4: the model's geometry is the *frame*; an
@@ -1941,28 +2040,42 @@ impl State {
         // the alternative is cloning them into owned buffers on every sync
         // -- i.e. on every pointer motion of a drag -- to hand across a call
         // that, on a cache hit, will not even look at them (M2).
-        let Self { wayland, title_rasters, button_glyph_cache, .. } = self;
+        let Self {
+            wayland,
+            title_rasters,
+            button_glyph_cache,
+            ..
+        } = self;
         let title_px = decorated
             .then(|| title_rasters.get(&id))
             .flatten()
             .and_then(|entry| {
-                entry.pixels.as_ref().map(|(width, height, pixels)| crate::wayland::TitleRaster {
-                    width: *width,
-                    height: *height,
-                    generation: entry.generation,
-                    pixels,
-                })
+                entry
+                    .pixels
+                    .as_ref()
+                    .map(|(width, height, pixels)| crate::wayland::TitleRaster {
+                        width: *width,
+                        height: *height,
+                        generation: entry.generation,
+                        pixels,
+                    })
             });
-        let button_glyph_px: [Option<crate::wayland::GlyphRaster<'_>>; 3] = std::array::from_fn(|i| {
-            if !decorated {
-                return None;
-            }
-            let key = (i, gw, gh, BUTTON_GLYPH_FG);
-            button_glyph_cache
-                .get(&key)
-                .and_then(|entry| entry.as_ref())
-                .map(|pixels| crate::wayland::GlyphRaster { width: gw, height: gh, fg: BUTTON_GLYPH_FG, pixels })
-        });
+        let button_glyph_px: [Option<crate::wayland::GlyphRaster<'_>>; 3] =
+            std::array::from_fn(|i| {
+                if !decorated {
+                    return None;
+                }
+                let key = (i, gw, gh, BUTTON_GLYPH_FG);
+                button_glyph_cache
+                    .get(&key)
+                    .and_then(|entry| entry.as_ref())
+                    .map(|pixels| crate::wayland::GlyphRaster {
+                        width: gw,
+                        height: gh,
+                        fg: BUTTON_GLYPH_FG,
+                        pixels,
+                    })
+            });
         wayland.sync_ssd(
             id,
             ssd,
@@ -2054,7 +2167,11 @@ impl State {
         // `rasterize_title` caps again internally (its own contract, kept
         // independent of this caller), so this is belt and suspenders on
         // the same bound, not two different ones.
-        let title = if title.len() > crate::text::MAX_TITLE_BYTES { crate::text::cap_title(&title).to_owned() } else { title };
+        let title = if title.len() > crate::text::MAX_TITLE_BYTES {
+            crate::text::cap_title(&title).to_owned()
+        } else {
+            title
+        };
         let width = (bar.width - 3 * crate::decoration::BUTTON_WIDTH).max(1);
         let height = bar.height.max(1);
 
@@ -2071,28 +2188,51 @@ impl State {
         let palette = crate::render::hex_to_rgba(&self.config.appearance.palette.foreground);
         let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
         let alpha = if focused { 255 } else { (255.0 * 0.6) as u8 };
-        let fg = [to_u8(palette[0]), to_u8(palette[1]), to_u8(palette[2]), alpha];
+        let fg = [
+            to_u8(palette[0]),
+            to_u8(palette[1]),
+            to_u8(palette[2]),
+            alpha,
+        ];
 
         let key: TitleRasterKey = (title, width, fg);
-        if self.title_rasters.get(&id).is_some_and(|entry| entry.key == key) {
+        if self
+            .title_rasters
+            .get(&id)
+            .is_some_and(|entry| entry.key == key)
+        {
             return;
         }
 
-        self.fonts
-            .get_or_init(|| (cosmic_text::FontSystem::new(), cosmic_text::SwashCache::new()));
+        self.fonts.get_or_init(|| {
+            (
+                cosmic_text::FontSystem::new(),
+                cosmic_text::SwashCache::new(),
+            )
+        });
         // `get_mut` cannot miss after `get_or_init`; the `else` is the
         // panic-free spelling of that, not a case with any behavior of its
         // own.
-        let Some((fonts, swash)) = self.fonts.get_mut() else { return };
-        let pixels = crate::text::rasterize_title(fonts, swash, &key.0, width, height, TITLE_PAD_X, fg)
-            .map(|pixels| (width, height, pixels));
+        let Some((fonts, swash)) = self.fonts.get_mut() else {
+            return;
+        };
+        let pixels =
+            crate::text::rasterize_title(fonts, swash, &key.0, width, height, TITLE_PAD_X, fg)
+                .map(|pixels| (width, height, pixels));
         // A fresh generation for fresh pixels: this is what tells the seam
         // its title node is out of date (M2). Bumped on a negative result
         // too -- "the title now shapes to nothing" is a change the seam has
         // to act on, by dropping the node.
         let generation = self.next_title_generation;
         self.next_title_generation += 1;
-        self.title_rasters.insert(id, TitleRasterEntry { key, generation, pixels });
+        self.title_rasters.insert(
+            id,
+            TitleRasterEntry {
+                key,
+                generation,
+                pixels,
+            },
+        );
     }
 
     /// Make sure every `BUTTON_GLYPHS` entry has a rasterized `width x
@@ -2110,12 +2250,19 @@ impl State {
             if self.button_glyph_cache.contains_key(&key) {
                 continue;
             }
-            self.fonts
-                .get_or_init(|| (cosmic_text::FontSystem::new(), cosmic_text::SwashCache::new()));
+            self.fonts.get_or_init(|| {
+                (
+                    cosmic_text::FontSystem::new(),
+                    cosmic_text::SwashCache::new(),
+                )
+            });
             // Same panic-free spelling as `ensure_title_raster`'s: `get_mut`
             // cannot miss right after `get_or_init`.
-            let Some((fonts, swash)) = self.fonts.get_mut() else { return };
-            let pixels = crate::text::rasterize_glyph(fonts, swash, glyph, width, height, BUTTON_GLYPH_FG);
+            let Some((fonts, swash)) = self.fonts.get_mut() else {
+                return;
+            };
+            let pixels =
+                crate::text::rasterize_glyph(fonts, swash, glyph, width, height, BUTTON_GLYPH_FG);
             self.button_glyph_cache.insert(key, pixels);
         }
     }
@@ -2177,7 +2324,11 @@ impl State {
         // stack is the current holder; the OR unmap/destroy/flip paths pop it
         // (handing the keyboard to the parent menu beneath, or, when the stack
         // empties, calling this so the model's focus is restored).
-        if self.or_keyboard_stack.last().is_some_and(|id| self.override_redirect.contains_key(id)) {
+        if self
+            .or_keyboard_stack
+            .last()
+            .is_some_and(|id| self.override_redirect.contains_key(id))
+        {
             return;
         }
         let focused = self
@@ -2353,8 +2504,12 @@ impl State {
         // Reuse the one visibility+ordering predicate (`visible_windows`, which
         // exists so this filter lives in exactly one place — review finding I1);
         // it yields MRU order (top first), so reverse for bottom-to-top.
-        let mut ids: Vec<WindowId> =
-            self.window_manager.visible_windows().iter().map(|w| w.id).collect();
+        let mut ids: Vec<WindowId> = self
+            .window_manager
+            .visible_windows()
+            .iter()
+            .map(|w| w.id)
+            .collect();
         ids.reverse();
         ids
     }
@@ -2417,7 +2572,9 @@ impl State {
     /// the model -- so an unmap followed by a destroy (both fire for the same
     /// surface) and an id we were never told about are each harmless.
     fn remove_xwayland_window(&mut self, id: wlr::XwaylandSurfaceId) {
-        let Some(window_id) = self.xwayland_windows.remove(&id) else { return };
+        let Some(window_id) = self.xwayland_windows.remove(&id) else {
+            return;
+        };
         self.forget_window(window_id);
         self.emit_pending();
     }
@@ -2434,7 +2591,10 @@ impl State {
     /// transient-parent aware), not the plain cascade.
     fn add_managed_x11(&mut self, surface: &wlr::XwaylandSurface<'_>) {
         let sid = surface.id();
-        let app_id = surface.class().or_else(|| surface.instance()).unwrap_or_default();
+        let app_id = surface
+            .class()
+            .or_else(|| surface.instance())
+            .unwrap_or_default();
         let title = surface.title().unwrap_or_default();
         let pid = surface.pid().unwrap_or(0);
         // X11 clients self-position, but a managed window is placed by the WM.
@@ -2455,12 +2615,19 @@ impl State {
         // this window (a fresh row has no client-decoration request yet, and a
         // just-mapped window is not fullscreen).
         let ssd = crate::decoration::has_ssd(&app_id, None, false);
-        let content = Rectangle { x: 0, y: 0, width: content_w, height: content_h };
+        let content = Rectangle {
+            x: 0,
+            y: 0,
+            width: content_w,
+            height: content_h,
+        };
         let frame_dims = crate::decoration::frame_rect(content, ssd);
         let geometry = self.place_managed_x11(surface, frame_dims.width, frame_dims.height);
         tracing::info!(?sid, %app_id, %title, pid, ?geometry, "managed X11 window mapped");
         let previous = self.focused_id();
-        let window_id = self.window_manager.add_window(&app_id, &title, pid, geometry);
+        let window_id = self
+            .window_manager
+            .add_window(&app_id, &title, pid, geometry);
         self.xwayland_windows.insert(sid, window_id);
         self.wayland.bind_x11(window_id, sid);
         self.sync_window_to_scene(window_id);
@@ -2487,7 +2654,12 @@ impl State {
             .and_then(|idx| self.outputs.get(&idx))
             .map(|o| o.usable)
             .or_else(|| self.usable_geo_for_pointer())
-            .unwrap_or(Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+            .unwrap_or(Rectangle {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            });
         let (x, y) = Self::clamp_top_left(frame.x, frame.y, frame.width, frame.height, clamp_geo);
         Rectangle { x, y, ..frame }
     }
@@ -2509,7 +2681,13 @@ impl State {
     /// must keep it on the parent's monitor; the old pointer-output clamp dragged
     /// it onto whichever screen the mouse happened to rest on. `fallback` (the
     /// pointer's usable area) is used only when `area`'s output cannot be found.
-    fn center_in_area(&self, area: Rectangle, width: i32, height: i32, fallback: Rectangle) -> (i32, i32) {
+    fn center_in_area(
+        &self,
+        area: Rectangle,
+        width: i32,
+        height: i32,
+        fallback: Rectangle,
+    ) -> (i32, i32) {
         let clamp_geo = self
             .output_for_window(area)
             .and_then(|idx| self.outputs.get(&idx))
@@ -2536,9 +2714,12 @@ impl State {
         width: i32,
         height: i32,
     ) -> Rectangle {
-        let output_geo = self
-            .usable_geo_for_pointer()
-            .unwrap_or(Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+        let output_geo = self.usable_geo_for_pointer().unwrap_or(Rectangle {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
         let centered_in = |area: Rectangle| self.center_in_area(area, width, height, output_geo);
         // The transient parent's frame, if it is a managed X11 window mapped on
         // the active, visible workspace — the anchor a dialog centers over.
@@ -2548,14 +2729,10 @@ impl State {
             .and_then(|rt| rt.xwayland_surface_parent(surface.id()))
             .and_then(|pid| self.xwayland_windows.get(&pid).copied())
             .and_then(|wid| self.window_manager.get(wid))
-            .filter(|w| {
-                w.workspace == self.window_manager.active_workspace() && !w.minimized
-            })
+            .filter(|w| w.workspace == self.window_manager.active_workspace() && !w.minimized)
             .map(|w| w.geometry);
         let (x, y) = match surface.window_type() {
-            wlr::XwaylandWindowType::Dialog => {
-                centered_in(parent_geo.unwrap_or(output_geo))
-            }
+            wlr::XwaylandWindowType::Dialog => centered_in(parent_geo.unwrap_or(output_geo)),
             wlr::XwaylandWindowType::Splash => centered_in(output_geo),
             _ if surface.is_modal() => centered_in(parent_geo.unwrap_or(output_geo)),
             _ => {
@@ -2568,7 +2745,12 @@ impl State {
                 layout::cascade_point_in(&occupied, (width, height), 24, output_geo)
             }
         };
-        Rectangle { x, y, width, height }
+        Rectangle {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Track and place a mapped override-redirect pop-up (M3). Shared by the
@@ -2590,13 +2772,19 @@ impl State {
             height: g.height.max(1),
         };
         let wants_focus = surface.override_redirect_wants_focus();
-        tracing::info!(?sid, ?geometry, wants_focus, "override-redirect X11 surface mapped");
+        tracing::info!(
+            ?sid,
+            ?geometry,
+            wants_focus,
+            "override-redirect X11 surface mapped"
+        );
         if let Some(rt) = self.wayland.runtime() {
             rt.reparent_xwayland_surface_to_band(sid, wlr::Band::Top);
             rt.set_xwayland_surface_position(sid, geometry.x, geometry.y);
             rt.raise_xwayland_surface(sid);
         }
-        self.override_redirect.insert(sid, OverrideRedirectSurface { geometry });
+        self.override_redirect
+            .insert(sid, OverrideRedirectSurface { geometry });
         if wants_focus {
             self.focus_override_redirect(sid);
         }
@@ -2605,7 +2793,9 @@ impl State {
     /// Hand the seat keyboard to a focus-taking OR pop-up and remember it holds
     /// it, so `sync_seat_focus` leaves it alone until it goes away.
     fn focus_override_redirect(&mut self, sid: wlr::XwaylandSurfaceId) {
-        let Some(rt) = self.wayland.runtime() else { return };
+        let Some(rt) = self.wayland.runtime() else {
+            return;
+        };
         rt.activate_xwayland_surface(sid, true);
         if rt.focus_xwayland_surface_keyboard(sid).is_some() {
             // Push onto the keyboard stack as the new top holder; move it up if
@@ -2678,7 +2868,10 @@ impl State {
         // before the borrow on `w` would otherwise need to outlive the
         // mutable calls below.
         let geometry = w.geometry;
-        let output_geo = self.output_for_window(geometry).and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry)?;
+        let output_geo = self
+            .output_for_window(geometry)
+            .and_then(|idx| self.outputs.get(&idx))
+            .map(|o| o.geometry)?;
         self.window_manager.set_fullscreen(id, target)?;
         if target {
             // Save current geometry before entering fullscreen
@@ -2723,13 +2916,17 @@ impl State {
         // (`output_for_window`), not the pointer -- see
         // `set_fullscreen_target`'s identical fix just above for why.
         let geometry = w.geometry;
-        let output_geo = self.output_for_window(geometry).and_then(|idx| self.outputs.get(&idx)).map(|o| o.usable)?;
+        let output_geo = self
+            .output_for_window(geometry)
+            .and_then(|idx| self.outputs.get(&idx))
+            .map(|o| o.usable)?;
         self.window_manager.set_maximized(id, target)?;
         if target {
             let current = self.window_manager.get(id)?.geometry;
             self.maximized_saved_geometry.insert(id, current);
             let gap = self.config.appearance.snap_gap;
-            self.window_manager.set_geometry(id, layout::maximized_geometry(output_geo, gap))?;
+            self.window_manager
+                .set_geometry(id, layout::maximized_geometry(output_geo, gap))?;
         } else if let Some(saved) = self.maximized_saved_geometry.remove(&id) {
             self.window_manager.set_geometry(id, saved)?;
         }
@@ -2747,18 +2944,36 @@ impl State {
     /// unanswered.
     ///
     /// Wired to `ToplevelHandler::request_maximize`.
-    pub fn reconcile_maximized(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
-        let Some(id) = self.wayland.window_for(toplevel) else { return false };
-        let changes = self.window_manager.get(id).is_some_and(|w| w.maximized != target);
+    pub fn reconcile_maximized(
+        &mut self,
+        toplevel: crate::wayland::ToplevelKey,
+        target: bool,
+    ) -> bool {
+        let Some(id) = self.wayland.window_for(toplevel) else {
+            return false;
+        };
+        let changes = self
+            .window_manager
+            .get(id)
+            .is_some_and(|w| w.maximized != target);
         changes && self.set_maximized_target(id, target).is_some()
     }
 
     /// Fullscreen counterpart of [`Self::reconcile_maximized`]; same
     /// "did a configure actually go out" contract. Wired to
     /// `ToplevelHandler::request_fullscreen`.
-    pub fn reconcile_fullscreen(&mut self, toplevel: crate::wayland::ToplevelKey, target: bool) -> bool {
-        let Some(id) = self.wayland.window_for(toplevel) else { return false };
-        let changes = self.window_manager.get(id).is_some_and(|w| w.fullscreen != target);
+    pub fn reconcile_fullscreen(
+        &mut self,
+        toplevel: crate::wayland::ToplevelKey,
+        target: bool,
+    ) -> bool {
+        let Some(id) = self.wayland.window_for(toplevel) else {
+            return false;
+        };
+        let changes = self
+            .window_manager
+            .get(id)
+            .is_some_and(|w| w.fullscreen != target);
         changes && self.set_fullscreen_target(id, target).is_some()
     }
 
@@ -2790,7 +3005,10 @@ impl State {
     /// sample bugs and document them here). Dropped; `apply_config`'s event
     /// is the one and only `ConfigReloaded` this path emits.
     pub fn reload_config_from_disk(&mut self) -> Vec<Event> {
-        let path = self.config_path.clone().unwrap_or_else(icedtea_config::default_db_path);
+        let path = self
+            .config_path
+            .clone()
+            .unwrap_or_else(icedtea_config::default_db_path);
         let cfg = icedtea_config::load_or_default(&path);
         self.apply_reloaded_config(cfg)
     }
@@ -2868,8 +3086,13 @@ impl State {
     /// hasn't been wired yet (only possible before `set_config_reload_sender`
     /// has run).
     fn spawn_config_reload(&self) {
-        let Some(tx) = self.config_reload_tx.clone() else { return };
-        let path = self.config_path.clone().unwrap_or_else(icedtea_config::default_db_path);
+        let Some(tx) = self.config_reload_tx.clone() else {
+            return;
+        };
+        let path = self
+            .config_path
+            .clone()
+            .unwrap_or_else(icedtea_config::default_db_path);
         // `try_clone` dup(2)s the wake pipe's write half so the worker
         // thread owns a handle it can move across the `'static` bound
         // rather than borrowing `self`'s. `None` (no test wires this, and a
@@ -2877,7 +3100,10 @@ impl State {
         // and `drain_config_reload`'s periodic poll from `should_stop`
         // remains the only way the result is ever picked up -- exactly the
         // pre-wake-pipe behavior, not a regression.
-        let wake = self.config_reload_wake.as_ref().and_then(|w| w.try_clone().ok());
+        let wake = self
+            .config_reload_wake
+            .as_ref()
+            .and_then(|w| w.try_clone().ok());
         let lock = Arc::clone(&self.config_db_lock);
         std::thread::spawn(move || {
             // `None` == persistently locked by another handle: send nothing so
@@ -2947,7 +3173,10 @@ impl State {
     /// `spawn_config_reload` does.
     fn spawn_config_save(&self) {
         let config = self.config.clone();
-        let path = self.config_path.clone().unwrap_or_else(icedtea_config::default_db_path);
+        let path = self
+            .config_path
+            .clone()
+            .unwrap_or_else(icedtea_config::default_db_path);
         let lock = Arc::clone(&self.config_db_lock);
         std::thread::spawn(move || Self::save_config_to(&lock, &config, &path));
     }
@@ -3028,7 +3257,10 @@ impl State {
         // `set_output_position` returns `None` on a stale output id; log it and
         // move on rather than discarding the mode/scale/transform we just
         // applied.
-        if runtime.set_output_position(output.id(), cfg.x, cfg.y).is_none() {
+        if runtime
+            .set_output_position(output.id(), cfg.x, cfg.y)
+            .is_none()
+        {
             tracing::warn!(%name, "persisted layout position rejected (stale output id)");
         }
         Ok(())
@@ -3180,8 +3412,13 @@ impl State {
         disabled: &HashMap<K, String>,
         name: &str,
     ) -> DisabledLookup<K> {
-        let mut matches = disabled.iter().filter(|(_, n)| n.as_str() == name).map(|(id, _)| *id);
-        let Some(first) = matches.next() else { return DisabledLookup::None };
+        let mut matches = disabled
+            .iter()
+            .filter(|(_, n)| n.as_str() == name)
+            .map(|(id, _)| *id);
+        let Some(first) = matches.next() else {
+            return DisabledLookup::None;
+        };
         if matches.next().is_some() {
             DisabledLookup::Ambiguous
         } else {
@@ -3197,7 +3434,9 @@ impl State {
     /// no stable key to store them under.
     fn upsert_displays_from_heads(&mut self, heads: &[wlr::AppliedHead]) {
         for head in heads {
-            let Some(name) = head.name.as_deref() else { continue };
+            let Some(name) = head.name.as_deref() else {
+                continue;
+            };
             let entry = icedtea_contract::DisplayConfig {
                 name: name.to_string(),
                 enabled: head.enabled,
@@ -3223,8 +3462,12 @@ impl State {
     /// lowest-index (survivor) output, mirroring
     /// [`Self::migrate_windows_from`]'s placement. A no-op with no outputs.
     fn reclaim_offscreen_windows(&mut self) {
-        let Some(survivor_idx) = self.outputs.keys().min().copied() else { return };
-        let Some(survivor) = self.outputs.get(&survivor_idx).map(|o| o.geometry) else { return };
+        let Some(survivor_idx) = self.outputs.keys().min().copied() else {
+            return;
+        };
+        let Some(survivor) = self.outputs.get(&survivor_idx).map(|o| o.geometry) else {
+            return;
+        };
 
         let stranded: Vec<WindowId> = self
             .window_manager
@@ -3238,19 +3481,32 @@ impl State {
             .collect();
 
         for id in stranded {
-            let Some(w) = self.window_manager.get(id) else { continue };
+            let Some(w) = self.window_manager.get(id) else {
+                continue;
+            };
             let geometry = w.geometry;
             let new_x = if geometry.width >= survivor.width {
                 survivor.x + (survivor.width - geometry.width) / 2
             } else {
-                geometry.x.clamp(survivor.x, survivor.x + survivor.width - geometry.width)
+                geometry
+                    .x
+                    .clamp(survivor.x, survivor.x + survivor.width - geometry.width)
             };
             let new_y = if geometry.height >= survivor.height {
                 survivor.y + (survivor.height - geometry.height) / 2
             } else {
-                geometry.y.clamp(survivor.y, survivor.y + survivor.height - geometry.height)
+                geometry
+                    .y
+                    .clamp(survivor.y, survivor.y + survivor.height - geometry.height)
             };
-            self.window_manager.set_geometry(id, Rectangle { x: new_x, y: new_y, ..geometry });
+            self.window_manager.set_geometry(
+                id,
+                Rectangle {
+                    x: new_x,
+                    y: new_y,
+                    ..geometry
+                },
+            );
             self.sync_window_to_scene(id);
         }
         self.emit_pending();
@@ -3276,7 +3532,10 @@ impl State {
     /// closes that off the same way `config_reload_wake` already does for
     /// its own channel.
     pub fn spawn_wallpaper(&mut self, path: Option<String>) {
-        let wake = self.wallpaper_wake.as_ref().and_then(|w| w.try_clone().ok());
+        let wake = self
+            .wallpaper_wake
+            .as_ref()
+            .and_then(|w| w.try_clone().ok());
         let rx = crate::render::spawn_wallpaper_decode(path, wake);
         self.wallpaper_rx = Some(rx);
     }
@@ -3457,11 +3716,17 @@ impl State {
             match conn.get_input_focus() {
                 Ok(cookie) => {
                     if let Err(err) = cookie.reply() {
-                        tracing::warn!(?err, "RESOURCE_MANAGER change may not have reached Xwayland");
+                        tracing::warn!(
+                            ?err,
+                            "RESOURCE_MANAGER change may not have reached Xwayland"
+                        );
                     }
                 }
                 Err(err) => {
-                    tracing::warn!(?err, "could not sync the RESOURCE_MANAGER change to Xwayland");
+                    tracing::warn!(
+                        ?err,
+                        "could not sync the RESOURCE_MANAGER change to Xwayland"
+                    );
                 }
             }
         });
@@ -3506,19 +3771,38 @@ impl State {
                 return Some(());
             }
             DbCommand::Quit => self.quitting = true,
-            DbCommand::InjectTouchDown { x, y, id, time_msec, reply } => {
-                let serial = self.wayland.runtime().and_then(|rt| rt.inject_touch_down(x, y, id, time_msec));
+            DbCommand::InjectTouchDown {
+                x,
+                y,
+                id,
+                time_msec,
+                reply,
+            } => {
+                let serial = self
+                    .wayland
+                    .runtime()
+                    .and_then(|rt| rt.inject_touch_down(x, y, id, time_msec));
                 let _ = reply.send(serial);
                 return Some(());
             }
-            DbCommand::InjectTouchMotion { x, y, id, time_msec, reply } => {
+            DbCommand::InjectTouchMotion {
+                x,
+                y,
+                id,
+                time_msec,
+                reply,
+            } => {
                 if let Some(rt) = self.wayland.runtime() {
                     rt.inject_touch_motion(x, y, id, time_msec);
                 }
                 let _ = reply.send(());
                 return Some(());
             }
-            DbCommand::InjectTouchUp { id, time_msec, reply } => {
+            DbCommand::InjectTouchUp {
+                id,
+                time_msec,
+                reply,
+            } => {
                 if let Some(rt) = self.wayland.runtime() {
                     rt.inject_touch_up(id, time_msec);
                 }
@@ -3526,17 +3810,28 @@ impl State {
                 return Some(());
             }
             DbCommand::DragIconPosition { reply } => {
-                let pos = self.wayland.runtime().and_then(|rt| rt.drag_icon_position());
+                let pos = self
+                    .wayland
+                    .runtime()
+                    .and_then(|rt| rt.drag_icon_position());
                 let _ = reply.send(pos);
                 return Some(());
             }
             DbCommand::SessionLocked { reply } => {
-                let locked = self.wayland.runtime().map(|rt| rt.is_session_locked()).unwrap_or(false);
+                let locked = self
+                    .wayland
+                    .runtime()
+                    .map(|rt| rt.is_session_locked())
+                    .unwrap_or(false);
                 let _ = reply.send(locked);
                 return Some(());
             }
             DbCommand::CursorPosition { reply } => {
-                let pos = self.wayland.runtime().map(|rt| rt.cursor_position()).unwrap_or((0.0, 0.0));
+                let pos = self
+                    .wayland
+                    .runtime()
+                    .map(|rt| rt.cursor_position())
+                    .unwrap_or((0.0, 0.0));
                 let _ = reply.send(pos);
                 return Some(());
             }
@@ -3561,7 +3856,13 @@ impl State {
                 // `usable`: this answers "how big is the screen", and a
                 // caller that wanted the space windows may occupy would be
                 // asking a different question (see `OutputSurface::usable`).
-                let geo = self.outputs.keys().min().copied().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry);
+                let geo = self
+                    .outputs
+                    .keys()
+                    .min()
+                    .copied()
+                    .and_then(|idx| self.outputs.get(&idx))
+                    .map(|o| o.geometry);
                 let _ = reply.send(geo);
                 return Some(());
             }
@@ -3573,7 +3874,10 @@ impl State {
                 // stored-on-`ready` field would, which is what lets the test
                 // read `DISPLAY` and connect the very client whose connection
                 // triggers the lazy `Xwayland` start.
-                let name = self.wayland.runtime().and_then(|rt| rt.xwayland_display_name());
+                let name = self
+                    .wayland
+                    .runtime()
+                    .and_then(|rt| rt.xwayland_display_name());
                 let _ = reply.send(name);
                 return Some(());
             }
@@ -3714,7 +4018,11 @@ impl State {
     /// Get the decoration action for a given window at the specified local coordinates.
     /// Returns the action if the window is focused and not fullscreen, None otherwise.
     /// Note: This gates on focused state (click-to-focus design), not CSD state.
-    pub fn decoration_action_for(&self, id: WindowId, local: (i32, i32)) -> Option<crate::decoration::DecorationAction> {
+    pub fn decoration_action_for(
+        &self,
+        id: WindowId,
+        local: (i32, i32),
+    ) -> Option<crate::decoration::DecorationAction> {
         let w = self.window_manager.get(id)?;
         if !w.focused || w.fullscreen {
             return None;
@@ -3724,7 +4032,11 @@ impl State {
 
     /// Apply a decoration action to a window: Close removes it, Maximize toggles maximized state,
     /// Minimize minimizes, Move would be handled by the input layer (not here).
-    pub fn apply_decoration_action(&mut self, id: WindowId, action: crate::decoration::DecorationAction) {
+    pub fn apply_decoration_action(
+        &mut self,
+        id: WindowId,
+        action: crate::decoration::DecorationAction,
+    ) {
         use crate::decoration::DecorationAction;
         match action {
             DecorationAction::Close => {
@@ -3819,11 +4131,19 @@ impl State {
                     self.window_manager.focus(wid);
                     self.sync_focus_change(previous);
                 }
-                self.emit(Event::AltTabState(AltTabState { active: true, entries, index: idx }));
+                self.emit(Event::AltTabState(AltTabState {
+                    active: true,
+                    entries,
+                    index: idx,
+                }));
             }
             "spawn" => {
                 let cmd = arg?;
-                std::process::Command::new("sh").arg("-c").arg(&cmd).spawn().ok();
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .spawn()
+                    .ok();
             }
             // Task 11 review #4: `n: u32` from an externally-parseable
             // action string (this dispatcher's own doc says it's also
@@ -3900,7 +4220,11 @@ impl State {
         let entries = self.alt_tab.entries().to_vec();
         let idx = self.alt_tab.index();
         self.alt_tab.end();
-        self.emit(Event::AltTabState(AltTabState { active: false, entries, index: idx }));
+        self.emit(Event::AltTabState(AltTabState {
+            active: false,
+            entries,
+            index: idx,
+        }));
         self.emit_pending();
     }
 
@@ -3933,7 +4257,8 @@ impl State {
         let gap = self.config.appearance.snap_gap;
         let current = self.window_manager.get(id)?.geometry;
         self.snap_saved_geometry.entry(id).or_insert(current);
-        self.window_manager.set_geometry(id, layout::snapped_geometry(output_geo, zone, gap))?;
+        self.window_manager
+            .set_geometry(id, layout::snapped_geometry(output_geo, zone, gap))?;
         self.sync_window_to_scene(id);
         Some(())
     }
@@ -4006,7 +4331,8 @@ impl State {
         input::warn_about_keybindings(&cfg.keybindings);
         // Reconcile the workspace list in place -- no window row is dropped;
         // a window on a removed workspace index migrates to workspace 0.
-        self.window_manager.set_workspace_names(cfg.workspace_names.clone());
+        self.window_manager
+            .set_workspace_names(cfg.workspace_names.clone());
 
         // Mirrors review finding I6 (`forget_window`'s same guard): a
         // truncated/clamped active workspace can leave migrated windows
@@ -4077,7 +4403,10 @@ impl State {
         // (`sync_seat_focus`/`sync_window_to_scene`), so this closes the one
         // remaining path into the model that a locked session left open.
         if self.session_locked {
-            tracing::debug!(?id, "ignoring a pointer press on a model window while the session is locked");
+            tracing::debug!(
+                ?id,
+                "ignoring a pointer press on a model window while the session is locked"
+            );
             return None;
         }
         let previous = self.focused_id();
@@ -4178,13 +4507,17 @@ impl State {
         if !self.pointer_pressed {
             return;
         }
-        let Some(rt) = self.wayland.runtime() else { return };
+        let Some(rt) = self.wayland.runtime() else {
+            return;
+        };
         let (px, py) = rt.pointer_position();
         let pointer = (px as i32, py as i32);
         if self.window_at_point(pointer) != Some(id) {
             return;
         }
-        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else { return };
+        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else {
+            return;
+        };
         // Baseline behavior: an interactive move raises and focuses, the
         // same as `handle_pointer_press`'s click-to-focus-then-drag path.
         let previous = self.focused_id();
@@ -4210,14 +4543,19 @@ impl State {
         if !self.pointer_pressed {
             return;
         }
-        let Some(rt) = self.wayland.runtime() else { return };
+        let Some(rt) = self.wayland.runtime() else {
+            return;
+        };
         let (px, py) = rt.pointer_position();
         let pointer = (px as i32, py as i32);
         if self.window_at_point(pointer) != Some(id) {
             return;
         }
-        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else { return };
-        self.resize.begin(id, resize_edges_from_wlr(edges), geo, pointer);
+        let Some(geo) = self.window_manager.get(id).map(|w| w.geometry) else {
+            return;
+        };
+        self.resize
+            .begin(id, resize_edges_from_wlr(edges), geo, pointer);
     }
 
     /// Pointer motion at `pointer` (output logical coordinates) during an
@@ -4238,7 +4576,11 @@ impl State {
     /// inside `update_ssd_hover`. `handle_pointer_motion` stays as the
     /// compute-it-yourself entry point for `handle_pointer`'s public
     /// `PointerEvent` dispatch, which unit tests drive directly.
-    fn handle_pointer_motion_with_hit(&mut self, pointer: (i32, i32), over: Option<WindowId>) -> Option<()> {
+    fn handle_pointer_motion_with_hit(
+        &mut self,
+        pointer: (i32, i32),
+        over: Option<WindowId>,
+    ) -> Option<()> {
         // Hover feedback tracks the pointer independently of drag/resize --
         // it must run even on every one of the early returns below, since
         // e.g. `self.drag.window_id()?` failing (no drag in progress, the
@@ -4267,10 +4609,9 @@ impl State {
             return Some(());
         }
         self.drag.motion(pointer, output_geo, threshold);
-        self.snap_preview = self
-            .drag
-            .preview_zone()
-            .map(|zone| layout::snapped_geometry(output_geo, zone, self.config.appearance.snap_gap));
+        self.snap_preview = self.drag.preview_zone().map(|zone| {
+            layout::snapped_geometry(output_geo, zone, self.config.appearance.snap_gap)
+        });
         self.sync_snap_preview();
         Some(())
     }
@@ -4302,7 +4643,12 @@ impl State {
                 let new_pos = (pointer.0 - grab_offset.0, pointer.1 - grab_offset.1);
                 self.window_manager.set_geometry(
                     id,
-                    Rectangle { x: new_pos.0, y: new_pos.1, width: geo.width, height: geo.height },
+                    Rectangle {
+                        x: new_pos.0,
+                        y: new_pos.1,
+                        width: geo.width,
+                        height: geo.height,
+                    },
                 )?;
                 self.sync_window_to_scene(id);
             }
@@ -4314,7 +4660,13 @@ impl State {
 
     /// A client mapped a new toplevel. Creates the model window at a cascade
     /// position, binds it to `toplevel`, and reconciles focus.
-    pub fn new_toplevel(&mut self, toplevel: crate::wayland::ToplevelKey, app_id: &str, title: &str, pid: u32) {
+    pub fn new_toplevel(
+        &mut self,
+        toplevel: crate::wayland::ToplevelKey,
+        app_id: &str,
+        title: &str,
+        pid: u32,
+    ) {
         // Default toplevel size: real geometry arrives from the client's
         // first commit, which isn't known yet; `PLACEHOLDER_SIZE` is the
         // model's placeholder until then. Position cascades off whatever is
@@ -4328,13 +4680,22 @@ impl State {
             .collect();
         let output_geo = self
             .usable_geo_for_pointer()
-            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+            .unwrap_or(icedtea_contract::Rectangle {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            });
         // Review finding M7: cascade positions wrap inside the output (and
         // count only this workspace's windows) so the Nth window can't open
         // off-screen with no title bar to grab.
         let (x, y) = layout::cascade_point_in(&occupied, PLACEHOLDER_SIZE, 24, output_geo);
-        let geometry =
-            icedtea_contract::Rectangle { x, y, width: PLACEHOLDER_SIZE.0, height: PLACEHOLDER_SIZE.1 };
+        let geometry = icedtea_contract::Rectangle {
+            x,
+            y,
+            width: PLACEHOLDER_SIZE.0,
+            height: PLACEHOLDER_SIZE.1,
+        };
         // `add_window` autofocuses, so this is a focus change like any other
         // (New-1): capture the outgoing focus before it happens.
         let previous = self.focused_id();
@@ -4348,7 +4709,8 @@ impl State {
         // with what the client was told.
         let requested = self.pending_decorations.remove(&toplevel).flatten();
         if requested.is_some() {
-            self.window_manager.set_client_decorations_requested(id, requested);
+            self.window_manager
+                .set_client_decorations_requested(id, requested);
         }
         // Explicit sync of the new window first (re-review minor 2):
         // `sync_focus_change` also reaches it today, but only because
@@ -4374,7 +4736,9 @@ impl State {
         // mapping still had a decoration preference parked for it, and
         // nothing else would ever come to collect it.
         self.pending_decorations.remove(&toplevel);
-        let Some(id) = self.wayland.window_for(toplevel) else { return };
+        let Some(id) = self.wayland.window_for(toplevel) else {
+            return;
+        };
         self.wayland.forget(id);
         self.forget_window(id);
         self.emit_pending();
@@ -4387,8 +4751,14 @@ impl State {
     /// would leave the old string on screen until some unrelated geometry
     /// change happened to re-sync the window.
     pub fn toplevel_title_changed(&mut self, toplevel: crate::wayland::ToplevelKey, title: &str) {
-        let Some(id) = self.wayland.window_for(toplevel) else { return };
-        if self.window_manager.set_title(id, title.to_string()).is_some() {
+        let Some(id) = self.wayland.window_for(toplevel) else {
+            return;
+        };
+        if self
+            .window_manager
+            .set_title(id, title.to_string())
+            .is_some()
+        {
             self.sync_window_to_scene(id);
             self.emit_pending();
         }
@@ -4422,7 +4792,10 @@ impl State {
         self.shutdown_source = Some(id);
     }
 
-    pub fn set_command_receiver(&mut self, rx: crossbeam_channel::Receiver<crate::dbus::DbCommand>) {
+    pub fn set_command_receiver(
+        &mut self,
+        rx: crossbeam_channel::Receiver<crate::dbus::DbCommand>,
+    ) {
         self.cmd_rx = Some(rx);
     }
 
@@ -4447,7 +4820,10 @@ impl State {
 
     /// Keep the receiving half of `render::spawn_wallpaper_decode`'s channel
     /// so [`Self::drain_wallpaper`] has somewhere to read from.
-    pub fn set_wallpaper_receiver(&mut self, rx: crossbeam_channel::Receiver<Option<image::RgbaImage>>) {
+    pub fn set_wallpaper_receiver(
+        &mut self,
+        rx: crossbeam_channel::Receiver<Option<image::RgbaImage>>,
+    ) {
         self.wallpaper_rx = Some(rx);
     }
 
@@ -4470,7 +4846,9 @@ impl State {
     /// Collected before applying, rather than iterated lazily: `handle_command`
     /// takes `&mut self`, and the receiver lives in `self`.
     fn drain_pending_commands(&mut self) {
-        let Some(rx) = self.cmd_rx.as_ref() else { return };
+        let Some(rx) = self.cmd_rx.as_ref() else {
+            return;
+        };
         let pending: Vec<crate::dbus::DbCommand> = rx.try_iter().collect();
         for cmd in pending {
             self.handle_command(cmd);
@@ -4549,12 +4927,14 @@ impl State {
     /// precisely the cases the hint exists for.
     fn raise_attention_if_answerable(&mut self, id: WindowId) {
         if !self.window_manager.get(id).is_some_and(|w| w.mapped) {
-            tracing::debug!(?id, "not flagging attention on an unmapped target; focus could never clear it");
+            tracing::debug!(
+                ?id,
+                "not flagging attention on an unmapped target; focus could never clear it"
+            );
             return;
         }
         self.window_manager.set_attention(id, true);
     }
-
 }
 
 // --- Compositor library handlers ---
@@ -4567,7 +4947,9 @@ impl State {
 
 impl wlr::OutputHandler for State {
     fn new_output(&mut self, output: &wlr::Output<'_>) {
-        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+        let Some(runtime) = self.wayland.runtime().cloned() else {
+            return;
+        };
         // Renderer before enable: the DRM backend's enabling commit needs a
         // framebuffer, which wlroots can only allocate once the output has
         // its renderer/allocator. Nested backends tolerate either order,
@@ -4583,7 +4965,12 @@ impl wlr::OutputHandler for State {
         // client and this lookup share; `None` (an unnamed output) matches
         // no persisted entry and takes the default preferred-mode path.
         let name = output.name().unwrap_or_default();
-        let display_cfg = self.config.displays.iter().find(|d| d.name == name).cloned();
+        let display_cfg = self
+            .config
+            .displays
+            .iter()
+            .find(|d| d.name == name)
+            .cloned();
         // The scale actually committed on this output, mirrored into
         // `OutputSurface::scale` below so the M4 HiDPI DPI-hint export can read
         // it off the model without a live handler. Every arm that ends in the
@@ -4704,8 +5091,18 @@ impl wlr::OutputHandler for State {
         // to the single-output-at-origin behavior this replaced.
         let geometry = runtime
             .output_layout_box(output.id())
-            .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
-            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width, height });
+            .map(|(x, y, w, h)| icedtea_contract::Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+            })
+            .unwrap_or(icedtea_contract::Rectangle {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            });
         self.create_output(index, geometry);
         // Record the connector name so the applied-config handler can map an
         // `AppliedHead` back to this index and `destroyed`/persist can look
@@ -4762,14 +5159,20 @@ impl wlr::OutputHandler for State {
         // `DbCommand::SetOutputScaleForTest` scale onto. `take` first so a
         // rejected `set_scale` still consumes the pending entry rather than
         // retrying forever against every future frame of every output.
-        if self.pending_test_output_scale.as_ref().is_some_and(|(oid, ..)| *oid == output.id()) {
+        if self
+            .pending_test_output_scale
+            .as_ref()
+            .is_some_and(|(oid, ..)| *oid == output.id())
+        {
             let (_, scale, reply) = self.pending_test_output_scale.take().unwrap();
             if let Err(err) = output.set_scale(scale) {
                 tracing::warn!(?err, "SetOutputScaleForTest: live scale rejected");
             }
             let _ = reply.send(true);
         }
-        let Some(runtime) = self.wayland.runtime() else { return };
+        let Some(runtime) = self.wayland.runtime() else {
+            return;
+        };
         // A rejected commit is routine — wlroots rejects one when nothing
         // changed — so it is logged at debug and never escalated.
         if let Err(err) = runtime.commit_output(output) {
@@ -4825,7 +5228,9 @@ impl wlr::OutputHandler for State {
         // output that shrank or went dark, persist the result, and
         // re-advertise. Never block on redb here -- `spawn_config_save` does
         // the write off-loop.
-        let Some(runtime) = self.wayland.runtime().cloned() else { return };
+        let Some(runtime) = self.wayland.runtime().cloned() else {
+            return;
+        };
 
         // Review finding #5 (interactive guard): whether any head in THIS
         // batch is being enabled. A disable that would empty `self.outputs` is
@@ -4843,9 +5248,15 @@ impl wlr::OutputHandler for State {
         let mut refused_disables: Vec<String> = Vec::new();
 
         for head in &heads {
-            let Some(head_name) = head.name.as_deref() else { continue };
+            let Some(head_name) = head.name.as_deref() else {
+                continue;
+            };
             // name -> our output index (via the name recorded in `new_output`).
-            let index = match self.outputs.iter().find(|(_, o)| o.name == head_name).map(|(i, _)| *i)
+            let index = match self
+                .outputs
+                .iter()
+                .find(|(_, o)| o.name == head_name)
+                .map(|(i, _)| *i)
             {
                 Some(index) => index,
                 None => {
@@ -4863,16 +5274,28 @@ impl wlr::OutputHandler for State {
                         self.next_output_index += 1;
                         let geometry = runtime
                             .output_layout_box(oid)
-                            .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
-                            .or_else(|| {
-                                (head.width > 0 && head.height > 0).then_some(icedtea_contract::Rectangle {
-                                    x: head.x,
-                                    y: head.y,
-                                    width: head.width,
-                                    height: head.height,
-                                })
+                            .map(|(x, y, w, h)| icedtea_contract::Rectangle {
+                                x,
+                                y,
+                                width: w,
+                                height: h,
                             })
-                            .unwrap_or(icedtea_contract::Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+                            .or_else(|| {
+                                (head.width > 0 && head.height > 0).then_some(
+                                    icedtea_contract::Rectangle {
+                                        x: head.x,
+                                        y: head.y,
+                                        width: head.width,
+                                        height: head.height,
+                                    },
+                                )
+                            })
+                            .unwrap_or(icedtea_contract::Rectangle {
+                                x: 0,
+                                y: 0,
+                                width: 1920,
+                                height: 1080,
+                            });
                         self.create_output(index, geometry);
                         if let Some(surface) = self.outputs.get_mut(&index) {
                             surface.name = head_name.to_string();
@@ -4900,10 +5323,19 @@ impl wlr::OutputHandler for State {
                 // Re-derive from the layout box wlroots just committed; fall
                 // back to the head's own reported mode/position, then to the
                 // prior box, so the output is never collapsed to nothing.
-                let oid = self.output_ids.iter().find(|(_, i)| **i == index).map(|(id, _)| *id);
+                let oid = self
+                    .output_ids
+                    .iter()
+                    .find(|(_, i)| **i == index)
+                    .map(|(id, _)| *id);
                 let geometry = oid
                     .and_then(|oid| runtime.output_layout_box(oid))
-                    .map(|(x, y, w, h)| icedtea_contract::Rectangle { x, y, width: w, height: h })
+                    .map(|(x, y, w, h)| icedtea_contract::Rectangle {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    })
                     .or_else(|| {
                         (head.width > 0 && head.height > 0).then_some(icedtea_contract::Rectangle {
                             x: head.x,
@@ -4953,8 +5385,11 @@ impl wlr::OutputHandler for State {
                 // rehydrate it -- see that map's doc and the enable branch
                 // above.
                 self.outputs.remove(&index);
-                if let Some(oid) =
-                    self.output_ids.iter().find(|(_, i)| **i == index).map(|(id, _)| *id)
+                if let Some(oid) = self
+                    .output_ids
+                    .iter()
+                    .find(|(_, i)| **i == index)
+                    .map(|(id, _)| *id)
                 {
                     self.disabled_outputs.insert(oid, head_name.to_string());
                     self.output_ids.remove(&oid);
@@ -5019,7 +5454,12 @@ impl wlr::OutputHandler for State {
 }
 
 impl wlr::FdHandler for State {
-    fn fd_ready(&mut self, source: wlr::SourceId, fd: std::os::fd::BorrowedFd<'_>, _readiness: wlr::Readiness) {
+    fn fd_ready(
+        &mut self,
+        source: wlr::SourceId,
+        fd: std::os::fd::BorrowedFd<'_>,
+        _readiness: wlr::Readiness,
+    ) {
         // Drain whatever byte(s) woke this source before acting on it, for
         // every arm below: libwayland's loop is level-triggered, so a
         // handler that leaves data behind is called again every turn
@@ -5109,9 +5549,15 @@ impl wlr::ToplevelHandler for State {
         let ssd = crate::decoration::has_ssd(&app_id, requested, false);
         self.wayland.set_decoration_mode(
             key,
-            if ssd { wlr::DecorationMode::ServerSide } else { wlr::DecorationMode::ClientSide },
+            if ssd {
+                wlr::DecorationMode::ServerSide
+            } else {
+                wlr::DecorationMode::ClientSide
+            },
         );
-        let Some(runtime) = self.wayland.runtime() else { return };
+        let Some(runtime) = self.wayland.runtime() else {
+            return;
+        };
         let placeholder = icedtea_contract::Rectangle {
             x: 0,
             y: 0,
@@ -5169,7 +5615,9 @@ impl wlr::ToplevelHandler for State {
         // leaving it pointed at a hidden surface.
         tracing::info!(?id, "toplevel unmapped");
         let key = crate::wayland::ToplevelKey::new(id);
-        let Some(window) = self.wayland.window_for(key) else { return };
+        let Some(window) = self.wayland.window_for(key) else {
+            return;
+        };
         self.wayland.set_visible(window, false);
         let previous = self.focused_id();
         self.window_manager.set_mapped(window, false);
@@ -5242,11 +5690,16 @@ impl wlr::ToplevelHandler for State {
     /// `focus`, so a unit test cannot tell a refusal from those.
     fn request_move(&mut self, id: wlr::ToplevelId) {
         if !self.client_grab_requests_allowed() {
-            tracing::debug!(?id, "refusing a client move request while the session is locked");
+            tracing::debug!(
+                ?id,
+                "refusing a client move request while the session is locked"
+            );
             return;
         }
         let key = crate::wayland::ToplevelKey::new(id);
-        let Some(window_id) = self.wayland.window_for(key) else { return };
+        let Some(window_id) = self.wayland.window_for(key) else {
+            return;
+        };
         self.begin_client_move(window_id);
     }
 
@@ -5261,11 +5714,17 @@ impl wlr::ToplevelHandler for State {
     /// that geometry, since focus would say nothing here.
     fn request_resize(&mut self, id: wlr::ToplevelId, edges: wlr::Edges) {
         if !self.client_grab_requests_allowed() {
-            tracing::debug!(?id, ?edges, "refusing a client resize request while the session is locked");
+            tracing::debug!(
+                ?id,
+                ?edges,
+                "refusing a client resize request while the session is locked"
+            );
             return;
         }
         let key = crate::wayland::ToplevelKey::new(id);
-        let Some(window_id) = self.wayland.window_for(key) else { return };
+        let Some(window_id) = self.wayland.window_for(key) else {
+            return;
+        };
         self.begin_client_resize(window_id, edges);
     }
 
@@ -5357,13 +5816,18 @@ impl wlr::ToplevelHandler for State {
     /// layer surface that no handler ever does.
     fn new_layer_surface(&mut self, surface: &wlr::LayerSurface<'_>) {
         let id = surface.id();
-        let client_output = surface.output_id().and_then(|oid| self.output_ids.get(&oid).copied());
+        let client_output = surface
+            .output_id()
+            .and_then(|oid| self.output_ids.get(&oid).copied());
         let output = client_output.or_else(|| self.output_for_pointer());
         let sequence = self.next_layer_sequence;
         self.next_layer_sequence += 1;
         // H2: bound the client-controlled exclusive zone at capture time --
         // see `clamp_exclusive_zone`'s own doc.
-        let exclusive = clamp_exclusive_zone(surface.exclusive_zone(), output.and_then(|idx| self.outputs.get(&idx)));
+        let exclusive = clamp_exclusive_zone(
+            surface.exclusive_zone(),
+            output.and_then(|idx| self.outputs.get(&idx)),
+        );
         self.layers.insert(
             id,
             LayerEntry {
@@ -5421,12 +5885,17 @@ impl wlr::ToplevelHandler for State {
     /// in this file takes.
     fn layer_surface_commit(&mut self, surface: &wlr::LayerSurface<'_>) {
         let id = surface.id();
-        let Some(output_idx) = self.layers.get(&id).map(|e| e.output) else { return };
+        let Some(output_idx) = self.layers.get(&id).map(|e| e.output) else {
+            return;
+        };
         // H2: bound the client-controlled exclusive zone at capture time --
         // see `clamp_exclusive_zone`'s own doc. Looked up before the
         // `entry` borrow below, since both read `self.outputs`.
-        let exclusive = clamp_exclusive_zone(surface.exclusive_zone(), self.outputs.get(&output_idx));
-        let Some(entry) = self.layers.get_mut(&id) else { return };
+        let exclusive =
+            clamp_exclusive_zone(surface.exclusive_zone(), self.outputs.get(&output_idx));
+        let Some(entry) = self.layers.get_mut(&id) else {
+            return;
+        };
         entry.layer = surface.layer();
         entry.anchor = surface.anchor();
         entry.exclusive = exclusive;
@@ -5460,11 +5929,15 @@ impl wlr::ToplevelHandler for State {
             entry.mapped = true;
         }
         self.arrange_layers();
-        let Some(entry) = self.layers.get(&id) else { return };
+        let Some(entry) = self.layers.get(&id) else {
+            return;
+        };
         if !entry.interactive {
             return;
         }
-        let Some(runtime) = self.wayland.runtime() else { return };
+        let Some(runtime) = self.wayland.runtime() else {
+            return;
+        };
         if runtime.focus_layer_keyboard(id).is_some() {
             self.layer_focus = Some(id);
         } else {
@@ -5472,7 +5945,10 @@ impl wlr::ToplevelHandler for State {
             // failed to take keyboard focus used to fail silently, leaving
             // no trace of why an auto-hide launcher/locker never got
             // keyboard input.
-            tracing::debug!(?id, "interactive layer surface mapped but did not take keyboard focus");
+            tracing::debug!(
+                ?id,
+                "interactive layer surface mapped but did not take keyboard focus"
+            );
         }
     }
 
@@ -5604,7 +6080,9 @@ impl wlr::ToplevelHandler for State {
     }
 
     fn xwayland_title_changed(&mut self, surface: &wlr::XwaylandSurface<'_>) {
-        let Some(&window_id) = self.xwayland_windows.get(&surface.id()) else { return };
+        let Some(&window_id) = self.xwayland_windows.get(&surface.id()) else {
+            return;
+        };
         let title = surface.title().unwrap_or_default();
         if self.window_manager.set_title(window_id, title).is_some() {
             self.sync_window_to_scene(window_id);
@@ -5613,8 +6091,13 @@ impl wlr::ToplevelHandler for State {
     }
 
     fn xwayland_class_changed(&mut self, surface: &wlr::XwaylandSurface<'_>) {
-        let Some(&window_id) = self.xwayland_windows.get(&surface.id()) else { return };
-        let app_id = surface.class().or_else(|| surface.instance()).unwrap_or_default();
+        let Some(&window_id) = self.xwayland_windows.get(&surface.id()) else {
+            return;
+        };
+        let app_id = surface
+            .class()
+            .or_else(|| surface.instance())
+            .unwrap_or_default();
         // `app_id` drives `decoration::has_ssd`, so a class change can flip a
         // window between decorated and undecorated; resync when it actually
         // changed (`set_app_id` returns `None` on a no-op, and emits nothing —
@@ -5626,11 +6109,7 @@ impl wlr::ToplevelHandler for State {
         }
     }
 
-    fn xwayland_request_configure(
-        &mut self,
-        id: wlr::XwaylandSurfaceId,
-        geometry: wlr::Box2D,
-    ) {
+    fn xwayland_request_configure(&mut self, id: wlr::XwaylandSurfaceId, geometry: wlr::Box2D) {
         // An override-redirect pop-up self-positioning: honour it verbatim —
         // an OR surface owns its own coordinates (a menu that follows its
         // anchor, a tooltip that repositions). Move the scene node to the new
@@ -5656,12 +6135,17 @@ impl wlr::ToplevelHandler for State {
         // storing it, then let the shared path re-inset and re-configure. Skip
         // a resize while an interactive grab owns the window, so a client
         // configure cannot fight a drag/resize in progress.
-        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        let Some(&window_id) = self.xwayland_windows.get(&id) else {
+            return;
+        };
         if self.drag.window_id() == Some(window_id) || self.resize.window_id() == Some(window_id) {
             return;
         }
-        let Some(w) = self.window_manager.get(window_id) else { return };
-        let ssd = crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen);
+        let Some(w) = self.window_manager.get(window_id) else {
+            return;
+        };
+        let ssd =
+            crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen);
         // A maximized/fullscreen window's geometry is WM-owned; ignore a
         // client's attempt to move out of it, matching how xdg toplevels are
         // pinned in those states.
@@ -5693,12 +6177,16 @@ impl wlr::ToplevelHandler for State {
         // `xdg_toplevel.move` does (`begin_client_move` is WindowId-keyed and
         // gates on the pointer being pressed), which writes geometry back
         // through the shared `sync_window_to_scene` path.
-        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        let Some(&window_id) = self.xwayland_windows.get(&id) else {
+            return;
+        };
         self.begin_client_move(window_id);
     }
 
     fn xwayland_request_resize(&mut self, id: wlr::XwaylandSurfaceId, edges: wlr::Edges) {
-        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        let Some(&window_id) = self.xwayland_windows.get(&id) else {
+            return;
+        };
         self.begin_client_resize(window_id, edges);
     }
 
@@ -5707,17 +6195,23 @@ impl wlr::ToplevelHandler for State {
         // restore slot and the reflect-back configure all come from
         // `set_maximized_target` -> `sync_window_to_scene`, whose seam pushes
         // `set_xwayland_surface_maximized` back to the client.
-        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        let Some(&window_id) = self.xwayland_windows.get(&id) else {
+            return;
+        };
         self.set_maximized_target(window_id, maximized);
     }
 
     fn xwayland_request_fullscreen(&mut self, id: wlr::XwaylandSurfaceId, fullscreen: bool) {
-        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        let Some(&window_id) = self.xwayland_windows.get(&id) else {
+            return;
+        };
         self.set_fullscreen_target(window_id, fullscreen);
     }
 
     fn xwayland_request_minimize(&mut self, id: wlr::XwaylandSurfaceId, minimized: bool) {
-        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        let Some(&window_id) = self.xwayland_windows.get(&id) else {
+            return;
+        };
         self.set_minimized_and_reconcile(window_id, minimized);
     }
 
@@ -5741,10 +6235,15 @@ impl wlr::ToplevelHandler for State {
     /// there is nothing to raise and nothing to flag.
     fn xwayland_request_activate(&mut self, id: wlr::XwaylandSurfaceId) {
         if self.session_locked {
-            tracing::debug!(?id, "ignoring X11 activate request while the session is locked");
+            tracing::debug!(
+                ?id,
+                "ignoring X11 activate request while the session is locked"
+            );
             return;
         }
-        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        let Some(&window_id) = self.xwayland_windows.get(&id) else {
+            return;
+        };
         let focused = self.focused_id();
         if focused == Some(window_id) {
             return;
@@ -5770,7 +6269,11 @@ impl wlr::ToplevelHandler for State {
             }
             return;
         }
-        tracing::debug!(?window_id, target_activatable, "refusing X11 focus steal; flagging attention instead");
+        tracing::debug!(
+            ?window_id,
+            target_activatable,
+            "refusing X11 focus steal; flagging attention instead"
+        );
         self.raise_attention_if_answerable(window_id);
         self.emit_pending();
     }
@@ -5918,7 +6421,9 @@ impl wlr::SeatHandler for State {
             // the scene knows nothing about workspaces or minimization, and
             // `window_at_point` is already MRU-ordered, which is a correct
             // topmost-first order (review finding I1).
-            let Some(id) = self.window_at_point(pointer) else { return };
+            let Some(id) = self.window_at_point(pointer) else {
+                return;
+            };
             self.handle_pointer(PointerEvent::Press { id, pointer });
         } else {
             self.handle_pointer(PointerEvent::Release { pointer });
@@ -5993,9 +6498,19 @@ impl wlr::SeatHandler for State {
     /// normally, and so route their own `set_shape` here like any toplevel.
     /// `the_ssd_title_bar_drops_a_cursor_shape_request` (in
     /// `compositor/tests/compat_protocols.rs`) pins all three readings.
-    fn request_set_shape(&mut self, device: wlr::CursorShapeDevice, serial: u32, shape: wlr::CursorShape) {
+    fn request_set_shape(
+        &mut self,
+        device: wlr::CursorShapeDevice,
+        serial: u32,
+        shape: wlr::CursorShape,
+    ) {
         if !Self::honors_cursor_shape_device(device) {
-            tracing::debug!(?device, serial, ?shape, "ignoring cursor-shape request from a non-pointer device");
+            tracing::debug!(
+                ?device,
+                serial,
+                ?shape,
+                "ignoring cursor-shape request from a non-pointer device"
+            );
             return;
         }
         self.apply_cursor_shape(shape);
@@ -6032,23 +6547,39 @@ impl wlr::SeatHandler for State {
         // the user cannot see, act on, or clear until then. The same
         // early-return `sync_window_to_scene`/`sync_seat_focus` take.
         if self.session_locked {
-            tracing::debug!(?target, ?token, "ignoring activation request while the session is locked");
+            tracing::debug!(
+                ?target,
+                ?token,
+                "ignoring activation request while the session is locked"
+            );
             return;
         }
         let Some(target) = target else {
-            tracing::debug!(?token, "ignoring activation request for a surface with no toplevel");
+            tracing::debug!(
+                ?token,
+                "ignoring activation request for a surface with no toplevel"
+            );
             return;
         };
-        let Some(target_window) = self.wayland.window_for(crate::wayland::ToplevelKey::new(target)) else {
-            tracing::debug!(?target, ?token, "ignoring activation request for an untracked toplevel");
+        let Some(target_window) = self
+            .wayland
+            .window_for(crate::wayland::ToplevelKey::new(target))
+        else {
+            tracing::debug!(
+                ?target,
+                ?token,
+                "ignoring activation request for an untracked toplevel"
+            );
             return;
         };
         let focused = self.focused_id();
         if focused == Some(target_window) {
             return;
         }
-        let requester =
-            token.requesting_toplevel.and_then(|id| self.wayland.window_for(crate::wayland::ToplevelKey::new(id)));
+        let requester = token.requesting_toplevel.and_then(|id| {
+            self.wayland
+                .window_for(crate::wayland::ToplevelKey::new(id))
+        });
         // Owner ruling: a client's activation request never switches
         // workspaces and never unminimizes. Honoring one aimed at a target
         // the focus could not actually land on where the user is looking
@@ -6060,7 +6591,11 @@ impl wlr::SeatHandler for State {
             .get(target_window)
             .is_some_and(|w| w.mapped && !w.minimized && w.workspace == active_workspace);
         if activation_may_steal_focus(token.has_seat, target_activatable, requester, focused) {
-            tracing::debug!(?target_window, ?requester, "honoring xdg-activation focus request");
+            tracing::debug!(
+                ?target_window,
+                ?requester,
+                "honoring xdg-activation focus request"
+            );
             if self.window_manager.focus(target_window).is_some() {
                 // Same ordering as every other explicit focus assertion: only
                 // after `focus` actually succeeded, so a refused focus leaves
@@ -6088,7 +6623,12 @@ mod tests {
     use icedtea_config::default_config;
     use icedtea_contract::Rectangle;
 
-    const DEFAULT_GEO: Rectangle = Rectangle { x: 0, y: 0, width: 640, height: 400 };
+    const DEFAULT_GEO: Rectangle = Rectangle {
+        x: 0,
+        y: 0,
+        width: 640,
+        height: 400,
+    };
 
     #[test]
     fn state_emits_pending_events_on_channel() {
@@ -6096,7 +6636,10 @@ mod tests {
         let mut state = State::new(default_config(), tx);
         state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.emit_pending();
-        assert!(matches!(rx.try_recv().map(|e| e.event), Ok(Event::WindowOpened(_))));
+        assert!(matches!(
+            rx.try_recv().map(|e| e.event),
+            Ok(Event::WindowOpened(_))
+        ));
     }
 
     #[test]
@@ -6104,23 +6647,62 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
-        state.window_manager.set_geometry(id, Rectangle { x: 100, y: 100, width: 600, height: 400 }).unwrap();
+        state
+            .window_manager
+            .set_geometry(
+                id,
+                Rectangle {
+                    x: 100,
+                    y: 100,
+                    width: 600,
+                    height: 400,
+                },
+            )
+            .unwrap();
         state.window_manager.focus(id).unwrap();
-        let geo = Rectangle { x: 100, y: 100, width: 600, height: 400 };
+        let geo = Rectangle {
+            x: 100,
+            y: 100,
+            width: 600,
+            height: 400,
+        };
         // Click on rightmost button (close button)
         let close_pt = (geo.x + geo.width - 5, geo.y + 5);
-        assert_eq!(state.decoration_action_for(id, close_pt), Some(crate::decoration::DecorationAction::Close));
+        assert_eq!(
+            state.decoration_action_for(id, close_pt),
+            Some(crate::decoration::DecorationAction::Close)
+        );
     }
 
     #[test]
     fn decoration_action_for_returns_none_for_unfocused_window() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        let id1 = state.window_manager.add_window("app1", "t1", 1, DEFAULT_GEO);
-        let _id2 = state.window_manager.add_window("app2", "t2", 2, DEFAULT_GEO);
+        let id1 = state
+            .window_manager
+            .add_window("app1", "t1", 1, DEFAULT_GEO);
+        let _id2 = state
+            .window_manager
+            .add_window("app2", "t2", 2, DEFAULT_GEO);
         // _id2 is now focused; id1 is unfocused
-        state.window_manager.set_geometry(id1, Rectangle { x: 100, y: 100, width: 600, height: 400 }).unwrap();
-        let geo = Rectangle { x: 100, y: 100, width: 600, height: 400 };
+        state
+            .window_manager
+            .set_geometry(
+                id1,
+                Rectangle {
+                    x: 100,
+                    y: 100,
+                    width: 600,
+                    height: 400,
+                },
+            )
+            .unwrap();
+        let geo = Rectangle {
+            x: 100,
+            y: 100,
+            width: 600,
+            height: 400,
+        };
         let close_pt = (geo.x + geo.width - 5, geo.y + 5);
         // Should return None because id1 is not focused
         assert_eq!(state.decoration_action_for(id1, close_pt), None);
@@ -6130,11 +6712,24 @@ mod tests {
     fn decoration_action_for_returns_none_for_fullscreen_window() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
+        state.outputs.insert(
+            0,
+            OutputSurface::new(Rectangle {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }),
+        );
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.window_manager.focus(id).unwrap();
         state.toggle_fullscreen(id).unwrap();
-        let geo = Rectangle { x: 0, y: 0, width: 1920, height: 1080 };
+        let geo = Rectangle {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
         let close_pt = (geo.x + 5, geo.y + 5);
         // Should return None because window is fullscreen
         assert_eq!(state.decoration_action_for(id, close_pt), None);
@@ -6144,27 +6739,67 @@ mod tests {
     fn decoration_action_for_ignores_csd_and_still_returns_close() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        let id = state.window_manager.add_window("org.gtk.App", "t", 1, DEFAULT_GEO);
-        state.window_manager.set_geometry(id, Rectangle { x: 100, y: 100, width: 600, height: 400 }).unwrap();
+        let id = state
+            .window_manager
+            .add_window("org.gtk.App", "t", 1, DEFAULT_GEO);
+        state
+            .window_manager
+            .set_geometry(
+                id,
+                Rectangle {
+                    x: 100,
+                    y: 100,
+                    width: 600,
+                    height: 400,
+                },
+            )
+            .unwrap();
         state.window_manager.focus(id).unwrap();
-        state.window_manager.set_client_decorations_requested(id, Some(true)).unwrap();
-        let geo = Rectangle { x: 100, y: 100, width: 600, height: 400 };
+        state
+            .window_manager
+            .set_client_decorations_requested(id, Some(true))
+            .unwrap();
+        let geo = Rectangle {
+            x: 100,
+            y: 100,
+            width: 600,
+            height: 400,
+        };
         let close_pt = (geo.x + geo.width - 5, geo.y + 5);
         // Should work even though client requested decorations (decoration_action_for doesn't filter by CSD)
         // CSD filtering happens at rendering time in draw_frame
-        assert_eq!(state.decoration_action_for(id, close_pt), Some(crate::decoration::DecorationAction::Close));
+        assert_eq!(
+            state.decoration_action_for(id, close_pt),
+            Some(crate::decoration::DecorationAction::Close)
+        );
     }
 
     #[test]
     fn toggle_fullscreen_flips_state_and_geometry() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
+        state.outputs.insert(
+            0,
+            OutputSurface::new(Rectangle {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }),
+        );
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.toggle_fullscreen(id).unwrap();
         let w = state.window_manager.get(id).unwrap();
         assert!(w.fullscreen);
-        assert_eq!(w.geometry, Rectangle { x: 0, y: 0, width: 1920, height: 1080 });
+        assert_eq!(
+            w.geometry,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080
+            }
+        );
     }
 
     // NOTE (brief deviation): the brief's Step-1 sample for
@@ -6197,12 +6832,23 @@ mod tests {
     fn apply_action_switches_workspaces_and_snaps() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
+        state.outputs.insert(
+            0,
+            OutputSurface::new(Rectangle {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 800,
+            }),
+        );
         state.apply_action("workspace:2").unwrap();
         assert_eq!(state.window_manager.active_workspace(), 1);
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.apply_action("snap:left").unwrap();
-        assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 1000 / 2 - 16);
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry.width,
+            1000 / 2 - 16
+        );
         state.apply_action("snap:restore").unwrap();
         assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 640);
     }
@@ -6226,7 +6872,10 @@ mod tests {
 
         // The window on a still-existing workspace index survives with its
         // assignment intact -- and no WindowClosed was emitted for it.
-        assert!(state.window_manager.get(a).is_some(), "window survives a reload");
+        assert!(
+            state.window_manager.get(a).is_some(),
+            "window survives a reload"
+        );
         assert_eq!(state.window_manager.get(a).unwrap().workspace, 0);
         assert!(!events.iter().any(|e| matches!(e, Event::WindowClosed(_))));
     }
@@ -6253,9 +6902,18 @@ mod tests {
         cfg.workspace_names = vec!["only".into()]; // removes workspaces 1..4
         let events = state.apply_config(cfg);
 
-        let w = state.window_manager.get(a).expect("window survives, is not closed");
-        assert_eq!(w.workspace, 0, "a window on a removed workspace migrates to 0");
-        assert!(w.focused, "M-1: landing on the active workspace with no focus set must re-pick it");
+        let w = state
+            .window_manager
+            .get(a)
+            .expect("window survives, is not closed");
+        assert_eq!(
+            w.workspace, 0,
+            "a window on a removed workspace migrates to 0"
+        );
+        assert!(
+            w.focused,
+            "M-1: landing on the active workspace with no focus set must re-pick it"
+        );
         assert!(!events.iter().any(|e| matches!(e, Event::WindowClosed(_))));
     }
 
@@ -6278,13 +6936,23 @@ mod tests {
         cfg.workspace_names = vec!["only".into()]; // removes workspaces 1..4
         let _ = state.apply_config(cfg);
 
-        assert_eq!(state.window_manager.active_workspace(), 0, "active clamps into range");
+        assert_eq!(
+            state.window_manager.active_workspace(),
+            0,
+            "active clamps into range"
+        );
         assert!(
             state
                 .window_manager
                 .pending_events
                 .iter()
-                .any(|se| matches!(se.event, Event::WorkspaceSet { id: 0, active: true })),
+                .any(|se| matches!(
+                    se.event,
+                    Event::WorkspaceSet {
+                        id: 0,
+                        active: true
+                    }
+                )),
             "clamping the active workspace must emit a WorkspaceSet"
         );
     }
@@ -6326,7 +6994,10 @@ mod tests {
             Some(a),
             "a migrated window must be re-focused, not left with a dangling focus pointer"
         );
-        assert!(focused.unwrap().focused, "the re-picked window's own focused flag must be set");
+        assert!(
+            focused.unwrap().focused,
+            "the re-picked window's own focused flag must be set"
+        );
     }
 
     /// Review finding: the brief's own sample test for this name is vacuous
@@ -6357,8 +7028,20 @@ mod tests {
         // "app" is not GTK-style, so `decoration::has_ssd` gives it a
         // server-side title bar -- `sync_window_to_scene` only rasterizes a
         // title for a decorated, visible window.
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
-        state.wayland.bind(id, crate::wayland::ToplevelKey::for_test(1));
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
+        state
+            .wayland
+            .bind(id, crate::wayland::ToplevelKey::for_test(1));
 
         // Drive one sync under the *old* palette to seed the cache, then
         // capture its pixels.
@@ -6394,11 +7077,20 @@ mod tests {
     fn reload_reswaps_wallpaper_only_on_path_change() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.wallpaper.set_decoded(Some(image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]))));
+        state
+            .wallpaper
+            .set_decoded(Some(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([0, 0, 0, 255]),
+            )));
         let mut cfg = icedtea_config::default_config();
         cfg.appearance.wallpaper = Some("/nonexistent/x.png".into());
         state.apply_reloaded_config(cfg);
-        assert!(state.wallpaper.decoded().is_none(), "path change clears the stale wallpaper before redecode");
+        assert!(
+            state.wallpaper.decoded().is_none(),
+            "path change clears the stale wallpaper before redecode"
+        );
     }
 
     /// The negative counterpart the review flagged as missing: reloading
@@ -6416,7 +7108,10 @@ mod tests {
         // unrelated field changes.
         let mut cfg = icedtea_config::default_config();
         cfg.appearance.palette.background = "#abcdef".into();
-        assert_eq!(cfg.appearance.wallpaper, state.config.appearance.wallpaper, "path unchanged");
+        assert_eq!(
+            cfg.appearance.wallpaper, state.config.appearance.wallpaper,
+            "path unchanged"
+        );
         state.apply_reloaded_config(cfg);
 
         assert_eq!(
@@ -6455,7 +7150,9 @@ mod tests {
         let mut state = State::new(default_config(), tx);
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         // Default config binds SUPER+q to "close" (see config/src/defaults.rs).
-        state.handle_key(input::Modifiers::SUPER, input::key_name_to_keysym("KEY_q")).unwrap();
+        state
+            .handle_key(input::Modifiers::SUPER, input::key_name_to_keysym("KEY_q"))
+            .unwrap();
         assert!(state.window_manager.get(id).is_none());
     }
 
@@ -6470,15 +7167,46 @@ mod tests {
     fn handle_pointer_drag_moves_window_without_snap() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 640, height: 400 });
+        state.outputs.insert(
+            0,
+            OutputSurface::new(Rectangle {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 800,
+            }),
+        );
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 100,
+                y: 100,
+                width: 640,
+                height: 400,
+            },
+        );
         state.window_manager.focus(id).unwrap();
         // Press inside the title bar's move area (not on a button).
-        state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) }).unwrap();
+        state
+            .handle_pointer(PointerEvent::Press {
+                id,
+                pointer: (120, 105),
+            })
+            .unwrap();
         // Drag to a point away from any snap edge.
-        state.handle_pointer(PointerEvent::Motion { pointer: (400, 400) }).unwrap();
+        state
+            .handle_pointer(PointerEvent::Motion {
+                pointer: (400, 400),
+            })
+            .unwrap();
         assert_eq!(state.snap_preview, None);
-        state.handle_pointer(PointerEvent::Release { pointer: (400, 400) }).unwrap();
+        state
+            .handle_pointer(PointerEvent::Release {
+                pointer: (400, 400),
+            })
+            .unwrap();
         let geo = state.window_manager.get(id).unwrap().geometry;
         // grab_offset was (20, 5); released at (400, 400) => top-left (380, 395).
         assert_eq!((geo.x, geo.y), (380, 395));
@@ -6488,13 +7216,40 @@ mod tests {
     fn handle_pointer_drag_to_edge_snaps() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 640, height: 400 });
+        state.outputs.insert(
+            0,
+            OutputSurface::new(Rectangle {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 800,
+            }),
+        );
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 100,
+                y: 100,
+                width: 640,
+                height: 400,
+            },
+        );
         state.window_manager.focus(id).unwrap();
-        state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) }).unwrap();
-        state.handle_pointer(PointerEvent::Motion { pointer: (2, 400) }).unwrap();
+        state
+            .handle_pointer(PointerEvent::Press {
+                id,
+                pointer: (120, 105),
+            })
+            .unwrap();
+        state
+            .handle_pointer(PointerEvent::Motion { pointer: (2, 400) })
+            .unwrap();
         assert!(state.snap_preview.is_some());
-        state.handle_pointer(PointerEvent::Release { pointer: (2, 400) }).unwrap();
+        state
+            .handle_pointer(PointerEvent::Release { pointer: (2, 400) })
+            .unwrap();
         let geo = state.window_manager.get(id).unwrap().geometry;
         assert_eq!(geo.width, 1000 / 2 - 16);
         assert_eq!(state.snap_preview, None);
@@ -6528,7 +7283,11 @@ mod tests {
         state.apply_action("cycle:alt_tab").unwrap(); // steps to index 1 (b, gone)
         state.apply_action("cycle:alt_tab").unwrap(); // steps to index 2 (c)
         assert!(state.alt_tab.is_active());
-        assert_eq!(state.alt_tab.entries().len(), 3, "entry list must stay frozen across churn");
+        assert_eq!(
+            state.alt_tab.entries().len(),
+            3,
+            "entry list must stay frozen across churn"
+        );
         assert!(state.window_manager.get(c).unwrap().focused);
 
         // Drain events so we can inspect exactly what `end_alt_tab` sends.
@@ -6537,7 +7296,10 @@ mod tests {
         assert!(!state.alt_tab.is_active());
         let events: Vec<_> = rx.try_iter().collect();
         assert!(
-            events.iter().any(|e| matches!(e.event, Event::AltTabState(AltTabState { active: false, .. }))),
+            events.iter().any(|e| matches!(
+                e.event,
+                Event::AltTabState(AltTabState { active: false, .. })
+            )),
             "end_alt_tab must emit a terminal AltTabState so the shell overlay can dismiss"
         );
 
@@ -6552,7 +7314,10 @@ mod tests {
         let mut state = State::new(default_config(), tx);
         assert!(!state.alt_tab.is_active());
         state.end_alt_tab();
-        assert!(rx.try_recv().is_err(), "no session was active, nothing should be emitted");
+        assert!(
+            rx.try_recv().is_err(),
+            "no session was active, nothing should be emitted"
+        );
     }
 
     /// Important #2: `saved_geometry` used to be a single map shared by
@@ -6563,13 +7328,29 @@ mod tests {
     fn snap_then_fullscreen_then_unfullscreen_then_snap_restore_round_trips() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
-        let original = Rectangle { x: 50, y: 60, width: 300, height: 200 };
+        state.outputs.insert(
+            0,
+            OutputSurface::new(Rectangle {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 800,
+            }),
+        );
+        let original = Rectangle {
+            x: 50,
+            y: 60,
+            width: 300,
+            height: 200,
+        };
         let id = state.window_manager.add_window("app", "t", 1, original);
         state.window_manager.focus(id).unwrap();
 
         state.snap(id, SnapZone::Left).unwrap();
-        assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 1000 / 2 - 16);
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry.width,
+            1000 / 2 - 16
+        );
 
         state.toggle_fullscreen(id).unwrap(); // enter fullscreen from the snapped geometry
         assert!(state.window_manager.get(id).unwrap().fullscreen);
@@ -6578,7 +7359,10 @@ mod tests {
         // Exiting fullscreen must restore the *snapped* geometry, not the
         // pre-snap original -- fullscreen's own restore point is untouched
         // by snap's map.
-        assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 1000 / 2 - 16);
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry.width,
+            1000 / 2 - 16
+        );
 
         state.snap_restore(id).unwrap();
         assert_eq!(state.window_manager.get(id).unwrap().geometry, original);
@@ -6592,15 +7376,39 @@ mod tests {
     fn apply_config_preserves_windows_and_does_not_close_them() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        let a = state.window_manager.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
-        let b = state.window_manager.add_window("b", "b", 1, Rectangle { x: 10, y: 10, width: 100, height: 100 });
+        let a = state.window_manager.add_window(
+            "a",
+            "a",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+        );
+        let b = state.window_manager.add_window(
+            "b",
+            "b",
+            1,
+            Rectangle {
+                x: 10,
+                y: 10,
+                width: 100,
+                height: 100,
+            },
+        );
         let mut cfg = icedtea_config::default_config();
         cfg.appearance.palette.background = "#123456".into();
         let events = state.apply_config(cfg);
-        assert!(state.window_manager.get(a).is_some() && state.window_manager.get(b).is_some(),
-                "windows survive a reload");
-        assert!(!events.iter().any(|e| matches!(e, Event::WindowClosed(_))),
-                "no WindowClosed burst on reload");
+        assert!(
+            state.window_manager.get(a).is_some() && state.window_manager.get(b).is_some(),
+            "windows survive a reload"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::WindowClosed(_))),
+            "no WindowClosed burst on reload"
+        );
         assert_eq!(state.config.appearance.palette.background, "#123456");
     }
 
@@ -6626,7 +7434,11 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         assert_eq!(state.apply_action("workspace:0"), None);
-        assert_eq!(state.window_manager.active_workspace(), 0, "a failed switch must not move the active workspace");
+        assert_eq!(
+            state.window_manager.active_workspace(),
+            0,
+            "a failed switch must not move the active workspace"
+        );
     }
 
     #[test]
@@ -6657,9 +7469,24 @@ mod tests {
     fn press_on_unfocused_window_focuses_then_hits_its_decorations() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        let a_geo = Rectangle { x: 0, y: 0, width: 640, height: 400 };
+        let a_geo = Rectangle {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 400,
+        };
         let a = state.window_manager.add_window("a", "a", 1, a_geo);
-        let b = state.window_manager.add_window("b", "b", 2, Rectangle { x: 700, y: 0, width: 640, height: 400 });
+        let b = state.window_manager.add_window(
+            "b",
+            "b",
+            2,
+            Rectangle {
+                x: 700,
+                y: 0,
+                width: 640,
+                height: 400,
+            },
+        );
         // `b` was added last, so it's focused; `a` is not.
         assert!(!state.window_manager.get(a).unwrap().focused);
         assert!(state.window_manager.get(b).unwrap().focused);
@@ -6667,14 +7494,24 @@ mod tests {
         // Press on `a`'s title bar (not a button): before the fix,
         // `decoration_action_for` would gate on `a.focused` (false) and
         // this whole call would return `None`, doing nothing.
-        state.handle_pointer(PointerEvent::Press { id: a, pointer: (20, 5) }).unwrap();
+        state
+            .handle_pointer(PointerEvent::Press {
+                id: a,
+                pointer: (20, 5),
+            })
+            .unwrap();
         assert!(state.window_manager.get(a).unwrap().focused);
         assert!(!state.window_manager.get(b).unwrap().focused);
 
         // Now that `a` is focused, a press on its close button must close
         // it -- proving the *same* click sequence both focuses and acts.
         let close_pt = (a_geo.x + a_geo.width - 5, a_geo.y + 5);
-        state.handle_pointer(PointerEvent::Press { id: a, pointer: close_pt }).unwrap();
+        state
+            .handle_pointer(PointerEvent::Press {
+                id: a,
+                pointer: close_pt,
+            })
+            .unwrap();
         assert!(state.window_manager.get(a).is_none());
     }
 
@@ -6685,22 +7522,44 @@ mod tests {
     fn apply_config_resets_drag_alt_tab_and_snap_preview() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
+        state.outputs.insert(
+            0,
+            OutputSurface::new(Rectangle {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 800,
+            }),
+        );
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
 
         state.drag.begin(a, (5, 5));
         state.alt_tab.start(vec![a, b]);
-        state.snap_preview = Some(Rectangle { x: 0, y: 0, width: 500, height: 800 });
+        state.snap_preview = Some(Rectangle {
+            x: 0,
+            y: 0,
+            width: 500,
+            height: 800,
+        });
         assert!(state.drag.window_id().is_some());
         assert!(state.alt_tab.is_active());
         assert!(state.snap_preview.is_some());
 
         let _ = state.apply_config(icedtea_config::default_config());
 
-        assert!(state.drag.window_id().is_none(), "drag must not survive a reload mid-drag");
-        assert!(!state.alt_tab.is_active(), "alt-tab session must not survive a reload mid-cycle");
-        assert!(state.snap_preview.is_none(), "a stale snap preview must not render forever after reload");
+        assert!(
+            state.drag.window_id().is_none(),
+            "drag must not survive a reload mid-drag"
+        );
+        assert!(
+            !state.alt_tab.is_active(),
+            "alt-tab session must not survive a reload mid-cycle"
+        );
+        assert!(
+            state.snap_preview.is_none(),
+            "a stale snap preview must not render forever after reload"
+        );
     }
 
     /// Important #4: `snapshot().seq` must never go backwards across a
@@ -6728,7 +7587,11 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         let seq_before = state.window_manager.snapshot().seq;
-        state.emit(Event::AltTabState(AltTabState { active: true, entries: vec![], index: 0 }));
+        state.emit(Event::AltTabState(AltTabState {
+            active: true,
+            entries: vec![],
+            index: 0,
+        }));
         assert!(
             state.window_manager.snapshot().seq > seq_before,
             "State::emit must bump seq like every other pending-event producer"
@@ -6753,7 +7616,9 @@ mod tests {
         let events = state.apply_config(icedtea_config::default_config());
 
         assert!(
-            events.iter().any(|e| matches!(e, Event::AltTabState(AltTabState { active: false, .. }))),
+            events
+                .iter()
+                .any(|e| matches!(e, Event::AltTabState(AltTabState { active: false, .. }))),
             "reload mid-cycle must emit the terminal AltTabState"
         );
         assert!(!state.alt_tab.is_active());
@@ -6776,17 +7641,34 @@ mod tests {
     fn press_on_unfocused_fullscreen_window_flushes_focus_immediately() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1000, height: 800 }));
+        state.outputs.insert(
+            0,
+            OutputSurface::new(Rectangle {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 800,
+            }),
+        );
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let _b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
         state.window_manager.set_fullscreen(a, true).unwrap();
         let _ = rx.try_iter().count(); // drain setup events
-        assert!(!state.window_manager.get(a).unwrap().focused, "b was added last and is focused, not a");
+        assert!(
+            !state.window_manager.get(a).unwrap().focused,
+            "b was added last and is focused, not a"
+        );
 
         // `decoration_action_for` returns `None` for a fullscreen window,
         // so this call itself returns `None` -- but the focus mutation
         // must already be visible on the channel by the time it does.
-        assert_eq!(state.handle_pointer(PointerEvent::Press { id: a, pointer: (20, 5) }), None);
+        assert_eq!(
+            state.handle_pointer(PointerEvent::Press {
+                id: a,
+                pointer: (20, 5)
+            }),
+            None
+        );
         assert!(state.window_manager.get(a).unwrap().focused);
         let events: Vec<_> = rx.try_iter().collect();
         assert!(
@@ -6817,7 +7699,11 @@ mod tests {
         assert_eq!(state.window_manager.workspace_info().len(), 3);
         assert!(events.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
         let emitted = rx.try_iter().collect::<Vec<_>>();
-        assert!(emitted.iter().any(|e| matches!(e.event, Event::ConfigReloaded(_))));
+        assert!(
+            emitted
+                .iter()
+                .any(|e| matches!(e.event, Event::ConfigReloaded(_)))
+        );
     }
 
     /// `handle_command`'s `ReloadConfig` arm must go through the async
@@ -6829,7 +7715,10 @@ mod tests {
     fn handle_command_reload_without_sender_wired_is_a_harmless_noop() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        assert_eq!(state.handle_command(crate::dbus::DbCommand::ReloadConfig), Some(()));
+        assert_eq!(
+            state.handle_command(crate::dbus::DbCommand::ReloadConfig),
+            Some(())
+        );
     }
 
     /// The async worker path actually delivers a reloaded config back to
@@ -6853,7 +7742,10 @@ mod tests {
         let (reload_tx, reload_rx) = crossbeam_channel::unbounded::<Config>();
         state.set_config_reload_sender(reload_tx);
 
-        assert_eq!(state.handle_command(crate::dbus::DbCommand::ReloadConfig), Some(()));
+        assert_eq!(
+            state.handle_command(crate::dbus::DbCommand::ReloadConfig),
+            Some(())
+        );
 
         // The worker thread runs off-loop; block briefly for its result
         // (mirrors how `drain_config_reload` would pick it up on the next
@@ -6878,7 +7770,11 @@ mod tests {
         state.apply_reloaded_config(cfg);
         assert_eq!(state.window_manager.workspace_info().len(), 2);
         let emitted = rx.try_iter().collect::<Vec<_>>();
-        assert!(emitted.iter().any(|e| matches!(e.event, Event::ConfigReloaded(_))));
+        assert!(
+            emitted
+                .iter()
+                .any(|e| matches!(e.event, Event::ConfigReloaded(_)))
+        );
     }
 
     /// The keybinding-triggered `"reload"` action (`SUPER+SHIFT+r` by
@@ -6931,10 +7827,21 @@ mod tests {
 
     // --- Final-review fix-round tests ---
 
-    fn state_with_output(width: i32, height: i32) -> (State, crossbeam_channel::Receiver<SeqEvent>) {
+    fn state_with_output(
+        width: i32,
+        height: i32,
+    ) -> (State, crossbeam_channel::Receiver<SeqEvent>) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width, height }));
+        state.outputs.insert(
+            0,
+            OutputSurface::new(Rectangle {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }),
+        );
         (state, rx)
     }
 
@@ -6944,13 +7851,29 @@ mod tests {
     #[test]
     fn maximize_applies_output_geometry_and_restores_it() {
         let (mut state, _rx) = state_with_output(1000, 800);
-        let original = Rectangle { x: 40, y: 50, width: 300, height: 200 };
+        let original = Rectangle {
+            x: 40,
+            y: 50,
+            width: 300,
+            height: 200,
+        };
         let id = state.window_manager.add_window("app", "t", 1, original);
 
         state.toggle_maximized(id).unwrap();
         let w = state.window_manager.get(id).unwrap();
         assert!(w.maximized);
-        assert_eq!(w.geometry, layout::maximized_geometry(Rectangle { x: 0, y: 0, width: 1000, height: 800 }, 8));
+        assert_eq!(
+            w.geometry,
+            layout::maximized_geometry(
+                Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 1000,
+                    height: 800
+                },
+                8
+            )
+        );
 
         state.toggle_maximized(id).unwrap();
         let w = state.window_manager.get(id).unwrap();
@@ -6964,7 +7887,12 @@ mod tests {
     #[test]
     fn maximize_and_snap_keep_independent_restore_points() {
         let (mut state, _rx) = state_with_output(1000, 800);
-        let original = Rectangle { x: 40, y: 50, width: 300, height: 200 };
+        let original = Rectangle {
+            x: 40,
+            y: 50,
+            width: 300,
+            height: 200,
+        };
         let id = state.window_manager.add_window("app", "t", 1, original);
         state.window_manager.focus(id).unwrap();
 
@@ -6972,7 +7900,11 @@ mod tests {
         let snapped = state.window_manager.get(id).unwrap().geometry;
         state.set_maximized_target(id, true).unwrap();
         state.set_maximized_target(id, false).unwrap();
-        assert_eq!(state.window_manager.get(id).unwrap().geometry, snapped, "unmaximize returns to the snapped geometry");
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry,
+            snapped,
+            "unmaximize returns to the snapped geometry"
+        );
         state.snap_restore(id).unwrap();
         assert_eq!(state.window_manager.get(id).unwrap().geometry, original);
     }
@@ -6983,14 +7915,29 @@ mod tests {
     #[test]
     fn maximize_command_is_idempotent_on_its_target() {
         let (mut state, _rx) = state_with_output(1000, 800);
-        let original = Rectangle { x: 40, y: 50, width: 300, height: 200 };
+        let original = Rectangle {
+            x: 40,
+            y: 50,
+            width: 300,
+            height: 200,
+        };
         let id = state.window_manager.add_window("app", "t", 1, original);
-        state.handle_command(crate::dbus::DbCommand::Maximize(id, true)).unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::Maximize(id, true))
+            .unwrap();
         let maximized = state.window_manager.get(id).unwrap().geometry;
-        state.handle_command(crate::dbus::DbCommand::Maximize(id, true)).unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::Maximize(id, true))
+            .unwrap();
         assert_eq!(state.window_manager.get(id).unwrap().geometry, maximized);
-        state.handle_command(crate::dbus::DbCommand::Maximize(id, false)).unwrap();
-        assert_eq!(state.window_manager.get(id).unwrap().geometry, original, "the restore point survived the no-op");
+        state
+            .handle_command(crate::dbus::DbCommand::Maximize(id, false))
+            .unwrap();
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry,
+            original,
+            "the restore point survived the no-op"
+        );
     }
 
     /// H1: `set_maximized_target` resolves the output via the window's own
@@ -7005,15 +7952,47 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
         state.config.appearance.snap_gap = 0;
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        state.create_output(
+            1,
+            Rectangle {
+                x: 800,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 810, y: 10, width: 300, height: 200 });
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 810,
+                y: 10,
+                width: 300,
+                height: 200,
+            },
+        );
         state.set_maximized_target(id, true).unwrap();
 
         let geo = state.window_manager.get(id).unwrap().geometry;
-        assert_eq!(geo, state.outputs[&1].usable, "must maximize onto output 1's usable rect, not output 0's");
-        assert!(geo.x >= 800, "must not have resolved onto output 0, got {geo:?}");
+        assert_eq!(
+            geo, state.outputs[&1].usable,
+            "must maximize onto output 1's usable rect, not output 0's"
+        );
+        assert!(
+            geo.x >= 800,
+            "must not have resolved onto output 0, got {geo:?}"
+        );
     }
 
     /// H1's fullscreen counterpart: `set_fullscreen_target` resolves via the
@@ -7023,15 +8002,47 @@ mod tests {
     fn set_fullscreen_target_resolves_via_the_windows_own_output_not_the_pointer() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        state.create_output(
+            1,
+            Rectangle {
+                x: 800,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 810, y: 10, width: 300, height: 200 });
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 810,
+                y: 10,
+                width: 300,
+                height: 200,
+            },
+        );
         state.set_fullscreen_target(id, true).unwrap();
 
         let geo = state.window_manager.get(id).unwrap().geometry;
-        assert_eq!(geo, state.outputs[&1].geometry, "must fullscreen onto output 1's geometry, not output 0's");
-        assert!(geo.x >= 800, "must not have resolved onto output 0, got {geo:?}");
+        assert_eq!(
+            geo, state.outputs[&1].geometry,
+            "must fullscreen onto output 1's geometry, not output 0's"
+        );
+        assert!(
+            geo.x >= 800,
+            "must not have resolved onto output 0, got {geo:?}"
+        );
     }
 
     /// Re-review Important 1: `DbCommand::Minimize` goes through the same
@@ -7042,12 +8053,19 @@ mod tests {
     #[test]
     fn dbus_minimize_of_focused_window_hands_focus_to_successor() {
         let (mut state, _rx) = state_with_output(1000, 800);
-        let geo = Rectangle { x: 10, y: 10, width: 300, height: 200 };
+        let geo = Rectangle {
+            x: 10,
+            y: 10,
+            width: 300,
+            height: 200,
+        };
         let a = state.window_manager.add_window("app", "a", 1, geo);
         let b = state.window_manager.add_window("app", "b", 2, geo);
         state.window_manager.focus(b).unwrap();
 
-        state.handle_command(crate::dbus::DbCommand::Minimize(b, true)).unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::Minimize(b, true))
+            .unwrap();
         assert!(state.window_manager.get(b).unwrap().minimized);
         assert_eq!(
             state.window_manager.focused_window().map(|w| w.id),
@@ -7065,7 +8083,12 @@ mod tests {
     #[test]
     fn self_minimize_emits_the_window_update_to_dbus() {
         let (mut state, rx) = state_with_output(1000, 800);
-        let geo = Rectangle { x: 10, y: 10, width: 300, height: 200 };
+        let geo = Rectangle {
+            x: 10,
+            y: 10,
+            width: 300,
+            height: 200,
+        };
         let id = state.window_manager.add_window("app", "a", 1, geo);
         state.window_manager.focus(id).unwrap();
         state.emit_pending();
@@ -7095,7 +8118,12 @@ mod tests {
     #[test]
     fn stacking_order_is_visible_windows_bottom_to_top() {
         let (mut state, _rx) = state_with_output(1000, 800);
-        let geo = Rectangle { x: 0, y: 0, width: 200, height: 150 };
+        let geo = Rectangle {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 150,
+        };
         let a = state.window_manager.add_window("app", "a", 1, geo);
         let b = state.window_manager.add_window("app", "b", 2, geo);
         let c = state.window_manager.add_window("app", "c", 3, geo);
@@ -7118,11 +8146,20 @@ mod tests {
     #[test]
     fn closing_a_submenu_returns_keyboard_to_its_parent_menu() {
         let (mut state, _rx) = state_with_output(1000, 800);
-        let geo = Rectangle { x: 0, y: 0, width: 100, height: 100 };
+        let geo = Rectangle {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         let menu1 = wlr::XwaylandSurfaceId::dangling_nth_for_test(1);
         let menu2 = wlr::XwaylandSurfaceId::dangling_nth_for_test(2);
-        state.override_redirect.insert(menu1, OverrideRedirectSurface { geometry: geo });
-        state.override_redirect.insert(menu2, OverrideRedirectSurface { geometry: geo });
+        state
+            .override_redirect
+            .insert(menu1, OverrideRedirectSurface { geometry: geo });
+        state
+            .override_redirect
+            .insert(menu2, OverrideRedirectSurface { geometry: geo });
         // menu1 is the parent, menu2 the submenu currently holding the keyboard.
         state.or_keyboard_stack = vec![menu1, menu2];
 
@@ -7136,7 +8173,9 @@ mod tests {
 
         // A middle entry closing (parent dismissed while submenu still open)
         // leaves the current holder untouched.
-        state.override_redirect.insert(menu2, OverrideRedirectSurface { geometry: geo });
+        state
+            .override_redirect
+            .insert(menu2, OverrideRedirectSurface { geometry: geo });
         state.or_keyboard_stack = vec![menu1, menu2];
         state.remove_override_redirect(menu1);
         assert_eq!(
@@ -7160,14 +8199,35 @@ mod tests {
     #[test]
     fn center_in_area_clamps_to_the_areas_own_output_not_the_fallback() {
         let (mut state, _rx) = state_with_output(1000, 800); // output A: x in 0..1000
-        state.create_output(1, Rectangle { x: 1000, y: 0, width: 1000, height: 800 }); // output B
+        state.create_output(
+            1,
+            Rectangle {
+                x: 1000,
+                y: 0,
+                width: 1000,
+                height: 800,
+            },
+        ); // output B
         // Parent frame sits on output B; the pointer's usable area (fallback) is A.
-        let parent_on_b = Rectangle { x: 1200, y: 300, width: 400, height: 300 };
-        let fallback_a = Rectangle { x: 0, y: 0, width: 1000, height: 800 };
+        let parent_on_b = Rectangle {
+            x: 1200,
+            y: 300,
+            width: 400,
+            height: 300,
+        };
+        let fallback_a = Rectangle {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        };
         let (x, y) = state.center_in_area(parent_on_b, 200, 150, fallback_a);
         // Centered over the parent: x = 1200 + (400-200)/2 = 1300, on output B.
         assert_eq!((x, y), (1300, 375), "dialog centers over its parent on B");
-        assert!(x >= 1000, "the dialog must land on the parent's output B, not the pointer's A");
+        assert!(
+            x >= 1000,
+            "the dialog must land on the parent's output B, not the pointer's A"
+        );
     }
 
     /// Review finding #9: a frame whose SSD title bar would sit above the top
@@ -7179,18 +8239,48 @@ mod tests {
     fn clamp_frame_onto_output_pulls_an_offscreen_title_bar_back() {
         let (state, _rx) = state_with_output(1000, 800);
         // Title bar above the top edge -> clamped so y >= output top (0).
-        let off_top = Rectangle { x: 100, y: -28, width: 300, height: 228 };
+        let off_top = Rectangle {
+            x: 100,
+            y: -28,
+            width: 300,
+            height: 228,
+        };
         let fixed = state.clamp_frame_onto_output(off_top);
         assert_eq!(fixed.y, 0, "the title bar must not sit above the output");
-        assert_eq!(fixed.x, 100, "x was already on-screen and must be left alone");
-        assert_eq!((fixed.width, fixed.height), (300, 228), "size is never changed");
+        assert_eq!(
+            fixed.x, 100,
+            "x was already on-screen and must be left alone"
+        );
+        assert_eq!(
+            (fixed.width, fixed.height),
+            (300, 228),
+            "size is never changed"
+        );
         // Off the right/bottom -> clamped so the frame stays fully on-output.
-        let off_corner = Rectangle { x: 950, y: 790, width: 300, height: 228 };
+        let off_corner = Rectangle {
+            x: 950,
+            y: 790,
+            width: 300,
+            height: 228,
+        };
         let fixed = state.clamp_frame_onto_output(off_corner);
-        assert_eq!(fixed.x, 1000 - 300, "clamped to keep the right edge on-output");
-        assert_eq!(fixed.y, 800 - 228, "clamped to keep the bottom edge on-output");
+        assert_eq!(
+            fixed.x,
+            1000 - 300,
+            "clamped to keep the right edge on-output"
+        );
+        assert_eq!(
+            fixed.y,
+            800 - 228,
+            "clamped to keep the bottom edge on-output"
+        );
         // A frame already fully on-screen is untouched.
-        let on = Rectangle { x: 200, y: 200, width: 300, height: 228 };
+        let on = Rectangle {
+            x: 200,
+            y: 200,
+            width: 300,
+            height: 228,
+        };
         assert_eq!(state.clamp_frame_onto_output(on), on);
     }
 
@@ -7201,21 +8291,50 @@ mod tests {
     fn snap_disabled_blocks_actions_and_drag_snapping() {
         let (mut state, _rx) = state_with_output(1000, 800);
         state.config.behavior.snap_enabled = false;
-        let geo = Rectangle { x: 100, y: 100, width: 640, height: 400 };
+        let geo = Rectangle {
+            x: 100,
+            y: 100,
+            width: 640,
+            height: 400,
+        };
         let id = state.window_manager.add_window("app", "t", 1, geo);
         state.window_manager.focus(id).unwrap();
 
-        assert_eq!(state.apply_action("snap:left"), None, "the snap action must not fire when snapping is off");
+        assert_eq!(
+            state.apply_action("snap:left"),
+            None,
+            "the snap action must not fire when snapping is off"
+        );
         assert_eq!(state.window_manager.get(id).unwrap().geometry, geo);
 
         // A drag to the left edge shows no preview and ends as a plain move.
-        state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) }).unwrap();
-        state.handle_pointer(PointerEvent::Motion { pointer: (2, 400) }).unwrap();
-        assert_eq!(state.snap_preview, None, "no snap preview may be drawn when snapping is off");
-        state.handle_pointer(PointerEvent::Release { pointer: (2, 400) }).unwrap();
+        state
+            .handle_pointer(PointerEvent::Press {
+                id,
+                pointer: (120, 105),
+            })
+            .unwrap();
+        state
+            .handle_pointer(PointerEvent::Motion { pointer: (2, 400) })
+            .unwrap();
+        assert_eq!(
+            state.snap_preview, None,
+            "no snap preview may be drawn when snapping is off"
+        );
+        state
+            .handle_pointer(PointerEvent::Release { pointer: (2, 400) })
+            .unwrap();
         let moved = state.window_manager.get(id).unwrap().geometry;
-        assert_eq!((moved.x, moved.y), (2 - 20, 400 - 5), "the drag still moves the window");
-        assert_eq!((moved.width, moved.height), (geo.width, geo.height), "…without resizing it");
+        assert_eq!(
+            (moved.x, moved.y),
+            (2 - 20, 400 - 5),
+            "the drag still moves the window"
+        );
+        assert_eq!(
+            (moved.width, moved.height),
+            (geo.width, geo.height),
+            "…without resizing it"
+        );
     }
 
     /// I3 (the other direction): the default config leaves snapping on, so
@@ -7227,7 +8346,10 @@ mod tests {
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.window_manager.focus(id).unwrap();
         assert_eq!(state.apply_action("snap:left"), Some(()));
-        assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 1000 / 2 - 16);
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry.width,
+            1000 / 2 - 16
+        );
     }
 
     /// I6: after `MoveToWorkspace` the destination has a focused window, so
@@ -7239,10 +8361,16 @@ mod tests {
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
         // `b` is focused (added last) and is the one that moves.
-        state.handle_command(crate::dbus::DbCommand::MoveToWorkspace(b, 1)).unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::MoveToWorkspace(b, 1))
+            .unwrap();
 
         assert_eq!(state.window_manager.active_workspace(), 1);
-        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(b), "the moved window is focused there");
+        assert_eq!(
+            state.window_manager.focused_window().map(|w| w.id),
+            Some(b),
+            "the moved window is focused there"
+        );
         // The origin kept a coherent focus rather than a dangling pointer.
         state.switch_workspace(0).unwrap();
         assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a));
@@ -7256,7 +8384,11 @@ mod tests {
         let (mut state, _rx) = state_with_output(1000, 800);
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.apply_action("move_to_workspace:2").unwrap();
-        assert_eq!(state.apply_action("fullscreen"), Some(()), "the next action must find a focused window");
+        assert_eq!(
+            state.apply_action("fullscreen"),
+            Some(()),
+            "the next action must find a focused window"
+        );
         assert!(state.window_manager.get(id).unwrap().fullscreen);
     }
 
@@ -7268,8 +8400,15 @@ mod tests {
         let (mut state, _rx) = state_with_output(1000, 800);
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         state.switch_workspace(1).unwrap();
-        assert!(state.window_manager.focused_window().is_none(), "workspace 2 is empty");
-        assert_eq!(state.apply_action("close"), None, "…so an action there is a clean no-op");
+        assert!(
+            state.window_manager.focused_window().is_none(),
+            "workspace 2 is empty"
+        );
+        assert_eq!(
+            state.apply_action("close"),
+            None,
+            "…so an action there is a clean no-op"
+        );
         state.switch_workspace(0).unwrap();
         assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a));
     }
@@ -7283,15 +8422,29 @@ mod tests {
         let (mut state, rx) = state_with_output(1000, 800);
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.emit_pending();
-        state.handle_command(crate::dbus::DbCommand::Fullscreen(id, true)).unwrap();
-        state.handle_command(crate::dbus::DbCommand::SetWorkspace(1)).unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::Fullscreen(id, true))
+            .unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::SetWorkspace(1))
+            .unwrap();
 
         let events: Vec<SeqEvent> = rx.try_iter().collect();
-        assert!(events.len() >= 3, "expected several events, got {}", events.len());
+        assert!(
+            events.len() >= 3,
+            "expected several events, got {}",
+            events.len()
+        );
         let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
-        assert!(seqs.windows(2).all(|w| w[1] > w[0]), "seqs must strictly increase: {seqs:?}");
+        assert!(
+            seqs.windows(2).all(|w| w[1] > w[0]),
+            "seqs must strictly increase: {seqs:?}"
+        );
         assert_eq!(*seqs.last().unwrap(), state.window_manager.snapshot().seq);
-        assert!(seqs[0] > 0, "seq 0 means 'nothing has happened yet' and must never be emitted");
+        assert!(
+            seqs[0] > 0,
+            "seq 0 means 'nothing has happened yet' and must never be emitted"
+        );
     }
 
     /// I2: the reload path used to bypass the counter entirely (its events
@@ -7309,10 +8462,20 @@ mod tests {
         state.apply_reloaded_config(icedtea_config::default_config());
         let events: Vec<SeqEvent> = rx.try_iter().collect();
         assert!(!events.is_empty());
-        assert!(events.iter().all(|e| e.seq > before), "reload events must advance past the pre-reload high-water mark");
+        assert!(
+            events.iter().all(|e| e.seq > before),
+            "reload events must advance past the pre-reload high-water mark"
+        );
         let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
-        assert!(seqs.windows(2).all(|w| w[1] > w[0]), "seqs must strictly increase: {seqs:?}");
-        assert!(events.iter().any(|e| matches!(e.event, Event::ConfigReloaded(_))));
+        assert!(
+            seqs.windows(2).all(|w| w[1] > w[0]),
+            "seqs must strictly increase: {seqs:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.event, Event::ConfigReloaded(_)))
+        );
     }
 
     /// C1: closing a model window with no backing client surface still
@@ -7325,7 +8488,11 @@ mod tests {
         let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
         state.request_close(b);
         assert!(state.window_manager.get(b).is_none());
-        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a), "focus must not dangle after a close");
+        assert_eq!(
+            state.window_manager.focused_window().map(|w| w.id),
+            Some(a),
+            "focus must not dangle after a close"
+        );
     }
 
     /// C1: closing must not leave restore points behind for an id that can
@@ -7351,24 +8518,64 @@ mod tests {
     #[test]
     fn interactive_resize_updates_geometry_and_ends_on_release() {
         let (mut state, _rx) = state_with_output(1000, 800);
-        let geo = Rectangle { x: 100, y: 100, width: 400, height: 300 };
+        let geo = Rectangle {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
         let id = state.window_manager.add_window("app", "t", 1, geo);
-        state.resize.begin(id, input::ResizeEdges { bottom: true, right: true, ..Default::default() }, geo, (500, 400));
-
-        state.handle_pointer(PointerEvent::Motion { pointer: (560, 430) }).unwrap();
-        assert_eq!(
-            state.window_manager.get(id).unwrap().geometry,
-            Rectangle { x: 100, y: 100, width: 460, height: 330 }
+        state.resize.begin(
+            id,
+            input::ResizeEdges {
+                bottom: true,
+                right: true,
+                ..Default::default()
+            },
+            geo,
+            (500, 400),
         );
 
-        state.handle_pointer(PointerEvent::Release { pointer: (600, 500) }).unwrap();
+        state
+            .handle_pointer(PointerEvent::Motion {
+                pointer: (560, 430),
+            })
+            .unwrap();
         assert_eq!(
             state.window_manager.get(id).unwrap().geometry,
-            Rectangle { x: 100, y: 100, width: 500, height: 400 }
+            Rectangle {
+                x: 100,
+                y: 100,
+                width: 460,
+                height: 330
+            }
         );
-        assert!(state.resize.window_id().is_none(), "the resize ended on release");
+
+        state
+            .handle_pointer(PointerEvent::Release {
+                pointer: (600, 500),
+            })
+            .unwrap();
+        assert_eq!(
+            state.window_manager.get(id).unwrap().geometry,
+            Rectangle {
+                x: 100,
+                y: 100,
+                width: 500,
+                height: 400
+            }
+        );
+        assert!(
+            state.resize.window_id().is_none(),
+            "the resize ended on release"
+        );
         // A later motion with no resize and no drag is a clean no-op.
-        assert_eq!(state.handle_pointer(PointerEvent::Motion { pointer: (700, 700) }), None);
+        assert_eq!(
+            state.handle_pointer(PointerEvent::Motion {
+                pointer: (700, 700)
+            }),
+            None
+        );
     }
 
     /// M2: `State::new` accepts an arbitrary `Config`, including one with no
@@ -7381,7 +8588,10 @@ mod tests {
         let mut state = State::new(cfg, tx);
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         assert_eq!(state.window_manager.workspace_info().len(), 1);
-        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(id));
+        assert_eq!(
+            state.window_manager.focused_window().map(|w| w.id),
+            Some(id)
+        );
     }
 
     // --- Re-review fix round: New-1 / New-2 / New-3 ---
@@ -7408,7 +8618,11 @@ mod tests {
         assert_eq!(state.focused_id(), Some(b));
 
         state.request_close(b);
-        assert_eq!(state.focused_id(), Some(a), "the successor is focused, not left dangling");
+        assert_eq!(
+            state.focused_id(),
+            Some(a),
+            "the successor is focused, not left dangling"
+        );
         assert!(state.window_manager.get(a).unwrap().focused);
     }
 
@@ -7433,9 +8647,15 @@ mod tests {
         let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
         assert!(state.window_manager.get(b).unwrap().focused);
 
-        state.handle_pointer(PointerEvent::Press { id: a, pointer: (5, 5) });
+        state.handle_pointer(PointerEvent::Press {
+            id: a,
+            pointer: (5, 5),
+        });
         assert!(state.window_manager.get(a).unwrap().focused);
-        assert!(!state.window_manager.get(b).unwrap().focused, "the old focus is dropped");
+        assert!(
+            !state.window_manager.get(b).unwrap().focused,
+            "the old focus is dropped"
+        );
     }
 
     /// New-3: switching to an empty workspace leaves nothing focused, and
@@ -7493,7 +8713,17 @@ mod tests {
         // clears `.focused` and never sets the destination's pointer, so a
         // test built on it would pass even with the old, unfixed guard.
         state.window_manager.set_active_workspace(2);
-        let a = state.window_manager.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let a = state.window_manager.add_window(
+            "a",
+            "a",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        );
         assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a));
         assert!(state.window_manager.get(a).unwrap().focused);
         // Switch away to ws 1 (now inactive workspace 2 still points at `a`),
@@ -7503,10 +8733,17 @@ mod tests {
         state.window_manager.set_active_workspace(2);
         assert!(
             state.window_manager.focused_window().is_none()
-                || state.window_manager.focused_window().map(|w| !w.minimized).unwrap_or(true),
+                || state
+                    .window_manager
+                    .focused_window()
+                    .map(|w| !w.minimized)
+                    .unwrap_or(true),
             "a minimized window must not remain the workspace's focus"
         );
-        assert!(!state.window_manager.get(a).unwrap().focused, "the hidden window's own focused flag must clear too");
+        assert!(
+            !state.window_manager.get(a).unwrap().focused,
+            "the hidden window's own focused flag must clear too"
+        );
     }
 
     /// New-4: the inset the sync path applies is the shared
@@ -7517,27 +8754,55 @@ mod tests {
     /// toplevel; this pins the geometry contract it consumes.)
     #[test]
     fn ssd_inset_applies_to_decorated_windows_only() {
-        use crate::decoration::{content_rect, has_ssd, TITLE_BAR_HEIGHT};
+        use crate::decoration::{TITLE_BAR_HEIGHT, content_rect, has_ssd};
         let (mut state, _rx) = state_with_output(1000, 800);
-        let geo = Rectangle { x: 10, y: 20, width: 400, height: 300 };
-        let ssd = state.window_manager.add_window("org.example.Ssd", "t", 1, geo);
+        let geo = Rectangle {
+            x: 10,
+            y: 20,
+            width: 400,
+            height: 300,
+        };
+        let ssd = state
+            .window_manager
+            .add_window("org.example.Ssd", "t", 1, geo);
         let csd = state.window_manager.add_window("org.gtk.Csd", "t", 2, geo);
 
         let w = state.window_manager.get(ssd).unwrap();
-        assert!(has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen));
+        assert!(has_ssd(
+            &w.app_id,
+            w.client_decorations_requested,
+            w.fullscreen
+        ));
         assert_eq!(
             content_rect(w.geometry, true),
-            Rectangle { x: 10, y: 20 + TITLE_BAR_HEIGHT, width: 400, height: 300 - TITLE_BAR_HEIGHT }
+            Rectangle {
+                x: 10,
+                y: 20 + TITLE_BAR_HEIGHT,
+                width: 400,
+                height: 300 - TITLE_BAR_HEIGHT
+            }
         );
 
         let w = state.window_manager.get(csd).unwrap();
-        assert!(!has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen));
-        assert_eq!(content_rect(w.geometry, false), geo, "CSD windows are untouched");
+        assert!(!has_ssd(
+            &w.app_id,
+            w.client_decorations_requested,
+            w.fullscreen
+        ));
+        assert_eq!(
+            content_rect(w.geometry, false),
+            geo,
+            "CSD windows are untouched"
+        );
 
         // Fullscreen drops the strip, so the client gets the whole output.
         state.set_fullscreen_target(ssd, true).unwrap();
         let w = state.window_manager.get(ssd).unwrap();
-        assert!(!has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen));
+        assert!(!has_ssd(
+            &w.app_id,
+            w.client_decorations_requested,
+            w.fullscreen
+        ));
         assert_eq!(content_rect(w.geometry, false), w.geometry);
     }
 
@@ -7560,7 +8825,10 @@ mod tests {
         let mut config = default_config();
         config.keybindings.insert(
             "quit".into(),
-            icedtea_config::KeyCombo { modifiers: vec![], key: "KEY_F12".into() },
+            icedtea_config::KeyCombo {
+                modifiers: vec![],
+                key: "KEY_F12".into(),
+            },
         );
         let mut state = State::new(config, tx);
         let keysym = crate::input::key_name_to_keysym("KEY_F12");
@@ -7584,7 +8852,15 @@ mod tests {
     fn wallpaper_nodes_track_outputs() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 9, 9, 255]));
         state.wallpaper.set_decoded(Some(img));
         state.sync_wallpaper_nodes();
@@ -7601,13 +8877,34 @@ mod tests {
     fn a_client_maximize_request_reaches_the_model() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 10, y: 10, width: 200, height: 100 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 10,
+                y: 10,
+                width: 200,
+                height: 100,
+            },
+        );
         let key = crate::wayland::ToplevelKey::for_test(1);
         state.wayland.bind(id, key);
         assert!(state.reconcile_maximized(key, true), "model must change");
         assert!(state.window_manager.get(id).expect("window").maximized);
-        assert!(!state.reconcile_maximized(key, true), "idempotent request must report no change");
+        assert!(
+            !state.reconcile_maximized(key, true),
+            "idempotent request must report no change"
+        );
     }
 
     /// Task 10 (Deviation 8): a move request that arrives with no button
@@ -7618,10 +8915,23 @@ mod tests {
     fn a_move_request_without_a_pressed_pointer_is_ignored() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+        );
         state.pointer_pressed = false;
         state.begin_client_move(id);
-        assert!(state.drag.window_id().is_none(), "no grab without a pressed pointer");
+        assert!(
+            state.drag.window_id().is_none(),
+            "no grab without a pressed pointer"
+        );
     }
 
     /// Review fix (task 10): `pointer_pressed` is a single scalar tracking
@@ -7640,13 +8950,22 @@ mod tests {
         const BTN_RIGHT: u32 = 0x111;
 
         wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_LEFT, true, 0);
-        assert!(state.pointer_pressed, "a left press must set pointer_pressed");
+        assert!(
+            state.pointer_pressed,
+            "a left press must set pointer_pressed"
+        );
 
         wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_RIGHT, true, 0);
-        assert!(state.pointer_pressed, "a right press must not clear a held left button");
+        assert!(
+            state.pointer_pressed,
+            "a right press must not clear a held left button"
+        );
 
         wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_RIGHT, false, 0);
-        assert!(state.pointer_pressed, "a right release must not clear a held left button");
+        assert!(
+            state.pointer_pressed,
+            "a right release must not clear a held left button"
+        );
     }
 
     /// Counterpart: a lone right-click (no left button ever pressed) must
@@ -7656,14 +8975,30 @@ mod tests {
     fn a_lone_right_click_leaves_pointer_pressed_false() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+        );
         const BTN_RIGHT: u32 = 0x111;
 
         wlr::SeatHandler::pointer_button(&mut state, 0.0, 0.0, BTN_RIGHT, true, 0);
-        assert!(!state.pointer_pressed, "a lone right press must not set pointer_pressed");
+        assert!(
+            !state.pointer_pressed,
+            "a lone right press must not set pointer_pressed"
+        );
 
         state.begin_client_move(id);
-        assert!(state.drag.window_id().is_none(), "request_move must be ignored without a held left button");
+        assert!(
+            state.drag.window_id().is_none(),
+            "request_move must be ignored without a held left button"
+        );
     }
 
     // --- Task 13: full server-side decorations ---
@@ -7681,12 +9016,25 @@ mod tests {
     fn a_titlebar_close_click_routes_to_request_close() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = state.window_manager.add_window(
             "plain.app",
             "t",
             1,
-            Rectangle { x: 100, y: 100, width: 300, height: 200 },
+            Rectangle {
+                x: 100,
+                y: 100,
+                width: 300,
+                height: 200,
+            },
         );
         let frame = state.window_manager.get(id).expect("w").geometry;
         let bar = crate::decoration::title_bar_rect(frame);
@@ -7694,11 +9042,22 @@ mod tests {
         // orders them minimize, maximize, close).
         let click = (bar.x + bar.width - 5, bar.y + 5);
 
-        wlr::SeatHandler::pointer_button(&mut state, click.0 as f64, click.1 as f64, 0x110, true, 1);
+        wlr::SeatHandler::pointer_button(
+            &mut state,
+            click.0 as f64,
+            click.1 as f64,
+            0x110,
+            true,
+            1,
+        );
 
-        assert!(state.window_manager.get(id).is_none(), "close button must close");
         assert!(
-            rx.try_iter().any(|e| matches!(e.event, icedtea_contract::Event::WindowClosed { .. })),
+            state.window_manager.get(id).is_none(),
+            "close button must close"
+        );
+        assert!(
+            rx.try_iter()
+                .any(|e| matches!(e.event, icedtea_contract::Event::WindowClosed { .. })),
             "the close must have been announced"
         );
     }
@@ -7709,31 +9068,65 @@ mod tests {
     fn titlebar_buttons_hit_the_models_own_command_paths() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = state.window_manager.add_window(
             "plain.app",
             "t",
             1,
-            Rectangle { x: 100, y: 100, width: 300, height: 200 },
+            Rectangle {
+                x: 100,
+                y: 100,
+                width: 300,
+                height: 200,
+            },
         );
         let frame = state.window_manager.get(id).expect("w").geometry;
         let rects = crate::decoration::button_rects(frame);
 
         let maximize = (rects[1].x + 5, rects[1].y + 5);
-        wlr::SeatHandler::pointer_button(&mut state, maximize.0 as f64, maximize.1 as f64, 0x110, true, 1);
-        assert!(state.window_manager.get(id).expect("w").maximized, "middle button maximizes");
+        wlr::SeatHandler::pointer_button(
+            &mut state,
+            maximize.0 as f64,
+            maximize.1 as f64,
+            0x110,
+            true,
+            1,
+        );
+        assert!(
+            state.window_manager.get(id).expect("w").maximized,
+            "middle button maximizes"
+        );
 
         let minimize = (rects[0].x + 5, rects[0].y + 5);
         // The window is maximized now, so its frame moved; re-derive.
         let frame = state.window_manager.get(id).expect("w").geometry;
-        let minimize = if crate::decoration::button_rects(frame)[0].contains(minimize.0, minimize.1) {
+        let minimize = if crate::decoration::button_rects(frame)[0].contains(minimize.0, minimize.1)
+        {
             minimize
         } else {
             let r = crate::decoration::button_rects(frame)[0];
             (r.x + 5, r.y + 5)
         };
-        wlr::SeatHandler::pointer_button(&mut state, minimize.0 as f64, minimize.1 as f64, 0x110, true, 1);
-        assert!(state.window_manager.get(id).expect("w").minimized, "left button minimizes");
+        wlr::SeatHandler::pointer_button(
+            &mut state,
+            minimize.0 as f64,
+            minimize.1 as f64,
+            0x110,
+            true,
+            1,
+        );
+        assert!(
+            state.window_manager.get(id).expect("w").minimized,
+            "left button minimizes"
+        );
     }
 
     /// The negotiation's model half: a client asking to draw its own
@@ -7742,7 +9135,17 @@ mod tests {
     fn decoration_mode_request_updates_the_model_preference() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+        );
         let key = crate::wayland::ToplevelKey::for_test(1);
         state.wayland.bind(id, key);
 
@@ -7751,17 +9154,38 @@ mod tests {
             key.0,
             Some(wlr::DecorationMode::ClientSide),
         );
-        assert_eq!(state.window_manager.get(id).expect("w").client_decorations_requested, Some(true));
+        assert_eq!(
+            state
+                .window_manager
+                .get(id)
+                .expect("w")
+                .client_decorations_requested,
+            Some(true)
+        );
 
         wlr::ToplevelHandler::request_decoration_mode(
             &mut state,
             key.0,
             Some(wlr::DecorationMode::ServerSide),
         );
-        assert_eq!(state.window_manager.get(id).expect("w").client_decorations_requested, Some(false));
+        assert_eq!(
+            state
+                .window_manager
+                .get(id)
+                .expect("w")
+                .client_decorations_requested,
+            Some(false)
+        );
 
         wlr::ToplevelHandler::request_decoration_mode(&mut state, key.0, None);
-        assert_eq!(state.window_manager.get(id).expect("w").client_decorations_requested, None);
+        assert_eq!(
+            state
+                .window_manager
+                .get(id)
+                .expect("w")
+                .client_decorations_requested,
+            None
+        );
     }
 
     /// The ordering that actually happens on the wire: the client states its
@@ -7779,12 +9203,19 @@ mod tests {
             key.0,
             Some(wlr::DecorationMode::ClientSide),
         );
-        assert!(state.window_manager.windows().next().is_none(), "nothing is mapped yet");
+        assert!(
+            state.window_manager.windows().next().is_none(),
+            "nothing is mapped yet"
+        );
 
         state.new_toplevel(key, "plain.app", "t", 1);
         let id = state.wayland.window_for(key).expect("bound at map");
         assert_eq!(
-            state.window_manager.get(id).expect("w").client_decorations_requested,
+            state
+                .window_manager
+                .get(id)
+                .expect("w")
+                .client_decorations_requested,
             Some(true),
             "the pre-map preference must reach the model"
         );
@@ -7809,7 +9240,10 @@ mod tests {
         );
         assert_eq!(state.pending_decorations.len(), 1);
         state.forget_toplevel(key);
-        assert!(state.pending_decorations.is_empty(), "an unmapped toplevel's preference must not leak");
+        assert!(
+            state.pending_decorations.is_empty(),
+            "an unmapped toplevel's preference must not leak"
+        );
     }
 
     /// The title raster is memoized on `(title, width, resolved color)`: the
@@ -7824,11 +9258,15 @@ mod tests {
             "plain.app",
             "first",
             1,
-            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 300,
+            },
         );
-        let bar = crate::decoration::title_bar_rect(
-            state.window_manager.get(id).expect("w").geometry,
-        );
+        let bar =
+            crate::decoration::title_bar_rect(state.window_manager.get(id).expect("w").geometry);
         let entry = |state: &State| {
             let e = state.title_rasters.get(&id).expect("cached");
             (e.generation, e.pixels.clone())
@@ -7839,12 +9277,23 @@ mod tests {
         let first = entry(&state);
 
         state.ensure_title_raster(id, "first".into(), bar, true);
-        assert_eq!(entry(&state), first, "an unchanged title must not re-shape or re-generation");
+        assert_eq!(
+            entry(&state),
+            first,
+            "an unchanged title must not re-shape or re-generation"
+        );
 
         state.ensure_title_raster(id, "second".into(), bar, true);
         let renamed = entry(&state);
-        assert_eq!(state.title_rasters.len(), 1, "one entry per window, replaced not appended");
-        assert_ne!(renamed.1, first.1, "a retitle must produce different pixels");
+        assert_eq!(
+            state.title_rasters.len(),
+            1,
+            "one entry per window, replaced not appended"
+        );
+        assert_ne!(
+            renamed.1, first.1,
+            "a retitle must produce different pixels"
+        );
         assert!(renamed.0 > first.0, "a retitle must advance the generation");
 
         // Losing focus changes the resolved color, so it invalidates too.
@@ -7854,7 +9303,10 @@ mod tests {
         assert_ne!(unfocused.1, renamed.1, "unfocused text is dimmer");
 
         state.forget_window(id);
-        assert!(state.title_rasters.is_empty(), "a closed window's raster must not outlive it");
+        assert!(
+            state.title_rasters.is_empty(),
+            "a closed window's raster must not outlive it"
+        );
     }
 
     /// M3: the cache key carries the resolved foreground color, so a palette
@@ -7868,11 +9320,15 @@ mod tests {
             "plain.app",
             "same",
             1,
-            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 300,
+            },
         );
-        let bar = crate::decoration::title_bar_rect(
-            state.window_manager.get(id).expect("w").geometry,
-        );
+        let bar =
+            crate::decoration::title_bar_rect(state.window_manager.get(id).expect("w").geometry);
 
         state.ensure_title_raster(id, "same".into(), bar, true);
         let before = state.title_rasters.get(&id).expect("cached").pixels.clone();
@@ -7884,7 +9340,10 @@ mod tests {
         state.ensure_title_raster(id, "same".into(), bar, true);
         let after = state.title_rasters.get(&id).expect("cached").pixels.clone();
 
-        assert_ne!(before, after, "a repainted palette must not serve stale-colored text");
+        assert_ne!(
+            before, after,
+            "a repainted palette must not serve stale-colored text"
+        );
     }
 
     /// M3 preserve contract: a reload keeps every window row, so it must
@@ -7900,17 +9359,27 @@ mod tests {
             "plain.app",
             "survivor",
             1,
-            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 300,
+            },
         );
-        let bar = crate::decoration::title_bar_rect(
-            state.window_manager.get(id).expect("w").geometry,
-        );
+        let bar =
+            crate::decoration::title_bar_rect(state.window_manager.get(id).expect("w").geometry);
         state.ensure_title_raster(id, "survivor".into(), bar, true);
         assert_eq!(state.title_rasters.len(), 1);
 
         let _ = state.apply_config(default_config());
-        assert!(state.window_manager.get(id).is_some(), "the window survives the reload");
-        assert!(state.title_rasters.contains_key(&id), "its cached title raster survives too");
+        assert!(
+            state.window_manager.get(id).is_some(),
+            "the window survives the reload"
+        );
+        assert!(
+            state.title_rasters.contains_key(&id),
+            "its cached title raster survives too"
+        );
     }
 
     /// The title node is inset by the three buttons, so a long title runs
@@ -7923,11 +9392,15 @@ mod tests {
             "plain.app",
             "a very long window title that would otherwise run under the buttons",
             1,
-            Rectangle { x: 0, y: 0, width: 400, height: 300 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 300,
+            },
         );
-        let bar = crate::decoration::title_bar_rect(
-            state.window_manager.get(id).expect("w").geometry,
-        );
+        let bar =
+            crate::decoration::title_bar_rect(state.window_manager.get(id).expect("w").geometry);
         let title = state.window_manager.get(id).expect("w").title.clone();
 
         state.ensure_title_raster(id, title, bar, true);
@@ -7951,7 +9424,10 @@ mod tests {
         let state = State::new(default_config(), tx);
         for color in state.button_colors() {
             for channel in &color[..3] {
-                assert!(*channel <= color[3] + f32::EPSILON, "{color:?} is not premultiplied");
+                assert!(
+                    *channel <= color[3] + f32::EPSILON,
+                    "{color:?} is not premultiplied"
+                );
             }
         }
     }
@@ -7966,7 +9442,12 @@ mod tests {
     fn snap_preview_rect_bookkeeping_follows_the_preview() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.snap_preview = Some(Rectangle { x: 0, y: 0, width: 400, height: 600 });
+        state.snap_preview = Some(Rectangle {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 600,
+        });
         state.sync_snap_preview();
         state.snap_preview = None;
         state.sync_snap_preview();
@@ -7983,14 +9464,32 @@ mod tests {
     fn a_click_under_an_active_snap_preview_hits_the_window() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = state.window_manager.add_window(
             "app",
             "t",
             1,
-            Rectangle { x: 100, y: 100, width: 300, height: 200 },
+            Rectangle {
+                x: 100,
+                y: 100,
+                width: 300,
+                height: 200,
+            },
         );
-        state.snap_preview = Some(Rectangle { x: 0, y: 0, width: 400, height: 600 });
+        state.snap_preview = Some(Rectangle {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 600,
+        });
         state.sync_snap_preview();
         // The window at a point inside both the preview and the window must
         // still resolve to the window -- the preview rect is not a hit
@@ -8048,8 +9547,13 @@ mod tests {
         let mut state = State::new(default_config(), tx);
         state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        assert_eq!(state.handle_command(crate::dbus::DbCommand::GetState(reply_tx)), Some(()));
-        let snapshot = reply_rx.try_recv().expect("GetState must reply synchronously");
+        assert_eq!(
+            state.handle_command(crate::dbus::DbCommand::GetState(reply_tx)),
+            Some(())
+        );
+        let snapshot = reply_rx
+            .try_recv()
+            .expect("GetState must reply synchronously");
         assert_eq!(snapshot.windows.len(), 1);
     }
 
@@ -8090,7 +9594,10 @@ mod tests {
         let mut cfg = default_config();
         cfg.keybindings.insert(
             "broken".into(),
-            icedtea_config::KeyCombo { modifiers: vec![], key: "NoSuchKeysym".into() },
+            icedtea_config::KeyCombo {
+                modifiers: vec![],
+                key: "NoSuchKeysym".into(),
+            },
         );
         state.apply_reloaded_config(cfg);
         // Surviving proof: the compositor did not panic and a real binding
@@ -8108,11 +9615,20 @@ mod tests {
     fn reload_swaps_the_wallpaper_when_the_path_changed() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.wallpaper.set_decoded(Some(image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]))));
+        state
+            .wallpaper
+            .set_decoded(Some(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([0, 0, 0, 255]),
+            )));
         let mut cfg = default_config();
         cfg.appearance.wallpaper = Some("/nonexistent/new.png".into());
         state.apply_reloaded_config(cfg);
-        assert!(state.wallpaper.decoded().is_none(), "stale wallpaper must not survive a path change");
+        assert!(
+            state.wallpaper.decoded().is_none(),
+            "stale wallpaper must not survive a path change"
+        );
     }
 
     /// The wallpaper path staying the same across a reload must not tear
@@ -8125,7 +9641,11 @@ mod tests {
         state.wallpaper.set_decoded(Some(image.clone()));
         let cfg = default_config(); // same (absent) wallpaper as boot
         state.apply_reloaded_config(cfg);
-        assert_eq!(state.wallpaper.decoded(), Some(&image), "an unrelated reload must not clear the wallpaper");
+        assert_eq!(
+            state.wallpaper.decoded(),
+            Some(&image),
+            "an unrelated reload must not clear the wallpaper"
+        );
     }
 
     // --- Task 17: multi-output placement and hotplug migration ---
@@ -8134,8 +9654,24 @@ mod tests {
     fn placement_targets_the_output_under_the_pointer() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        state.create_output(
+            1,
+            Rectangle {
+                x: 800,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         // Without a runtime, pointer_position is unavailable: output_for_pointer
         // must fall back to the lowest index deterministically.
         assert_eq!(state.output_for_pointer(), Some(0));
@@ -8145,15 +9681,42 @@ mod tests {
     fn windows_migrate_off_a_removed_output() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 900, y: 50, width: 300, height: 200 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        state.create_output(
+            1,
+            Rectangle {
+                x: 800,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 900,
+                y: 50,
+                width: 300,
+                height: 200,
+            },
+        );
         let dead = state.outputs.remove(&1).expect("output 1").geometry;
         state.migrate_windows_from(dead);
         let w = state.window_manager.get(id).expect("window survives");
         let survivor = state.outputs[&0].geometry;
         assert!(
-            w.geometry.x >= survivor.x && w.geometry.x + w.geometry.width <= survivor.x + survivor.width,
+            w.geometry.x >= survivor.x
+                && w.geometry.x + w.geometry.width <= survivor.x + survivor.width,
             "window must land inside the surviving output, got {:?}",
             w.geometry
         );
@@ -8168,9 +9731,36 @@ mod tests {
     fn an_oversized_migrated_window_is_centered_not_corner_pinned() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 900, y: 50, width: 1000, height: 800 });
-        let dead = state.outputs.remove(&1).map(|o| o.geometry).unwrap_or(Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 900,
+                y: 50,
+                width: 1000,
+                height: 800,
+            },
+        );
+        let dead = state
+            .outputs
+            .remove(&1)
+            .map(|o| o.geometry)
+            .unwrap_or(Rectangle {
+                x: 800,
+                y: 0,
+                width: 800,
+                height: 600,
+            });
         state.migrate_windows_from(dead);
         let w = state.window_manager.get(id).expect("window");
         // centered: x = 0 + (800 - 1000)/2 = -100 (symmetric overflow), not pinned to 0.
@@ -8181,8 +9771,26 @@ mod tests {
     fn migration_with_no_surviving_output_keeps_geometry() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 10, y: 10, width: 300, height: 200 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 10,
+                y: 10,
+                width: 300,
+                height: 200,
+            },
+        );
         let dead = state.outputs.remove(&0).expect("output 0").geometry;
         state.migrate_windows_from(dead); // zero outputs left: must not panic, must not move
         assert_eq!(state.window_manager.get(id).expect("w").geometry.x, 10);
@@ -8204,8 +9812,24 @@ mod tests {
 
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 1000, y: 2000, width: 800, height: 600 });
-        state.create_output(1, Rectangle { x: 1800, y: 2000, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 1000,
+                y: 2000,
+                width: 800,
+                height: 600,
+            },
+        );
+        state.create_output(
+            1,
+            Rectangle {
+                x: 1800,
+                y: 2000,
+                width: 800,
+                height: 600,
+            },
+        );
 
         let key = ToplevelKey::for_test(1);
         state.new_toplevel(key, "app", "t", 1);
@@ -8225,7 +9849,11 @@ mod tests {
         // occupied rects yet) -- pinning that it's `output0`'s `(x, y)`
         // (1000, 2000), not `(0, 0)`, is what actually distinguishes "used
         // the real box" from "used the (0,0)-origin fallback rect."
-        assert_eq!((geo.x, geo.y), (output0.x, output0.y), "cascade origin must be the output box's own (x, y)");
+        assert_eq!(
+            (geo.x, geo.y),
+            (output0.x, output0.y),
+            "cascade origin must be the output box's own (x, y)"
+        );
     }
 
     // --- Task 20: layer-shell arrangement and exclusive zones ---
@@ -8234,14 +9862,27 @@ mod tests {
     fn an_exclusive_top_panel_shrinks_the_usable_area() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         state.layers.insert(
             wlr::LayerSurfaceId::dangling_for_test(),
             LayerEntry {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+                anchor: wlr::Anchor {
+                    top: true,
+                    left: true,
+                    right: true,
+                    bottom: false,
+                },
                 exclusive: 30,
                 size: (800, 30),
                 interactive: false,
@@ -8252,7 +9893,15 @@ mod tests {
         );
         state.arrange_layers();
         let usable = state.outputs[&0].usable;
-        assert_eq!(usable, Rectangle { x: 0, y: 30, width: 800, height: 570 });
+        assert_eq!(
+            usable,
+            Rectangle {
+                x: 0,
+                y: 30,
+                width: 800,
+                height: 570
+            }
+        );
     }
 
     /// C1/I5's maximize helper (`maximize_applies_output_geometry_and_restores_it`)
@@ -8268,14 +9917,27 @@ mod tests {
         // expected numbers below are the panel's carve alone, not a mix of
         // the carve and an unrelated gap constant.
         state.config.appearance.snap_gap = 0;
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         state.layers.insert(
             wlr::LayerSurfaceId::dangling_for_test(),
             LayerEntry {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+                anchor: wlr::Anchor {
+                    top: true,
+                    left: true,
+                    right: true,
+                    bottom: false,
+                },
                 exclusive: 30,
                 size: (800, 30),
                 interactive: false,
@@ -8285,13 +9947,33 @@ mod tests {
             },
         );
         state.arrange_layers();
-        assert_eq!(state.outputs[&0].usable, Rectangle { x: 0, y: 30, width: 800, height: 570 });
+        assert_eq!(
+            state.outputs[&0].usable,
+            Rectangle {
+                x: 0,
+                y: 30,
+                width: 800,
+                height: 570
+            }
+        );
 
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 40, y: 50, width: 300, height: 200 });
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 40,
+                y: 50,
+                width: 300,
+                height: 200,
+            },
+        );
 
         // Maximize via the D-Bus command path (the established pattern):
         // its geometry must equal `usable`, the panel's zone excluded.
-        state.handle_command(crate::dbus::DbCommand::Maximize(id, true)).unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::Maximize(id, true))
+            .unwrap();
         assert_eq!(
             state.window_manager.get(id).unwrap().geometry,
             state.outputs[&0].usable,
@@ -8301,8 +9983,12 @@ mod tests {
         // Unmaximize, then fullscreen: fullscreen covers panels by
         // definition, so its geometry must equal the *full* output
         // geometry, not `usable`.
-        state.handle_command(crate::dbus::DbCommand::Maximize(id, false)).unwrap();
-        state.handle_command(crate::dbus::DbCommand::Fullscreen(id, true)).unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::Maximize(id, false))
+            .unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::Fullscreen(id, true))
+            .unwrap();
         assert_eq!(
             state.window_manager.get(id).unwrap().geometry,
             state.outputs[&0].geometry,
@@ -8317,7 +10003,12 @@ mod tests {
             output: 0,
             sequence: 0,
             layer: wlr::Layer::Top,
-            anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+            anchor: wlr::Anchor {
+                top: true,
+                left: true,
+                right: true,
+                bottom: false,
+            },
             exclusive,
             size: (800, exclusive as u32),
             interactive: false,
@@ -8335,14 +10026,27 @@ mod tests {
     fn an_unmapped_layer_entry_does_not_reserve_until_mapped() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(id, top_panel_entry(30, false));
 
         state.arrange_layers();
         assert_eq!(
             state.outputs[&0].usable,
-            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600
+            },
             "an unmapped entry must not reserve"
         );
 
@@ -8350,7 +10054,12 @@ mod tests {
         state.arrange_layers();
         assert_eq!(
             state.outputs[&0].usable,
-            Rectangle { x: 0, y: 30, width: 800, height: 570 },
+            Rectangle {
+                x: 0,
+                y: 30,
+                width: 800,
+                height: 570
+            },
             "mapping must start reserving"
         );
 
@@ -8358,7 +10067,12 @@ mod tests {
         state.arrange_layers();
         assert_eq!(
             state.outputs[&0].usable,
-            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600
+            },
             "unmapping must give the space back"
         );
     }
@@ -8374,23 +10088,49 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
         state.config.appearance.snap_gap = 0;
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let panel_id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(panel_id, top_panel_entry(30, true));
 
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
         // Maximized before the panel's zone is folded into `usable` (that
         // only happens inside `arrange_layers`), so the first arrange
         // below genuinely changes the target and must emit.
-        state.handle_command(crate::dbus::DbCommand::Maximize(id, true)).unwrap();
+        state
+            .handle_command(crate::dbus::DbCommand::Maximize(id, true))
+            .unwrap();
         while rx.try_recv().is_ok() {}
 
         state.arrange_layers();
-        assert!(rx.try_recv().is_ok(), "the first arrange changes the target and must emit");
+        assert!(
+            rx.try_recv().is_ok(),
+            "the first arrange changes the target and must emit"
+        );
         while rx.try_recv().is_ok() {}
 
         state.arrange_layers();
-        assert!(rx.try_recv().is_err(), "an unchanged maximize target must not re-emit");
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged maximize target must not re-emit"
+        );
     }
 
     /// J1: `arrange_layers` re-homes each maximized window through its own
@@ -8404,12 +10144,49 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
         state.config.appearance.snap_gap = 0;
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        state.create_output(
+            1,
+            Rectangle {
+                x: 800,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
         // Maximized on output 1.
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 810, y: 10, width: 300, height: 200 });
-        state.window_manager.set_geometry(id, Rectangle { x: 800, y: 0, width: 800, height: 600 }).unwrap();
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 810,
+                y: 10,
+                width: 300,
+                height: 200,
+            },
+        );
+        state
+            .window_manager
+            .set_geometry(
+                id,
+                Rectangle {
+                    x: 800,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                },
+            )
+            .unwrap();
         state.window_manager.set_maximized(id, true).unwrap();
 
         // A panel maps on output 1 -- with no runtime attached,
@@ -8422,7 +10199,12 @@ mod tests {
                 output: 1,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: true, left: true, right: true, bottom: false },
+                anchor: wlr::Anchor {
+                    top: true,
+                    left: true,
+                    right: true,
+                    bottom: false,
+                },
                 exclusive: 30,
                 size: (800, 30),
                 interactive: false,
@@ -8434,8 +10216,14 @@ mod tests {
         state.arrange_layers();
 
         let geo = state.window_manager.get(id).unwrap().geometry;
-        assert_eq!(geo, state.outputs[&1].usable, "must track output 1's usable rect, not output 0's");
-        assert!(geo.x >= 800, "must not have teleported onto output 0, got {geo:?}");
+        assert_eq!(
+            geo, state.outputs[&1].usable,
+            "must track output 1's usable rect, not output 0's"
+        );
+        assert!(
+            geo.x >= 800,
+            "must not have teleported onto output 0, got {geo:?}"
+        );
     }
 
     /// M5: a layer surface with no output at all when the sweep runs is a
@@ -8446,14 +10234,34 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
         let id = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(id, LayerEntry { output: NO_OUTPUT, ..top_panel_entry(30, false) });
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: NO_OUTPUT,
+                ..top_panel_entry(30, false)
+            },
+        );
 
         state.resolve_orphaned_layers();
-        assert_eq!(state.layers[&id].output, NO_OUTPUT, "no output exists yet: must stay parked, not vanish");
+        assert_eq!(
+            state.layers[&id].output, NO_OUTPUT,
+            "no output exists yet: must stay parked, not vanish"
+        );
 
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         state.resolve_orphaned_layers();
-        assert_eq!(state.layers[&id].output, 0, "must be re-homed the moment an output exists");
+        assert_eq!(
+            state.layers[&id].output, 0,
+            "must be re-homed the moment an output exists"
+        );
     }
 
     /// M5a: an entry orphaned by its output being removed is re-homed onto
@@ -8462,16 +10270,41 @@ mod tests {
     fn resolve_orphaned_layers_rehomes_onto_a_surviving_output() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        state.create_output(
+            1,
+            Rectangle {
+                x: 800,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(id, LayerEntry { output: 1, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            id,
+            LayerEntry {
+                output: 1,
+                ..top_panel_entry(30, true)
+            },
+        );
 
         // The caller (`OutputHandler::destroyed`) removes the dead output
         // from `self.outputs` before this runs.
         state.outputs.remove(&1);
         state.resolve_orphaned_layers();
-        assert_eq!(state.layers[&id].output, 0, "must re-home onto the surviving output");
+        assert_eq!(
+            state.layers[&id].output, 0,
+            "must re-home onto the surviving output"
+        );
     }
 
     /// Task 8, M5: each orphaned entry re-homes to whichever surviving
@@ -8485,8 +10318,24 @@ mod tests {
     fn resolve_orphaned_layers_rehomes_each_entry_by_its_own_frame_center() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        state.create_output(
+            1,
+            Rectangle {
+                x: 800,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         // Orphaned by a third, now-dead output; its own last-configured
         // placement sits squarely inside output 1's box, not output 0's
         // (the lowest index, and what a uniform pointer-derived pick would
@@ -8494,11 +10343,18 @@ mod tests {
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(
             id,
-            LayerEntry { output: 2, last_configured: Some((200, 30, 850, 0)), ..top_panel_entry(30, true) },
+            LayerEntry {
+                output: 2,
+                last_configured: Some((200, 30, 850, 0)),
+                ..top_panel_entry(30, true)
+            },
         );
 
         state.resolve_orphaned_layers();
-        assert_eq!(state.layers[&id].output, 1, "must land on the output its own frame center overlaps");
+        assert_eq!(
+            state.layers[&id].output, 1,
+            "must land on the output its own frame center overlaps"
+        );
     }
 
     /// M5: with no surviving output at all, the sweep is a deliberate
@@ -8509,13 +10365,24 @@ mod tests {
     fn resolve_orphaned_layers_is_a_no_op_with_no_surviving_output() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(id, top_panel_entry(30, true));
 
         state.outputs.remove(&0);
         state.resolve_orphaned_layers();
-        assert_eq!(state.layers[&id].output, 0, "left exactly where it was; no survivor to re-home onto");
+        assert_eq!(
+            state.layers[&id].output, 0,
+            "left exactly where it was; no survivor to re-home onto"
+        );
     }
 
     /// J3's guard, exercised directly: `true` only while `layer_focus`
@@ -8525,14 +10392,26 @@ mod tests {
     fn layer_holds_keyboard_focus_only_while_the_entry_is_mapped() {
         let mut layers: HashMap<wlr::LayerSurfaceId, LayerEntry> = HashMap::new();
         let id = wlr::LayerSurfaceId::dangling_for_test();
-        assert!(!layer_holds_keyboard_focus(None, &layers), "no layer focus at all");
-        assert!(!layer_holds_keyboard_focus(Some(id), &layers), "layer_focus names an entry that does not exist");
+        assert!(
+            !layer_holds_keyboard_focus(None, &layers),
+            "no layer focus at all"
+        );
+        assert!(
+            !layer_holds_keyboard_focus(Some(id), &layers),
+            "layer_focus names an entry that does not exist"
+        );
 
         layers.insert(id, top_panel_entry(30, false));
-        assert!(!layer_holds_keyboard_focus(Some(id), &layers), "the entry exists but is unmapped");
+        assert!(
+            !layer_holds_keyboard_focus(Some(id), &layers),
+            "the entry exists but is unmapped"
+        );
 
         layers.get_mut(&id).unwrap().mapped = true;
-        assert!(layer_holds_keyboard_focus(Some(id), &layers), "a mapped entry must block the model's own focus");
+        assert!(
+            layer_holds_keyboard_focus(Some(id), &layers),
+            "a mapped entry must block the model's own focus"
+        );
     }
 
     /// Finding 6: `resize_edges_from_wlr`'s field-by-field mapping, for
@@ -8543,31 +10422,125 @@ mod tests {
     #[test]
     fn resize_edges_from_wlr_maps_every_edge_and_corner() {
         let none = wlr::Edges::default();
-        assert_eq!(resize_edges_from_wlr(none), input::ResizeEdges { top: false, bottom: false, left: false, right: false });
+        assert_eq!(
+            resize_edges_from_wlr(none),
+            input::ResizeEdges {
+                top: false,
+                bottom: false,
+                left: false,
+                right: false
+            }
+        );
 
         let top = wlr::Edges { top: true, ..none };
-        assert_eq!(resize_edges_from_wlr(top), input::ResizeEdges { top: true, bottom: false, left: false, right: false });
+        assert_eq!(
+            resize_edges_from_wlr(top),
+            input::ResizeEdges {
+                top: true,
+                bottom: false,
+                left: false,
+                right: false
+            }
+        );
 
-        let bottom = wlr::Edges { bottom: true, ..none };
-        assert_eq!(resize_edges_from_wlr(bottom), input::ResizeEdges { top: false, bottom: true, left: false, right: false });
+        let bottom = wlr::Edges {
+            bottom: true,
+            ..none
+        };
+        assert_eq!(
+            resize_edges_from_wlr(bottom),
+            input::ResizeEdges {
+                top: false,
+                bottom: true,
+                left: false,
+                right: false
+            }
+        );
 
         let left = wlr::Edges { left: true, ..none };
-        assert_eq!(resize_edges_from_wlr(left), input::ResizeEdges { top: false, bottom: false, left: true, right: false });
+        assert_eq!(
+            resize_edges_from_wlr(left),
+            input::ResizeEdges {
+                top: false,
+                bottom: false,
+                left: true,
+                right: false
+            }
+        );
 
-        let right = wlr::Edges { right: true, ..none };
-        assert_eq!(resize_edges_from_wlr(right), input::ResizeEdges { top: false, bottom: false, left: false, right: true });
+        let right = wlr::Edges {
+            right: true,
+            ..none
+        };
+        assert_eq!(
+            resize_edges_from_wlr(right),
+            input::ResizeEdges {
+                top: false,
+                bottom: false,
+                left: false,
+                right: true
+            }
+        );
 
-        let top_left = wlr::Edges { top: true, left: true, ..none };
-        assert_eq!(resize_edges_from_wlr(top_left), input::ResizeEdges { top: true, bottom: false, left: true, right: false });
+        let top_left = wlr::Edges {
+            top: true,
+            left: true,
+            ..none
+        };
+        assert_eq!(
+            resize_edges_from_wlr(top_left),
+            input::ResizeEdges {
+                top: true,
+                bottom: false,
+                left: true,
+                right: false
+            }
+        );
 
-        let top_right = wlr::Edges { top: true, right: true, ..none };
-        assert_eq!(resize_edges_from_wlr(top_right), input::ResizeEdges { top: true, bottom: false, left: false, right: true });
+        let top_right = wlr::Edges {
+            top: true,
+            right: true,
+            ..none
+        };
+        assert_eq!(
+            resize_edges_from_wlr(top_right),
+            input::ResizeEdges {
+                top: true,
+                bottom: false,
+                left: false,
+                right: true
+            }
+        );
 
-        let bottom_left = wlr::Edges { bottom: true, left: true, ..none };
-        assert_eq!(resize_edges_from_wlr(bottom_left), input::ResizeEdges { top: false, bottom: true, left: true, right: false });
+        let bottom_left = wlr::Edges {
+            bottom: true,
+            left: true,
+            ..none
+        };
+        assert_eq!(
+            resize_edges_from_wlr(bottom_left),
+            input::ResizeEdges {
+                top: false,
+                bottom: true,
+                left: true,
+                right: false
+            }
+        );
 
-        let bottom_right = wlr::Edges { bottom: true, right: true, ..none };
-        assert_eq!(resize_edges_from_wlr(bottom_right), input::ResizeEdges { top: false, bottom: true, left: false, right: true });
+        let bottom_right = wlr::Edges {
+            bottom: true,
+            right: true,
+            ..none
+        };
+        assert_eq!(
+            resize_edges_from_wlr(bottom_right),
+            input::ResizeEdges {
+                top: false,
+                bottom: true,
+                left: false,
+                right: true
+            }
+        );
     }
 
     /// J3's wiring: with an interactive panel holding `layer_focus` and a
@@ -8589,22 +10562,55 @@ mod tests {
     fn arrange_layers_leaves_layer_focus_alone_and_unmap_clears_it() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let win_id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
-        state.handle_command(crate::dbus::DbCommand::Maximize(win_id, true)).unwrap();
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let win_id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
+        state
+            .handle_command(crate::dbus::DbCommand::Maximize(win_id, true))
+            .unwrap();
 
         let panel_id = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            panel_id,
+            LayerEntry {
+                interactive: true,
+                ..top_panel_entry(30, true)
+            },
+        );
         // What `layer_surface_mapped` would have set with a live runtime
         // attached (see that handler's own doc for why it cannot here).
         state.layer_focus = Some(panel_id);
 
         state.arrange_layers();
-        assert_eq!(state.layer_focus, Some(panel_id), "arrange_layers must not clear layer_focus");
+        assert_eq!(
+            state.layer_focus,
+            Some(panel_id),
+            "arrange_layers must not clear layer_focus"
+        );
 
         wlr::ToplevelHandler::layer_surface_unmapped(&mut state, panel_id);
         assert_eq!(state.layer_focus, None, "unmapping must clear layer_focus");
-        assert!(!state.layers[&panel_id].mapped, "unmapping must stop the entry from reserving");
+        assert!(
+            !state.layers[&panel_id].mapped,
+            "unmapping must stop the entry from reserving"
+        );
     }
 
     /// Task 8, N9: a layer surface that becomes keyboard-interactive
@@ -8622,19 +10628,34 @@ mod tests {
     fn a_layer_surface_that_becomes_interactive_after_map_takes_focus() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         // Mapped, not (yet) interactive -- what `layer_surface_mapped` left
         // behind for a surface that mapped before ever asking for the
         // keyboard.
         state.layers.insert(id, top_panel_entry(30, true));
-        assert_eq!(state.layer_focus, None, "must not hold focus before the flip");
+        assert_eq!(
+            state.layer_focus, None,
+            "must not hold focus before the flip"
+        );
 
         // The commit that flips `keyboard_interactive()` to `true`.
         state.layers.get_mut(&id).unwrap().interactive = true;
         state.sync_layer_interactive_focus(id, false, true);
 
-        assert_eq!(state.layer_focus, Some(id), "must take layer focus once it becomes interactive post-map");
+        assert_eq!(
+            state.layer_focus,
+            Some(id),
+            "must take layer focus once it becomes interactive post-map"
+        );
     }
 
     /// Task 8, N9: the release half -- a mapped, focused surface that
@@ -8644,15 +10665,32 @@ mod tests {
     fn a_layer_surface_that_stops_being_interactive_releases_focus() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            id,
+            LayerEntry {
+                interactive: true,
+                ..top_panel_entry(30, true)
+            },
+        );
         state.layer_focus = Some(id);
 
         state.layers.get_mut(&id).unwrap().interactive = false;
         state.sync_layer_interactive_focus(id, true, false);
 
-        assert_eq!(state.layer_focus, None, "must release layer focus once it stops being interactive");
+        assert_eq!(
+            state.layer_focus, None,
+            "must release layer focus once it stops being interactive"
+        );
     }
 
     /// Task 8, N9: a surface that is not mapped yet must never take focus
@@ -8663,14 +10701,25 @@ mod tests {
     fn an_unmapped_surface_does_not_take_focus_on_becoming_interactive() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(id, top_panel_entry(30, false));
 
         state.layers.get_mut(&id).unwrap().interactive = true;
         state.sync_layer_interactive_focus(id, false, true);
 
-        assert_eq!(state.layer_focus, None, "an unmapped surface must not take layer focus");
+        assert_eq!(
+            state.layer_focus, None,
+            "an unmapped surface must not take layer focus"
+        );
     }
 
     /// Task 8, N9: something else already holding layer focus must not be
@@ -8680,9 +10729,23 @@ mod tests {
     fn an_already_focused_layer_is_not_stolen_from_by_another_turning_interactive() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let held = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(held, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            held,
+            LayerEntry {
+                interactive: true,
+                ..top_panel_entry(30, true)
+            },
+        );
         state.layer_focus = Some(held);
 
         let other = wlr::LayerSurfaceId::dangling_for_test();
@@ -8690,7 +10753,11 @@ mod tests {
         state.layers.get_mut(&other).unwrap().interactive = true;
         state.sync_layer_interactive_focus(other, false, true);
 
-        assert_eq!(state.layer_focus, Some(held), "must not steal focus from an already-focused layer surface");
+        assert_eq!(
+            state.layer_focus,
+            Some(held),
+            "must not steal focus from an already-focused layer surface"
+        );
     }
 
     /// N6: two top-anchored exclusive panels on the same output must stack
@@ -8702,15 +10769,34 @@ mod tests {
     fn usable_before_stacks_two_same_edge_panels_instead_of_overlapping() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let first = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(first, LayerEntry { sequence: 0, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            first,
+            LayerEntry {
+                sequence: 0,
+                ..top_panel_entry(30, true)
+            },
+        );
 
         // `usable_before` for the first panel (nothing precedes it in
         // sequence order): the raw output box, unshrunk.
         assert_eq!(
             state.usable_before(0, 0).unwrap(),
-            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600
+            },
             "the first panel's placement base must be the raw box"
         );
 
@@ -8720,7 +10806,12 @@ mod tests {
         // instead of drawing over it.
         assert_eq!(
             state.usable_before(0, 1).unwrap(),
-            Rectangle { x: 0, y: 30, width: 800, height: 570 },
+            Rectangle {
+                x: 0,
+                y: 30,
+                width: 800,
+                height: 570
+            },
             "the second panel's placement base must exclude the first panel's zone"
         );
 
@@ -8730,7 +10821,12 @@ mod tests {
         state.layers.get_mut(&first).unwrap().mapped = false;
         assert_eq!(
             state.usable_before(0, 1).unwrap(),
-            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600
+            },
             "an unmapped earlier entry must not shrink a later panel's placement base"
         );
     }
@@ -8745,19 +10841,50 @@ mod tests {
     fn two_large_exclusive_top_panels_do_not_overflow_or_panic() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
         let first = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(first, LayerEntry { sequence: 0, exclusive: i32::MAX, ..top_panel_entry(i32::MAX, true) });
+        state.layers.insert(
+            first,
+            LayerEntry {
+                sequence: 0,
+                exclusive: i32::MAX,
+                ..top_panel_entry(i32::MAX, true)
+            },
+        );
         let second = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(second, LayerEntry { sequence: 1, exclusive: i32::MAX, ..top_panel_entry(i32::MAX, true) });
+        state.layers.insert(
+            second,
+            LayerEntry {
+                sequence: 1,
+                exclusive: i32::MAX,
+                ..top_panel_entry(i32::MAX, true)
+            },
+        );
 
         state.arrange_layers();
 
         let usable = state.outputs[&0].usable;
-        assert!(usable.height >= 0, "height must never go negative, got {usable:?}");
-        assert!(usable.width >= 0, "width must never go negative, got {usable:?}");
-        assert!(usable.y >= 0, "y must stay a sane, saturated value, got {usable:?}");
+        assert!(
+            usable.height >= 0,
+            "height must never go negative, got {usable:?}"
+        );
+        assert!(
+            usable.width >= 0,
+            "width must never go negative, got {usable:?}"
+        );
+        assert!(
+            usable.y >= 0,
+            "y must stay a sane, saturated value, got {usable:?}"
+        );
     }
 
     /// H2: the exclusive zone is also clamped where it is captured --
@@ -8768,11 +10895,32 @@ mod tests {
     /// no test constructor for `exclusive_zone()`.
     #[test]
     fn clamp_exclusive_zone_bounds_a_positive_value_to_the_outputs_extent() {
-        let output = OutputSurface::new(Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        assert_eq!(clamp_exclusive_zone(i32::MAX, Some(&output)), 800, "clamped to max(width, height)");
-        assert_eq!(clamp_exclusive_zone(30, Some(&output)), 30, "a sane value passes through unchanged");
-        assert_eq!(clamp_exclusive_zone(-5, Some(&output)), -5, "a non-positive sentinel is never touched");
-        assert_eq!(clamp_exclusive_zone(i32::MAX, None), i32::MAX, "no output resolved yet: left to the saturating fold");
+        let output = OutputSurface::new(Rectangle {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        });
+        assert_eq!(
+            clamp_exclusive_zone(i32::MAX, Some(&output)),
+            800,
+            "clamped to max(width, height)"
+        );
+        assert_eq!(
+            clamp_exclusive_zone(30, Some(&output)),
+            30,
+            "a sane value passes through unchanged"
+        );
+        assert_eq!(
+            clamp_exclusive_zone(-5, Some(&output)),
+            -5,
+            "a non-positive sentinel is never touched"
+        );
+        assert_eq!(
+            clamp_exclusive_zone(i32::MAX, None),
+            i32::MAX,
+            "no output resolved yet: left to the saturating fold"
+        );
     }
 
     // --- Task 20 re-review: Important-1, Minor-1 ---
@@ -8786,16 +10934,49 @@ mod tests {
     fn clicking_a_window_releases_layer_focus_for_an_interactive_panel() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 100, y: 100, width: 600, height: 400 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 100,
+                y: 100,
+                width: 600,
+                height: 400,
+            },
+        );
 
         let panel_id = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            panel_id,
+            LayerEntry {
+                interactive: true,
+                ..top_panel_entry(30, true)
+            },
+        );
         state.layer_focus = Some(panel_id);
 
-        let _ = state.handle_pointer(PointerEvent::Press { id, pointer: (120, 105) });
-        assert_eq!(state.layer_focus, None, "clicking a window must release layer_focus");
-        assert!(state.window_manager.get(id).unwrap().focused, "the model's own focus must have won");
+        let _ = state.handle_pointer(PointerEvent::Press {
+            id,
+            pointer: (120, 105),
+        });
+        assert_eq!(
+            state.layer_focus, None,
+            "clicking a window must release layer_focus"
+        );
+        assert!(
+            state.window_manager.get(id).unwrap().focused,
+            "the model's own focus must have won"
+        );
     }
 
     /// Important-1: `DbCommand::Focus` is the D-Bus-driven counterpart of a
@@ -8804,16 +10985,55 @@ mod tests {
     fn db_command_focus_releases_layer_focus_for_an_interactive_panel() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let a = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
-        let _b = state.window_manager.add_window("app2", "t2", 2, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let a = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
+        let _b = state.window_manager.add_window(
+            "app2",
+            "t2",
+            2,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
 
         let panel_id = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            panel_id,
+            LayerEntry {
+                interactive: true,
+                ..top_panel_entry(30, true)
+            },
+        );
         state.layer_focus = Some(panel_id);
 
-        state.handle_command(crate::dbus::DbCommand::Focus(a)).unwrap();
-        assert_eq!(state.layer_focus, None, "DbCommand::Focus must release layer_focus");
+        state
+            .handle_command(crate::dbus::DbCommand::Focus(a))
+            .unwrap();
+        assert_eq!(
+            state.layer_focus, None,
+            "DbCommand::Focus must release layer_focus"
+        );
         assert!(state.window_manager.get(a).unwrap().focused);
     }
 
@@ -8830,12 +11050,36 @@ mod tests {
     fn a_failing_db_command_focus_does_not_release_layer_focus() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let a = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let a = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
         state.window_manager.set_mapped(a, false).unwrap();
 
         let panel_id = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            panel_id,
+            LayerEntry {
+                interactive: true,
+                ..top_panel_entry(30, true)
+            },
+        );
         state.layer_focus = Some(panel_id);
 
         assert_eq!(
@@ -8843,7 +11087,11 @@ mod tests {
             None,
             "an unmapped window must never be focused via D-Bus"
         );
-        assert_eq!(state.layer_focus, Some(panel_id), "a failing focus request must not release layer_focus");
+        assert_eq!(
+            state.layer_focus,
+            Some(panel_id),
+            "a failing focus request must not release layer_focus"
+        );
     }
 
     /// Important-1: alt-tab's per-step focus is the third explicit path
@@ -8852,16 +11100,53 @@ mod tests {
     fn alt_tab_cycling_releases_layer_focus_for_an_interactive_panel() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let _a = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
-        let _b = state.window_manager.add_window("app2", "t2", 2, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let _a = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
+        let _b = state.window_manager.add_window(
+            "app2",
+            "t2",
+            2,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
 
         let panel_id = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            panel_id,
+            LayerEntry {
+                interactive: true,
+                ..top_panel_entry(30, true)
+            },
+        );
         state.layer_focus = Some(panel_id);
 
         state.apply_action("cycle:alt_tab");
-        assert_eq!(state.layer_focus, None, "alt-tab cycling must release layer_focus");
+        assert_eq!(
+            state.layer_focus, None,
+            "alt-tab cycling must release layer_focus"
+        );
     }
 
     /// Finding F9: an X11 client's `_NET_ACTIVE_WINDOW`
@@ -8882,18 +11167,55 @@ mod tests {
         use wlr::ToplevelHandler as _;
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let other = state.window_manager.add_window("other", "o", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
-        let win = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let other = state.window_manager.add_window(
+            "other",
+            "o",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
+        let win = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
         // `add_window` autofocuses, so `win` would be the already-focused
         // early return. Hand focus back to `other` so the request has a real
         // steal to attempt.
-        state.window_manager.focus(other).expect("other must be focusable");
+        state
+            .window_manager
+            .focus(other)
+            .expect("other must be focusable");
         let sid = wlr::XwaylandSurfaceId::dangling_for_test();
         state.xwayland_windows.insert(sid, win);
 
         let panel_id = wlr::LayerSurfaceId::dangling_for_test();
-        state.layers.insert(panel_id, LayerEntry { interactive: true, ..top_panel_entry(30, true) });
+        state.layers.insert(
+            panel_id,
+            LayerEntry {
+                interactive: true,
+                ..top_panel_entry(30, true)
+            },
+        );
         state.layer_focus = Some(panel_id);
 
         state.xwayland_request_activate(sid);
@@ -8904,7 +11226,11 @@ mod tests {
             "an X11 activate must not move focus; `_NET_ACTIVE_WINDOW` carries no seat serial"
         );
         assert!(
-            state.window_manager.get(win).expect("still in the model").attention,
+            state
+                .window_manager
+                .get(win)
+                .expect("still in the model")
+                .attention,
             "a refused X11 activate must raise the attention hint instead"
         );
         assert_eq!(
@@ -8950,7 +11276,15 @@ mod tests {
         use wlr::SeatHandler as _;
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let a = state.window_manager.add_window("a", "A", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "B", 2, DEFAULT_GEO);
         // Real toplevel bindings, so `request_activate`'s `window_for`
@@ -8992,13 +11326,20 @@ mod tests {
         // take the attention branch when unlocked, and must not even do that.
         state.request_activate(
             Some(wlr::ToplevelId::dangling_nth_for_test(2)),
-            wlr::ActivationToken { has_seat: false, serial: 0, requesting_toplevel: None },
+            wlr::ActivationToken {
+                has_seat: false,
+                serial: 0,
+                requesting_toplevel: None,
+            },
         );
         assert!(
             !state.window_manager.get(b).expect("B in model").attention,
             "a refused activation must not raise a hint the user cannot see or clear while locked"
         );
-        assert!(rx.try_recv().is_err(), "the refused branch must emit nothing while locked either");
+        assert!(
+            rx.try_recv().is_err(),
+            "the refused branch must emit nothing while locked either"
+        );
 
         // Control: unlocked, the very same honorable token moves focus. This
         // is what makes every assertion above a claim about the LOCK rather
@@ -9024,7 +11365,15 @@ mod tests {
         use wlr::{SeatHandler as _, ToplevelHandler as _};
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let a = state.window_manager.add_window("a", "A", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "B", 2, DEFAULT_GEO);
         let sid = wlr::XwaylandSurfaceId::dangling_for_test();
@@ -9036,12 +11385,19 @@ mod tests {
 
         state.xwayland_request_activate(sid);
 
-        assert_eq!(state.focused_id(), Some(a), "a locked X11 activate must not move focus");
+        assert_eq!(
+            state.focused_id(),
+            Some(a),
+            "a locked X11 activate must not move focus"
+        );
         assert!(
             !state.window_manager.get(b).expect("B in model").attention,
             "a locked X11 activate must not raise an attention hint either"
         );
-        assert!(rx.try_recv().is_err(), "a locked X11 activate must emit nothing at all");
+        assert!(
+            rx.try_recv().is_err(),
+            "a locked X11 activate must emit nothing at all"
+        );
 
         // Control: unlocked, the same request does reach the refusal branch
         // and flags B -- so the assertions above are about the lock.
@@ -9063,7 +11419,15 @@ mod tests {
         use wlr::SeatHandler as _;
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let a = state.window_manager.add_window("a", "A", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "B", 2, DEFAULT_GEO);
         state.window_manager.focus(a).expect("A must be focusable");
@@ -9074,20 +11438,37 @@ mod tests {
         state.session_lock_changed(true);
         while rx.try_recv().is_ok() {}
 
-        state.handle_pointer(PointerEvent::Press { id: b, pointer: inside_b });
+        state.handle_pointer(PointerEvent::Press {
+            id: b,
+            pointer: inside_b,
+        });
 
-        assert_eq!(state.focused_id(), Some(a), "a click behind the lock screen must not move focus");
+        assert_eq!(
+            state.focused_id(),
+            Some(a),
+            "a click behind the lock screen must not move focus"
+        );
         assert!(
             state.window_manager.get(b).expect("B in model").attention,
             "a click behind the lock screen must not clear an attention hint either"
         );
-        assert!(rx.try_recv().is_err(), "a locked pointer press must emit nothing at all");
+        assert!(
+            rx.try_recv().is_err(),
+            "a locked pointer press must emit nothing at all"
+        );
 
         // Control: unlocked, the very same press does focus B and answers
         // its hint -- so the assertions above are about the lock.
         state.session_lock_changed(false);
-        state.handle_pointer(PointerEvent::Press { id: b, pointer: inside_b });
-        assert_eq!(state.focused_id(), Some(b), "control: unlocked, the press focuses B");
+        state.handle_pointer(PointerEvent::Press {
+            id: b,
+            pointer: inside_b,
+        });
+        assert_eq!(
+            state.focused_id(),
+            Some(b),
+            "control: unlocked, the press focuses B"
+        );
         assert!(
             !state.window_manager.get(b).expect("B in model").attention,
             "control: unlocked, focusing B answers its attention hint"
@@ -9106,14 +11487,24 @@ mod tests {
 
         state.raise_attention_if_answerable(id);
         assert!(
-            !state.window_manager.get(id).expect("still in the model").attention,
+            !state
+                .window_manager
+                .get(id)
+                .expect("still in the model")
+                .attention,
             "an unmapped target must not be flagged: nothing could ever clear the hint"
         );
 
         // Control, so this is not passing because flagging is broken outright.
         state.window_manager.set_mapped(id, true);
         state.raise_attention_if_answerable(id);
-        assert!(state.window_manager.get(id).expect("still in the model").attention);
+        assert!(
+            state
+                .window_manager
+                .get(id)
+                .expect("still in the model")
+                .attention
+        );
     }
 
     /// Finding F6, second half: restoring a minimized window is the user
@@ -9125,21 +11516,47 @@ mod tests {
     fn restoring_a_minimized_window_clears_its_attention_hint() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let flagged = state.window_manager.add_window("a", "A", 1, DEFAULT_GEO);
         let keeper = state.window_manager.add_window("b", "B", 2, DEFAULT_GEO);
-        state.set_minimized_and_reconcile(flagged, true).expect("minimize");
-        state.window_manager.focus(keeper).expect("B takes the keyboard");
-        state.window_manager.set_attention(flagged, true).expect("flagged");
+        state
+            .set_minimized_and_reconcile(flagged, true)
+            .expect("minimize");
+        state
+            .window_manager
+            .focus(keeper)
+            .expect("B takes the keyboard");
+        state
+            .window_manager
+            .set_attention(flagged, true)
+            .expect("flagged");
         while rx.try_recv().is_ok() {}
 
-        state.set_minimized_and_reconcile(flagged, false).expect("restore");
+        state
+            .set_minimized_and_reconcile(flagged, false)
+            .expect("restore");
 
         assert!(
-            !state.window_manager.get(flagged).expect("still in the model").attention,
+            !state
+                .window_manager
+                .get(flagged)
+                .expect("still in the model")
+                .attention,
             "restoring a flagged window must clear its attention hint"
         );
-        assert_eq!(state.focused_id(), Some(keeper), "the restore must not have moved focus");
+        assert_eq!(
+            state.focused_id(),
+            Some(keeper),
+            "the restore must not have moved focus"
+        );
         assert!(
             rx.try_iter().any(|e| matches!(
                 e.event,
@@ -9158,20 +11575,50 @@ mod tests {
     fn switching_to_a_workspace_clears_its_focused_window_s_attention() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let here = state.window_manager.add_window("here", "H", 1, DEFAULT_GEO);
-        let there = state.window_manager.add_window("there", "T", 2, DEFAULT_GEO);
-        state.window_manager.set_workspace(there, 1).expect("move to workspace 1");
-        state.window_manager.focus(there).expect("focus it on its own workspace");
+        let there = state
+            .window_manager
+            .add_window("there", "T", 2, DEFAULT_GEO);
+        state
+            .window_manager
+            .set_workspace(there, 1)
+            .expect("move to workspace 1");
+        state
+            .window_manager
+            .focus(there)
+            .expect("focus it on its own workspace");
         state.switch_workspace(0).expect("back to workspace 0");
-        state.window_manager.focus(here).expect("H holds workspace 0");
-        state.window_manager.set_attention(there, true).expect("flag the off-workspace window");
+        state
+            .window_manager
+            .focus(here)
+            .expect("H holds workspace 0");
+        state
+            .window_manager
+            .set_attention(there, true)
+            .expect("flag the off-workspace window");
 
         state.switch_workspace(1).expect("switch to workspace 1");
 
-        assert_eq!(state.focused_id(), Some(there), "T must be workspace 1's focused window");
+        assert_eq!(
+            state.focused_id(),
+            Some(there),
+            "T must be workspace 1's focused window"
+        );
         assert!(
-            !state.window_manager.get(there).expect("still in the model").attention,
+            !state
+                .window_manager
+                .get(there)
+                .expect("still in the model")
+                .attention,
             "arriving on the workspace answers the hint on its focused window"
         );
     }
@@ -9198,13 +11645,25 @@ mod tests {
     fn arrange_layers_reconfigures_every_mapped_panel_even_without_its_own_commit() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(id, top_panel_entry(30, true));
 
         state.arrange_layers();
         let first_placement = state.layers[&id].last_configured;
-        assert_eq!(first_placement, Some((800, 30, 0, 0)), "the initial arrange must record a placement");
+        assert_eq!(
+            first_placement,
+            Some((800, 30, 0, 0)),
+            "the initial arrange must record a placement"
+        );
 
         // Nothing calls `configure_layer` or `layer_surface_commit` for
         // this entry between the two arranges -- an output mode change
@@ -9212,10 +11671,21 @@ mod tests {
         // new_output` re-recording a resized output's box) moves this
         // panel's placement input with no layer-side event of any kind,
         // real or simulated, in between.
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 640, height: 480 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+            },
+        );
         state.arrange_layers();
         let second_placement = state.layers[&id].last_configured;
-        assert_ne!(second_placement, first_placement, "arrange_layers must reconfigure a panel with no commit of its own");
+        assert_ne!(
+            second_placement, first_placement,
+            "arrange_layers must reconfigure a panel with no commit of its own"
+        );
         assert_eq!(second_placement, Some((640, 30, 0, 0)));
     }
 
@@ -9228,7 +11698,15 @@ mod tests {
     fn arrange_layers_does_not_reconfigure_an_unchanged_panel() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(id, top_panel_entry(30, true));
 
@@ -9236,7 +11714,10 @@ mod tests {
         let placement = state.layers[&id].last_configured;
 
         state.arrange_layers();
-        assert_eq!(state.layers[&id].last_configured, placement, "an unchanged panel's placement must not be re-recorded");
+        assert_eq!(
+            state.layers[&id].last_configured, placement,
+            "an unchanged panel's placement must not be re-recorded"
+        );
     }
 
     // --- Final review C1: wallpaper / background lowering order ---
@@ -9300,7 +11781,15 @@ mod tests {
     fn a_top_anchored_panel_still_spans_the_box_at_its_desired_thickness() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(id, top_panel_entry(30, true));
         state.configure_layer(id);
@@ -9316,7 +11805,15 @@ mod tests {
     fn a_corner_anchored_layer_surface_keeps_its_desired_size() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(
             id,
@@ -9324,7 +11821,12 @@ mod tests {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: true, right: true, left: false, bottom: false },
+                anchor: wlr::Anchor {
+                    top: true,
+                    right: true,
+                    left: false,
+                    bottom: false,
+                },
                 exclusive: 0,
                 size: (300, 100),
                 interactive: false,
@@ -9354,7 +11856,15 @@ mod tests {
     fn a_corner_anchored_panel_keeps_its_desired_width() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         // top+left anchored (a corner), desired 200x30: width must be 200, not 800.
         state.layers.insert(
             wlr::LayerSurfaceId::dangling_for_test(),
@@ -9362,7 +11872,12 @@ mod tests {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: true, left: true, right: false, bottom: false },
+                anchor: wlr::Anchor {
+                    top: true,
+                    left: true,
+                    right: false,
+                    bottom: false,
+                },
                 exclusive: 0,
                 size: (200, 30),
                 interactive: false,
@@ -9387,14 +11902,27 @@ mod tests {
     fn a_corner_anchored_exclusive_zone_reserves_nothing() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         state.layers.insert(
             wlr::LayerSurfaceId::dangling_for_test(),
             LayerEntry {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: true, left: true, right: false, bottom: false },
+                anchor: wlr::Anchor {
+                    top: true,
+                    left: true,
+                    right: false,
+                    bottom: false,
+                },
                 exclusive: 30,
                 size: (200, 30),
                 interactive: false,
@@ -9406,7 +11934,12 @@ mod tests {
         state.arrange_layers();
         assert_eq!(
             state.outputs[&0].usable,
-            Rectangle { x: 0, y: 0, width: 800, height: 600 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600
+            },
             "a corner anchor spans neither axis, so wlroots' own rule assigns it no exclusive edge at all"
         );
     }
@@ -9432,14 +11965,27 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         let mut top = State::new(icedtea_config::default_config(), tx.clone());
-        top.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        top.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         top.layers.insert(
             wlr::LayerSurfaceId::dangling_for_test(),
             LayerEntry {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: true, left: false, right: false, bottom: false },
+                anchor: wlr::Anchor {
+                    top: true,
+                    left: false,
+                    right: false,
+                    bottom: false,
+                },
                 exclusive: 12,
                 size: (0, 12),
                 interactive: false,
@@ -9451,19 +11997,37 @@ mod tests {
         top.arrange_layers();
         assert_eq!(
             top.outputs[&0].usable,
-            Rectangle { x: 0, y: 12, width: 800, height: 588 },
+            Rectangle {
+                x: 0,
+                y: 12,
+                width: 800,
+                height: 588
+            },
             "ANCHOR_TOP alone with a positive exclusive_zone must reserve at the top (WLCS conformance shape)"
         );
 
         let mut bottom = State::new(icedtea_config::default_config(), tx.clone());
-        bottom.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        bottom.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         bottom.layers.insert(
             wlr::LayerSurfaceId::dangling_for_test(),
             LayerEntry {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: false, left: false, right: false, bottom: true },
+                anchor: wlr::Anchor {
+                    top: false,
+                    left: false,
+                    right: false,
+                    bottom: true,
+                },
                 exclusive: 12,
                 size: (0, 12),
                 interactive: false,
@@ -9475,19 +12039,37 @@ mod tests {
         bottom.arrange_layers();
         assert_eq!(
             bottom.outputs[&0].usable,
-            Rectangle { x: 0, y: 0, width: 800, height: 588 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 588
+            },
             "ANCHOR_BOTTOM alone with a positive exclusive_zone must reserve at the bottom"
         );
 
         let mut left = State::new(icedtea_config::default_config(), tx.clone());
-        left.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        left.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         left.layers.insert(
             wlr::LayerSurfaceId::dangling_for_test(),
             LayerEntry {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: false, left: true, right: false, bottom: false },
+                anchor: wlr::Anchor {
+                    top: false,
+                    left: true,
+                    right: false,
+                    bottom: false,
+                },
                 exclusive: 12,
                 size: (12, 0),
                 interactive: false,
@@ -9499,19 +12081,37 @@ mod tests {
         left.arrange_layers();
         assert_eq!(
             left.outputs[&0].usable,
-            Rectangle { x: 12, y: 0, width: 788, height: 600 },
+            Rectangle {
+                x: 12,
+                y: 0,
+                width: 788,
+                height: 600
+            },
             "ANCHOR_LEFT alone with a positive exclusive_zone must reserve at the left"
         );
 
         let mut right = State::new(icedtea_config::default_config(), tx);
-        right.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        right.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         right.layers.insert(
             wlr::LayerSurfaceId::dangling_for_test(),
             LayerEntry {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: false, left: false, right: true, bottom: false },
+                anchor: wlr::Anchor {
+                    top: false,
+                    left: false,
+                    right: true,
+                    bottom: false,
+                },
                 exclusive: 12,
                 size: (12, 0),
                 interactive: false,
@@ -9523,7 +12123,12 @@ mod tests {
         right.arrange_layers();
         assert_eq!(
             right.outputs[&0].usable,
-            Rectangle { x: 0, y: 0, width: 788, height: 600 },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 788,
+                height: 600
+            },
             "ANCHOR_RIGHT alone with a positive exclusive_zone must reserve at the right"
         );
     }
@@ -9540,18 +12145,55 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
         state.config.appearance.snap_gap = 0;
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
         // A maximized, minimized window on the active workspace (0).
-        let minimized_id = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
-        state.window_manager.set_maximized(minimized_id, true).unwrap();
-        state.window_manager.set_minimized(minimized_id, true).unwrap();
+        let minimized_id = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
+        state
+            .window_manager
+            .set_maximized(minimized_id, true)
+            .unwrap();
+        state
+            .window_manager
+            .set_minimized(minimized_id, true)
+            .unwrap();
         let geo_before_min = state.window_manager.get(minimized_id).unwrap().geometry;
 
         // A maximized window on workspace 1, while workspace 0 stays active.
-        let other_ws_id = state.window_manager.add_window("app2", "t2", 2, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        let other_ws_id = state.window_manager.add_window(
+            "app2",
+            "t2",
+            2,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
         state.window_manager.set_workspace(other_ws_id, 1).unwrap();
-        state.window_manager.set_maximized(other_ws_id, true).unwrap();
+        state
+            .window_manager
+            .set_maximized(other_ws_id, true)
+            .unwrap();
         let geo_before_ws = state.window_manager.get(other_ws_id).unwrap().geometry;
 
         // A panel maps, changing `usable` -- the trigger that would have
@@ -9582,7 +12224,15 @@ mod tests {
     fn a_four_edge_anchored_layer_surface_fills_the_usable_box() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 100, y: 50, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 100,
+                y: 50,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(
             id,
@@ -9590,7 +12240,12 @@ mod tests {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Overlay,
-                anchor: wlr::Anchor { top: true, bottom: true, left: true, right: true },
+                anchor: wlr::Anchor {
+                    top: true,
+                    bottom: true,
+                    left: true,
+                    right: true,
+                },
                 exclusive: 0,
                 size: (0, 0),
                 interactive: true,
@@ -9614,7 +12269,15 @@ mod tests {
     fn an_unanchored_zero_sized_layer_surface_also_fills_the_usable_box() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(
             id,
@@ -9622,7 +12285,12 @@ mod tests {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Overlay,
-                anchor: wlr::Anchor { top: false, bottom: false, left: false, right: false },
+                anchor: wlr::Anchor {
+                    top: false,
+                    bottom: false,
+                    left: false,
+                    right: false,
+                },
                 exclusive: 0,
                 size: (0, 0),
                 interactive: true,
@@ -9642,7 +12310,15 @@ mod tests {
     fn an_unanchored_sized_layer_surface_is_centered() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(
             id,
@@ -9650,7 +12326,12 @@ mod tests {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Overlay,
-                anchor: wlr::Anchor { top: false, bottom: false, left: false, right: false },
+                anchor: wlr::Anchor {
+                    top: false,
+                    bottom: false,
+                    left: false,
+                    right: false,
+                },
                 exclusive: 0,
                 size: (400, 200),
                 interactive: true,
@@ -9660,7 +12341,10 @@ mod tests {
             },
         );
         state.configure_layer(id);
-        assert_eq!(state.layers[&id].last_configured, Some((400, 200, 200, 200)));
+        assert_eq!(
+            state.layers[&id].last_configured,
+            Some((400, 200, 200, 200))
+        );
     }
 
     /// Finding 7, security: a client-supplied `desired` size that dwarfs
@@ -9671,7 +12355,15 @@ mod tests {
     fn a_pathologically_large_desired_size_is_clamped_to_the_output() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(
             id,
@@ -9679,7 +12371,12 @@ mod tests {
                 output: 0,
                 sequence: 0,
                 layer: wlr::Layer::Top,
-                anchor: wlr::Anchor { top: false, bottom: false, left: false, right: false },
+                anchor: wlr::Anchor {
+                    top: false,
+                    bottom: false,
+                    left: false,
+                    right: false,
+                },
                 exclusive: 0,
                 size: (u32::MAX, u32::MAX),
                 interactive: true,
@@ -9690,8 +12387,14 @@ mod tests {
         );
         state.configure_layer(id);
         let (w, h, _, _) = state.layers[&id].last_configured.unwrap();
-        assert_eq!(w, 800, "width must clamp to the output's own span, not wrap negative");
-        assert_eq!(h, 600, "height must clamp to the output's own span, not wrap negative");
+        assert_eq!(
+            w, 800,
+            "width must clamp to the output's own span, not wrap negative"
+        );
+        assert_eq!(
+            h, 600,
+            "height must clamp to the output's own span, not wrap negative"
+        );
     }
 
     /// `layer_axis_placement` directly, for the same clamp: `desired` past
@@ -9699,9 +12402,20 @@ mod tests {
     /// `end` is set.
     #[test]
     fn layer_axis_placement_clamps_desired_to_the_span() {
-        assert_eq!(layer_axis_placement(false, false, u32::MAX, 0, 800), (800, 0));
-        assert_eq!(layer_axis_placement(true, false, u32::MAX, 0, 800), (800, 0), "flush start, still clamped");
-        assert_eq!(layer_axis_placement(false, true, u32::MAX, 0, 800), (800, 0), "flush end, still clamped");
+        assert_eq!(
+            layer_axis_placement(false, false, u32::MAX, 0, 800),
+            (800, 0)
+        );
+        assert_eq!(
+            layer_axis_placement(true, false, u32::MAX, 0, 800),
+            (800, 0),
+            "flush start, still clamped"
+        );
+        assert_eq!(
+            layer_axis_placement(false, true, u32::MAX, 0, 800),
+            (800, 0),
+            "flush end, still clamped"
+        );
     }
 
     // --- Final review I1: a remapped layer surface must be reconfigured ---
@@ -9719,7 +12433,15 @@ mod tests {
 
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(id, top_panel_entry(30, true));
 
@@ -9761,7 +12483,15 @@ mod tests {
 
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
         let key = crate::wayland::ToplevelKey::for_test(1);
         state.new_toplevel(key, "a", "A", 1);
@@ -9769,8 +12499,13 @@ mod tests {
 
         // Focus it on workspace 1 (`move_to_workspace` switches there and
         // focuses it), then leave for workspace 0.
-        state.move_to_workspace(id, 1).expect("moved to workspace 1");
-        assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(id));
+        state
+            .move_to_workspace(id, 1)
+            .expect("moved to workspace 1");
+        assert_eq!(
+            state.window_manager.focused_window().map(|w| w.id),
+            Some(id)
+        );
         state.switch_workspace(0).expect("switched away");
 
         // The unmap happens while workspace 1 is *not* the active one.
@@ -9806,10 +12541,38 @@ mod tests {
     fn switching_to_a_workspace_whose_focus_is_minimized_repicks() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
-        let a = state.window_manager.add_window("a", "A", 1, Rectangle { x: 0, y: 0, width: 100, height: 100 });
-        let b = state.window_manager.add_window("b", "B", 2, Rectangle { x: 0, y: 0, width: 100, height: 100 });
+        let a = state.window_manager.add_window(
+            "a",
+            "A",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+        );
+        let b = state.window_manager.add_window(
+            "b",
+            "B",
+            2,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+        );
         // `b` was added second so it is focused; minimize it and leave.
         assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(b));
         state.window_manager.set_minimized(b, true);
@@ -9853,7 +12616,11 @@ mod tests {
     fn transform_integer_mapping_round_trips_every_variant() {
         for value in 0..=7 {
             let t = State::transform_from_i32(value);
-            assert_eq!(State::transform_to_i32(t), value, "transform {value} must round-trip");
+            assert_eq!(
+                State::transform_to_i32(t),
+                value,
+                "transform {value} must round-trip"
+            );
         }
         // Out-of-range falls back to Normal (0), not a panic.
         assert_eq!(State::transform_from_i32(99), wlr::Transform::Normal);
@@ -9879,7 +12646,11 @@ mod tests {
         disabled.transform = wlr::Transform::R270;
         disabled.scale = 2.0;
         state.upsert_displays_from_heads(&[disabled]);
-        assert_eq!(state.config.displays.len(), 2, "same name must not append a duplicate");
+        assert_eq!(
+            state.config.displays.len(),
+            2,
+            "same name must not append a duplicate"
+        );
         let dp1 = &state.config.displays[0];
         assert_eq!(dp1.name, "DP-1");
         assert!(!dp1.enabled);
@@ -9896,7 +12667,10 @@ mod tests {
         let mut anon = head("ignored", true);
         anon.name = None;
         state.upsert_displays_from_heads(&[anon]);
-        assert!(state.config.displays.is_empty(), "an unnamed head has no key to store");
+        assert!(
+            state.config.displays.is_empty(),
+            "an unnamed head has no key to store"
+        );
     }
 
     #[test]
@@ -9916,7 +12690,11 @@ mod tests {
         State::save_config_to(&state.config_db_lock, &state.config, &path);
 
         let loaded = icedtea_config::load_or_default(&path);
-        assert_eq!(loaded.displays.len(), 1, "save_config_to must persist the displays");
+        assert_eq!(
+            loaded.displays.len(),
+            1,
+            "save_config_to must persist the displays"
+        );
         assert_eq!(loaded.displays[0].name, "DP-1");
         assert_eq!(loaded.displays[0].width, 1920);
         assert_eq!(loaded.displays[0].refresh_mhz, 60_000);
@@ -10034,11 +12812,31 @@ mod tests {
         // that is <= 0 or non-finite must not reach wlroots.
         assert_eq!(State::guarded_scale(1.0), 1.0);
         assert_eq!(State::guarded_scale(2.5), 2.5);
-        assert_eq!(State::guarded_scale(0.0), 1.0, "zero scale falls back to 1.0");
-        assert_eq!(State::guarded_scale(-2.0), 1.0, "negative scale falls back to 1.0");
-        assert_eq!(State::guarded_scale(f64::NAN), 1.0, "NaN scale falls back to 1.0");
-        assert_eq!(State::guarded_scale(f64::INFINITY), 1.0, "inf scale falls back to 1.0");
-        assert_eq!(State::guarded_scale(f64::NEG_INFINITY), 1.0, "-inf scale falls back to 1.0");
+        assert_eq!(
+            State::guarded_scale(0.0),
+            1.0,
+            "zero scale falls back to 1.0"
+        );
+        assert_eq!(
+            State::guarded_scale(-2.0),
+            1.0,
+            "negative scale falls back to 1.0"
+        );
+        assert_eq!(
+            State::guarded_scale(f64::NAN),
+            1.0,
+            "NaN scale falls back to 1.0"
+        );
+        assert_eq!(
+            State::guarded_scale(f64::INFINITY),
+            1.0,
+            "inf scale falls back to 1.0"
+        );
+        assert_eq!(
+            State::guarded_scale(f64::NEG_INFINITY),
+            1.0,
+            "-inf scale falls back to 1.0"
+        );
         // Review finding #8: an absurdly large but finite scale is capped, not
         // passed through to overflow `96 * scale` downstream.
         assert_eq!(
@@ -10114,7 +12912,15 @@ mod tests {
 
         // Once some present output is actually live, honoring another output's
         // persisted disable is safe.
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 2560, height: 1440 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            },
+        );
         assert!(
             !state.boot_disable_would_strand(),
             "a live output exists -> honoring a disable no longer strands the session"
@@ -10167,13 +12973,29 @@ mod tests {
         // active output unless the same atomic apply enables another.
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         // Only output 0 active, nothing else enabling -> disabling it strands.
         assert!(state.disable_would_strand_session(0, false));
         // A head in the same batch is enabling -> safe to disable index 0.
         assert!(!state.disable_would_strand_session(0, true));
         // A second active output survives the disable -> safe.
-        state.create_output(1, Rectangle { x: 800, y: 0, width: 800, height: 600 });
+        state.create_output(
+            1,
+            Rectangle {
+                x: 800,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
         assert!(!state.disable_would_strand_session(0, false));
     }
 
@@ -10184,9 +13006,26 @@ mod tests {
         // Single 800x600 output at origin: a window centered at (1400,300)
         // sits entirely off it (simulating the output it lived on shrinking
         // away under an applied config).
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let id =
-            state.window_manager.add_window("a", "A", 1, Rectangle { x: 1350, y: 250, width: 100, height: 100 });
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let id = state.window_manager.add_window(
+            "a",
+            "A",
+            1,
+            Rectangle {
+                x: 1350,
+                y: 250,
+                width: 100,
+                height: 100,
+            },
+        );
 
         state.reclaim_offscreen_windows();
 
@@ -10201,8 +13040,21 @@ mod tests {
     fn reclaim_offscreen_windows_leaves_onscreen_window_untouched() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
-        let onscreen = Rectangle { x: 100, y: 100, width: 200, height: 150 };
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let onscreen = Rectangle {
+            x: 100,
+            y: 100,
+            width: 200,
+            height: 150,
+        };
         let id = state.window_manager.add_window("a", "A", 1, onscreen);
 
         state.reclaim_offscreen_windows();

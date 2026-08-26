@@ -87,7 +87,11 @@ pub fn rasterize_title(
     // clipped by the bounds check in the draw loop below rather than being
     // wrapped onto a second line nobody would see.
     buffer.set_size(Some((width - pad_x).max(1) as f32), Some(height as f32));
-    buffer.set_text(text, &Attrs::new().family(Family::SansSerif), Shaping::Advanced);
+    buffer.set_text(
+        text,
+        &Attrs::new().family(Family::SansSerif),
+        Shaping::Advanced,
+    );
     buffer.shape_until_scroll(true);
 
     let mut px = vec![0u8; (width as usize) * (height as usize) * 4];
@@ -173,7 +177,11 @@ pub fn rasterize_glyph(
     let mut buffer = Buffer::new(fonts, metrics);
     let mut buffer = buffer.borrow_with(fonts);
     buffer.set_size(Some(width as f32), Some(height as f32));
-    buffer.set_text(glyph, &Attrs::new().family(Family::SansSerif), Shaping::Advanced);
+    buffer.set_text(
+        glyph,
+        &Attrs::new().family(Family::SansSerif),
+        Shaping::Advanced,
+    );
     for line in buffer.lines.iter_mut() {
         line.set_align(Some(Align::Center));
     }
@@ -222,10 +230,21 @@ mod tests {
     fn a_title_rasterizes_nonempty_pixels() {
         let mut fonts = cosmic_text::FontSystem::new();
         let mut swash = cosmic_text::SwashCache::new();
-        let px = rasterize_title(&mut fonts, &mut swash, "Hello", 200, 28, 8, [255, 255, 255, 255])
-            .expect("some pixels");
+        let px = rasterize_title(
+            &mut fonts,
+            &mut swash,
+            "Hello",
+            200,
+            28,
+            8,
+            [255, 255, 255, 255],
+        )
+        .expect("some pixels");
         assert_eq!(px.len(), 200 * 28 * 4);
-        assert!(px.chunks_exact(4).any(|p| p[3] != 0), "at least one glyph pixel must be opaque");
+        assert!(
+            px.chunks_exact(4).any(|p| p[3] != 0),
+            "at least one glyph pixel must be opaque"
+        );
     }
 
     #[test]
@@ -260,10 +279,25 @@ mod tests {
         let mut swash = cosmic_text::SwashCache::new();
         // A short string in a wide band guarantees untouched pixels on the
         // right-hand side.
-        let px = rasterize_title(&mut fonts, &mut swash, "i", 200, 28, 8, [255, 255, 255, 255])
-            .expect("some pixels");
-        let transparent = px.chunks_exact(4).find(|p| p[3] == 0).expect("some pixel stays clear");
-        assert_eq!(transparent, [0, 0, 0, 0], "a clear pixel must be fully zeroed");
+        let px = rasterize_title(
+            &mut fonts,
+            &mut swash,
+            "i",
+            200,
+            28,
+            8,
+            [255, 255, 255, 255],
+        )
+        .expect("some pixels");
+        let transparent = px
+            .chunks_exact(4)
+            .find(|p| p[3] == 0)
+            .expect("some pixel stays clear");
+        assert_eq!(
+            transparent,
+            [0, 0, 0, 0],
+            "a clear pixel must be fully zeroed"
+        );
         for p in px.chunks_exact(4) {
             assert!(
                 p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3],
@@ -285,9 +319,20 @@ mod tests {
     fn a_button_glyph_rasterizes_centered_nonempty() {
         let mut fonts = cosmic_text::FontSystem::new();
         let mut swash = cosmic_text::SwashCache::new();
-        let px = rasterize_glyph(&mut fonts, &mut swash, "\u{2715}", 40, 28, [255, 255, 255, 255]).expect("glyph");
+        let px = rasterize_glyph(
+            &mut fonts,
+            &mut swash,
+            "\u{2715}",
+            40,
+            28,
+            [255, 255, 255, 255],
+        )
+        .expect("glyph");
         assert_eq!(px.len(), 40 * 28 * 4);
-        assert!(px.chunks_exact(4).any(|p| p[3] != 0), "glyph has opaque pixels");
+        assert!(
+            px.chunks_exact(4).any(|p| p[3] != 0),
+            "glyph has opaque pixels"
+        );
     }
 
     #[test]
@@ -312,8 +357,15 @@ mod tests {
         let mut fonts = cosmic_text::FontSystem::new();
         let mut swash = cosmic_text::SwashCache::new();
         let width = 80;
-        let px = rasterize_glyph(&mut fonts, &mut swash, "\u{2715}", width, 28, [255, 255, 255, 255])
-            .expect("glyph");
+        let px = rasterize_glyph(
+            &mut fonts,
+            &mut swash,
+            "\u{2715}",
+            width,
+            28,
+            [255, 255, 255, 255],
+        )
+        .expect("glyph");
         let row_stride = width as usize * 4;
         let mut left_opaque = false;
         let mut right_opaque = false;
@@ -329,8 +381,14 @@ mod tests {
                 }
             }
         }
-        assert!(!left_opaque, "centered glyph must leave the left quarter clear");
-        assert!(!right_opaque, "centered glyph must leave the right quarter clear");
+        assert!(
+            !left_opaque,
+            "centered glyph must leave the left quarter clear"
+        );
+        assert!(
+            !right_opaque,
+            "centered glyph must leave the right quarter clear"
+        );
     }
 
     /// M3: a title rasterized with a lower-alpha `fg` must produce
@@ -341,10 +399,31 @@ mod tests {
     fn a_dimmed_title_has_lower_alpha_than_a_full_title() {
         let mut fonts = cosmic_text::FontSystem::new();
         let mut swash = cosmic_text::SwashCache::new();
-        let full = rasterize_title(&mut fonts, &mut swash, "Hi", 200, 28, 8, [255, 255, 255, 255]).expect("full");
-        let dim = rasterize_title(&mut fonts, &mut swash, "Hi", 200, 28, 8, [255, 255, 255, 153]).expect("dim");
+        let full = rasterize_title(
+            &mut fonts,
+            &mut swash,
+            "Hi",
+            200,
+            28,
+            8,
+            [255, 255, 255, 255],
+        )
+        .expect("full");
+        let dim = rasterize_title(
+            &mut fonts,
+            &mut swash,
+            "Hi",
+            200,
+            28,
+            8,
+            [255, 255, 255, 153],
+        )
+        .expect("dim");
         let max_a = |px: &[u8]| px.chunks_exact(4).map(|p| p[3]).max().unwrap_or(0);
-        assert!(max_a(&dim) < max_a(&full), "a lower-alpha fg yields lower-alpha glyph pixels");
+        assert!(
+            max_a(&dim) < max_a(&full),
+            "a lower-alpha fg yields lower-alpha glyph pixels"
+        );
     }
 
     /// Finding 3: an unbounded client title must not reach cosmic-text at
@@ -354,7 +433,11 @@ mod tests {
     #[test]
     fn cap_title_truncates_on_a_char_boundary() {
         let short = "a normal title";
-        assert_eq!(cap_title(short), short, "under the cap must pass through unchanged");
+        assert_eq!(
+            cap_title(short),
+            short,
+            "under the cap must pass through unchanged"
+        );
 
         let long = "x".repeat(MAX_TITLE_BYTES + 100);
         let capped = cap_title(&long);
@@ -369,6 +452,9 @@ mod tests {
         let capped = cap_title(&straddling);
         assert!(capped.len() <= MAX_TITLE_BYTES);
         assert!(straddling.is_char_boundary(capped.len()));
-        assert!(capped.chars().all(|c| c != '\u{FFFD}'), "no replacement character from a mid-codepoint cut");
+        assert!(
+            capped.chars().all(|c| c != '\u{FFFD}'),
+            "no replacement character from a mid-codepoint cut"
+        );
     }
 }

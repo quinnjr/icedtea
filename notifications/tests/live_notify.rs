@@ -64,7 +64,10 @@ fn daemon_binary() -> PathBuf {
             .args(["build", "-p", "icedtea-notifications"])
             .status()
             .expect("failed to invoke cargo to build icedtea-notifications");
-        assert!(status.success(), "cargo build -p icedtea-notifications failed");
+        assert!(
+            status.success(),
+            "cargo build -p icedtea-notifications failed"
+        );
     }
     bin
 }
@@ -75,7 +78,13 @@ fn wait_for_name_owner(conn: &zbus::blocking::Connection, name: &str, timeout: D
     let deadline = Instant::now() + timeout;
     loop {
         let owned = conn
-            .call_method(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", Some("org.freedesktop.DBus"), "NameHasOwner", &(name,))
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "NameHasOwner",
+                &(name,),
+            )
             .ok()
             .and_then(|reply| reply.body().deserialize::<bool>().ok())
             .unwrap_or(false);
@@ -107,7 +116,8 @@ where
         .member(member)
         .expect("member")
         .build();
-    let iter = zbus::blocking::MessageIterator::for_match_rule(rule, &conn, None).expect("subscribe");
+    let iter =
+        zbus::blocking::MessageIterator::for_match_rule(rule, &conn, None).expect("subscribe");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for msg in iter.flatten() {
@@ -124,11 +134,17 @@ where
     A: serde::Serialize + zbus::zvariant::DynamicType,
     R: for<'de> serde::Deserialize<'de> + zbus::zvariant::Type,
 {
-    conn.call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(NOTIF_BUS_NAME), member, args)
-        .unwrap_or_else(|err| panic!("{member} call failed: {err}"))
-        .body()
-        .deserialize()
-        .unwrap_or_else(|err| panic!("{member} reply body did not deserialize: {err}"))
+    conn.call_method(
+        Some(NOTIF_BUS_NAME),
+        NOTIF_PATH,
+        Some(NOTIF_BUS_NAME),
+        member,
+        args,
+    )
+    .unwrap_or_else(|err| panic!("{member} call failed: {err}"))
+    .body()
+    .deserialize()
+    .unwrap_or_else(|err| panic!("{member} reply body did not deserialize: {err}"))
 }
 
 fn call_icedtea<A, R>(conn: &zbus::blocking::Connection, member: &str, args: &A) -> R
@@ -136,11 +152,17 @@ where
     A: serde::Serialize + zbus::zvariant::DynamicType,
     R: for<'de> serde::Deserialize<'de> + zbus::zvariant::Type,
 {
-    conn.call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), member, args)
-        .unwrap_or_else(|err| panic!("{member} call failed: {err}"))
-        .body()
-        .deserialize()
-        .unwrap_or_else(|err| panic!("{member} reply body did not deserialize: {err}"))
+    conn.call_method(
+        Some(NOTIF_BUS_NAME),
+        NOTIF_PATH,
+        Some(ICEDTEA_IFACE),
+        member,
+        args,
+    )
+    .unwrap_or_else(|err| panic!("{member} call failed: {err}"))
+    .body()
+    .deserialize()
+    .unwrap_or_else(|err| panic!("{member} reply body did not deserialize: {err}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -157,17 +179,35 @@ fn notify(
     call_std(
         conn,
         "Notify",
-        &(app_name, replaces_id, "", "summary", "body", actions, hints, expire_timeout),
+        &(
+            app_name,
+            replaces_id,
+            "",
+            "summary",
+            "body",
+            actions,
+            hints,
+            expire_timeout,
+        ),
     )
 }
 
 /// `Notify` with an explicit `resident` hint (and a never-expire timeout, so
 /// only an action or DND — not a timer — can affect it).
-fn notify_resident(conn: &zbus::blocking::Connection, app_name: &str, actions: Vec<String>, resident: bool) -> u32 {
+fn notify_resident(
+    conn: &zbus::blocking::Connection,
+    app_name: &str,
+    actions: Vec<String>,
+    resident: bool,
+) -> u32 {
     let mut hints: HashMap<String, Value> = HashMap::new();
     hints.insert("urgency".into(), Value::U8(1));
     hints.insert("resident".into(), Value::Bool(resident));
-    call_std(conn, "Notify", &(app_name, 0u32, "", "summary", "body", actions, hints, 0i32))
+    call_std(
+        conn,
+        "Notify",
+        &(app_name, 0u32, "", "summary", "body", actions, hints, 0i32),
+    )
 }
 
 #[test]
@@ -180,7 +220,9 @@ fn full_notify_lifecycle_over_the_real_bus() {
         }
     };
     if wait_for_name_owner(&probe, NOTIF_BUS_NAME, Duration::from_millis(1)) {
-        eprintln!("SKIP: {NOTIF_BUS_NAME} is already owned -- a real notification daemon is running");
+        eprintln!(
+            "SKIP: {NOTIF_BUS_NAME} is already owned -- a real notification daemon is running"
+        );
         return;
     }
 
@@ -207,8 +249,17 @@ fn full_notify_lifecycle_over_the_real_bus() {
 
     // --- GetCapabilities / GetServerInformation literals ---
     let caps: Vec<String> = call_std(&conn, "GetCapabilities", &());
-    for expected in ["actions", "body", "body-markup", "icon-static", "persistence"] {
-        assert!(caps.contains(&expected.to_string()), "GetCapabilities missing {expected:?}: {caps:?}");
+    for expected in [
+        "actions",
+        "body",
+        "body-markup",
+        "icon-static",
+        "persistence",
+    ] {
+        assert!(
+            caps.contains(&expected.to_string()),
+            "GetCapabilities missing {expected:?}: {caps:?}"
+        );
     }
     let info: (String, String, String, String) = call_std(&conn, "GetServerInformation", &());
     assert_eq!(info.0, "icedtea-notifications");
@@ -219,21 +270,37 @@ fn full_notify_lifecycle_over_the_real_bus() {
     let id = notify(&conn, "app-one", 0, vec![], 1, -1);
     assert_ne!(id, 0, "Notify must return a nonzero id");
     let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
-    assert!(active.iter().any(|n| n.id == id), "fresh notification must appear in GetActive: {active:?}");
+    assert!(
+        active.iter().any(|n| n.id == id),
+        "fresh notification must appear in GetActive: {active:?}"
+    );
 
     // --- CloseNotification -> NotificationClosed(id, 3) + leaves GetActive ---
     let () = conn
-        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(NOTIF_BUS_NAME), "CloseNotification", &(id,))
+        .call_method(
+            Some(NOTIF_BUS_NAME),
+            NOTIF_PATH,
+            Some(NOTIF_BUS_NAME),
+            "CloseNotification",
+            &(id,),
+        )
         .expect("CloseNotification call failed")
         .body()
         .deserialize()
         .unwrap_or(());
-    let (closed_id, reason) =
-        closed_rx.recv_timeout(SIGNAL_TIMEOUT).expect("NotificationClosed never fired for CloseNotification");
+    let (closed_id, reason) = closed_rx
+        .recv_timeout(SIGNAL_TIMEOUT)
+        .expect("NotificationClosed never fired for CloseNotification");
     assert_eq!(closed_id, id);
-    assert_eq!(reason, 3, "CloseNotification's reason code must be 3 (ClosedByRequest)");
+    assert_eq!(
+        reason, 3,
+        "CloseNotification's reason code must be 3 (ClosedByRequest)"
+    );
     let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
-    assert!(!active.iter().any(|n| n.id == id), "closed notification must leave GetActive");
+    assert!(
+        !active.iter().any(|n| n.id == id),
+        "closed notification must leave GetActive"
+    );
 
     // --- Notify expire_timeout=50 -> NotificationClosed(id, 1) within a short deadline ---
     let expiring_id = notify(&conn, "app-two", 0, vec![], 1, 50);
@@ -247,76 +314,158 @@ fn full_notify_lifecycle_over_the_real_bus() {
             break;
         }
     }
-    assert_eq!(found, Some(1), "expire_timeout=50 must self-close with reason 1 (Expired) promptly");
+    assert_eq!(
+        found,
+        Some(1),
+        "expire_timeout=50 must self-close with reason 1 (Expired) promptly"
+    );
 
     // --- SetDoNotDisturb(true): Normal absent, Critical present ---
     let () = conn
-        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "SetDoNotDisturb", &(true,))
+        .call_method(
+            Some(NOTIF_BUS_NAME),
+            NOTIF_PATH,
+            Some(ICEDTEA_IFACE),
+            "SetDoNotDisturb",
+            &(true,),
+        )
         .expect("SetDoNotDisturb(true) call failed")
         .body()
         .deserialize()
         .unwrap_or(());
-    let (on,) = dnd_rx.recv_timeout(SIGNAL_TIMEOUT).expect("DoNotDisturbChanged never fired for SetDoNotDisturb(true)");
+    let (on,) = dnd_rx
+        .recv_timeout(SIGNAL_TIMEOUT)
+        .expect("DoNotDisturbChanged never fired for SetDoNotDisturb(true)");
     assert!(on, "DoNotDisturbChanged must report true");
-    assert!(call_icedtea::<_, bool>(&conn, "GetDoNotDisturb", &()), "GetDoNotDisturb must report true");
+    assert!(
+        call_icedtea::<_, bool>(&conn, "GetDoNotDisturb", &()),
+        "GetDoNotDisturb must report true"
+    );
 
     let normal_id = notify(&conn, "app-three", 0, vec![], 1, 0);
     let critical_id = notify(&conn, "app-four", 0, vec![], 2, 0);
     let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
-    assert!(!active.iter().any(|n| n.id == normal_id), "Normal urgency must be DND-suppressed from GetActive");
-    assert!(active.iter().any(|n| n.id == critical_id), "Critical urgency must still surface under DND");
+    assert!(
+        !active.iter().any(|n| n.id == normal_id),
+        "Normal urgency must be DND-suppressed from GetActive"
+    );
+    assert!(
+        active.iter().any(|n| n.id == critical_id),
+        "Critical urgency must still surface under DND"
+    );
 
     // --- toggle DND off -> Normal reappears ---
     let () = conn
-        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "SetDoNotDisturb", &(false,))
+        .call_method(
+            Some(NOTIF_BUS_NAME),
+            NOTIF_PATH,
+            Some(ICEDTEA_IFACE),
+            "SetDoNotDisturb",
+            &(false,),
+        )
         .expect("SetDoNotDisturb(false) call failed")
         .body()
         .deserialize()
         .unwrap_or(());
-    let (on,) =
-        dnd_rx.recv_timeout(SIGNAL_TIMEOUT).expect("DoNotDisturbChanged never fired for SetDoNotDisturb(false)");
+    let (on,) = dnd_rx
+        .recv_timeout(SIGNAL_TIMEOUT)
+        .expect("DoNotDisturbChanged never fired for SetDoNotDisturb(false)");
     assert!(!on, "DoNotDisturbChanged must report false");
     let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
-    assert!(active.iter().any(|n| n.id == normal_id), "Normal urgency must reappear once DND is off, same id");
+    assert!(
+        active.iter().any(|n| n.id == normal_id),
+        "Normal urgency must reappear once DND is off, same id"
+    );
 
     // --- register an action + InvokeAction -> ActionInvoked(id, key) ---
-    let action_id = notify(&conn, "app-five", 0, vec!["default".into(), "Open".into()], 1, 0);
+    let action_id = notify(
+        &conn,
+        "app-five",
+        0,
+        vec!["default".into(), "Open".into()],
+        1,
+        0,
+    );
     let () = conn
-        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "InvokeAction", &(action_id, "default"))
+        .call_method(
+            Some(NOTIF_BUS_NAME),
+            NOTIF_PATH,
+            Some(ICEDTEA_IFACE),
+            "InvokeAction",
+            &(action_id, "default"),
+        )
         .expect("InvokeAction call failed")
         .body()
         .deserialize()
         .unwrap_or(());
-    let (invoked_id, key) = action_rx.recv_timeout(SIGNAL_TIMEOUT).expect("ActionInvoked never fired");
+    let (invoked_id, key) = action_rx
+        .recv_timeout(SIGNAL_TIMEOUT)
+        .expect("ActionInvoked never fired");
     assert_eq!(invoked_id, action_id);
     assert_eq!(key, "default");
 
     // --- #3 resident hint: a non-resident notification is removed once an
     // action is invoked; a resident one stays. ---
-    let non_resident = notify_resident(&conn, "app-nonres", vec!["default".into(), "Open".into()], false);
+    let non_resident = notify_resident(
+        &conn,
+        "app-nonres",
+        vec!["default".into(), "Open".into()],
+        false,
+    );
     let () = conn
-        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "InvokeAction", &(non_resident, "default"))
+        .call_method(
+            Some(NOTIF_BUS_NAME),
+            NOTIF_PATH,
+            Some(ICEDTEA_IFACE),
+            "InvokeAction",
+            &(non_resident, "default"),
+        )
         .expect("InvokeAction call failed")
         .body()
         .deserialize()
         .unwrap_or(());
     // The action fires, then the non-resident notification auto-closes as Dismissed (2).
-    let (_, _) = action_rx.recv_timeout(SIGNAL_TIMEOUT).expect("ActionInvoked (non-resident) never fired");
+    let (_, _) = action_rx
+        .recv_timeout(SIGNAL_TIMEOUT)
+        .expect("ActionInvoked (non-resident) never fired");
     let closed = wait_for_closed(&closed_rx, non_resident, SIGNAL_TIMEOUT);
-    assert_eq!(closed, Some(2), "non-resident notification must auto-close (Dismissed=2) after its action");
+    assert_eq!(
+        closed,
+        Some(2),
+        "non-resident notification must auto-close (Dismissed=2) after its action"
+    );
     let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
-    assert!(!active.iter().any(|n| n.id == non_resident), "non-resident must leave GetActive after its action");
+    assert!(
+        !active.iter().any(|n| n.id == non_resident),
+        "non-resident must leave GetActive after its action"
+    );
 
-    let resident = notify_resident(&conn, "app-res", vec!["default".into(), "Open".into()], true);
+    let resident = notify_resident(
+        &conn,
+        "app-res",
+        vec!["default".into(), "Open".into()],
+        true,
+    );
     let () = conn
-        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "InvokeAction", &(resident, "default"))
+        .call_method(
+            Some(NOTIF_BUS_NAME),
+            NOTIF_PATH,
+            Some(ICEDTEA_IFACE),
+            "InvokeAction",
+            &(resident, "default"),
+        )
         .expect("InvokeAction call failed")
         .body()
         .deserialize()
         .unwrap_or(());
-    let (_, _) = action_rx.recv_timeout(SIGNAL_TIMEOUT).expect("ActionInvoked (resident) never fired");
+    let (_, _) = action_rx
+        .recv_timeout(SIGNAL_TIMEOUT)
+        .expect("ActionInvoked (resident) never fired");
     let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
-    assert!(active.iter().any(|n| n.id == resident), "resident notification must remain in GetActive after its action");
+    assert!(
+        active.iter().any(|n| n.id == resident),
+        "resident notification must remain in GetActive after its action"
+    );
 
     // --- #4 DND<->expiry: a Normal notification with a short timeout posted
     // under DND must not silently expire while hidden; it reappears (fresh
@@ -331,10 +480,16 @@ fn full_notify_lifecycle_over_the_real_bus() {
     );
     // Well past its 150ms timeout: it must still be alive (not expired while hidden).
     let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
-    assert!(!active.iter().any(|n| n.id == short), "short notification stays suppressed under DND");
+    assert!(
+        !active.iter().any(|n| n.id == short),
+        "short notification stays suppressed under DND"
+    );
     set_dnd(&conn, false);
     // #6: becoming visible emits NotificationAdded.
-    assert!(drain_added(&added_rx, short, SIGNAL_TIMEOUT), "un-suppressing must emit NotificationAdded");
+    assert!(
+        drain_added(&added_rx, short, SIGNAL_TIMEOUT),
+        "un-suppressing must emit NotificationAdded"
+    );
     let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
     assert!(
         active.iter().any(|n| n.id == short),
@@ -342,28 +497,51 @@ fn full_notify_lifecycle_over_the_real_bus() {
     );
     // And with its fresh countdown it eventually expires on its own.
     let closed = wait_for_closed(&closed_rx, short, Duration::from_secs(3));
-    assert_eq!(closed, Some(1), "after DND lifts, the fresh countdown eventually expires it (Expired=1)");
+    assert_eq!(
+        closed,
+        Some(1),
+        "after DND lifts, the fresh countdown eventually expires it (Expired=1)"
+    );
 
     // --- #2 DismissAll clears DND-suppressed notifications too. ---
     set_dnd(&conn, true);
     let hidden = notify(&conn, "app-dnd-hidden", 0, vec![], 1, 0);
     let active: Vec<icedtea_contract::Notification> = call_icedtea(&conn, "GetActive", &());
-    assert!(!active.iter().any(|n| n.id == hidden), "hidden under DND, absent from GetActive");
+    assert!(
+        !active.iter().any(|n| n.id == hidden),
+        "hidden under DND, absent from GetActive"
+    );
     let () = conn
-        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "DismissAll", &())
+        .call_method(
+            Some(NOTIF_BUS_NAME),
+            NOTIF_PATH,
+            Some(ICEDTEA_IFACE),
+            "DismissAll",
+            &(),
+        )
         .expect("DismissAll call failed")
         .body()
         .deserialize()
         .unwrap_or(());
     let closed = wait_for_closed(&closed_rx, hidden, SIGNAL_TIMEOUT);
-    assert_eq!(closed, Some(2), "DismissAll must dismiss (2) even a DND-suppressed notification");
+    assert_eq!(
+        closed,
+        Some(2),
+        "DismissAll must dismiss (2) even a DND-suppressed notification"
+    );
     set_dnd(&conn, false);
 }
 
 /// Call `SetDoNotDisturb(on)` and block until it returns.
 fn set_dnd(conn: &zbus::blocking::Connection, on: bool) {
     let () = conn
-        .call_method(Some(NOTIF_BUS_NAME), NOTIF_PATH, Some(ICEDTEA_IFACE), "SetDoNotDisturb", &(on,))
+        .call_method(
+            Some(NOTIF_BUS_NAME),
+            NOTIF_PATH,
+            Some(ICEDTEA_IFACE),
+            "SetDoNotDisturb",
+            &(on,),
+        )
         .expect("SetDoNotDisturb call failed")
         .body()
         .deserialize()

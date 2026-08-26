@@ -70,7 +70,11 @@ impl OutputsClient {
                 tracing::warn!(%err, "could not hook the outputs queue into glib; treating output management as unavailable");
                 conn.borrow().notify_disconnected();
                 detached.set(true);
-                return OutputsClient { conn, source_id: None, detached };
+                return OutputsClient {
+                    conn,
+                    source_id: None,
+                    detached,
+                };
             }
         };
 

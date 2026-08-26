@@ -7,12 +7,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Box as GtkBox, Button, Label, Orientation, Stack, StackSwitcher};
+use gtk4::{
+    Application, ApplicationWindow, Box as GtkBox, Button, Label, Orientation, Stack, StackSwitcher,
+};
 
 use icedtea_config::default_db_path;
+use icedtea_settings::compositor_reload::{ReloadClient, ReloadOutcome, apply_and_reload};
 use icedtea_settings::model::Model;
-use icedtea_settings::pages::{appearance, behavior, displays, keybindings, workspaces, Ctx, Page};
-use icedtea_settings::compositor_reload::{apply_and_reload, ReloadClient, ReloadOutcome};
+use icedtea_settings::pages::{Ctx, Page, appearance, behavior, displays, keybindings, workspaces};
 
 const APP_ID: &str = "org.icedtea.Settings";
 

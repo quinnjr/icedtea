@@ -6,8 +6,8 @@
 use async_channel::Sender;
 use futures_util::StreamExt as _;
 use icedtea_contract::{
-    Snapshot, WindowInfo, WindowUpdate, WorkspaceInfo, COMPOSITOR_BUS_NAME,
-    COMPOSITOR_CONTRACT_VERSION, COMPOSITOR_PATH,
+    COMPOSITOR_BUS_NAME, COMPOSITOR_CONTRACT_VERSION, COMPOSITOR_PATH, Snapshot, WindowInfo,
+    WindowUpdate, WorkspaceInfo,
 };
 
 use crate::taskbar::CompositorUpdate;
@@ -69,7 +69,13 @@ pub fn version_mismatch(remote: Option<u32>, local: u32) -> Option<String> {
 
 async fn run(tx: Sender<CompositorUpdate>) -> zbus::Result<()> {
     let conn = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(&conn, COMPOSITOR_BUS_NAME, COMPOSITOR_PATH, COMPOSITOR_IFACE).await?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        COMPOSITOR_BUS_NAME,
+        COMPOSITOR_PATH,
+        COMPOSITOR_IFACE,
+    )
+    .await?;
 
     // Read (never enforce) the contract revision first: a mismatch is
     // reported by name here, and the typed `GetState` immediately below is
@@ -100,12 +106,14 @@ async fn run(tx: Sender<CompositorUpdate>) -> zbus::Result<()> {
         let member = msg.header().member().map(|m| m.as_str().to_string());
         let body = msg.body();
         let update = match member.as_deref() {
-            Some("WindowOpened") => {
-                body.deserialize::<(u64, WindowInfo)>().ok().map(|(_, w)| CompositorUpdate::Opened(w))
-            }
-            Some("WindowClosed") => {
-                body.deserialize::<(u64, u32)>().ok().map(|(_, id)| CompositorUpdate::Closed(id))
-            }
+            Some("WindowOpened") => body
+                .deserialize::<(u64, WindowInfo)>()
+                .ok()
+                .map(|(_, w)| CompositorUpdate::Opened(w)),
+            Some("WindowClosed") => body
+                .deserialize::<(u64, u32)>()
+                .ok()
+                .map(|(_, id)| CompositorUpdate::Closed(id)),
             Some("WindowUpdated") => body
                 .deserialize::<(u64, u32, WindowUpdate)>()
                 .ok()
@@ -145,7 +153,9 @@ pub struct CompositorProxy {
 
 impl CompositorProxy {
     pub fn new() -> zbus::Result<Self> {
-        Ok(CompositorProxy { conn: zbus::blocking::Connection::session()? })
+        Ok(CompositorProxy {
+            conn: zbus::blocking::Connection::session()?,
+        })
     }
 }
 
@@ -153,13 +163,31 @@ impl CompositorCommands for CompositorProxy {
     // zbus's #[interface] exposes Rust methods in PascalCase, so the wire
     // members are FocusWindow/CloseWindow/SetWorkspace (matching GetState).
     fn focus_window(&self, id: u32) {
-        let _ = self.conn.call_method(Some(COMPOSITOR_BUS_NAME), COMPOSITOR_PATH, Some(COMPOSITOR_IFACE), "FocusWindow", &(id,));
+        let _ = self.conn.call_method(
+            Some(COMPOSITOR_BUS_NAME),
+            COMPOSITOR_PATH,
+            Some(COMPOSITOR_IFACE),
+            "FocusWindow",
+            &(id,),
+        );
     }
     fn close_window(&self, id: u32) {
-        let _ = self.conn.call_method(Some(COMPOSITOR_BUS_NAME), COMPOSITOR_PATH, Some(COMPOSITOR_IFACE), "CloseWindow", &(id,));
+        let _ = self.conn.call_method(
+            Some(COMPOSITOR_BUS_NAME),
+            COMPOSITOR_PATH,
+            Some(COMPOSITOR_IFACE),
+            "CloseWindow",
+            &(id,),
+        );
     }
     fn set_workspace(&self, id: u32) {
-        let _ = self.conn.call_method(Some(COMPOSITOR_BUS_NAME), COMPOSITOR_PATH, Some(COMPOSITOR_IFACE), "SetWorkspace", &(id,));
+        let _ = self.conn.call_method(
+            Some(COMPOSITOR_BUS_NAME),
+            COMPOSITOR_PATH,
+            Some(COMPOSITOR_IFACE),
+            "SetWorkspace",
+            &(id,),
+        );
     }
 }
 
@@ -170,7 +198,13 @@ mod tests {
     /// Finding F7: the version comparison itself, isolated from the bus.
     #[test]
     fn version_mismatch_names_both_skew_directions_and_stays_quiet_when_matched() {
-        assert_eq!(version_mismatch(Some(COMPOSITOR_CONTRACT_VERSION), COMPOSITOR_CONTRACT_VERSION), None);
+        assert_eq!(
+            version_mismatch(
+                Some(COMPOSITOR_CONTRACT_VERSION),
+                COMPOSITOR_CONTRACT_VERSION
+            ),
+            None
+        );
         let newer = version_mismatch(Some(99), 2).expect("a newer compositor is a mismatch");
         assert!(newer.contains("v99") && newer.contains("v2"), "{newer}");
         let older = version_mismatch(Some(1), 2).expect("an older compositor is a mismatch");

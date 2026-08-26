@@ -37,15 +37,18 @@ use std::time::{Duration, Instant};
 use icedtea_compositor::dbus::DbCommand;
 use icedtea_contract::{Event, SeqEvent, Snapshot};
 
+use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_keyboard, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm,
-    wl_shm_pool, wl_surface, wl_touch,
+    wl_data_source, wl_keyboard, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+    wl_surface, wl_touch,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop, event_created_child,
 };
-use wayland_protocols::ext::idle_notify::v1::client::{ext_idle_notification_v1, ext_idle_notifier_v1};
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1, ext_idle_notifier_v1,
+};
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
 };
@@ -70,16 +73,14 @@ use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
-use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
-    zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
-};
-use wayland_protocols::xdg::activation::v1::client::{
-    xdg_activation_token_v1, xdg_activation_v1,
-};
+use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
+};
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1, zwlr_data_control_manager_v1, zwlr_data_control_offer_v1,
     zwlr_data_control_source_v1,
@@ -95,7 +96,6 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
 };
-use wayland_client::protocol::wl_output::{self, WlOutput};
 use xkbcommon::xkb;
 
 /// The named cursor images `wp_cursor_shape_device_v1.set_shape` accepts,
@@ -233,7 +233,9 @@ impl Compositor {
             // just above: a test that maps a layer panel needs the global
             // to actually exist, not just for `lib.rs::run()`'s production
             // boot to log and move on.
-            runtime.create_layer_shell(&display, 4).expect("zwlr_layer_shell_v1");
+            runtime
+                .create_layer_shell(&display, 4)
+                .expect("zwlr_layer_shell_v1");
             // Same "harness cannot degrade" tone: the selection tests bind
             // these globals directly and would assert against ones that were
             // never advertised.
@@ -335,7 +337,11 @@ impl Compositor {
             // with a mode arrives; `new_output` resizes it) and the same
             // "lowered now so nothing later has to remember to" reasoning.
             let background = runtime
-                .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+                .add_rect(
+                    1,
+                    1,
+                    icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+                )
                 .expect("background rect");
             runtime.lower_rect_to_bottom(background);
             state.set_background(background);
@@ -360,7 +366,9 @@ impl Compositor {
             icedtea_compositor::state::State::publish_xwayland_env(
                 runtime.xwayland_display_name().as_deref(),
             );
-            boot_tx.send((socket, cmd_wake_write)).expect("boot handshake");
+            boot_tx
+                .send((socket, cmd_wake_write))
+                .expect("boot handshake");
             drop(boot_tx);
             drop(boot_guard);
 
@@ -391,7 +399,9 @@ impl Compositor {
     /// Send a command the way `dbus::CompositorInterface::send` does: onto the
     /// channel, then a nudge on the wake pipe.
     pub fn send(&self, cmd: DbCommand) {
-        self.commands.send(cmd).expect("compositor command channel closed");
+        self.commands
+            .send(cmd)
+            .expect("compositor command channel closed");
         icedtea_compositor::backend::wake(&self.wake);
     }
 
@@ -443,7 +453,10 @@ impl Compositor {
         let deadline = std::time::Instant::now() + TIMEOUT;
         loop {
             let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-            self.send(DbCommand::SetOutputScaleForTest { scale, reply: reply_tx });
+            self.send(DbCommand::SetOutputScaleForTest {
+                scale,
+                reply: reply_tx,
+            });
             let recorded = reply_rx
                 .recv_timeout(TIMEOUT)
                 .expect("compositor never answered SetOutputScaleForTest");
@@ -462,7 +475,9 @@ impl Compositor {
     /// tracking, reading each one's real scene state (position, whether it is in
     /// the band above managed toplevels, and whether it holds the keyboard).
     /// Blocks on the reply -- see [`Self::inject_touch_down`]'s doc.
-    pub fn xwayland_override_redirect(&self) -> Vec<icedtea_compositor::dbus::OverrideRedirectProbe> {
+    pub fn xwayland_override_redirect(
+        &self,
+    ) -> Vec<icedtea_compositor::dbus::OverrideRedirectProbe> {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::XwaylandOverrideRedirect { reply: reply_tx });
         reply_rx
@@ -477,24 +492,46 @@ impl Compositor {
     /// run before this returns -- see `DbCommand::InjectTouchDown`'s doc.
     pub fn inject_touch_down(&self, x: f64, y: f64, id: i32, time_msec: u32) -> Option<u32> {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        self.send(DbCommand::InjectTouchDown { x, y, id, time_msec, reply: reply_tx });
-        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchDown")
+        self.send(DbCommand::InjectTouchDown {
+            x,
+            y,
+            id,
+            time_msec,
+            reply: reply_tx,
+        });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InjectTouchDown")
     }
 
     /// Synthesize a touch-motion to `(x, y)` for touch point `id`. Blocks on
     /// the reply -- see [`Self::inject_touch_down`]'s doc.
     pub fn inject_touch_motion(&self, x: f64, y: f64, id: i32, time_msec: u32) {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        self.send(DbCommand::InjectTouchMotion { x, y, id, time_msec, reply: reply_tx });
-        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchMotion");
+        self.send(DbCommand::InjectTouchMotion {
+            x,
+            y,
+            id,
+            time_msec,
+            reply: reply_tx,
+        });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InjectTouchMotion");
     }
 
     /// Synthesize a touch-up for touch point `id`. Blocks on the reply --
     /// see [`Self::inject_touch_down`]'s doc.
     pub fn inject_touch_up(&self, id: i32, time_msec: u32) {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        self.send(DbCommand::InjectTouchUp { id, time_msec, reply: reply_tx });
-        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered InjectTouchUp");
+        self.send(DbCommand::InjectTouchUp {
+            id,
+            time_msec,
+            reply: reply_tx,
+        });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InjectTouchUp");
     }
 
     /// The drag icon's current scene layout position, via
@@ -504,7 +541,9 @@ impl Compositor {
     pub fn drag_icon_position(&self) -> Option<(i32, i32)> {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::DragIconPosition { reply: reply_tx });
-        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered DragIconPosition")
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered DragIconPosition")
     }
 
     /// Whether the session is currently locked, via
@@ -513,7 +552,9 @@ impl Compositor {
     pub fn session_locked(&self) -> bool {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::SessionLocked { reply: reply_tx });
-        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered SessionLocked")
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered SessionLocked")
     }
 
     /// The pointer's current position, via `wlr::Runtime::cursor_position`.
@@ -521,7 +562,9 @@ impl Compositor {
     pub fn cursor_position(&self) -> (f64, f64) {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::CursorPosition { reply: reply_tx });
-        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered CursorPosition")
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered CursorPosition")
     }
 
     /// The `Debug` name of the named cursor shape currently in force
@@ -535,7 +578,9 @@ impl Compositor {
     pub fn cursor_shape(&self) -> String {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::CursorShape { reply: reply_tx });
-        reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered CursorShape")
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered CursorShape")
     }
 
     /// The primary output's real geometry, via `State::outputs`. Panics if
@@ -554,12 +599,20 @@ impl Compositor {
         loop {
             let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
             self.send(DbCommand::OutputSize { reply: reply_tx });
-            let geo = reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered OutputSize");
+            let geo = reply_rx
+                .recv_timeout(TIMEOUT)
+                .expect("compositor never answered OutputSize");
             if let Some(geo) = geo {
-                assert!(geo.width > 0 && geo.height > 0, "output geometry must be real, got {geo:?}");
+                assert!(
+                    geo.width > 0 && geo.height > 0,
+                    "output geometry must be real, got {geo:?}"
+                );
                 return (geo.width, geo.height);
             }
-            assert!(std::time::Instant::now() < deadline, "no output ever appeared to size");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no output ever appeared to size"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -685,13 +738,11 @@ struct ClientState {
     /// This client's keyboard, created when the seat advertises the keyboard
     /// capability — the source of the input serial `set_selection` needs.
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    virtual_keyboard_manager:
-        Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
+    virtual_keyboard_manager: Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
     /// Lets a test spawn a [`VirtualPointerClient`] and mint pointer motion
     /// and button events without a real input device — the M4.2 drag-and-drop
     /// grab serial's source.
-    virtual_pointer_manager:
-        Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
+    virtual_pointer_manager: Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
     data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     /// This client's data device, created from the manager + seat during
     /// connect so it is listening before the client is ever focused.
@@ -818,8 +869,7 @@ struct ClientState {
 
     // --- pointer-constraints (M4.5) ---
     pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
-    relative_pointer_manager:
-        Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
+    relative_pointer_manager: Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
     /// Running sum of every `zwp_relative_pointer_v1.relative_motion` event's
     /// (accelerated) `dx`/`dy` this client has received.
     relative_delta: (f64, f64),
@@ -906,7 +956,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             state.globals.push((interface.clone(), name));
             match interface.as_str() {
                 "wl_compositor" => {
@@ -1035,7 +1090,11 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for ClientState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            xdg_toplevel::Event::Configure { width, height, states } => {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
                 state.configured = Some((width, height));
                 state.states = states
                     .chunks_exact(4)
@@ -1081,7 +1140,12 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for ClientState {
         // impl gives: an unacked configure wedges every later one, and
         // `map_layer_panel`'s own commit-after-ack sequencing depends on
         // this having already happened by the time it runs.
-        if let zwlr_layer_surface_v1::Event::Configure { serial, width, height } = event {
+        if let zwlr_layer_surface_v1::Event::Configure {
+            serial,
+            width,
+            height,
+        } = event
+        {
             surface.ack_configure(serial);
             state.layer_configured = Some((width, height));
             state.layer_configures += 1;
@@ -1197,7 +1261,9 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clie
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwlr_data_control_device_v1::Event::DataOffer { .. } => state.data_control_mimes.clear(),
+            zwlr_data_control_device_v1::Event::DataOffer { .. } => {
+                state.data_control_mimes.clear()
+            }
             zwlr_data_control_device_v1::Event::Selection { id } => state.data_control_offer = id,
             // data-control v2's primary (middle-click) selection, delivered the
             // same focus-less way the clipboard `Selection` is. Stored so the
@@ -1272,7 +1338,10 @@ impl Dispatch<wl_seat::WlSeat, ()> for ClientState {
         // Create a keyboard the moment the seat advertises the capability, so
         // that on focus this client receives `wl_keyboard.enter` — the input
         // serial `set_selection` is validated against.
-        if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        {
             if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
                 state.keyboard = Some(seat.get_keyboard(qh, ()));
             }
@@ -1476,14 +1545,26 @@ impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ()> for Clie
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        let ext_session_lock_surface_v1::Event::Configure { serial, width, height } = event else {
+        let ext_session_lock_surface_v1::Event::Configure {
+            serial,
+            width,
+            height,
+        } = event
+        else {
             return;
         };
         surface.ack_configure(serial);
-        let Some(entry) = state.lock_surfaces.iter_mut().find(|e| &e.lock_surface == surface) else {
+        let Some(entry) = state
+            .lock_surfaces
+            .iter_mut()
+            .find(|e| &e.lock_surface == surface)
+        else {
             return;
         };
-        let shm = state.shm.clone().expect("compositor did not advertise wl_shm");
+        let shm = state
+            .shm
+            .clone()
+            .expect("compositor did not advertise wl_shm");
         let (w, h) = (width.max(1) as i32, height.max(1) as i32);
         let (file, pool, buffer) = create_shm_buffer(&shm, qh, w, h);
         entry.wl_surface.attach(Some(&buffer), 0, 0);
@@ -1676,11 +1757,16 @@ pub struct TestClient {
 /// drift out of sync with reality.
 fn connect_and_bind(
     socket: &str,
-) -> (Connection, EventQueue<ClientState>, QueueHandle<ClientState>, ClientState) {
+) -> (
+    Connection,
+    EventQueue<ClientState>,
+    QueueHandle<ClientState>,
+    ClientState,
+) {
     let dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR must be set");
     let path = std::path::Path::new(&dir).join(socket);
-    let stream =
-        UnixStream::connect(&path).unwrap_or_else(|e| panic!("connecting to {}: {e}", path.display()));
+    let stream = UnixStream::connect(&path)
+        .unwrap_or_else(|e| panic!("connecting to {}: {e}", path.display()));
     let conn = Connection::from_socket(stream).expect("wayland connection");
 
     let mut queue = conn.new_event_queue::<ClientState>();
@@ -1719,7 +1805,11 @@ fn connect_and_bind(
 /// without the harness having to bind it.
 pub fn advertised_globals(socket: &str) -> Vec<String> {
     let (_conn, _queue, _qh, state) = connect_and_bind(socket);
-    state.globals.into_iter().map(|(interface, _)| interface).collect()
+    state
+        .globals
+        .into_iter()
+        .map(|(interface, _)| interface)
+        .collect()
 }
 
 /// Read the current clipboard selection that `reader` has been offered, in
@@ -1884,8 +1974,9 @@ fn create_shm_buffer(
     let stride = w * 4;
     let len = (stride * h) as usize;
 
-    let fd: OwnedFd = rustix::fs::memfd_create("icedtea-harness-shm", rustix::fs::MemfdFlags::CLOEXEC)
-        .expect("memfd_create");
+    let fd: OwnedFd =
+        rustix::fs::memfd_create("icedtea-harness-shm", rustix::fs::MemfdFlags::CLOEXEC)
+            .expect("memfd_create");
     rustix::fs::ftruncate(&fd, len as u64).expect("ftruncate");
     let mut shm_file = std::fs::File::from(fd);
     // Solid opaque grey. `Xrgb8888` (not `Argb8888`): it is the one format
@@ -1951,7 +2042,12 @@ impl ScreencopyClient {
             "compositor did not advertise zwlr_screencopy_manager_v1"
         );
         assert!(state.output.is_some(), "compositor advertised no wl_output");
-        ScreencopyClient { conn, queue, qh, state }
+        ScreencopyClient {
+            conn,
+            queue,
+            qh,
+            state,
+        }
     }
 
     /// Capture the output into a `wl_shm` buffer and return its pixels.
@@ -1967,7 +2063,9 @@ impl ScreencopyClient {
 
         // Pump until the `buffer` event lands (geometry/format), bounded.
         for _ in 0..500 {
-            self.queue.roundtrip(&mut self.state).expect("roundtrip buffer");
+            self.queue
+                .roundtrip(&mut self.state)
+                .expect("roundtrip buffer");
             if self.state.screencopy_frame.params.is_some() {
                 break;
             }
@@ -1992,14 +2090,22 @@ impl ScreencopyClient {
         self.conn.flush().expect("flush copy");
 
         for _ in 0..500 {
-            self.queue.roundtrip(&mut self.state).expect("roundtrip ready");
+            self.queue
+                .roundtrip(&mut self.state)
+                .expect("roundtrip ready");
             if self.state.screencopy_frame.ready || self.state.screencopy_frame.failed {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert!(!self.state.screencopy_frame.failed, "screencopy frame failed");
-        assert!(self.state.screencopy_frame.ready, "screencopy never became ready");
+        assert!(
+            !self.state.screencopy_frame.failed,
+            "screencopy frame failed"
+        );
+        assert!(
+            self.state.screencopy_frame.ready,
+            "screencopy never became ready"
+        );
 
         // Read the pixels back out of the shared file.
         use std::io::{Read, Seek, SeekFrom};
@@ -2007,7 +2113,13 @@ impl ScreencopyClient {
         file.seek(SeekFrom::Start(0)).expect("seek shm");
         let mut bytes = vec![0u8; (stride * height) as usize];
         file.read_exact(&mut bytes).expect("read shm pixels");
-        CapturedFrame { width, height, stride, format, bytes }
+        CapturedFrame {
+            width,
+            height,
+            stride,
+            format,
+            bytes,
+        }
     }
 }
 
@@ -2038,9 +2150,18 @@ impl TestClient {
     fn map(socket: &str, app_id: &str, title: &str, decorated: bool) -> TestClient {
         let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
 
-        let compositor = state.compositor.clone().expect("compositor did not advertise wl_compositor");
-        let shm = state.shm.clone().expect("compositor did not advertise wl_shm");
-        let wm_base = state.wm_base.clone().expect("compositor did not advertise xdg_wm_base");
+        let compositor = state
+            .compositor
+            .clone()
+            .expect("compositor did not advertise wl_compositor");
+        let shm = state
+            .shm
+            .clone()
+            .expect("compositor did not advertise wl_shm");
+        let wm_base = state
+            .wm_base
+            .clone()
+            .expect("compositor did not advertise xdg_wm_base");
 
         let surface = compositor.create_surface(&qh, ());
         let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
@@ -2370,7 +2491,8 @@ impl TestClient {
         // Now that the surface has the drag_icon role, attach and commit a
         // real buffer -- the scene node only gets live layout coordinates
         // once the icon surface has committed content.
-        let (icon_shm_file, icon_pool, icon_buffer) = create_shm_buffer(&shm, &self.qh, icon_w, icon_h);
+        let (icon_shm_file, icon_pool, icon_buffer) =
+            create_shm_buffer(&shm, &self.qh, icon_w, icon_h);
         icon_surface.attach(Some(&icon_buffer), 0, 0);
         icon_surface.damage_buffer(0, 0, icon_w, icon_h);
         icon_surface.commit();
@@ -2430,7 +2552,11 @@ impl TestClient {
     /// that state is set too (both are double-buffered surface state,
     /// applied together on the next commit).
     pub fn attach_pattern_buffer(&mut self, w: i32, h: i32, paint: impl Fn(i32, i32) -> u32) {
-        let shm = self.state.shm.clone().expect("compositor did not advertise wl_shm");
+        let shm = self
+            .state
+            .shm
+            .clone()
+            .expect("compositor did not advertise wl_shm");
         let stride = w * 4;
         let len = (stride * h) as usize;
         let fd: OwnedFd = rustix::fs::memfd_create(
@@ -2550,7 +2676,11 @@ impl TestClient {
         self.state.activation_token = None;
         let token = activation.get_activation_token(&self.qh, ());
         if let Some(serial) = serial {
-            let seat = self.state.seat.clone().expect("compositor did not advertise wl_seat");
+            let seat = self
+                .state
+                .seat
+                .clone()
+                .expect("compositor did not advertise wl_seat");
             token.set_serial(serial, &seat);
         }
         if own_surface {
@@ -2562,7 +2692,10 @@ impl TestClient {
             self.wait_until(|c| c.state.activation_token.is_some()),
             "no xdg_activation_token_v1.done arrived within {TIMEOUT:?}"
         );
-        self.state.activation_token.clone().expect("just asserted this is Some")
+        self.state
+            .activation_token
+            .clone()
+            .expect("just asserted this is Some")
     }
 
     /// Redeem `token` against *this* client's own surface, via
@@ -2613,8 +2746,16 @@ impl TestClient {
     /// Like [`set_selection_text`](Self::set_selection_text), needs an input
     /// serial and keyboard focus.
     pub fn set_primary_text(&mut self, mime: &str, payload: &[u8]) {
-        let manager = self.state.primary_manager.clone().expect("no primary manager");
-        let device = self.state.primary_device.clone().expect("no primary device");
+        let manager = self
+            .state
+            .primary_manager
+            .clone()
+            .expect("no primary manager");
+        let device = self
+            .state
+            .primary_device
+            .clone()
+            .expect("no primary device");
         // The native PRIMARY source has its own offer storage, distinct from the
         // native CLIPBOARD's `offered_mime`/`offered_payload` (review finding #13,
         // applied to the native pair too): a single client that owns both with
@@ -2729,8 +2870,14 @@ impl LayerPanelClient {
     fn spawn(socket: &str, exclusive: i32) -> LayerPanelClient {
         let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
 
-        let compositor = state.compositor.clone().expect("compositor did not advertise wl_compositor");
-        let shm = state.shm.clone().expect("compositor did not advertise wl_shm");
+        let compositor = state
+            .compositor
+            .clone()
+            .expect("compositor did not advertise wl_compositor");
+        let shm = state
+            .shm
+            .clone()
+            .expect("compositor did not advertise wl_shm");
         let layer_shell = state
             .layer_shell
             .clone()
@@ -2765,7 +2912,11 @@ impl LayerPanelClient {
         }
 
         let (w, h) = state.layer_configured.expect("just checked above");
-        let (w, h) = if w > 0 && h > 0 { (w as i32, h as i32) } else { FALLBACK_SIZE };
+        let (w, h) = if w > 0 && h > 0 {
+            (w as i32, h as i32)
+        } else {
+            FALLBACK_SIZE
+        };
         let (shm_file, pool, buffer) = create_shm_buffer(&shm, &qh, w, h);
 
         surface.attach(Some(&buffer), 0, 0);
@@ -2808,7 +2959,9 @@ impl LayerPanelClient {
 
     /// Most recent `zwlr_layer_surface_v1.configure` size.
     pub fn layer_configure(&self) -> Option<(i32, i32)> {
-        self.state.layer_configured.map(|(w, h)| (w as i32, h as i32))
+        self.state
+            .layer_configured
+            .map(|(w, h)| (w as i32, h as i32))
     }
 
     /// Unmap without destroying: attach a null buffer and commit. Mirrors
@@ -2922,18 +3075,22 @@ impl VirtualKeyboardClient {
         .expect("compile a minimal us xkb keymap");
         // Null-terminated, per `wl_keyboard.keymap`'s own contract for the
         // XKB_V1 text format -- `size` below includes that terminator.
-        let mut keymap_str = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1).into_bytes();
+        let mut keymap_str = keymap
+            .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+            .into_bytes();
         keymap_str.push(0);
-        let fd: OwnedFd = rustix::fs::memfd_create(
-            "icedtea-harness-keymap",
-            rustix::fs::MemfdFlags::CLOEXEC,
-        )
-        .expect("memfd_create");
+        let fd: OwnedFd =
+            rustix::fs::memfd_create("icedtea-harness-keymap", rustix::fs::MemfdFlags::CLOEXEC)
+                .expect("memfd_create");
         rustix::fs::ftruncate(&fd, keymap_str.len() as u64).expect("ftruncate keymap");
         let mut keymap_file = std::fs::File::from(fd);
         keymap_file.write_all(&keymap_str).expect("write keymap");
         keymap_file.flush().expect("flush keymap");
-        vk.keymap(KEYMAP_FORMAT_XKB_V1, keymap_file.as_fd(), keymap_str.len() as u32);
+        vk.keymap(
+            KEYMAP_FORMAT_XKB_V1,
+            keymap_file.as_fd(),
+            keymap_str.len() as u32,
+        );
         // The fd is dup'd across the wire by the connection's own send path
         // (wayland-client dups on `flush`), so the client's copy can close
         // right after -- drop it explicitly for clarity.
@@ -2944,7 +3101,13 @@ impl VirtualKeyboardClient {
         // the seat's capability change is on the wire before callers connect.
         queue.roundtrip(&mut state).expect("vk roundtrip");
         queue.roundtrip(&mut state).expect("vk settle");
-        VirtualKeyboardClient { conn, queue, state, vk, time: 0 }
+        VirtualKeyboardClient {
+            conn,
+            queue,
+            state,
+            vk,
+            time: 0,
+        }
     }
 
     /// Next monotonic timestamp for a request.
@@ -3000,7 +3163,13 @@ impl VirtualPointerClient {
         // the seat's capability change is on the wire before callers connect.
         queue.roundtrip(&mut state).expect("vp roundtrip");
         queue.roundtrip(&mut state).expect("vp settle");
-        VirtualPointerClient { conn, queue, state, vp, time: 0 }
+        VirtualPointerClient {
+            conn,
+            queue,
+            state,
+            vp,
+            time: 0,
+        }
     }
 
     /// Next monotonic timestamp for a request.
@@ -3013,7 +3182,8 @@ impl VirtualPointerClient {
     /// coordinate space + flush.
     pub fn motion_absolute(&mut self, x: f64, y: f64, x_extent: u32, y_extent: u32) {
         let time = self.next_time();
-        self.vp.motion_absolute(time, x as u32, y as u32, x_extent, y_extent);
+        self.vp
+            .motion_absolute(time, x as u32, y as u32, x_extent, y_extent);
         self.conn.flush().expect("flush motion_absolute");
     }
 
@@ -3031,8 +3201,11 @@ impl VirtualPointerClient {
     /// left) + flush.
     pub fn button(&mut self, button: u32, pressed: bool) {
         let time = self.next_time();
-        let state =
-            if pressed { wl_pointer::ButtonState::Pressed } else { wl_pointer::ButtonState::Released };
+        let state = if pressed {
+            wl_pointer::ButtonState::Pressed
+        } else {
+            wl_pointer::ButtonState::Released
+        };
         self.vp.button(time, button, state);
         self.conn.flush().expect("flush button");
     }
@@ -3071,14 +3244,27 @@ impl DataControlClient {
             state.data_control_device.is_some(),
             "compositor did not advertise zwlr_data_control_manager_v1"
         );
-        DataControlClient { conn, queue, qh, state }
+        DataControlClient {
+            conn,
+            queue,
+            qh,
+            state,
+        }
     }
 
     /// Own the clipboard with `payload` under `mime`. No serial: data-control
     /// is designed for focus-less clipboard managers.
     pub fn set_clipboard(&mut self, mime: &str, payload: &[u8]) {
-        let manager = self.state.data_control_manager.clone().expect("no data-control manager");
-        let device = self.state.data_control_device.clone().expect("no data-control device");
+        let manager = self
+            .state
+            .data_control_manager
+            .clone()
+            .expect("no data-control manager");
+        let device = self
+            .state
+            .data_control_device
+            .clone()
+            .expect("no data-control device");
         self.state.offered_mime = mime.to_string();
         self.state.offered_payload = payload.to_vec();
         let source = manager.create_data_source(&self.qh, ());
@@ -3098,8 +3284,16 @@ impl DataControlClient {
     /// focus-lessly, via data-control v2. The primary counterpart of
     /// [`set_clipboard`](Self::set_clipboard).
     pub fn set_primary(&mut self, mime: &str, payload: &[u8]) {
-        let manager = self.state.data_control_manager.clone().expect("no data-control manager");
-        let device = self.state.data_control_device.clone().expect("no data-control device");
+        let manager = self
+            .state
+            .data_control_manager
+            .clone()
+            .expect("no data-control manager");
+        let device = self
+            .state
+            .data_control_device
+            .clone()
+            .expect("no data-control device");
         // The primary selection's own payload pair, not the clipboard's, so a
         // client that owns both feeds each reader the right bytes (finding #13).
         self.state.offered_primary_mime = mime.to_string();
@@ -3143,7 +3337,10 @@ impl DataControlClient {
             if handle.is_finished() {
                 return handle.join().expect("read thread panicked");
             }
-            assert!(Instant::now() < deadline, "primary selection read timed out");
+            assert!(
+                Instant::now() < deadline,
+                "primary selection read timed out"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -3202,7 +3399,10 @@ impl DataControlClient {
             if handle.is_finished() {
                 return handle.join().expect("read thread panicked");
             }
-            assert!(Instant::now() < deadline, "self-served selection read timed out");
+            assert!(
+                Instant::now() < deadline,
+                "self-served selection read timed out"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -3238,7 +3438,8 @@ impl DataControlClient {
             std::thread::sleep(Duration::from_millis(5));
         }
         let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read data-control selection");
+        std::io::Read::read_to_end(&mut { read_end }, &mut buf)
+            .expect("read data-control selection");
         buf
     }
 
@@ -3268,7 +3469,8 @@ impl DataControlClient {
             std::thread::sleep(Duration::from_millis(5));
         }
         let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut { read_end }, &mut buf).expect("read data-control selection");
+        std::io::Read::read_to_end(&mut { read_end }, &mut buf)
+            .expect("read data-control selection");
         buf
     }
 }
@@ -3296,7 +3498,13 @@ impl SessionLockClient {
             "compositor did not advertise ext_session_lock_manager_v1"
         );
         assert!(state.output.is_some(), "compositor advertised no wl_output");
-        SessionLockClient { conn, queue, qh, state, lock: None }
+        SessionLockClient {
+            conn,
+            queue,
+            qh,
+            state,
+            lock: None,
+        }
     }
 
     /// Take the lock (`ext_session_lock_manager_v1.lock`), then immediately
@@ -3307,7 +3515,11 @@ impl SessionLockClient {
     /// buffer, and commits on its own -- this only has to pump the queue
     /// until that has happened.
     pub fn lock(&mut self) {
-        let manager = self.state.session_lock_manager.clone().expect("no ext_session_lock_manager_v1");
+        let manager = self
+            .state
+            .session_lock_manager
+            .clone()
+            .expect("no ext_session_lock_manager_v1");
         let compositor = self.state.compositor.clone().expect("no wl_compositor");
         let output = self.state.output.clone().expect("no wl_output");
 
@@ -3325,7 +3537,12 @@ impl SessionLockClient {
         // Pump until the lock surface's configure has round-tripped through
         // (ack + attach + commit happen inside its own Dispatch handler).
         let deadline = Instant::now() + TIMEOUT;
-        while self.state.lock_surfaces.iter().all(|e| e._buffer_keepalive.is_none()) {
+        while self
+            .state
+            .lock_surfaces
+            .iter()
+            .all(|e| e._buffer_keepalive.is_none())
+        {
             assert!(Instant::now() < deadline, "lock surface never configured");
             let _ = self.queue.roundtrip(&mut self.state);
             std::thread::sleep(Duration::from_millis(5));
@@ -3372,7 +3589,10 @@ impl SessionLockClient {
     /// protocol-correct thing to do and are kept for when that crate bug is
     /// fixed, even though invoking them currently crashes the test process.
     pub fn unlock(&mut self) {
-        let lock = self.lock.take().expect("unlock called without an active lock");
+        let lock = self
+            .lock
+            .take()
+            .expect("unlock called without an active lock");
         lock.unlock_and_destroy();
         for entry in self.state.lock_surfaces.drain(..) {
             entry.lock_surface.destroy();
@@ -3406,7 +3626,13 @@ impl IdleNotifyClient {
             "compositor did not advertise ext_idle_notifier_v1"
         );
         assert!(state.seat.is_some(), "compositor advertised no wl_seat");
-        IdleNotifyClient { conn, queue, qh, state, notification: None }
+        IdleNotifyClient {
+            conn,
+            queue,
+            qh,
+            state,
+            notification: None,
+        }
     }
 
     /// Request a fresh `ext_idle_notification_v1` with `timeout_ms`, on this
@@ -3416,7 +3642,11 @@ impl IdleNotifyClient {
     /// request -- exactly what letting the idle-inhibit test re-request a
     /// notification after destroying its inhibitor needs.
     pub fn notification(&mut self, timeout_ms: u32) {
-        let notifier = self.state.idle_notifier.clone().expect("no ext_idle_notifier_v1");
+        let notifier = self
+            .state
+            .idle_notifier
+            .clone()
+            .expect("no ext_idle_notifier_v1");
         let seat = self.state.seat.clone().expect("no wl_seat");
         if let Some(old) = self.notification.take() {
             old.destroy();
@@ -3504,14 +3734,25 @@ impl IdleInhibitClient {
         );
         let compositor = state.compositor.clone().expect("no wl_compositor");
         let surface = compositor.create_surface(&qh, ());
-        IdleInhibitClient { conn, queue, qh, state, surface, inhibitor: None }
+        IdleInhibitClient {
+            conn,
+            queue,
+            qh,
+            state,
+            surface,
+            inhibitor: None,
+        }
     }
 
     /// Create an inhibitor on this client's surface. Panics if one is
     /// already active -- callers destroy before creating another.
     pub fn create_inhibitor(&mut self) {
         assert!(self.inhibitor.is_none(), "an inhibitor is already active");
-        let manager = self.state.idle_inhibit_manager.clone().expect("no zwp_idle_inhibit_manager_v1");
+        let manager = self
+            .state
+            .idle_inhibit_manager
+            .clone()
+            .expect("no zwp_idle_inhibit_manager_v1");
         let inhibitor = manager.create_inhibitor(&self.surface, &self.qh, ());
         self.inhibitor = Some(inhibitor);
         self.conn.flush().expect("flush create_inhibitor");
@@ -3520,7 +3761,10 @@ impl IdleInhibitClient {
 
     /// Destroy the active inhibitor. Panics if none is active.
     pub fn destroy_inhibitor(&mut self) {
-        let inhibitor = self.inhibitor.take().expect("no active inhibitor to destroy");
+        let inhibitor = self
+            .inhibitor
+            .take()
+            .expect("no active inhibitor to destroy");
         inhibitor.destroy();
         self.conn.flush().expect("flush destroy_inhibitor");
         let _ = self.queue.roundtrip(&mut self.state);
@@ -3568,9 +3812,13 @@ impl PointerConstraintsClient {
             .relative_pointer_manager
             .clone()
             .expect("compositor did not advertise zwp_relative_pointer_manager_v1");
-        let pointer =
-            client.state.pointer.clone().expect("compositor advertised no pointer capability");
-        let relative_pointer = relative_pointer_manager.get_relative_pointer(&pointer, &client.qh, ());
+        let pointer = client
+            .state
+            .pointer
+            .clone()
+            .expect("compositor advertised no pointer capability");
+        let relative_pointer =
+            relative_pointer_manager.get_relative_pointer(&pointer, &client.qh, ());
         client.conn.flush().expect("flush get_relative_pointer");
 
         let mut this = PointerConstraintsClient {
@@ -3592,8 +3840,12 @@ impl PointerConstraintsClient {
     /// only activates on the *next* pointer motion, not at creation -- see
     /// the M4.5 design's activation-ordering note, and this module's T6 test.
     pub fn lock_pointer(&mut self) {
-        let pointer =
-            self.client.state.pointer.clone().expect("compositor advertised no pointer capability");
+        let pointer = self
+            .client
+            .state
+            .pointer
+            .clone()
+            .expect("compositor advertised no pointer capability");
         let locked = self.pointer_constraints.lock_pointer(
             &self.client.surface,
             &pointer,
@@ -3619,9 +3871,18 @@ impl PointerConstraintsClient {
     /// test's shape, which pins the compositor to re-anchoring into one of
     /// the rectangles rather than into the region's bounding-box extents.
     pub fn confine_pointer_rects(&mut self, rects: &[(i32, i32, i32, i32)]) {
-        let compositor = self.client.state.compositor.clone().expect("no wl_compositor");
-        let pointer =
-            self.client.state.pointer.clone().expect("compositor advertised no pointer capability");
+        let compositor = self
+            .client
+            .state
+            .compositor
+            .clone()
+            .expect("no wl_compositor");
+        let pointer = self
+            .client
+            .state
+            .pointer
+            .clone()
+            .expect("compositor advertised no pointer capability");
         let region = compositor.create_region(&self.client.qh, ());
         for &(x, y, w, h) in rects {
             region.add(x, y, w, h);
@@ -3650,7 +3911,12 @@ impl PointerConstraintsClient {
     /// As [`Self::set_confine_region`], but the replacement region is built
     /// from one or more rectangles -- see [`Self::confine_pointer_rects`].
     pub fn set_confine_region_rects(&mut self, rects: &[(i32, i32, i32, i32)]) {
-        let compositor = self.client.state.compositor.clone().expect("no wl_compositor");
+        let compositor = self
+            .client
+            .state
+            .compositor
+            .clone()
+            .expect("no wl_compositor");
         let confined = self
             .confined_pointer
             .as_ref()
@@ -3713,11 +3979,19 @@ impl GammaControlClient {
             .gamma_control_manager
             .clone()
             .expect("compositor did not advertise zwlr_gamma_control_manager_v1");
-        let output = state.output.clone().expect("compositor did not advertise wl_output");
+        let output = state
+            .output
+            .clone()
+            .expect("compositor did not advertise wl_output");
         let control = manager.get_gamma_control(&output, &qh, ());
         conn.flush().expect("flush get_gamma_control");
         queue.roundtrip(&mut state).expect("gamma roundtrip");
-        GammaControlClient { conn, queue, state, control }
+        GammaControlClient {
+            conn,
+            queue,
+            state,
+            control,
+        }
     }
 
     /// Pump until `pred` holds or [`TIMEOUT`] elapses; returns whether it
@@ -3783,11 +4057,9 @@ impl GammaControlClient {
                 bytes.extend_from_slice(&v.to_ne_bytes());
             }
         }
-        let fd: OwnedFd = rustix::fs::memfd_create(
-            "icedtea-harness-gamma",
-            rustix::fs::MemfdFlags::CLOEXEC,
-        )
-        .expect("memfd_create");
+        let fd: OwnedFd =
+            rustix::fs::memfd_create("icedtea-harness-gamma", rustix::fs::MemfdFlags::CLOEXEC)
+                .expect("memfd_create");
         let mut file = std::fs::File::from(fd);
         file.write_all(&bytes).expect("write gamma ramp");
         file.flush().expect("flush gamma ramp");

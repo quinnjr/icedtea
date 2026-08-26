@@ -53,19 +53,21 @@ static X11_TEST_LOCK: Mutex<()> = Mutex::new(());
 const MAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn x11_test_guard() -> MutexGuard<'static, ()> {
-    X11_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    X11_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 use icedtea_compositor::dbus::DbCommand;
 use icedtea_contract::WindowId;
-use icedtea_harness::{advertised_globals, Compositor, DataControlClient, VirtualPointerClient};
+use icedtea_harness::{Compositor, DataControlClient, VirtualPointerClient, advertised_globals};
 use x11rb::connection::Connection;
+use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
-    ConnectionExt as _, CreateWindowAux, EventMask, PropMode, SelectionNotifyEvent, WindowClass,
-    SELECTION_NOTIFY_EVENT,
+    ConnectionExt as _, CreateWindowAux, EventMask, PropMode, SELECTION_NOTIFY_EVENT,
+    SelectionNotifyEvent, WindowClass,
 };
-use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME, NONE};
 
@@ -94,9 +96,7 @@ const WINDOW_TITLE: &str = "Icedtea Spike Window";
 /// gives a clearer skip message.
 fn xwayland_on_path() -> bool {
     let present = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path).any(|dir| dir.join("Xwayland").is_file())
-        })
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join("Xwayland").is_file()))
         .unwrap_or(false);
     // Review finding #10: every test in this file returns early (reported as a
     // green PASS) when the `Xwayland` binary is absent, so on a runner without
@@ -205,8 +205,14 @@ fn one_managed_x11_window_maps_into_the_window_model() {
     let window = poll_for_window(&comp, MAP_TIMEOUT)
         .expect("the managed X11 window never entered the compositor's window model");
 
-    assert_eq!(window.app_id, WINDOW_CLASS, "app_id should be the WM_CLASS class");
-    assert_eq!(window.title, WINDOW_TITLE, "title should be the X11 window name");
+    assert_eq!(
+        window.app_id, WINDOW_CLASS,
+        "app_id should be the WM_CLASS class"
+    );
+    assert_eq!(
+        window.title, WINDOW_TITLE,
+        "title should be the X11 window name"
+    );
 
     // Exactly one window — the spike maps one, and nothing else runs here.
     let snapshot = comp.snapshot();
@@ -223,8 +229,13 @@ fn one_managed_x11_window_maps_into_the_window_model() {
     conn.flush().expect("flush destroy");
     drop(conn);
 
-    let emptied = poll_until(&comp, Duration::from_secs(15), |snap| snap.windows.is_empty());
-    assert!(emptied, "the model still held a window after the X11 client destroyed it");
+    let emptied = poll_until(&comp, Duration::from_secs(15), |snap| {
+        snap.windows.is_empty()
+    });
+    assert!(
+        emptied,
+        "the model still held a window after the X11 client destroyed it"
+    );
 }
 
 /// M2 — managed-window parity. One managed X11 window is first-class: it wears
@@ -277,10 +288,22 @@ fn managed_x11_window_is_first_class() {
     .expect("create X11 window");
     // A non-CSD class, so `decoration::has_ssd` decorates it.
     let wm_class = format!("{WINDOW_INSTANCE}\0{WINDOW_CLASS}\0");
-    conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_CLASS, AtomEnum::STRING, wm_class.as_bytes())
-        .expect("set WM_CLASS");
-    conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, WINDOW_TITLE.as_bytes())
-        .expect("set WM_NAME");
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        wm_class.as_bytes(),
+    )
+    .expect("set WM_CLASS");
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        WINDOW_TITLE.as_bytes(),
+    )
+    .expect("set WM_NAME");
     conn.map_window(win).expect("map X11 window");
     conn.flush().expect("flush");
 
@@ -302,7 +325,10 @@ fn managed_x11_window_is_first_class() {
         content_ok,
         "the X11 client was never configured to its requested content rect (expected {REQUESTED_W}x{REQUESTED_H})"
     );
-    assert_eq!(window.geometry.width, REQUESTED_W as i32, "model geometry is the frame width");
+    assert_eq!(
+        window.geometry.width, REQUESTED_W as i32,
+        "model geometry is the frame width"
+    );
     assert_eq!(
         window.geometry.height, FRAME_H,
         "model frame is the requested content plus the SSD title-bar strip"
@@ -325,7 +351,9 @@ fn managed_x11_window_is_first_class() {
     conn.flush().expect("flush move");
     assert!(
         poll_until(&comp, Duration::from_secs(10), |snap| {
-            snap.windows.iter().any(|w| w.id == id && w.geometry.x == 500)
+            snap.windows
+                .iter()
+                .any(|w| w.id == id && w.geometry.x == 500)
         }),
         "the client-initiated move never reached the model"
     );
@@ -345,7 +373,8 @@ fn managed_x11_window_is_first_class() {
     );
     let max_frame = maxed.geometry;
     let configured_to_max = poll_x_geometry(&conn, win, Duration::from_secs(10), |g| {
-        g.width == max_frame.width as u16 && g.height == (max_frame.height as u16 - TITLE_BAR_HEIGHT)
+        g.width == max_frame.width as u16
+            && g.height == (max_frame.height as u16 - TITLE_BAR_HEIGHT)
     });
     assert!(
         configured_to_max,
@@ -371,7 +400,9 @@ fn managed_x11_window_is_first_class() {
     conn.flush().expect("flush destroy");
     drop(conn);
     assert!(
-        poll_until(&comp, Duration::from_secs(15), |snap| snap.windows.is_empty()),
+        poll_until(&comp, Duration::from_secs(15), |snap| snap
+            .windows
+            .is_empty()),
         "the model still held a window after the X11 client destroyed it"
     );
 }
@@ -389,7 +420,9 @@ fn fullscreen_x11_window_fills_the_output_without_ssd() {
     // Serialize the heavyweight real-Xwayland e2e tests (see `X11_TEST_LOCK`).
     let _x11_guard = x11_test_guard();
     if !xwayland_on_path() {
-        eprintln!("SKIP: Xwayland is not installed on this host; the X11 fullscreen test cannot run");
+        eprintln!(
+            "SKIP: Xwayland is not installed on this host; the X11 fullscreen test cannot run"
+        );
         return;
     }
     let comp = Compositor::spawn();
@@ -411,7 +444,8 @@ fn fullscreen_x11_window_fills_the_output_without_ssd() {
     let id = window.id;
     // Baseline: decorated, so the client keeps its requested content size.
     assert!(
-        poll_x_geometry(&conn, win, Duration::from_secs(10), |g| g.height == REQUESTED_H),
+        poll_x_geometry(&conn, win, Duration::from_secs(10), |g| g.height
+            == REQUESTED_H),
         "the X11 window was never decorated to begin with"
     );
 
@@ -452,8 +486,14 @@ fn fullscreen_x11_window_fills_the_output_without_ssd() {
     comp.send(DbCommand::Fullscreen(id, false));
     let restored = poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| !w.fullscreen)
         .expect("the window never left fullscreen");
-    assert_eq!(restored.geometry.width, REQUESTED_W as i32, "frame width not restored");
-    assert_eq!(restored.geometry.height, FRAME_H, "frame height not restored");
+    assert_eq!(
+        restored.geometry.width, REQUESTED_W as i32,
+        "frame width not restored"
+    );
+    assert_eq!(
+        restored.geometry.height, FRAME_H,
+        "frame height not restored"
+    );
     assert!(
         poll_x_geometry(&conn, win, Duration::from_secs(10), |g| {
             g.width == REQUESTED_W && g.height == REQUESTED_H
@@ -514,7 +554,10 @@ fn minimize_x11_window_hides_it_and_reaches_the_surface() {
     let m = poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| w.minimized)
         .expect("the window never minimized in the model");
     assert!(m.minimized, "model window is not minimized");
-    assert!(!m.focused, "a minimized window must not stay in the focused set");
+    assert!(
+        !m.focused,
+        "a minimized window must not stay in the focused set"
+    );
     // Surface: the minimize reached the X client as _NET_WM_STATE_HIDDEN.
     assert!(
         poll_net_wm_state(&conn, win, net_wm_state, Duration::from_secs(10), |atoms| {
@@ -527,7 +570,10 @@ fn minimize_x11_window_hides_it_and_reaches_the_surface() {
     comp.send(DbCommand::Minimize(id, false));
     let r = poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| !w.minimized)
         .expect("the window never restored in the model");
-    assert!(!r.minimized, "model window is still minimized after restore");
+    assert!(
+        !r.minimized,
+        "model window is still minimized after restore"
+    );
     assert!(
         poll_net_wm_state(&conn, win, net_wm_state, Duration::from_secs(10), |atoms| {
             !atoms.contains(&hidden_atom)
@@ -552,7 +598,9 @@ fn interactive_move_via_net_wm_moveresize_moves_the_window() {
     // Serialize the heavyweight real-Xwayland e2e tests (see `X11_TEST_LOCK`).
     let _x11_guard = x11_test_guard();
     if !xwayland_on_path() {
-        eprintln!("SKIP: Xwayland is not installed on this host; the X11 interactive-move test cannot run");
+        eprintln!(
+            "SKIP: Xwayland is not installed on this host; the X11 interactive-move test cannot run"
+        );
         return;
     }
     let comp = Compositor::spawn();
@@ -660,8 +708,7 @@ fn raising_a_managed_x11_window_restacks_it_above_the_other() {
 
     // A maps first and is the only window.
     let win_a = map_managed_x11(&conn, &screen, 300, 200);
-    let a = poll_for_window(&comp, MAP_TIMEOUT)
-        .expect("window A never entered the model");
+    let a = poll_for_window(&comp, MAP_TIMEOUT).expect("window A never entered the model");
     let a_id = a.id;
 
     // B maps second, on top; wait until the model holds both, then take the id
@@ -698,7 +745,10 @@ fn raising_a_managed_x11_window_restacks_it_above_the_other() {
         "focusing A never restacked its X window above B's"
     );
     // Sanity: b_id is the row we raised A over, and both are still modelled.
-    assert!(comp.snapshot().windows.iter().any(|w| w.id == b_id), "B left the model unexpectedly");
+    assert!(
+        comp.snapshot().windows.iter().any(|w| w.id == b_id),
+        "B left the model unexpectedly"
+    );
 
     conn.destroy_window(win_a).expect("destroy A");
     conn.destroy_window(win_b).expect("destroy B");
@@ -746,17 +796,35 @@ fn wm_initiated_close_reaches_the_x11_client() {
     )
     .expect("create X11 window");
     let wm_class = format!("{WINDOW_INSTANCE}\0{WINDOW_CLASS}\0");
-    conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_CLASS, AtomEnum::STRING, wm_class.as_bytes())
-        .expect("set WM_CLASS");
-    conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, WINDOW_TITLE.as_bytes())
-        .expect("set WM_NAME");
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        wm_class.as_bytes(),
+    )
+    .expect("set WM_CLASS");
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        WINDOW_TITLE.as_bytes(),
+    )
+    .expect("set WM_NAME");
 
     // Advertise WM_DELETE_WINDOW so a graceful close is delivered as a client
     // message rather than an XKillClient.
     let wm_protocols = intern(&conn, b"WM_PROTOCOLS");
     let wm_delete = intern(&conn, b"WM_DELETE_WINDOW");
-    conn.change_property32(PropMode::REPLACE, win, wm_protocols, AtomEnum::ATOM, &[wm_delete])
-        .expect("set WM_PROTOCOLS");
+    conn.change_property32(
+        PropMode::REPLACE,
+        win,
+        wm_protocols,
+        AtomEnum::ATOM,
+        &[wm_delete],
+    )
+    .expect("set WM_PROTOCOLS");
 
     conn.map_window(win).expect("map X11 window");
     conn.flush().expect("flush");
@@ -792,7 +860,9 @@ fn live_title_and_class_updates_reach_the_model() {
     // Serialize the heavyweight real-Xwayland e2e tests (see `X11_TEST_LOCK`).
     let _x11_guard = x11_test_guard();
     if !xwayland_on_path() {
-        eprintln!("SKIP: Xwayland is not installed on this host; the X11 live-property test cannot run");
+        eprintln!(
+            "SKIP: Xwayland is not installed on this host; the X11 live-property test cannot run"
+        );
         return;
     }
     let comp = Compositor::spawn();
@@ -812,29 +882,50 @@ fn live_title_and_class_updates_reach_the_model() {
 
     // Live title change: set both WM_NAME and _NET_WM_NAME.
     const NEW_TITLE: &str = "Renamed Live Window";
-    conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, NEW_TITLE.as_bytes())
-        .expect("set WM_NAME");
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        NEW_TITLE.as_bytes(),
+    )
+    .expect("set WM_NAME");
     let net_wm_name = intern(&conn, b"_NET_WM_NAME");
     let utf8_string = intern(&conn, b"UTF8_STRING");
-    conn.change_property8(PropMode::REPLACE, win, net_wm_name, utf8_string, NEW_TITLE.as_bytes())
-        .expect("set _NET_WM_NAME");
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        net_wm_name,
+        utf8_string,
+        NEW_TITLE.as_bytes(),
+    )
+    .expect("set _NET_WM_NAME");
     conn.flush().expect("flush title change");
     assert!(
-        poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| w.title == NEW_TITLE).is_some(),
+        poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| w.title == NEW_TITLE)
+            .is_some(),
         "the live WM_NAME change never reached the model title"
     );
 
     // Live class change.
     const NEW_CLASS: &str = "RenamedLiveClass";
     let wm_class = format!("{WINDOW_INSTANCE}\0{NEW_CLASS}\0");
-    conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_CLASS, AtomEnum::STRING, wm_class.as_bytes())
-        .expect("set WM_CLASS");
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        wm_class.as_bytes(),
+    )
+    .expect("set WM_CLASS");
     conn.flush().expect("flush class change");
     // app_id has no dedicated update wire field in the contract (a noted,
     // out-of-scope minor), but a fresh snapshot reads the model directly, so
     // the updated app_id is observable there.
     assert!(
-        poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| w.app_id == NEW_CLASS).is_some(),
+        poll_snapshot_window(&comp, id, Duration::from_secs(10), |w| w.app_id
+            == NEW_CLASS)
+        .is_some(),
         "the live WM_CLASS change never reached the model app_id"
     );
 
@@ -889,7 +980,10 @@ fn override_redirect_popup_is_an_unmanaged_placed_focused_pop_up() {
         (OR_X as i32, OR_Y as i32),
         "the OR pop-up was not placed at its client-requested coordinates"
     );
-    assert!(p.above_toplevel, "the OR pop-up did not stack above managed toplevels");
+    assert!(
+        p.above_toplevel,
+        "the OR pop-up did not stack above managed toplevels"
+    );
     assert!(
         p.keyboard_focused,
         "the focus-taking OR pop-up did not receive the seat keyboard"
@@ -912,7 +1006,10 @@ fn override_redirect_popup_is_an_unmanaged_placed_focused_pop_up() {
     let full_size = poll_x_geometry(&conn, popup, Duration::from_secs(10), |g| {
         g.width == OR_W && g.height == OR_H
     });
-    assert!(full_size, "the OR pop-up was resized/decorated; it must keep its client size");
+    assert!(
+        full_size,
+        "the OR pop-up was resized/decorated; it must keep its client size"
+    );
 
     // Dismissing the pop-up (unmap) removes it from the side-table and hands the
     // keyboard back to the managed window.
@@ -924,7 +1021,8 @@ fn override_redirect_popup_is_an_unmanaged_placed_focused_pop_up() {
     );
 
     conn.destroy_window(popup).expect("destroy OR pop-up");
-    conn.destroy_window(managed).expect("destroy managed window");
+    conn.destroy_window(managed)
+        .expect("destroy managed window");
     conn.flush().expect("flush destroy");
 }
 
@@ -936,7 +1034,9 @@ fn override_redirect_popup_is_an_unmanaged_placed_focused_pop_up() {
 fn managed_transient_dialog_is_centered_over_its_parent() {
     let _x11_guard = x11_test_guard();
     if !xwayland_on_path() {
-        eprintln!("SKIP: Xwayland is not installed on this host; the dialog placement test cannot run");
+        eprintln!(
+            "SKIP: Xwayland is not installed on this host; the dialog placement test cannot run"
+        );
         return;
     }
 
@@ -950,8 +1050,8 @@ fn managed_transient_dialog_is_centered_over_its_parent() {
 
     // The parent, mapped and placed by the WM.
     let parent = map_managed_x11(&conn, screen, 600, 500);
-    let parent_win = poll_for_window(&comp, MAP_TIMEOUT)
-        .expect("the parent X11 window never entered the model");
+    let parent_win =
+        poll_for_window(&comp, MAP_TIMEOUT).expect("the parent X11 window never entered the model");
     let parent_geo = parent_win.geometry;
 
     // The dialog: transient for the parent, typed as a dialog, distinct title so
@@ -976,16 +1076,40 @@ fn managed_transient_dialog_is_centered_over_its_parent() {
     )
     .expect("create dialog window");
     let wm_class = format!("{WINDOW_INSTANCE}\0{WINDOW_CLASS}\0");
-    conn.change_property8(PropMode::REPLACE, dialog, AtomEnum::WM_CLASS, AtomEnum::STRING, wm_class.as_bytes())
-        .expect("set dialog WM_CLASS");
-    conn.change_property8(PropMode::REPLACE, dialog, AtomEnum::WM_NAME, AtomEnum::STRING, DIALOG_TITLE.as_bytes())
-        .expect("set dialog WM_NAME");
-    conn.change_property32(PropMode::REPLACE, dialog, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, &[parent])
-        .expect("set WM_TRANSIENT_FOR");
+    conn.change_property8(
+        PropMode::REPLACE,
+        dialog,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        wm_class.as_bytes(),
+    )
+    .expect("set dialog WM_CLASS");
+    conn.change_property8(
+        PropMode::REPLACE,
+        dialog,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        DIALOG_TITLE.as_bytes(),
+    )
+    .expect("set dialog WM_NAME");
+    conn.change_property32(
+        PropMode::REPLACE,
+        dialog,
+        AtomEnum::WM_TRANSIENT_FOR,
+        AtomEnum::WINDOW,
+        &[parent],
+    )
+    .expect("set WM_TRANSIENT_FOR");
     let wt_atom = intern(&conn, b"_NET_WM_WINDOW_TYPE");
     let dialog_atom = intern(&conn, b"_NET_WM_WINDOW_TYPE_DIALOG");
-    conn.change_property32(PropMode::REPLACE, dialog, wt_atom, AtomEnum::ATOM, &[dialog_atom])
-        .expect("set _NET_WM_WINDOW_TYPE");
+    conn.change_property32(
+        PropMode::REPLACE,
+        dialog,
+        wt_atom,
+        AtomEnum::ATOM,
+        &[dialog_atom],
+    )
+    .expect("set _NET_WM_WINDOW_TYPE");
     conn.map_window(dialog).expect("map dialog");
     conn.flush().expect("flush dialog");
 
@@ -1032,8 +1156,8 @@ fn runtime_override_redirect_flip_migrates_between_managed_and_or() {
 
     // Start managed.
     let win = map_managed_x11(&conn, screen, 300, 200);
-    let modelled = poll_for_window(&comp, MAP_TIMEOUT)
-        .expect("the window never entered the model as managed");
+    let modelled =
+        poll_for_window(&comp, MAP_TIMEOUT).expect("the window never entered the model as managed");
     assert_eq!(comp.snapshot().windows.len(), 1);
     assert!(comp.xwayland_override_redirect().is_empty(), "not OR yet");
     let _ = modelled;
@@ -1155,7 +1279,12 @@ fn poll_named_window(
 ) -> Option<icedtea_contract::WindowInfo> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Some(w) = comp.snapshot().windows.into_iter().find(|w| w.title == title) {
+        if let Some(w) = comp
+            .snapshot()
+            .windows
+            .into_iter()
+            .find(|w| w.title == title)
+        {
             return Some(w);
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -1196,7 +1325,12 @@ fn poll_snapshot_window(
 ) -> Option<icedtea_contract::WindowInfo> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Some(w) = comp.snapshot().windows.into_iter().find(|w| w.id == id && pred(w)) {
+        if let Some(w) = comp
+            .snapshot()
+            .windows
+            .into_iter()
+            .find(|w| w.id == id && pred(w))
+        {
             return Some(w);
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -1216,7 +1350,10 @@ fn poll_snapshot_window(
 /// process environment on `ready`; that republish was a `set_var` from inside
 /// `run_all` and is gone — DISPLAY is now published once, at boot. See review
 /// finding #5.)
-fn wait_for_xwayland_ready(comp: &Compositor, display: &str) -> (x11rb::rust_connection::RustConnection, usize) {
+fn wait_for_xwayland_ready(
+    comp: &Compositor,
+    display: &str,
+) -> (x11rb::rust_connection::RustConnection, usize) {
     // Connecting execs the lazy Xwayland, whose `ready` drives `set_xwayland_seat`.
     let pair = connect_with_retry(display);
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1232,9 +1369,7 @@ fn wait_for_xwayland_ready(comp: &Compositor, display: &str) -> (x11rb::rust_con
 
 /// Connect an X11 client to `display`, retrying briefly to absorb the lazy
 /// `Xwayland` exec. Panics with a clear message if it never comes up.
-fn connect_with_retry(
-    display: &str,
-) -> (x11rb::rust_connection::RustConnection, usize) {
+fn connect_with_retry(display: &str) -> (x11rb::rust_connection::RustConnection, usize) {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut last_err = None;
     while Instant::now() < deadline {
@@ -1250,10 +1385,7 @@ fn connect_with_retry(
 }
 
 /// Poll the compositor snapshot until it holds a managed window, returning it.
-fn poll_for_window(
-    comp: &Compositor,
-    timeout: Duration,
-) -> Option<icedtea_contract::WindowInfo> {
+fn poll_for_window(comp: &Compositor, timeout: Duration) -> Option<icedtea_contract::WindowInfo> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(window) = comp.snapshot().windows.into_iter().next() {
@@ -1346,10 +1478,22 @@ fn map_managed_x11(
     )
     .expect("create X11 window");
     let wm_class = format!("{WINDOW_INSTANCE}\0{WINDOW_CLASS}\0");
-    conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_CLASS, AtomEnum::STRING, wm_class.as_bytes())
-        .expect("set WM_CLASS");
-    conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, WINDOW_TITLE.as_bytes())
-        .expect("set WM_NAME");
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        wm_class.as_bytes(),
+    )
+    .expect("set WM_CLASS");
+    conn.change_property8(
+        PropMode::REPLACE,
+        win,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        WINDOW_TITLE.as_bytes(),
+    )
+    .expect("set WM_NAME");
     conn.map_window(win).expect("map X11 window");
     conn.flush().expect("flush");
     win
@@ -1359,13 +1503,7 @@ fn map_managed_x11(
 /// a real X11 app asks the WM to start an interactive drag of its title bar.
 /// `x_root`/`y_root` are advisory (wlroots' xwm starts the grab from the live
 /// pointer regardless), passed as the current press point for faithfulness.
-fn send_net_wm_moveresize(
-    conn: &impl Connection,
-    root: u32,
-    win: u32,
-    x_root: u32,
-    y_root: u32,
-) {
+fn send_net_wm_moveresize(conn: &impl Connection, root: u32, win: u32, x_root: u32, y_root: u32) {
     let atom = intern(conn, b"_NET_WM_MOVERESIZE");
     // data: [x_root, y_root, direction, button, source-indication].
     let data = [x_root, y_root, NET_WM_MOVERESIZE_MOVE, BTN_LEFT, 1];
@@ -1473,7 +1611,9 @@ const WL_PRIMARY_PAYLOAD: &[u8] = "wayland⇄icedtea PRIMARY ⎘".as_bytes();
 fn x11_clipboard_selection_bridges_to_a_wayland_reader() {
     let _x11_guard = x11_test_guard();
     if !xwayland_on_path() {
-        eprintln!("SKIP: Xwayland is not installed; the X11→Wayland clipboard bridge test cannot run");
+        eprintln!(
+            "SKIP: Xwayland is not installed; the X11→Wayland clipboard bridge test cannot run"
+        );
         return;
     }
     let comp = Compositor::spawn();
@@ -1488,7 +1628,8 @@ fn x11_clipboard_selection_bridges_to_a_wayland_reader() {
     let mut manager = DataControlClient::spawn(&comp.socket);
     // The X11 owner runs its own event loop on a second connection, servicing
     // the xwm's TARGETS/data requests as a real X app would.
-    let _owner = X11SelectionOwner::spawn(display.clone(), "CLIPBOARD", X11_CLIPBOARD_PAYLOAD.to_vec());
+    let _owner =
+        X11SelectionOwner::spawn(display.clone(), "CLIPBOARD", X11_CLIPBOARD_PAYLOAD.to_vec());
 
     assert!(
         manager.wait_until(|c| c.has_offer()),
@@ -1496,7 +1637,8 @@ fn x11_clipboard_selection_bridges_to_a_wayland_reader() {
     );
     let got = manager.read_offer_blocking(SELECTION_MIME);
     assert_eq!(
-        got, X11_CLIPBOARD_PAYLOAD,
+        got,
+        X11_CLIPBOARD_PAYLOAD,
         "the CLIPBOARD bytes did not round-trip X11 -> Wayland (got {:?})",
         String::from_utf8_lossy(&got)
     );
@@ -1512,7 +1654,9 @@ fn x11_clipboard_selection_bridges_to_a_wayland_reader() {
 fn wayland_clipboard_selection_bridges_to_an_x11_reader() {
     let _x11_guard = x11_test_guard();
     if !xwayland_on_path() {
-        eprintln!("SKIP: Xwayland is not installed; the Wayland→X11 clipboard bridge test cannot run");
+        eprintln!(
+            "SKIP: Xwayland is not installed; the Wayland→X11 clipboard bridge test cannot run"
+        );
         return;
     }
     let comp = Compositor::spawn();
@@ -1541,7 +1685,8 @@ fn wayland_clipboard_selection_bridges_to_an_x11_reader() {
         "the CLIPBOARD bytes did not round-trip Wayland -> X11 (got {:?})",
         got.as_ref().map(|b| String::from_utf8_lossy(b))
     );
-    conn.destroy_window(focused).expect("destroy focused window");
+    conn.destroy_window(focused)
+        .expect("destroy focused window");
 }
 
 /// M4 — PRIMARY, X11 → Wayland. As the CLIPBOARD X11→Wayland test, but over the
@@ -1552,7 +1697,9 @@ fn wayland_clipboard_selection_bridges_to_an_x11_reader() {
 fn x11_primary_selection_bridges_to_a_wayland_reader() {
     let _x11_guard = x11_test_guard();
     if !xwayland_on_path() {
-        eprintln!("SKIP: Xwayland is not installed; the X11→Wayland primary bridge test cannot run");
+        eprintln!(
+            "SKIP: Xwayland is not installed; the X11→Wayland primary bridge test cannot run"
+        );
         return;
     }
     let comp = Compositor::spawn();
@@ -1571,7 +1718,8 @@ fn x11_primary_selection_bridges_to_a_wayland_reader() {
     );
     let got = manager.read_primary_offer_blocking(SELECTION_MIME);
     assert_eq!(
-        got, X11_PRIMARY_PAYLOAD,
+        got,
+        X11_PRIMARY_PAYLOAD,
         "the PRIMARY bytes did not round-trip X11 -> Wayland (got {:?})",
         String::from_utf8_lossy(&got)
     );
@@ -1585,7 +1733,9 @@ fn x11_primary_selection_bridges_to_a_wayland_reader() {
 fn wayland_primary_selection_bridges_to_an_x11_reader() {
     let _x11_guard = x11_test_guard();
     if !xwayland_on_path() {
-        eprintln!("SKIP: Xwayland is not installed; the Wayland→X11 primary bridge test cannot run");
+        eprintln!(
+            "SKIP: Xwayland is not installed; the Wayland→X11 primary bridge test cannot run"
+        );
         return;
     }
     let comp = Compositor::spawn();
@@ -1609,7 +1759,8 @@ fn wayland_primary_selection_bridges_to_an_x11_reader() {
         "the PRIMARY bytes did not round-trip Wayland -> X11 (got {:?})",
         got.as_ref().map(|b| String::from_utf8_lossy(b))
     );
-    conn.destroy_window(focused).expect("destroy focused window");
+    conn.destroy_window(focused)
+        .expect("destroy focused window");
 }
 
 /// M4 — XDND / `wl_data_device` bridge wiring. A full cross-boundary drag gesture
@@ -1726,7 +1877,10 @@ fn xwayland_publishes_display_and_cursor_env_on_ready() {
         restore_cursor_env(saved_theme, saved_size);
         return;
     };
-    assert!(is_valid_display_name(&display), "advertised DISPLAY {display:?} is not a valid :N name");
+    assert!(
+        is_valid_display_name(&display),
+        "advertised DISPLAY {display:?} is not a valid :N name"
+    );
     // The env exports fire at boot; the `Xft.dpi`/`Xcursor.size` resource fires in
     // `xwayland_ready`, which is lazy — force it by connecting a client, then poll
     // the process environment for the defaults.
@@ -1757,9 +1911,13 @@ fn xwayland_publishes_display_and_cursor_env_on_ready() {
     // not the env: at the harness's scale-1 output it is the logical `24 * 1`.
     let root = conn.setup().roots[screen_num].root;
     let resource_manager = intern(&conn, b"RESOURCE_MANAGER");
-    let matched = poll_x_resource_manager(&conn, root, resource_manager, Duration::from_secs(10), |rm| {
-        rm.contains("Xcursor.size:\t24")
-    });
+    let matched = poll_x_resource_manager(
+        &conn,
+        root,
+        resource_manager,
+        Duration::from_secs(10),
+        |rm| rm.contains("Xcursor.size:\t24"),
+    );
     assert!(
         matched,
         "the compositor never published Xcursor.size=24 in RESOURCE_MANAGER for the scale-1 output; \
@@ -1892,9 +2050,13 @@ fn hidpi_dpi_hint_is_published_for_a_scaled_output() {
     let root = conn.setup().roots[screen_num].root;
 
     let resource_manager = intern(&conn, b"RESOURCE_MANAGER");
-    let matched = poll_x_resource_manager(&conn, root, resource_manager, Duration::from_secs(15), |rm| {
-        rm.contains("Xft.dpi:\t192")
-    });
+    let matched = poll_x_resource_manager(
+        &conn,
+        root,
+        resource_manager,
+        Duration::from_secs(15),
+        |rm| rm.contains("Xft.dpi:\t192"),
+    );
     assert!(
         matched,
         "the compositor never published Xft.dpi=192 in RESOURCE_MANAGER for a scale-2 output; \
@@ -1973,7 +2135,8 @@ impl X11SelectionOwner {
             let text = intern(&conn, b"TEXT");
             let string_atom: Atom = AtomEnum::STRING.into();
 
-            conn.set_selection_owner(win, sel, CURRENT_TIME).expect("set_selection_owner");
+            conn.set_selection_owner(win, sel, CURRENT_TIME)
+                .expect("set_selection_owner");
             conn.flush().expect("flush set_selection_owner");
             // Confirm we actually hold it before signalling ready.
             let owner = conn
@@ -1994,7 +2157,8 @@ impl X11SelectionOwner {
             let mut next_reassert = Instant::now() + Duration::from_millis(250);
             while !stop_thread.load(Ordering::Relaxed) {
                 if reasserts_left > 0 && Instant::now() >= next_reassert {
-                    conn.set_selection_owner(win, sel, CURRENT_TIME).expect("re-set_selection_owner");
+                    conn.set_selection_owner(win, sel, CURRENT_TIME)
+                        .expect("re-set_selection_owner");
                     conn.flush().expect("flush re-set_selection_owner");
                     reasserts_left -= 1;
                     next_reassert = Instant::now() + Duration::from_millis(250);
@@ -2050,7 +2214,10 @@ impl X11SelectionOwner {
         ready_rx
             .recv_timeout(Duration::from_secs(15))
             .expect("the X11 selection owner never took ownership");
-        X11SelectionOwner { stop, handle: Some(handle) }
+        X11SelectionOwner {
+            stop,
+            handle: Some(handle),
+        }
     }
 }
 
@@ -2157,7 +2324,9 @@ fn map_focused_managed_x11(
 /// Whether `name` is a well-formed X11 `DISPLAY` (`:N` or `:N.S`, host part
 /// empty for the local Xwayland socket).
 fn is_valid_display_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix(':') else { return false };
+    let Some(rest) = name.strip_prefix(':') else {
+        return false;
+    };
     let digits = rest.split('.').next().unwrap_or("");
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }

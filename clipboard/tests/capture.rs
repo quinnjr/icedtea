@@ -15,10 +15,10 @@ use icedtea_harness::{Compositor, DataControlClient, TestClient, VirtualKeyboard
 fn daemon_connection(socket: &str) -> wayland_client::Connection {
     let dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
     let path = std::path::Path::new(&dir).join(socket);
-    let stream = UnixStream::connect(&path).unwrap_or_else(|e| panic!("connect {}: {e}", path.display()));
+    let stream =
+        UnixStream::connect(&path).unwrap_or_else(|e| panic!("connect {}: {e}", path.display()));
     wayland_client::Connection::from_socket(stream).expect("wayland connection")
 }
-
 
 #[test]
 fn daemon_captures_a_copy_and_repastes_it() {
@@ -42,7 +42,10 @@ fn daemon_captures_a_copy_and_repastes_it() {
     // compositor forwards the daemon's request to `app`'s source, on this
     // thread), so the wait loop pumps it.
     let mut app = TestClient::map_toplevel(&comp.socket, "app.copy", "copier");
-    assert!(app.wait_until(|c| c.has_input_serial()), "no keyboard serial");
+    assert!(
+        app.wait_until(|c| c.has_input_serial()),
+        "no keyboard serial"
+    );
 
     let copy_and_wait = |app: &mut TestClient, text: &[u8]| {
         app.set_selection_text("text/plain;charset=utf-8", text);
@@ -50,10 +53,19 @@ fn daemon_captures_a_copy_and_repastes_it() {
         let end = Instant::now() + Duration::from_secs(5);
         loop {
             app.pump();
-            if snapshot.lock().unwrap().iter().any(|e| e.preview == preview) {
+            if snapshot
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.preview == preview)
+            {
                 return;
             }
-            assert!(Instant::now() < end, "daemon never captured {preview:?}: {:?}", snapshot.lock().unwrap());
+            assert!(
+                Instant::now() < end,
+                "daemon never captured {preview:?}: {:?}",
+                snapshot.lock().unwrap()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     };
@@ -79,7 +91,10 @@ fn daemon_captures_a_copy_and_repastes_it() {
 
     // A data-control reader now sees the re-pasted bytes (served by the daemon).
     let mut reader = DataControlClient::spawn(&comp.socket);
-    assert!(reader.wait_until(|c| c.has_offer()), "reader saw no data-control offer");
+    assert!(
+        reader.wait_until(|c| c.has_offer()),
+        "reader saw no data-control offer"
+    );
     assert_eq!(
         reader.read_offer_blocking("text/plain;charset=utf-8"),
         b"first",
@@ -91,7 +106,11 @@ fn daemon_captures_a_copy_and_repastes_it() {
     std::thread::sleep(Duration::from_millis(200));
     {
         let s = snapshot.lock().unwrap();
-        assert_eq!(s.len(), len_before, "re-paste changed the history (self-capture guard failed): {s:?}");
+        assert_eq!(
+            s.len(),
+            len_before,
+            "re-paste changed the history (self-capture guard failed): {s:?}"
+        );
         assert_eq!(
             s.iter().filter(|e| e.preview == "first").count(),
             1,

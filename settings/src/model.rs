@@ -7,7 +7,9 @@
 
 use std::path::Path;
 
-use icedtea_config::{keysym_to_key_name, load_or_default, open, Config, KeyCombo, MODIFIER_TOKENS};
+use icedtea_config::{
+    Config, KeyCombo, MODIFIER_TOKENS, keysym_to_key_name, load_or_default, open,
+};
 
 /// The working-copy state the settings UI edits: `working` is what the
 /// widgets are bound to, `saved` is a snapshot of what's actually on disk
@@ -25,7 +27,10 @@ impl Model {
     /// `saved` snapshot matches, so a freshly-loaded `Model` is never dirty.
     pub fn load(db_path: &Path) -> Self {
         let cfg = load_or_default(db_path);
-        Self { working: cfg.clone(), saved: cfg }
+        Self {
+            working: cfg.clone(),
+            saved: cfg,
+        }
     }
 
     /// Whether the working copy has diverged from the last-known-saved
@@ -150,7 +155,10 @@ pub fn combo_from_keysym(keysym: u32, modifiers: CaptureMods) -> Option<KeyCombo
     }
     debug_assert!(mods.iter().all(|m| MODIFIER_TOKENS.contains(&m.as_str())));
 
-    Some(KeyCombo { modifiers: mods, key })
+    Some(KeyCombo {
+        modifiers: mods,
+        key,
+    })
 }
 
 /// The order-independent identity of a combo: its key name plus its modifier
@@ -176,7 +184,10 @@ fn combo_identity(combo: &KeyCombo) -> (String, Vec<String>) {
 pub fn duplicate_bindings(cfg: &Config) -> Vec<(KeyCombo, Vec<String>)> {
     let mut groups: Vec<(KeyCombo, Vec<String>)> = Vec::new();
     for (action, combo) in &cfg.keybindings {
-        match groups.iter_mut().find(|(c, _)| combo_identity(c) == combo_identity(combo)) {
+        match groups
+            .iter_mut()
+            .find(|(c, _)| combo_identity(c) == combo_identity(combo))
+        {
             Some((_, actions)) => actions.push(action.clone()),
             None => groups.push((combo.clone(), vec![action.clone()])),
         }
@@ -200,7 +211,7 @@ pub const BAR_POSITIONS: [&str; 2] = ["top", "bottom"];
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icedtea_config::{key_name_to_keysym, Behavior, KeyCombo};
+    use icedtea_config::{Behavior, KeyCombo, key_name_to_keysym};
     use tempfile::tempdir;
 
     fn non_default_config() -> Config {
@@ -214,7 +225,10 @@ mod tests {
         cfg.workspace_names = vec!["alpha".to_string(), "beta".to_string()];
         cfg.keybindings.insert(
             "custom_action".to_string(),
-            KeyCombo { modifiers: vec!["SUPER".to_string(), "SHIFT".to_string()], key: "KEY_x".to_string() },
+            KeyCombo {
+                modifiers: vec!["SUPER".to_string(), "SHIFT".to_string()],
+                key: "KEY_x".to_string(),
+            },
         );
         cfg
     }
@@ -248,10 +262,18 @@ mod tests {
     /// which drives a real `gdk::Display` against a harness compositor.
     #[test]
     fn combo_round_trips_to_the_compositor_format() {
-        let mods = CaptureMods { ctrl: true, alt: false, shift: true, logo: true };
+        let mods = CaptureMods {
+            ctrl: true,
+            alt: false,
+            shift: true,
+            logo: true,
+        };
         for name in ["KEY_q", "KEY_Return", "KEY_F5"] {
             let sym = key_name_to_keysym(name);
-            assert_ne!(sym, 0, "{name} must resolve to a real keysym for this test to be non-vacuous");
+            assert_ne!(
+                sym, 0,
+                "{name} must resolve to a real keysym for this test to be non-vacuous"
+            );
 
             let combo = combo_from_keysym(sym, mods).unwrap_or_else(|| panic!("{name} must bind"));
 
@@ -261,7 +283,10 @@ mod tests {
                 "combo_from_keysym({name}) must serialize a key name that resolves back to the same keysym"
             );
             for token in &combo.modifiers {
-                assert!(MODIFIER_TOKENS.contains(&token.as_str()), "unexpected modifier token {token:?}");
+                assert!(
+                    MODIFIER_TOKENS.contains(&token.as_str()),
+                    "unexpected modifier token {token:?}"
+                );
             }
             assert_eq!(combo.modifiers, vec!["SUPER", "CTRL", "SHIFT"]);
         }
@@ -271,32 +296,61 @@ mod tests {
     fn lone_modifier_does_not_bind() {
         let shift_l = key_name_to_keysym("KEY_Shift_L");
         assert_ne!(shift_l, 0);
-        assert!(combo_from_keysym(shift_l, CaptureMods { shift: true, ..Default::default() }).is_none());
+        assert!(
+            combo_from_keysym(
+                shift_l,
+                CaptureMods {
+                    shift: true,
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
 
         let super_l = key_name_to_keysym("KEY_Super_L");
         assert_ne!(super_l, 0);
-        assert!(combo_from_keysym(super_l, CaptureMods { logo: true, ..Default::default() }).is_none());
+        assert!(
+            combo_from_keysym(
+                super_l,
+                CaptureMods {
+                    logo: true,
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn duplicate_bindings_finds_a_planted_conflict() {
         let mut cfg = icedtea_config::default_config();
-        let shared = KeyCombo { modifiers: vec!["SUPER".to_string()], key: "KEY_z".to_string() };
-        cfg.keybindings.insert("action_one".to_string(), shared.clone());
-        cfg.keybindings.insert("action_two".to_string(), shared.clone());
+        let shared = KeyCombo {
+            modifiers: vec!["SUPER".to_string()],
+            key: "KEY_z".to_string(),
+        };
+        cfg.keybindings
+            .insert("action_one".to_string(), shared.clone());
+        cfg.keybindings
+            .insert("action_two".to_string(), shared.clone());
 
         let dupes = duplicate_bindings(&cfg);
         assert_eq!(dupes.len(), 1);
         let (combo, mut actions) = dupes.into_iter().next().unwrap();
         assert_eq!(combo, shared);
         actions.sort();
-        assert_eq!(actions, vec!["action_one".to_string(), "action_two".to_string()]);
+        assert_eq!(
+            actions,
+            vec!["action_one".to_string(), "action_two".to_string()]
+        );
     }
 
     #[test]
     fn duplicate_bindings_is_empty_for_defaults() {
         let cfg = icedtea_config::default_config();
-        assert!(duplicate_bindings(&cfg).is_empty(), "default keybindings must not collide");
+        assert!(
+            duplicate_bindings(&cfg).is_empty(),
+            "default keybindings must not collide"
+        );
     }
 
     #[test]
@@ -308,14 +362,24 @@ mod tests {
         let mut cfg = icedtea_config::default_config();
         cfg.keybindings.insert(
             "a".to_string(),
-            KeyCombo { modifiers: vec!["SUPER".into(), "SHIFT".into()], key: "KEY_z".into() },
+            KeyCombo {
+                modifiers: vec!["SUPER".into(), "SHIFT".into()],
+                key: "KEY_z".into(),
+            },
         );
         cfg.keybindings.insert(
             "b".to_string(),
-            KeyCombo { modifiers: vec!["SHIFT".into(), "SUPER".into()], key: "KEY_z".into() },
+            KeyCombo {
+                modifiers: vec!["SHIFT".into(), "SUPER".into()],
+                key: "KEY_z".into(),
+            },
         );
         let dupes = duplicate_bindings(&cfg);
-        assert_eq!(dupes.len(), 1, "reordered-modifier duplicate must be caught");
+        assert_eq!(
+            dupes.len(),
+            1,
+            "reordered-modifier duplicate must be caught"
+        );
         let (_, actions) = &dupes[0];
         assert_eq!(actions.len(), 2);
     }
@@ -387,7 +451,10 @@ mod tests {
         // intact -- not overwritten by the working copy's stale empty list.
         let reloaded = load_or_default(&path);
         assert_eq!(reloaded.appearance.palette.accent, "#ff00aa");
-        assert_eq!(reloaded.displays, persisted, "Apply must not clobber persisted displays");
+        assert_eq!(
+            reloaded.displays, persisted,
+            "Apply must not clobber persisted displays"
+        );
     }
 
     #[test]

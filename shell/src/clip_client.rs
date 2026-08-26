@@ -4,7 +4,7 @@
 
 use async_channel::Sender;
 use futures_util::StreamExt as _;
-use icedtea_contract::{ClipEntry, CLIP_BUS_NAME, CLIP_PATH};
+use icedtea_contract::{CLIP_BUS_NAME, CLIP_PATH, ClipEntry};
 
 use crate::clipboard::ClipUpdate;
 
@@ -56,21 +56,47 @@ pub struct ClipProxy {
 
 impl ClipProxy {
     pub fn new() -> zbus::Result<Self> {
-        Ok(ClipProxy { conn: zbus::blocking::Connection::session()? })
+        Ok(ClipProxy {
+            conn: zbus::blocking::Connection::session()?,
+        })
     }
 }
 
 impl ClipCommands for ClipProxy {
     fn activate(&self, id: u64) {
-        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "Activate", &(id,));
+        let _ = self.conn.call_method(
+            Some(CLIP_BUS_NAME),
+            CLIP_PATH,
+            Some(CLIP_IFACE),
+            "Activate",
+            &(id,),
+        );
     }
     fn pin(&self, id: u64, on: bool) {
-        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "Pin", &(id, on));
+        let _ = self.conn.call_method(
+            Some(CLIP_BUS_NAME),
+            CLIP_PATH,
+            Some(CLIP_IFACE),
+            "Pin",
+            &(id, on),
+        );
     }
     fn remove(&self, id: u64) {
-        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "Remove", &(id,));
+        let _ = self.conn.call_method(
+            Some(CLIP_BUS_NAME),
+            CLIP_PATH,
+            Some(CLIP_IFACE),
+            "Remove",
+            &(id,),
+        );
     }
     fn clear(&self) {
-        let _ = self.conn.call_method(Some(CLIP_BUS_NAME), CLIP_PATH, Some(CLIP_IFACE), "Clear", &());
+        let _ = self.conn.call_method(
+            Some(CLIP_BUS_NAME),
+            CLIP_PATH,
+            Some(CLIP_IFACE),
+            "Clear",
+            &(),
+        );
     }
 }

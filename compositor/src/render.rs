@@ -54,7 +54,10 @@ pub fn scene_order(windows: &[&Window], snap_active: bool) -> Vec<SceneLayer> {
 /// these strips end, so the two no longer overlap. Anything that changes one
 /// side of that has to change the other.
 pub fn decoration_strip_geometry(windows: &[&Window]) -> Vec<Rectangle> {
-    windows.iter().map(|w| decoration::title_bar_rect(w.geometry)).collect()
+    windows
+        .iter()
+        .map(|w| decoration::title_bar_rect(w.geometry))
+        .collect()
 }
 
 /// The buffer-node destination rect for an output: stretch to fill.
@@ -164,7 +167,12 @@ mod tests {
             title: "t".into(),
             pid: 1,
             workspace: 0,
-            geometry: Rectangle { x: 0, y: 0, width: 10, height: 10 },
+            geometry: Rectangle {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
             maximized: false,
             minimized: false,
             fullscreen: false,
@@ -186,20 +194,29 @@ mod tests {
 
     #[test]
     fn no_windows_skips_window_layer() {
-        assert_eq!(scene_order(&[], true), vec![SceneLayer::Wallpaper, SceneLayer::SnapPreview]);
+        assert_eq!(
+            scene_order(&[], true),
+            vec![SceneLayer::Wallpaper, SceneLayer::SnapPreview]
+        );
         assert_eq!(scene_order(&[], false), vec![SceneLayer::Wallpaper]);
     }
 
     #[test]
     fn hex_conversion() {
         assert_eq!(hex_to_rgba("#ff0000"), [1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(hex_to_rgba("#1e1e2e"), [30.0 / 255.0, 30.0 / 255.0, 46.0 / 255.0, 1.0]);
+        assert_eq!(
+            hex_to_rgba("#1e1e2e"),
+            [30.0 / 255.0, 30.0 / 255.0, 46.0 / 255.0, 1.0]
+        );
     }
 
     #[test]
     fn decoration_strip_geometry_uses_title_bar_rect() {
         let w = fake_window();
-        assert_eq!(decoration_strip_geometry(&[&w]), vec![decoration::title_bar_rect(w.geometry)]);
+        assert_eq!(
+            decoration_strip_geometry(&[&w]),
+            vec![decoration::title_bar_rect(w.geometry)]
+        );
     }
 
     #[test]
@@ -209,7 +226,12 @@ mod tests {
 
     #[test]
     fn wallpaper_dest_is_the_full_output() {
-        let out = Rectangle { x: 0, y: 0, width: 1920, height: 1080 };
+        let out = Rectangle {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
         assert_eq!(wallpaper_dest(out), out);
     }
 

@@ -70,7 +70,11 @@ fn a_second_headless_output_is_tracked_with_a_layout_box() {
     state.wayland.attach(runtime.clone());
 
     let background = runtime
-        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .add_rect(
+            1,
+            1,
+            icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+        )
         .expect("background rect");
     runtime.lower_rect_to_bottom(background);
     state.set_background(background);
@@ -82,7 +86,8 @@ fn a_second_headless_output_is_tracked_with_a_layout_box() {
     // to stop.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     state.set_command_receiver(cmd_rx);
-    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
     state.set_cmd_wake_source(cmd_wake_id);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(150));
@@ -94,9 +99,16 @@ fn a_second_headless_output_is_tracked_with_a_layout_box() {
         .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
         .expect("run_all");
 
-    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+    assert!(
+        state.quitting,
+        "the backstop Quit command must have stopped the loop"
+    );
 
-    assert_eq!(state.outputs.len(), 2, "both headless outputs must have reached the model");
+    assert_eq!(
+        state.outputs.len(),
+        2,
+        "both headless outputs must have reached the model"
+    );
 
     let geometries: Vec<_> = state.outputs.values().map(|o| o.geometry).collect();
     let a = geometries[0];
@@ -108,8 +120,14 @@ fn a_second_headless_output_is_tracked_with_a_layout_box() {
     // Disjoint boxes are the proof the layout-box path (not the
     // (0,0)-at-origin fallback, which would stack both outputs on top of
     // each other) produced these geometries.
-    let disjoint = a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y;
-    assert!(disjoint, "the two outputs' layout boxes must not overlap, got {a:?} and {b:?}");
+    let disjoint = a.x + a.width <= b.x
+        || b.x + b.width <= a.x
+        || a.y + a.height <= b.y
+        || b.y + b.height <= a.y;
+    assert!(
+        disjoint,
+        "the two outputs' layout boxes must not overlap, got {a:?} and {b:?}"
+    );
 }
 
 /// [HIGH H4] `sync_wallpaper_nodes`' hot-unplug cleanup branch: a wallpaper
@@ -140,7 +158,11 @@ fn sync_wallpaper_nodes_removes_a_node_for_an_output_that_is_gone() {
     state.wayland.attach(runtime.clone());
 
     let background = runtime
-        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .add_rect(
+            1,
+            1,
+            icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+        )
         .expect("background rect");
     runtime.lower_rect_to_bottom(background);
     state.set_background(background);
@@ -150,7 +172,8 @@ fn sync_wallpaper_nodes_removes_a_node_for_an_output_that_is_gone() {
     // asking the loop to stop.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     state.set_command_receiver(cmd_rx);
-    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
     state.set_cmd_wake_source(cmd_wake_id);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(150));
@@ -162,13 +185,24 @@ fn sync_wallpaper_nodes_removes_a_node_for_an_output_that_is_gone() {
         .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
         .expect("run_all");
 
-    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
-    assert_eq!(state.outputs.len(), 2, "both headless outputs must have reached the model");
+    assert!(
+        state.quitting,
+        "the backstop Quit command must have stopped the loop"
+    );
+    assert_eq!(
+        state.outputs.len(),
+        2,
+        "both headless outputs must have reached the model"
+    );
 
     let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 8, 7, 255]));
     state.wallpaper.set_decoded(Some(image));
     state.sync_wallpaper_nodes();
-    assert_eq!(state.wallpaper_node_count(), 2, "one buffer node per output");
+    assert_eq!(
+        state.wallpaper_node_count(),
+        2,
+        "one buffer node per output"
+    );
 
     // Simulate `OutputHandler::destroyed`: it removes the output from the
     // model before calling `sync_wallpaper_nodes` (see `state.rs`), so drop
@@ -238,7 +272,11 @@ fn a_disabled_output_can_be_re_enabled_within_a_session() {
     state.config_path = Some(tmp.clone());
 
     let background = runtime
-        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .add_rect(
+            1,
+            1,
+            icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+        )
         .expect("background rect");
     runtime.lower_rect_to_bottom(background);
     state.set_background(background);
@@ -247,7 +285,8 @@ fn a_disabled_output_can_be_re_enabled_within_a_session() {
     // loop stops -- identical to the other tests in this file.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     state.set_command_receiver(cmd_rx);
-    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
     state.set_cmd_wake_source(cmd_wake_id);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(150));
@@ -259,17 +298,30 @@ fn a_disabled_output_can_be_re_enabled_within_a_session() {
         .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
         .expect("run_all");
 
-    assert_eq!(state.outputs.len(), 2, "both headless outputs must have reached the model");
+    assert_eq!(
+        state.outputs.len(),
+        2,
+        "both headless outputs must have reached the model"
+    );
 
     // The connector name of one output -- the stable key the disable/re-enable
     // round-trip matches against.
     let victim_index = *state.outputs.keys().min().expect("an output");
-    let victim_name = state.outputs.get(&victim_index).expect("victim surface").name.clone();
+    let victim_name = state
+        .outputs
+        .get(&victim_index)
+        .expect("victim surface")
+        .name
+        .clone();
     assert!(!victim_name.is_empty(), "headless outputs are named");
 
     // DISABLE: drops it from the active set but records name -> id.
     state.output_configuration_applied(vec![applied_head(&victim_name, false)]);
-    assert_eq!(state.outputs.len(), 1, "the disabled output left the active set");
+    assert_eq!(
+        state.outputs.len(),
+        1,
+        "the disabled output left the active set"
+    );
     assert!(
         state.outputs.values().all(|o| o.name != victim_name),
         "no active surface still carries the disabled connector's name"
@@ -278,9 +330,17 @@ fn a_disabled_output_can_be_re_enabled_within_a_session() {
     // RE-ENABLE the same connector: rehydrate must add it back under its own
     // name. Pre-fix this hit the `continue` and `outputs.len()` stayed at 1.
     state.output_configuration_applied(vec![applied_head(&victim_name, true)]);
-    assert_eq!(state.outputs.len(), 2, "the re-enabled output rejoined the active set");
     assert_eq!(
-        state.outputs.values().filter(|o| o.name == victim_name).count(),
+        state.outputs.len(),
+        2,
+        "the re-enabled output rejoined the active set"
+    );
+    assert_eq!(
+        state
+            .outputs
+            .values()
+            .filter(|o| o.name == victim_name)
+            .count(),
         1,
         "exactly one active surface carries the re-enabled connector's name"
     );
@@ -319,14 +379,19 @@ fn disabling_every_output_keeps_at_least_one_active() {
     state.config_path = Some(tmp.clone());
 
     let background = runtime
-        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .add_rect(
+            1,
+            1,
+            icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+        )
         .expect("background rect");
     runtime.lower_rect_to_bottom(background);
     state.set_background(background);
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     state.set_command_receiver(cmd_rx);
-    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
     state.set_cmd_wake_source(cmd_wake_id);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(150));
@@ -338,14 +403,22 @@ fn disabling_every_output_keeps_at_least_one_active() {
         .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
         .expect("run_all");
 
-    assert_eq!(state.outputs.len(), 2, "both headless outputs must have reached the model");
+    assert_eq!(
+        state.outputs.len(),
+        2,
+        "both headless outputs must have reached the model"
+    );
 
     let names: Vec<String> = state.outputs.values().map(|o| o.name.clone()).collect();
     let (name_a, name_b) = (names[0].clone(), names[1].clone());
 
     // Disable the first: allowed, because the second output survives it.
     state.output_configuration_applied(vec![applied_head(&name_a, false)]);
-    assert_eq!(state.outputs.len(), 1, "disabling one of two outputs is honored");
+    assert_eq!(
+        state.outputs.len(),
+        1,
+        "disabling one of two outputs is honored"
+    );
 
     // Review finding #6: seed a SAVED config for the last output with a real
     // custom mode/scale/transform/position, so we can prove that a REFUSED
@@ -373,7 +446,10 @@ fn disabling_every_output_keeps_at_least_one_active() {
         1,
         "the last active output must not be disabled -- >=1 output stays live"
     );
-    assert!(state.outputs.keys().min().is_some(), "an active survivor output remains for placement");
+    assert!(
+        state.outputs.keys().min().is_some(),
+        "an active survivor output remains for placement"
+    );
 
     // Review finding #6: the refused disable must NOT have corrupted name_b's
     // persisted entry. It stays enabled=true with its saved mode intact.
@@ -383,13 +459,34 @@ fn disabling_every_output_keeps_at_least_one_active() {
         .iter()
         .find(|d| d.name == name_b)
         .expect("the refused output's saved config entry must survive");
-    assert!(saved.enabled, "a refused disable must keep the output enabled=true in persisted config");
-    assert_eq!(saved.width, 2560, "the saved mode width must not be wiped to 0 by a refused disable");
-    assert_eq!(saved.height, 1440, "the saved mode height must survive a refused disable");
-    assert_eq!(saved.refresh_mhz, 144_000, "the saved refresh must survive a refused disable");
-    assert_eq!(saved.scale, 1.5, "the saved scale must survive a refused disable");
-    assert_eq!(saved.transform, 3, "the saved transform must survive a refused disable");
-    assert_eq!(saved.x, 100, "the saved position must survive a refused disable");
+    assert!(
+        saved.enabled,
+        "a refused disable must keep the output enabled=true in persisted config"
+    );
+    assert_eq!(
+        saved.width, 2560,
+        "the saved mode width must not be wiped to 0 by a refused disable"
+    );
+    assert_eq!(
+        saved.height, 1440,
+        "the saved mode height must survive a refused disable"
+    );
+    assert_eq!(
+        saved.refresh_mhz, 144_000,
+        "the saved refresh must survive a refused disable"
+    );
+    assert_eq!(
+        saved.scale, 1.5,
+        "the saved scale must survive a refused disable"
+    );
+    assert_eq!(
+        saved.transform, 3,
+        "the saved transform must survive a refused disable"
+    );
+    assert_eq!(
+        saved.x, 100,
+        "the saved position must survive a refused disable"
+    );
 
     let _ = std::fs::remove_file(&tmp);
 }

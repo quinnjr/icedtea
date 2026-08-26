@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
+use contract::{
+    Event, Rectangle, SeqEvent, Snapshot, WindowId, WindowInfo, WindowUpdate, WorkspaceInfo,
+};
 use icedtea_contract as contract;
-use contract::{Event, Rectangle, SeqEvent, Snapshot, WindowId, WindowInfo, WindowUpdate, WorkspaceInfo};
 
 #[derive(Debug, Clone)]
 pub struct Window {
@@ -69,12 +71,19 @@ impl WindowManager {
         // (`load_or_default` rejects an empty list), but `State::new` accepts
         // an arbitrary `Config`, so fall back to a single workspace here
         // rather than leaving a reachable index panic.
-        let workspace_names =
-            if workspace_names.is_empty() { vec!["1".to_string()] } else { workspace_names };
+        let workspace_names = if workspace_names.is_empty() {
+            vec!["1".to_string()]
+        } else {
+            workspace_names
+        };
         let workspaces = workspace_names
             .iter()
             .enumerate()
-            .map(|(i, name)| Workspace { id: i as u32, name: name.clone(), focused_window: None })
+            .map(|(i, name)| Workspace {
+                id: i as u32,
+                name: name.clone(),
+                focused_window: None,
+            })
             .collect();
         Self {
             windows: BTreeMap::new(),
@@ -104,7 +113,13 @@ impl WindowManager {
         self.emit(event);
     }
 
-    pub fn add_window(&mut self, app_id: &str, title: &str, pid: u32, geometry: Rectangle) -> WindowId {
+    pub fn add_window(
+        &mut self,
+        app_id: &str,
+        title: &str,
+        pid: u32,
+        geometry: Rectangle,
+    ) -> WindowId {
         let id = WindowId(self.next_id);
         self.next_id += 1;
         let window = Window {
@@ -148,7 +163,13 @@ impl WindowManager {
     pub fn set_title(&mut self, id: WindowId, title: String) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         w.title = title.clone();
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { title: Some(title), ..Default::default() } });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                title: Some(title),
+                ..Default::default()
+            },
+        });
         Some(())
     }
 
@@ -172,14 +193,26 @@ impl WindowManager {
     pub fn set_geometry(&mut self, id: WindowId, geometry: Rectangle) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         w.geometry = geometry;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { geometry: Some(geometry), ..Default::default() } });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                geometry: Some(geometry),
+                ..Default::default()
+            },
+        });
         Some(())
     }
 
     pub fn set_maximized(&mut self, id: WindowId, value: bool) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         w.maximized = value;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { maximized: Some(value), ..Default::default() } });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                maximized: Some(value),
+                ..Default::default()
+            },
+        });
         Some(())
     }
 
@@ -187,14 +220,26 @@ impl WindowManager {
         let w = self.windows.get_mut(&id)?;
         let new_value = !w.maximized;
         w.maximized = new_value;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { maximized: Some(new_value), ..Default::default() } });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                maximized: Some(new_value),
+                ..Default::default()
+            },
+        });
         Some(())
     }
 
     pub fn set_minimized(&mut self, id: WindowId, value: bool) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         w.minimized = value;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { minimized: Some(value), ..Default::default() } });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                minimized: Some(value),
+                ..Default::default()
+            },
+        });
         Some(())
     }
 
@@ -209,7 +254,13 @@ impl WindowManager {
             return None;
         }
         w.attention = value;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { attention: Some(value), ..Default::default() } });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                attention: Some(value),
+                ..Default::default()
+            },
+        });
         Some(())
     }
 
@@ -233,17 +284,30 @@ impl WindowManager {
     pub fn set_fullscreen(&mut self, id: WindowId, value: bool) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         w.fullscreen = value;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { fullscreen: Some(value), ..Default::default() } });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                fullscreen: Some(value),
+                ..Default::default()
+            },
+        });
         Some(())
     }
 
-    pub fn set_client_decorations_requested(&mut self, id: WindowId, value: Option<bool>) -> Option<()> {
+    pub fn set_client_decorations_requested(
+        &mut self,
+        id: WindowId,
+        value: Option<bool>,
+    ) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         if w.client_decorations_requested == value {
             return None;
         }
         w.client_decorations_requested = value;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate::default() });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate::default(),
+        });
         Some(())
     }
 
@@ -265,7 +329,13 @@ impl WindowManager {
             return None;
         }
         w.mapped = mapped;
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { mapped: Some(mapped), ..Default::default() } });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                mapped: Some(mapped),
+                ..Default::default()
+            },
+        });
         Some(())
     }
 
@@ -282,7 +352,14 @@ impl WindowManager {
         if was_focused && self.workspace_mut(old_workspace).focused_window == Some(id) {
             self.workspace_mut(old_workspace).focused_window = None;
         }
-        self.emit(Event::WindowUpdated { id, update: WindowUpdate { workspace: Some(workspace), focused: Some(false), ..Default::default() } });
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                workspace: Some(workspace),
+                focused: Some(false),
+                ..Default::default()
+            },
+        });
         Some(())
     }
 
@@ -337,7 +414,13 @@ impl WindowManager {
             Some(old_id) if old_id != id => {
                 if let Some(old_w) = self.windows.get_mut(&old_id) {
                     old_w.focused = false;
-                    self.emit(Event::WindowUpdated { id: old_id, update: WindowUpdate { focused: Some(false), ..Default::default() } });
+                    self.emit(Event::WindowUpdated {
+                        id: old_id,
+                        update: WindowUpdate {
+                            focused: Some(false),
+                            ..Default::default()
+                        },
+                    });
                 }
             }
             _ => {}
@@ -408,7 +491,10 @@ impl WindowManager {
             }
             self.emit(Event::WindowUpdated {
                 id,
-                update: WindowUpdate { focused: Some(false), ..Default::default() },
+                update: WindowUpdate {
+                    focused: Some(false),
+                    ..Default::default()
+                },
             });
         }
         self.focus_mru_in_workspace(ws)
@@ -436,11 +522,16 @@ impl WindowManager {
     pub fn windows(&self) -> impl Iterator<Item = &Window> {
         // Return windows ordered by focus MRU (most recent first).
         // Invariant: every window in self.windows is in focus_mru, so filter_map is safe.
-        self.focus_mru.iter().filter_map(move |id| self.windows.get(id))
+        self.focus_mru
+            .iter()
+            .filter_map(move |id| self.windows.get(id))
     }
 
     pub fn windows_in_workspace(&self, ws: u32) -> Vec<&Window> {
-        self.windows.values().filter(|w| w.workspace == ws).collect()
+        self.windows
+            .values()
+            .filter(|w| w.workspace == ws)
+            .collect()
     }
 
     /// The windows that should actually be drawn and hit-tested right now:
@@ -471,7 +562,9 @@ impl WindowManager {
     /// coordinates), i.e. what a click at that point acts on. Used by the
     /// backend's click-to-focus path (review finding I1).
     pub fn window_at(&self, point: (i32, i32)) -> Option<&Window> {
-        self.visible_windows().into_iter().find(|w| w.geometry.contains(point.0, point.1))
+        self.visible_windows()
+            .into_iter()
+            .find(|w| w.geometry.contains(point.0, point.1))
     }
 
     /// Focus the most-recently-focused non-minimized, mapped window on `ws`,
@@ -489,18 +582,21 @@ impl WindowManager {
     /// what let a hidden window remain `focused_window()` when it was the
     /// workspace's last visible one.
     pub fn refocus_after_hide(&mut self, ws: u32) -> Option<WindowId> {
-        let candidate = self
-            .focus_mru
-            .iter()
-            .copied()
-            .find(|id| self.windows.get(id).is_some_and(|w| w.workspace == ws && !w.minimized && w.mapped));
+        let candidate = self.focus_mru.iter().copied().find(|id| {
+            self.windows
+                .get(id)
+                .is_some_and(|w| w.workspace == ws && !w.minimized && w.mapped)
+        });
         match candidate {
             Some(id) => {
                 self.focus(id)?;
                 Some(id)
             }
             None => {
-                let cleared = self.workspaces.get_mut(ws as usize).and_then(|slot| slot.focused_window.take());
+                let cleared = self
+                    .workspaces
+                    .get_mut(ws as usize)
+                    .and_then(|slot| slot.focused_window.take());
                 // The pointer is only half the story: the hidden window's own
                 // `focused` field (what `to_info`/`snapshot` report to IPC
                 // clients, e.g. the taskbar) must drop too, with exactly one
@@ -511,13 +607,18 @@ impl WindowManager {
                 // no-op-on-no-change like every other setter here (the
                 // pointer and the flag can already disagree, e.g. a window
                 // unmapped without ever having been re-focused).
-                if let Some(prev_id) = cleared.filter(|id| self.windows.get(id).is_some_and(|w| w.focused)) {
+                if let Some(prev_id) =
+                    cleared.filter(|id| self.windows.get(id).is_some_and(|w| w.focused))
+                {
                     if let Some(w) = self.windows.get_mut(&prev_id) {
                         w.focused = false;
                     }
                     self.emit(Event::WindowUpdated {
                         id: prev_id,
-                        update: WindowUpdate { focused: Some(false), ..Default::default() },
+                        update: WindowUpdate {
+                            focused: Some(false),
+                            ..Default::default()
+                        },
                     });
                 }
                 None
@@ -557,7 +658,13 @@ impl WindowManager {
     }
 
     pub fn workspace_info(&self) -> Vec<WorkspaceInfo> {
-        self.workspaces.iter().map(|w| WorkspaceInfo { id: w.id, name: w.name.clone() }).collect()
+        self.workspaces
+            .iter()
+            .map(|w| WorkspaceInfo {
+                id: w.id,
+                name: w.name.clone(),
+            })
+            .collect()
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -627,14 +734,22 @@ impl WindowManager {
     pub fn set_workspace_names(&mut self, names: Vec<String>) {
         // Match `new`'s guard: never leave a zero-workspace manager, which
         // would panic `workspace_mut` on the next `add_window`.
-        let names = if names.is_empty() { vec!["1".to_string()] } else { names };
+        let names = if names.is_empty() {
+            vec!["1".to_string()]
+        } else {
+            names
+        };
         let new_len = names.len() as u32;
 
         // Migrate any window off a workspace index that is about to vanish.
         // Collect ids first so we don't borrow `windows` while mutating it.
         if new_len < self.workspaces.len() as u32 {
-            let migrants: Vec<WindowId> =
-                self.windows.values().filter(|w| w.workspace >= new_len).map(|w| w.id).collect();
+            let migrants: Vec<WindowId> = self
+                .windows
+                .values()
+                .filter(|w| w.workspace >= new_len)
+                .map(|w| w.id)
+                .collect();
             for id in migrants {
                 if let Some(w) = self.windows.get_mut(&id) {
                     w.workspace = 0;
@@ -657,7 +772,11 @@ impl WindowManager {
         for (i, name) in names.into_iter().enumerate() {
             match self.workspaces.get_mut(i) {
                 Some(ws) => ws.name = name,
-                None => self.workspaces.push(Workspace { id: i as u32, name, focused_window: None }),
+                None => self.workspaces.push(Workspace {
+                    id: i as u32,
+                    name,
+                    focused_window: None,
+                }),
             }
         }
 
@@ -670,7 +789,10 @@ impl WindowManager {
         // until a manual switch.
         if self.active_workspace >= new_len {
             self.active_workspace = 0;
-            self.emit(Event::WorkspaceSet { id: 0, active: true });
+            self.emit(Event::WorkspaceSet {
+                id: 0,
+                active: true,
+            });
         }
     }
 
@@ -695,14 +817,25 @@ mod tests {
         WindowManager::new(vec!["1".into(), "2".into()])
     }
 
-    const GEO: Rectangle = Rectangle { x: 0, y: 0, width: 640, height: 400 };
+    const GEO: Rectangle = Rectangle {
+        x: 0,
+        y: 0,
+        width: 640,
+        height: 400,
+    };
 
     #[test]
     fn add_focuses_window_and_emits_opened() {
         let mut m = mgr();
         let id = m.add_window("app", "title", 1, GEO);
         assert!(m.get(id).unwrap().focused);
-        assert!(matches!(m.pending_events.first(), Some(SeqEvent { event: Event::WindowOpened(_), .. })));
+        assert!(matches!(
+            m.pending_events.first(),
+            Some(SeqEvent {
+                event: Event::WindowOpened(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -765,7 +898,13 @@ mod tests {
         m.focus(a).unwrap();
         // Should emit an event for the minimized state change.
         assert!(!m.pending_events.is_empty());
-        assert!(matches!(m.pending_events.first(), Some(SeqEvent { event: Event::WindowUpdated { .. }, .. })));
+        assert!(matches!(
+            m.pending_events.first(),
+            Some(SeqEvent {
+                event: Event::WindowUpdated { .. },
+                ..
+            })
+        ));
         assert!(!m.get(a).unwrap().minimized);
     }
 
@@ -826,13 +965,25 @@ mod tests {
         m.set_workspace(c, 1).unwrap();
         m.set_minimized(b, true).unwrap();
 
-        assert_eq!(m.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(), vec![a]);
+        assert_eq!(
+            m.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![a]
+        );
         assert!(m.is_visible_id(a));
-        assert!(!m.is_visible_id(b), "minimized windows are not drawn or clickable");
-        assert!(!m.is_visible_id(c), "another workspace's windows are not drawn or clickable");
+        assert!(
+            !m.is_visible_id(b),
+            "minimized windows are not drawn or clickable"
+        );
+        assert!(
+            !m.is_visible_id(c),
+            "another workspace's windows are not drawn or clickable"
+        );
 
         m.set_active_workspace(1);
-        assert_eq!(m.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(), vec![c]);
+        assert_eq!(
+            m.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![c]
+        );
     }
 
     /// I1: a click must never land on a window from an inactive workspace,
@@ -857,23 +1008,42 @@ mod tests {
     #[test]
     fn hiding_the_sole_window_clears_the_focus_pointer() {
         let mut m = WindowManager::new(vec!["1".into()]);
-        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let a = m.add_window(
+            "a",
+            "a",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        );
         assert_eq!(m.focused_window().map(|w| w.id), Some(a));
         m.set_minimized(a, true);
         let seq_before = m.seq();
         assert_eq!(m.refocus_after_hide(m.active_workspace()), None);
-        assert!(m.focused_window().is_none(), "no hidden window may remain focused");
+        assert!(
+            m.focused_window().is_none(),
+            "no hidden window may remain focused"
+        );
         // The reporting boundary must agree: `a`'s own `focused` field --
         // what `to_info`/`snapshot` hand IPC clients like the taskbar -- has
         // to drop too, with exactly one `WindowUpdated{focused:false}`
         // emitted for it, not just the workspace pointer clearing.
-        assert!(!m.get(a).unwrap().focused, "the hidden window's own focused flag must clear too");
+        assert!(
+            !m.get(a).unwrap().focused,
+            "the hidden window's own focused flag must clear too"
+        );
         let emitted_unfocus = m
             .pending_events
             .iter()
             .filter(|e| e.seq > seq_before)
             .any(|e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.focused == Some(false)));
-        assert!(emitted_unfocus, "must emit exactly one WindowUpdated{{focused:false}} for the hidden window");
+        assert!(
+            emitted_unfocus,
+            "must emit exactly one WindowUpdated{{focused:false}} for the hidden window"
+        );
     }
 
     /// I6: after a window is moved away, the workspace it lands on has a
@@ -904,8 +1074,15 @@ mod tests {
         m.set_title(a, "new".into()).unwrap();
         let seqs: Vec<u64> = m.pending_events.iter().map(|e| e.seq).collect();
         assert!(seqs.len() >= 2);
-        assert!(seqs.windows(2).all(|w| w[1] > w[0]), "seqs must strictly increase: {seqs:?}");
-        assert_eq!(*seqs.last().unwrap(), m.seq(), "the last queued event carries the current seq");
+        assert!(
+            seqs.windows(2).all(|w| w[1] > w[0]),
+            "seqs must strictly increase: {seqs:?}"
+        );
+        assert_eq!(
+            *seqs.last().unwrap(),
+            m.seq(),
+            "the last queued event carries the current seq"
+        );
     }
 
     // --- Task 14: the model-level "unmapped" concept ---
@@ -916,8 +1093,28 @@ mod tests {
     #[test]
     fn an_unmapped_window_leaves_visibility_and_alt_tab_but_keeps_its_row() {
         let mut m = WindowManager::new(vec!["1".into()]);
-        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
-        let b = m.add_window("b", "b", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let a = m.add_window(
+            "a",
+            "a",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        );
+        let b = m.add_window(
+            "b",
+            "b",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        );
         assert_eq!(m.set_mapped(b, false), Some(()));
         assert!(!m.get(b).expect("row kept").mapped);
         assert!(!m.alt_tab_entries().contains(&b));
@@ -933,7 +1130,17 @@ mod tests {
     #[test]
     fn set_mapped_emits_exactly_one_window_updated() {
         let mut m = WindowManager::new(vec!["1".into()]);
-        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let a = m.add_window(
+            "a",
+            "a",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        );
         let before = m.seq();
         m.set_mapped(a, false);
         assert_eq!(m.seq(), before + 1, "exactly one emission");
@@ -956,7 +1163,17 @@ mod tests {
     #[test]
     fn set_client_decorations_requested_emits_one_window_updated() {
         let mut m = WindowManager::new(vec!["1".into()]);
-        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let a = m.add_window(
+            "a",
+            "a",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        );
         let before = m.seq();
         m.set_client_decorations_requested(a, Some(true));
         assert_eq!(m.seq(), before + 1, "exactly one emission");
@@ -970,13 +1187,26 @@ mod tests {
     #[test]
     fn set_mapped_payload_carries_mapped() {
         let mut m = WindowManager::new(vec!["1".into()]);
-        let a = m.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 10, height: 10 });
+        let a = m.add_window(
+            "a",
+            "a",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        );
         m.pending_events.clear(); // clear the add's events
         m.set_mapped(a, false);
         let carried = m.pending_events.iter().any(
             |e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.mapped == Some(false)),
         );
-        assert!(carried, "set_mapped's emission must carry update.mapped == Some(false)");
+        assert!(
+            carried,
+            "set_mapped's emission must carry update.mapped == Some(false)"
+        );
     }
 
     /// A2 task 8: `set_attention` emits the additive `attention` field and
@@ -993,10 +1223,21 @@ mod tests {
         let carried = m.pending_events.iter().any(
             |e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.attention == Some(true)),
         );
-        assert!(carried, "set_attention's emission must carry update.attention == Some(true)");
+        assert!(
+            carried,
+            "set_attention's emission must carry update.attention == Some(true)"
+        );
         assert!(m.get(a).unwrap().attention);
-        let info = m.snapshot().windows.into_iter().find(|w| w.id == a).unwrap();
-        assert!(info.attention, "snapshot must reflect the model's attention flag");
+        let info = m
+            .snapshot()
+            .windows
+            .into_iter()
+            .find(|w| w.id == a)
+            .unwrap();
+        assert!(
+            info.attention,
+            "snapshot must reflect the model's attention flag"
+        );
 
         // Setting the same value again is silent, like every other setter here.
         let before = m.seq();
@@ -1027,9 +1268,17 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(updates.len(), 1, "exactly one update for the newly focused window");
+        assert_eq!(
+            updates.len(),
+            1,
+            "exactly one update for the newly focused window"
+        );
         assert_eq!(updates[0].focused, Some(true));
-        assert_eq!(updates[0].attention, Some(false), "the focused update must clear attention");
+        assert_eq!(
+            updates[0].attention,
+            Some(false),
+            "the focused update must clear attention"
+        );
         assert!(!m.get(b).unwrap().focused);
     }
 
@@ -1043,14 +1292,20 @@ mod tests {
     fn focus_of_an_already_focused_window_still_clears_attention() {
         let mut m = mgr();
         let a = m.add_window("a", "a", 1, GEO);
-        assert!(m.get(a).unwrap().focused, "the only window in its workspace holds focus");
+        assert!(
+            m.get(a).unwrap().focused,
+            "the only window in its workspace holds focus"
+        );
         m.set_attention(a, true).unwrap();
         assert!(m.get(a).unwrap().attention);
         m.pending_events.clear();
 
         m.focus(a).unwrap();
 
-        assert!(!m.get(a).unwrap().attention, "re-focusing an already-focused window must clear attention");
+        assert!(
+            !m.get(a).unwrap().attention,
+            "re-focusing an already-focused window must clear attention"
+        );
         let updates: Vec<_> = m
             .pending_events
             .iter()
@@ -1059,9 +1314,22 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(updates.len(), 1, "the clear owes exactly one update, got {updates:?}");
-        assert_eq!(updates[0].attention, Some(false), "the update must carry the attention clear");
-        let info = m.snapshot().windows.into_iter().find(|w| w.id == a).unwrap();
+        assert_eq!(
+            updates.len(),
+            1,
+            "the clear owes exactly one update, got {updates:?}"
+        );
+        assert_eq!(
+            updates[0].attention,
+            Some(false),
+            "the update must carry the attention clear"
+        );
+        let info = m
+            .snapshot()
+            .windows
+            .into_iter()
+            .find(|w| w.id == a)
+            .unwrap();
         assert!(!info.attention, "snapshot must show the cleared flag");
     }
 
@@ -1073,7 +1341,11 @@ mod tests {
         let a = m.add_window("a", "a", 1, GEO);
         m.pending_events.clear();
         m.focus(a).unwrap();
-        assert!(m.pending_events.is_empty(), "a no-op focus must not emit, got {:?}", m.pending_events);
+        assert!(
+            m.pending_events.is_empty(),
+            "a no-op focus must not emit, got {:?}",
+            m.pending_events
+        );
     }
 
     /// Focusing a window that had no attention set must not advertise a

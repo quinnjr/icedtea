@@ -17,7 +17,12 @@ fn window_lifecycle_and_dbus_commands() {
         "org.test.App",
         "App",
         42,
-        Rectangle { x: 0, y: 0, width: 640, height: 400 },
+        Rectangle {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 400,
+        },
     );
     // NOTE (genuine brief-sample bug, fixed here per the plan's standing
     // ruling): `WindowManager::add_window` buffers its event on
@@ -29,7 +34,10 @@ fn window_lifecycle_and_dbus_commands() {
     // it would never observe the event. Draining explicitly here restores
     // the sample's evident intent without changing what's under test.
     state.emit_pending();
-    assert!(matches!(rx.try_recv().map(|e| e.event), Ok(Event::WindowOpened(_))));
+    assert!(matches!(
+        rx.try_recv().map(|e| e.event),
+        Ok(Event::WindowOpened(_))
+    ));
 
     // DBus commands mutate the model.
     state.handle_command(DbCommand::Focus(id)).unwrap();
@@ -50,7 +58,10 @@ fn window_lifecycle_and_dbus_commands() {
 
     state.handle_command(DbCommand::Close(id)).unwrap();
     assert!(state.window_manager.get(id).is_none());
-    assert!(matches!(rx.try_recv().map(|e| e.event), Ok(Event::WindowClosed(_))));
+    assert!(matches!(
+        rx.try_recv().map(|e| e.event),
+        Ok(Event::WindowClosed(_))
+    ));
 }
 
 #[test]
@@ -64,7 +75,15 @@ fn action_dispatch_cover_all_default_actions() {
     // flagged this same gap in a sibling test (see
     // `apply_action_switches_workspaces_and_snaps`'s doc comment); a single
     // output at (0, 0) mirrors that fix.
-    state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
+    state.outputs.insert(
+        0,
+        OutputSurface::new(Rectangle {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }),
+    );
     for action in [
         "close",
         "fullscreen",
@@ -86,8 +105,21 @@ fn action_dispatch_cover_all_default_actions() {
         // first a guaranteed `None`. Re-adding a window every iteration
         // (`add_window` auto-focuses, per `window.rs`) keeps each action
         // dispatchable regardless of what a prior iteration did to it.
-        state.window_manager.add_window("a", "a", 1, Rectangle { x: 0, y: 0, width: 640, height: 400 });
-        assert!(state.apply_action(action).is_some(), "action {action} should dispatch");
+        state.window_manager.add_window(
+            "a",
+            "a",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 400,
+            },
+        );
+        assert!(
+            state.apply_action(action).is_some(),
+            "action {action} should dispatch"
+        );
     }
 }
 
@@ -99,11 +131,27 @@ fn action_dispatch_cover_all_default_actions() {
 fn signals_carry_seq_that_orders_against_the_snapshot() {
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut state = State::new(default_config(), tx);
-    state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
+    state.outputs.insert(
+        0,
+        OutputSurface::new(Rectangle {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }),
+    );
 
-    let id = state
-        .window_manager
-        .add_window("org.test.App", "App", 42, Rectangle { x: 0, y: 0, width: 640, height: 400 });
+    let id = state.window_manager.add_window(
+        "org.test.App",
+        "App",
+        42,
+        Rectangle {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 400,
+        },
+    );
     state.emit_pending();
 
     // The shell's initial GetState().
@@ -118,12 +166,20 @@ fn signals_carry_seq_that_orders_against_the_snapshot() {
     // Everything after it is strictly newer, gapless, and ends exactly where
     // the next snapshot would.
     state.handle_command(DbCommand::Maximize(id, true)).unwrap();
-    state.handle_command(DbCommand::Fullscreen(id, true)).unwrap();
+    state
+        .handle_command(DbCommand::Fullscreen(id, true))
+        .unwrap();
     state.handle_command(DbCommand::SetWorkspace(1)).unwrap();
     let after: Vec<u64> = rx.try_iter().map(|e| e.seq).collect();
     assert!(!after.is_empty());
-    assert!(after[0] > snapshot.seq, "signals after the snapshot must have a higher seq");
-    assert!(after.windows(2).all(|w| w[1] == w[0] + 1), "no gaps within one uninterrupted stream: {after:?}");
+    assert!(
+        after[0] > snapshot.seq,
+        "signals after the snapshot must have a higher seq"
+    );
+    assert!(
+        after.windows(2).all(|w| w[1] == w[0] + 1),
+        "no gaps within one uninterrupted stream: {after:?}"
+    );
     assert_eq!(*after.last().unwrap(), state.window_manager.snapshot().seq);
 }
 
@@ -134,19 +190,55 @@ fn signals_carry_seq_that_orders_against_the_snapshot() {
 fn only_the_active_workspace_is_rendered_and_clickable() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut state = State::new(default_config(), tx);
-    state.outputs.insert(0, OutputSurface::new(Rectangle { x: 0, y: 0, width: 1920, height: 1080 }));
-    let geo = Rectangle { x: 0, y: 0, width: 640, height: 400 };
+    state.outputs.insert(
+        0,
+        OutputSurface::new(Rectangle {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }),
+    );
+    let geo = Rectangle {
+        x: 0,
+        y: 0,
+        width: 640,
+        height: 400,
+    };
     let a = state.window_manager.add_window("a", "a", 1, geo);
     let b = state.window_manager.add_window("b", "b", 2, geo);
 
     state.move_to_workspace(b, 1).unwrap();
     // Workspace 2 is active and holds only `b`.
-    assert_eq!(state.window_manager.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(), vec![b]);
-    assert_eq!(state.window_manager.window_at((10, 10)).map(|w| w.id), Some(b));
+    assert_eq!(
+        state
+            .window_manager
+            .visible_windows()
+            .iter()
+            .map(|w| w.id)
+            .collect::<Vec<_>>(),
+        vec![b]
+    );
+    assert_eq!(
+        state.window_manager.window_at((10, 10)).map(|w| w.id),
+        Some(b)
+    );
 
     state.switch_workspace(0).unwrap();
-    assert_eq!(state.window_manager.visible_windows().iter().map(|w| w.id).collect::<Vec<_>>(), vec![a]);
-    assert_eq!(state.window_manager.window_at((10, 10)).map(|w| w.id), Some(a), "a click can't reach another workspace");
+    assert_eq!(
+        state
+            .window_manager
+            .visible_windows()
+            .iter()
+            .map(|w| w.id)
+            .collect::<Vec<_>>(),
+        vec![a]
+    );
+    assert_eq!(
+        state.window_manager.window_at((10, 10)).map(|w| w.id),
+        Some(a),
+        "a click can't reach another workspace"
+    );
 
     // Minimizing removes the last one from both lists.
     state.handle_command(DbCommand::Minimize(a, true)).unwrap();

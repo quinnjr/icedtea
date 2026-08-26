@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use icedtea_contract::{Rectangle, WindowId};
 use xkbcommon::xkb;
 
-use crate::layout::{snap_zone_for_point, SnapZone};
+use crate::layout::{SnapZone, snap_zone_for_point};
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +20,7 @@ bitflags::bitflags! {
 // format, also consumed by the settings app); re-exported here so every
 // existing caller (`input::key_name_to_keysym`, etc.) keeps compiling
 // unchanged.
-pub use icedtea_config::{key_name_to_keysym, keysym_to_key_name, MODIFIER_TOKENS};
+pub use icedtea_config::{MODIFIER_TOKENS, key_name_to_keysym, keysym_to_key_name};
 
 /// Check every configured binding once, returning a human-readable problem
 /// description per unusable binding: an unrecognized modifier token, or a
@@ -30,7 +30,9 @@ pub use icedtea_config::{key_name_to_keysym, keysym_to_key_name, MODIFIER_TOKENS
 /// lookup, so a typo'd binding spammed the log on every single key press.
 /// `State` calls this at config load and on every reload instead, so each
 /// problem is reported exactly once per config.
-pub fn validate_keybindings(bindings: &HashMap<String, crate::config_combo::KeyCombo>) -> Vec<String> {
+pub fn validate_keybindings(
+    bindings: &HashMap<String, crate::config_combo::KeyCombo>,
+) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
     for (action, combo) in bindings {
         for m in &combo.modifiers {
@@ -157,13 +159,22 @@ pub fn modifiers_for_tokens(tokens: &[String]) -> Modifiers {
 /// names "SUPER", not "the left Super key" specifically.
 pub fn keysym_is_modifier(watched: Modifiers, keysym: u32) -> bool {
     (watched.contains(Modifiers::SUPER)
-        && matches!(keysym, xkb::keysyms::KEY_Super_L | xkb::keysyms::KEY_Super_R))
+        && matches!(
+            keysym,
+            xkb::keysyms::KEY_Super_L | xkb::keysyms::KEY_Super_R
+        ))
         || (watched.contains(Modifiers::CTRL)
-            && matches!(keysym, xkb::keysyms::KEY_Control_L | xkb::keysyms::KEY_Control_R))
+            && matches!(
+                keysym,
+                xkb::keysyms::KEY_Control_L | xkb::keysyms::KEY_Control_R
+            ))
         || (watched.contains(Modifiers::ALT)
             && matches!(keysym, xkb::keysyms::KEY_Alt_L | xkb::keysyms::KEY_Alt_R))
         || (watched.contains(Modifiers::SHIFT)
-            && matches!(keysym, xkb::keysyms::KEY_Shift_L | xkb::keysyms::KEY_Shift_R))
+            && matches!(
+                keysym,
+                xkb::keysyms::KEY_Shift_L | xkb::keysyms::KEY_Shift_R
+            ))
 }
 
 pub struct AltTabMachine {
@@ -180,7 +191,11 @@ impl Default for AltTabMachine {
 
 impl AltTabMachine {
     pub fn new() -> Self {
-        Self { entries: Vec::new(), index: 0, active: false }
+        Self {
+            entries: Vec::new(),
+            index: 0,
+            active: false,
+        }
     }
 
     pub fn start(&mut self, entries: Vec<WindowId>) {
@@ -196,7 +211,11 @@ impl AltTabMachine {
         if next {
             self.index = (self.index + 1) % self.entries.len();
         } else {
-            self.index = if self.index == 0 { self.entries.len() - 1 } else { self.index - 1 };
+            self.index = if self.index == 0 {
+                self.entries.len() - 1
+            } else {
+                self.index - 1
+            };
         }
         self.index
     }
@@ -243,7 +262,11 @@ impl Default for DragMachine {
 
 impl DragMachine {
     pub fn new() -> Self {
-        Self { window_id: None, grab_offset: (0, 0), preview_zone: None }
+        Self {
+            window_id: None,
+            grab_offset: (0, 0),
+            preview_zone: None,
+        }
     }
 
     pub fn begin(&mut self, window_id: WindowId, grab_offset: (i32, i32)) {
@@ -346,12 +369,23 @@ impl ResizeMachine {
         Self {
             window_id: None,
             edges: ResizeEdges::default(),
-            start_geometry: Rectangle { x: 0, y: 0, width: 0, height: 0 },
+            start_geometry: Rectangle {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
             start_pointer: (0, 0),
         }
     }
 
-    pub fn begin(&mut self, window_id: WindowId, edges: ResizeEdges, geometry: Rectangle, pointer: (i32, i32)) {
+    pub fn begin(
+        &mut self,
+        window_id: WindowId,
+        edges: ResizeEdges,
+        geometry: Rectangle,
+        pointer: (i32, i32),
+    ) {
         self.window_id = Some(window_id);
         self.edges = edges;
         self.start_geometry = geometry;
@@ -366,7 +400,10 @@ impl ResizeMachine {
     /// clamped to [`MIN_WINDOW_SIZE`]. `None` when no resize is in progress.
     pub fn geometry_for(&self, pointer: (i32, i32)) -> Option<Rectangle> {
         self.window_id?;
-        let (dx, dy) = (pointer.0 - self.start_pointer.0, pointer.1 - self.start_pointer.1);
+        let (dx, dy) = (
+            pointer.0 - self.start_pointer.0,
+            pointer.1 - self.start_pointer.1,
+        );
         let g = self.start_geometry;
         let (mut x, mut y, mut width, mut height) = (g.x, g.y, g.width, g.height);
         if self.edges.right {
@@ -383,7 +420,12 @@ impl ResizeMachine {
             height = (g.height - dy).max(MIN_WINDOW_SIZE.1);
             y = g.y + g.height - height;
         }
-        Some(Rectangle { x, y, width, height })
+        Some(Rectangle {
+            x,
+            y,
+            width,
+            height,
+        })
     }
 
     /// End the resize, returning the window it applied to (if any).
@@ -400,18 +442,33 @@ mod tests {
 
     fn bindings() -> HashMap<String, KeyCombo> {
         let mut m = HashMap::new();
-        m.insert("close".into(), KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_q".into() });
+        m.insert(
+            "close".into(),
+            KeyCombo {
+                modifiers: vec!["SUPER".into()],
+                key: "KEY_q".into(),
+            },
+        );
         m.insert(
             "cycle:alt_tab".into(),
-            KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_Tab".into() },
+            KeyCombo {
+                modifiers: vec!["SUPER".into()],
+                key: "KEY_Tab".into(),
+            },
         );
         m
     }
 
     #[test]
     fn exact_modifier_match() {
-        assert_eq!(match_action(&bindings(), Modifiers::SUPER, 0x71), Some("close".into()));
-        assert_eq!(match_action(&bindings(), Modifiers::SUPER | Modifiers::SHIFT, 0x71), None);
+        assert_eq!(
+            match_action(&bindings(), Modifiers::SUPER, 0x71),
+            Some("close".into())
+        );
+        assert_eq!(
+            match_action(&bindings(), Modifiers::SUPER | Modifiers::SHIFT, 0x71),
+            None
+        );
     }
 
     #[test]
@@ -426,7 +483,13 @@ mod tests {
         // silently fold to `Modifiers::empty()` -- that would make this
         // binding fire on a bare `KEY_q` with no modifiers at all, or on
         // any other combo that happens to share `wanted == mods`.
-        m.insert("typo".into(), KeyCombo { modifiers: vec!["Sooper".into()], key: "KEY_q".into() });
+        m.insert(
+            "typo".into(),
+            KeyCombo {
+                modifiers: vec!["Sooper".into()],
+                key: "KEY_q".into(),
+            },
+        );
         assert_eq!(match_action(&m, Modifiers::empty(), 0x71), None);
         assert_eq!(match_action(&m, Modifiers::SUPER, 0x71), None);
     }
@@ -441,8 +504,17 @@ mod tests {
     #[test]
     fn letter_bindings_can_match() {
         let mut m = HashMap::new();
-        m.insert("spawn:menu".into(), KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_a".into() });
-        assert_eq!(match_action(&m, Modifiers::SUPER, 0x61), Some("spawn:menu".into()));
+        m.insert(
+            "spawn:menu".into(),
+            KeyCombo {
+                modifiers: vec!["SUPER".into()],
+                key: "KEY_a".into(),
+            },
+        );
+        assert_eq!(
+            match_action(&m, Modifiers::SUPER, 0x61),
+            Some("spawn:menu".into())
+        );
     }
 
     /// I4: problems are reported once, by an explicit validation pass, not
@@ -450,14 +522,47 @@ mod tests {
     #[test]
     fn validate_keybindings_reports_bad_modifier_and_bad_key() {
         let mut m = HashMap::new();
-        m.insert("good".into(), KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_q".into() });
-        m.insert("bad_mod".into(), KeyCombo { modifiers: vec!["Sooper".into()], key: "KEY_q".into() });
-        m.insert("bad_key".into(), KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_nope".into() });
+        m.insert(
+            "good".into(),
+            KeyCombo {
+                modifiers: vec!["SUPER".into()],
+                key: "KEY_q".into(),
+            },
+        );
+        m.insert(
+            "bad_mod".into(),
+            KeyCombo {
+                modifiers: vec!["Sooper".into()],
+                key: "KEY_q".into(),
+            },
+        );
+        m.insert(
+            "bad_key".into(),
+            KeyCombo {
+                modifiers: vec!["SUPER".into()],
+                key: "KEY_nope".into(),
+            },
+        );
         let problems = validate_keybindings(&m);
-        assert_eq!(problems.len(), 2, "one problem per unusable binding: {problems:?}");
-        assert!(problems.iter().any(|p| p.contains("bad_mod") && p.contains("Sooper")));
-        assert!(problems.iter().any(|p| p.contains("bad_key") && p.contains("KEY_nope")));
-        assert!(validate_keybindings(&bindings()).is_empty(), "the default-shaped bindings are clean");
+        assert_eq!(
+            problems.len(),
+            2,
+            "one problem per unusable binding: {problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("bad_mod") && p.contains("Sooper"))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("bad_key") && p.contains("KEY_nope"))
+        );
+        assert!(
+            validate_keybindings(&bindings()).is_empty(),
+            "the default-shaped bindings are clean"
+        );
     }
 
     /// I4: an unresolvable key name must not match a key press whose keysym
@@ -465,8 +570,17 @@ mod tests {
     #[test]
     fn unresolvable_key_name_never_matches() {
         let mut m = HashMap::new();
-        m.insert("typo".into(), KeyCombo { modifiers: vec!["SUPER".into()], key: "KEY_nope".into() });
-        assert_eq!(match_action(&m, Modifiers::SUPER, xkb::keysyms::KEY_NoSymbol), None);
+        m.insert(
+            "typo".into(),
+            KeyCombo {
+                modifiers: vec!["SUPER".into()],
+                key: "KEY_nope".into(),
+            },
+        );
+        assert_eq!(
+            match_action(&m, Modifiers::SUPER, xkb::keysyms::KEY_NoSymbol),
+            None
+        );
     }
 
     // --- Interactive resize (C1 / ledger item 15: xdg `resize_request`) ---
@@ -474,26 +588,75 @@ mod tests {
     #[test]
     fn resize_from_bottom_right_grows_without_moving_the_origin() {
         let mut m = ResizeMachine::new();
-        let geo = Rectangle { x: 100, y: 100, width: 400, height: 300 };
-        m.begin(WindowId(1), ResizeEdges { bottom: true, right: true, ..Default::default() }, geo, (500, 400));
+        let geo = Rectangle {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        m.begin(
+            WindowId(1),
+            ResizeEdges {
+                bottom: true,
+                right: true,
+                ..Default::default()
+            },
+            geo,
+            (500, 400),
+        );
         assert_eq!(
             m.geometry_for((550, 450)),
-            Some(Rectangle { x: 100, y: 100, width: 450, height: 350 })
+            Some(Rectangle {
+                x: 100,
+                y: 100,
+                width: 450,
+                height: 350
+            })
         );
         assert_eq!(m.end(), Some(WindowId(1)));
-        assert_eq!(m.geometry_for((550, 450)), None, "no resize in progress after end()");
+        assert_eq!(
+            m.geometry_for((550, 450)),
+            None,
+            "no resize in progress after end()"
+        );
     }
 
     #[test]
     fn resize_from_top_left_moves_the_origin_and_clamps_to_minimum() {
         let mut m = ResizeMachine::new();
-        let geo = Rectangle { x: 100, y: 100, width: 400, height: 300 };
-        m.begin(WindowId(1), ResizeEdges { top: true, left: true, ..Default::default() }, geo, (100, 100));
-        assert_eq!(m.geometry_for((150, 140)), Some(Rectangle { x: 150, y: 140, width: 350, height: 260 }));
+        let geo = Rectangle {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        m.begin(
+            WindowId(1),
+            ResizeEdges {
+                top: true,
+                left: true,
+                ..Default::default()
+            },
+            geo,
+            (100, 100),
+        );
+        assert_eq!(
+            m.geometry_for((150, 140)),
+            Some(Rectangle {
+                x: 150,
+                y: 140,
+                width: 350,
+                height: 260
+            })
+        );
         // Dragging past the opposite edge clamps instead of inverting.
         let clamped = m.geometry_for((10_000, 10_000)).unwrap();
         assert_eq!((clamped.width, clamped.height), MIN_WINDOW_SIZE);
-        assert_eq!(clamped.x + clamped.width, geo.x + geo.width, "the far edge stays put");
+        assert_eq!(
+            clamped.x + clamped.width,
+            geo.x + geo.width,
+            "the far edge stays put"
+        );
         assert_eq!(clamped.y + clamped.height, geo.y + geo.height);
     }
 
@@ -511,7 +674,12 @@ mod tests {
 
     #[test]
     fn drag_to_edge_snaps() {
-        let output = Rectangle { x: 0, y: 0, width: 1000, height: 800 };
+        let output = Rectangle {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        };
         let mut m = DragMachine::new();
         m.begin(WindowId(1), (10, 10));
         m.motion((2, 400), output, 8);
@@ -521,7 +689,12 @@ mod tests {
 
     #[test]
     fn drag_center_moves() {
-        let output = Rectangle { x: 0, y: 0, width: 1000, height: 800 };
+        let output = Rectangle {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        };
         let mut m = DragMachine::new();
         m.begin(WindowId(1), (10, 10));
         m.motion((500, 400), output, 8);
@@ -531,7 +704,12 @@ mod tests {
 
     #[test]
     fn drag_cancel_restores() {
-        let output = Rectangle { x: 0, y: 0, width: 1000, height: 800 };
+        let output = Rectangle {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        };
         let mut m = DragMachine::new();
         m.begin(WindowId(1), (10, 10));
         m.motion((2, 400), output, 8);
@@ -548,7 +726,10 @@ mod tests {
     #[test]
     fn modifiers_for_tokens_maps_each_token_and_ignores_unknown_ones() {
         assert_eq!(modifiers_for_tokens(&["SUPER".into()]), Modifiers::SUPER);
-        assert_eq!(modifiers_for_tokens(&["ALT".into(), "SHIFT".into()]), Modifiers::ALT | Modifiers::SHIFT);
+        assert_eq!(
+            modifiers_for_tokens(&["ALT".into(), "SHIFT".into()]),
+            Modifiers::ALT | Modifiers::SHIFT
+        );
         assert_eq!(
             modifiers_for_tokens(&["SUPER".into(), "Sooper".into()]),
             Modifiers::SUPER,
@@ -559,16 +740,31 @@ mod tests {
 
     #[test]
     fn keysym_is_modifier_matches_either_physical_key_of_a_watched_modifier() {
-        assert!(keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Super_L));
-        assert!(keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Super_R));
-        assert!(!keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Alt_L), "not a watched modifier");
-        assert!(!keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Tab), "not a modifier key at all");
+        assert!(keysym_is_modifier(
+            Modifiers::SUPER,
+            xkb::keysyms::KEY_Super_L
+        ));
+        assert!(keysym_is_modifier(
+            Modifiers::SUPER,
+            xkb::keysyms::KEY_Super_R
+        ));
+        assert!(
+            !keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Alt_L),
+            "not a watched modifier"
+        );
+        assert!(
+            !keysym_is_modifier(Modifiers::SUPER, xkb::keysyms::KEY_Tab),
+            "not a modifier key at all"
+        );
 
         // A rebound cycle:alt_tab (e.g. ALT+Tab) watches ALT, not SUPER --
         // releasing Super must not be mistaken for releasing the bound
         // modifier.
         assert!(keysym_is_modifier(Modifiers::ALT, xkb::keysyms::KEY_Alt_R));
-        assert!(!keysym_is_modifier(Modifiers::ALT, xkb::keysyms::KEY_Super_L));
+        assert!(!keysym_is_modifier(
+            Modifiers::ALT,
+            xkb::keysyms::KEY_Super_L
+        ));
 
         // A multi-modifier binding watches every one of its modifiers.
         let watched = Modifiers::CTRL | Modifiers::ALT;
