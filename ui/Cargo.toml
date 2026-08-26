@@ -16,7 +16,7 @@ taffy = "0.14"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "event"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

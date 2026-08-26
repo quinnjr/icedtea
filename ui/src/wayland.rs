@@ -5,6 +5,9 @@
 //! already uses (see `harness/src/lib.rs`): no `smithay-client-toolkit`, no
 //! `calloop`.
 
+use std::os::fd::AsFd;
+use std::time::{Duration, Instant};
+
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
@@ -33,6 +36,10 @@ pub enum LayerWindowError {
     Io(std::io::Error),
     /// The event queue failed.
     Dispatch(DispatchError),
+    /// The compositor closed the layer surface before it ever configured it.
+    Closed,
+    /// The compositor did not configure the layer surface in time.
+    Timeout(Duration),
 }
 
 impl std::fmt::Display for LayerWindowError {
@@ -42,6 +49,14 @@ impl std::fmt::Display for LayerWindowError {
             Self::MissingGlobal(name) => write!(f, "compositor did not advertise {name}"),
             Self::Io(e) => write!(f, "shm buffer error: {e}"),
             Self::Dispatch(e) => write!(f, "Wayland dispatch failed: {e}"),
+            Self::Closed => write!(
+                f,
+                "the compositor closed the layer surface before configuring it"
+            ),
+            Self::Timeout(after) => write!(
+                f,
+                "the compositor did not configure the layer surface within {after:?}"
+            ),
         }
     }
 }
@@ -71,6 +86,25 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// A client state with nothing bound yet.
+    fn new(sheet: CompiledSheet, fonts: FontStack, button: Button) -> Self {
+        Self {
+            compositor: None,
+            shm: None,
+            layer_shell: None,
+            seat: None,
+            pointer: None,
+            configured: None,
+            dirty: true,
+            closed: false,
+            pointer_at: None,
+            released: Vec::new(),
+            sheet,
+            fonts,
+            button,
+        }
+    }
+
     /// Recompute state from the pointer, restyling only on an actual change.
     fn update_states(&mut self, hover: bool, active: bool) {
         let current = self.button.states();
@@ -108,6 +142,74 @@ pub struct LayerWindow {
 /// exactly where on the output the button lands.
 pub const MARGIN: i32 = 0;
 
+/// How long [`LayerWindow::open`] waits for the first `configure`.
+///
+/// A compositor that never configures -- or that closes the surface instead
+/// -- used to hang the client forever in an unconditional
+/// `blocking_dispatch` loop.
+pub const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Block until `ready` is satisfied, `closed` arrives, or `timeout` expires.
+///
+/// wayland-client 0.31's own bounded-wait shape: dispatch what is already
+/// queued, `prepare_read` to register interest, then `poll(2)` the
+/// connection fd with the remaining time before reading. No helper thread,
+/// and no `blocking_dispatch` that could outlive the deadline.
+fn wait_bounded(
+    conn: &Connection,
+    queue: &mut EventQueue<AppState>,
+    state: &mut AppState,
+    timeout: Duration,
+    ready: impl Fn(&AppState) -> bool,
+) -> Result<(), LayerWindowError> {
+    use rustix::event::{PollFlags, Timespec};
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        queue
+            .dispatch_pending(state)
+            .map_err(LayerWindowError::Dispatch)?;
+        if state.closed {
+            return Err(LayerWindowError::Closed);
+        }
+        if ready(state) {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(LayerWindowError::Timeout(timeout));
+        }
+        let remaining = deadline - now;
+
+        conn.flush().map_err(flush_error)?;
+        // `None` means this queue already has events to dispatch: go round
+        // rather than block on a socket that has nothing more to say.
+        let Some(guard) = queue.prepare_read() else {
+            continue;
+        };
+
+        let fd = queue.as_fd();
+        let mut fds = [rustix::event::PollFd::new(&fd, PollFlags::IN)];
+        let timespec = Timespec {
+            tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
+            tv_nsec: i64::from(remaining.subsec_nanos()),
+        };
+        match rustix::event::poll(&mut fds, Some(&timespec)) {
+            Ok(0) => return Err(LayerWindowError::Timeout(timeout)),
+            Ok(_) => match guard.read() {
+                Ok(_) => {}
+                // A racing reader on another queue drained the socket.
+                Err(wayland_client::backend::WaylandError::Io(err))
+                    if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => return Err(flush_error(err)),
+            },
+            Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(LayerWindowError::Io(err.into())),
+        }
+    }
+}
+
 impl LayerWindow {
     /// Connect, bind globals, map an overlay layer surface sized to the
     /// button, and paint it once.
@@ -133,21 +235,7 @@ impl LayerWindow {
         let qh = queue.handle();
         display.get_registry(&qh, ());
 
-        let mut state = AppState {
-            compositor: None,
-            shm: None,
-            layer_shell: None,
-            seat: None,
-            pointer: None,
-            configured: None,
-            dirty: true,
-            closed: false,
-            pointer_at: None,
-            released: Vec::new(),
-            sheet,
-            fonts,
-            button,
-        };
+        let mut state = AppState::new(sheet, fonts, button);
         queue
             .roundtrip(&mut state)
             .map_err(LayerWindowError::Dispatch)?;
@@ -188,11 +276,9 @@ impl LayerWindow {
         surface.commit();
         conn.flush().map_err(flush_error)?;
 
-        while state.configured.is_none() {
-            queue
-                .blocking_dispatch(&mut state)
-                .map_err(LayerWindowError::Dispatch)?;
-        }
+        wait_bounded(&conn, &mut queue, &mut state, CONFIGURE_TIMEOUT, |state| {
+            state.configured.is_some()
+        })?;
         tracing::debug!(configured = ?state.configured, "layer surface configured");
         if let Some((configured_width, configured_height)) = state.configured
             && (configured_width != width as u32 || configured_height != height as u32)
@@ -452,3 +538,98 @@ impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for AppState {
     }
 }
 delegate_noop!(AppState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+
+#[cfg(test)]
+mod tests {
+    use super::{AppState, CONFIGURE_TIMEOUT, LayerWindowError, wait_bounded};
+    use crate::BUNDLED_ADWAITA_LIGHT;
+    use crate::css::cascade::CompiledSheet;
+    use crate::css::select::{CssNode, PseudoStates};
+    use crate::text::FontStack;
+    use crate::widget::button::Button;
+    use std::time::{Duration, Instant};
+    use wayland_client::{Connection, EventQueue};
+
+    fn state() -> AppState {
+        let sheet = CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT);
+        let fonts = FontStack::system().expect("system font");
+        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
+        let mut button = Button::new("Click me", &[], window);
+        button.restyle(&sheet, &fonts);
+        AppState::new(sheet, fonts, button)
+    }
+
+    /// A connection to a socket nobody ever writes to: a compositor that
+    /// accepts the client and then says nothing at all.
+    fn silent_connection() -> (
+        Connection,
+        EventQueue<AppState>,
+        std::os::unix::net::UnixStream,
+    ) {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let conn = Connection::from_socket(ours).expect("connection");
+        let queue = conn.new_event_queue();
+        // `theirs` is returned so the peer stays open: dropping it would
+        // make the fd readable (EOF) and turn the test into a race.
+        (conn, queue, theirs)
+    }
+
+    #[test]
+    fn the_configure_wait_is_bounded() {
+        // A4: the wait was `while configured.is_none() { blocking_dispatch }`,
+        // which never returns against a compositor that never configures.
+        let (conn, mut queue, _peer) = silent_connection();
+        let mut state = state();
+        let timeout = Duration::from_millis(150);
+
+        let started = Instant::now();
+        let result = wait_bounded(&conn, &mut queue, &mut state, timeout, |state| {
+            state.configured.is_some()
+        });
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(LayerWindowError::Timeout(after)) if after == timeout),
+            "expected a Timeout, got {result:?}"
+        );
+        assert!(
+            elapsed >= timeout && elapsed < timeout * 20,
+            "the wait took {elapsed:?}, not about {timeout:?}"
+        );
+    }
+
+    #[test]
+    fn a_closed_surface_ends_the_configure_wait_immediately() {
+        let (conn, mut queue, _peer) = silent_connection();
+        let mut state = state();
+        state.closed = true;
+
+        let started = Instant::now();
+        let result = wait_bounded(&conn, &mut queue, &mut state, CONFIGURE_TIMEOUT, |state| {
+            state.configured.is_some()
+        });
+
+        assert!(
+            matches!(result, Err(LayerWindowError::Closed)),
+            "expected Closed, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "`closed` did not short-circuit the wait"
+        );
+    }
+
+    #[test]
+    fn an_already_satisfied_wait_returns_without_polling() {
+        let (conn, mut queue, _peer) = silent_connection();
+        let mut state = state();
+        state.configured = Some((78, 34));
+
+        let started = Instant::now();
+        wait_bounded(&conn, &mut queue, &mut state, CONFIGURE_TIMEOUT, |state| {
+            state.configured.is_some()
+        })
+        .expect("already configured");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+}
