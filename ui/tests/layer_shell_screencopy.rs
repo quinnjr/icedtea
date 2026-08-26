@@ -223,9 +223,20 @@ fn hovering_the_button_repaints_it_in_the_themes_hover_color() {
 }
 
 /// A6 end to end: pressing BTN_LEFT arms `:active`, dragging *off* the
-/// button while still held drops it, and dragging back on **re-arms** it.
-/// The pre-fix client never re-armed, because leaving cleared the only
-/// state it tracked and nothing remembered the mouse button was still down.
+/// button while still held drops it, dragging back on **re-arms** it, and a
+/// release *off* the button ends the press for good. The pre-fix client
+/// never re-armed, because leaving cleared the only state it tracked and
+/// nothing remembered the mouse button was still down.
+///
+/// The release half used to be left to the unit tests, because the
+/// compositor did not honour the Wayland implicit pointer grab: it
+/// re-focused on every motion, so a release delivered after the cursor had
+/// been dragged off the surface went to whatever was under the cursor and
+/// this client never saw it. `wlr` 0.20.27 fixes that in the crate, which
+/// makes the whole gesture assertable end to end -- and makes this the
+/// test that would catch the regression, since a client left believing the
+/// button is still down re-arms `:active` on a *hover* that should only
+/// ever paint `:hover`.
 #[test]
 fn dragging_off_and_back_while_held_re_arms_active() {
     let sample = Sample::derive();
@@ -289,11 +300,39 @@ fn dragging_off_and_back_while_held_re_arms_active() {
          `:active`: {again:?}"
     );
 
-    // The release is left to the unit tests: injecting it after a
-    // grab-crossing drag is not reliably delivered by the harness
-    // compositor, and `held` clearing on release is covered in
-    // `wayland.rs`'s own tests.
+    // Drag off once more and release *there*. The implicit grab means the
+    // release still reaches this surface even though the cursor has left
+    // it -- which is the only way the client can learn the press ended.
+    pointer.motion_absolute(ox, oy, output_w, output_h);
+    pointer.frame();
+    pointer.pump();
+    let off = capture_until(&mut sc, Some(&mut pointer), &sample, |px| {
+        !matches_active(px)
+    });
+    assert!(
+        !matches_active(off),
+        "the second drag off left `:active`: {off:?}"
+    );
+
     pointer.button(BTN_LEFT, false);
     pointer.frame();
     pointer.pump();
+
+    // Move back onto the button with nothing held. It must paint `:hover`,
+    // not `:active`: a client that never saw the release would still think
+    // the button was down and re-arm.
+    pointer.motion_absolute(cx, cy, output_w, output_h);
+    pointer.frame();
+    pointer.pump();
+    let after_release = capture_until(&mut sc, Some(&mut pointer), &sample, matches_hover);
+    assert!(
+        matches_hover(after_release),
+        "after a release off the button, hovering it paints {after_release:?} rather \
+         than `:hover`'s #1c6fd4: the release never reached the client, so it \
+         still believes BTN_LEFT is held"
+    );
+    assert!(
+        !matches_active(after_release),
+        "the button re-armed `:active` on a plain hover: the release was lost"
+    );
 }
