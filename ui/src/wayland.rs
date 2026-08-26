@@ -18,7 +18,7 @@ use skia_rs_safe::core::Color;
 
 use crate::css::cascade::CompiledSheet;
 use crate::css::select::PseudoStates;
-use crate::shm::ShmBuffer;
+use crate::shm::{BufferPool, BufferSlot};
 use crate::text::FontStack;
 use crate::widget::button::Button;
 
@@ -63,6 +63,8 @@ pub struct AppState {
     closed: bool,
     /// Last pointer position in surface coordinates.
     pointer_at: Option<(f64, f64)>,
+    /// Buffer slots the compositor released since the last repaint.
+    released: Vec<BufferSlot>,
     sheet: CompiledSheet,
     fonts: FontStack,
     button: Button,
@@ -97,7 +99,8 @@ pub struct LayerWindow {
     state: AppState,
     surface: wl_surface::WlSurface,
     _layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-    shm_buffer: ShmBuffer,
+    shm: wl_shm::WlShm,
+    buffers: BufferPool,
     skia: Surface,
 }
 
@@ -140,6 +143,7 @@ impl LayerWindow {
             dirty: true,
             closed: false,
             pointer_at: None,
+            released: Vec::new(),
             sheet,
             fonts,
             button,
@@ -208,7 +212,7 @@ impl LayerWindow {
             );
         }
 
-        let shm_buffer = ShmBuffer::new(&shm, &qh, width, height).map_err(LayerWindowError::Io)?;
+        let buffers = BufferPool::new(&shm, &qh, width, height).map_err(LayerWindowError::Io)?;
         let skia = Surface::new_raster_n32_premul(width, height)
             .ok_or_else(|| LayerWindowError::Io(std::io::Error::other("raster surface")))?;
 
@@ -219,29 +223,54 @@ impl LayerWindow {
             state,
             surface,
             _layer_surface: layer_surface,
-            shm_buffer,
+            shm,
+            buffers,
             skia,
         };
         window.repaint()?;
         Ok(window)
     }
 
-    /// Paint the widget, upload it, and commit.
+    /// Paint the widget into a buffer the compositor is not holding, upload
+    /// it, and commit.
+    ///
+    /// A buffer belongs to the compositor from the commit that attaches it
+    /// until its `wl_buffer.release`, so this never writes into a busy one.
+    /// If every buffer is busy and the pool is already at its maximum the
+    /// frame is *deferred*: `dirty` stays set and the next release wakes the
+    /// dispatch loop, which repaints then.
     fn repaint(&mut self) -> Result<(), LayerWindowError> {
-        let (width, height) = self.shm_buffer.size();
+        for slot in std::mem::take(&mut self.state.released) {
+            self.buffers.release(slot);
+        }
+        let Some(index) = self
+            .buffers
+            .acquire(&self.shm, &self.qh)
+            .map_err(LayerWindowError::Io)?
+        else {
+            tracing::debug!(
+                buffers = self.buffers.slots().len(),
+                "every shm buffer is still held by the compositor; deferring the frame"
+            );
+            self.state.dirty = true;
+            return Ok(());
+        };
+
+        let (width, height) = self.buffers.size();
         self.skia.canvas().clear(Color::TRANSPARENT);
         self.state
             .button
             .render(&mut self.skia, (0.0, 0.0), &self.state.fonts);
-        self.shm_buffer
-            .upload(&self.skia)
+        self.buffers
+            .upload(index, &self.skia)
             .map_err(LayerWindowError::Io)?;
-        self.surface.attach(Some(self.shm_buffer.wl_buffer()), 0, 0);
+        self.surface
+            .attach(Some(self.buffers.wl_buffer(index)), 0, 0);
         self.surface.damage_buffer(0, 0, width, height);
         self.surface.commit();
         self.conn.flush().map_err(flush_error)?;
         self.state.dirty = false;
-        tracing::debug!(width, height, "repainted and committed");
+        tracing::debug!(width, height, index, "repainted and committed");
         Ok(())
     }
 
@@ -406,5 +435,20 @@ delegate_noop!(AppState: ignore wl_compositor::WlCompositor);
 delegate_noop!(AppState: ignore wl_surface::WlSurface);
 delegate_noop!(AppState: ignore wl_shm::WlShm);
 delegate_noop!(AppState: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(AppState: ignore wl_buffer::WlBuffer);
+impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for AppState {
+    fn event(
+        state: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        slot: &BufferSlot,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_buffer::Event::Release) {
+            // Queued rather than applied here: the pool lives on
+            // `LayerWindow`, which drains this at the top of every repaint.
+            state.released.push(*slot);
+        }
+    }
+}
 delegate_noop!(AppState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
