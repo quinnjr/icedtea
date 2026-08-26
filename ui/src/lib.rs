@@ -5,6 +5,7 @@
 //! onto a `zwlr_layer_shell_v1` surface. See
 //! `docs/superpowers/specs/2026-08-20-pure-rust-gtk-ui-design.md`.
 
+pub mod app;
 pub mod css;
 pub mod layout;
 pub mod paint;
