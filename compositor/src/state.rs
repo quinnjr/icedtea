@@ -5970,6 +5970,29 @@ impl wlr::SeatHandler for State {
     /// here at all. That includes the locked case: while locked the lock
     /// surface is what holds pointer focus, so its own request (an I-beam in
     /// its password field) arrives and is honored, and nothing else's is.
+    ///
+    /// **The SSD title bar is the non-obvious consequence of that gate.**
+    /// This compositor's server-side decoration is a scene *rect* node
+    /// (`render::draw_frame`), not a `wl_surface` — the client's surface
+    /// begins `TITLE_BAR_HEIGHT` lower, at `decoration::content_rect`. So
+    /// while the pointer sits anywhere on the band, wlroots' pointer focus
+    /// is NULL rather than the window's client: the client is sent
+    /// `wl_pointer.leave` on the way in, the crate's own
+    /// `on_pointer_focus_change` resets the named shape to the default, and
+    /// any `set_shape` that client makes from then on is dropped by the
+    /// crate before it reaches this handler. That is the correct outcome and
+    /// not a gap to work around — a window's client has no business naming
+    /// the cursor for a strip *the compositor* draws and owns the hit
+    /// testing for (`decoration::hit_test`) — but it does mean "my
+    /// `set_shape` did nothing" is expected whenever the pointer is over a
+    /// title bar, and it is why the cursor over the band is whatever this
+    /// compositor last applied rather than whatever the window asked for.
+    ///
+    /// Nothing else this compositor puts on screen behaves that way: xdg
+    /// popups and layer surfaces are real `wl_surface`s, take pointer focus
+    /// normally, and so route their own `set_shape` here like any toplevel.
+    /// `the_ssd_title_bar_drops_a_cursor_shape_request` (in
+    /// `compositor/tests/compat_protocols.rs`) pins all three readings.
     fn request_set_shape(&mut self, device: wlr::CursorShapeDevice, serial: u32, shape: wlr::CursorShape) {
         if !Self::honors_cursor_shape_device(device) {
             tracing::debug!(?device, serial, ?shape, "ignoring cursor-shape request from a non-pointer device");

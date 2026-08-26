@@ -1199,3 +1199,107 @@ fn a_locked_session_refuses_a_client_resize_request() {
     fx.a.detach();
     fx.b.detach();
 }
+
+/// A2 batch-2 follow-up (load-bearing): the compositor's own SSD title bar
+/// takes pointer focus away from every client, so a `cursor-shape-v1`
+/// request made while the pointer sits on the band is dropped by the `wlr`
+/// crate before `State::request_set_shape` ever sees it.
+///
+/// Three readings, in order, on one decorated window:
+///
+/// 1. Pointer in the client's content area, `set_shape(Text)` -> `Text`.
+///    The control: the mechanism works for this client at this moment.
+/// 2. Pointer moved onto the title-bar band -> `Default`. wlroots' pointer
+///    focus becomes NULL (there is no surface there), which is a
+///    `focus_change` and so resets the named shape.
+/// 3. The same client asks for `Text` again, citing the last serial it holds
+///    -> still `Default`, because it no longer holds pointer focus.
+///
+/// Reading 3 is the one that would regress if the crate's 0.20.26 gate were
+/// lost or the band were ever backed by a real surface.
+#[test]
+fn the_ssd_title_bar_drops_a_cursor_shape_request() {
+    let comp = Compositor::spawn();
+    let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
+    let mut client = TestClient::map_decorated_toplevel(&comp.socket, "ssdcursor.app", "ssd");
+    assert!(
+        client.wait_until(|c| c.last_configure().is_some()),
+        "client never configured"
+    );
+    assert!(
+        client.wait_until(|c| c.decoration_mode() == Some(2)),
+        "this test's geometry math assumes the compositor chose server-side decorations"
+    );
+
+    let (ow, oh) = comp.output_size();
+    let geo = comp
+        .snapshot()
+        .windows
+        .into_iter()
+        .next()
+        .expect("mapped window in the model")
+        .geometry;
+    let content = icedtea_compositor::decoration::content_rect(geo, true);
+    let bar = icedtea_compositor::decoration::title_bar_rect(geo);
+
+    // 1. Content area: the client's own `wl_surface` is there, so it holds
+    //    pointer focus and its request is delivered.
+    let inside = (
+        content.x + content.width / 2,
+        content.y + content.height / 2,
+    );
+    vp.motion_absolute(inside.0 as f64, inside.1 as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert!(
+        client.wait_until(|c| c.last_pointer_serial().is_some()),
+        "client never got a pointer serial"
+    );
+    let serial = client
+        .last_pointer_serial()
+        .expect("just asserted this is Some");
+    client.set_cursor_shape(serial, icedtea_harness::CursorShape::Text);
+    assert_eq!(
+        wait_for_cursor_shape(&comp, "Text"),
+        "Text",
+        "control: the client under the pointer must be able to name the cursor"
+    );
+
+    // 2. The band. Left of the button cluster so the probe is a plain
+    //    title-bar pixel, and asserted to be both inside the frame and above
+    //    the client's content rect -- if the decoration metrics ever change,
+    //    this fails loudly rather than silently probing the content area.
+    let on_bar = (bar.x + bar.width / 4, bar.y + bar.height / 2);
+    assert!(
+        geo.contains(on_bar.0, on_bar.1),
+        "the title-bar probe must be inside the window frame"
+    );
+    assert!(
+        on_bar.1 < content.y,
+        "the title-bar probe must be above the client's content rect"
+    );
+    vp.motion_absolute(on_bar.0 as f64, on_bar.1 as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert_eq!(
+        wait_for_cursor_shape(&comp, "Default"),
+        "Default",
+        "moving onto the SSD title bar must drop the shape the client had named"
+    );
+
+    // 3. The same client asks again from the same place it always could.
+    //    A single reading after `settle()`, deliberately not
+    //    `wait_for_cursor_shape`: the value is already "Default", so a
+    //    poll-until-"Default" helper would return on its first sample,
+    //    before the request had been dispatched at all.
+    let last = client
+        .last_pointer_serial()
+        .expect("the client still holds its last pointer serial");
+    client.set_cursor_shape(last, icedtea_harness::CursorShape::Text);
+    comp.settle();
+    assert_eq!(
+        comp.cursor_shape(),
+        "Default",
+        "a client with no pointer focus (the pointer is on the SSD title bar) repainted the seat cursor"
+    );
+
+    client.detach();
+}
