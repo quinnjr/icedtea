@@ -1,17 +1,38 @@
-//! The cascade: which declarations a node actually gets.
+//! The cascade: which declarations a node actually gets, and in what order.
 //!
 //! Origin is not modelled (M1 loads exactly one author sheet), so the sort
 //! key is CSS's remainder: `!important` first, then selector specificity,
-//! then source order. Later wins on a tie, which is what makes a theme's
-//! own overrides work.
+//! then source order, then position within the rule. Later wins on a tie,
+//! which is what makes a theme's own overrides work.
+//!
+//! Two things make this more than a `HashMap<String, String>`:
+//!
+//! * **Shorthands are expanded here** (`super::shorthand`), carrying the
+//!   shorthand's own key, so `border-width: 5px` and a later
+//!   `border: 1px solid` are ordered by the cascade rather than by which
+//!   property the consumer reads first.
+//! * **Runner-ups are kept.** A theme routinely wins a property with a value
+//!   this milestone cannot interpret (`border-radius: 100%`,
+//!   `rgb(from currentColor ...)`). Reverting to the initial value in that
+//!   case throws away a perfectly good declaration that *did* match, so
+//!   `super::computed` walks down the list instead. CSS proper calls an
+//!   uninterpretable computed value "invalid at computed-value time" and
+//!   uses the inherited or initial value; falling back to the next
+//!   applicable declaration is a deliberate M1 divergence, and the safer
+//!   one while the property coverage is this narrow.
 
 use std::collections::HashMap;
 
 use selectors::SelectorList;
+use selectors::context::{
+    MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, QuirksMode, SelectorCaches,
+};
+use selectors::matching::{MatchingContext, matches_selector};
 
 use super::colors::{ColorTable, build_color_table};
 use super::parse::{Declaration, parse_stylesheet};
-use super::select::{CssNode, GtkSelectorImpl, matches, parse_selector_list};
+use super::select::{CssNode, GtkSelectorImpl, parse_selector_list};
+use super::shorthand;
 
 /// A rule whose prelude has been compiled to a selector list.
 #[derive(Debug)]
@@ -40,7 +61,13 @@ impl CompiledSheet {
     /// a real theme's unparseable corners must not take the sheet with them.
     #[must_use]
     pub fn compile(css: &str) -> Self {
-        let sheet = parse_stylesheet(css);
+        Self::from_stylesheet(parse_stylesheet(css))
+    }
+
+    /// Compile an already-parsed sheet -- the form
+    /// [`super::parse::parse_stylesheet_with_base`] produces.
+    #[must_use]
+    pub fn from_stylesheet(sheet: super::parse::Stylesheet) -> Self {
         let colors = build_color_table(&sheet.color_definitions);
         let mut rules = Vec::with_capacity(sheet.rules.len());
         for rule in sheet.rules {
@@ -59,46 +86,116 @@ impl CompiledSheet {
     }
 }
 
-/// The declarations `node` wins, keyed by property name.
+/// Where a declaration sits in the cascade. Ordered worst-to-best, so
+/// `max` is the winner and a descending sort puts the winner first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CascadeKey {
+    /// Whether the declaration carried `!important`.
+    pub important: bool,
+    /// The specificity of the selector that actually matched.
+    pub specificity: u32,
+    /// The rule's index in the sheet.
+    pub source_order: usize,
+    /// The declaration's index within its rule -- the last tiebreak, so the
+    /// later of two declarations in one block wins.
+    pub declaration_order: usize,
+}
+
+/// One declaration that applied to a node, with its place in the cascade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CascadedDecl {
+    /// The declaration's value (a longhand value: shorthands are expanded).
+    pub value: String,
+    /// Where it sits in the cascade.
+    pub key: CascadeKey,
+}
+
+/// Every declaration that applied to a node, per longhand, best first.
+#[derive(Clone, Debug, Default)]
+pub struct CascadedValues {
+    /// Longhand property name -> its declarations, sorted best-first.
+    pub map: HashMap<String, Vec<CascadedDecl>>,
+}
+
+impl CascadedValues {
+    /// Every declaration for `name`, winner first.
+    #[must_use]
+    pub fn candidates(&self, name: &str) -> &[CascadedDecl] {
+        self.map.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// The winning value for `name`, ignoring runner-ups.
+    #[must_use]
+    pub fn winner(&self, name: &str) -> Option<&str> {
+        self.candidates(name)
+            .first()
+            .map(|decl| decl.value.as_str())
+    }
+
+    /// Whether no declaration applied at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// How many distinct longhands applied.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// The declarations `node` wins, keyed by longhand property name.
 ///
 /// Specificity is taken per *selector*, not per rule: a rule whose prelude
 /// is `notebook > header > tabs > arrow, button` contributes the specificity
 /// of whichever of its selectors actually matched.
 #[must_use]
-pub fn cascade(sheet: &CompiledSheet, node: &CssNode) -> HashMap<String, String> {
-    // (important, specificity, source order) -> value, per property.
-    let mut winners: HashMap<String, (bool, u32, usize, String)> = HashMap::new();
+pub fn cascade(sheet: &CompiledSheet, node: &CssNode) -> CascadedValues {
+    // One matching context for the whole sheet: the previous code cloned a
+    // `SelectorList` and built fresh `SelectorCaches` per selector per rule.
+    let mut caches = SelectorCaches::default();
+    let mut context = MatchingContext::new(
+        MatchingMode::Normal,
+        None,
+        &mut caches,
+        QuirksMode::NoQuirks,
+        NeedsSelectorFlags::No,
+        MatchingForInvalidation::No,
+    );
 
+    let mut map: HashMap<String, Vec<CascadedDecl>> = HashMap::new();
     for rule in &sheet.rules {
         let Some(specificity) = rule
             .selectors
             .slice()
             .iter()
-            .filter(|selector| matches(&SelectorList::from_one((*selector).clone()), node))
+            .filter(|selector| matches_selector(selector, 0, None, node, &mut context))
             .map(selectors::parser::Selector::specificity)
             .max()
         else {
             continue;
         };
 
-        for decl in &rule.declarations {
-            let key = (decl.important, specificity, rule.source_order);
-            match winners.get(&decl.name) {
-                // Strictly greater, not `>=`: an equal key can only come from
-                // this same rule, and within one block the later declaration
-                // wins.
-                Some((imp, spec, order, _)) if (*imp, *spec, *order) > key => {}
-                _ => {
-                    winners.insert(decl.name.clone(), (key.0, key.1, key.2, decl.value.clone()));
-                }
+        for (declaration_order, decl) in rule.declarations.iter().enumerate() {
+            let key = CascadeKey {
+                important: decl.important,
+                specificity,
+                source_order: rule.source_order,
+                declaration_order,
+            };
+            for (name, value) in shorthand::expand(&decl.name, &decl.value) {
+                map.entry(name)
+                    .or_default()
+                    .push(CascadedDecl { value, key });
             }
         }
     }
 
-    winners
-        .into_iter()
-        .map(|(name, (_, _, _, value))| (name, value))
-        .collect()
+    for candidates in map.values_mut() {
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.key));
+    }
+    CascadedValues { map }
 }
 
 #[cfg(test)]
@@ -118,30 +215,21 @@ mod tests {
              button { color: red }",
         );
         let node = button(&["suggested-action"], PseudoStates::default());
-        assert_eq!(
-            cascade(&sheet, &node).get("color").map(String::as_str),
-            Some("blue")
-        );
+        assert_eq!(cascade(&sheet, &node).winner("color"), Some("blue"));
     }
 
     #[test]
     fn equal_specificity_falls_back_to_source_order() {
         let sheet = CompiledSheet::compile("button { color: red }\nbutton { color: green }");
         let node = button(&[], PseudoStates::default());
-        assert_eq!(
-            cascade(&sheet, &node).get("color").map(String::as_str),
-            Some("green")
-        );
+        assert_eq!(cascade(&sheet, &node).winner("color"), Some("green"));
     }
 
     #[test]
     fn later_declaration_in_the_same_rule_wins() {
         let sheet = CompiledSheet::compile("button { color: red; color: green }");
         let node = button(&[], PseudoStates::default());
-        assert_eq!(
-            cascade(&sheet, &node).get("color").map(String::as_str),
-            Some("green")
-        );
+        assert_eq!(cascade(&sheet, &node).winner("color"), Some("green"));
     }
 
     #[test]
@@ -151,10 +239,7 @@ mod tests {
              window > button.suggested-action { color: blue }",
         );
         let node = button(&["suggested-action"], PseudoStates::default());
-        assert_eq!(
-            cascade(&sheet, &node).get("color").map(String::as_str),
-            Some("red")
-        );
+        assert_eq!(cascade(&sheet, &node).winner("color"), Some("red"));
     }
 
     #[test]
@@ -168,15 +253,23 @@ mod tests {
     fn adwaita_button_cascade_resolves_the_expected_declarations() {
         let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
         let normal = cascade(&sheet, &button(&[], PseudoStates::default()));
-        assert_eq!(normal.get("border-radius").map(String::as_str), Some("5px"));
-        assert_eq!(normal.get("padding").map(String::as_str), Some("4px 9px"));
-        assert_eq!(normal.get("color").map(String::as_str), Some("#2e3436"));
+        assert_eq!(normal.winner("border-radius"), Some("5px"));
+        // The `padding: 4px 9px` shorthand entered the cascade as longhands.
+        assert_eq!(normal.winner("padding-top"), Some("4px"));
+        assert_eq!(normal.winner("padding-right"), Some("9px"));
+        assert_eq!(normal.winner("padding-bottom"), Some("4px"));
+        assert_eq!(normal.winner("padding-left"), Some("9px"));
         assert_eq!(
-            normal.get("border-color").map(String::as_str),
-            Some("#cdc7c2")
+            normal.winner("padding"),
+            None,
+            "the shorthand itself is gone"
         );
+        assert_eq!(normal.winner("color"), Some("#2e3436"));
+        assert_eq!(normal.winner("border-top-color"), Some("#cdc7c2"));
+        assert_eq!(normal.winner("border-top-width"), Some("1px"));
+        assert_eq!(normal.winner("border-top-style"), Some("solid"));
         assert_eq!(
-            normal.get("background-image").map(String::as_str),
+            normal.winner("background-image"),
             Some("linear-gradient(to top, #f6f5f4 2px, #fbfafa)")
         );
 
@@ -191,7 +284,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            hovered.get("background-image").map(String::as_str),
+            hovered.winner("background-image"),
             Some("linear-gradient(to top, #d6d1cd, #e8e6e3 1px)")
         );
 
@@ -205,22 +298,16 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(
-            active.get("background-image").map(String::as_str),
-            Some("image(#dad6d2)")
-        );
+        assert_eq!(active.winner("background-image"), Some("image(#dad6d2)"));
 
         let suggested = cascade(
             &sheet,
             &button(&["suggested-action"], PseudoStates::default()),
         );
-        assert_eq!(suggested.get("color").map(String::as_str), Some("white"));
+        assert_eq!(suggested.winner("color"), Some("white"));
+        assert_eq!(suggested.winner("border-top-color"), Some("#15539e"));
         assert_eq!(
-            suggested.get("border-color").map(String::as_str),
-            Some("#15539e")
-        );
-        assert_eq!(
-            suggested.get("background-image").map(String::as_str),
+            suggested.winner("background-image"),
             Some("linear-gradient(to top, #2c7fe3 2px, #3584e4)")
         );
     }
@@ -240,5 +327,44 @@ mod tests {
         // `:drop()`) used to fail selector parsing, dropping 62 rules.
         let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
         assert_eq!(sheet.rules.len(), 900);
+    }
+
+    #[test]
+    fn runner_ups_are_kept_in_cascade_order() {
+        // E3: the loser of a cascade used to be discarded outright, so an
+        // uninterpretable winner left `computed` with nothing to fall back on.
+        let sheet = CompiledSheet::compile(
+            "button { color: red }\n             button.x { color: green }\n             button { color: blue !important }",
+        );
+        let values = cascade(&sheet, &button(&["x"], PseudoStates::default()));
+        let candidates = values.candidates("color");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            ["blue", "green", "red"],
+            "candidates must be sorted best-first"
+        );
+        assert!(candidates[0].key.important);
+        assert!(candidates[1].key.specificity > candidates[2].key.specificity);
+        assert_eq!(values.winner("color"), Some("blue"));
+        assert!(values.candidates("nonesuch").is_empty());
+    }
+
+    #[test]
+    fn a_shorthand_carries_its_own_cascade_key_into_its_longhands() {
+        // E1: `border` used to be applied before `border-width` regardless of
+        // which one actually won the cascade.
+        let sheet = CompiledSheet::compile(
+            "button { border-width: 5px }\nbutton { border: 1px solid red }",
+        );
+        let values = cascade(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(values.winner("border-top-width"), Some("1px"));
+        assert_eq!(
+            values.candidates("border-top-width")[1].value,
+            "5px",
+            "the losing longhand is still available as a runner-up"
+        );
     }
 }

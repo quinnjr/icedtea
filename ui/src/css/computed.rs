@@ -10,13 +10,13 @@
 //! `background-image`, either GTK's `image(<color>)` flat-fill extension or
 //! a two-stop `linear-gradient(to top, ...)`.
 
-use std::collections::HashMap;
-
+use cssparser::{Parser, ParserInput, Token};
 use skia_rs_safe::core::Color;
 
-use super::cascade::{CompiledSheet, cascade};
+use super::cascade::{CascadedValues, CompiledSheet, cascade};
 use super::colors::{ColorTable, parse_color_value};
 use super::select::CssNode;
+use super::value::{comma_groups, component_values};
 
 /// One gradient stop: a color and an optional absolute position, measured in
 /// pixels along the gradient line from its origin.
@@ -137,66 +137,49 @@ impl Default for ComputedStyle {
 
 /// Parse a `<length>` in px. Unitless `0` is accepted; other units are not
 /// (M1 has no font/viewport context to resolve `em`/`%` against).
+///
+/// Tokenized rather than string-sliced, so the unit is matched
+/// ASCII-case-insensitively (`5PX`) and `NaNpx`/`infpx` -- which are
+/// identifiers, not dimensions -- cannot slip through.
 fn parse_px(value: &str) -> Option<f32> {
-    let value = value.trim();
-    if let Some(number) = value.strip_suffix("px") {
-        return number.trim().parse::<f32>().ok().filter(|n| n.is_finite());
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let token = parser.next().ok()?.clone();
+    if parser.expect_exhausted().is_err() {
+        return None;
     }
-    let number = value.parse::<f32>().ok().filter(|n| n.is_finite())?;
-    (number == 0.0).then_some(0.0)
+    match token {
+        Token::Dimension {
+            value, ref unit, ..
+        } if unit.eq_ignore_ascii_case("px") => value.is_finite().then_some(value),
+        Token::Number { value: 0.0, .. } => Some(0.0),
+        _ => None,
+    }
 }
 
-/// Split a function call `name(args)` into `(name, args)`.
-fn split_function(value: &str) -> Option<(&str, &str)> {
-    let value = value.trim();
-    let open = value.find('(')?;
-    let inner = value.strip_suffix(')')?;
-    Some((value[..open].trim(), &inner[open + 1..]))
-}
-
-/// Split `args` on top-level commas (parenthesised commas stay together).
-fn split_top_level_commas(args: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut current = String::new();
-    for ch in args.chars() {
-        match ch {
-            '(' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' => {
-                depth = depth.saturating_sub(1);
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                parts.push(current.trim().to_string());
-                current = String::new();
-            }
-            _ => current.push(ch),
+/// A `<line-width>`: a length, or one of CSS's three width keywords.
+fn parse_border_width(value: &str) -> Option<f32> {
+    for (keyword, width) in [("thin", 1.0), ("medium", 3.0), ("thick", 5.0)] {
+        if value.eq_ignore_ascii_case(keyword) {
+            return Some(width);
         }
     }
-    if !current.trim().is_empty() {
-        parts.push(current.trim().to_string());
-    }
-    parts
+    parse_px(value)
 }
 
-/// Parse one `<color> [<length>]` gradient stop.
-fn parse_stop(text: &str, colors: &ColorTable) -> Option<GradientStop> {
-    let text = text.trim();
-    if let Some((color_text, position_text)) = text.rsplit_once(char::is_whitespace)
-        && let Some(position) = parse_px(position_text)
-    {
-        return Some(GradientStop {
-            color: parse_color_value(color_text, colors)?,
-            position_px: Some(position),
-        });
+/// Parse one `<color> [<length>]` gradient stop from its components.
+fn parse_stop(components: &[String], colors: &ColorTable) -> Option<GradientStop> {
+    match components {
+        [color] => Some(GradientStop {
+            color: parse_color_value(color, colors)?,
+            position_px: None,
+        }),
+        [color, position] => Some(GradientStop {
+            color: parse_color_value(color, colors)?,
+            position_px: Some(parse_px(position)?),
+        }),
+        _ => None,
     }
-    Some(GradientStop {
-        color: parse_color_value(text, colors)?,
-        position_px: None,
-    })
 }
 
 /// Parse a `background-image` value into a [`Background`].
@@ -206,39 +189,36 @@ fn parse_stop(text: &str, colors: &ColorTable) -> Option<GradientStop> {
 /// -- radial gradients, `url()`, `-gtk-*` image functions, more than two
 /// stops -- yields `None`, which leaves the `background-color` value (or the
 /// transparent default) in place rather than painting something invented.
+///
+/// Function names and the `to top` keyword are matched
+/// ASCII-case-insensitively, and the direction is compared component-wise so
+/// `to  top` (or a newline between the two words) still matches.
 fn parse_background_image(value: &str, colors: &ColorTable) -> Option<Background> {
-    let (name, args) = split_function(value)?;
-    match name {
-        "image" => Some(Background::Solid(parse_color_value(args, colors)?)),
-        "linear-gradient" => {
-            let parts = split_top_level_commas(args);
-            let [direction, first, second] = parts.as_slice() else {
-                return None;
-            };
-            if direction.trim() != "to top" {
-                return None;
-            }
-            Some(Background::LinearGradientToTop {
-                from: parse_stop(first, colors)?,
-                to: parse_stop(second, colors)?,
-            })
-        }
-        _ => None,
+    let components = component_values(value);
+    let [single] = components.as_slice() else {
+        return None;
+    };
+    let (name, rest) = single.split_once('(')?;
+    let args = rest.strip_suffix(')')?;
+    if name.eq_ignore_ascii_case("image") {
+        return Some(Background::Solid(parse_color_value(args, colors)?));
     }
-}
-
-/// Parse a CSS 1-to-4-value `padding` shorthand into `[top, right, bottom, left]`.
-fn parse_padding(value: &str) -> Option<[f32; 4]> {
-    let parts: Vec<f32> = value
-        .split_whitespace()
-        .map(parse_px)
-        .collect::<Option<Vec<f32>>>()?;
-    Some(match parts.as_slice() {
-        [all] => [*all; 4],
-        [tb, lr] => [*tb, *lr, *tb, *lr],
-        [t, lr, b] => [*t, *lr, *b, *lr],
-        [t, r, b, l] => [*t, *r, *b, *l],
-        _ => return None,
+    if !name.eq_ignore_ascii_case("linear-gradient") {
+        return None;
+    }
+    let groups = comma_groups(args);
+    let [direction, first, second] = groups.as_slice() else {
+        return None;
+    };
+    let [to, top] = direction.as_slice() else {
+        return None;
+    };
+    if !to.eq_ignore_ascii_case("to") || !top.eq_ignore_ascii_case("top") {
+        return None;
+    }
+    Some(Background::LinearGradientToTop {
+        from: parse_stop(first, colors)?,
+        to: parse_stop(second, colors)?,
     })
 }
 
@@ -249,65 +229,116 @@ impl ComputedStyle {
         Self::from_declarations(&cascade(sheet, node), &sheet.colors)
     }
 
-    /// Resolve a set of winning declarations. Separated from [`Self::resolve`]
-    /// so the property logic is testable without a node tree.
+    /// Resolve a node's cascaded declarations. Separated from
+    /// [`Self::resolve`] so the property logic is testable without a node
+    /// tree.
+    ///
+    /// Every property is read through [`pick`], which walks the cascade's
+    /// runner-ups: a winner this milestone cannot interpret
+    /// (`border-radius: 100%`) yields to the next declaration that applied
+    /// instead of reverting to the initial value.
     #[must_use]
-    pub fn from_declarations(declarations: &HashMap<String, String>, colors: &ColorTable) -> Self {
+    pub fn from_declarations(values: &CascadedValues, colors: &ColorTable) -> Self {
         let mut style = Self::default();
-        let get = |name: &str| declarations.get(name).map(String::as_str);
 
-        if let Some(color) = get("color").and_then(|v| parse_color_value(v, colors)) {
+        if let Some(color) = pick(values, "color", |v| parse_color_value(v, colors)) {
             style.color = color;
         }
 
         // `background-color` first, then `background-image` on top: CSS
         // paints the image over the color, and every background M1 supports
         // is fully opaque where it paints at all.
-        if let Some(color) = get("background-color").and_then(|v| parse_color_value(v, colors)) {
+        if let Some(color) = pick(values, "background-color", |v| parse_color_value(v, colors)) {
             style.background = Background::Solid(color);
         }
-        if let Some(value) = get("background-image")
-            && value.trim() != "none"
-            && let Some(background) = parse_background_image(value, colors)
+        if let Some(background) = pick(values, "background-image", |value| {
+            if value.eq_ignore_ascii_case("none") {
+                // `none` is interpretable -- it just leaves the colour alone,
+                // so it must not fall through to a runner-up image.
+                Some(None)
+            } else {
+                parse_background_image(value, colors).map(Some)
+            }
+        })
+        .flatten()
         {
             style.background = background;
         }
 
-        // `border: <width> <style> [<color>]` -- Adwaita writes `1px solid`
-        // with no color and sets `border-color` separately.
-        if let Some(value) = get("border") {
-            for part in value.split_whitespace() {
-                if let Some(width) = parse_px(part) {
-                    style.border_width = width;
-                } else if let Some(color) = parse_color_value(part, colors) {
-                    style.border_color = color;
-                }
-            }
+        // Borders are cascaded per side (`super::shorthand`); M1 paints a
+        // uniform border, so the top side stands for all four. M2 widens
+        // `ComputedStyle` to four sides.
+        if let Some(width) = pick(values, "border-top-width", parse_border_width) {
+            style.border_width = width.max(0.0);
         }
-        if let Some(width) = get("border-width").and_then(parse_px) {
-            style.border_width = width;
+        // A `none`/`hidden` border style forces a used width of 0 -- that is
+        // what makes `border: none` undo an earlier `border: 1px solid`.
+        if let Some(style_keyword) = values.winner("border-top-style")
+            && (style_keyword.eq_ignore_ascii_case("none")
+                || style_keyword.eq_ignore_ascii_case("hidden"))
+        {
+            style.border_width = 0.0;
         }
-        if let Some(color) = get("border-color").and_then(|v| parse_color_value(v, colors)) {
+        if let Some(color) = pick(values, "border-top-color", |v| parse_color_value(v, colors)) {
             style.border_color = color;
         }
-        if let Some(radius) = get("border-radius").and_then(parse_px) {
-            style.border_radius = radius;
+        if let Some(radius) = pick(values, "border-radius", parse_px) {
+            style.border_radius = radius.max(0.0);
         }
-        if let Some(padding) = get("padding").and_then(parse_padding) {
-            style.padding = padding;
+        for (index, name) in [
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(padding) = pick(values, name, parse_px) {
+                style.padding[index] = padding.max(0.0);
+            }
         }
-        if let Some(min_width) = get("min-width").and_then(parse_px) {
-            style.min_width = min_width;
+        if let Some(min_width) = pick(values, "min-width", parse_px) {
+            style.min_width = min_width.max(0.0);
         }
-        if let Some(min_height) = get("min-height").and_then(parse_px) {
-            style.min_height = min_height;
+        if let Some(min_height) = pick(values, "min-height", parse_px) {
+            style.min_height = min_height.max(0.0);
         }
-        if let Some(font_size) = get("font-size").and_then(parse_px) {
-            style.font_size = font_size;
+        if let Some(font_size) = pick(values, "font-size", parse_px) {
+            style.font_size = font_size.max(0.0);
         }
 
         style
     }
+}
+
+/// Read one property, stepping past declarations this engine cannot
+/// interpret.
+///
+/// CSS proper calls an uninterpretable computed value "invalid at
+/// computed-value time" and falls back to the inherited or initial value.
+/// While M1's property coverage is this narrow that would throw away a
+/// perfectly applicable declaration -- Adwaita's `.sidebar-button` would
+/// lose its 5px radius to a `100%` this engine has no percentage context
+/// for -- so the next declaration in cascade order is used instead. The
+/// divergence is logged.
+fn pick<T>(
+    values: &CascadedValues,
+    name: &str,
+    mut parse: impl FnMut(&str) -> Option<T>,
+) -> Option<T> {
+    for (rank, candidate) in values.candidates(name).iter().enumerate() {
+        if let Some(parsed) = parse(&candidate.value) {
+            return Some(parsed);
+        }
+        tracing::debug!(
+            property = name,
+            value = %candidate.value,
+            rank,
+            "uninterpretable declaration; falling back to the next in cascade order"
+        );
+    }
+    None
 }
 
 #[cfg(test)]
@@ -499,5 +530,124 @@ mod tests {
         assert_eq!(s.border_radius, 0.0);
         assert_eq!(s.padding, [0.0; 4]);
         assert_eq!(s.font_size, ComputedStyle::DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn per_side_padding_longhands_override_the_shorthand() {
+        // E1: `padding-left`/`padding-right` were never read, so Adwaita's
+        // `button.image-button` (padding-left/right: 5px over the base
+        // `padding: 4px 9px`) computed as [4, 9, 4, 9].
+        let s = ComputedStyle::resolve(
+            &adwaita(),
+            &button(&["image-button"], PseudoStates::default()),
+        );
+        assert_eq!(s.padding, [4.0, 5.0, 4.0, 5.0]);
+        let t = ComputedStyle::resolve(
+            &adwaita(),
+            &button(&["text-button"], PseudoStates::default()),
+        );
+        assert_eq!(t.padding, [4.0, 16.0, 4.0, 16.0]);
+    }
+
+    #[test]
+    fn border_none_zeroes_the_used_width() {
+        // E1: `border: none` was a no-op, so a flat button kept a 1px border.
+        let sheet = CompiledSheet::compile(
+            "button { border: 1px solid; border-color: red }\n             button.flat { border: none }",
+        );
+        let s = ComputedStyle::resolve(&sheet, &button(&["flat"], PseudoStates::default()));
+        assert_eq!(s.border_width, 0.0);
+    }
+
+    #[test]
+    fn a_function_valued_border_colour_is_not_shredded() {
+        // E1: splitting `border` on whitespace turned `rgb(0 0 0)` into
+        // `0`, which hit the unitless-zero length path and zeroed the width.
+        let sheet = CompiledSheet::compile("button { border: 1px solid rgb(0 0 0) }");
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(s.border_width, 1.0);
+        assert_eq!(s.border_color, Color(0xFF00_0000));
+    }
+
+    #[test]
+    fn the_background_shorthand_is_read() {
+        // E1: `background` was never read at all.
+        let sheet = CompiledSheet::compile("button { background: #112233 }");
+        assert_eq!(
+            ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default())).background,
+            Background::Solid(Color(0xFF11_2233))
+        );
+        let sheet = CompiledSheet::compile("button { background: image(#dad6d2) }");
+        assert_eq!(
+            ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default())).background,
+            Background::Solid(Color(0xFFDA_D6D2))
+        );
+        // The shorthand resets the longhands it does not name.
+        let sheet = CompiledSheet::compile(
+            "button { background-image: image(#dad6d2) }\nbutton { background: #112233 }",
+        );
+        assert_eq!(
+            ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default())).background,
+            Background::Solid(Color(0xFF11_2233))
+        );
+    }
+
+    #[test]
+    fn a_shorthand_and_a_longhand_are_ordered_by_the_cascade_not_by_property_name() {
+        // E1: `from_declarations` applied `border` and then `border-width` in
+        // a fixed order, so the source order between them was ignored.
+        let later_shorthand = CompiledSheet::compile(
+            "button { border-width: 5px }\nbutton { border: 1px solid red }",
+        );
+        assert_eq!(
+            ComputedStyle::resolve(&later_shorthand, &button(&[], PseudoStates::default()))
+                .border_width,
+            1.0
+        );
+        let later_longhand = CompiledSheet::compile(
+            "button { border: 1px solid red }\nbutton { border-width: 5px }",
+        );
+        assert_eq!(
+            ComputedStyle::resolve(&later_longhand, &button(&[], PseudoStates::default()))
+                .border_width,
+            5.0
+        );
+    }
+
+    #[test]
+    fn an_uninterpretable_winner_falls_back_to_the_runner_up() {
+        // E3: Adwaita:1606 `button.sidebar-button { border-radius: 100% }`.
+        // M1 has no percentage lengths, so the winner is uninterpretable and
+        // the next applicable declaration -- the base button's 5px -- is used
+        // instead of silently reverting to the 0 default.
+        let s = ComputedStyle::resolve(
+            &adwaita(),
+            &button(&["sidebar-button"], PseudoStates::default()),
+        );
+        assert_eq!(s.border_radius, 5.0);
+
+        let sheet = CompiledSheet::compile(
+            "button { border-radius: 5px }\nbutton.round { border-radius: 100% }",
+        );
+        assert_eq!(
+            ComputedStyle::resolve(&sheet, &button(&["round"], PseudoStates::default()))
+                .border_radius,
+            5.0
+        );
+    }
+
+    #[test]
+    fn negative_lengths_clamp_to_zero() {
+        // E10: a negative padding or radius painted outside the box.
+        let sheet = CompiledSheet::compile(
+            "button { padding: -4px; border: -1px solid red; border-radius: -5px; \
+             min-width: -1px; min-height: -2px }",
+        );
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(s.padding, [0.0; 4]);
+        assert_eq!(s.border_width, 0.0);
+        assert_eq!(s.border_radius, 0.0);
+        assert_eq!(s.min_width, 0.0);
+        assert_eq!(s.min_height, 0.0);
     }
 }
