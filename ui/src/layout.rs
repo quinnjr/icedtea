@@ -23,6 +23,7 @@
 //! by exactly its padding plus border: Adwaita's "Click me" came out 27 px
 //! high against GTK 4.22's 34, and an empty button 20x27 against 36x34.
 
+use taffy::NodeId;
 use taffy::prelude::{
     AlignItems, AvailableSpace, Display, JustifyContent, Size, Style, TaffyTree, length,
 };
@@ -43,75 +44,127 @@ pub struct Allocation {
     pub label_y: f32,
 }
 
-/// Lay out a button whose label measures `label`.
+/// A reusable two-node `taffy` tree for one button.
 ///
-/// # Panics
+/// The tree is built once and its styles overwritten per layout: a restyle
+/// happens on every `:hover`/`:active` transition, and rebuilding a tree
+/// (two allocations, two node inserts, a fresh arena) for each of those was
+/// pure churn -- taffy is built to be kept and updated.
+pub struct ButtonLayout {
+    tree: TaffyTree<()>,
+    button: NodeId,
+    label: NodeId,
+}
+
+impl Default for ButtonLayout {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ButtonLayout {
+    /// Build the tree. Cheap enough to do once per widget.
+    ///
+    /// # Panics
+    ///
+    /// Only if `taffy` fails to insert a node, which for a two-node tree
+    /// means a bug in `taffy`, not bad input.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut tree: TaffyTree<()> = TaffyTree::new();
+        let label = tree.new_leaf(Style::default()).expect("taffy leaf");
+        let button = tree
+            .new_with_children(Style::default(), &[label])
+            .expect("taffy container");
+        Self {
+            tree,
+            button,
+            label,
+        }
+    }
+
+    /// Lay out a button whose label measures `label`.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if `taffy` itself fails, which for a two-node tree built
+    /// entirely from finite lengths means a bug in this function, not bad
+    /// input.
+    pub fn compute(&mut self, style: &ComputedStyle, label: &TextMetrics) -> Allocation {
+        let [pad_top, pad_right, pad_bottom, pad_left] = style.padding;
+        let border = style.border_width;
+
+        self.tree
+            .set_style(
+                self.label,
+                Style {
+                    size: Size {
+                        width: length(label.width),
+                        height: length(label.line_height),
+                    },
+                    ..Style::default()
+                },
+            )
+            .expect("taffy label style");
+        self.tree
+            .set_style(
+                self.button,
+                Style {
+                    display: Display::Flex,
+                    align_items: Some(AlignItems::CENTER),
+                    justify_content: Some(JustifyContent::CENTER),
+                    // Content-box minimums, converted to the border-box
+                    // minimums taffy wants: see this module's header.
+                    min_size: Size {
+                        width: length(style.min_width + pad_left + pad_right + border * 2.0),
+                        height: length(style.min_height + pad_top + pad_bottom + border * 2.0),
+                    },
+                    padding: taffy::geometry::Rect {
+                        left: length(pad_left),
+                        right: length(pad_right),
+                        top: length(pad_top),
+                        bottom: length(pad_bottom),
+                    },
+                    border: taffy::geometry::Rect {
+                        left: length(border),
+                        right: length(border),
+                        top: length(border),
+                        bottom: length(border),
+                    },
+                    ..Style::default()
+                },
+            )
+            .expect("taffy button style");
+
+        self.tree
+            .compute_layout(
+                self.button,
+                Size {
+                    width: AvailableSpace::MaxContent,
+                    height: AvailableSpace::MaxContent,
+                },
+            )
+            .expect("taffy layout");
+
+        let button = *self.tree.layout(self.button).expect("button layout");
+        let label_layout = *self.tree.layout(self.label).expect("label layout");
+
+        Allocation {
+            width: button.size.width,
+            height: button.size.height,
+            label_x: label_layout.location.x,
+            label_y: label_layout.location.y,
+        }
+    }
+}
+
+/// Lay out one button in a throwaway tree.
 ///
-/// Panics only if `taffy` itself fails, which for a two-node tree built
-/// entirely from finite lengths means a bug in this function, not bad input.
+/// Convenient for one-off callers and tests; a widget that restyles keeps a
+/// [`ButtonLayout`] instead.
 #[must_use]
 pub fn layout_button(style: &ComputedStyle, label: &TextMetrics) -> Allocation {
-    let [pad_top, pad_right, pad_bottom, pad_left] = style.padding;
-    let border = style.border_width;
-
-    let mut tree: TaffyTree<()> = TaffyTree::new();
-    let label_node = tree
-        .new_leaf(Style {
-            size: Size {
-                width: length(label.width),
-                height: length(label.line_height),
-            },
-            ..Style::default()
-        })
-        .expect("taffy leaf");
-    let button_node = tree
-        .new_with_children(
-            Style {
-                display: Display::Flex,
-                align_items: Some(AlignItems::CENTER),
-                justify_content: Some(JustifyContent::CENTER),
-                // Content-box minimums, converted to the border-box
-                // minimums taffy wants: see this module's header.
-                min_size: Size {
-                    width: length(style.min_width + pad_left + pad_right + border * 2.0),
-                    height: length(style.min_height + pad_top + pad_bottom + border * 2.0),
-                },
-                padding: taffy::geometry::Rect {
-                    left: length(pad_left),
-                    right: length(pad_right),
-                    top: length(pad_top),
-                    bottom: length(pad_bottom),
-                },
-                border: taffy::geometry::Rect {
-                    left: length(border),
-                    right: length(border),
-                    top: length(border),
-                    bottom: length(border),
-                },
-                ..Style::default()
-            },
-            &[label_node],
-        )
-        .expect("taffy container");
-
-    tree.compute_layout(
-        button_node,
-        Size {
-            width: AvailableSpace::MaxContent,
-            height: AvailableSpace::MaxContent,
-        },
-    )
-    .expect("taffy layout");
-
-    let button = *tree.layout(button_node).expect("button layout");
-    let label_layout = *tree.layout(label_node).expect("label layout");
-
-    Allocation {
-        width: button.size.width,
-        height: button.size.height,
-        label_x: label_layout.location.x,
-        label_y: label_layout.location.y,
-    }
+    ButtonLayout::new().compute(style, label)
 }
 
 #[cfg(test)]
@@ -198,6 +251,22 @@ mod tests {
         assert_eq!(allocation.height, 17.0);
         assert_eq!(allocation.label_x, 0.0);
         assert_eq!(allocation.label_y, 0.0);
+    }
+
+    #[test]
+    fn one_tree_reused_gives_the_same_answer_as_a_fresh_one() {
+        // A8: the tree is now kept across restyles, so a second layout must
+        // not inherit anything from the first.
+        let mut layout = super::ButtonLayout::new();
+        let tall = layout.compute(&adwaita_like(), &label(200.0, 40.0));
+        let small = layout.compute(&adwaita_like(), &label(0.0, 6.0));
+        assert_eq!(small, layout_button(&adwaita_like(), &label(0.0, 6.0)));
+        assert_eq!(tall, layout_button(&adwaita_like(), &label(200.0, 40.0)));
+        assert_eq!(
+            layout.compute(&adwaita_like(), &label(200.0, 40.0)),
+            tall,
+            "the tree did not go back to the larger layout"
+        );
     }
 
     #[test]

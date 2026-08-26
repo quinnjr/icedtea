@@ -12,16 +12,19 @@ use skia_rs_safe::path::PathBuilder;
 
 use crate::css::computed::{Background, BackgroundClip, ComputedStyle};
 use crate::layout::Allocation;
-use crate::text::FontStack;
+use crate::text::ShapedText;
 
 /// Paint `label` in a button of `allocation` at `origin`, styled by `style`.
+///
+/// The label arrives already shaped: this used to reshape it *and* remeasure
+/// it on every paint, reparsing the face twice per frame for a string that
+/// had not changed.
 pub fn paint_button(
     surface: &mut Surface,
     origin: (f32, f32),
     style: &ComputedStyle,
     allocation: &Allocation,
-    label: &str,
-    fonts: &FontStack,
+    label: Option<&ShapedText>,
 ) {
     let (ox, oy) = origin;
     let radius = style.border_radius;
@@ -119,18 +122,17 @@ pub fn paint_button(
     }
 
     // --- label ----------------------------------------------------------
-    if !label.is_empty()
-        && let Some(blob) = fonts.blob(label, style.font_size)
+    if let Some(label) = label
+        && let Some(blob) = label.blob.as_ref()
     {
-        let metrics = fonts.measure(label, style.font_size);
         let mut paint = Paint::new();
         paint.set_color32(style.color);
         paint.set_style(Style::Fill);
         paint.set_anti_alias(true);
         surface.canvas().draw_text_blob(
-            &blob,
+            blob,
             ox + allocation.label_x,
-            oy + allocation.label_y + metrics.ascent,
+            oy + allocation.label_y + label.metrics.ascent,
             &paint,
         );
     }
@@ -143,7 +145,6 @@ mod tests {
     use crate::css::computed::ComputedStyle;
     use crate::css::select::{CssNode, PseudoStates};
     use crate::layout::Allocation;
-    use crate::text::FontStack;
     use skia_rs_safe::canvas::Surface;
     use skia_rs_safe::core::Color;
 
@@ -153,7 +154,6 @@ mod tests {
         let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
         let node = CssNode::new("button", &[], PseudoStates::default(), Some(window));
         let style = ComputedStyle::resolve(&sheet, &node);
-        let fonts = FontStack::system().expect("no system font found");
         let allocation = Allocation {
             width: 40.0,
             height: 20.0,
@@ -162,7 +162,7 @@ mod tests {
         };
         let mut surface = Surface::new_raster_n32_premul(40, 20).expect("raster surface");
         surface.canvas().clear(Color::TRANSPARENT);
-        paint_button(&mut surface, (0.0, 0.0), &style, &allocation, "", &fonts);
+        paint_button(&mut surface, (0.0, 0.0), &style, &allocation, None);
         surface
     }
 

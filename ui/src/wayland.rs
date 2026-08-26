@@ -415,9 +415,7 @@ impl LayerWindow {
 
         let (width, height) = self.buffers.size();
         self.skia.canvas().clear(Color::TRANSPARENT);
-        self.state
-            .button
-            .render(&mut self.skia, (0.0, 0.0), &self.state.fonts);
+        self.state.button.render(&mut self.skia, (0.0, 0.0));
         self.buffers
             .upload(index, &self.skia)
             .map_err(LayerWindowError::Shm)?;
@@ -447,12 +445,6 @@ impl LayerWindow {
             }
         }
         Ok(())
-    }
-
-    /// The queue handle, for callers that need to create further objects.
-    #[must_use]
-    pub fn queue_handle(&self) -> &QueueHandle<AppState> {
-        &self.qh
     }
 }
 

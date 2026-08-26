@@ -43,10 +43,10 @@ fn fixture(classes: &[&str]) -> (CompiledSheet, FontStack, Button) {
 }
 
 /// Render `button` at the surface origin and return the surface.
-fn render(button: &Button, fonts: &FontStack) -> Surface {
+fn render(button: &Button) -> Surface {
     let mut surface = Surface::new_raster_n32_premul(SURFACE_W, SURFACE_H).expect("raster surface");
     surface.canvas().clear(Color::TRANSPARENT);
-    button.render(&mut surface, (0.0, 0.0), fonts);
+    button.render(&mut surface, (0.0, 0.0));
     surface
 }
 
@@ -118,7 +118,7 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
     );
 
     // --- 2. Pixels: the normal state -----------------------------------
-    let surface = render(&button, &fonts);
+    let surface = render(&button);
 
     // `linear-gradient(to top, #f6f5f4 2px, #fbfafa)`: below the 2px first
     // stop the fill is flat, so the row just inside the bottom border is
@@ -174,7 +174,7 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
     );
     assert_ne!(hovered.background, normal.background);
 
-    let hovered_surface = render(&button, &fonts);
+    let hovered_surface = render(&button);
     // The second stop sits 1px above the bottom edge, so everything above
     // it -- the whole centre -- is flat #e8e6e3.
     assert_eq!(
@@ -202,7 +202,7 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
         Background::Solid(Color(0xFFDA_D6D2)),
         "`button:active`'s image(#dad6d2) did not resolve to a flat fill"
     );
-    let active_surface = render(&button, &fonts);
+    let active_surface = render(&button);
     assert_eq!(
         pixel(&active_surface, bx, cy),
         Color(0xFFDA_D6D2),
@@ -213,7 +213,7 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
 
 #[test]
 fn suggested_action_button_is_adwaitas_accent_blue() {
-    let (_sheet, fonts, button) = fixture(&["suggested-action"]);
+    let (_sheet, _fonts, button) = fixture(&["suggested-action"]);
     let style = *button.style();
     assert_eq!(
         style.background,
@@ -237,7 +237,7 @@ fn suggested_action_button_is_adwaitas_accent_blue() {
         "sampling column 4 is not clear of the label, which starts at {}",
         allocation.label_x
     );
-    let surface = render(&button, &fonts);
+    let surface = render(&button);
     let center = pixel(&surface, 4, (allocation.height / 2.0) as i32);
     // Both stops are within 9/5/1 per channel of `@accent_color` #3584E4,
     // so any point on the gradient is close to it.
@@ -262,9 +262,9 @@ fn an_empty_adwaita_button_is_the_minimum_content_box_plus_its_frame() {
 
 #[test]
 fn the_label_is_actually_drawn() {
-    let (_sheet, fonts, button) = fixture(&[]);
+    let (_sheet, _fonts, button) = fixture(&[]);
     let allocation = button.allocation();
-    let surface = render(&button, &fonts);
+    let surface = render(&button);
 
     // The label is #2e3436 on a near-white background; count pixels
     // markedly darker than the lightest gradient stop inside the content

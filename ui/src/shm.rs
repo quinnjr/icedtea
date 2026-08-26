@@ -139,6 +139,36 @@ impl SlotPool {
     }
 }
 
+/// Read one pixel out of a `wl_shm`-formatted byte buffer as `(r, g, b)`.
+///
+/// The one definition of `wl_shm`'s byte orders in this crate: `Xrgb8888`
+/// and `Argb8888` are little-endian `0xAARRGGBB`, i.e. `B, G, R, A` in
+/// memory, while `Bgr888` is `R, G, B` in memory despite the name. Anything
+/// else, or an out-of-range coordinate, is `None`.
+///
+/// Screencopy captures come back in whichever of these the compositor
+/// chose, so tests that read pixels back share this rather than each
+/// carrying their own copy of the table.
+#[must_use]
+pub fn pixel_rgb(
+    format: wl_shm::Format,
+    bytes: &[u8],
+    stride: u32,
+    x: u32,
+    y: u32,
+) -> Option<(u8, u8, u8)> {
+    let (bpp, order): (usize, [usize; 3]) = match format {
+        wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888 => (4, [2, 1, 0]),
+        wl_shm::Format::Bgr888 => (3, [0, 1, 2]),
+        _ => return None,
+    };
+    let offset = (y as usize)
+        .checked_mul(stride as usize)?
+        .checked_add((x as usize).checked_mul(bpp)?)?;
+    let pixel = bytes.get(offset..offset.checked_add(bpp)?)?;
+    Some((pixel[order[0]], pixel[order[1]], pixel[order[2]]))
+}
+
 /// A memfd-backed `wl_shm` buffer in `Argb8888`.
 pub struct ShmBuffer {
     file: File,
@@ -332,10 +362,13 @@ impl BufferPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{POOL_INITIAL_BUFFERS, POOL_MAX_BUFFERS, Slot, SlotPool, skia_rgba_to_shm_argb};
+    use super::{
+        POOL_INITIAL_BUFFERS, POOL_MAX_BUFFERS, Slot, SlotPool, pixel_rgb, skia_rgba_to_shm_argb,
+    };
     use skia_rs_safe::canvas::Surface;
     use skia_rs_safe::core::{Color, Rect};
     use skia_rs_safe::paint::{Paint, Style};
+    use wayland_client::protocol::wl_shm::Format;
 
     #[test]
     fn rgba_becomes_argb8888_byte_order() {
@@ -374,6 +407,39 @@ mod tests {
         for pixel in dst.chunks_exact(4) {
             assert_eq!(pixel, [0xE4, 0x84, 0x35, 0xFF]);
         }
+    }
+
+    #[test]
+    fn shm_pixels_are_read_back_in_the_right_byte_order() {
+        // Two rows of two pixels, with padding in the stride: reading row 1
+        // proves the stride is honoured, not just the width.
+        let argb = [
+            0xE4u8, 0x84, 0x35, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xAA, 0xBB, 0xCC, //
+            0x11, 0x22, 0x33, 0xFF, 0x44, 0x55, 0x66, 0xFF, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            pixel_rgb(Format::Argb8888, &argb, 11, 0, 0),
+            Some((0x35, 0x84, 0xE4))
+        );
+        assert_eq!(
+            pixel_rgb(Format::Xrgb8888, &argb, 11, 1, 1),
+            Some((0x66, 0x55, 0x44))
+        );
+
+        // Bgr888 is R, G, B in memory, three bytes per pixel.
+        let bgr = [0x35u8, 0x84, 0xE4, 0x01, 0x02, 0x03];
+        assert_eq!(
+            pixel_rgb(Format::Bgr888, &bgr, 6, 1, 0),
+            Some((0x01, 0x02, 0x03))
+        );
+    }
+
+    #[test]
+    fn an_unknown_format_or_an_out_of_range_pixel_reads_none() {
+        let bytes = [0u8; 16];
+        assert_eq!(pixel_rgb(Format::Rgb565, &bytes, 8, 0, 0), None);
+        assert_eq!(pixel_rgb(Format::Argb8888, &bytes, 8, 0, 9), None);
+        assert_eq!(pixel_rgb(Format::Argb8888, &bytes, 8, 4, 0), None);
     }
 
     fn pool() -> SlotPool {

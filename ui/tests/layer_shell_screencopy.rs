@@ -80,23 +80,7 @@ impl Sample {
 }
 
 fn pixel_at(frame: &CapturedFrame, x: u32, y: u32) -> Option<(u8, u8, u8)> {
-    use wayland_client::protocol::wl_shm::Format;
-    // Byte order per the compositor suite's own screencopy tests: Xrgb/Argb
-    // are B, G, R, X in memory; Bgr888 is R, G, B despite the name.
-    let (bpp, order): (usize, [usize; 3]) = match frame.format {
-        Format::Xrgb8888 | Format::Argb8888 => (4, [2, 1, 0]),
-        Format::Bgr888 => (3, [0, 1, 2]),
-        _ => return None,
-    };
-    let offset = y as usize * frame.stride as usize + x as usize * bpp;
-    if offset + 2 >= frame.bytes.len() {
-        return None;
-    }
-    Some((
-        frame.bytes[offset + order[0]],
-        frame.bytes[offset + order[1]],
-        frame.bytes[offset + order[2]],
-    ))
+    icedtea_ui::shm::pixel_rgb(frame.format, &frame.bytes, frame.stride, x, y)
 }
 
 // 12 is a ceiling, not a comfortable margin: at this tolerance the accent

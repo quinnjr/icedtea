@@ -43,6 +43,19 @@ pub struct TextMetrics {
     pub line_height: f32,
 }
 
+/// A shaped label: its blob (empty text shapes to `None`) and its extents.
+///
+/// Shaping is the expensive half of the text path -- it reparses the face,
+/// runs `rustybuzz` and builds a blob -- so a widget shapes once per
+/// (text, size) and keeps this, rather than reshaping on every paint.
+pub struct ShapedText {
+    /// The positioned glyph run, relative to the baseline origin `(0, 0)`.
+    /// `None` for text that produced no glyphs, including `""`.
+    pub blob: Option<TextBlob>,
+    /// The measured extents that layout sizes the label against.
+    pub metrics: TextMetrics,
+}
+
 /// A loaded typeface plus a shaper.
 pub struct FontStack {
     typeface: Arc<Typeface>,
@@ -106,6 +119,19 @@ impl FontStack {
             ascent: -metrics.ascent,
             descent: metrics.descent,
             line_height: metrics.line_height(),
+        }
+    }
+
+    /// Shape and measure `text` in one pass.
+    #[must_use]
+    pub fn shape(&self, text: &str, size_px: f32) -> ShapedText {
+        ShapedText {
+            blob: if text.is_empty() {
+                None
+            } else {
+                self.blob(text, size_px)
+            },
+            metrics: self.measure(text, size_px),
         }
     }
 
@@ -191,6 +217,19 @@ mod tests {
         for pair in run.positions.windows(2) {
             assert!(pair[1].x > pair[0].x, "glyph positions did not advance");
         }
+    }
+
+    #[test]
+    fn shaping_returns_the_blob_and_the_metrics_together() {
+        let stack = FontStack::system().expect("system font");
+        let shaped = stack.shape("Click me", 14.0);
+        assert!(shaped.blob.is_some());
+        assert_eq!(shaped.metrics, stack.measure("Click me", 14.0));
+
+        let empty = stack.shape("", 14.0);
+        assert!(empty.blob.is_none(), "empty text must not build a blob");
+        assert_eq!(empty.metrics.width, 0.0);
+        assert!(empty.metrics.line_height > 0.0);
     }
 
     #[test]
