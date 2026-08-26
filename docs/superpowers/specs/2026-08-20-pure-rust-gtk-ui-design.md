@@ -1,7 +1,9 @@
 # Pure-Rust, GTK-themed Desktop UI — Design
 
 **Date:** 2026-08-20
-**Status:** M1 implemented (see `docs/superpowers/plans/2026-08-25-pure-rust-gtk-m1-proving-slice.md`); M2–M6 proposed
+**Status:** M1 implemented and hardened by two review waves (see
+`docs/superpowers/plans/2026-08-25-pure-rust-gtk-m1-proving-slice.md` and
+`.superpowers/sdd/2026-08-25-pure-rust-gtk-m1-proving-slice/`); M2–M6 proposed
 **Branch:** `rebuild/pure-rust-gtk`
 
 ## Goal
@@ -88,33 +90,45 @@ get their own spec** when reached; this document details M1 and sketches the res
    combinator coverage + cascade + specificity + the `-gtk-*` property set +
    gradients/shadows, tested against real theme files on abstract node trees.
 
-   **Findings from M1 that M2's spec must account for:**
-   - `cascade()` returns `HashMap<String, String>` and loses the cascade key,
-     so shorthand/longhand ordering (`border` vs. `border-width`/
-     `border-color`) cannot be correct — M2 must expand shorthands at
-     cascade time, or return the winning key alongside each value, before
-     adding the `-gtk-*` property set.
-   - `Element` tree gap: `is_empty`, sibling/child accessors, `has_id`,
-     `attr_matches`, `has_custom_state` are constants — real children,
-     sibling order, and nth-index are needed (33 Adwaita rules depend on
-     these).
-   - Functional pseudo-classes `:dir()` (39 lines) / `:drop()` (23 lines) are
-     unparsed — needs `parse_non_ts_functional_pseudo_class` plus a
-     directionality bit on `CssNode`.
-   - Relative colour and `currentColor` are one feature (8 `@define-color`s
-     and 11 rule declarations use
-     `rgb(from currentColor r g b / calc(alpha * …))`); `skia_rs_core::Color::
-     from_css` is comma-only and case-sensitive (rejects CSS4 `rgb(53 132
-     228)` and percentages) — M2 needs its own cssparser-based colour value
-     parser.
-   - `ComputedStyle` is flat/uniform — M2 needs per-side border width/colour
-     and per-corner radii.
+   **Findings from M1 that M2's spec must account for.** The two review
+   waves on the M1 branch closed most of the original list; what is left is
+   marked *open*, and what was fixed is kept only where M2 still inherits a
+   constraint.
+
+   - *Open* — `Element` tree gap: `is_empty`, sibling/child accessors,
+     `has_id`, `attr_matches`, `has_custom_state` are constants; real
+     children, sibling order and nth-index are needed (33 Adwaita rules
+     depend on these).
+   - *Open* — `ComputedStyle` is flat/uniform. The cascade now carries all
+     twelve `border-<side>-<prop>` longhands, but the computed style reads
+     the top side and paints a uniform stroke, and `border-radius` is one
+     scalar. M2 needs per-side border width/colour and per-corner radii;
+     `layout.rs` then takes a per-side border instead of one width.
+   - *Open* — relative colour syntax (`rgb(from currentColor r g b /
+     calc(alpha * …))`, 8 `@define-color`s and 11 rule declarations) is
+     still unresolved; `currentColor` itself is done.
+   - *Open* — RTL: `:dir()` parses and matches a `direction` field on
+     `CssNode`, but nothing ever sets it.
+   - *Open* — the cascade's "fall back to the runner-up when the winner is
+     uninterpretable" rule is an M1 divergence from CSS's
+     invalid-at-computed-value-time. M2 should decide whether to keep it as
+     the property coverage widens.
+   - **Done in M1's review waves** (do not re-plan): shorthand expansion at
+     cascade time with the shorthand's own key; `CascadedValues` keeping
+     runner-ups; inheritance of `color`/`font-size`; a cssparser-based
+     colour parser (CSS Color 4 space syntax, percentages, ASCII-case
+     insensitive, no panics); `@import`; `:dir()`/`:drop()` parsing;
+     `background-clip`; the GTK theme stack (theme + user override);
+     content-box `min-width`/`min-height`; a release-tracked double-buffered
+     `wl_shm` pool; a bounded configure wait; seat-capability loss;
+     BTN_LEFT-only `:active` with press tracking; one caller-owned
+     `SelectorCaches` in `cascade`.
    - Keep: the `Background` enum + `color_at` as the single row-colour
-     authority, `CssNode`'s `Rc` + `with_states`, and the parse/colors/
-     select/cascade/computed module split.
-   - Single-buffered `wl_shm` needs a release-tracked pool once continuous
-     repaint arrives; `cascade`'s per-selector `SelectorCaches` allocs should
-     move to `matches_selector` with one caller-owned context.
+     authority, `CssNode`'s `Rc` + `with_states`, the parse/colors/select/
+     cascade/computed module split, and `ButtonLayout`'s reused `taffy`
+     tree + the `(label, font-size)` shaping cache as the shape every
+     widget should follow.
+
 3. **M3 — Widget toolkit breadth**: the retained widget tree + event/focus model
    + a core widget set (window, headerbar, button, label, box, grid, entry,
    switch, checkbutton, dropdown, scrolledwindow, listview/row, stack,

@@ -25,14 +25,38 @@ cargo run -p icedtea-ui --bin themed-button
 
 Environment:
 
-- `ICEDTEA_UI_THEME` — `bundled`, or a path to a `gtk.css`. Default: the
-  user's installed GTK4 theme (`$XDG_CONFIG_HOME/gtk-4.0/gtk.css`, then
-  `/usr/share/themes/$GTK_THEME/gtk-4.0/gtk.css`, then
-  `/usr/share/themes/Adwaita/gtk-4.0/gtk.css`), falling back to the
-  bundled copy.
+- `ICEDTEA_UI_THEME` — `bundled`, or a path to a `gtk.css`. A path is a
+  **whole theme**, not an override: nothing is layered onto it. Default:
+  the user's own theme stack, below.
 - `ICEDTEA_UI_LABEL` — the button's label.
 - `ICEDTEA_UI_CLASSES` — comma-separated style classes, e.g.
   `suggested-action`.
+
+`--print-allocation` prints the border-box allocation the binary would map
+(`width height label_x label_y`) and exits without touching Wayland; the
+screencopy test derives its sample coordinates from it.
+
+## The theme stack
+
+GTK4 does not have *a* stylesheet, it has a stack. `icedtea-ui` reproduces
+the two layers that matter for a client, using the cascade's own source-order
+rule so the later layer wins ties:
+
+1. **Base theme (GTK priority 200).** `$GTK_THEME`, in GTK's `Name[:variant]`
+   form. `:dark` selects `gtk-dark.css`, anything else `gtk.css`, searched in
+   `~/.themes`, `$XDG_DATA_HOME/themes`, `~/.local/share/themes` and
+   `/usr/share/themes`, each under `<Name>/gtk-4.0/`; a `:dark` request falls
+   back to the theme's `gtk.css` if it has no dark variant. With `$GTK_THEME`
+   unset — or nothing found — the base is the **vendored Adwaita**, which is
+   the right answer anyway: GTK4 carries Adwaita internally rather than on
+   disk.
+2. **User override (GTK priority 800).** `$XDG_CONFIG_HOME/gtk-4.0/gtk.css`,
+   or `$HOME/.config/gtk-4.0/gtk.css` when `XDG_CONFIG_HOME` is unset **or
+   empty**. Its rules are appended after the theme's, so a file that only
+   restyles `headerbar` leaves the rest of the theme intact.
+
+Both layers are parsed with their own directory as the `@import` base, and
+both are named in an `info!` line.
 
 ## CSS engine behaviour
 
@@ -79,6 +103,40 @@ Notes that are load-bearing for anyone reading computed values:
 - **Negative lengths clamp to 0** for padding, border widths, radii and
   minimums.
 
+## Layout, paint and Wayland behaviour
+
+- **`min-width`/`min-height` are content-box minimums**, as they are in GTK
+  (and unlike CSS's own `min-width` on a border-box element):
+
+  ```text
+  content    = max(intrinsic, min)
+  border box = content + padding + border
+  ```
+
+  Adwaita's "Click me" is therefore 78x34 (`max(17, 24) + 4 + 4 + 1 + 1`
+  high) and an empty Adwaita button 36x34 (`max(0, 16) + 9 + 9 + 1 + 1`
+  wide) — the sizes GTK 4.22 allocates. `ButtonLayout` keeps one `taffy`
+  tree and overwrites its styles per restyle.
+- **Labels are shaped once per `(text, font-size)`** and cached on the
+  widget with their metrics; `paint_button` takes the shaped label rather
+  than reshaping it per frame.
+- **The surface is double-buffered.** A `wl_buffer` belongs to the
+  compositor from the commit that attaches it until `wl_buffer.release`, so
+  the pool starts with two buffers, hands out only free ones, grows to three
+  if both are busy, and defers a frame rather than painting into a buffer in
+  use. Buffers, their `wl_shm_pool`s and their memfds are destroyed on drop,
+  as are the `wl_pointer`, the layer surface and the `wl_surface`.
+- **The configure wait is bounded**: 5 s (`wayland::CONFIGURE_TIMEOUT`),
+  via `prepare_read` + `poll(2)` on the queue's fd, returning
+  `LayerWindowError::Timeout`. A `closed` event ends it immediately with
+  `LayerWindowError::Closed`.
+- **Pointer state follows GTK.** Only `BTN_LEFT` presses the widget; the
+  press (`held`) is tracked separately from `:hover`, so dragging off the
+  button drops the paint but not the press and dragging back on re-arms
+  `:active`; a release anywhere ends it. `wl_seat.capabilities` is treated
+  as the seat's whole current set: losing the pointer releases it and clears
+  hover and active, regaining it binds a new one.
+
 ## Tests
 
 ```bash
@@ -92,15 +150,22 @@ cargo test -p icedtea-ui
   instead), a pixel outside `border-radius: 5px` is transparent, and toggling
   `:hover`/`:active` changes both. No compositor needed.
 - `tests/layer_shell_screencopy.rs` proves the Wayland seam against the
-  harness compositor.
+  harness compositor: the button on screen, `:hover` driven by a real
+  pointer, and the press/drag-off/drag-back cycle. It derives its geometry
+  from `themed-button --print-allocation` rather than hardcoding it.
+- `tests/support/mod.rs` holds the shared child reaper, the hermetic
+  `themed-button` command and the allocation probe.
 
 ## Deliberately not covered by M1
 
-More than one widget; full selector and `-gtk-*` property coverage;
-box-shadows, radial gradients, `url()` images; GTK's `alpha()`/`shade()`/
-`mix()` color functions and CSS relative color syntax; icons; animations
-and transitions; accessibility; input methods; fractional scale; the app
-framework. See the spec's M2–M6.
+More than one widget; a real element tree (siblings, children, nth-index);
+full selector and `-gtk-*` property coverage; per-side borders and
+per-corner radii (the cascade carries the longhands, the computed style
+reads the top side); box-shadows, radial gradients, `url()` images; GTK's
+`alpha()`/`shade()`/`mix()` color functions and CSS relative color syntax;
+RTL (`:dir()` matches a field nothing sets); icons; animations and
+transitions; accessibility; input methods; fractional scale; surface
+resize; the app framework. See the spec's M2–M6.
 
 ## Vendored files
 
