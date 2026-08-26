@@ -4487,12 +4487,16 @@ impl State {
     /// session unlocks -- the same hole finding F1 closed for
     /// `request_activate` and click-to-focus.
     ///
-    /// Split out of the two handlers, rather than inlined, so the policy is
-    /// testable: with no `wlr::Runtime` attached both handlers bottom out in
+    /// Split out of the two handlers, rather than inlined, so the policy has
+    /// one name and one definition. It is deliberately *not* unit tested:
+    /// with no `wlr::Runtime` attached both handlers bottom out in
     /// `begin_client_move`'s own `pointer_position` guard (see its doc's
-    /// "finding 6, testing" note), so a unit test cannot tell a refusal
-    /// apart from that pre-existing early return by looking at the grab
-    /// machines.
+    /// "finding 6, testing" note), so a unit test can only ever re-state
+    /// this one-line predicate back to itself -- it stays green with both
+    /// call sites' gates deleted, which is worse than no test. The real
+    /// coverage is the pair of end-to-end tests named on
+    /// [`Self::request_move`] and [`Self::request_resize`], which drive the
+    /// handlers from a real locked session and are mutation-verified red.
     pub(crate) fn client_grab_requests_allowed(&self) -> bool {
         !self.session_locked
     }
@@ -5220,12 +5224,22 @@ impl wlr::ToplevelHandler for State {
     }
 
     /// Re-review: gated on the lock, like `request_activate` and the F1
-    /// click-to-focus path. `begin_client_move`/`begin_client_resize` both
-    /// run `WindowManager::focus` + `sync_focus_change`, so an
+    /// click-to-focus path. `begin_client_move` runs both
+    /// `WindowManager::focus` and `sync_focus_change`, so an
     /// `xdg_toplevel.move` arriving from a background client behind the lock
     /// screen would re-pick who owns the keyboard the instant the session
     /// unlocks -- and start a drag against geometry the user cannot see.
     /// Nothing a hidden client asks for may move focus.
+    ///
+    /// A2 batch-2 follow-up: proven end to end by
+    /// `a_locked_session_refuses_a_client_move_request` (in
+    /// `compositor/tests/compat_protocols.rs`), which drives this handler
+    /// from a real client holding a real implicit pointer grab. Deleting the
+    /// gate below turns it red. The
+    /// `client_grab_requests_allowed`-only unit test could not: with no
+    /// runtime attached, `begin_client_move` returns at its
+    /// `pointer_pressed`/`runtime()`/`window_at_point` guards long before
+    /// `focus`, so a unit test cannot tell a refusal from those.
     fn request_move(&mut self, id: wlr::ToplevelId) {
         if !self.client_grab_requests_allowed() {
             tracing::debug!(?id, "refusing a client move request while the session is locked");
@@ -5237,6 +5251,14 @@ impl wlr::ToplevelHandler for State {
     }
 
     /// Locked-session gate, for the same reason as [`Self::request_move`].
+    ///
+    /// The reason is *nearly* the same: `begin_client_resize` does not
+    /// focus, it only starts a `ResizeMachine` grab. What a hidden client
+    /// gains without this gate is therefore the geometry, not the keyboard
+    /// -- it resizes itself behind the lock screen off pointer motion the
+    /// user believes the lock surface is consuming.
+    /// `a_locked_session_refuses_a_client_resize_request` asserts exactly
+    /// that geometry, since focus would say nothing here.
     fn request_resize(&mut self, id: wlr::ToplevelId, edges: wlr::Edges) {
         if !self.client_grab_requests_allowed() {
             tracing::debug!(?id, ?edges, "refusing a client resize request while the session is locked");
@@ -8866,27 +8888,6 @@ mod tests {
             state.layer_focus,
             Some(panel_id),
             "a refused activate performs no focus assertion, so it must leave layer_focus alone"
-        );
-    }
-
-    /// Re-review (security): `xdg_toplevel.move`/`xdg_toplevel.resize` are
-    /// client-initiated focus assertions -- both begin by focusing the
-    /// window -- so they must be refused while the session is locked, the
-    /// same as `request_activate` (finding F1). The unlocked state is the
-    /// control.
-    #[test]
-    fn a_locked_session_refuses_client_move_and_resize_requests() {
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
-        assert!(
-            state.client_grab_requests_allowed(),
-            "control: an unlocked session honors a client move/resize request"
-        );
-
-        state.session_locked = true;
-        assert!(
-            !state.client_grab_requests_allowed(),
-            "a client behind the lock screen must not be able to start a grab, which would refocus it"
         );
     }
 

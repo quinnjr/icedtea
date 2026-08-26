@@ -898,3 +898,304 @@ fn gamma_control_answers_a_claim_on_the_headless_output() {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// A2 batch-2 follow-ups
+// ---------------------------------------------------------------------------
+
+/// Linux input-event code for the left mouse button -- the only button this
+/// compositor's grab paths act on at all (`State::pointer_button` gates
+/// everything past its own `BTN_LEFT` constant).
+const BTN_LEFT: u32 = 0x110;
+
+/// Two mapped windows, the left button held down over the second of them,
+/// and the keyboard handed back to the first. The fixture both
+/// client-grab-gate tests below start from.
+struct GrabFixture {
+    /// Held so neither client's connection (and so neither window) goes away
+    /// mid-test.
+    a: TestClient,
+    b: TestClient,
+    a_id: icedtea_contract::WindowId,
+    b_id: icedtea_contract::WindowId,
+    /// The serial the seat issued B for the still-held `BTN_LEFT` press --
+    /// the implicit pointer grab `xdg_toplevel.move`/`resize` must cite.
+    serial: u32,
+    /// Where the pointer is parked: inside B, inside nothing else.
+    pointer: (i32, i32),
+}
+
+/// A point inside `target`'s client *content* area that no part of `other`
+/// covers.
+///
+/// Both halves are load-bearing:
+///
+/// * Outside `other`, because `State::window_at_point` is MRU-ordered -- a
+///   point both windows cover answers with whichever one is focused, and
+///   these tests deliberately focus the other one. Cascade placement offsets
+///   the two frames by `layout::cascade_point`'s step, so such a point
+///   always exists.
+/// * Inside `content_rect` rather than the frame, because the SSD title bar
+///   is a scene rect with no `wl_surface` behind it: a pointer parked there
+///   earns the client no `wl_pointer.enter`, and so no serial to cite.
+fn point_inside_only(
+    target: icedtea_contract::Rectangle,
+    target_app_id: &str,
+    other: icedtea_contract::Rectangle,
+) -> (i32, i32) {
+    let ssd = icedtea_compositor::decoration::has_ssd(target_app_id, None, false);
+    let content = icedtea_compositor::decoration::content_rect(target, ssd);
+    let mut y = content.y + 4;
+    while y < content.y + content.height {
+        let mut x = content.x + 4;
+        while x < content.x + content.width {
+            if !other.contains(x, y) {
+                return (x, y);
+            }
+            x += 8;
+        }
+        y += 8;
+    }
+    panic!("no point of {target:?} lies outside {other:?}");
+}
+
+/// Map A and B, park the pointer inside B alone, press and *hold* the left
+/// button there, then hand the keyboard back to A.
+///
+/// The button stays down deliberately: `begin_client_move` and
+/// `begin_client_resize` both refuse outright unless `pointer_pressed` is
+/// true, so a released button would make every assertion below pass for the
+/// wrong reason. The refocus is equally deliberate -- the press itself is
+/// click-to-focus, so without it B would already hold the keyboard and the
+/// refusal half would be vacuous.
+fn grab_fixture(comp: &Compositor, vp: &mut icedtea_harness::VirtualPointerClient) -> GrabFixture {
+    let mut a = TestClient::map_toplevel(&comp.socket, "grab-a.app", "A");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "A never configured"
+    );
+    let mut b = TestClient::map_toplevel(&comp.socket, "grab-b.app", "B");
+    assert!(
+        b.wait_until(|c| c.last_configure().is_some()),
+        "B never configured"
+    );
+
+    let snapshot = comp.snapshot();
+    let find = |app_id: &str| {
+        snapshot
+            .windows
+            .iter()
+            .find(|w| w.app_id == app_id)
+            .unwrap_or_else(|| panic!("{app_id} must be in the model once mapped"))
+    };
+    let (a_id, a_geo) = {
+        let w = find("grab-a.app");
+        (w.id, w.geometry)
+    };
+    let (b_id, b_geo) = {
+        let w = find("grab-b.app");
+        (w.id, w.geometry)
+    };
+
+    let pointer = point_inside_only(b_geo, "grab-b.app", a_geo);
+    let (ow, oh) = comp.output_size();
+    vp.motion_absolute(pointer.0 as f64, pointer.1 as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert!(
+        b.wait_until(|c| c.last_pointer_serial().is_some()),
+        "B never got wl_pointer.enter"
+    );
+    let enter = b.last_pointer_serial().expect("just asserted this is Some");
+
+    vp.button(BTN_LEFT, true);
+    vp.frame();
+    assert!(
+        b.wait_until(|c| c.last_pointer_serial() != Some(enter)),
+        "B never got wl_pointer.button for the press"
+    );
+    let serial = b
+        .last_pointer_serial()
+        .expect("just asserted this changed from the enter serial");
+
+    comp.send(icedtea_compositor::dbus::DbCommand::Focus(a_id));
+    assert!(
+        wait_for_focus(comp, a_id),
+        "A must hold focus before a grab request has anything to protect"
+    );
+
+    GrabFixture {
+        a,
+        b,
+        a_id,
+        b_id,
+        serial,
+        pointer,
+    }
+}
+
+/// The `WindowInfo` for `id`, panicking if it left the model.
+fn window_info(comp: &Compositor, id: icedtea_contract::WindowId) -> icedtea_contract::WindowInfo {
+    comp.snapshot()
+        .windows
+        .into_iter()
+        .find(|w| w.id == id)
+        .unwrap_or_else(|| panic!("{id:?} must still be mapped"))
+}
+
+/// A2 batch-2 follow-up (control): an `xdg_toplevel.move` from the client
+/// that actually owns the held pointer *does* take the keyboard.
+///
+/// This is what makes the locked-session test below non-vacuous. Every
+/// precondition `begin_client_move` checks is satisfied here and there
+/// alike -- the button is down, a runtime exists, the pointer is over the
+/// requesting window -- so the only difference between the two outcomes is
+/// the lock.
+#[test]
+fn a_client_move_request_from_the_pointer_owner_takes_focus() {
+    let comp = Compositor::spawn();
+    let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
+    let mut fx = grab_fixture(&comp, &mut vp);
+
+    fx.b.request_move(fx.serial);
+    assert!(
+        wait_for_focus(&comp, fx.b_id),
+        "an honored xdg_toplevel.move did not focus the requesting window"
+    );
+    assert!(
+        !window_info(&comp, fx.a_id).focused,
+        "focus must have left A"
+    );
+
+    fx.a.detach();
+    fx.b.detach();
+}
+
+/// A2 batch-2 follow-up (load-bearing, security): the locked-session gate on
+/// `xdg_toplevel.move`, driven through the real handler.
+///
+/// The unit test this replaces asserted only `client_grab_requests_allowed()`
+/// -- the pure predicate -- and stayed green with the gate in
+/// `State::request_move` deleted outright. Here a real client with a real,
+/// still-held implicit pointer grab sends a real `xdg_toplevel.move` from
+/// behind the lock screen, and the assertion is on the model's focus:
+/// deleting the gate makes `begin_client_move` run to `WindowManager::focus`
+/// and this test fail.
+#[test]
+fn a_locked_session_refuses_a_client_move_request() {
+    let comp = Compositor::spawn();
+    let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
+    let mut fx = grab_fixture(&comp, &mut vp);
+
+    let mut locker = SessionLockClient::spawn(&comp.socket);
+    locker.lock();
+    assert!(locker.wait_locked(), "session never reported locked");
+    assert!(
+        comp.session_locked(),
+        "compositor is_session_locked() is false"
+    );
+
+    fx.b.request_move(fx.serial);
+    comp.settle();
+
+    assert!(
+        window_info(&comp, fx.a_id).focused,
+        "a client's move request from behind the lock screen moved the keyboard off A"
+    );
+    assert!(
+        !window_info(&comp, fx.b_id).focused,
+        "a client behind the lock screen took focus with xdg_toplevel.move"
+    );
+
+    locker.unlock();
+    assert!(!comp.session_locked(), "still locked after unlock");
+    fx.a.detach();
+    fx.b.detach();
+}
+
+/// A2 batch-2 follow-up (control): an `xdg_toplevel.resize` from the client
+/// that owns the held pointer really does start a resize grab -- proven by
+/// the geometry the model reports after the pointer moves.
+///
+/// Note that `begin_client_resize`, unlike `begin_client_move`, does *not*
+/// focus: it only calls `ResizeMachine::begin`. So the observable effect of
+/// an honored resize request is the grab itself, which is what this asserts.
+#[test]
+fn a_client_resize_request_from_the_pointer_owner_starts_a_grab() {
+    let comp = Compositor::spawn();
+    let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
+    let mut fx = grab_fixture(&comp, &mut vp);
+    let before = window_info(&comp, fx.b_id).geometry;
+
+    fx.b.request_resize(fx.serial, icedtea_harness::ResizeEdge::BottomRight);
+    comp.settle();
+
+    let (ow, oh) = comp.output_size();
+    vp.motion_absolute(
+        (fx.pointer.0 + 60) as f64,
+        (fx.pointer.1 + 40) as f64,
+        ow as u32,
+        oh as u32,
+    );
+    vp.frame();
+    comp.settle();
+
+    let after = window_info(&comp, fx.b_id).geometry;
+    assert_eq!(
+        (after.width, after.height),
+        (before.width + 60, before.height + 40),
+        "an honored bottom-right resize grab must track the pointer exactly"
+    );
+
+    fx.a.detach();
+    fx.b.detach();
+}
+
+/// A2 batch-2 follow-up (load-bearing, security): the locked-session gate on
+/// `xdg_toplevel.resize`, driven through the real handler.
+///
+/// Same argument as [`a_locked_session_refuses_a_client_move_request`], with
+/// the observable swapped for the one `begin_client_resize` actually
+/// produces: with the gate deleted the grab begins, the pointer motion below
+/// is consumed by `ResizeMachine` (which `handle_pointer_motion_with_hit`
+/// serves *before* any lock-aware path), and B's geometry changes behind the
+/// lock screen.
+#[test]
+fn a_locked_session_refuses_a_client_resize_request() {
+    let comp = Compositor::spawn();
+    let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
+    let mut fx = grab_fixture(&comp, &mut vp);
+    let before = window_info(&comp, fx.b_id).geometry;
+
+    let mut locker = SessionLockClient::spawn(&comp.socket);
+    locker.lock();
+    assert!(locker.wait_locked(), "session never reported locked");
+    assert!(
+        comp.session_locked(),
+        "compositor is_session_locked() is false"
+    );
+
+    fx.b.request_resize(fx.serial, icedtea_harness::ResizeEdge::BottomRight);
+    comp.settle();
+
+    let (ow, oh) = comp.output_size();
+    vp.motion_absolute(
+        (fx.pointer.0 + 60) as f64,
+        (fx.pointer.1 + 40) as f64,
+        ow as u32,
+        oh as u32,
+    );
+    vp.frame();
+    comp.settle();
+
+    assert_eq!(
+        window_info(&comp, fx.b_id).geometry,
+        before,
+        "a client behind the lock screen resized itself with xdg_toplevel.resize"
+    );
+
+    locker.unlock();
+    assert!(!comp.session_locked(), "still locked after unlock");
+    fx.a.detach();
+    fx.b.detach();
+}
