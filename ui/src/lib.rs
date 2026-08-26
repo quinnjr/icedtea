@@ -8,7 +8,9 @@
 pub mod css;
 pub mod layout;
 pub mod paint;
+pub mod shm;
 pub mod text;
+pub mod wayland;
 pub mod widget;
 
 /// GTK 4's default light theme, vendored so tests are hermetic.
