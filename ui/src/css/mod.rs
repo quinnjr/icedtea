@@ -3,5 +3,6 @@
 
 pub mod cascade;
 pub mod colors;
+pub mod computed;
 pub mod parse;
 pub mod select;
