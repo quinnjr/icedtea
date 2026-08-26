@@ -279,43 +279,16 @@ impl Compositor {
             runtime
                 .create_output_manager(&display)
                 .expect("zwlr_output_manager_v1");
-            // Same "harness cannot degrade" tone: the A2 batch-1
-            // compat_protocols tests bind these directly (viewporter,
-            // fractional-scale, presentation) or assert their advertisement
-            // (single-pixel-buffer, content-type, xdg-output) and would fail
-            // against globals that were never there. `create_xdg_output_manager`
-            // needs the scene's output layout, so it comes after
-            // `init_graphics` above (already true here); `create_presentation`
-            // needs the backend, and `set_scene_presentation` enforces it must
-            // follow both `init_graphics` and `create_presentation`.
-            runtime.create_viewporter(&display).expect("wp_viewporter");
-            runtime
-                .create_fractional_scale_manager(&display)
-                .expect("wp_fractional_scale_manager_v1");
-            runtime
-                .create_single_pixel_buffer_manager(&display)
-                .expect("wp_single_pixel_buffer_manager_v1");
-            runtime
-                .create_content_type_manager(&display)
-                .expect("wp_content_type_manager_v1");
-            runtime
-                .create_xdg_output_manager(&display)
-                .expect("zxdg_output_manager_v1");
-            runtime.create_presentation(&display, &backend).expect("wp_presentation");
-            runtime.set_scene_presentation().expect("scene presentation wiring");
-            // Same "harness cannot degrade" tone: the A2 batch-2
-            // compat_protocols tests bind all three of these directly.
-            // `create_gamma_control_manager` wires the manager into the
-            // scene, so it needs `init_graphics` above (already true here).
-            runtime
-                .create_cursor_shape_manager(&display)
-                .expect("wp_cursor_shape_manager_v1");
-            runtime
-                .create_xdg_activation_manager(&display)
-                .expect("xdg_activation_v1");
-            runtime
-                .create_gamma_control_manager(&display)
-                .expect("zwlr_gamma_control_manager_v1");
+            // Finding F13: the nine A2 compat globals come from the
+            // compositor crate's own `create_compat_globals`, the very
+            // function `lib.rs::run()` calls -- not a hand-copied list. That
+            // is what makes `a2_batch1_globals_are_advertised` /
+            // `a2_batch2_globals_are_advertised` load-bearing for the real
+            // boot path instead of proving only that the harness advertises
+            // them. Its non-fatal tone is inherited deliberately: those two
+            // tests are the assertion, so a `create_*` that fails here fails
+            // them rather than aborting the test process.
+            icedtea_compositor::create_compat_globals(&runtime, &display, &backend);
             runtime.create_seat(&display, "seat0").expect("seat0");
             // X11 application support. Non-fatal here, unlike the globals
             // above: a host with no `Xwayland` binary is a legitimate CI
