@@ -12,11 +12,13 @@
 #![allow(clippy::result_unit_err)]
 
 pub mod calc;
+pub mod color;
 pub mod keyword;
 pub mod length;
 pub mod timing;
 
 pub use calc::CalcNode;
+pub use color::{ColorCtx, ColorSpace, ColorTable, ColorValue, Rgba};
 pub use keyword::{Keyword, Wide};
 pub use length::{Length, LengthCtx, LengthUnit};
 pub use timing::Time;
