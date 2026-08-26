@@ -4119,6 +4119,27 @@ impl State {
     /// raise a window also be the click that acts on it, matching ordinary
     /// click-to-focus window manager behavior.
     fn handle_pointer_press(&mut self, id: WindowId, pointer: (i32, i32)) -> Option<()> {
+        // Round-2 re-review, same security class as finding F1: while the
+        // session is locked, a pointer press must not touch the model at
+        // all. Everything below this line acts on a window the lock screen
+        // is covering -- it moves model focus (which decides who holds the
+        // keyboard the instant the session unlocks), clears that window's
+        // attention hint via `WindowManager::focus`, and can fire a
+        // decoration action, so a blind click behind the lock screen could
+        // close a window outright.
+        //
+        // Nothing the lock surface needs is gated here. Its input never
+        // reaches this method: wlroots routes pointer events to the lock
+        // surface through the seat itself, and this handler only ever
+        // consults `window_at_point`, which answers from the *model* --
+        // where a lock surface is not a row at all. The compositor's own
+        // seat reconciliation is already lock-gated the same way
+        // (`sync_seat_focus`/`sync_window_to_scene`), so this closes the one
+        // remaining path into the model that a locked session left open.
+        if self.session_locked {
+            tracing::debug!(?id, "ignoring a pointer press on a model window while the session is locked");
+            return None;
+        }
         let previous = self.focused_id();
         self.window_manager.focus(id)?;
         // Re-review finding Important-1: click-to-focus is an explicit
@@ -9202,42 +9223,166 @@ mod tests {
     }
 
     /// Finding F1 (security): `request_activate` must do nothing at all
-    /// while the session is locked -- not honor, and not flag. A hint raised
-    /// behind the lock screen is one the user can neither see nor clear, and
-    /// a honored request would let a background client pick who gets the
-    /// keyboard the instant the session unlocks.
+    /// while the session is locked -- not honor, and not flag. A honored
+    /// request would let a background client pick who gets the keyboard the
+    /// instant the session unlocks; a hint raised behind the lock screen is
+    /// one the user can neither see nor clear until then.
+    ///
+    /// Round-2 re-review: this test used to drive the handler with
+    /// `target: None`, which returns at the `let Some(target) = target else`
+    /// arm with or without the lock gate -- so it asserted nothing about the
+    /// gate at all. It now redeems a **fully honorable** token (`has_seat`,
+    /// requester == the focused window, target mapped and on the active
+    /// workspace) against a real, bound toplevel: precisely the request that
+    /// DOES move focus when unlocked, which the unlocked control at the
+    /// bottom proves. Everything the handler could possibly have done is
+    /// asserted against: focus, the attention bit, and the event stream.
     #[test]
     fn activation_requests_are_ignored_while_the_session_is_locked() {
         use wlr::SeatHandler as _;
-        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let a = state.window_manager.add_window("a", "A", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "B", 2, DEFAULT_GEO);
+        // Real toplevel bindings, so `request_activate`'s `window_for`
+        // lookups resolve and the handler reaches its actual decision.
+        let a_key = crate::wayland::ToplevelKey::for_test(1);
+        let b_key = crate::wayland::ToplevelKey::for_test(2);
+        state.wayland.bind(a, a_key);
+        state.wayland.bind(b, b_key);
+        state.window_manager.focus(a).expect("A must be focusable");
+
+        // The token that WOULD be honored: seat-backed, minted by the
+        // focused window, aimed at a mapped target on the active workspace.
+        let honorable = || wlr::ActivationToken {
+            has_seat: true,
+            serial: 1,
+            requesting_toplevel: Some(wlr::ToplevelId::dangling_nth_for_test(1)),
+        };
+
+        state.session_lock_changed(true);
+        while rx.try_recv().is_ok() {}
+
+        state.request_activate(Some(wlr::ToplevelId::dangling_nth_for_test(2)), honorable());
+
+        assert_eq!(
+            state.focused_id(),
+            Some(a),
+            "a locked session must not let an activation move the model's focus"
+        );
+        assert!(
+            !state.window_manager.get(b).expect("B in model").attention,
+            "the honored branch must not run while locked -- and neither may the refused one"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a locked activation must emit nothing at all; the shell must not see it happen"
+        );
+
+        // The refused shape too: a token with no seat and no requester would
+        // take the attention branch when unlocked, and must not even do that.
+        state.request_activate(
+            Some(wlr::ToplevelId::dangling_nth_for_test(2)),
+            wlr::ActivationToken { has_seat: false, serial: 0, requesting_toplevel: None },
+        );
+        assert!(
+            !state.window_manager.get(b).expect("B in model").attention,
+            "a refused activation must not raise a hint the user cannot see or clear while locked"
+        );
+        assert!(rx.try_recv().is_err(), "the refused branch must emit nothing while locked either");
+
+        // Control: unlocked, the very same honorable token moves focus. This
+        // is what makes every assertion above a claim about the LOCK rather
+        // than about the token being unacceptable on its own merits.
+        state.session_lock_changed(false);
+        state.request_activate(Some(wlr::ToplevelId::dangling_nth_for_test(2)), honorable());
+        assert_eq!(
+            state.focused_id(),
+            Some(b),
+            "control: unlocked, this token is honored -- so the assertions above are about the lock"
+        );
+    }
+
+    /// Finding F1, the Xwayland half: `_NET_ACTIVE_WINDOW` is gated on the
+    /// lock for exactly the same reason, and by the same early return.
+    ///
+    /// The control at the bottom is the attention branch rather than a focus
+    /// move, because an X11 activate never steals (finding F9) -- raising the
+    /// hint is the whole of what this handler can do, so it is the whole of
+    /// what the lock has to suppress.
+    #[test]
+    fn xwayland_activate_requests_are_ignored_while_the_session_is_locked() {
+        use wlr::{SeatHandler as _, ToplevelHandler as _};
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let a = state.window_manager.add_window("a", "A", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "B", 2, DEFAULT_GEO);
+        let sid = wlr::XwaylandSurfaceId::dangling_for_test();
+        state.xwayland_windows.insert(sid, b);
+        state.window_manager.focus(a).expect("A must be focusable");
+
+        state.session_lock_changed(true);
+        while rx.try_recv().is_ok() {}
+
+        state.xwayland_request_activate(sid);
+
+        assert_eq!(state.focused_id(), Some(a), "a locked X11 activate must not move focus");
+        assert!(
+            !state.window_manager.get(b).expect("B in model").attention,
+            "a locked X11 activate must not raise an attention hint either"
+        );
+        assert!(rx.try_recv().is_err(), "a locked X11 activate must emit nothing at all");
+
+        // Control: unlocked, the same request does reach the refusal branch
+        // and flags B -- so the assertions above are about the lock.
+        state.session_lock_changed(false);
+        state.xwayland_request_activate(sid);
+        assert!(
+            state.window_manager.get(b).expect("B in model").attention,
+            "control: unlocked, an X11 activate flags attention"
+        );
+    }
+
+    /// Round-2 re-review (F1's security class): click-to-focus is a model
+    /// mutation and must not run while the session is locked. Without the
+    /// gate, a press routed at a window hidden behind the lock screen moved
+    /// the model's focus -- choosing who receives the keyboard on unlock --
+    /// and cleared that window's attention hint on the way through.
+    #[test]
+    fn a_pointer_press_does_not_move_focus_while_the_session_is_locked() {
+        use wlr::SeatHandler as _;
+        let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
         state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
         let a = state.window_manager.add_window("a", "A", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "B", 2, DEFAULT_GEO);
         state.window_manager.focus(a).expect("A must be focusable");
+        state.window_manager.set_attention(b, true).expect("flag B");
+        // A point inside B's frame, so the press has a real target.
+        let inside_b = (DEFAULT_GEO.x + 5, DEFAULT_GEO.y + DEFAULT_GEO.height / 2);
 
         state.session_lock_changed(true);
-        // A toplevel id this state has never been told about is enough: the
-        // lock gate must return before the id is even resolved, so the
-        // handler cannot reach either branch. Proven by the two assertions
-        // below -- with the gate removed, the `None` target arm logs and
-        // returns, which would ALSO leave these true, so the load-bearing
-        // half is the `b`-targeted call further down.
-        state.request_activate(None, wlr::ActivationToken { has_seat: false, serial: 0, requesting_toplevel: None });
-        assert_eq!(state.focused_id(), Some(a), "focus must not move while locked");
-        assert!(!state.window_manager.get(b).expect("B in model").attention);
+        while rx.try_recv().is_ok() {}
 
-        // The real claim: unlock, flag B through the ordinary refused path,
-        // and confirm the very same call is a no-op while locked.
-        state.session_lock_changed(false);
-        state.raise_attention_if_answerable(b);
-        assert!(state.window_manager.get(b).expect("B in model").attention, "control: B is flaggable");
-        state.window_manager.clear_attention(b);
-        state.session_lock_changed(true);
-        state.raise_attention_if_answerable(b);
+        state.handle_pointer(PointerEvent::Press { id: b, pointer: inside_b });
+
+        assert_eq!(state.focused_id(), Some(a), "a click behind the lock screen must not move focus");
         assert!(
             state.window_manager.get(b).expect("B in model").attention,
-            "raise_attention_if_answerable itself is not lock-gated -- the gate is in the two handlers"
+            "a click behind the lock screen must not clear an attention hint either"
+        );
+        assert!(rx.try_recv().is_err(), "a locked pointer press must emit nothing at all");
+
+        // Control: unlocked, the very same press does focus B and answers
+        // its hint -- so the assertions above are about the lock.
+        state.session_lock_changed(false);
+        state.handle_pointer(PointerEvent::Press { id: b, pointer: inside_b });
+        assert_eq!(state.focused_id(), Some(b), "control: unlocked, the press focuses B");
+        assert!(
+            !state.window_manager.get(b).expect("B in model").attention,
+            "control: unlocked, focusing B answers its attention hint"
         );
     }
 
