@@ -267,11 +267,7 @@ pub fn themed_button(
     theme: &ThemeSource,
 ) -> Result<(CompiledSheet, FontStack, Button), LayerWindowError> {
     let sheet = compile_theme(theme);
-    let fonts = FontStack::system().ok_or_else(|| {
-        LayerWindowError::Io(std::io::Error::other(
-            "no UI typeface found; install dejavu, liberation or noto sans",
-        ))
-    })?;
+    let fonts = FontStack::system().ok_or(LayerWindowError::NoFont)?;
     let mut button = button_node(label, classes);
     button.restyle(&sheet, &fonts);
     Ok((sheet, fonts, button))

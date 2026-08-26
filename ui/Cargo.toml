@@ -14,7 +14,6 @@ selectors = "0.40"
 precomputed-hash = "0.1"
 taffy = "0.14"
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 rustix = { version = "1", features = ["fs", "event"] }
 tracing.workspace = true

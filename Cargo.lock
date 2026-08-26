@@ -1640,10 +1640,10 @@ dependencies = [
  "selectors",
  "skia-rs-safe",
  "taffy",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "wayland-client",
- "wayland-protocols",
  "wayland-protocols-wlr",
 ]
 

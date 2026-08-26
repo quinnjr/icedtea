@@ -33,8 +33,14 @@ pub enum LayerWindowError {
     Connect(ConnectError),
     /// The compositor never advertised a global the client requires.
     MissingGlobal(&'static str),
-    /// shm buffer allocation, upload, or a socket flush failed.
-    Io(std::io::Error),
+    /// Allocating or uploading a `wl_shm` buffer failed.
+    Shm(std::io::Error),
+    /// The Wayland socket itself failed: a flush, a poll, or a read.
+    Socket(std::io::Error),
+    /// A Skia surface could not be allocated.
+    Render(&'static str),
+    /// No usable UI typeface is installed.
+    NoFont,
     /// The event queue failed.
     Dispatch(DispatchError),
     /// The compositor closed the layer surface before it ever configured it.
@@ -48,7 +54,13 @@ impl std::fmt::Display for LayerWindowError {
         match self {
             Self::Connect(e) => write!(f, "cannot connect to the Wayland display: {e}"),
             Self::MissingGlobal(name) => write!(f, "compositor did not advertise {name}"),
-            Self::Io(e) => write!(f, "shm buffer error: {e}"),
+            Self::Shm(e) => write!(f, "cannot allocate or upload the shm buffer: {e}"),
+            Self::Socket(e) => write!(f, "the Wayland socket failed: {e}"),
+            Self::Render(what) => write!(f, "cannot allocate {what}"),
+            Self::NoFont => write!(
+                f,
+                "no UI typeface found; install dejavu, liberation or noto sans"
+            ),
             Self::Dispatch(e) => write!(f, "Wayland dispatch failed: {e}"),
             Self::Closed => write!(
                 f,
@@ -62,7 +74,20 @@ impl std::fmt::Display for LayerWindowError {
     }
 }
 
-impl std::error::Error for LayerWindowError {}
+impl std::error::Error for LayerWindowError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect(e) => Some(e),
+            Self::Shm(e) | Self::Socket(e) => Some(e),
+            Self::Dispatch(e) => Some(e),
+            Self::MissingGlobal(_)
+            | Self::Render(_)
+            | Self::NoFont
+            | Self::Closed
+            | Self::Timeout(_) => None,
+        }
+    }
+}
 
 /// Client state: bound globals, pointer position, and the widget.
 pub struct AppState {
@@ -174,7 +199,7 @@ pub struct LayerWindow {
     qh: QueueHandle<AppState>,
     state: AppState,
     surface: wl_surface::WlSurface,
-    _layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     shm: wl_shm::WlShm,
     buffers: BufferPool,
     skia: Surface,
@@ -228,7 +253,7 @@ fn wait_bounded(
         }
         let remaining = deadline - now;
 
-        conn.flush().map_err(flush_error)?;
+        conn.flush().map_err(socket_error)?;
         // `None` means this queue already has events to dispatch: go round
         // rather than block on a socket that has nothing more to say.
         let Some(guard) = queue.prepare_read() else {
@@ -248,10 +273,10 @@ fn wait_bounded(
                 // A racing reader on another queue drained the socket.
                 Err(wayland_client::backend::WaylandError::Io(err))
                     if err.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(err) => return Err(flush_error(err)),
+                Err(err) => return Err(socket_error(err)),
             },
             Err(rustix::io::Errno::INTR) => {}
-            Err(err) => return Err(LayerWindowError::Io(err.into())),
+            Err(err) => return Err(LayerWindowError::Socket(err.into())),
         }
     }
 }
@@ -320,7 +345,7 @@ impl LayerWindow {
         layer_surface
             .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
         surface.commit();
-        conn.flush().map_err(flush_error)?;
+        conn.flush().map_err(socket_error)?;
 
         wait_bounded(&conn, &mut queue, &mut state, CONFIGURE_TIMEOUT, |state| {
             state.configured.is_some()
@@ -344,9 +369,9 @@ impl LayerWindow {
             );
         }
 
-        let buffers = BufferPool::new(&shm, &qh, width, height).map_err(LayerWindowError::Io)?;
+        let buffers = BufferPool::new(&shm, &qh, width, height).map_err(LayerWindowError::Shm)?;
         let skia = Surface::new_raster_n32_premul(width, height)
-            .ok_or_else(|| LayerWindowError::Io(std::io::Error::other("raster surface")))?;
+            .ok_or(LayerWindowError::Render("the raster surface to paint into"))?;
 
         let mut window = Self {
             conn,
@@ -354,7 +379,7 @@ impl LayerWindow {
             qh,
             state,
             surface,
-            _layer_surface: layer_surface,
+            layer_surface,
             shm,
             buffers,
             skia,
@@ -378,7 +403,7 @@ impl LayerWindow {
         let Some(index) = self
             .buffers
             .acquire(&self.shm, &self.qh)
-            .map_err(LayerWindowError::Io)?
+            .map_err(LayerWindowError::Shm)?
         else {
             tracing::debug!(
                 buffers = self.buffers.slots().len(),
@@ -395,12 +420,12 @@ impl LayerWindow {
             .render(&mut self.skia, (0.0, 0.0), &self.state.fonts);
         self.buffers
             .upload(index, &self.skia)
-            .map_err(LayerWindowError::Io)?;
+            .map_err(LayerWindowError::Shm)?;
         self.surface
             .attach(Some(self.buffers.wl_buffer(index)), 0, 0);
         self.surface.damage_buffer(0, 0, width, height);
         self.surface.commit();
-        self.conn.flush().map_err(flush_error)?;
+        self.conn.flush().map_err(socket_error)?;
         self.state.dirty = false;
         tracing::debug!(width, height, index, "repainted and committed");
         Ok(())
@@ -431,13 +456,31 @@ impl LayerWindow {
     }
 }
 
-/// `Connection::flush` reports a `WaylandError`, which is `io::Error` plus a
-/// protocol variant; fold both into [`LayerWindowError::Io`] rather than
-/// widening the error enum for a case that only ever means "the socket died".
-fn flush_error(err: wayland_client::backend::WaylandError) -> LayerWindowError {
+impl Drop for LayerWindow {
+    /// Hand every object back before the connection goes: the pointer, the
+    /// layer surface, then the `wl_surface` it wrapped. The buffers destroy
+    /// themselves (`ShmBuffer`'s own `Drop`). A compositor keeps these alive
+    /// until the client says otherwise, so a client that opens and closes
+    /// windows would otherwise leak one of each per window.
+    fn drop(&mut self) {
+        if let Some(pointer) = self.state.pointer.take()
+            && pointer.version() >= 3
+        {
+            pointer.release();
+        }
+        self.layer_surface.destroy();
+        self.surface.destroy();
+        let _ = self.conn.flush();
+    }
+}
+
+/// `Connection::flush`/`read` report a `WaylandError`, which is `io::Error`
+/// plus a protocol variant; both mean the socket is unusable, so both fold
+/// into [`LayerWindowError::Socket`].
+fn socket_error(err: wayland_client::backend::WaylandError) -> LayerWindowError {
     match err {
-        wayland_client::backend::WaylandError::Io(io) => LayerWindowError::Io(io),
-        other => LayerWindowError::Io(std::io::Error::other(other.to_string())),
+        wayland_client::backend::WaylandError::Io(io) => LayerWindowError::Socket(io),
+        other => LayerWindowError::Socket(std::io::Error::other(other.to_string())),
     }
 }
 
@@ -600,6 +643,7 @@ mod tests {
     use crate::css::select::{CssNode, PseudoStates};
     use crate::text::FontStack;
     use crate::widget::button::Button;
+    use std::error::Error;
     use std::time::{Duration, Instant};
     use wayland_client::{Connection, EventQueue};
 
@@ -631,6 +675,48 @@ mod tests {
     const INSIDE: (f64, f64) = (30.0, 17.0);
     /// A point comfortably outside it.
     const OUTSIDE: (f64, f64) = (300.0, 300.0);
+
+    #[test]
+    fn every_error_says_what_actually_failed() {
+        // A7: every failure was `Io`, whose message was "shm buffer error",
+        // so a dead socket, a missing font and a failed surface allocation
+        // all blamed the shm buffer.
+        let cases: Vec<(LayerWindowError, &str)> = vec![
+            (
+                LayerWindowError::Shm(std::io::Error::other("ENOSPC")),
+                "shm buffer",
+            ),
+            (
+                LayerWindowError::Socket(std::io::Error::other("EPIPE")),
+                "Wayland socket",
+            ),
+            (LayerWindowError::Render("the raster surface"), "raster"),
+            (LayerWindowError::NoFont, "typeface"),
+            (LayerWindowError::Closed, "closed"),
+            (
+                LayerWindowError::Timeout(Duration::from_secs(5)),
+                "did not configure",
+            ),
+            (
+                LayerWindowError::MissingGlobal("zwlr_layer_shell_v1"),
+                "zwlr_layer_shell_v1",
+            ),
+        ];
+        for (error, expected) in &cases {
+            let message = error.to_string();
+            assert!(
+                message.contains(expected),
+                "{error:?} reads {message:?}, which does not mention {expected:?}"
+            );
+        }
+        assert!(
+            LayerWindowError::Shm(std::io::Error::other("ENOSPC"))
+                .source()
+                .is_some(),
+            "the underlying io::Error is not reachable"
+        );
+        assert!(LayerWindowError::NoFont.source().is_none());
+    }
 
     #[test]
     fn only_btn_left_presses_the_button() {
