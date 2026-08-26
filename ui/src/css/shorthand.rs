@@ -11,7 +11,7 @@
 //! becomes an unusable longhand value, which the computed-value stage's
 //! runner-up fallback then steps over.
 
-use super::value::{comma_groups, component_values};
+use super::tokens::{comma_groups, component_values};
 
 /// The four sides, in CSS's clockwise order.
 const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];

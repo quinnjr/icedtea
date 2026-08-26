@@ -3,7 +3,7 @@
 //!
 //! Deliberately value-agnostic *in meaning*, but never in form: declaration
 //! values are the **serialization of their token stream**
-//! (`super::value`), so comments are gone and whitespace is normalized
+//! (`super::tokens`), so comments are gone and whitespace is normalized
 //! before any consumer sees them. Interpretation still happens later
 //! (`super::colors`, `super::computed`), which keeps every GTK-specific
 //! value form (`image()`, `-gtk-*`, relative color syntax) representable
@@ -18,7 +18,7 @@ use cssparser::{
     parse_important,
 };
 
-use super::value::serialize_remaining;
+use super::tokens::serialize_remaining;
 
 /// How deep `@import` chains are followed before the engine gives up.
 pub const MAX_IMPORT_DEPTH: usize = 8;
@@ -90,7 +90,7 @@ impl<'i> DeclarationParser<'i> for DeclarationBlockParser {
                 break;
             }
             let before = input.position();
-            super::value::write_one_component(input, &mut value);
+            super::tokens::write_one_component(input, &mut value);
             if input.position() == before {
                 break;
             }

@@ -280,7 +280,7 @@ impl<'i> selectors::parser::Parser<'i> for GtkSelectorParser {
         parser: &mut CssParser<'i, 't>,
         _after_part: bool,
     ) -> Result<GtkPseudoClass, cssparser::ParseError<'i, Self::Error>> {
-        let argument = crate::css::value::serialize_remaining(parser);
+        let argument = crate::css::tokens::serialize_remaining(parser);
         Ok(if name.eq_ignore_ascii_case("dir") {
             match Direction::parse(&argument) {
                 Some(direction) => GtkPseudoClass::Dir(direction),

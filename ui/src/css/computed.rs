@@ -16,7 +16,7 @@ use skia_rs_safe::core::Color;
 use super::cascade::{CascadedValues, CompiledSheet, cascade};
 use super::colors::{ColorRef, ColorTable, parse_color_ref, parse_color_value};
 use super::select::CssNode;
-use super::value::{comma_groups, component_values};
+use super::tokens::{comma_groups, component_values};
 
 /// One gradient stop: a color and an optional absolute position, measured in
 /// pixels along the gradient line from its origin.

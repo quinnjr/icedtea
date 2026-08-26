@@ -1,4 +1,9 @@
-//! Token-level handling of declaration values.
+//! Token-level handling of declaration values (M1's `css::value`, relocated).
+//!
+//! `css::value` is now the *typed* value module; this file keeps the
+//! token-stream serializers that turn a declaration's tokens into the
+//! normalized string `css::parse` stores. Bodies and tests are unchanged
+//! from M1.
 //!
 //! Every value in this engine is a *serialization of a token stream*, never
 //! a slice of the source text. That is what makes `padding: 4px /* x */ 9px`
