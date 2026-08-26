@@ -171,6 +171,7 @@ mod tests {
             focused: true,
             mapped: true,
             client_decorations_requested: None,
+            attention: false,
         }
     }
 

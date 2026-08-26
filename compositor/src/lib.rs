@@ -136,41 +136,10 @@ pub fn run() {
     if let Err(err) = runtime.create_output_manager(&display) {
         tracing::error!(%err, "output-management unavailable");
     }
-    // A2 batch-1 passive protocols: none of these change client-visible
-    // behavior on their own, they just let clients discover/opt into finer
-    // scaling, buffer, and geometry hints. Non-fatal, same tone as every
-    // `create_*` above -- a missing global just means the fallback path
-    // (unscaled buffers, integer scale, no logical geometry, etc.) stays in
-    // effect.
-    if let Err(err) = runtime.create_viewporter(&display) {
-        tracing::error!(%err, "viewporter unavailable; clients fall back to unscaled buffers");
-    }
-    if let Err(err) = runtime.create_fractional_scale_manager(&display) {
-        tracing::error!(
-            %err,
-            "fractional-scale unavailable; HiDPI clients render at integer scale"
-        );
-    }
-    if let Err(err) = runtime.create_single_pixel_buffer_manager(&display) {
-        tracing::error!(%err, "single-pixel-buffer unavailable");
-    }
-    if let Err(err) = runtime.create_content_type_manager(&display) {
-        tracing::error!(%err, "content-type manager unavailable");
-    }
-    if let Err(err) = runtime.create_xdg_output_manager(&display) {
-        tracing::error!(
-            %err,
-            "xdg-output unavailable; some panels/tools lose logical geometry"
-        );
-    }
-    // Needs the backend and the scene graph, so it can only run after
-    // `init_graphics` above created both; `set_scene_presentation` wires the
-    // scene side and the crate enforces that ordering internally.
-    if let Err(err) = runtime.create_presentation(&display, &backend) {
-        tracing::error!(%err, "presentation-time unavailable; clients get no presentation feedback");
-    } else if let Err(err) = runtime.set_scene_presentation() {
-        tracing::error!(%err, "presentation created but scene wiring failed");
-    }
+    // Every A2 compat global (batch 1 + batch 2) in one place, shared with
+    // the test harness -- see `create_compat_globals`' own doc for why the
+    // extraction is the point.
+    create_compat_globals(&runtime, &display, &backend);
     runtime
         .create_seat(&display, "seat0")
         .expect("failed to create the seat");
@@ -287,4 +256,95 @@ pub fn run() {
 
     dbus_quit_signal.store(true, Ordering::Relaxed);
     let _ = dbus_emitter_thread.join();
+}
+
+/// Advertise every A2 compatibility global, in the one order that satisfies
+/// their inter-dependencies. Called from [`run`]'s boot *and* from the test
+/// harness's own boot, so the two cannot drift.
+///
+/// Review finding F13: the harness used to carry its own hand-copied list of
+/// these `create_*` calls, which meant `a2_batch*_globals_are_advertised`
+/// proved only that *the harness* advertises them -- deleting the whole block
+/// from `run()` left every test green and shipped a compositor with no
+/// viewporter, no cursor-shape, and no gamma control. One shared function is
+/// what makes those tests load-bearing for the real boot path.
+///
+/// Non-fatal throughout, matching every other `create_*` in `run()`: a global
+/// that fails to come up just means clients take the fallback path (unscaled
+/// buffers, integer scale, no logical geometry, no named cursor, no gamma
+/// ramp). The harness deliberately inherits that tone rather than panicking:
+/// the advertisement tests are the assertion, and a `create_*` that silently
+/// failed there now fails them instead of aborting the process.
+///
+/// Ordering constraints, all of them real:
+///
+/// * `create_xdg_output_manager` needs the scene's output layout, so it must
+///   follow `init_graphics` (the caller's job -- both callers do it well
+///   before this).
+/// * `create_presentation` needs the backend, hence the `backend` parameter,
+///   and `set_scene_presentation` must follow both `init_graphics` and
+///   `create_presentation` (the crate enforces this internally).
+/// * `create_gamma_control_manager` wires the manager straight into this
+///   runtime's scene (`wlr_scene_set_gamma_control_manager_v1`), so it too
+///   needs `init_graphics`.
+///
+/// `create_cursor_shape_manager` and `create_xdg_activation_manager` only let
+/// clients *ask* for a named cursor or an activation -- the crate applies
+/// neither itself, so `State`'s `SeatHandler::request_set_shape` /
+/// `request_activate` are what make them do anything.
+pub fn create_compat_globals(runtime: &wlr::Runtime, display: &wlr::Display, backend: &wlr::Backend) {
+    // A2 batch-1 passive protocols: none of these change client-visible
+    // behavior on their own, they just let clients discover/opt into finer
+    // scaling, buffer, and geometry hints. Non-fatal, same tone as every
+    // `create_*` above -- a missing global just means the fallback path
+    // (unscaled buffers, integer scale, no logical geometry, etc.) stays in
+    // effect.
+    if let Err(err) = runtime.create_viewporter(display) {
+        tracing::error!(%err, "viewporter unavailable; clients fall back to unscaled buffers");
+    }
+    if let Err(err) = runtime.create_fractional_scale_manager(display) {
+        tracing::error!(
+            %err,
+            "fractional-scale unavailable; HiDPI clients render at integer scale"
+        );
+    }
+    if let Err(err) = runtime.create_single_pixel_buffer_manager(display) {
+        tracing::error!(%err, "single-pixel-buffer unavailable");
+    }
+    if let Err(err) = runtime.create_content_type_manager(display) {
+        tracing::error!(%err, "content-type manager unavailable");
+    }
+    if let Err(err) = runtime.create_xdg_output_manager(display) {
+        tracing::error!(
+            %err,
+            "xdg-output unavailable; some panels/tools lose logical geometry"
+        );
+    }
+    // Needs the backend and the scene graph, so it can only run after
+    // `init_graphics` above created both; `set_scene_presentation` wires the
+    // scene side and the crate enforces that ordering internally.
+    if let Err(err) = runtime.create_presentation(display, backend) {
+        tracing::error!(%err, "presentation-time unavailable; clients get no presentation feedback");
+    } else if let Err(err) = runtime.set_scene_presentation() {
+        tracing::error!(%err, "presentation created but scene wiring failed");
+    }
+    // A2 batch-2 passive/request-handled protocols: same non-fatal tone as
+    // the batch-1 block above. `create_cursor_shape_manager` and
+    // `create_xdg_activation_manager` only let clients *ask* for a named
+    // cursor or activation -- the crate does not apply either itself, so
+    // `SeatHandler::request_set_shape`/`request_activate` below are what
+    // make them do anything. `create_gamma_control_manager` needs
+    // `init_graphics` (already run above) because it wires the manager
+    // straight into this runtime's scene (`wlr_scene_set_gamma_control_manager_v1`),
+    // which applies gamma ramps on its own commit path with no handler
+    // involvement.
+    if let Err(err) = runtime.create_cursor_shape_manager(display) {
+        tracing::error!(%err, "cursor-shape unavailable; clients cannot name a cursor image");
+    }
+    if let Err(err) = runtime.create_xdg_activation_manager(display) {
+        tracing::error!(%err, "xdg-activation unavailable; clients cannot request focus-raise");
+    }
+    if let Err(err) = runtime.create_gamma_control_manager(display) {
+        tracing::error!(%err, "gamma-control unavailable; clients cannot set a display gamma ramp");
+    }
 }

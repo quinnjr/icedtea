@@ -13,3 +13,18 @@
 #workspaces button.active {
     font-weight: bold;
 }
+
+/* Finding F10: `taskbar::render` adds these two classes to a window button
+   and nothing styled either, so the compositor's focus and attention bits
+   were invisible on the bar. Minimal: a left accent bar plus a tinted
+   background, so both read at a glance without changing the button metrics
+   (a border would reflow the row). */
+#bar button.focused {
+    background-image: linear-gradient(to right, #89b4fa 3px, rgba(255, 255, 255, 0.06) 3px);
+    font-weight: bold;
+}
+
+#bar button.attention {
+    background-image: linear-gradient(to right, #f38ba8 3px, rgba(243, 139, 168, 0.18) 3px);
+    color: #f5e0dc;
+}

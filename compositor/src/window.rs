@@ -29,6 +29,13 @@ pub struct Window {
     pub mapped: bool,
     /// Client's negotiated xdg-decoration mode: Some(true) for ClientSide, Some(false) for ServerSide, None if unset.
     pub client_decorations_requested: Option<bool>,
+    /// The window is asking to be noticed without being allowed to take the
+    /// keyboard: an `xdg-activation-v1` request this compositor's focus-steal
+    /// policy refused (see `State::request_activate`). Purely a shell-facing
+    /// hint -- it gates nothing in the model -- and it is cleared the moment
+    /// the window actually gains focus (`focus`), which is the only thing
+    /// that can answer it.
+    pub attention: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +120,7 @@ impl WindowManager {
             focused: false,
             mapped: true,
             client_decorations_requested: None,
+            attention: false,
         };
         self.windows.insert(id, window.clone());
         self.emit(Event::WindowOpened(self.to_info(&self.windows[&id])));
@@ -190,6 +198,38 @@ impl WindowManager {
         Some(())
     }
 
+    /// Raise or drop `id`'s attention hint. `None` (no emission) on an
+    /// unknown id or a value that already matches, like the setters around
+    /// it. The compositor sets this when it *refuses* an activation request
+    /// (`State::request_activate`); `focus` is what clears it, so a caller
+    /// normally only ever passes `true` here.
+    pub fn set_attention(&mut self, id: WindowId, value: bool) -> Option<()> {
+        let w = self.windows.get_mut(&id)?;
+        if w.attention == value {
+            return None;
+        }
+        w.attention = value;
+        self.emit(Event::WindowUpdated { id, update: WindowUpdate { attention: Some(value), ..Default::default() } });
+        Some(())
+    }
+
+    /// Drop `id`'s attention hint, if it has one -- the named counterpart of
+    /// [`Self::set_attention`], which callers otherwise only ever call with
+    /// `true`.
+    ///
+    /// Finding F6: an attention hint is a "look at me until the user does",
+    /// and until now only [`Self::focus`] could answer one. So every way a
+    /// user could attend to a flagged window *without* focusing it --
+    /// restoring it from the taskbar while another window keeps the keyboard,
+    /// or switching to the workspace where it already holds the focus pointer
+    /// -- left the hint stuck on the shell forever. Those paths call this.
+    ///
+    /// `None` (no emission) when the window is unknown or already clear, the
+    /// same contract `set_attention` has.
+    pub fn clear_attention(&mut self, id: WindowId) -> Option<()> {
+        self.set_attention(id, false)
+    }
+
     pub fn set_fullscreen(&mut self, id: WindowId, value: bool) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         w.fullscreen = value;
@@ -258,11 +298,31 @@ impl WindowManager {
             return None;
         }
         if was_focused {
-            // If already focused but minimized, unminimize and emit event.
-            if was_minimized {
-                let w = self.windows.get_mut(&id)?;
-                w.minimized = false;
-                self.emit(Event::WindowUpdated { id, update: WindowUpdate { minimized: Some(false), ..Default::default() } });
+            // Already focused: there is no focus *transition* to emit, but
+            // the two side effects a focus carries still apply.
+            //
+            // The attention clear is not theoretical. `State::request_activate`
+            // compares its target against the *active* workspace's focused
+            // window (`State::focused_id`), so a window that is the focused
+            // window of some INACTIVE workspace is not "already focused" by
+            // that test and can be flagged; `switch_workspace` then leaves
+            // that workspace's focus pointer alone, so when the user comes
+            // back and clicks the window, focus lands right here. Clearing
+            // only on the not-yet-focused path below left such a hint stuck
+            // on forever.
+            let w = self.windows.get_mut(&id)?;
+            w.minimized = false;
+            let cleared_attention = std::mem::take(&mut w.attention);
+            // One combined event, and only when something actually changed.
+            if was_minimized || cleared_attention {
+                self.emit(Event::WindowUpdated {
+                    id,
+                    update: WindowUpdate {
+                        minimized: was_minimized.then_some(false),
+                        attention: cleared_attention.then_some(false),
+                        ..Default::default()
+                    },
+                });
             }
             return Some(());
         }
@@ -284,12 +344,22 @@ impl WindowManager {
         }
         let w = self.windows.get_mut(&id)?;
         w.focused = true;
-        // Emit combined event if we unminimized during focus change.
-        if was_minimized {
-            self.emit(Event::WindowUpdated { id, update: WindowUpdate { focused: Some(true), minimized: Some(false), ..Default::default() } });
-        } else {
-            self.emit(Event::WindowUpdated { id, update: WindowUpdate { focused: Some(true), ..Default::default() } });
-        }
+        // Gaining focus answers an attention hint, so it clears one: the
+        // shell must not go on flagging a window the user is now looking at.
+        // Folded into the focus emission below rather than emitted
+        // separately -- one mutation, one event.
+        let cleared_attention = std::mem::take(&mut w.attention);
+        // One combined event, carrying whichever of the two side effects
+        // (an unminimize, an attention clear) this focus actually performed.
+        self.emit(Event::WindowUpdated {
+            id,
+            update: WindowUpdate {
+                focused: Some(true),
+                minimized: was_minimized.then_some(false),
+                attention: cleared_attention.then_some(false),
+                ..Default::default()
+            },
+        });
         // Update focus MRU.
         self.focus_mru.retain(|&wid| wid != id);
         self.focus_mru.insert(0, id);
@@ -482,6 +552,7 @@ impl WindowManager {
             minimized: w.minimized,
             fullscreen: w.fullscreen,
             focused: w.focused,
+            attention: w.attention,
         }
     }
 
@@ -906,5 +977,123 @@ mod tests {
             |e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.mapped == Some(false)),
         );
         assert!(carried, "set_mapped's emission must carry update.mapped == Some(false)");
+    }
+
+    /// A2 task 8: `set_attention` emits the additive `attention` field and
+    /// the snapshot reads the model's real value rather than a hard-coded
+    /// `false`.
+    #[test]
+    fn set_attention_emits_update_and_shows_in_snapshot() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        assert!(!m.get(a).unwrap().attention, "attention defaults to false");
+        m.pending_events.clear();
+
+        assert_eq!(m.set_attention(a, true), Some(()));
+        let carried = m.pending_events.iter().any(
+            |e| matches!(&e.event, Event::WindowUpdated { id, update } if *id == a && update.attention == Some(true)),
+        );
+        assert!(carried, "set_attention's emission must carry update.attention == Some(true)");
+        assert!(m.get(a).unwrap().attention);
+        let info = m.snapshot().windows.into_iter().find(|w| w.id == a).unwrap();
+        assert!(info.attention, "snapshot must reflect the model's attention flag");
+
+        // Setting the same value again is silent, like every other setter here.
+        let before = m.seq();
+        assert_eq!(m.set_attention(a, true), None);
+        assert_eq!(m.seq(), before, "unchanged value is silent");
+    }
+
+    /// A2 task 8: gaining focus clears attention, folded into the very
+    /// `focused: Some(true)` update rather than a second event.
+    #[test]
+    fn focus_clears_attention_in_the_focused_update() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        let b = m.add_window("b", "b", 2, GEO);
+        // `b` is focused; mark the background window `a` as needing attention.
+        m.set_attention(a, true).unwrap();
+        assert!(m.get(a).unwrap().attention);
+        m.pending_events.clear();
+
+        m.focus(a).unwrap();
+
+        assert!(!m.get(a).unwrap().attention, "focus must clear attention");
+        let updates: Vec<_> = m
+            .pending_events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::WindowUpdated { id, update } if *id == a => Some(update),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates.len(), 1, "exactly one update for the newly focused window");
+        assert_eq!(updates[0].focused, Some(true));
+        assert_eq!(updates[0].attention, Some(false), "the focused update must clear attention");
+        assert!(!m.get(b).unwrap().focused);
+    }
+
+    /// Final-review finding 2: attention must also clear on the
+    /// *already-focused* path. A window that holds its own workspace's
+    /// focus pointer can still be flagged (`State::request_activate` tests
+    /// only the ACTIVE workspace's focused window), and the user's eventual
+    /// click on it takes `focus`'s `was_focused` early return -- which used
+    /// to leave the hint set forever.
+    #[test]
+    fn focus_of_an_already_focused_window_still_clears_attention() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        assert!(m.get(a).unwrap().focused, "the only window in its workspace holds focus");
+        m.set_attention(a, true).unwrap();
+        assert!(m.get(a).unwrap().attention);
+        m.pending_events.clear();
+
+        m.focus(a).unwrap();
+
+        assert!(!m.get(a).unwrap().attention, "re-focusing an already-focused window must clear attention");
+        let updates: Vec<_> = m
+            .pending_events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::WindowUpdated { id, update } if *id == a => Some(update),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates.len(), 1, "the clear owes exactly one update, got {updates:?}");
+        assert_eq!(updates[0].attention, Some(false), "the update must carry the attention clear");
+        let info = m.snapshot().windows.into_iter().find(|w| w.id == a).unwrap();
+        assert!(!info.attention, "snapshot must show the cleared flag");
+    }
+
+    /// The already-focused path stays silent when there is nothing to
+    /// clear: no attention, not minimized, no event.
+    #[test]
+    fn focus_of_an_already_focused_clean_window_emits_nothing() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        m.pending_events.clear();
+        m.focus(a).unwrap();
+        assert!(m.pending_events.is_empty(), "a no-op focus must not emit, got {:?}", m.pending_events);
+    }
+
+    /// Focusing a window that had no attention set must not advertise a
+    /// clear it never needed.
+    #[test]
+    fn focus_without_attention_omits_the_field() {
+        let mut m = mgr();
+        let a = m.add_window("a", "a", 1, GEO);
+        let _b = m.add_window("b", "b", 2, GEO);
+        m.pending_events.clear();
+        m.focus(a).unwrap();
+        let update = m
+            .pending_events
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::WindowUpdated { id, update } if *id == a => Some(update),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(update.focused, Some(true));
+        assert_eq!(update.attention, None);
     }
 }

@@ -116,6 +116,22 @@ pub enum DbCommand {
     /// runtime handle. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `SessionLocked`.
     CursorPosition { reply: Sender<(f64, f64)> },
+    /// Test-only: read `wlr::Runtime::cursor_shape` -- the named shape
+    /// currently in force as the crate itself records it, `None` rendered as
+    /// `"Default"` -- as its `Debug` name. Not reachable from `CompositorInterface` --
+    /// only the test harness sends this, same reasoning as `SessionLocked`.
+    CursorShape { reply: Sender<String> },
+    /// Test-only: the primary output's real geometry, straight off
+    /// `State::outputs`. `None` before any output exists.
+    ///
+    /// Review finding F11: tests that need the output's extent (to address a
+    /// `zwlr_virtual_pointer_v1.motion_absolute` coordinate, or to pick a
+    /// point on bare desktop) used to discover it by maximizing a window and
+    /// reading its geometry back -- which is the snap-gap-inset *usable*
+    /// rect, not the output, and so was systematically short by the gap on
+    /// each edge. Not reachable from `CompositorInterface` -- only the test
+    /// harness sends this, same reasoning as `CursorShape`.
+    OutputSize { reply: Sender<Option<icedtea_contract::Rectangle>> },
     /// Test-only: read the `DISPLAY` name (`:N`) Xwayland advertises, via
     /// `wlr::Runtime::xwayland_display_name`. `None` when no Xwayland was
     /// created (the `Xwayland` binary is absent), so the X11 end-to-end test
@@ -239,6 +255,18 @@ impl CompositorInterface {
         self.send(DbCommand::GetState(reply_tx));
         reply_rx.recv().unwrap_or_else(|_| Snapshot { seq: 0, windows: vec![], workspaces: vec![], active_workspace: 0 })
     }
+    /// The wire-contract revision this compositor speaks
+    /// ([`icedtea_contract::COMPOSITOR_CONTRACT_VERSION`]), so a client can
+    /// name a mismatch instead of only discovering one as a
+    /// `SignatureMismatch` on its first typed call (review finding F7).
+    ///
+    /// A read-only zbus *property*: adding it leaves every method signature
+    /// on this interface exactly as it was, so it cannot itself be the
+    /// incompatibility it exists to report.
+    #[zbus(property)]
+    fn version(&self) -> u32 {
+        icedtea_contract::COMPOSITOR_CONTRACT_VERSION
+    }
     fn reload_config(&self) {
         self.send(DbCommand::ReloadConfig);
     }
@@ -293,10 +321,15 @@ pub fn spawn_service(
             // signal, so a subscriber can drop signals already folded into
             // the `GetState()` snapshot it started from (`seq <=
             // snapshot.seq`) and detect a gap (`seq > last_seen + 1`) that
-            // means it must re-sync. Recorded signatures:
-            //   WindowOpened   t(ussuu(iiii)bbbb)
+            // means it must re-sync. Recorded signatures (kept in step with
+            // `contract`'s own `wire_signatures_are_locked` test -- the
+            // `attention` bit added the fifth `b` to `WindowInfo` and a
+            // SIXTH `ab` to `WindowUpdate` -- whose bools run
+            // maximized/minimized/fullscreen/focused/mapped/attention --
+            // which is what `COMPOSITOR_CONTRACT_VERSION` 2 names):
+            //   WindowOpened   t(ussuu(iiii)bbbbb)
             //   WindowClosed   tu
-            //   WindowUpdated  tu(asa(iiii)auabababab)
+            //   WindowUpdated  tu(asa(iiii)auabababababab)
             //   WorkspaceSet   tub
             //   WorkspaceList  ta(us)
             //   AltTabState    t(baut)
@@ -369,6 +402,7 @@ mod tests {
             minimized: false,
             fullscreen: false,
             focused: true,
+            attention: false,
         }
     }
     fn default_appearance() -> Appearance {

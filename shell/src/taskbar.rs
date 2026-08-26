@@ -79,6 +79,9 @@ fn merge(w: &mut WindowInfo, u: WindowUpdate) {
     if let Some(f) = u.focused {
         w.focused = f;
     }
+    if let Some(a) = u.attention {
+        w.attention = a;
+    }
     // `mapped` has no field on WindowInfo; the taskbar ignores it.
 }
 
@@ -115,6 +118,12 @@ pub fn render(model: &TaskbarModel, container: &GtkBox, wm: &Rc<dyn CompositorCo
         if w.focused {
             button.add_css_class("focused");
         }
+        // The compositor refused this window's activation request and
+        // flagged it instead (`State::request_activate`); surfacing it is
+        // the whole point of the bit, so give CSS something to style.
+        if w.attention {
+            button.add_css_class("attention");
+        }
         let id = w.id.0;
         let wm_focus = wm.clone();
         button.connect_clicked(move |_| wm_focus.focus_window(id));
@@ -146,6 +155,7 @@ mod tests {
             minimized: false,
             fullscreen: false,
             focused: false,
+            attention: false,
         }
     }
 
@@ -178,6 +188,33 @@ mod tests {
         m.apply(CompositorUpdate::Opened(win(1, "a")));
         m.apply(CompositorUpdate::Updated { id: 1, update: title_update("renamed") });
         assert_eq!(m.windows[0].title, "renamed");
+    }
+
+    /// Final-review finding 3: the additive `attention` bit is part of the
+    /// update stream the taskbar folds in, and it must round-trip in both
+    /// directions -- the compositor clears it (on focus) as well as raising
+    /// it, and a merge that ignored the field left a button flagged forever.
+    #[test]
+    fn updated_merges_attention_in_both_directions() {
+        let mut m = TaskbarModel::default();
+        m.apply(CompositorUpdate::Opened(win(1, "a")));
+        assert!(!m.windows[0].attention, "attention starts clear");
+
+        m.apply(CompositorUpdate::Updated {
+            id: 1,
+            update: WindowUpdate { attention: Some(true), ..Default::default() },
+        });
+        assert!(m.windows[0].attention, "a raised attention hint must reach the taskbar model");
+
+        // An unrelated update must not disturb it.
+        m.apply(CompositorUpdate::Updated { id: 1, update: title_update("renamed") });
+        assert!(m.windows[0].attention, "an unrelated update must leave attention alone");
+
+        m.apply(CompositorUpdate::Updated {
+            id: 1,
+            update: WindowUpdate { attention: Some(false), ..Default::default() },
+        });
+        assert!(!m.windows[0].attention, "the compositor's clear must reach the taskbar model too");
     }
 
     #[test]
