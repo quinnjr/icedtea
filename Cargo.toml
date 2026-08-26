@@ -16,3 +16,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
 image = "0.25"
+
+# Development-only: point `wlr` at the implicit-pointer-grab worktree so the
+# compositor's own tests exercise the fix before it is published. Dropped in
+# favour of a plain `wlr = "0.20.27"` bump once the crate is on crates.io.
+[patch.crates-io]
+wlr = { path = "/home/joseph/Projects/wlroots-sys/.claude/worktrees/wlr-implicit-grab/crates/wlr" }
