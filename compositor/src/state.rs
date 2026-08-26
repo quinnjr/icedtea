@@ -2265,8 +2265,7 @@ impl State {
         let workspace = target.workspace;
         let was_focused_on_own_workspace = target.focused;
         self.window_manager.set_minimized(id, value)?;
-        if value {
-        } else {
+        if !value {
             // Finding F6: restoring a window is the user attending to it, so
             // it answers an attention hint even when the restore does not
             // move focus (the taskbar's un-minimize on a background window,
