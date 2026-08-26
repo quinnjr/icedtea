@@ -6,6 +6,7 @@
 //! `docs/superpowers/specs/2026-08-20-pure-rust-gtk-ui-design.md`.
 
 pub mod css;
+pub mod layout;
 pub mod text;
 
 /// GTK 4's default light theme, vendored so tests are hermetic.
