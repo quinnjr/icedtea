@@ -23,7 +23,7 @@
 //! leave, both branches of the xdg-activation focus-steal policy, and a real
 //! `zwlr_gamma_control_v1` claim answered rather than left hanging.
 
-use icedtea_harness::{Compositor, PresentationOutcome, TestClient};
+use icedtea_harness::{Compositor, PresentationOutcome, SessionLockClient, TestClient};
 
 /// The six A2 batch-1 globals must all be advertised -- the daemon-free
 /// baseline every other test in this file assumes.
@@ -334,25 +334,24 @@ fn wait_for_cursor_shape(comp: &Compositor, want: &str) -> String {
 /// it -- then reverts to the platform default once the pointer leaves that
 /// client's surface.
 ///
-/// Both halves are real claims about `State`, not about the protocol object
-/// existing:
+/// All three halves are real claims, not about the protocol object existing:
 ///
 /// 1. `SeatHandler::request_set_shape` -> `State::apply_cursor_shape` ->
 ///    `wlr::Runtime::set_cursor_shape`. Deleting that call leaves the
 ///    request accepted and silently ignored, and this assertion is what
-///    notices.
-/// 2. The revert-on-leave in `pointer_motion` (see `pointer_over_window`'s
-///    field doc): the request carries no seat-client identity, so without
-///    it a *background* client's `set_shape` would keep repainting the
-///    shared cursor forever. Moving the pointer to genuinely empty desktop
-///    -- asserted to be outside every mapped window, not assumed -- is the
-///    leave this compositor can observe.
-/// 3. The re-assertion in `State::reassert_cursor_shape_after_wlroots_stomp`:
-///    wlroots resets the cursor image to `left_ptr` on its own, before
-///    every pointer callback reaches this compositor, so a named shape has
-///    to be put back on each one or it survives exactly one pointer event.
-///    Deleting the re-assert makes the within-window assertion below read
-///    `Default`.
+///    notices -- load-bearing since `wlr` 0.20.26, because
+///    `Compositor::cursor_shape` now reads `wlr::Runtime::cursor_shape`,
+///    the crate's own record of what it handed wlroots, rather than a
+///    compositor-side mirror that stayed true with the call deleted.
+/// 2. Persistence across motion *inside the same window*: before 0.20.26
+///    the crate's `ensure_cursor_image` stomped the image back to
+///    `left_ptr` before every pointer callback and the compositor put it
+///    back by hand on each one. The crate now leaves a named shape alone,
+///    and this assertion is what would notice a regression there.
+/// 3. Revert-on-leave, now also the crate's: it resets the named shape on
+///    every wlroots pointer-focus change, including a move to no surface at
+///    all. Moving the pointer to genuinely empty desktop -- asserted to be
+///    outside every mapped window, not assumed -- is that leave.
 ///
 /// The serial passed to `set_shape` is a real one the seat issued to this
 /// client (its `wl_pointer.enter`), read back off the client, not invented.
@@ -460,6 +459,131 @@ fn cursor_shape_set_by_the_pointer_owner_applies_and_reverts_on_leave() {
         "the seat cursor kept the shape a client named after the pointer left that client's surface"
     );
 
+    client.detach();
+}
+
+/// Workstream C (load-bearing): a client that does *not* hold the seat's
+/// pointer focus cannot repaint the shared cursor.
+///
+/// This is the end-to-end proof of the `wlr` 0.20.26 gate that replaced this
+/// compositor's own model hit test: the crate delivers
+/// `SeatHandler::request_set_shape` only to the seat client that currently
+/// holds pointer focus, so `State::request_set_shape` may honor every
+/// request it sees unconditionally. Two real clients, one pointer:
+///
+/// * A is under the pointer and names `Text` -- the control, so a failure
+///   here means the mechanism is broken rather than the gate being tested.
+/// * B has its own `wl_pointer` and its own `wp_cursor_shape_device_v1`, is
+///   mapped but nowhere near the pointer, and asks for `Wait`. The cursor
+///   must stay `Text`.
+///
+/// Without the crate's gate B's request reaches the handler and wins, since
+/// nothing in the request itself says who sent it -- that is exactly the
+/// surfaceless-daemon hijack the deleted `named_cursor_owner`/
+/// `pointer_over_window` tracking used to guess at.
+#[test]
+fn a_client_without_pointer_focus_cannot_name_the_cursor() {
+    let comp = Compositor::spawn();
+    let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
+
+    // B is mapped FIRST so that A, mapped second, is the topmost window at
+    // the default placement the two share -- `window_at_point` is MRU
+    // ordered, so the pointer put inside that rect belongs to A. Without
+    // this the pointer would land on B and there would be no unfocused
+    // client left to test.
+    let mut b = TestClient::map_toplevel(&comp.socket, "background.app", "background");
+    assert!(b.wait_until(|c| c.last_configure().is_some()), "client B never configured");
+    let mut a = TestClient::map_toplevel(&comp.socket, "focused.app", "focused");
+    assert!(a.wait_until(|c| c.last_configure().is_some()), "client A never configured");
+
+    let (ow, oh) = comp.output_size();
+    let windows = comp.snapshot().windows;
+    let a_geo = windows
+        .iter()
+        .find(|w| w.app_id == "focused.app")
+        .expect("A must be in the model")
+        .geometry;
+
+    // Put the pointer inside A, and take the enter serial off A itself.
+    vp.motion_absolute((a_geo.x + a_geo.width / 2) as f64, (a_geo.y + a_geo.height / 2) as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert!(a.wait_until(|c| c.last_pointer_serial().is_some()), "A never got a pointer serial");
+    let enter_serial = a.last_pointer_serial().expect("just asserted this is Some");
+
+    a.set_cursor_shape(enter_serial, icedtea_harness::CursorShape::Text);
+    assert_eq!(
+        wait_for_cursor_shape(&comp, "Text"),
+        "Text",
+        "control: the client under the pointer must be able to name the cursor"
+    );
+
+    // B never received a `wl_pointer.enter`, so it has no serial of its own
+    // -- 0 is what a client with nothing to cite would send, and the point
+    // is that the request is dropped on *identity*, not on the serial.
+    b.set_cursor_shape(0, icedtea_harness::CursorShape::Wait);
+    // A single reading after `settle()`, deliberately not
+    // `wait_for_cursor_shape`: the value is already "Text", so a
+    // poll-until-"Text" helper returns on its first sample and would pass
+    // before B's request had even been dispatched. See the same argument in
+    // `cursor_shape_set_by_the_pointer_owner_applies_and_reverts_on_leave`.
+    comp.settle();
+    assert_eq!(
+        comp.cursor_shape(),
+        "Text",
+        "a client with no pointer focus repainted the shared seat cursor"
+    );
+
+    a.detach();
+    b.detach();
+}
+
+/// Workstream C (load-bearing): engaging the session lock drops whatever
+/// shape a client had named, so a hidden client's cursor does not ride onto
+/// the lock screen.
+///
+/// This is the one path `wlr` 0.20.26's own reset does **not** cover, and
+/// the reason `State::session_lock_changed` still calls
+/// `apply_cursor_shape(Default)` by hand: the crate drops a named shape on a
+/// wlroots pointer-*focus* change, and a lock engaging under a stationary
+/// pointer is not one -- no pointer event happens at all, so no
+/// `focus_change` fires and the shape would simply persist. Deleting that
+/// one line makes the assertion below read `"Text"`.
+#[test]
+fn engaging_the_session_lock_drops_a_client_named_cursor() {
+    let comp = Compositor::spawn();
+    let mut vp = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
+
+    let mut client = TestClient::map_toplevel(&comp.socket, "locktest.app", "locktest");
+    assert!(client.wait_until(|c| c.last_configure().is_some()), "client never configured");
+    let (ow, oh) = comp.output_size();
+    let geo = comp.snapshot().windows.into_iter().next().expect("mapped window in the model").geometry;
+
+    vp.motion_absolute((geo.x + geo.width / 2) as f64, (geo.y + geo.height / 2) as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert!(client.wait_until(|c| c.last_pointer_serial().is_some()), "client never got a pointer serial");
+    let enter_serial = client.last_pointer_serial().expect("just asserted this is Some");
+    client.set_cursor_shape(enter_serial, icedtea_harness::CursorShape::Text);
+    assert_eq!(
+        wait_for_cursor_shape(&comp, "Text"),
+        "Text",
+        "control: the client under the pointer must be able to name the cursor before the lock"
+    );
+
+    // Lock with the pointer left exactly where it is: no motion, so nothing
+    // makes wlroots emit a pointer focus change of its own.
+    let mut locker = SessionLockClient::spawn(&comp.socket);
+    locker.lock();
+    assert!(locker.wait_locked(), "session never reported locked");
+    assert!(comp.session_locked(), "compositor is_session_locked() is false");
+
+    assert_eq!(
+        wait_for_cursor_shape(&comp, "Default"),
+        "Default",
+        "a client's named cursor survived onto the lock screen"
+    );
+
+    locker.unlock();
+    assert!(!comp.session_locked(), "still locked after unlock");
     client.detach();
 }
 
