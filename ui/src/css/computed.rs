@@ -47,6 +47,12 @@ pub enum Background {
 }
 
 /// Round-to-nearest linear interpolation between two bytes.
+///
+/// Deliberately *not* `Color4f::lerp`: that round-trips each channel
+/// through `x / 255.0` and back, so it is not bit-identical to rounding the
+/// byte-space interpolation once. The offscreen gate asserts exact pixel
+/// equality against values derived straight from the theme's declarations,
+/// which only this form guarantees.
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let a = f32::from(a);
     let b = f32::from(b);

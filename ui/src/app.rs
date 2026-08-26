@@ -1,5 +1,6 @@
 //! Wiring: theme discovery plus one themed button on a layer surface.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use crate::BUNDLED_ADWAITA_LIGHT;
@@ -39,26 +40,29 @@ fn user_theme_candidates() -> Vec<PathBuf> {
 }
 
 /// Read the CSS for `source`, falling back to the bundled copy.
+///
+/// Borrowed for the bundled theme: it is a 147 KB `&'static str`, and
+/// copying it per call bought nothing.
 #[must_use]
-pub fn load_theme(source: &ThemeSource) -> String {
+pub fn load_theme(source: &ThemeSource) -> Cow<'static, str> {
     match source {
-        ThemeSource::Bundled => BUNDLED_ADWAITA_LIGHT.to_string(),
+        ThemeSource::Bundled => Cow::Borrowed(BUNDLED_ADWAITA_LIGHT),
         ThemeSource::File(path) => match std::fs::read_to_string(path) {
-            Ok(css) => css,
+            Ok(css) => Cow::Owned(css),
             Err(err) => {
                 tracing::warn!(path = %path.display(), %err, "cannot read theme; using bundled Adwaita");
-                BUNDLED_ADWAITA_LIGHT.to_string()
+                Cow::Borrowed(BUNDLED_ADWAITA_LIGHT)
             }
         },
         ThemeSource::UserPreferred => {
             for candidate in user_theme_candidates() {
                 if let Ok(css) = std::fs::read_to_string(&candidate) {
                     tracing::info!(path = %candidate.display(), "loaded user GTK4 theme");
-                    return css;
+                    return Cow::Owned(css);
                 }
             }
             tracing::info!("no installed GTK4 theme found; using bundled Adwaita");
-            BUNDLED_ADWAITA_LIGHT.to_string()
+            Cow::Borrowed(BUNDLED_ADWAITA_LIGHT)
         }
     }
 }
