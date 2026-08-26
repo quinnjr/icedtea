@@ -140,9 +140,9 @@ impl Default for ComputedStyle {
 fn parse_px(value: &str) -> Option<f32> {
     let value = value.trim();
     if let Some(number) = value.strip_suffix("px") {
-        return number.trim().parse::<f32>().ok();
+        return number.trim().parse::<f32>().ok().filter(|n| n.is_finite());
     }
-    let number = value.parse::<f32>().ok()?;
+    let number = value.parse::<f32>().ok().filter(|n| n.is_finite())?;
     (number == 0.0).then_some(0.0)
 }
 
@@ -331,6 +331,15 @@ mod tests {
             color: Color(color),
             position_px,
         }
+    }
+
+    #[test]
+    fn non_finite_lengths_are_rejected() {
+        assert_eq!(super::parse_px("NaNpx"), None);
+        assert_eq!(super::parse_px("infpx"), None);
+        assert_eq!(super::parse_px("1e40px"), None);
+        assert_eq!(super::parse_px("4px"), Some(4.0));
+        assert_eq!(super::parse_px("0"), Some(0.0));
     }
 
     #[test]
