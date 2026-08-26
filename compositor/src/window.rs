@@ -213,6 +213,23 @@ impl WindowManager {
         Some(())
     }
 
+    /// Drop `id`'s attention hint, if it has one -- the named counterpart of
+    /// [`Self::set_attention`], which callers otherwise only ever call with
+    /// `true`.
+    ///
+    /// Finding F6: an attention hint is a "look at me until the user does",
+    /// and until now only [`Self::focus`] could answer one. So every way a
+    /// user could attend to a flagged window *without* focusing it --
+    /// restoring it from the taskbar while another window keeps the keyboard,
+    /// or switching to the workspace where it already holds the focus pointer
+    /// -- left the hint stuck on the shell forever. Those paths call this.
+    ///
+    /// `None` (no emission) when the window is unknown or already clear, the
+    /// same contract `set_attention` has.
+    pub fn clear_attention(&mut self, id: WindowId) -> Option<()> {
+        self.set_attention(id, false)
+    }
+
     pub fn set_fullscreen(&mut self, id: WindowId, value: bool) -> Option<()> {
         let w = self.windows.get_mut(&id)?;
         w.fullscreen = value;

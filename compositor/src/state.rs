@@ -652,10 +652,28 @@ pub struct State {
     /// than merely optimistic:
     ///
     /// - `Self::apply_cursor_shape`, the single call site for
-    ///   `wlr::Runtime::set_cursor_shape`.
+    ///   `wlr::Runtime::set_cursor_shape` -- and, since finding F8, written
+    ///   only on the branch that actually made that call, so this never
+    ///   claims a shape the seat cursor could not have taken.
     /// - the pointer callbacks, which record wlroots' own unconditional
     ///   reset back to the arrow before re-asserting -- see
     ///   `Self::reassert_cursor_shape_after_wlroots_stomp`.
+    ///
+    /// Not collapsible into `pointer_shape_request` (finding F8's
+    /// follow-up): the two diverge for a full pointer event every time
+    /// wlroots stomps the image, which is what the re-assert reads them
+    /// both to detect, and this one additionally stays `Default` when there
+    /// is no runtime to apply anything to.
+    ///
+    /// **Known limit, and the reason F8's re-verification came back GREEN:**
+    /// `wlr` 0.20.25 exposes no way to read the seat cursor's actual image
+    /// back, so this is a *record of intent to apply*, not an observation.
+    /// Deleting the `rt.set_cursor_shape(shape)` call inside
+    /// `apply_cursor_shape` therefore still leaves this field -- and the
+    /// `DbCommand::CursorShape` probe built on it -- reading correctly. A
+    /// genuinely load-bearing assertion needs a crate-side getter, which is
+    /// `wlr` 0.20.26's job; until that pin lands no compositor-side test can
+    /// close this gap.
     pub cursor_shape: wlr::CursorShape,
     /// The shape the client that currently owns the pointer named through
     /// `cursor-shape-v1`, or `Default` when none has (or when the pointer
@@ -2303,6 +2321,21 @@ impl State {
         let workspace = target.workspace;
         let was_focused_on_own_workspace = target.focused;
         self.window_manager.set_minimized(id, value)?;
+        if value {
+            // Finding F5: minimizing the window under the pointer hides it
+            // without any pointer event, so nothing else would ever drop the
+            // shape it named.
+            self.clear_named_cursor_for(id);
+        } else {
+            // Finding F6: restoring a window is the user attending to it, so
+            // it answers an attention hint even when the restore does not
+            // move focus (the taskbar's un-minimize on a background window,
+            // `DbCommand::Minimize(id, false)`, and an X11 client's own
+            // unminimize all land here). `focus` below clears it too when the
+            // restore does take the keyboard; `clear_attention` is a no-op
+            // when there was no hint.
+            self.window_manager.clear_attention(id);
+        }
         if value && was_focused_on_own_workspace {
             // Task 6: resolve `id`'s *own* workspace, not whichever one is
             // currently active -- `DbCommand::Minimize` can target a window
@@ -2422,6 +2455,12 @@ impl State {
         if self.ssd_press.is_some_and(|(hid, _)| hid == id) {
             self.ssd_press = None;
         }
+        // Finding F5, same reasoning as the two above and the reason the
+        // single choke point matters: a destroyed client's `cursor-shape-v1`
+        // request must not outlive it. Both the xdg (`forget_toplevel`) and
+        // the Xwayland (`remove_xwayland_window`) destroy paths run through
+        // here.
+        self.clear_named_cursor_for(id);
         if self.window_manager.focused_window().is_none() {
             let active = self.window_manager.active_workspace();
             self.window_manager.refocus_after_hide(active);
@@ -3572,6 +3611,16 @@ impl State {
                 let _ = reply.send(format!("{:?}", self.cursor_shape));
                 return Some(());
             }
+            DbCommand::OutputSize { reply } => {
+                // The lowest-index output, which is the only one the headless
+                // harness ever has -- and `geometry`, deliberately, not
+                // `usable`: this answers "how big is the screen", and a
+                // caller that wanted the space windows may occupy would be
+                // asking a different question (see `OutputSurface::usable`).
+                let geo = self.outputs.keys().min().copied().and_then(|idx| self.outputs.get(&idx)).map(|o| o.geometry);
+                let _ = reply.send(geo);
+                return Some(());
+            }
             DbCommand::XwaylandDisplay { reply } => {
                 // Read live from the runtime rather than the `xwayland_display`
                 // field: with lazy start the manager reserves its display
@@ -3682,7 +3731,22 @@ impl State {
         if current.is_none_or(|id| !self.window_manager.is_visible_id(id)) {
             self.window_manager.refocus_after_hide(workspace);
         }
+        // Finding F14: arriving on the workspace answers an attention hint on
+        // whatever window is focused there. `WindowManager::focus` clears the
+        // hint, but a window that *already* holds its own workspace's focus
+        // pointer is never re-focused by the switch (nothing calls `focus`),
+        // so exactly the case `focus`'s already-focused branch was written
+        // for -- a background window flagged on an inactive workspace -- kept
+        // its hint after the user came and looked straight at it.
+        if let Some(id) = self.window_manager.focused_window().map(|w| w.id) {
+            self.window_manager.clear_attention(id);
+        }
+        // Finding F5: every window under the pointer just changed. Whatever
+        // client last named a cursor shape is now hidden, so its shape must
+        // not go on being re-asserted over the incoming workspace.
+        self.clear_named_cursor();
         self.sync_scene();
+        self.emit_pending();
         Some(())
     }
 
@@ -4117,8 +4181,8 @@ impl State {
     /// Scene-only state (`ssd_hover`'s own doc): no `contract::Event` is
     /// ever queued from here, only a `sync_window_to_scene` push to the
     /// seam.
-    fn update_ssd_hover(&mut self, pointer: (i32, i32)) {
-        let hovered = self.window_at_point(pointer).and_then(|id| {
+    fn update_ssd_hover(&mut self, pointer: (i32, i32), over: Option<WindowId>) {
+        let hovered = over.and_then(|id| {
             let geo = self.window_manager.get(id)?.geometry;
             crate::decoration::button_at(geo, pointer).map(|idx| (id, idx))
         });
@@ -4199,12 +4263,27 @@ impl State {
     /// in-progress drag: updates the snap-zone preview (rendering consumes
     /// `self.snap_preview`).
     fn handle_pointer_motion(&mut self, pointer: (i32, i32)) -> Option<()> {
+        let over = self.window_at_point(pointer);
+        self.handle_pointer_motion_with_hit(pointer, over)
+    }
+
+    /// [`Self::handle_pointer_motion`] with the "which window is under the
+    /// pointer" hit test already computed.
+    ///
+    /// Finding F12: the real `SeatHandler::pointer_motion` needs that answer
+    /// for its own cursor-shape tracking anyway, and `window_at_point` walks
+    /// and *allocates* (`visible_windows` builds a `Vec`) -- so it is
+    /// computed once there and threaded through here rather than recomputed
+    /// inside `update_ssd_hover`. `handle_pointer_motion` stays as the
+    /// compute-it-yourself entry point for `handle_pointer`'s public
+    /// `PointerEvent` dispatch, which unit tests drive directly.
+    fn handle_pointer_motion_with_hit(&mut self, pointer: (i32, i32), over: Option<WindowId>) -> Option<()> {
         // Hover feedback tracks the pointer independently of drag/resize --
         // it must run even on every one of the early returns below, since
         // e.g. `self.drag.window_id()?` failing (no drag in progress, the
         // ordinary case whenever the pointer merely moves over a title bar)
         // must not skip it.
-        self.update_ssd_hover(pointer);
+        self.update_ssd_hover(pointer, over);
         // An interactive resize (started by the client's `resize_request`)
         // takes precedence: it owns the pointer until the button is
         // released.
@@ -4443,10 +4522,197 @@ impl State {
     /// the test-only `DbCommand::CursorShape` channel can observe what was
     /// last applied without a live handler.
     fn apply_cursor_shape(&mut self, shape: wlr::CursorShape) {
+        // Finding F8: the mirror write lives *inside* the guard, not after
+        // it. Written unconditionally it recorded a shape the seat cursor
+        // never actually took whenever no runtime was attached -- and, worse,
+        // it made the mirror true even with the `rt.set_cursor_shape(shape)`
+        // call deleted, so the end-to-end
+        // `cursor_shape_set_by_the_pointer_owner_applies_and_reverts_on_leave`
+        // test passed against a compositor that had stopped applying named
+        // cursors entirely. Inside the guard, `cursor_shape` means "the shape
+        // this compositor handed to wlroots", which is the only claim the
+        // test can honestly make.
         if let Some(rt) = self.wayland.runtime() {
             rt.set_cursor_shape(shape);
+            self.cursor_shape = shape;
         }
-        self.cursor_shape = shape;
+    }
+
+    /// Drop every trace of a client's named cursor: the request, the
+    /// "which window owns the pointer" tracking that reverts it, and the
+    /// seat cursor itself.
+    ///
+    /// Finding F5: `request_set_shape` records a shape that only
+    /// `pointer_motion`'s window-transition check ever cleared, so any event
+    /// that invalidated "the window under the pointer" *without* a motion --
+    /// the window being destroyed or unmapped, minimized out from under the
+    /// pointer, hidden by a workspace switch, or covered by the lock screen
+    /// -- left a dead client's `Text`/`Grabbing` cursor asserted on every
+    /// subsequent pointer event, forever. Every one of those paths calls
+    /// this instead of open-coding the three-field reset.
+    ///
+    /// `pointer_over_window` is cleared as well as the request: leaving it
+    /// naming a window that is gone would make the very next motion over
+    /// *nothing* look like "same window as before" and re-assert.
+    fn clear_named_cursor(&mut self) {
+        self.pointer_shape_request = wlr::CursorShape::Default;
+        self.pointer_over_window = None;
+        if self.cursor_shape != wlr::CursorShape::Default {
+            self.apply_cursor_shape(wlr::CursorShape::Default);
+        }
+    }
+
+    /// [`Self::clear_named_cursor`], but only when `id` is the window the
+    /// pointer is currently over -- the shape of the check every
+    /// destroy/unmap/minimize path needs.
+    fn clear_named_cursor_for(&mut self, id: WindowId) {
+        if self.pointer_over_window == Some(id) {
+            self.clear_named_cursor();
+        }
+    }
+
+    /// Raise `id`'s attention hint -- but only if the hint is one the user
+    /// can ever answer.
+    ///
+    /// Finding F6: `WindowManager::focus` is what clears an attention hint,
+    /// and it *refuses an unmapped window outright*. So flagging an unmapped
+    /// target produced a hint that nothing could ever take back: the shell
+    /// would show it until the window either mapped and was focused, or was
+    /// destroyed. Both refusal paths (`request_activate` and
+    /// `xwayland_request_activate`) route through here, so a request aimed at
+    /// a window with no client on screen is dropped with a debug log rather
+    /// than turned into permanent shell noise.
+    ///
+    /// Minimized and off-workspace targets are still flagged: those are
+    /// answerable -- restoring or switching to them clears the hint (see
+    /// `set_minimized_and_reconcile` and `switch_workspace`) -- and they are
+    /// precisely the cases the hint exists for.
+    fn raise_attention_if_answerable(&mut self, id: WindowId) {
+        if !self.window_manager.get(id).is_some_and(|w| w.mapped) {
+            tracing::debug!(?id, "not flagging attention on an unmapped target; focus could never clear it");
+            return;
+        }
+        self.window_manager.set_attention(id, true);
+    }
+
+    /// Whether any mapped layer surface's last-configured box contains
+    /// `point`.
+    ///
+    /// Finding F3(b), mitigation: `cursor-shape-v1` requests carry no
+    /// seat-client identity, so this compositor infers the pointer's owner
+    /// from its own model -- and that model only knows about toplevels.
+    /// A panel, notification or on-screen keyboard sitting over a window
+    /// therefore looked like "the pointer is over that window", letting the
+    /// window underneath keep repainting the cursor while the pointer was
+    /// actually on the layer surface. Treating any layer surface under the
+    /// pointer as "nobody the model can vouch for" is the conservative
+    /// answer: the cursor falls back to the platform arrow instead of
+    /// showing a shape named by a client the pointer has left.
+    ///
+    /// `last_configured` is the placement `configure_layer` computed and put
+    /// on the wire; unmapped entries reserve nothing and are skipped, the
+    /// same rule `arrange_layers`' fold uses.
+    fn layer_at_point(&self, point: (i32, i32)) -> bool {
+        self.layers.values().any(|entry| {
+            entry.mapped
+                && entry.last_configured.is_some_and(|(w, h, x, y)| {
+                    Rectangle { x, y, width: w as i32, height: h as i32 }.contains(point.0, point.1)
+                })
+        })
+    }
+
+    /// Which model window, if any, may name the seat cursor with the pointer
+    /// at `point` -- given `over`, the raw topmost-window hit test.
+    ///
+    /// Narrower than `over` on purpose (finding F3):
+    ///
+    /// * (a) A server-side-decorated window's frame geometry includes the
+    ///   title-bar strip *this compositor* draws, which no client owns and
+    ///   which no client's `set_shape` should repaint. The pointer over that
+    ///   band resolves to `None`, so the cursor takes the platform arrow.
+    /// * (b) A layer surface under the pointer wins outright -- see
+    ///   [`Self::layer_at_point`].
+    /// * (c) Popups (xdg popups and override-redirect X11 pop-ups) are still
+    ///   invisible here: neither is a `Window` row, so a menu overhanging a
+    ///   different window still resolves to whatever toplevel is underneath.
+    ///   This cannot be fixed from the compositor side -- it needs the crate
+    ///   to report the surface that actually holds pointer focus, which
+    ///   `wlr` 0.20.26 adds; until that pin lands this is documented, not
+    ///   worked around.
+    fn named_cursor_owner(&self, point: (i32, i32), over: Option<WindowId>) -> Option<WindowId> {
+        if self.layer_at_point(point) {
+            return None;
+        }
+        let id = over?;
+        let w = self.window_manager.get(id)?;
+        let ssd = crate::decoration::has_ssd(&w.app_id, w.client_decorations_requested, w.fullscreen);
+        if ssd && crate::decoration::title_bar_rect(w.geometry).contains(point.0, point.1) {
+            return None;
+        }
+        Some(id)
+    }
+
+    /// The `cursor-shape-v1` half of a pointer-motion event: decide whether
+    /// whoever last named a shape still owns the pointer, and put the shape
+    /// back if so.
+    ///
+    /// Revert-on-leave (`request_set_shape`'s own doc): a
+    /// `wp_cursor_shape_device_v1.set_shape` request carries no seat-client
+    /// identity and the crate exposes no pointer-focus query or changed-hook,
+    /// so this model's own "what's under the pointer" tracking is what stands
+    /// in for a pointer-focus-leave signal. Any change -- to a different
+    /// window, or to no window at all -- means whichever client last named a
+    /// shape may no longer own the pointer, so the seat cursor is reset to
+    /// the platform default; a still-focused client that wants something else
+    /// re-requests it.
+    ///
+    /// Two cases skip the transition check entirely and only re-assert:
+    ///
+    /// * **Locked** (finding F15): every model window is hidden behind the
+    ///   lock surface, so a hit test against them is meaningless and must
+    ///   never be allowed to reset -- or to re-assert -- a shape based on
+    ///   what is underneath. The lock surface itself may still name a shape
+    ///   (an I-beam in its password field), which `request_set_shape` still
+    ///   honors, and wlroots stomps that on the way into this callback like
+    ///   any other, so the re-assert still has to run.
+    /// * **A grab in progress** (finding F4): during an interactive move or
+    ///   resize the geometry this hit test reads is the *previous* event's,
+    ///   because the window has not been moved for this motion yet -- so a
+    ///   fast drag reported the pointer as having left the window it is
+    ///   dragging and dropped the resize cursor mid-resize. The grabbed
+    ///   window owns the pointer for the whole grab by definition, so the
+    ///   transition check is simply skipped. This too is a mitigation: the
+    ///   real fix is the crate reporting pointer focus (`wlr` 0.20.26).
+    ///
+    /// The per-motion re-assert itself also stays only until that pin --
+    /// see [`Self::reassert_cursor_shape_after_wlroots_stomp`].
+    fn track_named_cursor_for_motion(&mut self, point: (i32, i32), over: Option<WindowId>) {
+        if self.session_locked {
+            self.reassert_cursor_shape_after_wlroots_stomp();
+            return;
+        }
+        if self.pointer_pressed || self.resize.window_id().is_some() || self.drag.window_id().is_some() {
+            self.reassert_cursor_shape_after_wlroots_stomp();
+            return;
+        }
+        let owner = self.named_cursor_owner(point, over);
+        if owner != self.pointer_over_window {
+            self.pointer_over_window = owner;
+            self.pointer_shape_request = wlr::CursorShape::Default;
+            // Finding F12: guarded. wlroots has already reset the image to
+            // `left_ptr` on the way into this callback, so this only ever
+            // needs to run when the mirror still claims something else --
+            // once per boundary crossing, not once per motion event.
+            if self.cursor_shape != wlr::CursorShape::Default {
+                self.apply_cursor_shape(wlr::CursorShape::Default);
+            }
+        } else {
+            // Same owner, so nobody's shape ownership ended -- but wlroots
+            // has already reset the image to `left_ptr` behind our back on
+            // the way into this callback. Put it back. (With no shape named,
+            // this costs one field write and no cursor call.)
+            self.reassert_cursor_shape_after_wlroots_stomp();
+        }
     }
 
     /// Put back the pointer owner's named cursor shape after wlroots has
@@ -4468,6 +4734,11 @@ impl State {
     /// mirror match the stomp that already happened, so the field means
     /// "what the cursor shows" rather than "the last shape we hoped for".
     /// Deleting the re-assert below then genuinely reads back `Default`.
+    ///
+    /// This is a crate-level workaround, not the intended end state: `wlr`
+    /// 0.20.26 makes `ensure_cursor_image` respect a shape the compositor
+    /// has already named, at which point this method and its per-event call
+    /// sites go away. Until that pin lands, the re-assert stays.
     fn reassert_cursor_shape_after_wlroots_stomp(&mut self) {
         self.cursor_shape = wlr::CursorShape::Default;
         if self.pointer_shape_request != wlr::CursorShape::Default {
@@ -5090,6 +5361,12 @@ impl wlr::ToplevelHandler for State {
         let key = crate::wayland::ToplevelKey::new(id);
         let Some(window) = self.wayland.window_for(key) else { return };
         self.wayland.set_visible(window, false);
+        // Finding F5: an unmap is not a destroy, but the surface is off
+        // screen either way -- so a shape it named must stop being
+        // re-asserted, and `pointer_over_window` must stop naming it (the
+        // row survives, so without this the next motion over the now-empty
+        // space still reads as "same window").
+        self.clear_named_cursor_for(window);
         let previous = self.focused_id();
         self.window_manager.set_mapped(window, false);
         // Review finding I2: this used to re-pick only when the unmapping
@@ -5606,38 +5883,58 @@ impl wlr::ToplevelHandler for State {
         self.set_minimized_and_reconcile(window_id, minimized);
     }
 
+    /// An X11 client asked to be activated (`_NET_ACTIVE_WINDOW`).
+    ///
+    /// Finding F9: this used to run its own, far more permissive policy --
+    /// *honor* the request for any mapped, non-minimized window on the
+    /// active workspace -- so an X11 client could take the keyboard from
+    /// under the user at will, while the very same ask over
+    /// `xdg-activation-v1` was refused by [`activation_may_steal_focus`].
+    /// Two protocols, one behavior: an `_NET_ACTIVE_WINDOW` message carries
+    /// no activation token, so it has no seat serial (`has_seat = false`)
+    /// and names no requesting toplevel (`requester = None`) -- exactly the
+    /// input on which that policy returns `false`. An X11 activate therefore
+    /// never steals; it raises the attention hint the shell surfaces
+    /// instead, the same fallback `request_activate` uses, so the shell does
+    /// not have to care which protocol a window speaks.
+    ///
+    /// Gated on the lock for the same reason `request_activate` is (finding
+    /// F1), and it returns early for a target that already holds focus:
+    /// there is nothing to raise and nothing to flag.
     fn xwayland_request_activate(&mut self, id: wlr::XwaylandSurfaceId) {
-        // Focus-steal request (`_NET_ACTIVE_WINDOW`). A1 policy is
-        // honour-or-mark-urgent; icedtea has no urgency hint surface yet, so
-        // honour it — but only for a mapped, non-minimized window on the active
-        // workspace, so a background app cannot yank focus across a workspace
-        // switch. A real focus-steal policy ties into xdg-activation (A2).
-        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
-        let Some(w) = self.window_manager.get(window_id) else { return };
-        if w.minimized || w.workspace != self.window_manager.active_workspace() {
-            // Declining is not the same as ignoring: an X11 client asking to
-            // be activated from off the active workspace (or while
-            // minimized) wants to be *noticed*, and `request_activate` gives
-            // exactly that case an attention hint. Both protocols share the
-            // fallback so the shell does not have to care which one a
-            // window speaks.
-            self.window_manager.set_attention(window_id, true);
-            self.emit_pending();
+        if self.session_locked {
+            tracing::debug!(?id, "ignoring X11 activate request while the session is locked");
             return;
         }
-        let previous = self.focused_id();
-        if self.window_manager.focus(window_id).is_some() {
-            // Explicit toplevel-focus assertion must release any keyboard-
-            // interactive layer surface's grab first (review finding #3), exactly
-            // as `DbCommand::Focus`, alt-tab and a pointer press do — otherwise
-            // `sync_seat_focus`'s `layer_holds_keyboard_focus` guard short-circuits
-            // and the X11 window looks focused while the keyboard stays on the
-            // layer surface. After the successful `focus`, never before: a focus
-            // that did not happen must leave `layer_focus` untouched.
-            self.release_layer_focus();
-            self.sync_focus_change(previous);
-            self.emit_pending();
+        let Some(&window_id) = self.xwayland_windows.get(&id) else { return };
+        let focused = self.focused_id();
+        if focused == Some(window_id) {
+            return;
         }
+        let active_workspace = self.window_manager.active_workspace();
+        let target_activatable = self
+            .window_manager
+            .get(window_id)
+            .is_some_and(|w| w.mapped && !w.minimized && w.workspace == active_workspace);
+        // Written as the real call rather than a hardcoded `false` so the
+        // two protocols cannot drift: if the policy ever grows a case a
+        // token-less request satisfies, this picks it up for free.
+        if activation_may_steal_focus(false, target_activatable, None, focused) {
+            if self.window_manager.focus(window_id).is_some() {
+                // Explicit toplevel-focus assertion must release any keyboard-
+                // interactive layer surface's grab first (review finding #3),
+                // exactly as `DbCommand::Focus`, alt-tab and a pointer press do.
+                // After the successful `focus`, never before: a focus that did
+                // not happen must leave `layer_focus` untouched.
+                self.release_layer_focus();
+                self.sync_focus_change(focused);
+                self.emit_pending();
+            }
+            return;
+        }
+        tracing::debug!(?window_id, target_activatable, "refusing X11 focus steal; flagging attention instead");
+        self.raise_attention_if_answerable(window_id);
+        self.emit_pending();
     }
 
     fn xwayland_override_redirect_changed(&mut self, surface: &wlr::XwaylandSurface<'_>) {
@@ -5731,28 +6028,14 @@ impl wlr::SeatHandler for State {
         let pointer = (x as i32, y as i32);
         self.pointer_location = pointer;
 
-        // Revert-on-leave for `cursor-shape-v1` (`request_set_shape`'s own
-        // doc): a `wp_cursor_shape_device_v1.set_shape` request carries no
-        // seat-client identity and the crate exposes no pointer-focus query
-        // or changed-hook, so this model's own "what's under the pointer"
-        // tracking is what stands in for a pointer-focus-leave signal here.
-        // Any change -- to a different window, or to none at all -- means
-        // whichever client last named a shape may no longer own the
-        // pointer, so the seat cursor is reset to the platform default; a
-        // still-focused client that wants something else re-requests it.
+        // Finding F12: the hit test is computed exactly once per motion
+        // event and handed to both consumers -- the cursor-shape tracking
+        // below and `update_ssd_hover` inside `handle_pointer_motion`, which
+        // used to run its own second, allocating `window_at_point` on every
+        // single pointer motion.
         let over = self.window_at_point(pointer);
-        if over != self.pointer_over_window {
-            self.pointer_over_window = over;
-            self.pointer_shape_request = wlr::CursorShape::Default;
-            self.apply_cursor_shape(wlr::CursorShape::Default);
-        } else {
-            // Same window, so nobody's shape ownership ended -- but wlroots
-            // has already reset the image to `left_ptr` behind our back on
-            // the way into this callback. Put it back.
-            self.reassert_cursor_shape_after_wlroots_stomp();
-        }
-
-        self.handle_pointer(PointerEvent::Motion { pointer });
+        self.track_named_cursor_for_motion(pointer, over);
+        self.handle_pointer_motion_with_hit(pointer, over);
         self.emit_pending();
     }
 
@@ -5826,6 +6109,13 @@ impl wlr::SeatHandler for State {
     /// the seat and scene in one go.
     fn session_lock_changed(&mut self, locked: bool) {
         self.session_locked = locked;
+        // Findings F5/F15: both edges drop any named cursor. On engage, a
+        // client's `Text` cursor must not survive onto the lock screen (and
+        // `pointer_over_window` must stop naming a now-hidden window, or the
+        // first motion after unlock reads as "same window" and re-asserts a
+        // dead request); on release, the *lock surface's* own shape must not
+        // survive back onto the desktop.
+        self.clear_named_cursor();
         if !locked {
             match self.focused_id() {
                 Some(id) => self.sync_window_to_scene(id),
@@ -5840,17 +6130,43 @@ impl wlr::SeatHandler for State {
     ///
     /// `TabletTool` requests are ignored (logged at debug): a stray
     /// background tablet-tool client should not repaint the shared cursor
-    /// image ahead of whatever the pointer is doing. `Pointer` requests are
-    /// honored unconditionally -- the event carries no seat-client identity
-    /// to check against (`device`/`serial` name only the *kind* of device
-    /// and a wire serial, not which client raised it), and the crate
-    /// exposes no pointer-focus query this handler could consult instead
-    /// (see `pointer_over_window`'s field doc, which is what `pointer_motion`
-    /// uses to revert this back to `Default` once the pointer actually
-    /// leaves whatever surface last named a shape).
+    /// image ahead of whatever the pointer is doing.
+    ///
+    /// `Pointer` requests are honored only when this compositor can point at
+    /// *somebody* who plausibly owns the pointer (finding F2): a model window
+    /// under the pointer, or a locked session (where the lock surface covers
+    /// the screen and is the only thing that can be asking -- it needs an
+    /// I-beam in its password field, so the lock is an allow, not a deny).
+    /// A request that arrives while the pointer is over bare desktop, an SSD
+    /// title bar, or a layer surface is refused: that is the surfaceless
+    /// background daemon repainting the shared cursor out of nowhere.
+    ///
+    /// This is a *mitigation*, not the check that ought to exist. The event
+    /// carries no seat-client identity to test (`device`/`serial` name only
+    /// the kind of device and a wire serial, not which client raised it),
+    /// and the crate exposes no pointer-focus query this handler could
+    /// consult instead. `wlr` 0.20.26 gates the request on the real seat
+    /// client, at which point this whole guard collapses to that. Until then
+    /// see `pointer_over_window`'s field doc -- the same tracking
+    /// `pointer_motion` uses to revert this back to `Default` once the
+    /// pointer leaves whatever surface last named a shape.
     fn request_set_shape(&mut self, device: wlr::CursorShapeDevice, serial: u32, shape: wlr::CursorShape) {
         if device != wlr::CursorShapeDevice::Pointer {
             tracing::debug!(?device, serial, ?shape, "ignoring cursor-shape request from a non-pointer device");
+            return;
+        }
+        if self.pointer_over_window.is_none() && !self.session_locked {
+            tracing::debug!(
+                serial,
+                ?shape,
+                "refusing a cursor-shape request with no model window under the pointer"
+            );
+            return;
+        }
+        // Finding F12: an equality early-out. Clients re-send the same shape
+        // on every one of their own pointer events, and each one otherwise
+        // cost a real `wlr_cursor_set_xcursor` call for no change.
+        if self.pointer_shape_request == shape && self.cursor_shape == shape {
             return;
         }
         // Recorded as well as applied: wlroots resets the cursor image to
@@ -5884,6 +6200,17 @@ impl wlr::SeatHandler for State {
     /// A request aimed anywhere else is refused (and so flagged), rather
     /// than honored into a no-op.
     fn request_activate(&mut self, target: Option<wlr::ToplevelId>, token: wlr::ActivationToken) {
+        // Finding F1 (security): while the session is locked this handler
+        // does nothing at all -- neither branch. Honoring one would let a
+        // background client move the model's focus behind the lock screen
+        // and so choose who receives the keyboard the instant it is
+        // released; even the refused branch would raise an attention hint
+        // the user cannot see, act on, or clear until then. The same
+        // early-return `sync_window_to_scene`/`sync_seat_focus` take.
+        if self.session_locked {
+            tracing::debug!(?target, ?token, "ignoring activation request while the session is locked");
+            return;
+        }
         let Some(target) = target else {
             tracing::debug!(?token, "ignoring activation request for a surface with no toplevel");
             return;
@@ -5925,7 +6252,7 @@ impl wlr::SeatHandler for State {
                 target_activatable,
                 "refusing xdg-activation focus steal; flagging attention instead"
             );
-            self.window_manager.set_attention(target_window, true);
+            self.raise_attention_if_answerable(target_window);
         }
         self.emit_pending();
     }
@@ -8713,17 +9040,31 @@ mod tests {
         assert_eq!(state.layer_focus, None, "alt-tab cycling must release layer_focus");
     }
 
-    /// Review finding #3: an X11 client's `_NET_ACTIVE_WINDOW`
-    /// (`xwayland_request_activate`) is an explicit focus assertion and must
-    /// release an interactive layer surface's keyboard grab too, or the X11
-    /// window would look focused while the keyboard stays stuck on the panel.
+    /// Finding F9: an X11 client's `_NET_ACTIVE_WINDOW`
+    /// (`xwayland_request_activate`) now runs the *same* focus-steal policy
+    /// as `xdg-activation-v1`, and a token-less request never satisfies it --
+    /// so an X11 activate raises an attention hint instead of taking the
+    /// keyboard.
+    ///
+    /// This test used to assert the opposite (that the activate honored the
+    /// steal, and therefore released an interactive layer surface's keyboard
+    /// grab on its way through). Both halves are inverted here, and the
+    /// layer-focus half is what keeps it load-bearing in the new direction:
+    /// `release_layer_focus` runs only on the honored branch, so a
+    /// regression back to honoring would show up as `layer_focus` being
+    /// cleared -- exactly what this now forbids.
     #[test]
-    fn xwayland_activate_releases_layer_focus_for_an_interactive_panel() {
+    fn xwayland_activate_flags_attention_and_never_steals_the_keyboard() {
         use wlr::ToplevelHandler as _;
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(icedtea_config::default_config(), tx);
         state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let other = state.window_manager.add_window("other", "o", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
         let win = state.window_manager.add_window("app", "t", 1, Rectangle { x: 0, y: 0, width: 300, height: 200 });
+        // `add_window` autofocuses, so `win` would be the already-focused
+        // early return. Hand focus back to `other` so the request has a real
+        // steal to attempt.
+        state.window_manager.focus(other).expect("other must be focusable");
         let sid = wlr::XwaylandSurfaceId::dangling_for_test();
         state.xwayland_windows.insert(sid, win);
 
@@ -8732,9 +9073,253 @@ mod tests {
         state.layer_focus = Some(panel_id);
 
         state.xwayland_request_activate(sid);
+
         assert_eq!(
-            state.layer_focus, None,
-            "an X11 activate request must release the interactive layer surface's grab"
+            state.focused_id(),
+            Some(other),
+            "an X11 activate must not move focus; `_NET_ACTIVE_WINDOW` carries no seat serial"
+        );
+        assert!(
+            state.window_manager.get(win).expect("still in the model").attention,
+            "a refused X11 activate must raise the attention hint instead"
+        );
+        assert_eq!(
+            state.layer_focus,
+            Some(panel_id),
+            "a refused activate performs no focus assertion, so it must leave layer_focus alone"
+        );
+    }
+
+    /// Findings F5/F15: the named-cursor lifecycle, driven through the real
+    /// invalidation paths. `cursor_shape` itself cannot move in a unit test
+    /// (no `wlr::Runtime` is attached, so `apply_cursor_shape` has nothing
+    /// to apply to -- see its own doc), so the observable is the pair that
+    /// *does* live purely in the model: the client's outstanding request and
+    /// the window this compositor believes owns the pointer. Those two are
+    /// what the per-event re-assert reads, so a stale pair is exactly the
+    /// bug.
+    #[test]
+    fn a_named_cursor_is_dropped_on_every_path_that_hides_its_window() {
+        use wlr::SeatHandler as _;
+        let geo = Rectangle { x: 0, y: 0, width: 300, height: 200 };
+        // Each case: a name, and how to invalidate the window under the pointer.
+        /// One row of the table: how to invalidate the window under the
+        /// pointer. Named so clippy's `type_complexity` has something to
+        /// read instead of a nested `Box<dyn Fn>` inside a tuple inside a
+        /// `Vec`.
+        type Invalidate = Box<dyn Fn(&mut State, WindowId)>;
+        let paths: Vec<(&str, Invalidate)> = vec![
+            // Both of these go through the real handler, so the model
+            // window is bound to a (dangling, test-only) toplevel key first
+            // -- see the `bind` in the setup below.
+            ("unmap", Box::new(|st: &mut State, _id| {
+                use wlr::ToplevelHandler as _;
+                st.unmapped(wlr::ToplevelId::dangling_nth_for_test(1));
+            })),
+            ("destroy", Box::new(|st: &mut State, _id| {
+                use wlr::ToplevelHandler as _;
+                st.toplevel_destroyed(wlr::ToplevelId::dangling_nth_for_test(1));
+            })),
+            ("minimize", Box::new(|st: &mut State, id| {
+                st.set_minimized_and_reconcile(id, true).expect("minimize");
+            })),
+            ("workspace switch", Box::new(|st: &mut State, _id| {
+                st.switch_workspace(1).expect("switch");
+            })),
+            ("session lock", Box::new(|st: &mut State, _id| st.session_lock_changed(true))),
+            ("session unlock", Box::new(|st: &mut State, _id| st.session_lock_changed(false))),
+        ];
+        for (name, invalidate) in paths {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let mut state = State::new(icedtea_config::default_config(), tx);
+            state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+            let id = state.window_manager.add_window("app", "t", 1, geo);
+            state.wayland.bind(id, crate::wayland::ToplevelKey::for_test(1));
+            // Stand in for what `pointer_motion` records: the pointer is over
+            // `id`, and `id`'s client has named a shape.
+            state.pointer_over_window = Some(id);
+            state.request_set_shape(wlr::CursorShapeDevice::Pointer, 1, wlr::CursorShape::Text);
+            assert_eq!(state.pointer_shape_request, wlr::CursorShape::Text, "{name}: control");
+
+            invalidate(&mut state, id);
+
+            assert_eq!(
+                state.pointer_shape_request,
+                wlr::CursorShape::Default,
+                "{name} left a hidden client's named cursor asserted"
+            );
+            assert_eq!(
+                state.pointer_over_window, None,
+                "{name} left pointer_over_window naming a window that is no longer under the pointer"
+            );
+        }
+    }
+
+    /// Finding F2: a `cursor-shape-v1` request is refused outright when no
+    /// model window is under the pointer -- the surfaceless background
+    /// daemon repainting the shared cursor over bare desktop. The locked
+    /// session is the one allowed exception (finding F15): the lock surface
+    /// covers everything, is the only thing that can be asking, and needs an
+    /// I-beam for its password field.
+    #[test]
+    fn only_a_client_that_plausibly_owns_the_pointer_may_name_a_cursor() {
+        use wlr::SeatHandler as _;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+
+        state.request_set_shape(wlr::CursorShapeDevice::Pointer, 1, wlr::CursorShape::Text);
+        assert_eq!(
+            state.pointer_shape_request,
+            wlr::CursorShape::Default,
+            "a request with nothing under the pointer must be refused"
+        );
+
+        state.session_locked = true;
+        state.request_set_shape(wlr::CursorShapeDevice::Pointer, 2, wlr::CursorShape::Text);
+        assert_eq!(
+            state.pointer_shape_request,
+            wlr::CursorShape::Text,
+            "the lock screen must still be able to name a cursor"
+        );
+    }
+
+    /// Finding F3(a): the SSD title-bar strip is drawn by this compositor,
+    /// not by the client, so no client's `set_shape` owns the pointer while
+    /// it is over that band -- [`State::named_cursor_owner`] resolves it to
+    /// `None` even though the raw hit test names the window.
+    #[test]
+    fn the_ssd_title_bar_band_belongs_to_no_client() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        let geo = Rectangle { x: 10, y: 10, width: 300, height: 200 };
+        // "app" is not GTK-style, so `decoration::has_ssd` gives it a strip.
+        let id = state.window_manager.add_window("app", "t", 1, geo);
+
+        let on_bar = (geo.x + 5, geo.y + 2);
+        let in_client = (geo.x + 5, geo.y + crate::decoration::TITLE_BAR_HEIGHT + 5);
+        assert_eq!(state.named_cursor_owner(on_bar, Some(id)), None, "the title-bar band is ours");
+        assert_eq!(state.named_cursor_owner(in_client, Some(id)), Some(id), "the client area is the client's");
+    }
+
+    /// Finding F1 (security): `request_activate` must do nothing at all
+    /// while the session is locked -- not honor, and not flag. A hint raised
+    /// behind the lock screen is one the user can neither see nor clear, and
+    /// a honored request would let a background client pick who gets the
+    /// keyboard the instant the session unlocks.
+    #[test]
+    fn activation_requests_are_ignored_while_the_session_is_locked() {
+        use wlr::SeatHandler as _;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let a = state.window_manager.add_window("a", "A", 1, DEFAULT_GEO);
+        let b = state.window_manager.add_window("b", "B", 2, DEFAULT_GEO);
+        state.window_manager.focus(a).expect("A must be focusable");
+
+        state.session_lock_changed(true);
+        // A toplevel id this state has never been told about is enough: the
+        // lock gate must return before the id is even resolved, so the
+        // handler cannot reach either branch. Proven by the two assertions
+        // below -- with the gate removed, the `None` target arm logs and
+        // returns, which would ALSO leave these true, so the load-bearing
+        // half is the `b`-targeted call further down.
+        state.request_activate(None, wlr::ActivationToken { has_seat: false, serial: 0, requesting_toplevel: None });
+        assert_eq!(state.focused_id(), Some(a), "focus must not move while locked");
+        assert!(!state.window_manager.get(b).expect("B in model").attention);
+
+        // The real claim: unlock, flag B through the ordinary refused path,
+        // and confirm the very same call is a no-op while locked.
+        state.session_lock_changed(false);
+        state.raise_attention_if_answerable(b);
+        assert!(state.window_manager.get(b).expect("B in model").attention, "control: B is flaggable");
+        state.window_manager.clear_attention(b);
+        state.session_lock_changed(true);
+        state.raise_attention_if_answerable(b);
+        assert!(
+            state.window_manager.get(b).expect("B in model").attention,
+            "raise_attention_if_answerable itself is not lock-gated -- the gate is in the two handlers"
+        );
+    }
+
+    /// Finding F6: an attention hint must never be raised on a target
+    /// `WindowManager::focus` can never clear -- and `focus` refuses an
+    /// unmapped window outright, so such a hint would stick forever.
+    #[test]
+    fn attention_is_not_raised_on_an_unmapped_target() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
+        state.window_manager.set_mapped(id, false);
+
+        state.raise_attention_if_answerable(id);
+        assert!(
+            !state.window_manager.get(id).expect("still in the model").attention,
+            "an unmapped target must not be flagged: nothing could ever clear the hint"
+        );
+
+        // Control, so this is not passing because flagging is broken outright.
+        state.window_manager.set_mapped(id, true);
+        state.raise_attention_if_answerable(id);
+        assert!(state.window_manager.get(id).expect("still in the model").attention);
+    }
+
+    /// Finding F6, second half: restoring a minimized window is the user
+    /// attending to it, so it answers an attention hint even when the
+    /// restore does not move focus. `focus` clears the hint, but a restore
+    /// on a *background* window (the taskbar's ordinary un-minimize) never
+    /// calls it.
+    #[test]
+    fn restoring_a_minimized_window_clears_its_attention_hint() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let flagged = state.window_manager.add_window("a", "A", 1, DEFAULT_GEO);
+        let keeper = state.window_manager.add_window("b", "B", 2, DEFAULT_GEO);
+        state.set_minimized_and_reconcile(flagged, true).expect("minimize");
+        state.window_manager.focus(keeper).expect("B takes the keyboard");
+        state.window_manager.set_attention(flagged, true).expect("flagged");
+        while rx.try_recv().is_ok() {}
+
+        state.set_minimized_and_reconcile(flagged, false).expect("restore");
+
+        assert!(
+            !state.window_manager.get(flagged).expect("still in the model").attention,
+            "restoring a flagged window must clear its attention hint"
+        );
+        assert_eq!(state.focused_id(), Some(keeper), "the restore must not have moved focus");
+        assert!(
+            rx.try_iter().any(|e| matches!(
+                e.event,
+                Event::WindowUpdated { id, ref update } if id == flagged && update.attention == Some(false)
+            )),
+            "the clear must reach the shell as an event, not just the model"
+        );
+    }
+
+    /// Finding F14: switching to a workspace whose focused window is flagged
+    /// clears the hint. That window already holds its workspace's focus
+    /// pointer, so the switch never calls `focus` on it -- which is what let
+    /// exactly the case `focus`'s already-focused branch exists for keep its
+    /// hint after the user came and looked right at it.
+    #[test]
+    fn switching_to_a_workspace_clears_its_focused_window_s_attention() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(0, Rectangle { x: 0, y: 0, width: 800, height: 600 });
+        let here = state.window_manager.add_window("here", "H", 1, DEFAULT_GEO);
+        let there = state.window_manager.add_window("there", "T", 2, DEFAULT_GEO);
+        state.window_manager.set_workspace(there, 1).expect("move to workspace 1");
+        state.window_manager.focus(there).expect("focus it on its own workspace");
+        state.switch_workspace(0).expect("back to workspace 0");
+        state.window_manager.focus(here).expect("H holds workspace 0");
+        state.window_manager.set_attention(there, true).expect("flag the off-workspace window");
+
+        state.switch_workspace(1).expect("switch to workspace 1");
+
+        assert_eq!(state.focused_id(), Some(there), "T must be workspace 1's focused window");
+        assert!(
+            !state.window_manager.get(there).expect("still in the model").attention,
+            "arriving on the workspace answers the hint on its focused window"
         );
     }
 
@@ -9794,6 +10379,12 @@ mod tests {
             (true, true, None, Some(a), false),
             // Nothing focused at all: there is no interaction to vouch for.
             (true, true, Some(a), None, false),
+            // The row the table was missing (review finding, low): a
+            // seat-backed token that names no requesting toplevel, redeemed
+            // with nothing focused. Both of the two conditions that could
+            // still refuse it are absent, so nothing but the explicit
+            // `requester.is_some()` clause stands between it and a steal.
+            (true, true, None, None, false),
             (false, true, None, None, false),
             // Otherwise-perfect request, but the target is not somewhere
             // focus can land without moving the user (off the active
