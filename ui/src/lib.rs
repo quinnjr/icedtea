@@ -5,6 +5,8 @@
 //! onto a `zwlr_layer_shell_v1` surface. See
 //! `docs/superpowers/specs/2026-08-20-pure-rust-gtk-ui-design.md`.
 
+pub mod css;
+
 /// GTK 4's default light theme, vendored so tests are hermetic.
 ///
 /// See `ui/themes/README.md` for provenance and the LGPL-2.1-or-later
