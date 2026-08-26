@@ -41,9 +41,11 @@ cargo test -p icedtea-ui
 ```
 
 - `tests/themed_button_offscreen.rs` is the **load-bearing gate**: computed
-  values equal Adwaita's resolved values, the centre pixel equals the color
-  the theme declares, a pixel outside `border-radius: 5px` is transparent,
-  and toggling `:hover`/`:active` changes both. No compositor needed.
+  values equal Adwaita's resolved values, the padding-gutter column (x=4) on
+  the centre row equals the color the theme declares (the centred label
+  covers the geometric centre pixel, so the gutter column is sampled
+  instead), a pixel outside `border-radius: 5px` is transparent, and toggling
+  `:hover`/`:active` changes both. No compositor needed.
 - `tests/layer_shell_screencopy.rs` proves the Wayland seam against the
   harness compositor.
 

@@ -332,14 +332,26 @@ impl Element for CssNode {
         false
     }
 
+    // M2: constant because M1's tree is a two-node chain (window > button). A
+    // real tree makes this wrong in both directions (:first-child/:last-child/
+    // :only-child match everything; :not(:first-child) matches nothing). 33
+    // Adwaita rules depend on these.
     fn prev_sibling_element(&self) -> Option<Self> {
         None
     }
 
+    // M2: constant because M1's tree is a two-node chain (window > button). A
+    // real tree makes this wrong in both directions (:first-child/:last-child/
+    // :only-child match everything; :not(:first-child) matches nothing). 33
+    // Adwaita rules depend on these.
     fn next_sibling_element(&self) -> Option<Self> {
         None
     }
 
+    // M2: constant because M1's tree is a two-node chain (window > button). A
+    // real tree makes this wrong in both directions (:first-child/:last-child/
+    // :only-child match everything; :not(:first-child) matches nothing). 33
+    // Adwaita rules depend on these.
     fn first_element_child(&self) -> Option<Self> {
         None
     }
@@ -425,6 +437,10 @@ impl Element for CssNode {
         false
     }
 
+    // M2: constant because M1's tree is a two-node chain (window > button). A
+    // real tree makes this wrong in both directions (:first-child/:last-child/
+    // :only-child match everything; :not(:first-child) matches nothing). 33
+    // Adwaita rules depend on these.
     fn is_empty(&self) -> bool {
         true
     }

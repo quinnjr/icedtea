@@ -87,6 +87,34 @@ get their own spec** when reached; this document details M1 and sketches the res
 2. **M2 — GTK-CSS engine breadth**: full parse + `@define-color` + selector/
    combinator coverage + cascade + specificity + the `-gtk-*` property set +
    gradients/shadows, tested against real theme files on abstract node trees.
+
+   **Findings from M1 that M2's spec must account for:**
+   - `cascade()` returns `HashMap<String, String>` and loses the cascade key,
+     so shorthand/longhand ordering (`border` vs. `border-width`/
+     `border-color`) cannot be correct — M2 must expand shorthands at
+     cascade time, or return the winning key alongside each value, before
+     adding the `-gtk-*` property set.
+   - `Element` tree gap: `is_empty`, sibling/child accessors, `has_id`,
+     `attr_matches`, `has_custom_state` are constants — real children,
+     sibling order, and nth-index are needed (33 Adwaita rules depend on
+     these).
+   - Functional pseudo-classes `:dir()` (39 lines) / `:drop()` (23 lines) are
+     unparsed — needs `parse_non_ts_functional_pseudo_class` plus a
+     directionality bit on `CssNode`.
+   - Relative colour and `currentColor` are one feature (8 `@define-color`s
+     and 11 rule declarations use
+     `rgb(from currentColor r g b / calc(alpha * …))`); `skia_rs_core::Color::
+     from_css` is comma-only and case-sensitive (rejects CSS4 `rgb(53 132
+     228)` and percentages) — M2 needs its own cssparser-based colour value
+     parser.
+   - `ComputedStyle` is flat/uniform — M2 needs per-side border width/colour
+     and per-corner radii.
+   - Keep: the `Background` enum + `color_at` as the single row-colour
+     authority, `CssNode`'s `Rc` + `with_states`, and the parse/colors/
+     select/cascade/computed module split.
+   - Single-buffered `wl_shm` needs a release-tracked pool once continuous
+     repaint arrives; `cascade`'s per-selector `SelectorCaches` allocs should
+     move to `matches_selector` with one caller-owned context.
 3. **M3 — Widget toolkit breadth**: the retained widget tree + event/focus model
    + a core widget set (window, headerbar, button, label, box, grid, entry,
    switch, checkbutton, dropdown, scrolledwindow, listview/row, stack,
@@ -156,10 +184,12 @@ commit.
   build the button node, and assert the *computed* `background`, `border-radius`,
   and `color` equal the theme's resolved values (e.g. the button background
   resolves through Adwaita's named colors). Render to an offscreen `SkSurface`
-  and assert pixels: the button's center pixel equals the computed background
-  color, and a pixel just outside the corner radius is transparent. Toggling
-  `:hover` changes the computed background and the center pixel. This proves
-  CSS → cascade → Skia paint end-to-end, and fails if any seam is wrong.
+  and assert pixels: the padding-gutter column (x=4) on the centre row equals
+  the computed background color -- the centred label covers the geometric
+  centre pixel, so the gutter column is sampled instead -- and a pixel just
+  outside the corner radius is transparent. Toggling `:hover` changes the
+  computed background and that gutter pixel. This proves CSS → cascade →
+  Skia paint end-to-end, and fails if any seam is wrong.
 - **Runnable binary:** shows the themed button as a layer surface under the
   running icedtea compositor (manual/visual, or a harness screencopy check).
 - The offscreen test is the load-bearing gate; the layer-shell binary proves the
