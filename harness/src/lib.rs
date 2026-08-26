@@ -77,7 +77,9 @@ use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xd
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
 };
@@ -820,6 +822,40 @@ struct ClientState {
     /// surface, and `button` always arrives after `enter`, so the latest
     /// value here is always the right one to pass.
     last_pointer_serial: Option<u32>,
+    /// Every `wl_pointer.button` this client has seen, as
+    /// `(button_code, pressed)` in arrival order.
+    ///
+    /// A `Vec` rather than a "last button" scalar: the implicit-grab tests
+    /// assert on a *sequence* (press here, release there) and on the
+    /// *absence* of an event on the other client, both of which a scalar
+    /// that the next event overwrites cannot express.
+    pointer_buttons: Vec<(u32, bool)>,
+    /// Every `wl_pointer.motion` this client has seen, in surface-local
+    /// coordinates. `enter` is deliberately *not* recorded here -- the
+    /// grab tests need to tell "the surface was re-entered" from "the
+    /// surface was sent a motion while it held the grab" apart.
+    pointer_motions: Vec<(f64, f64)>,
+    /// How many `wl_pointer.enter` events this client has seen. The grab
+    /// tests assert this does *not* advance while another surface holds
+    /// the implicit grab.
+    pointer_enters: u32,
+    /// Whether the popup this client opened has been dismissed with
+    /// `xdg_popup.popup_done`. Set once and never cleared: a dismissed
+    /// popup is gone for good.
+    popup_done: bool,
+    /// Whether the popup's own `xdg_surface.configure` has arrived, which
+    /// is what says the popup may attach a buffer and map.
+    popup_configured: bool,
+    /// The surface-local coordinates the most recent `wl_pointer.enter`
+    /// carried.
+    ///
+    /// Tracked separately from `pointer_motions` because wlroots suppresses
+    /// a `motion` whose coordinates match the ones the `enter` just
+    /// established -- so the enter is the only place the grab's reference
+    /// point is observable from a client.
+    pointer_enter_position: Option<(f64, f64)>,
+    /// How many `wl_pointer.leave` events this client has seen.
+    pointer_leaves: u32,
     /// The drag offer delivered on `wl_data_device.enter` while this client
     /// is a drag-and-drop destination, or `None` before a drag has entered
     /// (or after it has left).
@@ -1079,6 +1115,51 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for ClientState {
         }
     }
 }
+
+/// Marker user-data for a **popup's** `xdg_surface`, so its configures are
+/// acked and counted separately from the toplevel's.
+///
+/// Without it both roles would share `Dispatch<XdgSurface, ()>` and a popup
+/// configure would advance [`TestClient::configure_count`], quietly breaking
+/// every test that waits on that counter to observe a toplevel change.
+pub(crate) struct PopupRole;
+
+impl Dispatch<xdg_surface::XdgSurface, PopupRole> for ClientState {
+    fn event(
+        state: &mut Self,
+        surface: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &PopupRole,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Acked here for the same reason the toplevel's is -- see that impl.
+        if let xdg_surface::Event::Configure { serial } = event {
+            surface.ack_configure(serial);
+            state.popup_configured = true;
+        }
+    }
+}
+
+impl Dispatch<xdg_popup::XdgPopup, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &xdg_popup::XdgPopup,
+        event: xdg_popup::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // `Configure` carries the geometry the compositor chose; this
+        // harness maps at whatever it asked for and never repositions, so
+        // only the dismissal matters.
+        if let xdg_popup::Event::PopupDone = event {
+            state.popup_done = true;
+        }
+    }
+}
+
+delegate_noop!(ClientState: ignore xdg_positioner::XdgPositioner);
 
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for ClientState {
     fn event(
@@ -1377,8 +1458,40 @@ impl Dispatch<wl_pointer::WlPointer, ()> for ClientState {
         // implicit grab `start_drag` validates against) always arrives after
         // `enter`, so the latest one recorded is always the right one.
         match event {
-            wl_pointer::Event::Enter { serial, .. } => state.last_pointer_serial = Some(serial),
-            wl_pointer::Event::Button { serial, .. } => state.last_pointer_serial = Some(serial),
+            wl_pointer::Event::Enter {
+                serial,
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                state.last_pointer_serial = Some(serial);
+                state.pointer_enters = state.pointer_enters.saturating_add(1);
+                state.pointer_enter_position = Some((surface_x, surface_y));
+            }
+            wl_pointer::Event::Leave { .. } => {
+                state.pointer_leaves = state.pointer_leaves.saturating_add(1);
+            }
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => state.pointer_motions.push((surface_x, surface_y)),
+            wl_pointer::Event::Button {
+                serial,
+                button,
+                state: button_state,
+                ..
+            } => {
+                state.last_pointer_serial = Some(serial);
+                let pressed = match button_state {
+                    WEnum::Value(wl_pointer::ButtonState::Pressed) => true,
+                    WEnum::Value(wl_pointer::ButtonState::Released) => false,
+                    other => {
+                        panic!("wl_pointer.button carried an unrecognized button_state: {other:?}")
+                    }
+                };
+                state.pointer_buttons.push((button, pressed));
+            }
             _ => {}
         }
     }
@@ -1720,12 +1833,50 @@ impl Dispatch<zwlr_gamma_control_v1::ZwlrGammaControlV1, ()> for ClientState {
     }
 }
 
+/// The objects backing one `xdg_popup`, held so the popup outlives the call
+/// that made it.
+///
+/// Dropping these fields does *not* destroy the popup: `wayland-client`
+/// 0.31 proxies have no `Drop` impl that sends a protocol destroy request,
+/// so simply letting a `PopupHandles` go out of scope leaks the objects
+/// server-side until the connection itself closes. To retire a popup
+/// deliberately, call [`PopupHandles::destroy`] (or go through
+/// [`TestClient::detach`], which does so for you). `popup_done` -- what
+/// [`TestClient::popup_dismissed`] watches for -- is sent by the compositor
+/// on its own initiative; nothing this struct does triggers it.
+///
+/// No buffer or pool: the popup is never configured and so never legally
+/// attaches one. See [`TestClient::open_grabbing_popup`].
+pub(crate) struct PopupHandles {
+    popup: xdg_popup::XdgPopup,
+    xdg_surface: xdg_surface::XdgSurface,
+    surface: wl_surface::WlSurface,
+    positioner: xdg_positioner::XdgPositioner,
+}
+
+impl PopupHandles {
+    /// Destroy every object backing this popup, child-to-parent as
+    /// xdg-shell requires: the `xdg_popup` role object, then its
+    /// `xdg_surface`, then the `wl_surface` it was assigned to, then the
+    /// `xdg_positioner` that placed it (order-independent, but destroyed
+    /// alongside the rest rather than leaked).
+    pub(crate) fn destroy(self) {
+        self.popup.destroy();
+        self.xdg_surface.destroy();
+        self.surface.destroy();
+        self.positioner.destroy();
+    }
+}
+
 /// A real wayland client with exactly one mapped xdg toplevel.
 pub struct TestClient {
     // Field order is drop order: the wayland objects go before the queue and
     // the connection that own their backing.
     decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     buffer: wl_buffer::WlBuffer,
+    /// The size the mapped `buffer` was created at -- what
+    /// [`TestClient::mapped_size`] reports.
+    mapped_size: (i32, i32),
     pool: wl_shm_pool::WlShmPool,
     toplevel: xdg_toplevel::XdgToplevel,
     xdg_surface: xdg_surface::XdgSurface,
@@ -1742,6 +1893,12 @@ pub struct TestClient {
         wl_shm_pool::WlShmPool,
         std::fs::File,
     )>,
+    /// The popup opened by [`TestClient::open_grabbing_popup`] and every
+    /// object backing it, held so the popup outlives that call. `None`
+    /// until that method has been called; see [`PopupHandles`] for why
+    /// simply dropping this does not tear the popup down, and
+    /// [`TestClient::detach`] for where it actually is destroyed.
+    popup: Option<PopupHandles>,
     state: ClientState,
     queue: EventQueue<ClientState>,
     qh: QueueHandle<ClientState>,
@@ -2216,12 +2373,14 @@ impl TestClient {
         TestClient {
             decoration,
             buffer,
+            mapped_size: (w, h),
             pool,
             toplevel,
             xdg_surface,
             surface,
             shm_file,
             icon: None,
+            popup: None,
             state,
             queue,
             qh,
@@ -2238,7 +2397,19 @@ impl TestClient {
     /// compositor that has nothing to say, turning a failed assertion into a
     /// hung test.
     pub fn wait_until(&mut self, pred: impl Fn(&TestClient) -> bool) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        self.wait_until_timeout(TIMEOUT, pred)
+    }
+
+    /// As [`Self::wait_until`], but with an explicit timeout rather than
+    /// [`TIMEOUT`] -- for a negative assertion ("this must not happen")
+    /// where waiting the full default timeout on every green run would slow
+    /// the suite down for no benefit.
+    pub fn wait_until_timeout(
+        &mut self,
+        timeout: Duration,
+        pred: impl Fn(&TestClient) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
         loop {
             if pred(self) {
                 return true;
@@ -2257,6 +2428,15 @@ impl TestClient {
     /// Most recent `xdg_toplevel.configure` size.
     pub fn last_configure(&self) -> Option<(i32, i32)> {
         self.state.configured
+    }
+
+    /// The size of the buffer actually attached at map time -- the
+    /// compositor's configure size, or [`FALLBACK_SIZE`] if it configured
+    /// `0x0`. A caller that derives a press point from the model's snapshot
+    /// geometry should check it against this rather than assume the two
+    /// agree.
+    pub fn mapped_size(&self) -> (i32, i32) {
+        self.mapped_size
     }
 
     /// `xdg_toplevel` states from the most recent configure.
@@ -2367,24 +2547,35 @@ impl TestClient {
     }
 
     /// Destroy the toplevel cleanly, in the order xdg-shell requires
-    /// (toplevel, then xdg_surface, then the wl_surface), and flush so the
-    /// compositor sees it before the connection goes away.
+    /// (any popup child first, then the toplevel, then its xdg_surface, then
+    /// the wl_surface), and flush so the compositor sees it before the
+    /// connection goes away.
     pub fn detach(self) {
-        if let Some(decoration) = &self.decoration {
+        let mut this = self;
+        // The popup (if any) is a child of `this.xdg_surface`; xdg-shell
+        // requires children destroyed before their parent.
+        if let Some(popup) = this.popup.take() {
+            popup.destroy();
+        }
+        if let Some(decoration) = &this.decoration {
             decoration.destroy();
         }
-        self.buffer.destroy();
-        self.pool.destroy();
-        self.toplevel.destroy();
-        self.xdg_surface.destroy();
-        self.surface.destroy();
-        self.conn.flush().expect("flush");
+        this.buffer.destroy();
+        this.pool.destroy();
+        this.toplevel.destroy();
+        this.xdg_surface.destroy();
+        this.surface.destroy();
+        this.conn.flush().expect("flush");
         // `roundtrip` so the destroys have provably been processed before the
         // connection drops: a bare flush leaves it racing the socket close,
-        // and the two produce different server-side teardown paths.
-        let mut this = self;
+        // and the two produce different server-side teardown paths. Best
+        // effort only -- the connection is going away regardless -- but a
+        // failure here is still worth flagging in a debug build rather than
+        // silently swallowing it.
         let TestClient { state, queue, .. } = &mut this;
-        let _ = queue.roundtrip(state);
+        if let Err(e) = queue.roundtrip(state) {
+            debug_assert!(false, "TestClient::detach roundtrip failed: {e}");
+        }
     }
 
     /// Own the clipboard: create a `wl_data_source` advertising `mime` with
@@ -2414,12 +2605,91 @@ impl TestClient {
         self.state.data_device.is_some()
     }
 
-    /// Start a drag-and-drop session from this client's own surface: create a
-    /// `wl_data_source` advertising `mime` with `payload`, declare it
-    /// supports the `copy` action, and `start_drag` it with `serial` -- the
-    /// implicit-grab serial of the `wl_pointer.button` press that began the
-    /// drag ([`TestClient::last_pointer_serial`]). No icon: this harness
-    /// passes `None`, so the icon path is not exercised here.
+    /// Open a child `xdg_popup` of this client's toplevel and take an
+    /// **explicit** popup grab on it with `serial`.
+    ///
+    /// `serial` must be one the seat issued this client's `wl_pointer` --
+    /// [`TestClient::last_pointer_serial`] after a button press. The grab is
+    /// requested before the popup's first commit, as xdg-shell requires.
+    ///
+    /// The popup is created and grabbed but never mapped -- see
+    /// [`TestClient::popup_configured`] for why, and why that costs this
+    /// nothing. Panics if called while a previous popup from this method is
+    /// still live; see [`TestClient::detach`] and [`PopupHandles::destroy`]
+    /// for the only supported way to retire one.
+    pub fn open_grabbing_popup(&mut self, serial: u32, w: i32, h: i32) {
+        assert!(
+            self.popup.is_none(),
+            "open_grabbing_popup called with a previous popup still live -- \
+             destroy it first (PopupHandles::destroy) before opening another"
+        );
+        assert!(
+            w > 0 && h > 0,
+            "popup size ({w}, {h}) must be positive -- xdg-shell rejects a \
+             zero-sized positioner outright"
+        );
+        let wm_base = self
+            .state
+            .wm_base
+            .clone()
+            .expect("compositor did not advertise xdg_wm_base");
+        let compositor = self
+            .state
+            .compositor
+            .clone()
+            .expect("compositor did not advertise wl_compositor");
+        let seat = self.state.seat.clone().expect("no wl_seat");
+
+        let positioner = wm_base.create_positioner(&self.qh, ());
+        positioner.set_size(w, h);
+        positioner.set_anchor_rect(0, 0, w, h);
+
+        let surface = compositor.create_surface(&self.qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &self.qh, PopupRole);
+        let popup = xdg_surface.get_popup(Some(&self.xdg_surface), &positioner, &self.qh, ());
+        // Before the first commit, per xdg-shell.
+        popup.grab(&seat, serial);
+        surface.commit();
+        self.conn.flush().expect("flush popup create");
+        self.queue
+            .roundtrip(&mut self.state)
+            .expect("roundtrip after opening the grabbing popup");
+
+        self.popup = Some(PopupHandles {
+            popup,
+            xdg_surface,
+            surface,
+            positioner,
+        });
+    }
+
+    /// Whether the popup's own `xdg_surface.configure` has arrived.
+    ///
+    /// `false` today for every popup this harness opens: the `wlr` crate has
+    /// no xdg-popup support yet (every `wlr_xdg_popup*` symbol is still
+    /// `not-yet` in its coverage ledger), so nothing ever answers the
+    /// popup's `xdg_surface` with a configure and it cannot legally attach a
+    /// buffer or map. That does not weaken a popup *grab*, though: the seat
+    /// grab is not the compositor's to install one for -- wlroots' own
+    /// xdg-shell implementation keeps a `wlr_xdg_popup_grab` per seat and
+    /// starts it from the popup's `grab` request itself, so the grab is
+    /// live regardless of whether the popup ever configures.
+    ///
+    /// Asserted `false` by the popup-grab test so the day this changes is
+    /// the day that test tells someone. Kept as an accessor rather than
+    /// deleted because it is the executable record of the gap. Every other
+    /// place this project notes the same gap should link here rather than
+    /// restate it.
+    pub fn popup_configured(&self) -> bool {
+        self.state.popup_configured
+    }
+
+    /// Whether the popup opened by [`TestClient::open_grabbing_popup`] has
+    /// been dismissed with `xdg_popup.popup_done`.
+    pub fn popup_dismissed(&self) -> bool {
+        self.state.popup_done
+    }
+
     pub fn start_drag_text(&mut self, mime: &str, payload: &[u8], serial: u32) {
         let manager = self
             .state
@@ -2725,6 +2995,35 @@ impl TestClient {
         self.state.last_pointer_serial
     }
 
+    /// Every `wl_pointer.button` this client has seen, as
+    /// `(button_code, pressed)` in arrival order.
+    pub fn pointer_buttons(&self) -> &[(u32, bool)] {
+        &self.state.pointer_buttons
+    }
+
+    /// Every `wl_pointer.motion` this client has seen, in surface-local
+    /// coordinates and in arrival order. Excludes the coordinates carried by
+    /// `wl_pointer.enter`.
+    pub fn pointer_motions(&self) -> &[(f64, f64)] {
+        &self.state.pointer_motions
+    }
+
+    /// The surface-local coordinates carried by the most recent
+    /// `wl_pointer.enter`, or `None` if the pointer never entered.
+    pub fn pointer_enter_position(&self) -> Option<(f64, f64)> {
+        self.state.pointer_enter_position
+    }
+
+    /// How many `wl_pointer.enter` events this client has seen.
+    pub fn pointer_enters(&self) -> u32 {
+        self.state.pointer_enters
+    }
+
+    /// How many `wl_pointer.leave` events this client has seen.
+    pub fn pointer_leaves(&self) -> u32 {
+        self.state.pointer_leaves
+    }
+
     /// Whether `wl_data_device.drop` has arrived for the drag currently
     /// entering this client's surface.
     pub fn got_drop(&self) -> bool {
@@ -2816,6 +3115,15 @@ impl TestClient {
     /// whose data source must answer `send`.
     pub fn pump(&mut self) {
         let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// One `roundtrip` that panics if the connection is dead, for tests whose
+    /// NEGATIVE assertions ("B was not entered") would otherwise pass vacuously
+    /// after a protocol error killed the client.
+    pub fn pump_checked(&mut self) {
+        self.queue
+            .roundtrip(&mut self.state)
+            .expect("roundtrip on a live connection");
     }
 
     /// How many `send` requests this client's source(s) have serviced.
@@ -2955,6 +3263,42 @@ impl LayerPanelClient {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Every `wl_pointer.button` this panel has seen, as
+    /// `(button_code, pressed)` in arrival order. The layer-shell twin of
+    /// [`TestClient::pointer_buttons`].
+    pub fn pointer_buttons(&self) -> &[(u32, bool)] {
+        &self.state.pointer_buttons
+    }
+
+    /// Every `wl_pointer.motion` this panel has seen, in surface-local
+    /// coordinates. The layer-shell twin of [`TestClient::pointer_motions`].
+    pub fn pointer_motions(&self) -> &[(f64, f64)] {
+        &self.state.pointer_motions
+    }
+
+    /// How many `wl_pointer.enter` events this panel has seen.
+    pub fn pointer_enters(&self) -> u32 {
+        self.state.pointer_enters
+    }
+
+    /// The surface-local coordinates carried by the most recent
+    /// `wl_pointer.enter`, or `None` if the pointer never entered.
+    pub fn pointer_enter_position(&self) -> Option<(f64, f64)> {
+        self.state.pointer_enter_position
+    }
+
+    /// How many `wl_pointer.leave` events this panel has seen. The
+    /// layer-shell twin of [`TestClient::pointer_leaves`].
+    pub fn pointer_leaves(&self) -> u32 {
+        self.state.pointer_leaves
+    }
+
+    /// The last serial this panel saw on `wl_pointer` (enter or button).
+    /// The layer-shell twin of [`TestClient::last_pointer_serial`].
+    pub fn last_pointer_serial(&self) -> Option<u32> {
+        self.state.last_pointer_serial
     }
 
     /// Most recent `zwlr_layer_surface_v1.configure` size.
