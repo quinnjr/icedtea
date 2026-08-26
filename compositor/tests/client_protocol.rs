@@ -2449,7 +2449,7 @@ fn an_implicit_grab_keeps_delivering_to_the_pressed_surface() {
         a.wait_until(|c| c.pointer_enters() > a_enters),
         "A never got wl_pointer.enter over its own content"
     );
-    b.pump();
+    b.pump_checked();
     let b_enters = b.pointer_enters();
     // The grab's reference point, read off the `enter` itself: wlroots
     // suppresses a `motion` carrying the coordinates the `enter` just
@@ -2497,7 +2497,7 @@ fn an_implicit_grab_keeps_delivering_to_the_pressed_surface() {
     );
 
     // 3. B must not have been entered while A holds the grab.
-    b.pump();
+    b.pump_checked();
     assert_eq!(
         b.pointer_enters(),
         b_enters,
@@ -2593,7 +2593,7 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
         panel.wait_until(|p| p.pointer_enters() > panel_enters),
         "the panel never got wl_pointer.enter"
     );
-    win.pump();
+    win.pump_checked();
     let win_enters = win.pointer_enters();
     let anchor = panel
         .pointer_enter_position()
@@ -2634,7 +2634,7 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
          it, though the implicit grab holds it"
     );
 
-    win.pump();
+    win.pump_checked();
     assert_eq!(
         win.pointer_enters(),
         win_enters,

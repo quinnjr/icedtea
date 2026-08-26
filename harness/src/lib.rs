@@ -3117,6 +3117,15 @@ impl TestClient {
         let _ = self.queue.roundtrip(&mut self.state);
     }
 
+    /// One `roundtrip` that panics if the connection is dead, for tests whose
+    /// NEGATIVE assertions ("B was not entered") would otherwise pass vacuously
+    /// after a protocol error killed the client.
+    pub fn pump_checked(&mut self) {
+        self.queue
+            .roundtrip(&mut self.state)
+            .expect("roundtrip on a live connection");
+    }
+
     /// How many `send` requests this client's source(s) have serviced.
     pub fn source_sends(&self) -> u32 {
         self.state.source_sends
