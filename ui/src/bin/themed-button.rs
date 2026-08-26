@@ -8,10 +8,15 @@
 //! - `ICEDTEA_UI_LABEL`   — the button's label. Default: `Click me`.
 //! - `ICEDTEA_UI_CLASSES` — comma-separated style classes, e.g.
 //!   `suggested-action`. Default: none.
+//!
+//! With `--print-allocation` it prints the border-box allocation it *would*
+//! map, as `width height label_x label_y` on one line, and exits without
+//! touching Wayland. That is how `tests/layer_shell_screencopy.rs` derives
+//! the on-screen geometry it samples instead of hardcoding it.
 
 use std::path::PathBuf;
 
-use icedtea_ui::app::{ThemeSource, run_themed_button};
+use icedtea_ui::app::{ThemeSource, run_themed_button, themed_button_allocation};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -33,6 +38,20 @@ fn main() {
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .collect();
+
+    if std::env::args().any(|arg| arg == "--print-allocation") {
+        match themed_button_allocation(&label, &classes, &theme) {
+            Ok(allocation) => println!(
+                "{} {} {} {}",
+                allocation.width, allocation.height, allocation.label_x, allocation.label_y
+            ),
+            Err(err) => {
+                tracing::error!(%err, "themed-button failed");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     if let Err(err) = run_themed_button(&label, &classes, &theme) {
         tracing::error!(%err, "themed-button failed");

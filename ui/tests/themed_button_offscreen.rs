@@ -27,14 +27,19 @@ fn stop(color: u32, position_px: Option<f32>) -> GradientStop {
 }
 
 /// A window > button node tree, a compiled Adwaita sheet and a system font.
-fn fixture(classes: &[&str]) -> (CompiledSheet, FontStack, Button) {
+fn labelled_fixture(label: &str, classes: &[&str]) -> (CompiledSheet, FontStack, Button) {
     let sheet = CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT);
     let fonts =
         FontStack::system().expect("no system font found; install dejavu/liberation/noto sans");
     let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-    let mut button = Button::new("Click me", classes, window);
+    let mut button = Button::new(label, classes, window);
     button.restyle(&sheet, &fonts);
     (sheet, fonts, button)
+}
+
+/// The same, labelled "Click me" -- what every pixel assertion here pins.
+fn fixture(classes: &[&str]) -> (CompiledSheet, FontStack, Button) {
+    labelled_fixture("Click me", classes)
 }
 
 /// Render `button` at the surface origin and return the surface.
@@ -89,7 +94,14 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
         "implausible allocation width {}",
         allocation.width
     );
-    assert!(allocation.height >= 24.0, "min-height was not honored");
+    // A2: GTK's `min-height` floors the *content* box, so the border box is
+    // `max(line-height, min-height 24) + padding 4 + 4 + border 1 + 1`. At
+    // 14px no UI face has a 24px line height, so 34 is exact and font
+    // independent -- and it is what GTK 4.22 allocates for this button.
+    assert_eq!(
+        allocation.height, 34.0,
+        "min-height was applied to the border box, not the content box"
+    );
 
     let cx = (allocation.width / 2.0) as i32;
     let cy = (allocation.height / 2.0) as i32;
@@ -234,6 +246,18 @@ fn suggested_action_button_is_adwaitas_accent_blue() {
         close(center.red(), 0x35) && close(center.green(), 0x84) && close(center.blue(), 0xE4),
         "suggested-action centre {center:?} is not Adwaita's accent blue"
     );
+}
+
+#[test]
+fn an_empty_adwaita_button_is_the_minimum_content_box_plus_its_frame() {
+    // The other half of A2, with no intrinsic size in play at all:
+    // min-width 16 + padding 9 + 9 + border 1 + 1 = 36 wide, and
+    // min-height 24 + padding 4 + 4 + border 1 + 1 = 34 high. Before the
+    // fix this button was 20x27 -- GTK 4.22 makes it 36x34.
+    let (_sheet, _fonts, button) = labelled_fixture("", &[]);
+    let allocation = button.allocation();
+    assert_eq!(allocation.width, 36.0);
+    assert_eq!(allocation.height, 34.0);
 }
 
 #[test]

@@ -5,24 +5,68 @@
 //! screencopy test: boot the headless harness compositor, run a real
 //! client against it, capture the output, and read pixels back.
 
-use std::process::{Child, Command};
+mod support;
+
 use std::time::{Duration, Instant};
 
 use icedtea_harness::{CapturedFrame, Compositor, ScreencopyClient, VirtualPointerClient};
+use icedtea_ui::layout::Allocation;
 
-/// The button's padding gutter, left of the label (`label_x` is 10) and clear
-/// of the 4px corner arcs: the one column whose color is the background alone.
-const GUTTER_X: u32 = 4;
-/// The button's centre row; its border box is 78x27 at the output origin.
-const CENTRE_Y: u32 = 13;
+use support::{allocation_of, spawn_themed_button};
 
-/// Kill the child on the way out however the test ends.
-struct Reaper(Child);
+/// The class list the pixel assertions below are pinned to.
+const CLASSES: &str = "suggested-action";
+/// The label the pixel assertions below are pinned to.
+const LABEL: &str = "Click me";
 
-impl Drop for Reaper {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+/// The headless harness output, which the pointer's absolute motion is
+/// expressed against.
+const OUTPUT_W: u32 = 1280;
+const OUTPUT_H: u32 = 720;
+
+/// Where on the output the button's background can be sampled.
+///
+/// The button is anchored top-left with margin 0, so its border box starts
+/// at the output origin. `x` is the padding gutter: inside the 1 px border,
+/// left of the label's content box, and clear of the 5 px corner arcs. `y`
+/// is the button's centre row, which is derived from the allocation rather
+/// than hardcoded -- A2's content-box minimum moved it.
+struct Sample {
+    allocation: Allocation,
+    x: u32,
+    y: u32,
+}
+
+impl Sample {
+    fn derive() -> Self {
+        let allocation = allocation_of(LABEL, CLASSES);
+        let x = 4;
+        let y = (allocation.height / 2.0) as u32;
+        assert!(
+            allocation.label_x > x as f32,
+            "sampling column {x} is not clear of the label, which starts at {}",
+            allocation.label_x
+        );
+        assert!(
+            y >= 6 && (allocation.height - y as f32) >= 6.0,
+            "sampling row {y} is not clear of the 5px corner arcs of a \
+             {}-high button",
+            allocation.height
+        );
+        Self { allocation, x, y }
+    }
+
+    /// The centre of the button, in output coordinates: where to put the
+    /// pointer so it is unambiguously inside the border box.
+    fn centre(&self) -> (f64, f64) {
+        (
+            f64::from(self.allocation.width) / 2.0,
+            f64::from(self.allocation.height) / 2.0,
+        )
+    }
+
+    fn pixel(&self, frame: &CapturedFrame) -> (u8, u8, u8) {
+        pixel_at(frame, self.x, self.y).expect("sample pixel inside the frame")
     }
 }
 
@@ -65,6 +109,15 @@ fn matches_accent(px: (u8, u8, u8)) -> bool {
     close(px.0, 0x35) && close(px.1, 0x84) && close(px.2, 0xE4)
 }
 
+/// `.suggested-action:hover`'s background is
+/// `linear-gradient(to top, #185cb0, #1c6fd4 1px)`, i.e. flat #1c6fd4
+/// everywhere above the bottom pixel row -- distinct from the unhovered
+/// gradient (#2c7fe3 -> #3584e4) on every channel by more than the
+/// tolerance above.
+fn matches_hover(px: (u8, u8, u8)) -> bool {
+    close(px.0, 0x1C) && close(px.1, 0x6F) && close(px.2, 0xD4)
+}
+
 fn count_accent_pixels(frame: &CapturedFrame) -> u32 {
     let mut count = 0;
     for y in 0..frame.height {
@@ -77,20 +130,31 @@ fn count_accent_pixels(frame: &CapturedFrame) -> u32 {
     count
 }
 
+/// Capture until `ready` accepts the sample pixel, or the deadline passes.
+fn capture_until(
+    sc: &mut ScreencopyClient,
+    pointer: Option<&mut VirtualPointerClient>,
+    sample: &Sample,
+    ready: impl Fn((u8, u8, u8)) -> bool,
+) -> (u8, u8, u8) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pointer = pointer;
+    let mut px = sample.pixel(&sc.capture());
+    while !ready(px) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        if let Some(pointer) = pointer.as_deref_mut() {
+            pointer.pump();
+        }
+        px = sample.pixel(&sc.capture());
+    }
+    px
+}
+
 #[test]
 fn themed_button_paints_accent_blue_on_a_layer_surface() {
+    let sample = Sample::derive();
     let comp = Compositor::spawn();
-
-    let child = Command::new(env!("CARGO_BIN_EXE_themed-button"))
-        .env("WAYLAND_DISPLAY", &comp.socket)
-        // Bundled, not the developer's own gtk.css: the assertion below is
-        // Adwaita's accent blue and the test must not depend on the host.
-        .env("ICEDTEA_UI_THEME", "bundled")
-        .env("ICEDTEA_UI_CLASSES", "suggested-action")
-        .env("ICEDTEA_UI_LABEL", "Click me")
-        .spawn()
-        .expect("failed to spawn themed-button");
-    let _reaper = Reaper(child);
+    let _child = spawn_themed_button(&comp.socket, LABEL, CLASSES);
 
     let mut sc = ScreencopyClient::spawn(&comp.socket);
     let mut frame = sc.capture();
@@ -109,21 +173,16 @@ fn themed_button_paints_accent_blue_on_a_layer_surface() {
     );
 
     // And it is where the layer surface anchors it: top-left, margin 0.
-    let sample = pixel_at(&frame, GUTTER_X, CENTRE_Y).expect("sample pixel inside the frame");
+    let px = sample.pixel(&frame);
     assert!(
-        matches_accent(sample),
-        "pixel ({GUTTER_X}, {CENTRE_Y}) is {sample:?}, not the accent blue the \
-         top-left-anchored button should be painting there"
+        matches_accent(px),
+        "pixel ({}, {}) is {px:?}, not the accent blue the top-left-anchored \
+         {}x{} button should be painting there",
+        sample.x,
+        sample.y,
+        sample.allocation.width,
+        sample.allocation.height
     );
-}
-
-/// `.suggested-action:hover`'s background is
-/// `linear-gradient(to top, #185cb0, #1c6fd4 1px)`, i.e. flat #1c6fd4
-/// everywhere above the bottom pixel row -- distinct from the unhovered
-/// gradient (#2c7fe3 -> #3584e4) on every channel by more than the
-/// tolerance below.
-fn matches_hover(px: (u8, u8, u8)) -> bool {
-    close(px.0, 0x1C) && close(px.1, 0x6F) && close(px.2, 0xD4)
 }
 
 /// The other half of the seam: a real pointer entering the layer surface
@@ -131,51 +190,35 @@ fn matches_hover(px: (u8, u8, u8)) -> bool {
 /// screen as the hover colour the theme declares.
 #[test]
 fn hovering_the_button_repaints_it_in_the_themes_hover_color() {
+    let sample = Sample::derive();
     let comp = Compositor::spawn();
-
-    let child = Command::new(env!("CARGO_BIN_EXE_themed-button"))
-        .env("WAYLAND_DISPLAY", &comp.socket)
-        .env("ICEDTEA_UI_THEME", "bundled")
-        .env("ICEDTEA_UI_CLASSES", "suggested-action")
-        .env("ICEDTEA_UI_LABEL", "Click me")
-        .spawn()
-        .expect("failed to spawn themed-button");
-    let _reaper = Reaper(child);
+    let _child = spawn_themed_button(&comp.socket, LABEL, CLASSES);
 
     // Wait for the unhovered button to be on screen before injecting, so a
     // hover match cannot be confused with "the surface never mapped".
     let mut sc = ScreencopyClient::spawn(&comp.socket);
-    let mut frame = sc.capture();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while count_accent_pixels(&frame) == 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-        frame = sc.capture();
-    }
-    let before = pixel_at(&frame, GUTTER_X, CENTRE_Y).expect("sample pixel inside the frame");
+    let before = capture_until(&mut sc, None, &sample, matches_accent);
     assert!(
         matches_accent(before),
         "the button was not showing its unhovered accent blue at \
-         ({GUTTER_X}, {CENTRE_Y}) before the pointer moved: {before:?}"
+         ({}, {}) before the pointer moved: {before:?}",
+        sample.x,
+        sample.y
     );
 
-    // Onto the button's centre: inside its 78x27 border box either way.
     let mut pointer = VirtualPointerClient::spawn(&comp.socket);
-    pointer.motion_absolute(39.0, f64::from(CENTRE_Y), 1280, 720);
+    let (cx, cy) = sample.centre();
+    pointer.motion_absolute(cx, cy, OUTPUT_W, OUTPUT_H);
     pointer.frame();
     pointer.pump();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut sample = before;
-    while !matches_hover(sample) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-        pointer.pump();
-        let frame = sc.capture();
-        sample = pixel_at(&frame, GUTTER_X, CENTRE_Y).expect("sample pixel inside the frame");
-    }
+    let px = capture_until(&mut sc, Some(&mut pointer), &sample, matches_hover);
     assert!(
-        matches_hover(sample),
-        "pixel ({GUTTER_X}, {CENTRE_Y}) is {sample:?}, not the #1c6fd4 that \
+        matches_hover(px),
+        "pixel ({}, {}) is {px:?}, not the #1c6fd4 that \
          `.suggested-action:hover` declares: the pointer never drove :hover through \
-         the cascade and back onto the screen"
+         the cascade and back onto the screen",
+        sample.x,
+        sample.y
     );
 }

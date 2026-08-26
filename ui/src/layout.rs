@@ -5,6 +5,23 @@
 //! then produces the border-box allocation and the label's position inside
 //! it, including the min-size clamp and the centring -- none of which this
 //! crate reimplements.
+//!
+//! # `min-width`/`min-height` are content-box minimums
+//!
+//! GTK's `min-width`/`min-height` floor the widget's *content*, exactly as
+//! `box-sizing: content-box` says they should; CSS's own `min-width` on a
+//! `border-box` element does not. Taffy takes `min_size` in the box the
+//! node's `box_sizing` names, so the minimums are converted here:
+//!
+//! ```text
+//! content    = max(intrinsic, min)
+//! border box = content + padding + border
+//! ```
+//!
+//! Passing them through as border-box minimums (which is what this module
+//! used to do) makes every button that is floored by its minimum too small
+//! by exactly its padding plus border: Adwaita's "Click me" came out 27 px
+//! high against GTK 4.22's 34, and an empty button 20x27 against 36x34.
 
 use taffy::prelude::{
     AlignItems, AvailableSpace, Display, JustifyContent, Size, Style, TaffyTree, length,
@@ -53,9 +70,11 @@ pub fn layout_button(style: &ComputedStyle, label: &TextMetrics) -> Allocation {
                 display: Display::Flex,
                 align_items: Some(AlignItems::CENTER),
                 justify_content: Some(JustifyContent::CENTER),
+                // Content-box minimums, converted to the border-box
+                // minimums taffy wants: see this module's header.
                 min_size: Size {
-                    width: length(style.min_width),
-                    height: length(style.min_height),
+                    width: length(style.min_width + pad_left + pad_right + border * 2.0),
+                    height: length(style.min_height + pad_top + pad_bottom + border * 2.0),
                 },
                 padding: taffy::geometry::Rect {
                     left: length(pad_left),
@@ -129,26 +148,40 @@ mod tests {
     #[test]
     fn allocation_is_text_plus_padding_plus_border() {
         let allocation = layout_button(&adwaita_like(), &label(60.0, 18.0));
-        // 60 + 9 + 9 + 1 + 1
+        // content max(60, min-width 16) = 60, + 9 + 9 + 1 + 1
         assert_eq!(allocation.width, 80.0);
-        // 18 + 4 + 4 + 1 + 1
-        assert_eq!(allocation.height, 28.0);
+        // content max(18, min-height 24) = 24, + 4 + 4 + 1 + 1
+        assert_eq!(allocation.height, 34.0);
         assert_eq!(allocation.label_x, 10.0, "border 1 + padding-left 9");
-        assert_eq!(allocation.label_y, 5.0, "border 1 + padding-top 4");
+        assert_eq!(
+            allocation.label_y, 8.0,
+            "border 1 + padding-top 4 + (24 - 18) / 2 centring"
+        );
     }
 
     #[test]
-    fn min_size_floors_a_tiny_label() {
-        // "" is 0 wide and 6 tall: min-width 16 / min-height 24 must win.
+    fn min_size_is_a_content_box_minimum_not_a_border_box_one() {
+        // A2, the reviewer's scenario. GTK's `min-width`/`min-height` floor
+        // the *content* box, so the padding and border are added on top:
+        // an empty Adwaita button is 36x34, not 20x27.
         let allocation = layout_button(&adwaita_like(), &label(0.0, 6.0));
         assert_eq!(
-            allocation.width, 20.0,
-            "max(0 + 18 + 2, min-width 16) == 20"
+            allocation.width, 36.0,
+            "max(0, min-width 16) + 9 + 9 + 1 + 1 == 36"
         );
         assert_eq!(
-            allocation.height, 24.0,
-            "max(6 + 8 + 2, min-height 24) == 24"
+            allocation.height, 34.0,
+            "max(6, min-height 24) + 4 + 4 + 1 + 1 == 34"
         );
+    }
+
+    #[test]
+    fn an_intrinsic_size_above_the_minimum_still_wins() {
+        // The clamp is `max`, not "always the minimum": a label taller than
+        // min-height must still grow the button.
+        let allocation = layout_button(&adwaita_like(), &label(200.0, 40.0));
+        assert_eq!(allocation.width, 220.0);
+        assert_eq!(allocation.height, 50.0);
     }
 
     #[test]
@@ -170,8 +203,8 @@ mod tests {
     #[test]
     fn the_label_is_centred_when_min_size_grows_the_button() {
         let allocation = layout_button(&adwaita_like(), &label(0.0, 6.0));
-        // Content box is 24 - 2 - 8 = 14 tall; a 6-tall label centres at 4
-        // inside it, i.e. 1 (border) + 4 (padding) + 4 == 9 from the top.
-        assert_eq!(allocation.label_y, 9.0);
+        // The content box is min-height 24 tall; a 6-tall label centres at 9
+        // inside it, i.e. 1 (border) + 4 (padding) + 9 == 14 from the top.
+        assert_eq!(allocation.label_y, 14.0);
     }
 }
