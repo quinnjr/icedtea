@@ -1,23 +1,35 @@
 //! `cssparser` glue: CSS text in, `(selector text, declarations)` rules and
-//! raw `@define-color` pairs out.
+//! `@define-color` pairs out.
 //!
-//! Deliberately value-agnostic: declaration values are kept as their
-//! verbatim source text and interpreted later (`super::colors`,
-//! `super::computed`). That keeps every GTK-specific value form
-//! (`image()`, `-gtk-*`, relative color syntax) parseable-as-text even
-//! when this milestone cannot yet interpret it.
+//! Deliberately value-agnostic *in meaning*, but never in form: declaration
+//! values are the **serialization of their token stream**
+//! (`super::value`), so comments are gone and whitespace is normalized
+//! before any consumer sees them. Interpretation still happens later
+//! (`super::colors`, `super::computed`), which keeps every GTK-specific
+//! value form (`image()`, `-gtk-*`, relative color syntax) representable
+//! even when this milestone cannot yet interpret it.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use cssparser::{
     AtRuleParser, CowRcStr, DeclarationParser, ParseError, Parser, ParserInput, ParserState,
-    QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser,
+    QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
+    parse_important,
 };
+
+use super::value::serialize_remaining;
+
+/// How deep `@import` chains are followed before the engine gives up.
+pub const MAX_IMPORT_DEPTH: usize = 8;
 
 /// One `name: value` pair from a declaration block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
     /// Property name, ASCII-lowercased.
     pub name: String,
-    /// Verbatim value text, `!important` stripped and trimmed.
+    /// The value, serialized from its token stream: comments removed,
+    /// whitespace collapsed, `!important` stripped.
     pub value: String,
     /// Whether the declaration carried `!important`.
     pub important: bool,
@@ -37,46 +49,24 @@ pub struct StyleRule {
 /// A parsed stylesheet.
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
-    /// Qualified rules, in source order.
+    /// Qualified rules, in source order (imports spliced in at their site).
     pub rules: Vec<StyleRule>,
-    /// `(name, raw value)` for every `@define-color`, in source order.
+    /// `(name, value)` for every `@define-color`, in source order.
     pub color_definitions: Vec<(String, String)>,
 }
 
-/// Split a raw declaration value into `(value, important)`.
+/// Parses a single declaration block.
 ///
-/// Tolerates whitespace between `!` and `important` (`cssparser` tokenizes
-/// them as separate tokens, so the source text can carry either spelling).
-fn split_important(raw: &str) -> (String, bool) {
-    let trimmed = raw.trim();
-    // `to_ascii_lowercase` only rewrites ASCII bytes, so it never changes the
-    // string's length or moves a byte off a UTF-8 char boundary: the length
-    // it reports lines up with `trimmed`'s own indices.
-    let lower = trimmed.to_ascii_lowercase();
-    if let Some(head_len) = lower.strip_suffix("important").map(str::len) {
-        let head = trimmed[..head_len].trim_end();
-        if let Some(head) = head.strip_suffix('!') {
-            return (head.trim_end().to_string(), true);
-        }
-    }
-    (trimmed.to_string(), false)
-}
-
-/// Consume every remaining token in `input` and return the source text it spanned.
-fn remaining_text<'i>(input: &mut Parser<'i, '_>) -> &'i str {
-    let start = input.position();
-    while input.next().is_ok() {}
-    input.slice_from(start)
-}
-
-/// Parses a single declaration block. `RuleBodyItemParser` demands one type
-/// for declarations, nested qualified rules and nested at-rules alike; nested
-/// rules are refused (`parse_qualified` is `false`), so `Declaration` serves
-/// as all three.
+/// `RuleBodyItemParser` demands one item type for declarations, nested
+/// qualified rules and nested at-rules alike, so the item is
+/// `Option<Declaration>`: `None` is a nested rule, which is consumed and
+/// discarded so the declarations *after* it are still seen (GTK has no
+/// nesting, but a sheet that uses it must not lose its remaining
+/// properties).
 struct DeclarationBlockParser;
 
 impl<'i> DeclarationParser<'i> for DeclarationBlockParser {
-    type Declaration = Declaration;
+    type Declaration = Option<Declaration>;
     type Error = ();
 
     fn parse_value<'t>(
@@ -84,56 +74,102 @@ impl<'i> DeclarationParser<'i> for DeclarationBlockParser {
         name: CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
         _start: &ParserState,
-    ) -> Result<Declaration, ParseError<'i, ()>> {
-        let (value, important) = split_important(remaining_text(input));
-        Ok(Declaration {
+    ) -> Result<Option<Declaration>, ParseError<'i, ()>> {
+        let mut value = String::new();
+        let mut important = false;
+        loop {
+            if input.is_exhausted() {
+                break;
+            }
+            // `!important` is detected with cssparser's own helper, which
+            // skips whitespace and comments -- so `red !important /* c */`
+            // still carries the flag.
+            if input.try_parse(parse_important).is_ok() {
+                important = true;
+                while input.next().is_ok() {}
+                break;
+            }
+            let before = input.position();
+            super::value::write_one_component(input, &mut value);
+            if input.position() == before {
+                break;
+            }
+        }
+        while value.ends_with(' ') {
+            value.pop();
+        }
+        Ok(Some(Declaration {
             name: name.as_ref().to_ascii_lowercase(),
             value,
             important,
-        })
+        }))
     }
 }
 
 impl<'i> AtRuleParser<'i> for DeclarationBlockParser {
     type Prelude = ();
-    type AtRule = Declaration;
+    type AtRule = Option<Declaration>;
     type Error = ();
 }
 
 impl<'i> QualifiedRuleParser<'i> for DeclarationBlockParser {
     type Prelude = ();
-    type QualifiedRule = Declaration;
+    type QualifiedRule = Option<Declaration>;
     type Error = ();
+
+    fn parse_prelude<'t>(&mut self, input: &mut Parser<'i, 't>) -> Result<(), ParseError<'i, ()>> {
+        while input.next().is_ok() {}
+        Ok(())
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        _prelude: (),
+        _start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Option<Declaration>, ParseError<'i, ()>> {
+        while input.next().is_ok() {}
+        Ok(None)
+    }
 }
 
-impl<'i> RuleBodyItemParser<'i, Declaration, ()> for DeclarationBlockParser {
+impl<'i> RuleBodyItemParser<'i, Option<Declaration>, ()> for DeclarationBlockParser {
     fn parse_declarations(&self) -> bool {
         true
     }
 
     fn parse_qualified(&self) -> bool {
-        false
+        true
     }
 }
 
-/// Top-level rule-list parser. `StyleSheetParser` unifies qualified rules and
-/// at-rules under one type, so both yield `Option<StyleRule>`: `Some` for a
-/// style rule, `None` for an `@define-color` (whose payload is pushed onto
-/// `color_definitions` instead).
-struct SheetParser {
-    color_definitions: Vec<(String, String)>,
+/// What a top-level item in a sheet turned out to be.
+enum SheetItem {
+    /// A qualified rule.
+    Rule(StyleRule),
+    /// `@define-color <name> <value>`.
+    Color(String, String),
+    /// `@import <url>`.
+    Import(String),
+    /// Something parsed but carrying nothing this engine keeps.
+    Ignored,
 }
+
+/// Top-level rule-list parser.
+struct SheetParser;
 
 impl<'i> QualifiedRuleParser<'i> for SheetParser {
     type Prelude = String;
-    type QualifiedRule = Option<StyleRule>;
+    type QualifiedRule = SheetItem;
     type Error = ();
 
     fn parse_prelude<'t>(
         &mut self,
         input: &mut Parser<'i, 't>,
     ) -> Result<String, ParseError<'i, ()>> {
-        Ok(remaining_text(input).trim().to_string())
+        let start = input.position();
+        while input.next().is_ok() {}
+        Ok(input.slice_from(start).trim().to_string())
     }
 
     fn parse_block<'t>(
@@ -141,87 +177,199 @@ impl<'i> QualifiedRuleParser<'i> for SheetParser {
         prelude: String,
         _start: &ParserState,
         input: &mut Parser<'i, 't>,
-    ) -> Result<Option<StyleRule>, ParseError<'i, ()>> {
+    ) -> Result<SheetItem, ParseError<'i, ()>> {
         let mut block = DeclarationBlockParser;
         // A malformed declaration must not discard the rest of the block --
         // GTK themes routinely carry properties this milestone's tokenizer
-        // path cannot interpret, so errors are simply dropped (`.flatten()`).
+        // path cannot interpret, so errors are simply dropped.
         let declarations: Vec<Declaration> = RuleBodyParser::<_, _, ()>::new(input, &mut block)
             .flatten()
+            .flatten()
             .collect();
-        Ok(Some(StyleRule {
+        Ok(SheetItem::Rule(StyleRule {
             selector_text: prelude,
             declarations,
-            // Filled in by `parse_stylesheet`, which knows the index.
+            // Filled in by `parse_into`, which knows the index.
             source_order: 0,
         }))
     }
 }
 
+/// The prelude of an at-rule this engine understands.
+enum AtPrelude {
+    Color(String, String),
+    Import(String),
+}
+
+/// Read an `@import` prelude's URL: `'x.css'`, `"x.css"` or `url(...)`.
+fn parse_import_url<'i>(input: &mut Parser<'i, '_>) -> Result<String, ParseError<'i, ()>> {
+    let token = input.next()?.clone();
+    let url = match token {
+        Token::QuotedString(value) | Token::UnquotedUrl(value) => value.as_ref().to_string(),
+        Token::Function(ref name) if name.eq_ignore_ascii_case("url") => {
+            input.parse_nested_block(|inner| {
+                Ok::<String, ParseError<'i, ()>>(inner.expect_string()?.as_ref().to_string())
+            })?
+        }
+        _ => return Err(input.new_custom_error(())),
+    };
+    // Media queries after the URL are not modelled; drop them.
+    while input.next().is_ok() {}
+    Ok(url)
+}
+
 impl<'i> AtRuleParser<'i> for SheetParser {
-    type Prelude = ();
-    type AtRule = Option<StyleRule>;
+    type Prelude = AtPrelude;
+    type AtRule = SheetItem;
     type Error = ();
 
     fn parse_prelude<'t>(
         &mut self,
         name: CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
-    ) -> Result<(), ParseError<'i, ()>> {
+    ) -> Result<AtPrelude, ParseError<'i, ()>> {
+        if name.eq_ignore_ascii_case("import") {
+            return parse_import_url(input).map(AtPrelude::Import);
+        }
         if !name.eq_ignore_ascii_case("define-color") {
             return Err(input.new_custom_error(()));
         }
         let color_name = input.expect_ident()?.as_ref().to_string();
-        let value = remaining_text(input).trim().to_string();
+        let value = serialize_remaining(input);
         if value.is_empty() {
             return Err(input.new_custom_error(()));
         }
-        self.color_definitions.push((color_name, value));
-        Ok(())
+        Ok(AtPrelude::Color(color_name, value))
+    }
+
+    /// The at-rules this engine keeps carry no block, so a block means the
+    /// rule was malformed: the definition is *not* recorded. (Recording it
+    /// from `parse_prelude` would let an invalid at-rule mutate the colour
+    /// table.)
+    fn parse_block<'t>(
+        &mut self,
+        _prelude: AtPrelude,
+        _start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<SheetItem, ParseError<'i, ()>> {
+        while input.next().is_ok() {}
+        Ok(SheetItem::Ignored)
     }
 
     fn rule_without_block(
         &mut self,
-        _prelude: (),
+        prelude: AtPrelude,
         _start: &ParserState,
-    ) -> Result<Option<StyleRule>, ()> {
-        Ok(None)
+    ) -> Result<SheetItem, ()> {
+        Ok(match prelude {
+            AtPrelude::Color(name, value) => SheetItem::Color(name, value),
+            AtPrelude::Import(url) => SheetItem::Import(url),
+        })
     }
 }
 
 /// Parse `css` into rules and `@define-color` pairs.
 ///
+/// `@import` is only resolvable relative to a base directory, so this
+/// base-less wrapper logs and skips every import. Callers that read a sheet
+/// off disk should use [`parse_stylesheet_with_base`].
+///
 /// Invalid rules are skipped rather than aborting the sheet, matching CSS's
 /// own error-recovery rules and GTK's tolerance of unknown syntax.
 #[must_use]
 pub fn parse_stylesheet(css: &str) -> Stylesheet {
+    parse_stylesheet_with_base(css, None)
+}
+
+/// Parse `css`, resolving `@import` relative to `base_dir`.
+///
+/// Imports are spliced in at their site (so source order, and therefore the
+/// cascade, is the order a browser would see), followed recursively to a
+/// depth of [`MAX_IMPORT_DEPTH`], and guarded by a visited set so a cycle
+/// terminates. `resource://` URLs -- GTK's own bundled resources -- are
+/// skipped with a debug log, as is any import when `base_dir` is `None`.
+#[must_use]
+pub fn parse_stylesheet_with_base(css: &str, base_dir: Option<&Path>) -> Stylesheet {
+    let mut sheet = Stylesheet::default();
+    let mut visited = HashSet::new();
+    parse_into(css, base_dir, 0, &mut visited, &mut sheet);
+    sheet
+}
+
+fn parse_into(
+    css: &str,
+    base_dir: Option<&Path>,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+    out: &mut Stylesheet,
+) {
     let mut input = ParserInput::new(css);
     let mut parser = Parser::new(&mut input);
-    let mut sheet_parser = SheetParser {
-        color_definitions: Vec::new(),
-    };
-    let mut rules: Vec<StyleRule> = Vec::new();
+    let mut sheet_parser = SheetParser;
     for item in StyleSheetParser::new(&mut parser, &mut sheet_parser) {
         match item {
-            Ok(Some(mut rule)) => {
-                rule.source_order = rules.len();
-                rules.push(rule);
+            Ok(SheetItem::Rule(mut rule)) => {
+                rule.source_order = out.rules.len();
+                out.rules.push(rule);
             }
-            Ok(None) => {}
+            Ok(SheetItem::Color(name, value)) => out.color_definitions.push((name, value)),
+            Ok(SheetItem::Import(url)) => resolve_import(&url, base_dir, depth, visited, out),
+            Ok(SheetItem::Ignored) => {}
             Err((err, slice)) => {
                 tracing::debug!(?err, rule = %slice.chars().take(80).collect::<String>(), "skipping invalid CSS rule");
             }
         }
     }
-    Stylesheet {
-        rules,
-        color_definitions: sheet_parser.color_definitions,
+}
+
+fn resolve_import(
+    url: &str,
+    base_dir: Option<&Path>,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+    out: &mut Stylesheet,
+) {
+    if depth >= MAX_IMPORT_DEPTH {
+        tracing::debug!(%url, depth, "@import nesting limit reached; skipping");
+        return;
     }
+    if url.contains("://") {
+        tracing::debug!(%url, "non-file @import URL (GTK resource?); skipping");
+        return;
+    }
+    let Some(base_dir) = base_dir else {
+        tracing::debug!(%url, "@import with no base directory to resolve against; skipping");
+        return;
+    };
+    let path = base_dir.join(url);
+    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    if !visited.insert(canonical) {
+        tracing::debug!(path = %path.display(), "@import cycle; skipping");
+        return;
+    }
+    let css = match std::fs::read_to_string(&path) {
+        Ok(css) => css,
+        Err(err) => {
+            tracing::debug!(path = %path.display(), %err, "cannot read @import target; skipping");
+            return;
+        }
+    };
+    let nested_base = path.parent().map(Path::to_path_buf);
+    parse_into(&css, nested_base.as_deref(), depth + 1, visited, out);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Declaration, parse_stylesheet};
+    use super::{Declaration, parse_stylesheet, parse_stylesheet_with_base};
+    use std::path::PathBuf;
+
+    /// A fresh scratch directory for the `@import` tests.
+    fn tempdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("icedtea-ui-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn decl<'a>(decls: &'a [Declaration], name: &str) -> &'a str {
         decls
@@ -312,5 +460,125 @@ mod tests {
             decl(&base.declarations, "background-image"),
             "linear-gradient(to top, #f6f5f4 2px, #fbfafa)"
         );
+    }
+
+    #[test]
+    fn comments_inside_values_are_removed_not_kept() {
+        // E4: `remaining_text` sliced raw source, so a comment inside a value
+        // survived into the value string and broke every later parse.
+        let sheet = parse_stylesheet("button { padding: 4px /* x */ 9px }");
+        assert_eq!(decl(&sheet.rules[0].declarations, "padding"), "4px 9px");
+    }
+
+    #[test]
+    fn important_survives_a_trailing_comment() {
+        let sheet = parse_stylesheet("button { color: red !important /* c */ }");
+        assert_eq!(decl(&sheet.rules[0].declarations, "color"), "red");
+        assert!(sheet.rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn define_color_survives_a_trailing_comment() {
+        let sheet = parse_stylesheet("@define-color accent #3584e4 /* brand */;");
+        assert_eq!(
+            sheet.color_definitions,
+            vec![("accent".to_string(), "#3584e4".to_string())]
+        );
+    }
+
+    #[test]
+    fn whitespace_in_values_is_normalised() {
+        let sheet = parse_stylesheet(
+            "button { background-image: linear-gradient(\n  to   top,\n  #f6f5f4 2px,\n  #fbfafa) }",
+        );
+        assert_eq!(
+            decl(&sheet.rules[0].declarations, "background-image"),
+            "linear-gradient(to top, #f6f5f4 2px, #fbfafa)"
+        );
+    }
+
+    #[test]
+    fn declarations_after_a_nested_block_are_not_swallowed() {
+        // E10: the nested rule is discarded, but `color` after it must survive.
+        let sheet =
+            parse_stylesheet("button { border-radius: 5px; &:hover { color: red } color: blue }");
+        assert_eq!(decl(&sheet.rules[0].declarations, "border-radius"), "5px");
+        assert_eq!(decl(&sheet.rules[0].declarations, "color"), "blue");
+    }
+
+    #[test]
+    fn define_color_with_a_block_does_not_leak_a_definition() {
+        // E10: the table entry used to be pushed from `parse_prelude`, before
+        // the at-rule was known to be valid.
+        let sheet = parse_stylesheet("@define-color leaked #fff { }");
+        assert!(
+            sheet.color_definitions.is_empty(),
+            "{:?}",
+            sheet.color_definitions
+        );
+    }
+
+    #[test]
+    fn import_is_resolved_relative_to_the_importing_file() {
+        let dir = tempdir("import-basic");
+        std::fs::write(dir.join("colors.css"), "@define-color accent #3584e4;\n").unwrap();
+        std::fs::write(dir.join("widgets.css"), "button { color: @accent }\n").unwrap();
+        let sheet = parse_stylesheet_with_base(
+            "@import 'colors.css';\n@import url(\"widgets.css\");\nbutton { padding: 1px }",
+            Some(&dir),
+        );
+        assert_eq!(
+            sheet.color_definitions,
+            vec![("accent".to_string(), "#3584e4".to_string())]
+        );
+        // Imported rules are spliced in at the import site, so source order
+        // -- and therefore the cascade -- matches what a browser would see.
+        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules[0].selector_text, "button");
+        assert_eq!(decl(&sheet.rules[0].declarations, "color"), "@accent");
+        assert_eq!(sheet.rules[0].source_order, 0);
+        assert_eq!(decl(&sheet.rules[1].declarations, "padding"), "1px");
+        assert_eq!(sheet.rules[1].source_order, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nested_imports_resolve_against_their_own_directory() {
+        let dir = tempdir("import-nested");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/leaf.css"), "entry { color: red }").unwrap();
+        std::fs::write(dir.join("sub/mid.css"), "@import 'leaf.css';").unwrap();
+        let sheet = parse_stylesheet_with_base("@import 'sub/mid.css';", Some(&dir));
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selector_text, "entry");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_import_cycle_terminates() {
+        let dir = tempdir("import-cycle");
+        std::fs::write(dir.join("a.css"), "@import 'b.css';\nbutton { color: red }").unwrap();
+        std::fs::write(dir.join("b.css"), "@import 'a.css';\nentry { color: blue }").unwrap();
+        let sheet = parse_stylesheet_with_base("@import 'a.css';", Some(&dir));
+        assert_eq!(sheet.rules.len(), 2, "{:?}", sheet.rules);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resource_urls_and_base_less_sheets_skip_imports_without_dropping_the_rest() {
+        let sheet = parse_stylesheet(
+            "@import url(\"resource:///org/gtk/libgtk/theme/Default/Default-light.css\");\n             button { color: red }",
+        );
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(decl(&sheet.rules[0].declarations, "color"), "red");
+    }
+
+    #[test]
+    fn a_missing_import_target_does_not_abort_the_sheet() {
+        let dir = tempdir("import-missing");
+        let sheet =
+            parse_stylesheet_with_base("@import 'nope.css';\nbutton { color: red }", Some(&dir));
+        assert_eq!(sheet.rules.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

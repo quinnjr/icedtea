@@ -100,6 +100,37 @@ impl ToCss for CssString {
     }
 }
 
+/// Writing direction, the argument `:dir()` matches against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Direction {
+    /// Left-to-right. GTK's default, and this engine's.
+    #[default]
+    Ltr,
+    /// Right-to-left.
+    Rtl,
+}
+
+impl Direction {
+    /// Parse `ltr`/`rtl`, ASCII-case-insensitively.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        if text.eq_ignore_ascii_case("ltr") {
+            Some(Self::Ltr)
+        } else if text.eq_ignore_ascii_case("rtl") {
+            Some(Self::Rtl)
+        } else {
+            None
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ltr => "ltr",
+            Self::Rtl => "rtl",
+        }
+    }
+}
+
 /// The pseudo-classes M1 models, plus a catch-all.
 ///
 /// `Other` exists so a rule carrying a pseudo-class this milestone does not
@@ -123,8 +154,20 @@ pub enum GtkPseudoClass {
     Backdrop,
     /// `:selected`
     Selected,
+    /// `:dir(ltr)` / `:dir(rtl)`, matched against [`CssNode::direction`].
+    Dir(Direction),
+    /// `:drop(...)`. GTK sets it only mid-drag, which M1 has no notion of,
+    /// so it parses and never matches.
+    Drop(CssString),
     /// Any pseudo-class M1 does not model. Parses; never matches.
     Other(CssString),
+    /// Any *functional* pseudo-class M1 does not model, argument text
+    /// included so the selector still serializes. Parses; never matches.
+    ///
+    /// Crucially this keeps the rest of a comma-separated selector list
+    /// alive: `colorswatch:drop(active), colorswatch` must not lose its
+    /// second, perfectly valid selector.
+    OtherFunctional(CssString, CssString),
 }
 
 impl ToCss for GtkPseudoClass {
@@ -139,7 +182,23 @@ impl ToCss for GtkPseudoClass {
             Self::FocusVisible => dest.write_str("focus-visible"),
             Self::Backdrop => dest.write_str("backdrop"),
             Self::Selected => dest.write_str("selected"),
+            Self::Dir(direction) => {
+                dest.write_str("dir(")?;
+                dest.write_str(direction.as_str())?;
+                dest.write_char(')')
+            }
+            Self::Drop(argument) => {
+                dest.write_str("drop(")?;
+                dest.write_str(argument.as_str())?;
+                dest.write_char(')')
+            }
             Self::Other(name) => dest.write_str(name.as_str()),
+            Self::OtherFunctional(name, argument) => {
+                dest.write_str(name.as_str())?;
+                dest.write_char('(')?;
+                dest.write_str(argument.as_str())?;
+                dest.write_char(')')
+            }
         }
     }
 }
@@ -211,6 +270,37 @@ impl<'i> selectors::parser::Parser<'i> for GtkSelectorParser {
         Ok(match_pseudo_class_name(name.as_ref()))
     }
 
+    /// Functional pseudo-classes: `:dir()` and `:drop()` are modelled;
+    /// everything else parses into a never-matching
+    /// [`GtkPseudoClass::OtherFunctional`] rather than erroring, so one
+    /// unknown selector cannot take its whole comma list with it.
+    fn parse_non_ts_functional_pseudo_class<'t>(
+        &self,
+        name: CowRcStr<'i>,
+        parser: &mut CssParser<'i, 't>,
+        _after_part: bool,
+    ) -> Result<GtkPseudoClass, cssparser::ParseError<'i, Self::Error>> {
+        let argument = crate::css::value::serialize_remaining(parser);
+        Ok(if name.eq_ignore_ascii_case("dir") {
+            match Direction::parse(&argument) {
+                Some(direction) => GtkPseudoClass::Dir(direction),
+                // `:dir(sideways)` is well-formed syntax with a bogus
+                // argument: it must parse and never match.
+                None => GtkPseudoClass::OtherFunctional(
+                    CssString::new("dir"),
+                    CssString::new(&argument),
+                ),
+            }
+        } else if name.eq_ignore_ascii_case("drop") {
+            GtkPseudoClass::Drop(CssString::new(&argument))
+        } else {
+            GtkPseudoClass::OtherFunctional(
+                CssString::new(&name.to_ascii_lowercase()),
+                CssString::new(&argument),
+            )
+        })
+    }
+
     fn parse_pseudo_element(
         &self,
         _location: SourceLocation,
@@ -259,6 +349,7 @@ pub struct NodeData {
     name: CssString,
     classes: Vec<CssString>,
     states: PseudoStates,
+    direction: Direction,
     parent: Option<CssNode>,
 }
 
@@ -283,8 +374,33 @@ impl CssNode {
             name: CssString::new(name),
             classes: classes.iter().map(|c| CssString::new(c)).collect(),
             states,
+            direction: Direction::default(),
             parent,
         }))
+    }
+
+    /// A copy of this node with a different writing direction.
+    #[must_use]
+    pub fn with_direction(&self, direction: Direction) -> Self {
+        Self(Rc::new(NodeData {
+            name: self.0.name.clone(),
+            classes: self.0.classes.clone(),
+            states: self.0.states,
+            direction,
+            parent: self.0.parent.clone(),
+        }))
+    }
+
+    /// This node's writing direction.
+    #[must_use]
+    pub fn direction(&self) -> Direction {
+        self.0.direction
+    }
+
+    /// This node's parent, if any.
+    #[must_use]
+    pub fn parent(&self) -> Option<Self> {
+        self.0.parent.clone()
     }
 
     /// A copy of this node with different pseudo-class state, sharing the
@@ -295,6 +411,7 @@ impl CssNode {
             name: self.0.name.clone(),
             classes: self.0.classes.clone(),
             states,
+            direction: self.0.direction,
             parent: self.0.parent.clone(),
         }))
     }
@@ -395,7 +512,10 @@ impl Element for CssNode {
             GtkPseudoClass::Focus | GtkPseudoClass::FocusVisible => s.focus,
             GtkPseudoClass::Backdrop => s.backdrop,
             GtkPseudoClass::Selected => s.selected,
-            GtkPseudoClass::Other(_) => false,
+            GtkPseudoClass::Dir(direction) => self.0.direction == *direction,
+            GtkPseudoClass::Drop(_)
+            | GtkPseudoClass::Other(_)
+            | GtkPseudoClass::OtherFunctional(..) => false,
         }
     }
 
@@ -572,5 +692,38 @@ mod tests {
         assert_eq!(base.slice().len(), 2);
         let node = window_button(&[], PseudoStates::default());
         assert!(matches(&base, &node));
+    }
+
+    #[test]
+    fn dir_matches_the_nodes_direction() {
+        let ltr = window_button(&[], PseudoStates::default());
+        let rtl = ltr.with_direction(super::Direction::Rtl);
+        assert!(hits("button:dir(ltr)", &ltr));
+        assert!(!hits("button:dir(rtl)", &ltr));
+        assert!(hits("button:dir(rtl)", &rtl));
+        assert!(!hits("button:dir(ltr)", &rtl));
+        assert_eq!(ltr.direction(), super::Direction::Ltr, "default is ltr");
+        // A bogus argument parses (so the rule survives) but never matches.
+        assert!(!hits("button:dir(sideways)", &ltr));
+    }
+
+    #[test]
+    fn drop_never_matches_but_keeps_the_rest_of_the_comma_list() {
+        // E6: `colorswatch:drop(active), colorswatch` used to fail to parse
+        // as a whole, taking the valid `colorswatch` selector with it.
+        let node = CssNode::new("colorswatch", &[], PseudoStates::default(), None);
+        let list = parse_selector_list("colorswatch:drop(active), colorswatch")
+            .expect("the comma list must parse");
+        assert_eq!(list.slice().len(), 2);
+        assert!(matches(&list, &node));
+        assert!(!hits("colorswatch:drop(active)", &node));
+    }
+
+    #[test]
+    fn unknown_functional_pseudo_classes_parse_but_never_match() {
+        let node = window_button(&[], PseudoStates::default());
+        assert!(parse_selector_list("button:lang(en), button").is_some());
+        assert!(!hits("button:lang(en)", &node));
+        assert!(hits("button", &node));
     }
 }

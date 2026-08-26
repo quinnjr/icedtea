@@ -233,4 +233,12 @@ mod tests {
             Some(&skia_rs_safe::core::Color(0xFF35_84E4))
         );
     }
+
+    #[test]
+    fn every_adwaita_rule_compiles() {
+        // E6: the two functional pseudo-classes GTK uses (`:dir()`,
+        // `:drop()`) used to fail selector parsing, dropping 62 rules.
+        let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
+        assert_eq!(sheet.rules.len(), 900);
+    }
 }
