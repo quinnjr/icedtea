@@ -113,6 +113,7 @@ mod tests {
             min_width: 16.0,
             min_height: 24.0,
             font_size: 14.0,
+            ..ComputedStyle::default()
         }
     }
 

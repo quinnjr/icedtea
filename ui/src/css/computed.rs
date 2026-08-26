@@ -88,6 +88,39 @@ impl Background {
     }
 }
 
+/// Which box a background is clipped to.
+///
+/// CSS's -- and GTK's -- default is `border-box`: the background fills the
+/// whole element and the border is painted over it, which is what makes a
+/// translucent border show the element's own background rather than what is
+/// behind it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackgroundClip {
+    /// The whole element, border included. The default.
+    #[default]
+    BorderBox,
+    /// Inside the border.
+    PaddingBox,
+    /// Inside the border and the padding.
+    ContentBox,
+}
+
+impl BackgroundClip {
+    /// Parse a `background-clip` keyword, ASCII-case-insensitively.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("border-box") {
+            Some(Self::BorderBox)
+        } else if value.eq_ignore_ascii_case("padding-box") {
+            Some(Self::PaddingBox)
+        } else if value.eq_ignore_ascii_case("content-box") {
+            Some(Self::ContentBox)
+        } else {
+            None
+        }
+    }
+}
+
 /// The properties the M1 slice needs, fully resolved.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ComputedStyle {
@@ -109,6 +142,8 @@ pub struct ComputedStyle {
     pub min_height: f32,
     /// Font size in px.
     pub font_size: f32,
+    /// Which box the background is clipped to.
+    pub background_clip: BackgroundClip,
 }
 
 impl ComputedStyle {
@@ -131,6 +166,7 @@ impl Default for ComputedStyle {
             min_width: 0.0,
             min_height: 0.0,
             font_size: Self::DEFAULT_FONT_SIZE,
+            background_clip: BackgroundClip::default(),
         }
     }
 }
@@ -340,6 +376,9 @@ impl ComputedStyle {
             if let Some(padding) = pick(values, name, parse_px) {
                 style.padding[index] = padding.max(0.0);
             }
+        }
+        if let Some(clip) = pick(values, "background-clip", BackgroundClip::parse) {
+            style.background_clip = clip;
         }
         if let Some(min_width) = pick(values, "min-width", parse_px) {
             style.min_width = min_width.max(0.0);

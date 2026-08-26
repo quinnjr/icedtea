@@ -9,7 +9,7 @@
 
 use icedtea_ui::BUNDLED_ADWAITA_LIGHT;
 use icedtea_ui::css::cascade::CompiledSheet;
-use icedtea_ui::css::computed::{Background, ComputedStyle, GradientStop};
+use icedtea_ui::css::computed::{Background, BackgroundClip, ComputedStyle, GradientStop};
 use icedtea_ui::css::select::{CssNode, PseudoStates};
 use icedtea_ui::text::FontStack;
 use icedtea_ui::widget::button::Button;
@@ -76,6 +76,12 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
     assert_eq!(normal.min_width, 16.0);
     assert_eq!(normal.min_height, 24.0);
     assert_eq!(normal.font_size, ComputedStyle::DEFAULT_FONT_SIZE);
+    // Adwaita sets no `background-clip` on `button`, so the background fills
+    // the border box -- CSS's and GTK's default. The opaque #cdc7c2 border
+    // is painted over it, which is why the border-pixel assertion below
+    // still reads the border colour and the corner outside the radius is
+    // still transparent.
+    assert_eq!(normal.background_clip, BackgroundClip::BorderBox);
 
     let allocation = button.allocation();
     assert!(
