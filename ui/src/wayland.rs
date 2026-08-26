@@ -12,7 +12,8 @@ use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{
-    ConnectError, Connection, Dispatch, DispatchError, EventQueue, QueueHandle, delegate_noop,
+    ConnectError, Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle,
+    delegate_noop,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
@@ -103,6 +104,17 @@ impl AppState {
             fonts,
             button,
         }
+    }
+
+    /// Forget everything that depended on having a pointer.
+    ///
+    /// The compositor can take the pointer capability away at any time (the
+    /// last mouse is unplugged); whatever the widget was showing because of
+    /// the pointer is no longer true, so hover and active are cleared and
+    /// the surface repainted.
+    fn on_pointer_gone(&mut self) {
+        self.pointer_at = None;
+        self.update_states(false, false);
     }
 
     /// Recompute state from the pointer, restyling only on an actual change.
@@ -434,13 +446,30 @@ impl Dispatch<wl_seat::WlSeat, ()> for AppState {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        // Capabilities are the seat's *whole* current set, not an addition:
+        // a seat that loses its last pointer sends the event again without
+        // the bit, and a client that only ever adds keeps dispatching to a
+        // pointer the compositor has taken away.
         if let wl_seat::Event::Capabilities {
             capabilities: wayland_client::WEnum::Value(caps),
         } = event
-            && caps.contains(wl_seat::Capability::Pointer)
-            && state.pointer.is_none()
         {
-            state.pointer = Some(seat.get_pointer(qh, ()));
+            let has_pointer = caps.contains(wl_seat::Capability::Pointer);
+            match (has_pointer, state.pointer.take()) {
+                (true, Some(pointer)) => state.pointer = Some(pointer),
+                (true, None) => {
+                    tracing::debug!("seat gained a pointer");
+                    state.pointer = Some(seat.get_pointer(qh, ()));
+                }
+                (false, Some(pointer)) => {
+                    tracing::debug!("seat lost its pointer");
+                    if pointer.version() >= 3 {
+                        pointer.release();
+                    }
+                    state.on_pointer_gone();
+                }
+                (false, None) => {}
+            }
         }
     }
 }
@@ -572,6 +601,21 @@ mod tests {
         // `theirs` is returned so the peer stays open: dropping it would
         // make the fd readable (EOF) and turn the test into a race.
         (conn, queue, theirs)
+    }
+
+    #[test]
+    fn losing_the_pointer_capability_clears_hover_and_active() {
+        // A5: capabilities were additive-only, so a seat that lost its
+        // pointer left the widget stuck in whatever state it was showing.
+        let mut state = state();
+        state.update_states(true, true);
+        assert!(state.button.states().hover && state.button.states().active);
+        state.dirty = false;
+
+        state.on_pointer_gone();
+        assert!(!state.button.states().hover);
+        assert!(!state.button.states().active);
+        assert!(state.dirty, "clearing hover must schedule a repaint");
     }
 
     #[test]
