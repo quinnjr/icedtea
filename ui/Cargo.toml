@@ -1,0 +1,28 @@
+[package]
+name = "icedtea-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# A pure-Rust, GTK4-theme-compatible UI layer: no gtk4/gio/glib/pango/cairo/gdk,
+# and no Smithay (these are Wayland *clients*; wlroots is the server side).
+
+[dependencies]
+skia-rs-safe = { version = "0.4.0", default-features = false, features = ["std", "text"] }
+cssparser = "0.37"
+selectors = "0.40"
+precomputed-hash = "0.1"
+taffy = "0.14"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+rustix = { version = "1", features = ["fs"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+icedtea-harness = { path = "../harness" }
+
+[[bin]]
+name = "themed-button"
+path = "src/bin/themed-button.rs"
