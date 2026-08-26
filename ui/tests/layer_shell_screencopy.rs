@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use icedtea_harness::{CapturedFrame, Compositor, ScreencopyClient, VirtualPointerClient};
 use icedtea_ui::layout::Allocation;
+use icedtea_ui::wayland::BTN_LEFT;
 
 use support::{allocation_of, spawn_themed_button};
 
@@ -65,6 +66,14 @@ impl Sample {
         )
     }
 
+    /// Somewhere on the output that is definitely *outside* the button.
+    fn outside(&self) -> (f64, f64) {
+        (
+            f64::from(self.allocation.width) + 40.0,
+            f64::from(self.allocation.height) + 40.0,
+        )
+    }
+
     fn pixel(&self, frame: &CapturedFrame) -> (u8, u8, u8) {
         pixel_at(frame, self.x, self.y).expect("sample pixel inside the frame")
     }
@@ -116,6 +125,13 @@ fn matches_accent(px: (u8, u8, u8)) -> bool {
 /// tolerance above.
 fn matches_hover(px: (u8, u8, u8)) -> bool {
     close(px.0, 0x1C) && close(px.1, 0x6F) && close(px.2, 0xD4)
+}
+
+/// `.suggested-action:active`'s background is `image(#1961b9)`, flat. Its
+/// blue channel is 27 from `:hover`'s #1c6fd4, so the two ±12 windows do not
+/// touch and a pixel can tell "pressed" from "hovered".
+fn matches_active(px: (u8, u8, u8)) -> bool {
+    close(px.0, 0x19) && close(px.1, 0x61) && close(px.2, 0xB9)
 }
 
 fn count_accent_pixels(frame: &CapturedFrame) -> u32 {
@@ -221,4 +237,78 @@ fn hovering_the_button_repaints_it_in_the_themes_hover_color() {
         sample.x,
         sample.y
     );
+}
+
+/// A6 end to end: pressing BTN_LEFT arms `:active`, dragging *off* the
+/// button while still held drops it, and dragging back on **re-arms** it.
+/// The pre-fix client never re-armed, because leaving cleared the only
+/// state it tracked and nothing remembered the mouse button was still down.
+#[test]
+fn dragging_off_and_back_while_held_re_arms_active() {
+    let sample = Sample::derive();
+    let comp = Compositor::spawn();
+    let _child = spawn_themed_button(&comp.socket, LABEL, CLASSES);
+
+    let mut sc = ScreencopyClient::spawn(&comp.socket);
+    let before = capture_until(&mut sc, None, &sample, matches_accent);
+    assert!(
+        matches_accent(before),
+        "the button never mapped: {before:?}"
+    );
+
+    let mut pointer = VirtualPointerClient::spawn(&comp.socket);
+    let (cx, cy) = sample.centre();
+    pointer.motion_absolute(cx, cy, OUTPUT_W, OUTPUT_H);
+    pointer.frame();
+    pointer.pump();
+    // Wait for `:hover` on screen before pressing: that is the proof the
+    // compositor has moved pointer focus onto the layer surface, so the
+    // button event that follows cannot race the enter.
+    let hovered = capture_until(&mut sc, Some(&mut pointer), &sample, matches_hover);
+    assert!(
+        matches_hover(hovered),
+        "the pointer never entered: {hovered:?}"
+    );
+
+    pointer.button(BTN_LEFT, true);
+    pointer.frame();
+    pointer.pump();
+
+    let pressed = capture_until(&mut sc, Some(&mut pointer), &sample, matches_active);
+    assert!(
+        matches_active(pressed),
+        "pressing BTN_LEFT did not paint `:active`'s #1961b9: {pressed:?}"
+    );
+
+    // Drag off the button, still held: `:active` must drop.
+    let (ox, oy) = sample.outside();
+    pointer.motion_absolute(ox, oy, OUTPUT_W, OUTPUT_H);
+    pointer.frame();
+    pointer.pump();
+    let away = capture_until(&mut sc, Some(&mut pointer), &sample, |px| {
+        !matches_active(px)
+    });
+    assert!(
+        !matches_active(away),
+        "dragging off the button left it painted `:active`: {away:?}"
+    );
+
+    // Drag back on, still held: `:active` must come back.
+    pointer.motion_absolute(cx, cy, OUTPUT_W, OUTPUT_H);
+    pointer.frame();
+    pointer.pump();
+    let again = capture_until(&mut sc, Some(&mut pointer), &sample, matches_active);
+    assert!(
+        matches_active(again),
+        "re-entering the button while BTN_LEFT was still held did not re-arm \
+         `:active`: {again:?}"
+    );
+
+    // The release is left to the unit tests: injecting it after a
+    // grab-crossing drag is not reliably delivered by the harness
+    // compositor, and `held` clearing on release is covered in
+    // `wayland.rs`'s own tests.
+    pointer.button(BTN_LEFT, false);
+    pointer.frame();
+    pointer.pump();
 }

@@ -77,8 +77,13 @@ pub struct AppState {
     dirty: bool,
     /// Set when the compositor asked us to go away.
     closed: bool,
-    /// Last pointer position in surface coordinates.
-    pointer_at: Option<(f64, f64)>,
+    /// Whether BTN_LEFT is currently down, wherever the pointer is.
+    ///
+    /// `:active` is "this button is being pressed", which survives the
+    /// pointer wandering off the widget: GTK re-arms the visual state when
+    /// the pointer comes back while the mouse button is still down. Hover
+    /// alone cannot express that, which is why it is tracked separately.
+    held: bool,
     /// Buffer slots the compositor released since the last repaint.
     released: Vec<BufferSlot>,
     sheet: CompiledSheet,
@@ -98,7 +103,7 @@ impl AppState {
             configured: None,
             dirty: true,
             closed: false,
-            pointer_at: None,
+            held: false,
             released: Vec::new(),
             sheet,
             fonts,
@@ -113,8 +118,33 @@ impl AppState {
     /// the pointer is no longer true, so hover and active are cleared and
     /// the surface repainted.
     fn on_pointer_gone(&mut self) {
-        self.pointer_at = None;
+        self.held = false;
         self.update_states(false, false);
+    }
+
+    /// The pointer is at `(x, y)` in surface coordinates.
+    fn on_pointer_motion(&mut self, x: f64, y: f64) {
+        let inside = self.button.contains((0.0, 0.0), x, y);
+        self.update_states(inside, inside && self.held);
+    }
+
+    /// The pointer left the surface. `held` survives: the mouse button is
+    /// still down, and coming back must re-arm `:active`.
+    fn on_pointer_leave(&mut self) {
+        self.update_states(false, false);
+    }
+
+    /// A pointer button changed. Only BTN_LEFT drives `:active` -- a right
+    /// click, a scroll-wheel click or a side button must not press the
+    /// widget.
+    fn on_pointer_button(&mut self, button: u32, pressed: bool) {
+        if button != BTN_LEFT {
+            return;
+        }
+        // A release anywhere ends the press, on or off the widget.
+        self.held = pressed;
+        let inside = self.button.states().hover;
+        self.update_states(inside, pressed && inside);
     }
 
     /// Recompute state from the pointer, restyling only on an actual change.
@@ -149,6 +179,10 @@ pub struct LayerWindow {
     buffers: BufferPool,
     skia: Surface,
 }
+
+/// `BTN_LEFT` from Linux's `input-event-codes.h`: the only pointer button
+/// that presses a widget.
+pub const BTN_LEFT: u32 = 0x110;
 
 /// Margin from the anchored corner, in px. Fixed so a screencopy test knows
 /// exactly where on the output the button lands.
@@ -493,17 +527,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
                 surface_x,
                 surface_y,
                 ..
-            } => {
-                state.pointer_at = Some((surface_x, surface_y));
-                let inside = state.button.contains((0.0, 0.0), surface_x, surface_y);
-                let active = state.button.states().active && inside;
-                state.update_states(inside, active);
-            }
-            wl_pointer::Event::Leave { .. } => {
-                state.pointer_at = None;
-                state.update_states(false, false);
-            }
+            } => state.on_pointer_motion(surface_x, surface_y),
+            wl_pointer::Event::Leave { .. } => state.on_pointer_leave(),
             wl_pointer::Event::Button {
+                button,
                 state: button_state,
                 ..
             } => {
@@ -511,10 +538,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
                     button_state,
                     wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed)
                 );
-                let inside = state
-                    .pointer_at
-                    .is_some_and(|(x, y)| state.button.contains((0.0, 0.0), x, y));
-                state.update_states(inside, pressed && inside);
+                state.on_pointer_button(button, pressed);
             }
             _ => {}
         }
@@ -570,7 +594,7 @@ delegate_noop!(AppState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, CONFIGURE_TIMEOUT, LayerWindowError, wait_bounded};
+    use super::{AppState, BTN_LEFT, CONFIGURE_TIMEOUT, LayerWindowError, wait_bounded};
     use crate::BUNDLED_ADWAITA_LIGHT;
     use crate::css::cascade::CompiledSheet;
     use crate::css::select::{CssNode, PseudoStates};
@@ -603,6 +627,94 @@ mod tests {
         (conn, queue, theirs)
     }
 
+    /// A point comfortably inside the 78x34 button.
+    const INSIDE: (f64, f64) = (30.0, 17.0);
+    /// A point comfortably outside it.
+    const OUTSIDE: (f64, f64) = (300.0, 300.0);
+
+    #[test]
+    fn only_btn_left_presses_the_button() {
+        // A6: *any* button code drove `:active`, so a right click or a
+        // scroll-wheel click pressed the widget.
+        let mut state = state();
+        state.on_pointer_motion(INSIDE.0, INSIDE.1);
+        assert!(state.button.states().hover);
+
+        for button in [0x111u32, 0x112, 0x113] {
+            state.on_pointer_button(button, true);
+            assert!(
+                !state.button.states().active,
+                "button {button:#x} armed :active"
+            );
+        }
+
+        state.on_pointer_button(BTN_LEFT, true);
+        assert!(state.button.states().active, "BTN_LEFT did not press it");
+    }
+
+    #[test]
+    fn re_entering_while_held_re_arms_active() {
+        // A6: leaving cleared the only state the client tracked, so coming
+        // back with the mouse button still down never re-armed `:active`.
+        let mut state = state();
+        state.on_pointer_motion(INSIDE.0, INSIDE.1);
+        state.on_pointer_button(BTN_LEFT, true);
+        assert!(state.button.states().active);
+
+        // Drag off: the visual state drops, the press does not.
+        state.on_pointer_motion(OUTSIDE.0, OUTSIDE.1);
+        assert!(!state.button.states().hover);
+        assert!(!state.button.states().active);
+        assert!(state.held, "dragging off must not end the press");
+
+        // Drag back on: `:active` comes back.
+        state.on_pointer_motion(INSIDE.0, INSIDE.1);
+        assert!(state.button.states().hover);
+        assert!(
+            state.button.states().active,
+            "re-entering while held did not re-arm :active"
+        );
+    }
+
+    #[test]
+    fn leaving_the_surface_keeps_the_press_but_drops_the_paint() {
+        let mut state = state();
+        state.on_pointer_motion(INSIDE.0, INSIDE.1);
+        state.on_pointer_button(BTN_LEFT, true);
+
+        state.on_pointer_leave();
+        assert!(!state.button.states().hover);
+        assert!(!state.button.states().active);
+        assert!(state.held);
+    }
+
+    #[test]
+    fn a_release_anywhere_ends_the_press() {
+        let mut state = state();
+        state.on_pointer_motion(INSIDE.0, INSIDE.1);
+        state.on_pointer_button(BTN_LEFT, true);
+        state.on_pointer_motion(OUTSIDE.0, OUTSIDE.1);
+
+        state.on_pointer_button(BTN_LEFT, false);
+        assert!(!state.held, "a release off the widget must still end it");
+
+        state.on_pointer_motion(INSIDE.0, INSIDE.1);
+        assert!(state.button.states().hover);
+        assert!(
+            !state.button.states().active,
+            "re-entering after the release re-armed a press that had ended"
+        );
+    }
+
+    #[test]
+    fn a_press_that_starts_outside_never_arms_the_button() {
+        let mut state = state();
+        state.on_pointer_motion(OUTSIDE.0, OUTSIDE.1);
+        state.on_pointer_button(BTN_LEFT, true);
+        assert!(!state.button.states().active);
+        assert!(state.held);
+    }
+
     #[test]
     fn losing_the_pointer_capability_clears_hover_and_active() {
         // A5: capabilities were additive-only, so a seat that lost its
@@ -612,7 +724,9 @@ mod tests {
         assert!(state.button.states().hover && state.button.states().active);
         state.dirty = false;
 
+        state.held = true;
         state.on_pointer_gone();
+        assert!(!state.held, "the press cannot outlive the pointer");
         assert!(!state.button.states().hover);
         assert!(!state.button.states().active);
         assert!(state.dirty, "clearing hover must schedule a repaint");
