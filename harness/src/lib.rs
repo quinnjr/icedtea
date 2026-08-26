@@ -529,6 +529,32 @@ impl Compositor {
         reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered CursorShape")
     }
 
+    /// The primary output's real geometry, via `State::outputs`. Panics if
+    /// no output ever appears within [`TIMEOUT`].
+    ///
+    /// Review finding F11: the honest answer to "how big is the screen",
+    /// replacing the maximize-a-window-and-read-its-geometry dance the
+    /// compat tests used -- that returned the *usable* rect inset by the
+    /// configured snap gap, so a test picking a point "just inside the
+    /// bottom-right corner" was actually picking one a gap-width away from
+    /// it. Polls because `spawn` returns at the boot handshake, before
+    /// `run_all` has created the headless output (the same race
+    /// [`Self::set_output_scale_for_test`] documents).
+    pub fn output_size(&self) -> (i32, i32) {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            self.send(DbCommand::OutputSize { reply: reply_tx });
+            let geo = reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered OutputSize");
+            if let Some(geo) = geo {
+                assert!(geo.width > 0 && geo.height > 0, "output geometry must be real, got {geo:?}");
+                return (geo.width, geo.height);
+            }
+            assert!(std::time::Instant::now() < deadline, "no output ever appeared to size");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Give the compositor a bounded window to finish processing something
     /// this side of the socket can't directly observe -- most notably a
     /// client's disconnect, which the event loop only notices on its own
@@ -2580,6 +2606,19 @@ impl TestClient {
         self.state.last_serial
     }
 
+    /// Forget the last `wl_keyboard` serial this client captured, so a
+    /// following [`TestClient::wait_until`] on
+    /// [`TestClient::has_input_serial`] can only succeed on a serial that
+    /// arrives *after* this call.
+    ///
+    /// Review finding (low): a test that focuses this client and then waits
+    /// for `has_input_serial()` passes instantly on a serial left over from
+    /// an earlier focus -- it asserts nothing about the focus it just
+    /// requested. Clearing first turns that wait into a real one.
+    pub fn clear_input_serial(&mut self) {
+        self.state.last_serial = None;
+    }
+
     /// How many `wl_keyboard.key` events this client has received, ever. The
     /// M4.4 lock-isolation test's load-bearing observable: a key injected via
     /// the virtual keyboard advances this when (and only when) the compositor
@@ -3661,8 +3700,10 @@ impl GammaControlClient {
         self.state.gamma_size
     }
 
-    /// Whether the compositor sent `failed` -- the control object's
-    /// destructor event.
+    /// Whether the compositor sent `failed` -- the protocol's "this object
+    /// is now inert" event. Not a destructor: the object stays alive on the
+    /// wire and the *client* is the one that must destroy it, which is why
+    /// this is a readable flag rather than a state the harness tears down.
     pub fn failed(&self) -> bool {
         self.state.gamma_failed
     }
@@ -3686,10 +3727,14 @@ impl GammaControlClient {
         let mut bytes = Vec::with_capacity(entries * 3 * 2);
         for _ in 0..3 {
             for i in 0..entries {
+                // Widened to `u64`: `i * 65535` overflows `u32` for any
+                // `size` past ~65538, which is a legal (if unusual) LUT size
+                // for a client to be told, and a debug build would panic
+                // rather than upload a ramp.
                 let v = if entries <= 1 {
                     0u16
                 } else {
-                    ((i as u32 * 65535) / (entries as u32 - 1)) as u16
+                    ((i as u64 * 65535) / (entries as u64 - 1)) as u16
                 };
                 bytes.extend_from_slice(&v.to_ne_bytes());
             }
