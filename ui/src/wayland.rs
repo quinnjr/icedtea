@@ -190,6 +190,23 @@ impl LayerWindow {
                 .map_err(LayerWindowError::Dispatch)?;
         }
         tracing::debug!(configured = ?state.configured, "layer surface configured");
+        if let Some((configured_width, configured_height)) = state.configured
+            && (configured_width != width as u32 || configured_height != height as u32)
+        {
+            // The compositor's `configure` is stored but never resized against
+            // (no resize logic in M1): a mismatch here means the buffer we are
+            // about to attach does not match what the compositor asked for,
+            // which a compositor may reject as `invalid_surface_state` instead
+            // of clamping silently. Logging it turns that into a diagnosable
+            // warning rather than a mystery protocol error.
+            tracing::warn!(
+                configured_width,
+                configured_height,
+                buffer_width = width,
+                buffer_height = height,
+                "layer surface configure size does not match the button's buffer size"
+            );
+        }
 
         let shm_buffer = ShmBuffer::new(&shm, &qh, width, height).map_err(LayerWindowError::Io)?;
         let skia = Surface::new_raster_n32_premul(width, height)

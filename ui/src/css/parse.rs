@@ -49,8 +49,12 @@ pub struct Stylesheet {
 /// them as separate tokens, so the source text can carry either spelling).
 fn split_important(raw: &str) -> (String, bool) {
     let trimmed = raw.trim();
-    if let Some(head) = trimmed.strip_suffix("important") {
-        let head = head.trim_end();
+    // `to_ascii_lowercase` only rewrites ASCII bytes, so it never changes the
+    // string's length or moves a byte off a UTF-8 char boundary: the length
+    // it reports lines up with `trimmed`'s own indices.
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(head_len) = lower.strip_suffix("important").map(str::len) {
+        let head = trimmed[..head_len].trim_end();
         if let Some(head) = head.strip_suffix('!') {
             return (head.trim_end().to_string(), true);
         }
@@ -243,6 +247,13 @@ mod tests {
         assert_eq!(sheet.rules[1].source_order, 1);
         assert_eq!(decl(&sheet.rules[1].declarations, "border-color"), "red");
         assert!(sheet.rules[1].declarations[0].important);
+    }
+
+    #[test]
+    fn important_is_case_insensitive() {
+        let sheet = parse_stylesheet("button:hover { border-color: red !IMPORTANT }");
+        assert_eq!(decl(&sheet.rules[0].declarations, "border-color"), "red");
+        assert!(sheet.rules[0].declarations[0].important);
     }
 
     #[test]
