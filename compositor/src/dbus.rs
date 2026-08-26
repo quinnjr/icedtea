@@ -323,9 +323,10 @@ pub fn spawn_service(
             // snapshot.seq`) and detect a gap (`seq > last_seen + 1`) that
             // means it must re-sync. Recorded signatures (kept in step with
             // `contract`'s own `wire_signatures_are_locked` test -- the
-            // `attention` bit added the fifth `b` to `WindowInfo` and the
-            // fifth `ab` to `WindowUpdate`, which is what
-            // `COMPOSITOR_CONTRACT_VERSION` 2 names):
+            // `attention` bit added the fifth `b` to `WindowInfo` and a
+            // SIXTH `ab` to `WindowUpdate` -- whose bools run
+            // maximized/minimized/fullscreen/focused/mapped/attention --
+            // which is what `COMPOSITOR_CONTRACT_VERSION` 2 names):
             //   WindowOpened   t(ussuu(iiii)bbbbb)
             //   WindowClosed   tu
             //   WindowUpdated  tu(asa(iiii)auabababababab)
