@@ -103,6 +103,11 @@ use xkbcommon::xkb;
 /// `wayland-protocols` itself.
 pub use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape as CursorShape;
 
+/// The edge set `xdg_toplevel.resize` names, re-exported for the same reason
+/// as [`CursorShape`]: a test naming an edge should not have to depend on
+/// `wayland-protocols` itself.
+pub use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
+
 /// How long any "wait for the compositor to do a thing" helper waits before
 /// declaring the harness broken.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -2193,6 +2198,41 @@ impl TestClient {
             self.toplevel.unset_fullscreen();
         }
         self.conn.flush().expect("flush");
+    }
+
+    /// Ask the compositor to start an interactive move of this toplevel
+    /// (`xdg_toplevel.move`), citing `serial` against this client's own seat.
+    ///
+    /// `serial` must be one the seat genuinely issued to *this* client for a
+    /// button press -- [`TestClient::last_pointer_serial`] after a
+    /// `VirtualPointerClient` button press over this window's surface. The
+    /// compositor's own grab path additionally requires the pointer to still
+    /// be down and over this window, so a test that wants the request
+    /// honored has to leave the button pressed.
+    ///
+    /// Panics if the compositor never advertised a `wl_seat`.
+    pub fn request_move(&mut self, serial: u32) {
+        let seat = self
+            .state
+            .seat
+            .clone()
+            .expect("compositor did not advertise wl_seat");
+        self.toplevel._move(&seat, serial);
+        self.conn.flush().expect("flush move");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// As [`TestClient::request_move`], but `xdg_toplevel.resize` with an
+    /// explicit edge set.
+    pub fn request_resize(&mut self, serial: u32, edges: ResizeEdge) {
+        let seat = self
+            .state
+            .seat
+            .clone()
+            .expect("compositor did not advertise wl_seat");
+        self.toplevel.resize(&seat, serial, edges);
+        self.conn.flush().expect("flush resize");
+        let _ = self.queue.roundtrip(&mut self.state);
     }
 
     /// Unmap without destroying: attach a null buffer and commit, exactly
