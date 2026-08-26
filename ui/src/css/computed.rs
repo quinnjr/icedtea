@@ -14,7 +14,7 @@ use cssparser::{Parser, ParserInput, Token};
 use skia_rs_safe::core::Color;
 
 use super::cascade::{CascadedValues, CompiledSheet, cascade};
-use super::colors::{ColorTable, parse_color_value};
+use super::colors::{ColorRef, ColorTable, parse_color_ref, parse_color_value};
 use super::select::CssNode;
 use super::value::{comma_groups, component_values};
 
@@ -223,10 +223,37 @@ fn parse_background_image(value: &str, colors: &ColorTable) -> Option<Background
 }
 
 impl ComputedStyle {
-    /// Resolve `node`'s style against `sheet`.
+    /// Resolve `node`'s style against `sheet`, resolving its whole ancestor
+    /// chain first so inherited properties (`color`, `font-size`) and
+    /// `currentColor` have something to inherit *from*.
+    ///
+    /// A caller that already holds the parent's computed style should use
+    /// [`Self::resolve_with_parent`] and skip the walk.
     #[must_use]
     pub fn resolve(sheet: &CompiledSheet, node: &CssNode) -> Self {
-        Self::from_declarations(&cascade(sheet, node), &sheet.colors)
+        let mut chain = vec![node.clone()];
+        while let Some(parent) = chain.last().and_then(CssNode::parent) {
+            chain.push(parent);
+        }
+        let mut style: Option<Self> = None;
+        for ancestor in chain.iter().rev() {
+            style = Some(Self::from_declarations(
+                &cascade(sheet, ancestor),
+                &sheet.colors,
+                style.as_ref(),
+            ));
+        }
+        style.unwrap_or_default()
+    }
+
+    /// Resolve `node`'s style given its parent's already-computed style.
+    #[must_use]
+    pub fn resolve_with_parent(
+        sheet: &CompiledSheet,
+        node: &CssNode,
+        parent: Option<&Self>,
+    ) -> Self {
+        Self::from_declarations(&cascade(sheet, node), &sheet.colors, parent)
     }
 
     /// Resolve a node's cascaded declarations. Separated from
@@ -238,17 +265,33 @@ impl ComputedStyle {
     /// (`border-radius: 100%`) yields to the next declaration that applied
     /// instead of reverting to the initial value.
     #[must_use]
-    pub fn from_declarations(values: &CascadedValues, colors: &ColorTable) -> Self {
+    pub fn from_declarations(
+        values: &CascadedValues,
+        colors: &ColorTable,
+        parent: Option<&Self>,
+    ) -> Self {
         let mut style = Self::default();
 
-        if let Some(color) = pick(values, "color", |v| parse_color_value(v, colors)) {
-            style.color = color;
-        }
+        // `color` and `font-size` inherit; everything else this milestone
+        // models starts from its own initial value.
+        let inherited_color = parent.map_or(Color::BLACK, |parent| parent.color);
+        style.color = pick(values, "color", |value| {
+            // On `color` itself, `currentColor` *is* the inherited colour.
+            resolve_color(value, colors, inherited_color)
+        })
+        .unwrap_or(inherited_color);
+        style.font_size = pick(values, "font-size", parse_px)
+            .map(|size| size.max(0.0))
+            .unwrap_or_else(|| parent.map_or(Self::DEFAULT_FONT_SIZE, |parent| parent.font_size));
+
+        // Everywhere else `currentColor` is this element's own colour.
+        let current = style.color;
+        let color_of = |value: &str| resolve_color(value, colors, current);
 
         // `background-color` first, then `background-image` on top: CSS
         // paints the image over the color, and every background M1 supports
         // is fully opaque where it paints at all.
-        if let Some(color) = pick(values, "background-color", |v| parse_color_value(v, colors)) {
+        if let Some(color) = pick(values, "background-color", color_of) {
             style.background = Background::Solid(color);
         }
         if let Some(background) = pick(values, "background-image", |value| {
@@ -279,7 +322,7 @@ impl ComputedStyle {
         {
             style.border_width = 0.0;
         }
-        if let Some(color) = pick(values, "border-top-color", |v| parse_color_value(v, colors)) {
+        if let Some(color) = pick(values, "border-top-color", color_of) {
             style.border_color = color;
         }
         if let Some(radius) = pick(values, "border-radius", parse_px) {
@@ -304,10 +347,6 @@ impl ComputedStyle {
         if let Some(min_height) = pick(values, "min-height", parse_px) {
             style.min_height = min_height.max(0.0);
         }
-        if let Some(font_size) = pick(values, "font-size", parse_px) {
-            style.font_size = font_size.max(0.0);
-        }
-
         style
     }
 }
@@ -322,6 +361,14 @@ impl ComputedStyle {
 /// lose its 5px radius to a `100%` this engine has no percentage context
 /// for -- so the next declaration in cascade order is used instead. The
 /// divergence is logged.
+/// Resolve a colour value, mapping `currentColor` onto `current`.
+fn resolve_color(value: &str, colors: &ColorTable, current: Color) -> Option<Color> {
+    match parse_color_ref(value, colors)? {
+        ColorRef::Absolute(color) => Some(color),
+        ColorRef::CurrentColor => Some(current),
+    }
+}
+
 fn pick<T>(
     values: &CascadedValues,
     name: &str,
@@ -649,5 +696,77 @@ mod tests {
         assert_eq!(s.border_radius, 0.0);
         assert_eq!(s.min_width, 0.0);
         assert_eq!(s.min_height, 0.0);
+    }
+
+    #[test]
+    fn color_and_font_size_inherit_from_the_ancestor_chain() {
+        // E2: `resolve` ignored ancestors entirely, so this button computed
+        // black at 14px.
+        let sheet = CompiledSheet::compile(
+            "window { color: #ff0000; font-size: 20px }\n             button { background-color: #ffffff }",
+        );
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(s.color, Color(0xFFFF_0000));
+        assert_eq!(s.font_size, 20.0);
+        // The node's own declaration still wins over the inherited value.
+        let sheet = CompiledSheet::compile(
+            "window { color: #ff0000; font-size: 20px }\n             button { color: #00ff00; font-size: 11px }",
+        );
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(s.color, Color(0xFF00_FF00));
+        assert_eq!(s.font_size, 11.0);
+    }
+
+    #[test]
+    fn non_inherited_properties_do_not_leak_down() {
+        let sheet = CompiledSheet::compile("window { padding: 7px; border-radius: 9px }");
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(s.padding, [0.0; 4]);
+        assert_eq!(s.border_radius, 0.0);
+    }
+
+    #[test]
+    fn current_color_resolves_against_the_elements_own_colour() {
+        let sheet = CompiledSheet::compile(
+            "window { color: #ff0000 }\n             button { border: 1px solid currentColor }",
+        );
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(
+            s.border_color,
+            Color(0xFFFF_0000),
+            "currentColor is the inherited colour"
+        );
+
+        let sheet = CompiledSheet::compile(
+            "window { color: #ff0000 }\n             button { color: #0000ff; border: 1px solid currentColor;              background-color: currentColor }",
+        );
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(
+            s.border_color,
+            Color(0xFF00_00FF),
+            "the element's own colour wins"
+        );
+        assert_eq!(s.background, Background::Solid(Color(0xFF00_00FF)));
+    }
+
+    #[test]
+    fn color_current_color_means_the_inherited_colour() {
+        // Adwaita:898 `tab button.flat:hover { color: currentColor }`.
+        let sheet =
+            CompiledSheet::compile("window { color: #ff0000 }\nbutton { color: currentColor }");
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(s.color, Color(0xFFFF_0000));
+    }
+
+    #[test]
+    fn resolve_with_parent_matches_resolving_the_whole_chain() {
+        let sheet = CompiledSheet::compile("window { color: #ff0000 }\nbutton { padding: 2px }");
+        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
+        let node = CssNode::new("button", &[], PseudoStates::default(), Some(window.clone()));
+        let window_style = ComputedStyle::resolve(&sheet, &window);
+        assert_eq!(
+            ComputedStyle::resolve_with_parent(&sheet, &node, Some(&window_style)),
+            ComputedStyle::resolve(&sheet, &node)
+        );
     }
 }
