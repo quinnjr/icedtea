@@ -19,7 +19,7 @@ use gtk4::{
 };
 
 use crate::outputs::{Head, HeadEdit, Mode, ModeRequest, OutputsClient, OutputsMsg};
-use crate::pages::displays_canvas::{compute_view, head_rect, hit_test, snap, Rect, View};
+use crate::pages::displays_canvas::{Rect, View, compute_view, head_rect, hit_test, snap};
 
 /// Canvas padding (canvas px) kept clear around the scaled monitor layout.
 const CANVAS_MARGIN: f64 = 16.0;
@@ -67,7 +67,11 @@ impl DisplaysState {
             edits: Vec::new(),
             selected: None,
             dirty: false,
-            view: View { scale: 1.0, off_x: CANVAS_MARGIN, off_y: CANVAS_MARGIN },
+            view: View {
+                scale: 1.0,
+                off_x: CANVAS_MARGIN,
+                off_y: CANVAS_MARGIN,
+            },
             drag: None,
             res_options: Vec::new(),
             refresh_options: Vec::new(),
@@ -81,9 +85,11 @@ fn baseline_edit(h: &Head) -> HeadEdit {
     HeadEdit {
         name: h.name.clone(),
         enabled: h.enabled,
-        mode: h
-            .current_mode
-            .map(|m| ModeRequest { width: m.width, height: m.height, refresh_mhz: m.refresh_mhz }),
+        mode: h.current_mode.map(|m| ModeRequest {
+            width: m.width,
+            height: m.height,
+            refresh_mhz: m.refresh_mhz,
+        }),
         position: Some((h.x, h.y)),
         scale: Some(h.scale),
         transform: Some(h.transform),
@@ -101,7 +107,11 @@ fn default_mode_for(head: &Head) -> Option<ModeRequest> {
     head.current_mode
         .or_else(|| head.modes.iter().find(|m| m.preferred).copied())
         .or_else(|| head.modes.first().copied())
-        .map(|m| ModeRequest { width: m.width, height: m.height, refresh_mhz: m.refresh_mhz })
+        .map(|m| ModeRequest {
+            width: m.width,
+            height: m.height,
+            refresh_mhz: m.refresh_mhz,
+        })
 }
 
 /// Whether two head snapshots describe the same set of connectors (same names,
@@ -150,8 +160,9 @@ fn reconcile(
     new_heads: &[Head],
 ) -> Reconciled {
     let compatible = same_connector_set(old_heads, new_heads);
-    let selected_name =
-        old_selected.and_then(|i| old_heads.get(i)).map(|h| h.name.as_str());
+    let selected_name = old_selected
+        .and_then(|i| old_heads.get(i))
+        .map(|h| h.name.as_str());
     let selected = selected_name
         .and_then(|name| new_heads.iter().position(|h| h.name == name))
         .or(if new_heads.is_empty() { None } else { Some(0) });
@@ -176,10 +187,20 @@ fn reconcile(
                 }
             })
             .collect();
-        Reconciled { edits, selected, compatible, dropped: false }
+        Reconciled {
+            edits,
+            selected,
+            compatible,
+            dropped: false,
+        }
     } else {
         let edits = new_heads.iter().map(baseline_edit).collect();
-        Reconciled { edits, selected, compatible, dropped: dirty }
+        Reconciled {
+            edits,
+            selected,
+            compatible,
+            dropped: dirty,
+        }
     }
 }
 
@@ -197,8 +218,11 @@ fn distinct_resolutions(modes: &[Mode]) -> Vec<(i32, i32)> {
 
 /// Refresh rates (mHz) a head offers at a given resolution, highest first.
 fn refreshes_for(modes: &[Mode], w: i32, h: i32) -> Vec<i32> {
-    let mut out: Vec<i32> =
-        modes.iter().filter(|m| m.width == w && m.height == h).map(|m| m.refresh_mhz).collect();
+    let mut out: Vec<i32> = modes
+        .iter()
+        .filter(|m| m.width == w && m.height == h)
+        .map(|m| m.refresh_mhz)
+        .collect();
     out.sort_unstable_by(|a, b| b.cmp(a));
     out.dedup();
     out
@@ -454,16 +478,21 @@ pub fn build() -> gtk4::Widget {
                         .iter()
                         .position(|&(w, h)| w == cur_w && h == cur_h)
                         .unwrap_or(0);
-                    let res_labels: Vec<String> =
-                        res_options.iter().map(|(w, h)| format!("{w}\u{d7}{h}")).collect();
+                    let res_labels: Vec<String> = res_options
+                        .iter()
+                        .map(|(w, h)| format!("{w}\u{d7}{h}"))
+                        .collect();
                     set_dropdown(&res_dd, &res_labels, res_sel);
                     res_dd.set_sensitive(!res_options.is_empty());
 
-                    let (sel_w, sel_h) = res_options.get(res_sel).copied().unwrap_or((cur_w, cur_h));
+                    let (sel_w, sel_h) =
+                        res_options.get(res_sel).copied().unwrap_or((cur_w, cur_h));
                     let refresh_options = refreshes_for(&modes, sel_w, sel_h);
                     let cur_r = edit.mode.map(|m| m.refresh_mhz).unwrap_or(0);
-                    let r_sel =
-                        refresh_options.iter().position(|&r| r == cur_r).unwrap_or(0);
+                    let r_sel = refresh_options
+                        .iter()
+                        .position(|&r| r == cur_r)
+                        .unwrap_or(0);
                     let r_labels: Vec<String> =
                         refresh_options.iter().map(|&r| format_refresh(r)).collect();
                     set_dropdown(&refresh_dd, &r_labels, r_sel);
@@ -624,8 +653,11 @@ pub fn build() -> gtk4::Widget {
                         .filter(|r| refreshes.contains(r))
                         .or_else(|| refreshes.first().copied())
                         .unwrap_or(0);
-                    st.edits[idx].mode =
-                        Some(ModeRequest { width: w, height: h, refresh_mhz: refresh });
+                    st.edits[idx].mode = Some(ModeRequest {
+                        width: w,
+                        height: h,
+                        refresh_mhz: refresh,
+                    });
                     st.dirty = true;
                     changed = true;
                 }
@@ -662,8 +694,11 @@ pub fn build() -> gtk4::Widget {
                         // first resolution, so synthesize a full mode from it so
                         // the pick actually takes effect rather than being
                         // dropped for want of an existing mode. (#14)
-                        st.edits[idx].mode =
-                            Some(ModeRequest { width: w, height: h, refresh_mhz: r });
+                        st.edits[idx].mode = Some(ModeRequest {
+                            width: w,
+                            height: h,
+                            refresh_mhz: r,
+                        });
                         st.dirty = true;
                         created = true;
                     }
@@ -930,9 +965,8 @@ pub fn build() -> gtk4::Widget {
                             set_available(true);
                             let dropped = rebuild(heads);
                             if dropped {
-                                status.set_text(
-                                    "Displays changed \u{2014} pending edits discarded",
-                                );
+                                status
+                                    .set_text("Displays changed \u{2014} pending edits discarded");
                             } else {
                                 status.set_text("");
                             }
@@ -999,7 +1033,12 @@ mod tests {
     use super::*;
 
     fn mode(w: i32, h: i32, r: i32, preferred: bool) -> Mode {
-        Mode { width: w, height: h, refresh_mhz: r, preferred }
+        Mode {
+            width: w,
+            height: h,
+            refresh_mhz: r,
+            preferred,
+        }
     }
 
     #[test]
@@ -1044,7 +1083,14 @@ mod tests {
         let e = baseline_edit(&head);
         assert_eq!(e.name, "DP-1");
         assert!(e.enabled);
-        assert_eq!(e.mode, Some(ModeRequest { width: 1920, height: 1080, refresh_mhz: 60000 }));
+        assert_eq!(
+            e.mode,
+            Some(ModeRequest {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60000
+            })
+        );
         assert_eq!(e.position, Some((10, 20)));
         assert_eq!(e.scale, Some(1.5));
         assert_eq!(e.transform, Some(2));
@@ -1109,7 +1155,10 @@ mod tests {
 
         let r = reconcile(&old_heads, &edits, Some(1), true, &new_heads);
         assert!(!r.compatible);
-        assert!(r.dropped, "unapplied edits were discarded, so dropped must be set");
+        assert!(
+            r.dropped,
+            "unapplied edits were discarded, so dropped must be set"
+        );
         // Everything falls back to baseline for the surviving head.
         assert_eq!(r.edits, vec![baseline_edit(&head("DP-1"))]);
         // Selection was on the now-gone head, so it resets to the first head.
@@ -1152,7 +1201,11 @@ mod tests {
         h.current_mode = Some(mode(1280, 720, 60000, false));
         assert_eq!(
             default_mode_for(&h),
-            Some(ModeRequest { width: 1280, height: 720, refresh_mhz: 60000 })
+            Some(ModeRequest {
+                width: 1280,
+                height: 720,
+                refresh_mhz: 60000
+            })
         );
 
         // No current_mode: the preferred advertised mode wins over the first.
@@ -1161,16 +1214,27 @@ mod tests {
         h.current_mode = None;
         assert_eq!(
             default_mode_for(&h),
-            Some(ModeRequest { width: 1920, height: 1080, refresh_mhz: 60000 })
+            Some(ModeRequest {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60000
+            })
         );
 
         // No current and none preferred: the first advertised mode.
         let mut h = head("DP-1");
-        h.modes = vec![mode(1600, 900, 60000, false), mode(1920, 1080, 60000, false)];
+        h.modes = vec![
+            mode(1600, 900, 60000, false),
+            mode(1920, 1080, 60000, false),
+        ];
         h.current_mode = None;
         assert_eq!(
             default_mode_for(&h),
-            Some(ModeRequest { width: 1600, height: 900, refresh_mhz: 60000 })
+            Some(ModeRequest {
+                width: 1600,
+                height: 900,
+                refresh_mhz: 60000
+            })
         );
 
         // A truly mode-less head (headless/nested) yields None.
@@ -1211,7 +1275,10 @@ mod tests {
 
         let (idxs, rects, _enabled) = all_rects(&st);
         assert_eq!(idxs, vec![0]);
-        assert!(rects[0].w > 0.0 && rects[0].h > 0.0, "fallback rect must be non-empty");
+        assert!(
+            rects[0].w > 0.0 && rects[0].h > 0.0,
+            "fallback rect must be non-empty"
+        );
     }
 
     #[test]
@@ -1223,7 +1290,11 @@ mod tests {
         assert_eq!(TRANSFORM_LABELS.len(), 8);
         for t in 0..8 {
             let sel = TRANSFORM_VALUES.iter().position(|&v| v == t);
-            assert_eq!(sel, Some(t as usize), "transform {t} must be present at its index");
+            assert_eq!(
+                sel,
+                Some(t as usize),
+                "transform {t} must be present at its index"
+            );
         }
     }
 

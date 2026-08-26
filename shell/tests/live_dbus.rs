@@ -37,7 +37,9 @@ fn clip_proxy_commands_reach_the_real_service() {
     let _conn = match service::spawn(snapshot.clone(), cmd_tx, wake_write, chg_rx) {
         Ok(conn) => conn,
         Err(err) => {
-            eprintln!("SKIP: cannot register org.icedtea.Clipboard ({err}) -- bus down or a daemon is running");
+            eprintln!(
+                "SKIP: cannot register org.icedtea.Clipboard ({err}) -- bus down or a daemon is running"
+            );
             return;
         }
     };
@@ -62,10 +64,20 @@ fn clip_proxy_commands_reach_the_real_service() {
 
     // A ClipProxy command must arrive at the service as the right Command.
     proxy.activate(77);
-    let cmd = cmd_rx.recv_timeout(Duration::from_secs(5)).expect("service never got the command");
-    assert!(matches!(cmd, Command::Activate(77)), "wrong command reached the service: {cmd:?}");
+    let cmd = cmd_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("service never got the command");
+    assert!(
+        matches!(cmd, Command::Activate(77)),
+        "wrong command reached the service: {cmd:?}"
+    );
 
     proxy.pin(9, true);
-    let cmd = cmd_rx.recv_timeout(Duration::from_secs(5)).expect("service never got Pin");
-    assert!(matches!(cmd, Command::Pin(9, true)), "wrong command: {cmd:?}");
+    let cmd = cmd_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("service never got Pin");
+    assert!(
+        matches!(cmd, Command::Pin(9, true)),
+        "wrong command: {cmd:?}"
+    );
 }

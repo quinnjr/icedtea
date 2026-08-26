@@ -63,12 +63,12 @@
 //!   (200ms) it's waiting on, not by traffic on `events_rx`.
 
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use icedtea_contract::{Event, SeqEvent, Snapshot, WindowId, COMPOSITOR_BUS_NAME, COMPOSITOR_PATH};
+use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_PATH, Event, SeqEvent, Snapshot, WindowId};
 use zbus::blocking::Connection;
 use zbus::interface;
 
@@ -92,35 +92,59 @@ pub enum DbCommand {
     /// Not reachable from `CompositorInterface` -- only the test harness sends
     /// this, directly onto `cmd_tx`, since injecting synthetic touch input
     /// makes no sense as a D-Bus-exposed production operation.
-    InjectTouchDown { x: f64, y: f64, id: i32, time_msec: u32, reply: Sender<Option<u32>> },
+    InjectTouchDown {
+        x: f64,
+        y: f64,
+        id: i32,
+        time_msec: u32,
+        reply: Sender<Option<u32>>,
+    },
     /// Test-only: synthesize a touch-motion to `(x, y)` for touch point
     /// `id` via `wlr::Runtime::inject_touch_motion`. `reply` is purely a
     /// synchronization ack -- see `InjectTouchDown`'s doc -- so the harness
     /// call blocks until the injection has actually run on the compositor
     /// thread instead of racing ahead of it.
-    InjectTouchMotion { x: f64, y: f64, id: i32, time_msec: u32, reply: Sender<()> },
+    InjectTouchMotion {
+        x: f64,
+        y: f64,
+        id: i32,
+        time_msec: u32,
+        reply: Sender<()>,
+    },
     /// Test-only: synthesize a touch-up for touch point `id` via
     /// `wlr::Runtime::inject_touch_up`. See `InjectTouchDown`'s doc.
-    InjectTouchUp { id: i32, time_msec: u32, reply: Sender<()> },
+    InjectTouchUp {
+        id: i32,
+        time_msec: u32,
+        reply: Sender<()>,
+    },
     /// Test-only: read the drag icon's current scene layout position via
     /// `wlr::Runtime::drag_icon_position`, replying with `None` if no drag
     /// with a visible icon is in progress. Not reachable from
     /// `CompositorInterface` -- only the test harness sends this, same reasoning
     /// as `InjectTouchDown`.
-    DragIconPosition { reply: Sender<Option<(i32, i32)>> },
+    DragIconPosition {
+        reply: Sender<Option<(i32, i32)>>,
+    },
     /// Test-only: read `wlr::Runtime::is_session_locked` via `wayland`'s
     /// runtime handle. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `DragIconPosition`.
-    SessionLocked { reply: Sender<bool> },
+    SessionLocked {
+        reply: Sender<bool>,
+    },
     /// Test-only: read `wlr::Runtime::cursor_position` via `wayland`'s
     /// runtime handle. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `SessionLocked`.
-    CursorPosition { reply: Sender<(f64, f64)> },
+    CursorPosition {
+        reply: Sender<(f64, f64)>,
+    },
     /// Test-only: read `wlr::Runtime::cursor_shape` -- the named shape
     /// currently in force as the crate itself records it, `None` rendered as
     /// `"Default"` -- as its `Debug` name. Not reachable from `CompositorInterface` --
     /// only the test harness sends this, same reasoning as `SessionLocked`.
-    CursorShape { reply: Sender<String> },
+    CursorShape {
+        reply: Sender<String>,
+    },
     /// Test-only: the primary output's real geometry, straight off
     /// `State::outputs`. `None` before any output exists.
     ///
@@ -131,7 +155,9 @@ pub enum DbCommand {
     /// rect, not the output, and so was systematically short by the gap on
     /// each edge. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `CursorShape`.
-    OutputSize { reply: Sender<Option<icedtea_contract::Rectangle>> },
+    OutputSize {
+        reply: Sender<Option<icedtea_contract::Rectangle>>,
+    },
     /// Test-only: read the `DISPLAY` name (`:N`) Xwayland advertises, via
     /// `wlr::Runtime::xwayland_display_name`. `None` when no Xwayland was
     /// created (the `Xwayland` binary is absent), so the X11 end-to-end test
@@ -140,7 +166,9 @@ pub enum DbCommand {
     /// the test read `DISPLAY`, connect an X11 client, and *trigger* that lazy
     /// start. Not reachable from `CompositorInterface` -- only the test harness sends
     /// this, same reasoning as `SessionLocked`.
-    XwaylandDisplay { reply: Sender<Option<String>> },
+    XwaylandDisplay {
+        reply: Sender<Option<String>>,
+    },
     /// Test-only: report whether `xwayland_ready` has fired — i.e. the lazy
     /// `Xwayland` has actually started and the crate has wired its seat (arming
     /// the clipboard/primary/DND bridge). Distinct from `XwaylandDisplay`, which
@@ -150,7 +178,9 @@ pub enum DbCommand {
     /// republish-`DISPLAY`-on-ready barrier, which relied on a `set_var` from
     /// inside `run_all` (review finding #5). Not reachable from `CompositorInterface` --
     /// only the test harness sends this, same reasoning as `SessionLocked`.
-    XwaylandReady { reply: Sender<bool> },
+    XwaylandReady {
+        reply: Sender<bool>,
+    },
     /// Test-only: probe every mapped override-redirect (OR) X11 pop-up the
     /// compositor is tracking in its M3 side-table, reading each one's *real*
     /// scene state — node position, whether it is parented in the band above
@@ -160,7 +190,9 @@ pub enum DbCommand {
     /// `Window` model (which is the whole point of the OR path). Not reachable
     /// from `CompositorInterface` -- only the test harness sends this, same reasoning as
     /// `SessionLocked`.
-    XwaylandOverrideRedirect { reply: Sender<Vec<OverrideRedirectProbe>> },
+    XwaylandOverrideRedirect {
+        reply: Sender<Vec<OverrideRedirectProbe>>,
+    },
     /// Test-only: record the primary output's scale. The reply is `true` only
     /// when an output actually existed to record it on — `spawn` returns at the
     /// boot handshake, *before* `run_all` creates the headless output, so a scale
@@ -168,7 +200,10 @@ pub enum DbCommand {
     /// "recorded" (review finding #11). The harness helper polls on this `bool`
     /// until the output exists, making the ordering deterministic instead of a
     /// flaky red.
-    SetOutputScaleForTest { scale: f64, reply: Sender<bool> },
+    SetOutputScaleForTest {
+        scale: f64,
+        reply: Sender<bool>,
+    },
 }
 
 /// One mapped override-redirect X11 pop-up, as the test-only
@@ -253,7 +288,12 @@ impl CompositorInterface {
         // iteration takes -- by design, per the brief.
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::GetState(reply_tx));
-        reply_rx.recv().unwrap_or_else(|_| Snapshot { seq: 0, windows: vec![], workspaces: vec![], active_workspace: 0 })
+        reply_rx.recv().unwrap_or_else(|_| Snapshot {
+            seq: 0,
+            windows: vec![],
+            workspaces: vec![],
+            active_workspace: 0,
+        })
     }
     /// The wire-contract revision this compositor speaks
     /// ([`icedtea_contract::COMPOSITOR_CONTRACT_VERSION`]), so a client can
@@ -295,8 +335,13 @@ pub fn spawn_service(
     cmd_wake: UnixStream,
 ) -> (Connection, std::thread::JoinHandle<()>) {
     let conn = Connection::session().expect("session bus available");
-    let iface = CompositorInterface { cmd_tx, wake: cmd_wake };
-    conn.object_server().at(COMPOSITOR_PATH, iface).expect("register org.icedtea.Compositor interface");
+    let iface = CompositorInterface {
+        cmd_tx,
+        wake: cmd_wake,
+    };
+    conn.object_server()
+        .at(COMPOSITOR_PATH, iface)
+        .expect("register org.icedtea.Compositor interface");
     conn.request_name(COMPOSITOR_BUS_NAME).unwrap_or_else(|err| {
         panic!(
             "failed to acquire the {COMPOSITOR_BUS_NAME} bus name -- is another icedtea-compositor \
@@ -335,23 +380,55 @@ pub fn spawn_service(
             //   AltTabState    t(baut)
             //   ConfigReloaded t(siii(sss)as)
             let result = match &event {
-                Event::WindowOpened(info) => {
-                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, info.clone()))
-                }
-                Event::WindowClosed(id) => emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, id.0)),
-                Event::WindowUpdated { id, update } => {
-                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, id.0, update.clone()))
-                }
-                Event::WorkspaceSet { id, active } => {
-                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, *id, *active))
-                }
-                Event::WorkspaceList(ws) => {
-                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, ws.clone()))
-                }
-                Event::AltTabState(s) => emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, s.clone())),
-                Event::ConfigReloaded(a) => {
-                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &(seq, a.clone()))
-                }
+                Event::WindowOpened(info) => emitter_conn.emit_signal(
+                    dest,
+                    COMPOSITOR_PATH,
+                    COMPOSITOR_BUS_NAME,
+                    name,
+                    &(seq, info.clone()),
+                ),
+                Event::WindowClosed(id) => emitter_conn.emit_signal(
+                    dest,
+                    COMPOSITOR_PATH,
+                    COMPOSITOR_BUS_NAME,
+                    name,
+                    &(seq, id.0),
+                ),
+                Event::WindowUpdated { id, update } => emitter_conn.emit_signal(
+                    dest,
+                    COMPOSITOR_PATH,
+                    COMPOSITOR_BUS_NAME,
+                    name,
+                    &(seq, id.0, update.clone()),
+                ),
+                Event::WorkspaceSet { id, active } => emitter_conn.emit_signal(
+                    dest,
+                    COMPOSITOR_PATH,
+                    COMPOSITOR_BUS_NAME,
+                    name,
+                    &(seq, *id, *active),
+                ),
+                Event::WorkspaceList(ws) => emitter_conn.emit_signal(
+                    dest,
+                    COMPOSITOR_PATH,
+                    COMPOSITOR_BUS_NAME,
+                    name,
+                    &(seq, ws.clone()),
+                ),
+                Event::AltTabState(s) => emitter_conn.emit_signal(
+                    dest,
+                    COMPOSITOR_PATH,
+                    COMPOSITOR_BUS_NAME,
+                    name,
+                    &(seq, s.clone()),
+                ),
+                Event::ConfigReloaded(a) => emitter_conn.emit_signal(
+                    dest,
+                    COMPOSITOR_PATH,
+                    COMPOSITOR_BUS_NAME,
+                    name,
+                    &(seq, a.clone()),
+                ),
             };
             if let Err(err) = result {
                 tracing::warn!(signal = name, error = %err, "failed to emit D-Bus signal");
@@ -365,27 +442,54 @@ pub fn spawn_service(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icedtea_contract::{AltTabState, Appearance, Rectangle, WindowInfo, WindowUpdate, WorkspaceInfo};
+    use icedtea_contract::{
+        AltTabState, Appearance, Rectangle, WindowInfo, WindowUpdate, WorkspaceInfo,
+    };
 
     #[test]
     fn event_names_match_interface() {
-        assert_eq!(event_signal_name(&Event::WindowOpened(sample_info())), "WindowOpened");
-        assert_eq!(event_signal_name(&Event::WindowClosed(WindowId(1))), "WindowClosed");
-        assert_eq!(event_signal_name(&Event::ConfigReloaded(default_appearance())), "ConfigReloaded");
+        assert_eq!(
+            event_signal_name(&Event::WindowOpened(sample_info())),
+            "WindowOpened"
+        );
+        assert_eq!(
+            event_signal_name(&Event::WindowClosed(WindowId(1))),
+            "WindowClosed"
+        );
+        assert_eq!(
+            event_signal_name(&Event::ConfigReloaded(default_appearance())),
+            "ConfigReloaded"
+        );
         // Fix-round addition: the brief's own Step-1 sample only exercised
         // 3 of the 7 `Event` variants; cover the remaining 4 so every
         // `event_signal_name` match arm has a passing assertion behind it.
         assert_eq!(
-            event_signal_name(&Event::WindowUpdated { id: WindowId(1), update: WindowUpdate::default() }),
+            event_signal_name(&Event::WindowUpdated {
+                id: WindowId(1),
+                update: WindowUpdate::default()
+            }),
             "WindowUpdated"
         );
-        assert_eq!(event_signal_name(&Event::WorkspaceSet { id: 0, active: true }), "WorkspaceSet");
         assert_eq!(
-            event_signal_name(&Event::WorkspaceList(vec![WorkspaceInfo { id: 0, name: "1".into() }])),
+            event_signal_name(&Event::WorkspaceSet {
+                id: 0,
+                active: true
+            }),
+            "WorkspaceSet"
+        );
+        assert_eq!(
+            event_signal_name(&Event::WorkspaceList(vec![WorkspaceInfo {
+                id: 0,
+                name: "1".into()
+            }])),
             "WorkspaceList"
         );
         assert_eq!(
-            event_signal_name(&Event::AltTabState(AltTabState { active: true, entries: vec![], index: 0 })),
+            event_signal_name(&Event::AltTabState(AltTabState {
+                active: true,
+                entries: vec![],
+                index: 0
+            })),
             "AltTabState"
         );
     }
@@ -397,7 +501,12 @@ mod tests {
             title: "t".into(),
             pid: 1,
             workspace: 0,
-            geometry: Rectangle { x: 0, y: 0, width: 10, height: 10 },
+            geometry: Rectangle {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
             maximized: false,
             minimized: false,
             fullscreen: false,

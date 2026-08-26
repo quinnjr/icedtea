@@ -20,13 +20,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender};
-use icedtea_contract::{CloseReason, IconSource, Notification, NotificationAction, NOTIF_BUS_NAME, NOTIF_PATH};
+use icedtea_contract::{
+    CloseReason, IconSource, NOTIF_BUS_NAME, NOTIF_PATH, Notification, NotificationAction,
+};
 use zbus::blocking::Connection;
 use zbus::interface;
 use zbus::zvariant::{OwnedValue, Structure, Value};
 
 use crate::expiry::Tick;
-use crate::store::{parse_urgency, Change, Store};
+use crate::store::{Change, Store, parse_urgency};
 
 /// Well-known bus name for the icedtea extension interface. The standard
 /// interface is served at the same object path under [`NOTIF_BUS_NAME`]
@@ -42,7 +44,10 @@ use crate::store::{parse_urgency, Change, Store};
 const ICEDTEA_INTERFACE: &str = "org.icedtea.Notifications";
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Standard freedesktop close-reason wire codes — fixed by the spec, not the
@@ -93,12 +98,21 @@ where
 /// hardening pass. Takes the value out of the map by ownership so the (large)
 /// pixel buffer is moved, never cloned.
 fn parse_image_data_hint(hints: &mut HashMap<String, OwnedValue>) -> Option<IconSource> {
-    let raw = hints.remove("image-data").or_else(|| hints.remove("icon_data"))?;
+    let raw = hints
+        .remove("image-data")
+        .or_else(|| hints.remove("icon_data"))?;
     let value: Value = raw.into();
     let structure = Structure::try_from(value).ok()?;
     let fields = structure.into_fields();
-    let [width, height, rowstride, has_alpha, bits_per_sample, channels, data]: [Value; 7] =
-        fields.try_into().ok()?;
+    let [
+        width,
+        height,
+        rowstride,
+        has_alpha,
+        bits_per_sample,
+        channels,
+        data,
+    ]: [Value; 7] = fields.try_into().ok()?;
     Some(IconSource::Pixels {
         width: i32::try_from(width).ok()?,
         height: i32::try_from(height).ok()?,
@@ -168,8 +182,16 @@ impl StdInterface {
         // name or filesystem path), then the `app_icon` argument, then
         // nothing. See `contract::notifications::IconSource`.
         let icon = parse_image_data_hint(&mut hints)
-            .or_else(|| hint::<String>(&mut hints, "image-path").filter(|p| !p.is_empty()).map(IconSource::Named))
-            .unwrap_or(if app_icon.is_empty() { IconSource::None } else { IconSource::Named(app_icon) });
+            .or_else(|| {
+                hint::<String>(&mut hints, "image-path")
+                    .filter(|p| !p.is_empty())
+                    .map(IconSource::Named)
+            })
+            .unwrap_or(if app_icon.is_empty() {
+                IconSource::None
+            } else {
+                IconSource::Named(app_icon)
+            });
         let actions = pair_actions(actions);
         let urgency = parse_urgency(hint::<u8>(&mut hints, "urgency"));
         let category = hint::<String>(&mut hints, "category");
@@ -213,15 +235,27 @@ impl StdInterface {
 
     fn close_notification(&self, id: u32) {
         let mut store = self.0.store.lock().unwrap();
-        self.0.cancel_and_close(&mut store, id, CloseReason::ClosedByRequest);
+        self.0
+            .cancel_and_close(&mut store, id, CloseReason::ClosedByRequest);
     }
 
     fn get_capabilities(&self) -> Vec<String> {
-        vec!["actions".into(), "body".into(), "body-markup".into(), "icon-static".into(), "persistence".into()]
+        vec![
+            "actions".into(),
+            "body".into(),
+            "body-markup".into(),
+            "icon-static".into(),
+            "persistence".into(),
+        ]
     }
 
     fn get_server_information(&self) -> (String, String, String, String) {
-        ("icedtea-notifications".into(), "icedtea".into(), env!("CARGO_PKG_VERSION").into(), "1.2".into())
+        (
+            "icedtea-notifications".into(),
+            "icedtea".into(),
+            env!("CARGO_PKG_VERSION").into(),
+            "1.2".into(),
+        )
     }
 }
 
@@ -241,7 +275,8 @@ impl IcedteaInterface {
         // "clear everything" must also clear DND-suppressed ones, which
         // `active()` hides.
         for id in store.live_ids() {
-            self.0.cancel_and_close(&mut store, id, CloseReason::Dismissed);
+            self.0
+                .cancel_and_close(&mut store, id, CloseReason::Dismissed);
         }
     }
 
@@ -254,7 +289,8 @@ impl IcedteaInterface {
         // `resident == false` (the default): the notification is removed once
         // an action is invoked. `resident == true` keeps it up. See the spec.
         if store.is_resident(id) == Some(false) {
-            self.0.cancel_and_close(&mut store, id, CloseReason::Dismissed);
+            self.0
+                .cancel_and_close(&mut store, id, CloseReason::Dismissed);
         }
     }
 
@@ -336,10 +372,16 @@ pub fn spawn(
 ) -> Result<Connection, SpawnError> {
     let conn = Connection::session()?;
 
-    let shared = Arc::new(Shared { store, changes: changes_tx, ticks });
+    let shared = Arc::new(Shared {
+        store,
+        changes: changes_tx,
+        ticks,
+    });
 
-    conn.object_server().at(NOTIF_PATH, StdInterface(shared.clone()))?;
-    conn.object_server().at(NOTIF_PATH, IcedteaInterface(shared))?;
+    conn.object_server()
+        .at(NOTIF_PATH, StdInterface(shared.clone()))?;
+    conn.object_server()
+        .at(NOTIF_PATH, IcedteaInterface(shared))?;
     // `request_name`'s default flags are `AllowReplacement | ReplaceExisting
     // | DoNotQueue` (see zbus's own fdo/dbus.rs test), which would let us
     // steal the name from a replacement-allowing owner and would mark
@@ -348,8 +390,11 @@ pub fn spawn(
     // alone (no `AllowReplacement`/`ReplaceExisting`) is what the design
     // spec's Decision 6 actually calls for: fail loudly if anyone else owns
     // the name, and never let anyone take it from us.
-    let name_taken =
-        || SpawnError::NameTaken(format!("another notification daemon already owns {NOTIF_BUS_NAME}"));
+    let name_taken = || {
+        SpawnError::NameTaken(format!(
+            "another notification daemon already owns {NOTIF_BUS_NAME}"
+        ))
+    };
     // A conflict surfaces two ways depending on the bus: as `Err(NameTaken)`
     // from `request_name_with_flags` itself, or as an `Ok(_)` reply that
     // isn't `PrimaryOwner` (`DoNotQueue` yields `Exists` rather than queuing).
@@ -357,7 +402,10 @@ pub fn spawn(
     // fatal + loud, never steal the name), so map both to `NameTaken` — never
     // the generic `Bus` variant that `main` would treat as a restartable
     // failure and crash-loop on.
-    match conn.request_name_with_flags(NOTIF_BUS_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into()) {
+    match conn.request_name_with_flags(
+        NOTIF_BUS_NAME,
+        zbus::fdo::RequestNameFlags::DoNotQueue.into(),
+    ) {
         Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {}
         Ok(_) => return Err(name_taken()),
         Err(zbus::Error::NameTaken) => return Err(name_taken()),
@@ -381,29 +429,57 @@ pub fn spawn(
 
 fn emit(conn: &Connection, dest: Option<&str>, change: Change) {
     let result = match change {
-        Change::Added(id) => conn.emit_signal(dest, NOTIF_PATH, ICEDTEA_INTERFACE, "NotificationAdded", &(id,)),
+        Change::Added(id) => conn.emit_signal(
+            dest,
+            NOTIF_PATH,
+            ICEDTEA_INTERFACE,
+            "NotificationAdded",
+            &(id,),
+        ),
         Change::Closed(id, reason) => {
-            let std_result =
-                conn.emit_signal(dest, NOTIF_PATH, NOTIF_BUS_NAME, "NotificationClosed", &(id, reason_code(reason)));
-            let icedtea_result =
-                conn.emit_signal(dest, NOTIF_PATH, ICEDTEA_INTERFACE, "NotificationRemoved", &(id, reason));
+            let std_result = conn.emit_signal(
+                dest,
+                NOTIF_PATH,
+                NOTIF_BUS_NAME,
+                "NotificationClosed",
+                &(id, reason_code(reason)),
+            );
+            let icedtea_result = conn.emit_signal(
+                dest,
+                NOTIF_PATH,
+                ICEDTEA_INTERFACE,
+                "NotificationRemoved",
+                &(id, reason),
+            );
             std_result.and(icedtea_result)
         }
-        Change::ActionInvoked(id, key) => {
-            conn.emit_signal(dest, NOTIF_PATH, NOTIF_BUS_NAME, "ActionInvoked", &(id, key))
-        }
-        Change::DndChanged(on) => {
-            conn.emit_signal(dest, NOTIF_PATH, ICEDTEA_INTERFACE, "DoNotDisturbChanged", &(on,))
-        }
+        Change::ActionInvoked(id, key) => conn.emit_signal(
+            dest,
+            NOTIF_PATH,
+            NOTIF_BUS_NAME,
+            "ActionInvoked",
+            &(id, key),
+        ),
+        Change::DndChanged(on) => conn.emit_signal(
+            dest,
+            NOTIF_PATH,
+            ICEDTEA_INTERFACE,
+            "DoNotDisturbChanged",
+            &(on,),
+        ),
         // A DND-suppressed notification is *hidden*, not closed: emit only the
         // icedtea `NotificationRemoved` (so a popup UI drops the card and
         // stays consistent with GetActive), never the standard
         // `NotificationClosed` (the sender must not think its notification
         // went away). `Undefined` marks "removed from the active view without
         // a real close reason".
-        Change::Suppressed(id) => {
-            conn.emit_signal(dest, NOTIF_PATH, ICEDTEA_INTERFACE, "NotificationRemoved", &(id, CloseReason::Undefined))
-        }
+        Change::Suppressed(id) => conn.emit_signal(
+            dest,
+            NOTIF_PATH,
+            ICEDTEA_INTERFACE,
+            "NotificationRemoved",
+            &(id, CloseReason::Undefined),
+        ),
     };
     if let Err(err) = result {
         tracing::warn!(error = %err, "failed to emit D-Bus signal");

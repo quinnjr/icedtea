@@ -80,7 +80,10 @@ fn enumerates_heads_and_applies_a_configuration() {
         for msg in drain(&rx) {
             match msg {
                 OutputsMsg::ApplySucceeded { is_test } => {
-                    assert!(!is_test, "build_and_send_configuration is an apply, not a test");
+                    assert!(
+                        !is_test,
+                        "build_and_send_configuration is an apply, not a test"
+                    );
                     result = Some(Ok(()));
                 }
                 OutputsMsg::ApplyFailed { .. } => result = Some(Err("failed")),

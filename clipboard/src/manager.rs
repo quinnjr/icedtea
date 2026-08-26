@@ -50,7 +50,10 @@ fn kind_of(mime: &str) -> ClipKind {
 }
 
 fn pick_mime(offered: &[String]) -> Option<String> {
-    MIMES.iter().find(|m| offered.iter().any(|o| o == *m)).map(|m| m.to_string())
+    MIMES
+        .iter()
+        .find(|m| offered.iter().any(|o| o == *m))
+        .map(|m| m.to_string())
 }
 
 struct App {
@@ -99,8 +102,12 @@ impl App {
         if self.our_source.is_some() {
             return;
         }
-        let Some(off) = self.offer.clone() else { return };
-        let Some(mime) = pick_mime(&self.offer_mimes) else { return };
+        let Some(off) = self.offer.clone() else {
+            return;
+        };
+        let Some(mime) = pick_mime(&self.offer_mimes) else {
+            return;
+        };
 
         let (read_end, write_end) = match std::io::pipe() {
             Ok(p) => p,
@@ -150,9 +157,15 @@ impl App {
 
     /// Re-paste: own the selection with a source serving `id`'s stored bytes.
     fn activate(&mut self, id: u64, qh: &QueueHandle<App>, conn: &Connection) {
-        let Some((mime, bytes)) = self.history.bytes_for(id) else { return };
-        let Some(manager) = self.manager.as_ref() else { return };
-        let Some(device) = self.device.as_ref() else { return };
+        let Some((mime, bytes)) = self.history.bytes_for(id) else {
+            return;
+        };
+        let Some(manager) = self.manager.as_ref() else {
+            return;
+        };
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
         let source = manager.create_data_source(qh, ());
         source.offer(mime.clone());
         device.set_selection(Some(&source));
@@ -174,7 +187,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             match interface.as_str() {
                 "zwlr_data_control_manager_v1" => {
                     // Bind v1 deliberately: v2 also delivers primary-selection

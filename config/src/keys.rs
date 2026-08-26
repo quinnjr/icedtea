@@ -72,12 +72,23 @@ mod tests {
         assert_eq!(key_name_to_keysym("KEY_space"), 0x20);
         assert_eq!(key_name_to_keysym("KEY_bracketleft"), 0x5b);
         // Still unresolvable, still reported as `NoSymbol`.
-        assert_eq!(key_name_to_keysym("KEY_definitely_not_a_key"), xkb::keysyms::KEY_NoSymbol);
+        assert_eq!(
+            key_name_to_keysym("KEY_definitely_not_a_key"),
+            xkb::keysyms::KEY_NoSymbol
+        );
     }
 
     #[test]
     fn key_name_round_trips_through_keysym_to_key_name() {
-        for name in ["KEY_Return", "KEY_Tab", "KEY_q", "KEY_a", "KEY_F5", "KEY_1", "KEY_space"] {
+        for name in [
+            "KEY_Return",
+            "KEY_Tab",
+            "KEY_q",
+            "KEY_a",
+            "KEY_F5",
+            "KEY_1",
+            "KEY_space",
+        ] {
             assert_eq!(keysym_to_key_name(key_name_to_keysym(name)), name);
         }
     }

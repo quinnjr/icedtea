@@ -16,8 +16,8 @@ pub mod text;
 pub mod wayland;
 pub mod window;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use icedtea_contract::SeqEvent;
 
@@ -231,8 +231,12 @@ pub fn run() {
     tracing::info!(%socket, "listening on wayland socket");
 
     let dbus_quit_signal = Arc::new(AtomicBool::new(false));
-    let (_dbus_conn, dbus_emitter_thread) =
-        dbus::spawn_service(dbus_events_rx, cmd_tx, dbus_quit_signal.clone(), cmd_wake_write);
+    let (_dbus_conn, dbus_emitter_thread) = dbus::spawn_service(
+        dbus_events_rx,
+        cmd_tx,
+        dbus_quit_signal.clone(),
+        cmd_wake_write,
+    );
 
     let wallpaper_path = state.config.appearance.wallpaper.clone();
     state.spawn_wallpaper(wallpaper_path);
@@ -292,7 +296,11 @@ pub fn run() {
 /// clients *ask* for a named cursor or an activation -- the crate applies
 /// neither itself, so `State`'s `SeatHandler::request_set_shape` /
 /// `request_activate` are what make them do anything.
-pub fn create_compat_globals(runtime: &wlr::Runtime, display: &wlr::Display, backend: &wlr::Backend) {
+pub fn create_compat_globals(
+    runtime: &wlr::Runtime,
+    display: &wlr::Display,
+    backend: &wlr::Backend,
+) {
     // A2 batch-1 passive protocols: none of these change client-visible
     // behavior on their own, they just let clients discover/opt into finer
     // scaling, buffer, and geometry hints. Non-fatal, same tone as every

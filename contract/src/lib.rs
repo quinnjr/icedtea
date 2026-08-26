@@ -26,10 +26,9 @@ pub const COMPOSITOR_PATH: &str = "/org/icedtea/Compositor";
 /// * `2` -- A2 batch 2: `WindowInfo.attention` / `WindowUpdate.attention`.
 pub const COMPOSITOR_CONTRACT_VERSION: u32 = 2;
 
-pub use clipboard::{ClipEntry, ClipKind, CLIP_BUS_NAME, CLIP_PATH};
+pub use clipboard::{CLIP_BUS_NAME, CLIP_PATH, ClipEntry, ClipKind};
 pub use event::{Event, SeqEvent};
 pub use notifications::{
-    CloseReason, IconSource, Notification, NotificationAction, Urgency, NOTIF_BUS_NAME,
-    NOTIF_PATH,
+    CloseReason, IconSource, NOTIF_BUS_NAME, NOTIF_PATH, Notification, NotificationAction, Urgency,
 };
 pub use types::*;

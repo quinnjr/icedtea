@@ -16,8 +16,8 @@ use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use icedtea_shell::bridge;
 use icedtea_shell::clip_client::{self, ClipCommands, ClipProxy};
 use icedtea_shell::clipboard::{self, ClipboardModel};
-use icedtea_shell::taskbar::{self, TaskbarModel};
 use icedtea_shell::compositor_client::{self, CompositorCommands, CompositorProxy};
+use icedtea_shell::taskbar::{self, TaskbarModel};
 
 const APP_ID: &str = "org.icedtea.Shell";
 

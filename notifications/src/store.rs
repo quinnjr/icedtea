@@ -90,13 +90,23 @@ pub struct Store {
 
 impl Store {
     pub fn new(history_max: usize) -> Self {
-        Store { items: Vec::new(), closed_history: std::collections::VecDeque::new(), history_max, next_id: 1, dnd: false }
+        Store {
+            items: Vec::new(),
+            closed_history: std::collections::VecDeque::new(),
+            history_max,
+            next_id: 1,
+            dnd: false,
+        }
     }
 
     fn alloc_id(&mut self) -> u32 {
         loop {
             let id = self.next_id;
-            self.next_id = if self.next_id == u32::MAX { 1 } else { self.next_id + 1 };
+            self.next_id = if self.next_id == u32::MAX {
+                1
+            } else {
+                self.next_id + 1
+            };
             // Skip 0 (spec requires nonzero), any still-live id, and any id
             // still in closed_history — after a `u32::MAX` wrap a reused id
             // that collided with a closed-history entry would let two
@@ -281,7 +291,11 @@ impl Store {
                 newly_visible.push((n.id, n.expire_at_ms));
             }
         }
-        Some(DndChange { on, newly_suppressed, newly_visible })
+        Some(DndChange {
+            on,
+            newly_suppressed,
+            newly_visible,
+        })
     }
 
     pub fn dnd(&self) -> bool {
@@ -290,13 +304,21 @@ impl Store {
 
     /// Live, not DND-suppressed — what the popup UI should currently show.
     pub fn active(&self) -> Vec<Notification> {
-        self.items.iter().filter(|n| !n.suppressed).cloned().collect()
+        self.items
+            .iter()
+            .filter(|n| !n.suppressed)
+            .cloned()
+            .collect()
     }
 
     /// The full "what did I miss" timeline: the bounded closed-history ring
     /// (oldest first) followed by everything still live.
     pub fn history(&self) -> Vec<Notification> {
-        self.closed_history.iter().cloned().chain(self.items.iter().cloned()).collect()
+        self.closed_history
+            .iter()
+            .cloned()
+            .chain(self.items.iter().cloned())
+            .collect()
     }
 }
 
@@ -305,7 +327,10 @@ mod tests {
     use super::*;
 
     fn n(id: u32) -> NotificationAction {
-        NotificationAction { key: format!("key{id}"), label: format!("Label {id}") }
+        NotificationAction {
+            key: format!("key{id}"),
+            label: format!("Label {id}"),
+        }
     }
 
     fn store() -> Store {
@@ -339,7 +364,11 @@ mod tests {
         assert_eq!(parse_urgency(Some(1)), Urgency::Normal);
         assert_eq!(parse_urgency(Some(2)), Urgency::Critical);
         assert_eq!(parse_urgency(None), Urgency::Normal);
-        assert_eq!(parse_urgency(Some(200)), Urgency::Normal, "out-of-range degrades to default");
+        assert_eq!(
+            parse_urgency(Some(200)),
+            Urgency::Normal,
+            "out-of-range degrades to default"
+        );
     }
 
     #[test]
@@ -350,7 +379,11 @@ mod tests {
             Some(now + SERVER_DEFAULT_EXPIRE_MS),
             "-1 uses the server default"
         );
-        assert_eq!(compute_expire_at(Urgency::Normal, 0, now), None, "0 never expires");
+        assert_eq!(
+            compute_expire_at(Urgency::Normal, 0, now),
+            None,
+            "0 never expires"
+        );
         assert_eq!(
             compute_expire_at(Urgency::Normal, 2500, now),
             Some(now + 2500),
@@ -374,7 +407,10 @@ mod tests {
     fn resolve_expire_timeout_handles_adversarial_negatives() {
         // Not just -1: any other negative value degrades to the same
         // server-default behavior instead of wrapping through `as u64`.
-        assert_eq!(resolve_expire_timeout(i32::MIN), Some(SERVER_DEFAULT_EXPIRE_MS));
+        assert_eq!(
+            resolve_expire_timeout(i32::MIN),
+            Some(SERVER_DEFAULT_EXPIRE_MS)
+        );
         assert_eq!(resolve_expire_timeout(-2), Some(SERVER_DEFAULT_EXPIRE_MS));
     }
 
@@ -432,10 +468,16 @@ mod tests {
         let mut s = store();
         let closed = push(&mut s, Urgency::Normal, 0);
         s.close(closed, CloseReason::Dismissed);
-        assert!(s.history().iter().any(|n| n.id == closed), "still in history");
+        assert!(
+            s.history().iter().any(|n| n.id == closed),
+            "still in history"
+        );
         s.next_id = closed; // force the collision
         let fresh = push(&mut s, Urgency::Normal, 0);
-        assert_ne!(fresh, closed, "must not reuse an id still held in closed_history");
+        assert_ne!(
+            fresh, closed,
+            "must not reuse an id still held in closed_history"
+        );
     }
 
     #[test]
@@ -473,7 +515,10 @@ mod tests {
         assert!(!dc.on);
         assert!(dc.newly_suppressed.is_empty());
         assert_eq!(dc.newly_visible.len(), 1);
-        assert_eq!(dc.newly_visible[0].0, id, "the suppressed one became visible");
+        assert_eq!(
+            dc.newly_visible[0].0, id,
+            "the suppressed one became visible"
+        );
         let active = s.active();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, id, "same id, not a new notification");
@@ -513,11 +558,25 @@ mod tests {
         s.set_dnd(true, 0);
         // expire_timeout 0 => never expires
         let (id, _, _) = s.notify(
-            "app".into(), 0, IconSource::None, "s".into(), "b".into(), vec![],
-            Urgency::Normal, None, false, false, 0, 0,
+            "app".into(),
+            0,
+            IconSource::None,
+            "s".into(),
+            "b".into(),
+            vec![],
+            Urgency::Normal,
+            None,
+            false,
+            false,
+            0,
+            0,
         );
         let dc = s.set_dnd(false, 500).expect("changed");
-        assert_eq!(dc.newly_visible, vec![(id, None)], "never-expire stays never-expire");
+        assert_eq!(
+            dc.newly_visible,
+            vec![(id, None)],
+            "never-expire stays never-expire"
+        );
     }
 
     #[test]
@@ -526,9 +585,16 @@ mod tests {
         let normal = push(&mut s, Urgency::Normal, 0);
         let critical = push(&mut s, Urgency::Critical, 0);
         let dc = s.set_dnd(true, 0).expect("changed");
-        assert_eq!(dc.newly_suppressed, vec![normal], "only the normal one is hidden");
+        assert_eq!(
+            dc.newly_suppressed,
+            vec![normal],
+            "only the normal one is hidden"
+        );
         assert!(dc.newly_visible.is_empty());
-        assert!(s.active().iter().any(|n| n.id == critical), "critical stays visible");
+        assert!(
+            s.active().iter().any(|n| n.id == critical),
+            "critical stays visible"
+        );
     }
 
     // --- close ---
@@ -538,7 +604,11 @@ mod tests {
         let mut s = store();
         let id = push(&mut s, Urgency::Normal, 0);
         assert!(s.close(id, CloseReason::Dismissed).is_some());
-        assert_eq!(s.close(id, CloseReason::Dismissed), None, "second close is a no-op");
+        assert_eq!(
+            s.close(id, CloseReason::Dismissed),
+            None,
+            "second close is a no-op"
+        );
     }
 
     #[test]
@@ -568,7 +638,10 @@ mod tests {
             0,
         );
         s.close(id, CloseReason::Dismissed);
-        assert!(!s.history().iter().any(|n| n.id == id), "transient never enters history");
+        assert!(
+            !s.history().iter().any(|n| n.id == id),
+            "transient never enters history"
+        );
     }
 
     // --- closed-history ring ---
@@ -584,7 +657,10 @@ mod tests {
         }
         let history = s.history();
         assert_eq!(history.len(), 2, "ring bounded to history_max");
-        assert_eq!(history[0].id, ids[2], "oldest evicted, ring keeps the newest 2, oldest-first");
+        assert_eq!(
+            history[0].id, ids[2],
+            "oldest evicted, ring keeps the newest 2, oldest-first"
+        );
         assert_eq!(history[1].id, ids[3]);
     }
 
@@ -608,7 +684,10 @@ mod tests {
     fn invoke_action_on_live_id_returns_change() {
         let mut s = store();
         let id = push(&mut s, Urgency::Normal, 0);
-        assert_eq!(s.invoke_action(id, "key1"), Some(Change::ActionInvoked(id, "key1".into())));
+        assert_eq!(
+            s.invoke_action(id, "key1"),
+            Some(Change::ActionInvoked(id, "key1".into()))
+        );
     }
 
     #[test]
@@ -639,10 +718,24 @@ mod tests {
         let id = push(&mut s, Urgency::Normal, 0); // expire_at_ms == 5000
         // Replace with a much longer timeout; new deadline 10 + 60_000.
         s.notify(
-            "app".into(), id, IconSource::None, "s".into(), "b".into(), vec![],
-            Urgency::Normal, None, false, false, 60_000, 10,
+            "app".into(),
+            id,
+            IconSource::None,
+            "s".into(),
+            "b".into(),
+            vec![],
+            Urgency::Normal,
+            None,
+            false,
+            false,
+            60_000,
+            10,
         );
-        assert_eq!(s.close_if_due(id, 5000), None, "extended deadline not yet due");
+        assert_eq!(
+            s.close_if_due(id, 5000),
+            None,
+            "extended deadline not yet due"
+        );
         assert!(s.active().iter().any(|n| n.id == id), "still live");
     }
 
@@ -651,10 +744,24 @@ mod tests {
         let mut s = store();
         let id = push(&mut s, Urgency::Normal, 0); // expire_at_ms == 5000
         s.notify(
-            "app".into(), id, IconSource::None, "s".into(), "b".into(), vec![],
-            Urgency::Normal, None, false, false, 0 /* never */, 10,
+            "app".into(),
+            id,
+            IconSource::None,
+            "s".into(),
+            "b".into(),
+            vec![],
+            Urgency::Normal,
+            None,
+            false,
+            false,
+            0, /* never */
+            10,
         );
-        assert_eq!(s.close_if_due(id, 1_000_000), None, "never-expire is never due");
+        assert_eq!(
+            s.close_if_due(id, 1_000_000),
+            None,
+            "never-expire is never due"
+        );
         assert!(s.active().iter().any(|n| n.id == id));
     }
 
@@ -663,7 +770,11 @@ mod tests {
         let mut s = store();
         let id = push(&mut s, Urgency::Normal, 0);
         s.close(id, CloseReason::Dismissed);
-        assert_eq!(s.close_if_due(id, 1_000_000), None, "already gone, no wrong-reason close");
+        assert_eq!(
+            s.close_if_due(id, 1_000_000),
+            None,
+            "already gone, no wrong-reason close"
+        );
     }
 
     #[test]
@@ -672,7 +783,11 @@ mod tests {
         let mut s = store();
         s.set_dnd(true, 0);
         let id = push(&mut s, Urgency::Normal, 0); // suppressed, expire_at_ms == 5000
-        assert_eq!(s.close_if_due(id, 1_000_000), None, "suppressed never expires while hidden");
+        assert_eq!(
+            s.close_if_due(id, 1_000_000),
+            None,
+            "suppressed never expires while hidden"
+        );
         assert!(s.live_ids().contains(&id), "still live");
     }
 
@@ -684,7 +799,10 @@ mod tests {
         s.set_dnd(true, 0);
         let hidden = push(&mut s, Urgency::Normal, 0);
         let critical = push(&mut s, Urgency::Critical, 0);
-        assert!(s.active().iter().all(|n| n.id != hidden), "hidden from active()");
+        assert!(
+            s.active().iter().all(|n| n.id != hidden),
+            "hidden from active()"
+        );
         let ids = s.live_ids();
         assert!(ids.contains(&hidden), "but present in live_ids()");
         assert!(ids.contains(&critical));
@@ -694,8 +812,18 @@ mod tests {
     fn is_resident_reports_the_hint() {
         let mut s = store();
         let (resident_id, _, _) = s.notify(
-            "app".into(), 0, IconSource::None, "s".into(), "b".into(), vec![],
-            Urgency::Normal, None, true /* resident */, false, -1, 0,
+            "app".into(),
+            0,
+            IconSource::None,
+            "s".into(),
+            "b".into(),
+            vec![],
+            Urgency::Normal,
+            None,
+            true, /* resident */
+            false,
+            -1,
+            0,
         );
         let non_resident = push(&mut s, Urgency::Normal, 0);
         assert_eq!(s.is_resident(resident_id), Some(true));

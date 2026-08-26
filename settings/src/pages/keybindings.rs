@@ -14,13 +14,13 @@ use std::rc::Rc;
 use gtk4::glib::translate::IntoGlib;
 use gtk4::prelude::*;
 use gtk4::{
-    gdk, glib, Box as GtkBox, Button, EventControllerFocus, EventControllerKey, Label, Orientation,
-    PropagationPhase, ScrolledWindow,
+    Box as GtkBox, Button, EventControllerFocus, EventControllerKey, Label, Orientation,
+    PropagationPhase, ScrolledWindow, gdk, glib,
 };
 
 use icedtea_config::KeyCombo;
 
-use crate::model::{combo_from_keysym, duplicate_bindings, CaptureMods};
+use crate::model::{CaptureMods, combo_from_keysym, duplicate_bindings};
 use crate::pages::{Ctx, Page};
 
 /// The fixed part of the action set -- always present regardless of
@@ -87,7 +87,9 @@ fn sync_rows(rows: &[Row], cfg: &icedtea_config::Config) {
         } else {
             row.combo_label.set_label("(unbound)");
         }
-        let colliding = conflicts.iter().any(|(_, actions)| actions.contains(&row.action));
+        let colliding = conflicts
+            .iter()
+            .any(|(_, actions)| actions.contains(&row.action));
         if colliding {
             row.combo_label.add_css_class(CONFLICT_CSS_CLASS);
         } else {
@@ -153,10 +155,18 @@ pub fn unshifted_keysym(keycode: u32, fallback_keysym: u32) -> u32 {
 /// display, once. Purely advisory styling (a red label) -- see the brief's
 /// Step 4: conflicts never block Apply.
 fn install_conflict_css() {
-    let Some(display) = gdk::Display::default() else { return };
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
     let provider = gtk4::CssProvider::new();
-    provider.load_from_data(&format!(".{CONFLICT_CSS_CLASS} {{ color: #f38ba8; font-weight: bold; }}"));
-    gtk4::style_context_add_provider_for_display(&display, &provider, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    provider.load_from_data(&format!(
+        ".{CONFLICT_CSS_CLASS} {{ color: #f38ba8; font-weight: bold; }}"
+    ));
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
 }
 
 pub fn build(ctx: Ctx) -> Page {
@@ -227,7 +237,11 @@ pub fn build(ctx: Ctx) -> Page {
             // and wait for the "real" key.
             let keysym = unshifted_keysym(keycode, keyval.into_glib());
             if let Some(combo) = combo_from_keysym(keysym, mods) {
-                model.borrow_mut().working.keybindings.insert(action.clone(), combo);
+                model
+                    .borrow_mut()
+                    .working
+                    .keybindings
+                    .insert(action.clone(), combo);
                 if !populating.get() {
                     (on_dirty)();
                 }
@@ -319,7 +333,11 @@ pub fn build(ctx: Ctx) -> Page {
                     });
                 }
 
-                rows.borrow_mut().push(Row { action, combo_label, set_button });
+                rows.borrow_mut().push(Row {
+                    action,
+                    combo_label,
+                    set_button,
+                });
             }
 
             sync_rows(&rows.borrow(), &cfg);
@@ -337,7 +355,10 @@ pub fn build(ctx: Ctx) -> Page {
     };
     refresh();
 
-    Page { root: scroller.upcast(), refresh }
+    Page {
+        root: scroller.upcast(),
+        refresh,
+    }
 }
 
 #[cfg(test)]
@@ -348,7 +369,10 @@ mod tests {
     fn action_list_is_fixed_plus_generated_workspace_pairs() {
         let actions = action_list(2);
         for fixed in FIXED_ACTIONS {
-            assert!(actions.contains(&fixed.to_string()), "{fixed} must be present");
+            assert!(
+                actions.contains(&fixed.to_string()),
+                "{fixed} must be present"
+            );
         }
         assert!(actions.contains(&SNAP_RESTORE.to_string()));
         assert!(actions.contains(&"workspace:1".to_string()));
@@ -373,25 +397,40 @@ mod tests {
         for n in 1..=cfg.workspace_names.len() {
             let ws = format!("workspace:{n}");
             let mv = format!("move_to_workspace:{n}");
-            assert!(cfg.keybindings.contains_key(&ws), "default_config must bind {ws}");
-            assert!(cfg.keybindings.contains_key(&mv), "default_config must bind {mv}");
+            assert!(
+                cfg.keybindings.contains_key(&ws),
+                "default_config must bind {ws}"
+            );
+            assert!(
+                cfg.keybindings.contains_key(&mv),
+                "default_config must bind {mv}"
+            );
             assert!(actions.contains(&ws));
             assert!(actions.contains(&mv));
         }
         for action in FIXED_ACTIONS.iter().chain(std::iter::once(&SNAP_RESTORE)) {
-            assert!(cfg.keybindings.contains_key(*action), "default binding {action:?} missing from default_config");
+            assert!(
+                cfg.keybindings.contains_key(*action),
+                "default binding {action:?} missing from default_config"
+            );
         }
     }
 
     #[test]
     fn format_combo_renders_super_shift_key() {
-        let combo = KeyCombo { modifiers: vec!["SUPER".to_string(), "SHIFT".to_string()], key: "KEY_q".to_string() };
+        let combo = KeyCombo {
+            modifiers: vec!["SUPER".to_string(), "SHIFT".to_string()],
+            key: "KEY_q".to_string(),
+        };
         assert_eq!(format_combo(&combo), "SUPER+SHIFT+q");
     }
 
     #[test]
     fn format_combo_with_no_modifiers() {
-        let combo = KeyCombo { modifiers: vec![], key: "KEY_F5".to_string() };
+        let combo = KeyCombo {
+            modifiers: vec![],
+            key: "KEY_F5".to_string(),
+        };
         assert_eq!(format_combo(&combo), "F5");
     }
 
@@ -400,8 +439,14 @@ mod tests {
         // Both conditions required: an armed capture on a hidden page (the user
         // switched away without completing) must NOT consume keystrokes.
         assert!(should_capture(true, true));
-        assert!(!should_capture(false, true), "armed but page hidden: must not hijack");
-        assert!(!should_capture(true, false), "visible but nothing armed: pass through");
+        assert!(
+            !should_capture(false, true),
+            "armed but page hidden: must not hijack"
+        );
+        assert!(
+            !should_capture(true, false),
+            "visible but nothing armed: pass through"
+        );
         assert!(!should_capture(false, false));
     }
 

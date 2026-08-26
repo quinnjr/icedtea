@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use icedtea_harness::Compositor;
 use icedtea_settings::model::Model;
-use icedtea_settings::pages::{appearance, Ctx};
+use icedtea_settings::pages::{Ctx, appearance};
 
 /// Point GDK at the harness compositor and init GTK. `false` means GTK
 /// could not come up -- a FAILURE by default (the harness provides a
@@ -71,7 +71,10 @@ fn populate_never_writes_a_widget_fallback_back_into_the_model() {
     // Not in `BAR_POSITIONS` -- forces the dropdown's fallback-to-index-0
     // path in `refresh()`.
     cfg.appearance.bar_position = "left".to_string();
-    let model = Rc::new(RefCell::new(Model { working: cfg.clone(), saved: cfg }));
+    let model = Rc::new(RefCell::new(Model {
+        working: cfg.clone(),
+        saved: cfg,
+    }));
 
     let ctx = Ctx {
         model: model.clone(),
@@ -91,5 +94,8 @@ fn populate_never_writes_a_widget_fallback_back_into_the_model() {
         "left",
         "populate must not overwrite an out-of-domain value the widget can't represent"
     );
-    assert!(!model.borrow().is_dirty(), "populate must never mark the model dirty");
+    assert!(
+        !model.borrow().is_dirty(),
+        "populate must never mark the model dirty"
+    );
 }

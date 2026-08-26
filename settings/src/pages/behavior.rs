@@ -43,7 +43,11 @@ pub fn build(ctx: Ctx) -> Page {
     {
         let ctx = ctx.clone();
         hide_bar_on_fullscreen.connect_state_set(move |_, active| {
-            ctx.model.borrow_mut().working.behavior.hide_bar_on_fullscreen = active;
+            ctx.model
+                .borrow_mut()
+                .working
+                .behavior
+                .hide_bar_on_fullscreen = active;
             ctx.mark_dirty();
             glib::Propagation::Proceed
         });
@@ -76,5 +80,8 @@ pub fn build(ctx: Ctx) -> Page {
     };
     refresh();
 
-    Page { root: grid.upcast(), refresh }
+    Page {
+        root: grid.upcast(),
+        refresh,
+    }
 }

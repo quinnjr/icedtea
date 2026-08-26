@@ -27,5 +27,12 @@ fn main() {
         .expect("failed to register org.icedtea.Clipboard (session bus? another daemon?)");
 
     // Runs until the Wayland connection dies.
-    manager::run(conn, history::History::new(HISTORY_MAX), cmd_rx, chg_tx, wake_read, snapshot);
+    manager::run(
+        conn,
+        history::History::new(HISTORY_MAX),
+        cmd_rx,
+        chg_tx,
+        wake_read,
+        snapshot,
+    );
 }

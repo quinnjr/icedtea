@@ -98,7 +98,11 @@ fn a_headless_compositor_boots_runs_and_stops() {
     state.wayland.attach(runtime.clone());
 
     let background = runtime
-        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .add_rect(
+            1,
+            1,
+            icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+        )
         .expect("background rect");
     runtime.lower_rect_to_bottom(background);
     state.set_background(background);
@@ -127,7 +131,8 @@ fn a_headless_compositor_boots_runs_and_stops() {
     // fails the test rather than hanging it.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     state.set_command_receiver(cmd_rx);
-    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
     state.set_cmd_wake_source(cmd_wake_id);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -149,7 +154,10 @@ fn a_headless_compositor_boots_runs_and_stops() {
         geo.width > 0 && geo.height > 0,
         "an enabled output reports a real size, got {geo:?}"
     );
-    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+    assert!(
+        state.quitting,
+        "the backstop Quit command must have stopped the loop"
+    );
     // Review finding I1: before `new_output` called `output.schedule_frame()`,
     // nothing owned the first frame -- it arrived only incidentally, via
     // whatever damage the background rect's own resize happened to cause.
@@ -216,7 +224,8 @@ fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     state.set_command_receiver(cmd_rx);
-    let (wake_write, wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("wake source");
+    let (wake_write, wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("wake source");
     state.set_cmd_wake_source(wake_id);
 
     // From another thread, exactly like the real producers
@@ -232,7 +241,10 @@ fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
         .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
         .expect("run_all");
 
-    assert!(state.quitting, "the Quit command must have reached State through the wake pipe");
+    assert!(
+        state.quitting,
+        "the Quit command must have reached State through the wake pipe"
+    );
 }
 
 /// The config-reload counterpart to `a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe`:
@@ -279,7 +291,8 @@ fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
     // bounded backstop -- see the doc above.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     state.set_command_receiver(cmd_rx);
-    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
     state.set_cmd_wake_source(cmd_wake_id);
 
     let starting_workspaces = state.window_manager.workspace_info().len();
@@ -305,7 +318,10 @@ fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
         .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
         .expect("run_all");
 
-    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+    assert!(
+        state.quitting,
+        "the backstop Quit command must have stopped the loop"
+    );
     assert_eq!(
         state.window_manager.workspace_info().len(),
         3,
@@ -367,7 +383,8 @@ fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
     // bounded backstop -- same role as in the config-reload sibling test.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     state.set_command_receiver(cmd_rx);
-    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
     state.set_cmd_wake_source(cmd_wake_id);
 
     // No image path: the worker resolves to `None` almost instantly. What
@@ -388,7 +405,10 @@ fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
         .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
         .expect("run_all");
 
-    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
+    assert!(
+        state.quitting,
+        "the backstop Quit command must have stopped the loop"
+    );
 
     const TURNS_BOUND: u64 = 50;
     assert!(
@@ -439,7 +459,15 @@ fn an_ssd_window_with_no_live_toplevel_never_gets_a_rect() {
 
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut state = State::new(icedtea_config::default_config(), tx);
-    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+    state.create_output(
+        0,
+        icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
+    );
     state.wayland.attach(runtime);
 
     // Default app id ("term") has no CSD request and doesn't match the
@@ -459,7 +487,11 @@ fn an_ssd_window_with_no_live_toplevel_never_gets_a_rect() {
     // no rect, independent of whether the toplevel id resolves at all.
     let csd_key = ToplevelKey::for_test(2);
     state.new_toplevel(csd_key, "org.gtk.MyApp", "GTK App", 2);
-    assert_eq!(state.wayland.ssd_rect_count(), 0, "a CSD window must not get a rect");
+    assert_eq!(
+        state.wayland.ssd_rect_count(),
+        0,
+        "a CSD window must not get a rect"
+    );
 
     // Forgetting either window is still harmless with no rect ever recorded.
     state.forget_toplevel(ssd_key);
@@ -481,7 +513,15 @@ fn a_toplevel_becomes_a_model_window_and_releases_it_on_destroy() {
 
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut state = State::new(icedtea_config::default_config(), tx);
-    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+    state.create_output(
+        0,
+        icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
+    );
 
     let runtime = wlr::Runtime::new().expect("runtime");
     state.wayland.attach(runtime);
@@ -489,7 +529,10 @@ fn a_toplevel_becomes_a_model_window_and_releases_it_on_destroy() {
     let first = ToplevelKey::for_test(1);
     state.new_toplevel(first, "term", "Terminal", 4242);
 
-    let id = state.wayland.window_for(first).expect("the key resolves to a model window");
+    let id = state
+        .wayland
+        .window_for(first)
+        .expect("the key resolves to a model window");
     let w = state.window_manager.get(id).expect("model row exists");
     assert_eq!(w.app_id, "term");
     assert_eq!(w.title, "Terminal");
@@ -504,8 +547,15 @@ fn a_toplevel_becomes_a_model_window_and_releases_it_on_destroy() {
     // A second toplevel cascades rather than stacking exactly on the first.
     let second = ToplevelKey::for_test(2);
     state.new_toplevel(second, "editor", "Editor", 4243);
-    let id2 = state.wayland.window_for(second).expect("second key resolves");
-    let g1 = state.window_manager.get(id).expect("first still there").geometry;
+    let id2 = state
+        .wayland
+        .window_for(second)
+        .expect("second key resolves");
+    let g1 = state
+        .window_manager
+        .get(id)
+        .expect("first still there")
+        .geometry;
     let g2 = state.window_manager.get(id2).expect("second").geometry;
     assert_ne!((g1.x, g1.y), (g2.x, g2.y), "cascade, not overlap");
     assert!(
@@ -526,7 +576,10 @@ fn a_toplevel_becomes_a_model_window_and_releases_it_on_destroy() {
 
     // Destruction drops the row, the binding, and hands focus back.
     state.forget_toplevel(second);
-    assert!(state.wayland.window_for(second).is_none(), "binding cleared");
+    assert!(
+        state.wayland.window_for(second).is_none(),
+        "binding cleared"
+    );
     assert!(state.window_manager.get(id2).is_none(), "model row cleared");
     assert!(
         state.window_manager.get(id).is_some_and(|w| w.focused),
@@ -535,7 +588,10 @@ fn a_toplevel_becomes_a_model_window_and_releases_it_on_destroy() {
 
     // Every mutation above emitted; nothing was left queued.
     let events: Vec<_> = rx.try_iter().collect();
-    assert!(!events.is_empty(), "model mutations must reach the event channel");
+    assert!(
+        !events.is_empty(),
+        "model mutations must reach the event channel"
+    );
     assert!(
         events.windows(2).all(|p| p[0].seq < p[1].seq),
         "sequence numbers are strictly monotonic: {:?}",
@@ -552,7 +608,15 @@ fn closing_distinguishes_a_real_client_from_a_model_only_window() {
 
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut state = State::new(icedtea_config::default_config(), tx);
-    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+    state.create_output(
+        0,
+        icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
+    );
     let runtime = wlr::Runtime::new().expect("runtime");
     state.wayland.attach(runtime);
 
@@ -560,7 +624,12 @@ fn closing_distinguishes_a_real_client_from_a_model_only_window() {
         "ghost",
         "Ghost",
         1,
-        icedtea_contract::Rectangle { x: 0, y: 0, width: 10, height: 10 },
+        icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        },
     );
     state.request_close(model_only);
     assert!(
@@ -588,10 +657,34 @@ fn modifier_translation_covers_every_flag_the_model_knows() {
     // A table rather than four asserts: what matters is that each library
     // flag lands on its own model flag and on no other.
     for (logo, ctrl, alt, shift, expected) in [
-        (true, false, false, false, icedtea_compositor::input::Modifiers::SUPER),
-        (false, true, false, false, icedtea_compositor::input::Modifiers::CTRL),
-        (false, false, true, false, icedtea_compositor::input::Modifiers::ALT),
-        (false, false, false, true, icedtea_compositor::input::Modifiers::SHIFT),
+        (
+            true,
+            false,
+            false,
+            false,
+            icedtea_compositor::input::Modifiers::SUPER,
+        ),
+        (
+            false,
+            true,
+            false,
+            false,
+            icedtea_compositor::input::Modifiers::CTRL,
+        ),
+        (
+            false,
+            false,
+            true,
+            false,
+            icedtea_compositor::input::Modifiers::ALT,
+        ),
+        (
+            false,
+            false,
+            false,
+            true,
+            icedtea_compositor::input::Modifiers::SHIFT,
+        ),
     ] {
         assert_eq!(
             to_model_modifiers(logo, ctrl, alt, shift),
@@ -618,7 +711,15 @@ fn a_press_on_an_unfocused_window_moves_focus_at_both_ends() {
 
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut state = State::new(icedtea_config::default_config(), tx);
-    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+    state.create_output(
+        0,
+        icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
+    );
     let runtime = wlr::Runtime::new().expect("runtime");
     state.wayland.attach(runtime);
 
@@ -629,7 +730,10 @@ fn a_press_on_an_unfocused_window_moves_focus_at_both_ends() {
     state.new_toplevel(second, "b", "B", 2);
     let b = state.wayland.window_for(second).expect("b");
 
-    assert!(state.window_manager.get(b).is_some_and(|w| w.focused), "newest is focused");
+    assert!(
+        state.window_manager.get(b).is_some_and(|w| w.focused),
+        "newest is focused"
+    );
 
     // Press inside A's frame, but outside B's: B cascades 24px off A
     // (`layout::cascade_point_in`, step 24) in both axes, on top of A in
@@ -644,9 +748,15 @@ fn a_press_on_an_unfocused_window_moves_focus_at_both_ends() {
     let point = (geo_a.x + 5, geo_a.y + 5);
     assert_eq!(state.window_at_point(point), Some(a));
 
-    state.handle_pointer(PointerEvent::Press { id: a, pointer: point });
+    state.handle_pointer(PointerEvent::Press {
+        id: a,
+        pointer: point,
+    });
 
-    assert!(state.window_manager.get(a).is_some_and(|w| w.focused), "A gained focus");
+    assert!(
+        state.window_manager.get(a).is_some_and(|w| w.focused),
+        "A gained focus"
+    );
     assert!(
         state.window_manager.get(b).is_some_and(|w| !w.focused),
         "B lost it -- both ends, not just the winner"
@@ -672,8 +782,13 @@ fn a_bound_key_is_consumed_and_an_unbound_one_is_forwarded() {
     // `SUPER+SHIFT+q` is the default `quit` binding, and 0x71 is the
     // *unshifted* keysym for q -- which is exactly why the library reports
     // the unshifted symbol.
-    let mods = icedtea_compositor::input::Modifiers::SUPER | icedtea_compositor::input::Modifiers::SHIFT;
-    assert_eq!(state.handle_key(mods, 0x71), Some(()), "the default quit binding matched");
+    let mods =
+        icedtea_compositor::input::Modifiers::SUPER | icedtea_compositor::input::Modifiers::SHIFT;
+    assert_eq!(
+        state.handle_key(mods, 0x71),
+        Some(()),
+        "the default quit binding matched"
+    );
     assert!(state.quitting, "and it fired");
 
     let (tx2, _rx2) = crossbeam_channel::unbounded();
@@ -709,7 +824,12 @@ fn alt_tab_ends_on_the_watched_modifiers_own_release_event() {
     // keysym alone.
     const KEY_SUPER_L: u32 = 0xffeb;
     assert!(
-        alt_tab_should_end(watched, /* mods (stale) */ Modifiers::SUPER, /* pressed */ false, KEY_SUPER_L),
+        alt_tab_should_end(
+            watched,
+            /* mods (stale) */ Modifiers::SUPER,
+            /* pressed */ false,
+            KEY_SUPER_L
+        ),
         "the modifier's own release event must end the session even though \
          its reported `mods` still shows it held"
     );
@@ -733,7 +853,10 @@ fn alt_tab_ends_on_the_watched_modifiers_own_release_event() {
 
     // A key that is neither a release of the watched modifier nor missing
     // it from `mods` must not end the session.
-    assert!(!alt_tab_should_end(watched, Modifiers::SUPER, true, KEY_TAB), "Tab press mid-cycle keeps going");
+    assert!(
+        !alt_tab_should_end(watched, Modifiers::SUPER, true, KEY_TAB),
+        "Tab press mid-cycle keeps going"
+    );
 }
 
 /// A rebound `cycle:alt_tab` (e.g. ALT+Tab) must watch the modifier it was
@@ -750,7 +873,12 @@ fn alt_tab_end_condition_follows_a_rebound_modifier_not_a_hardcoded_one() {
     const KEY_ALT_L: u32 = 0xffe9;
 
     assert!(
-        !alt_tab_should_end(watched, Modifiers::ALT | Modifiers::SUPER, false, KEY_SUPER_L),
+        !alt_tab_should_end(
+            watched,
+            Modifiers::ALT | Modifiers::SUPER,
+            false,
+            KEY_SUPER_L
+        ),
         "releasing an unwatched modifier (SUPER) must not end an ALT-watched session"
     );
     assert!(
@@ -776,14 +904,25 @@ fn unmapping_the_focused_window_reroutes_the_seat_without_panicking() {
 
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut state = State::new(icedtea_config::default_config(), tx);
-    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 1000, height: 800 });
+    state.create_output(
+        0,
+        icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
+    );
     let runtime = wlr::Runtime::new().expect("runtime");
     state.wayland.attach(runtime);
 
     let key = ToplevelKey::for_test(1);
     state.new_toplevel(key, "a", "A", 1);
     let id = state.wayland.window_for(key).expect("bound");
-    assert!(state.window_manager.get(id).is_some_and(|w| w.focused), "the only window is focused");
+    assert!(
+        state.window_manager.get(id).is_some_and(|w| w.focused),
+        "the only window is focused"
+    );
 
     // `for_test(1)` and `wlr::ToplevelId::dangling_nth_for_test(1)` name the
     // same underlying id (`ToplevelKey::for_test` is a thin wrapper over
@@ -806,7 +945,10 @@ fn unmapping_the_focused_window_reroutes_the_seat_without_panicking() {
         state.window_manager.focused_window().is_none(),
         "the workspace's focus pointer must be cleared, not left dangling"
     );
-    assert!(state.wayland.is_backed(id), "still bound -- an unmap is not a destroy");
+    assert!(
+        state.wayland.is_backed(id),
+        "still bound -- an unmap is not a destroy"
+    );
 }
 
 /// Task 7: a decoded wallpaper gets one buffer scene node per output, and
@@ -835,7 +977,11 @@ fn a_decoded_wallpaper_gets_one_buffer_node_per_output() {
     state.wayland.attach(runtime.clone());
 
     let background = runtime
-        .add_rect(1, 1, icedtea_compositor::render::wallpaper_color(&state.config.appearance))
+        .add_rect(
+            1,
+            1,
+            icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+        )
         .expect("background rect");
     runtime.lower_rect_to_bottom(background);
     state.set_background(background);
@@ -847,7 +993,8 @@ fn a_decoded_wallpaper_gets_one_buffer_node_per_output() {
     // asking the loop to stop.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     state.set_command_receiver(cmd_rx);
-    let (cmd_wake_write, cmd_wake_id) = icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
     state.set_cmd_wake_source(cmd_wake_id);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -859,8 +1006,15 @@ fn a_decoded_wallpaper_gets_one_buffer_node_per_output() {
         .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
         .expect("run_all");
 
-    assert!(state.quitting, "the backstop Quit command must have stopped the loop");
-    assert_eq!(state.outputs.len(), 1, "the headless output must have reached the model");
+    assert!(
+        state.quitting,
+        "the backstop Quit command must have stopped the loop"
+    );
+    assert_eq!(
+        state.outputs.len(),
+        1,
+        "the headless output must have reached the model"
+    );
 
     let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
     state.wallpaper.set_decoded(Some(image));
@@ -904,19 +1058,39 @@ fn snap_preview_rect_is_created_and_torn_down_against_a_live_scene() {
 
     assert!(state.snap_preview_rect().is_none());
 
-    state.snap_preview = Some(icedtea_contract::Rectangle { x: 10, y: 20, width: 400, height: 600 });
+    state.snap_preview = Some(icedtea_contract::Rectangle {
+        x: 10,
+        y: 20,
+        width: 400,
+        height: 600,
+    });
     state.sync_snap_preview();
-    assert!(state.snap_preview_rect().is_some(), "a preview target must create a rect");
+    assert!(
+        state.snap_preview_rect().is_some(),
+        "a preview target must create a rect"
+    );
 
     // Reposition: the same rect id is kept, not recreated.
     let id = state.snap_preview_rect().unwrap();
-    state.snap_preview = Some(icedtea_contract::Rectangle { x: 30, y: 40, width: 500, height: 700 });
+    state.snap_preview = Some(icedtea_contract::Rectangle {
+        x: 30,
+        y: 40,
+        width: 500,
+        height: 700,
+    });
     state.sync_snap_preview();
-    assert_eq!(state.snap_preview_rect(), Some(id), "a changed target repositions, does not recreate");
+    assert_eq!(
+        state.snap_preview_rect(),
+        Some(id),
+        "a changed target repositions, does not recreate"
+    );
 
     state.snap_preview = None;
     state.sync_snap_preview();
-    assert!(state.snap_preview_rect().is_none(), "clearing the preview must remove the rect");
+    assert!(
+        state.snap_preview_rect().is_none(),
+        "clearing the preview must remove the rect"
+    );
 }
 
 /// [HIGH H5] `migrate_windows_from`'s oversized-window guard: when the
@@ -940,15 +1114,36 @@ fn migration_centers_an_oversized_window_into_the_survivor_without_panicking() {
     let mut state = State::new(icedtea_config::default_config(), tx);
 
     // The dead output the oversized window is currently on.
-    state.create_output(1, icedtea_contract::Rectangle { x: 800, y: 0, width: 1000, height: 800 });
+    state.create_output(
+        1,
+        icedtea_contract::Rectangle {
+            x: 800,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
+    );
     // The surviving output, smaller on both axes than the window below.
-    state.create_output(0, icedtea_contract::Rectangle { x: 0, y: 0, width: 800, height: 600 });
+    state.create_output(
+        0,
+        icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        },
+    );
 
     let id = state.window_manager.add_window(
         "app",
         "t",
         1,
-        icedtea_contract::Rectangle { x: 800, y: 0, width: 1000, height: 800 },
+        icedtea_contract::Rectangle {
+            x: 800,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
     );
 
     let dead = state.outputs.remove(&1).expect("output 1").geometry;
@@ -962,7 +1157,10 @@ fn migration_centers_an_oversized_window_into_the_survivor_without_panicking() {
         .geometry;
     assert_eq!(
         (geo.x, geo.y),
-        (survivor.x + (survivor.width - geo.width) / 2, survivor.y + (survivor.height - geo.height) / 2),
+        (
+            survivor.x + (survivor.width - geo.width) / 2,
+            survivor.y + (survivor.height - geo.height) / 2
+        ),
         "a window wider and taller than the survivor must be centered on it, not pinned to its origin, got {geo:?}"
     );
 }

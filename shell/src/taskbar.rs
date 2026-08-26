@@ -97,7 +97,11 @@ pub fn render(model: &TaskbarModel, container: &GtkBox, wm: &Rc<dyn CompositorCo
     let workspaces = GtkBox::new(Orientation::Horizontal, 2);
     workspaces.set_widget_name("workspaces");
     for ws in &model.workspaces {
-        let label = if ws.name.is_empty() { (ws.id + 1).to_string() } else { ws.name.clone() };
+        let label = if ws.name.is_empty() {
+            (ws.id + 1).to_string()
+        } else {
+            ws.name.clone()
+        };
         let button = Button::with_label(&label);
         if ws.id == model.active_workspace {
             button.add_css_class("active");
@@ -112,7 +116,11 @@ pub fn render(model: &TaskbarModel, container: &GtkBox, wm: &Rc<dyn CompositorCo
     let windows = GtkBox::new(Orientation::Horizontal, 2);
     windows.set_widget_name("windows");
     for w in &model.windows {
-        let label = if w.title.is_empty() { w.app_id.clone() } else { w.title.clone() };
+        let label = if w.title.is_empty() {
+            w.app_id.clone()
+        } else {
+            w.title.clone()
+        };
         let button = Button::with_label(&label);
         button.set_widget_name("window-button");
         if w.focused {
@@ -150,7 +158,12 @@ mod tests {
             title: app.into(),
             pid: 0,
             workspace: 0,
-            geometry: Rectangle { x: 0, y: 0, width: 1, height: 1 },
+            geometry: Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
             maximized: false,
             minimized: false,
             fullscreen: false,
@@ -160,7 +173,10 @@ mod tests {
     }
 
     fn title_update(t: &str) -> WindowUpdate {
-        WindowUpdate { title: Some(t.into()), ..Default::default() }
+        WindowUpdate {
+            title: Some(t.into()),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -170,7 +186,10 @@ mod tests {
         m.apply(CompositorUpdate::Opened(win(2, "b")));
         assert_eq!(m.windows.len(), 2);
         m.apply(CompositorUpdate::Closed(1));
-        assert_eq!(m.windows.iter().map(|w| w.id.0).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            m.windows.iter().map(|w| w.id.0).collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[test]
@@ -186,7 +205,10 @@ mod tests {
     fn updated_merges_title() {
         let mut m = TaskbarModel::default();
         m.apply(CompositorUpdate::Opened(win(1, "a")));
-        m.apply(CompositorUpdate::Updated { id: 1, update: title_update("renamed") });
+        m.apply(CompositorUpdate::Updated {
+            id: 1,
+            update: title_update("renamed"),
+        });
         assert_eq!(m.windows[0].title, "renamed");
     }
 
@@ -202,27 +224,54 @@ mod tests {
 
         m.apply(CompositorUpdate::Updated {
             id: 1,
-            update: WindowUpdate { attention: Some(true), ..Default::default() },
+            update: WindowUpdate {
+                attention: Some(true),
+                ..Default::default()
+            },
         });
-        assert!(m.windows[0].attention, "a raised attention hint must reach the taskbar model");
+        assert!(
+            m.windows[0].attention,
+            "a raised attention hint must reach the taskbar model"
+        );
 
         // An unrelated update must not disturb it.
-        m.apply(CompositorUpdate::Updated { id: 1, update: title_update("renamed") });
-        assert!(m.windows[0].attention, "an unrelated update must leave attention alone");
+        m.apply(CompositorUpdate::Updated {
+            id: 1,
+            update: title_update("renamed"),
+        });
+        assert!(
+            m.windows[0].attention,
+            "an unrelated update must leave attention alone"
+        );
 
         m.apply(CompositorUpdate::Updated {
             id: 1,
-            update: WindowUpdate { attention: Some(false), ..Default::default() },
+            update: WindowUpdate {
+                attention: Some(false),
+                ..Default::default()
+            },
         });
-        assert!(!m.windows[0].attention, "the compositor's clear must reach the taskbar model too");
+        assert!(
+            !m.windows[0].attention,
+            "the compositor's clear must reach the taskbar model too"
+        );
     }
 
     #[test]
     fn workspace_set_tracks_active_only_when_active() {
         let mut m = TaskbarModel::default();
-        m.apply(CompositorUpdate::WorkspaceSet { id: 3, active: true });
+        m.apply(CompositorUpdate::WorkspaceSet {
+            id: 3,
+            active: true,
+        });
         assert_eq!(m.active_workspace, 3);
-        m.apply(CompositorUpdate::WorkspaceSet { id: 5, active: false });
-        assert_eq!(m.active_workspace, 3, "an inactive set must not move the active workspace");
+        m.apply(CompositorUpdate::WorkspaceSet {
+            id: 5,
+            active: false,
+        });
+        assert_eq!(
+            m.active_workspace, 3,
+            "an inactive set must not move the active workspace"
+        );
     }
 }

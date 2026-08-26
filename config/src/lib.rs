@@ -11,7 +11,7 @@ pub mod schema;
 
 use schema::*;
 
-pub use keys::{key_name_to_keysym, keysym_to_key_name, MODIFIER_TOKENS};
+pub use keys::{MODIFIER_TOKENS, key_name_to_keysym, keysym_to_key_name};
 
 /// Written into `DB_META` on every `Config::save`, for the future settings
 /// crate (the plan's single config writer) to use for migrations. It is
@@ -21,9 +21,9 @@ pub use keys::{key_name_to_keysym, keysym_to_key_name, MODIFIER_TOKENS};
 /// this read path.
 pub const SCHEMA_VERSION: u64 = 1;
 
-pub use defaults::default_config;
 pub use contract::Appearance;
 pub use contract::DisplayConfig;
+pub use defaults::default_config;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyCombo {
@@ -105,7 +105,10 @@ pub fn open(db_path: &Path) -> Result<Database, redb::Error> {
         Err(payload) => {
             let msg = panic_payload_message(&payload);
             tracing::warn!("config db open panicked ({msg}), treating file as corrupt");
-            Err(std::io::Error::other(format!("redb panicked while opening database: {msg}")).into())
+            Err(
+                std::io::Error::other(format!("redb panicked while opening database: {msg}"))
+                    .into(),
+            )
         }
     }
 }
@@ -145,7 +148,11 @@ fn read_json<T: DeserializeOwned>(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &'static str,
 ) -> Option<T> {
-    table.get(key).ok().flatten().and_then(|v| serde_json::from_slice(v.value()).ok())
+    table
+        .get(key)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_slice(v.value()).ok())
 }
 
 /// Outcome of [`try_load`]: the load path that must NOT silently turn a live
@@ -296,7 +303,9 @@ fn read_config_from_db(db: Database) -> Config {
         }
         Err(payload) => {
             let msg = panic_payload_message(&payload);
-            tracing::warn!("config db read panicked ({msg}), treating as corrupt and using defaults");
+            tracing::warn!(
+                "config db read panicked ({msg}), treating as corrupt and using defaults"
+            );
             default
         }
     }
@@ -479,7 +488,10 @@ mod tests {
         seeded.appearance.wallpaper = Some("/custom/wall.png".into());
         seeded.keybindings.insert(
             "custom_action".into(),
-            KeyCombo { modifiers: vec!["Super".into()], key: "z".into() },
+            KeyCombo {
+                modifiers: vec!["Super".into()],
+                key: "z".into(),
+            },
         );
         seeded.displays = sample_displays();
         {
@@ -529,7 +541,10 @@ mod tests {
         let mut cfg = default_config();
         cfg.keybindings.insert(
             "doomed".into(),
-            KeyCombo { modifiers: vec!["Super".into()], key: "q".into() },
+            KeyCombo {
+                modifiers: vec!["Super".into()],
+                key: "q".into(),
+            },
         );
         {
             let db = open(&path).unwrap();
@@ -591,7 +606,9 @@ mod tests {
             let write_txn = db.begin_write().unwrap();
             {
                 let mut table = write_txn.open_table(DB_APPEARANCE).unwrap();
-                table.insert(KEY_APPEARANCE, b"not json".as_slice()).unwrap();
+                table
+                    .insert(KEY_APPEARANCE, b"not json".as_slice())
+                    .unwrap();
             }
             write_txn.commit().unwrap();
         }

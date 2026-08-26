@@ -96,7 +96,11 @@ impl View {
 /// view so callers never divide by zero.
 pub fn compute_view(rects: &[Rect], view_w: f64, view_h: f64, margin: f64) -> View {
     let Some((min_x, min_y, max_x, max_y)) = content_bounds(rects) else {
-        return View { scale: 1.0, off_x: margin, off_y: margin };
+        return View {
+            scale: 1.0,
+            off_x: margin,
+            off_y: margin,
+        };
     };
     let avail_w = (view_w - 2.0 * margin).max(1.0);
     let avail_h = (view_h - 2.0 * margin).max(1.0);
@@ -112,7 +116,11 @@ pub fn compute_view(rects: &[Rect], view_w: f64, view_h: f64, margin: f64) -> Vi
     // content's own min corner lands at the padded origin.
     let off_x = margin + (avail_w - used_w) / 2.0 - min_x * scale;
     let off_y = margin + (avail_h - used_h) / 2.0 - min_y * scale;
-    View { scale, off_x, off_y }
+    View {
+        scale,
+        off_x,
+        off_y,
+    }
 }
 
 /// Hit-test a canvas-space point against layout-space `rects` mapped through
@@ -184,15 +192,26 @@ mod tests {
     #[test]
     fn compute_view_fits_content_into_viewport() {
         // Two 1920-wide heads side by side → 3840 layout px total.
-        let rects = [Rect::new(0.0, 0.0, 1920.0, 1080.0), Rect::new(1920.0, 0.0, 1920.0, 1080.0)];
+        let rects = [
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            Rect::new(1920.0, 0.0, 1920.0, 1080.0),
+        ];
         let view = compute_view(&rects, 400.0, 300.0, 10.0);
         // Width is the binding dimension: (400-20)/3840.
         let expected = 380.0 / 3840.0;
-        assert!((view.scale - expected).abs() < 1e-9, "scale {} != {}", view.scale, expected);
+        assert!(
+            (view.scale - expected).abs() < 1e-9,
+            "scale {} != {}",
+            view.scale,
+            expected
+        );
         // The whole content must land inside the viewport.
         for r in &rects {
             let c = view.to_canvas(r);
-            assert!(c.x >= 10.0 - 1e-6 && c.x + c.w <= 400.0 - 10.0 + 1e-6, "rect {c:?} escaped viewport");
+            assert!(
+                c.x >= 10.0 - 1e-6 && c.x + c.w <= 400.0 - 10.0 + 1e-6,
+                "rect {c:?} escaped viewport"
+            );
         }
         // Non-vacuous: a big desktop is scaled *down*, not left at 1.0.
         assert!(view.scale < 0.5);
@@ -206,7 +225,10 @@ mod tests {
 
     #[test]
     fn hit_test_picks_the_right_head_and_topmost_on_overlap() {
-        let rects = [Rect::new(0.0, 0.0, 1920.0, 1080.0), Rect::new(1920.0, 0.0, 1920.0, 1080.0)];
+        let rects = [
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            Rect::new(1920.0, 0.0, 1920.0, 1080.0),
+        ];
         let view = compute_view(&rects, 400.0, 300.0, 10.0);
         // A point inside the second head's canvas rect resolves to index 1.
         let c1 = view.to_canvas(&rects[1]);
@@ -222,8 +244,15 @@ mod tests {
     #[test]
     fn hit_test_topmost_wins_when_rects_overlap() {
         // Two rects sharing space; the later one is "on top".
-        let rects = [Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(50.0, 50.0, 100.0, 100.0)];
-        let view = View { scale: 1.0, off_x: 0.0, off_y: 0.0 };
+        let rects = [
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Rect::new(50.0, 50.0, 100.0, 100.0),
+        ];
+        let view = View {
+            scale: 1.0,
+            off_x: 0.0,
+            off_y: 0.0,
+        };
         // (60,60) is inside both; index 1 (drawn last) must win.
         assert_eq!(hit_test(&rects, &view, 60.0, 60.0), Some(1));
         // (10,10) is only inside index 0.
@@ -236,7 +265,10 @@ mod tests {
         // Dragged near the neighbour's right edge (1920) but 12px short.
         let dragged = Rect::new(1908.0, 3.0, 1920.0, 1080.0);
         let (x, y) = snap(dragged, &[neighbour], 30.0);
-        assert_eq!(x, 1920, "should snap to adjacency at the neighbour's right edge");
+        assert_eq!(
+            x, 1920,
+            "should snap to adjacency at the neighbour's right edge"
+        );
         assert_eq!(y, 0, "should snap to top-edge alignment");
     }
 
@@ -246,7 +278,11 @@ mod tests {
         // 500px away on both axes — well past the 30px threshold.
         let dragged = Rect::new(2420.0, 600.0, 1920.0, 1080.0);
         let (x, y) = snap(dragged, &[neighbour], 30.0);
-        assert_eq!((x, y), (2420, 600), "nothing within threshold: pass-through");
+        assert_eq!(
+            (x, y),
+            (2420, 600),
+            "nothing within threshold: pass-through"
+        );
     }
 
     #[test]

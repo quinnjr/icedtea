@@ -2,7 +2,7 @@
 //! vocabulary shared by the `icedtea-notifications` daemon (which serves both
 //! interfaces) and the future shell popup UI (which renders the icedtea one).
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use zvariant::{Signature, Type};
 
 /// Well-known bus name the notification daemon claims — the standard
@@ -75,23 +75,34 @@ const ICON_TAG_PIXELS: u32 = 2;
 impl From<&IconSource> for IconSourceWire {
     fn from(src: &IconSource) -> Self {
         match src {
-            IconSource::None => IconSourceWire { tag: ICON_TAG_NONE, ..Default::default() },
-            IconSource::Named(name) => {
-                IconSourceWire { tag: ICON_TAG_NAMED, name: name.clone(), ..Default::default() }
-            }
-            IconSource::Pixels { width, height, rowstride, has_alpha, bits_per_sample, channels, data } => {
-                IconSourceWire {
-                    tag: ICON_TAG_PIXELS,
-                    width: *width,
-                    height: *height,
-                    rowstride: *rowstride,
-                    has_alpha: *has_alpha,
-                    bits_per_sample: *bits_per_sample,
-                    channels: *channels,
-                    data: data.clone(),
-                    ..Default::default()
-                }
-            }
+            IconSource::None => IconSourceWire {
+                tag: ICON_TAG_NONE,
+                ..Default::default()
+            },
+            IconSource::Named(name) => IconSourceWire {
+                tag: ICON_TAG_NAMED,
+                name: name.clone(),
+                ..Default::default()
+            },
+            IconSource::Pixels {
+                width,
+                height,
+                rowstride,
+                has_alpha,
+                bits_per_sample,
+                channels,
+                data,
+            } => IconSourceWire {
+                tag: ICON_TAG_PIXELS,
+                width: *width,
+                height: *height,
+                rowstride: *rowstride,
+                has_alpha: *has_alpha,
+                bits_per_sample: *bits_per_sample,
+                channels: *channels,
+                data: data.clone(),
+                ..Default::default()
+            },
         }
     }
 }

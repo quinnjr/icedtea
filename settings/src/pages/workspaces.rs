@@ -72,7 +72,10 @@ fn prune_orphaned_workspace_bindings(cfg: &mut icedtea_config::Config) {
     let workspace_count = cfg.workspace_names.len();
     cfg.keybindings.retain(|action, _| {
         for prefix in ["workspace:", "move_to_workspace:"] {
-            if let Some(n) = action.strip_prefix(prefix).and_then(|s| s.parse::<usize>().ok()) {
+            if let Some(n) = action
+                .strip_prefix(prefix)
+                .and_then(|s| s.parse::<usize>().ok())
+            {
                 return n <= workspace_count;
             }
         }
@@ -146,7 +149,9 @@ pub fn build(ctx: Ctx, on_change: Rc<dyn Fn()>) -> Page {
                     remove_button.connect_clicked(move |_| {
                         {
                             let mut model = ctx.model.borrow_mut();
-                            if model.working.workspace_names.len() > 1 && i < model.working.workspace_names.len() {
+                            if model.working.workspace_names.len() > 1
+                                && i < model.working.workspace_names.len()
+                            {
                                 model.working.workspace_names.remove(i);
                                 prune_orphaned_workspace_bindings(&mut model.working);
                             }
@@ -195,7 +200,10 @@ pub fn build(ctx: Ctx, on_change: Rc<dyn Fn()>) -> Page {
     };
     refresh();
 
-    Page { root: root.upcast(), refresh }
+    Page {
+        root: root.upcast(),
+        refresh,
+    }
 }
 
 #[cfg(test)]
@@ -209,7 +217,11 @@ mod tests {
         // old `len + 1` formula would compute `1 + 1 = "2"`, duplicating
         // the survivor -- `next_workspace_name` must not do that.
         let existing = vec!["2".to_string()];
-        assert_eq!(next_workspace_name(&existing), "1", "must reuse the freed slot, not collide with \"2\"");
+        assert_eq!(
+            next_workspace_name(&existing),
+            "1",
+            "must reuse the freed slot, not collide with \"2\""
+        );
     }
 
     #[test]
@@ -231,12 +243,18 @@ mod tests {
         // never pick an already-used name.
         let existing = vec!["1".to_string(), "99".to_string()];
         let name = next_workspace_name(&existing);
-        assert!(!existing.contains(&name), "{name} must not already be in use");
+        assert!(
+            !existing.contains(&name),
+            "{name} must not already be in use"
+        );
         assert_eq!(name, "2");
     }
 
     fn combo(key: &str) -> KeyCombo {
-        KeyCombo { modifiers: vec![], key: key.to_string() }
+        KeyCombo {
+            modifiers: vec![],
+            key: key.to_string(),
+        }
     }
 
     #[test]
@@ -247,23 +265,38 @@ mod tests {
         // everything else, including unrelated fixed actions.
         let mut cfg = icedtea_config::default_config();
         cfg.workspace_names = vec!["a".to_string(), "b".to_string()];
-        cfg.keybindings.insert("workspace:1".to_string(), combo("KEY_1"));
-        cfg.keybindings.insert("workspace:2".to_string(), combo("KEY_2"));
-        cfg.keybindings.insert("workspace:3".to_string(), combo("KEY_3"));
-        cfg.keybindings.insert("move_to_workspace:1".to_string(), combo("KEY_1"));
-        cfg.keybindings.insert("move_to_workspace:2".to_string(), combo("KEY_2"));
-        cfg.keybindings.insert("move_to_workspace:3".to_string(), combo("KEY_3"));
+        cfg.keybindings
+            .insert("workspace:1".to_string(), combo("KEY_1"));
+        cfg.keybindings
+            .insert("workspace:2".to_string(), combo("KEY_2"));
+        cfg.keybindings
+            .insert("workspace:3".to_string(), combo("KEY_3"));
+        cfg.keybindings
+            .insert("move_to_workspace:1".to_string(), combo("KEY_1"));
+        cfg.keybindings
+            .insert("move_to_workspace:2".to_string(), combo("KEY_2"));
+        cfg.keybindings
+            .insert("move_to_workspace:3".to_string(), combo("KEY_3"));
         cfg.keybindings.insert("close".to_string(), combo("KEY_q"));
 
         prune_orphaned_workspace_bindings(&mut cfg);
 
         assert!(cfg.keybindings.contains_key("workspace:1"));
         assert!(cfg.keybindings.contains_key("workspace:2"));
-        assert!(!cfg.keybindings.contains_key("workspace:3"), "workspace:3 must be pruned");
+        assert!(
+            !cfg.keybindings.contains_key("workspace:3"),
+            "workspace:3 must be pruned"
+        );
         assert!(cfg.keybindings.contains_key("move_to_workspace:1"));
         assert!(cfg.keybindings.contains_key("move_to_workspace:2"));
-        assert!(!cfg.keybindings.contains_key("move_to_workspace:3"), "move_to_workspace:3 must be pruned");
-        assert!(cfg.keybindings.contains_key("close"), "unrelated fixed actions must survive");
+        assert!(
+            !cfg.keybindings.contains_key("move_to_workspace:3"),
+            "move_to_workspace:3 must be pruned"
+        );
+        assert!(
+            cfg.keybindings.contains_key("close"),
+            "unrelated fixed actions must survive"
+        );
     }
 
     #[test]
@@ -279,7 +312,10 @@ mod tests {
         let max = cfg_before.workspace_names.len();
         for n in 1..=max {
             assert!(cfg.keybindings.contains_key(&format!("workspace:{n}")));
-            assert!(cfg.keybindings.contains_key(&format!("move_to_workspace:{n}")));
+            assert!(
+                cfg.keybindings
+                    .contains_key(&format!("move_to_workspace:{n}"))
+            );
         }
     }
 }

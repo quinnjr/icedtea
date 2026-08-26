@@ -15,9 +15,7 @@ use async_channel::Sender;
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_output;
 use wayland_client::protocol::wl_registry;
-use wayland_client::{
-    event_created_child, Connection, Dispatch, EventQueue, Proxy, QueueHandle,
-};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, event_created_child};
 use wayland_protocols_wlr::output_management::v1::client::{
     zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1,
     zwlr_output_configuration_v1::{self, ZwlrOutputConfigurationV1},
@@ -301,8 +299,8 @@ impl OutputsConnection {
         tx: Sender<OutputsMsg>,
     ) -> std::io::Result<Self> {
         let stream = UnixStream::connect(path)?;
-        let conn = Connection::from_socket(stream)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let conn =
+            Connection::from_socket(stream).map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(Self::from_connection(conn, tx))
     }
 
@@ -396,10 +394,7 @@ impl OutputsConnection {
     /// Build a `zwlr_output_configuration_v1` from `edits` and `apply()` it.
     /// Results arrive asynchronously as [`OutputsMsg::ApplySucceeded`] /
     /// `ApplyFailed` / `ApplyCancelled`.
-    pub fn build_and_send_configuration(
-        &mut self,
-        edits: &[HeadEdit],
-    ) -> Result<(), OutputsError> {
+    pub fn build_and_send_configuration(&mut self, edits: &[HeadEdit]) -> Result<(), OutputsError> {
         self.build_configuration(edits, true)
     }
 
@@ -409,11 +404,7 @@ impl OutputsConnection {
         self.build_configuration(edits, false)
     }
 
-    fn build_configuration(
-        &mut self,
-        edits: &[HeadEdit],
-        apply: bool,
-    ) -> Result<(), OutputsError> {
+    fn build_configuration(&mut self, edits: &[HeadEdit], apply: bool) -> Result<(), OutputsError> {
         let manager = self
             .state
             .manager
@@ -431,8 +422,11 @@ impl OutputsConnection {
         // does not override (and for heads with no edit at all). An edit naming
         // a head that is no longer present is simply skipped — there is nothing
         // live to configure it against.
-        let config =
-            manager.create_configuration(self.state.serial, &self.qh, ConfigData { is_test: !apply });
+        let config = manager.create_configuration(
+            self.state.serial,
+            &self.qh,
+            ConfigData { is_test: !apply },
+        );
         for head in &self.state.heads {
             let edit = edits.iter().find(|e| e.name == head.name);
             let head_proxy = head.proxy.clone();
@@ -523,8 +517,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for OutputsState {
             && state.manager.is_none()
         {
             let bind_version = version.min(MANAGER_VERSION);
-            let manager =
-                registry.bind::<ZwlrOutputManagerV1, _, _>(name, bind_version, qh, ());
+            let manager = registry.bind::<ZwlrOutputManagerV1, _, _>(name, bind_version, qh, ());
             state.manager = Some(manager);
         }
     }
@@ -665,11 +658,15 @@ impl Dispatch<ZwlrOutputConfigurationV1, ConfigData> for OutputsState {
         match event {
             zwlr_output_configuration_v1::Event::Succeeded => {
                 config.destroy();
-                state.emit(OutputsMsg::ApplySucceeded { is_test: data.is_test });
+                state.emit(OutputsMsg::ApplySucceeded {
+                    is_test: data.is_test,
+                });
             }
             zwlr_output_configuration_v1::Event::Failed => {
                 config.destroy();
-                state.emit(OutputsMsg::ApplyFailed { is_test: data.is_test });
+                state.emit(OutputsMsg::ApplyFailed {
+                    is_test: data.is_test,
+                });
             }
             zwlr_output_configuration_v1::Event::Cancelled => {
                 config.destroy();

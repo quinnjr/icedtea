@@ -10,7 +10,7 @@ use gtk4::{
     Align, Button, ColorDialog, ColorDialogButton, DropDown, FileDialog, Grid, Label, SpinButton,
 };
 
-use crate::model::{valid_hex, BAR_POSITIONS};
+use crate::model::{BAR_POSITIONS, valid_hex};
 use crate::pages::{Ctx, Page};
 
 /// Parse a `#RRGGBB` string into an opaque `RGBA`; falls back to black for
@@ -22,14 +22,24 @@ fn hex_to_rgba(s: &str) -> RGBA {
     }
     let digits = &s[1..];
     let byte = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).unwrap_or(0);
-    RGBA::new(byte(0) as f32 / 255.0, byte(2) as f32 / 255.0, byte(4) as f32 / 255.0, 1.0)
+    RGBA::new(
+        byte(0) as f32 / 255.0,
+        byte(2) as f32 / 255.0,
+        byte(4) as f32 / 255.0,
+        1.0,
+    )
 }
 
 /// Format an `RGBA`'s color channels (alpha is ignored -- the palette has no
 /// transparency concept) as `#RRGGBB`.
 fn rgba_to_hex(c: &RGBA) -> String {
     let chan = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    format!("#{:02x}{:02x}{:02x}", chan(c.red()), chan(c.green()), chan(c.blue()))
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        chan(c.red()),
+        chan(c.green()),
+        chan(c.blue())
+    )
 }
 
 fn labeled_row(grid: &Grid, row: i32, text: &str, widget: &impl IsA<gtk4::Widget>) {
@@ -169,20 +179,23 @@ pub fn build(ctx: Ctx) -> Page {
             let parent = ctx.window.clone();
             let ctx = ctx.clone();
             let wallpaper_path = wallpaper_path.clone();
-            FileDialog::builder().title("Choose wallpaper").build().open(
-                Some(&parent),
-                None::<&gtk4::gio::Cancellable>,
-                move |result| {
-                    if let Ok(file) = result
-                        && let Some(path) = file.path()
-                    {
-                        let path = path.display().to_string();
-                        wallpaper_path.set_label(&path);
-                        ctx.model.borrow_mut().working.appearance.wallpaper = Some(path);
-                        ctx.mark_dirty();
-                    }
-                },
-            );
+            FileDialog::builder()
+                .title("Choose wallpaper")
+                .build()
+                .open(
+                    Some(&parent),
+                    None::<&gtk4::gio::Cancellable>,
+                    move |result| {
+                        if let Ok(file) = result
+                            && let Some(path) = file.path()
+                        {
+                            let path = path.display().to_string();
+                            wallpaper_path.set_label(&path);
+                            ctx.model.borrow_mut().working.appearance.wallpaper = Some(path);
+                            ctx.mark_dirty();
+                        }
+                    },
+                );
         });
     }
     {
@@ -208,7 +221,10 @@ pub fn build(ctx: Ctx) -> Page {
         Rc::new(move || {
             ctx.populating.set(true);
             let appearance = ctx.model.borrow().working.appearance.clone();
-            let idx = BAR_POSITIONS.iter().position(|p| *p == appearance.bar_position).unwrap_or(0);
+            let idx = BAR_POSITIONS
+                .iter()
+                .position(|p| *p == appearance.bar_position)
+                .unwrap_or(0);
             bar_position.set_selected(idx as u32);
             bar_height.set_value(appearance.bar_height as f64);
             corner_radius.set_value(appearance.corner_radius as f64);
@@ -222,7 +238,10 @@ pub fn build(ctx: Ctx) -> Page {
     };
     refresh();
 
-    Page { root: grid.upcast(), refresh }
+    Page {
+        root: grid.upcast(),
+        refresh,
+    }
 }
 
 #[cfg(test)]

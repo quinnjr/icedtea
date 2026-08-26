@@ -1,9 +1,22 @@
 use icedtea_contract::Rectangle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapZone { Left, Right, Top, Bottom, TopLeft, TopRight, BottomLeft, BottomRight }
+pub enum SnapZone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
 
-pub fn snap_zone_for_point(output: Rectangle, point: (i32, i32), threshold: i32) -> Option<SnapZone> {
+pub fn snap_zone_for_point(
+    output: Rectangle,
+    point: (i32, i32),
+    threshold: i32,
+) -> Option<SnapZone> {
     let (x, y) = point;
     let near_left = x <= output.x + threshold;
     let near_right = x >= output.x + output.width - threshold;
@@ -32,7 +45,13 @@ pub fn snap_zone_for_point(output: Rectangle, point: (i32, i32), threshold: i32)
         return edge(near_left, near_right);
     }
     if near_top || near_bottom {
-        return if near_top && !near_bottom { Some(SnapZone::Top) } else if near_bottom && !near_top { Some(SnapZone::Bottom) } else { None };
+        return if near_top && !near_bottom {
+            Some(SnapZone::Top)
+        } else if near_bottom && !near_top {
+            Some(SnapZone::Bottom)
+        } else {
+            None
+        };
     }
     None
 }
@@ -42,14 +61,54 @@ pub fn snapped_geometry(output: Rectangle, zone: SnapZone, gap: i32) -> Rectangl
     let h = output.height / 2;
     let (left_x, top_y, right_x, bottom_y) = (output.x, output.y, output.x + w, output.y + h);
     match zone {
-        SnapZone::Left => Rectangle { x: output.x + gap, y: output.y + gap, width: w - 2 * gap, height: output.height - 2 * gap },
-        SnapZone::Right => Rectangle { x: right_x + gap, y: output.y + gap, width: w - 2 * gap, height: output.height - 2 * gap },
-        SnapZone::Top => Rectangle { x: output.x + gap, y: output.y + gap, width: output.width - 2 * gap, height: h - 2 * gap },
-        SnapZone::Bottom => Rectangle { x: output.x + gap, y: bottom_y + gap, width: output.width - 2 * gap, height: h - 2 * gap },
-        SnapZone::TopLeft => Rectangle { x: left_x + gap, y: top_y + gap, width: w - 2 * gap, height: h - 2 * gap },
-        SnapZone::TopRight => Rectangle { x: right_x + gap, y: top_y + gap, width: w - 2 * gap, height: h - 2 * gap },
-        SnapZone::BottomLeft => Rectangle { x: left_x + gap, y: bottom_y + gap, width: w - 2 * gap, height: h - 2 * gap },
-        SnapZone::BottomRight => Rectangle { x: right_x + gap, y: bottom_y + gap, width: w - 2 * gap, height: h - 2 * gap },
+        SnapZone::Left => Rectangle {
+            x: output.x + gap,
+            y: output.y + gap,
+            width: w - 2 * gap,
+            height: output.height - 2 * gap,
+        },
+        SnapZone::Right => Rectangle {
+            x: right_x + gap,
+            y: output.y + gap,
+            width: w - 2 * gap,
+            height: output.height - 2 * gap,
+        },
+        SnapZone::Top => Rectangle {
+            x: output.x + gap,
+            y: output.y + gap,
+            width: output.width - 2 * gap,
+            height: h - 2 * gap,
+        },
+        SnapZone::Bottom => Rectangle {
+            x: output.x + gap,
+            y: bottom_y + gap,
+            width: output.width - 2 * gap,
+            height: h - 2 * gap,
+        },
+        SnapZone::TopLeft => Rectangle {
+            x: left_x + gap,
+            y: top_y + gap,
+            width: w - 2 * gap,
+            height: h - 2 * gap,
+        },
+        SnapZone::TopRight => Rectangle {
+            x: right_x + gap,
+            y: top_y + gap,
+            width: w - 2 * gap,
+            height: h - 2 * gap,
+        },
+        SnapZone::BottomLeft => Rectangle {
+            x: left_x + gap,
+            y: bottom_y + gap,
+            width: w - 2 * gap,
+            height: h - 2 * gap,
+        },
+        SnapZone::BottomRight => Rectangle {
+            x: right_x + gap,
+            y: bottom_y + gap,
+            width: w - 2 * gap,
+            height: h - 2 * gap,
+        },
     }
 }
 
@@ -86,18 +145,31 @@ pub fn cascade_point(occupied: &[Rectangle], _size: (i32, i32), step: i32) -> (i
 /// `cascade_point`, wrapped so a new window always lands fully inside
 /// `output` (review finding M7: the unbounded version put the 40th window at
 /// (960, 960) -- off-screen on a 1080p output, with no title bar to grab).
-pub fn cascade_point_in(occupied: &[Rectangle], size: (i32, i32), step: i32, output: Rectangle) -> (i32, i32) {
+pub fn cascade_point_in(
+    occupied: &[Rectangle],
+    size: (i32, i32),
+    step: i32,
+    output: Rectangle,
+) -> (i32, i32) {
     let (x, y) = cascade_point(occupied, size, step);
     let span_x = (output.width - size.0).max(1);
     let span_y = (output.height - size.1).max(1);
-    (output.x + x.rem_euclid(span_x), output.y + y.rem_euclid(span_y))
+    (
+        output.x + x.rem_euclid(span_x),
+        output.y + y.rem_euclid(span_y),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const OUTPUT: Rectangle = Rectangle { x: 0, y: 0, width: 1000, height: 800 };
+    const OUTPUT: Rectangle = Rectangle {
+        x: 0,
+        y: 0,
+        width: 1000,
+        height: 800,
+    };
 
     #[test]
     fn left_edge_snaps_left_half() {
@@ -118,22 +190,43 @@ mod tests {
 
     #[test]
     fn corner_wins_over_edge() {
-        assert_eq!(snap_zone_for_point(OUTPUT, (0, 0), 10), Some(SnapZone::TopLeft));
-        assert_eq!(snap_zone_for_point(OUTPUT, (999, 799), 10), Some(SnapZone::BottomRight));
-        assert_eq!(snap_zone_for_point(OUTPUT, (500, 0), 10), Some(SnapZone::Top));
+        assert_eq!(
+            snap_zone_for_point(OUTPUT, (0, 0), 10),
+            Some(SnapZone::TopLeft)
+        );
+        assert_eq!(
+            snap_zone_for_point(OUTPUT, (999, 799), 10),
+            Some(SnapZone::BottomRight)
+        );
+        assert_eq!(
+            snap_zone_for_point(OUTPUT, (500, 0), 10),
+            Some(SnapZone::Top)
+        );
     }
 
     #[test]
     fn all_four_corners() {
         let threshold = 10;
         // Top-left corner
-        assert_eq!(snap_zone_for_point(OUTPUT, (0, 0), threshold), Some(SnapZone::TopLeft));
+        assert_eq!(
+            snap_zone_for_point(OUTPUT, (0, 0), threshold),
+            Some(SnapZone::TopLeft)
+        );
         // Top-right corner
-        assert_eq!(snap_zone_for_point(OUTPUT, (999, 0), threshold), Some(SnapZone::TopRight));
+        assert_eq!(
+            snap_zone_for_point(OUTPUT, (999, 0), threshold),
+            Some(SnapZone::TopRight)
+        );
         // Bottom-left corner
-        assert_eq!(snap_zone_for_point(OUTPUT, (0, 799), threshold), Some(SnapZone::BottomLeft));
+        assert_eq!(
+            snap_zone_for_point(OUTPUT, (0, 799), threshold),
+            Some(SnapZone::BottomLeft)
+        );
         // Bottom-right corner
-        assert_eq!(snap_zone_for_point(OUTPUT, (999, 799), threshold), Some(SnapZone::BottomRight));
+        assert_eq!(
+            snap_zone_for_point(OUTPUT, (999, 799), threshold),
+            Some(SnapZone::BottomRight)
+        );
     }
 
     #[test]
@@ -143,7 +236,12 @@ mod tests {
 
     #[test]
     fn gap_keeps_window_inside_output() {
-        for zone in [SnapZone::Left, SnapZone::Right, SnapZone::Top, SnapZone::Bottom] {
+        for zone in [
+            SnapZone::Left,
+            SnapZone::Right,
+            SnapZone::Top,
+            SnapZone::Bottom,
+        ] {
             let g = snapped_geometry(OUTPUT, zone, 8);
             assert!(g.x >= 0 && g.y >= 0);
             assert!(g.x + g.width <= OUTPUT.width);
@@ -154,13 +252,26 @@ mod tests {
     #[test]
     fn maximized_is_output_minus_gap() {
         let g = maximized_geometry(OUTPUT, 8);
-        assert_eq!(g, Rectangle { x: 8, y: 8, width: 1000 - 16, height: 800 - 16 });
+        assert_eq!(
+            g,
+            Rectangle {
+                x: 8,
+                y: 8,
+                width: 1000 - 16,
+                height: 800 - 16
+            }
+        );
         assert_eq!(maximized_geometry(OUTPUT, 0), OUTPUT);
     }
 
     #[test]
     fn maximized_never_degenerates_on_a_tiny_output() {
-        let tiny = Rectangle { x: 0, y: 0, width: 10, height: 10 };
+        let tiny = Rectangle {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
         let g = maximized_geometry(tiny, 8);
         assert!(g.width >= 1 && g.height >= 1);
     }
@@ -170,21 +281,47 @@ mod tests {
         // M7: the 40th window used to open at (960, 960) -- off-screen on a
         // 1080p output. Positions now wrap so a window always lands where it
         // can be seen and grabbed.
-        let occupied: Vec<Rectangle> = (0..40).map(|_| Rectangle { x: 0, y: 0, width: 1, height: 1 }).collect();
+        let occupied: Vec<Rectangle> = (0..40)
+            .map(|_| Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            })
+            .collect();
         let (x, y) = cascade_point_in(&occupied, (640, 400), 24, OUTPUT);
-        assert!(x >= OUTPUT.x && x + 640 <= OUTPUT.x + OUTPUT.width, "x = {x}");
-        assert!(y >= OUTPUT.y && y + 400 <= OUTPUT.y + OUTPUT.height, "y = {y}");
+        assert!(
+            x >= OUTPUT.x && x + 640 <= OUTPUT.x + OUTPUT.width,
+            "x = {x}"
+        );
+        assert!(
+            y >= OUTPUT.y && y + 400 <= OUTPUT.y + OUTPUT.height,
+            "y = {y}"
+        );
     }
 
     #[test]
     fn restore_returns_original() {
-        let orig = Rectangle { x: 10, y: 10, width: 200, height: 100 };
-        assert_eq!(restored_geometry(orig, snapped_geometry(OUTPUT, SnapZone::Left, 8)), orig);
+        let orig = Rectangle {
+            x: 10,
+            y: 10,
+            width: 200,
+            height: 100,
+        };
+        assert_eq!(
+            restored_geometry(orig, snapped_geometry(OUTPUT, SnapZone::Left, 8)),
+            orig
+        );
     }
 
     #[test]
     fn cascade_steps_by_count() {
-        let occupied = vec![Rectangle { x: 0, y: 0, width: 100, height: 100 }];
+        let occupied = vec![Rectangle {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }];
         assert_eq!(cascade_point(&occupied, (200, 100), 24), (24, 24));
         assert_eq!(cascade_point(&[], (200, 100), 24), (0, 0));
     }

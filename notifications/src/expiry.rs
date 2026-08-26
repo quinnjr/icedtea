@@ -16,7 +16,10 @@ use crate::store::{Change, Store};
 /// Wall-clock unix epoch in ms — matches the clock `Store` stores
 /// `expire_at_ms` in, so [`Store::close_if_due`] compares like against like.
 fn epoch_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// A message from the D-Bus service thread to the expiry worker.
@@ -122,8 +125,15 @@ mod tests {
         let store_clone = store.clone();
         let handle = thread::spawn(move || run(store_clone, tick_rx, chg_tx));
 
-        tick_tx.send(Tick::Deadline(id, Instant::now() + Duration::from_millis(20))).unwrap();
-        let change = chg_rx.recv_timeout(Duration::from_secs(2)).expect("expiry fired");
+        tick_tx
+            .send(Tick::Deadline(
+                id,
+                Instant::now() + Duration::from_millis(20),
+            ))
+            .unwrap();
+        let change = chg_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("expiry fired");
         assert_eq!(change, Change::Closed(id, CloseReason::Expired));
         assert!(chg_rx.try_recv().is_err(), "fires exactly once");
 
@@ -140,10 +150,18 @@ mod tests {
         let store_clone = store.clone();
         let handle = thread::spawn(move || run(store_clone, tick_rx, chg_tx));
 
-        tick_tx.send(Tick::Deadline(id, Instant::now() + Duration::from_millis(50))).unwrap();
+        tick_tx
+            .send(Tick::Deadline(
+                id,
+                Instant::now() + Duration::from_millis(50),
+            ))
+            .unwrap();
         tick_tx.send(Tick::Cancel(id)).unwrap();
         // Give the worker time to process both before it would have fired.
-        assert!(chg_rx.recv_timeout(Duration::from_millis(300)).is_err(), "cancelled deadline never fires");
+        assert!(
+            chg_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "cancelled deadline never fires"
+        );
 
         drop(tick_tx);
         let _ = handle.join();
@@ -162,12 +180,24 @@ mod tests {
         let now = Instant::now();
         // Send the later-firing one first to prove the heap orders by
         // deadline, not arrival order.
-        tick_tx.send(Tick::Deadline(b, now + Duration::from_millis(100))).unwrap();
-        tick_tx.send(Tick::Deadline(a, now + Duration::from_millis(20))).unwrap();
+        tick_tx
+            .send(Tick::Deadline(b, now + Duration::from_millis(100)))
+            .unwrap();
+        tick_tx
+            .send(Tick::Deadline(a, now + Duration::from_millis(20)))
+            .unwrap();
 
-        let first = chg_rx.recv_timeout(Duration::from_secs(2)).expect("first fires");
-        let second = chg_rx.recv_timeout(Duration::from_secs(2)).expect("second fires");
-        assert_eq!(first, Change::Closed(a, CloseReason::Expired), "earlier deadline fires first");
+        let first = chg_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first fires");
+        let second = chg_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second fires");
+        assert_eq!(
+            first,
+            Change::Closed(a, CloseReason::Expired),
+            "earlier deadline fires first"
+        );
         assert_eq!(second, Change::Closed(b, CloseReason::Expired));
 
         drop(tick_tx);

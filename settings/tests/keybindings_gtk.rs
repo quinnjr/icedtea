@@ -22,7 +22,7 @@ use gtk4::glib::translate::IntoGlib;
 use gtk4::prelude::*;
 use icedtea_config::keysym_to_key_name;
 use icedtea_harness::Compositor;
-use icedtea_settings::model::{combo_from_keysym, CaptureMods};
+use icedtea_settings::model::{CaptureMods, combo_from_keysym};
 use icedtea_settings::pages::keybindings::unshifted_keysym;
 
 /// Point GDK at the harness compositor (which speaks a real "us" xkb
@@ -65,9 +65,10 @@ fn unshifted_keysym_normalizes_shift_to_the_base_key() {
     const KEYCODE_Q: u32 = 16 + 8; // evdev KEY_Q
     const KEYCODE_1: u32 = 2 + 8; // evdev KEY_1
 
-    for (keycode, base_name, shifted_name) in
-        [(KEYCODE_Q, "KEY_q", "KEY_Q"), (KEYCODE_1, "KEY_1", "KEY_exclam")]
-    {
+    for (keycode, base_name, shifted_name) in [
+        (KEYCODE_Q, "KEY_q", "KEY_Q"),
+        (KEYCODE_1, "KEY_1", "KEY_exclam"),
+    ] {
         // The shift-adjusted keysym GDK hands a real Shift+key press --
         // exactly what `EventControllerKey`'s `keyval` carries.
         let (shifted_key, ..) = display
@@ -94,10 +95,17 @@ fn unshifted_keysym_normalizes_shift_to_the_base_key() {
         // End-to-end through the real serialization path: a capture with
         // Super+Shift held must store the unshifted key name -- the
         // CORRECTNESS BAR the finding names explicitly.
-        let mods = CaptureMods { shift: true, logo: true, ..Default::default() };
+        let mods = CaptureMods {
+            shift: true,
+            logo: true,
+            ..Default::default()
+        };
         let combo = combo_from_keysym(normalized, mods).expect("must bind");
         assert_eq!(combo.key, base_name);
-        assert_eq!(combo.modifiers, vec!["SUPER".to_string(), "SHIFT".to_string()]);
+        assert_eq!(
+            combo.modifiers,
+            vec!["SUPER".to_string(), "SHIFT".to_string()]
+        );
 
         // Contrast: feeding the pre-fix (raw, shift-adjusted) keysym
         // straight into `combo_from_keysym` -- what the old code did --

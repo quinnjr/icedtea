@@ -142,7 +142,10 @@ mod tests {
             BackendChoice::from_args(["icedtea-compositor".into(), "--nested".into()]),
             BackendChoice::Nested
         );
-        assert_eq!(BackendChoice::from_args(["icedtea-compositor".into()]), BackendChoice::Auto);
+        assert_eq!(
+            BackendChoice::from_args(["icedtea-compositor".into()]),
+            BackendChoice::Auto
+        );
         assert_eq!(
             BackendChoice::from_args(["icedtea-compositor".into(), "--nestedish".into()]),
             BackendChoice::Auto
