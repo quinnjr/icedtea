@@ -519,9 +519,13 @@ impl Compositor {
         reply_rx.recv_timeout(TIMEOUT).expect("compositor never answered CursorPosition")
     }
 
-    /// The `Debug` name of the shape last applied via
-    /// `wlr::Runtime::set_cursor_shape` (e.g. `"Default"`, `"Text"`),
-    /// via `State::cursor_shape`. Blocks on the reply -- see
+    /// The `Debug` name of the named cursor shape currently in force
+    /// (e.g. `"Default"`, `"Text"`), read straight off
+    /// `wlr::Runtime::cursor_shape` -- the crate's own record of what it
+    /// handed wlroots, with `None` rendered as `"Default"`. Load-bearing
+    /// since `wlr` 0.20.26: deleting the compositor's
+    /// `Runtime::set_cursor_shape` call now genuinely makes this read
+    /// `"Default"`. Blocks on the reply -- see
     /// [`Self::inject_touch_down`]'s doc.
     pub fn cursor_shape(&self) -> String {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);

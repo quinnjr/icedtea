@@ -116,9 +116,9 @@ pub enum DbCommand {
     /// runtime handle. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `SessionLocked`.
     CursorPosition { reply: Sender<(f64, f64)> },
-    /// Test-only: read `State::cursor_shape` (the shape last applied via
-    /// `wlr::Runtime::set_cursor_shape` by the A2 batch-2 cursor-shape
-    /// handler), as its `Debug` name. Not reachable from `CompositorInterface` --
+    /// Test-only: read `wlr::Runtime::cursor_shape` -- the named shape
+    /// currently in force as the crate itself records it, `None` rendered as
+    /// `"Default"` -- as its `Debug` name. Not reachable from `CompositorInterface` --
     /// only the test harness sends this, same reasoning as `SessionLocked`.
     CursorShape { reply: Sender<String> },
     /// Test-only: the primary output's real geometry, straight off
