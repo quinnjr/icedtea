@@ -6,9 +6,20 @@
 //! never panics on any token stream. `Err(())` means *invalid at parse
 //! time*: the declaration is dropped, CSS-style.
 
-pub mod keyword;
+// Every value parser in this module tree returns `Result<T, ()>`: the
+// contract freezes that signature, and `Err(())` carries all the meaning
+// CSS gives it -- *invalid at parse time*, drop the declaration.
+#![allow(clippy::result_unit_err)]
 
+pub mod calc;
+pub mod keyword;
+pub mod length;
+pub mod timing;
+
+pub use calc::CalcNode;
 pub use keyword::{Keyword, Wide};
+pub use length::{Length, LengthCtx, LengthUnit};
+pub use timing::Time;
 
 /// Odd inputs every value family's never-panic battery runs.
 ///
