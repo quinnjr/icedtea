@@ -441,8 +441,18 @@ fn cursor_shape_set_by_the_pointer_owner_applies_and_reverts_on_leave() {
     );
     vp.motion_absolute(inner_x as f64, inner_y as f64, ow as u32, oh as u32);
     vp.frame();
+    // `settle()` then a SINGLE reading, deliberately not `wait_for_cursor_shape`
+    // (see `Compositor::settle`'s own doc): the shape is already "Text" going
+    // into this motion, so a poll-until-it-reads-"Text" helper returns on its
+    // very first sample and would pass vacuously whenever the command channel
+    // beats the compositor's dispatch of the virtual-pointer motion -- with
+    // the bug fully present. The motion arrives over the wayland socket while
+    // `cursor_shape()` arrives over the command channel, and nothing orders
+    // the two, so the reading has to be taken *after* the loop has been given
+    // real dispatch cycles.
+    comp.settle();
     assert_eq!(
-        wait_for_cursor_shape(&comp, "Text"),
+        comp.cursor_shape(),
         "Text",
         "a pointer motion inside the very same window dropped the client's named cursor shape \
          (wlroots reset it to left_ptr and nothing put it back)"
