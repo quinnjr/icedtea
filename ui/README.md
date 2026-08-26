@@ -74,6 +74,13 @@ Notes that are load-bearing for anyone reading computed values:
   width); `background` becomes `background-color` + `background-image`.
   `ComputedStyle` still paints a *uniform* border and takes the top side for
   all four -- M2 widens it to four sides.
+- **Multi-layer `background` keeps only the first image**, which is the one
+  CSS paints on top. The colour is taken from the final layer, as CSS
+  requires; if no layer but an earlier one declares a colour it is still
+  accepted (GTK's own themes are lax here -- Adwaita's `junction` puts the
+  colour first), and two or more candidate colours fall back to the final
+  layer's. The `background` shorthand does **not** set `background-clip` or
+  `background-origin`; declare those longhands directly.
 - **Runner-ups are kept.** `cascade` returns `CascadedValues`: per longhand,
   every declaration that applied, sorted best-first. When the winner is a
   value this engine cannot interpret (Adwaita's
@@ -81,7 +88,12 @@ Notes that are load-bearing for anyone reading computed values:
   declaration is used and the fallback is logged at debug. CSS proper would
   use the inherited or initial value here; falling back is a deliberate M1
   divergence, chosen because the property coverage is still narrow enough
-  that reverting to an initial value loses more than it protects.
+  that reverting to an initial value loses more than it protects. The
+  consequence in the other direction is a known divergence too: an
+  unparseable *later* value does not leave the property at its initial value,
+  it leaves it at whatever an earlier rule declared -- `background:
+  nosuch(1)` layered over a working `background-image`, or Adwaita's
+  `cross-fade(...)`, keeps painting the older background rather than nothing.
 - **`color` and `font-size` inherit**, resolved by walking the node's
   ancestor chain (`ComputedStyle::resolve`, or `resolve_with_parent` when
   the caller already has the parent). `currentColor` resolves to the
@@ -91,7 +103,8 @@ Notes that are load-bearing for anyone reading computed values:
   base_dir)` resolves relative imports recursively (depth <= 8, cycle-safe)
   and splices them in at the import site; `parse_stylesheet(css)` is the
   base-less wrapper and skips every import with a debug log, as does any
-  `resource://` URL.
+  `resource://` URL. Media conditions on an import are **ignored**, so a
+  conditional `@import ... (min-width: 100px)` applies unconditionally.
 - **`background-clip`** is honoured (`border-box` default, `padding-box`,
   `content-box`). `background-origin` stays at its CSS default
   (padding-box), so a gradient is sized against the padding box however the

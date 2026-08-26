@@ -22,6 +22,23 @@ const BORDER_STYLES: [&str; 10] = [
     "none", "hidden", "dotted", "dashed", "solid", "double", "groove", "ridge", "inset", "outset",
 ];
 
+/// `<line-width>` keywords. They are bare identifiers, so they must be
+/// claimed before the colour test -- which accepts any bare identifier as a
+/// named colour -- or `border: thin solid` sets its *colour* to `thin`.
+/// `super::computed::parse_border_width` resolves them to px.
+const LINE_WIDTHS: [&str; 3] = ["thin", "medium", "thick"];
+
+/// Whether `value` is a `border-style` keyword, and if so whether it
+/// suppresses the border entirely (`none`/`hidden` force a used width of 0).
+///
+/// `None` for anything that is not a border style, so the computed stage can
+/// step past an uninterpretable winner like every other property.
+#[must_use]
+pub fn parse_border_style(value: &str) -> Option<bool> {
+    is_keyword(value, &BORDER_STYLES)
+        .then(|| value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("hidden"))
+}
+
 /// `background` keywords that are positions, repeats, attachments or boxes
 /// -- i.e. anything a bare identifier in a `background` value can be
 /// *other* than a named colour.
@@ -115,6 +132,8 @@ fn border_shorthand(sides: &[&str], value: &str) -> Vec<(String, String)> {
     for component in component_values(value) {
         if is_keyword(&component, &BORDER_STYLES) {
             style = component;
+        } else if is_keyword(&component, &LINE_WIDTHS) {
+            width = component;
         } else if looks_like_a_colour(&component) {
             color = component;
         } else {
@@ -136,26 +155,41 @@ fn border_shorthand(sides: &[&str], value: &str) -> Vec<(String, String)> {
 /// shorthand resets the longhands it omits, so `background: #112233` must
 /// clear an earlier `background-image`.
 fn background_shorthand(value: &str) -> Vec<(String, String)> {
-    let groups = comma_groups(value);
-    let mut color = "transparent".to_string();
-    let mut image = "none".to_string();
-    // Only the final layer may carry the colour; the first layer is the one
-    // painted on top, and the only image this engine draws.
-    for (index, components) in groups.iter().enumerate() {
-        let is_final = index + 1 == groups.len();
+    let mut image: Option<String> = None;
+    // One colour candidate per layer -- CSS allows one only in the final
+    // layer, but GTK's own themes are lax (Adwaita:1359 `junction` puts it
+    // first), so a single colour anywhere is accepted. Two or more is
+    // genuinely ambiguous, and then only the final layer's counts.
+    let mut layer_colors: Vec<Option<String>> = Vec::new();
+    for components in comma_groups(value) {
+        let mut layer_color = None;
         for component in components {
-            if is_final && looks_like_a_colour(component) {
-                color = component.clone();
-            } else if index == 0 && function_name(component).is_some() {
-                image = component.clone();
-            } else if index == 0 && component.eq_ignore_ascii_case("none") {
-                image = "none".to_string();
+            if looks_like_a_colour(&component) {
+                layer_color = Some(component);
+            } else if image.is_none() && function_name(&component).is_some() {
+                // The first image found is the one painted on top, and the
+                // only one this engine draws.
+                image = Some(component);
             }
         }
+        layer_colors.push(layer_color);
     }
+    let color = layer_colors
+        .last()
+        .cloned()
+        .flatten()
+        .or_else(|| {
+            let mut declared = layer_colors.iter().flatten();
+            let only = declared.next()?;
+            declared.next().is_none().then(|| only.clone())
+        })
+        .unwrap_or_else(|| "transparent".to_string());
     vec![
         ("background-color".to_string(), color),
-        ("background-image".to_string(), image),
+        (
+            "background-image".to_string(),
+            image.unwrap_or_else(|| "none".to_string()),
+        ),
     ]
 }
 
@@ -299,5 +333,43 @@ mod tests {
             expanded("padding", "1px 2px 3px 4px 5px"),
             vec![("padding".to_string(), "1px 2px 3px 4px 5px".to_string())]
         );
+    }
+
+    #[test]
+    fn line_width_keywords_are_widths_not_colours() {
+        // Review round 1: `thin`/`medium`/`thick` are bare identifiers, so
+        // the colour test claimed them first -- `border: thin solid` came out
+        // as width `medium` and colour `thin`, which then resolved to nothing
+        // and let `pick()` resurrect a colour the shorthand should have reset.
+        let thin = expanded("border", "thin solid");
+        assert_eq!(get(&thin, "border-top-width"), Some("thin"));
+        assert_eq!(get(&thin, "border-top-color"), Some("currentColor"));
+        let thick = expanded("border", "thick dotted red");
+        assert_eq!(get(&thick, "border-top-width"), Some("thick"));
+        assert_eq!(get(&thick, "border-top-style"), Some("dotted"));
+        assert_eq!(get(&thick, "border-top-color"), Some("red"));
+        assert_eq!(
+            get(&expanded("border", "medium solid"), "border-top-width"),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn a_colour_in_a_non_final_background_layer_is_still_found() {
+        // Review round 1: Adwaita:1359 puts the colour in the *first* layer.
+        // GTK accepts it; CSS does not. One colour anywhere is unambiguous.
+        let junction = expanded(
+            "background",
+            "#cdc7c2, linear-gradient(to bottom, transparent 1px, #cecece 1px),              linear-gradient(to left, transparent 1px, #cecece 1px)",
+        );
+        assert_eq!(get(&junction, "background-color"), Some("#cdc7c2"));
+        assert_eq!(
+            get(&junction, "background-image"),
+            Some("linear-gradient(to bottom, transparent 1px, #cecece 1px)"),
+            "the first layer is the one painted on top"
+        );
+        // Two candidate colours are ambiguous: only the final layer's counts.
+        let ambiguous = expanded("background", "red, blue");
+        assert_eq!(get(&ambiguous, "background-color"), Some("blue"));
     }
 }

@@ -20,6 +20,17 @@
 //!   uses the inherited or initial value; falling back to the next
 //!   applicable declaration is a deliberate M1 divergence, and the safer
 //!   one while the property coverage is this narrow.
+//!
+//! That divergence cuts both ways, and the second direction is worth
+//! stating plainly: a *later* declaration this engine cannot parse does not
+//! merely fail to apply -- the property keeps the **earlier** longhand's
+//! value. `background: nosuch(1)` after a working `background-image`, or
+//! Adwaita:640's `cross-fade(...)`, therefore paints the older background
+//! rather than nothing. Real CSS would drop the unparseable declaration at
+//! parse time and land on the same place; real CSS with a value that parses
+//! but computes to nothing would fall back to inherited/initial instead.
+//! Every such step is logged at debug with the property, the value and its
+//! rank.
 
 use std::collections::HashMap;
 

@@ -362,11 +362,19 @@ fn resolve_import(
 mod tests {
     use super::{Declaration, parse_stylesheet, parse_stylesheet_with_base};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fresh scratch directory for the `@import` tests.
+    ///
+    /// Unique per call -- pid plus a monotonic counter -- so two tests (or
+    /// two concurrent `cargo test` runs) never collide. Nothing is wiped up
+    /// front: a name that has never been used cannot hold anything, and
+    /// wiping would have deleted a live directory on a name collision.
     fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("icedtea-ui-{tag}-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("icedtea-ui-{tag}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

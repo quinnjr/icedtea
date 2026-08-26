@@ -357,10 +357,14 @@ impl ComputedStyle {
             style.border_width = width.max(0.0);
         }
         // A `none`/`hidden` border style forces a used width of 0 -- that is
-        // what makes `border: none` undo an earlier `border: 1px solid`.
-        if let Some(style_keyword) = values.winner("border-top-style")
-            && (style_keyword.eq_ignore_ascii_case("none")
-                || style_keyword.eq_ignore_ascii_case("hidden"))
+        // what makes `border: none` undo an earlier `border: 1px solid`. Read
+        // through `pick` like every other property, so a winner that is not a
+        // border-style keyword at all steps aside for one that is.
+        if pick(
+            values,
+            "border-top-style",
+            super::shorthand::parse_border_style,
+        ) == Some(true)
         {
             style.border_width = 0.0;
         }
@@ -406,6 +410,12 @@ impl ComputedStyle {
 /// lose its 5px radius to a `100%` this engine has no percentage context
 /// for -- so the next declaration in cascade order is used instead. The
 /// divergence is logged.
+///
+/// Known consequence, both directions: an unparseable *winner* does not
+/// leave the property at its initial value, it leaves it at whatever an
+/// earlier rule declared. `background: nosuch(1)` layered over a working
+/// `background-image`, or Adwaita:640's `cross-fade(...)`, keeps painting
+/// the older background instead of falling back to none.
 /// Resolve a colour value, mapping `currentColor` onto `current`.
 fn resolve_color(value: &str, colors: &ColorTable, current: Color) -> Option<Color> {
     match parse_color_ref(value, colors)? {
@@ -812,6 +822,38 @@ mod tests {
         assert_eq!(
             ComputedStyle::resolve_with_parent(&sheet, &node, Some(&window_style)),
             ComputedStyle::resolve(&sheet, &node)
+        );
+    }
+
+    #[test]
+    fn border_line_width_keywords_resolve_to_pixels() {
+        // Review round 1: `thin` was classified as the border *colour*, so
+        // the width fell back to `medium` (3px) and the colour reset was lost.
+        let sheet =
+            CompiledSheet::compile("window { color: #ff0000 }\nbutton { border: thin solid }");
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(s.border_width, 1.0);
+        assert_eq!(
+            s.border_color,
+            Color(0xFFFF_0000),
+            "the omitted colour resets to currentColor, i.e. the inherited colour"
+        );
+
+        let sheet = CompiledSheet::compile("button { border: thick dotted red }");
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(s.border_width, 5.0);
+        assert_eq!(s.border_color, Color(0xFFFF_0000));
+
+        // ...and the reset is not undone by a runner-up the shorthand beat.
+        let sheet = CompiledSheet::compile(
+            "button { border-color: #00ff00 }\nbutton { border: thin solid }",
+        );
+        let s = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(s.border_width, 1.0);
+        assert_eq!(
+            s.border_color,
+            Color::BLACK,
+            "currentColor, not the reset colour"
         );
     }
 }
