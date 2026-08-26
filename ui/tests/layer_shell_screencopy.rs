@@ -224,9 +224,20 @@ fn hovering_the_button_repaints_it_in_the_themes_hover_color() {
 
 /// A6 end to end: pressing BTN_LEFT arms `:active`, dragging *off* the
 /// button while still held drops it, dragging back on **re-arms** it, and a
-/// release *off* the button ends the press for good. The pre-fix client
-/// never re-armed, because leaving cleared the only state it tracked and
-/// nothing remembered the mouse button was still down.
+/// release *off* the button ends the press for good.
+///
+/// With the implicit pointer grab in place, a held drag off the surface
+/// never produces a `wl_pointer.leave` at all -- the compositor keeps
+/// delivering `wl_pointer.motion` to the pressed surface regardless of
+/// where the cursor actually is, exactly what the client's own
+/// `on_pointer_motion` handler expects. So the "drag off and back while
+/// held" half this test drives is
+/// motion-only: it proves `:active` drops and re-arms across an
+/// out-of-bounds `on_pointer_motion`, not that leaving-while-held survives
+/// an actual `on_pointer_leave` -- that client-side contract (`held` must
+/// outlive a leave) has no `wl_pointer.leave` left to trigger it here, and
+/// is covered instead by a `wayland.rs` unit test that calls
+/// `on_pointer_leave` directly.
 ///
 /// The release half used to be left to the unit tests, because the
 /// compositor did not honour the Wayland implicit pointer grab: it
@@ -329,10 +340,8 @@ fn dragging_off_and_back_while_held_re_arms_active() {
         matches_hover(after_release),
         "after a release off the button, hovering it paints {after_release:?} rather \
          than `:hover`'s #1c6fd4: the release never reached the client, so it \
-         still believes BTN_LEFT is held"
-    );
-    assert!(
-        !matches_active(after_release),
-        "the button re-armed `:active` on a plain hover: the release was lost"
+         still believes BTN_LEFT is held. (A false pass here can't hide a stuck \
+         `:active` either: `matches_hover` and `matches_active` are disjoint \
+         ±12 windows, so this assertion already rules that out.)"
     );
 }

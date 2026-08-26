@@ -9,6 +9,8 @@
 //! here because a client actually mapped a surface, and the compositor
 //! actually ran the `mapped` path against a live toplevel.
 
+use std::time::Duration;
+
 use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
@@ -2457,13 +2459,15 @@ fn an_implicit_grab_keeps_delivering_to_the_pressed_surface() {
         .expect("just asserted an enter arrived");
 
     // 1. Press over A.
+    let a_buttons = a.pointer_buttons().len();
     vp.button(GRAB_BTN_LEFT, true);
     vp.frame();
     assert!(
-        a.wait_until(|c| c.pointer_buttons().contains(&(GRAB_BTN_LEFT, true))),
+        a.wait_until(|c| c.pointer_buttons()[a_buttons..].contains(&(GRAB_BTN_LEFT, true))),
         "A never got the wl_pointer.button press"
     );
     let a_motions = a.pointer_motions().len();
+    let a_leaves = a.pointer_leaves();
 
     // 2. Drag off A and onto B, still held.
     vp.motion_absolute(bx as f64, by as f64, ow, oh);
@@ -2485,6 +2489,12 @@ fn an_implicit_grab_keeps_delivering_to_the_pressed_surface() {
          ({want_dx}, {want_dy}): the grab is not applying the cursor delta to \
          the coordinates the enter established"
     );
+    assert_eq!(
+        a.pointer_leaves(),
+        a_leaves,
+        "A got a wl_pointer.leave while the cursor was dragged off it, though \
+         the implicit grab holds it: the pressed surface must not lose focus"
+    );
 
     // 3. B must not have been entered while A holds the grab.
     b.pump();
@@ -2495,10 +2505,11 @@ fn an_implicit_grab_keeps_delivering_to_the_pressed_surface() {
     );
 
     // 4. The release goes to A, not to whatever is under the cursor.
+    let a_buttons = a.pointer_buttons().len();
     vp.button(GRAB_BTN_LEFT, false);
     vp.frame();
     assert!(
-        a.wait_until(|c| c.pointer_buttons().contains(&(GRAB_BTN_LEFT, false))),
+        a.wait_until(|c| c.pointer_buttons()[a_buttons..].contains(&(GRAB_BTN_LEFT, false))),
         "A never got the wl_pointer.button release after the cursor was \
          dragged off it: the implicit grab dropped the button on the floor"
     );
@@ -2533,11 +2544,10 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
     let comp = Compositor::spawn();
     let mut vp = VirtualPointerClient::spawn(&comp.socket);
 
+    // `map_layer_panel` (`LayerPanelClient::spawn`) already blocks until the
+    // panel's own `configure` has arrived, so there is nothing left to wait
+    // for here.
     let mut panel = TestClient::map_layer_panel(&comp.socket, PANEL_HEIGHT);
-    assert!(
-        panel.wait_until(|p| p.layer_configure().is_some()),
-        "the panel never configured"
-    );
     let mut win = TestClient::map_toplevel(&comp.socket, "under.app", "under");
     assert!(
         win.wait_until(|c| c.last_configure().is_some()),
@@ -2554,9 +2564,17 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
     let ssd = icedtea_compositor::decoration::has_ssd("under.app", None, false);
     let content = icedtea_compositor::decoration::content_rect(win_geo, ssd);
     assert!(
-        content.y >= PANEL_HEIGHT,
-        "the toplevel's client area ({content:?}) overlaps the panel's \
-         exclusive zone, so the two press targets would not be distinct"
+        win_geo.y >= PANEL_HEIGHT,
+        "the toplevel's frame ({win_geo:?}) overlaps the panel's exclusive \
+         zone: `content_rect` insets it by the title bar, so checking \
+         `content.y` here would pass even with the frame itself overlapping"
+    );
+    assert_eq!(
+        (content.width, content.height),
+        win.mapped_size(),
+        "the model's content size does not match the buffer actually \
+         mapped -- the press point below would not land on real surface \
+         content"
     );
 
     let (ow, oh) = comp.output_size();
@@ -2568,10 +2586,11 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
     let (ow, oh) = (ow as u32, oh as u32);
 
     // Park on the panel and press.
+    let panel_enters = panel.pointer_enters();
     vp.motion_absolute(px as f64, py as f64, ow, oh);
     vp.frame();
     assert!(
-        panel.wait_until(|p| p.pointer_enters() > 0),
+        panel.wait_until(|p| p.pointer_enters() > panel_enters),
         "the panel never got wl_pointer.enter"
     );
     win.pump();
@@ -2580,13 +2599,15 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
         .pointer_enter_position()
         .expect("just asserted an enter arrived");
 
+    let panel_buttons = panel.pointer_buttons().len();
     vp.button(GRAB_BTN_LEFT, true);
     vp.frame();
     assert!(
-        panel.wait_until(|p| p.pointer_buttons().contains(&(GRAB_BTN_LEFT, true))),
+        panel.wait_until(|p| p.pointer_buttons()[panel_buttons..].contains(&(GRAB_BTN_LEFT, true))),
         "the panel never got the wl_pointer.button press"
     );
     let motions = panel.pointer_motions().len();
+    let panel_leaves = panel.pointer_leaves();
 
     // Drag down onto the window, still held.
     vp.motion_absolute(wx as f64, wy as f64, ow, oh);
@@ -2599,11 +2620,18 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
         .pointer_motions()
         .last()
         .expect("just asserted a motion arrived");
-    let (dy, want_dy) = (moved.1 - anchor.1, (wy - py) as f64);
+    let (dx, dy) = (moved.0 - anchor.0, moved.1 - anchor.1);
+    let (want_dx, want_dy) = ((wx - px) as f64, (wy - py) as f64);
     assert!(
-        (dy - want_dy).abs() <= 1.0,
-        "the panel's surface-local motion moved by {dy} vertically, not the \
-         cursor's own {want_dy}"
+        (dx - want_dx).abs() <= 1.0 && (dy - want_dy).abs() <= 1.0,
+        "the panel's surface-local motion moved by ({dx}, {dy}), not the \
+         cursor's own ({want_dx}, {want_dy})"
+    );
+    assert_eq!(
+        panel.pointer_leaves(),
+        panel_leaves,
+        "the panel got a wl_pointer.leave while the cursor was dragged off \
+         it, though the implicit grab holds it"
     );
 
     win.pump();
@@ -2614,10 +2642,12 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
     );
 
     // Release over the window: the panel gets it, then the window enters.
+    let panel_buttons = panel.pointer_buttons().len();
     vp.button(GRAB_BTN_LEFT, false);
     vp.frame();
     assert!(
-        panel.wait_until(|p| p.pointer_buttons().contains(&(GRAB_BTN_LEFT, false))),
+        panel
+            .wait_until(|p| p.pointer_buttons()[panel_buttons..].contains(&(GRAB_BTN_LEFT, false))),
         "the panel never got the release after the cursor was dragged off it"
     );
     assert!(
@@ -2640,12 +2670,9 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
 /// notifying the button. The implicit grab deliberately steps aside whenever
 /// `wlr_seat_pointer_has_grab` is true; this is the test that says so.
 ///
-/// The popup is created and grabbed but never mapped: the `wlr` crate has
-/// no xdg-popup support yet, so nothing configures one. That costs this test
-/// nothing — wlroots starts the `wlr_xdg_popup_grab` from the `grab` request
-/// itself, so the seat grab under test is live regardless. The assertion on
-/// `popup_configured` is there to say so out loud, and to fail the day that
-/// changes.
+/// The popup is created and grabbed but never mapped -- see
+/// `TestClient::popup_configured` for why that costs this test nothing, and
+/// for the assertion that says so and fails the day it stops being true.
 ///
 /// Green on the current code by design — it guards behaviour rather than
 /// driving it. Verified non-vacuous by mutation: skipping `notify_button`
@@ -2670,6 +2697,13 @@ fn a_popup_grab_still_dismisses_on_a_click_outside_it() {
         .geometry;
     let ssd = icedtea_compositor::decoration::has_ssd("popup.app", None, false);
     let content = icedtea_compositor::decoration::content_rect(a_geo, ssd);
+    assert_eq!(
+        (content.width, content.height),
+        a.mapped_size(),
+        "the model's content size does not match the buffer actually \
+         mapped -- the press point below would not land on real surface \
+         content"
+    );
     let (ow, oh) = comp.output_size();
 
     // A press inside the parent's client area, to mint the serial the popup
@@ -2678,35 +2712,34 @@ fn a_popup_grab_still_dismisses_on_a_click_outside_it() {
         content.x + content.width / 2,
         content.y + content.height / 2,
     );
+    let a_enters = a.pointer_enters();
     vp.motion_absolute(inside.0 as f64, inside.1 as f64, ow as u32, oh as u32);
     vp.frame();
     assert!(
-        a.wait_until(|c| c.pointer_enters() > 0),
+        a.wait_until(|c| c.pointer_enters() > a_enters),
         "the parent never got wl_pointer.enter"
     );
+    let a_buttons = a.pointer_buttons().len();
     vp.button(GRAB_BTN_LEFT, true);
     vp.frame();
     assert!(
-        a.wait_until(|c| c.pointer_buttons().contains(&(GRAB_BTN_LEFT, true))),
+        a.wait_until(|c| c.pointer_buttons()[a_buttons..].contains(&(GRAB_BTN_LEFT, true))),
         "the parent never got the press that mints the grab serial"
     );
     let serial = a
         .last_pointer_serial()
         .expect("the press just delivered a serial");
+    let a_buttons = a.pointer_buttons().len();
     vp.button(GRAB_BTN_LEFT, false);
     vp.frame();
     assert!(
-        a.wait_until(|c| c.pointer_buttons().contains(&(GRAB_BTN_LEFT, false))),
+        a.wait_until(|c| c.pointer_buttons()[a_buttons..].contains(&(GRAB_BTN_LEFT, false))),
         "the parent never got the release"
     );
 
     a.open_grabbing_popup(serial, 64, 48);
     assert!(
-        !a.popup_dismissed(),
-        "the popup was dismissed before any click"
-    );
-    assert!(
-        !a.popup_configured(),
+        !a.wait_until_timeout(Duration::from_millis(300), |c| c.popup_configured()),
         "a popup was configured: the `wlr` crate has grown xdg-popup support, \
          so this test should now map the popup properly rather than relying on \
          the grab alone"
