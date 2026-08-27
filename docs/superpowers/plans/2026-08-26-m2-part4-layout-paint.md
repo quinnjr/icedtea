@@ -37,7 +37,7 @@ Paint, §10 Migration, §11 Part boundaries — P4).
 
 ## Contract deviations
 
-The Part 0 contract is binding; the ten items below are places where it
+The Part 0 contract is binding; the eleven items below are places where it
 cannot be followed verbatim, each with the amendment this plan implements.
 Nothing else in this plan diverges from it.
 
@@ -102,6 +102,26 @@ Nothing else in this plan diverges from it.
    §8 writes `skia_rs_codec::image::Image`; `skia-rs-codec` is not a direct
    dependency of `icedtea-ui` — the type is reached through
    `skia_rs_safe::codec`, which re-exports `image::*` at its root.
+
+11. **P4 carries §10.3's `src/text.rs` row, it does not shed it.**
+    Deviation 6 authorises P4 to *create* `text.rs`'s §9 surface; it does not
+    authorise dropping the five M1 tests §10.3 pins at "same properties
+    asserted". P4's first pass kept two by name
+    (`measurement_scales_with_size_and_length`, and
+    `a_sans_serif_query_resolves_to_something` for
+    `a_system_typeface_is_found_without_fontconfig`) and lost three:
+    `shaping_produces_one_positioned_glyph_per_character`,
+    `shaping_returns_the_blob_and_the_metrics_together` and
+    `blob_width_agrees_with_measure` — with them, the 1:1 glyph-per-character
+    rule, `run.glyphs.len() == run.positions.len()`, left-to-right position
+    advance, and blob-vs-`metrics.width` agreement. All three are restored
+    against `FontDatabase`/`ShapedText`. One property could not be restored
+    verbatim: M1's `shaped.metrics == stack.measure(..)` compared two entry
+    points, and `FontDatabase` has one, so the restored test asserts instead
+    that a single `ShapedText` (and its cached second handle) carries a blob
+    *and* usable metrics. **P6 owns `text.rs`; when it replaces the probe
+    bodies with fontconfig it must keep these three tests, whose assertions
+    are API-shaped, not backend-shaped.**
 
 10. **`Container::Box` centres its children on both axes.** §7 does not say
     how a box aligns children. M1's `ButtonLayout` used
