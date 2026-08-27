@@ -22,7 +22,7 @@ use crate::css::node::Node;
 use crate::css::registry::Prop;
 use crate::css::value::{
     BorderImageSlice, BorderImageWidthSide, ColorCtx, ColorTable, Image, Keyword, LengthCtx,
-    RepeatStyle, Rgba, Shadow, Value,
+    RepeatStyle, Rgba, Value,
 };
 use crate::layout::Allocation;
 use crate::text::{FontDatabase, ShapedText};
@@ -157,7 +157,7 @@ pub fn radii_for_box(radii: &[[f32; 2]; 4], alloc: &Allocation, k: Keyword) -> [
 /// `overrides` layers Part 5's animation output over `style`.
 pub fn paint_node(
     canvas: &mut Canvas<'_>,
-    node: &Node,
+    _node: &Node,
     style: &ComputedStyle,
     alloc: &Allocation,
     overrides: Option<&Overrides>,
@@ -171,7 +171,6 @@ pub fn paint_node(
         }
         _ => style,
     };
-    let _ = node;
 
     let save = effects::begin_effects(canvas, style, alloc, &cx.base_length_ctx());
     let len_ctx = cx.base_length_ctx();
@@ -248,7 +247,6 @@ pub fn paint_node(
     }
 
     effects::end_effects(canvas, save);
-    let _: &[Shadow] = &shadows;
 }
 
 #[cfg(test)]

@@ -25,40 +25,24 @@ pub fn sigma_for_blur_radius(blur_px: f32) -> f32 {
     }
 }
 
-/// The box-pass radius that approximates a Gaussian of `sigma`.
-///
-/// Skia's rule: `radius = floor(sigma * 3 * sqrt(2*pi) / 4 + 0.5)`, i.e.
-/// about `1.88 * sigma`, run three times.
-#[must_use]
-pub fn box_blur_radius(sigma: f32) -> i32 {
-    if !sigma.is_finite() || sigma <= 0.0 {
-        return 0;
-    }
-    let scale = 3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0;
-    let r = sigma.mul_add(scale, 0.5).floor();
-    if r.is_finite() {
-        r.clamp(0.0, 512.0) as i32
-    } else {
-        0
-    }
-}
-
 /// The three box-pass radii that variance-match a Gaussian of `sigma`.
 ///
-/// [`box_blur_radius`]'s "one radius, run three times" rule is Skia's own
-/// shorthand for *large* blurs, where losing a pixel of precision to
-/// rounding is invisible; splitting `sigma` unevenly across the three
-/// passes (Kutskir's `boxesForGauss`: an ideal box width
-/// `w = sqrt(12*sigma^2/3 + 1)`, floored to the nearest odd integer below
-/// and above, weighted by how far the ideal width sits between them) is
-/// the standard construction that keeps the three-pass approximation close
-/// to a true Gaussian at *every* sigma, small ones included. That matters
-/// here specifically because a separable box kernel's reach is a square
-/// (Chebyshev) neighbourhood, not a disk: outside a rounded corner, the
-/// uneven, tighter split still over-reaches a true Gaussian's tail less
-/// than three equal, rounded-up passes did, which is what a small
-/// `box-shadow` blur next to a `border-radius` corner needs to stay clear
-/// at a sample point a true Gaussian would have left fully transparent.
+/// Skia's own "one radius, run three times" shorthand
+/// (`radius = floor(sigma * 3 * sqrt(2*pi) / 4 + 0.5)`, about `1.88 *
+/// sigma`) is fine for *large* blurs, where losing a pixel of precision to
+/// rounding is invisible.
+/// Splitting `sigma` unevenly across the three passes instead (Kutskir's
+/// `boxesForGauss`: an ideal box width `w = sqrt(12*sigma^2/3 + 1)`, floored
+/// to the nearest odd integer below and above, weighted by how far the
+/// ideal width sits between them) is the standard construction that keeps
+/// the three-pass approximation close to a true Gaussian at *every* sigma,
+/// small ones included. That matters here specifically because a separable
+/// box kernel's reach is a square (Chebyshev) neighbourhood, not a disk:
+/// outside a rounded corner, the uneven, tighter split still over-reaches a
+/// true Gaussian's tail less than three equal, rounded-up passes did, which
+/// is what a small `box-shadow` blur next to a `border-radius` corner needs
+/// to stay clear at a sample point a true Gaussian would have left fully
+/// transparent.
 #[must_use]
 fn box_radii_for_gauss(sigma: f32) -> [i32; 3] {
     if !sigma.is_finite() || sigma <= 0.0 {
@@ -191,7 +175,7 @@ pub fn blurred_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{blur_premul_rgba, blurred_image, box_blur_radius, sigma_for_blur_radius};
+    use super::{blur_premul_rgba, blurred_image, sigma_for_blur_radius};
     use skia_rs_safe::core::{Color, Rect};
     use skia_rs_safe::paint::{Paint, Style};
 
@@ -266,15 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn box_blur_radius_follows_skias_sigma_to_radius_rule() {
-        // SkBlurMask::ConvertSigmaToRadius-equivalent rounding. Mutation
-        // check: truncating instead of rounding gives 4 for sigma 2.0.
-        assert_eq!(box_blur_radius(0.0), 0);
-        assert_eq!(box_blur_radius(1.0), 2);
-        assert_eq!(box_blur_radius(2.0), 4);
-    }
-
-    #[test]
     fn blurred_image_renders_and_returns_a_bitmap() {
         // Mutation check: forgetting to clear the offscreen surface leaves
         // uninitialised alpha and the outside-the-shape assertion fails.
@@ -299,7 +274,6 @@ mod tests {
         for &sigma in &[f32::NAN, f32::INFINITY, -1.0, 0.0, 1.0e9] {
             let (mut px, stride) = buffer(3, 3);
             blur_premul_rgba(&mut px, 3, 3, stride, sigma);
-            let _ = box_blur_radius(sigma);
             let _ = sigma_for_blur_radius(sigma);
         }
         // Degenerate geometry must not index out of bounds.
