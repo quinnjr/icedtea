@@ -79,12 +79,22 @@ impl Keyframes {
                     );
                 }
             }
-            let mut offsets: Vec<f32> = offsets
+            // CSS Animations 1: a keyframe selector outside 0%..100% is
+            // invalid and the *keyframe* is ignored. Clamping it instead let
+            // a bogus `150%` land on 1.0 and, being later in source order,
+            // replace the real 100% endpoint in the sampler's dedupe-by-
+            // offset, so the animation ended at the wrong value.
+            if offsets
                 .iter()
-                .copied()
-                .filter(|offset| offset.is_finite())
-                .map(|offset| offset.clamp(0.0, 1.0))
-                .collect();
+                .any(|offset| !offset.is_finite() || !(0.0..=1.0).contains(offset))
+            {
+                tracing::debug!(
+                    ?offsets,
+                    "keyframe selector out of 0%..100%; dropping keyframe"
+                );
+                continue;
+            }
+            let mut offsets: Vec<f32> = offsets.clone();
             offsets.sort_by(f32::total_cmp);
             if offsets.is_empty() {
                 continue;
@@ -116,16 +126,35 @@ impl Keyframes {
     }
 
     /// The two frames bracketing `t` for `prop`, the local `0..1` progress
-    /// between them, and the segment's timing function.
+    /// between them, and the segment's *own* timing function.
     ///
-    /// `None` when fewer than two frames declare `prop`.
+    /// The timing is `None` when the starting keyframe declares no
+    /// `animation-timing-function`, because the fallback is the animation's
+    /// own value (CSS initial `ease`), which only the caller knows. Reporting
+    /// `Linear` here silently discarded an `animation: spin 1s ease-in-out`
+    /// and disagreed with `anim::keyframes::resolve_segment`, which has
+    /// always returned an `Option` for exactly this reason.
+    ///
+    /// `None` for the whole tuple when fewer than two frames declare `prop`.
     #[must_use]
-    pub fn segment(&self, prop: Prop, t: f32) -> Option<(&Value, &Value, f32, TimingFunction)> {
+    pub fn segment(
+        &self,
+        prop: Prop,
+        t: f32,
+    ) -> Option<(&Value, &Value, f32, Option<TimingFunction>)> {
         // Flatten to (offset, value, timing) for every offset a frame that
         // declares `prop` applies at.
         let mut points: Vec<(f32, &Value, Option<TimingFunction>)> = Vec::new();
         for frame in self.frames.iter() {
-            let Some((_, value)) = frame.declarations.iter().find(|(name, _)| *name == prop) else {
+            // Last-wins inside one keyframe block, as everywhere else in CSS
+            // and as `anim::keyframes::resolve_segment` already does: a
+            // `padding: 0px` followed by `padding-left: 10px` starts at 10px.
+            let Some((_, value)) = frame
+                .declarations
+                .iter()
+                .rev()
+                .find(|(name, _)| *name == prop)
+            else {
                 continue;
             };
             for offset in frame.offsets.iter() {
@@ -146,16 +175,11 @@ impl Keyframes {
                 } else {
                     (t - start) / (end - start)
                 };
-                return Some((from, to, local, timing.unwrap_or(TimingFunction::Linear)));
+                return Some((from, to, local, timing));
             }
         }
         let last = points.len() - 1;
-        Some((
-            points[last - 1].1,
-            points[last].1,
-            1.0,
-            points[last - 1].2.unwrap_or(TimingFunction::Linear),
-        ))
+        Some((points[last - 1].1, points[last].1, 1.0, points[last - 1].2))
     }
 }
 
@@ -200,7 +224,10 @@ mod tests {
         assert_eq!(*from, Value::Number(0.0));
         assert_eq!(*to, Value::Number(1.0));
         assert!((local - 0.5).abs() < 1e-6, "{local}");
-        assert_eq!(timing, TimingFunction::Linear);
+        // No per-frame `animation-timing-function`, so the segment reports
+        // `None` and the caller substitutes the animation's own value; it
+        // does *not* claim `linear` (F48).
+        assert_eq!(timing, None);
         let (from, to, local, _) = frames.segment(Prop::Opacity, 0.75).expect("second segment");
         assert_eq!(*from, Value::Number(1.0));
         assert_eq!(*to, Value::Number(0.0));
@@ -218,7 +245,7 @@ mod tests {
             "@keyframes fade { 0% { opacity: 0; animation-timing-function: ease-in } 100% { opacity: 1 } }",
         );
         let (_, _, _, timing) = frames.segment(Prop::Opacity, 0.5).expect("segment exists");
-        assert_eq!(timing, TimingFunction::EASE_IN);
+        assert_eq!(timing, Some(TimingFunction::EASE_IN));
         // The timing declaration is not itself an animated property.
         assert!(!frames.properties().contains(&Prop::AnimationTimingFunction));
     }
@@ -249,5 +276,72 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::Keyframes;
+    use crate::css::parse::parse_stylesheet;
+    use crate::css::registry::Prop;
+    use crate::css::value::{Length, Value};
+
+    fn compiled(css: &str) -> Keyframes {
+        Keyframes::compile(&parse_stylesheet(css).keyframes[0])
+    }
+
+    // F45: CSS Animations 1 makes a keyframe selector outside 0%..100%
+    // invalid and ignores the keyframe. Clamping it let the bogus frame
+    // replace the real endpoint.
+    #[test]
+    fn an_out_of_range_keyframe_selector_drops_its_keyframe() {
+        let frames = compiled(
+            "@keyframes k { 0% { opacity: 0 } 100% { opacity: 1 } 150% { opacity: 0.5 } }",
+        );
+        let (_, to, _, _) = frames
+            .segment(Prop::Opacity, 1.0)
+            .expect("two real frames remain");
+        assert_eq!(
+            *to,
+            Value::Number(1.0),
+            "the 150% frame must not have replaced the 100% endpoint"
+        );
+        assert_eq!(frames.frames.len(), 2);
+
+        // Negative selectors collapse onto 0% the same way, and are dropped.
+        let negative =
+            compiled("@keyframes k { -50% { opacity: 0.5 } 0% { opacity: 0 } to { opacity: 1 } }");
+        let (from, _, _, _) = negative
+            .segment(Prop::Opacity, 0.0)
+            .expect("the two valid frames remain");
+        assert_eq!(*from, Value::Number(0.0));
+        assert_eq!(negative.frames.len(), 2);
+    }
+
+    // F46/F47: last declaration wins inside a keyframe block, as it does
+    // everywhere else and as the production sampler already assumed.
+    #[test]
+    fn the_last_declaration_of_a_longhand_in_a_keyframe_wins() {
+        let frames = compiled(
+            "@keyframes k { from { padding: 0px; padding-left: 10px } to { padding-left: 20px } }",
+        );
+        let (from, to, _, _) = frames
+            .segment(Prop::PaddingLeft, 0.0)
+            .expect("both frames declare padding-left");
+        assert_eq!(*from, Value::Length(Length::px(10.0)));
+        assert_eq!(*to, Value::Length(Length::px(20.0)));
+        // The shorthand's other sides are unaffected: `padding: 0px` still
+        // sets padding-top, and only `to` omits it, so there is no segment.
+        assert!(frames.segment(Prop::PaddingTop, 0.0).is_none());
+    }
+
+    // F48/F49: a frame with no `animation-timing-function` reports `None`,
+    // so the caller can substitute the animation's own value; claiming
+    // `linear` silently discarded an `animation: spin 1s ease-in-out`.
+    #[test]
+    fn a_frame_without_its_own_timing_reports_none_not_linear() {
+        let frames = compiled("@keyframes spin { from { opacity: 0 } to { opacity: 1 } }");
+        let (_, _, _, timing) = frames.segment(Prop::Opacity, 0.5).expect("segment exists");
+        assert_eq!(timing, None);
     }
 }

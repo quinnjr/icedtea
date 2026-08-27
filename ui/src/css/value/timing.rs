@@ -248,6 +248,13 @@ fn parse_timing_body(name: &str, input: &mut Parser<'_, '_>) -> Result<TimingFun
             } else {
                 StepPosition::JumpEnd
             };
+            // CSS Easing 1: `jump-none` needs at least two steps -- its
+            // denominator is `count - 1`. The `.max(1.0)` in `eval` hid the
+            // zero denominator and made `steps(1, jump-none)` behave like
+            // `step-end` instead of dropping the declaration.
+            if matches!(position, StepPosition::JumpNone) && count < 2 {
+                return Err(());
+            }
             let count = u32::try_from(count).map_err(|_| ())?;
             TimingFunction::Steps(count, position)
         }
@@ -465,5 +472,29 @@ mod tests {
             let _ = parse_entirely_with(input, AnimationName::parse);
             let _ = parse_entirely_with(input, IterationCount::parse);
         }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::TimingFunction;
+    use crate::css::value::parse_entirely_with;
+
+    // F56: CSS Easing 1 declares `steps(1, jump-none)` invalid -- its
+    // denominator is `count - 1`. The `.max(1.0)` in `eval` hid the zero
+    // denominator and made it behave like `step-end`.
+    #[test]
+    fn steps_one_jump_none_is_invalid() {
+        assert!(parse_entirely_with("steps(1, jump-none)", TimingFunction::parse).is_err());
+        assert!(parse_entirely_with("steps(2, jump-none)", TimingFunction::parse).is_ok());
+        // Every other position accepts a single step.
+        for position in ["jump-start", "jump-end", "jump-both", "start", "end"] {
+            let text = format!("steps(1, {position})");
+            assert!(
+                parse_entirely_with(&text, TimingFunction::parse).is_ok(),
+                "`{text}` must parse"
+            );
+        }
+        assert!(parse_entirely_with("steps(1)", TimingFunction::parse).is_ok());
     }
 }

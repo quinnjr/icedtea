@@ -158,6 +158,16 @@ pub fn decompose_2d(matrix: &Matrix) -> Option<Decomposed2d> {
     if !determinant.is_finite() || determinant == 0.0 {
         return None;
     }
+    // A negative determinant is a reflection. Factoring it out of the *first
+    // column* before the Gram-Schmidt step -- rather than negating `scale_y`
+    // after it -- is what makes the decomposition round-trip: negating the
+    // column is right-multiplying by `diag(-1, 1)`, whose inverse is folded
+    // back into `scale_x` below, leaving the rotation and the skew alone.
+    // Negating `scale_y` afterwards left a skew of the wrong sign, so
+    // `scale(1,-1) skewX(45deg)` recomposed to a mirrored shear and the
+    // element jumped at t = 0.
+    let flipped = determinant < 0.0;
+    let (a, b) = if flipped { (-a, -b) } else { (a, b) };
     let scale_x = (a * a + b * b).sqrt();
     if scale_x == 0.0 {
         return None;
@@ -170,15 +180,11 @@ pub fn decompose_2d(matrix: &Matrix) -> Option<Decomposed2d> {
         return None;
     }
     let skew_xy = skew / scale_y;
-    let mut scale_y = scale_y;
-    if determinant < 0.0 {
-        scale_y = -scale_y;
-    }
     Some(Decomposed2d {
         tx: e,
         ty: f,
         rotate: b_n.atan2(a_n).to_degrees(),
-        scale_x,
+        scale_x: if flipped { -scale_x } else { scale_x },
         scale_y,
         skew_xy,
     })

@@ -51,6 +51,18 @@ fn lerp_length(a: &Length, b: &Length, t: f32) -> Length {
             }
         }
         (Length::Percent(x), Length::Percent(y)) => Length::Percent(lerp(*x, *y, t)),
+        // `auto` is not a length and has no numeric value to blend toward,
+        // so CSS makes it a *discrete* endpoint. Folding it into the calc
+        // sum below produced a `CalcNode` that can never resolve, which the
+        // used-value accessors then read as 0 for the whole transition --
+        // an `auto` margin snapped hard against its edge and stayed there.
+        (Length::Auto, _) | (_, Length::Auto) => {
+            if t >= 0.5 {
+                b.clone()
+            } else {
+                a.clone()
+            }
+        }
         // Unit-incompatible endpoints become a calc sum, which resolves
         // once a LengthCtx exists (CSS Values L4 §interpolation).
         _ => {
@@ -213,27 +225,117 @@ pub fn image(a: &Value, b: &Value, t: f32) -> Value {
     })))
 }
 
+/// Component-wise interpolation of two transform primitives of the same
+/// kind, per CSS Transforms 1 §interpolation of transform functions.
+///
+/// Every primitive the parser can produce is handled except `matrix()` and
+/// `matrix3d()`, which CSS interpolates by decomposition rather than
+/// component-wise, and which the caller's matrix path already covers.
+/// Leaving the *Z*, `*3d` and axis-suffixed forms out meant a structurally
+/// identical `rotateZ(0deg)` -> `rotateZ(360deg)` pair fell into that path,
+/// where both endpoints flatten to the identity matrix and the element never
+/// span at all.
 fn lerp_transform_fn(a: &TransformFn, b: &TransformFn, t: f32) -> Option<TransformFn> {
+    use TransformFn as F;
     Some(match (a, b) {
-        (TransformFn::Translate(ax, ay), TransformFn::Translate(bx, by)) => {
-            TransformFn::Translate(lerp_length(ax, bx, t), lerp_length(ay, by, t))
+        (F::Translate(ax, ay), F::Translate(bx, by)) => {
+            F::Translate(lerp_length(ax, bx, t), lerp_length(ay, by, t))
         }
-        (TransformFn::TranslateX(x), TransformFn::TranslateX(y)) => {
-            TransformFn::TranslateX(lerp_length(x, y, t))
+        (F::TranslateX(x), F::TranslateX(y)) => F::TranslateX(lerp_length(x, y, t)),
+        (F::TranslateY(x), F::TranslateY(y)) => F::TranslateY(lerp_length(x, y, t)),
+        (F::TranslateZ(x), F::TranslateZ(y)) => F::TranslateZ(lerp_length(x, y, t)),
+        (F::Translate3d(ax, ay, az), F::Translate3d(bx, by, bz)) => F::Translate3d(
+            lerp_length(ax, bx, t),
+            lerp_length(ay, by, t),
+            lerp_length(az, bz, t),
+        ),
+        (F::Scale(ax, ay), F::Scale(bx, by)) => F::Scale(lerp(*ax, *bx, t), lerp(*ay, *by, t)),
+        (F::ScaleX(x), F::ScaleX(y)) => F::ScaleX(lerp(*x, *y, t)),
+        (F::ScaleY(x), F::ScaleY(y)) => F::ScaleY(lerp(*x, *y, t)),
+        (F::ScaleZ(x), F::ScaleZ(y)) => F::ScaleZ(lerp(*x, *y, t)),
+        (F::Scale3d(ax, ay, az), F::Scale3d(bx, by, bz)) => {
+            F::Scale3d(lerp(*ax, *bx, t), lerp(*ay, *by, t), lerp(*az, *bz, t))
         }
-        (TransformFn::TranslateY(x), TransformFn::TranslateY(y)) => {
-            TransformFn::TranslateY(lerp_length(x, y, t))
+        // `rotate()` and `rotateZ()` are the same primitive spelled two ways,
+        // so a mixed pair interpolates as one; the result takes the 2-D
+        // spelling, which is what the painter reads.
+        (F::Rotate(x) | F::RotateZ(x), F::Rotate(y) | F::RotateZ(y)) => F::Rotate(lerp(*x, *y, t)),
+        (F::RotateX(x), F::RotateX(y)) => F::RotateX(lerp(*x, *y, t)),
+        (F::RotateY(x), F::RotateY(y)) => F::RotateY(lerp(*x, *y, t)),
+        // Only a shared axis interpolates component-wise; a different axis is
+        // a different primitive and falls through to the matrix path.
+        (F::Rotate3d(ax, ay, az, angle_a), F::Rotate3d(bx, by, bz, angle_b))
+            if (ax, ay, az) == (bx, by, bz) =>
+        {
+            F::Rotate3d(*ax, *ay, *az, lerp(*angle_a, *angle_b, t))
         }
-        (TransformFn::Scale(ax, ay), TransformFn::Scale(bx, by)) => {
-            TransformFn::Scale(lerp(*ax, *bx, t), lerp(*ay, *by, t))
-        }
-        (TransformFn::Rotate(x), TransformFn::Rotate(y)) => TransformFn::Rotate(lerp(*x, *y, t)),
-        (TransformFn::SkewX(x), TransformFn::SkewX(y)) => TransformFn::SkewX(lerp(*x, *y, t)),
-        (TransformFn::SkewY(x), TransformFn::SkewY(y)) => TransformFn::SkewY(lerp(*x, *y, t)),
-        (TransformFn::Skew(ax, ay), TransformFn::Skew(bx, by)) => {
-            TransformFn::Skew(lerp(*ax, *bx, t), lerp(*ay, *by, t))
-        }
+        (F::SkewX(x), F::SkewX(y)) => F::SkewX(lerp(*x, *y, t)),
+        (F::SkewY(x), F::SkewY(y)) => F::SkewY(lerp(*x, *y, t)),
+        (F::Skew(ax, ay), F::Skew(bx, by)) => F::Skew(lerp(*ax, *bx, t), lerp(*ay, *by, t)),
+        (F::Perspective(x), F::Perspective(y)) => F::Perspective(lerp_length(x, y, t)),
         _ => return None,
+    })
+}
+
+/// The identity value of one transform primitive: what CSS Transforms 1
+/// substitutes for a missing function when one endpoint's list is shorter --
+/// which is what makes `transform: none` -> `rotate(1turn)` a real rotation
+/// rather than a discrete flip.
+///
+/// `perspective()` has no finite identity (its neutral element is
+/// `perspective(infinity)`), so a list containing one is not padded.
+fn identity_like(function: &TransformFn) -> Option<TransformFn> {
+    use TransformFn as F;
+    Some(match function {
+        F::Matrix(_) => F::Matrix([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+        F::Matrix3d(_) => {
+            let mut identity = [0.0_f32; 16];
+            for index in [0, 5, 10, 15] {
+                identity[index] = 1.0;
+            }
+            F::Matrix3d(identity)
+        }
+        F::Translate(..) => F::Translate(Length::zero(), Length::zero()),
+        F::TranslateX(_) => F::TranslateX(Length::zero()),
+        F::TranslateY(_) => F::TranslateY(Length::zero()),
+        F::TranslateZ(_) => F::TranslateZ(Length::zero()),
+        F::Translate3d(..) => F::Translate3d(Length::zero(), Length::zero(), Length::zero()),
+        F::Scale(..) => F::Scale(1.0, 1.0),
+        F::ScaleX(_) => F::ScaleX(1.0),
+        F::ScaleY(_) => F::ScaleY(1.0),
+        F::ScaleZ(_) => F::ScaleZ(1.0),
+        F::Scale3d(..) => F::Scale3d(1.0, 1.0, 1.0),
+        F::Rotate(_) => F::Rotate(0.0),
+        F::RotateX(_) => F::RotateX(0.0),
+        F::RotateY(_) => F::RotateY(0.0),
+        F::RotateZ(_) => F::RotateZ(0.0),
+        F::Rotate3d(x, y, z, _) => F::Rotate3d(*x, *y, *z, 0.0),
+        F::Skew(..) => F::Skew(0.0, 0.0),
+        F::SkewX(_) => F::SkewX(0.0),
+        F::SkewY(_) => F::SkewY(0.0),
+        F::Perspective(_) => return None,
+    })
+}
+
+/// Whether every length in `list` is already absolute.
+///
+/// `computed` absolutises transform lengths except percentages, so a
+/// percentage is the only thing left that the matrix path cannot honour:
+/// it flattens with a `(0, 0)` basis, which silently zeroes the translation.
+fn is_matrix_safe(list: &[TransformFn]) -> bool {
+    fn absolute(length: &Length) -> bool {
+        matches!(length, Length::Abs { .. })
+    }
+    list.iter().all(|function| {
+        use TransformFn as F;
+        match function {
+            F::Translate(x, y) => absolute(x) && absolute(y),
+            F::TranslateX(x) | F::TranslateY(x) | F::TranslateZ(x) | F::Perspective(x) => {
+                absolute(x)
+            }
+            F::Translate3d(x, y, z) => absolute(x) && absolute(y) && absolute(z),
+            _ => true,
+        }
     })
 }
 
@@ -243,6 +345,21 @@ fn lerp_transform_fn(a: &TransformFn, b: &TransformFn, t: f32) -> Option<Transfo
 pub fn transform(a: &Value, b: &Value, t: f32) -> Value {
     let (Value::Transform(xs), Value::Transform(ys)) = (a, b) else {
         return discrete(a, b, t);
+    };
+    // `transform: none` is the empty list. CSS Transforms 1 pads the shorter
+    // side with each missing function's identity value rather than falling
+    // through to matrix decomposition, which is what makes a spinner's
+    // `none` -> `rotate(1turn)` an actual rotation instead of two identity
+    // matrices that decompose to the same zero angle.
+    let padded: Option<Rc<[TransformFn]>> = match (xs.is_empty(), ys.is_empty()) {
+        (true, false) => ys.iter().map(identity_like).collect(),
+        (false, true) => xs.iter().map(identity_like).collect(),
+        _ => None,
+    };
+    let (xs, ys) = match (&padded, xs.is_empty()) {
+        (Some(identities), true) => (identities, ys),
+        (Some(identities), false) => (xs, identities),
+        (None, _) => (xs, ys),
     };
     if xs.len() == ys.len() {
         let mut out = Vec::with_capacity(xs.len());
@@ -259,6 +376,13 @@ pub fn transform(a: &Value, b: &Value, t: f32) -> Value {
         if matched {
             return Value::Transform(out.into());
         }
+    }
+    // The matrix fallback flattens both endpoints with a `(0, 0)` percentage
+    // basis, so a percentage translation would silently become zero and the
+    // element would snap untranslated at t = 0. A discrete flip is the honest
+    // answer there; every other length is already absolute by computed time.
+    if !is_matrix_safe(xs) || !is_matrix_safe(ys) {
+        return discrete(a, b, t);
     }
     let ctx = super::length::LengthCtx::default();
     let from = super::transform::transform_list_matrix(xs, &ctx, (0.0, 0.0), (0.0, 0.0));
@@ -518,6 +642,207 @@ mod tests {
                     let _ = super::font_weight(a, b, t);
                     let _ = super::line_height(a, b, t);
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use std::rc::Rc;
+
+    use super::{Value, length, transform};
+    use crate::css::value::length::{Length, LengthCtx};
+    use crate::css::value::transform::{
+        TransformFn, decompose_2d, recompose_2d, transform_list_matrix,
+    };
+
+    fn transforms(list: Vec<TransformFn>) -> Value {
+        Value::Transform(Rc::from(list))
+    }
+
+    fn only(value: &Value) -> &[TransformFn] {
+        match value {
+            Value::Transform(list) => list,
+            other => panic!("expected a transform list, got {other:?}"),
+        }
+    }
+
+    // F18/F42: `auto` is a discrete endpoint. Blending it into a calc sum
+    // produced a value that never resolves, read as 0 for the whole
+    // transition.
+    #[test]
+    fn an_auto_length_endpoint_flips_discretely_instead_of_becoming_a_dead_calc() {
+        let auto = Value::Length(Length::Auto);
+        let twenty = Value::Length(Length::px(20.0));
+        let ctx = LengthCtx {
+            percent_basis: Some(100.0),
+            ..LengthCtx::default()
+        };
+        let resolves = |value: &Value| match value {
+            Value::Length(Length::Auto) => Some(f32::NAN),
+            Value::Length(other) => other.resolve(&ctx),
+            _ => None,
+        };
+        for t in [0.0_f32, 0.25, 0.49] {
+            assert_eq!(length(&auto, &twenty, t), auto);
+        }
+        for t in [0.5_f32, 0.75, 1.0] {
+            assert_eq!(length(&auto, &twenty, t), twenty);
+        }
+        // Whatever it flips to must actually resolve -- the old calc did not.
+        assert!(resolves(&length(&auto, &twenty, 0.75)).is_some_and(f32::is_finite));
+        // Two ordinary lengths still interpolate continuously.
+        let ten = Value::Length(Length::px(10.0));
+        assert_eq!(length(&ten, &twenty, 0.5), Value::Length(Length::px(15.0)));
+    }
+
+    // F43: `rotateZ` is `rotate` under another name, and every other
+    // primitive interpolates component-wise too. Falling into matrix
+    // decomposition lost whole turns.
+    #[test]
+    fn every_transform_primitive_interpolates_component_wise() {
+        let spun = transform(
+            &transforms(vec![TransformFn::RotateZ(0.0)]),
+            &transforms(vec![TransformFn::RotateZ(360.0)]),
+            0.25,
+        );
+        assert_eq!(only(&spun), &[TransformFn::Rotate(90.0)]);
+        // A mixed `rotate`/`rotateZ` pair is one primitive.
+        let mixed = transform(
+            &transforms(vec![TransformFn::Rotate(0.0)]),
+            &transforms(vec![TransformFn::RotateZ(360.0)]),
+            0.5,
+        );
+        assert_eq!(only(&mixed), &[TransformFn::Rotate(180.0)]);
+
+        let scaled = transform(
+            &transforms(vec![TransformFn::Scale3d(1.0, 1.0, 1.0)]),
+            &transforms(vec![TransformFn::Scale3d(3.0, 3.0, 3.0)]),
+            0.5,
+        );
+        assert_eq!(only(&scaled), &[TransformFn::Scale3d(2.0, 2.0, 2.0)]);
+        for (from, to, half) in [
+            (
+                TransformFn::ScaleX(1.0),
+                TransformFn::ScaleX(3.0),
+                TransformFn::ScaleX(2.0),
+            ),
+            (
+                TransformFn::ScaleY(1.0),
+                TransformFn::ScaleY(3.0),
+                TransformFn::ScaleY(2.0),
+            ),
+            (
+                TransformFn::RotateX(0.0),
+                TransformFn::RotateX(90.0),
+                TransformFn::RotateX(45.0),
+            ),
+            (
+                TransformFn::RotateY(0.0),
+                TransformFn::RotateY(90.0),
+                TransformFn::RotateY(45.0),
+            ),
+            (
+                TransformFn::TranslateZ(Length::px(0.0)),
+                TransformFn::TranslateZ(Length::px(10.0)),
+                TransformFn::TranslateZ(Length::px(5.0)),
+            ),
+            (
+                TransformFn::Rotate3d(0.0, 1.0, 0.0, 0.0),
+                TransformFn::Rotate3d(0.0, 1.0, 0.0, 90.0),
+                TransformFn::Rotate3d(0.0, 1.0, 0.0, 45.0),
+            ),
+        ] {
+            let blended = transform(&transforms(vec![from]), &transforms(vec![to]), 0.5);
+            assert_eq!(only(&blended), &[half]);
+        }
+    }
+
+    // F43, the `none` half: `transform: none` is the empty list and must be
+    // padded with each missing function's identity, or a spinner's
+    // `none` -> `rotate(1turn)` decomposes to two identical zero angles.
+    #[test]
+    fn none_pads_with_identities_so_a_full_turn_still_animates() {
+        let quarter = transform(
+            &transforms(Vec::new()),
+            &transforms(vec![TransformFn::Rotate(360.0)]),
+            0.25,
+        );
+        assert_eq!(only(&quarter), &[TransformFn::Rotate(90.0)]);
+        // And in the other direction.
+        let back = transform(
+            &transforms(vec![TransformFn::Rotate(360.0)]),
+            &transforms(Vec::new()),
+            0.25,
+        );
+        assert_eq!(only(&back), &[TransformFn::Rotate(270.0)]);
+        // A padded translate starts from zero, not from a decomposed matrix.
+        let slid = transform(
+            &transforms(Vec::new()),
+            &transforms(vec![TransformFn::TranslateX(Length::px(40.0))]),
+            0.5,
+        );
+        assert_eq!(only(&slid), &[TransformFn::TranslateX(Length::px(20.0))]);
+    }
+
+    // F44: the matrix fallback flattens with a (0, 0) percentage basis, so a
+    // percentage translation would silently vanish. A discrete flip is the
+    // honest answer; every other length is absolute by computed time.
+    #[test]
+    fn a_percentage_translation_never_takes_the_lossy_matrix_path() {
+        let from = transforms(vec![TransformFn::Translate(
+            Length::Percent(0.5),
+            Length::px(0.0),
+        )]);
+        let to = transforms(vec![
+            TransformFn::Translate(Length::Percent(0.5), Length::px(0.0)),
+            TransformFn::Rotate(10.0),
+        ]);
+        // Structures differ, so the matrix path would be taken -- and would
+        // zero the 50%. Discrete keeps the declared value instead.
+        assert_eq!(transform(&from, &to, 0.25), from);
+        assert_eq!(transform(&from, &to, 0.75), to);
+
+        // With absolute lengths the matrix path still runs.
+        let px_from = transforms(vec![TransformFn::Translate(
+            Length::px(10.0),
+            Length::px(0.0),
+        )]);
+        let px_to = transforms(vec![
+            TransformFn::Translate(Length::px(10.0), Length::px(0.0)),
+            TransformFn::Rotate(10.0),
+        ]);
+        assert!(matches!(
+            only(&transform(&px_from, &px_to, 0.5)),
+            [TransformFn::Matrix(_)]
+        ));
+    }
+
+    // F57: a negative-determinant matrix must round-trip through
+    // decompose/recompose; the skew used to come back with the wrong sign.
+    #[test]
+    fn a_reflecting_matrix_round_trips_through_decomposition() {
+        let ctx = LengthCtx::default();
+        for list in [
+            vec![TransformFn::Scale(1.0, -1.0), TransformFn::SkewX(45.0)],
+            vec![TransformFn::Scale(-1.0, 1.0), TransformFn::SkewY(30.0)],
+            vec![TransformFn::Scale(1.0, -1.0), TransformFn::Rotate(30.0)],
+            vec![TransformFn::Scale(2.0, 3.0), TransformFn::SkewX(20.0)],
+        ] {
+            let matrix = transform_list_matrix(&list, &ctx, (0.0, 0.0), (0.0, 0.0));
+            let decomposed = decompose_2d(&matrix).expect("decomposes");
+            let round_tripped = recompose_2d(&decomposed);
+            for (index, (left, right)) in matrix
+                .values
+                .iter()
+                .zip(round_tripped.values.iter())
+                .enumerate()
+            {
+                assert!(
+                    (left - right).abs() < 1e-5,
+                    "{list:?} slot {index}: {left} != {right}"
+                );
             }
         }
     }

@@ -71,6 +71,15 @@ fn parse_shadow(input: &mut Parser<'_, '_>, box_form: bool) -> Result<Shadow, ()
     if lengths.len() < 2 {
         return Err(());
     }
+    // CSS Backgrounds 3: a negative blur radius makes the whole declaration
+    // invalid. Accepting it let the bad declaration win the cascade and the
+    // painter floor it to 0, drawing a hard-edged shadow where the earlier,
+    // valid `box-shadow` should have kept applying. Spread may be negative.
+    if let Some(Length::Abs { value, .. }) = lengths.get(2)
+        && *value < 0.0
+    {
+        return Err(());
+    }
     Ok(Shadow {
         color,
         offset_x: lengths[0].clone(),
@@ -135,5 +144,31 @@ mod tests {
             let _ = parse_entirely_with(input, Shadow::parse);
             let _ = parse_entirely_with(input, Shadow::parse_text);
         }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::Shadow;
+    use crate::css::value::length::Length;
+    use crate::css::value::parse_entirely_with;
+
+    // F50: CSS makes a negative blur radius invalid, so the declaration is
+    // dropped and the earlier valid `box-shadow` keeps applying. Accepting
+    // it let the bad one win and the painter floor the blur to 0, drawing a
+    // hard-edged shadow.
+    #[test]
+    fn a_negative_blur_radius_invalidates_the_shadow() {
+        assert!(parse_entirely_with("0 2px -4px red", Shadow::parse).is_err());
+        // Zero and positive blur are fine.
+        assert!(parse_entirely_with("0 2px 0 red", Shadow::parse).is_ok());
+        assert!(parse_entirely_with("0 2px 4px red", Shadow::parse).is_ok());
+        // Spread *may* be negative -- Adwaita ships `inset 0 2px 2px -2px`.
+        let shadow = parse_entirely_with("inset 0 2px 2px -2px red", Shadow::parse)
+            .expect("a negative spread is valid");
+        assert_eq!(shadow.spread, Length::px(-2.0));
+        assert_eq!(shadow.blur, Length::px(2.0));
+        // A negative *offset* is valid too.
+        assert!(parse_entirely_with("-1px -2px 3px red", Shadow::parse).is_ok());
     }
 }
