@@ -22,8 +22,11 @@ use std::sync::Once;
 use skia_rs_safe::core::Point;
 use skia_rs_safe::text::{Font, Shaper, TextBlob, TextBlobBuilder, Typeface};
 
+use crate::css::computed::ComputedStyle;
+use crate::css::registry::Prop;
 use crate::css::value::{
-    FeatureSetting, FontFamily, FontStyle, GenericFamily, Keyword, VariationSetting,
+    FeatureSetting, FontFamily, FontStyle, FontWeight, GenericFamily, Keyword, Length, LengthUnit,
+    LineHeight, Value, VariationSetting,
 };
 
 /// Well-known UI sans-serif faces, in preference order.
@@ -731,14 +734,288 @@ pub fn css_style_to_fc_slant(s: FontStyle) -> i32 {
     }
 }
 
+/// The computed text properties of one element, in the shape the font stack
+/// consumes them.
+///
+/// Read once per restyle: [`TextStyle::query`] resolves the face and
+/// [`TextStyle::shape_key`] shapes a label with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextStyle {
+    /// `font-family`, in priority order.
+    pub families: Rc<[FontFamily]>,
+    /// `font-weight`, computed to an absolute 1..=1000.
+    pub weight: f32,
+    /// `font-style`.
+    pub style: FontStyle,
+    /// `font-width`, falling back to `font-stretch`, as a percentage.
+    pub stretch: f32,
+    /// `font-size`, in device pixels.
+    pub size_px: f32,
+    /// `letter-spacing`, in device pixels (`normal` is 0).
+    pub letter_spacing_px: f32,
+    /// `font-feature-settings`.
+    pub features: Rc<[FeatureSetting]>,
+    /// `font-variation-settings`.
+    pub variations: Rc<[VariationSetting]>,
+    /// `text-transform`.
+    pub transform: Keyword,
+    /// `line-height`, unresolved (it needs the face's metrics — see
+    /// [`TextStyle::line_height_px`]).
+    pub line_height: LineHeight,
+}
+
+impl TextStyle {
+    /// Read the text properties out of a computed style.
+    ///
+    /// Values are read raw and matched on their variant rather than coerced,
+    /// so a property that somehow holds the wrong shape falls back to its
+    /// initial value instead of to a coerced nonsense number.
+    #[must_use]
+    pub fn from_computed(style: &ComputedStyle) -> TextStyle {
+        let families = match style.raw(Prop::FontFamily) {
+            Value::FontFamilies(list) => Rc::clone(list),
+            _ => Rc::from(vec![FontFamily::Generic(GenericFamily::SansSerif)]),
+        };
+        let weight = match style.raw(Prop::FontWeight) {
+            Value::FontWeight(FontWeight::Absolute(w)) if w.is_finite() => w.clamp(1.0, 1000.0),
+            _ => 400.0,
+        };
+        let font_style = match style.raw(Prop::FontStyle) {
+            Value::FontStyle(s) => *s,
+            _ => FontStyle::Normal,
+        };
+        // GTK 4.22 registers `font-width` and `font-stretch` as two rows with
+        // one grammar; the L4 name wins where it is set.
+        let width = stretch_percent(style.raw(Prop::FontWidth));
+        let stretch = if (width - 100.0).abs() < f32::EPSILON {
+            stretch_percent(style.raw(Prop::FontStretch))
+        } else {
+            width
+        };
+        let features = match style.raw(Prop::FontFeatureSettings) {
+            Value::FontFeatures(list) => Rc::clone(list),
+            _ => Rc::from(Vec::<FeatureSetting>::new()),
+        };
+        let variations = match style.raw(Prop::FontVariationSettings) {
+            Value::FontVariations(list) => Rc::clone(list),
+            _ => Rc::from(Vec::<VariationSetting>::new()),
+        };
+        TextStyle {
+            families,
+            weight,
+            style: font_style,
+            stretch,
+            size_px: style.font_size_px(),
+            letter_spacing_px: computed_px(style.raw(Prop::LetterSpacing)),
+            features,
+            variations,
+            transform: match style.raw(Prop::TextTransform) {
+                Value::Keyword(keyword) => *keyword,
+                _ => Keyword::None,
+            },
+            line_height: match style.raw(Prop::LineHeight) {
+                Value::LineHeight(line_height) => line_height.clone(),
+                _ => LineHeight::Normal,
+            },
+        }
+    }
+
+    /// The font query for these properties.
+    #[must_use]
+    pub fn query(&self) -> FontQuery<'_> {
+        FontQuery {
+            families: &self.families,
+            weight: self.weight,
+            style: self.style,
+            stretch: self.stretch,
+            size_px: self.size_px,
+        }
+    }
+
+    /// The shaping key for `text` on `face`.
+    #[must_use]
+    pub fn shape_key<'a>(&'a self, text: &'a str, face: &'a FontFace) -> ShapeKey<'a> {
+        ShapeKey {
+            text,
+            face,
+            size_px: self.size_px,
+            letter_spacing_px: self.letter_spacing_px,
+            features: &self.features,
+            variations: &self.variations,
+            transform: self.transform,
+        }
+    }
+
+    /// `line-height` in device pixels. `normal` is the face's own line height;
+    /// a number multiplies the computed `font-size`.
+    #[must_use]
+    pub fn line_height_px(&self, metrics: &TextMetrics) -> f32 {
+        match self.line_height {
+            LineHeight::Normal => metrics.line_height,
+            LineHeight::Number(factor) if factor.is_finite() && factor >= 0.0 => {
+                factor * self.size_px
+            }
+            LineHeight::Number(_) => metrics.line_height,
+            LineHeight::Length(ref length) => absolute_px(length).unwrap_or(metrics.line_height),
+        }
+    }
+}
+
+/// A computed length as device pixels. Computed values are already resolved to
+/// `px` (the contract's resolution order), so anything else is a bug upstream
+/// and reads as 0 rather than as a guess.
+fn computed_px(value: &Value) -> f32 {
+    match value {
+        Value::Length(length) => absolute_px(length).unwrap_or(0.0),
+        Value::Number(number) if number.is_finite() => *number,
+        _ => 0.0,
+    }
+}
+
+fn absolute_px(length: &Length) -> Option<f32> {
+    match length {
+        Length::Abs {
+            value,
+            unit: LengthUnit::Px,
+        } if value.is_finite() => Some(*value),
+        _ => None,
+    }
+}
+
+/// A computed `font-width`/`font-stretch` as a percentage. `Value::Percentage`
+/// is a fraction (1.0 == 100%), per the value contract.
+fn stretch_percent(value: &Value) -> f32 {
+    match value {
+        Value::Percentage(fraction) if fraction.is_finite() => fraction * 100.0,
+        Value::Number(number) if number.is_finite() => *number,
+        Value::Keyword(keyword) => match keyword {
+            Keyword::UltraCondensed => 50.0,
+            Keyword::ExtraCondensed => 62.5,
+            Keyword::Condensed => 75.0,
+            Keyword::SemiCondensed => 87.5,
+            Keyword::SemiExpanded => 112.5,
+            Keyword::Expanded => 125.0,
+            Keyword::ExtraExpanded => 150.0,
+            Keyword::UltraExpanded => 200.0,
+            _ => 100.0,
+        },
+        _ => 100.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FontDatabase, FontFace, FontQuery, ShapeKey, ShapedText, css_stretch_to_fc,
-        css_style_to_fc_slant, css_weight_to_fc,
+        FontDatabase, FontFace, FontQuery, ShapeKey, ShapedText, TextMetrics, TextStyle,
+        css_stretch_to_fc, css_style_to_fc_slant, css_weight_to_fc,
     };
-    use crate::css::value::{FontFamily, FontStyle, GenericFamily, Keyword};
+    use crate::css::cascade::CompiledSheet;
+    use crate::css::computed::{ComputedStyle, ResolveEnv};
+    use crate::css::node::Node;
+    use crate::css::select::MatchCx;
+    use crate::css::value::{FontFamily, FontStyle, GenericFamily, Keyword, LineHeight};
     use std::rc::Rc;
+
+    fn style_for(css: &str) -> ComputedStyle {
+        let sheet = CompiledSheet::compile(css);
+        let node = Node::new("label");
+        let mut cx = MatchCx::new();
+        ComputedStyle::resolve_chain(&sheet, &node, &ResolveEnv::default(), &mut cx)
+    }
+
+    #[test]
+    fn the_text_style_reads_every_font_property_off_the_computed_style() {
+        let style = style_for(
+            "label { font-family: \"Adwaita Sans\", sans-serif; font-size: 20px; \
+             font-weight: bold; font-style: italic; font-width: 75%; \
+             letter-spacing: 2px; text-transform: uppercase; line-height: 1.5; }",
+        );
+        let text = TextStyle::from_computed(&style);
+        assert_eq!(
+            text.families.as_ref(),
+            &[
+                FontFamily::Named("Adwaita Sans".into()),
+                FontFamily::Generic(GenericFamily::SansSerif),
+            ]
+        );
+        assert_eq!(text.size_px, 20.0);
+        assert_eq!(text.weight, 700.0);
+        assert_eq!(text.style, FontStyle::Italic);
+        assert_eq!(text.stretch, 75.0);
+        assert_eq!(text.letter_spacing_px, 2.0);
+        assert_eq!(text.transform, Keyword::Uppercase);
+        assert_eq!(text.line_height, LineHeight::Number(1.5));
+    }
+
+    #[test]
+    fn an_unstyled_node_gets_the_registrys_initial_font() {
+        let text = TextStyle::from_computed(&style_for("other { color: red; }"));
+        assert_eq!(
+            text.families.as_ref(),
+            &[FontFamily::Generic(GenericFamily::SansSerif)]
+        );
+        assert_eq!(text.weight, 400.0);
+        assert_eq!(text.style, FontStyle::Normal);
+        assert_eq!(text.stretch, 100.0);
+        assert_eq!(text.letter_spacing_px, 0.0);
+        assert_eq!(text.transform, Keyword::None);
+        assert_eq!(text.line_height, LineHeight::Normal);
+        assert!(text.features.is_empty() && text.variations.is_empty());
+    }
+
+    #[test]
+    fn font_stretch_is_read_only_when_font_width_is_normal() {
+        // GTK 4.22 registers both rows; font-width wins where it is set.
+        let both = TextStyle::from_computed(&style_for(
+            "label { font-width: 125%; font-stretch: condensed; }",
+        ));
+        assert_eq!(both.stretch, 125.0, "font-width must win over font-stretch");
+
+        let stretch_only =
+            TextStyle::from_computed(&style_for("label { font-stretch: condensed; }"));
+        assert_eq!(stretch_only.stretch, 75.0, "the condensed keyword is 75%");
+    }
+
+    #[test]
+    fn the_text_style_hands_the_database_a_query_and_a_key() {
+        let style = style_for("label { font-size: 18px; text-transform: lowercase; }");
+        let text = TextStyle::from_computed(&style);
+        let mut db = FontDatabase::probe_only();
+        let face = db.match_face(&text.query()).expect("system font");
+        let run = db.shape(&text.shape_key("ABC", &face));
+        assert_eq!(run.size_px, 18.0);
+        assert!(run.blob.is_some());
+
+        let untransformed = db.shape(&text.shape_key("abc", &face));
+        assert!(
+            (run.metrics.width - untransformed.metrics.width).abs() < 0.01,
+            "text-transform: lowercase did not reach the shaper through shape_key"
+        );
+    }
+
+    #[test]
+    fn line_height_resolves_against_the_faces_metrics() {
+        let metrics = TextMetrics {
+            width: 0.0,
+            ascent: 12.0,
+            descent: 4.0,
+            line_height: 18.0,
+        };
+        let normal = TextStyle::from_computed(&style_for("label { font-size: 20px; }"));
+        assert_eq!(
+            normal.line_height_px(&metrics),
+            18.0,
+            "`normal` is the face's own"
+        );
+
+        let numeric =
+            TextStyle::from_computed(&style_for("label { font-size: 20px; line-height: 1.5; }"));
+        assert_eq!(numeric.line_height_px(&metrics), 30.0);
+
+        let absolute =
+            TextStyle::from_computed(&style_for("label { font-size: 20px; line-height: 26px; }"));
+        assert_eq!(absolute.line_height_px(&metrics), 26.0);
+    }
 
     fn db() -> FontDatabase {
         FontDatabase::probe_only()
