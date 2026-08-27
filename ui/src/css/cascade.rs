@@ -33,6 +33,7 @@
 //! rank.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use selectors::SelectorList;
 use selectors::context::{
@@ -41,35 +42,55 @@ use selectors::context::{
 use selectors::matching::{MatchingContext, matches_selector};
 
 use super::colors::{ColorTable, build_color_table};
-use super::parse::{Declaration, parse_stylesheet};
-use super::select::{CssNode, GtkSelectorImpl, parse_selector_list};
+use super::parse::{Declaration, KeyframesRule, MediaEnv, StyleRule, Stylesheet, parse_stylesheet};
+use super::select::{CssNode, GtkSelectorImpl, RuleBuckets, parse_selector_list};
 use super::shorthand;
+use super::value::Keyframes;
 
 /// A rule whose prelude has been compiled to a selector list.
 #[derive(Debug)]
 pub struct CompiledRule {
     /// The rule's selectors.
     pub selectors: SelectorList<GtkSelectorImpl>,
-    /// The rule's declarations.
+    /// The rule's declarations, still as source text: the cascade parses each
+    /// one through its registry `ParseFn`, which needs the property to know
+    /// the grammar.
     pub declarations: Vec<Declaration>,
     /// Index of this rule in the source sheet.
     pub source_order: usize,
 }
 
-/// A stylesheet ready for matching.
+/// A stylesheet ready for matching, under one [`MediaEnv`].
+///
+/// `@media` blocks are kept *unevaluated* in [`Stylesheet`] so one parse can be
+/// compiled under several environments -- the coverage gate compiles Adwaita's
+/// light, dark and high-contrast sheets from the same parse.
 #[derive(Debug)]
 pub struct CompiledSheet {
-    /// Rules whose preludes parsed.
+    /// Rules whose preludes parsed, in source order.
     pub rules: Vec<CompiledRule>,
-    /// Resolved `@define-color` names.
+    /// `@define-color` names, **unresolved**: a definition may reference a name
+    /// defined later, so resolution is lazy and cycle-guarded.
+    ///
+    /// This is M1's `super::colors::ColorTable`
+    /// (`HashMap<String, skia_rs_safe::core::Color>`), not P1's
+    /// `super::value::color::ColorTable`. `computed.rs`'s M1 body (still the
+    /// only consumer of this field -- Task 2 of this part rewrites it) is
+    /// built entirely on the old table; switching the field's type here would
+    /// break that file's compile, which is outside this task's scope. Task 2
+    /// swaps this field onto the registry-native table when it rewrites
+    /// `computed.rs` to match.
     pub colors: ColorTable,
+    /// `@keyframes` by name; the last definition of a name wins.
+    pub keyframes: HashMap<Rc<str>, Rc<Keyframes>>,
+    /// Rules bucketed by the rightmost compound's id/class/name.
+    pub buckets: RuleBuckets,
+    /// The media environment these rules were selected under.
+    pub env: MediaEnv,
 }
 
 impl CompiledSheet {
-    /// Parse and compile `css`.
-    ///
-    /// Rules whose prelude does not parse are dropped with a debug log;
-    /// a real theme's unparseable corners must not take the sheet with them.
+    /// Parse and compile `css` under the default media environment.
     #[must_use]
     pub fn compile(css: &str) -> Self {
         Self::from_stylesheet(parse_stylesheet(css))
@@ -78,14 +99,40 @@ impl CompiledSheet {
     /// Compile an already-parsed sheet -- the form
     /// [`super::parse::parse_stylesheet_with_base`] produces.
     #[must_use]
-    pub fn from_stylesheet(sheet: super::parse::Stylesheet) -> Self {
-        let colors = build_color_table(&sheet.color_definitions);
-        let mut rules = Vec::with_capacity(sheet.rules.len());
-        for rule in sheet.rules {
+    pub fn from_stylesheet(sheet: Stylesheet) -> Self {
+        Self::compile_with_env(&sheet, &MediaEnv::default())
+    }
+
+    /// Compile `sheet` under `env`, splicing every matching `@media` block's
+    /// rules, keyframes and colours in at the block's own source position.
+    ///
+    /// Rules whose prelude does not parse are dropped with a debug log; a real
+    /// theme's unparseable corners must not take the sheet with them.
+    #[must_use]
+    pub fn compile_with_env(sheet: &Stylesheet, env: &MediaEnv) -> Self {
+        let mut style_rules: Vec<&StyleRule> = sheet.rules.iter().collect();
+        let mut keyframe_rules: Vec<&KeyframesRule> = sheet.keyframes.iter().collect();
+        let mut definitions: Vec<(String, String)> = sheet.color_definitions.clone();
+        for block in &sheet.media_blocks {
+            if !block.query.evaluate(env) {
+                tracing::debug!(query = ?block.query, "media block does not match; dropping");
+                continue;
+            }
+            style_rules.extend(block.rules.iter());
+            keyframe_rules.extend(block.keyframes.iter());
+            definitions.extend(block.color_definitions.iter().cloned());
+        }
+        // Splice, do not append: a media rule's source order is the position it
+        // occupied in the outer sheet.
+        style_rules.sort_by_key(|rule| rule.source_order);
+        keyframe_rules.sort_by_key(|rule| rule.source_order);
+
+        let mut rules = Vec::with_capacity(style_rules.len());
+        for rule in style_rules {
             match parse_selector_list(&rule.selector_text) {
                 Some(selectors) => rules.push(CompiledRule {
                     selectors,
-                    declarations: rule.declarations,
+                    declarations: rule.declarations.clone(),
                     source_order: rule.source_order,
                 }),
                 None => {
@@ -93,7 +140,33 @@ impl CompiledSheet {
                 }
             }
         }
-        Self { rules, colors }
+
+        // `css::value::keyframes::Keyframes::compile` already does exactly
+        // what this step needs -- expand shorthands, parse every longhand
+        // through the registry, lift `animation-timing-function` out into the
+        // frame's own timing, drop what does not parse. Reimplementing it here
+        // would only diverge from P1's copy.
+        let mut keyframes: HashMap<Rc<str>, Rc<Keyframes>> = HashMap::new();
+        for rule in keyframe_rules {
+            let compiled = Keyframes::compile(rule);
+            // Last definition wins, per CSS Animations L1.
+            keyframes.insert(Rc::clone(&compiled.name), Rc::new(compiled));
+        }
+
+        let buckets = RuleBuckets::build(&rules);
+        Self {
+            rules,
+            colors: build_color_table(&definitions),
+            keyframes,
+            buckets,
+            env: *env,
+        }
+    }
+
+    /// The `@keyframes` rule named `name`, if the sheet defines one.
+    #[must_use]
+    pub fn keyframes(&self, name: &str) -> Option<&Rc<Keyframes>> {
+        self.keyframes.get(name)
     }
 }
 
@@ -212,7 +285,10 @@ pub fn cascade(sheet: &CompiledSheet, node: &CssNode) -> CascadedValues {
 #[cfg(test)]
 mod tests {
     use super::{CompiledSheet, cascade};
+    use crate::css::parse::{ColorScheme, Contrast, MediaEnv};
+    use crate::css::registry::Prop;
     use crate::css::select::{CssNode, PseudoStates};
+    use crate::css::value::{Length, Value};
 
     fn button(classes: &[&str], states: PseudoStates) -> CssNode {
         let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
@@ -376,6 +452,109 @@ mod tests {
             values.candidates("border-top-width")[1].value,
             "5px",
             "the losing longhand is still available as a runner-up"
+        );
+    }
+
+    #[test]
+    fn a_matching_media_block_is_spliced_in_at_its_source_position() {
+        // GTK 4.20+ media queries: the same parsed sheet compiles under
+        // several envs, which is what lets the coverage gate compile
+        // light/dark/hc from one parse.
+        let css = "button { color: red }\n\
+                   @media (prefers-color-scheme: dark) { button { color: blue } }\n\
+                   button { border-width: 1px }";
+        let parsed = crate::css::parse::parse_stylesheet(css);
+
+        let light = CompiledSheet::compile_with_env(&parsed, &MediaEnv::default());
+        assert_eq!(light.rules.len(), 2, "the dark block must be dropped");
+        assert_eq!(light.env, MediaEnv::default());
+
+        let dark = CompiledSheet::compile_with_env(
+            &parsed,
+            &MediaEnv {
+                color_scheme: ColorScheme::Dark,
+                contrast: Contrast::NoPreference,
+            },
+        );
+        assert_eq!(dark.rules.len(), 3);
+        // Spliced at its own source position, not appended at the end.
+        assert!(
+            dark.rules[0].source_order < dark.rules[1].source_order
+                && dark.rules[1].source_order < dark.rules[2].source_order,
+            "media rules were not spliced in source order: {:?}",
+            dark.rules
+                .iter()
+                .map(|rule| rule.source_order)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(dark.rules[1].declarations[0].value, "blue");
+    }
+
+    #[test]
+    fn keyframes_are_compiled_to_longhands_and_the_last_definition_wins() {
+        let sheet = CompiledSheet::compile(
+            "@keyframes pulse { from { padding: 1px } to { padding: 2px } }\n\
+             @keyframes pulse { from { opacity: 0 } to { opacity: 1 } }",
+        );
+        let frames = sheet.keyframes("pulse").expect("@keyframes pulse");
+        assert_eq!(&*frames.name, "pulse");
+        assert_eq!(frames.frames.len(), 2);
+        assert_eq!(&*frames.frames[0].offsets, &[0.0]);
+        assert_eq!(&*frames.frames[1].offsets, &[1.0]);
+        assert_eq!(
+            frames.frames[0].declarations.as_ref(),
+            &[(Prop::Opacity, Value::Number(0.0))],
+            "the later @keyframes of the same name must win outright"
+        );
+        assert!(sheet.keyframes("nosuch").is_none());
+    }
+
+    #[test]
+    fn a_shorthand_inside_a_keyframe_is_expanded_to_longhands() {
+        let sheet = CompiledSheet::compile("@keyframes grow { to { padding: 4px 9px } }");
+        let frames = sheet.keyframes("grow").expect("@keyframes grow");
+        let declared: Vec<Prop> = frames.frames[0]
+            .declarations
+            .iter()
+            .map(|(prop, _)| *prop)
+            .collect();
+        assert_eq!(
+            declared,
+            vec![
+                Prop::PaddingTop,
+                Prop::PaddingRight,
+                Prop::PaddingBottom,
+                Prop::PaddingLeft
+            ]
+        );
+        assert_eq!(
+            frames.frames[0].declarations[1].1,
+            Value::Length(Length::px(9.0))
+        );
+    }
+
+    #[test]
+    fn the_rule_buckets_are_built_from_the_compiled_rules() {
+        let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
+        assert_eq!(sheet.rules.len(), 900);
+        // `RuleBuckets::candidates` matches against `css::node::Node`, not
+        // this module's `CssNode` (M1's immutable, parent-only stand-in that
+        // Part 3 deletes); the plan's own `button()` fixture builds a
+        // `CssNode`, so a detached `Node` is built directly here instead. Its
+        // id/classes/name are all `RuleBuckets::candidates` reads.
+        let node = crate::css::node::Node::new("button");
+        let candidates = sheet.buckets.candidates(&node);
+        assert!(
+            !candidates.is_empty(),
+            "the buckets returned no candidate rules for a plain Adwaita button"
+        );
+        assert!(
+            candidates.iter().all(|index| *index < sheet.rules.len()),
+            "a bucket handed back an out-of-range rule index"
+        );
+        assert!(
+            candidates.windows(2).all(|pair| pair[0] < pair[1]),
+            "candidates must be in source order and deduped"
         );
     }
 }
