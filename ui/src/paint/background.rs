@@ -256,7 +256,7 @@ fn radial_radii(
 /// the surface rectangle, so this is a *finite* superset of every pixel a
 /// draw call can touch. `None` means the CTM is singular, so nothing this
 /// function's caller draws could land anywhere.
-fn drawable_bounds(canvas: &Canvas<'_>) -> Option<Rect> {
+pub(crate) fn drawable_bounds(canvas: &Canvas<'_>) -> Option<Rect> {
     let device = canvas.clip_bounds();
     let inverse = canvas.total_matrix().invert()?;
     // Under a rotation the inverse-mapped rect is the quad's bounding box,
@@ -274,7 +274,7 @@ fn drawable_bounds(canvas: &Canvas<'_>) -> Option<Rect> {
 ///
 /// A non-finite edge propagates into a non-positive extent, which
 /// `Rect::is_empty` rejects, so a NaN or infinite input yields `None`.
-fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+pub(crate) fn intersect(a: Rect, b: Rect) -> Option<Rect> {
     let x = a.x.max(b.x);
     let y = a.y.max(b.y);
     let right = a.right().min(b.right());
