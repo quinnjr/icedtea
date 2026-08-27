@@ -382,6 +382,111 @@ impl ComputedStyle {
                 .max(0.0),
         )
     }
+
+    /// Used border widths in px, `[top, right, bottom, left]`.
+    ///
+    /// A `none`/`hidden` style forces its side's used width to zero -- that is
+    /// what makes `border: none` undo an earlier `border: 1px solid`.
+    #[must_use]
+    pub fn border_widths(&self) -> [f32; 4] {
+        const WIDTHS: [Prop; 4] = [
+            Prop::BorderTopWidth,
+            Prop::BorderRightWidth,
+            Prop::BorderBottomWidth,
+            Prop::BorderLeftWidth,
+        ];
+        let styles = self.border_styles();
+        let mut widths = [0.0; 4];
+        for (slot, prop) in WIDTHS.into_iter().enumerate() {
+            if matches!(styles[slot], Keyword::None | Keyword::Hidden) {
+                continue;
+            }
+            widths[slot] = self.length_px(prop, None).unwrap_or(0.0).max(0.0);
+        }
+        widths
+    }
+
+    /// Border colours, `[top, right, bottom, left]`.
+    #[must_use]
+    pub fn border_colors(&self) -> [Rgba; 4] {
+        [
+            self.get::<Rgba>(Prop::BorderTopColor),
+            self.get::<Rgba>(Prop::BorderRightColor),
+            self.get::<Rgba>(Prop::BorderBottomColor),
+            self.get::<Rgba>(Prop::BorderLeftColor),
+        ]
+    }
+
+    /// Border styles, `[top, right, bottom, left]`.
+    #[must_use]
+    pub fn border_styles(&self) -> [Keyword; 4] {
+        [
+            self.get::<Keyword>(Prop::BorderTopStyle),
+            self.get::<Keyword>(Prop::BorderRightStyle),
+            self.get::<Keyword>(Prop::BorderBottomStyle),
+            self.get::<Keyword>(Prop::BorderLeftStyle),
+        ]
+    }
+
+    /// Corner radii in px, `[top-left, top-right, bottom-right, bottom-left]`,
+    /// each `[rx, ry]`, already scaled by CSS's overlapping-curves rule.
+    ///
+    /// Horizontal radii resolve percentages against `w`, vertical ones against
+    /// `h`, per CSS Backgrounds and Borders L3 §border-radius.
+    #[must_use]
+    pub fn border_radii(&self, w: f32, h: f32) -> [[f32; 2]; 4] {
+        const CORNERS: [Prop; 4] = [
+            Prop::BorderTopLeftRadius,
+            Prop::BorderTopRightRadius,
+            Prop::BorderBottomRightRadius,
+            Prop::BorderBottomLeftRadius,
+        ];
+        let horizontal = self.used_ctx(Some(w));
+        let vertical = self.used_ctx(Some(h));
+        let mut radii = [[0.0f32; 2]; 4];
+        for (slot, prop) in CORNERS.into_iter().enumerate() {
+            let (rx, ry) = match self.raw(prop) {
+                Value::Pair(pair) => (pair.0.clone(), pair.1.clone()),
+                other => (other.clone(), other.clone()),
+            };
+            radii[slot][0] = used_length(&rx, &horizontal);
+            radii[slot][1] = used_length(&ry, &vertical);
+        }
+
+        // f = min over the four sides of side / (sum of its two radii).
+        let mut factor = f32::INFINITY;
+        for (side, sum) in [
+            (w, radii[0][0] + radii[1][0]),
+            (h, radii[1][1] + radii[2][1]),
+            (w, radii[3][0] + radii[2][0]),
+            (h, radii[0][1] + radii[3][1]),
+        ] {
+            if sum > 0.0 {
+                factor = factor.min(side / sum);
+            }
+        }
+        if factor.is_finite() && factor < 1.0 {
+            for corner in &mut radii {
+                corner[0] *= factor;
+                corner[1] *= factor;
+            }
+        }
+        radii
+    }
+}
+
+/// One half of a corner radius, in px. Non-lengths and non-finite results are
+/// zero: a radius is never negative and never `auto`.
+fn used_length(value: &Value, ctx: &LengthCtx) -> f32 {
+    match value {
+        Value::Length(length) => length
+            .resolve(ctx)
+            .filter(|px| px.is_finite())
+            .unwrap_or(0.0)
+            .max(0.0),
+        Value::Number(number) if *number == 0.0 => 0.0,
+        _ => 0.0,
+    }
 }
 
 impl Default for ComputedStyle {
@@ -1165,7 +1270,7 @@ mod tests {
     use crate::css::registry::Prop;
     use crate::css::select::MatchCx;
     use crate::css::value::color::Rgba;
-    use crate::css::value::{Length, Value};
+    use crate::css::value::{Keyword, Length, Value};
     use skia_rs_safe::core::Color;
 
     fn adwaita() -> CompiledSheet {
@@ -1863,5 +1968,79 @@ mod tests {
         let style = resolve(&sheet, &button(&[], PseudoStates::default()));
         assert_eq!(style.opacity(), 1.0, "opacity is not inherited");
         assert_eq!(style.color().to_color32(), Color(0xFFFF_0000));
+    }
+
+    #[test]
+    fn mixed_per_side_borders_are_first_class() {
+        // The headline M1 gap: `border_width`/`border_color` were one scalar
+        // each, so the top side stood for all four.
+        let sheet = CompiledSheet::compile(
+            "button { border-width: 1px 2px 3px 4px; \
+             border-color: red green blue white; \
+             border-style: solid dashed dotted double }",
+        );
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(style.border_widths(), [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            style.border_colors().map(Rgba::to_color32),
+            [
+                Color(0xFFFF_0000),
+                Color(0xFF00_8000),
+                Color(0xFF00_00FF),
+                Color(0xFFFF_FFFF),
+            ]
+        );
+        assert_eq!(
+            style.border_styles(),
+            [
+                Keyword::Solid,
+                Keyword::Dashed,
+                Keyword::Dotted,
+                Keyword::Double
+            ]
+        );
+    }
+
+    #[test]
+    fn a_none_or_hidden_border_style_forces_a_used_width_of_zero() {
+        // E1: `border: none` was a no-op, so a flat button kept a 1px border.
+        let sheet = CompiledSheet::compile(
+            "button { border: 5px solid red }\n\
+             button.flat { border-top-style: none; border-right-style: hidden }",
+        );
+        let style = resolve(&sheet, &button(&["flat"], PseudoStates::default()));
+        assert_eq!(style.border_widths(), [0.0, 0.0, 5.0, 5.0]);
+    }
+
+    #[test]
+    fn per_corner_radii_carry_both_axes_and_percentages() {
+        let sheet = CompiledSheet::compile(
+            "button { border-radius: 4px 8px 12px 16px / 2px 4px 6px 8px }\n\
+             button.round { border-radius: 50% }",
+        );
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(
+            style.border_radii(200.0, 100.0),
+            [[4.0, 2.0], [8.0, 4.0], [12.0, 6.0], [16.0, 8.0]]
+        );
+
+        let round = resolve(&sheet, &button(&["round"], PseudoStates::default()));
+        assert_eq!(
+            round.border_radii(200.0, 100.0),
+            [[100.0, 50.0]; 4],
+            "a percentage radius resolves against the box's own width and height"
+        );
+    }
+
+    #[test]
+    fn overlapping_corner_radii_are_scaled_down_together() {
+        // CSS Backgrounds L3 §corner overlap: if two adjacent radii exceed the
+        // side they share, every radius on the box scales by the same factor.
+        let sheet = CompiledSheet::compile("button { border-radius: 60px }");
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        // Top edge is 100 wide but wants 60 + 60: f = 100 / 120.
+        assert_eq!(style.border_radii(100.0, 100.0), [[50.0, 50.0]; 4]);
+        // Big enough box: no scaling at all.
+        assert_eq!(style.border_radii(400.0, 400.0), [[60.0, 60.0]; 4]);
     }
 }
