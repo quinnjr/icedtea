@@ -1618,3 +1618,54 @@ rules and the `37/37` `@define-color`s are unchanged. `N_LONGHANDS` and
 `N_PROPS` are both derived by the registry macro from the property list
 itself, and `registry.rs`'s own test pins them at 95 and 114, so the code and
 this amendment cannot drift apart silently.
+
+### E15 — the review-fix waves changed six things this contract described differently.
+
+Two `/code-review` waves on the finished M2 branch (89 findings) and the
+reconciliation round that merged them changed six things the earlier sections
+of this contract pin or describe. All six are amendments of record; none
+reopens a part.
+
+1. **A user layer is a cascade *origin*, not a source-order tiebreak.**
+   `CascadeKey` gained `origin: u8`, ranked *above* specificity and below
+   `important`. §4's "the later layer wins ties" understated it: GTK loads the
+   user's `gtk.css` at `GTK_STYLE_PROVIDER_PRIORITY_USER` (800) over the
+   theme's 200, and a higher-priority provider wins regardless of specificity.
+   Folded into `source_order` — which ranks *below* specificity — a user
+   `button { background-color: #f00 }` (0,0,1) lost to Adwaita's
+   `button:hover` (0,1,1), so the override applied only in the base state.
+   `important` stays the outermost key and origins never reverse; that is
+   GTK's model, not CSS's.
+
+2. **`Prop::Border` expands to 16 longhands, not 12.** `border` resets the
+   four `border-image-*` longhands as well as the twelve per-side
+   `-width`/`-style`/`-color` ones, so a stale `border-image` cannot survive a
+   later `border:`. Any reading of §1/§2 that says twelve reads sixteen.
+
+3. **`fontconfig` is a cargo feature, default on.** `default = ["fontconfig"]`;
+   `--no-default-features` does not link `libfontconfig` and `FontDatabase::new`
+   *is* `FontDatabase::probe_only`. §6 assumed fontconfig unconditionally. Both
+   configurations are gated: `cargo clippy -p icedtea-ui --no-default-features
+   --all-targets -- -D warnings` runs alongside the default one.
+
+4. **Three bundled sheets, selected by `MediaEnv`.** `BUNDLED_ADWAITA_LIGHT`,
+   `BUNDLED_ADWAITA_DARK` and `BUNDLED_ADWAITA_HC` all live at the crate root,
+   and `app::bundled_sheet_for` picks between them (high contrast over colour
+   scheme; `HighContrastInverse` falls to the dark sheet). §4's single vendored
+   fallback is now three. `GTK_THEME=Adwaita:dark` used to compile the *light*
+   sheet under a dark `MediaEnv`.
+
+5. **The gradient line-length API.** An absolute stop position is a distance
+   along the *gradient line*, not the box's inline axis, so `Gradient` gained
+   `line_length_for_box`, `stop_positions_for_line`, `color_at_on_line`,
+   `resolve_stops`/`resolve_stops_on_line` and `color_at_resolved`. The last
+   three exist because the painter samples per pixel and `color_at` resolves
+   the whole stop list per call. `color_at` is unchanged and delegates.
+
+6. **One `radial_radii`.** `css::value::image::radial_radii` is the single
+   definition of a radial gradient's ending shape; `paint::background`'s
+   private copy is deleted. The sampler's `t` and this module's stop fractions
+   have to be measured on the same shape or a stop at the shape's edge does
+   not land there. An *ellipse* sized to a corner is `side * sqrt(2)` per axis
+   (CSS Images L3 §3.2), not the corner distance on both; a *circle* keeps the
+   corner distance.

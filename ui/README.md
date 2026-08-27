@@ -16,7 +16,7 @@ tree.
 | Wayland + layer shell | `wayland-client`, `wayland-protocols-wlr` (hand-rolled, no sctk/calloop) |
 | 2D paint | `skia-rs-safe` (pure Rust) |
 | Text shaping | `skia-rs-text` — `Typeface::from_data` + `rustybuzz` (**not** `cosmic-text`) |
-| Font discovery | `fontconfig` — real `fc-match` parity |
+| Font discovery | `fontconfig` — real `fc-match` parity (default feature; see below) |
 | Layout | `taffy` |
 | CSS parse / match | Servo's `cssparser` + `selectors` |
 | Widget | bespoke — a `css::node::Node` tree wearing GTK's node identity |
@@ -47,9 +47,17 @@ screencopy test derives its sample coordinates from it.
 
 ## The theme stack
 
-GTK4 does not have *a* stylesheet, it has a stack. `icedtea-ui` reproduces
-the two layers that matter for a client, using the cascade's own source-order
-rule so the later layer wins ties:
+GTK4 does not have *a* stylesheet, it has a stack. `icedtea-ui` reproduces the
+two layers that matter for a client. The later layer is a higher cascade
+**origin**, which outranks specificity — not a source-order tiebreak that only
+settles ties. That is GTK's model: it loads the user's `gtk.css` at
+`GTK_STYLE_PROVIDER_PRIORITY_USER` (800) over the theme's 200, and a
+higher-priority provider wins *regardless* of specificity, so a user
+`button { background-color: #f00 }` (specificity 0,0,1) beats Adwaita's
+`button:hover` (0,1,1) rather than applying only in the base state.
+`!important` stays the outermost key and origins are never reversed — unlike
+CSS, which ranks the user origin *below* the author's for normal declarations
+and flips origin order for `!important`.
 
 1. **Base theme (GTK priority 200).** `$GTK_THEME`, in GTK's `Name[:variant]`
    form. `:dark` selects `gtk-dark.css`, anything else `gtk.css`, searched in
@@ -66,6 +74,24 @@ rule so the later layer wins ties:
 
 Both layers are parsed with their own directory as the `@import` base, and
 both are named in an `info!` line.
+
+**Caveat, unverified.** GTK's real lookup walks providers in priority order and
+takes the first match, which may rank a *normal* declaration from the user
+provider (800) above an `!important` one from the theme (200) — the opposite of
+what the model above does, since `important` is the outermost key here. No test
+covers that combination; if a theme's `!important` rule appears to be losing to
+a user override, this is the difference.
+
+With `$GTK_THEME` unset and nothing found on disk, the vendored fallback is
+chosen by the `MediaEnv` the sheet compiles under, not fixed to the light
+sheet: high contrast takes `themes/adwaita-hc.css`, a dark colour scheme takes
+`themes/adwaita-dark.css`, and everything else `themes/adwaita-light.css`
+(`app::bundled_sheet_for`; the three are `BUNDLED_ADWAITA_HC`,
+`BUNDLED_ADWAITA_DARK` and `BUNDLED_ADWAITA_LIGHT` at the crate root). High
+contrast wins over the colour scheme, because GTK ships high contrast as its
+own theme and the vendored copy is the light one — which is what `Adwaita:hc`
+and `HighContrast` both name. `HighContrastInverse` has no vendored copy and
+falls to the plain dark sheet, the closer of the two.
 
 ## CSS engine behaviour
 
@@ -142,10 +168,17 @@ Notes that are load-bearing for anyone reading computed values:
   `FC_WEIGHT` 200 and 400 is 80; `font-stretch: 87.5%` is `FC_WIDTH` 87. The
   conversions are table lookups with piecewise-linear interpolation
   (`css_weight_to_fc`, `css_stretch_to_fc`, `css_style_to_fc_slant`), not casts.
+- **`fontconfig` is a cargo feature, on by default.**
+  `default = ["fontconfig"]`; building with `--no-default-features` does not
+  link `libfontconfig` at all, and `FontDatabase::new` *is*
+  `FontDatabase::probe_only`. That is what a stripped container or a build
+  that must not take the C dependency wants. Both configurations are gated:
+  `cargo clippy -p icedtea-ui --no-default-features --all-targets` runs in CI
+  alongside the default one.
 - **`FontDatabase::probe_only()` is the fallback**, and the whole of what M1
-  had: the fixed `FONT_CANDIDATES` path list. It is used when `FcInit` fails
-  (a stripped container, a machine with no fontconfig), so the UI still has a
-  face.
+  had: the fixed `FONT_CANDIDATES` path list. It is used when the feature is
+  off, and when it is on but `FcInit` fails (a machine with no fontconfig), so
+  the UI always has a face.
 - **Three caches, dropped together by `clear_caches`:** query → `FontFace`,
   `(path, index)` → `Typeface`, and `ShapeKey` → `ShapedText`. A shaping key
   covers the text, face, size, letter-spacing, feature and variation settings
@@ -179,6 +212,14 @@ Notes that are load-bearing for anyone reading computed values:
 - **Labels are shaped once per `(text, font-size)`** and cached on the
   widget with their metrics; `paint_button` takes the shaped label rather
   than reshaping it per frame.
+- **The surface covers the widget's ink rect, not its border box.** A shadow,
+  an outline or a blur reaches outside the border box, and a buffer sized to
+  the border box clipped it away. `LayerWindow` sizes the buffer to
+  `Button::ink_rect` and shifts the widget tree by the negation of that rect's
+  origin (`render_origin`), so an ink rect starting left of or above the border
+  box still lands inside the surface. `themed-button --print-allocation` still
+  reports the *border-box* allocation, which is what the screencopy test's
+  sample coordinates are derived from.
 - **The surface is double-buffered.** A `wl_buffer` belongs to the
   compositor from the commit that attaches it until `wl_buffer.release`, so
   the pool starts with two buffers, hands out only free ones, grows to three

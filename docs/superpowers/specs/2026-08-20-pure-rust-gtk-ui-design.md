@@ -90,29 +90,41 @@ get their own spec** when reached; this document details M1 and sketches the res
    combinator coverage + cascade + specificity + the `-gtk-*` property set +
    gradients/shadows, tested against real theme files on abstract node trees.
 
-   **Findings from M1 that M2's spec must account for.** The two review
-   waves on the M1 branch closed most of the original list; what is left is
-   marked *open*, and what was fixed is kept only where M2 still inherits a
-   constraint.
+   **Implementation status: M2 is complete** (branch `rebuild/pure-rust-gtk-m2`;
+   contract `docs/superpowers/plans/2026-08-26-m2-part0-contract.md`, six
+   parts, then a whole-M2 review, two parallel review-fix waves closing
+   89 `/code-review` findings, and a reconciliation round — see contract §12
+   E15). The registry carries **114 rows / 95 longhands / 19 shorthands**
+   (E14), and the M2 gate (`ui/tests/adwaita_coverage.rs`) is green on
+   Adwaita light, dark and high-contrast: 0 unknown properties, 0 unparseable
+   declarations, 37/37 `@define-color`s resolved on each.
 
-   - *Open* — `Element` tree gap: `is_empty`, sibling/child accessors,
+   **Findings from M1 that M2's spec had to account for.** The two review
+   waves on the M1 branch closed most of the original list; what was left is
+   marked *open* below with M2's disposition, and what was fixed is kept only
+   where M2 still inherits a constraint.
+
+   - *Open — **closed in M2***: `Element` tree gap: `is_empty`, sibling/child accessors,
      `has_id`, `attr_matches`, `has_custom_state` are constants; real
      children, sibling order and nth-index are needed (33 Adwaita rules
      depend on these).
-   - *Open* — `ComputedStyle` is flat/uniform. The cascade now carries all
+   - *Open — **closed in M2***: `ComputedStyle` is flat/uniform. The cascade now carries all
      twelve `border-<side>-<prop>` longhands, but the computed style reads
      the top side and paints a uniform stroke, and `border-radius` is one
      scalar. M2 needs per-side border width/colour and per-corner radii;
      `layout.rs` then takes a per-side border instead of one width.
-   - *Open* — relative colour syntax (`rgb(from currentColor r g b /
+   - *Open — **closed in M2***: relative colour syntax (`rgb(from currentColor r g b /
      calc(alpha * …))`, 8 `@define-color`s and 11 rule declarations) is
      still unresolved; `currentColor` itself is done.
-   - *Open* — RTL: `:dir()` parses and matches a `direction` field on
+   - *Open — **still open after M2***: RTL: `:dir()` parses and matches a `direction` field on
      `CssNode`, but nothing ever sets it.
-   - *Open* — the cascade's "fall back to the runner-up when the winner is
+   - *Open — **closed in M2***: the cascade's "fall back to the runner-up when the winner is
      uninterpretable" rule is an M1 divergence from CSS's
      invalid-at-computed-value-time. M2 should decide whether to keep it as
-     the property coverage widens.
+     the property coverage widens. **Decided: dropped.** The winner that
+     cannot be interpreted falls back to the inherited value for an
+     inherited property and to the registry initial otherwise, per CSS;
+     `CascadedValues` still keeps the runner-ups, as diagnostics only.
    - **Done in M1's review waves** (do not re-plan): shorthand expansion at
      cascade time with the shorthand's own key; `CascadedValues` keeping
      runner-ups; inheritance of `color`/`font-size`; a cssparser-based
@@ -128,6 +140,17 @@ get their own spec** when reached; this document details M1 and sketches the res
      cascade/computed module split, and `ButtonLayout`'s reused `taffy`
      tree + the `(label, font-size)` shaping cache as the shape every
      widget should follow.
+
+   **What M2 added beyond the list above**, each load-bearing for M3: `@media`
+   parsed once and evaluated per environment (so one parse compiles under
+   light/dark/high-contrast); a user `gtk.css` layer as a higher cascade
+   *origin* that outranks specificity, matching GTK's provider priorities;
+   CSS transitions and `@keyframes` animations; the `fontconfig` cargo
+   feature (default on, `--no-default-features` falls to
+   `FontDatabase::probe_only`); vendored dark and high-contrast Adwaita
+   selected by `MediaEnv`; and a layer surface sized to the widget's *ink*
+   rect rather than its border box, so shadows and outlines are not clipped.
+   `ui/README.md` is the reference for all of these.
 
 3. **M3 — Widget toolkit breadth**: the retained widget tree + event/focus model
    + a core widget set (window, headerbar, button, label, box, grid, entry,
