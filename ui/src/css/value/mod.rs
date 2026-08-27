@@ -14,19 +14,26 @@
 pub mod border;
 pub mod calc;
 pub mod color;
+pub mod font;
 pub mod image;
 pub mod keyword;
 pub mod length;
 pub mod shadow;
+pub mod text;
 pub mod timing;
 
 pub use border::{BgSize, BorderImageSlice, BorderImageWidthSide, NumberOrPercent, RepeatStyle};
 pub use calc::CalcNode;
 pub use color::{ColorCtx, ColorSpace, ColorTable, ColorValue, Rgba};
+pub use font::{
+    FeatureSetting, FontFamily, FontStyle, FontVariantFlags, FontWeight, GenericFamily, LineHeight,
+    VariationSetting,
+};
 pub use image::{Gradient, IconRef, Image, Position};
 pub use keyword::{Keyword, Wide};
 pub use length::{Length, LengthCtx, LengthUnit};
 pub use shadow::Shadow;
+pub use text::TextDecorationLines;
 pub use timing::Time;
 
 /// Odd inputs every value family's never-panic battery runs.
