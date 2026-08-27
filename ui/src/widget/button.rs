@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use skia_rs_safe::canvas::Surface;
 
-use crate::anim::Overrides;
+use crate::anim::{AnimationState, Clock, MonotonicClock, Overrides};
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::{ComputedStyle, ResolveEnv};
 use crate::css::node::{Node, PseudoStates};
@@ -35,6 +35,17 @@ pub struct Button {
     layout: LayoutTree,
     images: ImageCache,
     env: ResolveEnv,
+    /// The clock this widget's transitions and animations run on. Shared with
+    /// the `LayerWindow` that drives its frame callbacks, and swapped for a
+    /// `ManualClock` in tests.
+    clock: Rc<dyn Clock>,
+    /// Everything currently animating on this widget.
+    anim: AnimationState,
+    /// The values `render` paints instead of the computed ones this frame.
+    overrides: Overrides,
+    /// Whether `restyle` has ever run. The first style is not a change, so it
+    /// starts no transitions.
+    styled: bool,
 }
 
 /// Reports the shaped label's extents for the `label` leaf.
@@ -88,13 +99,17 @@ impl Button {
             layout: LayoutTree::new(),
             images: ImageCache::new(),
             env,
+            clock: Rc::new(MonotonicClock::new()),
+            anim: AnimationState::new(),
+            overrides: Overrides::default(),
+            styled: false,
         }
     }
 
     /// Recascade, reshape and relayout.
     pub fn restyle(&mut self, sheet: &CompiledSheet, fonts: &mut FontDatabase) {
         let mut cx = MatchCx::new();
-        self.style = ComputedStyle::resolve_chain(sheet, &self.node, &self.env, &mut cx);
+        let computed = ComputedStyle::resolve_chain(sheet, &self.node, &self.env, &mut cx);
         self.label_style =
             ComputedStyle::resolve_chain(sheet, &self.label_node, &self.env, &mut cx);
 
@@ -117,6 +132,18 @@ impl Button {
                 transform: self.label_style.get(Prop::TextTransform),
             })
         });
+
+        let previous = if self.styled {
+            Some(std::mem::replace(&mut self.style, computed))
+        } else {
+            self.style = computed;
+            None
+        };
+        self.styled = true;
+        let now = self.clock.now();
+        self.anim
+            .restyle(previous.as_ref(), &self.style, now, sheet);
+        self.overrides = self.anim.sample(now);
 
         let root = self.node.root();
         if self.layout.sync(&root).is_err() {
@@ -208,6 +235,43 @@ impl Button {
         self.allocation
     }
 
+    /// Drive this widget's transitions and animations from `clock`.
+    ///
+    /// The `LayerWindow` passes its own clock in so the widget and the frame
+    /// pump agree on what "now" means; tests pass a `ManualClock`.
+    pub fn set_clock(&mut self, clock: Rc<dyn Clock>) {
+        self.clock = clock;
+    }
+
+    /// Resample the animation clock.
+    ///
+    /// Returns `true` when the animated values changed and the widget must be
+    /// repainted. Paint only: `tick` deliberately does not relayout, so a
+    /// property that animates *and* affects layout animates its appearance
+    /// but not its allocation in M2. The widget/event model that would make
+    /// per-frame relayout sensible is M3's.
+    pub fn tick(&mut self) -> bool {
+        let sampled = self.anim.sample(self.clock.now());
+        if sampled == self.overrides {
+            return false;
+        }
+        self.overrides = sampled;
+        true
+    }
+
+    /// Whether this widget still needs frames.
+    #[must_use]
+    pub fn is_animating(&self) -> bool {
+        self.anim.is_active(self.clock.now())
+    }
+
+    /// This frame's animated values, layered over the computed style by
+    /// `paint_node`.
+    #[must_use]
+    pub fn overrides(&self) -> &Overrides {
+        &self.overrides
+    }
+
     /// Paint the button at `origin` on `surface`.
     pub fn render(
         &mut self,
@@ -215,7 +279,6 @@ impl Button {
         origin: (f32, f32),
         sheet: &CompiledSheet,
         fonts: &mut FontDatabase,
-        overrides: Option<&Overrides>,
     ) {
         let alloc = translated(self.allocation, origin);
         let label_alloc = translated(self.label_allocation, origin);
@@ -233,18 +296,23 @@ impl Button {
                 &self.node,
                 &self.style,
                 &alloc,
-                overrides,
+                Some(&self.overrides),
                 &mut cx,
             );
         }
         cx.text = self.shaped.as_deref();
         let mut canvas = surface.canvas();
+        // The label never transitions anything of its own -- the widget's
+        // `AnimationState` only ever diffs `self.style` (see `restyle`) -- so
+        // it must not receive the button's overrides too, or it would paint
+        // with a property (e.g. an animating `background-color`) it never
+        // computed for itself.
         paint_node(
             &mut canvas,
             &self.label_node,
             &self.label_style,
             &label_alloc,
-            overrides,
+            None,
             &mut cx,
         );
     }
@@ -269,5 +337,171 @@ fn translated(alloc: Allocation, origin: (f32, f32)) -> Allocation {
         border_box: shift(alloc.border_box),
         content_box: shift(alloc.content_box),
         ..alloc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anim::{Clock, ManualClock};
+    use crate::css::value::Value;
+    use std::rc::Rc;
+
+    /// A window > button node tree, a compiled sheet from `css` and a font
+    /// database, restyled once.
+    fn fixture(css: &str, label: &str) -> (CompiledSheet, FontDatabase, Button) {
+        let sheet = CompiledSheet::compile(css);
+        let mut fonts = FontDatabase::probe_only();
+        let window = Node::with_classes("window", &["background"]);
+        let mut button = Button::new(label, &[], window);
+        button.restyle(&sheet, &mut fonts);
+        (sheet, fonts, button)
+    }
+
+    /// The pixel at `(x, y)` of `surface`, matching `ui/src/paint/`'s own
+    /// `pixel` test helper.
+    fn pixel(surface: &Surface, x: i32, y: i32) -> skia_rs_safe::core::Color {
+        surface.pixel_buffer().get_pixel(x, y).expect("pixel")
+    }
+
+    const FADE_BUTTON: &str = "\
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; transition: opacity 200ms linear; }
+button:hover { opacity: 0; }
+";
+
+    // Mutation check: drop the `self.anim.restyle(..)` call at the end of
+    // `Button::restyle` and the hover change snaps -- `overrides()` is empty
+    // and the 100 ms assertion fails.
+    #[test]
+    fn a_state_change_animates_through_the_widgets_own_clock() {
+        let (sheet, mut fonts, mut button) = fixture(FADE_BUTTON, "Click me");
+        let clock = Rc::new(ManualClock::new());
+        button.set_clock(Rc::clone(&clock) as Rc<dyn Clock>);
+        // Re-style once on the manual clock so the *next* restyle has a
+        // before-change style recorded against t = 0.
+        button.restyle(&sheet, &mut fonts);
+        assert!(button.overrides().is_empty());
+        assert!(!button.is_animating());
+
+        button.set_states(PseudoStates::HOVER, &sheet, &mut fonts);
+        assert!(
+            button.is_animating(),
+            "hovering starts the opacity transition"
+        );
+
+        clock.set_ms(100);
+        assert!(
+            button.tick(),
+            "a mid-transition tick changes the painted values"
+        );
+        assert_eq!(
+            button.overrides().get(Prop::Opacity),
+            Some(&Value::Number(0.5))
+        );
+
+        clock.set_ms(200);
+        assert!(button.tick(), "the final tick clears the override");
+        assert!(button.overrides().is_empty());
+        assert!(!button.is_animating());
+    }
+
+    // Mutation check: have `tick` return `true` unconditionally and the
+    // Wayland pump repaints forever -- this assertion is the tripwire.
+    #[test]
+    fn ticking_an_idle_button_reports_no_change() {
+        let (sheet, mut fonts, mut button) = fixture(FADE_BUTTON, "Click me");
+        let clock = Rc::new(ManualClock::new());
+        button.set_clock(Rc::clone(&clock) as Rc<dyn Clock>);
+        button.restyle(&sheet, &mut fonts);
+        clock.set_ms(5_000);
+        assert!(!button.tick());
+        assert!(!button.is_animating());
+    }
+
+    // Mutation check: keep passing `None` for `overrides` in
+    // `Button::render`'s call to `paint_node` and the two surfaces come out
+    // identical, failing the inequality.
+    #[test]
+    fn the_painted_pixels_follow_the_animated_value_not_the_computed_one() {
+        let css = "\
+window { background-color: rgb(255 255 255); }
+button { min-width: 40px; min-height: 40px; padding: 0; border: 0 solid transparent; \
+border-radius: 0; background-color: rgb(255 0 0); background-image: none; \
+transition: background-color 200ms linear; }
+button:hover { background-color: rgb(0 0 255); }
+";
+        let (sheet, mut fonts, mut button) = fixture(css, "");
+        let clock = Rc::new(ManualClock::new());
+        button.set_clock(Rc::clone(&clock) as Rc<dyn Clock>);
+        button.restyle(&sheet, &mut fonts);
+        button.set_states(PseudoStates::HOVER, &sheet, &mut fonts);
+
+        let mut start = Surface::new_raster_n32_premul(60, 60).expect("surface");
+        button.render(&mut start, (0.0, 0.0), &sheet, &mut fonts);
+
+        clock.set_ms(100);
+        button.tick();
+        let mut middle = Surface::new_raster_n32_premul(60, 60).expect("surface");
+        button.render(&mut middle, (0.0, 0.0), &sheet, &mut fonts);
+
+        assert_ne!(
+            pixel(&start, 5, 5),
+            pixel(&middle, 5, 5),
+            "half way through a 200 ms background-color transition the painted \
+             pixel must differ from the one painted at t = 0"
+        );
+    }
+
+    // Controller note: `render` must not hand the button's own `Overrides`
+    // to the label's `paint_node` call too -- the label never transitioned
+    // anything, so a leaked override would paint it with a property (here,
+    // a background colour) it never computed for itself.
+    //
+    // Mutation check: pass `Some(&self.overrides)` to both `paint_node`
+    // calls in `Button::render` and the label picks up the button's
+    // mid-transition background colour, failing the "not fully transparent"
+    // assertion below.
+    #[test]
+    fn the_labels_paint_does_not_receive_the_buttons_overrides() {
+        // The label has its own, non-transitioning green background;
+        // no text, so the sampled pixel can only ever be the label's own
+        // background-color, never anti-aliased glyph ink.
+        let css = "\
+window { background-color: rgb(255 255 255); }
+button { min-width: 80px; min-height: 40px; padding: 0; border: 0 solid transparent; \
+border-radius: 0; background-color: rgb(255 0 0); background-image: none; \
+transition: background-color 200ms linear; }
+button:hover { background-color: rgb(0 0 255); }
+label { min-width: 20px; min-height: 20px; background-color: rgb(0 255 0); }
+";
+        let (sheet, mut fonts, mut button) = fixture(css, "");
+        let clock = Rc::new(ManualClock::new());
+        button.set_clock(Rc::clone(&clock) as Rc<dyn Clock>);
+        button.restyle(&sheet, &mut fonts);
+        button.set_states(PseudoStates::HOVER, &sheet, &mut fonts);
+        clock.set_ms(100);
+        button.tick();
+
+        assert!(
+            button.overrides().get(Prop::BackgroundColor).is_some(),
+            "the fixture must actually be mid-transition for this test to mean anything"
+        );
+
+        let label_alloc = translated(button.label_allocation, (0.0, 0.0));
+        let x = label_alloc.border_box.x as i32 + 5;
+        let y = label_alloc.border_box.y as i32 + 5;
+
+        let mut surface = Surface::new_raster_n32_premul(120, 60).expect("surface");
+        button.render(&mut surface, (0.0, 0.0), &sheet, &mut fonts);
+        let color = pixel(&surface, x, y);
+
+        assert_eq!(
+            color,
+            skia_rs_safe::core::Color(0xFF00_FF00),
+            "the label's own background-color is an opaque green that never \
+             transitions; it must stay that colour instead of picking up the \
+             button's mid-transition fill (pixel: {color:?})"
+        );
     }
 }

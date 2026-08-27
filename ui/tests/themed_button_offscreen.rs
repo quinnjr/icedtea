@@ -73,7 +73,7 @@ fn fixture(classes: &[&str]) -> (CompiledSheet, FontDatabase, Button) {
 fn render(sheet: &CompiledSheet, fonts: &mut FontDatabase, button: &mut Button) -> Surface {
     let mut surface = Surface::new_raster_n32_premul(SURFACE_W, SURFACE_H).expect("raster surface");
     surface.canvas().clear(Color::TRANSPARENT);
-    button.render(&mut surface, (0.0, 0.0), sheet, fonts, None);
+    button.render(&mut surface, (0.0, 0.0), sheet, fonts);
     surface
 }
 

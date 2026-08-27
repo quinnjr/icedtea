@@ -421,7 +421,6 @@ impl LayerWindow {
             (0.0, 0.0),
             &self.state.sheet,
             &mut self.state.fonts,
-            None,
         );
         self.buffers
             .upload(index, &self.skia)
