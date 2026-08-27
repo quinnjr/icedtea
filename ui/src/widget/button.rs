@@ -275,6 +275,13 @@ impl Button {
         self.allocation
     }
 
+    /// The label's own border-box allocation, in the same tree-absolute
+    /// coordinates as [`allocation`](Self::allocation).
+    #[must_use]
+    pub fn label_allocation(&self) -> Allocation {
+        self.label_allocation
+    }
+
     /// Drive this widget's transitions and animations from `clock`.
     ///
     /// The `LayerWindow` passes its own clock in so the widget and the frame

@@ -21,8 +21,8 @@ use std::rc::Rc;
 use selectors::Element as _;
 use selectors::OpaqueElement;
 use taffy::prelude::{
-    AlignItems, BoxSizing, Dimension, Display, FlexDirection, JustifyContent, LengthPercentageAuto,
-    Size, Style, TaffyAuto as _, TaffyTree, auto, length,
+    AlignItems, BoxSizing, Dimension, Display, FlexDirection, JustifyContent, LengthPercentage,
+    LengthPercentageAuto, Size, Style, TaffyAuto as _, TaffyTree, auto, length, percent,
 };
 
 use crate::css::computed::{ComputedStyle, ResolveEnv};
@@ -366,14 +366,43 @@ impl LayoutTree {
         };
 
         // CSS resolves *every* percentage in the box model against the
-        // containing block's inline size, so one basis serves all sides.
-        // taffy resolves its own percentages, so a basis of 0.0 here only
-        // affects values this crate resolves eagerly.
+        // containing block's inline size, and taffy is the only thing here
+        // that knows what that is -- so a percentage must reach taffy *as* a
+        // percentage. Resolving it eagerly against a hard-coded basis of 0.0
+        // and handing over an absolute length collapsed `padding: 0 5%`,
+        // `margin: 10%` and `min-width: 50%` to 0px. The basis below is used
+        // only for the values that are *not* percentages, where it is
+        // irrelevant.
         let basis = 0.0_f32;
         let [pad_top, pad_right, pad_bottom, pad_left] = style.padding(basis);
         let [bt, br, bb, bl] = style.border_widths();
         let margin = style.margin(basis);
         let (min_w, min_h) = style.min_size((basis, basis));
+
+        /// The declared value's own percentage, when it has one.
+        fn declared_percent(style: &ComputedStyle, prop: Prop) -> Option<f32> {
+            match style.raw(prop) {
+                Value::Length(crate::css::value::Length::Percent(fraction))
+                    if fraction.is_finite() =>
+                {
+                    Some(*fraction)
+                }
+                _ => None,
+            }
+        }
+        let len = |prop: Prop, px: f32| -> LengthPercentage {
+            declared_percent(style, prop).map_or_else(|| length(px), percent)
+        };
+        let len_auto = |prop: Prop, px: Option<f32>| -> LengthPercentageAuto {
+            match (px, declared_percent(style, prop)) {
+                (None, _) => auto(),
+                (Some(_), Some(fraction)) => percent(fraction),
+                (Some(px), None) => length(px),
+            }
+        };
+        let min = |prop: Prop, px: f32| -> LengthPercentageAuto {
+            declared_percent(style, prop).map_or_else(|| length(px), percent)
+        };
         let (gap_x, gap_y) = Self::border_spacing_px(style, env);
 
         let (display, flex_direction) = match container {
@@ -386,8 +415,6 @@ impl LayoutTree {
             ),
             Container::Leaf => (Display::Flex, FlexDirection::Row),
         };
-
-        let to_margin = |v: Option<f32>| -> LengthPercentageAuto { v.map_or_else(auto, length) };
 
         let taffy_style = Style {
             display,
@@ -403,20 +430,20 @@ impl LayoutTree {
                 height: Dimension::AUTO,
             },
             min_size: Size {
-                width: length(min_w),
-                height: length(min_h),
+                width: min(Prop::MinWidth, min_w),
+                height: min(Prop::MinHeight, min_h),
             },
             margin: taffy::geometry::Rect {
-                top: to_margin(margin[0]),
-                right: to_margin(margin[1]),
-                bottom: to_margin(margin[2]),
-                left: to_margin(margin[3]),
+                top: len_auto(Prop::MarginTop, margin[0]),
+                right: len_auto(Prop::MarginRight, margin[1]),
+                bottom: len_auto(Prop::MarginBottom, margin[2]),
+                left: len_auto(Prop::MarginLeft, margin[3]),
             },
             padding: taffy::geometry::Rect {
-                top: length(pad_top),
-                right: length(pad_right),
-                bottom: length(pad_bottom),
-                left: length(pad_left),
+                top: len(Prop::PaddingTop, pad_top),
+                right: len(Prop::PaddingRight, pad_right),
+                bottom: len(Prop::PaddingBottom, pad_bottom),
+                left: len(Prop::PaddingLeft, pad_left),
             },
             border: taffy::geometry::Rect {
                 top: length(bt),
@@ -1098,5 +1125,62 @@ mod tests {
         let a = tree.allocation(&leaf).expect("leaf");
         assert_eq!(a.border_box.width, 33.0);
         assert_eq!(a.border_box.height, 11.0);
+    }
+    #[test]
+    fn a_box_model_percentage_reaches_taffy_as_a_percentage() {
+        // F58. Every box-model percentage was resolved eagerly against a
+        // hard-coded basis of 0.0 and handed to taffy as an absolute length,
+        // so `padding: 0 5%`, `margin: 10%` and `min-width: 50%` all
+        // collapsed to 0px. taffy is the only thing here that knows the
+        // containing block's size, so the percentage has to reach it intact.
+        //
+        // Mutation check: restore `length(pad_left)` and the padding
+        // assertion reads `length(0.0)`.
+        use taffy::prelude::{LengthPercentage, LengthPercentageAuto, percent};
+
+        let sheet = CompiledSheet::compile(
+            "button { padding: 0 5%; margin-left: 10%; min-width: 50%; \
+             border: 0 solid transparent }",
+        );
+        let window = Node::with_classes("window", &["background"]);
+        let button = Node::new("button");
+        window.append_child(&button);
+        let env = ResolveEnv::default();
+        let style = ComputedStyle::resolve_chain(
+            &sheet,
+            &button,
+            &env,
+            &mut crate::css::select::MatchCx::new(),
+        );
+
+        let mut tree = LayoutTree::new();
+        tree.sync(&window).expect("sync");
+        tree.set_style(&button, &style, Container::Leaf, &env);
+        let taffy = tree.taffy_style(&button).expect("styled");
+
+        assert_eq!(
+            taffy.padding.left,
+            {
+                let p: LengthPercentage = percent(0.05);
+                p
+            },
+            "padding: 0 5% survives as a percentage"
+        );
+        assert_eq!(
+            taffy.margin.left,
+            {
+                let p: LengthPercentageAuto = percent(0.10);
+                p
+            },
+            "margin-left: 10% survives as a percentage"
+        );
+        assert_eq!(
+            taffy.min_size.width,
+            {
+                let p: LengthPercentageAuto = percent(0.50);
+                p
+            },
+            "min-width: 50% survives as a percentage"
+        );
     }
 }
