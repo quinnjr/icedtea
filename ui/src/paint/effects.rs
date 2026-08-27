@@ -131,7 +131,7 @@ fn matrix_for(filter: &FilterFn) -> Option<[f32; 20]> {
     })
 }
 
-/// Rec.601 luma mixed with the identity by `amount` (1 == full grayscale).
+/// Rec.709 luma mixed with the identity by `amount` (1 == full grayscale).
 fn luminance_mix(amount: f32) -> [f32; 20] {
     let gray = [
         0.2126, 0.7152, 0.0722, 0.0, 0.0, //
@@ -397,7 +397,7 @@ mod tests {
         let p = pixel(&surface, 10, 10);
         assert_eq!(p.red(), p.green());
         assert_eq!(p.green(), p.blue());
-        assert!(p.red() > 0x30 && p.red() < 0x70, "Rec.601 luma of pure red");
+        assert!(p.red() > 0x30 && p.red() < 0x70, "Rec.709 luma of pure red");
     }
 
     #[test]

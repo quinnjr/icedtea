@@ -163,12 +163,19 @@ impl ActiveAnimation {
     }
 
     fn duration_ms(&self) -> f64 {
-        let ms = f64::from(self.spec.duration.as_secs_f32()) * 1000.0;
+        // Multiply in f32 before widening -- same ordering as, and for the
+        // same reason as, `transition::duration_ms_of`: `Time` stores
+        // seconds as f32, and widening to f64 before multiplying by 1000.0
+        // exposes the f32 rounding of the stored seconds value as
+        // sub-millisecond noise (200.00000298023224 instead of 200.0).
+        let ms = f64::from(self.spec.duration.as_secs_f32() * 1000.0);
         if ms.is_finite() { ms.max(0.0) } else { 0.0 }
     }
 
     fn delay_ms(&self) -> f64 {
-        let ms = f64::from(self.spec.delay.as_secs_f32()) * 1000.0;
+        // Same f32-then-widen ordering as `duration_ms`, and as
+        // `transition::delay_ms_of`.
+        let ms = f64::from(self.spec.delay.as_secs_f32() * 1000.0);
         if ms.is_finite() { ms } else { 0.0 }
     }
 
@@ -629,6 +636,38 @@ mod tests {
             Some(0.25),
             "iteration 2 forwards"
         );
+    }
+
+    // Mutation check: revert `duration_ms`/`delay_ms` to widening before
+    // multiplying (`f64::from(x.as_secs_f32()) * 1000.0`) and this fails --
+    // `Time(0.2)` (from a literal `200ms`) round-trips to exactly `200.0` the
+    // multiply-in-f32 way but to `200.00000298023224` the widen-first way.
+    #[test]
+    fn duration_and_delay_convert_ms_the_same_way_transitions_do() {
+        use crate::anim::TransitionSpec;
+        use crate::anim::transition::{delay_ms_of, duration_ms_of};
+
+        let anim = ActiveAnimation::start(
+            spec(
+                200.0,
+                75.0,
+                IterationCount::Count(1.0),
+                Keyword::Normal,
+                Keyword::None,
+            ),
+            Rc::from("fade"),
+            fade(),
+            0.0,
+        );
+        let equivalent_transition = TransitionSpec {
+            prop: None,
+            all: false,
+            duration: Time(200.0 / 1000.0),
+            delay: Time(75.0 / 1000.0),
+            timing: TimingFunction::Linear,
+        };
+        assert_eq!(anim.duration_ms(), duration_ms_of(&equivalent_transition));
+        assert_eq!(anim.delay_ms(), delay_ms_of(&equivalent_transition));
     }
 
     // Mutation check: map `Reverse` to `q` and both assertions collapse onto
