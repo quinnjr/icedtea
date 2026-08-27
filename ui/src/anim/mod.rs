@@ -18,6 +18,7 @@ use std::time::Duration;
 
 pub use clock::{Clock, ManualClock, MonotonicClock};
 
+use crate::anim::keyframes::ActiveAnimation;
 use crate::anim::transition::{Transition, combined_ms, transitioned_props};
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::ComputedStyle;
@@ -146,6 +147,10 @@ pub fn interpolate_prop(prop: Prop, a: &Value, b: &Value, t: f32) -> Value {
 /// whole engine testable to the millisecond.
 pub struct AnimationState {
     transitions: Vec<Transition>,
+    animations: Vec<ActiveAnimation>,
+    /// The most recent computed style. Keyframe endpoints the `@keyframes`
+    /// rule omits are taken from here.
+    base: Option<ComputedStyle>,
 }
 
 impl Default for AnimationState {
@@ -160,6 +165,8 @@ impl AnimationState {
     pub fn new() -> AnimationState {
         AnimationState {
             transitions: Vec::new(),
+            animations: Vec::new(),
+            base: None,
         }
     }
 
@@ -172,15 +179,22 @@ impl AnimationState {
         self.transitions.len()
     }
 
+    /// How many `@keyframes` animations are currently bound.
+    ///
+    /// Observability for this part's own tests (deviation 7); nothing outside
+    /// `anim` reads it.
+    #[must_use]
+    pub fn animation_count(&self) -> usize {
+        self.animations.len()
+    }
+
     /// Take a new computed style.
     ///
     /// `old` is the style this node had before the change; `None` means this
     /// is the node's first style, which is not a change and therefore starts
     /// no transitions (CSS Transitions: there is no before-change style).
     ///
-    /// `sheet` carries the `@keyframes` rules `animation-name` binds to; it
-    /// is unused until Task 7b wires animations in, and is present now
-    /// because the contract freezes this signature.
+    /// `sheet` carries the `@keyframes` rules `animation-name` binds to.
     pub fn restyle(
         &mut self,
         old: Option<&ComputedStyle>,
@@ -188,9 +202,37 @@ impl AnimationState {
         now: Duration,
         sheet: &CompiledSheet,
     ) {
-        let _ = sheet;
         let now_ms = millis(now);
         self.update_transitions(old, new, now_ms);
+        self.update_animations(new, now_ms, sheet);
+        self.base = Some(new.clone());
+    }
+
+    /// Bind `animation-name` to the sheet's `@keyframes`, keeping animations
+    /// that survive the restyle running rather than rewinding them.
+    fn update_animations(&mut self, new: &ComputedStyle, now_ms: f64, sheet: &CompiledSheet) {
+        let specs = new.animation_specs();
+        let mut kept: Vec<ActiveAnimation> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let AnimationName::Named(name) = spec.name.clone() else {
+                continue;
+            };
+            let Some(keyframes) = sheet.keyframes(&name).cloned() else {
+                tracing::debug!(%name, "animation-name has no matching @keyframes rule");
+                continue;
+            };
+            let mut animation = match self.animations.iter().position(|a| a.name == name) {
+                Some(index) => {
+                    let mut existing = self.animations.remove(index);
+                    existing.rebind(spec, keyframes);
+                    existing
+                }
+                None => ActiveAnimation::start(spec, name, keyframes, now_ms),
+            };
+            animation.apply_play_state(now_ms);
+            kept.push(animation);
+        }
+        self.animations = kept;
     }
 
     /// CSS Transitions §3.1, applied to every longhand the new style says it
@@ -257,6 +299,10 @@ impl AnimationState {
     }
 
     /// Every animated value for this frame.
+    ///
+    /// Transitions are written first and animations second, so an animation
+    /// wins on a property both touch — CSS's precedence, expressed as write
+    /// order rather than as a conditional.
     pub fn sample(&mut self, now: Duration) -> Overrides {
         let now_ms = millis(now);
         // A finished transition's end value *is* the computed style's value,
@@ -267,6 +313,11 @@ impl AnimationState {
         for transition in &self.transitions {
             out.set(transition.prop, transition.value_at(now_ms));
         }
+        if let Some(base) = &self.base {
+            for animation in &self.animations {
+                animation.sample(now_ms, base, &mut out);
+            }
+        }
         out
     }
 
@@ -275,6 +326,7 @@ impl AnimationState {
     pub fn is_active(&self, now: Duration) -> bool {
         let now_ms = millis(now);
         self.transitions.iter().any(|t| !t.is_finished(now_ms))
+            || self.animations.iter().any(|a| a.is_active(now_ms))
     }
 
     /// The earliest instant at which [`sample`](Self::sample) could return
@@ -301,6 +353,11 @@ impl AnimationState {
             } else {
                 now_ms
             });
+        }
+        for animation in &self.animations {
+            if animation.is_active(now_ms) {
+                deadline = deadline.min(animation.next_change_ms(now_ms));
+            }
         }
         if !deadline.is_finite() {
             return None;
@@ -475,5 +532,80 @@ button:hover { opacity: 0; color: rgb(255 0 0); }
         );
         let _ = state.sample(Duration::from_millis(200));
         assert_eq!(state.next_deadline(Duration::from_millis(200)), None);
+    }
+
+    // Mutation check: sample animations before transitions and the 100 ms
+    // reading becomes the transition's 0.5.
+    #[test]
+    fn an_animation_overrides_a_transition_on_the_same_property() {
+        let css = "\
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; transition: opacity 200ms linear; animation: fade 1000ms linear; }
+button:hover { opacity: 0; }
+";
+        let sheet = CompiledSheet::compile(css);
+        assert!(
+            sheet.keyframes("fade").is_some(),
+            "the sheet must carry @keyframes fade"
+        );
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        assert_eq!(state.animation_count(), 1);
+        state.restyle(Some(&normal), &hover, Duration::ZERO, &sheet);
+
+        let sampled = state.sample(Duration::from_millis(100));
+        assert_eq!(
+            number(&sampled, Prop::Opacity),
+            Some(0.1),
+            "0.1 is the animation's value at 100 ms of 1000 ms; 0.5 would be \
+             the transition's, which the animation must override"
+        );
+    }
+
+    // Mutation check: rebuild `animations` unconditionally in
+    // `update_animations` and the resumed sample restarts at 0.0.
+    #[test]
+    fn a_restyle_that_keeps_the_animation_name_does_not_restart_it() {
+        let css = "\
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; animation: fade 1000ms linear; }
+button:hover { color: rgb(255 0 0); }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &hover, Duration::from_millis(500), &sheet);
+        assert_eq!(
+            number(&state.sample(Duration::from_millis(500)), Prop::Opacity),
+            Some(0.5)
+        );
+    }
+
+    // Mutation check: keep animations whose name is gone from the new style
+    // and the second sample still reports the animation's value.
+    #[test]
+    fn dropping_animation_name_stops_the_animation() {
+        let css = "\
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; animation: fade 1000ms linear; }
+button:hover { animation-name: none; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        assert_eq!(state.animation_count(), 1);
+        state.restyle(Some(&normal), &hover, Duration::from_millis(100), &sheet);
+        assert_eq!(state.animation_count(), 0);
+        assert!(state.sample(Duration::from_millis(200)).is_empty());
     }
 }
