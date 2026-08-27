@@ -19,6 +19,12 @@ use crate::text::{FontDatabase, FontQuery, ShapeKey, ShapedText};
 /// A themed button: a `button` node with a `label` child.
 pub struct Button {
     label: String,
+    /// Nothing but this strong handle keeps `node`'s ancestors (the window,
+    /// any layer-shell root) reachable: `css::node::Node`'s parent link is a
+    /// `Weak`, so without a strong reference somewhere the chain above
+    /// `node` is dropped the instant `new`'s `parent` parameter goes out of
+    /// scope, and `node.root()` silently degrades to `node` itself.
+    _root: Node,
     node: Node,
     label_node: Node,
     style: ComputedStyle,
@@ -71,6 +77,7 @@ impl Button {
         };
         Self {
             label: label.to_owned(),
+            _root: parent,
             node,
             label_node,
             style: (*ComputedStyle::initial(&env)).clone(),
