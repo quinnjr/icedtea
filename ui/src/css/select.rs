@@ -14,13 +14,9 @@
 //! and an ancestor bloom filter — and drops it when the tree generation moves.
 //! [`RuleBuckets`] narrows a stylesheet to the rules a node could match, which
 //! `selectors` itself does not provide.
-//!
-//! M1's `CssNode` (immutable, parent-only) is still here because the rest of the
-//! crate has not been migrated onto `Node` yet; Part 3 of M2 deletes it.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::rc::Rc;
 
 use cssparser::{CowRcStr, Parser as CssParser, ParserInput, SourceLocation, ToCss};
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
@@ -36,10 +32,7 @@ use selectors::parser::{
 use selectors::{Element, OpaqueElement, SelectorImpl, SelectorList};
 
 use crate::css::cascade::CompiledRule;
-use crate::css::node::Node;
-// M1's `CssNode` still uses `select::PseudoStates`, the 7-bool struct below.
-// Part 3 deletes both and this alias goes with them.
-use crate::css::node::PseudoStates as NodeStates;
+use crate::css::node::{Node, PseudoStates};
 
 // `CssString` and `Direction` live with the tree they describe (contract §3);
 // they are re-exported here because every M1 caller reaches them through
@@ -79,7 +72,7 @@ pub enum GtkPseudoClass {
     Link,
     /// `:visited`. GTK never sets it on a node, so it parses and never matches.
     Visited,
-    /// `:dir(ltr)` / `:dir(rtl)`, matched against [`CssNode::direction`].
+    /// `:dir(ltr)` / `:dir(rtl)`, matched against [`Node::direction`].
     Dir(Direction),
     /// `:drop(...)`. GTK sets it only mid-drag, which M1 has no notion of,
     /// so it parses and never matches.
@@ -254,262 +247,6 @@ fn match_pseudo_class_name(name: &str) -> GtkPseudoClass {
         "link" => GtkPseudoClass::Link,
         "visited" => GtkPseudoClass::Visited,
         other => GtkPseudoClass::Other(CssString::new(other)),
-    }
-}
-
-/// The pseudo-class state a node currently carries.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PseudoStates {
-    /// `:hover`
-    pub hover: bool,
-    /// `:active`
-    pub active: bool,
-    /// `:checked`
-    pub checked: bool,
-    /// `:disabled`
-    pub disabled: bool,
-    /// `:focus` and `:focus-visible`
-    pub focus: bool,
-    /// `:backdrop`
-    pub backdrop: bool,
-    /// `:selected`
-    pub selected: bool,
-}
-
-/// The immutable payload behind a [`CssNode`].
-#[derive(Debug)]
-pub struct NodeData {
-    name: CssString,
-    classes: Vec<CssString>,
-    states: PseudoStates,
-    direction: Direction,
-    parent: Option<CssNode>,
-}
-
-/// A GTK CSS node: element name, style classes, pseudo-class state, parent.
-///
-/// Immutable and `Rc`-shared, because `Element::parent_element` must return
-/// `Self` by value. Changing state means rebuilding the node (cheap: the
-/// ancestors are shared), which is also exactly what a restyle is.
-#[derive(Clone, Debug)]
-pub struct CssNode(Rc<NodeData>);
-
-impl CssNode {
-    /// Build a node with the given identity, state and parent.
-    #[must_use]
-    pub fn new(
-        name: &str,
-        classes: &[&str],
-        states: PseudoStates,
-        parent: Option<CssNode>,
-    ) -> Self {
-        Self(Rc::new(NodeData {
-            name: CssString::new(name),
-            classes: classes.iter().map(|c| CssString::new(c)).collect(),
-            states,
-            direction: Direction::default(),
-            parent,
-        }))
-    }
-
-    /// A copy of this node with a different writing direction.
-    #[must_use]
-    pub fn with_direction(&self, direction: Direction) -> Self {
-        Self(Rc::new(NodeData {
-            name: self.0.name.clone(),
-            classes: self.0.classes.clone(),
-            states: self.0.states,
-            direction,
-            parent: self.0.parent.clone(),
-        }))
-    }
-
-    /// This node's writing direction.
-    #[must_use]
-    pub fn direction(&self) -> Direction {
-        self.0.direction
-    }
-
-    /// This node's parent, if any.
-    #[must_use]
-    pub fn parent(&self) -> Option<Self> {
-        self.0.parent.clone()
-    }
-
-    /// A copy of this node with different pseudo-class state, sharing the
-    /// same name, classes and ancestors.
-    #[must_use]
-    pub fn with_states(&self, states: PseudoStates) -> Self {
-        Self(Rc::new(NodeData {
-            name: self.0.name.clone(),
-            classes: self.0.classes.clone(),
-            states,
-            direction: self.0.direction,
-            parent: self.0.parent.clone(),
-        }))
-    }
-
-    /// This node's pseudo-class state.
-    #[must_use]
-    pub fn states(&self) -> PseudoStates {
-        self.0.states
-    }
-}
-
-impl Element for CssNode {
-    type Impl = GtkSelectorImpl;
-
-    fn opaque(&self) -> OpaqueElement {
-        // The `Rc`'s payload address: stable for the node's lifetime and
-        // unique per node, which is all `OpaqueElement` needs. (Upstream's
-        // constructor takes `&T`, not a raw pointer.)
-        OpaqueElement::new(&*self.0)
-    }
-
-    fn parent_element(&self) -> Option<Self> {
-        self.0.parent.clone()
-    }
-
-    fn parent_node_is_shadow_root(&self) -> bool {
-        false
-    }
-
-    fn containing_shadow_host(&self) -> Option<Self> {
-        None
-    }
-
-    fn is_pseudo_element(&self) -> bool {
-        false
-    }
-
-    // M2: constant because M1's tree is a two-node chain (window > button). A
-    // real tree makes this wrong in both directions (:first-child/:last-child/
-    // :only-child match everything; :not(:first-child) matches nothing). 33
-    // Adwaita rules depend on these.
-    fn prev_sibling_element(&self) -> Option<Self> {
-        None
-    }
-
-    // M2: constant because M1's tree is a two-node chain (window > button). A
-    // real tree makes this wrong in both directions (:first-child/:last-child/
-    // :only-child match everything; :not(:first-child) matches nothing). 33
-    // Adwaita rules depend on these.
-    fn next_sibling_element(&self) -> Option<Self> {
-        None
-    }
-
-    // M2: constant because M1's tree is a two-node chain (window > button). A
-    // real tree makes this wrong in both directions (:first-child/:last-child/
-    // :only-child match everything; :not(:first-child) matches nothing). 33
-    // Adwaita rules depend on these.
-    fn first_element_child(&self) -> Option<Self> {
-        None
-    }
-
-    fn is_html_element_in_html_document(&self) -> bool {
-        false
-    }
-
-    fn has_local_name(&self, local_name: &str) -> bool {
-        self.0.name.as_str() == local_name
-    }
-
-    fn has_namespace(&self, ns: &str) -> bool {
-        ns.is_empty()
-    }
-
-    fn is_same_type(&self, other: &Self) -> bool {
-        self.0.name == other.0.name
-    }
-
-    fn attr_matches(
-        &self,
-        _ns: &NamespaceConstraint<&CssString>,
-        _local_name: &CssString,
-        _operation: &AttrSelectorOperation<&CssString>,
-    ) -> bool {
-        false
-    }
-
-    fn match_non_ts_pseudo_class(
-        &self,
-        pc: &GtkPseudoClass,
-        _context: &mut MatchingContext<GtkSelectorImpl>,
-    ) -> bool {
-        let s = self.0.states;
-        match pc {
-            GtkPseudoClass::Hover => s.hover,
-            GtkPseudoClass::Active => s.active,
-            GtkPseudoClass::Checked => s.checked,
-            GtkPseudoClass::Disabled => s.disabled,
-            GtkPseudoClass::Focus | GtkPseudoClass::FocusVisible => s.focus,
-            GtkPseudoClass::Backdrop => s.backdrop,
-            GtkPseudoClass::Selected => s.selected,
-            GtkPseudoClass::Dir(direction) => self.0.direction == *direction,
-            // M1's `CssNode` has no bit for these; `Node` matches them properly.
-            // This impl disappears with `CssNode` in Part 3.
-            GtkPseudoClass::Indeterminate
-            | GtkPseudoClass::FocusWithin
-            | GtkPseudoClass::Link
-            | GtkPseudoClass::Visited
-            | GtkPseudoClass::Drop(_)
-            | GtkPseudoClass::Other(_)
-            | GtkPseudoClass::OtherFunctional(..) => false,
-        }
-    }
-
-    fn match_pseudo_element(
-        &self,
-        _pe: &GtkPseudoElement,
-        _context: &mut MatchingContext<GtkSelectorImpl>,
-    ) -> bool {
-        false
-    }
-
-    fn apply_selector_flags(&self, _flags: ElementSelectorFlags) {}
-
-    fn is_link(&self) -> bool {
-        false
-    }
-
-    fn is_html_slot_element(&self) -> bool {
-        false
-    }
-
-    fn has_id(&self, _id: &CssString, _case_sensitivity: CaseSensitivity) -> bool {
-        false
-    }
-
-    fn has_class(&self, name: &CssString, _case_sensitivity: CaseSensitivity) -> bool {
-        self.0.classes.iter().any(|c| c == name)
-    }
-
-    fn has_custom_state(&self, _name: &CssString) -> bool {
-        false
-    }
-
-    fn imported_part(&self, _name: &CssString) -> Option<CssString> {
-        None
-    }
-
-    fn is_part(&self, _name: &CssString) -> bool {
-        false
-    }
-
-    // M2: constant because M1's tree is a two-node chain (window > button). A
-    // real tree makes this wrong in both directions (:first-child/:last-child/
-    // :only-child match everything; :not(:first-child) matches nothing). 33
-    // Adwaita rules depend on these.
-    fn is_empty(&self) -> bool {
-        true
-    }
-
-    fn is_root(&self) -> bool {
-        self.0.parent.is_none()
-    }
-
-    fn add_element_unique_hashes(&self, _filter: &mut BloomFilter) -> bool {
-        false
     }
 }
 
@@ -744,23 +481,23 @@ impl Element for Node {
     ) -> bool {
         let states = self.states();
         match pc {
-            GtkPseudoClass::Hover => states.contains(NodeStates::HOVER),
-            GtkPseudoClass::Active => states.contains(NodeStates::ACTIVE),
-            GtkPseudoClass::Checked => states.contains(NodeStates::CHECKED),
-            GtkPseudoClass::Indeterminate => states.contains(NodeStates::INDETERMINATE),
-            GtkPseudoClass::Disabled => states.contains(NodeStates::DISABLED),
-            GtkPseudoClass::Focus => states.contains(NodeStates::FOCUS),
-            GtkPseudoClass::FocusVisible => states.contains(NodeStates::FOCUS_VISIBLE),
-            GtkPseudoClass::FocusWithin => states.contains(NodeStates::FOCUS_WITHIN),
-            GtkPseudoClass::Backdrop => states.contains(NodeStates::BACKDROP),
-            GtkPseudoClass::Selected => states.contains(NodeStates::SELECTED),
+            GtkPseudoClass::Hover => states.contains(PseudoStates::HOVER),
+            GtkPseudoClass::Active => states.contains(PseudoStates::ACTIVE),
+            GtkPseudoClass::Checked => states.contains(PseudoStates::CHECKED),
+            GtkPseudoClass::Indeterminate => states.contains(PseudoStates::INDETERMINATE),
+            GtkPseudoClass::Disabled => states.contains(PseudoStates::DISABLED),
+            GtkPseudoClass::Focus => states.contains(PseudoStates::FOCUS),
+            GtkPseudoClass::FocusVisible => states.contains(PseudoStates::FOCUS_VISIBLE),
+            GtkPseudoClass::FocusWithin => states.contains(PseudoStates::FOCUS_WITHIN),
+            GtkPseudoClass::Backdrop => states.contains(PseudoStates::BACKDROP),
+            GtkPseudoClass::Selected => states.contains(PseudoStates::SELECTED),
             // GTK never sets these; the bits exist so the grammar is complete.
-            GtkPseudoClass::Link => states.contains(NodeStates::LINK),
-            GtkPseudoClass::Visited => states.contains(NodeStates::VISITED),
+            GtkPseudoClass::Link => states.contains(PseudoStates::LINK),
+            GtkPseudoClass::Visited => states.contains(PseudoStates::VISITED),
             GtkPseudoClass::Dir(direction) => self.direction() == *direction,
             GtkPseudoClass::Drop(argument) => {
                 argument.as_str().eq_ignore_ascii_case("active")
-                    && states.contains(NodeStates::DROP_ACTIVE)
+                    && states.contains(PseudoStates::DROP_ACTIVE)
             }
             GtkPseudoClass::Other(_) | GtkPseudoClass::OtherFunctional(..) => false,
         }
