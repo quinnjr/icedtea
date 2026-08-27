@@ -296,6 +296,10 @@ mod tests {
         ComputedStyle::resolve_chain(sheet, &button, &ResolveEnv::default(), &mut MatchCx::new())
     }
 
+    fn button_min_height(sheet: &crate::css::cascade::CompiledSheet) -> f32 {
+        button_style(sheet).min_size((0.0, 0.0)).1
+    }
+
     fn headerbar_min_height(sheet: &crate::css::cascade::CompiledSheet) -> f32 {
         let window = Node::with_classes("window", &["background"]);
         let headerbar = Node::new("headerbar");
@@ -306,7 +310,8 @@ mod tests {
             &ResolveEnv::default(),
             &mut MatchCx::new(),
         )
-        .min_height
+        .min_size((0.0, 0.0))
+        .1
     }
 
     #[test]
@@ -328,11 +333,11 @@ mod tests {
             crate::css::cascade::CompiledSheet::from_stylesheet(load_layered_stylesheet(&env));
         let style = button_style(&sheet);
         assert_eq!(
-            style.border_color,
+            style.border_colors()[0].to_color32(),
             Color(0xFFCD_C7C2),
             "the override replaced the base theme instead of layering onto it"
         );
-        assert_eq!(style.padding, [4.0, 9.0, 4.0, 9.0]);
+        assert_eq!(style.padding(0.0), [4.0, 9.0, 4.0, 9.0]);
         assert_eq!(
             headerbar_min_height(&sheet),
             32.0,
@@ -354,7 +359,7 @@ mod tests {
         let sheet =
             crate::css::cascade::CompiledSheet::from_stylesheet(load_layered_stylesheet(&env));
         assert_eq!(
-            button_style(&sheet).min_height,
+            button_min_height(&sheet),
             41.0,
             "an equally specific override rule must win on source order"
         );
@@ -377,7 +382,7 @@ mod tests {
         };
         let sheet =
             crate::css::cascade::CompiledSheet::from_stylesheet(load_layered_stylesheet(&env));
-        assert_eq!(button_style(&sheet).min_height, 43.0);
+        assert_eq!(button_min_height(&sheet), 43.0);
     }
 
     #[test]
@@ -398,7 +403,7 @@ mod tests {
         );
         let sheet =
             crate::css::cascade::CompiledSheet::from_stylesheet(load_layered_stylesheet(&env));
-        assert_eq!(button_style(&sheet).min_height, 77.0);
+        assert_eq!(button_min_height(&sheet), 77.0);
     }
 
     #[test]
@@ -414,7 +419,7 @@ mod tests {
         };
         let sheet =
             crate::css::cascade::CompiledSheet::from_stylesheet(load_layered_stylesheet(&env));
-        assert_eq!(button_style(&sheet).min_height, 11.0);
+        assert_eq!(button_min_height(&sheet), 11.0);
     }
 
     #[test]
@@ -431,7 +436,7 @@ mod tests {
         };
         let sheet =
             crate::css::cascade::CompiledSheet::from_stylesheet(load_layered_stylesheet(&env));
-        assert_eq!(button_style(&sheet).min_height, 11.0);
+        assert_eq!(button_min_height(&sheet), 11.0);
     }
 
     #[test]
@@ -483,28 +488,27 @@ mod tests {
         let path = tmp.path().join("only.css");
         std::fs::write(&path, "button { min-height: 13px }\n").expect("write");
         let sheet = compile_theme(&ThemeSource::File(path));
-        let style = button_style(&sheet);
-        assert_eq!(style.min_height, 13.0);
-        // Contract deviation 4: `border-color`'s registry initial is
-        // `currentColor`, which resolves to the initial `color` -- opaque
-        // black. M1 had no initial and left it transparent. What the test
-        // means is unchanged: Adwaita's #cdc7c2 is nowhere near it.
-        assert_eq!(
-            style.border_color,
-            Color(0xFF00_0000),
-            "an explicit file must not be layered onto Adwaita"
-        );
+        assert_eq!(button_min_height(&sheet), 13.0);
+        let border = button_style(&sheet).border_colors()[0].to_color32();
+        // M2's initial `border-color` is `currentColor`, which resolves to the
+        // initial `color` -- opaque black. (M1 had no initial and defaulted to
+        // transparent.) What the test is really pinning is that Adwaita's
+        // #cdc7c2 never got layered underneath.
+        assert_eq!(border, Color(0xFF00_0000));
         assert_ne!(
-            style.border_color,
+            border,
             Color(0xFFCD_C7C2),
-            "Adwaita was layered under the explicit file"
+            "an explicit file must not be layered onto Adwaita"
         );
     }
 
     #[test]
     fn the_bundled_source_is_exactly_the_vendored_sheet() {
         let sheet = compile_theme(&ThemeSource::Bundled);
-        assert_eq!(button_style(&sheet).border_color, Color(0xFFCD_C7C2));
+        assert_eq!(
+            button_style(&sheet).border_colors()[0].to_color32(),
+            Color(0xFFCD_C7C2)
+        );
         assert_eq!(sheet.rules.len(), 900);
     }
 }
