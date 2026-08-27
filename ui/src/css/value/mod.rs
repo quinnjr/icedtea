@@ -37,7 +37,7 @@ pub use keyword::{Keyword, Wide};
 pub use length::{Length, LengthCtx, LengthUnit};
 pub use shadow::Shadow;
 pub use text::TextDecorationLines;
-pub use timing::Time;
+pub use timing::{AnimationName, IterationCount, StepPosition, Time, TimingFunction};
 pub use transform::{Decomposed2d, TransformFn};
 
 /// Odd inputs every value family's never-panic battery runs.
