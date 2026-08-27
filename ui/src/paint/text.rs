@@ -9,8 +9,8 @@ use crate::css::computed::ComputedStyle;
 use crate::css::registry::Prop;
 use crate::css::value::{ColorValue, Keyword, LengthCtx, Rgba, Shadow, TextDecorationLines, Value};
 use crate::layout::Rect;
-use crate::paint::blur::{blurred_image, sigma_for_blur_radius};
 use crate::paint::fill_paint;
+use crate::paint::shadow::blit_blurred;
 use crate::text::ShapedText;
 
 /// The rects a `text-decoration-line` set paints, top-first.
@@ -183,20 +183,20 @@ fn paint_text_shadow(
         canvas.draw_text_blob(blob, bx, by, &fill_paint(color));
         return;
     }
-    let sigma = sigma_for_blur_radius(blur);
-    let pad = (sigma * 3.0).ceil().clamp(0.0, 512.0);
-    let w = (text.metrics.width + pad * 2.0).ceil();
-    let h = (text.metrics.ascent + text.metrics.descent + pad * 2.0).ceil();
-    if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 || w > 8192.0 || h > 8192.0 {
-        return;
-    }
-    let ox = (bx - pad).floor();
-    let oy = (by - text.metrics.ascent - pad).floor();
-    if let Some(image) = blurred_image(w as i32, h as i32, sigma, |offscreen| {
-        offscreen.draw_text_blob(blob, bx - ox, by - oy, &fill_paint(color));
-    }) {
-        canvas.draw_image(&image, ox, oy, None);
-    }
+    // The run's ink rect, in the caller's coordinates. `blit_blurred` owns
+    // the offscreen surface budget -- the padding, the sigma cap that keeps
+    // the blur from being cut off at a hard edge, and the dimension ceiling
+    // that is the only defence against `text-shadow: 0 0 99999px` asking
+    // for a gigapixel buffer. Duplicating it here let the two copies drift.
+    let ink = Rect::new(
+        bx,
+        by - text.metrics.ascent,
+        text.metrics.width,
+        text.metrics.ascent + text.metrics.descent,
+    );
+    blit_blurred(canvas, ink, blur, |offscreen, offset, _surface| {
+        offscreen.draw_text_blob(blob, bx - offset.0, by - offset.1, &fill_paint(color));
+    });
 }
 
 #[cfg(test)]

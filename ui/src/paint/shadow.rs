@@ -9,7 +9,7 @@ use skia_rs_safe::canvas::{Canvas, ClipOp};
 
 use crate::css::value::{ColorValue, LengthCtx, Rgba, Shadow};
 use crate::layout::{Allocation, Rect};
-use crate::paint::blur::{blurred_image, sigma_for_blur_radius};
+use crate::paint::blur::{blur_reach, blurred_image, sigma_for_blur_radius, sigma_within_pad};
 use crate::paint::fill_paint;
 use crate::paint::geometry::{inner_radii, rounded_rect_path, rounded_ring_path};
 
@@ -102,18 +102,24 @@ fn paint_outset(
     if shape.is_empty() {
         return;
     }
-    let shape_radii: [[f32; 2]; 4] = std::array::from_fn(|i| {
-        [
-            (radii[i][0] + spread).max(0.0),
-            (radii[i][1] + spread).max(0.0),
-        ]
-    });
+    let shape_radii = spread_radii(radii, spread);
 
-    if blur <= 0.0 {
+    // CSS Backgrounds L3 §7.1.1: an outer shadow is cast "as if the
+    // border-box were opaque", and is *not painted inside the border box*.
+    // Filling the whole shape instead put an opaque core under the element,
+    // which shows through any translucent background.
+    let save = canvas.save();
+    canvas.clip_path(&rounded_rect_path(base, radii), ClipOp::Difference, true);
+    if blur <= 0.0 || blur_reach(sigma_for_blur_radius(blur)) <= 0.0 {
+        // A blur too small for the box approximation to resolve (under
+        // ~1.2px) used to take the offscreen path, where the pre-blur shape
+        // is drawn with anti-aliasing *off* and the blur then no-ops: a
+        // jagged hard edge, strictly worse than no blur at all.
         canvas.draw_path(&rounded_rect_path(shape, &shape_radii), &fill_paint(color));
+        canvas.restore_to_count(save);
         return;
     }
-    blit_blurred(canvas, shape, blur, |offscreen_canvas, offset| {
+    blit_blurred(canvas, shape, blur, |offscreen_canvas, offset, _surface| {
         let local = Rect::new(
             shape.x - offset.0,
             shape.y - offset.1,
@@ -125,6 +131,38 @@ fn paint_outset(
             &hard_fill_paint(color),
         );
     });
+    canvas.restore_to_count(save);
+}
+
+/// The smallest rectangle containing both `a` and `b`.
+///
+/// The "everything outside the hole" shape is one even-odd path, and the
+/// even-odd rule only punches a hole where the outer contour actually
+/// *contains* the inner one; a hole that has been offset or spread clear of
+/// the padding box would otherwise come back filled.
+fn bounding(a: Rect, b: Rect) -> Rect {
+    if b.is_empty() || !(b.x.is_finite() && b.y.is_finite()) {
+        return a;
+    }
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    Rect::new(
+        x,
+        y,
+        a.right().max(b.right()) - x,
+        a.bottom().max(b.bottom()) - y,
+    )
+}
+
+/// Grow every *non-zero* corner radius by `spread`.
+///
+/// CSS Backgrounds L3 §7.1.1: the spread shape's radii are the element's
+/// own, adjusted by the spread -- but "if the border radius is 0, the
+/// corner is not rounded", so a square-cornered box casts a square-cornered
+/// shadow however large the spread is.
+fn spread_radii(radii: &[[f32; 2]; 4], spread: f32) -> [[f32; 2]; 4] {
+    let grow = |r: f32| if r > 0.0 { (r + spread).max(0.0) } else { 0.0 };
+    std::array::from_fn(|i| [grow(radii[i][0]), grow(radii[i][1])])
 }
 
 /// One inset shadow: the ring between the padding box and the shrunken,
@@ -154,12 +192,7 @@ fn paint_inset(
         (outer.width - spread * 2.0).max(0.0),
         (outer.height - spread * 2.0).max(0.0),
     );
-    let hole_radii: [[f32; 2]; 4] = std::array::from_fn(|i| {
-        [
-            (outer_radii[i][0] - spread).max(0.0),
-            (outer_radii[i][1] - spread).max(0.0),
-        ]
-    });
+    let hole_radii = spread_radii(&outer_radii, -spread);
 
     let save = canvas.save();
     canvas.clip_path(
@@ -167,49 +200,79 @@ fn paint_inset(
         ClipOp::Intersect,
         true,
     );
-    if blur <= 0.0 {
-        let ring = rounded_ring_path(outer, &outer_radii, hole, &hole_radii);
-        canvas.draw_path(&ring, &fill_paint(color));
+    // CSS Backgrounds L3 §7.1.1: an inner shadow fills *everything outside*
+    // the offset, spread inner rectangle, clipped to the padding box -- it
+    // is not a ring bounded at the padding box. Bounding it there made
+    // `inset 0 0 4px` (hole == padding box) and Adwaita's
+    // `inset 0 2px 2px -2px` (hole strictly *contains* the padding box)
+    // paint nothing at all, when both are visible edge glows.
+    if blur <= 0.0 || blur_reach(sigma_for_blur_radius(blur)) <= 0.0 {
+        let field = bounding(outer.outset([1.0; 4]), hole.outset([1.0; 4]));
+        let outside = rounded_ring_path(field, &[[0.0, 0.0]; 4], hole, &hole_radii);
+        canvas.draw_path(&outside, &fill_paint(color));
     } else {
-        blit_blurred(canvas, outer, blur, |offscreen_canvas, offset| {
-            let local_outer = Rect::new(
-                outer.x - offset.0,
-                outer.y - offset.1,
-                outer.width,
-                outer.height,
-            );
+        blit_blurred(canvas, outer, blur, |offscreen_canvas, offset, surface| {
             let local_hole = Rect::new(
                 hole.x - offset.0,
                 hole.y - offset.1,
                 hole.width,
                 hole.height,
             );
-            let ring = rounded_ring_path(local_outer, &outer_radii, local_hole, &hole_radii);
-            offscreen_canvas.draw_path(&ring, &hard_fill_paint(color));
+            // The whole offscreen surface, minus the hole: the padded
+            // margin has to be *inked* so the blur reaching in from it is
+            // at full alpha at the padding box's own edge.
+            let field = bounding(surface, local_hole.outset([1.0; 4]));
+            let outside = rounded_ring_path(field, &[[0.0, 0.0]; 4], local_hole, &hole_radii);
+            offscreen_canvas.draw_path(&outside, &hard_fill_paint(color));
         });
     }
     canvas.restore_to_count(save);
 }
 
+/// The most padding an offscreen blur surface is given per side.
+///
+/// Bounds the buffer a single `box-shadow`/`text-shadow` can ask for. The
+/// *sigma*, not the padding, is what gets clamped to fit
+/// (see [`sigma_within_pad`]): padding a surface by less than the blur's
+/// own reach cuts the blur off at a hard rectangular edge, which is exactly
+/// what a large blur must not do.
+pub(crate) const MAX_BLUR_PAD: f32 = 512.0;
+
+/// The largest offscreen blur surface, per axis.
+pub(crate) const MAX_BLUR_SURFACE: f32 = 8192.0;
+
 /// Render `draw` into an offscreen surface padded for `blur`, blur it and
 /// blit it at the right place.
-fn blit_blurred(
+///
+/// `draw` receives the offscreen's origin in the caller's coordinate space
+/// and the offscreen's own rectangle in *offscreen-local* coordinates, so a
+/// shape that has to reach the surface edge (an inset shadow's field) can
+/// be built without re-deriving the padding.
+pub(crate) fn blit_blurred(
     canvas: &mut Canvas<'_>,
     shape: Rect,
     blur: f32,
-    draw: impl FnOnce(&mut Canvas<'_>, (f32, f32)),
+    draw: impl FnOnce(&mut Canvas<'_>, (f32, f32), Rect),
 ) {
-    let sigma = sigma_for_blur_radius(blur);
-    let pad = (sigma * 3.0).ceil().clamp(0.0, 512.0);
+    let sigma = sigma_within_pad(sigma_for_blur_radius(blur), MAX_BLUR_PAD);
+    // The blur's *actual* reach, so a sample outside the padding is exactly
+    // transparent rather than a truncated tail.
+    let pad = blur_reach(sigma).ceil().clamp(0.0, MAX_BLUR_PAD);
     let ox = (shape.x - pad).floor();
     let oy = (shape.y - pad).floor();
     let w = (shape.width + pad * 2.0).ceil();
     let h = (shape.height + pad * 2.0).ceil();
-    if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 || w > 8192.0 || h > 8192.0 {
+    if !(w.is_finite() && h.is_finite())
+        || w <= 0.0
+        || h <= 0.0
+        || w > MAX_BLUR_SURFACE
+        || h > MAX_BLUR_SURFACE
+    {
         return;
     }
+    let local = Rect::new(0.0, 0.0, w, h);
     let Some(image) = blurred_image(w as i32, h as i32, sigma, |offscreen| {
-        draw(offscreen, (ox, oy))
+        draw(offscreen, (ox, oy), local);
     }) else {
         return;
     };
@@ -294,12 +357,120 @@ mod tests {
         // Mutation check: applying the offset to the wrong axis moves the
         // core off (35, 20) and the assertion fails.
         let surface = painted(&[shadow(5.0, 0.0, 0.0, 0.0, false)], false);
-        assert_eq!(pixel(&surface, 35, 20), Color(0xFF00_0000));
+        // The shape spans x 25..45; the border box (x 20..40) is knocked out
+        // of it (F70), so the flat core is sampled in 40..45 rather than at
+        // the old x == 35, which is inside the border box.
+        assert_eq!(pixel(&surface, 42, 20), Color(0xFF00_0000));
         assert_eq!(
             pixel(&surface, 22, 20).alpha(),
             0,
             "left of the offset shadow"
         );
+    }
+
+    #[test]
+    fn an_outset_shadow_is_not_painted_inside_the_border_box() {
+        // F70. CSS Backgrounds L3 §7.1.1: an outer shadow is cast as if the
+        // border box were opaque and is not painted inside it. Painting the
+        // full shape put an opaque core under the element, which shows
+        // through a translucent background.
+        // Mutation check: dropping the Difference clip inks (30, 20).
+        let surface = painted(&[shadow(0.0, 0.0, 0.0, 6.0, false)], false);
+        assert_eq!(
+            pixel(&surface, 30, 20).alpha(),
+            0,
+            "nothing under the border box"
+        );
+        assert_eq!(
+            pixel(&surface, 16, 20),
+            Color(0xFF00_0000),
+            "the spread ring outside it still paints"
+        );
+    }
+
+    #[test]
+    fn spread_leaves_a_square_corner_square() {
+        // F69. `box-shadow: 0 0 0 8px` on border-radius 0 must stay a sharp
+        // ring; adding the spread to a zero radius rounded it.
+        // Mutation check: growing zero radii too leaves (13, 8) clear.
+        let surface = painted(&[shadow(0.0, 0.0, 0.0, 8.0, false)], false);
+        assert_eq!(
+            pixel(&surface, 13, 8),
+            Color(0xFF00_0000),
+            "the spread shape's own top-left corner is square"
+        );
+    }
+
+    #[test]
+    fn an_inset_shadow_with_no_offset_or_spread_still_paints_its_blur() {
+        // F71. The hole equals the padding box here, so the old even-odd
+        // ring was two identical contours and filled nothing at all.
+        // Mutation check: rebuilding the ring bounded at `outer` clears
+        // (21, 20).
+        // blur 4 -> sigma 2 -> box radii [1, 1, 2], reach 4px inward.
+        let surface = painted(&[shadow(0.0, 0.0, 4.0, 0.0, true)], true);
+        assert!(
+            pixel(&surface, 22, 20).alpha() > 0,
+            "the blur reaches 2px in from the padding box's left edge"
+        );
+        assert_eq!(
+            pixel(&surface, 30, 20).alpha(),
+            0,
+            "the centre is 5px from every edge, past a 4px reach"
+        );
+        assert_eq!(pixel(&surface, 5, 5).alpha(), 0, "nothing outside the box");
+    }
+
+    #[test]
+    fn an_inset_shadow_whose_hole_swallows_the_box_still_glows_at_the_edge() {
+        // F71, Adwaita's `inset 0 2px 2px -2px`: the negative spread makes
+        // the hole strictly *contain* the padding box, so the even-odd ring
+        // was empty. Filling outside the hole leaves the blur bleeding in
+        // from the hole's top edge -- the 2px top highlight Adwaita wants.
+        // Adwaita's shape with the blur widened to 4px so the 4px reach is
+        // legible on this 20x10 box: hole == (18, 15, 24, 14) strictly
+        // contains the padding box (20, 15, 20, 10), and its top edge sits
+        // exactly on the box's, so the ink outside it blurs downward in.
+        let surface = painted(&[shadow(0.0, 2.0, 4.0, -2.0, true)], true);
+        assert!(pixel(&surface, 30, 16).alpha() > 0, "the top edge is lit");
+        assert_eq!(
+            pixel(&surface, 30, 23).alpha(),
+            0,
+            "the bottom of the box is not"
+        );
+    }
+
+    #[test]
+    fn a_blur_too_small_for_the_box_passes_is_still_anti_aliased() {
+        // F63. Under ~1.2px of blur `box_radii_for_gauss` returns [0, 0, 0]
+        // and the blur no-ops -- but the pre-blur shape is drawn with
+        // anti-aliasing *off*, so a 1px blur used to render a jagged edge,
+        // strictly worse than blur 0. Mutation check: routing this back
+        // through `blit_blurred` makes the rounded corner hard-stepped.
+        let mut surface = Surface::new_raster_n32_premul(60, 40).expect("raster surface");
+        surface.canvas().clear(Color::TRANSPARENT);
+        {
+            let mut canvas = surface.canvas();
+            paint_box_shadows(
+                &mut canvas,
+                &[shadow(0.0, 0.0, 1.0, 6.0, false)],
+                false,
+                &alloc(),
+                &[[6.0, 6.0]; 4],
+                black(),
+                &ctx(),
+            );
+        }
+        // The spread shape's top-left corner arc: an anti-aliased fill
+        // leaves a partially-covered pixel on the diagonal, a hard fill
+        // never does.
+        let soft = (10..20)
+            .flat_map(|x| (5..15).map(move |y| (x, y)))
+            .any(|(x, y)| {
+                let a = pixel(&surface, x, y).alpha();
+                a > 0 && a < 0xFF
+            });
+        assert!(soft, "a sub-pixel blur radius still anti-aliases the shape");
     }
 
     #[test]

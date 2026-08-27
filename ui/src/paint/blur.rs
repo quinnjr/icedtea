@@ -74,6 +74,50 @@ fn box_radii_for_gauss(sigma: f32) -> [i32; 3] {
     })
 }
 
+/// How far a blur of `sigma` actually reaches, in px.
+///
+/// The three box passes run in sequence, so their reaches *add*: a sample
+/// farther than the sum of the three pass radii from any inked pixel is
+/// exactly transparent. That sum -- not the `3 * sigma` rule of thumb -- is
+/// what an offscreen surface has to be padded by for a blurred shape to
+/// fade to nothing instead of being cut off at a hard rectangular edge.
+#[must_use]
+pub fn blur_reach(sigma: f32) -> f32 {
+    box_radii_for_gauss(sigma).iter().sum::<i32>() as f32
+}
+
+/// The largest `sigma` whose [`blur_reach`] still fits in `pad` px.
+///
+/// A blurred shadow is rendered into an offscreen surface padded by its own
+/// reach; letting `sigma` grow without bound would let a single
+/// `box-shadow: 0 0 99999px` ask for a gigapixel buffer. Clamping the
+/// *sigma* rather than the *padding* degrades gracefully -- the shadow is
+/// slightly less blurred than asked for, but it still fades out -- where
+/// clamping the padding cut the blur off at a visible straight edge.
+#[must_use]
+pub fn sigma_within_pad(sigma: f32, pad: f32) -> f32 {
+    if !sigma.is_finite() || sigma <= 0.0 || !pad.is_finite() || pad <= 0.0 {
+        return 0.0;
+    }
+    let mut capped = sigma;
+    // `blur_reach` is very nearly linear in sigma (each pass's radius is
+    // about sigma), so scaling by the overshoot lands on the cap in one
+    // step from any finite input, `f32::MAX` included; the loop is there
+    // only to absorb the integer rounding inside `box_radii_for_gauss`.
+    for _ in 0..16 {
+        let reach = blur_reach(capped);
+        if reach <= pad {
+            break;
+        }
+        capped *= (pad / reach).clamp(0.05, 0.95);
+    }
+    if blur_reach(capped) > pad {
+        0.0
+    } else {
+        capped
+    }
+}
+
 /// Blur a premultiplied RGBA buffer in place.
 ///
 /// Three box passes per axis, sized by [`box_radii_for_gauss`] rather than
