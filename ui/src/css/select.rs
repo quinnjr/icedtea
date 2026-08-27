@@ -16,11 +16,17 @@ use selectors::bloom::BloomFilter;
 use selectors::context::{
     MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, QuirksMode, SelectorCaches,
 };
-use selectors::matching::{ElementSelectorFlags, MatchingContext, matches_selector_list};
+use selectors::matching::{ElementSelectorFlags, MatchingContext, matches_selector};
 use selectors::parser::{
-    NonTSPseudoClass, ParseRelative, PseudoElement as PseudoElementTrait, SelectorParseErrorKind,
+    AncestorHashes, NonTSPseudoClass, ParseRelative, PseudoElement as PseudoElementTrait, Selector,
+    SelectorParseErrorKind,
 };
 use selectors::{Element, OpaqueElement, SelectorImpl, SelectorList};
+
+use crate::css::node::Node;
+// M1's `CssNode` still uses `select::PseudoStates`, the 7-bool struct below.
+// Part 3 deletes both and this alias goes with them.
+use crate::css::node::PseudoStates as NodeStates;
 
 // `CssString` and `Direction` live with the tree they describe (contract §3);
 // they are re-exported here because every M1 caller reaches them through
@@ -502,34 +508,373 @@ pub fn parse_selector_list(text: &str) -> Option<SelectorList<GtkSelectorImpl>> 
     SelectorList::parse(&GtkSelectorParser, &mut parser, ParseRelative::No).ok()
 }
 
+/// The matching state a whole restyle pass shares.
+///
+/// It carries three things `selectors` wants kept alive across calls:
+/// - `SelectorCaches`, whose `nth_index` memoises `:nth-child()` counts so a wide
+///   sibling list costs O(n) rather than O(n²) across a pass;
+/// - a `BloomFilter` holding the identity hashes of the *ancestors* of the node
+///   being matched, which fast-rejects selectors whose ancestor hashes cannot be
+///   present;
+/// - the tree generation and filter position both were built for, so a stale
+///   cache can never answer for a mutated tree.
+///
+/// [`matches`] and [`matches_with_specificity`] call [`MatchCx::seed_for`]
+/// themselves; a caller walking a tree depth-first can instead drive the filter
+/// with [`MatchCx::push_ancestor`]/[`MatchCx::pop_ancestor`] and pay for each
+/// ancestor once.
+pub struct MatchCx {
+    caches: SelectorCaches,
+    bloom: BloomFilter,
+    /// `(addr of the deepest ancestor in `bloom`, tree generation)`. `0` is the
+    /// address of "no ancestors", i.e. the filter is empty and that is correct.
+    filter_top: Option<(usize, u64)>,
+    /// The tree generation `caches` was built against.
+    generation: Option<u64>,
+    /// How many ancestors are currently inserted.
+    depth: usize,
+}
+
+impl Default for MatchCx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MatchCx {
+    /// An empty context, positioned for nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            caches: SelectorCaches::default(),
+            bloom: BloomFilter::new(),
+            filter_top: None,
+            generation: None,
+            depth: 0,
+        }
+    }
+
+    /// Forget every cache and empty the filter.
+    pub fn reset(&mut self) {
+        self.caches = SelectorCaches::default();
+        self.bloom.clear();
+        self.filter_top = None;
+        self.generation = None;
+        self.depth = 0;
+    }
+
+    /// Position the filter for `node` by walking its ancestors root-first.
+    ///
+    /// A no-op when the filter already holds exactly `node`'s ancestors at
+    /// `node`'s current tree generation, which is the common case when a whole
+    /// stylesheet is matched against one node.
+    pub fn seed_for(&mut self, node: &Node) {
+        let generation = node.generation();
+        if self.generation != Some(generation) {
+            // The tree changed: every memoised nth-index count is now suspect.
+            self.caches = SelectorCaches::default();
+            self.generation = Some(generation);
+            self.filter_top = None;
+        }
+        let wanted = node.parent().map_or(0, |parent| parent.addr());
+        if self.filter_top == Some((wanted, generation)) {
+            return;
+        }
+
+        self.bloom.clear();
+        self.depth = 0;
+        let mut chain: Vec<Node> = node.ancestors().collect();
+        chain.reverse();
+        for ancestor in &chain {
+            self.push_ancestor(ancestor);
+        }
+        self.filter_top = Some((wanted, generation));
+    }
+
+    /// Insert `node`'s identity hashes, making the filter correct for `node`'s
+    /// children.
+    pub fn push_ancestor(&mut self, node: &Node) {
+        node.for_each_identity_hash(|hash| self.bloom.insert_hash(hash));
+        self.depth += 1;
+        self.filter_top = Some((node.addr(), node.generation()));
+    }
+
+    /// Undo one [`MatchCx::push_ancestor`].
+    pub fn pop_ancestor(&mut self, node: &Node) {
+        node.for_each_identity_hash(|hash| self.bloom.remove_hash(hash));
+        self.depth = self.depth.saturating_sub(1);
+        self.filter_top = node
+            .parent()
+            .map(|parent| (parent.addr(), parent.generation()));
+    }
+}
+
+/// The complete `selectors::Element` implementation over the node tree.
+///
+/// Everything `selectors` can ask about a GTK node is answered for real here:
+/// siblings (which drive `+`, `~` and the whole `:nth-*` family), the first
+/// child, emptiness, root-ness, ids, classes, the pseudo-class state, and the
+/// identity hashes the ancestor bloom filter is built from.
+///
+/// The methods below are constant because GTK's node model genuinely has no
+/// such concept — they are not stubs:
+/// * `attr_matches`, `has_attr_in_no_namespace` — GTK nodes have no attributes.
+/// * `has_custom_state` — no `:state()` custom states.
+/// * `imported_part`, `is_part` — no shadow parts.
+/// * `is_html_slot_element`, `assigned_slot`, `parent_node_is_shadow_root`,
+///   `containing_shadow_host` — no shadow DOM.
+/// * `is_html_element_in_html_document` — not HTML.
+/// * `is_link` — `:link`/`:visited` are matched from `PseudoStates`, which GTK
+///   never sets, so link-ness is meaningless here.
+/// * `is_pseudo_element`, `match_pseudo_element`,
+///   `pseudo_element_originating_element` — no pseudo-element boxes (M3+).
+/// * `apply_selector_flags` — M2 restyles whole dirty subtrees, so there is no
+///   invalidation bookkeeping to record.
+impl Element for Node {
+    type Impl = GtkSelectorImpl;
+
+    fn opaque(&self) -> OpaqueElement {
+        // The payload address: stable for the node's lifetime and unique per
+        // node. `OpaqueElement::new` takes `&T`, so the borrow must be of the
+        // payload itself -- passing a raw pointer would take the address of a
+        // temporary instead. Binding the `Rc` keeps the payload alive for the
+        // whole expression.
+        let payload = self.opaque_payload();
+        OpaqueElement::new(&*payload)
+    }
+
+    fn parent_element(&self) -> Option<Self> {
+        self.parent()
+    }
+
+    fn parent_node_is_shadow_root(&self) -> bool {
+        false
+    }
+
+    fn containing_shadow_host(&self) -> Option<Self> {
+        None
+    }
+
+    fn pseudo_element_originating_element(&self) -> Option<Self> {
+        None
+    }
+
+    fn is_pseudo_element(&self) -> bool {
+        false
+    }
+
+    fn prev_sibling_element(&self) -> Option<Self> {
+        let parent = self.parent()?;
+        let index = self.index_in_parent()?;
+        if index == 0 {
+            return None;
+        }
+        parent.child(index - 1)
+    }
+
+    fn next_sibling_element(&self) -> Option<Self> {
+        let parent = self.parent()?;
+        let index = self.index_in_parent()?;
+        parent.child(index + 1)
+    }
+
+    fn first_element_child(&self) -> Option<Self> {
+        self.child(0)
+    }
+
+    fn is_html_element_in_html_document(&self) -> bool {
+        false
+    }
+
+    fn has_local_name(&self, local_name: &str) -> bool {
+        &*self.name() == local_name
+    }
+
+    fn has_namespace(&self, ns: &str) -> bool {
+        ns.is_empty()
+    }
+
+    fn is_same_type(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+
+    fn attr_matches(
+        &self,
+        _ns: &NamespaceConstraint<&CssString>,
+        _local_name: &CssString,
+        _operation: &AttrSelectorOperation<&CssString>,
+    ) -> bool {
+        false
+    }
+
+    fn match_non_ts_pseudo_class(
+        &self,
+        pc: &GtkPseudoClass,
+        _context: &mut MatchingContext<GtkSelectorImpl>,
+    ) -> bool {
+        let states = self.states();
+        match pc {
+            GtkPseudoClass::Hover => states.contains(NodeStates::HOVER),
+            GtkPseudoClass::Active => states.contains(NodeStates::ACTIVE),
+            GtkPseudoClass::Checked => states.contains(NodeStates::CHECKED),
+            GtkPseudoClass::Indeterminate => states.contains(NodeStates::INDETERMINATE),
+            GtkPseudoClass::Disabled => states.contains(NodeStates::DISABLED),
+            GtkPseudoClass::Focus => states.contains(NodeStates::FOCUS),
+            GtkPseudoClass::FocusVisible => states.contains(NodeStates::FOCUS_VISIBLE),
+            GtkPseudoClass::FocusWithin => states.contains(NodeStates::FOCUS_WITHIN),
+            GtkPseudoClass::Backdrop => states.contains(NodeStates::BACKDROP),
+            GtkPseudoClass::Selected => states.contains(NodeStates::SELECTED),
+            // GTK never sets these; the bits exist so the grammar is complete.
+            GtkPseudoClass::Link => states.contains(NodeStates::LINK),
+            GtkPseudoClass::Visited => states.contains(NodeStates::VISITED),
+            GtkPseudoClass::Dir(direction) => self.direction() == *direction,
+            GtkPseudoClass::Drop(argument) => {
+                argument.as_str().eq_ignore_ascii_case("active")
+                    && states.contains(NodeStates::DROP_ACTIVE)
+            }
+            GtkPseudoClass::Other(_) | GtkPseudoClass::OtherFunctional(..) => false,
+        }
+    }
+
+    fn match_pseudo_element(
+        &self,
+        _pe: &GtkPseudoElement,
+        _context: &mut MatchingContext<GtkSelectorImpl>,
+    ) -> bool {
+        false
+    }
+
+    fn apply_selector_flags(&self, _flags: ElementSelectorFlags) {}
+
+    fn is_link(&self) -> bool {
+        false
+    }
+
+    fn is_html_slot_element(&self) -> bool {
+        false
+    }
+
+    fn assigned_slot(&self) -> Option<Self> {
+        None
+    }
+
+    fn has_id(&self, id: &CssString, case_sensitivity: CaseSensitivity) -> bool {
+        self.borrow_id(|own| {
+            own.is_some_and(|own| {
+                case_sensitivity.eq(own.as_str().as_bytes(), id.as_str().as_bytes())
+            })
+        })
+    }
+
+    fn has_class(&self, name: &CssString, case_sensitivity: CaseSensitivity) -> bool {
+        self.borrow_classes(|classes| {
+            classes.iter().any(|class| {
+                case_sensitivity.eq(class.as_str().as_bytes(), name.as_str().as_bytes())
+            })
+        })
+    }
+
+    fn has_custom_state(&self, _name: &CssString) -> bool {
+        false
+    }
+
+    fn imported_part(&self, _name: &CssString) -> Option<CssString> {
+        None
+    }
+
+    fn is_part(&self, _name: &CssString) -> bool {
+        false
+    }
+
+    fn is_empty(&self) -> bool {
+        self.child_count() == 0
+    }
+
+    fn is_root(&self) -> bool {
+        self.parent().is_none()
+    }
+
+    fn add_element_unique_hashes(&self, _filter: &mut BloomFilter) -> bool {
+        // Task 7 fills this in; a `false` here makes the filter a permanent
+        // no-op, which is only correct while nothing seeds it.
+        false
+    }
+}
+
 /// Whether any selector in `list` matches `node`.
 #[must_use]
-pub fn matches(list: &SelectorList<GtkSelectorImpl>, node: &CssNode) -> bool {
-    let mut caches = SelectorCaches::default();
+pub fn matches(list: &SelectorList<GtkSelectorImpl>, node: &Node, cx: &mut MatchCx) -> bool {
+    matches_with_specificity(list, node, cx).is_some()
+}
+
+/// The highest specificity among the selectors in `list` that match `node`, or
+/// `None` when none of them do.
+///
+/// Specificity is per *selector*, not per rule: a prelude like
+/// `notebook > header > tabs > arrow, button` contributes the specificity of
+/// whichever of its selectors actually matched.
+#[must_use]
+pub fn matches_with_specificity(
+    list: &SelectorList<GtkSelectorImpl>,
+    node: &Node,
+    cx: &mut MatchCx,
+) -> Option<u32> {
+    cx.seed_for(node);
+    let MatchCx { caches, bloom, .. } = cx;
     let mut context = MatchingContext::new(
         MatchingMode::Normal,
-        None,
-        &mut caches,
+        Some(&*bloom),
+        caches,
         QuirksMode::NoQuirks,
         NeedsSelectorFlags::No,
         MatchingForInvalidation::No,
     );
-    matches_selector_list(list, node, &mut context)
+    list.slice()
+        .iter()
+        .filter(|selector| {
+            // `matches_selector_list` passes no hashes, so it can never use the
+            // filter; going selector by selector is what turns the bloom filter
+            // on (selectors-0.40.0/matching.rs:287-300).
+            let hashes = AncestorHashes::new(selector, QuirksMode::NoQuirks);
+            matches_selector(selector, 0, Some(&hashes), node, &mut context)
+        })
+        .map(Selector::specificity)
+        .max()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CssNode, PseudoStates, matches, parse_selector_list};
+    use std::cell::RefCell;
 
-    fn window_button(classes: &[&str], states: PseudoStates) -> CssNode {
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        CssNode::new("button", classes, states, Some(window))
+    use super::{MatchCx, matches, matches_with_specificity, parse_selector_list};
+    use crate::css::node::{Direction, Node, PseudoStates};
+
+    thread_local! {
+        /// Fixture roots. A node's parent link is `Weak` — a tree is owned by
+        /// handles to its root — so a helper that hands back a *descendant*
+        /// must park the root somewhere, or the ancestors it returns are freed
+        /// before the assertions run.
+        static FIXTURE_ROOTS: RefCell<Vec<Node>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn hits(selector: &str, node: &CssNode) -> bool {
+    fn keep_alive(root: Node) {
+        FIXTURE_ROOTS.with(|roots| roots.borrow_mut().push(root));
+    }
+
+    fn window_button(classes: &[&str], states: PseudoStates) -> Node {
+        let window = Node::with_classes("window", &["background"]);
+        let button = Node::with_classes("button", classes);
+        window.append_child(&button);
+        button.set_states(states);
+        keep_alive(window);
+        button
+    }
+
+    fn hits(selector: &str, node: &Node) -> bool {
         let list =
             parse_selector_list(selector).unwrap_or_else(|| panic!("`{selector}` failed to parse"));
-        matches(&list, node)
+        let mut cx = MatchCx::new();
+        matches(&list, node, &mut cx)
     }
 
     #[test]
@@ -545,13 +890,7 @@ mod tests {
     #[test]
     fn pseudo_class_state_gates_matching() {
         let plain = window_button(&[], PseudoStates::default());
-        let hovered = window_button(
-            &[],
-            PseudoStates {
-                hover: true,
-                ..PseudoStates::default()
-            },
-        );
+        let hovered = window_button(&[], PseudoStates::HOVER);
         assert!(!hits("button:hover", &plain));
         assert!(hits("button:hover", &hovered));
         assert!(!hits("button:active", &hovered));
@@ -575,13 +914,13 @@ mod tests {
 
     #[test]
     fn unknown_pseudo_classes_parse_but_never_match() {
-        // GTK carries pseudo-classes this milestone does not model. They must
-        // not make the whole rule unparseable (which would silently drop
-        // hundreds of Adwaita rules) and must not match either.
+        // GTK carries pseudo-classes this engine does not model. They must not
+        // make the whole rule unparseable (which would silently drop hundreds of
+        // Adwaita rules) and must not match either.
         let node = window_button(&[], PseudoStates::default());
         assert!(hits("button", &node));
-        assert!(!hits("button:indeterminate", &node));
-        assert!(parse_selector_list("button:indeterminate").is_some());
+        assert!(!hits("button:placeholder-shown", &node));
+        assert!(parse_selector_list("button:placeholder-shown").is_some());
     }
 
     #[test]
@@ -611,18 +950,20 @@ mod tests {
         let base = parse_selector_list("notebook > header > tabs > arrow, button").unwrap();
         assert_eq!(base.slice().len(), 2);
         let node = window_button(&[], PseudoStates::default());
-        assert!(matches(&base, &node));
+        let mut cx = MatchCx::new();
+        assert!(matches(&base, &node, &mut cx));
     }
 
     #[test]
     fn dir_matches_the_nodes_direction() {
         let ltr = window_button(&[], PseudoStates::default());
-        let rtl = ltr.with_direction(super::Direction::Rtl);
+        let rtl = window_button(&[], PseudoStates::default());
+        rtl.set_direction(Some(Direction::Rtl));
         assert!(hits("button:dir(ltr)", &ltr));
         assert!(!hits("button:dir(rtl)", &ltr));
         assert!(hits("button:dir(rtl)", &rtl));
         assert!(!hits("button:dir(ltr)", &rtl));
-        assert_eq!(ltr.direction(), super::Direction::Ltr, "default is ltr");
+        assert_eq!(ltr.direction(), Direction::Ltr, "default is ltr");
         // A bogus argument parses (so the rule survives) but never matches.
         assert!(!hits("button:dir(sideways)", &ltr));
     }
@@ -631,12 +972,21 @@ mod tests {
     fn drop_never_matches_but_keeps_the_rest_of_the_comma_list() {
         // E6: `colorswatch:drop(active), colorswatch` used to fail to parse
         // as a whole, taking the valid `colorswatch` selector with it.
-        let node = CssNode::new("colorswatch", &[], PseudoStates::default(), None);
+        let node = Node::new("colorswatch");
         let list = parse_selector_list("colorswatch:drop(active), colorswatch")
             .expect("the comma list must parse");
         assert_eq!(list.slice().len(), 2);
-        assert!(matches(&list, &node));
+        let mut cx = MatchCx::new();
+        assert!(matches(&list, &node, &mut cx));
         assert!(!hits("colorswatch:drop(active)", &node));
+
+        // New in M2: the node tree can actually carry the drop state.
+        node.set_state(PseudoStates::DROP_ACTIVE, true);
+        assert!(hits("colorswatch:drop(active)", &node));
+        assert!(
+            !hits("colorswatch:drop(highlight)", &node),
+            "only `active` is modelled"
+        );
     }
 
     #[test]
@@ -645,6 +995,204 @@ mod tests {
         assert!(parse_selector_list("button:lang(en), button").is_some());
         assert!(!hits("button:lang(en)", &node));
         assert!(hits("button", &node));
+    }
+
+    // ---- new in M2: the tree-structural constructs M1 could not express ----
+
+    fn linked_box(count: usize) -> Node {
+        let box_node = Node::with_classes("box", &["linked"]);
+        for _ in 0..count {
+            box_node.append_child(&Node::new("button"));
+        }
+        box_node
+    }
+
+    #[test]
+    fn first_last_and_only_child_read_the_real_sibling_list() {
+        let three = linked_box(3);
+        let first = three.child(0).expect("first");
+        let middle = three.child(1).expect("middle");
+        let last = three.child(2).expect("last");
+
+        assert!(hits("button:first-child", &first));
+        assert!(!hits("button:first-child", &middle));
+        assert!(!hits("button:first-child", &last));
+        assert!(hits("button:last-child", &last));
+        assert!(!hits("button:last-child", &middle));
+        assert!(hits("button:not(:first-child)", &middle));
+        assert!(!hits("button:only-child", &first));
+
+        let alone = linked_box(1);
+        let only = alone.child(0).expect("only");
+        assert!(hits("button:only-child", &only));
+        assert!(hits("button:first-child", &only));
+        assert!(hits("button:last-child", &only));
+        assert!(!hits("button:not(:first-child)", &only));
+    }
+
+    #[test]
+    fn nth_child_counts_from_both_ends() {
+        let five = linked_box(5);
+        let nodes: Vec<Node> = five.children();
+        assert!(hits("button:nth-child(2)", &nodes[1]));
+        assert!(!hits("button:nth-child(2)", &nodes[2]));
+        assert!(hits("button:nth-child(odd)", &nodes[0]));
+        assert!(hits("button:nth-child(odd)", &nodes[2]));
+        assert!(hits("button:nth-child(2n)", &nodes[1]));
+        assert!(hits("button:nth-child(2n + 1)", &nodes[4]));
+        assert!(hits("button:nth-last-child(1)", &nodes[4]));
+        assert!(hits("button:nth-last-child(2)", &nodes[3]));
+        assert!(!hits("button:nth-last-child(2)", &nodes[4]));
+    }
+
+    #[test]
+    fn adjacent_and_general_sibling_combinators_match() {
+        let box_node = Node::new("box");
+        let entry = Node::new("entry");
+        let button = Node::new("button");
+        let label = Node::new("label");
+        box_node.append_child(&entry);
+        box_node.append_child(&button);
+        box_node.append_child(&label);
+
+        assert!(hits("entry + button", &button));
+        assert!(!hits("entry + label", &label), "+ is strictly adjacent");
+        assert!(hits("entry ~ label", &label));
+        assert!(hits("entry ~ button", &button));
+        assert!(!hits("label ~ entry", &entry), "~ looks backwards only");
+    }
+
+    #[test]
+    fn root_empty_and_id_selectors_match_the_tree() {
+        let window = Node::new("window");
+        let swatch = Node::new("colorswatch");
+        swatch.set_id(Some("add-color-button"));
+        window.append_child(&swatch);
+
+        assert!(hits(":root", &window));
+        assert!(!hits(":root", &swatch));
+        assert!(hits("colorswatch#add-color-button", &swatch));
+        assert!(!hits("colorswatch#other", &swatch));
+        assert!(hits("#add-color-button:only-child", &swatch));
+        assert!(hits("colorswatch:empty", &swatch), "no children == :empty");
+        assert!(!hits("window:empty", &window));
+    }
+
+    #[test]
+    fn focus_within_matches_the_ancestors_of_the_focused_node() {
+        let window = Node::new("window");
+        let box_node = Node::new("box");
+        let entry = Node::new("entry");
+        window.append_child(&box_node);
+        box_node.append_child(&entry);
+
+        assert!(!hits("window:focus-within", &window));
+        entry.set_state(PseudoStates::FOCUS, true);
+        assert!(hits("window:focus-within", &window));
+        assert!(hits("box:focus-within", &box_node));
+        assert!(hits("entry:focus", &entry));
+        assert!(
+            !hits("window:focus", &window),
+            ":focus itself does not propagate"
+        );
+    }
+
+    #[test]
+    fn matching_follows_the_tree_after_it_is_restructured() {
+        // The nth-index cache inside `MatchCx` is per pass, not per tree: a
+        // context reused across a mutation must not answer from stale counts.
+        let box_node = linked_box(2);
+        let first = box_node.child(0).expect("first");
+        let second = box_node.child(1).expect("second");
+        let list = parse_selector_list("button:last-child").expect("parses");
+        let mut cx = MatchCx::new();
+
+        assert!(!matches(&list, &first, &mut cx));
+        assert!(matches(&list, &second, &mut cx));
+
+        box_node.remove_child(&second);
+        assert!(
+            matches(&list, &first, &mut cx),
+            "the surviving child is now the last one"
+        );
+    }
+
+    #[test]
+    fn matches_with_specificity_returns_the_best_matching_selector() {
+        let node = window_button(&["suggested-action"], PseudoStates::HOVER);
+        let mut cx = MatchCx::new();
+
+        let list =
+            parse_selector_list("button, window > button.suggested-action:hover").expect("parses");
+        let best = matches_with_specificity(&list, &node, &mut cx).expect("the list matches");
+        let plain = parse_selector_list("button").expect("parses");
+        let plain_specificity =
+            matches_with_specificity(&plain, &node, &mut cx).expect("`button` matches");
+        assert!(
+            best > plain_specificity,
+            "the most specific matching selector wins, not the first"
+        );
+
+        let miss = parse_selector_list("entry, headerbar").expect("parses");
+        assert_eq!(matches_with_specificity(&miss, &node, &mut cx), None);
+    }
+
+    #[test]
+    fn nth_child_of_a_selector_list_is_not_enabled() {
+        // GTK CSS has no `:nth-child(An+B of S)`; `GtkSelectorParser` keeps
+        // `parse_nth_child_of`'s `false` default, so the form is rejected.
+        assert!(parse_selector_list("button:nth-child(2n of .flat)").is_none());
+        assert!(parse_selector_list("button:nth-child(2n)").is_some());
+    }
+
+    #[test]
+    fn selector_parsing_never_panics_on_odd_input() {
+        // Theme files are third-party text; a panic here takes the compositor
+        // down. Every one of these must return Some or None, never unwind.
+        for text in [
+            "",
+            " ",
+            ",",
+            "button,",
+            ",button",
+            "button >",
+            "> button",
+            "button ~~ label",
+            "button::",
+            "button::selection::selection",
+            "button:",
+            "button:()",
+            "button:dir()",
+            "button:dir(",
+            "button:drop()",
+            "button:nth-child()",
+            "button:nth-child(+)",
+            "button:nth-child(2n+)",
+            "button:not()",
+            "button:not(:not(:not(button)))",
+            "#",
+            ".",
+            "#.",
+            "[",
+            "[attr=]",
+            "button[",
+            "\u{0}",
+            "🙂",
+            "button/*unterminated",
+            "button{",
+            "*|*",
+            "|button",
+            "button:is(,)",
+            "button:where()",
+            &"button ".repeat(200),
+            &":not(".repeat(50),
+        ] {
+            let _ = parse_selector_list(text);
+        }
+        assert!(
+            parse_selector_list("button").is_some(),
+            "the parser still works"
+        );
     }
 
     #[test]

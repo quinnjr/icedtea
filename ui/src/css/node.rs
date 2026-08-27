@@ -181,7 +181,7 @@ impl PseudoStates {
 // later. `-D warnings`'s `dead_code` lint would otherwise fail this task's
 // gate for fields no Task 1 method reads yet.
 #[allow(dead_code)]
-struct NodeInner {
+pub(crate) struct NodeInner {
     /// Element name, interned for hashing and comparison.
     name: CssString,
     /// The same text as a cheap-to-clone handle, for [`Node::name`].
@@ -405,35 +405,31 @@ impl Node {
     }
 
     /// The node's payload address — a stable per-node identity for caches.
-    ///
-    /// Unused until Task 3 (`RuleBuckets`/`MatchCx` cache keys); kept here
-    /// because it is part of this task's frozen `Produces` interface.
-    #[allow(dead_code)]
     pub(crate) fn addr(&self) -> usize {
         Rc::as_ptr(&self.0) as usize
     }
 
-    /// Borrow the id without cloning it.
+    /// The payload behind this handle, for `selectors`' identity comparisons.
     ///
-    /// Unused until Task 2/3's matching code; kept here because it is part
-    /// of this task's frozen `Produces` interface.
-    #[allow(dead_code)]
+    /// The `NodeInner` allocation's address is identical for every handle to
+    /// the node and stable while any handle lives, which is the whole of
+    /// `OpaqueElement`'s contract.
+    pub(crate) fn opaque_payload(&self) -> Rc<NodeInner> {
+        Rc::clone(&self.0)
+    }
+
+    /// Borrow the id without cloning it.
     pub(crate) fn borrow_id<R>(&self, f: impl FnOnce(Option<&CssString>) -> R) -> R {
         f(self.0.id.borrow().as_ref())
     }
 
     /// Borrow the class list without cloning it.
-    ///
-    /// Unused until Task 2/3's matching code; kept here because it is part
-    /// of this task's frozen `Produces` interface.
-    #[allow(dead_code)]
     pub(crate) fn borrow_classes<R>(&self, f: impl FnOnce(&[CssString]) -> R) -> R {
         f(&self.0.classes.borrow())
     }
 
     /// Feed every identity hash (name, id, each class) to `f`, pre-masked for
     /// `selectors`' bloom filter, whose queries mask with `BLOOM_HASH_MASK`.
-    #[allow(dead_code)]
     pub(crate) fn for_each_identity_hash(&self, mut f: impl FnMut(u32)) {
         f(self.0.name.precomputed_hash() & BLOOM_HASH_MASK);
         if let Some(id) = self.0.id.borrow().as_ref() {
