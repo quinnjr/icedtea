@@ -18,6 +18,7 @@ pub mod filter;
 pub mod font;
 pub mod image;
 pub mod interpolate;
+pub mod keyframes;
 pub mod keyword;
 pub mod length;
 pub mod shadow;
@@ -35,6 +36,7 @@ pub use font::{
     VariationSetting,
 };
 pub use image::{Gradient, IconRef, Image, Position};
+pub use keyframes::{Keyframe, Keyframes};
 pub use keyword::{Keyword, Wide};
 pub use length::{Length, LengthCtx, LengthUnit};
 pub use shadow::Shadow;
