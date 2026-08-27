@@ -10,9 +10,12 @@
 //! `background-image`, either GTK's `image(<color>)` flat-fill extension or
 //! a two-stop `linear-gradient(to top, ...)`.
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use skia_rs_safe::core::Color;
+
+use crate::anim::{AnimationSpec, Overrides, TransitionSpec};
 
 use super::cascade::{CascadedValues, CompiledSheet, cascade};
 use super::node::Node;
@@ -1340,6 +1343,107 @@ impl ComputedStyle {
     }
 }
 
+impl ComputedStyle {
+    /// The `transition-*` longhands, flattened into one spec per entry of
+    /// `transition-property`. An entry naming an unknown property, and
+    /// `transition-property: none`, contribute nothing.
+    #[must_use]
+    pub fn transition_specs(&self) -> Vec<TransitionSpec> {
+        let properties = comma_list(self.raw(Prop::TransitionProperty));
+        let durations = comma_list(self.raw(Prop::TransitionDuration));
+        let timings = comma_list(self.raw(Prop::TransitionTimingFunction));
+        let delays = comma_list(self.raw(Prop::TransitionDelay));
+
+        let mut specs = Vec::with_capacity(properties.len());
+        for (index, property) in properties.iter().enumerate() {
+            let (prop, all) = match property {
+                Value::Keyword(Keyword::All) => (None, true),
+                Value::Keyword(Keyword::None) => continue,
+                Value::AnimationName(AnimationName::Named(name)) => match registry::lookup(name) {
+                    Some(prop) if prop.is_longhand() => (Some(prop), false),
+                    _ => {
+                        tracing::debug!(%name, "transition-property names no longhand");
+                        continue;
+                    }
+                },
+                _ => continue,
+            };
+            specs.push(TransitionSpec {
+                prop,
+                all,
+                duration: time_at(&durations, index),
+                delay: time_at(&delays, index),
+                timing: timing_at(&timings, index),
+            });
+        }
+        specs
+    }
+
+    /// The `animation-*` longhands, flattened into one spec per entry of
+    /// `animation-name`. `animation-name: none` contributes nothing.
+    #[must_use]
+    pub fn animation_specs(&self) -> Vec<AnimationSpec> {
+        let names = comma_list(self.raw(Prop::AnimationName));
+        let durations = comma_list(self.raw(Prop::AnimationDuration));
+        let timings = comma_list(self.raw(Prop::AnimationTimingFunction));
+        let delays = comma_list(self.raw(Prop::AnimationDelay));
+        let iterations = comma_list(self.raw(Prop::AnimationIterationCount));
+        let directions = comma_list(self.raw(Prop::AnimationDirection));
+        let fills = comma_list(self.raw(Prop::AnimationFillMode));
+        let states = comma_list(self.raw(Prop::AnimationPlayState));
+
+        let mut specs = Vec::with_capacity(names.len());
+        for (index, name) in names.iter().enumerate() {
+            let Value::AnimationName(AnimationName::Named(name)) = name else {
+                continue;
+            };
+            specs.push(AnimationSpec {
+                name: AnimationName::Named(Rc::clone(name)),
+                duration: time_at(&durations, index),
+                delay: time_at(&delays, index),
+                timing: timing_at(&timings, index),
+                iterations: match cycle(&iterations, index) {
+                    Some(value) => IterationCount::from_value(value),
+                    None => IterationCount::Count(1.0),
+                },
+                direction: keyword_or(cycle(&directions, index), Keyword::Normal),
+                fill: keyword_or(cycle(&fills, index), Keyword::None),
+                play_state: keyword_or(cycle(&states, index), Keyword::Running),
+            });
+        }
+        specs
+    }
+
+    /// This style with `overrides` layered on top. Borrowed unchanged when
+    /// `overrides` is empty -- the common case, every frame nothing animates.
+    #[must_use]
+    pub fn with_overrides<'a>(&'a self, overrides: &Overrides) -> Cow<'a, ComputedStyle> {
+        if overrides.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        let mut style = self.clone();
+        for (prop, value) in overrides.iter() {
+            style.values[prop.slot()] = value.clone();
+        }
+        style.derive_m1_view();
+        Cow::Owned(style)
+    }
+}
+
+fn time_at(list: &[&Value], index: usize) -> Time {
+    match cycle(list, index) {
+        Some(value) => Time::from_value(value),
+        None => Time(0.0),
+    }
+}
+
+fn timing_at(list: &[&Value], index: usize) -> TimingFunction {
+    match cycle(list, index) {
+        Some(value) => TimingFunction::from_value(value),
+        None => TimingFunction::EASE,
+    }
+}
+
 /// A comma-multiplied value as a slice of its entries. A non-list value is one
 /// entry; `none` is still one entry, and the caller decides what that means.
 fn comma_list(value: &Value) -> Vec<&Value> {
@@ -1372,8 +1476,10 @@ mod tests {
     use crate::css::node::{Node, PseudoStates};
     use crate::css::registry::Prop;
     use crate::css::select::MatchCx;
-    use crate::css::value::color::Rgba;
-    use crate::css::value::{Image, Keyword, Length, Value};
+    use crate::css::value::color::{ColorValue, Rgba};
+    use crate::css::value::{
+        AnimationName, Image, IterationCount, Keyword, Length, Time, TimingFunction, Value,
+    };
     use skia_rs_safe::core::Color;
 
     fn adwaita() -> CompiledSheet {
@@ -2239,5 +2345,104 @@ mod tests {
             adwaita_shadows[0].color,
             Some(crate::css::value::color::ColorValue::Absolute(_))
         ));
+    }
+
+    #[test]
+    fn adwaitas_button_transition_flattens_to_one_spec() {
+        // Adwaita animates buttons with a plain `transition: <time>`; the
+        // property defaults to `all`.
+        let sheet = CompiledSheet::compile("button { transition: 200ms ease-out 50ms }");
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        let specs = style.transition_specs();
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].all);
+        assert_eq!(specs[0].prop, None);
+        assert_eq!(specs[0].duration, Time::from_ms(200.0));
+        assert_eq!(specs[0].delay, Time::from_ms(50.0));
+        assert_eq!(specs[0].timing, TimingFunction::EASE_OUT);
+    }
+
+    #[test]
+    fn named_transition_properties_resolve_through_the_registry() {
+        let sheet = CompiledSheet::compile(
+            "button { transition-property: background-color, nosuch-property, color; \
+             transition-duration: 100ms, 200ms }",
+        );
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        let specs = style.transition_specs();
+        assert_eq!(
+            specs.iter().map(|spec| spec.prop).collect::<Vec<_>>(),
+            vec![Some(Prop::BackgroundColor), Some(Prop::Color)],
+            "an unknown property name contributes no spec"
+        );
+        // Durations cycle, and the dropped entry does not shift the pairing:
+        // `color` is the third property, so it takes the first duration again.
+        assert_eq!(specs[0].duration, Time::from_ms(100.0));
+        assert_eq!(specs[1].duration, Time::from_ms(100.0));
+        assert!(
+            resolve(
+                &CompiledSheet::compile("button { transition-property: none }"),
+                &button(&[], PseudoStates::default())
+            )
+            .transition_specs()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn animation_specs_carry_every_animation_longhand() {
+        let sheet = CompiledSheet::compile(
+            "button { animation: pulse 2s linear 1s infinite alternate both paused }",
+        );
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        let specs = style.animation_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].name,
+            AnimationName::Named(std::rc::Rc::from("pulse"))
+        );
+        assert_eq!(specs[0].duration, Time(2.0));
+        assert_eq!(specs[0].delay, Time(1.0));
+        assert_eq!(specs[0].timing, TimingFunction::Linear);
+        assert_eq!(specs[0].iterations, IterationCount::Infinite);
+        assert_eq!(specs[0].direction, Keyword::Alternate);
+        assert_eq!(specs[0].fill, Keyword::Both);
+        assert_eq!(specs[0].play_state, Keyword::Paused);
+        assert!(
+            resolve(&adwaita(), &button(&[], PseudoStates::default()))
+                .animation_specs()
+                .is_empty(),
+            "`animation-name: none` produces no spec"
+        );
+    }
+
+    #[test]
+    fn overrides_layer_over_the_computed_style_without_cloning_when_empty() {
+        use crate::anim::Overrides;
+        let style = resolve(&adwaita(), &button(&[], PseudoStates::default()));
+        let empty = Overrides::default();
+        let borrowed = style.with_overrides(&empty);
+        assert!(matches!(borrowed, std::borrow::Cow::Borrowed(_)));
+
+        let mut overrides = Overrides::default();
+        overrides.set(
+            Prop::Color,
+            Value::Color(ColorValue::Absolute(Rgba::from_color32(Color(0xFF00_FF00)))),
+        );
+        // A later `set` of the same property wins: animation over transition.
+        overrides.set(
+            Prop::Color,
+            Value::Color(ColorValue::Absolute(Rgba::from_color32(Color(0xFF00_00FF)))),
+        );
+        let animated = style.with_overrides(&overrides);
+        assert!(matches!(animated, std::borrow::Cow::Owned(_)));
+        assert_eq!(animated.color().to_color32(), Color(0xFF00_00FF));
+        assert_eq!(
+            style.color().to_color32(),
+            Color(0xFF2E_3436),
+            "the base style must not be mutated"
+        );
+        assert_eq!(overrides.iter().count(), 1);
+        assert!(overrides.get(Prop::Opacity).is_none());
     }
 }
