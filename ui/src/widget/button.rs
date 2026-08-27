@@ -9,12 +9,10 @@ use crate::anim::{AnimationState, Clock, MonotonicClock, Overrides};
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::{ComputedStyle, ResolveEnv};
 use crate::css::node::{Node, PseudoStates};
-use crate::css::registry::Prop;
 use crate::css::select::MatchCx;
-use crate::css::value::{FontFamily, FontStyle};
 use crate::layout::{Allocation, BoxDirection, Container, LayoutTree, Measure};
 use crate::paint::{ImageCache, PaintCx, paint_node};
-use crate::text::{FontDatabase, FontQuery, ShapeKey, ShapedText};
+use crate::text::{FontDatabase, ShapedText, TextMetrics, TextStyle};
 
 /// A themed button: a `button` node with a `label` child.
 pub struct Button {
@@ -32,6 +30,12 @@ pub struct Button {
     allocation: Allocation,
     label_allocation: Allocation,
     shaped: Option<Rc<ShapedText>>,
+    /// The label's computed text properties: what `match_face` and `shape`
+    /// were last asked for.
+    text: TextStyle,
+    /// The label's used `line-height` in px, from `text` and the shaped run's
+    /// metrics.
+    line_height: f32,
     layout: LayoutTree,
     images: ImageCache,
     env: ResolveEnv,
@@ -51,6 +55,9 @@ pub struct Button {
 /// Reports the shaped label's extents for the `label` leaf.
 struct LabelMeasure<'a> {
     shaped: Option<&'a Rc<ShapedText>>,
+    /// The used `line-height` in px -- the face's own only when `line-height`
+    /// is `normal`.
+    line_height: f32,
 }
 
 impl Measure for LabelMeasure<'_> {
@@ -64,7 +71,7 @@ impl Measure for LabelMeasure<'_> {
         match (&*node.name(), self.shaped) {
             ("label", Some(shaped)) => taffy::Size {
                 width: shaped.metrics.width,
-                height: shaped.metrics.line_height,
+                height: self.line_height,
             },
             _ => taffy::Size::ZERO,
         }
@@ -96,6 +103,8 @@ impl Button {
             allocation: empty,
             label_allocation: empty,
             shaped: None,
+            text: TextStyle::from_computed(&ComputedStyle::initial(&env)),
+            line_height: 0.0,
             layout: LayoutTree::new(),
             images: ImageCache::new(),
             env,
@@ -109,29 +118,44 @@ impl Button {
     /// Recascade, reshape and relayout.
     pub fn restyle(&mut self, sheet: &CompiledSheet, fonts: &mut FontDatabase) {
         let mut cx = MatchCx::new();
-        let computed = ComputedStyle::resolve_chain(sheet, &self.node, &self.env, &mut cx);
+        let mut computed = ComputedStyle::resolve_chain(sheet, &self.node, &self.env, &mut cx);
         self.label_style =
             ComputedStyle::resolve_chain(sheet, &self.label_node, &self.env, &mut cx);
+        self.text = TextStyle::from_computed(&self.label_style);
+        let mut face = fonts.match_face(&self.text.query());
 
-        let families: Rc<[FontFamily]> = self.label_style.get(Prop::FontFamily);
-        let face = fonts.match_face(&FontQuery {
-            families: &families,
-            weight: self.label_style.get(Prop::FontWeight),
-            style: FontStyle::Normal,
-            stretch: 100.0,
-            size_px: self.label_style.font_size_px(),
-        });
-        self.shaped = face.map(|face| {
-            fonts.shape(&ShapeKey {
-                text: &self.label,
-                face: &face,
-                size_px: self.label_style.font_size_px(),
-                letter_spacing_px: self.label_style.get(Prop::LetterSpacing),
-                features: &[],
-                variations: &[],
-                transform: self.label_style.get(Prop::TextTransform),
-            })
-        });
+        // `ex` resolves against the *matched* face's x-height, which is not
+        // known until the face is matched -- so a face whose ratio differs
+        // from the one this chain just resolved against costs one re-resolve.
+        // The ratio is remembered in `env`, so the next restyle re-resolves
+        // only if the face changed.
+        if let Some(matched) = face.as_ref() {
+            let ratio = fonts.ex_ratio(matched);
+            if ratio.is_finite() && ratio > 0.0 && (ratio - self.env.ex_ratio).abs() > 1e-6 {
+                self.env.ex_ratio = ratio;
+                computed = ComputedStyle::resolve_chain(sheet, &self.node, &self.env, &mut cx);
+                self.label_style =
+                    ComputedStyle::resolve_chain(sheet, &self.label_node, &self.env, &mut cx);
+                self.text = TextStyle::from_computed(&self.label_style);
+                face = fonts.match_face(&self.text.query());
+            }
+        }
+
+        self.shaped = face
+            .as_ref()
+            .map(|face| fonts.shape(&self.text.shape_key(&self.label, face)));
+        // With no face there is nothing to measure, so `normal` is 0 -- but a
+        // numeric or length `line-height` still gives the leaf a height.
+        let metrics = self.shaped.as_ref().map_or(
+            TextMetrics {
+                width: 0.0,
+                ascent: 0.0,
+                descent: 0.0,
+                line_height: 0.0,
+            },
+            |shaped| shaped.metrics,
+        );
+        self.line_height = self.text.line_height_px(&metrics);
 
         let previous = if self.styled {
             Some(std::mem::replace(&mut self.style, computed))
@@ -168,6 +192,7 @@ impl Button {
         );
         let mut measure = LabelMeasure {
             shaped: self.shaped.as_ref(),
+            line_height: self.line_height,
         };
         if self
             .layout
@@ -344,6 +369,8 @@ fn translated(alloc: Allocation, origin: (f32, f32)) -> Allocation {
 mod tests {
     use super::*;
     use crate::anim::{Clock, ManualClock};
+    use crate::css::registry::Prop;
+    use crate::css::value::FontStyle;
     use crate::css::value::Value;
     use std::rc::Rc;
 
@@ -362,6 +389,72 @@ mod tests {
     /// `pixel` test helper.
     fn pixel(surface: &Surface, x: i32, y: i32) -> skia_rs_safe::core::Color {
         surface.pixel_buffer().get_pixel(x, y).expect("pixel")
+    }
+
+    // Mutation check: hardcode `style: FontStyle::Normal, stretch: 100.0,
+    // features: &[], variations: &[]` back into `restyle`'s query/shape key
+    // (P6's pre-bridge state) and all four assertions fail.
+    #[test]
+    fn the_labels_font_style_width_and_settings_reach_the_font_stack() {
+        let (_, _, button) = fixture(
+            "label { font-style: italic; font-width: condensed; \
+             font-feature-settings: \"liga\" 0; font-variation-settings: \"wght\" 700 }",
+            "Click me",
+        );
+        assert_eq!(button.text.style, FontStyle::Italic);
+        assert!(
+            button.text.stretch < 100.0,
+            "condensed narrows the query: {}",
+            button.text.stretch
+        );
+        assert_eq!(button.text.features.len(), 1, "font-feature-settings kept");
+        assert_eq!(
+            button.text.variations.len(),
+            1,
+            "font-variation-settings kept"
+        );
+    }
+
+    // Mutation check: measure the label with `shaped.metrics.line_height`
+    // again and the 60px box collapses back to the face's own line height.
+    #[test]
+    fn line_height_sets_the_labels_measured_height() {
+        let (_, _, normal) = fixture("label { font-size: 20px }", "Click me");
+        let (_, _, tall) = fixture("label { font-size: 20px; line-height: 3 }", "Click me");
+        assert!((tall.line_height - 60.0).abs() < 1e-3, "3 x 20px");
+        assert!(normal.line_height < 60.0, "`normal` is the face's own");
+        let height = |b: &Button| b.label_allocation.border_box.height;
+        assert!(
+            (height(&tall) - 60.0).abs() < 1e-3,
+            "the leaf is measured at the used line-height: {}",
+            height(&tall)
+        );
+        assert!(height(&normal) < height(&tall));
+    }
+
+    // Mutation check: drop the `self.env.ex_ratio = ratio` re-resolve from
+    // `restyle` and `1ex` stays pinned at the 0.5 default.
+    #[test]
+    fn ex_units_resolve_against_the_matched_faces_x_height() {
+        let (_, mut fonts, button) =
+            fixture("label { font-size: 20px; letter-spacing: 1ex }", "Click me");
+        let face = fonts
+            .match_face(&button.text.query())
+            .expect("no system font found; install dejavu/liberation/noto sans");
+        let ratio = fonts.ex_ratio(&face);
+        assert!(
+            (0.1..0.9).contains(&ratio) && (ratio - 0.5).abs() > 1e-6,
+            "a plausible x-height ratio: {ratio}"
+        );
+        assert!(
+            (button.env.ex_ratio - ratio).abs() < 1e-6,
+            "fed back into env"
+        );
+        assert!(
+            (button.text.letter_spacing_px - 20.0 * ratio).abs() < 1e-3,
+            "1ex is the face's x-height: {}",
+            button.text.letter_spacing_px
+        );
     }
 
     const FADE_BUTTON: &str = "\

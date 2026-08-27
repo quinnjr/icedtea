@@ -33,6 +33,11 @@ pub struct ResolveEnv {
     /// The initial `font-size`, which is what `rem` resolves against in GTK --
     /// not the root node's computed size, as CSS would have it.
     pub root_font_size: f32,
+    /// x-height / em for the face the styled element ends up using: the basis
+    /// the `ex` unit resolves against. A widget that has matched a face feeds
+    /// [`crate::text::FontDatabase::ex_ratio`] back in here; until then it is
+    /// [`EX_RATIO`], the CSS-recommended default.
+    pub ex_ratio: f32,
 }
 
 impl Default for ResolveEnv {
@@ -40,6 +45,7 @@ impl Default for ResolveEnv {
         Self {
             dpi: 96.0,
             root_font_size: ComputedStyle::DEFAULT_FONT_SIZE,
+            ex_ratio: EX_RATIO,
         }
     }
 }
@@ -55,9 +61,10 @@ pub trait FromValue: Sized {
     fn from_value(value: &Value) -> Self;
 }
 
-/// The x-height/em ratio used before a face is resolved. The real ratio comes
-/// from the matched face (P6); `ex` appears in no GTK theme this crate ships.
-const EX_RATIO: f32 = 0.5;
+/// The x-height/em ratio used before a face is resolved -- CSS's recommended
+/// default. The real ratio comes from the matched face, through
+/// [`ResolveEnv::ex_ratio`]; `ex` appears in no GTK theme this crate ships.
+pub const EX_RATIO: f32 = 0.5;
 
 /// Every longhand's computed value, indexed by `Prop::slot()`.
 ///
@@ -143,7 +150,7 @@ impl ComputedStyle {
         LengthCtx {
             font_size_px: self.font_size_px(),
             root_font_size_px: env.root_font_size,
-            ex_ratio: EX_RATIO,
+            ex_ratio: env.ex_ratio,
             dpi: self.dpi(),
             percent_basis,
         }
@@ -551,7 +558,7 @@ impl ComputedStyle {
         let seed_ctx = LengthCtx {
             font_size_px: parent_font_size,
             root_font_size_px: env.root_font_size,
-            ex_ratio: EX_RATIO,
+            ex_ratio: env.ex_ratio,
             dpi: env.dpi,
             percent_basis: None,
         };
@@ -571,7 +578,7 @@ impl ComputedStyle {
         let font_ctx = LengthCtx {
             font_size_px: parent_font_size,
             root_font_size_px: env.root_font_size,
-            ex_ratio: EX_RATIO,
+            ex_ratio: env.ex_ratio,
             dpi,
             percent_basis: Some(parent_font_size),
         };
@@ -594,7 +601,7 @@ impl ComputedStyle {
         let length_ctx = LengthCtx {
             font_size_px: font_size,
             root_font_size_px: env.root_font_size,
-            ex_ratio: EX_RATIO,
+            ex_ratio: env.ex_ratio,
             dpi,
             percent_basis: None,
         };
@@ -1218,6 +1225,30 @@ mod tests {
     }
 
     #[test]
+    fn ex_lengths_resolve_against_the_environments_x_height_ratio() {
+        // Mutation check: put `EX_RATIO` back in `resolve`'s length contexts
+        // and both assertions collapse onto the same 10px.
+        let sheet = CompiledSheet::compile("button { padding-top: 1ex; font-size: 20px }");
+        let node = Node::new("button");
+        let mut cx = MatchCx::new();
+        let mut at = |ratio: f32| {
+            let env = ResolveEnv {
+                ex_ratio: ratio,
+                ..ResolveEnv::default()
+            };
+            ComputedStyle::resolve_chain(&sheet, &node, &env, &mut cx).padding(0.0)[0]
+        };
+        assert!(
+            (at(super::EX_RATIO) - 10.0).abs() < 1e-4,
+            "the default is 0.5 em"
+        );
+        assert!(
+            (at(0.25) - 5.0).abs() < 1e-4,
+            "a face-derived ratio is used"
+        );
+    }
+
+    #[test]
     fn adwaita_hex_bytes_round_trip_through_rgba() {
         // The M1 tests pin exact bytes; M2 resolves colours as f32 `Rgba` and
         // converts back. If that round trip were lossy, every pinned byte in
@@ -1604,6 +1635,7 @@ mod tests {
         let custom = ComputedStyle::initial(&ResolveEnv {
             dpi: 192.0,
             root_font_size: 16.0,
+            ex_ratio: 0.5,
         });
         assert_eq!(custom.raw(Prop::GtkDpi), &Value::Number(192.0));
         assert_eq!(custom.raw(Prop::FontSize), &Value::Length(Length::px(16.0)));
