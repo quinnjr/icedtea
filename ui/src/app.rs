@@ -10,6 +10,39 @@
 use std::path::{Path, PathBuf};
 
 use crate::BUNDLED_ADWAITA_LIGHT;
+
+/// GTK 4's default *dark* theme, vendored alongside the light one.
+///
+/// GTK4 carries Adwaita internally rather than on disk, so on a stock system
+/// `/usr/share/themes/Adwaita*/` holds only `gtk-3.0` files and every
+/// [`ThemeEnv::base_theme_candidates`] entry misses. Without this,
+/// `GTK_THEME=Adwaita:dark` compiled the *light* sheet under a dark
+/// [`MediaEnv`] and rendered `#f6f5f4` backgrounds.
+///
+/// See `ui/themes/README.md` for provenance and the LGPL-2.1-or-later note.
+pub const BUNDLED_ADWAITA_DARK: &str = include_str!("../themes/adwaita-dark.css");
+
+/// GTK 4's high-contrast theme, vendored for the same reason.
+///
+/// `GTK_THEME=Adwaita:hc` / `HighContrast` used to get `Contrast::More` over
+/// the light sheet.
+pub const BUNDLED_ADWAITA_HC: &str = include_str!("../themes/adwaita-hc.css");
+
+/// The bundled sheet that matches `env`.
+///
+/// High contrast wins over the colour scheme: GTK ships high contrast as its
+/// own theme, and the vendored copy is the light one, which is what
+/// `Adwaita:hc` and `HighContrast` both name. `HighContrastInverse` has no
+/// vendored copy, so it falls to the plain dark sheet -- the closer of the
+/// two.
+#[must_use]
+pub fn bundled_sheet_for(env: &MediaEnv) -> &'static str {
+    match (env.contrast, env.color_scheme) {
+        (Contrast::More, ColorScheme::Light) => BUNDLED_ADWAITA_HC,
+        (_, ColorScheme::Dark) => BUNDLED_ADWAITA_DARK,
+        _ => BUNDLED_ADWAITA_LIGHT,
+    }
+}
 use crate::css::cascade::CompiledSheet;
 use crate::css::node::Node;
 use crate::css::parse::{ColorScheme, Contrast, MediaEnv, Stylesheet, parse_stylesheet_with_base};
@@ -244,9 +277,20 @@ pub fn load_layered_stylesheet(env: &ThemeEnv) -> Stylesheet {
             break;
         }
     }
+    let media = env.media_env();
     let mut sheet = sheet.unwrap_or_else(|| {
-        tracing::info!(base = "bundled Adwaita", "no installed GTK4 theme found");
-        parse_stylesheet_with_base(BUNDLED_ADWAITA_LIGHT, None)
+        // The bundled fallback has to match the media environment the sheet
+        // will be *compiled* under, or `GTK_THEME=Adwaita:dark` renders the
+        // light theme's colours with the dark sheet's `@media` blocks
+        // applied to it.
+        let bundled = bundled_sheet_for(&media);
+        tracing::info!(
+            base = "bundled Adwaita",
+            color_scheme = ?media.color_scheme,
+            contrast = ?media.contrast,
+            "no installed GTK4 theme found"
+        );
+        parse_stylesheet_with_base(bundled, None)
     });
 
     if let Some(path) = env.user_override_path()
@@ -316,6 +360,15 @@ pub fn themed_button(
     let sheet = compile_theme(theme);
     let mut fonts = FontDatabase::new();
     let mut button = button_node(label, classes);
+    // A theme's relative `url()`s are relative to the sheet that declared
+    // them, not to the process's working directory. Only `ThemeSource::File`
+    // has a directory of its own; the bundled sheet declares no `url()`s and
+    // `UserPreferred`'s images are absolute in every GTK theme on disk.
+    if let ThemeSource::File(path) = theme
+        && let Some(dir) = path.parent()
+    {
+        button.set_image_base_dir(dir);
+    }
     button.restyle(&sheet, &mut fonts);
     Ok((sheet, fonts, button))
 }
@@ -333,8 +386,29 @@ pub fn themed_button_allocation(
     classes: &[&str],
     theme: &ThemeSource,
 ) -> Result<Allocation, LayerWindowError> {
+    Ok(themed_button_allocations(label, classes, theme)?.0)
+}
+
+/// The button's allocation *and* its label's, both tree-absolute.
+///
+/// `themed-button --print-allocation` prints the label's origin relative to
+/// the button's border box. It used to print the button's own border +
+/// padding inset instead and call it `label_x label_y`, which happens to
+/// coincide on `x` for Adwaita and is wrong on `y` by the centring offset:
+/// a 24px content box holding an 18px label puts the label 3px lower than
+/// the padding edge, so a test sampling a glyph row from the printed `y`
+/// sampled the padding gutter.
+///
+/// # Errors
+///
+/// [`LayerWindowError::NoFont`] if no usable typeface is installed.
+pub fn themed_button_allocations(
+    label: &str,
+    classes: &[&str],
+    theme: &ThemeSource,
+) -> Result<(Allocation, Allocation), LayerWindowError> {
     let (_sheet, _fonts, button) = themed_button(label, classes, theme)?;
-    Ok(button.allocation())
+    Ok((button.allocation(), button.label_allocation()))
 }
 
 /// Show one themed button on a layer surface until the compositor closes it.
@@ -761,5 +835,60 @@ mod tests {
             Color(0xFFCD_C7C2)
         );
         assert_eq!(sheet.rules.len(), 900);
+    }
+    #[test]
+    fn a_dark_or_high_contrast_theme_falls_back_to_the_matching_bundled_sheet() {
+        // F1. `media_env()` derives `ColorScheme::Dark` from `$GTK_THEME`,
+        // but the loader only ever fell back to the *light* bundled sheet.
+        // GTK4 carries Adwaita internally, so on a stock system every
+        // `base_theme_candidates` entry misses and `GTK_THEME=Adwaita:dark`
+        // rendered `#f6f5f4` backgrounds under a dark media environment.
+        //
+        // Mutation check: return BUNDLED_ADWAITA_LIGHT unconditionally from
+        // `bundled_sheet_for` and the dark and hc assertions fail. (Compared
+        // by content, not by pointer: these are `const` items, so each use
+        // site may get its own copy of the literal.)
+        use super::{BUNDLED_ADWAITA_DARK, BUNDLED_ADWAITA_HC, bundled_sheet_for};
+        use crate::BUNDLED_ADWAITA_LIGHT;
+        use crate::css::parse::{ColorScheme, Contrast};
+
+        let dark = MediaEnv {
+            color_scheme: ColorScheme::Dark,
+            contrast: Contrast::NoPreference,
+        };
+        assert_eq!(bundled_sheet_for(&dark), BUNDLED_ADWAITA_DARK);
+
+        let hc = MediaEnv {
+            color_scheme: ColorScheme::Light,
+            contrast: Contrast::More,
+        };
+        assert_eq!(bundled_sheet_for(&hc), BUNDLED_ADWAITA_HC);
+
+        assert_eq!(
+            bundled_sheet_for(&MediaEnv::default()),
+            BUNDLED_ADWAITA_LIGHT
+        );
+    }
+
+    #[test]
+    fn a_dark_gtk_theme_with_nothing_on_disk_compiles_dark_colours() {
+        // The end-to-end half of F1: no theme directory exists at all, so
+        // the loader takes the bundled fallback, and the compiled button's
+        // background must be a dark colour rather than Adwaita light's
+        // #f6f5f4 family.
+        let home = tempfile::tempdir().expect("tempdir");
+        let env = ThemeEnv {
+            gtk_theme: Some("Adwaita:dark".to_string()),
+            xdg_config_home: Some(home.path().join("config").display().to_string()),
+            xdg_data_home: Some(home.path().join("data").display().to_string()),
+            home: Some(home.path().display().to_string()),
+        };
+        let sheet = compile_for_theme_env(&env);
+        let color = button_style(&sheet).color();
+        // Adwaita dark's foreground is near-white; light's is near-black.
+        assert!(
+            color.r > 0.7 && color.g > 0.7 && color.b > 0.7,
+            "expected a dark theme's light foreground, got {color:?}"
+        );
     }
 }

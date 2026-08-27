@@ -13,6 +13,7 @@ use crate::css::value::{
     BorderImageSlice, BorderImageWidthSide, Image, Keyword, NumberOrPercent, RepeatStyle, Rgba,
 };
 use crate::layout::{Allocation, Rect};
+use crate::paint::background::{drawable_bounds, intersect};
 use crate::paint::geometry::{Side, inner_radii, rounded_ring_path, side_wedge_path};
 use crate::paint::{PaintCx, fill_paint, rounded_rect_path};
 
@@ -119,8 +120,14 @@ fn paint_one_side(
             // let the wedge clip keep it inside the side. `DashEffect` is
             // the crate's only dash primitive and it applies to strokes.
             let w = used[index];
+            // A round-capped dash of length `w` already spans `2w`, so the
+            // classic `[w, w]` interval makes every dot touch its
+            // neighbours: a 1px dotted border came out pixel-identical to
+            // solid. Blink and Gecko both use a zero-length dash on a `2w`
+            // period, which a round cap renders as a `w`-diameter dot with
+            // a `w` gap after it.
             let (on, off) = if matches!(style, Keyword::Dotted) {
-                (w, w)
+                (0.0, w * 2.0)
             } else {
                 (w * 3.0, w * 2.0)
             };
@@ -215,59 +222,74 @@ pub fn paint_border_image(
     }
 
     // Nine slots: (src IRect, dst Rect, tiles?).
-    let src = |x: f32, y: f32, w: f32, h: f32| {
-        IRect::new(x as i32, y as i32, (x + w) as i32, (y + h) as i32)
+    //
+    // The source grid's four column edges and four row edges are rounded
+    // *once* and shared. Truncating each slot's own `x`/`x + w` with `as
+    // i32` made a fractional slice (`border-image-slice: 33%` on a 10x10
+    // source) hand neighbouring slots overlapping rectangles -- column 3
+    // and column 6 sampled twice -- and drop source columns elsewhere.
+    let edge = |v: f32, limit: f32| -> i32 {
+        if v.is_finite() {
+            v.round().clamp(0.0, limit) as i32
+        } else {
+            0
+        }
     };
-    let mid_w = (iw - sl - sr).max(0.0);
-    let mid_h = (ih - st - sb).max(0.0);
+    let (col0, col3) = (0, edge(iw, iw));
+    let col1 = edge(sl, iw).min(col3);
+    let col2 = edge(iw - sr, iw).max(col1);
+    let (row0, row3) = (0, edge(ih, ih));
+    let row1 = edge(st, ih).min(row3);
+    let row2 = edge(ih - sb, ih).max(row1);
+    let src = |x0: i32, y0: i32, x1: i32, y1: i32| IRect::new(x0, y0, x1, y1);
     let dmid_w = (outer.width - dl - dr).max(0.0);
     let dmid_h = (outer.height - dt - db).max(0.0);
 
     let mut slots: Vec<(IRect, Rect, bool, bool)> = vec![
         (
-            src(0.0, 0.0, sl, st),
+            src(col0, row0, col1, row1),
             Rect::new(outer.x, outer.y, dl, dt),
             false,
             false,
         ),
         (
-            src(sl, 0.0, mid_w, st),
+            src(col1, row0, col2, row1),
             Rect::new(outer.x + dl, outer.y, dmid_w, dt),
             true,
             false,
         ),
         (
-            src(iw - sr, 0.0, sr, st),
+            src(col2, row0, col3, row1),
             Rect::new(outer.right() - dr, outer.y, dr, dt),
             false,
             false,
         ),
         (
-            src(0.0, st, sl, mid_h),
+            src(col0, row1, col1, row2),
             Rect::new(outer.x, outer.y + dt, dl, dmid_h),
             false,
             true,
         ),
         (
-            src(iw - sr, st, sr, mid_h),
+            src(col2, row1, col3, row2),
             Rect::new(outer.right() - dr, outer.y + dt, dr, dmid_h),
             false,
             true,
         ),
         (
-            src(0.0, ih - sb, sl, sb),
+            src(col0, row2, col1, row3),
             Rect::new(outer.x, outer.bottom() - db, dl, db),
             false,
             false,
         ),
         (
-            src(sl, ih - sb, mid_w, sb),
+            src(col1, row2, col2, row3),
             Rect::new(outer.x + dl, outer.bottom() - db, dmid_w, db),
             true,
             false,
         ),
         (
-            src(iw - sr, ih - sb, sr, sb),
+            src(col2, row2, col3, row3),
             Rect::new(outer.right() - dr, outer.bottom() - db, dr, db),
             false,
             false,
@@ -275,7 +297,7 @@ pub fn paint_border_image(
     ];
     if slice.fill {
         slots.push((
-            src(sl, st, mid_w, mid_h),
+            src(col1, row1, col2, row2),
             Rect::new(outer.x + dl, outer.y + dt, dmid_w, dmid_h),
             true,
             true,
@@ -284,10 +306,19 @@ pub fn paint_border_image(
 
     let tiles_x = matches!(repeat.x, Keyword::Repeat | Keyword::Round | Keyword::Space);
     let tiles_y = matches!(repeat.y, Keyword::Repeat | Keyword::Round | Keyword::Space);
+    // Every tiling loop below is bounded by what can actually reach a pixel.
+    // `Rect::is_empty` accepts `+inf`, so a border box of `1e9` px (or an
+    // infinite one) drove `while x < dst.right() { x += step }` for up to
+    // `i32::MAX` iterations -- and at `x >= 2^24` a `+= 1.0` step is a no-op
+    // in f32, so the inner loop never terminated at all.
+    let Some(bounds) = drawable_bounds(canvas) else {
+        return false;
+    };
     let Some(image) = cx.images.get(url) else {
         return false;
     };
     let mut painted = false;
+    let mut budget = MAX_BORDER_IMAGE_TILES;
     for (src_rect, dst_rect, edge_x, edge_y) in slots {
         if dst_rect.is_empty() || src_rect.width() <= 0 || src_rect.height() <= 0 {
             continue;
@@ -304,17 +335,32 @@ pub fn paint_border_image(
             } else {
                 dst_rect.height
             };
-            let mut y = dst_rect.y;
-            while y < dst_rect.bottom() && step_y > 0.0 {
-                let mut x = dst_rect.x;
-                while x < dst_rect.right() && step_x > 0.0 {
+            // A step under one device pixel emits copies nothing can tell
+            // apart, and a non-finite one never advances.
+            let (step_x, step_y) = (
+                step_x.max(MIN_BORDER_IMAGE_STEP),
+                step_y.max(MIN_BORDER_IMAGE_STEP),
+            );
+            if !(step_x.is_finite() && step_y.is_finite()) {
+                continue;
+            }
+            let Some(visible) = intersect(dst_rect, bounds) else {
+                continue;
+            };
+            let mut y = visible.y - ((visible.y - dst_rect.y) % step_y);
+            while y < visible.bottom() && budget > 0 {
+                let mut x = visible.x - ((visible.x - dst_rect.x) % step_x);
+                while x < visible.right() && budget > 0 {
                     let piece = Rect::new(
                         x,
                         y,
                         step_x.min(dst_rect.right() - x),
                         step_y.min(dst_rect.bottom() - y),
                     );
-                    canvas.draw_image_rect(image, Some(&src_rect), &piece.to_skia(), None);
+                    if !piece.is_empty() {
+                        canvas.draw_image_rect(image, Some(&src_rect), &piece.to_skia(), None);
+                        budget -= 1;
+                    }
                     x += step_x;
                 }
                 y += step_y;
@@ -326,6 +372,17 @@ pub fn paint_border_image(
     }
     painted
 }
+
+/// The most nine-patch copies one `border-image` may emit per paint.
+///
+/// A 3x3 source with `1 fill` and `repeat` over a 1920x1080 border box asks
+/// for about two million `draw_image_rect` calls *per frame*; the visible
+/// area is the same handful of pixels either way.
+const MAX_BORDER_IMAGE_TILES: u32 = 1 << 16;
+
+/// The narrowest nine-patch tiling step, in px. One device pixel, for the
+/// same reason `background`'s `MIN_TILE_STEP` is.
+const MIN_BORDER_IMAGE_STEP: f32 = 1.0;
 
 #[cfg(test)]
 mod tests {
@@ -665,5 +722,144 @@ mod tests {
                 [[v, v]; 4],
             );
         }
+    }
+    /// A 3x3 opaque-red PNG, so a `border-image` test has real pixels to
+    /// slice without depending on anything on disk.
+    const RED_3X3_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x03, 0x08, 0x06, 0x00, 0x00, 0x00, 0x56,
+        0x28, 0xb5, 0xbf, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x86, 0x19, 0x70, 0x72, 0x00, 0x5d, 0xd7, 0x11, 0xef, 0xdc, 0x4f,
+        0x31, 0x10, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn a_dotted_border_leaves_gaps_between_its_dots() {
+        // F64. `[w, w]` dash intervals with round caps make every dot span
+        // its whole period, so a dotted border was pixel-identical to a
+        // solid one. Mutation check: restoring `(w, w)` inks every pixel of
+        // the top edge and the gap assertion fails.
+        let surface = painted(
+            [4.0; 4],
+            [rgba(255, 0, 0); 4],
+            [Keyword::Dotted; 4],
+            [[0.0, 0.0]; 4],
+        );
+        let top: Vec<u8> = (6..34).map(|x| pixel(&surface, x, 2).alpha()).collect();
+        assert!(top.iter().any(|&a| a > 0), "the dots are drawn");
+        assert!(top.contains(&0), "and there are gaps");
+    }
+
+    #[test]
+    fn a_fractional_border_image_slice_does_not_overlap_its_slots() {
+        // F65. `border-image-slice: 33%` on a 3x3 source truncated each
+        // slot's own edges with `as i32`, so neighbouring slots sampled the
+        // same source column twice and dropped others. The grid's edges are
+        // now rounded once and shared, so the nine slots partition the
+        // source exactly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("border.png");
+        std::fs::write(&path, RED_3X3_PNG).expect("write png");
+        let url = path.to_string_lossy().into_owned();
+
+        let mut surface = Surface::new_raster_n32_premul(40, 20).expect("raster surface");
+        surface.canvas().clear(Color::TRANSPARENT);
+        let env = crate::css::computed::ResolveEnv::default();
+        let colors = crate::css::value::ColorTable::default();
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut images = crate::paint::ImageCache::new();
+        let mut cx = crate::paint::PaintCx {
+            env: &env,
+            colors: &colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let slice = crate::css::value::BorderImageSlice {
+            sides: [crate::css::value::NumberOrPercent::Percent(0.33); 4],
+            fill: false,
+        };
+        let widths: [crate::css::value::BorderImageWidthSide; 4] =
+            std::array::from_fn(|_| crate::css::value::BorderImageWidthSide::Number(1.0));
+        let repeat = crate::css::value::RepeatStyle {
+            x: Keyword::Stretch,
+            y: Keyword::Stretch,
+        };
+        let mut canvas = surface.canvas();
+        let drew = super::paint_border_image(
+            &mut canvas,
+            &alloc(40.0, 20.0, [4.0; 4]),
+            &crate::css::value::Image::Url(std::rc::Rc::from(url.as_str())),
+            &slice,
+            &widths,
+            repeat,
+            &mut cx,
+        );
+        assert!(drew, "a decodable url() paints the nine-patch");
+    }
+
+    #[test]
+    fn a_tiling_border_image_over_an_unbounded_box_terminates() {
+        // F66. The nine-patch tiling loops were bounded only by the
+        // destination rect, which `Rect::is_empty` lets be `+inf`; and past
+        // 2^24 a `x += 1.0` step is a no-op in f32, so the inner loop never
+        // terminated at all. Both loops are now bounded by the drawable
+        // bounds, a one-device-pixel step floor and a total tile budget.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("border.png");
+        std::fs::write(&path, RED_3X3_PNG).expect("write png");
+        let url = path.to_string_lossy().into_owned();
+
+        let env = crate::css::computed::ResolveEnv::default();
+        let colors = crate::css::value::ColorTable::default();
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut images = crate::paint::ImageCache::new();
+        let mut cx = crate::paint::PaintCx {
+            env: &env,
+            colors: &colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let slice = crate::css::value::BorderImageSlice {
+            sides: [crate::css::value::NumberOrPercent::Number(1.0); 4],
+            fill: true,
+        };
+        let widths: [crate::css::value::BorderImageWidthSide; 4] =
+            std::array::from_fn(|_| crate::css::value::BorderImageWidthSide::Number(1.0));
+        let repeat = crate::css::value::RepeatStyle {
+            x: Keyword::Repeat,
+            y: Keyword::Repeat,
+        };
+        let source = crate::css::value::Image::Url(std::rc::Rc::from(url.as_str()));
+
+        let mut surface = Surface::new_raster_n32_premul(40, 20).expect("raster surface");
+        let started = std::time::Instant::now();
+        {
+            let mut canvas = surface.canvas();
+            for &extent in &[f32::INFINITY, 1.0e9, 1.0e30] {
+                let border_box = Rect::new(0.0, 0.0, extent, extent);
+                let alloc = Allocation {
+                    border_box,
+                    content_box: border_box,
+                    border: [1.0; 4],
+                    padding: [0.0; 4],
+                };
+                let _ = super::paint_border_image(
+                    &mut canvas,
+                    &alloc,
+                    &source,
+                    &slice,
+                    &widths,
+                    repeat,
+                    &mut cx,
+                );
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "an unbounded border-image took {elapsed:?}"
+        );
     }
 }

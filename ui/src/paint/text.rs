@@ -9,8 +9,8 @@ use crate::css::computed::ComputedStyle;
 use crate::css::registry::Prop;
 use crate::css::value::{ColorValue, Keyword, LengthCtx, Rgba, Shadow, TextDecorationLines, Value};
 use crate::layout::Rect;
-use crate::paint::blur::{blurred_image, sigma_for_blur_radius};
 use crate::paint::fill_paint;
+use crate::paint::shadow::blit_blurred;
 use crate::text::ShapedText;
 
 /// The rects a `text-decoration-line` set paints, top-first.
@@ -57,18 +57,47 @@ pub fn decoration_rects(
     out
 }
 
-/// Paint one shaped run at `origin` (the content box's top-left).
+/// The top of the glyphs' own box inside a line box of `line_height`.
+///
+/// CSS Inline L3: the difference between the line box and the font's own
+/// `ascent + descent` is the *leading*, and half of it goes above the
+/// glyphs. Placing the baseline at `content_top + ascent` instead made the
+/// glyphs hug the top of a tall line box -- `line-height: 2` at 14px put the
+/// text 5.8px above where GTK and every browser draw it.
+#[must_use]
+pub fn half_leading(text: &ShapedText, line_height: f32) -> f32 {
+    let ink = text.metrics.ascent.max(0.0) + text.metrics.descent.max(0.0);
+    if !line_height.is_finite() || line_height <= ink {
+        return 0.0;
+    }
+    (line_height - ink) / 2.0
+}
+
+/// Paint one shaped run inside `content` (the content box).
+///
+/// The run is placed against the content box's *top* plus the half-leading
+/// its height implies, so a line box taller than the glyphs centres them
+/// rather than pinning them to the top.
 pub fn paint_text(
     canvas: &mut Canvas<'_>,
     text: &ShapedText,
-    origin: (f32, f32),
+    content: Rect,
     style: &ComputedStyle,
     ctx: &LengthCtx,
 ) {
     let (ox, oy) = (
-        if origin.0.is_finite() { origin.0 } else { 0.0 },
-        if origin.1.is_finite() { origin.1 } else { 0.0 },
+        if content.x.is_finite() {
+            content.x
+        } else {
+            0.0
+        },
+        if content.y.is_finite() {
+            content.y
+        } else {
+            0.0
+        },
     );
+    let oy = oy + half_leading(text, content.height);
     let color = style.color();
     let baseline = oy + text.metrics.ascent.max(0.0);
 
@@ -183,25 +212,28 @@ fn paint_text_shadow(
         canvas.draw_text_blob(blob, bx, by, &fill_paint(color));
         return;
     }
-    let sigma = sigma_for_blur_radius(blur);
-    let pad = (sigma * 3.0).ceil().clamp(0.0, 512.0);
-    let w = (text.metrics.width + pad * 2.0).ceil();
-    let h = (text.metrics.ascent + text.metrics.descent + pad * 2.0).ceil();
-    if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 || w > 8192.0 || h > 8192.0 {
-        return;
-    }
-    let ox = (bx - pad).floor();
-    let oy = (by - text.metrics.ascent - pad).floor();
-    if let Some(image) = blurred_image(w as i32, h as i32, sigma, |offscreen| {
-        offscreen.draw_text_blob(blob, bx - ox, by - oy, &fill_paint(color));
-    }) {
-        canvas.draw_image(&image, ox, oy, None);
-    }
+    // The run's ink rect, in the caller's coordinates. `blit_blurred` owns
+    // the offscreen surface budget -- the padding, the sigma cap that keeps
+    // the blur from being cut off at a hard edge, and the dimension ceiling
+    // that is the only defence against `text-shadow: 0 0 99999px` asking
+    // for a gigapixel buffer. Duplicating it here let the two copies drift.
+    let ink = Rect::new(
+        bx,
+        by - text.metrics.ascent,
+        text.metrics.width,
+        text.metrics.ascent + text.metrics.descent,
+    );
+    // Not cached: the key would have to describe the shaped run, and a
+    // `TextBlob` has no content identity to hash. `paint::shadow`'s box
+    // shapes do.
+    blit_blurred(canvas, ink, blur, None, |offscreen, offset, _surface| {
+        offscreen.draw_text_blob(blob, bx - offset.0, by - offset.1, &fill_paint(color));
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decoration_rects, paint_text};
+    use super::{decoration_rects, half_leading, paint_text};
     use crate::css::cascade::CompiledSheet;
     use crate::css::computed::{ComputedStyle, ResolveEnv};
     use crate::css::node::Node;
@@ -209,6 +241,7 @@ mod tests {
     use crate::css::value::{
         FontFamily, FontStyle, GenericFamily, Keyword, LengthCtx, TextDecorationLines,
     };
+    use crate::layout::Rect;
     use crate::text::{FontDatabase, FontQuery, ShapeKey};
     use skia_rs_safe::canvas::Surface;
     use skia_rs_safe::core::Color;
@@ -258,7 +291,13 @@ mod tests {
         surface.canvas().clear(Color::TRANSPARENT);
         {
             let mut canvas = surface.canvas();
-            paint_text(&mut canvas, &text, (10.0, 10.0), &style, &ctx());
+            paint_text(
+                &mut canvas,
+                &text,
+                Rect::new(10.0, 10.0, 200.0, 0.0),
+                &style,
+                &ctx(),
+            );
         }
         surface
     }
@@ -391,9 +430,37 @@ mod tests {
         paint_text(
             &mut canvas,
             &empty,
-            (f32::NAN, f32::INFINITY),
+            Rect::new(f32::NAN, f32::INFINITY, f32::NAN, f32::INFINITY),
             &style,
             &ctx(),
         );
+    }
+    #[test]
+    fn a_tall_line_box_centres_the_glyphs_instead_of_pinning_them_to_the_top() {
+        // F73/F84. CSS Inline L3: the line box's excess over the font's own
+        // ascent + descent is the leading, half of it above the glyphs.
+        // Placing the baseline at `content_top + ascent` put `line-height: 2`
+        // text 5.8px above where GTK and every browser draw it.
+        // Mutation check: return 0.0 from `half_leading` and the first
+        // assertion collapses to the second.
+        let mut db = FontDatabase::probe_only();
+        let text = shaped(&mut db);
+        let ink = text.metrics.ascent + text.metrics.descent;
+        let tall = half_leading(&text, ink + 12.0);
+        assert!(
+            (tall - 6.0).abs() < 1.0e-3,
+            "12px of leading is split evenly: {tall}"
+        );
+        assert_eq!(
+            half_leading(&text, ink),
+            0.0,
+            "a line box exactly as tall as the glyphs has no leading"
+        );
+        assert_eq!(
+            half_leading(&text, 0.0),
+            0.0,
+            "a line box shorter than the glyphs never pushes them down"
+        );
+        assert_eq!(half_leading(&text, f32::NAN), 0.0);
     }
 }

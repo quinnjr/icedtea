@@ -11,6 +11,8 @@ pub mod shadow;
 pub mod text;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use skia_rs_safe::canvas::Canvas;
 use skia_rs_safe::codec::Image as DecodedImage;
@@ -78,13 +80,41 @@ impl PaintCx<'_> {
     }
 }
 
-/// Decoded `url()` images, keyed by URL.
+/// How long a `url()` that failed to resolve stays a recorded miss.
+///
+/// A miss must not be permanent: a relative `url()` is resolved against the
+/// stylesheet's own directory, and a theme that is being edited (or one
+/// whose files arrive after the first frame) would otherwise never paint its
+/// images for the lifetime of the process. Long enough that a missing file
+/// is not re-`stat`ed every frame, short enough that a fixed one shows up.
+const IMAGE_MISS_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// One cache slot: the decoded image, or the moment the decode last failed.
+enum CacheEntry {
+    /// Decoded and ready.
+    Decoded(DecodedImage),
+    /// The last attempt failed, at this instant. Retried after
+    /// [`IMAGE_MISS_COOLDOWN`].
+    Missed(Instant),
+}
+
+/// Decoded `url()` images, keyed by `(base directory, url)`.
+///
+/// The base directory is part of the key because a relative `url()` means
+/// different files under different stylesheets, and one `ImageCache` outlives
+/// a restyle: keying on the URL alone let a theme swap serve the previous
+/// theme's bitmap.
 ///
 /// A URL that fails to decode is *recorded unresolved*: it is remembered as
 /// a miss so the file is not re-read every frame, logged once, and paints
-/// nothing. That is not an error -- the computed value keeps the URL.
+/// nothing. That is not an error -- the computed value keeps the URL. The
+/// miss expires after [`IMAGE_MISS_COOLDOWN`] rather than lasting forever.
 pub struct ImageCache {
-    entries: HashMap<String, Option<DecodedImage>>,
+    /// What a relative `url()` resolves against: the stylesheet's own
+    /// directory. Empty means "the process's working directory", which is
+    /// the only thing a sheet with no path of its own can mean.
+    base_dir: PathBuf,
+    entries: HashMap<(PathBuf, String), CacheEntry>,
 }
 
 impl Default for ImageCache {
@@ -94,29 +124,79 @@ impl Default for ImageCache {
 }
 
 impl ImageCache {
-    /// An empty cache.
+    /// An empty cache resolving relative URLs against the working directory.
     #[must_use]
     pub fn new() -> Self {
         Self {
+            base_dir: PathBuf::new(),
             entries: HashMap::new(),
         }
     }
 
+    /// Resolve relative `url()`s against `dir` from now on.
+    ///
+    /// Already-cached entries are keyed by the base they were read under, so
+    /// this never serves the previous base's pixels.
+    pub fn set_base_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.base_dir = dir.into();
+    }
+
+    /// The path `url` names, resolved against the base directory.
+    ///
+    /// An absolute path is used as-is; CSS `url()`s in a GTK theme are
+    /// otherwise relative to the sheet that declared them.
+    #[must_use]
+    fn resolve(&self, url: &str) -> PathBuf {
+        let path = Path::new(url);
+        if path.is_absolute() || self.base_dir.as_os_str().is_empty() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
+        }
+    }
+
+    /// Forget every recorded miss, as [`IMAGE_MISS_COOLDOWN`] passing does.
+    ///
+    /// Test-only: the cooldown is measured against a real `Instant`, and a
+    /// test that slept through five seconds to prove a miss expires would be
+    /// five seconds of nothing.
+    #[cfg(test)]
+    fn expire_misses_for_test(&mut self) {
+        self.entries
+            .retain(|_, entry| matches!(entry, CacheEntry::Decoded(_)));
+    }
+
     /// The decoded image for `url`, decoding it on first use.
     pub fn get(&mut self, url: &str) -> Option<&DecodedImage> {
-        if !self.entries.contains_key(url) {
-            let decoded = std::fs::read(url)
+        let key = (self.base_dir.clone(), url.to_owned());
+        let now = Instant::now();
+        let retry = match self.entries.get(&key) {
+            Some(CacheEntry::Decoded(_)) => false,
+            Some(CacheEntry::Missed(at)) => now.duration_since(*at) >= IMAGE_MISS_COOLDOWN,
+            None => true,
+        };
+        if retry {
+            let path = self.resolve(url);
+            let decoded = std::fs::read(&path)
                 .ok()
                 .and_then(|bytes| skia_rs_safe::codec::decode_image(&bytes).ok());
-            if decoded.is_none() {
-                tracing::debug!(
-                    url,
-                    "background image could not be decoded; recorded unresolved"
-                );
-            }
-            self.entries.insert(url.to_owned(), decoded);
+            let entry = match decoded {
+                Some(image) => CacheEntry::Decoded(image),
+                None => {
+                    tracing::debug!(
+                        url,
+                        path = %path.display(),
+                        "background image could not be decoded; recorded unresolved"
+                    );
+                    CacheEntry::Missed(now)
+                }
+            };
+            self.entries.insert(key.clone(), entry);
         }
-        self.entries.get(url).and_then(Option::as_ref)
+        match self.entries.get(&key) {
+            Some(CacheEntry::Decoded(image)) => Some(image),
+            _ => None,
+        }
     }
 }
 
@@ -171,6 +251,36 @@ pub fn paint_node(
     alloc: &Allocation,
     overrides: Option<&Overrides>,
     cx: &mut PaintCx<'_>,
+) {
+    paint_node_with_children(canvas, node, style, alloc, overrides, cx, |_, _| {});
+}
+
+/// Paint one node, then its children, inside the node's own effect layer.
+///
+/// `opacity`, `transform` and `filter` are one save-layer, and a save-layer
+/// only affects what is drawn while it is open. [`paint_node`] opens and
+/// closes it around *this node's* boxes, so a caller that paints the
+/// children afterwards paints them onto a fresh canvas: `button { opacity:
+/// .5 }` left the label fully opaque, a hover `translateY` moved the
+/// background out from under a stationary label, and a `grayscale()` filter
+/// missed the label entirely.
+///
+/// `children` runs with the layer still open, immediately after this node's
+/// own paint and before the layer is popped, which is the tree order CSS
+/// wants. It receives the canvas and the paint context so a child can paint
+/// its own text and images.
+#[allow(
+    unused_variables,
+    reason = "`node` is contract §8's signature and M3's tree-walk hook"
+)]
+pub fn paint_node_with_children<'cx>(
+    canvas: &mut Canvas<'_>,
+    node: &Node,
+    style: &ComputedStyle,
+    alloc: &Allocation,
+    overrides: Option<&Overrides>,
+    cx: &mut PaintCx<'cx>,
+    children: impl FnOnce(&mut Canvas<'_>, &mut PaintCx<'cx>),
 ) {
     let owned;
     let style: &ComputedStyle = match overrides {
@@ -246,14 +356,10 @@ pub fn paint_node(
     );
 
     if let Some(shaped) = cx.text {
-        text::paint_text(
-            canvas,
-            shaped,
-            (alloc.content_box.x, alloc.content_box.y),
-            style,
-            &len_ctx,
-        );
+        text::paint_text(canvas, shaped, alloc.content_box, style, &len_ctx);
     }
+
+    children(canvas, cx);
 
     effects::end_effects(canvas, save);
 }
@@ -398,4 +504,76 @@ mod tests {
             paint_node(&mut canvas, &node, &style, &alloc, None, &mut paint_cx);
         }
     }
+    #[test]
+    fn the_image_cache_resolves_relative_urls_against_its_base_directory() {
+        // A relative `url()` in a GTK theme means "relative to this sheet",
+        // not "relative to whatever directory the process happens to be in".
+        // Mutation check: drop `resolve` and read `url` directly and the
+        // first lookup misses.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("bg.png"), RED_3X3_PNG).expect("write");
+
+        let mut cache = ImageCache::new();
+        assert!(
+            cache.get("bg.png").is_none(),
+            "with no base directory the relative url is not found"
+        );
+        cache.set_base_dir(dir.path());
+        assert!(
+            cache.get("bg.png").is_some(),
+            "under the sheet's own directory it is"
+        );
+    }
+
+    #[test]
+    fn a_cache_miss_is_not_permanent() {
+        // A miss used to be remembered forever, so a theme whose image
+        // arrives after the first frame never painted it for the lifetime of
+        // the process. Mutation check: store `None` forever and the second
+        // lookup still misses.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cache = ImageCache::new();
+        cache.set_base_dir(dir.path());
+        assert!(cache.get("late.png").is_none(), "not there yet");
+
+        std::fs::write(dir.path().join("late.png"), RED_3X3_PNG).expect("write");
+        // The miss is still inside its cooldown, so it is *not* re-read --
+        // that is the point of recording it. Expiring the entry is what a
+        // later frame does.
+        assert!(cache.get("late.png").is_none(), "still inside the cooldown");
+        cache.expire_misses_for_test();
+        assert!(
+            cache.get("late.png").is_some(),
+            "once the cooldown passes the file is read again"
+        );
+    }
+
+    #[test]
+    fn two_base_directories_do_not_share_a_relative_urls_pixels() {
+        // The key is `(base directory, url)`: one `ImageCache` outlives a
+        // restyle, and keying on the URL alone let a theme swap serve the
+        // previous theme's bitmap. Mutation check: key on `url` alone and
+        // the second lookup returns the first directory's image.
+        let first = tempfile::tempdir().expect("tempdir");
+        let second = tempfile::tempdir().expect("tempdir");
+        std::fs::write(first.path().join("bg.png"), RED_3X3_PNG).expect("write");
+
+        let mut cache = ImageCache::new();
+        cache.set_base_dir(first.path());
+        assert!(cache.get("bg.png").is_some());
+        cache.set_base_dir(second.path());
+        assert!(
+            cache.get("bg.png").is_none(),
+            "the second theme has no bg.png of its own"
+        );
+    }
+
+    /// A 3x3 opaque-red PNG, as in `paint::border`'s tests.
+    const RED_3X3_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x03, 0x08, 0x06, 0x00, 0x00, 0x00, 0x56,
+        0x28, 0xb5, 0xbf, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x86, 0x19, 0x70, 0x72, 0x00, 0x5d, 0xd7, 0x11, 0xef, 0xdc, 0x4f,
+        0x31, 0x10, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
 }

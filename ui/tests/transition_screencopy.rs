@@ -6,15 +6,14 @@
 //! to a millisecond). What *is* asserted is that reaching the end took
 //! roughly the declared duration, which is the only thing that distinguishes
 //! an animation from a snap when both begin red and end blue.
-//!
-//! Self-contained on purpose: it does not share `tests/support/mod.rs`,
-//! whose `allocation_of` helper belongs to the offscreen pixel gate.
 
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use icedtea_harness::{CapturedFrame, Compositor, ScreencopyClient, VirtualPointerClient};
+use icedtea_harness::{Compositor, ScreencopyClient, VirtualPointerClient};
+
+mod support;
+use support::{capture_until, matches, spawn_themed_button_with_theme};
 
 /// A whole theme (never layered under Adwaita) declaring one long, linear,
 /// unmistakable colour transition on hover.
@@ -46,65 +45,14 @@ const CENTRE: (f64, f64) = (40.0, 30.0);
 /// The declared transition duration.
 const DURATION: Duration = Duration::from_millis(2000);
 
-struct Reaper(Child);
-
-impl Drop for Reaper {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn spawn_button(socket: &str, theme_path: &std::path::Path) -> Reaper {
-    Reaper(
-        Command::new(env!("CARGO_BIN_EXE_themed-button"))
-            .env("WAYLAND_DISPLAY", socket)
-            .env("ICEDTEA_UI_THEME", theme_path)
-            .env("ICEDTEA_UI_LABEL", "Click me")
-            .env("ICEDTEA_UI_CLASSES", "")
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn themed-button"),
-    )
-}
-
-fn pixel(frame: &CapturedFrame) -> (u8, u8, u8) {
-    icedtea_ui::shm::pixel_rgb(frame.format, &frame.bytes, frame.stride, SAMPLE.0, SAMPLE.1)
-        .expect("sample pixel inside the captured frame")
-}
-
-fn close(a: u8, b: u8) -> bool {
-    i32::from(a).abs_diff(i32::from(b)) <= 12
-}
-
 /// `rgb(255 0 0)` — the button's resting background.
 fn is_start(px: (u8, u8, u8)) -> bool {
-    close(px.0, 0xFF) && close(px.1, 0x00) && close(px.2, 0x00)
+    matches(px, (0xFF, 0x00, 0x00))
 }
 
 /// `rgb(0 0 255)` — `button:hover`'s background.
 fn is_end(px: (u8, u8, u8)) -> bool {
-    close(px.0, 0x00) && close(px.1, 0x00) && close(px.2, 0xFF)
-}
-
-/// Capture until `ready` accepts the sample pixel, pumping `pointer` so the
-/// compositor keeps delivering, or until `timeout` passes.
-fn capture_until(
-    screencopy: &mut ScreencopyClient,
-    mut pointer: Option<&mut VirtualPointerClient>,
-    timeout: Duration,
-    ready: impl Fn((u8, u8, u8)) -> bool,
-) -> ((u8, u8, u8), Duration) {
-    let started = Instant::now();
-    let mut px = pixel(&screencopy.capture());
-    while !ready(px) && started.elapsed() < timeout {
-        std::thread::sleep(Duration::from_millis(25));
-        if let Some(pointer) = pointer.as_deref_mut() {
-            pointer.pump();
-        }
-        px = pixel(&screencopy.capture());
-    }
-    (px, started.elapsed())
+    matches(px, (0x00, 0x00, 0xFF))
 }
 
 /// The one on-screen animation proof: hovering starts a 2 s transition that
@@ -126,10 +74,16 @@ fn a_background_color_transition_animates_on_a_real_compositor() {
     let comp = Compositor::spawn();
     let (output_w, output_h) = comp.output_size();
     let (output_w, output_h) = (output_w as u32, output_h as u32);
-    let _child = spawn_button(&comp.socket, theme.path());
+    let _child = spawn_themed_button_with_theme(&comp.socket, theme.path(), "Click me", "");
 
     let mut screencopy = ScreencopyClient::spawn(&comp.socket);
-    let (before, _) = capture_until(&mut screencopy, None, Duration::from_secs(10), is_start);
+    let (before, _) = capture_until(
+        &mut screencopy,
+        None,
+        SAMPLE,
+        Duration::from_secs(10),
+        is_start,
+    );
     assert!(
         is_start(before),
         "the button never reached the screen in its resting rgb(255 0 0): \
@@ -144,6 +98,7 @@ fn a_background_color_transition_animates_on_a_real_compositor() {
     let (after, elapsed) = capture_until(
         &mut screencopy,
         Some(&mut pointer),
+        SAMPLE,
         Duration::from_secs(10),
         is_end,
     );

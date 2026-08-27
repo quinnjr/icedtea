@@ -14,6 +14,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "fontconfig")]
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -227,6 +228,7 @@ const FACE_CACHE_CAPACITY: usize = 64;
 /// Single-threaded by construction: fontconfig's own objects are `!Send`
 /// and `!Sync`, and one `Fontconfig` handle serves the whole UI thread.
 pub struct FontDatabase {
+    #[cfg(feature = "fontconfig")]
     fontconfig: Option<fontconfig::Fontconfig>,
     typefaces: BoundedCache<(PathBuf, i32), Option<Arc<Typeface>>>,
     faces: BoundedCache<String, Option<FontFace>>,
@@ -249,6 +251,7 @@ impl FontDatabase {
     /// deliberately never calls `FcFini`, so one database should live for the
     /// lifetime of the UI thread.
     #[must_use]
+    #[cfg(feature = "fontconfig")]
     pub fn new() -> Self {
         match fontconfig::Fontconfig::new() {
             Some(fc) => {
@@ -269,6 +272,15 @@ impl FontDatabase {
         }
     }
 
+    /// With the `fontconfig` feature off there is nothing to initialise:
+    /// this *is* [`probe_only`](Self::probe_only), which is also what
+    /// `FontDatabase::new` degrades to when `FcInit` fails.
+    #[must_use]
+    #[cfg(not(feature = "fontconfig"))]
+    pub fn new() -> Self {
+        Self::probe_only()
+    }
+
     /// The fontconfig-free database: M1's fixed [`FONT_CANDIDATES`] probe.
     ///
     /// This is the CI / stripped-container fallback, and what
@@ -276,6 +288,7 @@ impl FontDatabase {
     #[must_use]
     pub fn probe_only() -> Self {
         Self {
+            #[cfg(feature = "fontconfig")]
             fontconfig: None,
             typefaces: BoundedCache::new(FACE_CACHE_CAPACITY),
             faces: BoundedCache::new(FACE_CACHE_CAPACITY),
@@ -288,7 +301,14 @@ impl FontDatabase {
     /// Whether real fontconfig matching is in play.
     #[must_use]
     pub fn has_fontconfig(&self) -> bool {
-        self.fontconfig.is_some()
+        #[cfg(feature = "fontconfig")]
+        {
+            self.fontconfig.is_some()
+        }
+        #[cfg(not(feature = "fontconfig"))]
+        {
+            false
+        }
     }
 
     /// Resolve `query` to a face, with `fc-match` parity when fontconfig is
@@ -303,12 +323,15 @@ impl FontDatabase {
         if let Some(cached) = self.faces.get(&key) {
             return cached.clone();
         }
+        #[cfg(feature = "fontconfig")]
         let face = match self.fontconfig.as_ref() {
             // A fontconfig miss still falls through to the probe list: a
             // configured-but-empty fontconfig must not leave the UI textless.
             Some(fc) => fc_match(fc, query).or_else(|| probe_face(query)),
             None => probe_face(query),
         };
+        #[cfg(not(feature = "fontconfig"))]
+        let face = probe_face(query);
         self.faces.insert(key, face.clone());
         face
     }
@@ -541,6 +564,7 @@ fn family_names(family: &FontFamily) -> Vec<&str> {
 /// `FC_WEIGHT`/`FC_SLANT`/`FC_WIDTH`/`FC_PIXEL_SIZE`, then `FcFontMatch` — the
 /// same path `fc-match` takes, so aliases, generic families and user rules in
 /// `~/.config/fontconfig` are honoured without any special-casing here.
+#[cfg(feature = "fontconfig")]
 fn fc_match(fc: &fontconfig::Fontconfig, query: &FontQuery<'_>) -> Option<FontFace> {
     let mut pattern = fontconfig::Pattern::new(fc).ok()?;
     for family in query.families {
@@ -694,6 +718,10 @@ pub fn apply_text_transform(text: &str, transform: Keyword) -> Cow<'_, str> {
 /// each word" and Pango's own capitalisation come to in practice:
 /// punctuation ends a word (`foo-bar` -> `Foo-Bar`, `(click)` ->
 /// `(Click)`), an apostrophe does not (`don't` -> `Don't`, not `Don'T`).
+///
+/// An apostrophe only *continues* a word; it is not itself a letter unit,
+/// so one at a word start does not consume the word-start slot. `'tis`
+/// capitalises to `'Tis`, not to `'tis`.
 fn capitalize(text: &str) -> String {
     /// Whether `ch` continues the word it is in rather than ending it.
     fn continues_word(ch: char) -> bool {
@@ -706,7 +734,7 @@ fn capitalize(text: &str) -> String {
         if !continues_word(ch) {
             at_word_start = true;
             out.push(ch);
-        } else if at_word_start {
+        } else if at_word_start && ch.is_alphanumeric() {
             at_word_start = false;
             out.extend(ch.to_uppercase());
         } else {
@@ -871,8 +899,17 @@ impl TextStyle {
             Value::FontFamilies(list) => Rc::clone(list),
             _ => Rc::from(vec![FontFamily::Generic(GenericFamily::SansSerif)]),
         };
+        // `bolder`/`lighter` are relative to the *parent's* computed weight,
+        // which nothing in the crate resolves for them yet (the computed
+        // pass leaves the keyword). Collapsing them to the initial 400 made
+        // `bolder` under a bold parent pick a strictly *lighter* face than
+        // the parent got; CSS Fonts 4 §2.2's relative-weight table maps
+        // `bolder` and `lighter` against a 400 parent to 700 and 100, which
+        // is at least on the right side of normal.
         let weight = match style.raw(Prop::FontWeight) {
             Value::FontWeight(FontWeight::Absolute(w)) if w.is_finite() => w.clamp(1.0, 1000.0),
+            Value::FontWeight(FontWeight::Bolder) => 700.0,
+            Value::FontWeight(FontWeight::Lighter) => 100.0,
             _ => 400.0,
         };
         let font_style = match style.raw(Prop::FontStyle) {
@@ -951,6 +988,14 @@ impl TextStyle {
                 factor * self.size_px
             }
             LineHeight::Number(_) => metrics.line_height,
+            // A `<percentage>` line-height resolves against the element's
+            // own `font-size`. The computed pass leaves it a percentage
+            // (its `LengthCtx` carries no basis there), and `absolute_px`
+            // only accepts `Abs { unit: Px }` -- so `line-height: 150%` was
+            // silently dropped and rendered as `normal`.
+            LineHeight::Length(Length::Percent(fraction)) if fraction.is_finite() => {
+                fraction.max(0.0) * self.size_px
+            }
             LineHeight::Length(ref length) => absolute_px(length).unwrap_or(metrics.line_height),
         }
     }
@@ -1110,6 +1155,32 @@ mod tests {
         let absolute =
             TextStyle::from_computed(&style_for("label { font-size: 20px; line-height: 26px; }"));
         assert_eq!(absolute.line_height_px(&metrics), 26.0);
+
+        // F78: a percentage resolves against the element's own font-size.
+        // The computed pass leaves it a percentage (no basis in its
+        // `LengthCtx`), and `absolute_px` only accepts `Abs { unit: Px }`,
+        // so this silently fell through to the face's `normal` 18px.
+        // Mutation check: drop the `Length::Percent` arm and this reads 18.
+        let percent =
+            TextStyle::from_computed(&style_for("label { font-size: 20px; line-height: 150%; }"));
+        assert_eq!(percent.line_height_px(&metrics), 30.0);
+    }
+
+    #[test]
+    fn a_relative_font_weight_is_not_collapsed_to_normal() {
+        // F76. `bolder`/`lighter` failed the `Absolute` guard and fell to
+        // 400, so `bolder` produced a *lighter* face than a bold parent got.
+        // CSS Fonts 4 §2.2's relative-weight table against a 400 parent.
+        // Mutation check: restore the single `_ => 400.0` arm and both of
+        // these read 400.
+        let bolder = TextStyle::from_computed(&style_for("label { font-weight: bolder }"));
+        assert!(bolder.weight > 400.0, "bolder is bolder: {}", bolder.weight);
+        let lighter = TextStyle::from_computed(&style_for("label { font-weight: lighter }"));
+        assert!(
+            lighter.weight < 400.0,
+            "lighter is lighter: {}",
+            lighter.weight
+        );
     }
 
     fn db() -> FontDatabase {
@@ -1825,6 +1896,20 @@ mod tests {
             apply_text_transform("a.b/c_d", Keyword::Capitalize),
             "A.B/C_D",
             "an underscore is punctuation to CSS, not a letter"
+        );
+
+        // F75: an apostrophe *continues* a word but is not itself a letter
+        // unit, so one at a word start must not consume the word-start slot.
+        // Mutation check: drop the `is_alphanumeric` guard in `capitalize`
+        // and these three come out `'tis`, `'click me'` and `\u{2019}Twas`.
+        assert_eq!(apply_text_transform("'tis", Keyword::Capitalize), "'Tis");
+        assert_eq!(
+            apply_text_transform("'click me'", Keyword::Capitalize),
+            "'Click Me'"
+        );
+        assert_eq!(
+            apply_text_transform("\u{2019}twas", Keyword::Capitalize),
+            "\u{2019}Twas"
         );
 
         // An apostrophe is not: `don't` is one word.

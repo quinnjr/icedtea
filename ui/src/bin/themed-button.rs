@@ -11,12 +11,15 @@
 //!
 //! With `--print-allocation` it prints the border-box allocation it *would*
 //! map, as `width height label_x label_y` on one line, and exits without
-//! touching Wayland. That is how `tests/layer_shell_screencopy.rs` derives
+//! touching Wayland. `label_x`/`label_y` are the *label node's* border-box
+//! origin relative to the button's — not the button's own border + padding
+//! inset, which coincides on `x` for Adwaita but is short on `y` by the
+//! label's centring offset within the content box. That is how `tests/layer_shell_screencopy.rs` derives
 //! the on-screen geometry it samples instead of hardcoding it.
 
 use std::path::PathBuf;
 
-use icedtea_ui::app::{ThemeSource, run_themed_button, themed_button_allocation};
+use icedtea_ui::app::{ThemeSource, run_themed_button, themed_button_allocations};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -40,13 +43,13 @@ fn main() {
         .collect();
 
     if std::env::args().any(|arg| arg == "--print-allocation") {
-        match themed_button_allocation(&label, &classes, &theme) {
-            Ok(allocation) => println!(
+        match themed_button_allocations(&label, &classes, &theme) {
+            Ok((allocation, label_allocation)) => println!(
                 "{} {} {} {}",
                 allocation.border_box.width,
                 allocation.border_box.height,
-                allocation.content_box.x - allocation.border_box.x,
-                allocation.content_box.y - allocation.border_box.y
+                label_allocation.border_box.x - allocation.border_box.x,
+                label_allocation.border_box.y - allocation.border_box.y
             ),
             Err(err) => {
                 tracing::error!(%err, "themed-button failed");

@@ -14,6 +14,32 @@ use crate::paint::border::is_visible_border_style;
 use crate::paint::fill_paint;
 use crate::paint::geometry::{inner_radii, rounded_rect_path, rounded_ring_path};
 
+/// The smallest rectangle containing `border_box` and the outline this
+/// `width`, `offset`, `color` and `style` would paint.
+///
+/// `outline-offset` puts the ring *outside* the border box, so a buffer
+/// sized to the border box clips a focus ring away entirely.
+#[must_use]
+pub fn outline_ink_rect(
+    border_box: Rect,
+    width: f32,
+    offset: f32,
+    color: Rgba,
+    style: Keyword,
+) -> Rect {
+    if !width.is_finite() || width <= 0.0 || !is_visible_border_style(style) || color.a <= 0.0 {
+        return border_box;
+    }
+    let offset = if offset.is_finite() { offset } else { 0.0 };
+    let grow = (offset + width).max(0.0);
+    Rect::new(
+        border_box.x - grow,
+        border_box.y - grow,
+        border_box.width + grow * 2.0,
+        border_box.height + grow * 2.0,
+    )
+}
+
 /// Paint one outline around `alloc`.
 pub fn paint_outline(
     canvas: &mut Canvas<'_>,
@@ -39,8 +65,26 @@ pub fn paint_outline(
         return;
     }
     let grow = offset + width;
-    let outer_radii: [[f32; 2]; 4] =
-        std::array::from_fn(|i| [(radii[i][0] + grow).max(0.0), (radii[i][1] + grow).max(0.0)]);
+    // CSS UI L4 §4.3, and what GTK and Blink both render: the outline's
+    // radii are the element's own *adjusted* by the offset, and "if the
+    // border radius is 0 the corner is not rounded". Growing every radius
+    // from zero put a rounded focus ring around a square-cornered element --
+    // Adwaita's `outline-width: 2px; outline-offset: 2px` on a
+    // `border-radius: 0` element came out with a 4px radius.
+    let outer_radii: [[f32; 2]; 4] = std::array::from_fn(|i| {
+        [
+            if radii[i][0] > 0.0 {
+                (radii[i][0] + grow).max(0.0)
+            } else {
+                0.0
+            },
+            if radii[i][1] > 0.0 {
+                (radii[i][1] + grow).max(0.0)
+            } else {
+                0.0
+            },
+        ]
+    });
     let inner = outer.inset([width; 4]);
     let inner_r = inner_radii(&outer_radii, [width; 4]);
 
@@ -68,8 +112,11 @@ pub fn paint_outline(
             );
         }
         Keyword::Dotted | Keyword::Dashed => {
+            // As in `border.rs`: a round-capped dash of length `width`
+            // already spans `2 * width`, so `[width, width]` merges every
+            // dot into its neighbour and renders as solid.
             let (on, off) = if matches!(style, Keyword::Dotted) {
-                (width, width)
+                (0.0, width * 2.0)
             } else {
                 (width * 3.0, width * 2.0)
             };
@@ -185,6 +232,49 @@ mod tests {
         // falling through to "unknown -> nothing" loses the focus ring.
         let surface = painted(2.0, 0.0, Keyword::Wavy, [[0.0, 0.0]; 4]);
         assert_eq!(pixel(&surface, 30, 14), Color(0xFF00_00FF));
+    }
+
+    #[test]
+    fn a_square_cornered_box_gets_a_square_focus_ring() {
+        // F68. Adwaita's `outline-width: 2px; outline-offset: 2px` on a
+        // `border-radius: 0` element must stay square; growing every radius
+        // from zero gave it a 4px rounded ring.
+        // Mutation check: restoring the unconditional grow clears (16, 11).
+        let surface = painted(2.0, 2.0, Keyword::Solid, [[0.0, 0.0]; 4]);
+        // The outline's own outer corner: border box (20, 15), grown by
+        // offset 2 + width 2 -> (16, 11).
+        assert_eq!(
+            pixel(&surface, 16, 11),
+            Color(0xFF00_00FF),
+            "the outline's corner pixel is square"
+        );
+    }
+
+    #[test]
+    fn a_rounded_box_still_gets_a_rounded_focus_ring() {
+        // The other half of F68: a *non-zero* radius is still grown by the
+        // offset plus the width, so the corner pixel is outside the arc.
+        let surface = painted(2.0, 2.0, Keyword::Solid, [[6.0, 6.0]; 4]);
+        assert_eq!(
+            pixel(&surface, 16, 11).alpha(),
+            0,
+            "a 10px outer radius clears the corner pixel"
+        );
+    }
+
+    #[test]
+    fn a_dotted_outline_leaves_gaps_between_its_dots() {
+        // F64's sibling. `[width, width]` with round caps makes every dot
+        // span its whole period, so a dotted outline was pixel-identical to
+        // a solid one. Mutation check: restoring `(width, width)` inks every
+        // pixel of the top edge and this assertion fails.
+        let surface = painted(4.0, 0.0, Keyword::Dotted, [[0.0, 0.0]; 4]);
+        let top = (20..40).map(|x| pixel(&surface, x, 12).alpha());
+        assert!(top.clone().any(|a| a > 0), "the dots are drawn");
+        assert!(
+            top.into_iter().any(|a| a == 0),
+            "and there are gaps between them"
+        );
     }
 
     #[test]

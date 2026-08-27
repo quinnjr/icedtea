@@ -244,11 +244,23 @@ fn unresolved_colors(sheet: &Stylesheet) -> Vec<String> {
 }
 
 /// One sheet, walked end to end: the whole gate for that sheet.
-fn assert_sheet_is_fully_covered(name: &str, css: &str) {
+///
+/// `rules` and `declarations` are the *exact* counts this sheet must walk.
+/// They used to be floors of 500 and 850 against real counts of ~900 and
+/// ~2330 — a 2.6x margin, wide enough for a parser regression that silently
+/// dropped 60% of Adwaita's declarations to still report zero unknown and
+/// zero unparseable properties and pass the gate. `parse_stylesheet` skips
+/// an invalid rule with a `tracing::debug` and drops a nested `@media` block
+/// whole, neither of which shows up in the unknown/unparseable lists, so the
+/// count is the only thing that catches them. Pinned exactly, as
+/// `the_vendored_sheets_are_the_extracted_gtk4_themes` pins line counts.
+fn assert_sheet_is_fully_covered(name: &str, css: &str, rules: usize, declarations: usize) {
     let (coverage, sheet) = Coverage::walk(css);
-    assert!(
-        coverage.rules > 500 && coverage.declarations > 850,
-        "{name}: only {} rules / {} declarations walked — the sheet did not parse",
+    assert_eq!(
+        (coverage.rules, coverage.declarations),
+        (rules, declarations),
+        "{name}: walked {} rules / {} declarations, expected {rules} / {declarations} — \
+         either the vendored sheet changed or the parser started dropping rules",
         coverage.rules,
         coverage.declarations
     );
@@ -262,8 +274,12 @@ fn assert_sheet_is_fully_covered(name: &str, css: &str) {
     let unresolved = unresolved_colors(&sheet);
     assert!(
         unresolved.is_empty(),
+        // `unresolved` gathers every `@media` block's definitions too, so
+        // its length can exceed 37; a plain `37 - len` panicked with a
+        // subtract-overflow on the failure path instead of naming the
+        // colours that did not resolve.
         "{name}: {}/37 @define-colors resolved; these did not: {unresolved:#?}",
-        37 - unresolved.len()
+        37_usize.saturating_sub(unresolved.len())
     );
 }
 
@@ -307,7 +323,12 @@ fn a_colour_cycle_is_broken_not_hung() {
 
 #[test]
 fn the_m2_gate_adwaita_light_dark_and_high_contrast() {
-    assert_sheet_is_fully_covered("Adwaita light", icedtea_ui::BUNDLED_ADWAITA_LIGHT);
-    assert_sheet_is_fully_covered("Adwaita dark", ADWAITA_DARK);
-    assert_sheet_is_fully_covered("Adwaita high-contrast", ADWAITA_HC);
+    assert_sheet_is_fully_covered(
+        "Adwaita light",
+        icedtea_ui::BUNDLED_ADWAITA_LIGHT,
+        900,
+        2327,
+    );
+    assert_sheet_is_fully_covered("Adwaita dark", ADWAITA_DARK, 894, 2316);
+    assert_sheet_is_fully_covered("Adwaita high-contrast", ADWAITA_HC, 902, 2333);
 }
