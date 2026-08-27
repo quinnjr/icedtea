@@ -19,6 +19,7 @@ use cssparser::{
     parse_important,
 };
 
+use super::depth_guard::DepthGuard;
 use super::tokens::serialize_remaining;
 
 /// How deep `@import` chains are followed before the engine gives up.
@@ -103,22 +104,60 @@ pub enum MediaQuery {
     And(Rc<[MediaQuery]>),
     /// `<query>, <query> ...` / `<query> or <query>`.
     Or(Rc<[MediaQuery]>),
-    /// An unknown feature: parses, never matches.
-    AlwaysFalse,
+    /// A `<media-type>` this engine has already decided about: `screen` and
+    /// `all` are `true`, `print` and friends `false`. Unlike
+    /// [`MediaQuery::Unknown`] this is a *definite* answer, so `not print`
+    /// matches.
+    Always(bool),
+    /// A feature this engine does not model. Media Queries 4 gives such a
+    /// query the third truth value: it matches nothing, and negating it
+    /// still matches nothing.
+    Unknown,
 }
 
 impl MediaQuery {
     /// Whether this query matches `env`.
     #[must_use]
     pub fn evaluate(&self, env: &MediaEnv) -> bool {
+        self.evaluate3(env) == Some(true)
+    }
+
+    /// Media Queries 4's three-valued evaluation: `None` is *unknown*.
+    ///
+    /// The third value is what keeps `@media not (forced-colors: active)`
+    /// from applying unconditionally. `not unknown` is unknown; `unknown and
+    /// false` is false and `unknown or true` is true, because those are
+    /// decided by the other operand alone.
+    fn evaluate3(&self, env: &MediaEnv) -> Option<bool> {
         match self {
-            MediaQuery::ColorScheme(scheme) => env.color_scheme == *scheme,
-            MediaQuery::Contrast(contrast) => env.contrast == *contrast,
-            MediaQuery::ReducedMotion => false,
-            MediaQuery::Not(inner) => !inner.evaluate(env),
-            MediaQuery::And(list) => list.iter().all(|query| query.evaluate(env)),
-            MediaQuery::Or(list) => list.iter().any(|query| query.evaluate(env)),
-            MediaQuery::AlwaysFalse => false,
+            MediaQuery::ColorScheme(scheme) => Some(env.color_scheme == *scheme),
+            MediaQuery::Contrast(contrast) => Some(env.contrast == *contrast),
+            MediaQuery::ReducedMotion => Some(false),
+            MediaQuery::Always(answer) => Some(*answer),
+            MediaQuery::Unknown => None,
+            MediaQuery::Not(inner) => inner.evaluate3(env).map(|value| !value),
+            MediaQuery::And(list) => {
+                let mut unknown = false;
+                for query in list.iter() {
+                    match query.evaluate3(env) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => unknown = true,
+                    }
+                }
+                (!unknown).then_some(true)
+            }
+            MediaQuery::Or(list) => {
+                let mut unknown = false;
+                for query in list.iter() {
+                    match query.evaluate3(env) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => unknown = true,
+                    }
+                }
+                (!unknown).then_some(false)
+            }
         }
     }
 }
@@ -516,11 +555,28 @@ impl<'i> AtRuleParser<'i> for SheetParser {
     }
 }
 
+/// Consume a comma if the next token is one, leaving the parser untouched
+/// otherwise.
+///
+/// `cssparser`'s `expect_comma()` is built on `next()`, which consumes the
+/// token it then rejects; used as a loop condition it silently eats one
+/// stray token and accepts the truncated production. Every "an optional
+/// comma continues the list" site has to reset instead.
+fn eat_comma(input: &mut Parser<'_, '_>) -> bool {
+    let state = input.state();
+    if matches!(input.next(), Ok(Token::Comma)) {
+        true
+    } else {
+        input.reset(&state);
+        false
+    }
+}
+
 /// `<media-query-list>`, restricted to the features GTK documents.
 fn parse_media_query_list(input: &mut Parser<'_, '_>) -> Result<MediaQuery, ()> {
-    let mut queries = vec![parse_media_condition(input)?];
-    while input.expect_comma().is_ok() {
-        queries.push(parse_media_condition(input)?);
+    let mut queries = vec![parse_media_query(input)?];
+    while eat_comma(input) {
+        queries.push(parse_media_query(input)?);
     }
     input.skip_whitespace();
     if !input.is_exhausted() {
@@ -533,7 +589,61 @@ fn parse_media_query_list(input: &mut Parser<'_, '_>) -> Result<MediaQuery, ()> 
     })
 }
 
+/// One `<media-query>`: either a bare `<media-condition>`, or Media Queries
+/// 4's `[ not | only ]? <media-type> [ and <media-condition> ]?` form.
+///
+/// The type form is why `@media screen { ... }` has to parse at all: without
+/// it the prelude failed and the whole block was dropped, where MQ4 says an
+/// unrecognised *type* merely makes the query `not all` -- the block stays,
+/// it just never matches. `screen` and `all` do match here; a GTK widget is
+/// on a screen.
+fn parse_media_query(input: &mut Parser<'_, '_>) -> Result<MediaQuery, ()> {
+    let state = input.state();
+    if let Ok(query) = parse_media_type_query(input) {
+        return Ok(query);
+    }
+    input.reset(&state);
+    parse_media_condition(input)
+}
+
+fn parse_media_type_query(input: &mut Parser<'_, '_>) -> Result<MediaQuery, ()> {
+    let mut negated = false;
+    let first = input.expect_ident().map_err(|_| ())?.as_ref().to_string();
+    let name = if first.eq_ignore_ascii_case("not") || first.eq_ignore_ascii_case("only") {
+        negated = first.eq_ignore_ascii_case("not");
+        // `not (feature)` is a condition, not a type query: only an ident
+        // may follow the modifier here.
+        input.expect_ident().map_err(|_| ())?.as_ref().to_string()
+    } else {
+        first
+    };
+    // `and`/`or` are combinators, never types.
+    if name.eq_ignore_ascii_case("and") || name.eq_ignore_ascii_case("or") {
+        return Err(());
+    }
+    let matches_type = name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("screen");
+    let mut query = MediaQuery::Always(matches_type);
+    let after_type = input.state();
+    if matches!(input.next(), Ok(Token::Ident(word)) if word.eq_ignore_ascii_case("and")) {
+        let condition = parse_media_condition(input)?;
+        query = MediaQuery::And(vec![query, condition].into());
+    } else {
+        input.reset(&after_type);
+    }
+    Ok(if negated {
+        MediaQuery::Not(Rc::new(query))
+    } else {
+        query
+    })
+}
+
 fn parse_media_condition(input: &mut Parser<'_, '_>) -> Result<MediaQuery, ()> {
+    // Every recursive entry point in this grammar -- a leading `not`, a
+    // parenthesized group, a nested condition inside a feature -- runs
+    // through here or `parse_media_in_parens`, so one guard at each bounds
+    // the whole prelude. `@media` + 15000 `(` and `not not not ...` both
+    // overflowed the stack before.
+    let _guard = DepthGuard::enter().ok_or(())?;
     let state = input.state();
     let negated = matches!(
         input.next(),
@@ -578,6 +688,7 @@ fn parse_media_condition(input: &mut Parser<'_, '_>) -> Result<MediaQuery, ()> {
 }
 
 fn parse_media_in_parens(input: &mut Parser<'_, '_>) -> Result<MediaQuery, ()> {
+    let _guard = DepthGuard::enter().ok_or(())?;
     input.expect_parenthesis_block().map_err(|_| ())?;
     input
         .parse_nested_block(|inner| match parse_media_feature(inner) {
@@ -613,7 +724,7 @@ fn parse_media_feature(input: &mut Parser<'_, '_>) -> Result<MediaQuery, ()> {
         .map_err(|_| ());
     let Ok(value) = value else {
         while input.next().is_ok() {}
-        return Ok(MediaQuery::AlwaysFalse);
+        return Ok(MediaQuery::Unknown);
     };
     input.skip_whitespace();
     if !input.is_exhausted() {
@@ -631,7 +742,7 @@ fn parse_media_feature(input: &mut Parser<'_, '_>) -> Result<MediaQuery, ()> {
         ("prefers-reduced-motion", "no-preference") => {
             MediaQuery::Not(Rc::new(MediaQuery::ReducedMotion))
         }
-        _ => MediaQuery::AlwaysFalse,
+        _ => MediaQuery::Unknown,
     })
 }
 
@@ -657,7 +768,11 @@ impl<'i> QualifiedRuleParser<'i> for KeyframeListParser {
                 _ => return Err(input.new_custom_error(())),
             };
             offsets.push(offset);
-            if input.expect_comma().is_err() {
+            // A resetting comma: `expect_comma()` would swallow the offending
+            // token, so `0% 50% { ... }` was accepted with the `50%` dropped.
+            let after_offset = input.state();
+            if !matches!(input.next(), Ok(Token::Comma)) {
+                input.reset(&after_offset);
                 break;
             }
         }
@@ -1125,7 +1240,10 @@ mod tests {
         assert!(!MediaQuery::Contrast(Contrast::More).evaluate(&light));
         // `prefers-reduced-motion: reduce` parses and never matches in M2.
         assert!(!MediaQuery::ReducedMotion.evaluate(&light));
-        assert!(!MediaQuery::AlwaysFalse.evaluate(&light));
+        assert!(!MediaQuery::Unknown.evaluate(&light));
+        // Media Queries 4's third truth value: negating an unknown query
+        // still matches nothing (F10).
+        assert!(!MediaQuery::Not(std::rc::Rc::new(MediaQuery::Unknown)).evaluate(&light));
         let not_dark =
             MediaQuery::Not(std::rc::Rc::new(MediaQuery::ColorScheme(ColorScheme::Dark)));
         assert!(not_dark.evaluate(&light));
@@ -1180,7 +1298,7 @@ mod tests {
         ));
         // An unknown feature parses and never matches, so its block is
         // fully parsed and then simply never applies.
-        assert_eq!(query("(min-width: 100px)"), Some(MediaQuery::AlwaysFalse));
+        assert_eq!(query("(min-width: 100px)"), Some(MediaQuery::Unknown));
     }
 
     #[test]
@@ -1285,5 +1403,146 @@ mod tests {
         assert_eq!(sheet.rules[0].selector_text, "headerbar");
         assert_eq!(sheet.media_blocks.len(), 1);
         assert!(sheet.media_blocks[0].rules.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{ColorScheme, Contrast, MediaEnv, MediaQuery, parse_stylesheet};
+
+    fn block(text: &str) -> Option<MediaQuery> {
+        let css = format!("@media {text} {{ button {{ color: red }} }}");
+        parse_stylesheet(&css)
+            .media_blocks
+            .first()
+            .map(|found| found.query.clone())
+    }
+
+    fn applies(text: &str) -> bool {
+        block(text).is_some_and(|query| query.evaluate(&MediaEnv::default()))
+    }
+
+    // F10: Media Queries 4's three-valued logic. Negating a feature this
+    // engine does not model must *not* make the block apply unconditionally.
+    #[test]
+    fn negating_an_unmodelled_feature_still_matches_nothing() {
+        assert_eq!(
+            block("not (forced-colors: active)"),
+            Some(MediaQuery::Not(std::rc::Rc::new(MediaQuery::Unknown))),
+            "the block must still parse"
+        );
+        assert!(!applies("not (forced-colors: active)"));
+        assert!(!applies("(forced-colors: active)"));
+        // An unknown operand does not poison a decision the other operand
+        // already makes on its own.
+        assert!(!applies(
+            "(forced-colors: active) and (prefers-color-scheme: dark)"
+        ));
+        assert!(applies(
+            "(forced-colors: active), (prefers-color-scheme: light)"
+        ));
+        assert!(!applies(
+            "(forced-colors: active) and (prefers-color-scheme: light)"
+        ));
+    }
+
+    // F11: a stray token after a media condition must reject the query, not
+    // be swallowed by `expect_comma()` leaving a truncated one behind.
+    #[test]
+    fn a_media_query_missing_its_and_is_rejected_rather_than_truncated() {
+        assert_eq!(
+            block("(prefers-color-scheme: dark) (prefers-contrast: more)"),
+            None,
+            "the malformed query must not be accepted as its first half"
+        );
+        // The well-formed spelling still works.
+        assert!(
+            block("(prefers-color-scheme: dark) and (prefers-contrast: more)").is_some_and(
+                |query| query.evaluate(&MediaEnv {
+                    color_scheme: ColorScheme::Dark,
+                    contrast: Contrast::More,
+                })
+            )
+        );
+    }
+
+    // F12/F13: the prelude parser is depth-bounded. Both of these aborted the
+    // process with a stack overflow before the guard.
+    #[test]
+    fn a_pathologically_deep_media_prelude_is_refused_rather_than_overflowing() {
+        let nots = format!("{}(prefers-color-scheme: dark)", "not ".repeat(30_000));
+        assert_eq!(block(&nots), None);
+        let parens = format!(
+            "{}(prefers-color-scheme: dark){}",
+            "(".repeat(15_000),
+            ")".repeat(15_000)
+        );
+        assert_eq!(block(&parens), None);
+        // A humanly-deep prelude still parses.
+        assert!(applies("((((prefers-color-scheme: light))))"));
+    }
+
+    // Priority item: MQ4 media types. An unrecognised type makes the query
+    // `not all`; the block still parses instead of being dropped whole.
+    #[test]
+    fn media_types_and_only_parse_rather_than_dropping_the_block() {
+        assert!(applies("screen"));
+        assert!(applies("all"));
+        assert!(applies("only screen"));
+        assert!(applies("screen and (prefers-color-scheme: light)"));
+        assert!(!applies("screen and (prefers-color-scheme: dark)"));
+        // An unrecognised type parses and never matches; negated, it matches.
+        assert_eq!(block("print"), Some(MediaQuery::Always(false)));
+        assert!(!applies("print"));
+        assert!(applies("not print"));
+        assert!(!applies("not screen"));
+        // The block itself survives -- that is the whole point.
+        let sheet = parse_stylesheet("@media print { button { color: red } }");
+        assert_eq!(sheet.media_blocks.len(), 1);
+        assert_eq!(sheet.media_blocks[0].rules.len(), 1);
+    }
+
+    // F14: the keyframe-selector prelude used the same swallowing
+    // `expect_comma()`, so `0% 50% { ... }` was accepted with `50%` dropped.
+    #[test]
+    fn a_malformed_keyframe_selector_list_is_rejected_not_truncated() {
+        let sheet = parse_stylesheet("@keyframes fade { 0% 50% { opacity: 0 } to { opacity: 1 } }");
+        let frames = &sheet.keyframes[0].frames;
+        assert!(
+            frames.iter().all(|(offsets, _)| offsets != &vec![0.0]),
+            "the malformed `0% 50%` selector must not survive as a bare 0%"
+        );
+        assert_eq!(frames.len(), 1, "only the well-formed `to` frame remains");
+        assert_eq!(frames[0].0, vec![1.0]);
+        // A real comma-separated selector list still parses.
+        let ok = parse_stylesheet("@keyframes fade { 0%, 50% { opacity: 0 } }");
+        assert_eq!(ok.keyframes[0].frames[0].0, vec![0.0, 0.5]);
+    }
+
+    // F20: a function name is re-serialized through `serialize_identifier`,
+    // so an escaped name round-trips as the same token rather than as a
+    // different function wrapping another.
+    #[test]
+    fn an_escaped_function_name_round_trips_as_one_token() {
+        let sheet = parse_stylesheet("button { background-image: a\\28 b(red) }");
+        let value = &sheet.rules[0].declarations[0].value;
+        // The round-trip property, not one particular spelling of the escape
+        // (`serialize_identifier` writes `\(`, the tokenizer wrote `\28 `):
+        // re-tokenizing must give back a *single* function named `a(b`.
+        let mut source = cssparser::ParserInput::new(value);
+        let mut parser = cssparser::Parser::new(&mut source);
+        match parser.next() {
+            Ok(cssparser::Token::Function(name)) => {
+                assert_eq!(name.as_ref(), "a(b", "re-parsed as a different function");
+            }
+            other => panic!("expected one function token, got {other:?} from {value:?}"),
+        }
+        // An ordinary name is untouched.
+        let plain = parse_stylesheet("button { background-image: linear-gradient(red, blue) }");
+        assert!(
+            plain.rules[0].declarations[0]
+                .value
+                .starts_with("linear-gradient(")
+        );
     }
 }

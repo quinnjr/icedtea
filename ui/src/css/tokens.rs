@@ -26,7 +26,10 @@ use super::depth_guard::DepthGuard;
 fn write_token(token: &Token<'_>, input: &mut Parser<'_, '_>, out: &mut String) {
     match token {
         Token::Function(name) => {
-            out.push_str(name);
+            // The name arrives *unescaped*; writing it raw re-serializes an
+            // escaped name into a different token stream (`a\28 b(` would
+            // come back as a function `a` wrapping a function `b`).
+            let _ = cssparser::serialize_identifier(name, out);
             out.push('(');
             // A function's block must be consumed through `parse_nested_block`
             // or the outer parser desynchronises.
