@@ -1,5 +1,6 @@
 //! The CSS painter.
 
+pub mod blur;
 pub mod geometry;
 
 pub use geometry::{
