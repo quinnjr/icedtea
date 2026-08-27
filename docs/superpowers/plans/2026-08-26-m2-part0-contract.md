@@ -1568,3 +1568,27 @@ re-export. **Ruling:** P4 adds `pub use crate::css::computed::BackgroundLayer;` 
   the gate — with every number byte-identical through both.
 - `113` / `95` longhands / `18` shorthands, `900` compiled Adwaita rules and
   `37/37` `@define-color`s are used consistently in P1, P3 and P6.
+
+### E13 — §10.3's `themed_button_offscreen.rs` pin is amended a third time: E5's signature drop forces one mechanical line in P5, too.
+
+E5 removes `Button::render`'s `overrides: Option<&Overrides>` parameter and
+names exactly two call sites P5 updates: `wayland.rs::repaint` and P5's own
+tests. It omits a third: `ui/tests/themed_button_offscreen.rs`'s `fixture`
+helper, which P4 left calling `button.render(&mut surface, (0.0, 0.0), sheet,
+fonts, None)` (P4 deviation/E12: P4 "finishes the rewrite onto
+`paint_node`/`Allocation` and owns the gate"). Once P5 lands E5's signature
+change, that call site no longer compiles — `render` takes four arguments,
+not five — and the Global Constraints' "P5 must not edit it at all" and E5's
+two-call-site enumeration are both silent on who fixes it. Leaving it broken
+is not an option (the M1 gate must build); the only real question is whether
+this counts as an authorized touch.
+
+This is the same shape as E4: a cross-part signature change reaches into a
+byte-identical-pinned test file through no fault of the part being pinned.
+**Ruling, by the same rule E4 applied:** P5 may make exactly the one
+mechanical edit E5's own signature change requires — dropping the trailing
+`None` argument from the `fixture` helper's `button.render(...)` call — and
+nothing else. Every constant and every pixel assertion in the file stay
+byte-identical; the diff is one line, token-for-token the same shape as E4's
+`use` line amendment. This closes the gap E5 left open; E5's two-call-site
+list should be read as three going forward.
