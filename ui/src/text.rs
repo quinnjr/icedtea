@@ -383,77 +383,101 @@ fn transform_text(text: &str, transform: Keyword) -> String {
     }
 }
 
-/// Piecewise-linear CSS 1..1000 -> fontconfig `FC_WEIGHT_*`.
+/// CSS `font-weight` (1..1000) → fontconfig `FC_WEIGHT`.
 ///
-/// The two scales are not proportional: CSS 600 is fontconfig 180, CSS 700
-/// is 200. Interpolating between the anchor points is the only way to keep
-/// `fc-match` parity.
+/// This is a table lookup with piecewise-linear interpolation, **not** a cast:
+/// the two scales are not proportional (fontconfig's own
+/// `FcWeightFromOpenType` table). `fc-match "DejaVu Sans:weight=200"` picks the
+/// Bold face, which is CSS 700 — passing 700 straight through would ask for a
+/// weight past extra-black.
+const CSS_TO_FC_WEIGHT: &[(f32, f32)] = &[
+    (100.0, 0.0),
+    (200.0, 40.0),
+    (300.0, 50.0),
+    (350.0, 55.0),
+    (380.0, 75.0),
+    (400.0, 80.0),
+    (500.0, 100.0),
+    (600.0, 180.0),
+    (700.0, 200.0),
+    (800.0, 205.0),
+    (900.0, 210.0),
+    (1000.0, 215.0),
+];
+
+/// CSS `font-width`/`font-stretch` percentage → fontconfig `FC_WIDTH`.
+const CSS_TO_FC_WIDTH: &[(f32, f32)] = &[
+    (50.0, 50.0),
+    (62.5, 63.0),
+    (75.0, 75.0),
+    (87.5, 87.0),
+    (100.0, 100.0),
+    (112.5, 113.0),
+    (125.0, 125.0),
+    (150.0, 150.0),
+    (200.0, 200.0),
+];
+
+/// Piecewise-linear lookup over an ascending `(input, output)` table. Values
+/// outside the table clamp to its ends rather than extrapolating.
+fn interpolate_table(table: &[(f32, f32)], x: f32) -> f32 {
+    let first = table[0];
+    let last = table[table.len() - 1];
+    if x <= first.0 {
+        return first.1;
+    }
+    if x >= last.0 {
+        return last.1;
+    }
+    for pair in table.windows(2) {
+        let (x0, y0) = pair[0];
+        let (x1, y1) = pair[1];
+        if x <= x1 {
+            let span = x1 - x0;
+            if span <= 0.0 {
+                return y1;
+            }
+            return y0 + (y1 - y0) * ((x - x0) / span);
+        }
+    }
+    last.1
+}
+
+/// CSS `font-weight` → `FC_WEIGHT`. Non-finite input resolves to regular (80).
 #[must_use]
 pub fn css_weight_to_fc(w: f32) -> i32 {
-    const TABLE: &[(f32, f32)] = &[
-        (100.0, 0.0),
-        (200.0, 40.0),
-        (300.0, 50.0),
-        (350.0, 75.0),
-        (400.0, 80.0),
-        (500.0, 100.0),
-        (600.0, 180.0),
-        (700.0, 200.0),
-        (800.0, 205.0),
-        (900.0, 210.0),
-        (1000.0, 215.0),
-    ];
-    interpolate_table(TABLE, w)
+    if !w.is_finite() {
+        return 80;
+    }
+    interpolate_table(CSS_TO_FC_WEIGHT, w)
+        .round()
+        .clamp(0.0, 215.0) as i32
 }
 
-/// Piecewise-linear CSS percentage -> fontconfig `FC_WIDTH_*`.
+/// CSS `font-width`/`font-stretch` percentage → `FC_WIDTH`. Non-finite input
+/// resolves to normal (100).
 #[must_use]
 pub fn css_stretch_to_fc(pct: f32) -> i32 {
-    const TABLE: &[(f32, f32)] = &[
-        (50.0, 50.0),
-        (62.5, 63.0),
-        (75.0, 75.0),
-        (87.5, 87.0),
-        (100.0, 100.0),
-        (112.5, 113.0),
-        (125.0, 125.0),
-        (150.0, 150.0),
-        (200.0, 200.0),
-    ];
-    interpolate_table(TABLE, pct)
+    if !pct.is_finite() {
+        return 100;
+    }
+    interpolate_table(CSS_TO_FC_WIDTH, pct)
+        .round()
+        .clamp(1.0, 400.0) as i32
 }
 
-/// CSS `font-style` -> fontconfig `FC_SLANT_*`.
+/// CSS `font-style` → `FC_SLANT` (`ROMAN` 0, `ITALIC` 100, `OBLIQUE` 110).
+///
+/// `oblique 0deg` is upright text, so it maps to `ROMAN`; every other angle,
+/// including a non-finite one, is oblique.
 #[must_use]
 pub fn css_style_to_fc_slant(s: FontStyle) -> i32 {
     match s {
         FontStyle::Normal => 0,
         FontStyle::Italic => 100,
+        FontStyle::Oblique(degrees) if degrees.is_finite() && degrees.abs() < 0.5 => 0,
         FontStyle::Oblique(_) => 110,
     }
-}
-
-/// Look `value` up in a sorted `(input, output)` table, interpolating
-/// between neighbours and clamping at both ends.
-fn interpolate_table(table: &[(f32, f32)], value: f32) -> i32 {
-    if !value.is_finite() {
-        return table[0].1 as i32;
-    }
-    if value <= table[0].0 {
-        return table[0].1 as i32;
-    }
-    let last = table[table.len() - 1];
-    if value >= last.0 {
-        return last.1 as i32;
-    }
-    for pair in table.windows(2) {
-        let (lo, hi) = (pair[0], pair[1]);
-        if value >= lo.0 && value <= hi.0 {
-            let t = (value - lo.0) / (hi.0 - lo.0);
-            return (lo.1 + t * (hi.1 - lo.1)).round() as i32;
-        }
-    }
-    last.1 as i32
 }
 
 #[cfg(test)]
@@ -793,5 +817,97 @@ mod tests {
     #[test]
     fn a_probe_only_database_reports_no_fontconfig() {
         assert!(!FontDatabase::probe_only().has_fontconfig());
+    }
+
+    #[test]
+    fn css_weights_map_onto_fontconfigs_own_scale() {
+        // fontconfig's FcWeightFromOpenType table, the mapping `fc-match` itself
+        // uses. Verified on this machine: `fc-match "DejaVu Sans:weight=200"`
+        // resolves to DejaVu Sans Bold, `weight=80` to Book.
+        assert_eq!(css_weight_to_fc(100.0), 0, "thin");
+        assert_eq!(css_weight_to_fc(200.0), 40, "extra-light");
+        assert_eq!(css_weight_to_fc(300.0), 50, "light");
+        assert_eq!(css_weight_to_fc(350.0), 55, "semi-light");
+        assert_eq!(css_weight_to_fc(380.0), 75, "book");
+        assert_eq!(css_weight_to_fc(400.0), 80, "regular");
+        assert_eq!(css_weight_to_fc(500.0), 100, "medium");
+        assert_eq!(css_weight_to_fc(600.0), 180, "semi-bold");
+        assert_eq!(css_weight_to_fc(700.0), 200, "bold");
+        assert_eq!(css_weight_to_fc(800.0), 205, "extra-bold");
+        assert_eq!(css_weight_to_fc(900.0), 210, "black");
+        assert_eq!(css_weight_to_fc(1000.0), 215, "extra-black");
+    }
+
+    #[test]
+    fn css_weights_between_table_rows_interpolate_and_clamp() {
+        // 450 is halfway between 400 (fc 80) and 500 (fc 100).
+        assert_eq!(css_weight_to_fc(450.0), 90);
+        // 650 is halfway between 600 (fc 180) and 700 (fc 200).
+        assert_eq!(css_weight_to_fc(650.0), 190);
+        // Outside the table the ends hold, they do not extrapolate.
+        assert_eq!(css_weight_to_fc(0.0), 0);
+        assert_eq!(css_weight_to_fc(-500.0), 0);
+        assert_eq!(css_weight_to_fc(5000.0), 215);
+    }
+
+    #[test]
+    fn css_stretch_percentages_map_onto_fc_width() {
+        assert_eq!(css_stretch_to_fc(50.0), 50, "ultra-condensed");
+        assert_eq!(css_stretch_to_fc(62.5), 63, "extra-condensed");
+        assert_eq!(css_stretch_to_fc(75.0), 75, "condensed");
+        assert_eq!(css_stretch_to_fc(87.5), 87, "semi-condensed");
+        assert_eq!(css_stretch_to_fc(100.0), 100, "normal");
+        assert_eq!(css_stretch_to_fc(112.5), 113, "semi-expanded");
+        assert_eq!(css_stretch_to_fc(125.0), 125, "expanded");
+        assert_eq!(css_stretch_to_fc(150.0), 150, "extra-expanded");
+        assert_eq!(css_stretch_to_fc(200.0), 200, "ultra-expanded");
+        // The two scales are not proportional: 68.75% sits between
+        // extra-condensed (63) and condensed (75), i.e. 69, not 68.
+        assert_eq!(css_stretch_to_fc(68.75), 69);
+        assert_eq!(
+            css_stretch_to_fc(10.0),
+            50,
+            "clamped at the ultra-condensed end"
+        );
+        assert_eq!(
+            css_stretch_to_fc(900.0),
+            200,
+            "clamped at the ultra-expanded end"
+        );
+    }
+
+    #[test]
+    fn css_styles_map_onto_fc_slant() {
+        assert_eq!(css_style_to_fc_slant(FontStyle::Normal), 0);
+        assert_eq!(css_style_to_fc_slant(FontStyle::Italic), 100);
+        assert_eq!(css_style_to_fc_slant(FontStyle::Oblique(14.0)), 110);
+        assert_eq!(css_style_to_fc_slant(FontStyle::Oblique(-14.0)), 110);
+        // `oblique 0deg` is upright, per CSS Fonts 4.
+        assert_eq!(css_style_to_fc_slant(FontStyle::Oblique(0.0)), 0);
+    }
+
+    #[test]
+    fn the_scale_conversions_never_panic_on_hostile_numbers() {
+        for value in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN,
+            f32::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            1e30,
+            -1e30,
+        ] {
+            let _ = css_weight_to_fc(value);
+            let _ = css_stretch_to_fc(value);
+            let _ = css_style_to_fc_slant(FontStyle::Oblique(value));
+        }
+        // A non-finite input must land on the neutral row, never on 0 or a
+        // saturated cast.
+        assert_eq!(css_weight_to_fc(f32::NAN), 80);
+        assert_eq!(css_stretch_to_fc(f32::NAN), 100);
+        assert_eq!(css_style_to_fc_slant(FontStyle::Oblique(f32::NAN)), 110);
     }
 }
