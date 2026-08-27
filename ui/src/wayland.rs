@@ -469,6 +469,10 @@ impl LayerWindow {
         self.surface
             .attach(Some(self.buffers.wl_buffer(index)), 0, 0);
         self.surface.damage_buffer(0, 0, width, height);
+        // The event-driven half of the staleness reset: something else made
+        // the surface dirty while a callback was outstanding. The clock-driven
+        // half -- the case where *nothing* arrives -- is in `run`, via
+        // `frame_recovery_wait`.
         let now = self.state.clock.now();
         if self.state.frame_pending
             && frame_pending_is_stale(self.state.frame_requested_at, now, FRAME_CALLBACK_DEADLINE)
@@ -479,8 +483,7 @@ impl LayerWindow {
                 "a frame callback has been outstanding past the deadline; \
                  resuming animation without it"
             );
-            self.state.frame_pending = false;
-            self.state.frame_requested_at = None;
+            self.state.clear_frame_pending();
         }
         if should_request_frame(self.state.button.is_animating(), self.state.frame_pending) {
             self.surface.frame(&self.qh, ());
@@ -506,9 +509,54 @@ impl LayerWindow {
     /// [`LayerWindowError`] if a dispatch, an shm upload or a flush fails.
     pub fn run(&mut self) -> Result<(), LayerWindowError> {
         while !self.state.closed {
-            self.queue
-                .blocking_dispatch(&mut self.state)
-                .map_err(LayerWindowError::Dispatch)?;
+            let now = self.state.clock.now();
+            match frame_recovery_wait(
+                self.state.frame_pending,
+                self.state.frame_requested_at,
+                now,
+                self.state.button.next_frame_in(),
+            ) {
+                // Nothing is waiting on a clock: sleep until the compositor
+                // says something.
+                None => {
+                    self.queue
+                        .blocking_dispatch(&mut self.state)
+                        .map_err(LayerWindowError::Dispatch)?;
+                }
+                // An outstanding frame callback is the only thing standing
+                // between us and the next animation frame. Wait for it, but
+                // not past the deadline: a callback for a surface that never
+                // gets presented simply never arrives, and a `blocking_dispatch`
+                // would sit on it forever.
+                Some(wait) => match wait_bounded(
+                    &self.conn,
+                    &mut self.queue,
+                    &mut self.state,
+                    wait,
+                    |state| state.dirty || !state.frame_pending,
+                ) {
+                    Ok(()) => {}
+                    Err(LayerWindowError::Closed) => break,
+                    Err(LayerWindowError::Timeout(_)) => {
+                        let now = self.state.clock.now();
+                        if frame_pending_is_stale(
+                            self.state.frame_requested_at,
+                            now,
+                            FRAME_CALLBACK_DEADLINE,
+                        ) {
+                            tracing::warn!(
+                                ?now,
+                                requested_at = ?self.state.frame_requested_at,
+                                "a frame callback has been outstanding past the deadline; \
+                                 resuming animation without it"
+                            );
+                            self.state.clear_frame_pending();
+                            self.state.dirty = true;
+                        }
+                    }
+                    Err(err) => return Err(err),
+                },
+            }
             if self.state.dirty {
                 self.repaint()?;
             }
@@ -573,6 +621,47 @@ fn should_request_frame(animating: bool, frame_pending: bool) -> bool {
 /// seconds is far past any real compositor's frame cadence, so this only
 /// ever fires on the genuinely-stuck case.
 const FRAME_CALLBACK_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The shortest a stuck-callback wait ever sleeps: one 60 Hz frame.
+///
+/// [`Button::next_frame_in`](crate::widget::button::Button::next_frame_in)
+/// reports `Duration::ZERO` for an interpolating transition -- it changes
+/// continuously, so "now" is the honest lower bound -- and polling on a
+/// zero timeout is a busy loop. A surface cannot be presented faster than
+/// its output refreshes anyway, so a frame is the right floor.
+const MIN_FRAME_POLL: Duration = Duration::from_millis(16);
+
+/// How long [`LayerWindow::run`] should wait on an outstanding frame
+/// callback before giving up on it, or `None` to block until the compositor
+/// speaks.
+///
+/// The staleness reset used to live only inside `repaint`, which runs only
+/// when something already set `dirty`. A `frame_pending` that got stuck with
+/// no events arriving therefore never recovered, however long the deadline
+/// said it should: `blocking_dispatch` sat on a socket that had nothing more
+/// to say. Recovery has to be driven by a clock, so the pump asks for a
+/// bounded wait whenever a callback it is actually waiting on is outstanding.
+///
+/// The wait ends at whichever comes first: the animation's own next change
+/// (never sooner than [`MIN_FRAME_POLL`]) or what is left of
+/// [`FRAME_CALLBACK_DEADLINE`]. `None` when nothing is pending, and also
+/// when nothing is animating -- a stuck callback with no animation behind it
+/// costs nothing, and the next repaint clears it on the way past.
+#[must_use]
+fn frame_recovery_wait(
+    frame_pending: bool,
+    requested_at: Option<Duration>,
+    now: Duration,
+    next_frame_in: Option<Duration>,
+) -> Option<Duration> {
+    if !frame_pending {
+        return None;
+    }
+    let next_frame_in = next_frame_in?;
+    let waited = requested_at.map_or(Duration::ZERO, |at| now.saturating_sub(at));
+    let remaining = FRAME_CALLBACK_DEADLINE.saturating_sub(waited);
+    Some(remaining.min(next_frame_in.max(MIN_FRAME_POLL)))
+}
 
 /// Whether an outstanding frame callback requested at `requested_at` has
 /// been waiting at least `deadline` as of `now` -- and so should be given up
@@ -1124,6 +1213,92 @@ mod tests {
             state.clock.now() < std::time::Duration::from_secs(1),
             "the client's clock is created with the state, so it starts near zero"
         );
+    }
+
+    // Mutation check: return `None` unconditionally and a stuck
+    // `frame_pending` puts `run` back in an unbounded `blocking_dispatch`,
+    // which is exactly the hang this replaced; return the raw
+    // `next_frame_in` and an interpolating transition (whose honest next
+    // deadline is `ZERO`) turns the wait into a busy loop.
+    #[test]
+    fn a_pending_frame_callback_makes_the_pump_wait_on_a_clock() {
+        use super::{FRAME_CALLBACK_DEADLINE, MIN_FRAME_POLL, frame_recovery_wait};
+        let now = Duration::from_secs(10);
+
+        assert_eq!(
+            frame_recovery_wait(false, None, now, Some(Duration::ZERO)),
+            None,
+            "nothing is outstanding: block until the compositor speaks"
+        );
+        assert_eq!(
+            frame_recovery_wait(true, Some(now), now, None),
+            None,
+            "a stuck callback with nothing animating behind it costs nothing"
+        );
+
+        // An interpolating transition reports `ZERO`; the wait is floored at
+        // one frame rather than spinning.
+        assert_eq!(
+            frame_recovery_wait(true, Some(now), now, Some(Duration::ZERO)),
+            Some(MIN_FRAME_POLL)
+        );
+        // A `steps()` transition with a real gap waits that long...
+        assert_eq!(
+            frame_recovery_wait(true, Some(now), now, Some(Duration::from_millis(120))),
+            Some(Duration::from_millis(120))
+        );
+        // ...but never past what is left of the callback deadline.
+        let nearly_up = now + FRAME_CALLBACK_DEADLINE - Duration::from_millis(30);
+        assert_eq!(
+            frame_recovery_wait(true, Some(now), nearly_up, Some(Duration::from_secs(9))),
+            Some(Duration::from_millis(30))
+        );
+        // Past the deadline the wait is zero, so the very next loop turn
+        // resets `frame_pending` and repaints instead of waiting again.
+        assert_eq!(
+            frame_recovery_wait(
+                true,
+                Some(now),
+                now + FRAME_CALLBACK_DEADLINE,
+                Some(Duration::from_secs(9))
+            ),
+            Some(Duration::ZERO)
+        );
+        assert!(super::frame_pending_is_stale(
+            Some(now),
+            now + FRAME_CALLBACK_DEADLINE,
+            FRAME_CALLBACK_DEADLINE
+        ));
+    }
+
+    // The bounded wait a stuck callback uses really does return -- and
+    // returns a `Timeout`, which is what `run` turns into the reset.
+    #[test]
+    fn the_stuck_callback_wait_times_out_instead_of_hanging() {
+        let (conn, mut queue, _peer) = silent_connection();
+        let mut state = state();
+        state.dirty = false;
+        state.frame_pending = true;
+        state.frame_requested_at = Some(state.clock.now());
+        let wait = Duration::from_millis(120);
+
+        let started = Instant::now();
+        let result = wait_bounded(&conn, &mut queue, &mut state, wait, |state| {
+            state.dirty || !state.frame_pending
+        });
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(LayerWindowError::Timeout(after)) if after == wait),
+            "expected a Timeout, got {result:?}"
+        );
+        assert!(elapsed >= wait && elapsed < wait * 20, "took {elapsed:?}");
+
+        // And the reset `run` performs on that Timeout leaves the pump able
+        // to ask for a fresh callback.
+        state.clear_frame_pending();
+        state.dirty = true;
+        assert!(super::should_request_frame(true, state.frame_pending));
     }
 
     // Mutation check: drop the `>=` deadline comparison (or flip it to `>`)

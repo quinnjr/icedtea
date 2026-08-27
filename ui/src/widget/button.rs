@@ -290,6 +290,19 @@ impl Button {
         self.anim.is_active(self.clock.now())
     }
 
+    /// How long until this widget's animated values could next differ, or
+    /// `None` when nothing is running.
+    ///
+    /// A *lower* bound, straight off [`AnimationState::next_deadline`]: an
+    /// interpolating transition changes continuously, so the honest answer
+    /// there is "now", i.e. `Duration::ZERO`. The frame pump uses it to size
+    /// a time-driven wake-up, and must not treat zero as "spin".
+    #[must_use]
+    pub fn next_frame_in(&self) -> Option<std::time::Duration> {
+        let now = self.clock.now();
+        Some(self.anim.next_deadline(now)?.saturating_sub(now))
+    }
+
     /// This frame's animated values, layered over the computed style by
     /// `paint_node`.
     #[must_use]
