@@ -12,7 +12,7 @@
 //! with a one-time warning rather than silently ignored.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -148,15 +148,88 @@ pub struct ShapedText {
 
 static FEATURES_WARNED: Once = Once::new();
 
+/// A cache that never grows past `capacity`, evicting in insertion order.
+///
+/// The three caches on [`FontDatabase`] are keyed by things a stylesheet
+/// controls -- a font query string, a font file path, a shaped run's text
+/// and style -- so an unbounded `HashMap` is unbounded *by the theme*: a
+/// long-lived UI that shapes many distinct labels (or a hostile `gtk.css`
+/// that varies `font-size` per rule) would grow one forever. A hard cap with
+/// oldest-first eviction bounds that without needing a reload signal.
+///
+/// Insertion order, not use order: a true LRU would have to touch the queue
+/// on every hit, and these caches are read on every restyle. Re-inserting an
+/// existing key replaces its value and keeps its original position, so a hot
+/// entry can still be evicted -- the cost of that is one re-shape, which is
+/// exactly what the cache was saving.
+struct BoundedCache<K, V> {
+    entries: HashMap<K, V>,
+    order: VecDeque<K>,
+    capacity: usize,
+}
+
+impl<K: Clone + Eq + std::hash::Hash, V> BoundedCache<K, V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if self.entries.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+        }
+        while self.entries.len() > self.capacity {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.entries.remove(&oldest);
+                }
+                // Unreachable while `order` and `entries` agree; breaking
+                // rather than looping keeps a bookkeeping bug from hanging
+                // the UI thread.
+                None => break,
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// How many shaped runs [`FontDatabase`] keeps.
+///
+/// A window's worth of distinct labels, several times over: M2's widget tree
+/// is one button, and even a full settings dialog shapes tens of runs, not
+/// hundreds.
+const SHAPE_CACHE_CAPACITY: usize = 256;
+
+/// How many resolved font queries and loaded typefaces [`FontDatabase`]
+/// keeps. A theme names a handful of families across a handful of weights
+/// and styles; 64 is far above that and each entry is small.
+const FACE_CACHE_CAPACITY: usize = 64;
+
 /// Font discovery, loading and shaping, with caches.
 ///
 /// Single-threaded by construction: fontconfig's own objects are `!Send`
 /// and `!Sync`, and Part 6 will own one `Fontconfig` for the process.
 pub struct FontDatabase {
     fontconfig: Option<fontconfig::Fontconfig>,
-    typefaces: HashMap<(PathBuf, i32), Option<Arc<Typeface>>>,
-    faces: HashMap<String, Option<FontFace>>,
-    shapes: HashMap<OwnedShapeKey, Rc<ShapedText>>,
+    typefaces: BoundedCache<(PathBuf, i32), Option<Arc<Typeface>>>,
+    faces: BoundedCache<String, Option<FontFace>>,
+    shapes: BoundedCache<OwnedShapeKey, Rc<ShapedText>>,
     shaper: Shaper,
     warned_collection_index: bool,
 }
@@ -181,9 +254,9 @@ impl FontDatabase {
                 tracing::debug!("fontconfig initialised");
                 Self {
                     fontconfig: Some(fc),
-                    typefaces: HashMap::new(),
-                    faces: HashMap::new(),
-                    shapes: HashMap::new(),
+                    typefaces: BoundedCache::new(FACE_CACHE_CAPACITY),
+                    faces: BoundedCache::new(FACE_CACHE_CAPACITY),
+                    shapes: BoundedCache::new(SHAPE_CACHE_CAPACITY),
                     shaper: Shaper::new(),
                     warned_collection_index: false,
                 }
@@ -203,9 +276,9 @@ impl FontDatabase {
     pub fn probe_only() -> Self {
         Self {
             fontconfig: None,
-            typefaces: HashMap::new(),
-            faces: HashMap::new(),
-            shapes: HashMap::new(),
+            typefaces: BoundedCache::new(FACE_CACHE_CAPACITY),
+            faces: BoundedCache::new(FACE_CACHE_CAPACITY),
+            shapes: BoundedCache::new(SHAPE_CACHE_CAPACITY),
             shaper: Shaper::new(),
             warned_collection_index: false,
         }
@@ -221,8 +294,9 @@ impl FontDatabase {
     /// available (a later task wires that in) and the [`FONT_CANDIDATES`]
     /// probe otherwise.
     ///
-    /// Cached per query; a query that resolves to nothing is cached as
-    /// nothing, so a missing font costs one lookup, not one per restyle.
+    /// Cached per query, up to [`FACE_CACHE_CAPACITY`] entries; a query that
+    /// resolves to nothing is cached as nothing, so a missing font costs one
+    /// lookup, not one per restyle.
     pub fn match_face(&mut self, query: &FontQuery<'_>) -> Option<FontFace> {
         let key = match_cache_key(query);
         if let Some(cached) = self.faces.get(&key) {
@@ -238,7 +312,8 @@ impl FontDatabase {
         face
     }
 
-    /// The loaded typeface for `face`, cached by `(path, index)`.
+    /// The loaded typeface for `face`, cached by `(path, index)` up to
+    /// [`FACE_CACHE_CAPACITY`] entries.
     ///
     /// `index` is kept even though `skia-rs-text` 0.4.0's `Typeface::from_data`
     /// cannot select a face inside a collection: it is part of the cache
@@ -407,6 +482,14 @@ impl FontDatabase {
     }
 
     /// Drop every cached face, typeface and shaped run.
+    ///
+    /// Nothing in M2 calls this: the sheet is compiled once when the window
+    /// opens and never swapped, so there is no reload edge to invalidate on.
+    /// What bounds the caches instead is their capacity
+    /// ([`SHAPE_CACHE_CAPACITY`], [`FACE_CACHE_CAPACITY`]), which holds
+    /// whether or not anything ever signals a reload. This stays as the hook
+    /// a live theme-reload path would call, and as the way a test proves an
+    /// entry really was cached rather than recomputed.
     pub fn clear_caches(&mut self) {
         self.typefaces.clear();
         self.faces.clear();
@@ -1217,6 +1300,93 @@ mod tests {
             2,
             "the transform is not part of the cache key"
         );
+    }
+
+    #[test]
+    fn the_shape_cache_stops_growing_at_its_capacity() {
+        // The caches are keyed by things a stylesheet controls, so an
+        // unbounded map is unbounded by the theme. Inserting one more than
+        // the cap must evict the oldest entry, not grow.
+        let mut db = db();
+        let families = sans();
+        let face = db.match_face(&query(&families)).expect("system font");
+
+        let first = db.shape(&key("label 0", &face, 14.0));
+        for i in 1..super::SHAPE_CACHE_CAPACITY {
+            let text = format!("label {i}");
+            let _ = db.shape(&key(&text, &face, 14.0));
+        }
+        assert_eq!(db.shape_cache_len(), super::SHAPE_CACHE_CAPACITY);
+        assert!(
+            Rc::ptr_eq(&first, &db.shape(&key("label 0", &face, 14.0))),
+            "a full-but-not-over cache must still be serving its oldest entry"
+        );
+
+        // One past the cap: the oldest goes, the cache does not grow.
+        let text = format!("label {}", super::SHAPE_CACHE_CAPACITY);
+        let _ = db.shape(&key(&text, &face, 14.0));
+        assert_eq!(
+            db.shape_cache_len(),
+            super::SHAPE_CACHE_CAPACITY,
+            "the shape cache grew past its capacity"
+        );
+        assert!(
+            !Rc::ptr_eq(&first, &db.shape(&key("label 0", &face, 14.0))),
+            "the oldest entry was not the one evicted"
+        );
+
+        // And it stays capped however far past it goes.
+        for i in 0..(super::SHAPE_CACHE_CAPACITY * 3) {
+            let text = format!("more {i}");
+            let _ = db.shape(&key(&text, &face, 14.0));
+            assert!(db.shape_cache_len() <= super::SHAPE_CACHE_CAPACITY);
+        }
+    }
+
+    #[test]
+    fn the_face_cache_stops_growing_at_its_capacity() {
+        let mut db = db();
+        for i in 0..(super::FACE_CACHE_CAPACITY * 2 + 1) {
+            let families = vec![FontFamily::Named(format!("Nonexistent {i}").into())];
+            let _ = db.match_face(&query(&families));
+            assert!(
+                db.match_cache_len() <= super::FACE_CACHE_CAPACITY,
+                "the face cache grew past its capacity"
+            );
+        }
+        assert_eq!(db.match_cache_len(), super::FACE_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn a_bounded_cache_keeps_the_newest_entries_and_replaces_in_place() {
+        let mut cache: super::BoundedCache<u32, &str> = super::BoundedCache::new(3);
+        for (k, v) in [(1, "a"), (2, "b"), (3, "c")] {
+            cache.insert(k, v);
+        }
+        assert_eq!(cache.len(), 3);
+        // Replacing an existing key must not queue a second eviction slot.
+        cache.insert(2, "B");
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(&2), Some(&"B"));
+        assert_eq!(cache.get(&1), Some(&"a"), "the replace evicted something");
+
+        cache.insert(4, "d");
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(&1), None, "the oldest key survived eviction");
+        assert_eq!(cache.get(&2), Some(&"B"), "a replaced key kept its slot");
+        assert_eq!(cache.get(&4), Some(&"d"));
+
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        cache.insert(5, "e");
+        assert_eq!(cache.len(), 1, "clear left stale eviction bookkeeping");
+
+        // A zero capacity would divide the cache by zero conceptually; it is
+        // clamped to one rather than made useless or unbounded.
+        let mut tiny: super::BoundedCache<u32, u32> = super::BoundedCache::new(0);
+        tiny.insert(1, 1);
+        tiny.insert(2, 2);
+        assert_eq!(tiny.len(), 1);
     }
 
     #[test]
