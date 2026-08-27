@@ -126,27 +126,56 @@ impl ThemeEnv {
     /// it that way. Everything else is `no-preference`, which is
     /// [`MediaEnv`]'s default.
     ///
-    /// Variants are matched case-insensitively, as GTK matches them.
+    /// A `-dark` or `-hc` *name* suffix counts too, because that is what
+    /// people actually type: `GTK_THEME=Adwaita-dark` names a whole theme
+    /// directory, which [`base_theme_candidates`](Self::base_theme_candidates)
+    /// already resolves to the right files -- so the media environment has to
+    /// agree with it, or a `-dark` theme's dark `@media` blocks get dropped.
+    ///
+    /// Names and variants are matched case-insensitively, as GTK matches
+    /// them, and by character rather than by byte: `$GTK_THEME` is
+    /// user-controlled text and need not be ASCII.
     #[must_use]
     pub fn media_env(&self) -> MediaEnv {
         let Some((name, variants)) = self.theme_spec() else {
             return MediaEnv::default();
         };
         let variants: Vec<&str> = variants.collect();
-        let has = |wanted: &[&str]| {
+        let has_variant = |wanted: &[&str]| {
             variants
                 .iter()
                 .any(|v| wanted.iter().any(|w| v.eq_ignore_ascii_case(w)))
         };
-        let high_contrast = name.len() >= "HighContrast".len()
-            && name[.."HighContrast".len()].eq_ignore_ascii_case("HighContrast");
+        // `$GTK_THEME` is user-controlled text and need not be ASCII, so both
+        // affix tests go through `str::get`, which returns `None` on a byte
+        // index that lands inside a character rather than panicking. A plain
+        // `name[..n]` here aborted startup on a theme called, say,
+        // `AAAAAAAAAAAéTheme`.
+        let starts_with = |prefix: &str| {
+            name.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        };
+        let ends_with = |suffix: &str| {
+            name.len() > suffix.len()
+                && name
+                    .get(name.len() - suffix.len()..)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+        };
         MediaEnv {
-            color_scheme: if has(&["dark"]) || name.eq_ignore_ascii_case("HighContrastInverse") {
+            color_scheme: if has_variant(&["dark"])
+                || ends_with("-dark")
+                || name.eq_ignore_ascii_case("HighContrastInverse")
+            {
                 ColorScheme::Dark
             } else {
                 ColorScheme::Light
             },
-            contrast: if high_contrast || has(&["hc", "highcontrast", "high-contrast"]) {
+            contrast: if starts_with("HighContrast")
+                || ends_with("-hc")
+                || ends_with("-highcontrast")
+                || ends_with("-high-contrast")
+                || has_variant(&["hc", "highcontrast", "high-contrast"])
+            {
                 Contrast::More
             } else {
                 Contrast::NoPreference
@@ -529,6 +558,84 @@ mod tests {
             11.0,
             "the light variant must not match prefers-color-scheme: dark"
         );
+    }
+
+    /// `$GTK_THEME` is user-controlled text, not ASCII by construction. The
+    /// high-contrast check used to byte-slice `name[..12]`, which panics when
+    /// byte 12 lands inside a multi-byte character -- on the live
+    /// `UserPreferred` startup path, before anything is drawn.
+    #[test]
+    fn a_non_ascii_gtk_theme_name_does_not_panic() {
+        // Byte 12 of this name is the middle of the `é`.
+        let spec = "AAAAAAAAAAA\u{e9}Theme";
+        assert!(!spec.is_char_boundary("HighContrast".len()));
+        let env = ThemeEnv {
+            gtk_theme: Some(spec.to_string()),
+            ..ThemeEnv::default()
+        };
+        assert_eq!(env.media_env(), MediaEnv::default());
+
+        // The same hazard at every other length a check could look at, plus a
+        // name that is *shorter* than every affix.
+        for spec in [
+            "\u{e9}",
+            "\u{1f600}",
+            "d\u{e9}",
+            "\u{e9}-dark",
+            "-\u{e9}",
+            "HighContrast\u{e9}",
+            "\u{e9}:dark",
+            "\u{4e2d}\u{6587}\u{4e3b}\u{9898}-Dark",
+        ] {
+            let env = ThemeEnv {
+                gtk_theme: Some(spec.to_string()),
+                ..ThemeEnv::default()
+            };
+            let _ = env.media_env();
+            let _ = env.base_theme_candidates();
+        }
+    }
+
+    /// The `-dark` / `-hc` spellings users actually type. GTK treats these as
+    /// whole theme *names* (`~/.themes/Adwaita-dark/gtk-4.0/gtk.css`), which
+    /// `base_theme_candidates` already resolves correctly -- but the media
+    /// environment read them as plain light themes, so a `-dark` theme's
+    /// `@media (prefers-color-scheme: dark)` blocks were dropped.
+    #[test]
+    fn a_dark_or_hc_theme_name_suffix_is_read_like_the_variant() {
+        let env = |spec: &str| {
+            ThemeEnv {
+                gtk_theme: Some(spec.to_string()),
+                ..ThemeEnv::default()
+            }
+            .media_env()
+        };
+        for spec in ["Adwaita-dark", "Foo-Dark", "Foo-DARK"] {
+            assert_eq!(
+                env(spec).color_scheme,
+                crate::css::parse::ColorScheme::Dark,
+                "`{spec}` is a dark theme"
+            );
+        }
+        for spec in ["Foo-hc", "Foo-HC", "Foo-highcontrast", "Foo-high-contrast"] {
+            assert_eq!(
+                env(spec).contrast,
+                crate::css::parse::Contrast::More,
+                "`{spec}` is a high-contrast theme"
+            );
+        }
+        // Both at once, in either spelling.
+        assert_eq!(
+            env("Adwaita-dark:hc"),
+            MediaEnv {
+                color_scheme: crate::css::parse::ColorScheme::Dark,
+                contrast: crate::css::parse::Contrast::More,
+            }
+        );
+        // And a name that merely *contains* the word is not a suffix match.
+        assert_eq!(env("Darkroom"), MediaEnv::default());
+        assert_eq!(env("dark"), MediaEnv::default(), "the affix needs a stem");
+        assert_eq!(env("-dark"), MediaEnv::default(), "so does the hyphen form");
     }
 
     #[test]

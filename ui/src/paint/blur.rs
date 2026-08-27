@@ -106,23 +106,25 @@ pub fn blur_premul_rgba(pixels: &mut [u8], width: i32, height: i32, stride: usiz
 
 /// Add the four channels at `src[o..o + 4]` into the running window sum.
 ///
-/// The slice is read as one `[u8; 4]` rather than four indexed bytes: a
-/// single bounds check per sample, which is the whole per-pixel cost of the
-/// pass in an unoptimised build.
+/// The four bytes are indexed directly rather than collected into a `[u8; 4]`
+/// first: converting the slice needs a fallible `try_into`, and every way of
+/// spelling the failure branch is either an `unwrap` or a silently wrong
+/// default for a case that cannot happen. `blur_premul_rgba` has already
+/// refused any buffer shorter than `stride * h`, and both passes only ever
+/// address samples inside `w`/`h`, so every offset here is in range by
+/// construction.
 #[inline]
 fn add(sum: &mut [u32; 4], src: &[u8], o: usize) {
-    let px: [u8; 4] = src[o..o + 4].try_into().unwrap_or([0; 4]);
     for c in 0..4 {
-        sum[c] += u32::from(px[c]);
+        sum[c] += u32::from(src[o + c]);
     }
 }
 
 /// Remove the four channels at `src[o..o + 4]` from the running window sum.
 #[inline]
 fn sub(sum: &mut [u32; 4], src: &[u8], o: usize) {
-    let px: [u8; 4] = src[o..o + 4].try_into().unwrap_or([0; 4]);
     for c in 0..4 {
-        sum[c] -= u32::from(px[c]);
+        sum[c] -= u32::from(src[o + c]);
     }
 }
 

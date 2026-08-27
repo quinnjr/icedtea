@@ -1212,6 +1212,50 @@ mod tests {
         assert!(sheet.media_blocks.is_empty());
     }
 
+    /// Skipping a nested `@media` must consume *exactly* its block and stop:
+    /// the rules on either side of it, inside the same outer `@media`, still
+    /// parse, and so does the top-level rule after the whole thing. The
+    /// nested body deliberately contains a `}` and a `"` inside a comment,
+    /// and a `}` inside a string, so a skip that scanned for a brace by hand
+    /// instead of using the tokenizer's own block tracking would stop in the
+    /// wrong place and swallow -- or resurrect -- a sibling.
+    #[test]
+    fn skipping_a_nested_media_block_stops_exactly_at_its_closing_brace() {
+        let css = "@media (prefers-color-scheme: dark) {\n\
+                   button { min-width: 41px }\n\
+                   @media (prefers-contrast: more) {\n\
+                   /* } \" */\n\
+                   spinner { min-width: 999px }\n\
+                   label { font-family: \"} not a brace {\" }\n\
+                   }\n\
+                   headerbar { min-height: 42px }\n\
+                   }\n\
+                   window { min-width: 43px }\n";
+        let sheet = parse_stylesheet(css);
+
+        // The rule after the outer `@media` is still top-level.
+        let top: Vec<&str> = sheet
+            .rules
+            .iter()
+            .map(|rule| rule.selector_text.as_str())
+            .collect();
+        assert_eq!(top, ["window"]);
+
+        // Both siblings of the nested block survive, in source order, and
+        // nothing from inside the nested block leaked out.
+        assert_eq!(sheet.media_blocks.len(), 1);
+        let inner: Vec<&str> = sheet.media_blocks[0]
+            .rules
+            .iter()
+            .map(|rule| rule.selector_text.as_str())
+            .collect();
+        assert_eq!(
+            inner,
+            ["button", "headerbar"],
+            "the nested block's skip did not stop at its own closing brace"
+        );
+    }
+
     /// Nested `@media` used to recurse `parse_block -> StyleSheetParser ->
     /// parse_block` with no depth limit of its own, so a hostile `gtk.css`
     /// with a few hundred `@media (...) {` in a row overflowed the stack and
