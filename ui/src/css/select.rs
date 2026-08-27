@@ -7,6 +7,7 @@
 //! [`selectors::Element`], so the upstream matcher drives selection with no
 //! fork and no shim.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
@@ -18,11 +19,12 @@ use selectors::context::{
 };
 use selectors::matching::{ElementSelectorFlags, MatchingContext, matches_selector};
 use selectors::parser::{
-    AncestorHashes, NonTSPseudoClass, ParseRelative, PseudoElement as PseudoElementTrait, Selector,
-    SelectorParseErrorKind,
+    AncestorHashes, Component, NonTSPseudoClass, ParseRelative,
+    PseudoElement as PseudoElementTrait, Selector, SelectorParseErrorKind,
 };
 use selectors::{Element, OpaqueElement, SelectorImpl, SelectorList};
 
+use crate::css::cascade::CompiledRule;
 use crate::css::node::Node;
 // M1's `CssNode` still uses `select::PseudoStates`, the 7-bool struct below.
 // Part 3 deletes both and this alias goes with them.
@@ -803,6 +805,132 @@ impl Element for Node {
     }
 }
 
+/// Compiled rules indexed by the rightmost compound selector's id, class or
+/// element name, so a node is only offered the rules that can possibly match it.
+///
+/// `selectors` 0.40 has no bucketing of its own (research/cssparser-selectors.md
+/// §7); this is built on `Selector::iter()`, whose first sequence is exactly the
+/// rightmost compound.
+#[derive(Debug, Default)]
+pub struct RuleBuckets {
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    by_name: HashMap<String, Vec<usize>>,
+    universal: Vec<usize>,
+    len: usize,
+}
+
+/// Which bucket one selector belongs in.
+enum BucketKey {
+    Id(String),
+    Class(String),
+    Name(String),
+    /// The rightmost compound names no id, class or element -- `* > :first-child`,
+    /// `:root`, `::selection`. These rules must be offered to every node.
+    Universal,
+}
+
+/// The bucket for one selector: id, else the first class, else the element name,
+/// else universal. Only the rightmost compound is considered -- `Selector::iter()`
+/// stops at the first combinator, and `next_sequence()` is deliberately not
+/// called.
+fn bucket_key(selector: &Selector<GtkSelectorImpl>) -> BucketKey {
+    let mut id = None;
+    let mut class = None;
+    let mut name = None;
+    for component in selector.iter() {
+        match component {
+            Component::ID(value) => id = Some(value.as_str().to_string()),
+            Component::Class(value) => {
+                if class.is_none() {
+                    class = Some(value.as_str().to_string());
+                }
+            }
+            Component::LocalName(local) => name = Some(local.name.as_str().to_string()),
+            _ => {}
+        }
+    }
+    if let Some(id) = id {
+        BucketKey::Id(id)
+    } else if let Some(class) = class {
+        BucketKey::Class(class)
+    } else if let Some(name) = name {
+        BucketKey::Name(name)
+    } else {
+        BucketKey::Universal
+    }
+}
+
+impl RuleBuckets {
+    /// Index `rules` by their rightmost compounds. A rule with several selectors
+    /// is indexed once per selector.
+    #[must_use]
+    pub fn build(rules: &[CompiledRule]) -> Self {
+        let mut buckets = RuleBuckets {
+            len: rules.len(),
+            ..RuleBuckets::default()
+        };
+        for (index, rule) in rules.iter().enumerate() {
+            for selector in rule.selectors.slice() {
+                match bucket_key(selector) {
+                    BucketKey::Id(key) => buckets.by_id.entry(key).or_default().push(index),
+                    BucketKey::Class(key) => buckets.by_class.entry(key).or_default().push(index),
+                    BucketKey::Name(key) => buckets.by_name.entry(key).or_default().push(index),
+                    BucketKey::Universal => buckets.universal.push(index),
+                }
+            }
+        }
+        for list in buckets
+            .by_id
+            .values_mut()
+            .chain(buckets.by_class.values_mut())
+            .chain(buckets.by_name.values_mut())
+            .chain(std::iter::once(&mut buckets.universal))
+        {
+            list.dedup();
+        }
+        buckets
+    }
+
+    /// Every rule index that could match `node`, ascending and deduped.
+    ///
+    /// Sound by construction: a rule is only left out when the rightmost
+    /// compound of *every* one of its selectors names an id, class or element
+    /// this node does not have, which no matcher could then satisfy.
+    #[must_use]
+    pub fn candidates(&self, node: &Node) -> Vec<usize> {
+        let mut out = self.universal.clone();
+        if let Some(id) = node.id()
+            && let Some(list) = self.by_id.get(id.as_str())
+        {
+            out.extend_from_slice(list);
+        }
+        for class in node.classes() {
+            if let Some(list) = self.by_class.get(class.as_str()) {
+                out.extend_from_slice(list);
+            }
+        }
+        if let Some(list) = self.by_name.get(&*node.name()) {
+            out.extend_from_slice(list);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// How many rules are indexed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no rules are indexed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Whether any selector in `list` matches `node`.
 #[must_use]
 pub fn matches(list: &SelectorList<GtkSelectorImpl>, node: &Node, cx: &mut MatchCx) -> bool {
@@ -1368,6 +1496,114 @@ mod tests {
                 .to_css(&mut out)
                 .expect("serialising to a String cannot fail");
             assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn buckets_index_by_the_rightmost_compound() {
+        use super::RuleBuckets;
+        use crate::css::cascade::CompiledSheet;
+
+        // id beats class beats name; a rightmost compound with none of the three
+        // (`* > :first-child`) must land in the universal bucket.
+        let sheet = CompiledSheet::compile(concat!(
+            "button { color: red; }\n",
+            ".suggested-action { color: green; }\n",
+            "#close { color: blue; }\n",
+            "window > * { color: black; }\n",
+            "box > :first-child { color: white; }\n",
+        ));
+        assert_eq!(sheet.rules.len(), 5, "the fixture must compile whole");
+        let buckets = RuleBuckets::build(&sheet.rules);
+        assert_eq!(buckets.len(), 5);
+
+        let window = Node::new("window");
+        let button = Node::with_classes("button", &["suggested-action"]);
+        window.append_child(&button);
+        let candidates = buckets.candidates(&button);
+        // button (name) + .suggested-action (class) + the two universals.
+        assert_eq!(candidates, vec![0, 1, 3, 4]);
+        assert!(
+            !candidates.contains(&2),
+            "a rule bucketed by id must not reach a node without that id"
+        );
+
+        button.set_id(Some("close"));
+        assert_eq!(buckets.candidates(&button), vec![0, 1, 2, 3, 4]);
+
+        let entry = Node::new("entry");
+        window.append_child(&entry);
+        assert_eq!(
+            buckets.candidates(&entry),
+            vec![3, 4],
+            "only the universal bucket applies"
+        );
+    }
+
+    #[test]
+    fn a_rule_lands_in_a_bucket_for_every_selector_it_has() {
+        use super::RuleBuckets;
+        use crate::css::cascade::CompiledSheet;
+
+        let sheet =
+            CompiledSheet::compile("notebook > header > tabs > arrow, button { color: red; }");
+        let buckets = RuleBuckets::build(&sheet.rules);
+        assert_eq!(buckets.candidates(&Node::new("arrow")), vec![0]);
+        assert_eq!(buckets.candidates(&Node::new("button")), vec![0]);
+        assert!(buckets.candidates(&Node::new("entry")).is_empty());
+    }
+
+    #[test]
+    fn every_matching_adwaita_rule_is_offered_as_a_candidate() {
+        // Bucketing is only sound if it never hides a rule that would match.
+        use super::RuleBuckets;
+        use crate::css::cascade::CompiledSheet;
+
+        let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
+        let buckets = RuleBuckets::build(&sheet.rules);
+
+        let window = Node::with_classes("window", &["background", "csd"]);
+        let headerbar = Node::with_classes("headerbar", &["titlebar"]);
+        // As in `the_bloom_filter_never_changes_an_answer` above: the bundled
+        // Adwaita subset only reaches a bare `box` through
+        // `headerbar > windowhandle > box` (adwaita-light.css:620), so
+        // `windowhandle` is threaded in to give `box_node` a real rule to
+        // match, mirroring upstream GTK's own headerbar structure.
+        let windowhandle = Node::new("windowhandle");
+        let box_node = Node::with_classes("box", &["linked"]);
+        let button = Node::with_classes("button", &["suggested-action"]);
+        let label = Node::new("label");
+        let swatch = Node::new("colorswatch");
+        swatch.set_id(Some("add-color-button"));
+        window.append_child(&headerbar);
+        headerbar.append_child(&windowhandle);
+        windowhandle.append_child(&box_node);
+        box_node.append_child(&button);
+        button.append_child(&label);
+        headerbar.append_child(&swatch);
+        button.set_states(PseudoStates::HOVER);
+
+        let mut cx = MatchCx::new();
+        for node in [&window, &headerbar, &box_node, &button, &label, &swatch] {
+            let candidates = buckets.candidates(node);
+            let mut matched = 0usize;
+            for (index, rule) in sheet.rules.iter().enumerate() {
+                if matches(&rule.selectors, node, &mut cx) {
+                    matched += 1;
+                    assert!(
+                        candidates.binary_search(&index).is_ok(),
+                        "rule {index} matches {:?} but was not a candidate",
+                        node.name()
+                    );
+                }
+            }
+            assert!(matched > 0, "{:?} must match something", node.name());
+            assert!(
+                candidates.len() < sheet.rules.len(),
+                "bucketing must actually narrow {} rules for {:?}",
+                sheet.rules.len(),
+                node.name()
+            );
         }
     }
 }
