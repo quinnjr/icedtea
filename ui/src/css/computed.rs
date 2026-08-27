@@ -254,6 +254,136 @@ impl ComputedStyle {
     }
 }
 
+/// Used-value accessors: the computed table, read the way layout, paint and
+/// text want it -- in device pixels, per side, with percentages resolved
+/// against the basis the caller actually has.
+impl ComputedStyle {
+    /// The computed `font-size`, in px.
+    #[must_use]
+    pub fn font_size_px(&self) -> f32 {
+        let size = self.get::<f32>(Prop::FontSize);
+        if size.is_finite() && size >= 0.0 {
+            size
+        } else {
+            Self::DEFAULT_FONT_SIZE
+        }
+    }
+
+    /// The computed `-gtk-dpi`. Physical units convert through this.
+    #[must_use]
+    pub fn dpi(&self) -> f32 {
+        let dpi = self.get::<f32>(Prop::GtkDpi);
+        if dpi.is_finite() && dpi > 0.0 {
+            dpi
+        } else {
+            ResolveEnv::default().dpi
+        }
+    }
+
+    /// A length context for resolving whatever survived computed time.
+    ///
+    /// Only percentages do, so `root_font_size_px` is inert here; it is taken
+    /// from `env` anyway so a caller with a non-default environment stays
+    /// self-consistent.
+    #[must_use]
+    pub fn length_ctx(&self, env: &ResolveEnv, percent_basis: Option<f32>) -> LengthCtx {
+        LengthCtx {
+            font_size_px: self.font_size_px(),
+            root_font_size_px: env.root_font_size,
+            ex_ratio: EX_RATIO,
+            dpi: self.dpi(),
+            percent_basis,
+        }
+    }
+
+    /// The default-environment context the accessors below use.
+    fn used_ctx(&self, percent_basis: Option<f32>) -> LengthCtx {
+        self.length_ctx(&ResolveEnv::default(), percent_basis)
+    }
+
+    /// One longhand as a used length in px, or `None` if it is not a length.
+    fn length_px(&self, prop: Prop, basis: Option<f32>) -> Option<f32> {
+        match self.raw(prop) {
+            Value::Length(length) => length
+                .resolve(&self.used_ctx(basis))
+                .filter(|px| px.is_finite()),
+            Value::Number(number) if *number == 0.0 => Some(0.0),
+            _ => None,
+        }
+    }
+
+    /// The computed `color`.
+    #[must_use]
+    pub fn color(&self) -> Rgba {
+        self.get::<Rgba>(Prop::Color)
+    }
+
+    /// The computed `opacity`, clamped into `0..=1` as CSS requires.
+    #[must_use]
+    pub fn opacity(&self) -> f32 {
+        let opacity = self.get::<f32>(Prop::Opacity);
+        if opacity.is_finite() {
+            opacity.clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// `padding-*` in px, `[top, right, bottom, left]`. `basis` is the
+    /// containing block's width: CSS resolves every padding percentage,
+    /// vertical ones included, against the width.
+    #[must_use]
+    pub fn padding(&self, basis: f32) -> [f32; 4] {
+        const SIDES: [Prop; 4] = [
+            Prop::PaddingTop,
+            Prop::PaddingRight,
+            Prop::PaddingBottom,
+            Prop::PaddingLeft,
+        ];
+        let mut padding = [0.0; 4];
+        for (slot, prop) in SIDES.into_iter().enumerate() {
+            padding[slot] = self.length_px(prop, Some(basis)).unwrap_or(0.0).max(0.0);
+        }
+        padding
+    }
+
+    /// `margin-*` in px, `[top, right, bottom, left]`; `None` is `auto`.
+    /// Negative margins are legal and are **not** clamped.
+    #[must_use]
+    pub fn margin(&self, basis: f32) -> [Option<f32>; 4] {
+        const SIDES: [Prop; 4] = [
+            Prop::MarginTop,
+            Prop::MarginRight,
+            Prop::MarginBottom,
+            Prop::MarginLeft,
+        ];
+        let mut margin = [Some(0.0); 4];
+        for (slot, prop) in SIDES.into_iter().enumerate() {
+            margin[slot] = match self.raw(prop) {
+                Value::Length(Length::Auto) => None,
+                _ => Some(self.length_px(prop, Some(basis)).unwrap_or(0.0)),
+            };
+        }
+        margin
+    }
+
+    /// `min-width`/`min-height` as a **content-box** minimum, in px.
+    ///
+    /// GTK's minimums floor the content box, not the border box -- the M1
+    /// ruling that makes Adwaita's empty button 36x34 rather than 20x27.
+    #[must_use]
+    pub fn min_size(&self, basis: (f32, f32)) -> (f32, f32) {
+        (
+            self.length_px(Prop::MinWidth, Some(basis.0))
+                .unwrap_or(0.0)
+                .max(0.0),
+            self.length_px(Prop::MinHeight, Some(basis.1))
+                .unwrap_or(0.0)
+                .max(0.0),
+        )
+    }
+}
+
 impl Default for ComputedStyle {
     fn default() -> Self {
         (*Self::initial(&ResolveEnv::default())).clone()
@@ -1676,5 +1806,62 @@ mod tests {
             ComputedStyle::resolve(&sheet, &node, Some(&window_style), &env, &mut cx),
             ComputedStyle::resolve_chain(&sheet, &node, &env, &mut cx)
         );
+    }
+
+    #[test]
+    fn the_box_accessors_read_adwaitas_button_in_used_pixels() {
+        let style = resolve(&adwaita(), &button(&[], PseudoStates::default()));
+        assert_eq!(style.font_size_px(), 14.0);
+        assert_eq!(style.dpi(), 96.0);
+        assert_eq!(style.color().to_color32(), Color(0xFF2E_3436));
+        assert_eq!(style.opacity(), 1.0);
+        assert_eq!(style.padding(0.0), [4.0, 9.0, 4.0, 9.0]);
+        assert_eq!(style.margin(0.0), [Some(0.0); 4]);
+        assert_eq!(style.min_size((0.0, 0.0)), (16.0, 24.0));
+    }
+
+    #[test]
+    fn percentage_box_values_resolve_against_the_used_basis() {
+        let sheet = CompiledSheet::compile(
+            "button { padding: 25%; min-width: 50%; min-height: 10%; margin-left: 5% }",
+        );
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        // CSS resolves *every* padding side against the containing block's
+        // *width*; the accessor takes that one basis.
+        assert_eq!(style.padding(200.0), [50.0, 50.0, 50.0, 50.0]);
+        assert_eq!(style.min_size((200.0, 80.0)), (100.0, 8.0));
+        assert_eq!(style.margin(200.0)[3], Some(10.0));
+    }
+
+    #[test]
+    fn auto_margins_are_none_and_everything_else_clamps_sanely() {
+        let sheet = CompiledSheet::compile(
+            "button { margin: auto; padding: -4px; min-width: -1px; min-height: -2px; \
+             opacity: 4 }",
+        );
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(style.margin(0.0), [None; 4]);
+        assert_eq!(style.padding(0.0), [0.0; 4], "negative padding clamps to 0");
+        assert_eq!(style.min_size((0.0, 0.0)), (0.0, 0.0));
+        assert_eq!(style.opacity(), 1.0, "opacity clamps into 0..=1");
+    }
+
+    #[test]
+    fn the_length_context_carries_the_styles_own_font_size_and_dpi() {
+        let sheet = CompiledSheet::compile("button { font-size: 21px; -gtk-dpi: 192 }");
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        let ctx = style.length_ctx(&ResolveEnv::default(), Some(64.0));
+        assert_eq!(ctx.font_size_px, 21.0);
+        assert_eq!(ctx.dpi, 192.0);
+        assert_eq!(ctx.root_font_size_px, 14.0);
+        assert_eq!(ctx.percent_basis, Some(64.0));
+    }
+
+    #[test]
+    fn opacity_and_colour_survive_inheritance_without_leaking() {
+        let sheet = CompiledSheet::compile("window { opacity: 0.5; color: #ff0000 }");
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert_eq!(style.opacity(), 1.0, "opacity is not inherited");
+        assert_eq!(style.color().to_color32(), Color(0xFFFF_0000));
     }
 }
