@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use cssparser::{Parser, Token};
+use cssparser::{Parser, ParserState, Token};
 
 use crate::css::registry::{Prop, longhands};
 
@@ -18,8 +18,8 @@ use super::border::{
 };
 use super::color::{ColorValue, Rgba};
 use super::font::{
-    FontStyle, FontVariantFlags, FontWeight, LineHeight, parse_family_list, parse_font_size,
-    parse_stretch,
+    FontFamily, FontStyle, FontVariantFlags, FontWeight, LineHeight, parse_family_list,
+    parse_font_size, parse_stretch,
 };
 use super::image::{Image, Position};
 use super::keyword::Keyword;
@@ -694,12 +694,47 @@ pub fn expand_text_decoration(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Res
     Ok(())
 }
 
+/// The `<font-size> [/ <line-height>]? <font-family>` tail of a `font`
+/// shorthand.
+struct FontTail {
+    size: Length,
+    line_height: Option<LineHeight>,
+    families: Rc<[FontFamily]>,
+}
+
+/// The `<font-size> [/ <line-height>]? <font-family>` tail of a `font`
+/// shorthand, including the requirement that nothing follows it.
+///
+/// Split out so `expand_font` can try it twice: once with a leading bare
+/// `<percentage>` taken as `font-stretch`, and again with it given back to
+/// `font-size` (CSS Fonts 3 §3.7).
+fn parse_font_tail(input: &mut Parser<'_, '_>) -> Result<FontTail, ()> {
+    let size = parse_font_size(input)?;
+    let before_slash = input.state();
+    let line_height = if input.expect_delim('/').is_ok() {
+        Some(LineHeight::parse(input)?)
+    } else {
+        input.reset(&before_slash);
+        None
+    };
+    let families = parse_family_list(input)?;
+    require_exhausted(input)?;
+    Ok(FontTail {
+        size,
+        line_height,
+        families,
+    })
+}
+
 /// `font` -- GTK's form also carries `/ <line-height>`.
 pub fn expand_font(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), ()> {
     let mut style = None;
     let mut weight = None;
     let mut variant = None;
     let mut stretch = None;
+    // Where an ambiguous bare `<percentage>` taken as `font-stretch` began,
+    // so it can be handed back to `font-size` if the tail does not parse.
+    let mut ambiguous_percentage: Option<ParserState> = None;
     // Each slot is filled at most once, so an explicit initial value --
     // `normal`, `400`, `100%` -- is *consumed* rather than rejected: it fills
     // the first slot that accepts it and the next `normal` moves on to the
@@ -729,25 +764,45 @@ pub fn expand_font(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), ()>
             continue;
         }
         input.reset(&state);
+        // A stretch *keyword* is never a font-size, so only a percentage is
+        // ambiguous; note which this was before `parse_stretch` consumes it.
+        let percentage = matches!(input.next(), Ok(Token::Percentage { .. }));
+        input.reset(&state);
         if stretch.is_none()
             && let Ok(parsed) = parse_stretch(input)
         {
+            // CSS Fonts 3 §3.7: a bare `<percentage>` here is ambiguous --
+            // `font-stretch` and `font-size` both take one. It is the stretch
+            // only if a `<font-size>` still follows, so remember where it
+            // started and be ready to give it back to the size below.
+            // `font: 100% serif` was rejected outright: the stretch slot ate
+            // the `100%` and `parse_font_size` then found `serif`.
+            if percentage {
+                ambiguous_percentage = Some(state.clone());
+            }
             stretch = Some(parsed);
             continue;
         }
         input.reset(&state);
         break;
     }
-    let size = parse_font_size(input)?;
-    let before_slash = input.state();
-    let line_height = if input.expect_delim('/').is_ok() {
-        Some(LineHeight::parse(input)?)
-    } else {
-        input.reset(&before_slash);
-        None
+    // Every prefix slot precedes the size in the grammar, so if the tail does
+    // not parse, the only thing that can be reinterpreted is that percentage,
+    // and nothing after it needs re-reading as a prefix keyword.
+    let tail = match parse_font_tail(input) {
+        Ok(tail) => tail,
+        Err(()) => {
+            let state = ambiguous_percentage.ok_or(())?;
+            input.reset(&state);
+            stretch = None;
+            parse_font_tail(input)?
+        }
     };
-    let families = parse_family_list(input)?;
-    require_exhausted(input)?;
+    let FontTail {
+        size,
+        line_height,
+        families,
+    } = tail;
     sink(
         Prop::FontStyle,
         Value::FontStyle(style.unwrap_or(FontStyle::Normal)),
@@ -1382,6 +1437,7 @@ mod review_tests {
     use crate::css::value::font::{FontStyle, FontWeight};
     use crate::css::value::image::Image;
     use crate::css::value::keyword::Keyword;
+    use crate::css::value::length::Length;
 
     fn expanded(expand: ExpandFn, text: &str) -> Result<Vec<(Prop, Value)>, ()> {
         let mut source = cssparser::ParserInput::new(text);
@@ -1442,6 +1498,69 @@ mod review_tests {
             get(&pairs, Prop::FontWeight),
             Some(&Value::FontWeight(FontWeight::Absolute(700.0)))
         );
+    }
+
+    /// A bare `<percentage>` in a `font` shorthand is `font-stretch` only if
+    /// a `<font-size>` still follows it; otherwise it *is* the size
+    /// (CSS Fonts 3 §3.7).
+    ///
+    /// `font: 100% serif` was rejected outright: the stretch slot ate the
+    /// `100%` and `parse_font_size` then found `serif`.
+    ///
+    /// Mutation check: delete the `ambiguous_percentage` retry in
+    /// `expand_font` and the first two rows below stop expanding.
+    #[test]
+    fn a_bare_percentage_is_the_font_size_unless_a_size_follows_it() {
+        let px = |value: f32| Some(Value::Length(Length::px(value)));
+        let percent = |fraction: f32| Some(Value::Percentage(fraction));
+        // (source, expected font-size, expected font-stretch)
+        for (text, size, stretch) in [
+            // Nothing follows, so the percentage is the size.
+            (
+                "100% serif",
+                Some(Value::Length(Length::Percent(1.0))),
+                percent(1.0),
+            ),
+            (
+                "150% serif",
+                Some(Value::Length(Length::Percent(1.5))),
+                percent(1.0),
+            ),
+            // A size follows, so the percentage is the stretch.
+            ("100% 14px serif", px(14.0), percent(1.0)),
+            ("150% 14px serif", px(14.0), percent(1.5)),
+            // A stretch *keyword* is never ambiguous, so the percentage that
+            // follows it can only be the size.
+            (
+                "condensed 100% serif",
+                Some(Value::Length(Length::Percent(1.0))),
+                percent(0.75),
+            ),
+            // The unambiguous baseline, unchanged.
+            ("normal 12px sans-serif", px(12.0), percent(1.0)),
+        ] {
+            let pairs = expanded(expand_font, text)
+                .unwrap_or_else(|()| panic!("`font: {text}` must expand"));
+            assert_eq!(
+                get(&pairs, Prop::FontSize).cloned(),
+                size,
+                "`font: {text}` font-size"
+            );
+            assert_eq!(
+                get(&pairs, Prop::FontStretch).cloned(),
+                stretch,
+                "`font: {text}` font-stretch"
+            );
+            // F16: the two spellings always agree.
+            assert_eq!(
+                get(&pairs, Prop::FontWidth),
+                get(&pairs, Prop::FontStretch),
+                "`font: {text}`"
+            );
+        }
+        // Still invalid either way: no family, and no size at all.
+        assert!(expanded(expand_font, "100% 14px").is_err());
+        assert!(expanded(expand_font, "100%").is_err());
     }
 
     // F35/F36: `small-caps` followed by another ident used to poison the

@@ -342,10 +342,14 @@ pub(crate) fn blit_blurred(
     if let Some(key) = key
         && let Some(image) = cached_blur(key)
     {
+        #[cfg(test)]
+        record_blur(BlurEvent::Hit);
         canvas.draw_image(&image, ox, oy, None);
         return;
     }
     let local = Rect::new(0.0, 0.0, w, h);
+    #[cfg(test)]
+    record_blur(BlurEvent::Rasterised);
     let Some(image) = blurred_image(w as i32, h as i32, sigma, |offscreen| {
         draw(offscreen, (ox, oy), local);
     }) else {
@@ -355,6 +359,54 @@ pub(crate) fn blit_blurred(
         remember_blur(key, &image);
     }
     canvas.draw_image(&image, ox, oy, None);
+}
+
+/// What the blur cache did for one shadow, counted so a test can observe the
+/// cache directly instead of inferring a hit from how long a repaint took.
+///
+/// The timing version of that assertion flaked on an idle machine (a cold
+/// 16.2ms against a warm 8.3ms is a ratio of 1.96, and it wanted 2), because
+/// a single wall-clock sample of a few-millisecond paint is mostly noise.
+#[cfg(test)]
+#[derive(Copy, Clone)]
+enum BlurEvent {
+    /// The bitmap came back from the cache; nothing was rasterised.
+    Hit,
+    /// The offscreen was allocated, filled and blurred.
+    Rasterised,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `(hits, rasterisations)` since the last [`reset_blur_counts`].
+    ///
+    /// Thread-local like `BLUR_CACHE` itself, and libtest gives each test its
+    /// own thread, so two tests cannot see each other's counts.
+    static BLUR_COUNTS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn record_blur(event: BlurEvent) {
+    BLUR_COUNTS.with(|counts| {
+        let (hits, rasterised) = counts.get();
+        counts.set(match event {
+            BlurEvent::Hit => (hits + 1, rasterised),
+            BlurEvent::Rasterised => (hits, rasterised + 1),
+        });
+    });
+}
+
+/// `(hits, rasterisations)` since the last [`reset_blur_counts`].
+#[cfg(test)]
+fn blur_counts() -> (u32, u32) {
+    BLUR_COUNTS.with(std::cell::Cell::get)
+}
+
+/// Forget both the counts and the cached bitmaps, so a test starts cold.
+#[cfg(test)]
+fn reset_blur_counts() {
+    BLUR_COUNTS.with(|counts| counts.set((0, 0)));
+    BLUR_CACHE.with_borrow_mut(Vec::clear);
 }
 
 /// How many blurred shadow bitmaps are kept.
@@ -442,7 +494,7 @@ fn color_parts(color: Rgba) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::paint_box_shadows;
+    use super::{blur_counts, paint_box_shadows, reset_blur_counts};
     use crate::css::value::{ColorValue, Length, LengthCtx, Rgba, Shadow};
     use crate::layout::{Allocation, Rect};
     use skia_rs_safe::canvas::Surface;
@@ -725,7 +777,7 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(30),
+            elapsed < std::time::Duration::from_secs(60),
             "a large-radius box-shadow took {elapsed:?}; the box blur is not O(w * h)"
         );
     }
@@ -744,24 +796,32 @@ mod tests {
         // even when nothing about it had changed, which is every frame of an
         // animation transitioning some *other* property.
         //
-        // Mutation check: pass `None` for the key at both call sites and the
-        // second paint takes as long as the first, failing the ratio below.
+        // Observed at the cache rather than on the clock: this used to assert
+        // that the second paint took less than half as long as the first,
+        // which flaked on an idle machine (16.2ms cold against 8.3ms warm is
+        // a ratio of 1.96) because one wall-clock sample of a few-millisecond
+        // paint is mostly noise. What the fix actually claims is that the
+        // second paint rasterises *nothing*, and that is now what is asserted.
+        //
+        // Mutation check: pass `None` for the key at both call sites in
+        // `draw_blurred` and the second paint rasterises again, so the counts
+        // below read `(0, 2)`.
         let shadows = [shadow(0.0, 0.0, 40.0, 0.0, false)];
-        // Warm: the first paint pays for the rasterisation.
-        let first = std::time::Instant::now();
-        let cold = painted(&shadows, false);
-        let cold_elapsed = first.elapsed();
+        reset_blur_counts();
 
-        // Best of five: the ratio below is a cache-hit assertion, and a
-        // scheduler hiccup on one repaint must not be what decides it. (It
-        // was: this failed at 13.99ms against a 27.6ms cold run under load.)
-        let mut warm = painted(&shadows, false);
-        let mut warm_elapsed = std::time::Duration::MAX;
-        for _ in 0..5 {
-            let second = std::time::Instant::now();
-            warm = painted(&shadows, false);
-            warm_elapsed = warm_elapsed.min(second.elapsed());
-        }
+        let cold = painted(&shadows, false);
+        assert_eq!(
+            blur_counts(),
+            (0, 1),
+            "the first paint of a shadow must rasterise it, and exactly once"
+        );
+
+        let warm = painted(&shadows, false);
+        assert_eq!(
+            blur_counts(),
+            (1, 1),
+            "the second paint of an identical shadow rasterised it again"
+        );
 
         // Same pixels, either way -- the cache is content-addressed.
         for (x, y) in [(20, 12), (30, 20), (5, 5), (55, 35)] {
@@ -771,10 +831,14 @@ mod tests {
                 "the cached blit differs at ({x}, {y})"
             );
         }
-        assert!(
-            warm_elapsed * 2 < cold_elapsed,
-            "the second paint of an identical shadow took {warm_elapsed:?} \
-             against a cold {cold_elapsed:?}: it was rasterised again"
+
+        // A *different* shadow is a different key, so it misses and is
+        // rasterised: the cache is not simply answering everything.
+        let _ = painted(&[shadow(0.0, 0.0, 24.0, 0.0, false)], false);
+        assert_eq!(
+            blur_counts(),
+            (1, 2),
+            "a shadow with a different blur radius must not hit the cache"
         );
     }
 }

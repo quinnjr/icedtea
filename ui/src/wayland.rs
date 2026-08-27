@@ -524,8 +524,7 @@ impl LayerWindow {
                     buffers = self.buffers.slots().len(),
                     "every shm buffer is still held by the compositor; deferring the frame"
                 );
-                self.state.dirty = true;
-                return Ok(Repaint::Deferred);
+                return Ok(defer_frame(&mut self.state.dirty));
             }
         };
 
@@ -643,16 +642,11 @@ impl LayerWindow {
                     Err(err) => return Err(err),
                 },
             }
-            if self.state.dirty && self.repaint()? == Repaint::Deferred {
-                // Every shm buffer is still held by the compositor. `dirty`
-                // is still set and a frame callback may still be
-                // outstanding, so the next turn's `wait_bounded` predicate
-                // (`dirty || !frame_pending`) is *already* satisfied and
-                // returns without ever polling the socket -- a 100% CPU
-                // livelock in which the `wl_buffer.release` that would break
-                // the deadlock is never read. Wait for that release
-                // explicitly instead.
-                self.wait_for_a_released_buffer()?;
+            if self.state.dirty {
+                let outcome = self.repaint()?;
+                if must_await_release(self.state.dirty, outcome) {
+                    self.wait_for_a_released_buffer()?;
+                }
             }
         }
         Ok(())
@@ -707,6 +701,36 @@ enum Repaint {
     /// Every shm buffer is still held by the compositor. `dirty` stays set;
     /// the caller must wait for a `wl_buffer.release` rather than spin.
     Deferred,
+}
+
+/// The outcome of a repaint that had no buffer to paint into.
+///
+/// Both halves of the deferral live here so neither can be changed without
+/// the other: `dirty` stays set so the next release repaints, and the
+/// `Deferred` report is what makes the pump wait for that release. Losing
+/// either one breaks the same thing -- a `Painted` report and
+/// [`LayerWindow::run`] never waits, so the `wl_buffer.release` that would
+/// free a slot is never read; a cleared `dirty` and the frame is simply
+/// dropped.
+///
+/// Wayland-object-free on purpose, like [`select_paint_slot`], so the
+/// decision is testable without a live compositor.
+fn defer_frame(dirty: &mut bool) -> Repaint {
+    *dirty = true;
+    Repaint::Deferred
+}
+
+/// Whether the pump must block on a `wl_buffer.release` before going round
+/// again, given the surface's state after a repaint attempt.
+///
+/// Every shm buffer is still held by the compositor, `dirty` is still set,
+/// and a frame callback may still be outstanding -- so the next turn's
+/// `wait_bounded` predicate (`dirty || !frame_pending`) is *already*
+/// satisfied and returns without ever polling the socket. That is a 100% CPU
+/// livelock in which the release that would break the deadlock is never
+/// read. Waiting for it explicitly is the way out.
+fn must_await_release(dirty: bool, outcome: Repaint) -> bool {
+    dirty && outcome == Repaint::Deferred
 }
 
 /// How long to wait for a `wl_buffer.release` when every buffer is busy.
@@ -1547,12 +1571,27 @@ mod tests {
     // Mutation check: make `repaint` return `Repaint::Painted` on the
     // deferral arm and the `Deferred` assertion below fails.
     #[test]
-    fn a_deferred_repaint_is_reported_so_the_pump_can_wait_for_a_release() {
-        use super::Repaint;
+    fn a_deferred_repaint_keeps_the_surface_dirty_and_makes_the_pump_wait() {
+        use super::{Repaint, defer_frame, must_await_release};
         use crate::shm::{POOL_INITIAL_BUFFERS, POOL_MAX_BUFFERS, SlotPool};
 
-        // The pure half of `repaint`'s decision: with every slot held and
-        // the pool at its maximum, there is nothing to paint into.
+        // F79. This used to end on `assert_ne!(Repaint::Deferred,
+        // Repaint::Painted)` -- true of any two enum variants, and it never
+        // called anything on the deferral path, so the documented mutation
+        // (the deferral arm reporting `Painted`) left every test passing.
+        //
+        // The path has three steps, and each is asserted below:
+        //   1. every slot busy and the pool at its maximum -> no slot,
+        //   2. no slot -> `dirty` stays set *and* the outcome is `Deferred`,
+        //   3. `Deferred` -> the pump blocks on a `wl_buffer.release`
+        //      instead of going round and spinning on a socket it never
+        //      polls.
+        //
+        // Mutation check: make `defer_frame` return `Repaint::Painted` and
+        // step 2 fails; make it leave `dirty` alone and step 2 fails; make
+        // `must_await_release` return `false` and step 3 fails.
+
+        // 1. The pure half of `repaint`'s slot decision.
         let mut released = Vec::new();
         let mut slots = SlotPool::new(POOL_INITIAL_BUFFERS, POOL_MAX_BUFFERS);
         let mut held = Vec::new();
@@ -1568,9 +1607,39 @@ mod tests {
             "every buffer is busy, so the frame has to defer"
         );
 
-        // And a deferral is a distinct outcome from a painted frame, which
-        // is the whole point: `run` branches on it.
-        assert_ne!(Repaint::Deferred, Repaint::Painted);
+        // 2. What `repaint` does with that: the frame is not lost.
+        let mut dirty = true;
+        let outcome = defer_frame(&mut dirty);
+        assert_eq!(outcome, Repaint::Deferred, "a deferral must report itself");
+        assert!(dirty, "a deferred frame must leave the surface dirty");
+        // And it is still not lost if the deferral is what *made* it dirty.
+        let mut clean = false;
+        assert_eq!(defer_frame(&mut clean), Repaint::Deferred);
+        assert!(clean, "`defer_frame` sets `dirty`, it does not assume it");
+
+        // 3. What `run` does with *that*: it waits for the release.
+        assert!(
+            must_await_release(dirty, outcome),
+            "a deferred frame must make the pump wait for a wl_buffer.release"
+        );
+        // A painted frame does not wait -- the pump goes straight round.
+        assert!(!must_await_release(false, Repaint::Painted));
+        assert!(!must_await_release(true, Repaint::Painted));
+        // Nor does a deferral that somehow left the surface clean: there
+        // would be nothing to repaint when the release arrived.
+        assert!(!must_await_release(false, Repaint::Deferred));
+
+        // A released buffer ends the deferral: the next attempt gets a slot.
+        let freed = match held.remove(0) {
+            crate::shm::Slot::Existing(index) | crate::shm::Slot::New(index) => {
+                crate::shm::BufferSlot(index)
+            }
+        };
+        released.push(freed);
+        assert!(
+            select_paint_slot(&mut released, &mut slots).is_some(),
+            "a wl_buffer.release must let the deferred frame paint"
+        );
     }
 
     // F81. A `wl_surface.leave` clears the pending callback -- but clearing

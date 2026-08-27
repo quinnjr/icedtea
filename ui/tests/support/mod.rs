@@ -154,7 +154,7 @@ pub const SCREENCOPY_TOLERANCE: u8 = 12;
 /// [`SCREENCOPY_TOLERANCE`].
 #[must_use]
 pub fn close(a: u8, b: u8) -> bool {
-    i32::from(a).abs_diff(i32::from(b)) <= i32::from(SCREENCOPY_TOLERANCE).unsigned_abs()
+    i32::from(a).abs_diff(i32::from(b)) <= u32::from(SCREENCOPY_TOLERANCE)
 }
 
 /// Whether an RGB triple matches `expected` on every channel, within
