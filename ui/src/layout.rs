@@ -224,7 +224,14 @@ pub struct LayoutTree {
     tree: TaffyTree<NodeCtx>,
     ids: HashMap<OpaqueElement, taffy::NodeId>,
     root: Option<taffy::NodeId>,
-    synced_generation: Option<u64>,
+    /// `(root.tree_id(), root.generation())` as of the last successful
+    /// [`sync`](Self::sync). Keyed on both, the same ABA fix as
+    /// `css::select::MatchCx`: a generation counter alone can collide across
+    /// two different `Node` trees (one torn down, a new one built, its
+    /// internal generation counter happening to reach the same value the
+    /// old tree was last synced at), which would make `is_synced` wrongly
+    /// report the new, never-mirrored tree as already synced.
+    synced_generation: Option<(u64, u64)>,
     env: ResolveEnv,
 }
 
@@ -256,7 +263,7 @@ impl LayoutTree {
     /// Whether [`sync`](Self::sync) would be a no-op for `root` right now.
     #[must_use]
     pub fn is_synced(&self, root: &Node) -> bool {
-        self.synced_generation == Some(root.generation())
+        self.synced_generation == Some((root.tree_id(), root.generation()))
     }
 
     /// Mirror `root`'s subtree into taffy, creating, reparenting and
@@ -290,7 +297,7 @@ impl LayoutTree {
             self.tree.remove(id)?;
         }
 
-        self.synced_generation = Some(root.generation());
+        self.synced_generation = Some((root.tree_id(), root.generation()));
         Ok(())
     }
 
@@ -677,6 +684,33 @@ mod tests {
         let mut tree = LayoutTree::new();
         tree.sync(&window).expect("sync");
         assert_eq!(tree.node_count(), 4);
+    }
+
+    #[test]
+    fn is_synced_rejects_a_tree_id_mismatch_even_when_generation_collides() {
+        // Regression test for the same ABA hazard `css::select::MatchCx`
+        // guards against with its own `(tree_id, ...)` key: keying
+        // `is_synced` on generation alone would let a dropped tree's
+        // generation-counter value be "matched" by an unrelated later tree
+        // that happens to read the same generation (every fresh, untouched
+        // tree starts at the same low generation, so this is not exotic),
+        // wrongly treating the new tree as already mirrored into taffy and
+        // silently skipping its sync.
+        let (window_b, _c, _a, _b) = small_tree();
+        let mut tree = LayoutTree::new();
+
+        // Forge the exact state such a collision would leave behind: the
+        // real, current generation of `window_b` is on file, but under a
+        // foreign tree id (`0` is never issued -- `NEXT_TREE_ID` starts at
+        // 1 and only grows) that does not belong to `window_b`'s tree.
+        tree.synced_generation = Some((0, window_b.generation()));
+
+        assert!(
+            !tree.is_synced(&window_b),
+            "a matching generation under the wrong tree id must not read as synced -- \
+             without tree_id in the key this new tree would wrongly be treated as \
+             already mirrored and never actually synced"
+        );
     }
 
     #[test]
