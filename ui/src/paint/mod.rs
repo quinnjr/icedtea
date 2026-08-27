@@ -11,7 +11,7 @@ use skia_rs_safe::codec::Image as DecodedImage;
 use skia_rs_safe::paint::{Paint, Style};
 
 use crate::css::computed::ResolveEnv;
-use crate::css::value::{ColorCtx, ColorTable, Keyword, Rgba};
+use crate::css::value::{ColorCtx, ColorTable, Keyword, LengthCtx, Rgba};
 use crate::layout::Allocation;
 use crate::text::{FontDatabase, ShapedText};
 
@@ -43,6 +43,20 @@ impl PaintCx<'_> {
             table: self.colors,
             current,
             depth: 0,
+        }
+    }
+
+    /// A length context for paint-time resolution: `em` is unavailable here
+    /// (the computed style already resolved it), so only absolute units,
+    /// the DPI and an explicit percentage basis matter.
+    #[must_use]
+    pub fn base_length_ctx(&self) -> LengthCtx {
+        LengthCtx {
+            font_size_px: self.env.root_font_size,
+            root_font_size_px: self.env.root_font_size,
+            ex_ratio: 0.5,
+            dpi: self.env.dpi,
+            percent_basis: None,
         }
     }
 }
