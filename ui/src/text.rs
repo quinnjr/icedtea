@@ -97,6 +97,11 @@ pub struct ShapeKey<'a> {
 }
 
 /// The owned form of a [`ShapeKey`], for the cache map.
+///
+/// `features`/`variations` are stored (as `(tag, bits)` pairs, so the
+/// `f32` variation value stays `Hash`/`Eq`) even though this shaper stack
+/// cannot honour them: when it can, the cache must not serve a run shaped
+/// without them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct OwnedShapeKey {
     text: String,
@@ -104,6 +109,8 @@ struct OwnedShapeKey {
     size_bits: u32,
     spacing_bits: u32,
     transform: Keyword,
+    features: Vec<([u8; 4], i32)>,
+    variations: Vec<([u8; 4], u32)>,
 }
 
 impl OwnedShapeKey {
@@ -114,6 +121,12 @@ impl OwnedShapeKey {
             size_bits: key.size_px.to_bits(),
             spacing_bits: key.letter_spacing_px.to_bits(),
             transform: key.transform,
+            features: key.features.iter().map(|f| (f.tag, f.value)).collect(),
+            variations: key
+                .variations
+                .iter()
+                .map(|v| (v.tag, v.value.to_bits()))
+                .collect(),
         }
     }
 }
@@ -273,9 +286,13 @@ impl FontDatabase {
 
     /// Shape and measure a run, cached.
     ///
-    /// `text-transform` is applied to the string *before* shaping;
-    /// `letter-spacing` is added between glyphs (never after the last one),
-    /// through `TextBlobBuilder::add_positioned_run`.
+    /// `text-transform` is applied first (it changes which characters
+    /// exist), then the shaper runs, then `letter-spacing` is added after
+    /// *every* glyph, including the last -- CSS 2.1's rule, so a trailing
+    /// step is part of the measured width.
+    ///
+    /// A face that will not load yields an empty run rather than `None`: a
+    /// missing font must not take the widget tree down with it.
     pub fn shape(&mut self, key: &ShapeKey<'_>) -> Rc<ShapedText> {
         if !key.features.is_empty() || !key.variations.is_empty() {
             FEATURES_WARNED.call_once(|| {
@@ -298,7 +315,15 @@ impl FontDatabase {
     }
 
     fn shape_uncached(&mut self, text: &str, key: &ShapeKey<'_>) -> ShapedText {
-        let Some(font) = self.font(key.face, key.size_px) else {
+        // Neither `Font::new` nor the shaper is documented against
+        // non-finite or non-positive sizes; hostile CSS (`font-size:
+        // calc(NaN)`, a negative computed length) must not reach either.
+        let size_px = if key.size_px.is_finite() && key.size_px > 0.0 {
+            key.size_px
+        } else {
+            0.0
+        };
+        let Some(font) = self.font(key.face, size_px) else {
             return ShapedText {
                 blob: None,
                 metrics: TextMetrics {
@@ -308,7 +333,7 @@ impl FontDatabase {
                     line_height: 0.0,
                 },
                 face: key.face.clone(),
-                size_px: key.size_px,
+                size_px,
             };
         };
         let font_metrics = font.metrics();
@@ -318,49 +343,64 @@ impl FontDatabase {
             0.0
         };
 
+        let runs = if text.is_empty() {
+            None
+        } else {
+            self.shaper.shape_auto(text, &font)
+        };
+
         let mut builder = TextBlobBuilder::new();
         let mut pen_x = 0.0f32;
-        let mut glyph_count = 0usize;
         let mut any = false;
-        if let Some(runs) = self.shaper.shape_auto(text, &font) {
-            for run in &runs {
+        if let Some(runs) = runs.as_ref() {
+            for run in runs {
                 let mut glyphs = Vec::with_capacity(run.glyphs.len());
                 let mut positions = Vec::with_capacity(run.glyphs.len());
                 for glyph in &run.glyphs {
-                    if glyph_count > 0 {
-                        pen_x += spacing;
-                    }
                     glyphs.push(glyph.glyph_id.0);
                     positions.push(Point::new(pen_x + glyph.x_offset, glyph.y_offset));
-                    pen_x += glyph.x_advance;
-                    glyph_count += 1;
+                    pen_x += glyph.x_advance + spacing;
                 }
                 if !glyphs.is_empty() {
                     builder.add_positioned_run(&run.font, &glyphs, &positions);
                     any = true;
                 }
             }
-        } else {
-            pen_x = font.measure_text(text);
         }
+
+        // Width comes from the shaper's advances when shaping succeeded (so
+        // kerning and ligatures count), and from `Font::measure_text`'s
+        // per-glyph `hmtx` sum otherwise -- M1's rule, unchanged.
+        let width = if any {
+            pen_x
+        } else if text.is_empty() {
+            0.0
+        } else {
+            font.measure_text(text) + spacing * text.chars().count() as f32
+        };
 
         ShapedText {
             blob: if any { builder.build() } else { None },
             metrics: TextMetrics {
-                width: pen_x,
+                width,
                 // `FontMetrics::ascent` is negative (above the baseline).
                 ascent: -font_metrics.ascent,
                 descent: font_metrics.descent,
                 line_height: font_metrics.line_height(),
             },
             face: key.face.clone(),
-            size_px: key.size_px,
+            size_px,
         }
     }
 
     #[cfg(test)]
     fn match_cache_len(&self) -> usize {
         self.faces.len()
+    }
+
+    #[cfg(test)]
+    fn shape_cache_len(&self) -> usize {
+        self.shapes.len()
     }
 
     /// Drop every cached face, typeface and shaped run.
@@ -694,10 +734,11 @@ pub fn css_style_to_fc_slant(s: FontStyle) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FontDatabase, FontFace, FontQuery, ShapeKey, css_stretch_to_fc, css_style_to_fc_slant,
-        css_weight_to_fc,
+        FontDatabase, FontFace, FontQuery, ShapeKey, ShapedText, css_stretch_to_fc,
+        css_style_to_fc_slant, css_weight_to_fc,
     };
     use crate::css::value::{FontFamily, FontStyle, GenericFamily, Keyword};
+    use std::rc::Rc;
 
     fn db() -> FontDatabase {
         FontDatabase::probe_only()
@@ -737,173 +778,6 @@ mod tests {
     }
 
     #[test]
-    fn measurement_scales_with_size_and_length() {
-        // M1's assertion, preserved through the new API.
-        let mut db = db();
-        let families = sans();
-        let query = FontQuery {
-            families: &families,
-            weight: 400.0,
-            style: FontStyle::Normal,
-            stretch: 100.0,
-            size_px: 14.0,
-        };
-        let face = db.match_face(&query).expect("face");
-        let small = db.shape(&ShapeKey {
-            text: "Click me",
-            face: &face,
-            size_px: 14.0,
-            letter_spacing_px: 0.0,
-            features: &[],
-            variations: &[],
-            transform: Keyword::None,
-        });
-        let big = db.shape(&ShapeKey {
-            text: "Click me",
-            face: &face,
-            size_px: 28.0,
-            letter_spacing_px: 0.0,
-            features: &[],
-            variations: &[],
-            transform: Keyword::None,
-        });
-        assert!(big.metrics.width > small.metrics.width * 1.8);
-        assert!(small.blob.is_some());
-    }
-
-    #[test]
-    fn letter_spacing_widens_the_run_by_one_gap_per_glyph() {
-        // Mutation check: applying spacing after the last glyph too (or not
-        // at all) changes this width by exactly one or eight gaps.
-        let mut db = db();
-        let families = sans();
-        let face = db
-            .match_face(&FontQuery {
-                families: &families,
-                weight: 400.0,
-                style: FontStyle::Normal,
-                stretch: 100.0,
-                size_px: 14.0,
-            })
-            .expect("face");
-        let base = ShapeKey {
-            text: "Click me",
-            face: &face,
-            size_px: 14.0,
-            letter_spacing_px: 0.0,
-            features: &[],
-            variations: &[],
-            transform: Keyword::None,
-        };
-        let plain = db.shape(&base);
-        let spaced = db.shape(&ShapeKey {
-            letter_spacing_px: 2.0,
-            ..base
-        });
-        let glyphs = "Click me".chars().count() as f32;
-        let delta = spaced.metrics.width - plain.metrics.width;
-        assert!(
-            (delta - 2.0 * (glyphs - 1.0)).abs() < 0.01,
-            "letter-spacing added {delta}px across {glyphs} glyphs"
-        );
-    }
-
-    #[test]
-    fn text_transform_is_applied_before_shaping() {
-        // Mutation check: leaving the string untouched makes the two widths
-        // equal for a lowercase-only label.
-        let mut db = db();
-        let families = sans();
-        let face = db
-            .match_face(&FontQuery {
-                families: &families,
-                weight: 400.0,
-                style: FontStyle::Normal,
-                stretch: 100.0,
-                size_px: 14.0,
-            })
-            .expect("face");
-        let key = ShapeKey {
-            text: "iii",
-            face: &face,
-            size_px: 20.0,
-            letter_spacing_px: 0.0,
-            features: &[],
-            variations: &[],
-            transform: Keyword::None,
-        };
-        let lower = db.shape(&key);
-        let upper = db.shape(&ShapeKey {
-            transform: Keyword::Uppercase,
-            ..key
-        });
-        assert!(
-            upper.metrics.width > lower.metrics.width,
-            "III is wider than iii"
-        );
-    }
-
-    #[test]
-    fn an_empty_string_has_no_blob_but_a_positive_line_height() {
-        // M1's assertion, preserved.
-        let mut db = db();
-        let families = sans();
-        let face = db
-            .match_face(&FontQuery {
-                families: &families,
-                weight: 400.0,
-                style: FontStyle::Normal,
-                stretch: 100.0,
-                size_px: 14.0,
-            })
-            .expect("face");
-        let shaped = db.shape(&ShapeKey {
-            text: "",
-            face: &face,
-            size_px: 14.0,
-            letter_spacing_px: 0.0,
-            features: &[],
-            variations: &[],
-            transform: Keyword::None,
-        });
-        assert!(shaped.blob.is_none());
-        assert!(shaped.metrics.line_height > 0.0);
-        assert_eq!(shaped.metrics.width, 0.0);
-    }
-
-    #[test]
-    fn shaping_the_same_key_twice_returns_the_cached_handle() {
-        // Mutation check: dropping the cache makes the two Rc's differ, and
-        // the widget would reshape on every paint (M1's perf regression).
-        let mut db = db();
-        let families = sans();
-        let face = db
-            .match_face(&FontQuery {
-                families: &families,
-                weight: 400.0,
-                style: FontStyle::Normal,
-                stretch: 100.0,
-                size_px: 14.0,
-            })
-            .expect("face");
-        let key = ShapeKey {
-            text: "Click me",
-            face: &face,
-            size_px: 14.0,
-            letter_spacing_px: 0.0,
-            features: &[],
-            variations: &[],
-            transform: Keyword::None,
-        };
-        let a = db.shape(&key);
-        let b = db.shape(&key);
-        assert!(std::rc::Rc::ptr_eq(&a, &b));
-        db.clear_caches();
-        let c = db.shape(&key);
-        assert!(!std::rc::Rc::ptr_eq(&a, &c));
-    }
-
-    #[test]
     fn the_css_and_fontconfig_scales_are_a_table_lookup_not_a_cast() {
         // research/taffy-fontconfig.md §2.4: the two scales are NOT
         // proportional. Mutation check: `w as i32 / 4` passes none of these.
@@ -928,12 +802,11 @@ mod tests {
         assert_eq!(css_style_to_fc_slant(FontStyle::Oblique(14.0)), 110);
     }
 
-    /// The `ShapeKey` M1's three restored shaping tests all shape.
-    fn click_me(face: &FontFace) -> ShapeKey<'_> {
+    fn key<'a>(text: &'a str, face: &'a FontFace, size_px: f32) -> ShapeKey<'a> {
         ShapeKey {
-            text: "Click me",
+            text,
             face,
-            size_px: 14.0,
+            size_px,
             letter_spacing_px: 0.0,
             features: &[],
             variations: &[],
@@ -941,26 +814,39 @@ mod tests {
         }
     }
 
+    fn shaped(db: &mut FontDatabase, text: &str, size_px: f32) -> Rc<ShapedText> {
+        let families = sans();
+        let face = db.match_face(&query(&families)).expect("system font");
+        db.shape(&key(text, &face, size_px))
+    }
+
+    #[test]
+    fn measurement_scales_with_size_and_length() {
+        let mut db = db();
+        let small = shaped(&mut db, "Click me", 14.0);
+        let large = shaped(&mut db, "Click me", 28.0);
+        assert!(
+            small.metrics.width > 0.0,
+            "zero-width measurement means no hmtx data reached us"
+        );
+        assert!(
+            large.metrics.width > small.metrics.width * 1.8,
+            "28px measured {} vs 14px {}: advances are not scaling with size",
+            large.metrics.width,
+            small.metrics.width
+        );
+        let longer = shaped(&mut db, "Click me twice", 14.0);
+        assert!(longer.metrics.width > small.metrics.width);
+
+        assert!(small.metrics.ascent > 0.0 && small.metrics.descent > 0.0);
+        assert!(small.metrics.line_height >= small.metrics.ascent + small.metrics.descent);
+    }
+
     #[test]
     fn shaping_produces_one_positioned_glyph_per_character() {
-        // M1's assertion, restored onto `FontDatabase`/`ShapedText`
-        // (contract §10.3 pins src/text.rs at "same properties asserted").
-        // Mutation check: dropping the `pen_x += glyph.x_advance` in
-        // `shape_uncached` stops the positions advancing; pushing a glyph id
-        // without its position breaks the two-vector length equality.
         let mut db = db();
-        let families = sans();
-        let face = db
-            .match_face(&FontQuery {
-                families: &families,
-                weight: 400.0,
-                style: FontStyle::Normal,
-                stretch: 100.0,
-                size_px: 14.0,
-            })
-            .expect("face");
-        let shaped = db.shape(&click_me(&face));
-        let blob = shaped.blob.as_ref().expect("shaping produced no runs");
+        let run = shaped(&mut db, "Click me", 14.0);
+        let blob = run.blob.as_ref().expect("shaping produced no runs");
         let glyphs: usize = blob.runs().iter().map(|r| r.glyphs.len()).sum();
         assert_eq!(
             glyphs,
@@ -970,69 +856,133 @@ mod tests {
         for run in blob.runs() {
             assert_eq!(run.glyphs.len(), run.positions.len());
         }
-        // Positions must advance left to right.
-        let run = &blob.runs()[0];
-        for pair in run.positions.windows(2) {
+        let first = &blob.runs()[0];
+        for pair in first.positions.windows(2) {
             assert!(pair[1].x > pair[0].x, "glyph positions did not advance");
         }
     }
 
     #[test]
-    fn shaping_returns_the_blob_and_the_metrics_together() {
-        // M1's assertion, restored. M1 compared `shape()`'s metrics against a
-        // separate `measure()` call; `FontDatabase` has one entry point, so
-        // the same invariant is that one `ShapedText` carries a blob *and*
-        // usable metrics, and that the cached second call carries both too.
-        // Mutation check: returning `blob: None` on the cache hit, or
-        // building the metrics from a separate unshaped measure, fails here.
+    fn shaping_returns_the_blob_the_metrics_and_the_face_together() {
         let mut db = db();
         let families = sans();
-        let face = db
-            .match_face(&FontQuery {
-                families: &families,
-                weight: 400.0,
-                style: FontStyle::Normal,
-                stretch: 100.0,
-                size_px: 14.0,
-            })
-            .expect("face");
-        let shaped = db.shape(&click_me(&face));
-        assert!(shaped.blob.is_some());
-        assert!(shaped.metrics.width > 0.0);
-        assert!(shaped.metrics.ascent > 0.0 && shaped.metrics.descent > 0.0);
+        let face = db.match_face(&query(&families)).expect("system font");
+        let run = db.shape(&key("Click me", &face, 14.0));
+        assert!(run.blob.is_some());
+        assert_eq!(run.face, face);
+        assert_eq!(run.size_px, 14.0);
 
-        let again = db.shape(&click_me(&face));
-        assert!(again.blob.is_some());
-        assert_eq!(again.metrics, shaped.metrics);
+        let empty = db.shape(&key("", &face, 14.0));
+        assert!(empty.blob.is_none(), "empty text must not build a blob");
+        assert_eq!(empty.metrics.width, 0.0);
+        assert!(
+            empty.metrics.line_height > 0.0,
+            "an empty label still occupies a line"
+        );
     }
 
     #[test]
-    fn blob_width_agrees_with_measure() {
-        // M1's assertion, restored: the last glyph's origin sits inside the
-        // measured width, and past its half -- the blob and the metrics come
-        // from the same pen walk. Mutation check: measuring with
-        // `font.measure_text` while positioning from the shaper (M1's bug)
-        // drifts these apart on any face whose advances differ.
+    fn the_last_glyph_origin_sits_inside_the_measured_width() {
         let mut db = db();
-        let families = sans();
-        let face = db
-            .match_face(&FontQuery {
-                families: &families,
-                weight: 400.0,
-                style: FontStyle::Normal,
-                stretch: 100.0,
-                size_px: 14.0,
-            })
-            .expect("face");
-        let shaped = db.shape(&click_me(&face));
-        let blob = shaped.blob.as_ref().expect("blob");
+        let run = shaped(&mut db, "Click me", 14.0);
+        let blob = run.blob.as_ref().expect("blob");
         let last = blob.runs()[0].positions.last().copied().expect("positions");
         assert!(
-            last.x < shaped.metrics.width && last.x > shaped.metrics.width * 0.5,
+            last.x < run.metrics.width && last.x > run.metrics.width * 0.5,
             "last glyph origin {} is not inside the measured width {}",
             last.x,
-            shaped.metrics.width
+            run.metrics.width
         );
+    }
+
+    #[test]
+    fn letter_spacing_widens_the_run_by_one_step_per_glyph() {
+        let mut db = db();
+        let families = sans();
+        let face = db.match_face(&query(&families)).expect("system font");
+        let tight = db.shape(&key("Click me", &face, 14.0));
+        let mut spaced_key = key("Click me", &face, 14.0);
+        spaced_key.letter_spacing_px = 3.0;
+        let spaced = db.shape(&spaced_key);
+
+        let glyphs = "Click me".chars().count() as f32;
+        assert!(
+            (spaced.metrics.width - (tight.metrics.width + 3.0 * glyphs)).abs() < 0.01,
+            "letter-spacing 3px over {glyphs} glyphs widened {} to {}",
+            tight.metrics.width,
+            spaced.metrics.width
+        );
+
+        let tight_positions = &tight.blob.as_ref().expect("blob").runs()[0].positions;
+        let spaced_positions = &spaced.blob.as_ref().expect("blob").runs()[0].positions;
+        // The nth glyph has n spacing steps in front of it; the first has none.
+        assert!((spaced_positions[0].x - tight_positions[0].x).abs() < 0.01);
+        assert!((spaced_positions[3].x - (tight_positions[3].x + 9.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_transform_changes_the_glyphs_and_the_cache_key() {
+        let mut db = db();
+        let families = sans();
+        let face = db.match_face(&query(&families)).expect("system font");
+        let plain = db.shape(&key("click", &face, 14.0));
+        let mut upper_key = key("click", &face, 14.0);
+        upper_key.transform = Keyword::Uppercase;
+        let upper = db.shape(&upper_key);
+        assert!(
+            upper.metrics.width > plain.metrics.width,
+            "CLICK ({}) is not wider than click ({}) — was the transform applied?",
+            upper.metrics.width,
+            plain.metrics.width
+        );
+        assert_eq!(
+            db.shape_cache_len(),
+            2,
+            "the transform is not part of the cache key"
+        );
+    }
+
+    #[test]
+    fn identical_keys_are_served_from_the_shaping_cache() {
+        let mut db = db();
+        let families = sans();
+        let face = db.match_face(&query(&families)).expect("system font");
+        let first = db.shape(&key("Click me", &face, 14.0));
+        let second = db.shape(&key("Click me", &face, 14.0));
+        assert!(Rc::ptr_eq(&first, &second), "the same key reshaped");
+        assert_eq!(db.shape_cache_len(), 1);
+
+        db.clear_caches();
+        let third = db.shape(&key("Click me", &face, 14.0));
+        assert!(
+            !Rc::ptr_eq(&first, &third),
+            "clear_caches did not drop the shaping cache"
+        );
+    }
+
+    #[test]
+    fn shaping_never_panics_on_hostile_text() {
+        let mut db = db();
+        let families = sans();
+        let face = db.match_face(&query(&families)).expect("system font");
+        for text in [
+            "",
+            " ",
+            "\u{0}",
+            "\u{200b}\u{feff}",
+            "مرحبا بالعالم",
+            "🇯🇵👩‍👩‍👧‍👦",
+            "e\u{301}\u{301}",
+            "\u{10FFFF}",
+        ] {
+            for size in [0.0_f32, -12.0, 1.0, 4096.0, f32::NAN] {
+                let mut hostile = key(text, &face, size);
+                hostile.letter_spacing_px = if size.is_nan() { f32::INFINITY } else { -100.0 };
+                let _ = db.shape(&hostile);
+            }
+        }
+        let long = "Click me ".repeat(2_000);
+        let _ = db.shape(&key(&long, &face, 14.0));
     }
 
     #[test]
