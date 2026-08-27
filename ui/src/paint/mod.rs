@@ -4,6 +4,7 @@
 pub mod background;
 pub mod blur;
 pub mod border;
+pub mod effects;
 pub mod geometry;
 pub mod outline;
 pub mod shadow;
@@ -22,6 +23,7 @@ use crate::text::{FontDatabase, ShapedText};
 pub use crate::css::computed::BackgroundLayer;
 pub use background::paint_backgrounds;
 pub use border::{is_visible_border_style, paint_border_image, paint_borders};
+pub use effects::{begin_effects, end_effects};
 pub use geometry::{
     Side, clamp_radii, inner_radii, rounded_rect_path, rounded_ring_path, side_wedge_path,
 };
