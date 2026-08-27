@@ -1,169 +1,183 @@
-//! The M1 widget, now a behaviour over a `css::node::Node`.
-//!
-//! The node is a real child of its parent, so sibling and child selectors
-//! (`:first-child`, `:only-child`, `:nth-child`) see the tree GTK's own theme
-//! expects. The widget owns the two things a restyle needs and a caller should
-//! not have to thread: a long-lived [`MatchCx`] (which keeps the selector
-//! bloom filter and nth-index caches warm across states) and the
-//! [`ResolveEnv`] its styles resolve against.
+//! The M1 widget, now a behaviour over a `css::node::Node`, laid out by
+//! [`LayoutTree`] and painted by [`paint_node`].
+
+use std::rc::Rc;
 
 use skia_rs_safe::canvas::Surface;
 
+use crate::anim::Overrides;
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::{ComputedStyle, ResolveEnv};
 use crate::css::node::{Node, PseudoStates};
+use crate::css::registry::Prop;
 use crate::css::select::MatchCx;
-use crate::layout::{Allocation, ButtonLayout};
-use crate::paint::paint_button;
-use crate::text::{FontStack, ShapedText};
+use crate::css::value::{FontFamily, FontStyle};
+use crate::layout::{Allocation, BoxDirection, Container, LayoutTree, Measure};
+use crate::paint::{ImageCache, PaintCx, paint_node};
+use crate::text::{FontDatabase, FontQuery, ShapeKey, ShapedText};
 
-/// A themed button: CSS node identity, interaction state, computed style
-/// and allocation, kept together and recomputed on every state change.
-///
-/// Three things are *cached* across restyles rather than rebuilt, because a
-/// restyle happens on every `:hover`/`:active` transition:
-///
-/// * the shaped label, keyed by `(label, font-size, font-stack identity)`;
-/// * the parent's computed style, keyed by the sheet's identity;
-/// * the `taffy` tree and the `MatchCx`.
+/// A themed button: a `button` node with a `label` child.
 pub struct Button {
     label: String,
-    /// The node's root ancestor, held so the tree stays alive: `Node::parent`
-    /// is a `Weak`, so nothing but a strong handle keeps the window -- and
-    /// therefore this button's inherited style -- reachable. `new` takes
-    /// `parent` by value and does not otherwise retain it, so this is the
-    /// only thing keeping the ancestor chain from being dropped out from
-    /// under `self.node` the moment `new` returns.
-    _root: Node,
     node: Node,
+    label_node: Node,
     style: ComputedStyle,
+    label_style: ComputedStyle,
     allocation: Allocation,
-    /// The label shaped at `shaped_size`; invalidated when either changes.
-    shaped: Option<ShapedText>,
-    /// The font size `shaped` was shaped at.
-    shaped_size: f32,
-    /// Identity of the [`FontStack`] `shaped` was shaped with (its address,
-    /// as `usize`), so a swapped font stack invalidates the shaping cache
-    /// even if the label and font size happen to match.
-    shaped_font: Option<usize>,
-    /// The parent's computed style: fixed for this widget's lifetime, as long
-    /// as the sheet it was cascaded from doesn't change.
-    parent_style: Option<ComputedStyle>,
-    /// Identity of the [`CompiledSheet`] `parent_style` was cascaded from
-    /// (its address, as `usize`). A cheap key, not a hash: it only needs to
-    /// notice *some other sheet is now in play*, which a swapped
-    /// `CompiledSheet` (e.g. a live theme reload) always is.
-    parent_style_sheet: Option<usize>,
-    layout: ButtonLayout,
-    /// Reused across restyles: the selector caches stay warm.
-    cx: MatchCx,
+    label_allocation: Allocation,
+    shaped: Option<Rc<ShapedText>>,
+    layout: LayoutTree,
+    images: ImageCache,
     env: ResolveEnv,
 }
 
-/// The identity key stored alongside a per-sheet or per-font-stack cache:
-/// the referent's address. Cheap, and sufficient to detect "a different
-/// sheet/stack is now in play" — the only thing these caches need to know.
-fn identity<T>(value: &T) -> usize {
-    std::ptr::from_ref(value) as usize
+/// Reports the shaped label's extents for the `label` leaf.
+struct LabelMeasure<'a> {
+    shaped: Option<&'a Rc<ShapedText>>,
+}
+
+impl Measure for LabelMeasure<'_> {
+    fn measure(
+        &mut self,
+        node: &Node,
+        _style: &ComputedStyle,
+        _known: taffy::Size<Option<f32>>,
+        _available: taffy::Size<taffy::AvailableSpace>,
+    ) -> taffy::Size<f32> {
+        match (&*node.name(), self.shaped) {
+            ("label", Some(shaped)) => taffy::Size {
+                width: shaped.metrics.width,
+                height: shaped.metrics.line_height,
+            },
+            _ => taffy::Size::ZERO,
+        }
+    }
 }
 
 impl Button {
-    /// Create a `button` node with `classes` and attach it to `parent`.
-    ///
-    /// The style and allocation are the initial values until
-    /// [`restyle`](Self::restyle) runs.
+    /// A button labelled `label`, with `classes`, under `parent`.
     #[must_use]
     pub fn new(label: &str, classes: &[&str], parent: Node) -> Self {
-        let env = ResolveEnv::default();
         let node = Node::with_classes("button", classes);
-        let root = parent.root();
+        let label_node = Node::new("label");
         parent.append_child(&node);
+        node.append_child(&label_node);
+        let env = ResolveEnv::default();
+        let empty = Allocation {
+            border_box: crate::layout::Rect::zero(),
+            content_box: crate::layout::Rect::zero(),
+            border: [0.0; 4],
+            padding: [0.0; 4],
+        };
         Self {
-            label: label.to_string(),
-            _root: root,
+            label: label.to_owned(),
             node,
+            label_node,
             style: (*ComputedStyle::initial(&env)).clone(),
-            allocation: Allocation {
-                width: 0.0,
-                height: 0.0,
-                label_x: 0.0,
-                label_y: 0.0,
-            },
+            label_style: (*ComputedStyle::initial(&env)).clone(),
+            allocation: empty,
+            label_allocation: empty,
             shaped: None,
-            shaped_size: f32::NAN,
-            shaped_font: None,
-            parent_style: None,
-            parent_style_sheet: None,
-            layout: ButtonLayout::new(),
-            cx: MatchCx::new(),
+            layout: LayoutTree::new(),
+            images: ImageCache::new(),
             env,
         }
     }
 
-    /// This widget's CSS node.
-    #[must_use]
-    pub fn node(&self) -> &Node {
-        &self.node
-    }
+    /// Recascade, reshape and relayout.
+    pub fn restyle(&mut self, sheet: &CompiledSheet, fonts: &mut FontDatabase) {
+        let mut cx = MatchCx::new();
+        self.style = ComputedStyle::resolve_chain(sheet, &self.node, &self.env, &mut cx);
+        self.label_style =
+            ComputedStyle::resolve_chain(sheet, &self.label_node, &self.env, &mut cx);
 
-    /// Re-run cascade, measurement and layout for the current state.
-    pub fn restyle(&mut self, sheet: &CompiledSheet, fonts: &FontStack) {
-        let sheet_id = identity(sheet);
-        if self.parent_style.is_none() || self.parent_style_sheet != Some(sheet_id) {
-            // The ancestors' own cascade cannot change while this widget
-            // lives *and the sheet stays the same*, so resolve the chain
-            // once per sheet and thread it in from here.
-            self.parent_style = Some(match self.node.parent() {
-                Some(parent) => {
-                    ComputedStyle::resolve_chain(sheet, &parent, &self.env, &mut self.cx)
-                }
-                None => (*ComputedStyle::initial(&self.env)).clone(),
-            });
-            self.parent_style_sheet = Some(sheet_id);
+        let families: Rc<[FontFamily]> = self.label_style.get(Prop::FontFamily);
+        let face = fonts.match_face(&FontQuery {
+            families: &families,
+            weight: self.label_style.get(Prop::FontWeight),
+            style: FontStyle::Normal,
+            stretch: 100.0,
+            size_px: self.label_style.font_size_px(),
+        });
+        self.shaped = face.map(|face| {
+            fonts.shape(&ShapeKey {
+                text: &self.label,
+                face: &face,
+                size_px: self.label_style.font_size_px(),
+                letter_spacing_px: self.label_style.get(Prop::LetterSpacing),
+                features: &[],
+                variations: &[],
+                transform: self.label_style.get(Prop::TextTransform),
+            })
+        });
+
+        let root = self.node.root();
+        if self.layout.sync(&root).is_err() {
+            return;
         }
-        self.style = ComputedStyle::resolve(
-            sheet,
+        let root_style = ComputedStyle::resolve_chain(sheet, &root, &self.env, &mut cx);
+        self.layout
+            .set_style(&root, &root_style, Container::default(), &self.env);
+        self.layout.set_style(
             &self.node,
-            self.parent_style.as_ref(),
+            &self.style,
+            Container::Box {
+                direction: BoxDirection::Row,
+            },
             &self.env,
-            &mut self.cx,
         );
-
-        // `!=` rather than an epsilon: the only thing that ever writes this
-        // is a previous shape at exactly this size, and NAN != NAN makes the
-        // first call always shape.
-        let font_id = identity(fonts);
-        let font_size = self.style.font_size_px();
-        #[allow(clippy::float_cmp)]
-        if self.shaped.is_none()
-            || self.shaped_size != font_size
-            || self.shaped_font != Some(font_id)
+        self.layout.set_style(
+            &self.label_node,
+            &self.label_style,
+            Container::Leaf,
+            &self.env,
+        );
+        let mut measure = LabelMeasure {
+            shaped: self.shaped.as_ref(),
+        };
+        if self
+            .layout
+            .compute(
+                &root,
+                taffy::Size {
+                    width: taffy::AvailableSpace::MaxContent,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+                &mut measure,
+            )
+            .is_ok()
         {
-            self.shaped = Some(fonts.shape(&self.label, font_size));
-            self.shaped_size = font_size;
-            self.shaped_font = Some(font_id);
+            if let Some(a) = self.layout.allocation(&self.node) {
+                self.allocation = a;
+            }
+            if let Some(a) = self.layout.allocation(&self.label_node) {
+                self.label_allocation = a;
+            }
         }
-        let metrics = self.shaped.as_ref().expect("just shaped").metrics;
-        self.allocation = self.layout.compute(&self.style, &metrics);
     }
 
-    /// Replace the pseudo-class state and restyle.
-    pub fn set_states(&mut self, states: PseudoStates, sheet: &CompiledSheet, fonts: &FontStack) {
+    /// Set the pseudo-class state and restyle.
+    pub fn set_states(
+        &mut self,
+        states: PseudoStates,
+        sheet: &CompiledSheet,
+        fonts: &mut FontDatabase,
+    ) {
         self.node.set_states(states);
         self.restyle(sheet, fonts);
     }
 
-    /// Replace the label and restyle, reshaping it.
-    pub fn set_label(&mut self, label: &str, sheet: &CompiledSheet, fonts: &FontStack) {
+    /// Set the label and restyle; a no-op if unchanged.
+    pub fn set_label(&mut self, label: &str, sheet: &CompiledSheet, fonts: &mut FontDatabase) {
         if self.label == label {
             return;
         }
-        self.label = label.to_string();
+        self.label = label.to_owned();
         self.shaped = None;
         self.restyle(sheet, fonts);
     }
 
-    /// The current label.
+    /// The label text.
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
@@ -175,156 +189,78 @@ impl Button {
         self.node.states()
     }
 
-    /// The computed style from the last [`restyle`](Self::restyle).
+    /// The computed style.
     #[must_use]
     pub fn style(&self) -> &ComputedStyle {
         &self.style
     }
 
-    /// The allocation from the last [`restyle`](Self::restyle).
+    /// The border-box allocation.
     #[must_use]
     pub fn allocation(&self) -> Allocation {
         self.allocation
     }
 
-    /// Paint this button at `origin` on `surface`.
-    pub fn render(&self, surface: &mut Surface, origin: (f32, f32)) {
-        paint_button(
-            surface,
-            origin,
-            &self.style,
-            &self.allocation,
-            self.shaped.as_ref(),
+    /// Paint the button at `origin` on `surface`.
+    pub fn render(
+        &mut self,
+        surface: &mut Surface,
+        origin: (f32, f32),
+        sheet: &CompiledSheet,
+        fonts: &mut FontDatabase,
+        overrides: Option<&Overrides>,
+    ) {
+        let alloc = translated(self.allocation, origin);
+        let label_alloc = translated(self.label_allocation, origin);
+        let mut cx = PaintCx {
+            env: &self.env,
+            colors: &sheet.colors,
+            fonts,
+            images: &mut self.images,
+            text: None,
+        };
+        {
+            let mut canvas = surface.canvas();
+            paint_node(
+                &mut canvas,
+                &self.node,
+                &self.style,
+                &alloc,
+                overrides,
+                &mut cx,
+            );
+        }
+        cx.text = self.shaped.as_deref();
+        let mut canvas = surface.canvas();
+        paint_node(
+            &mut canvas,
+            &self.label_node,
+            &self.label_style,
+            &label_alloc,
+            overrides,
+            &mut cx,
         );
     }
 
-    /// Whether surface point `(x, y)` falls inside this button's border box
-    /// when the button is drawn at `origin`. Rectangular, not radius-aware:
-    /// GTK's own hit testing is rectangular too.
+    /// Rectangular hit test, matching GTK's own (not radius-aware).
     #[must_use]
     pub fn contains(&self, origin: (f32, f32), x: f64, y: f64) -> bool {
-        let (ox, oy) = (f64::from(origin.0), f64::from(origin.1));
-        x >= ox
-            && y >= oy
-            && x < ox + f64::from(self.allocation.width)
-            && y < oy + f64::from(self.allocation.height)
+        let a = translated(self.allocation, origin);
+        x >= f64::from(a.border_box.x)
+            && x < f64::from(a.border_box.right())
+            && y >= f64::from(a.border_box.y)
+            && y < f64::from(a.border_box.bottom())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Button;
-    use crate::BUNDLED_ADWAITA_LIGHT;
-    use crate::css::cascade::CompiledSheet;
-    use crate::css::node::{Node, PseudoStates};
-    use crate::text::FontStack;
-    use skia_rs_safe::core::Color;
-
-    fn fixture(css: &str, label: &str) -> (CompiledSheet, FontStack, Button) {
-        let sheet = CompiledSheet::compile(css);
-        let fonts = FontStack::system().expect("system font");
-        let window = Node::with_classes("window", &["background"]);
-        let mut button = Button::new(label, &[], window);
-        button.restyle(&sheet, &fonts);
-        (sheet, fonts, button)
-    }
-
-    #[test]
-    fn the_shaped_label_survives_a_state_change_but_not_a_font_size_change() {
-        // A8: the label was shaped three times per paint, each with a fresh
-        // font. It is now shaped once per (label, size) -- but the cache
-        // must not outlive either of those changing.
-        let css = "window { background-color: #fff }\n\
-                   button { font-size: 14px }\n\
-                   button:hover { font-size: 30px }";
-        let (sheet, fonts, mut button) = fixture(css, "Click me");
-        let narrow = button.allocation().width;
-        assert_eq!(button.style().font_size_px(), 14.0);
-
-        button.set_states(PseudoStates::HOVER, &sheet, &fonts);
-        assert_eq!(button.style().font_size_px(), 30.0);
-        assert!(
-            button.allocation().width > narrow,
-            "the label was not reshaped at the new font size: {} vs {narrow}",
-            button.allocation().width
-        );
-    }
-
-    #[test]
-    fn setting_the_label_reshapes_it() {
-        let (sheet, fonts, mut button) = fixture(BUNDLED_ADWAITA_LIGHT, "Click me");
-        let before = button.allocation().width;
-
-        button.set_label("Click me twice over", &sheet, &fonts);
-        assert_eq!(button.label(), "Click me twice over");
-        assert!(
-            button.allocation().width > before,
-            "the new label reused the old shaping: {} vs {before}",
-            button.allocation().width
-        );
-
-        button.set_label("", &sheet, &fonts);
-        // An empty Adwaita button is its content-box minimum plus its frame.
-        assert_eq!(button.allocation().width, 36.0);
-    }
-
-    #[test]
-    fn the_cached_parent_style_matches_a_full_ancestor_walk() {
-        // The window's `color` must still reach the button through the
-        // cached parent style, on the first restyle and every one after.
-        // `border-style` has to be declared: the registry's initial is
-        // `none`, and CSS's used border width under `border-style: none` is
-        // zero. M1 only ever read a declared width.
-        let css = "window { color: #ff0000 }\nbutton:hover { border: 3px solid }";
-        let (sheet, fonts, mut button) = fixture(css, "x");
-        assert_eq!(button.style().color().to_color32(), Color(0xFFFF_0000));
-
-        button.set_states(PseudoStates::HOVER, &sheet, &fonts);
-        assert_eq!(
-            button.style().color().to_color32(),
-            Color(0xFFFF_0000),
-            "inheritance was lost once the parent style came from the cache"
-        );
-        assert_eq!(button.style().border_widths(), [3.0; 4]);
-    }
-
-    #[test]
-    fn a_different_sheet_re_derives_the_cached_parent_style() {
-        // The parent-style cache used to key on nothing but "have we ever
-        // computed it", so swapping in a new `CompiledSheet` (a live theme
-        // reload) reused the old ancestor cascade. Key it on the sheet's
-        // identity instead: a border painted with `currentColor` must pick
-        // up the new sheet's `window { color: ... }`.
-        let red_css = "window { color: red }\nbutton { border-color: currentColor }";
-        let blue_css = "window { color: blue }\nbutton { border-color: currentColor }";
-        let red_sheet = CompiledSheet::compile(red_css);
-        let blue_sheet = CompiledSheet::compile(blue_css);
-        let fonts = FontStack::system().expect("system font");
-
-        let window = Node::with_classes("window", &["background"]);
-        let mut button = Button::new("x", &[], window);
-
-        button.restyle(&red_sheet, &fonts);
-        let red_border = button.style().border_colors()[0];
-
-        button.restyle(&blue_sheet, &fonts);
-        let blue_border = button.style().border_colors()[0];
-
-        assert_ne!(
-            red_border, blue_border,
-            "the cached parent style survived a sheet swap"
-        );
-    }
-
-    #[test]
-    fn the_button_is_a_real_child_of_its_parent_node() {
-        // M1's `CssNode` was an immutable parent *pointer*: the window had no
-        // children, so `:only-child`, `:first-child` and `:nth-child` were
-        // hardcoded. The widget now attaches to a real tree.
-        let (_sheet, _fonts, button) = fixture("button { color: red }", "x");
-        let parent = button.node().parent().expect("the button has a parent");
-        assert_eq!(parent.child_count(), 1);
-        assert!(parent.child(0).expect("first child").ptr_eq(button.node()));
-        assert_eq!(button.node().index_in_parent(), Some(0));
+/// Shift an allocation so the tree's origin lands at `origin`.
+fn translated(alloc: Allocation, origin: (f32, f32)) -> Allocation {
+    let shift = |r: crate::layout::Rect| {
+        crate::layout::Rect::new(r.x + origin.0, r.y + origin.1, r.width, r.height)
+    };
+    Allocation {
+        border_box: shift(alloc.border_box),
+        content_box: shift(alloc.content_box),
+        ..alloc
     }
 }

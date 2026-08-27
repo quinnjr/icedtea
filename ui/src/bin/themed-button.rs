@@ -43,7 +43,10 @@ fn main() {
         match themed_button_allocation(&label, &classes, &theme) {
             Ok(allocation) => println!(
                 "{} {} {} {}",
-                allocation.width, allocation.height, allocation.label_x, allocation.label_y
+                allocation.border_box.width,
+                allocation.border_box.height,
+                allocation.content_box.x - allocation.border_box.x,
+                allocation.content_box.y - allocation.border_box.y
             ),
             Err(err) => {
                 tracing::error!(%err, "themed-button failed");

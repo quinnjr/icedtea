@@ -13,6 +13,22 @@ use crate::paint::blur::{blurred_image, sigma_for_blur_radius};
 use crate::paint::fill_paint;
 use crate::paint::geometry::{inner_radii, rounded_rect_path, rounded_ring_path};
 
+/// A fill paint for a shape that is about to be box-blurred, with
+/// anti-aliasing off.
+///
+/// The box blur's own reach (`paint::blur::box_radii_for_gauss`'s three
+/// passes) already produces the soft edge a blurred shadow wants;
+/// anti-aliasing the pre-blur shape as well stacks a second soft edge on
+/// top of the first, pushing the total nonzero-alpha reach out past what
+/// the blur radius alone predicts. Drawing the shape hard-edged keeps the
+/// blur's own math the only source of softness, so a sample far enough
+/// outside `radius + blur reach` is exactly transparent.
+fn hard_fill_paint(color: Rgba) -> skia_rs_safe::paint::Paint {
+    let mut paint = fill_paint(color);
+    paint.set_anti_alias(false);
+    paint
+}
+
 /// A finite length in px, or `default`.
 fn px(length: &crate::css::value::Length, ctx: &LengthCtx, default: f32) -> f32 {
     length
@@ -104,7 +120,10 @@ fn paint_outset(
             shape.width,
             shape.height,
         );
-        offscreen_canvas.draw_path(&rounded_rect_path(local, &shape_radii), &fill_paint(color));
+        offscreen_canvas.draw_path(
+            &rounded_rect_path(local, &shape_radii),
+            &hard_fill_paint(color),
+        );
     });
 }
 
@@ -166,7 +185,7 @@ fn paint_inset(
                 hole.height,
             );
             let ring = rounded_ring_path(local_outer, &outer_radii, local_hole, &hole_radii);
-            offscreen_canvas.draw_path(&ring, &fill_paint(color));
+            offscreen_canvas.draw_path(&ring, &hard_fill_paint(color));
         });
     }
     canvas.restore_to_count(save);

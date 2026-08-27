@@ -7,8 +7,6 @@
 
 use std::process::{Child, Command, Stdio};
 
-use icedtea_ui::layout::Allocation;
-
 /// The theme every test pins its expected colours against. Never the
 /// developer's own `gtk.css`.
 pub const TEST_THEME: &str = "bundled";
@@ -33,6 +31,19 @@ fn themed_button(label: &str, classes: &str) -> Command {
     command
 }
 
+/// The four numbers `themed-button --print-allocation` prints.
+///
+/// A local struct, not `icedtea_ui::layout::Allocation`: M2 reshaped that
+/// type, and `tests/layer_shell_screencopy.rs` is a gated file whose only
+/// permitted edit is the `use` line that names this one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrintedAllocation {
+    pub width: f32,
+    pub height: f32,
+    pub label_x: f32,
+    pub label_y: f32,
+}
+
 /// The allocation the binary itself computes for `label`/`classes`.
 ///
 /// Asking the binary rather than recomputing it here is what keeps the
@@ -45,7 +56,7 @@ fn themed_button(label: &str, classes: &str) -> Command {
 /// If the binary cannot be run, exits non-zero, or prints something other
 /// than the four numbers `--print-allocation` documents.
 #[must_use]
-pub fn allocation_of(label: &str, classes: &str) -> Allocation {
+pub fn allocation_of(label: &str, classes: &str) -> PrintedAllocation {
     let output = themed_button(label, classes)
         .arg("--print-allocation")
         .stderr(Stdio::null())
@@ -70,7 +81,7 @@ pub fn allocation_of(label: &str, classes: &str) -> Allocation {
         4,
         "expected `width height label_x label_y`, got {stdout:?}"
     );
-    Allocation {
+    PrintedAllocation {
         width: numbers[0],
         height: numbers[1],
         label_x: numbers[2],

@@ -43,30 +43,73 @@ pub fn box_blur_radius(sigma: f32) -> i32 {
     }
 }
 
+/// The three box-pass radii that variance-match a Gaussian of `sigma`.
+///
+/// [`box_blur_radius`]'s "one radius, run three times" rule is Skia's own
+/// shorthand for *large* blurs, where losing a pixel of precision to
+/// rounding is invisible; splitting `sigma` unevenly across the three
+/// passes (Kutskir's `boxesForGauss`: an ideal box width
+/// `w = sqrt(12*sigma^2/3 + 1)`, floored to the nearest odd integer below
+/// and above, weighted by how far the ideal width sits between them) is
+/// the standard construction that keeps the three-pass approximation close
+/// to a true Gaussian at *every* sigma, small ones included. That matters
+/// here specifically because a separable box kernel's reach is a square
+/// (Chebyshev) neighbourhood, not a disk: outside a rounded corner, the
+/// uneven, tighter split still over-reaches a true Gaussian's tail less
+/// than three equal, rounded-up passes did, which is what a small
+/// `box-shadow` blur next to a `border-radius` corner needs to stay clear
+/// at a sample point a true Gaussian would have left fully transparent.
+#[must_use]
+fn box_radii_for_gauss(sigma: f32) -> [i32; 3] {
+    if !sigma.is_finite() || sigma <= 0.0 {
+        return [0, 0, 0];
+    }
+    let n = 3.0f32;
+    let ideal_width = (12.0 * sigma * sigma / n + 1.0).sqrt();
+    let mut lower = ideal_width.floor();
+    if (lower as i64).rem_euclid(2) == 0 {
+        lower -= 1.0;
+    }
+    let lower = lower.max(1.0);
+    let upper = lower + 2.0;
+    let ideal_lower_count = (12.0 * sigma * sigma - n * lower * lower - 4.0 * n * lower - 3.0 * n)
+        / (-4.0 * lower - 4.0);
+    let lower_count = if ideal_lower_count.is_finite() {
+        ideal_lower_count.round().clamp(0.0, n) as i32
+    } else {
+        0
+    };
+    let to_radius = |width: f32| (((width - 1.0) / 2.0).max(0.0).clamp(0.0, 512.0)) as i32;
+    let (r_lower, r_upper) = (to_radius(lower), to_radius(upper));
+    std::array::from_fn(|i| {
+        if (i as i32) < lower_count {
+            r_lower
+        } else {
+            r_upper
+        }
+    })
+}
+
 /// Blur a premultiplied RGBA buffer in place.
 ///
-/// Three box passes per axis, each sized to a third of
-/// [`box_blur_radius`]'s total: three independent box passes of the *same*
-/// full radius sum their variances (the passes are independent, so the
-/// combined variance is additive), which would triple the effective blur
-/// instead of reproducing one Gaussian of `sigma`. Splitting the radius
-/// three ways keeps the three-pass Gaussian-ish approximation (smoother
-/// falloff than one box) while landing on the target spread. Edges are
-/// clamped (the buffer is assumed to already carry the padding the caller
-/// wants).
+/// Three box passes per axis, sized by [`box_radii_for_gauss`] rather than
+/// one radius repeated three times: three passes of the *same full* radius
+/// would sum their reach to `3 * radius` (each pass's reach adds, since
+/// they run in sequence), tripling the intended spread. Edges are clamped
+/// (the buffer is assumed to already carry the padding the caller wants).
 pub fn blur_premul_rgba(pixels: &mut [u8], width: i32, height: i32, stride: usize, sigma: f32) {
-    let radius = box_blur_radius(sigma);
-    if radius == 0 || width <= 0 || height <= 0 {
+    let radii = box_radii_for_gauss(sigma);
+    if radii == [0, 0, 0] || width <= 0 || height <= 0 {
         return;
     }
     let (w, h) = (width as usize, height as usize);
     if stride < w * 4 || pixels.len() < stride * h {
         return;
     }
-    let r = ((radius as f32 / 3.0).round() as i32).max(1) as usize;
     let mut scratch = vec![0u8; stride * h];
 
-    for _ in 0..3 {
+    for pass_radius in radii {
+        let r = pass_radius.max(0) as usize;
         box_pass_horizontal(pixels, &mut scratch, w, h, stride, r);
         box_pass_vertical(&scratch, pixels, w, h, stride, r);
     }

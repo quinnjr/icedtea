@@ -23,7 +23,7 @@ use skia_rs_safe::core::Color;
 use crate::css::cascade::CompiledSheet;
 use crate::css::node::PseudoStates;
 use crate::shm::{BufferPool, BufferSlot, ShmBuffer, Slot, SlotPool};
-use crate::text::FontStack;
+use crate::text::FontDatabase;
 use crate::widget::button::Button;
 
 /// Everything that can go wrong opening or running the window.
@@ -112,13 +112,13 @@ pub struct AppState {
     /// Buffer slots the compositor released since the last repaint.
     released: Vec<BufferSlot>,
     sheet: CompiledSheet,
-    fonts: FontStack,
+    fonts: FontDatabase,
     button: Button,
 }
 
 impl AppState {
     /// A client state with nothing bound yet.
-    fn new(sheet: CompiledSheet, fonts: FontStack, button: Button) -> Self {
+    fn new(sheet: CompiledSheet, fonts: FontDatabase, button: Button) -> Self {
         Self {
             compositor: None,
             shm: None,
@@ -184,7 +184,7 @@ impl AppState {
         let mut states = PseudoStates::empty();
         states.set(PseudoStates::HOVER, hover);
         states.set(PseudoStates::ACTIVE, active);
-        self.button.set_states(states, &self.sheet, &self.fonts);
+        self.button.set_states(states, &self.sheet, &mut self.fonts);
         self.dirty = true;
     }
 }
@@ -288,13 +288,13 @@ impl LayerWindow {
     /// failed shm allocation or a failed dispatch.
     pub fn open(
         sheet: CompiledSheet,
-        fonts: FontStack,
+        mut fonts: FontDatabase,
         mut button: Button,
     ) -> Result<Self, LayerWindowError> {
-        button.restyle(&sheet, &fonts);
+        button.restyle(&sheet, &mut fonts);
         let allocation = button.allocation();
-        let width = allocation.width.ceil().max(1.0) as i32;
-        let height = allocation.height.ceil().max(1.0) as i32;
+        let width = allocation.border_box.width.ceil().max(1.0) as i32;
+        let height = allocation.border_box.height.ceil().max(1.0) as i32;
         tracing::info!(width, height, "opening layer window");
 
         let conn = Connection::connect_to_env().map_err(LayerWindowError::Connect)?;
@@ -416,7 +416,13 @@ impl LayerWindow {
 
         let (width, height) = self.buffers.size();
         self.skia.canvas().clear(Color::TRANSPARENT);
-        self.state.button.render(&mut self.skia, (0.0, 0.0));
+        self.state.button.render(
+            &mut self.skia,
+            (0.0, 0.0),
+            &self.state.sheet,
+            &mut self.state.fonts,
+            None,
+        );
         self.buffers
             .upload(index, &self.skia)
             .map_err(LayerWindowError::Shm)?;
@@ -654,7 +660,7 @@ mod tests {
     use crate::css::cascade::CompiledSheet;
     use crate::css::node::{Node, PseudoStates};
     use crate::shm::{BufferSlot, Slot, SlotPool};
-    use crate::text::FontStack;
+    use crate::text::FontDatabase;
     use crate::widget::button::Button;
     use std::error::Error;
     use std::time::{Duration, Instant};
@@ -662,10 +668,10 @@ mod tests {
 
     fn state() -> AppState {
         let sheet = CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT);
-        let fonts = FontStack::system().expect("system font");
+        let mut fonts = FontDatabase::probe_only();
         let window = Node::with_classes("window", &["background"]);
         let mut button = Button::new("Click me", &[], window);
-        button.restyle(&sheet, &fonts);
+        button.restyle(&sheet, &mut fonts);
         AppState::new(sheet, fonts, button)
     }
 

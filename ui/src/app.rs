@@ -14,7 +14,7 @@ use crate::css::cascade::CompiledSheet;
 use crate::css::node::Node;
 use crate::css::parse::{Stylesheet, parse_stylesheet_with_base};
 use crate::layout::Allocation;
-use crate::text::FontStack;
+use crate::text::FontDatabase;
 use crate::wayland::{LayerWindow, LayerWindowError};
 use crate::widget::button::Button;
 
@@ -218,11 +218,11 @@ pub fn themed_button(
     label: &str,
     classes: &[&str],
     theme: &ThemeSource,
-) -> Result<(CompiledSheet, FontStack, Button), LayerWindowError> {
+) -> Result<(CompiledSheet, FontDatabase, Button), LayerWindowError> {
     let sheet = compile_theme(theme);
-    let fonts = FontStack::system().ok_or(LayerWindowError::NoFont)?;
+    let mut fonts = FontDatabase::new();
     let mut button = button_node(label, classes);
-    button.restyle(&sheet, &fonts);
+    button.restyle(&sheet, &mut fonts);
     Ok((sheet, fonts, button))
 }
 

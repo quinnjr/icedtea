@@ -10,8 +10,8 @@ mod support;
 use std::time::{Duration, Instant};
 
 use icedtea_harness::{CapturedFrame, Compositor, ScreencopyClient, VirtualPointerClient};
-use icedtea_ui::layout::Allocation;
 use icedtea_ui::wayland::BTN_LEFT;
+use support::PrintedAllocation as Allocation;
 
 use support::{allocation_of, spawn_themed_button};
 
