@@ -1,7 +1,9 @@
 # Pure-Rust GTK-themed UI — M2: GTK-CSS Engine Breadth — Design
 
 **Date:** 2026-08-26
-**Status:** approved in brainstorming (2026-08-26); awaiting owner spec review
+**Status:** implemented on `rebuild/pure-rust-gtk-m2` (parts 1–6 of
+`docs/superpowers/plans/2026-08-26-m2-part0-contract.md`); awaiting owner review
+before merge
 **Branch:** `rebuild/pure-rust-gtk-m2` (off `develop` @ 216a8e8)
 **Parent spec:** `docs/superpowers/specs/2026-08-20-pure-rust-gtk-ui-design.md` (§Decomposition, M2; M1 hand-off list)
 **Crate:** `ui/` (`icedtea-ui`), continuing M1 (`develop` @ a4dbbe6 + fix waves)
@@ -272,6 +274,34 @@ queries beyond `prefers-color-scheme`/`prefers-contrast`.
 - **Size** — this is the largest milestone; the plan decomposes by family
   (registry+values → node/selectors → cascade/computed → layout/paint per
   family → animation → fonts → coverage gate).
+
+## Implementation status
+
+Implemented across six part-plans against the frozen interface contract
+`docs/superpowers/plans/2026-08-26-m2-part0-contract.md`:
+
+| Part | Scope | Plan |
+|---|---|---|
+| P1 | registry, values, `@keyframes`/`@media` | `2026-08-26-m2-part1-registry-values-parse.md` |
+| P2 | node tree, selectors | `2026-08-26-m2-part2-node-selectors.md` |
+| P3 | cascade, computed style, M1 migration | `2026-08-26-m2-part3-cascade-computed-migration.md` |
+| P4 | layout, paint | `2026-08-26-m2-part4-layout-paint.md` |
+| P5 | transitions, animations | `2026-08-26-m2-part5-animation.md` |
+| P6 | fonts, coverage gate, docs | `2026-08-26-m2-part6-fonts-gate-docs.md` |
+
+The gate (§7) is `ui/tests/adwaita_coverage.rs`: GTK 4.22 Adwaita light, dark
+and high-contrast, every declaration through the registry, **0 unknown
+properties / 0 unparseable declarations / 37 of 37 `@define-color`s resolved**,
+plus `ui/tests/gtk4_property_reference.rs` pinning the registry's 113 rows
+against the vendored GTK 4.22 property table. M1's pixel gate
+`ui/tests/themed_button_offscreen.rs` keeps every one of its numbers.
+
+Carried into later milestones as written here: `-gtk-icon-*` values parse,
+compute and store but draw nothing (M4). Two limits of the shaper stack are
+warned about once at runtime rather than silently ignored:
+`font-feature-settings`/`font-variation-settings` cannot reach `rustybuzz`
+through `skia-rs-text` 0.4.0, and a face index inside a font collection cannot
+be selected.
 
 ## Open items for M3
 
