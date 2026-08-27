@@ -8,16 +8,33 @@ rust-version.workspace = true
 # and no Smithay (these are Wayland *clients*; wlroots is the server side).
 
 [dependencies]
-skia-rs-safe = { version = "0.4.0", default-features = false, features = ["std", "text"] }
+skia-rs-safe = { version = "0.4.0", default-features = false, features = [
+    "std",
+    "text",
+    "codec",
+    "codec-png",
+    "svg",
+] }
+bitflags = "2"
 cssparser = "0.37"
 selectors = "0.40"
 precomputed-hash = "0.1"
 taffy = "0.14"
+fontconfig = { version = "0.11", optional = true }
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 rustix = { version = "1", features = ["fs", "event"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+default = ["fontconfig"]
+# Real `fc-match` parity: aliases, generic families and the user's own
+# `~/.config/fontconfig` rules. Off, `FontDatabase::new` is
+# `FontDatabase::probe_only` -- the fixed `FONT_CANDIDATES` list -- which is
+# what a stripped container or a build that must not link libfontconfig
+# wants, and is already the fallback when `FcInit` fails.
+fontconfig = ["dep:fontconfig"]
 
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }

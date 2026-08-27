@@ -2,9 +2,11 @@
 //! cascade, and computed values.
 
 pub mod cascade;
-pub mod colors;
 pub mod computed;
+pub(crate) mod depth_guard;
+pub mod node;
 pub mod parse;
+pub mod registry;
 pub mod select;
-pub mod shorthand;
+pub mod tokens;
 pub mod value;
