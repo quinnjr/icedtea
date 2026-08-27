@@ -205,35 +205,7 @@ pub fn recompose_2d(d: &Decomposed2d) -> Matrix {
 
 /// `none | <transform-list>`.
 pub fn parse_transform_list(input: &mut Parser<'_, '_>) -> Result<Rc<[TransformFn]>, ()> {
-    let state = input.state();
-    if let Ok(name) = input.expect_ident()
-        && name.eq_ignore_ascii_case("none")
-    {
-        return Ok(Rc::from(Vec::new()));
-    }
-    input.reset(&state);
-    let mut functions: Vec<TransformFn> = Vec::new();
-    loop {
-        let state = input.state();
-        let name = match input.expect_function() {
-            Ok(name) => name.as_ref().to_ascii_lowercase(),
-            Err(_) => {
-                input.reset(&state);
-                break;
-            }
-        };
-        let function = input
-            .parse_nested_block(|inner| match parse_transform_function(&name, inner) {
-                Ok(function) => Ok(function),
-                Err(()) => Err(inner.new_custom_error::<(), ()>(())),
-            })
-            .map_err(|_: cssparser::ParseError<'_, ()>| ())?;
-        functions.push(function);
-    }
-    if functions.is_empty() {
-        return Err(());
-    }
-    Ok(functions.into())
+    super::parse_function_list(input, parse_transform_function)
 }
 
 fn numbers<const N: usize>(input: &mut Parser<'_, '_>) -> Result<[f32; N], ()> {

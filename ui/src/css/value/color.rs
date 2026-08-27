@@ -13,6 +13,7 @@ use cssparser::{Parser, ParserInput, Token};
 use skia_rs_safe::core::{Color, hsl_to_rgb, rgb_to_hsl};
 
 use super::calc::{CalcNode, parse_angle, parse_math_function};
+use super::{nested, require_exhausted};
 
 /// An unpremultiplied sRGB colour with components in `0..=1`.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -713,28 +714,6 @@ fn parse_color_function(name: &str, input: &mut Parser<'_, '_>) -> Result<ColorV
             require_exhausted(inner)?;
             Ok(ColorValue::Legacy(Rc::new(LegacyColorFn::Darker(color))))
         })
-    } else {
-        Err(())
-    }
-}
-
-/// Run `body` inside a function's block, translating its `()` error.
-fn nested<T>(
-    input: &mut Parser<'_, '_>,
-    body: fn(&mut Parser<'_, '_>) -> Result<T, ()>,
-) -> Result<T, ()> {
-    input
-        .parse_nested_block(|inner| match body(inner) {
-            Ok(value) => Ok(value),
-            Err(()) => Err(inner.new_custom_error::<(), ()>(())),
-        })
-        .map_err(|_: cssparser::ParseError<'_, ()>| ())
-}
-
-fn require_exhausted(input: &mut Parser<'_, '_>) -> Result<(), ()> {
-    input.skip_whitespace();
-    if input.is_exhausted() {
-        Ok(())
     } else {
         Err(())
     }

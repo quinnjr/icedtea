@@ -54,35 +54,7 @@ fn amount(input: &mut Parser<'_, '_>, default: f32) -> Result<f32, ()> {
 
 /// `none | <filter-function>+`.
 pub fn parse_filter_list(input: &mut Parser<'_, '_>) -> Result<Rc<[FilterFn]>, ()> {
-    let state = input.state();
-    if let Ok(name) = input.expect_ident()
-        && name.eq_ignore_ascii_case("none")
-    {
-        return Ok(Rc::from(Vec::new()));
-    }
-    input.reset(&state);
-    let mut functions: Vec<FilterFn> = Vec::new();
-    loop {
-        let state = input.state();
-        let name = match input.expect_function() {
-            Ok(name) => name.as_ref().to_ascii_lowercase(),
-            Err(_) => {
-                input.reset(&state);
-                break;
-            }
-        };
-        let function = input
-            .parse_nested_block(|inner| match parse_filter_function(&name, inner) {
-                Ok(function) => Ok(function),
-                Err(()) => Err(inner.new_custom_error::<(), ()>(())),
-            })
-            .map_err(|_: cssparser::ParseError<'_, ()>| ())?;
-        functions.push(function);
-    }
-    if functions.is_empty() {
-        return Err(());
-    }
-    Ok(functions.into())
+    super::parse_function_list(input, parse_filter_function)
 }
 
 fn parse_filter_function(name: &str, input: &mut Parser<'_, '_>) -> Result<FilterFn, ()> {

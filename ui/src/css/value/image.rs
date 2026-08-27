@@ -10,6 +10,7 @@ use skia_rs_safe::core::Point;
 use super::calc::parse_angle;
 use super::color::{ColorCtx, ColorValue, Rgba};
 use super::length::{Length, LengthCtx};
+use super::{nested, require_exhausted};
 use crate::css::depth_guard::DepthGuard;
 
 /// A `<position>`: `background-position` and `transform-origin`.
@@ -630,27 +631,6 @@ fn parse_stops(input: &mut Parser<'_, '_>) -> Result<Vec<ColorStop>, ()> {
         if input.expect_comma().is_err() {
             return Ok(stops);
         }
-    }
-}
-
-fn nested<T>(
-    input: &mut Parser<'_, '_>,
-    body: fn(&mut Parser<'_, '_>) -> Result<T, ()>,
-) -> Result<T, ()> {
-    input
-        .parse_nested_block(|inner| match body(inner) {
-            Ok(value) => Ok(value),
-            Err(()) => Err(inner.new_custom_error::<(), ()>(())),
-        })
-        .map_err(|_: cssparser::ParseError<'_, ()>| ())
-}
-
-fn require_exhausted(input: &mut Parser<'_, '_>) -> Result<(), ()> {
-    input.skip_whitespace();
-    if input.is_exhausted() {
-        Ok(())
-    } else {
-        Err(())
     }
 }
 

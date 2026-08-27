@@ -24,22 +24,18 @@ use super::font::{
 use super::image::{Image, Position};
 use super::keyword::Keyword;
 use super::length::Length;
+use super::require_exhausted;
 use super::text::TextDecorationLines;
 use super::timing::{AnimationName, IterationCount, Time, TimingFunction};
 
 type Sink<'a> = &'a mut dyn FnMut(Prop, Value);
 
-fn require_exhausted(input: &mut Parser<'_, '_>) -> Result<(), ()> {
-    input.skip_whitespace();
-    if input.is_exhausted() {
-        Ok(())
-    } else {
-        Err(())
-    }
-}
-
 /// Collect 1..=4 values with `parse`, then apply the four-sides rule.
-fn box_sides<T: Clone>(
+///
+/// `pub(crate)` because `border-image-width`'s longhand parser needs exactly
+/// this loop; it had its own copy of the subtle `< 5` bound and the
+/// reset-on-`Err` discipline, so a fix here silently left it behind.
+pub(crate) fn box_sides<T: Clone>(
     input: &mut Parser<'_, '_>,
     parse: fn(&mut Parser<'_, '_>) -> Result<T, ()>,
 ) -> Result<[T; 4], ()> {

@@ -4,6 +4,7 @@
 use cssparser::{Parser, Token};
 
 use super::keyword::Keyword;
+use super::keyword_in;
 use super::length::Length;
 
 /// `<number>` or `<percentage>`, as `border-image-slice` uses them.
@@ -124,12 +125,7 @@ pub fn parse_line_style(input: &mut Parser<'_, '_>) -> Result<Keyword, ()> {
         Keyword::Inset,
         Keyword::Outset,
     ];
-    let name = input.expect_ident().map_err(|_| ())?.as_ref().to_string();
-    STYLES
-        .iter()
-        .copied()
-        .find(|style| name.eq_ignore_ascii_case(style.as_str()))
-        .ok_or(())
+    keyword_in(input, STYLES)
 }
 
 fn parse_number_or_percent(input: &mut Parser<'_, '_>) -> Result<NumberOrPercent, ()> {
@@ -206,9 +202,9 @@ impl RepeatStyle {
             Keyword::Round,
             Keyword::Space,
         ];
-        let x = parse_one_of(input, AXES)?;
+        let x = keyword_in(input, AXES)?;
         let state = input.state();
-        let y = match parse_one_of(input, AXES) {
+        let y = match keyword_in(input, AXES) {
             Ok(keyword) => keyword,
             Err(()) => {
                 input.reset(&state);
@@ -242,9 +238,9 @@ impl RepeatStyle {
             }
         }
         input.reset(&state);
-        let x = parse_one_of(input, AXES)?;
+        let x = keyword_in(input, AXES)?;
         let state = input.state();
-        let y = match parse_one_of(input, AXES) {
+        let y = match keyword_in(input, AXES) {
             Ok(keyword) => keyword,
             Err(()) => {
                 input.reset(&state);
@@ -253,15 +249,6 @@ impl RepeatStyle {
         };
         Ok(RepeatStyle { x, y })
     }
-}
-
-fn parse_one_of(input: &mut Parser<'_, '_>, allowed: &[Keyword]) -> Result<Keyword, ()> {
-    let name = input.expect_ident().map_err(|_| ())?.as_ref().to_string();
-    allowed
-        .iter()
-        .copied()
-        .find(|keyword| name.eq_ignore_ascii_case(keyword.as_str()))
-        .ok_or(())
 }
 
 impl BgSize {

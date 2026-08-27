@@ -137,6 +137,98 @@ pub(crate) const FUZZ_INPUTS: &[&str] = &[
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 ];
 
+/// Require the parser to be at the end of its input.
+///
+/// The "a value must end here" rule, in one place. It was written out six
+/// times across this module -- `image`, `color`, `shorthand` and inline in
+/// `filter`, `transform` and `timing` -- so a change to it (whitespace
+/// skipping does not skip comments, for one) had to be applied six times and
+/// three of the copies were not greppable.
+pub(crate) fn require_exhausted(input: &mut Parser<'_, '_>) -> Result<(), ()> {
+    input.skip_whitespace();
+    if input.is_exhausted() {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Run `body` inside the already-consumed function's or block's contents,
+/// translating its bare `Err(())` into a `cssparser` error and back.
+///
+/// The one place a nested block's `()` error crosses the `cssparser`
+/// boundary; it had five identical copies.
+pub(crate) fn nested<T>(
+    input: &mut Parser<'_, '_>,
+    body: impl FnOnce(&mut Parser<'_, '_>) -> Result<T, ()>,
+) -> Result<T, ()> {
+    let mut body = Some(body);
+    input
+        .parse_nested_block(|inner| {
+            let body = body
+                .take()
+                .ok_or_else(|| inner.new_custom_error::<(), ()>(()))?;
+            match body(inner) {
+                Ok(value) => Ok(value),
+                Err(()) => Err(inner.new_custom_error::<(), ()>(())),
+            }
+        })
+        .map_err(|_: cssparser::ParseError<'_, ()>| ())
+}
+
+/// The one `<ident>` restricted to a keyword set, used by every longhand
+/// that takes a fixed vocabulary.
+///
+/// [`Keyword::from_str_ascii_ci`] does the matching, so no `String` is
+/// allocated per keyword parse -- the four hand-rolled copies each did.
+pub(crate) fn keyword_in(input: &mut Parser<'_, '_>, allowed: &[Keyword]) -> Result<Keyword, ()> {
+    let state = input.state();
+    let found = Keyword::from_str_ascii_ci(input.expect_ident().map_err(|_| ())?.as_ref());
+    match found.filter(|keyword| allowed.contains(keyword)) {
+        Some(keyword) => Ok(keyword),
+        None => {
+            input.reset(&state);
+            Err(())
+        }
+    }
+}
+
+/// `none | <function>+` -- the shape `transform` and `filter` share.
+///
+/// Both encode the same policy (`none` short-circuits to the empty list, an
+/// unparseable function name resets and ends the run, an empty run is an
+/// error) and both let the caller's whole-value check reject any trailing
+/// garbage. Sharing it keeps `filter: blur(2px) !!!` and
+/// `transform: scale(2) !!!` agreeing on validity.
+pub(crate) fn parse_function_list<T>(
+    input: &mut Parser<'_, '_>,
+    parse: impl Fn(&str, &mut Parser<'_, '_>) -> Result<T, ()>,
+) -> Result<Rc<[T]>, ()> {
+    let state = input.state();
+    if let Ok(name) = input.expect_ident()
+        && name.eq_ignore_ascii_case("none")
+    {
+        return Ok(Rc::from(Vec::new()));
+    }
+    input.reset(&state);
+    let mut functions: Vec<T> = Vec::new();
+    loop {
+        let state = input.state();
+        let name = match input.expect_function() {
+            Ok(name) => name.as_ref().to_ascii_lowercase(),
+            Err(_) => {
+                input.reset(&state);
+                break;
+            }
+        };
+        functions.push(nested(input, |inner| parse(&name, inner))?);
+    }
+    if functions.is_empty() {
+        return Err(());
+    }
+    Ok(functions.into())
+}
+
 /// Parse `text` with `f`, requiring the whole input to be consumed.
 ///
 /// The test-side mirror of the registry's whole-value rule: a trailing
@@ -356,5 +448,64 @@ mod tests {
             parse_entirely_with("1px, red", |input| Value::parse_list(input, length_parser))
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{Keyword, keyword_in, nested, parse_entirely_with, require_exhausted};
+
+    // F21: one `keyword_in` for every fixed vocabulary, matching through
+    // `Keyword::from_str_ascii_ci` so no `String` is allocated, and leaving
+    // the rejected token unconsumed so the caller can try another grammar.
+    #[test]
+    fn keyword_in_matches_case_insensitively_and_resets_on_a_miss() {
+        const ALLOWED: &[Keyword] = &[Keyword::BorderBox, Keyword::PaddingBox];
+        assert_eq!(
+            parse_entirely_with("padding-box", |i| keyword_in(i, ALLOWED)),
+            Ok(Keyword::PaddingBox)
+        );
+        assert_eq!(
+            parse_entirely_with("PADDING-BOX", |i| keyword_in(i, ALLOWED)),
+            Ok(Keyword::PaddingBox)
+        );
+        // A keyword that exists but is not allowed here.
+        assert!(parse_entirely_with("content-box", |i| keyword_in(i, ALLOWED)).is_err());
+        // A word that is not a keyword at all.
+        assert!(parse_entirely_with("nosuchthing", |i| keyword_in(i, ALLOWED)).is_err());
+        // A miss leaves the token for the next grammar to try.
+        let mut source = cssparser::ParserInput::new("content-box");
+        let mut parser = cssparser::Parser::new(&mut source);
+        assert!(keyword_in(&mut parser, ALLOWED).is_err());
+        assert!(parser.expect_ident_matching("content-box").is_ok());
+    }
+
+    // F38: one "the value must end here" rule.
+    #[test]
+    fn require_exhausted_skips_whitespace_and_rejects_a_trailing_token() {
+        assert_eq!(parse_entirely_with("   ", require_exhausted), Ok(()));
+        assert!(parse_entirely_with("x", require_exhausted).is_err());
+    }
+
+    // F37: one place a nested block's `Err(())` crosses the cssparser
+    // boundary, and it must propagate rather than being swallowed.
+    #[test]
+    fn nested_propagates_the_inner_error() {
+        let ok: Result<u8, ()> = parse_entirely_with("(1)", |i| {
+            i.expect_parenthesis_block().map_err(|_| ())?;
+            nested(i, |inner| {
+                inner.expect_integer().map_err(|_| ())?;
+                Ok(7)
+            })
+        });
+        assert_eq!(ok, Ok(7));
+        let err: Result<u8, ()> = parse_entirely_with("(x)", |i| {
+            i.expect_parenthesis_block().map_err(|_| ())?;
+            nested(i, |inner| {
+                inner.expect_integer().map_err(|_| ())?;
+                Ok(7)
+            })
+        });
+        assert_eq!(err, Err(()));
     }
 }

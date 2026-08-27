@@ -269,14 +269,7 @@ fn wide(input: &mut Parser<'_, '_>, inner: ParseFn) -> Result<Value, ()> {
     Value::parse_wide_or(input, inner)
 }
 
-fn keyword_in(input: &mut Parser<'_, '_>, allowed: &[Keyword]) -> Result<Keyword, ()> {
-    let name = input.expect_ident().map_err(|_| ())?.as_ref().to_string();
-    allowed
-        .iter()
-        .copied()
-        .find(|keyword| name.eq_ignore_ascii_case(keyword.as_str()))
-        .ok_or(())
-}
+use crate::css::value::keyword_in;
 
 // ---- longhand parsers -------------------------------------------------
 
@@ -430,20 +423,8 @@ fn p_border_image_slice(input: &mut Parser<'_, '_>) -> Result<Value, ()> {
 
 fn p_border_image_width(input: &mut Parser<'_, '_>) -> Result<Value, ()> {
     wide(input, |i| {
-        let mut values: Vec<BorderImageWidthSide> = Vec::new();
-        while values.len() < 5 {
-            let state = i.state();
-            match BorderImageWidthSide::parse(i) {
-                Ok(value) => values.push(value),
-                Err(()) => {
-                    i.reset(&state);
-                    break;
-                }
-            }
-        }
-        crate::css::value::border::four_sides(values)
+        crate::css::value::shorthand::box_sides(i, BorderImageWidthSide::parse)
             .map(Value::BorderImageWidths)
-            .ok_or(())
     })
 }
 

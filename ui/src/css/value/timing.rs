@@ -24,12 +24,6 @@ impl Time {
         self.0
     }
 
-    /// Milliseconds.
-    #[must_use]
-    pub fn as_millis_f32(self) -> f32 {
-        self.0 * 1000.0
-    }
-
     /// Parse `<time>`: `s`, `ms`, a unitless `0`, or a math function.
     ///
     /// CSS proper rejects a unitless zero for `<time>`; GTK themes are
@@ -335,7 +329,6 @@ mod tests {
         assert_eq!(time("0S"), Some(Time(0.0)));
         assert_eq!(time("-1.5s"), Some(Time(-1.5)));
         assert_eq!(Time::from_ms(250.0), Time(0.25));
-        assert_eq!(Time(0.25).as_millis_f32(), 250.0);
         assert_eq!(Time(0.25).as_secs_f32(), 0.25);
     }
 
