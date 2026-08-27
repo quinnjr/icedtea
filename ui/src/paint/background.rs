@@ -7,6 +7,8 @@
 use skia_rs_safe::canvas::{Canvas, ClipOp};
 use skia_rs_safe::paint::{BlendMode, Paint};
 
+use std::f32::consts::SQRT_2;
+
 use crate::css::computed::BackgroundLayer;
 use crate::css::value::image::{GradientKind, RadialExtent, RadialShape};
 use crate::css::value::{BgSize, Gradient, Image, Keyword, LengthCtx, Position, RepeatStyle, Rgba};
@@ -57,32 +59,21 @@ fn paint_layer(
     let clip_path = rounded_rect_path(clip_rect, &radii_for_box(radii, alloc, layer.clip));
     canvas.clip_path(&clip_path, ClipOp::Intersect, true);
 
-    match &layer.image {
-        Image::Solid(color) => {
-            if let Some(rgba) = color.resolve(&cx.color_ctx(current)) {
-                let origin = alloc.box_for(layer.origin);
-                let mut paint = fill_paint(rgba);
-                paint.set_anti_alias(false);
-                paint.set_blend_mode(blend_mode_for(layer.blend));
-                canvas.draw_rect(&origin.to_skia(), &paint);
-            }
-        }
-        Image::Gradient(gradient) => {
-            let origin = alloc.box_for(layer.origin);
-            paint_gradient(
-                canvas,
-                gradient,
-                origin,
-                clip_rect,
-                cx,
-                current,
-                blend_mode_for(layer.blend),
-            );
-        }
+    // `background-size`, `-position` and `-repeat` apply to *every* layer
+    // image, not just `url()`: a gradient or an `image(<color>)` is sized and
+    // tiled exactly like a bitmap (CSS Backgrounds L3 §3.5-§3.9). Only
+    // `url()` has an intrinsic size for `auto` to fall back to; a gradient's
+    // `auto` is the whole origin box, which is what `layer_tile` does with
+    // `None`.
+    let origin = alloc.box_for(layer.origin);
+    if origin.is_empty() {
+        canvas.restore_to_count(save);
+        return;
+    }
+    let len_ctx = cx.base_length_ctx();
+    let intrinsic = match &layer.image {
         Image::Url(url) => {
-            let origin = alloc.box_for(layer.origin);
-            let len_ctx = cx.base_length_ctx();
-            let Some((iw, ih)) = cx
+            let Some(size) = cx
                 .images
                 .get(url)
                 .map(|img| (img.width() as f32, img.height() as f32))
@@ -91,10 +82,43 @@ fn paint_layer(
                 canvas.restore_to_count(save);
                 return;
             };
-            let tile = layer_tile(layer, origin, Some((iw, ih)), &len_ctx);
-            let rects = tile_positions(&tile, clip_rect, layer.repeat);
+            Some(size)
+        }
+        _ => None,
+    };
+    let tile = layer_tile(layer, origin, intrinsic, &len_ctx);
+    if tile.rect.is_empty() {
+        canvas.restore_to_count(save);
+        return;
+    }
+    let rects = tile_positions(&tile, clip_rect, layer.repeat);
+    let blend = blend_mode_for(layer.blend);
+
+    match &layer.image {
+        Image::Solid(color) => {
+            if let Some(rgba) = color.resolve(&cx.color_ctx(current)) {
+                let mut paint = fill_paint(rgba);
+                paint.set_anti_alias(false);
+                paint.set_blend_mode(blend);
+                for rect in rects {
+                    canvas.draw_rect(&rect.to_skia(), &paint);
+                }
+            }
+        }
+        Image::Gradient(gradient) => {
+            for rect in rects {
+                // Each copy is its own gradient box: the gradient line is
+                // sized against the tile, and the copy is clipped to itself
+                // so `no-repeat` cannot flood the clip box.
+                let Some(piece) = intersect(rect, clip_rect) else {
+                    continue;
+                };
+                paint_gradient(canvas, gradient, rect, piece, cx, current, blend);
+            }
+        }
+        Image::Url(url) => {
             let mut paint = Paint::new();
-            paint.set_blend_mode(blend_mode_for(layer.blend));
+            paint.set_blend_mode(blend);
             if let Some(image) = cx.images.get(url) {
                 for rect in rects {
                     canvas.draw_image_rect(image, None, &rect.to_skia(), Some(&paint));
@@ -192,14 +216,13 @@ fn radial_radii(
     let (rx, ry) = match extent {
         RadialExtent::ClosestSide => (sx, sy),
         RadialExtent::FarthestSide => (fx, fy),
-        RadialExtent::ClosestCorner => {
-            let d = sx.hypot(sy);
-            (d, d)
-        }
-        RadialExtent::FarthestCorner => {
-            let d = fx.hypot(fy);
-            (d, d)
-        }
+        // CSS Images L3 §3.2: an *ellipse* sized to a corner has the same
+        // aspect ratio as the matching `-side` ellipse and passes through
+        // that corner, which works out to `side * sqrt(2)` per axis --
+        // not one circular `hypot(sx, sy)` on both axes. The circle arm
+        // below still uses the true corner distance.
+        RadialExtent::ClosestCorner => (sx * SQRT_2, sy * SQRT_2),
+        RadialExtent::FarthestCorner => (fx * SQRT_2, fy * SQRT_2),
         RadialExtent::Explicit(x, y) => {
             let mut x_ctx = *ctx;
             x_ctx.percent_basis = Some(w);
@@ -216,7 +239,9 @@ fn radial_radii(
             let r = match extent {
                 RadialExtent::ClosestSide => sx.min(sy),
                 RadialExtent::FarthestSide => fx.max(fy),
-                _ => rx,
+                RadialExtent::ClosestCorner => sx.hypot(sy),
+                RadialExtent::FarthestCorner => fx.hypot(fy),
+                RadialExtent::Explicit(..) => rx,
             };
             (r, r)
         }
@@ -432,10 +457,21 @@ pub fn layer_tile(
                 (iw * s, ih * s)
             }
         }
-        BgSize::Explicit(x, y) => (
-            x.resolve(&w_ctx).unwrap_or(iw),
-            y.resolve(&h_ctx).unwrap_or(ih),
-        ),
+        BgSize::Explicit(x, y) => {
+            // CSS Backgrounds L3 §3.9: with one axis given and the other
+            // `auto`, the `auto` axis is scaled to keep the image's own
+            // aspect ratio -- it does *not* fall back to the raw intrinsic
+            // size. `background-size: 100% auto` on a 200px box with a
+            // 10x40 image is (200, 800), not (200, 40).
+            let given_w = x.resolve(&w_ctx);
+            let given_h = y.resolve(&h_ctx);
+            let ratio = (iw > 0.0 && ih > 0.0).then(|| ih / iw);
+            match (given_w, given_h, ratio) {
+                (Some(w), None, Some(r)) => (w, w * r),
+                (None, Some(h), Some(r)) => (h / r, h),
+                (w, h, _) => (w.unwrap_or(iw), h.unwrap_or(ih)),
+            }
+        }
     };
     let (w, h) = (
         if w.is_finite() && w > 0.0 { w } else { 0.0 },
@@ -470,6 +506,15 @@ pub fn layer_tile(
 /// `MAX_TILES_PER_AXIS` however large the clip claims to be.
 const MAX_TILES_PER_AXIS: i32 = 4096;
 
+/// The narrowest repeat step, in px.
+///
+/// One device pixel: two copies starting inside the same pixel are
+/// indistinguishable on the device grid, so nothing is lost by stepping at
+/// least this far -- and it is what keeps a `background-size: 0.01px`
+/// repeat proportional to the clip's own pixel count instead of to
+/// `clip / size`.
+const MIN_TILE_STEP: f32 = 1.0;
+
 /// The most tile copies both axes together may emit.
 ///
 /// The per-axis cap alone still allows `MAX_TILES_PER_AXIS` squared.
@@ -482,6 +527,21 @@ const MAX_TILES_TOTAL: usize = 1 << 16;
 #[must_use]
 pub fn tile_positions(tile: &Tile, clip: Rect, repeat: RepeatStyle) -> Vec<Rect> {
     let repeats = |axis: Keyword| matches!(axis, Keyword::Repeat | Keyword::Round | Keyword::Space);
+    // Two copies whose starts fall inside the same device pixel cannot be
+    // told apart on the device grid, so a sub-pixel step is *widened* to one
+    // device pixel, with the copy's own extent scaled by the same factor so
+    // the copies still meet. Capping the copy *count* instead -- what this
+    // did -- left most of the box unpainted: `background-size: 2%` on a 40px
+    // box stepped 0.8px, and 42 copies covered 33.6px of it.
+    let widen = |step: f32, extent: f32| -> (f32, f32) {
+        if !(step.is_finite() && step > 0.0) || step >= MIN_TILE_STEP {
+            return (step, extent);
+        }
+        let factor = MIN_TILE_STEP / step;
+        (MIN_TILE_STEP, extent * factor)
+    };
+    let (step_x, width) = widen(tile.step_x, tile.rect.width);
+    let (step_y, height) = widen(tile.step_y, tile.rect.height);
     let count = |start: f32, step: f32, lo: f32, hi: f32| -> (i32, i32) {
         if !(step.is_finite() && step > 0.0) || !(start.is_finite() && lo.is_finite()) {
             return (0, 0);
@@ -509,12 +569,12 @@ pub fn tile_positions(tile: &Tile, clip: Rect, repeat: RepeatStyle) -> Vec<Rect>
     };
 
     let (ix0, ix1) = if repeats(repeat.x) {
-        count(tile.rect.x, tile.step_x, clip.x, clip.right())
+        count(tile.rect.x, step_x, clip.x, clip.right())
     } else {
         (0, 0)
     };
     let (iy0, iy1) = if repeats(repeat.y) {
-        count(tile.rect.y, tile.step_y, clip.y, clip.bottom())
+        count(tile.rect.y, step_y, clip.y, clip.bottom())
     } else {
         (0, 0)
     };
@@ -526,10 +586,10 @@ pub fn tile_positions(tile: &Tile, clip: Rect, repeat: RepeatStyle) -> Vec<Rect>
                 break 'rows;
             }
             out.push(Rect::new(
-                tile.step_x.mul_add(ix as f32, tile.rect.x),
-                tile.step_y.mul_add(iy as f32, tile.rect.y),
-                tile.rect.width,
-                tile.rect.height,
+                step_x.mul_add(ix as f32, tile.rect.x),
+                step_y.mul_add(iy as f32, tile.rect.y),
+                width,
+                height,
             ));
         }
     }
@@ -586,6 +646,23 @@ mod tests {
 
     /// A 40x20 node with a 4px border and 4px padding, painted from `css`.
     fn painted(css: &str) -> Surface {
+        painted_with(css, [4.0; 4], [4.0; 4])
+    }
+
+    /// A 40x20 node with no border and no padding, so the origin box, the
+    /// clip box and the surface are all the same rectangle.
+    ///
+    /// The gradient tests need this: `painted` hard-codes a 4px border and
+    /// 4px padding whatever the CSS says, so its origin box is (4, 4, 32, 12)
+    /// while its clip box is the whole surface. Sampling the gradient's own
+    /// shape outside its origin box only worked while a gradient layer
+    /// ignored `background-repeat` and flooded the clip; with the default
+    /// `repeat` honoured, the area outside the origin box is the *next copy*.
+    fn painted_flat(css: &str) -> Surface {
+        painted_with(css, [0.0; 4], [0.0; 4])
+    }
+
+    fn painted_with(css: &str, border: [f32; 4], padding: [f32; 4]) -> Surface {
         let sheet = CompiledSheet::compile(css);
         let window = Node::new("window");
         let button = Node::new("button");
@@ -595,11 +672,12 @@ mod tests {
         let style = ComputedStyle::resolve_chain(&sheet, &button, &env, &mut cx);
 
         let border_box = Rect::new(0.0, 0.0, 40.0, 20.0);
+        let sides = std::array::from_fn(|i| border[i] + padding[i]);
         let alloc = Allocation {
             border_box,
-            content_box: border_box.inset([8.0, 8.0, 8.0, 8.0]),
-            border: [4.0; 4],
-            padding: [4.0; 4],
+            content_box: border_box.inset(sides),
+            border,
+            padding,
         };
         let radii = style.border_radii(40.0, 20.0);
         let layers = style.background_layers();
@@ -724,7 +802,7 @@ mod tests {
         // 2px first stop. Mutation check: sampling at `y` instead of
         // `y + 0.5`, or against the border box instead of the origin box,
         // moves this off the stop colour.
-        let surface = painted(
+        let surface = painted_flat(
             "button { background-image: linear-gradient(to top, #f6f5f4 2px, #fbfafa); \
              border-radius: 0; border: 0 solid transparent; padding: 0 }",
         );
@@ -739,7 +817,7 @@ mod tests {
     fn a_horizontal_gradient_varies_along_x_not_y() {
         // Mutation check: falling through to the vertical fast path paints
         // uniform columns and the first two assertions become equal.
-        let surface = painted(
+        let surface = painted_flat(
             "button { background-image: linear-gradient(to right, #000000, #ffffff); \
              border-radius: 0; border: 0 solid transparent; padding: 0 }",
         );
@@ -751,7 +829,7 @@ mod tests {
     fn a_radial_gradient_is_darkest_at_its_centre() {
         // Mutation check: normalising the radius against the box width only
         // makes the corner sample equal the centre on a 40x20 box.
-        let surface = painted(
+        let surface = painted_flat(
             "button { background-image: radial-gradient(circle closest-side, #000000, #ffffff); \
              border-radius: 0; border: 0 solid transparent; padding: 0 }",
         );
@@ -764,7 +842,7 @@ mod tests {
         // Mutation check: measuring the angle from the +x axis rather than
         // straight up (CSS's 0deg) rotates the whole wheel by 90 degrees and
         // swaps these two samples.
-        let surface = painted(
+        let surface = painted_flat(
             "button { background-image: conic-gradient(#000000, #ffffff 50%, #000000); \
              border-radius: 0; border: 0 solid transparent; padding: 0 }",
         );
@@ -964,6 +1042,113 @@ mod tests {
             layer.repeat,
         );
         assert!(unbounded.len() <= MAX_TILES_TOTAL);
+    }
+
+    #[test]
+    fn a_gradient_layer_honours_background_size_position_and_repeat() {
+        // F60. `layer_tile`/`tile_positions` were wired only into
+        // `Image::Url`, so a gradient flooded the whole clip box whatever
+        // `background-size`/`-position`/`-repeat` said. Adwaita's
+        // `stackswitcher > button.needs-attention` is a 6x6 no-repeat
+        // radial gradient pinned to the right edge.
+        // Mutation check: skipping the tiling paints the gradient across the
+        // whole 40x20 box and (2, 10) stops being clear.
+        let surface = painted_flat(
+            "button { background-image: radial-gradient(circle closest-side, #ff0000, #ff0000);              background-size: 6px 6px; background-position: right 0;              background-repeat: no-repeat;              border-radius: 0; border: 0 solid transparent; padding: 0 }",
+        );
+        assert_eq!(
+            pixel(&surface, 36, 2),
+            Color(0xFFFF_0000),
+            "the 6x6 tile sits at the right edge"
+        );
+        assert_eq!(
+            pixel(&surface, 2, 10).alpha(),
+            0,
+            "no-repeat leaves the rest of the box clear"
+        );
+    }
+
+    #[test]
+    fn an_image_color_layer_honours_background_size_and_repeat() {
+        // F59. `Image::Solid` filled the whole origin box with one
+        // `draw_rect`, ignoring size/position/repeat -- which is how
+        // Adwaita's `paned > separator.wide` (two 1px `image()` rules with
+        // the pane colour between them) rendered as a solid slab.
+        // Mutation check: restoring the single `draw_rect` inks (20, 10).
+        let surface = painted_flat(
+            "button { background-image: image(#00ff00); background-size: 2px 20px;              background-position: left 0; background-repeat: no-repeat;              border-radius: 0; border: 0 solid transparent; padding: 0 }",
+        );
+        assert_eq!(pixel(&surface, 1, 10), Color(0xFF00_FF00), "the 2px rule");
+        assert_eq!(
+            pixel(&surface, 20, 10).alpha(),
+            0,
+            "no-repeat does not flood the origin box"
+        );
+    }
+
+    #[test]
+    fn one_auto_axis_keeps_the_images_aspect_ratio() {
+        // F61. `background-size: 100% auto` on a 200px-wide box with a
+        // 10x40 image is (200, 800): the `auto` axis scales with the given
+        // one. Falling back to the raw intrinsic size gave (200, 40).
+        let sheet = CompiledSheet::compile(
+            "button { background-image: image(#f00); background-size: 100% auto }",
+        );
+        let window = Node::new("window");
+        let button = Node::new("button");
+        window.append_child(&button);
+        let env = ResolveEnv::default();
+        let mut cx = MatchCx::new();
+        let style = ComputedStyle::resolve_chain(&sheet, &button, &env, &mut cx);
+        let layer = style.background_layers().pop().expect("one layer");
+        let ctx = style.length_ctx(&env, None);
+        let tile = layer_tile(
+            &layer,
+            Rect::new(0.0, 0.0, 200.0, 100.0),
+            Some((10.0, 40.0)),
+            &ctx,
+        );
+        assert_eq!(tile.rect.width, 200.0);
+        assert_eq!(tile.rect.height, 800.0);
+    }
+
+    #[test]
+    fn a_sub_pixel_repeat_step_still_covers_the_whole_box() {
+        // F62. The per-axis cap truncated the copy *count*, so
+        // `background-size: 2%; repeat` on a 40px box stepped 0.8px and its
+        // 42 copies covered 33.6px, leaving the right 6.4px blank. The step
+        // is widened to one device pixel instead.
+        // Mutation check: dropping `widen` leaves (39, 10) clear.
+        let surface = painted_flat(
+            "button { background-image: image(#0000ff); background-size: 0.02px 0.02px;              background-repeat: repeat;              border-radius: 0; border: 0 solid transparent; padding: 0 }",
+        );
+        assert_eq!(
+            pixel(&surface, 39, 19),
+            Color(0xFF00_00FF),
+            "the far corner is painted, not left blank"
+        );
+    }
+
+    #[test]
+    fn an_ellipse_sized_to_a_corner_is_not_a_circle() {
+        // CSS Images L3 §3.2: a corner-sized *ellipse* keeps the matching
+        // `-side` aspect ratio and passes through the corner, i.e.
+        // `side * sqrt(2)` per axis. Using one `hypot(sx, sy)` on both axes
+        // made every corner-sized ellipse a circle.
+        // Mutation check: restoring the circular radii makes these equal.
+        let gradient = gradient_of("radial-gradient(ellipse farthest-corner, #000, #fff)");
+        let ctx = crate::css::value::LengthCtx {
+            font_size_px: 14.0,
+            root_font_size_px: 14.0,
+            ex_ratio: 0.5,
+            dpi: 96.0,
+            percent_basis: None,
+        };
+        // 40x20 box, centred: fx = 20, fy = 10 -> rx = 28.28, ry = 14.14.
+        let along_x = gradient_t(&gradient, 40.0, 20.0, 20.0 + 28.284_27, 10.0, &ctx);
+        let along_y = gradient_t(&gradient, 40.0, 20.0, 20.0, 10.0 + 14.142_136, &ctx);
+        assert!((along_x - 1.0).abs() < 1.0e-3, "{along_x}");
+        assert!((along_y - 1.0).abs() < 1.0e-3, "{along_y}");
     }
 
     #[test]
