@@ -40,16 +40,26 @@ pub enum GtkPseudoClass {
     Active,
     /// `:checked`
     Checked,
+    /// `:indeterminate` — a tri-state check button's middle state.
+    Indeterminate,
     /// `:disabled`
     Disabled,
     /// `:focus`
     Focus,
     /// `:focus-visible`
     FocusVisible,
+    /// `:focus-within` — derived by the node tree from a descendant's focus.
+    /// Not built into `selectors` (unlike `:nth-child` and friends), so it is a
+    /// custom pseudo-class like `:hover`.
+    FocusWithin,
     /// `:backdrop`
     Backdrop,
     /// `:selected`
     Selected,
+    /// `:link`. GTK never sets it on a node, so it parses and never matches.
+    Link,
+    /// `:visited`. GTK never sets it on a node, so it parses and never matches.
+    Visited,
     /// `:dir(ltr)` / `:dir(rtl)`, matched against [`CssNode::direction`].
     Dir(Direction),
     /// `:drop(...)`. GTK sets it only mid-drag, which M1 has no notion of,
@@ -73,11 +83,15 @@ impl ToCss for GtkPseudoClass {
             Self::Hover => dest.write_str("hover"),
             Self::Active => dest.write_str("active"),
             Self::Checked => dest.write_str("checked"),
+            Self::Indeterminate => dest.write_str("indeterminate"),
             Self::Disabled => dest.write_str("disabled"),
             Self::Focus => dest.write_str("focus"),
             Self::FocusVisible => dest.write_str("focus-visible"),
+            Self::FocusWithin => dest.write_str("focus-within"),
             Self::Backdrop => dest.write_str("backdrop"),
             Self::Selected => dest.write_str("selected"),
+            Self::Link => dest.write_str("link"),
+            Self::Visited => dest.write_str("visited"),
             Self::Dir(direction) => {
                 dest.write_str("dir(")?;
                 dest.write_str(direction.as_str())?;
@@ -109,7 +123,7 @@ impl NonTSPseudoClass for GtkPseudoClass {
     fn is_user_action_state(&self) -> bool {
         matches!(
             self,
-            Self::Hover | Self::Active | Self::Focus | Self::FocusVisible
+            Self::Hover | Self::Active | Self::Focus | Self::FocusVisible | Self::FocusWithin
         )
     }
 }
@@ -211,11 +225,15 @@ fn match_pseudo_class_name(name: &str) -> GtkPseudoClass {
         "hover" => GtkPseudoClass::Hover,
         "active" => GtkPseudoClass::Active,
         "checked" => GtkPseudoClass::Checked,
+        "indeterminate" => GtkPseudoClass::Indeterminate,
         "disabled" => GtkPseudoClass::Disabled,
         "focus" => GtkPseudoClass::Focus,
         "focus-visible" => GtkPseudoClass::FocusVisible,
+        "focus-within" => GtkPseudoClass::FocusWithin,
         "backdrop" => GtkPseudoClass::Backdrop,
         "selected" => GtkPseudoClass::Selected,
+        "link" => GtkPseudoClass::Link,
+        "visited" => GtkPseudoClass::Visited,
         other => GtkPseudoClass::Other(CssString::new(other)),
     }
 }
@@ -409,7 +427,13 @@ impl Element for CssNode {
             GtkPseudoClass::Backdrop => s.backdrop,
             GtkPseudoClass::Selected => s.selected,
             GtkPseudoClass::Dir(direction) => self.0.direction == *direction,
-            GtkPseudoClass::Drop(_)
+            // M1's `CssNode` has no bit for these; `Node` matches them properly.
+            // This impl disappears with `CssNode` in Part 3.
+            GtkPseudoClass::Indeterminate
+            | GtkPseudoClass::FocusWithin
+            | GtkPseudoClass::Link
+            | GtkPseudoClass::Visited
+            | GtkPseudoClass::Drop(_)
             | GtkPseudoClass::Other(_)
             | GtkPseudoClass::OtherFunctional(..) => false,
         }
@@ -621,5 +645,59 @@ mod tests {
         assert!(parse_selector_list("button:lang(en), button").is_some());
         assert!(!hits("button:lang(en)", &node));
         assert!(hits("button", &node));
+    }
+
+    #[test]
+    fn the_gtk_pseudo_class_set_is_modelled_not_swallowed() {
+        use super::GtkPseudoClass;
+
+        // Every pseudo-class GTK 4.22 sets on a node must reach the matcher as a
+        // modelled variant. Anything landing in `Other` matches nothing, which is
+        // how M1 silently dropped :focus-within, :indeterminate, :link, :visited.
+        for (text, expected) in [
+            ("hover", GtkPseudoClass::Hover),
+            ("active", GtkPseudoClass::Active),
+            ("checked", GtkPseudoClass::Checked),
+            ("indeterminate", GtkPseudoClass::Indeterminate),
+            ("disabled", GtkPseudoClass::Disabled),
+            ("focus", GtkPseudoClass::Focus),
+            ("focus-visible", GtkPseudoClass::FocusVisible),
+            ("focus-within", GtkPseudoClass::FocusWithin),
+            ("backdrop", GtkPseudoClass::Backdrop),
+            ("selected", GtkPseudoClass::Selected),
+            ("link", GtkPseudoClass::Link),
+            ("visited", GtkPseudoClass::Visited),
+            ("FOCUS-WITHIN", GtkPseudoClass::FocusWithin),
+        ] {
+            assert_eq!(
+                super::match_pseudo_class_name(text),
+                expected,
+                "`:{text}` must be modelled"
+            );
+        }
+        assert!(matches!(
+            super::match_pseudo_class_name("hover-ish"),
+            GtkPseudoClass::Other(_)
+        ));
+    }
+
+    #[test]
+    fn every_pseudo_class_serialises_back_to_its_own_syntax() {
+        use super::GtkPseudoClass;
+        use cssparser::ToCss;
+
+        let mut out = String::new();
+        for (pseudo, expected) in [
+            (GtkPseudoClass::FocusWithin, ":focus-within"),
+            (GtkPseudoClass::Indeterminate, ":indeterminate"),
+            (GtkPseudoClass::Link, ":link"),
+            (GtkPseudoClass::Visited, ":visited"),
+        ] {
+            out.clear();
+            pseudo
+                .to_css(&mut out)
+                .expect("serialising to a String cannot fail");
+            assert_eq!(out, expected);
+        }
     }
 }
