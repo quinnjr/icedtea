@@ -82,6 +82,9 @@ pub struct ComputedStyle {
     /// the caller's root font size was, and `calc(50% - 2ex)` against the
     /// 0.5 placeholder even when a matched face had fed a real x-height in.
     env: ResolveEnv,
+    /// Which longhands hold a *declared* value -- see
+    /// [`ComputedStyle::is_specified`].
+    specified: Box<[bool; N_LONGHANDS]>,
 }
 
 impl ComputedStyle {
@@ -140,7 +143,37 @@ impl ComputedStyle {
             }
         }
 
-        Rc::new(Self { values, env: *env })
+        Rc::new(Self {
+            values,
+            env: *env,
+            // Nothing here was declared: this *is* the registry initial.
+            specified: Box::new([false; N_LONGHANDS]),
+        })
+    }
+
+    /// Whether this longhand's value came from a *declaration* rather than
+    /// from the registry initial.
+    ///
+    /// True when a declaration for `prop` won the cascade on this element
+    /// (`inherit`, `initial` and `unset` included -- the author wrote them),
+    /// and, for an inherited property, when the value was inherited from an
+    /// ancestor where that was true. False when the value is the registry
+    /// initial, and false when the winning declaration turned out to be
+    /// invalid at computed-value time and the initial was used instead.
+    ///
+    /// The tie-break between GTK 4.22's `font-width` and CSS's older
+    /// `font-stretch` needs exactly this: the two are one grammar over two
+    /// rows, and the L4 name wins *where it is set*. `font-width`'s computed
+    /// value alone cannot say that, because an explicit `font-width: normal`
+    /// and an unset one are both 100%.
+    ///
+    /// # Panics
+    ///
+    /// If `prop` is a shorthand: shorthands have no computed slot.
+    #[must_use]
+    pub fn is_specified(&self, prop: Prop) -> bool {
+        assert!(prop.is_longhand(), "{} is a shorthand", prop.name());
+        self.specified[prop.slot()]
     }
 
     /// This longhand's computed value.
@@ -396,6 +429,29 @@ fn used_length(value: &Value, ctx: &LengthCtx) -> f32 {
     }
 }
 
+/// `bolder`/`lighter` against an inherited weight, per CSS Fonts 4 2.2's
+/// relative-weight table.
+fn relative_weight(relative: FontWeight, inherited: f32) -> f32 {
+    let (bolder, lighter) = if inherited < 100.0 {
+        (400.0, inherited)
+    } else if inherited < 350.0 {
+        (400.0, 100.0)
+    } else if inherited < 550.0 {
+        (700.0, 100.0)
+    } else if inherited < 750.0 {
+        (900.0, 400.0)
+    } else if inherited < 900.0 {
+        (900.0, 700.0)
+    } else {
+        (inherited, 700.0)
+    };
+    match relative {
+        FontWeight::Bolder => bolder,
+        FontWeight::Lighter => lighter,
+        FontWeight::Absolute(weight) => weight,
+    }
+}
+
 impl Default for ComputedStyle {
     fn default() -> Self {
         (*Self::initial(&ResolveEnv::default())).clone()
@@ -597,6 +653,7 @@ impl ComputedStyle {
 
         let mut values: Box<[Value; N_LONGHANDS]> =
             Box::new(std::array::from_fn(|_| Value::Keyword(Keyword::None)));
+        let mut specified: Box<[bool; N_LONGHANDS]> = Box::new([false; N_LONGHANDS]);
 
         let parent_font_size = parent.font_size_px();
         let parent_color = parent.color();
@@ -614,7 +671,7 @@ impl ComputedStyle {
             current: parent_color,
             depth: 0,
         };
-        values[Prop::GtkDpi.slot()] =
+        (values[Prop::GtkDpi.slot()], specified[Prop::GtkDpi.slot()]) =
             compute_one(Prop::GtkDpi, &cascaded, parent, &seed_ctx, &seed_colors);
         let dpi = match &values[Prop::GtkDpi.slot()] {
             Value::Number(number) if number.is_finite() && *number > 0.0 => *number,
@@ -629,8 +686,10 @@ impl ComputedStyle {
             dpi,
             percent_basis: Some(parent_font_size),
         };
-        values[Prop::FontSize.slot()] =
-            compute_one(Prop::FontSize, &cascaded, parent, &font_ctx, &seed_colors);
+        (
+            values[Prop::FontSize.slot()],
+            specified[Prop::FontSize.slot()],
+        ) = compute_one(Prop::FontSize, &cascaded, parent, &font_ctx, &seed_colors);
         let font_size = match &values[Prop::FontSize.slot()] {
             Value::Length(Length::Abs {
                 value,
@@ -654,7 +713,7 @@ impl ComputedStyle {
             dpi,
             percent_basis: None,
         };
-        values[Prop::Color.slot()] =
+        (values[Prop::Color.slot()], specified[Prop::Color.slot()]) =
             compute_one(Prop::Color, &cascaded, parent, &length_ctx, &seed_colors);
         let own_color = Rgba::from_value(&values[Prop::Color.slot()]);
         let color_ctx = ColorCtx {
@@ -668,10 +727,37 @@ impl ComputedStyle {
             if matches!(prop, Prop::GtkDpi | Prop::FontSize | Prop::Color) {
                 continue;
             }
-            values[prop.slot()] = compute_one(prop, &cascaded, parent, &length_ctx, &color_ctx);
+            (values[prop.slot()], specified[prop.slot()]) =
+                compute_one(prop, &cascaded, parent, &length_ctx, &color_ctx);
         }
 
-        ComputedStyle { values, env: *env }
+        // H3 / CSS Fonts 4 2.2: `bolder` and `lighter` are relative to the
+        // *parent's* computed weight, so they have to become absolute here --
+        // the only place that parent is in hand. Left unresolved they reached
+        // the text stack as a keyword with no parent to measure against, and
+        // `bolder` under a bold parent picked a strictly lighter face.
+        let weight_slot = Prop::FontWeight.slot();
+        if let Value::FontWeight(relative @ (FontWeight::Bolder | FontWeight::Lighter)) =
+            values[weight_slot]
+        {
+            let inherited = match parent.raw(Prop::FontWeight) {
+                Value::FontWeight(FontWeight::Absolute(weight)) if weight.is_finite() => {
+                    weight.clamp(1.0, 1000.0)
+                }
+                // A parent's weight is made absolute by this same step, so
+                // this is only reachable for a table that was built without
+                // it -- fall back to the initial.
+                _ => 400.0,
+            };
+            values[weight_slot] =
+                Value::FontWeight(FontWeight::Absolute(relative_weight(relative, inherited)));
+        }
+
+        ComputedStyle {
+            values,
+            env: *env,
+            specified,
+        }
     }
 
     /// Resolve `node` by walking its whole ancestor chain from the root down --
@@ -697,13 +783,16 @@ impl ComputedStyle {
 
 /// One longhand's computed value: the inheritance rule, the wide keywords and
 /// invalid-at-computed-value-time (contract §5).
+///
+/// The `bool` is what [`ComputedStyle::is_specified`] reports: whether this
+/// value came from a declaration rather than from the registry initial.
 fn compute_one(
     prop: Prop,
     cascaded: &CascadedValues,
     parent: &ComputedStyle,
     length: &LengthCtx,
     color: &ColorCtx<'_>,
-) -> Value {
+) -> (Value, bool) {
     // The registry's initial values are unresolved too: `border-*-color`'s is
     // `currentColor`, which has to become an absolute colour before it lands
     // in the table.
@@ -711,24 +800,28 @@ fn compute_one(
         let declared = prop.initial();
         resolve_value(&declared, length, color).unwrap_or(declared)
     };
+    // An inherited property that falls back carries the ancestor's answer,
+    // including whether *that* value was declared: `font-width: condensed` on
+    // a parent is still a specified font-width as far as the child is
+    // concerned, which is the question F77's tie-break asks.
     let fallback = || {
         if prop.is_inherited() {
-            parent.raw(prop).clone()
+            (parent.raw(prop).clone(), parent.is_specified(prop))
         } else {
-            initial()
+            (initial(), false)
         }
     };
     let Some(declared) = cascaded.winner(prop) else {
         return fallback();
     };
     match declared {
-        Value::Wide(Wide::Inherit) => return parent.raw(prop).clone(),
-        Value::Wide(Wide::Initial) => return initial(),
-        Value::Wide(Wide::Unset) => return fallback(),
+        Value::Wide(Wide::Inherit) => return (parent.raw(prop).clone(), true),
+        Value::Wide(Wide::Initial) => return (initial(), true),
+        Value::Wide(Wide::Unset) => return (fallback().0, true),
         _ => {}
     }
     match resolve_value(declared, length, color) {
-        Some(value) => value,
+        Some(value) => (value, true),
         None => {
             // Decision 6: CSS's "invalid at computed value time". The runner-ups
             // stay in `CascadedValues` for diagnostics; they are not consulted.
@@ -1128,6 +1221,9 @@ impl ComputedStyle {
         let mut style = self.clone();
         for (prop, value) in overrides.iter() {
             style.values[prop.slot()] = value.clone();
+            // An override stands in for a declaration -- it is the running
+            // value of a transition or animation on a declared property.
+            style.specified[prop.slot()] = true;
         }
         Cow::Owned(style)
     }
@@ -2420,6 +2516,7 @@ mod review_tests {
     use crate::css::node::Node;
     use crate::css::registry::Prop;
     use crate::css::select::MatchCx;
+    use crate::css::value::font::FontWeight;
     use crate::css::value::font::LineHeight;
     use crate::css::value::length::Length;
     use crate::css::value::{Keyword, Value};
@@ -2428,6 +2525,85 @@ mod review_tests {
         let sheet = CompiledSheet::compile(css);
         let mut cx = MatchCx::new();
         ComputedStyle::resolve(&sheet, &Node::new("button"), None, env, &mut cx)
+    }
+
+    /// H3 / CSS Fonts 4 §2.2: `bolder` and `lighter` are made absolute
+    /// against the *parent's* computed weight at computed time.
+    ///
+    /// Mutation check: delete the relative-weight step in `resolve` and every
+    /// `expected` below reads back as the keyword instead.
+    #[test]
+    fn relative_font_weights_resolve_against_the_parents_weight() {
+        let env = ResolveEnv::default();
+        for (parent_weight, keyword, expected) in [
+            (400.0, "bolder", 700.0),
+            (400.0, "lighter", 100.0),
+            (700.0, "bolder", 900.0),
+            // The case the 700/100 stopgap got wrong: `bolder` under a bold
+            // parent must not come out *lighter* than the parent.
+            (700.0, "lighter", 400.0),
+            (900.0, "bolder", 900.0),
+            (900.0, "lighter", 700.0),
+            (50.0, "lighter", 50.0),
+        ] {
+            let sheet = CompiledSheet::compile(&format!(
+                "window {{ font-weight: {parent_weight} }} button {{ font-weight: {keyword} }}"
+            ));
+            let window = Node::new("window");
+            let button = Node::new("button");
+            window.append_child(&button);
+            let mut cx = MatchCx::new();
+            let parent = ComputedStyle::resolve(&sheet, &window, None, &env, &mut cx);
+            assert_eq!(
+                parent.raw(Prop::FontWeight),
+                &Value::FontWeight(FontWeight::Absolute(parent_weight)),
+                "the parent's own weight"
+            );
+            let child = ComputedStyle::resolve(&sheet, &button, Some(&parent), &env, &mut cx);
+            assert_eq!(
+                child.raw(Prop::FontWeight),
+                &Value::FontWeight(FontWeight::Absolute(expected)),
+                "{keyword} under {parent_weight}"
+            );
+        }
+    }
+
+    /// H1: `is_specified` separates a declared value from the registry
+    /// initial, which a computed value alone cannot do.
+    ///
+    /// Mutation check: return `true` unconditionally and the `font-stretch`
+    /// and unset cases below fail.
+    #[test]
+    fn is_specified_reports_whether_a_declaration_won() {
+        let env = ResolveEnv::default();
+        // Declared, even at the value the initial already holds.
+        let explicit = styled("button { font-width: normal }", &env);
+        assert!(explicit.is_specified(Prop::FontWidth));
+        assert!(!explicit.is_specified(Prop::FontStretch));
+        // Not declared at all.
+        let bare = styled("button { color: #000 }", &env);
+        assert!(!bare.is_specified(Prop::FontWidth));
+        assert!(bare.is_specified(Prop::Color));
+        // Invalid at computed-value time is not "specified": the value in
+        // the table is the initial, not the declaration.
+        let broken = styled("button { color: rgb(@nope) }", &env);
+        assert!(!broken.is_specified(Prop::Color));
+        // The wide keywords are declarations.
+        let wide = styled("button { font-width: initial }", &env);
+        assert!(wide.is_specified(Prop::FontWidth));
+        // An inherited property carries the ancestor's answer, so a child
+        // that declares nothing still sees the parent's `font-width` as set.
+        let sheet = CompiledSheet::compile("window { font-width: condensed }");
+        let window = Node::new("window");
+        let button = Node::new("button");
+        window.append_child(&button);
+        let mut cx = MatchCx::new();
+        let parent = ComputedStyle::resolve(&sheet, &window, None, &env, &mut cx);
+        let child = ComputedStyle::resolve(&sheet, &button, Some(&parent), &env, &mut cx);
+        assert_eq!(child.raw(Prop::FontWidth), parent.raw(Prop::FontWidth));
+        assert!(child.is_specified(Prop::FontWidth));
+        // A non-inherited property does not.
+        assert!(!child.is_specified(Prop::BackgroundColor));
     }
 
     // F5: the used-value accessors rebuilt a default environment, so a `rem`

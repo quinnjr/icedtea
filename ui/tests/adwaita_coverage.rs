@@ -216,7 +216,11 @@ fn unresolved_colors(sheet: &Stylesheet) -> Vec<String> {
     for block in &sheet.media_blocks {
         definitions.extend(block.color_definitions.iter().cloned());
     }
-    let table = build_color_table(&definitions);
+    let pairs: Vec<(String, String)> = definitions
+        .iter()
+        .map(|definition| (definition.name.clone(), definition.value.clone()))
+        .collect();
+    let table = build_color_table(&pairs);
     let ctx = ColorCtx {
         table: &table,
         // `@define-color` bodies are resolved outside any element, so
@@ -230,7 +234,8 @@ fn unresolved_colors(sheet: &Stylesheet) -> Vec<String> {
         depth: 0,
     };
     let mut unresolved = Vec::new();
-    for (name, _source) in &definitions {
+    for definition in &definitions {
+        let name = &definition.name;
         match table.get(name) {
             Some(value) => {
                 if value.resolve(&ctx).is_none() {
@@ -292,10 +297,9 @@ fn adwaita_light_resolves_all_37_define_colors() {
     let sheet = parse_stylesheet(icedtea_ui::BUNDLED_ADWAITA_LIGHT);
     assert_eq!(sheet.color_definitions.len(), 37);
     assert!(
-        sheet
-            .color_definitions
-            .iter()
-            .any(|(name, value)| name == "wm_title" && value.contains("hsl(from")),
+        sheet.color_definitions.iter().any(|definition| {
+            definition.name == "wm_title" && definition.value.contains("hsl(from")
+        }),
         "the relative-colour definitions are not in the sheet this test claims to cover"
     );
     assert!(unresolved_colors(&sheet).is_empty());

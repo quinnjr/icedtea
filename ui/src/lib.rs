@@ -21,6 +21,23 @@ pub mod widget;
 /// note that covers it.
 pub const BUNDLED_ADWAITA_LIGHT: &str = include_str!("../themes/adwaita-light.css");
 
+/// GTK 4's default *dark* theme, vendored alongside the light one.
+///
+/// GTK4 carries Adwaita internally rather than on disk, so on a stock system
+/// `/usr/share/themes/Adwaita*/` holds only `gtk-3.0` files and every
+/// [`app::ThemeEnv::base_theme_candidates`] entry misses. Without this,
+/// `GTK_THEME=Adwaita:dark` compiled the *light* sheet under a dark
+/// [`css::parse::MediaEnv`] and rendered `#f6f5f4` backgrounds.
+///
+/// See `ui/themes/README.md` for provenance and the LGPL-2.1-or-later note.
+pub const BUNDLED_ADWAITA_DARK: &str = include_str!("../themes/adwaita-dark.css");
+
+/// GTK 4's high-contrast theme, vendored for the same reason.
+///
+/// `GTK_THEME=Adwaita:hc` / `HighContrast` used to get `Contrast::More` over
+/// the light sheet.
+pub const BUNDLED_ADWAITA_HC: &str = include_str!("../themes/adwaita-hc.css");
+
 #[cfg(test)]
 mod tests {
     use super::BUNDLED_ADWAITA_LIGHT;

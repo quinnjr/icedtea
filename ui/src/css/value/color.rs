@@ -1259,7 +1259,13 @@ mod tests {
     use crate::css::parse::parse_stylesheet;
 
     fn adwaita_table() -> ColorTable {
-        build_color_table(&parse_stylesheet(crate::BUNDLED_ADWAITA_LIGHT).color_definitions)
+        build_color_table(
+            &parse_stylesheet(crate::BUNDLED_ADWAITA_LIGHT)
+                .color_definitions
+                .into_iter()
+                .map(|definition| (definition.name, definition.value))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn resolved(table: &ColorTable, name: &str) -> Option<Color> {

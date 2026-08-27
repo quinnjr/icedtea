@@ -181,11 +181,7 @@ pub struct MediaBlock {
     /// Its `@keyframes`.
     pub keyframes: Vec<KeyframesRule>,
     /// Its `@define-color`s.
-    pub color_definitions: Vec<(String, String)>,
-    /// The source-order slot of each entry of `color_definitions`, parallel
-    /// to it. Kept alongside rather than folded into the tuple so the pair
-    /// stays `(name, value)` for every existing consumer.
-    pub color_definition_orders: Vec<usize>,
+    pub color_definitions: Vec<ColorDefinition>,
 }
 
 /// One `@keyframes` rule, with raw declarations; compiled in `cascade.rs`.
@@ -199,21 +195,29 @@ pub struct KeyframesRule {
     pub source_order: usize,
 }
 
+/// One `@define-color`, with where it sits in the sheet.
+///
+/// The source order matters because a definition inside a matching `@media`
+/// block is spliced back in at *its own* position rather than appended after
+/// every top-level one: without that, `@media (...) { @define-color bg black }`
+/// beat a later top-level `@define-color bg white` that GTK would have let win.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColorDefinition {
+    /// The name after `@define-color`, without the `@`.
+    pub name: String,
+    /// Its value, as written.
+    pub value: String,
+    /// Position in the sheet; the last definition of a name wins.
+    pub source_order: usize,
+}
+
 /// A parsed stylesheet.
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
     /// Qualified rules, in source order (imports spliced in at their site).
     pub rules: Vec<StyleRule>,
-    /// `(name, value)` for every `@define-color`, in source order.
-    pub color_definitions: Vec<(String, String)>,
-    /// The source-order slot of each entry of `color_definitions`, parallel
-    /// to it.
-    ///
-    /// A definition inside a matching `@media` block has to be spliced back
-    /// in at *its own* position, not appended after every top-level one, or
-    /// `@media (...) { @define-color bg black }` beats a later top-level
-    /// `@define-color bg white` that GTK would have let win.
-    pub color_definition_orders: Vec<usize>,
+    /// Every `@define-color`, in source order.
+    pub color_definitions: Vec<ColorDefinition>,
     /// Every `@keyframes`, in source order.
     pub keyframes: Vec<KeyframesRule>,
     /// Every `@media` block, unevaluated.
@@ -241,8 +245,8 @@ impl Stylesheet {
             rule.source_order += offset;
             rule.origin = origin;
         }
-        for order in &mut base.color_definition_orders {
-            *order += offset;
+        for definition in &mut base.color_definitions {
+            definition.source_order += offset;
         }
         for keyframes in &mut base.keyframes {
             keyframes.source_order += offset;
@@ -255,14 +259,12 @@ impl Stylesheet {
             for keyframes in &mut block.keyframes {
                 keyframes.source_order += offset;
             }
-            for order in &mut block.color_definition_orders {
-                *order += offset;
+            for definition in &mut block.color_definitions {
+                definition.source_order += offset;
             }
         }
         self.rules.extend(base.rules);
         self.color_definitions.extend(base.color_definitions);
-        self.color_definition_orders
-            .extend(base.color_definition_orders);
         self.keyframes.extend(base.keyframes);
         self.media_blocks.extend(base.media_blocks);
     }
@@ -275,15 +277,15 @@ impl Stylesheet {
 /// compile time restores document order exactly.
 fn next_source_order(sheet: &Stylesheet) -> usize {
     let colors = sheet
-        .color_definition_orders
+        .color_definitions
         .iter()
         .chain(
             sheet
                 .media_blocks
                 .iter()
-                .flat_map(|block| block.color_definition_orders.iter()),
+                .flat_map(|block| block.color_definitions.iter()),
         )
-        .map(|order| order + 1)
+        .map(|definition| definition.source_order + 1)
         .max()
         .unwrap_or(0);
     let rules = sheet
@@ -563,7 +565,13 @@ impl<'i> AtRuleParser<'i> for SheetParser {
                     match item {
                         Ok(SheetItem::Rule(rule)) => nested.rules.push(rule),
                         Ok(SheetItem::Color(name, value)) => {
-                            nested.color_definitions.push((name, value));
+                            // The source order is filled in by the caller,
+                            // which knows where the block itself sits.
+                            nested.color_definitions.push(ColorDefinition {
+                                name,
+                                value,
+                                source_order: 0,
+                            });
                         }
                         Ok(SheetItem::Keyframes(frames)) => nested.keyframes.push(frames),
                         Ok(SheetItem::Import(url)) => {
@@ -583,9 +591,6 @@ impl<'i> AtRuleParser<'i> for SheetParser {
                     rules: nested.rules,
                     keyframes: nested.keyframes,
                     color_definitions: nested.color_definitions,
-                    // Filled in by the caller, which knows where the block
-                    // itself sits in the outer sheet.
-                    color_definition_orders: Vec::new(),
                 }))
             }
             // `@import`/`@define-color` carry no block, so a block means the
@@ -921,9 +926,12 @@ fn parse_into(
                 out.rules.push(rule);
             }
             Ok(SheetItem::Color(name, value)) => {
-                let order = next_source_order(out);
-                out.color_definitions.push((name, value));
-                out.color_definition_orders.push(order);
+                let source_order = next_source_order(out);
+                out.color_definitions.push(ColorDefinition {
+                    name,
+                    value,
+                    source_order,
+                });
             }
             Ok(SheetItem::Import(url)) => resolve_import(&url, base_dir, depth, visited, out),
             Ok(SheetItem::Keyframes(mut frames)) => {
@@ -942,9 +950,9 @@ fn parse_into(
                 // sits, after its rules and keyframes, so an earlier
                 // top-level definition loses to it and a later one wins.
                 let after = base + block.rules.len() + block.keyframes.len();
-                block.color_definition_orders = (0..block.color_definitions.len())
-                    .map(|index| after + index)
-                    .collect();
+                for (index, definition) in block.color_definitions.iter_mut().enumerate() {
+                    definition.source_order = after + index;
+                }
                 out.media_blocks.push(block);
             }
             Ok(SheetItem::Ignored) => {}
@@ -993,9 +1001,18 @@ fn resolve_import(
 
 #[cfg(test)]
 mod tests {
-    use super::{Declaration, parse_stylesheet, parse_stylesheet_with_base};
+    use super::{ColorDefinition, Declaration, parse_stylesheet, parse_stylesheet_with_base};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `@define-color`s as `(name, value)`, for assertions that do not care
+    /// where in the sheet they sat.
+    fn pairs(definitions: &[ColorDefinition]) -> Vec<(String, String)> {
+        definitions
+            .iter()
+            .map(|definition| (definition.name.clone(), definition.value.clone()))
+            .collect()
+    }
 
     /// A fresh scratch directory for the `@import` tests.
     ///
@@ -1053,7 +1070,7 @@ mod tests {
              @define-color accent_color #3584E4;",
         );
         assert_eq!(
-            sheet.color_definitions,
+            pairs(&sheet.color_definitions),
             vec![
                 ("borders".to_string(), "#cdc7c2".to_string()),
                 ("accent_color".to_string(), "#3584E4".to_string()),
@@ -1122,7 +1139,7 @@ mod tests {
     fn define_color_survives_a_trailing_comment() {
         let sheet = parse_stylesheet("@define-color accent #3584e4 /* brand */;");
         assert_eq!(
-            sheet.color_definitions,
+            pairs(&sheet.color_definitions),
             vec![("accent".to_string(), "#3584e4".to_string())]
         );
     }
@@ -1169,7 +1186,7 @@ mod tests {
             Some(&dir),
         );
         assert_eq!(
-            sheet.color_definitions,
+            pairs(&sheet.color_definitions),
             vec![("accent".to_string(), "#3584e4".to_string())]
         );
         // Imported rules are spliced in at the import site, so source order

@@ -41,7 +41,9 @@ use cssparser::{Parser, ParserInput};
 use selectors::SelectorList;
 
 use super::node::Node;
-use super::parse::{Declaration, KeyframesRule, MediaEnv, StyleRule, Stylesheet, parse_stylesheet};
+use super::parse::{
+    ColorDefinition, Declaration, KeyframesRule, MediaEnv, StyleRule, Stylesheet, parse_stylesheet,
+};
 use super::registry::{self, N_LONGHANDS, Prop};
 use super::select::{
     GtkSelectorImpl, MatchCx, RuleBuckets, matches_with_specificity, parse_selector_list,
@@ -117,12 +119,7 @@ impl CompiledSheet {
         // `@media (...) { @define-color bg black }` always beat a later
         // top-level `@define-color bg white`, where GTK's last-wins rule
         // gives the top-level one.
-        let mut definitions: Vec<(usize, &String, &String)> = sheet
-            .color_definitions
-            .iter()
-            .zip(sheet.color_definition_orders.iter().copied())
-            .map(|((name, value), order)| (order, name, value))
-            .collect();
+        let mut definitions: Vec<&ColorDefinition> = sheet.color_definitions.iter().collect();
         for block in &sheet.media_blocks {
             if !block.query.evaluate(env) {
                 tracing::debug!(query = ?block.query, "media block does not match; dropping");
@@ -130,18 +127,12 @@ impl CompiledSheet {
             }
             style_rules.extend(block.rules.iter());
             keyframe_rules.extend(block.keyframes.iter());
-            definitions.extend(
-                block
-                    .color_definitions
-                    .iter()
-                    .zip(block.color_definition_orders.iter().copied())
-                    .map(|((name, value), order)| (order, name, value)),
-            );
+            definitions.extend(block.color_definitions.iter());
         }
-        definitions.sort_by_key(|(order, _, _)| *order);
+        definitions.sort_by_key(|definition| definition.source_order);
         let definitions: Vec<(String, String)> = definitions
             .into_iter()
-            .map(|(_, name, value)| (name.clone(), value.clone()))
+            .map(|definition| (definition.name.clone(), definition.value.clone()))
             .collect();
         // Splice, do not append: a media rule's source order is the position it
         // occupied in the outer sheet.

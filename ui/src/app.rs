@@ -9,24 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::BUNDLED_ADWAITA_LIGHT;
-
-/// GTK 4's default *dark* theme, vendored alongside the light one.
-///
-/// GTK4 carries Adwaita internally rather than on disk, so on a stock system
-/// `/usr/share/themes/Adwaita*/` holds only `gtk-3.0` files and every
-/// [`ThemeEnv::base_theme_candidates`] entry misses. Without this,
-/// `GTK_THEME=Adwaita:dark` compiled the *light* sheet under a dark
-/// [`MediaEnv`] and rendered `#f6f5f4` backgrounds.
-///
-/// See `ui/themes/README.md` for provenance and the LGPL-2.1-or-later note.
-pub const BUNDLED_ADWAITA_DARK: &str = include_str!("../themes/adwaita-dark.css");
-
-/// GTK 4's high-contrast theme, vendored for the same reason.
-///
-/// `GTK_THEME=Adwaita:hc` / `HighContrast` used to get `Contrast::More` over
-/// the light sheet.
-pub const BUNDLED_ADWAITA_HC: &str = include_str!("../themes/adwaita-hc.css");
+use crate::{BUNDLED_ADWAITA_DARK, BUNDLED_ADWAITA_HC, BUNDLED_ADWAITA_LIGHT};
 
 /// The bundled sheet that matches `env`.
 ///
@@ -848,9 +831,9 @@ mod tests {
         // `bundled_sheet_for` and the dark and hc assertions fail. (Compared
         // by content, not by pointer: these are `const` items, so each use
         // site may get its own copy of the literal.)
-        use super::{BUNDLED_ADWAITA_DARK, BUNDLED_ADWAITA_HC, bundled_sheet_for};
-        use crate::BUNDLED_ADWAITA_LIGHT;
+        use super::bundled_sheet_for;
         use crate::css::parse::{ColorScheme, Contrast};
+        use crate::{BUNDLED_ADWAITA_DARK, BUNDLED_ADWAITA_HC, BUNDLED_ADWAITA_LIGHT};
 
         let dark = MediaEnv {
             color_scheme: ColorScheme::Dark,

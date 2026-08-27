@@ -899,17 +899,11 @@ impl TextStyle {
             Value::FontFamilies(list) => Rc::clone(list),
             _ => Rc::from(vec![FontFamily::Generic(GenericFamily::SansSerif)]),
         };
-        // `bolder`/`lighter` are relative to the *parent's* computed weight,
-        // which nothing in the crate resolves for them yet (the computed
-        // pass leaves the keyword). Collapsing them to the initial 400 made
-        // `bolder` under a bold parent pick a strictly *lighter* face than
-        // the parent got; CSS Fonts 4 §2.2's relative-weight table maps
-        // `bolder` and `lighter` against a 400 parent to 700 and 100, which
-        // is at least on the right side of normal.
+        // `bolder`/`lighter` are resolved against the parent's computed
+        // weight by `ComputedStyle::resolve` (CSS Fonts 4 §2.2), so a weight
+        // that reaches here is always absolute.
         let weight = match style.raw(Prop::FontWeight) {
             Value::FontWeight(FontWeight::Absolute(w)) if w.is_finite() => w.clamp(1.0, 1000.0),
-            Value::FontWeight(FontWeight::Bolder) => 700.0,
-            Value::FontWeight(FontWeight::Lighter) => 100.0,
             _ => 400.0,
         };
         let font_style = match style.raw(Prop::FontStyle) {
@@ -917,12 +911,14 @@ impl TextStyle {
             _ => FontStyle::Normal,
         };
         // GTK 4.22 registers `font-width` and `font-stretch` as two rows with
-        // one grammar; the L4 name wins where it is set.
-        let width = stretch_percent(style.raw(Prop::FontWidth));
-        let stretch = if (width - 100.0).abs() < f32::EPSILON {
-            stretch_percent(style.raw(Prop::FontStretch))
+        // one grammar; the L4 name wins where it is set. "Set" is a question
+        // about the cascade, not about the computed value -- an explicit
+        // `font-width: normal` computes to the same 100% an unset one does,
+        // and used to lose to `font-stretch: ultra-expanded`.
+        let stretch = if style.is_specified(Prop::FontWidth) {
+            stretch_percent(style.raw(Prop::FontWidth))
         } else {
-            width
+            stretch_percent(style.raw(Prop::FontStretch))
         };
         let features = match style.raw(Prop::FontFeatureSettings) {
             Value::FontFeatures(list) => Rc::clone(list),
@@ -1166,13 +1162,54 @@ mod tests {
         assert_eq!(percent.line_height_px(&metrics), 30.0);
     }
 
+    /// F77/H1: an explicit `font-width` wins over `font-stretch` even when
+    /// it computes to the same 100% an unset one does.
+    ///
+    /// Mutation check: compare `stretch_percent(FontWidth)` against 100.0
+    /// instead of asking `is_specified` and the first case below reads 200.
+    #[test]
+    fn an_explicit_font_width_beats_font_stretch() {
+        // Both set: the L4 name wins, even at its initial value.
+        let both = TextStyle::from_computed(&style_for(
+            "label { font-stretch: ultra-expanded; font-width: normal }",
+        ));
+        assert!(
+            (both.stretch - 100.0).abs() < 1e-3,
+            "an explicit font-width: normal lost: {}",
+            both.stretch
+        );
+        // Only `font-stretch` set: it is what there is.
+        let legacy = TextStyle::from_computed(&style_for("label { font-stretch: ultra-expanded }"));
+        assert!(
+            (legacy.stretch - 200.0).abs() < 1e-3,
+            "font-stretch alone was ignored: {}",
+            legacy.stretch
+        );
+        // Only `font-width` set.
+        let modern = TextStyle::from_computed(&style_for("label { font-width: 62.5% }"));
+        assert!(
+            (modern.stretch - 62.5).abs() < 1e-3,
+            "font-width alone was ignored: {}",
+            modern.stretch
+        );
+        // Neither: the initial.
+        let neither = TextStyle::from_computed(&style_for("label { color: #000 }"));
+        assert!(
+            (neither.stretch - 100.0).abs() < 1e-3,
+            "{}",
+            neither.stretch
+        );
+    }
+
     #[test]
     fn a_relative_font_weight_is_not_collapsed_to_normal() {
-        // F76. `bolder`/`lighter` failed the `Absolute` guard and fell to
+        // F76/H3. `bolder`/`lighter` failed the `Absolute` guard and fell to
         // 400, so `bolder` produced a *lighter* face than a bold parent got.
-        // CSS Fonts 4 §2.2's relative-weight table against a 400 parent.
-        // Mutation check: restore the single `_ => 400.0` arm and both of
-        // these read 400.
+        // `ComputedStyle::resolve` now makes them absolute against the
+        // parent's weight (CSS Fonts 4 §2.2), which for this parentless
+        // label is the initial 400.
+        // Mutation check: drop the relative-weight step in `resolve` and
+        // both of these fall back to 400.
         let bolder = TextStyle::from_computed(&style_for("label { font-weight: bolder }"));
         assert!(bolder.weight > 400.0, "bolder is bolder: {}", bolder.weight);
         let lighter = TextStyle::from_computed(&style_for("label { font-weight: lighter }"));
