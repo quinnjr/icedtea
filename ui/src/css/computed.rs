@@ -2103,4 +2103,183 @@ mod tests {
         assert_eq!(style, cloned);
         assert_eq!(style.raw(Prop::MinHeight), &Value::Length(Length::px(24.0)));
     }
+
+    #[test]
+    fn decision_six_goes_both_ways() {
+        // An invalid winner takes the *inherited* value on an inherited
+        // property and the *initial* value on a non-inherited one. Never the
+        // runner-up, which is what M1 did.
+        let sheet = CompiledSheet::compile(
+            "window { color: #ff0000; letter-spacing: 3px }\n\
+             button { color: #00ff00; letter-spacing: 9px; background-color: #0000ff }\n\
+             button.bad { color: @nosuch; letter-spacing: calc(1px + 1s); \
+                          background-color: @nosuch }",
+        );
+        let style = resolve(&sheet, &button(&["bad"], PseudoStates::default()));
+
+        // inherited -> the parent's computed value
+        assert_eq!(
+            style.color().to_color32(),
+            Color(0xFFFF_0000),
+            "an invalid inherited colour must inherit"
+        );
+        assert_eq!(
+            style.get::<f32>(Prop::LetterSpacing),
+            3.0,
+            "an invalid inherited length must inherit"
+        );
+        // not inherited -> the registry initial (transparent), not #0000ff
+        assert_eq!(
+            style.get::<Rgba>(Prop::BackgroundColor),
+            Rgba::from_value(&Prop::BackgroundColor.initial()),
+            "an invalid non-inherited colour must take its initial value"
+        );
+    }
+
+    #[test]
+    fn every_adwaita_node_resolves_without_panicking_and_every_accessor_reads() {
+        // The whole vendored theme, across the node shapes it actually styles:
+        // resolve each, then read every accessor. This is the crate-level
+        // never-panic battery for computed values and used values.
+        let sheet = adwaita();
+        let mut cx = MatchCx::new();
+        let env = ResolveEnv::default();
+        for name in [
+            "window",
+            "headerbar",
+            "button",
+            "entry",
+            "label",
+            "notebook",
+            "menuitem",
+            "scrollbar",
+            "check",
+            "radio",
+            "popover",
+            "tooltip",
+            "levelbar",
+            "progressbar",
+        ] {
+            for classes in [
+                &[][..],
+                &["flat"][..],
+                &["suggested-action"][..],
+                &["osd"][..],
+            ] {
+                for states in [
+                    PseudoStates::default(),
+                    PseudoStates::HOVER,
+                    PseudoStates::ACTIVE,
+                    PseudoStates::DISABLED,
+                    PseudoStates::CHECKED | PseudoStates::FOCUS,
+                ] {
+                    let window = Node::with_classes("window", &["background"]);
+                    let node = Node::with_classes(name, classes);
+                    window.append_child(&node);
+                    node.set_states(states);
+                    let style = ComputedStyle::resolve_chain(&sheet, &node, &env, &mut cx);
+
+                    // Every longhand slot is readable...
+                    for prop in crate::css::registry::longhands() {
+                        let _ = style.raw(prop);
+                        let _ = style.get::<f32>(prop);
+                        let _ = style.get::<Keyword>(prop);
+                        let _ = style.get::<Rgba>(prop);
+                    }
+                    // ...and every used-value accessor, at a plausible box and
+                    // at a degenerate one.
+                    for (w, h) in [(0.0, 0.0), (120.0, 40.0), (f32::MAX, 1.0)] {
+                        let _ = style.padding(w);
+                        let _ = style.margin(w);
+                        let _ = style.min_size((w, h));
+                        let _ = style.border_widths();
+                        let _ = style.border_colors();
+                        let _ = style.border_styles();
+                        let _ = style.border_radii(w, h);
+                        let _ = style.background_layers();
+                        let _ = style.box_shadows();
+                        let _ = style.transition_specs();
+                        let _ = style.animation_specs();
+                        let _ = style.opacity();
+                        let _ = style.color();
+                        let _ = style.font_size_px();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolving_hostile_declarations_never_panics_and_never_invents_a_value() {
+        // The cascade's own hostile battery covers parse time; this covers
+        // computed and used-value time, where the failure mode is a panic in a
+        // resolver or a NaN escaping into layout.
+        const HOSTILE: &[&str] = &[
+            "button { padding: calc(100% - 100%) }",
+            "button { padding: calc(1px / 0) }",
+            "button { min-width: calc(1s + 1px) }",
+            "button { border-radius: calc(1px * 1e30) / 1px }",
+            "button { font-size: calc(-1em) }",
+            "button { font-size: 0 }",
+            "button { color: color-mix(in srgb, @nosuch, red) }",
+            "@define-color a @b;\n@define-color b @a;\nbutton { color: @a }",
+            "button { box-shadow: 1px 2px 3px 4px @nosuch }",
+            "button { background-image: linear-gradient(to top, @nosuch, red) }",
+            "button { letter-spacing: 1e38em }",
+            "button { -gtk-dpi: 0 }",
+            "button { -gtk-dpi: -5 }",
+            "button { transform: translate(50%, calc(1px + 1%)) }",
+            "button { opacity: calc(1 / 0) }",
+        ];
+        let mut cx = MatchCx::new();
+        for css in HOSTILE {
+            let sheet = CompiledSheet::compile(css);
+            let style = ComputedStyle::resolve_chain(
+                &sheet,
+                &button(&[], PseudoStates::default()),
+                &ResolveEnv::default(),
+                &mut cx,
+            );
+            assert!(
+                style.font_size_px().is_finite() && style.font_size_px() >= 0.0,
+                "{css} produced a non-finite font size"
+            );
+            assert!(
+                style.dpi().is_finite() && style.dpi() > 0.0,
+                "{css} broke the dpi"
+            );
+            for value in style.padding(100.0) {
+                assert!(value.is_finite(), "{css} produced a non-finite padding");
+            }
+            for corner in style.border_radii(100.0, 50.0) {
+                assert!(
+                    corner[0].is_finite() && corner[1].is_finite(),
+                    "{css} produced a non-finite radius"
+                );
+            }
+            assert!(
+                (0.0..=1.0).contains(&style.opacity()),
+                "{css} broke opacity"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restyle_pass_reuses_one_match_context_across_the_whole_tree() {
+        // `MatchCx` is caller-owned precisely so a pass keeps the bloom filter
+        // and nth-index caches warm; a reused context must not change answers.
+        let sheet = adwaita();
+        let env = ResolveEnv::default();
+        let node = button(&["suggested-action"], PseudoStates::default());
+
+        let mut shared = MatchCx::new();
+        let first = ComputedStyle::resolve_chain(&sheet, &node, &env, &mut shared);
+        let hovered_node = button(&[], PseudoStates::HOVER);
+        let _ = ComputedStyle::resolve_chain(&sheet, &hovered_node, &env, &mut shared);
+        let again = ComputedStyle::resolve_chain(&sheet, &node, &env, &mut shared);
+        assert_eq!(first, again, "a reused MatchCx leaked state between nodes");
+
+        let fresh = ComputedStyle::resolve_chain(&sheet, &node, &env, &mut MatchCx::new());
+        assert_eq!(first, fresh, "a warm MatchCx disagrees with a cold one");
+    }
 }
