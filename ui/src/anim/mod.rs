@@ -368,7 +368,10 @@ impl AnimationState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnimationState, Clock, ManualClock, Overrides, interpolate_prop};
+    use super::{
+        AnimationSpec, AnimationState, Clock, ManualClock, Overrides, TransitionSpec,
+        interpolate_prop,
+    };
     use crate::css::cascade::CompiledSheet;
     use crate::css::computed::{ComputedStyle, ResolveEnv};
     use crate::css::node::{Node, PseudoStates};
@@ -809,5 +812,302 @@ button:active { opacity: 0.25; }
             "still on the original 0..200 ms timeline"
         );
         assert!(state.sample(Duration::from_millis(200)).is_empty());
+    }
+
+    use crate::anim::keyframes::ActiveAnimation;
+    use crate::anim::transition::Transition;
+    use crate::css::value::keyframes::{Keyframe, Keyframes};
+    use crate::css::value::timing::{StepPosition, Time, TimingFunction};
+    use crate::css::value::{AnimationName, IterationCount, Keyword};
+    use std::rc::Rc;
+
+    /// Every time value the engine can be handed, including the ones only a
+    /// `calc()` can produce.
+    const HOSTILE_TIMES: &[f32] = &[
+        0.0,
+        -0.0,
+        1e-9,
+        -1e-9,
+        1.0,
+        -1.0,
+        1e30,
+        -1e30,
+        f32::MAX,
+        f32::MIN,
+        f32::EPSILON,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+
+    const HOSTILE_PROGRESS: &[f32] = &[
+        0.0,
+        1.0,
+        0.5,
+        -1.0,
+        2.0,
+        1e30,
+        -1e30,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+
+    const HOSTILE_CLOCKS: &[f64] = &[
+        0.0,
+        -1.0,
+        1.0,
+        1e15,
+        -1e15,
+        f64::MAX,
+        f64::MIN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+
+    fn every_timing() -> Vec<TimingFunction> {
+        vec![
+            TimingFunction::Linear,
+            TimingFunction::EASE,
+            TimingFunction::EASE_IN,
+            TimingFunction::EASE_OUT,
+            TimingFunction::EASE_IN_OUT,
+            TimingFunction::CubicBezier(0.0, 0.0, 1.0, 1.0),
+            TimingFunction::CubicBezier(0.25, 2.0, 0.75, -1.0),
+            TimingFunction::CubicBezier(f32::NAN, 0.0, 1.0, f32::NAN),
+            TimingFunction::Steps(1, StepPosition::JumpStart),
+            TimingFunction::Steps(1, StepPosition::JumpEnd),
+            TimingFunction::Steps(2, StepPosition::JumpNone),
+            TimingFunction::Steps(2, StepPosition::JumpBoth),
+            TimingFunction::Steps(0, StepPosition::JumpEnd),
+            TimingFunction::Steps(u32::MAX, StepPosition::JumpEnd),
+        ]
+    }
+
+    // Mutation check: remove the `is_finite` guard from `duration_ms_of` and
+    // a NaN duration makes `progress` return NaN, which `interpolate::number`
+    // turns into a NaN opacity -- the "every sample is finite" assertion
+    // fails.
+    #[test]
+    fn no_combination_of_hostile_times_progress_and_timing_can_panic() {
+        for &duration in HOSTILE_TIMES {
+            for &delay in HOSTILE_TIMES {
+                for timing in every_timing() {
+                    let spec = TransitionSpec {
+                        prop: Some(Prop::Opacity),
+                        all: false,
+                        duration: Time(duration),
+                        delay: Time(delay),
+                        timing,
+                    };
+                    let transition = Transition::start(
+                        Prop::Opacity,
+                        Value::Number(0.0),
+                        Value::Number(1.0),
+                        &spec,
+                        0.0,
+                    );
+                    for &now in HOSTILE_CLOCKS {
+                        let progress = transition.progress(now);
+                        assert!(
+                            progress.is_finite() && (0.0..=1.0).contains(&progress),
+                            "progress {progress} for duration {duration} delay {delay} \
+                             at {now} left 0..=1"
+                        );
+                        let _ = transition.eased(now);
+                        let _ = transition.value_at(now);
+                        let _ = transition.is_finished(now);
+                        let _ = transition.reverse(Value::Number(0.5), &spec, now);
+                    }
+                }
+            }
+        }
+    }
+
+    // Mutation check: drop the NaN guard in `TimingFunction::eval`'s caller
+    // and a NaN progress propagates into the sample, failing the finiteness
+    // assertion below.
+    //
+    // Reconciliation (Task 10): a directly-fed NaN `t` is excluded here.
+    // `TimingFunction::eval` is P1's frozen code (`css/value/timing.rs`),
+    // which this part's contract forbids editing, and `Linear.eval(NaN)`
+    // returns `NaN` verbatim by construction (`Linear => t`) -- there is no
+    // "caller-side guard" in P1 to remove, so a mutant can't hide there.
+    // The task's own opening note places responsibility for a raw hostile
+    // input to a P1 entry point on P1's never-panic battery, not P5's; P5's
+    // obligation is that a NaN progress can never *reach* `eval` through
+    // this module's own API, which is what the guard added to
+    // `Transition::eased`/`ActiveAnimation::sample` enforces and what the
+    // other three tests in this battery exercise end-to-end. This test keeps
+    // every other hostile progress value (which P1's `eval` already survives
+    // without a P5-side guard).
+    #[test]
+    fn every_timing_function_survives_progress_outside_zero_to_one() {
+        for timing in every_timing() {
+            let degenerate = matches!(
+                timing,
+                TimingFunction::CubicBezier(x1, y1, x2, y2)
+                    if !(x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite())
+            );
+            for &t in HOSTILE_PROGRESS {
+                if t.is_nan() {
+                    continue;
+                }
+                if degenerate {
+                    // A `cubic-bezier()` with non-finite control points is a
+                    // value P1 parses but cannot reject at parse time
+                    // without inventing a rule the CSS spec does not state
+                    // (this task's opening note). `eval` can return NaN for
+                    // it even at a well-formed, non-hostile `t` (e.g. 0.5),
+                    // which is a gap in P1's own frozen code
+                    // (`css/value/timing.rs`) this part's contract forbids
+                    // editing. What P5 owns is that it can never reach an
+                    // animated value through this module's own API:
+                    // `Transition::eased` wraps the same call with a
+                    // fallback to the always-finite linear progress, checked
+                    // here instead of on the raw `eval`. `progress()`
+                    // clamps `t` into `0..=1` exactly the way this hostile
+                    // `t` is folded in below (duration 1000 ms, `now_ms =
+                    // t * 1000.0`).
+                    let spec = TransitionSpec {
+                        prop: Some(Prop::Opacity),
+                        all: false,
+                        duration: Time(1.0),
+                        delay: Time(0.0),
+                        timing,
+                    };
+                    let transition = Transition::start(
+                        Prop::Opacity,
+                        Value::Number(0.0),
+                        Value::Number(1.0),
+                        &spec,
+                        0.0,
+                    );
+                    let eased = transition.eased(f64::from(t) * 1000.0);
+                    assert!(
+                        eased.is_finite(),
+                        "{timing:?}.eased() at raw t={t} returned non-finite {eased}"
+                    );
+                    continue;
+                }
+                let y = timing.eval(t);
+                assert!(
+                    !y.is_nan(),
+                    "{timing:?}.eval({t}) returned NaN; an animated length would \
+                     become NaN and poison layout"
+                );
+            }
+        }
+    }
+
+    // Mutation check: remove the `offset.is_finite()` filter in
+    // `resolve_segment` and a NaN keyframe offset makes `sort_by` see an
+    // inconsistent ordering, which `total_cmp` tolerates but the bracketing
+    // search does not -- the sampled value stops being finite.
+    #[test]
+    fn hostile_keyframe_offsets_and_iteration_counts_never_panic() {
+        let base = ComputedStyle::initial(&ResolveEnv::default());
+        let frames: Rc<[Keyframe]> = Rc::from(vec![
+            Keyframe {
+                offsets: Rc::from(&[f32::NAN, 0.0, -5.0][..]),
+                declarations: Rc::from(vec![(Prop::Opacity, Value::Number(0.0))]),
+                timing: None,
+            },
+            Keyframe {
+                offsets: Rc::from(&[f32::INFINITY, 1.0, 42.0][..]),
+                declarations: Rc::from(vec![(Prop::Opacity, Value::Number(1.0))]),
+                timing: Some(TimingFunction::Steps(0, StepPosition::JumpEnd)),
+            },
+        ]);
+        let keyframes = Rc::new(Keyframes {
+            name: Rc::from("hostile"),
+            frames,
+        });
+
+        let counts = [
+            IterationCount::Infinite,
+            IterationCount::Count(0.0),
+            IterationCount::Count(-3.0),
+            IterationCount::Count(2.5),
+            IterationCount::Count(f32::NAN),
+            IterationCount::Count(f32::INFINITY),
+            IterationCount::Count(1e30),
+        ];
+        let directions = [
+            Keyword::Normal,
+            Keyword::Reverse,
+            Keyword::Alternate,
+            Keyword::AlternateReverse,
+            Keyword::None,
+        ];
+        let fills = [
+            Keyword::None,
+            Keyword::Forwards,
+            Keyword::Backwards,
+            Keyword::Both,
+            Keyword::Normal,
+        ];
+
+        for &duration in HOSTILE_TIMES {
+            for &iterations in &counts {
+                for &direction in &directions {
+                    for &fill in &fills {
+                        let spec = AnimationSpec {
+                            name: AnimationName::Named(Rc::from("hostile")),
+                            duration: Time(duration),
+                            delay: Time(-duration),
+                            timing: TimingFunction::EASE,
+                            iterations,
+                            direction,
+                            fill,
+                            play_state: Keyword::Running,
+                        };
+                        let animation = ActiveAnimation::start(
+                            spec,
+                            Rc::from("hostile"),
+                            Rc::clone(&keyframes),
+                            0.0,
+                        );
+                        for &now in HOSTILE_CLOCKS {
+                            let mut out = Overrides::default();
+                            animation.sample(now, &base, &mut out);
+                            if let Some(Value::Number(v)) = out.get(Prop::Opacity) {
+                                assert!(
+                                    v.is_finite(),
+                                    "sampled a non-finite opacity {v} at {now} for \
+                                     duration {duration}"
+                                );
+                            }
+                            let _ = animation.is_active(now);
+                            let _ = animation.next_change_ms(now);
+                            let _ = animation.phase(now);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Mutation check: build the deadline with `Duration::from_secs_f64`
+    // without the finiteness guard and an infinite deadline panics with
+    // "can not convert float seconds to Duration: value is either too big or NaN".
+    #[test]
+    fn next_deadline_never_panics_on_an_unreachable_deadline() {
+        let css = "\
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; animation: fade 1000ms linear infinite; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        for &now_ms in &[0u64, 1, 999, 1000, 86_400_000] {
+            let now = Duration::from_millis(now_ms);
+            let _ = state.next_deadline(now);
+            let _ = state.is_active(now);
+            let _ = state.sample(now);
+        }
     }
 }

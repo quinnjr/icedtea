@@ -285,7 +285,14 @@ impl ActiveAnimation {
                 continue;
             };
             let timing = timing.unwrap_or(self.spec.timing);
-            out.set(prop, interpolate_prop(prop, &from, &to, timing.eval(t)));
+            // Mirrors `Transition::eased`'s guard: a `cubic-bezier()` with
+            // NaN control points is P1's degenerate input to accept at parse
+            // time, not reject; this module's boundary is where it is
+            // clamped back to a finite value rather than poisoning the
+            // sampled property.
+            let eased = timing.eval(t);
+            let eased = if eased.is_finite() { eased } else { t };
+            out.set(prop, interpolate_prop(prop, &from, &to, eased));
         }
     }
 

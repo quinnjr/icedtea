@@ -109,9 +109,19 @@ impl Transition {
     }
 
     /// Eased progress. May leave `0..=1` for an overshooting `cubic-bezier`.
+    ///
+    /// `TimingFunction::eval` (`css::value::timing`, owned by P1) can return
+    /// NaN for a degenerate input it parses but cannot reject at parse time
+    /// without inventing a rule the CSS spec does not state -- a
+    /// `cubic-bezier()` with NaN control points. `progress` above is already
+    /// guaranteed finite, so a NaN here can only come from `eval` itself;
+    /// falling back to the (finite) linear progress keeps this module's
+    /// promise that no public entry point ever emits a non-finite value.
     #[must_use]
     pub fn eased(&self, now_ms: f64) -> f32 {
-        self.timing.eval(self.progress(now_ms))
+        let progress = self.progress(now_ms);
+        let y = self.timing.eval(progress);
+        if y.is_finite() { y } else { progress }
     }
 
     /// This transition's contribution to the frame at `now_ms`.
