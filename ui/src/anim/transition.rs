@@ -424,4 +424,116 @@ mod tests {
             "transitioned_props must return a strictly ascending Prop table"
         );
     }
+
+    // THE GATE (spec §7: "reversal continuity").
+    // Mutation check: set the reversed transition's `duration_ms` to the
+    // spec's full duration instead of scaling it by the shortening factor,
+    // and the reversed run finishes at 300 ms instead of 200 ms -- the
+    // `is_finished(200.0)` assertion fails.
+    #[test]
+    fn reversing_half_way_through_takes_half_as_long_to_come_back() {
+        let forward = opacity_transition(200.0, TimingFunction::Linear);
+        // Half way: the value on screen is 0.5.
+        assert_eq!(forward.value_at(100.0), Value::Number(0.5));
+
+        // The style flips back to the value the transition started from.
+        let back = forward.reverse(
+            Value::Number(0.0),
+            &spec(200.0, 0.0, TimingFunction::Linear),
+            100.0,
+        );
+        assert_eq!(
+            back.from,
+            Value::Number(0.5),
+            "it reverses from what is on screen"
+        );
+        assert_eq!(back.to, Value::Number(0.0));
+        assert_eq!(
+            back.reversing_adjusted_start,
+            Value::Number(1.0),
+            "the anchor for a further reversal is the run's own end value"
+        );
+        assert!(
+            (back.reversing_shortening_factor - 0.5).abs() < 1e-6,
+            "half-eased progress gives a 0.5 shortening factor, got {}",
+            back.reversing_shortening_factor
+        );
+        assert!(
+            (back.duration_ms - 100.0).abs() < 1e-6,
+            "got {}",
+            back.duration_ms
+        );
+        assert_eq!(back.value_at(150.0), Value::Number(0.25), "half way back");
+        assert!(
+            back.is_finished(200.0),
+            "it must be home 100 ms after reversing"
+        );
+        assert_eq!(back.value_at(200.0), Value::Number(0.0));
+    }
+
+    // Mutation check: use raw linear progress instead of the eased output in
+    // the shortening factor and this factor becomes 0.5 rather than ~0.8024.
+    #[test]
+    fn the_shortening_factor_uses_the_eased_output_not_linear_progress() {
+        let forward = opacity_transition(200.0, TimingFunction::EASE);
+        let back = forward.reverse(
+            Value::Number(0.0),
+            &spec(200.0, 0.0, TimingFunction::EASE),
+            100.0,
+        );
+        assert!(
+            (0.79..0.81).contains(&back.reversing_shortening_factor),
+            "`ease` reports 0.8024 at t = 0.5, got {}",
+            back.reversing_shortening_factor
+        );
+    }
+
+    // Mutation check: scale a *positive* delay by the shortening factor and
+    // the start time moves from 150 to 125.
+    #[test]
+    fn a_positive_delay_is_not_shortened_but_a_negative_one_is() {
+        let forward = opacity_transition(200.0, TimingFunction::Linear);
+        let positive = forward.reverse(
+            Value::Number(0.0),
+            &spec(200.0, 50.0, TimingFunction::Linear),
+            100.0,
+        );
+        assert!(
+            (positive.start_ms - 150.0).abs() < 1e-6,
+            "got {}",
+            positive.start_ms
+        );
+
+        let negative = forward.reverse(
+            Value::Number(0.0),
+            &spec(200.0, -50.0, TimingFunction::Linear),
+            100.0,
+        );
+        assert!(
+            (negative.start_ms - 75.0).abs() < 1e-6,
+            "a negative delay is scaled by the 0.5 shortening factor, got {}",
+            negative.start_ms
+        );
+    }
+
+    // Mutation check: drop the clamp and a factor computed from an
+    // overshooting cubic-bezier leaves 0..=1, producing a negative duration.
+    #[test]
+    fn the_shortening_factor_is_clamped_into_zero_to_one() {
+        // cubic-bezier with y2 = 2.0 overshoots above 1 before settling.
+        let overshoot = Transition::start(
+            Prop::Opacity,
+            Value::Number(0.0),
+            Value::Number(1.0),
+            &spec(200.0, 0.0, TimingFunction::CubicBezier(0.0, 0.0, 0.5, 2.0)),
+            0.0,
+        );
+        let back = overshoot.reverse(
+            Value::Number(0.0),
+            &spec(200.0, 0.0, TimingFunction::CubicBezier(0.0, 0.0, 0.5, 2.0)),
+            100.0,
+        );
+        assert!((0.0..=1.0).contains(&back.reversing_shortening_factor));
+        assert!(back.duration_ms >= 0.0);
+    }
 }
