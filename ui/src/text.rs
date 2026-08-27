@@ -14,6 +14,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "fontconfig")]
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -227,6 +228,7 @@ const FACE_CACHE_CAPACITY: usize = 64;
 /// Single-threaded by construction: fontconfig's own objects are `!Send`
 /// and `!Sync`, and one `Fontconfig` handle serves the whole UI thread.
 pub struct FontDatabase {
+    #[cfg(feature = "fontconfig")]
     fontconfig: Option<fontconfig::Fontconfig>,
     typefaces: BoundedCache<(PathBuf, i32), Option<Arc<Typeface>>>,
     faces: BoundedCache<String, Option<FontFace>>,
@@ -249,6 +251,7 @@ impl FontDatabase {
     /// deliberately never calls `FcFini`, so one database should live for the
     /// lifetime of the UI thread.
     #[must_use]
+    #[cfg(feature = "fontconfig")]
     pub fn new() -> Self {
         match fontconfig::Fontconfig::new() {
             Some(fc) => {
@@ -269,6 +272,15 @@ impl FontDatabase {
         }
     }
 
+    /// With the `fontconfig` feature off there is nothing to initialise:
+    /// this *is* [`probe_only`](Self::probe_only), which is also what
+    /// `FontDatabase::new` degrades to when `FcInit` fails.
+    #[must_use]
+    #[cfg(not(feature = "fontconfig"))]
+    pub fn new() -> Self {
+        Self::probe_only()
+    }
+
     /// The fontconfig-free database: M1's fixed [`FONT_CANDIDATES`] probe.
     ///
     /// This is the CI / stripped-container fallback, and what
@@ -276,6 +288,7 @@ impl FontDatabase {
     #[must_use]
     pub fn probe_only() -> Self {
         Self {
+            #[cfg(feature = "fontconfig")]
             fontconfig: None,
             typefaces: BoundedCache::new(FACE_CACHE_CAPACITY),
             faces: BoundedCache::new(FACE_CACHE_CAPACITY),
@@ -288,7 +301,14 @@ impl FontDatabase {
     /// Whether real fontconfig matching is in play.
     #[must_use]
     pub fn has_fontconfig(&self) -> bool {
-        self.fontconfig.is_some()
+        #[cfg(feature = "fontconfig")]
+        {
+            self.fontconfig.is_some()
+        }
+        #[cfg(not(feature = "fontconfig"))]
+        {
+            false
+        }
     }
 
     /// Resolve `query` to a face, with `fc-match` parity when fontconfig is
@@ -303,12 +323,15 @@ impl FontDatabase {
         if let Some(cached) = self.faces.get(&key) {
             return cached.clone();
         }
+        #[cfg(feature = "fontconfig")]
         let face = match self.fontconfig.as_ref() {
             // A fontconfig miss still falls through to the probe list: a
             // configured-but-empty fontconfig must not leave the UI textless.
             Some(fc) => fc_match(fc, query).or_else(|| probe_face(query)),
             None => probe_face(query),
         };
+        #[cfg(not(feature = "fontconfig"))]
+        let face = probe_face(query);
         self.faces.insert(key, face.clone());
         face
     }
@@ -541,6 +564,7 @@ fn family_names(family: &FontFamily) -> Vec<&str> {
 /// `FC_WEIGHT`/`FC_SLANT`/`FC_WIDTH`/`FC_PIXEL_SIZE`, then `FcFontMatch` — the
 /// same path `fc-match` takes, so aliases, generic families and user rules in
 /// `~/.config/fontconfig` are honoured without any special-casing here.
+#[cfg(feature = "fontconfig")]
 fn fc_match(fc: &fontconfig::Fontconfig, query: &FontQuery<'_>) -> Option<FontFace> {
     let mut pattern = fontconfig::Pattern::new(fc).ok()?;
     for family in query.families {

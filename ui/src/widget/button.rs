@@ -282,6 +282,15 @@ impl Button {
         self.label_allocation
     }
 
+    /// Resolve this widget's relative `url()` images against `dir`.
+    ///
+    /// A GTK theme's `url()`s are relative to the sheet that declared them,
+    /// which nothing below the loader knows; `app::themed_button` passes the
+    /// theme file's own directory in.
+    pub fn set_image_base_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.images.set_base_dir(dir);
+    }
+
     /// Drive this widget's transitions and animations from `clock`.
     ///
     /// The `LayerWindow` passes its own clock in so the widget and the frame

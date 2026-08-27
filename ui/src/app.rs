@@ -360,6 +360,15 @@ pub fn themed_button(
     let sheet = compile_theme(theme);
     let mut fonts = FontDatabase::new();
     let mut button = button_node(label, classes);
+    // A theme's relative `url()`s are relative to the sheet that declared
+    // them, not to the process's working directory. Only `ThemeSource::File`
+    // has a directory of its own; the bundled sheet declares no `url()`s and
+    // `UserPreferred`'s images are absolute in every GTK theme on disk.
+    if let ThemeSource::File(path) = theme
+        && let Some(dir) = path.parent()
+    {
+        button.set_image_base_dir(dir);
+    }
     button.restyle(&sheet, &mut fonts);
     Ok((sheet, fonts, button))
 }
