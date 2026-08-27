@@ -6,10 +6,12 @@
 //! `calloop`.
 
 use std::os::fd::AsFd;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+    wl_surface,
 };
 use wayland_client::{
     ConnectError, Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle,
@@ -20,6 +22,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 use skia_rs_safe::canvas::Surface;
 use skia_rs_safe::core::Color;
 
+use crate::anim::{Clock, MonotonicClock};
 use crate::css::cascade::CompiledSheet;
 use crate::css::node::PseudoStates;
 use crate::shm::{BufferPool, BufferSlot, ShmBuffer, Slot, SlotPool};
@@ -114,11 +117,22 @@ pub struct AppState {
     sheet: CompiledSheet,
     fonts: FontDatabase,
     button: Button,
+    /// The clock the widget's transitions and animations run on. Shared with
+    /// the `Button` so the pump and the widget agree on "now".
+    clock: Rc<MonotonicClock>,
+    /// A `wl_surface.frame` callback is outstanding.
+    ///
+    /// A frame callback fires once per commit that requested it, so asking
+    /// again while one is pending multiplies the `done` events the compositor
+    /// sends and turns a smooth animation into a repaint storm.
+    frame_pending: bool,
 }
 
 impl AppState {
     /// A client state with nothing bound yet.
-    fn new(sheet: CompiledSheet, fonts: FontDatabase, button: Button) -> Self {
+    fn new(sheet: CompiledSheet, fonts: FontDatabase, mut button: Button) -> Self {
+        let clock = Rc::new(MonotonicClock::new());
+        button.set_clock(Rc::clone(&clock) as Rc<dyn Clock>);
         Self {
             compositor: None,
             shm: None,
@@ -133,6 +147,8 @@ impl AppState {
             sheet,
             fonts,
             button,
+            clock,
+            frame_pending: false,
         }
     }
 
@@ -428,6 +444,14 @@ impl LayerWindow {
         self.surface
             .attach(Some(self.buffers.wl_buffer(index)), 0, 0);
         self.surface.damage_buffer(0, 0, width, height);
+        if should_request_frame(self.state.button.is_animating(), self.state.frame_pending) {
+            self.surface.frame(&self.qh, ());
+            self.state.frame_pending = true;
+            tracing::trace!(
+                now = ?self.state.clock.now(),
+                "requested a frame callback: the widget is animating"
+            );
+        }
         self.surface.commit();
         self.conn.flush().map_err(socket_error)?;
         self.state.dirty = false;
@@ -487,6 +511,15 @@ fn select_paint_slot(released: &mut Vec<BufferSlot>, slots: &mut SlotPool) -> Op
         slots.release(slot.0);
     }
     slots.acquire()
+}
+
+/// Whether this commit should carry a `wl_surface.frame` request.
+///
+/// Wayland-object-free on purpose, like [`select_paint_slot`]: the decision
+/// that separates "animate at the compositor's pace" from "busy loop" is
+/// worth testing without a live compositor.
+fn should_request_frame(animating: bool, frame_pending: bool) -> bool {
+    animating && !frame_pending
 }
 
 /// `Connection::flush`/`read` report a `WaylandError`, which is `io::Error`
@@ -650,12 +683,40 @@ impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for AppState {
 }
 delegate_noop!(AppState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 
+impl Dispatch<wl_callback::WlCallback, ()> for AppState {
+    /// A frame callback is the compositor saying "now is a good time to draw
+    /// the next frame". Resample the animation clock, and keep asking for
+    /// frames while anything is still running.
+    ///
+    /// The repaint is marked dirty even when the sampled values did not
+    /// change, because a frame callback only fires for a commit that asked
+    /// for one: without a repaint there is no commit, and without a commit
+    /// there is no next callback, so the animation would stall.
+    fn event(
+        state: &mut Self,
+        _callback: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.frame_pending = false;
+            let changed = state.button.tick();
+            if changed || state.button.is_animating() {
+                state.dirty = true;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AppState, BTN_LEFT, CONFIGURE_TIMEOUT, LayerWindowError, select_paint_slot, wait_bounded,
     };
     use crate::BUNDLED_ADWAITA_LIGHT;
+    use crate::anim::Clock;
     use crate::css::cascade::CompiledSheet;
     use crate::css::node::{Node, PseudoStates};
     use crate::shm::{BufferSlot, Slot, SlotPool};
@@ -932,5 +993,36 @@ mod tests {
         })
         .expect("already configured");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    // Mutation check: drop the `!frame_pending` term and every repaint stacks
+    // another frame callback on the surface, so the compositor delivers one
+    // `done` per outstanding request and the client repaints in a storm.
+    #[test]
+    fn a_frame_callback_is_requested_only_while_animating_and_never_twice() {
+        assert!(super::should_request_frame(true, false));
+        assert!(
+            !super::should_request_frame(true, true),
+            "a callback is already outstanding: asking again multiplies the \
+             `done` events the compositor will send"
+        );
+        assert!(
+            !super::should_request_frame(false, false),
+            "an idle widget must not ask for another frame -- that is the \
+             whole difference between this and a busy loop"
+        );
+        assert!(!super::should_request_frame(false, true));
+    }
+
+    // Mutation check: initialise `frame_pending` to `true` and the very first
+    // animating repaint never requests a callback, so nothing ever animates.
+    #[test]
+    fn a_fresh_client_state_has_no_frame_callback_outstanding() {
+        let state = state();
+        assert!(!state.frame_pending);
+        assert!(
+            state.clock.now() < std::time::Duration::from_secs(1),
+            "the client's clock is created with the state, so it starts near zero"
+        );
     }
 }
