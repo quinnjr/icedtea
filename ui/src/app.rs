@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::BUNDLED_ADWAITA_LIGHT;
 use crate::css::cascade::CompiledSheet;
 use crate::css::node::Node;
-use crate::css::parse::{Stylesheet, parse_stylesheet_with_base};
+use crate::css::parse::{ColorScheme, Contrast, MediaEnv, Stylesheet, parse_stylesheet_with_base};
 use crate::layout::Allocation;
 use crate::text::FontDatabase;
 use crate::wayland::{LayerWindow, LayerWindowError};
@@ -99,6 +99,61 @@ impl ThemeEnv {
         dirs
     }
 
+    /// `$GTK_THEME` split into its theme name and its `:`-separated
+    /// variants, or `None` when it is unset or names an empty theme.
+    fn theme_spec(&self) -> Option<(&str, impl Iterator<Item = &str>)> {
+        let spec = self.gtk_theme.as_ref()?;
+        let mut parts = spec.split(':');
+        let name = parts.next().unwrap_or(spec.as_str());
+        if name.is_empty() {
+            return None;
+        }
+        Some((name, parts))
+    }
+
+    /// The `@media` environment this theme selection implies.
+    ///
+    /// GTK does not expose a separate colour-scheme or contrast setting to a
+    /// client this far down the stack: the *theme spelling* is the setting.
+    /// `Name:dark` asks for the dark variant, so
+    /// `(prefers-color-scheme: dark)` must match -- without this, a theme's
+    /// dark `gtk-dark.css` loaded and then had every one of its
+    /// `@media (prefers-color-scheme: dark)` blocks thrown away.
+    ///
+    /// Contrast comes from the same string: GTK ships high contrast as its
+    /// own theme (`HighContrast`, and `HighContrastInverse` for the dark
+    /// one), and a `Name:hc` variant is accepted for the themes that spell
+    /// it that way. Everything else is `no-preference`, which is
+    /// [`MediaEnv`]'s default.
+    ///
+    /// Variants are matched case-insensitively, as GTK matches them.
+    #[must_use]
+    pub fn media_env(&self) -> MediaEnv {
+        let Some((name, variants)) = self.theme_spec() else {
+            return MediaEnv::default();
+        };
+        let variants: Vec<&str> = variants.collect();
+        let has = |wanted: &[&str]| {
+            variants
+                .iter()
+                .any(|v| wanted.iter().any(|w| v.eq_ignore_ascii_case(w)))
+        };
+        let high_contrast = name.len() >= "HighContrast".len()
+            && name[.."HighContrast".len()].eq_ignore_ascii_case("HighContrast");
+        MediaEnv {
+            color_scheme: if has(&["dark"]) || name.eq_ignore_ascii_case("HighContrastInverse") {
+                ColorScheme::Dark
+            } else {
+                ColorScheme::Light
+            },
+            contrast: if high_contrast || has(&["hc", "highcontrast", "high-contrast"]) {
+                Contrast::More
+            } else {
+                Contrast::NoPreference
+            },
+        }
+    }
+
     /// Candidate base-theme files for `$GTK_THEME`, in search order.
     ///
     /// `Name:dark` asks for the theme's dark variant, which GTK4 ships as
@@ -112,15 +167,10 @@ impl ThemeEnv {
     /// copy *is* the right answer and there is nothing to probe.
     #[must_use]
     pub fn base_theme_candidates(&self) -> Vec<PathBuf> {
-        let Some(spec) = &self.gtk_theme else {
+        let Some((name, mut variants)) = self.theme_spec() else {
             return Vec::new();
         };
-        let mut parts = spec.split(':');
-        let name = parts.next().unwrap_or(spec);
-        if name.is_empty() {
-            return Vec::new();
-        }
-        let dark = parts.any(|variant| variant.eq_ignore_ascii_case("dark"));
+        let dark = variants.any(|variant| variant.eq_ignore_ascii_case("dark"));
 
         let dirs = self.theme_dirs();
         let mut candidates = Vec::with_capacity(dirs.len() * 2);
@@ -183,7 +233,24 @@ pub fn load_layered_stylesheet(env: &ThemeEnv) -> Stylesheet {
     sheet
 }
 
+/// GTK's theme stack for `env`, compiled under the `@media` environment
+/// `env` itself implies (see [`ThemeEnv::media_env`]).
+///
+/// Split out from [`compile_theme`] so the pairing of the loaded sheet with
+/// its media environment is testable without mutating the process
+/// environment.
+#[must_use]
+pub fn compile_for_theme_env(env: &ThemeEnv) -> CompiledSheet {
+    CompiledSheet::compile_with_env(&load_layered_stylesheet(env), &env.media_env())
+}
+
 /// Compile the stylesheet `source` describes.
+///
+/// [`ThemeSource::Bundled`] and [`ThemeSource::File`] compile under
+/// [`MediaEnv::default`] (light, no contrast preference): neither carries a
+/// theme *spelling* to derive a preference from -- the bundled sheet is
+/// Adwaita's light one, and an explicit file is whatever the caller pointed
+/// at. Only [`ThemeSource::UserPreferred`] has `$GTK_THEME` to read.
 #[must_use]
 pub fn compile_theme(source: &ThemeSource) -> CompiledSheet {
     match source {
@@ -197,9 +264,7 @@ pub fn compile_theme(source: &ThemeSource) -> CompiledSheet {
             });
             CompiledSheet::from_stylesheet(sheet)
         }
-        ThemeSource::UserPreferred => {
-            CompiledSheet::from_stylesheet(load_layered_stylesheet(&ThemeEnv::from_env()))
-        }
+        ThemeSource::UserPreferred => compile_for_theme_env(&ThemeEnv::from_env()),
     }
 }
 
@@ -261,9 +326,12 @@ pub fn run_themed_button(
 
 #[cfg(test)]
 mod tests {
-    use super::{ThemeEnv, ThemeSource, compile_theme, load_layered_stylesheet};
+    use super::{
+        ThemeEnv, ThemeSource, compile_for_theme_env, compile_theme, load_layered_stylesheet,
+    };
     use crate::css::computed::{ComputedStyle, ResolveEnv};
     use crate::css::node::Node;
+    use crate::css::parse::MediaEnv;
     use crate::css::select::MatchCx;
     use skia_rs_safe::core::Color;
     use std::path::Path;
@@ -282,6 +350,10 @@ mod tests {
 
     fn button_min_height(sheet: &crate::css::cascade::CompiledSheet) -> f32 {
         button_style(sheet).min_size((0.0, 0.0)).1
+    }
+
+    fn button_min_width(sheet: &crate::css::cascade::CompiledSheet) -> f32 {
+        button_style(sheet).min_size((0.0, 0.0)).0
     }
 
     fn headerbar_min_height(sheet: &crate::css::cascade::CompiledSheet) -> f32 {
@@ -421,6 +493,94 @@ mod tests {
         let sheet =
             crate::css::cascade::CompiledSheet::from_stylesheet(load_layered_stylesheet(&env));
         assert_eq!(button_min_height(&sheet), 11.0);
+    }
+
+    #[test]
+    fn a_dark_gtk_theme_evaluates_prefers_color_scheme_dark() {
+        // `MediaEnv` used to be left at its default (light) for every
+        // production compile, so `$GTK_THEME=Foo:dark` loaded the dark
+        // *file* and then threw away every `@media (prefers-color-scheme:
+        // dark)` block inside it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let theme = tmp.path().join(".themes/Foo/gtk-4.0");
+        write(&theme.join("gtk.css"), "button { min-width: 11px }\n");
+        write(
+            &theme.join("gtk-dark.css"),
+            "button { min-width: 11px }\n\
+             @media (prefers-color-scheme: dark) { button { min-width: 77px } }\n",
+        );
+        let dark = ThemeEnv {
+            gtk_theme: Some("Foo:dark".to_string()),
+            home: Some(tmp.path().display().to_string()),
+            ..ThemeEnv::default()
+        };
+        assert_eq!(
+            button_min_width(&compile_for_theme_env(&dark)),
+            77.0,
+            "the dark variant's @media block never reached the cascade"
+        );
+
+        let light = ThemeEnv {
+            gtk_theme: Some("Foo".to_string()),
+            ..dark.clone()
+        };
+        assert_eq!(
+            button_min_width(&compile_for_theme_env(&light)),
+            11.0,
+            "the light variant must not match prefers-color-scheme: dark"
+        );
+    }
+
+    #[test]
+    fn a_high_contrast_gtk_theme_evaluates_prefers_contrast_more() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            &tmp.path().join(".themes/HighContrast/gtk-4.0/gtk.css"),
+            "button { min-width: 11px }\n\
+             @media (prefers-contrast: more) { button { min-width: 79px } }\n",
+        );
+        let env = ThemeEnv {
+            gtk_theme: Some("HighContrast".to_string()),
+            home: Some(tmp.path().display().to_string()),
+            ..ThemeEnv::default()
+        };
+        assert_eq!(button_min_width(&compile_for_theme_env(&env)), 79.0);
+    }
+
+    #[test]
+    fn the_media_env_is_derived_from_the_gtk_theme_spelling() {
+        let env = |spec: &str| {
+            ThemeEnv {
+                gtk_theme: Some(spec.to_string()),
+                ..ThemeEnv::default()
+            }
+            .media_env()
+        };
+        assert_eq!(ThemeEnv::default().media_env(), MediaEnv::default());
+        assert_eq!(env("Adwaita"), MediaEnv::default());
+        assert_eq!(
+            env("Adwaita:dark").color_scheme,
+            crate::css::parse::ColorScheme::Dark
+        );
+        assert_eq!(
+            env("Adwaita:DARK").color_scheme,
+            crate::css::parse::ColorScheme::Dark,
+            "GTK matches the variant case-insensitively"
+        );
+        assert_eq!(
+            env("HighContrast").contrast,
+            crate::css::parse::Contrast::More
+        );
+        assert_eq!(
+            env("HighContrastInverse").color_scheme,
+            crate::css::parse::ColorScheme::Dark,
+            "the inverse high-contrast theme is the dark one"
+        );
+        assert_eq!(
+            env("HighContrastInverse").contrast,
+            crate::css::parse::Contrast::More
+        );
+        assert_eq!(env("Foo:hc").contrast, crate::css::parse::Contrast::More);
     }
 
     #[test]
