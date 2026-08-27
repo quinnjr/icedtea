@@ -11,6 +11,7 @@
 //! slice and exposes no variation axes, so they are dropped at the shaper
 //! with a one-time warning rather than silently ignored.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -290,7 +291,7 @@ impl FontDatabase {
             return Rc::clone(cached);
         }
 
-        let text = transform_text(key.text, key.transform);
+        let text = apply_text_transform(key.text, key.transform);
         let shaped = Rc::new(self.shape_uncached(&text, key));
         self.shapes.insert(owned, Rc::clone(&shaped));
         shaped
@@ -507,37 +508,90 @@ fn load_typeface(path: &Path) -> Option<Arc<Typeface>> {
     Typeface::from_data(data).map(Arc::new)
 }
 
-/// Apply CSS `text-transform` to a string.
+/// Small kana → their full-size form, for `text-transform: full-size-kana`.
 ///
-/// `full-width` maps the ASCII range onto its fullwidth forms (U+FF01..FF5E,
-/// and U+3000 for the space), which is what GTK does.
-fn transform_text(text: &str, transform: Keyword) -> String {
+/// The hiragana and katakana small letters GTK's own `full-size-kana` covers;
+/// the half-width katakana block is left alone (it is a *width* transform, not
+/// a size one, and `full-width` handles it).
+const FULL_SIZE_KANA: &[(char, char)] = &[
+    ('ぁ', 'あ'),
+    ('ぃ', 'い'),
+    ('ぅ', 'う'),
+    ('ぇ', 'え'),
+    ('ぉ', 'お'),
+    ('っ', 'つ'),
+    ('ゃ', 'や'),
+    ('ゅ', 'ゆ'),
+    ('ょ', 'よ'),
+    ('ゎ', 'わ'),
+    ('ゕ', 'か'),
+    ('ゖ', 'け'),
+    ('ァ', 'ア'),
+    ('ィ', 'イ'),
+    ('ゥ', 'ウ'),
+    ('ェ', 'エ'),
+    ('ォ', 'オ'),
+    ('ッ', 'ツ'),
+    ('ャ', 'ヤ'),
+    ('ュ', 'ユ'),
+    ('ョ', 'ヨ'),
+    ('ヮ', 'ワ'),
+    ('ヵ', 'カ'),
+    ('ヶ', 'ケ'),
+];
+
+/// Apply CSS `text-transform` to `text`.
+///
+/// This runs *before* shaping (as it does in GTK): the transform changes which
+/// characters exist, so the shaper must see the transformed string, and the
+/// result is what [`FontDatabase::shape`] caches.
+///
+/// A keyword that is not a `text-transform` value — including
+/// [`Keyword::None`] — borrows the input unchanged.
+#[must_use]
+pub fn apply_text_transform(text: &str, transform: Keyword) -> Cow<'_, str> {
     match transform {
-        Keyword::Uppercase => text.to_uppercase(),
-        Keyword::Lowercase => text.to_lowercase(),
-        Keyword::Capitalize => {
-            let mut out = String::with_capacity(text.len());
-            let mut at_word_start = true;
-            for ch in text.chars() {
-                if at_word_start {
-                    out.extend(ch.to_uppercase());
-                } else {
-                    out.push(ch);
-                }
-                at_word_start = ch.is_whitespace();
-            }
-            out
-        }
-        Keyword::FullWidth => text
-            .chars()
-            .map(|ch| match ch {
-                ' ' => '\u{3000}',
-                '!'..='~' => char::from_u32(ch as u32 - 0x21 + 0xFF01).unwrap_or(ch),
-                other => other,
-            })
-            .collect(),
-        _ => text.to_owned(),
+        Keyword::Uppercase => Cow::Owned(text.to_uppercase()),
+        Keyword::Lowercase => Cow::Owned(text.to_lowercase()),
+        Keyword::Capitalize => Cow::Owned(capitalize(text)),
+        Keyword::FullWidth => Cow::Owned(text.chars().map(to_full_width).collect()),
+        Keyword::FullSizeKana => Cow::Owned(text.chars().map(to_full_size_kana).collect()),
+        _ => Cow::Borrowed(text),
     }
+}
+
+/// Upper-case the first letter of every whitespace-delimited word.
+fn capitalize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at_word_start = true;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            at_word_start = true;
+            out.push(ch);
+        } else if at_word_start {
+            at_word_start = false;
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// ASCII → the Halfwidth and Fullwidth Forms block; space → ideographic space.
+fn to_full_width(ch: char) -> char {
+    match ch {
+        ' ' => '\u{3000}',
+        '!'..='~' => char::from_u32(ch as u32 + 0xFEE0).unwrap_or(ch),
+        _ => ch,
+    }
+}
+
+fn to_full_size_kana(ch: char) -> char {
+    FULL_SIZE_KANA
+        .iter()
+        .find_map(|&(small, full)| (small == ch).then_some(full))
+        .unwrap_or(ch)
 }
 
 /// CSS `font-weight` (1..1000) → fontconfig `FC_WEIGHT`.
@@ -1296,5 +1350,112 @@ mod tests {
             2,
             "the weight is not part of the cache key"
         );
+    }
+
+    use super::apply_text_transform;
+
+    #[test]
+    fn text_transform_none_borrows_the_input_unchanged() {
+        let out = apply_text_transform("Click me", Keyword::None);
+        assert_eq!(out, "Click me");
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "`none` must not allocate"
+        );
+        // Any keyword that is not a text-transform value is also a no-op.
+        assert_eq!(apply_text_transform("Click me", Keyword::Solid), "Click me");
+    }
+
+    #[test]
+    fn text_transform_cases_follow_unicode_not_ascii() {
+        assert_eq!(
+            apply_text_transform("straße", Keyword::Uppercase),
+            "STRASSE"
+        );
+        assert_eq!(
+            apply_text_transform("ÅNGSTRÖM", Keyword::Lowercase),
+            "ångström"
+        );
+        assert_eq!(
+            apply_text_transform("ábc déf", Keyword::Capitalize),
+            "Ábc Déf"
+        );
+    }
+
+    #[test]
+    fn capitalize_starts_a_word_after_any_whitespace_or_punctuation_run() {
+        assert_eq!(
+            apply_text_transform("click me now", Keyword::Capitalize),
+            "Click Me Now"
+        );
+        assert_eq!(
+            apply_text_transform("  leading", Keyword::Capitalize),
+            "  Leading"
+        );
+        assert_eq!(
+            apply_text_transform("multi\tword\nlines", Keyword::Capitalize),
+            "Multi\tWord\nLines"
+        );
+        assert_eq!(
+            apply_text_transform("ALREADY UP", Keyword::Capitalize),
+            "ALREADY UP",
+            "capitalize only touches the first letter of each word"
+        );
+    }
+
+    #[test]
+    fn full_width_maps_ascii_into_the_fullwidth_block() {
+        assert_eq!(apply_text_transform("AB1!", Keyword::FullWidth), "ＡＢ１！");
+        assert_eq!(apply_text_transform(" ", Keyword::FullWidth), "\u{3000}");
+        assert_eq!(
+            apply_text_transform("あ", Keyword::FullWidth),
+            "あ",
+            "a character that is already full width is left alone"
+        );
+    }
+
+    #[test]
+    fn full_size_kana_promotes_the_small_kana() {
+        assert_eq!(
+            apply_text_transform("ぁぃっゃ", Keyword::FullSizeKana),
+            "あいつや"
+        );
+        assert_eq!(
+            apply_text_transform("ァィッャ", Keyword::FullSizeKana),
+            "アイツヤ"
+        );
+        assert_eq!(
+            apply_text_transform("あア", Keyword::FullSizeKana),
+            "あア",
+            "full-size kana are already full size"
+        );
+    }
+
+    #[test]
+    fn text_transform_never_panics_on_hostile_text() {
+        let hostile = [
+            "",
+            "\u{0}",
+            "\u{7}\u{1b}\u{7f}",
+            "\u{200b}\u{200e}\u{feff}",
+            "e\u{301}\u{301}\u{301}",
+            "🇯🇵👩‍👩‍👧‍👦",
+            "\u{10FFFF}",
+            "ﬁﬂﬀ",
+        ];
+        for transform in [
+            Keyword::None,
+            Keyword::Capitalize,
+            Keyword::Uppercase,
+            Keyword::Lowercase,
+            Keyword::FullWidth,
+            Keyword::FullSizeKana,
+        ] {
+            for text in hostile {
+                let _ = apply_text_transform(text, transform);
+            }
+            let long = "aあ ".repeat(5_000);
+            let _ = apply_text_transform(&long, transform);
+        }
     }
 }
