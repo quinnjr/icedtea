@@ -16,6 +16,7 @@ use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cssparser::ToCss;
 use precomputed_hash::PrecomputedHash;
@@ -174,13 +175,39 @@ impl PseudoStates {
     pub const DERIVED: PseudoStates = PseudoStates::FOCUS_WITHIN.union(PseudoStates::FOCUS_VISIBLE);
 }
 
+/// Monotonic source for [`TreeToken::id`]. Every freshly built tree (a new
+/// `Node`, or a subtree split off by [`Node::remove_child`]) draws the next
+/// value, so no two trees that are ever live at once — or ever will be —
+/// share an id, even if a later tree's `Rc<TreeToken>` allocation reuses a
+/// dropped one's heap address.
+static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The generation counter for one tree, plus an id that is unique across
+/// every tree this process ever builds.
+///
+/// [`Node::generation`] used to be keyed on `Rc::as_ptr` of the bare
+/// `Cell<u64>` this replaces. That address is only unique among *live*
+/// trees: once a tree is dropped, its allocation can be reused by a later,
+/// unrelated tree, and if that tree's counter happens to coincide too, a
+/// cache keyed on `(addr, generation)` (e.g. [`super::select::MatchCx`]'s
+/// bloom-filter position) would answer for the wrong tree — an ABA bug, not
+/// a hypothetical one. `id` never repeats, so a key that includes it cannot
+/// collide across trees.
+struct TreeToken {
+    id: u64,
+    generation: Cell<u64>,
+}
+
+impl TreeToken {
+    fn new(generation: u64) -> Rc<TreeToken> {
+        Rc::new(TreeToken {
+            id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
+            generation: Cell::new(generation),
+        })
+    }
+}
+
 /// The interior-mutable payload behind a [`Node`].
-// `own_states`, `focus_count`, `direction` and `parent` are wired up starting
-// Task 2 (state/direction accessors, tree mutation); they are declared here
-// because they are part of `NodeInner`'s one true shape, not reallocated
-// later. `-D warnings`'s `dead_code` lint would otherwise fail this task's
-// gate for fields no Task 1 method reads yet.
-#[allow(dead_code)]
 pub(crate) struct NodeInner {
     /// Element name, interned for hashing and comparison.
     name: CssString,
@@ -197,7 +224,7 @@ pub(crate) struct NodeInner {
     parent: RefCell<Weak<NodeInner>>,
     children: RefCell<Vec<Node>>,
     /// Shared by every node of one tree; bumped by every mutation anywhere.
-    tree: RefCell<Rc<Cell<u64>>>,
+    tree: RefCell<Rc<TreeToken>>,
     /// The value `tree` held when this node was last touched.
     self_generation: Cell<u64>,
 }
@@ -252,7 +279,7 @@ impl Node {
             direction: Cell::new(None),
             parent: RefCell::new(Weak::new()),
             children: RefCell::new(Vec::new()),
-            tree: RefCell::new(Rc::new(Cell::new(1))),
+            tree: RefCell::new(TreeToken::new(1)),
             self_generation: Cell::new(1),
         }))
     }
@@ -388,7 +415,17 @@ impl Node {
     /// The tree-wide generation: any mutation anywhere in this tree bumps it.
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.0.tree.borrow().get()
+        self.0.tree.borrow().generation.get()
+    }
+
+    /// An id unique to this node's current tree, for every tree this process
+    /// ever builds — never just among the trees presently alive. Combine it
+    /// with [`Node::addr`] and [`Node::generation`] in a cache key to rule out
+    /// the ABA hazard where a dropped tree's allocation is reused by an
+    /// unrelated later tree (see [`TreeToken`]).
+    #[must_use]
+    pub(crate) fn tree_id(&self) -> u64 {
+        self.0.tree.borrow().id
     }
 
     /// The tree generation at this node's last own mutation. Comparable across
@@ -566,7 +603,7 @@ impl Node {
 
         // The removed subtree becomes a tree of its own, starting past both
         // trees' counters so no handle ever sees a generation go backwards.
-        let token = Rc::new(Cell::new(self.0.tree.borrow().get() + 1));
+        let token = TreeToken::new(self.0.tree.borrow().generation.get() + 1);
         adopt_tree(child, &token);
 
         self.touch();
@@ -607,8 +644,8 @@ impl Node {
     fn touch(&self) {
         let generation = {
             let tree = self.0.tree.borrow();
-            let next = tree.get() + 1;
-            tree.set(next);
+            let next = tree.generation.get() + 1;
+            tree.generation.set(next);
             next
         };
         self.0.self_generation.set(generation);
@@ -651,10 +688,10 @@ impl Iterator for Descendants {
 
 /// Move `node`'s whole subtree onto `token`, carrying the counter forward so a
 /// generation is monotonic for every handle involved.
-fn adopt_tree(node: &Node, token: &Rc<Cell<u64>>) {
-    let previous = node.0.tree.borrow().get();
-    if token.get() < previous {
-        token.set(previous);
+fn adopt_tree(node: &Node, token: &Rc<TreeToken>) {
+    let previous = node.0.tree.borrow().generation.get();
+    if token.generation.get() < previous {
+        token.generation.set(previous);
     }
     *node.0.tree.borrow_mut() = Rc::clone(token);
     for child in node.0.children.borrow().iter() {

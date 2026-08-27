@@ -539,11 +539,17 @@ pub fn parse_selector_list(text: &str) -> Option<SelectorList<GtkSelectorImpl>> 
 pub struct MatchCx {
     caches: SelectorCaches,
     bloom: BloomFilter,
-    /// `(addr of the deepest ancestor in `bloom`, tree generation)`. `0` is the
-    /// address of "no ancestors", i.e. the filter is empty and that is correct.
-    filter_top: Option<(usize, u64)>,
-    /// The tree generation `caches` was built against.
-    generation: Option<u64>,
+    /// `(tree id, addr of the deepest ancestor in `bloom`, tree generation)`.
+    /// `0` is the address of "no ancestors", i.e. the filter is empty and that
+    /// is correct. The tree id (`Node::tree_id`) is load-bearing, not
+    /// decorative: a heap address and a generation counter both restart from
+    /// values a *dropped* tree could also have held, so `(addr, generation)`
+    /// alone can alias a stale filter position onto an unrelated new tree
+    /// (ABA). The tree id is drawn from a process-wide monotonic counter and
+    /// never repeats, so including it rules that out.
+    filter_top: Option<(u64, usize, u64)>,
+    /// `(tree id, tree generation)` `caches` was built against.
+    generation: Option<(u64, u64)>,
     /// How many ancestors are currently inserted.
     depth: usize,
 }
@@ -582,15 +588,16 @@ impl MatchCx {
     /// `node`'s current tree generation, which is the common case when a whole
     /// stylesheet is matched against one node.
     pub fn seed_for(&mut self, node: &Node) {
+        let tree_id = node.tree_id();
         let generation = node.generation();
-        if self.generation != Some(generation) {
+        if self.generation != Some((tree_id, generation)) {
             // The tree changed: every memoised nth-index count is now suspect.
             self.caches = SelectorCaches::default();
-            self.generation = Some(generation);
+            self.generation = Some((tree_id, generation));
             self.filter_top = None;
         }
         let wanted = node.parent().map_or(0, |parent| parent.addr());
-        if self.filter_top == Some((wanted, generation)) {
+        if self.filter_top == Some((tree_id, wanted, generation)) {
             return;
         }
 
@@ -601,7 +608,7 @@ impl MatchCx {
         for ancestor in &chain {
             self.push_ancestor(ancestor);
         }
-        self.filter_top = Some((wanted, generation));
+        self.filter_top = Some((tree_id, wanted, generation));
     }
 
     /// Insert `node`'s identity hashes, making the filter correct for `node`'s
@@ -609,16 +616,26 @@ impl MatchCx {
     pub fn push_ancestor(&mut self, node: &Node) {
         node.for_each_identity_hash(|hash| self.bloom.insert_hash(hash));
         self.depth += 1;
-        self.filter_top = Some((node.addr(), node.generation()));
+        self.filter_top = Some((node.tree_id(), node.addr(), node.generation()));
     }
 
     /// Undo one [`MatchCx::push_ancestor`].
     pub fn pop_ancestor(&mut self, node: &Node) {
+        debug_assert!(self.depth > 0, "pop_ancestor without a matching push");
         node.for_each_identity_hash(|hash| self.bloom.remove_hash(hash));
         self.depth = self.depth.saturating_sub(1);
         self.filter_top = node
             .parent()
-            .map(|parent| (parent.addr(), parent.generation()));
+            .map(|parent| (parent.tree_id(), parent.addr(), parent.generation()));
+    }
+
+    /// Test-only probe: whether the ancestor filter currently reports it might
+    /// contain `hash` (already masked with [`selectors::bloom::BLOOM_HASH_MASK`]).
+    /// Bypasses [`MatchCx::seed_for`] entirely, so a test can observe `cx`'s own
+    /// filter state rather than one a fresh, hidden `MatchCx` would rebuild.
+    #[cfg(test)]
+    pub(crate) fn might_contain_hash(&self, hash: u32) -> bool {
+        self.bloom.might_contain_hash(hash)
     }
 }
 
@@ -911,16 +928,20 @@ impl RuleBuckets {
     #[must_use]
     pub fn candidates(&self, node: &Node) -> Vec<usize> {
         let mut out = self.universal.clone();
-        if let Some(id) = node.id()
-            && let Some(list) = self.by_id.get(id.as_str())
-        {
-            out.extend_from_slice(list);
-        }
-        for class in node.classes() {
-            if let Some(list) = self.by_class.get(class.as_str()) {
+        node.borrow_id(|id| {
+            if let Some(id) = id
+                && let Some(list) = self.by_id.get(id.as_str())
+            {
                 out.extend_from_slice(list);
             }
-        }
+        });
+        node.borrow_classes(|classes| {
+            for class in classes {
+                if let Some(list) = self.by_class.get(class.as_str()) {
+                    out.extend_from_slice(list);
+                }
+            }
+        });
         if let Some(list) = self.by_name.get(&*node.name()) {
             out.extend_from_slice(list);
         }
@@ -1418,18 +1439,106 @@ mod tests {
 
     #[test]
     fn push_and_pop_ancestor_are_exact_inverses() {
+        // `hits()` builds its own fresh `MatchCx` (via `matches` -> `seed_for`),
+        // so asserting through it never observes whatever `cx.push_ancestor`/
+        // `cx.pop_ancestor` actually did to `cx`'s filter -- the test would stay
+        // green even if `pop_ancestor` were gutted into a no-op. Assert against
+        // `cx`'s own filter state directly instead, bypassing `seed_for`.
+        use selectors::bloom::BLOOM_HASH_MASK;
+
         let window = Node::with_classes("window", &["background"]);
         let button = Node::new("button");
         window.append_child(&button);
 
+        let background_hash = crate::css::node::fnv1a(b"background") & BLOOM_HASH_MASK;
+
         let mut cx = MatchCx::new();
-        cx.push_ancestor(&window);
-        assert!(hits("window.background > button", &button));
-        cx.pop_ancestor(&window);
-        cx.reset();
         assert!(
-            hits("window.background > button", &button),
-            "a popped filter must leave no residue that rejects a real match"
+            !cx.might_contain_hash(background_hash),
+            "a fresh filter must not already report an unrelated hash"
+        );
+
+        cx.push_ancestor(&window);
+        assert!(
+            cx.might_contain_hash(background_hash),
+            "push_ancestor(&window) must insert window's own hashes into cx's filter"
+        );
+
+        cx.pop_ancestor(&window);
+        assert!(
+            !cx.might_contain_hash(background_hash),
+            "pop_ancestor(&window) must undo exactly what push_ancestor(&window) did \
+             (mutation check: gutting pop_ancestor into a no-op fails this assertion)"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "pop_ancestor without a matching push")
+    )]
+    fn pop_ancestor_without_a_push_is_a_bug() {
+        // `depth` exists to catch a caller popping more than it pushed -- a bug
+        // that would otherwise sail through silently (the saturating decrement
+        // just clamps at zero). In debug builds this must panic; in a release
+        // build (`debug_assert!` compiled out) the saturating decrement is the
+        // only guard left, so the call is harmless there and this test is
+        // skipped rather than asserting a panic that cannot happen.
+        let window = Node::with_classes("window", &["background"]);
+        let mut cx = MatchCx::new();
+        cx.pop_ancestor(&window);
+    }
+
+    #[test]
+    fn seed_for_reseeds_on_a_tree_id_mismatch_even_when_addr_and_generation_collide() {
+        // Regression test for the ABA hazard in `MatchCx`'s cache key. It used
+        // to be `(parent addr, tree generation)` alone: a tree that gets
+        // dropped can free memory a later, wholly unrelated tree's root then
+        // gets allocated at, and if that new tree also happens to read the
+        // same generation counter value (every freshly built, untouched tree
+        // starts at generation 1, so this is not exotic), the old key would
+        // read back a hit for the wrong tree -- `seed_for` would skip
+        // reseeding and leave a stale bloom filter in place, silently
+        // rejecting real matches. `tree_id` closes the hole because it is
+        // drawn from a process-wide monotonic counter that never repeats.
+        //
+        // This test forges that exact collision by hand -- an address match
+        // real allocator reuse *would* produce, but that a test cannot force
+        // -- to prove the fix without depending on allocator behaviour.
+        use selectors::bloom::BLOOM_HASH_MASK;
+
+        let tree_a = Node::with_classes("window", &["danger"]);
+        let child_a = Node::new("button");
+        tree_a.append_child(&child_a);
+        let danger_hash = crate::css::node::fnv1a(b"danger") & BLOOM_HASH_MASK;
+
+        let mut cx = MatchCx::new();
+        cx.seed_for(&child_a);
+        assert!(
+            cx.might_contain_hash(danger_hash),
+            "sanity: a real seed_for must populate the filter with the ancestor's hashes"
+        );
+
+        // Forge `cx` into the exact state an `(addr, generation)`-only cache
+        // could reach after a dropped tree's address was reused: the addr and
+        // generation on file are `child_a`'s real, current ones (so an
+        // addr/generation-only key would call this "already seeded"), but the
+        // tree id on file belongs to a different tree, and the bloom filter
+        // holds that other tree's (empty, here) ancestor hashes rather than
+        // `child_a`'s real ancestor's.
+        let real_addr = tree_a.addr();
+        let real_generation = child_a.generation();
+        let other_tree_id = tree_a.tree_id() ^ 1; // guaranteed different from tree_a's real id
+        cx.filter_top = Some((other_tree_id, real_addr, real_generation));
+        cx.generation = Some((other_tree_id, real_generation));
+        cx.bloom.clear();
+
+        cx.seed_for(&child_a);
+        assert!(
+            cx.might_contain_hash(danger_hash),
+            "seed_for must reseed when the cached tree id doesn't match `child_a`'s, \
+             even though the cached (addr, generation) exactly matches -- without \
+             tree_id in the key this would wrongly be treated as an up-to-date filter"
         );
     }
 
