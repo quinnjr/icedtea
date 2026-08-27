@@ -362,7 +362,12 @@ impl AnimationState {
         if !deadline.is_finite() {
             return None;
         }
-        Some(Duration::from_secs_f64(deadline.max(now_ms) / 1000.0))
+        // Finite is not the same as representable: a `calc()`-sized delay can
+        // put the deadline decades past `Duration`'s ceiling, and the
+        // infallible conversion panics there. Saturating is the honest answer
+        // — the frame pump waits "forever", which is what such a deadline
+        // means — and it keeps hostile numbers from aborting the process.
+        Some(Duration::try_from_secs_f64(deadline.max(now_ms) / 1000.0).unwrap_or(Duration::MAX))
     }
 }
 
@@ -1109,6 +1114,60 @@ button { opacity: 1; animation: fade 1000ms linear infinite; }
             let _ = state.is_active(now);
             let _ = state.sample(now);
         }
+    }
+
+    // The companion to the test above: a deadline that is *finite* but far
+    // beyond what a `Duration` can hold. A `calc()`-sized delay (`1e30s`)
+    // sails past the `is_finite` guard, so only a fallible conversion keeps
+    // this from aborting the frame pump.
+    //
+    // Mutation check: build the deadline with `Duration::from_secs_f64`
+    // instead of `try_from_secs_f64(..).unwrap_or(Duration::MAX)` and both
+    // arms panic with "can not convert float seconds to Duration: value is
+    // either too big or NaN".
+    #[test]
+    fn next_deadline_never_panics_on_a_huge_finite_deadline() {
+        // (a) the transition arm: `now_ms < start_ms`, so the deadline is the
+        // transition's own out-of-range start instant.
+        let css = "\
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; transition: opacity 200ms 1e30s linear; }
+button:hover { opacity: 0; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hovered = style_of(&sheet, PseudoStates::HOVER);
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &hovered, Duration::ZERO, &sheet);
+        assert_eq!(
+            state.transition_count(),
+            1,
+            "the huge delay must still start a transition, or this proves nothing"
+        );
+        let deadline = state.next_deadline(Duration::ZERO);
+        assert_eq!(
+            deadline,
+            Some(Duration::MAX),
+            "an out-of-range deadline saturates rather than panicking"
+        );
+
+        // (b) the animation arm: `Phase::Before`'s `start_ms + delay_ms()`.
+        let css = "\
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; animation: fade 1s linear 1e30s 1 normal both; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        assert_eq!(
+            state.animation_count(),
+            1,
+            "the huge delay must still bind an animation, or this proves nothing"
+        );
+        assert_eq!(state.next_deadline(Duration::ZERO), Some(Duration::MAX));
     }
 
     use crate::BUNDLED_ADWAITA_LIGHT;
