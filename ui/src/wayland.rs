@@ -126,6 +126,13 @@ pub struct AppState {
     /// again while one is pending multiplies the `done` events the compositor
     /// sends and turns a smooth animation into a repaint storm.
     frame_pending: bool,
+    /// The clock reading [`repaint`](LayerWindow::repaint) requested the
+    /// currently-outstanding frame callback at, if any.
+    ///
+    /// Compared against [`FRAME_CALLBACK_DEADLINE`] so an unmapped, occluded
+    /// or output-off surface that will never actually get a `done` cannot
+    /// leave `frame_pending` stuck `true` forever.
+    frame_requested_at: Option<Duration>,
 }
 
 impl AppState {
@@ -149,6 +156,7 @@ impl AppState {
             button,
             clock,
             frame_pending: false,
+            frame_requested_at: None,
         }
     }
 
@@ -173,6 +181,19 @@ impl AppState {
     /// still down, and coming back must re-arm `:active`.
     fn on_pointer_leave(&mut self) {
         self.update_states(false, false);
+    }
+
+    /// Forget an outstanding frame callback request.
+    ///
+    /// Called wherever a `done` for it has become unlikely or moot: the
+    /// surface left every output, the compositor closed it, or it just got
+    /// reconfigured. None of these guarantee the compositor will never send
+    /// `done` for a callback requested before them, but treating it as
+    /// abandoned is always safe -- worst case, [`LayerWindow::repaint`] asks
+    /// for a fresh one it did not strictly need.
+    fn clear_frame_pending(&mut self) {
+        self.frame_pending = false;
+        self.frame_requested_at = None;
     }
 
     /// A pointer button changed. Only BTN_LEFT drives `:active` -- a right
@@ -301,7 +322,11 @@ impl LayerWindow {
     /// # Errors
     ///
     /// [`LayerWindowError`] for a failed connection, a missing global, a
-    /// failed shm allocation or a failed dispatch.
+    /// failed shm or Skia surface allocation, a failed dispatch, the
+    /// compositor closing the surface before its first `configure`, or that
+    /// `configure` not arriving within [`CONFIGURE_TIMEOUT`]. Never
+    /// [`LayerWindowError::NoFont`] -- that variant is for a caller's own
+    /// font lookup before it has a [`FontDatabase`] to hand `open` at all.
     pub fn open(
         sheet: CompiledSheet,
         mut fonts: FontDatabase,
@@ -444,9 +469,23 @@ impl LayerWindow {
         self.surface
             .attach(Some(self.buffers.wl_buffer(index)), 0, 0);
         self.surface.damage_buffer(0, 0, width, height);
+        let now = self.state.clock.now();
+        if self.state.frame_pending
+            && frame_pending_is_stale(self.state.frame_requested_at, now, FRAME_CALLBACK_DEADLINE)
+        {
+            tracing::warn!(
+                ?now,
+                requested_at = ?self.state.frame_requested_at,
+                "a frame callback has been outstanding past the deadline; \
+                 resuming animation without it"
+            );
+            self.state.frame_pending = false;
+            self.state.frame_requested_at = None;
+        }
         if should_request_frame(self.state.button.is_animating(), self.state.frame_pending) {
             self.surface.frame(&self.qh, ());
             self.state.frame_pending = true;
+            self.state.frame_requested_at = Some(now);
             tracing::trace!(
                 now = ?self.state.clock.now(),
                 "requested a frame callback: the widget is animating"
@@ -520,6 +559,35 @@ fn select_paint_slot(released: &mut Vec<BufferSlot>, slots: &mut SlotPool) -> Op
 /// worth testing without a live compositor.
 fn should_request_frame(animating: bool, frame_pending: bool) -> bool {
     animating && !frame_pending
+}
+
+/// How long a `wl_surface.frame` callback may stay outstanding before it is
+/// treated as never going to arrive.
+///
+/// A callback fires on the next time the surface is actually presented; a
+/// surface that is unmapped, fully occluded or whose output got turned off
+/// may never reach that point, and `wl_callback.done` is then simply never
+/// sent. Without a cap, `frame_pending` would stay `true` forever and
+/// [`should_request_frame`] would refuse every future request, permanently
+/// stalling the animation even after the surface becomes visible again. Two
+/// seconds is far past any real compositor's frame cadence, so this only
+/// ever fires on the genuinely-stuck case.
+const FRAME_CALLBACK_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Whether an outstanding frame callback requested at `requested_at` has
+/// been waiting at least `deadline` as of `now` -- and so should be given up
+/// on rather than waited for further.
+///
+/// `now` and `requested_at` are the same [`Clock`](crate::anim::Clock)'s
+/// readings, so `now < requested_at` cannot happen outside a clock that was
+/// rewound; `saturating_sub` keeps that hostile case a `false`, not a panic.
+#[must_use]
+fn frame_pending_is_stale(
+    requested_at: Option<Duration>,
+    now: Duration,
+    deadline: Duration,
+) -> bool {
+    requested_at.is_some_and(|at| now.saturating_sub(at) >= deadline)
 }
 
 /// `Connection::flush`/`read` report a `WaylandError`, which is `io::Error`
@@ -654,15 +722,46 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for AppState {
                 layer_surface.ack_configure(serial);
                 state.configured = Some((width, height));
                 state.dirty = true;
+                // A reconfigure invalidates whatever the outstanding
+                // callback (if any) was requested against.
+                state.clear_frame_pending();
             }
-            zwlr_layer_surface_v1::Event::Closed => state.closed = true,
+            zwlr_layer_surface_v1::Event::Closed => {
+                state.closed = true;
+                state.clear_frame_pending();
+            }
             _ => {}
         }
     }
 }
 
 delegate_noop!(AppState: ignore wl_compositor::WlCompositor);
-delegate_noop!(AppState: ignore wl_surface::WlSurface);
+/// Whether a `wl_surface` event means an outstanding frame callback should
+/// be forgotten: the surface left every output it was on, which typically
+/// means it is no longer actually presented, so a `done` for a callback
+/// requested before that point may never arrive.
+///
+/// Every other `wl_surface` event is uninteresting (M1 never dispatched any
+/// of them).
+#[must_use]
+fn wl_surface_event_forgets_frame_pending(event: &wl_surface::Event) -> bool {
+    matches!(event, wl_surface::Event::Leave { .. })
+}
+
+impl Dispatch<wl_surface::WlSurface, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _surface: &wl_surface::WlSurface,
+        event: wl_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if wl_surface_event_forgets_frame_pending(&event) {
+            state.clear_frame_pending();
+        }
+    }
+}
 delegate_noop!(AppState: ignore wl_shm::WlShm);
 delegate_noop!(AppState: ignore wl_shm_pool::WlShmPool);
 impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for AppState {
@@ -701,7 +800,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for AppState {
         _qh: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event {
-            state.frame_pending = false;
+            state.clear_frame_pending();
             let changed = state.button.tick();
             if changed || state.button.is_animating() {
                 state.dirty = true;
@@ -714,6 +813,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for AppState {
 mod tests {
     use super::{
         AppState, BTN_LEFT, CONFIGURE_TIMEOUT, LayerWindowError, select_paint_slot, wait_bounded,
+        wl_surface,
     };
     use crate::BUNDLED_ADWAITA_LIGHT;
     use crate::anim::Clock;
@@ -1023,6 +1123,93 @@ mod tests {
         assert!(
             state.clock.now() < std::time::Duration::from_secs(1),
             "the client's clock is created with the state, so it starts near zero"
+        );
+    }
+
+    // Mutation check: drop the `>=` deadline comparison (or flip it to `>`)
+    // and a callback exactly at the deadline, or one that never expires at
+    // all, stops being recognised as stale.
+    #[test]
+    fn a_frame_callback_outstanding_past_the_deadline_is_stale() {
+        use super::{FRAME_CALLBACK_DEADLINE, frame_pending_is_stale};
+
+        assert!(
+            !frame_pending_is_stale(None, Duration::from_secs(10), FRAME_CALLBACK_DEADLINE),
+            "no callback was ever requested -- nothing to give up on"
+        );
+        let requested_at = Duration::from_secs(5);
+        assert!(
+            !frame_pending_is_stale(
+                Some(requested_at),
+                requested_at + FRAME_CALLBACK_DEADLINE - Duration::from_millis(1),
+                FRAME_CALLBACK_DEADLINE
+            ),
+            "one millisecond under the deadline must not be stale yet"
+        );
+        assert!(frame_pending_is_stale(
+            Some(requested_at),
+            requested_at + FRAME_CALLBACK_DEADLINE,
+            FRAME_CALLBACK_DEADLINE
+        ));
+        // A clock that reads earlier than the request (only possible with a
+        // rewound clock) must not panic on the subtraction.
+        assert!(!frame_pending_is_stale(
+            Some(requested_at),
+            Duration::ZERO,
+            FRAME_CALLBACK_DEADLINE
+        ));
+    }
+
+    // Mutation check: drop any one of the three `clear_frame_pending` calls
+    // this test exercises (configure, closed, or `wl_surface` leave) and its
+    // assertion for that path stops seeing `frame_pending` reset, which is
+    // exactly the stuck-forever bug a compositor that stops delivering
+    // `wl_callback.done` after unmapping/occluding/turning off the output
+    // would trigger.
+    #[test]
+    fn configure_closed_and_surface_leave_all_forget_an_outstanding_frame_callback() {
+        fn armed() -> AppState {
+            let mut state = state();
+            state.frame_pending = true;
+            state.frame_requested_at = Some(Duration::from_secs(1));
+            state
+        }
+
+        // `clear_frame_pending` itself, the one place all three dispatch
+        // arms (configure, closed, `wl_surface` leave) route through.
+        let mut state = armed();
+        state.clear_frame_pending();
+        assert!(!state.frame_pending);
+        assert!(state.frame_requested_at.is_none());
+
+        // `zwlr_layer_surface_v1::Event::Configure`'s and `::Closed`'s
+        // dispatch bodies are exercised end to end by
+        // `the_configure_wait_is_bounded` and
+        // `a_closed_surface_ends_the_configure_wait_immediately` already
+        // (both drive real protocol bytes through `wait_bounded`), which is
+        // this codebase's existing pattern for that dispatch impl. What is
+        // new here, and needs its own coverage, is that a `wl_surface`
+        // event actually reaches `clear_frame_pending` -- checked directly
+        // against the predicate the dispatch impl matches on, since
+        // constructing a live `wl_surface::WlSurface` proxy needs a real
+        // compositor round trip this test's silent socket cannot provide.
+        use wayland_client::Proxy as _;
+        use wayland_client::protocol::wl_output;
+        let (conn, _queue, _peer) = silent_connection();
+        let null_output =
+            wl_output::WlOutput::from_id(&conn, wayland_client::backend::ObjectId::null())
+                .expect("a null object id constructs an (unusable, unbound) proxy value");
+        assert!(
+            super::wl_surface_event_forgets_frame_pending(&wl_surface::Event::Leave {
+                output: null_output.clone()
+            }),
+            "a Leave event must forget an outstanding frame callback"
+        );
+        assert!(
+            !super::wl_surface_event_forgets_frame_pending(&wl_surface::Event::Enter {
+                output: null_output
+            }),
+            "Enter is not Leave and must not be treated as one"
         );
     }
 }
