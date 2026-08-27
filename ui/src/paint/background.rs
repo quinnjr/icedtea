@@ -224,11 +224,55 @@ fn radial_radii(
     }
 }
 
+/// The current clip's bounds, mapped back into the coordinate space the
+/// caller draws in.
+///
+/// `Canvas::clip_bounds` is in device pixels and is always intersected with
+/// the surface rectangle, so this is a *finite* superset of every pixel a
+/// draw call can touch. `None` means the CTM is singular, so nothing this
+/// function's caller draws could land anywhere.
+fn drawable_bounds(canvas: &Canvas<'_>) -> Option<Rect> {
+    let device = canvas.clip_bounds();
+    let inverse = canvas.total_matrix().invert()?;
+    // Under a rotation the inverse-mapped rect is the quad's bounding box,
+    // which is still a superset -- exactly what a loop bound needs.
+    let local = inverse.map_rect(&device);
+    Some(Rect::new(
+        local.left,
+        local.top,
+        local.right - local.left,
+        local.bottom - local.top,
+    ))
+}
+
+/// The overlap of `a` and `b`, or `None` when they do not overlap.
+///
+/// A non-finite edge propagates into a non-positive extent, which
+/// `Rect::is_empty` rejects, so a NaN or infinite input yields `None`.
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = a.right().min(b.right());
+    let bottom = a.bottom().min(b.bottom());
+    let out = Rect::new(x, y, right - x, bottom - y);
+    (!out.is_empty() && x.is_finite() && y.is_finite()).then_some(out)
+}
+
 /// Fill `clip` with `gradient`, sized against `origin`.
 ///
 /// Axis-aligned linear gradients are filled band-by-band -- one `draw_rect`
 /// per constant row or column -- which is exactly M1's model and keeps the
-/// gate's band assertions exact. Everything else samples per pixel.
+/// gate's band assertions exact. Everything else samples per pixel, in runs
+/// of equal colour.
+///
+/// # Bounded work
+///
+/// Every loop below is driven by the *painted* rectangle, which is `clip`
+/// intersected with [`drawable_bounds`] -- never by `clip` alone.
+/// `Rect::is_empty` accepts `+inf` and huge finite extents, so a CSS-reachable
+/// clip of `1e9` px (or an infinite one) would otherwise spin up to
+/// `i32::MAX` iterations, each issuing a `draw_rect`: a hang, not a panic.
+/// Clamping to the surface makes the cost proportional to visible pixels.
 pub fn paint_gradient(
     canvas: &mut Canvas<'_>,
     gradient: &Gradient,
@@ -241,6 +285,12 @@ pub fn paint_gradient(
     if origin.is_empty() || clip.is_empty() {
         return;
     }
+    let Some(bounds) = drawable_bounds(canvas) else {
+        return;
+    };
+    let Some(clip) = intersect(clip, bounds) else {
+        return;
+    };
     let len_ctx = &LengthCtx {
         percent_basis: Some(origin.width),
         ..cx.base_length_ctx()
@@ -298,13 +348,42 @@ pub fn paint_gradient(
         return;
     }
 
+    // Per-pixel sampling, emitted as horizontal runs of the identical colour.
+    // The sampled colour of every pixel is unchanged -- only the number of
+    // `draw_rect` calls drops, from one per pixel to one per colour change.
     for row in y0..y1 {
         let py = row as f32 + 0.5 - origin.y;
+        let mut run_start = x0;
+        let mut run_color: Option<Rgba> = None;
         for col in x0..x1 {
             let px = col as f32 + 0.5 - origin.x;
             let t = gradient_t(gradient, origin.width, origin.height, px, py, len_ctx);
             let color = gradient.color_at(t, &color_ctx, len_ctx);
-            band(canvas, Rect::new(col as f32, row as f32, 1.0, 1.0), color);
+            match run_color {
+                Some(previous) if previous == color => {}
+                Some(previous) => {
+                    let width = (col - run_start) as f32;
+                    band(
+                        canvas,
+                        Rect::new(run_start as f32, row as f32, width, 1.0),
+                        previous,
+                    );
+                    run_start = col;
+                    run_color = Some(color);
+                }
+                None => {
+                    run_start = col;
+                    run_color = Some(color);
+                }
+            }
+        }
+        if let Some(previous) = run_color {
+            let width = (x1 - run_start) as f32;
+            band(
+                canvas,
+                Rect::new(run_start as f32, row as f32, width, 1.0),
+                previous,
+            );
         }
     }
 }
@@ -379,12 +458,32 @@ pub fn layer_tile(
     }
 }
 
+/// The most tile copies one axis may emit.
+///
+/// `background-size` is CSS-reachable at any positive magnitude, and
+/// `layer_tile` only rejects a non-finite or non-positive step -- so
+/// `background-size: 0.01px; background-repeat: repeat` over a 100px box
+/// asks for 10 000 copies per axis (100 million rects, ~1.6 GB, and worse
+/// as the size shrinks). Two copies inside the same device pixel cannot be
+/// told apart on the device grid, so each axis emits at most one copy per
+/// device pixel of clip, plus one at each end, and never more than
+/// `MAX_TILES_PER_AXIS` however large the clip claims to be.
+const MAX_TILES_PER_AXIS: i32 = 4096;
+
+/// The most tile copies both axes together may emit.
+///
+/// The per-axis cap alone still allows `MAX_TILES_PER_AXIS` squared.
+const MAX_TILES_TOTAL: usize = 1 << 16;
+
 /// Every copy of `tile` that intersects `clip`, per `repeat`.
+///
+/// The returned vector is bounded by [`MAX_TILES_TOTAL`] for every input,
+/// including a sub-device-pixel step or an infinite clip.
 #[must_use]
 pub fn tile_positions(tile: &Tile, clip: Rect, repeat: RepeatStyle) -> Vec<Rect> {
     let repeats = |axis: Keyword| matches!(axis, Keyword::Repeat | Keyword::Round | Keyword::Space);
     let count = |start: f32, step: f32, lo: f32, hi: f32| -> (i32, i32) {
-        if !(step.is_finite() && step > 0.0) {
+        if !(step.is_finite() && step > 0.0) || !(start.is_finite() && lo.is_finite()) {
             return (0, 0);
         }
         let first = ((lo - start) / step).floor() as i32;
@@ -393,8 +492,20 @@ pub fn tile_positions(tile: &Tile, clip: Rect, repeat: RepeatStyle) -> Vec<Rect>
         // whole extra step past `hi` with zero overlap. `.floor()` keeps the
         // last index whose start is at-or-before `hi` (still touching-
         // inclusive when the division is exact, e.g. the y axis below).
-        let last = ((hi - start) / step).floor() as i32;
-        (first, last.max(first))
+        // `as i32` saturates, so a non-finite `hi` lands on `i32::MAX`; the
+        // cap below is what actually bounds the loop.
+        let last = (((hi - start) / step).floor() as i32).max(first);
+        let span = hi - lo;
+        let cap = if span.is_finite() {
+            // `as i64` saturates too, so a huge finite span is safe here.
+            i32::try_from((span.ceil() as i64).clamp(0, i64::from(MAX_TILES_PER_AXIS)))
+                .unwrap_or(MAX_TILES_PER_AXIS)
+                .saturating_add(2)
+                .min(MAX_TILES_PER_AXIS)
+        } else {
+            MAX_TILES_PER_AXIS
+        };
+        (first, last.min(first.saturating_add(cap - 1)))
     };
 
     let (ix0, ix1) = if repeats(repeat.x) {
@@ -409,8 +520,11 @@ pub fn tile_positions(tile: &Tile, clip: Rect, repeat: RepeatStyle) -> Vec<Rect>
     };
 
     let mut out = Vec::new();
-    for iy in iy0..=iy1 {
+    'rows: for iy in iy0..=iy1 {
         for ix in ix0..=ix1 {
+            if out.len() >= MAX_TILES_TOTAL {
+                break 'rows;
+            }
             out.push(Rect::new(
                 tile.step_x.mul_add(ix as f32, tile.rect.x),
                 tile.step_y.mul_add(iy as f32, tile.rect.y),
@@ -450,14 +564,19 @@ pub fn blend_mode_for(keyword: Keyword) -> BlendMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tile, blend_mode_for, layer_tile, tile_positions};
+    use super::{
+        MAX_TILES_TOTAL, Tile, blend_mode_for, gradient_t, layer_tile, paint_gradient,
+        tile_positions,
+    };
     use crate::css::cascade::CompiledSheet;
     use crate::css::computed::{ComputedStyle, ResolveEnv};
     use crate::css::node::Node;
     use crate::css::registry::Prop;
     use crate::css::select::MatchCx;
+    use std::rc::Rc;
+
     use crate::css::value::RepeatStyle;
-    use crate::css::value::{Keyword, Rgba};
+    use crate::css::value::{Gradient, Image, Keyword, Rgba};
     use crate::layout::{Allocation, Rect};
     use crate::paint::{ImageCache, PaintCx, paint_backgrounds, radii_for_box};
     use crate::text::FontDatabase;
@@ -670,6 +789,181 @@ mod tests {
         ] {
             let _ = painted(css);
         }
+    }
+
+    /// The hostile floats every geometry-consuming function in this part is
+    /// fuzzed over (Global Constraints, "Never-panic discipline").
+    const HOSTILE: [f32; 10] = [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        -1.0e30,
+        -1.0,
+        -0.0,
+        0.0,
+        0.5,
+        1.0,
+        1.0e30,
+    ];
+
+    /// The `Gradient` a one-image `background-image` declaration computes to.
+    fn gradient_of(image: &str) -> Rc<Gradient> {
+        let sheet = CompiledSheet::compile(&format!("button {{ background-image: {image} }}"));
+        let window = Node::new("window");
+        let button = Node::new("button");
+        window.append_child(&button);
+        let env = ResolveEnv::default();
+        let mut cx = MatchCx::new();
+        let style = ComputedStyle::resolve_chain(&sheet, &button, &env, &mut cx);
+        match style.background_layers().pop().expect("one layer").image {
+            Image::Gradient(gradient) => gradient,
+            other => panic!("{image} did not compute to a gradient: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gradient_t_and_color_at_survive_every_hostile_float() {
+        // The battery the degenerate-box test's comment always claimed:
+        // NaN, +/-inf, negatives, signed zero and 1e30 are fed *directly*
+        // into `gradient_t` as the box size and the sample point, and the
+        // `t` that comes back is fed straight into `color_at`. Mutation
+        // check: dropping either `is_finite` guard in `gradient_t` (the
+        // linear `len2` one or the radial `rx`/`ry` one) makes `color_at`
+        // receive a NaN `t` and the stop search index out of bounds.
+        let env = ResolveEnv::default();
+        let sheet = CompiledSheet::compile("button { color: #000 }");
+        let mut fonts = FontDatabase::probe_only();
+        let mut images = ImageCache::new();
+        let cx = PaintCx {
+            env: &env,
+            colors: &sheet.colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let len_ctx = cx.base_length_ctx();
+        let color_ctx = cx.color_ctx(Rgba::TRANSPARENT);
+
+        for image in [
+            "linear-gradient(to top, #f6f5f4 2px, #fbfafa)",
+            "linear-gradient(45deg, #f00, #00f)",
+            "radial-gradient(circle closest-side at 0 0, #f00, #00f)",
+            "radial-gradient(ellipse farthest-corner, #f00, #0f0 50%, #00f)",
+            "conic-gradient(from 30deg, #f00, #fff 50%, #f00)",
+            "repeating-linear-gradient(#f00 0, #00f 1px)",
+        ] {
+            let gradient = gradient_of(image);
+            for w in HOSTILE {
+                for h in HOSTILE {
+                    for p in HOSTILE {
+                        let t = gradient_t(&gradient, w, h, p, p, &len_ctx);
+                        let _ = gradient.color_at(t, &color_ctx, &len_ctx);
+                        let t = gradient_t(&gradient, w, h, p, 0.5, &len_ctx);
+                        let _ = gradient.color_at(t, &color_ctx, &len_ctx);
+                    }
+                }
+            }
+            // `t` itself, unfiltered.
+            for t in HOSTILE {
+                let _ = gradient.color_at(t, &color_ctx, &len_ctx);
+            }
+        }
+    }
+
+    #[test]
+    fn paint_gradient_clamps_a_hostile_clip_to_the_surface() {
+        // Mutation check: removing the `drawable_bounds` intersection makes
+        // the `1e9` and `INFINITY` clips below loop up to `i32::MAX` times,
+        // one `draw_rect` each -- this test then never returns.
+        let env = ResolveEnv::default();
+        let sheet = CompiledSheet::compile("button { color: #000 }");
+        let mut fonts = FontDatabase::probe_only();
+        let mut images = ImageCache::new();
+        let mut cx = PaintCx {
+            env: &env,
+            colors: &sheet.colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let mut surface = Surface::new_raster_n32_premul(8, 8).expect("raster surface");
+        surface.canvas().clear(Color::TRANSPARENT);
+
+        let hostile = [
+            Rect::new(0.0, 0.0, 1.0e9, 1.0e9),
+            Rect::new(0.0, 0.0, f32::INFINITY, f32::INFINITY),
+            Rect::new(-1.0e9, -1.0e9, f32::INFINITY, f32::INFINITY),
+            Rect::new(f32::NAN, 0.0, 8.0, 8.0),
+            Rect::new(0.0, 0.0, f32::NAN, 8.0),
+            Rect::new(0.0, 0.0, -8.0, -8.0),
+        ];
+        for image in [
+            "linear-gradient(to top, #f00, #00f)",
+            "linear-gradient(to right, #f00, #00f)",
+            "radial-gradient(#f00, #00f)",
+            "conic-gradient(#f00, #00f)",
+        ] {
+            let gradient = gradient_of(image);
+            for clip in hostile {
+                for origin in hostile {
+                    let mut canvas = surface.canvas();
+                    paint_gradient(
+                        &mut canvas,
+                        &gradient,
+                        origin,
+                        clip,
+                        &mut cx,
+                        Rgba::TRANSPARENT,
+                        BlendMode::SrcOver,
+                    );
+                }
+            }
+        }
+        // The surface is still a surface: nothing above wrote out of bounds.
+        assert!(surface.pixel_buffer().get_pixel(7, 7).is_some());
+    }
+
+    #[test]
+    fn a_sub_pixel_background_size_cannot_explode_the_tile_list() {
+        // `background-size: 0.01px; background-repeat: repeat` over a 100x100
+        // origin box asks for 10 000 copies per axis -- 100 million rects.
+        // Mutation check: dropping the per-axis cap in `tile_positions`
+        // brings this assertion (and ~1.6 GB of allocation) down with it.
+        let sheet = CompiledSheet::compile(
+            "button { background-image: image(#f00); background-size: 0.01px; \
+             background-repeat: repeat }",
+        );
+        let window = Node::new("window");
+        let button = Node::new("button");
+        window.append_child(&button);
+        let env = ResolveEnv::default();
+        let mut cx = MatchCx::new();
+        let style = ComputedStyle::resolve_chain(&sheet, &button, &env, &mut cx);
+        let layer = style.background_layers().pop().expect("one layer");
+        let ctx = style.length_ctx(&env, None);
+        let origin = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let tile = layer_tile(&layer, origin, None, &ctx);
+        assert!(
+            (tile.step_x - 0.01).abs() < 1.0e-6,
+            "the CSS step survives; only the copy count is capped"
+        );
+
+        let rects = tile_positions(&tile, origin, layer.repeat);
+        assert!(
+            rects.len() <= MAX_TILES_TOTAL,
+            "{} tiles emitted for a 0.01px step",
+            rects.len()
+        );
+        // One copy per device pixel of clip, plus an end at each side.
+        assert!(rects.len() <= 102 * 102, "{} tiles emitted", rects.len());
+
+        // An infinite clip is bounded too.
+        let unbounded = tile_positions(
+            &tile,
+            Rect::new(0.0, 0.0, f32::INFINITY, f32::INFINITY),
+            layer.repeat,
+        );
+        assert!(unbounded.len() <= MAX_TILES_TOTAL);
     }
 
     #[test]
