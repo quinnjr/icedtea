@@ -2539,7 +2539,7 @@ mod review_tests {
             (400.0, "bolder", 700.0),
             (400.0, "lighter", 100.0),
             (700.0, "bolder", 900.0),
-            // The case the 700/100 stopgap got wrong: `bolder` under a bold
+            // The case wave B's fixed 700/100 mapping got wrong: `bolder` under a bold
             // parent must not come out *lighter* than the parent.
             (700.0, "lighter", 400.0),
             (900.0, "bolder", 900.0),

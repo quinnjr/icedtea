@@ -985,10 +985,13 @@ impl TextStyle {
             }
             LineHeight::Number(_) => metrics.line_height,
             // A `<percentage>` line-height resolves against the element's
-            // own `font-size`. The computed pass leaves it a percentage
-            // (its `LengthCtx` carries no basis there), and `absolute_px`
-            // only accepts `Abs { unit: Px }` -- so `line-height: 150%` was
-            // silently dropped and rendered as `normal`.
+            // own `font-size`. `ComputedStyle::resolve` does that now (H4),
+            // so nothing that came through the cascade reaches this arm --
+            // but `line_height` is a public field, and a hand-built
+            // `TextStyle` carrying a percentage must not silently render as
+            // `normal`, which is what happened before either fix: the
+            // computed pass left the percentage alone and `absolute_px`
+            // only accepts `Abs { unit: Px }`.
             LineHeight::Length(Length::Percent(fraction)) if fraction.is_finite() => {
                 fraction.max(0.0) * self.size_px
             }
@@ -1048,8 +1051,11 @@ mod tests {
     use crate::css::cascade::CompiledSheet;
     use crate::css::computed::{ComputedStyle, ResolveEnv};
     use crate::css::node::Node;
+    use crate::css::registry::Prop;
     use crate::css::select::MatchCx;
-    use crate::css::value::{FontFamily, FontStyle, GenericFamily, Keyword, LineHeight};
+    use crate::css::value::{
+        FontFamily, FontStyle, GenericFamily, Keyword, Length, LineHeight, Value,
+    };
     use std::rc::Rc;
 
     fn style_for(css: &str) -> ComputedStyle {
@@ -1152,14 +1158,31 @@ mod tests {
             TextStyle::from_computed(&style_for("label { font-size: 20px; line-height: 26px; }"));
         assert_eq!(absolute.line_height_px(&metrics), 26.0);
 
-        // F78: a percentage resolves against the element's own font-size.
-        // The computed pass leaves it a percentage (no basis in its
-        // `LengthCtx`), and `absolute_px` only accepts `Abs { unit: Px }`,
-        // so this silently fell through to the face's `normal` 18px.
-        // Mutation check: drop the `Length::Percent` arm and this reads 18.
-        let percent =
-            TextStyle::from_computed(&style_for("label { font-size: 20px; line-height: 150%; }"));
+        // F78/H4: a percentage resolves against the element's own font-size,
+        // and it is resolved by the *computed* pass -- which is where the
+        // contract's resolution order puts it -- so what reaches the text
+        // stack is already an absolute length.
+        // Mutation check: drop the `line-height` percentage arm in
+        // `computed.rs`'s `resolve_value` and the assertion on the computed
+        // value below fails.
+        let computed = style_for("label { font-size: 20px; line-height: 150%; }");
+        assert_eq!(
+            computed.raw(Prop::LineHeight),
+            &Value::LineHeight(LineHeight::Length(Length::px(30.0))),
+            "a percentage line-height is absolute by computed time"
+        );
+        let percent = TextStyle::from_computed(&computed);
         assert_eq!(percent.line_height_px(&metrics), 30.0);
+
+        // And the belt-and-braces arm still holds for a hand-built style
+        // that was never near the cascade.
+        // Mutation check: drop the `Length::Percent` arm in
+        // `line_height_px` and this reads the face's 18.
+        let by_hand = TextStyle {
+            line_height: LineHeight::Length(Length::Percent(1.5)),
+            ..percent
+        };
+        assert_eq!(by_hand.line_height_px(&metrics), 30.0);
     }
 
     /// F77/H1: an explicit `font-width` wins over `font-stretch` even when
