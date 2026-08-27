@@ -6,12 +6,15 @@
 //! diagonals, which is exactly what GTK draws.
 
 use skia_rs_safe::canvas::{Canvas, ClipOp};
+use skia_rs_safe::core::IRect;
 use skia_rs_safe::path::{DashEffect, PathEffectRef};
 
-use crate::css::value::{Keyword, Rgba};
-use crate::layout::Allocation;
+use crate::css::value::{
+    BorderImageSlice, BorderImageWidthSide, Image, Keyword, NumberOrPercent, RepeatStyle, Rgba,
+};
+use crate::layout::{Allocation, Rect};
 use crate::paint::geometry::{Side, inner_radii, rounded_ring_path, side_wedge_path};
-use crate::paint::{fill_paint, rounded_rect_path};
+use crate::paint::{PaintCx, fill_paint, rounded_rect_path};
 
 /// Whether a `border-style` keyword paints anything at all.
 #[must_use]
@@ -149,6 +152,181 @@ fn paint_one_side(
     }
 }
 
+/// Paint a nine-patch `border-image` over the border box.
+///
+/// Returns `false` when the source cannot be resolved to pixels, so the
+/// caller falls back to [`paint_borders`]. Only `url()` sources have pixels
+/// in M2; gradients and `-gtk-*` images as border-image sources are M4.
+pub fn paint_border_image(
+    canvas: &mut Canvas<'_>,
+    alloc: &Allocation,
+    source: &Image,
+    slice: &BorderImageSlice,
+    widths: &[BorderImageWidthSide; 4],
+    repeat: RepeatStyle,
+    cx: &mut PaintCx<'_>,
+) -> bool {
+    let Image::Url(url) = source else {
+        return false;
+    };
+    let Some((iw, ih)) = cx
+        .images
+        .get(url)
+        .map(|img| (img.width() as f32, img.height() as f32))
+    else {
+        return false;
+    };
+    if iw <= 0.0 || ih <= 0.0 {
+        return false;
+    }
+
+    // Slice offsets in source pixels, TRBL.
+    let slice_px = |value: NumberOrPercent, basis: f32| -> f32 {
+        match value {
+            NumberOrPercent::Number(n) if n.is_finite() => n.clamp(0.0, basis),
+            NumberOrPercent::Percent(p) if p.is_finite() => (p * basis).clamp(0.0, basis),
+            _ => 0.0,
+        }
+    };
+    let st = slice_px(slice.sides[0], ih);
+    let sr = slice_px(slice.sides[1], iw);
+    let sb = slice_px(slice.sides[2], ih);
+    let sl = slice_px(slice.sides[3], iw);
+
+    // Destination widths, TRBL: `auto` uses the slice, a number scales the
+    // used border width, a length resolves directly.
+    let ctx = cx.base_length_ctx();
+    let dest = |side: &BorderImageWidthSide, used: f32, slice: f32| -> f32 {
+        match side {
+            BorderImageWidthSide::Auto => slice,
+            BorderImageWidthSide::Number(n) if n.is_finite() => n * used,
+            BorderImageWidthSide::Length(len) => len.resolve(&ctx).unwrap_or(used),
+            BorderImageWidthSide::Number(_) => used,
+        }
+    };
+    let dt = dest(&widths[0], alloc.border[0], st);
+    let dr = dest(&widths[1], alloc.border[1], sr);
+    let db = dest(&widths[2], alloc.border[2], sb);
+    let dl = dest(&widths[3], alloc.border[3], sl);
+
+    let outer = alloc.border_box;
+    if outer.is_empty() {
+        return false;
+    }
+
+    // Nine slots: (src IRect, dst Rect, tiles?).
+    let src = |x: f32, y: f32, w: f32, h: f32| {
+        IRect::new(x as i32, y as i32, (x + w) as i32, (y + h) as i32)
+    };
+    let mid_w = (iw - sl - sr).max(0.0);
+    let mid_h = (ih - st - sb).max(0.0);
+    let dmid_w = (outer.width - dl - dr).max(0.0);
+    let dmid_h = (outer.height - dt - db).max(0.0);
+
+    let mut slots: Vec<(IRect, Rect, bool, bool)> = vec![
+        (
+            src(0.0, 0.0, sl, st),
+            Rect::new(outer.x, outer.y, dl, dt),
+            false,
+            false,
+        ),
+        (
+            src(sl, 0.0, mid_w, st),
+            Rect::new(outer.x + dl, outer.y, dmid_w, dt),
+            true,
+            false,
+        ),
+        (
+            src(iw - sr, 0.0, sr, st),
+            Rect::new(outer.right() - dr, outer.y, dr, dt),
+            false,
+            false,
+        ),
+        (
+            src(0.0, st, sl, mid_h),
+            Rect::new(outer.x, outer.y + dt, dl, dmid_h),
+            false,
+            true,
+        ),
+        (
+            src(iw - sr, st, sr, mid_h),
+            Rect::new(outer.right() - dr, outer.y + dt, dr, dmid_h),
+            false,
+            true,
+        ),
+        (
+            src(0.0, ih - sb, sl, sb),
+            Rect::new(outer.x, outer.bottom() - db, dl, db),
+            false,
+            false,
+        ),
+        (
+            src(sl, ih - sb, mid_w, sb),
+            Rect::new(outer.x + dl, outer.bottom() - db, dmid_w, db),
+            true,
+            false,
+        ),
+        (
+            src(iw - sr, ih - sb, sr, sb),
+            Rect::new(outer.right() - dr, outer.bottom() - db, dr, db),
+            false,
+            false,
+        ),
+    ];
+    if slice.fill {
+        slots.push((
+            src(sl, st, mid_w, mid_h),
+            Rect::new(outer.x + dl, outer.y + dt, dmid_w, dmid_h),
+            true,
+            true,
+        ));
+    }
+
+    let tiles_x = matches!(repeat.x, Keyword::Repeat | Keyword::Round | Keyword::Space);
+    let tiles_y = matches!(repeat.y, Keyword::Repeat | Keyword::Round | Keyword::Space);
+    let Some(image) = cx.images.get(url) else {
+        return false;
+    };
+    let mut painted = false;
+    for (src_rect, dst_rect, edge_x, edge_y) in slots {
+        if dst_rect.is_empty() || src_rect.width() <= 0 || src_rect.height() <= 0 {
+            continue;
+        }
+        if (edge_x && tiles_x) || (edge_y && tiles_y) {
+            // Tile the slot with source-sized copies rather than stretching.
+            let step_x = if edge_x && tiles_x {
+                src_rect.width() as f32
+            } else {
+                dst_rect.width
+            };
+            let step_y = if edge_y && tiles_y {
+                src_rect.height() as f32
+            } else {
+                dst_rect.height
+            };
+            let mut y = dst_rect.y;
+            while y < dst_rect.bottom() && step_y > 0.0 {
+                let mut x = dst_rect.x;
+                while x < dst_rect.right() && step_x > 0.0 {
+                    let piece = Rect::new(
+                        x,
+                        y,
+                        step_x.min(dst_rect.right() - x),
+                        step_y.min(dst_rect.bottom() - y),
+                    );
+                    canvas.draw_image_rect(image, Some(&src_rect), &piece.to_skia(), None);
+                    x += step_x;
+                }
+                y += step_y;
+            }
+        } else {
+            canvas.draw_image_rect(image, Some(&src_rect), &dst_rect.to_skia(), None);
+        }
+        painted = true;
+    }
+    painted
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_visible_border_style, paint_borders};
@@ -200,6 +378,97 @@ mod tests {
 
     fn pixel(surface: &Surface, x: i32, y: i32) -> Color {
         surface.pixel_buffer().get_pixel(x, y).expect("pixel")
+    }
+
+    use super::paint_border_image;
+    use crate::css::computed::ResolveEnv;
+    use crate::css::value::{
+        BorderImageSlice, BorderImageWidthSide, Image, NumberOrPercent, RepeatStyle,
+    };
+    use crate::paint::{ImageCache, PaintCx};
+    use crate::text::FontDatabase;
+    use std::collections::HashMap;
+
+    #[test]
+    fn an_unresolvable_border_image_reports_false_so_the_caller_falls_back() {
+        // Contract §8: `false` means "I painted nothing; use paint_borders".
+        // Mutation check: returning `true` unconditionally silently loses
+        // every ordinary border on a theme with a bad border-image URL.
+        let env = ResolveEnv::default();
+        let colors = HashMap::new();
+        let mut fonts = FontDatabase::probe_only();
+        let mut images = ImageCache::new();
+        let mut cx = PaintCx {
+            env: &env,
+            colors: &colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let mut surface = Surface::new_raster_n32_premul(40, 20).expect("raster surface");
+        let mut canvas = surface.canvas();
+        let painted = paint_border_image(
+            &mut canvas,
+            &alloc(40.0, 20.0, [4.0; 4]),
+            &Image::Url("/nonexistent/icedtea-border.png".into()),
+            &BorderImageSlice {
+                sides: [NumberOrPercent::Number(4.0); 4],
+                fill: false,
+            },
+            &[
+                BorderImageWidthSide::Number(1.0),
+                BorderImageWidthSide::Number(1.0),
+                BorderImageWidthSide::Number(1.0),
+                BorderImageWidthSide::Number(1.0),
+            ],
+            RepeatStyle {
+                x: Keyword::Repeat,
+                y: Keyword::Repeat,
+            },
+            &mut cx,
+        );
+        assert!(!painted);
+    }
+
+    #[test]
+    fn image_none_reports_false_without_touching_the_canvas() {
+        let env = ResolveEnv::default();
+        let colors = HashMap::new();
+        let mut fonts = FontDatabase::probe_only();
+        let mut images = ImageCache::new();
+        let mut cx = PaintCx {
+            env: &env,
+            colors: &colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let mut surface = Surface::new_raster_n32_premul(40, 20).expect("raster surface");
+        surface.canvas().clear(Color::TRANSPARENT);
+        {
+            let mut canvas = surface.canvas();
+            assert!(!paint_border_image(
+                &mut canvas,
+                &alloc(40.0, 20.0, [4.0; 4]),
+                &Image::None,
+                &BorderImageSlice {
+                    sides: [NumberOrPercent::Number(0.0); 4],
+                    fill: false,
+                },
+                &[
+                    BorderImageWidthSide::Auto,
+                    BorderImageWidthSide::Auto,
+                    BorderImageWidthSide::Auto,
+                    BorderImageWidthSide::Auto,
+                ],
+                RepeatStyle {
+                    x: Keyword::Stretch,
+                    y: Keyword::Stretch,
+                },
+                &mut cx,
+            ));
+        }
+        assert_eq!(pixel(&surface, 20, 1).alpha(), 0);
     }
 
     #[test]
