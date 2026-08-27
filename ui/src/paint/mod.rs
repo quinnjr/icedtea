@@ -5,6 +5,7 @@ pub mod background;
 pub mod blur;
 pub mod border;
 pub mod geometry;
+pub mod shadow;
 
 use std::collections::HashMap;
 
@@ -22,6 +23,7 @@ pub use border::{is_visible_border_style, paint_border_image, paint_borders};
 pub use geometry::{
     Side, clamp_radii, inner_radii, rounded_rect_path, rounded_ring_path, side_wedge_path,
 };
+pub use shadow::paint_box_shadows;
 
 /// Everything a paint pass needs beyond the node's own style and geometry.
 pub struct PaintCx<'a> {
