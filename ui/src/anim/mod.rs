@@ -608,4 +608,206 @@ button:hover { animation-name: none; }
         assert_eq!(state.animation_count(), 0);
         assert!(state.sample(Duration::from_millis(200)).is_empty());
     }
+
+    // Mutation check: gate transition construction behind
+    // `combined_ms(spec) > 0.0` and `transition_count` reports 0 here --
+    // the contract asks for the transition to be *constructed* and complete
+    // instantly, not special-cased away.
+    #[test]
+    fn a_zero_duration_transition_is_constructed_and_completes_at_once() {
+        let css = "\
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; transition: opacity 0s linear; }
+button:hover { opacity: 0; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &hover, Duration::ZERO, &sheet);
+        assert_eq!(state.transition_count(), 1, "it is constructed");
+        assert!(
+            state.sample(Duration::ZERO).is_empty(),
+            "and finished on the frame it was created"
+        );
+        assert!(!state.is_active(Duration::ZERO));
+    }
+
+    // Mutation check: start interpolating at the style change instead of at
+    // `start_ms` and the 50 ms sample becomes 0.75 rather than 1.0.
+    #[test]
+    fn a_transition_delay_holds_the_old_value_before_it_starts() {
+        let css = "\
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; transition: opacity 200ms linear 100ms; }
+button:hover { opacity: 0; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &hover, Duration::ZERO, &sheet);
+
+        assert_eq!(
+            number(&state.sample(Duration::from_millis(50)), Prop::Opacity),
+            Some(1.0)
+        );
+        // Queried before the transition is sampled past its end: `sample`
+        // permanently prunes a transition once it is finished relative to
+        // the `now` it was called with (see
+        // `next_deadline_is_none_only_when_nothing_is_running`), so asking
+        // this after the 300 ms sample below would see an empty state and
+        // trivially (and wrongly) return `None`.
+        assert_eq!(
+            state.next_deadline(Duration::from_millis(50)),
+            Some(Duration::from_millis(100)),
+            "inside the delay the next interesting instant is the start, not now"
+        );
+        assert_eq!(
+            number(&state.sample(Duration::from_millis(200)), Prop::Opacity),
+            Some(0.5)
+        );
+        assert!(state.sample(Duration::from_millis(300)).is_empty());
+    }
+
+    // Mutation check: clamp the delay non-negative in `delay_ms_of` and the
+    // t = 0 sample becomes 1.0 instead of 0.5.
+    #[test]
+    fn a_negative_transition_delay_starts_part_way_through() {
+        let css = "\
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; transition: opacity 200ms linear -100ms; }
+button:hover { opacity: 0; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &hover, Duration::ZERO, &sheet);
+        assert_eq!(
+            number(&state.sample(Duration::ZERO), Prop::Opacity),
+            Some(0.5)
+        );
+        assert!(state.sample(Duration::from_millis(100)).is_empty());
+    }
+
+    // Mutation check: make `interpolate_prop` fall back to the *new* value
+    // rather than to `discrete`, and the 99 ms sample flips early.
+    #[test]
+    fn a_non_animatable_property_named_explicitly_switches_at_the_half_way_point() {
+        let css = "\
+window { background-color: rgb(255 255 255); }
+button { font-family: \"Alpha\"; transition: font-family 200ms linear; }
+button:hover { font-family: \"Beta\"; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+        assert_ne!(normal.raw(Prop::FontFamily), hover.raw(Prop::FontFamily));
+
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &hover, Duration::ZERO, &sheet);
+
+        let early = state.sample(Duration::from_millis(99));
+        assert_eq!(
+            early.get(Prop::FontFamily),
+            Some(normal.raw(Prop::FontFamily))
+        );
+        let late = state.sample(Duration::from_millis(100));
+        assert_eq!(
+            late.get(Prop::FontFamily),
+            Some(hover.raw(Prop::FontFamily))
+        );
+    }
+
+    // Mutation check: drop the `retain` that prunes transitions no longer
+    // governed and the third style leaves the opacity transition running.
+    #[test]
+    fn a_property_leaving_transition_property_stops_transitioning_at_once() {
+        let css = "\
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; transition: opacity 200ms linear; }
+button:hover { opacity: 0; }
+button:active { opacity: 0.5; transition-property: none; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+        let active = style_of(&sheet, PseudoStates::ACTIVE);
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &hover, Duration::ZERO, &sheet);
+        assert_eq!(state.transition_count(), 1);
+        state.restyle(Some(&hover), &active, Duration::from_millis(100), &sheet);
+        assert_eq!(state.transition_count(), 0);
+        assert!(state.sample(Duration::from_millis(100)).is_empty());
+    }
+
+    // Mutation check: treat every mid-flight change as a reversal and this
+    // run comes back shortened (finishing at 200 ms), failing the 250 ms
+    // assertion which expects it still in flight.
+    #[test]
+    fn retargeting_to_a_third_value_restarts_from_what_is_on_screen() {
+        let css = "\
+window { background-color: rgb(255 255 255); }
+button { opacity: 1; transition: opacity 200ms linear; }
+button:hover { opacity: 0; }
+button:active { opacity: 0.25; }
+";
+        let sheet = CompiledSheet::compile(css);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+        let active = style_of(&sheet, PseudoStates::ACTIVE);
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &hover, Duration::ZERO, &sheet);
+        assert_eq!(
+            number(&state.sample(Duration::from_millis(100)), Prop::Opacity),
+            Some(0.5)
+        );
+
+        // 0.25 is neither the running transition's end (0.0) nor its
+        // reversing anchor (1.0), so this is a retarget, not a reversal.
+        state.restyle(Some(&hover), &active, Duration::from_millis(100), &sheet);
+        assert_eq!(state.transition_count(), 1);
+        assert_eq!(
+            number(&state.sample(Duration::from_millis(200)), Prop::Opacity),
+            Some(0.375),
+            "half way from the 0.5 on screen to 0.25, over a fresh 200 ms"
+        );
+        assert!(
+            state.is_active(Duration::from_millis(250)),
+            "a retarget runs the full duration; it is not shortened"
+        );
+        assert_eq!(
+            number(&state.sample(Duration::from_millis(300)), Prop::Opacity),
+            None
+        );
+    }
+
+    // Mutation check: skip the "already heading there" check in
+    // `update_transitions` and a repeated restyle to the same target restarts
+    // the run, so the 150 ms sample becomes 0.25 instead of 0.25's successor
+    // 0.5 -- i.e. the run visibly stretches.
+    #[test]
+    fn restyling_to_the_target_it_is_already_heading_for_does_not_restart_it() {
+        let sheet = CompiledSheet::compile(FADE_ON_HOVER);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let hover = style_of(&sheet, PseudoStates::HOVER);
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &hover, Duration::ZERO, &sheet);
+        // A restyle that changes nothing about opacity's target.
+        state.restyle(Some(&hover), &hover, Duration::from_millis(100), &sheet);
+        assert_eq!(
+            number(&state.sample(Duration::from_millis(150)), Prop::Opacity),
+            Some(0.25),
+            "still on the original 0..200 ms timeline"
+        );
+        assert!(state.sample(Duration::from_millis(200)).is_empty());
+    }
 }
