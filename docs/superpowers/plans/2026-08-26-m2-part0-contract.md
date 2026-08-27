@@ -109,7 +109,7 @@ pub enum Prop {
 }
 
 pub const N_LONGHANDS: usize = 95;
-pub const N_PROPS: usize = 113;
+pub const N_PROPS: usize = 113; // amended to 114 by E14: the `all` shorthand
 ```
 
 `FontWidth` and `FontStretch` are two distinct rows with identical grammar and
@@ -1278,6 +1278,13 @@ hex in the screencopy tolerance derivation (`#3584e4`, `#1c6fd4`, `#1961b9`).
 | `src/app.rs` | 4 of 11 | the 4 going through `button_style`/`headerbar_min_height` touch `ComputedStyle` fields | same values (`#cdc7c2`, padding `[4,9,4,9]`, layering/tie-break outcomes). The other **7** (theme-dir discovery, `$GTK_THEME` variants, XDG fallbacks, `the_bundled_source_is_exactly_the_vendored_sheet`) are byte-identical and join §10.2's gate. |
 | `tests/themed_button_offscreen.rs` | 4 | **the M1 pixel gate** — reads `style.background`, `Background::LinearGradientToTop`, `allocation.width/label_x`, `CssNode::new` | rewritten *mechanically only*. Every numeric constant and every pixel assertion is byte-identical: height exactly `34.0`; `y = height-2` band `0xFFF6F5F4`; gutter column `bx = 4`; midpoint between the two stops; corner (0,0) transparent; border pixel `(cx,0)` `0xFFCDC7C2`; hover gutter `0xFFE8E6E3`; active `0xFFDAD6D2`; suggested-action `#2c7fe3`→`#3584e4`, white text, border `0xFF15539E`, gutter within ±10/channel of `#3584e4`; empty button 36×34; >20 dark label pixels. A diff that changes a *number* here fails review. |
 
+The M1 gate's font stack changes with it: `tests/themed_button_offscreen.rs`
+now builds its `FontDatabase` with `FontDatabase::probe_only()` rather than
+M1's `FontStack::system()`. That is a hermeticity fix, not a numbers change —
+the fixed candidate list makes the gate independent of whatever fontconfig
+reports on the machine running it, and every pixel constant above stays
+byte-identical.
+
 New M2 gate tests (P6): `tests/adwaita_coverage.rs` (light + dark + hc: 0
 unparseable declarations, 0 unknown properties, 37/37 `@define-color`s) and
 `tests/gtk4_property_reference.rs` (`every_gtk4_property_is_registered`: the
@@ -1567,7 +1574,9 @@ re-export. **Ruling:** P4 adds `pub use crate::css::computed::BackgroundLayer;` 
   (P3 deviation 1), P4 finishes the rewrite onto `paint_node`/`Allocation` and owns
   the gate — with every number byte-identical through both.
 - `113` / `95` longhands / `18` shorthands, `900` compiled Adwaita rules and
-  `37/37` `@define-color`s are used consistently in P1, P3 and P6.
+  `37/37` `@define-color`s are used consistently in P1, P3 and P6. (Amended by
+  E14: the counts of record are `114` / `95` / `19`, forced by Adwaita's
+  `all: unset`.)
 
 ### E13 — §10.3's `themed_button_offscreen.rs` pin is amended a third time: E5's signature drop forces one mechanical line in P5, too.
 
@@ -1592,3 +1601,20 @@ nothing else. Every constant and every pixel assertion in the file stay
 byte-identical; the diff is one line, token-for-token the same shape as E4's
 `use` line amendment. This closes the gap E5 left open; E5's two-call-site
 list should be read as three going forward.
+
+### E14 — the registry is **114** rows, not 113: the `all` shorthand was added after §1.1 was written.
+
+§1.1 states `N_PROPS = 113`, and E12 checks "`113` / `95` longhands / `18`
+shorthands" as used consistently across P1, P3 and P6. Both predate the `all`
+shorthand, which P1 added (commit `4d475fc`) because Adwaita declares
+`all: unset` and the coverage gate (§7: **0 unknown properties**) counts an
+unregistered property as a failure. `all` is a shorthand of every longhand, so
+it lands in the shorthand group and moves only the shorthand and total counts.
+
+**Ruling:** the numbers of record are **114 properties / 95 longhands / 19
+shorthands**. §1.1's `N_PROPS = 113` and E12's "113 / 95 / 18" read as
+114 / 95 / 19 going forward; the longhand count, the `900` compiled Adwaita
+rules and the `37/37` `@define-color`s are unchanged. `N_LONGHANDS` and
+`N_PROPS` are both derived by the registry macro from the property list
+itself, and `registry.rs`'s own test pins them at 95 and 114, so the code and
+this amendment cannot drift apart silently.

@@ -292,7 +292,7 @@ Implemented across six part-plans against the frozen interface contract
 The gate (§7) is `ui/tests/adwaita_coverage.rs`: GTK 4.22 Adwaita light, dark
 and high-contrast, every declaration through the registry, **0 unknown
 properties / 0 unparseable declarations / 37 of 37 `@define-color`s resolved**,
-plus `ui/tests/gtk4_property_reference.rs` pinning the registry's 113 rows
+plus `ui/tests/gtk4_property_reference.rs` pinning the registry's 114 rows
 against the vendored GTK 4.22 property table. M1's pixel gate
 `ui/tests/themed_button_offscreen.rs` keeps every one of its numbers.
 
