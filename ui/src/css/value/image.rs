@@ -223,8 +223,8 @@ pub struct Gradient {
 /// A `-gtk-recolor()` / `-gtk-icon-palette` palette: `name <color>` pairs.
 pub type IconPalette = Rc<[(Rc<str>, ColorValue)]>;
 
-/// A GTK image function, stored for Part 4 of the milestone chain (icons
-/// are drawn in M4, not M2).
+/// A GTK image function. Parsed and stored, but not rasterised: drawing
+/// icons is M4's, so a paint that reaches one draws nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum IconRef {
     /// `-gtk-icontheme(name)`.
@@ -658,7 +658,7 @@ impl Gradient {
     /// The colour at gradient-line parameter `t`, already normalised for
     /// the box (`0` at the line start, `1` at its end).
     ///
-    /// This is the sampler Part 4's pixel tests derive expected colours
+    /// This is the sampler the gradient pixel tests derive expected colours
     /// from: interpolation is component-wise premultiplied sRGB and the
     /// result rounds to the nearest byte, so an assertion at a stop is
     /// exactly the theme's declared hex.

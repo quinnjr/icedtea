@@ -154,10 +154,19 @@ pub fn radii_for_box(radii: &[[f32; 2]; 4], alloc: &Allocation, k: Keyword) -> [
 /// borders) -> inset `box-shadow` -> `outline` -> text. Children are painted
 /// by the caller, which owns the tree walk and each child's allocation.
 ///
-/// `overrides` layers Part 5's animation output over `style`.
+/// `overrides` layers the animation state's sampled output over `style`.
+///
+/// `node` is unread here: painting one node needs only its computed style
+/// and its allocation. It stays in the signature because contract §8 names
+/// it, and because M3's tree walk -- which descends from a node to its
+/// children -- is the caller this function is shaped for.
+#[allow(
+    unused_variables,
+    reason = "`node` is contract §8's signature and M3's tree-walk hook"
+)]
 pub fn paint_node(
     canvas: &mut Canvas<'_>,
-    _node: &Node,
+    node: &Node,
     style: &ComputedStyle,
     alloc: &Allocation,
     overrides: Option<&Overrides>,

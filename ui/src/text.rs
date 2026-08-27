@@ -1,9 +1,10 @@
 //! The text stack: `skia-rs-text` for shaping and rasterisation, with font
 //! *discovery* behind [`FontDatabase`].
 //!
-//! M2 Part 4 lands the database's API shape with M1's fixed probe list
-//! behind it; Part 6 replaces `match_face`'s body with a real
-//! `FcPattern`/`FcFontMatch` call. Every signature here is final either way.
+//! [`FontDatabase::new`] matches through fontconfig
+//! (`FcPattern`/`FcFontMatch`); [`FontDatabase::probe_only`] is the
+//! fontconfig-free fallback, matching against a fixed candidate list, and is
+//! what `new` degrades to when `FcInit` fails. Both present the same API.
 //!
 //! `font-feature-settings` and `font-variation-settings` reach [`ShapeKey`]
 //! and stop there: `skia-rs-text` 0.4.0's `Shaper::shape` calls
@@ -224,7 +225,7 @@ const FACE_CACHE_CAPACITY: usize = 64;
 /// Font discovery, loading and shaping, with caches.
 ///
 /// Single-threaded by construction: fontconfig's own objects are `!Send`
-/// and `!Sync`, and Part 6 will own one `Fontconfig` for the process.
+/// and `!Sync`, and one `Fontconfig` handle serves the whole UI thread.
 pub struct FontDatabase {
     fontconfig: Option<fontconfig::Fontconfig>,
     typefaces: BoundedCache<(PathBuf, i32), Option<Arc<Typeface>>>,
@@ -686,12 +687,23 @@ pub fn apply_text_transform(text: &str, transform: Keyword) -> Cow<'_, str> {
     }
 }
 
-/// Upper-case the first letter of every whitespace-delimited word.
+/// Upper-case the first letter of every word.
+///
+/// A word runs until anything that is neither alphanumeric nor an
+/// apostrophe, which is what CSS Text's "first typographic letter unit of
+/// each word" and Pango's own capitalisation come to in practice:
+/// punctuation ends a word (`foo-bar` -> `Foo-Bar`, `(click)` ->
+/// `(Click)`), an apostrophe does not (`don't` -> `Don't`, not `Don'T`).
 fn capitalize(text: &str) -> String {
+    /// Whether `ch` continues the word it is in rather than ending it.
+    fn continues_word(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '\'' || ch == '\u{2019}'
+    }
+
     let mut out = String::with_capacity(text.len());
     let mut at_word_start = true;
     for ch in text.chars() {
-        if ch.is_whitespace() {
+        if !continues_word(ch) {
             at_word_start = true;
             out.push(ch);
         } else if at_word_start {
@@ -1797,6 +1809,37 @@ mod tests {
             apply_text_transform("ALREADY UP", Keyword::Capitalize),
             "ALREADY UP",
             "capitalize only touches the first letter of each word"
+        );
+
+        // Punctuation is a word boundary, which is what CSS Text and Pango
+        // both do -- these two used to come out `Foo-bar` and `(click)`.
+        assert_eq!(
+            apply_text_transform("foo-bar", Keyword::Capitalize),
+            "Foo-Bar"
+        );
+        assert_eq!(
+            apply_text_transform("(click)", Keyword::Capitalize),
+            "(Click)"
+        );
+        assert_eq!(
+            apply_text_transform("a.b/c_d", Keyword::Capitalize),
+            "A.B/C_D",
+            "an underscore is punctuation to CSS, not a letter"
+        );
+
+        // An apostrophe is not: `don't` is one word.
+        assert_eq!(apply_text_transform("don't", Keyword::Capitalize), "Don't");
+        assert_eq!(
+            apply_text_transform("don\u{2019}t", Keyword::Capitalize),
+            "Don\u{2019}t",
+            "the typographic apostrophe behaves like the ASCII one"
+        );
+
+        // A digit is a typographic letter unit: it takes the word-start slot
+        // without changing, and the letter after it is not re-capitalised.
+        assert_eq!(
+            apply_text_transform("3rd place", Keyword::Capitalize),
+            "3rd Place"
         );
     }
 

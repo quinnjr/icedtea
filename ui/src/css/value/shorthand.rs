@@ -982,10 +982,15 @@ pub fn expand_animation(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<()
 /// `all`. The only value CSS gives this shorthand is a wide keyword
 /// (`inherit` / `initial` / `unset`); it resets every longhand to it.
 ///
-/// `cascade.rs`'s `parse_declaration` already intercepts a wide keyword on
-/// *any* shorthand before reaching its `ExpandFn` (via `Prop::longhands()`),
-/// so in the live cascade this function is a backstop; the coverage
-/// instrument in `tests/adwaita_coverage.rs` calls it directly.
+/// This body is unreachable by design, and cannot be deleted:
+/// `cascade.rs`'s `parse_declaration` intercepts a wide keyword on *any*
+/// shorthand before its `ExpandFn` is consulted (via `Prop::longhands()`),
+/// and a wide keyword is the only thing `all` accepts -- so the live cascade
+/// never calls this. The registry still needs an `ExpandFn` for the `all`
+/// row to exist at all, and that row is what makes `all: unset` (which
+/// Adwaita uses) a recognised declaration rather than a dropped one. The
+/// coverage instrument in `tests/adwaita_coverage.rs` calls it directly, so
+/// the expansion it describes is still exercised.
 pub fn expand_all(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), ()> {
     let wide = Value::parse_wide(input)?;
     for prop in longhands() {
