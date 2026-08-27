@@ -170,23 +170,34 @@ pub fn layout_button(style: &ComputedStyle, label: &TextMetrics) -> Allocation {
 #[cfg(test)]
 mod tests {
     use super::layout_button;
-    use crate::css::computed::{Background, ComputedStyle};
+    use crate::css::cascade::CompiledSheet;
+    use crate::css::computed::{ComputedStyle, ResolveEnv};
+    use crate::css::node::Node;
+    use crate::css::select::MatchCx;
     use crate::text::TextMetrics;
-    use skia_rs_safe::core::Color;
+
+    /// The Adwaita button box, expressed as the CSS it actually comes from.
+    fn style_from(css: &str) -> ComputedStyle {
+        let sheet = CompiledSheet::compile(css);
+        let window = Node::with_classes("window", &["background"]);
+        let button = Node::new("button");
+        window.append_child(&button);
+        ComputedStyle::resolve_chain(&sheet, &button, &ResolveEnv::default(), &mut MatchCx::new())
+    }
 
     fn adwaita_like() -> ComputedStyle {
-        ComputedStyle {
-            background: Background::Solid(Color(0xFFDA_D6D2)),
-            color: Color(0xFF2E_3436),
-            border_width: 1.0,
-            border_color: Color(0xFFCD_C7C2),
-            border_radius: 5.0,
-            padding: [4.0, 9.0, 4.0, 9.0],
-            min_width: 16.0,
-            min_height: 24.0,
-            font_size: 14.0,
-            ..ComputedStyle::default()
-        }
+        style_from(
+            "button { background-color: #dad6d2; color: #2e3436; \
+             border: 1px solid #cdc7c2; border-radius: 5px; padding: 4px 9px; \
+             min-width: 16px; min-height: 24px; font-size: 14px }",
+        )
+    }
+
+    fn bare() -> ComputedStyle {
+        style_from(
+            "button { background-color: #dad6d2; color: #2e3436; border: 0 solid #cdc7c2; \
+             border-radius: 5px; padding: 0; min-width: 0; min-height: 0; font-size: 14px }",
+        )
     }
 
     fn label(width: f32, height: f32) -> TextMetrics {
@@ -239,13 +250,7 @@ mod tests {
 
     #[test]
     fn a_borderless_paddingless_button_is_exactly_the_label() {
-        let style = ComputedStyle {
-            padding: [0.0; 4],
-            border_width: 0.0,
-            min_width: 0.0,
-            min_height: 0.0,
-            ..adwaita_like()
-        };
+        let style = bare();
         let allocation = layout_button(&style, &label(42.0, 17.0));
         assert_eq!(allocation.width, 42.0);
         assert_eq!(allocation.height, 17.0);

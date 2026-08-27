@@ -3,8 +3,9 @@
 use skia_rs_safe::canvas::Surface;
 
 use crate::css::cascade::CompiledSheet;
-use crate::css::computed::ComputedStyle;
+use crate::css::computed::{ComputedStyle, ResolveEnv};
 use crate::css::node::{Node, PseudoStates};
+use crate::css::select::MatchCx;
 use crate::layout::{Allocation, ButtonLayout};
 use crate::paint::paint_button;
 use crate::text::{FontStack, ShapedText};
@@ -93,13 +94,25 @@ impl Button {
             self.parent_style = Some(
                 self.node
                     .parent()
-                    .map(|parent| ComputedStyle::resolve(sheet, &parent))
+                    .map(|parent| {
+                        ComputedStyle::resolve_chain(
+                            sheet,
+                            &parent,
+                            &ResolveEnv::default(),
+                            &mut MatchCx::new(),
+                        )
+                    })
                     .unwrap_or_default(),
             );
             self.parent_style_sheet = Some(sheet_id);
         }
-        self.style =
-            ComputedStyle::resolve_with_parent(sheet, &self.node, self.parent_style.as_ref());
+        self.style = ComputedStyle::resolve(
+            sheet,
+            &self.node,
+            self.parent_style.as_ref(),
+            &ResolveEnv::default(),
+            &mut MatchCx::new(),
+        );
 
         // `!=` rather than an epsilon: the only thing that ever writes this
         // is a previous shape at exactly this size, and NAN != NAN makes the
@@ -242,7 +255,10 @@ mod tests {
     fn the_cached_parent_style_matches_a_full_ancestor_walk() {
         // The window's `color` must still reach the button through the
         // cached parent style, on the first restyle and every one after.
-        let css = "window { color: #ff0000 }\nbutton:hover { border-width: 3px }";
+        // `border-style` has to be declared: the registry's initial is
+        // `none`, and CSS's used border width under `border-style: none` is
+        // zero. M1 only ever read a declared width.
+        let css = "window { color: #ff0000 }\nbutton:hover { border: 3px solid }";
         let (sheet, fonts, mut button) = fixture(css, "x");
         assert_eq!(button.style().color, skia_rs_safe::core::Color(0xFFFF_0000));
 

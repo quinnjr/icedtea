@@ -154,7 +154,12 @@ mod tests {
         let window = Node::with_classes("window", &["background"]);
         let node = Node::new("button");
         window.append_child(&node);
-        let style = ComputedStyle::resolve(&sheet, &node);
+        let style = ComputedStyle::resolve_chain(
+            &sheet,
+            &node,
+            &crate::css::computed::ResolveEnv::default(),
+            &mut crate::css::select::MatchCx::new(),
+        );
         let allocation = Allocation {
             width: 40.0,
             height: 20.0,

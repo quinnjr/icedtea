@@ -278,8 +278,9 @@ pub fn run_themed_button(
 #[cfg(test)]
 mod tests {
     use super::{ThemeEnv, ThemeSource, compile_theme, load_layered_stylesheet};
-    use crate::css::computed::ComputedStyle;
+    use crate::css::computed::{ComputedStyle, ResolveEnv};
     use crate::css::node::Node;
+    use crate::css::select::MatchCx;
     use skia_rs_safe::core::Color;
     use std::path::Path;
 
@@ -292,14 +293,20 @@ mod tests {
         let window = Node::with_classes("window", &["background"]);
         let button = Node::new("button");
         window.append_child(&button);
-        ComputedStyle::resolve(sheet, &button)
+        ComputedStyle::resolve_chain(sheet, &button, &ResolveEnv::default(), &mut MatchCx::new())
     }
 
     fn headerbar_min_height(sheet: &crate::css::cascade::CompiledSheet) -> f32 {
         let window = Node::with_classes("window", &["background"]);
         let headerbar = Node::new("headerbar");
         window.append_child(&headerbar);
-        ComputedStyle::resolve(sheet, &headerbar).min_height
+        ComputedStyle::resolve_chain(
+            sheet,
+            &headerbar,
+            &ResolveEnv::default(),
+            &mut MatchCx::new(),
+        )
+        .min_height
     }
 
     #[test]
@@ -478,10 +485,19 @@ mod tests {
         let sheet = compile_theme(&ThemeSource::File(path));
         let style = button_style(&sheet);
         assert_eq!(style.min_height, 13.0);
+        // Contract deviation 4: `border-color`'s registry initial is
+        // `currentColor`, which resolves to the initial `color` -- opaque
+        // black. M1 had no initial and left it transparent. What the test
+        // means is unchanged: Adwaita's #cdc7c2 is nowhere near it.
         assert_eq!(
             style.border_color,
-            Color(0x0000_0000),
+            Color(0xFF00_0000),
             "an explicit file must not be layered onto Adwaita"
+        );
+        assert_ne!(
+            style.border_color,
+            Color(0xFFCD_C7C2),
+            "Adwaita was layered under the explicit file"
         );
     }
 

@@ -64,7 +64,7 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
 
     // --- 1. Computed values equal Adwaita's resolved values ------------
     // `button` (line 215 of the vendored sheet).
-    let normal = *button.style();
+    let normal = button.style().clone();
     assert_eq!(
         normal.background,
         Background::LinearGradientToTop {
@@ -156,7 +156,7 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
 
     // --- 3. Toggling :hover changes computed style AND pixels ----------
     button.set_states(PseudoStates::HOVER, &sheet, &fonts);
-    let hovered = *button.style();
+    let hovered = button.style().clone();
     assert_eq!(
         hovered.background,
         Background::LinearGradientToTop {
@@ -200,7 +200,7 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
 #[test]
 fn suggested_action_button_is_adwaitas_accent_blue() {
     let (_sheet, _fonts, button) = fixture(&["suggested-action"]);
-    let style = *button.style();
+    let style = button.style().clone();
     assert_eq!(
         style.background,
         Background::LinearGradientToTop {
