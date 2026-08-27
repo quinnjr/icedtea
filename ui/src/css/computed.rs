@@ -10,13 +10,14 @@
 //! `background-image`, either GTK's `image(<color>)` flat-fill extension or
 //! a two-stop `linear-gradient(to top, ...)`.
 
-use cssparser::{Parser, ParserInput, Token};
 use skia_rs_safe::core::Color;
 
 use super::cascade::{CascadedValues, CompiledSheet, cascade};
-use super::colors::{ColorRef, ColorTable, parse_color_ref, parse_color_value};
-use super::select::CssNode;
-use super::tokens::{comma_groups, component_values};
+use super::node::Node;
+use super::registry::Prop;
+use super::select::MatchCx;
+use super::value::Value;
+use super::value::color::ColorTable;
 
 /// One gradient stop: a color and an optional absolute position, measured in
 /// pixels along the gradient line from its origin.
@@ -177,91 +178,155 @@ impl Default for ComputedStyle {
     }
 }
 
-/// Parse a `<length>` in px. Unitless `0` is accepted; other units are not
-/// (M1 has no font/viewport context to resolve `em`/`%` against).
+/// The M1 bridge: read a computed-shaped scalar out of a parsed `Value`.
 ///
-/// Tokenized rather than string-sliced, so the unit is matched
-/// ASCII-case-insensitively (`5PX`) and `NaNpx`/`infpx` -- which are
-/// identifiers, not dimensions -- cannot slip through.
-fn parse_px(value: &str) -> Option<f32> {
-    let mut input = ParserInput::new(value);
-    let mut parser = Parser::new(&mut input);
-    let token = parser.next().ok()?.clone();
-    if parser.expect_exhausted().is_err() {
-        return None;
-    }
-    match token {
-        Token::Dimension {
-            value, ref unit, ..
-        } if unit.eq_ignore_ascii_case("px") => value.is_finite().then_some(value),
-        Token::Number { value: 0.0, .. } => Some(0.0),
-        _ => None,
-    }
-}
+/// Task 3 replaces every one of these with the registry-indexed table and
+/// deletes this module. It exists so the cascade can move to `Prop` in one
+/// commit while `ComputedStyle`'s M1 fields -- and all of its tests -- stay
+/// exactly as they are, which is what makes them a regression bar rather than a
+/// thing to be rewritten on trust.
+mod m1_bridge {
+    use super::{Background, BackgroundClip, GradientStop};
+    use crate::css::value::color::{ColorCtx, ColorTable, ColorValue, Rgba};
+    use crate::css::value::image::{
+        ColorStop, Gradient, GradientKind, LinearDirection, SideOrCorner,
+    };
+    use crate::css::value::{Image, Keyword, Length, LengthCtx, Value};
+    use skia_rs_safe::core::Color;
 
-/// A `<line-width>`: a length, or one of CSS's three width keywords.
-fn parse_border_width(value: &str) -> Option<f32> {
-    for (keyword, width) in [("thin", 1.0), ("medium", 3.0), ("thick", 5.0)] {
-        if value.eq_ignore_ascii_case(keyword) {
-            return Some(width);
+    /// A length context with M1's fixed assumptions: 14px `rem` base, 96 dpi,
+    /// and no percentage basis unless the caller supplies one.
+    pub fn ctx(font_size_px: f32, percent_basis: Option<f32>) -> LengthCtx {
+        LengthCtx {
+            font_size_px,
+            root_font_size_px: super::ComputedStyle::DEFAULT_FONT_SIZE,
+            ex_ratio: 0.5,
+            dpi: 96.0,
+            percent_basis,
         }
     }
-    parse_px(value)
-}
 
-/// Parse one `<color> [<length>]` gradient stop from its components.
-fn parse_stop(components: &[String], colors: &ColorTable) -> Option<GradientStop> {
-    match components {
-        [color] => Some(GradientStop {
-            color: parse_color_value(color, colors)?,
-            position_px: None,
-        }),
-        [color, position] => Some(GradientStop {
-            color: parse_color_value(color, colors)?,
-            position_px: Some(parse_px(position)?),
-        }),
-        _ => None,
+    /// A `<length>` in px. A percentage with no basis is uninterpretable, which
+    /// is what keeps `border-radius: 100%` falling through to its runner-up.
+    pub fn px(value: &Value, ctx: &LengthCtx) -> Option<f32> {
+        match value {
+            Value::Length(length) => length.resolve(ctx).filter(|px| px.is_finite()),
+            Value::Number(number) if *number == 0.0 => Some(0.0),
+            _ => None,
+        }
     }
-}
 
-/// Parse a `background-image` value into a [`Background`].
-///
-/// Supports GTK's `image(<color>)` flat fill and the two-stop
-/// `linear-gradient(to top, ...)` form Adwaita's buttons use. Anything else
-/// -- radial gradients, `url()`, `-gtk-*` image functions, more than two
-/// stops -- yields `None`, which leaves the `background-color` value (or the
-/// transparent default) in place rather than painting something invented.
-///
-/// Function names and the `to top` keyword are matched
-/// ASCII-case-insensitively, and the direction is compared component-wise so
-/// `to  top` (or a newline between the two words) still matches.
-fn parse_background_image(value: &str, colors: &ColorTable) -> Option<Background> {
-    let components = component_values(value);
-    let [single] = components.as_slice() else {
-        return None;
-    };
-    let (name, rest) = single.split_once('(')?;
-    let args = rest.strip_suffix(')')?;
-    if name.eq_ignore_ascii_case("image") {
-        return Some(Background::Solid(parse_color_value(args, colors)?));
+    /// The horizontal half of a corner radius.
+    pub fn radius(value: &Value, ctx: &LengthCtx) -> Option<f32> {
+        match value {
+            Value::Pair(pair) => px(&pair.0, ctx),
+            other => px(other, ctx),
+        }
     }
-    if !name.eq_ignore_ascii_case("linear-gradient") {
-        return None;
+
+    /// A `<color>`, with `currentColor` mapped onto `current`.
+    pub fn color(value: &Value, colors: &ColorTable, current: Color) -> Option<Color> {
+        let Value::Color(color) = value else {
+            return None;
+        };
+        resolve(color, colors, current)
     }
-    let groups = comma_groups(args);
-    let [direction, first, second] = groups.as_slice() else {
-        return None;
-    };
-    let [to, top] = direction.as_slice() else {
-        return None;
-    };
-    if !to.eq_ignore_ascii_case("to") || !top.eq_ignore_ascii_case("top") {
-        return None;
+
+    /// `true` when this border style forces a used width of zero.
+    pub fn border_style_is_none(value: &Value) -> Option<bool> {
+        match value {
+            Value::Keyword(Keyword::None | Keyword::Hidden) => Some(true),
+            Value::Keyword(_) => Some(false),
+            _ => None,
+        }
     }
-    Some(Background::LinearGradientToTop {
-        from: parse_stop(first, colors)?,
-        to: parse_stop(second, colors)?,
-    })
+
+    /// A `background-clip` keyword. The property is comma-multiplied; M1 paints
+    /// one layer, so the first entry wins.
+    pub fn clip(value: &Value) -> Option<BackgroundClip> {
+        match first(value) {
+            Value::Keyword(Keyword::BorderBox) => Some(BackgroundClip::BorderBox),
+            Value::Keyword(Keyword::PaddingBox) => Some(BackgroundClip::PaddingBox),
+            Value::Keyword(Keyword::ContentBox) => Some(BackgroundClip::ContentBox),
+            _ => None,
+        }
+    }
+
+    /// The first entry of a comma-multiplied value, or the value itself.
+    fn first(value: &Value) -> &Value {
+        match value {
+            Value::List(items) => items.first().unwrap_or(value),
+            other => other,
+        }
+    }
+
+    /// `background-image` as an M1 [`Background`].
+    ///
+    /// `Some(None)` means "interpretable, but paints nothing" (`none`), which
+    /// must not fall through to a runner-up image.
+    pub fn background(
+        value: &Value,
+        colors: &ColorTable,
+        current: Color,
+        ctx: &LengthCtx,
+    ) -> Option<Option<Background>> {
+        let Value::Image(image) = first(value) else {
+            return None;
+        };
+        match image {
+            Image::None => Some(None),
+            Image::Solid(fill) => Some(Some(Background::Solid(resolve(fill, colors, current)?))),
+            Image::Gradient(gradient) => Some(Some(to_top(gradient, colors, current, ctx)?)),
+            _ => None,
+        }
+    }
+
+    fn resolve(value: &ColorValue, colors: &ColorTable, current: Color) -> Option<Color> {
+        let ctx = ColorCtx {
+            table: colors,
+            current: Rgba::from_color32(current),
+            depth: 0,
+        };
+        value.resolve(&ctx).map(Rgba::to_color32)
+    }
+
+    /// A two-stop, non-repeating `linear-gradient(to top, ...)` -- the only
+    /// gradient shape M1's `Background` can hold.
+    fn to_top(
+        gradient: &Gradient,
+        colors: &ColorTable,
+        current: Color,
+        ctx: &LengthCtx,
+    ) -> Option<Background> {
+        if gradient.repeating {
+            return None;
+        }
+        let GradientKind::Linear {
+            direction: LinearDirection::Side(SideOrCorner::Top),
+        } = gradient.kind
+        else {
+            return None;
+        };
+        let [from, to] = gradient.stops.as_ref() else {
+            return None;
+        };
+        let stop = |stop: &ColorStop| -> Option<GradientStop> {
+            Some(GradientStop {
+                color: resolve(&stop.color, colors, current)?,
+                position_px: match &stop.position {
+                    Some(length @ (Length::Abs { .. } | Length::Calc(_))) => {
+                        Some(length.resolve(ctx).filter(|px| px.is_finite())?)
+                    }
+                    Some(_) => return None,
+                    None => None,
+                },
+            })
+        };
+        Some(Background::LinearGradientToTop {
+            from: stop(from)?,
+            to: stop(to)?,
+        })
+    }
 }
 
 impl ComputedStyle {
@@ -272,15 +337,16 @@ impl ComputedStyle {
     /// A caller that already holds the parent's computed style should use
     /// [`Self::resolve_with_parent`] and skip the walk.
     #[must_use]
-    pub fn resolve(sheet: &CompiledSheet, node: &CssNode) -> Self {
+    pub fn resolve(sheet: &CompiledSheet, node: &Node) -> Self {
+        let mut cx = MatchCx::new();
         let mut chain = vec![node.clone()];
-        while let Some(parent) = chain.last().and_then(CssNode::parent) {
+        while let Some(parent) = chain.last().and_then(Node::parent) {
             chain.push(parent);
         }
         let mut style: Option<Self> = None;
         for ancestor in chain.iter().rev() {
             style = Some(Self::from_declarations(
-                &cascade(sheet, ancestor),
+                &cascade(sheet, ancestor, &mut cx),
                 &sheet.colors,
                 style.as_ref(),
             ));
@@ -290,12 +356,9 @@ impl ComputedStyle {
 
     /// Resolve `node`'s style given its parent's already-computed style.
     #[must_use]
-    pub fn resolve_with_parent(
-        sheet: &CompiledSheet,
-        node: &CssNode,
-        parent: Option<&Self>,
-    ) -> Self {
-        Self::from_declarations(&cascade(sheet, node), &sheet.colors, parent)
+    pub fn resolve_with_parent(sheet: &CompiledSheet, node: &Node, parent: Option<&Self>) -> Self {
+        let mut cx = MatchCx::new();
+        Self::from_declarations(&cascade(sheet, node, &mut cx), &sheet.colors, parent)
     }
 
     /// Resolve a node's cascaded declarations. Separated from
@@ -313,87 +376,82 @@ impl ComputedStyle {
         parent: Option<&Self>,
     ) -> Self {
         let mut style = Self::default();
-
-        // `color` and `font-size` inherit; everything else this milestone
-        // models starts from its own initial value.
         let inherited_color = parent.map_or(Color::BLACK, |parent| parent.color);
-        style.color = pick(values, "color", |value| {
-            // On `color` itself, `currentColor` *is* the inherited colour.
-            resolve_color(value, colors, inherited_color)
+        let parent_font_size = parent.map_or(Self::DEFAULT_FONT_SIZE, |parent| parent.font_size);
+        let font_ctx = m1_bridge::ctx(parent_font_size, Some(parent_font_size));
+
+        style.color = pick(values, Prop::Color, |value| {
+            m1_bridge::color(value, colors, inherited_color)
         })
         .unwrap_or(inherited_color);
-        style.font_size = pick(values, "font-size", parse_px)
-            .map(|size| size.max(0.0))
-            .unwrap_or_else(|| parent.map_or(Self::DEFAULT_FONT_SIZE, |parent| parent.font_size));
+        style.font_size = pick(values, Prop::FontSize, |value| {
+            m1_bridge::px(value, &font_ctx)
+        })
+        .map(|size| size.max(0.0))
+        .unwrap_or(parent_font_size);
 
-        // Everywhere else `currentColor` is this element's own colour.
         let current = style.color;
-        let color_of = |value: &str| resolve_color(value, colors, current);
+        let ctx = m1_bridge::ctx(style.font_size, None);
 
-        // `background-color` first, then `background-image` on top: CSS
-        // paints the image over the color, and every background M1 supports
-        // is fully opaque where it paints at all.
-        if let Some(color) = pick(values, "background-color", color_of) {
+        if let Some(color) = pick(values, Prop::BackgroundColor, |value| {
+            m1_bridge::color(value, colors, current)
+        }) {
             style.background = Background::Solid(color);
         }
-        if let Some(background) = pick(values, "background-image", |value| {
-            if value.eq_ignore_ascii_case("none") {
-                // `none` is interpretable -- it just leaves the colour alone,
-                // so it must not fall through to a runner-up image.
-                Some(None)
-            } else {
-                parse_background_image(value, colors).map(Some)
-            }
+        if let Some(background) = pick(values, Prop::BackgroundImage, |value| {
+            m1_bridge::background(value, colors, current, &ctx)
         })
         .flatten()
         {
             style.background = background;
         }
 
-        // Borders are cascaded per side (`super::shorthand`); M1 paints a
-        // uniform border, so the top side stands for all four. M2 widens
-        // `ComputedStyle` to four sides.
-        if let Some(width) = pick(values, "border-top-width", parse_border_width) {
+        // Borders are cascaded per side; M1 paints a uniform border, so the top
+        // side stands for all four. Task 3 widens `ComputedStyle` to four sides.
+        if let Some(width) = pick(values, Prop::BorderTopWidth, |value| {
+            m1_bridge::px(value, &ctx)
+        }) {
             style.border_width = width.max(0.0);
         }
-        // A `none`/`hidden` border style forces a used width of 0 -- that is
-        // what makes `border: none` undo an earlier `border: 1px solid`. Read
-        // through `pick` like every other property, so a winner that is not a
-        // border-style keyword at all steps aside for one that is.
         if pick(
             values,
-            "border-top-style",
-            super::shorthand::parse_border_style,
+            Prop::BorderTopStyle,
+            m1_bridge::border_style_is_none,
         ) == Some(true)
         {
             style.border_width = 0.0;
         }
-        if let Some(color) = pick(values, "border-top-color", color_of) {
+        if let Some(color) = pick(values, Prop::BorderTopColor, |value| {
+            m1_bridge::color(value, colors, current)
+        }) {
             style.border_color = color;
         }
-        if let Some(radius) = pick(values, "border-radius", parse_px) {
+        if let Some(radius) = pick(values, Prop::BorderTopLeftRadius, |value| {
+            m1_bridge::radius(value, &ctx)
+        }) {
             style.border_radius = radius.max(0.0);
         }
-        for (index, name) in [
-            "padding-top",
-            "padding-right",
-            "padding-bottom",
-            "padding-left",
+        for (index, prop) in [
+            Prop::PaddingTop,
+            Prop::PaddingRight,
+            Prop::PaddingBottom,
+            Prop::PaddingLeft,
         ]
         .into_iter()
         .enumerate()
         {
-            if let Some(padding) = pick(values, name, parse_px) {
+            if let Some(padding) = pick(values, prop, |value| m1_bridge::px(value, &ctx)) {
                 style.padding[index] = padding.max(0.0);
             }
         }
-        if let Some(clip) = pick(values, "background-clip", BackgroundClip::parse) {
+        if let Some(clip) = pick(values, Prop::BackgroundClip, m1_bridge::clip) {
             style.background_clip = clip;
         }
-        if let Some(min_width) = pick(values, "min-width", parse_px) {
+        if let Some(min_width) = pick(values, Prop::MinWidth, |value| m1_bridge::px(value, &ctx)) {
             style.min_width = min_width.max(0.0);
         }
-        if let Some(min_height) = pick(values, "min-height", parse_px) {
+        if let Some(min_height) = pick(values, Prop::MinHeight, |value| m1_bridge::px(value, &ctx))
+        {
             style.min_height = min_height.max(0.0);
         }
         style
@@ -410,31 +468,22 @@ impl ComputedStyle {
 /// lose its 5px radius to a `100%` this engine has no percentage context
 /// for -- so the next declaration in cascade order is used instead. The
 /// divergence is logged.
-/// Resolve a colour value, mapping `currentColor` onto `current`.
-fn resolve_color(value: &str, colors: &ColorTable, current: Color) -> Option<Color> {
-    match parse_color_ref(value, colors)? {
-        ColorRef::Absolute(color) => Some(color),
-        ColorRef::CurrentColor => Some(current),
-    }
-}
-
-/// Known consequence, both directions: an unparseable *winner* does not
+///
+/// Known consequence, both directions: an uninterpretable *winner* does not
 /// leave the property at its initial value, it leaves it at whatever an
-/// earlier rule declared. `background: nosuch(1)` layered over a working
-/// `background-image`, or Adwaita:640's `cross-fade(...)`, keeps painting
-/// the older background instead of falling back to none.
+/// earlier rule declared. Task 3 replaces this with CSS's own rule.
 fn pick<T>(
     values: &CascadedValues,
-    name: &str,
-    mut parse: impl FnMut(&str) -> Option<T>,
+    prop: Prop,
+    mut parse: impl FnMut(&Value) -> Option<T>,
 ) -> Option<T> {
-    for (rank, candidate) in values.candidates(name).iter().enumerate() {
+    for (rank, candidate) in values.candidates(prop).iter().enumerate() {
         if let Some(parsed) = parse(&candidate.value) {
             return Some(parsed);
         }
         tracing::debug!(
-            property = name,
-            value = %candidate.value,
+            property = prop.name(),
+            value = ?candidate.value,
             rank,
             "uninterpretable declaration; falling back to the next in cascade order"
         );
@@ -446,16 +495,40 @@ fn pick<T>(
 mod tests {
     use super::{Background, ComputedStyle, GradientStop};
     use crate::css::cascade::CompiledSheet;
-    use crate::css::select::{CssNode, PseudoStates};
+    use crate::css::node::{Node, PseudoStates};
     use skia_rs_safe::core::Color;
 
     fn adwaita() -> CompiledSheet {
         CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT)
     }
 
-    fn button(classes: &[&str], states: PseudoStates) -> CssNode {
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        CssNode::new("button", classes, states, Some(window))
+    /// A `window.background > button` tree.
+    ///
+    /// A [`Node`]'s parent link is a `Weak`, so the fixture keeps the window
+    /// alive for as long as the button is used; it derefs to the button so
+    /// every call site reads as if it were the bare node.
+    struct ButtonTree {
+        _window: Node,
+        button: Node,
+    }
+
+    impl std::ops::Deref for ButtonTree {
+        type Target = Node;
+
+        fn deref(&self) -> &Node {
+            &self.button
+        }
+    }
+
+    fn button(classes: &[&str], states: PseudoStates) -> ButtonTree {
+        let window = Node::with_classes("window", &["background"]);
+        let button = Node::with_classes("button", classes);
+        window.append_child(&button);
+        button.set_states(states);
+        ButtonTree {
+            _window: window,
+            button,
+        }
     }
 
     fn stop(color: u32, position_px: Option<f32>) -> GradientStop {
@@ -467,11 +540,45 @@ mod tests {
 
     #[test]
     fn non_finite_lengths_are_rejected() {
-        assert_eq!(super::parse_px("NaNpx"), None);
-        assert_eq!(super::parse_px("infpx"), None);
-        assert_eq!(super::parse_px("1e40px"), None);
-        assert_eq!(super::parse_px("4px"), Some(4.0));
-        assert_eq!(super::parse_px("0"), Some(0.0));
+        // M1's `parse_px` is now the registry's `<length>` parser plus
+        // `m1_bridge::px`; `NaNpx`/`infpx` are identifiers, not dimensions,
+        // so they are invalid at parse time, and `1e40px` overflows f32.
+        use crate::css::registry::{Prop, parse_declaration_value};
+        let ctx = super::m1_bridge::ctx(ComputedStyle::DEFAULT_FONT_SIZE, None);
+        let px = |text: &str| {
+            parse_declaration_value(Prop::PaddingTop, text)
+                .ok()
+                .and_then(|value| super::m1_bridge::px(&value, &ctx))
+        };
+        assert_eq!(px("NaNpx"), None);
+        assert_eq!(px("infpx"), None);
+        assert_eq!(px("1e40px"), None);
+        assert_eq!(px("4px"), Some(4.0));
+        assert_eq!(px("0"), Some(0.0));
+    }
+
+    #[test]
+    fn adwaita_hex_bytes_round_trip_through_rgba() {
+        // The M1 tests pin exact bytes; M2 resolves colours as f32 `Rgba` and
+        // converts back. If that round trip were lossy, every pinned byte in
+        // this file and in the offscreen gate would drift by one.
+        use crate::css::value::color::Rgba;
+        for declared in [
+            0xFF2E_3436u32,
+            0xFFCD_C7C2,
+            0xFFF6_F5F4,
+            0xFFFB_FAFA,
+            0xFFD6_D1CD,
+            0xFFE8_E6E3,
+            0xFFDA_D6D2,
+            0xFF2C_7FE3,
+            0xFF35_84E4,
+            0xFF15_539E,
+            0xFF19_61B9,
+        ] {
+            let color = Color(declared);
+            assert_eq!(Rgba::from_color32(color).to_color32(), color);
+        }
     }
 
     #[test]
@@ -497,16 +604,7 @@ mod tests {
     #[test]
     fn adwaita_hover_and_active_button() {
         let sheet = adwaita();
-        let hovered = ComputedStyle::resolve(
-            &sheet,
-            &button(
-                &[],
-                PseudoStates {
-                    hover: true,
-                    ..PseudoStates::default()
-                },
-            ),
-        );
+        let hovered = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::HOVER));
         assert_eq!(
             hovered.background,
             Background::LinearGradientToTop {
@@ -516,16 +614,7 @@ mod tests {
         );
         assert_eq!(hovered.border_color, Color(0xFFCD_C7C2));
 
-        let active = ComputedStyle::resolve(
-            &sheet,
-            &button(
-                &[],
-                PseudoStates {
-                    active: true,
-                    ..PseudoStates::default()
-                },
-            ),
-        );
+        let active = ComputedStyle::resolve(&sheet, &button(&[], PseudoStates::ACTIVE));
         assert_eq!(active.background, Background::Solid(Color(0xFFDA_D6D2)));
         assert_eq!(
             active.border_radius, 5.0,
@@ -550,16 +639,8 @@ mod tests {
         assert_eq!(s.color, Color(0xFFFF_FFFF));
         assert_eq!(s.border_color, Color(0xFF15_539E));
 
-        let pressed = ComputedStyle::resolve(
-            &sheet,
-            &button(
-                &["suggested-action"],
-                PseudoStates {
-                    active: true,
-                    ..PseudoStates::default()
-                },
-            ),
-        );
+        let pressed =
+            ComputedStyle::resolve(&sheet, &button(&["suggested-action"], PseudoStates::ACTIVE));
         assert_eq!(pressed.background, Background::Solid(Color(0xFF19_61B9)));
     }
 
@@ -815,8 +896,9 @@ mod tests {
     #[test]
     fn resolve_with_parent_matches_resolving_the_whole_chain() {
         let sheet = CompiledSheet::compile("window { color: #ff0000 }\nbutton { padding: 2px }");
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        let node = CssNode::new("button", &[], PseudoStates::default(), Some(window.clone()));
+        let window = Node::with_classes("window", &["background"]);
+        let node = Node::new("button");
+        window.append_child(&node);
         let window_style = ComputedStyle::resolve(&sheet, &window);
         assert_eq!(
             ComputedStyle::resolve_with_parent(&sheet, &node, Some(&window_style)),

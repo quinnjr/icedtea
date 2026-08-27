@@ -21,7 +21,7 @@ use skia_rs_safe::canvas::Surface;
 use skia_rs_safe::core::Color;
 
 use crate::css::cascade::CompiledSheet;
-use crate::css::select::PseudoStates;
+use crate::css::node::PseudoStates;
 use crate::shm::{BufferPool, BufferSlot, ShmBuffer, Slot, SlotPool};
 use crate::text::FontStack;
 use crate::widget::button::Button;
@@ -168,26 +168,23 @@ impl AppState {
         }
         // A release anywhere ends the press, on or off the widget.
         self.held = pressed;
-        let inside = self.button.states().hover;
+        let inside = self.button.states().contains(PseudoStates::HOVER);
         self.update_states(inside, pressed && inside);
     }
 
     /// Recompute state from the pointer, restyling only on an actual change.
     fn update_states(&mut self, hover: bool, active: bool) {
         let current = self.button.states();
-        if current.hover == hover && current.active == active {
+        if current.contains(PseudoStates::HOVER) == hover
+            && current.contains(PseudoStates::ACTIVE) == active
+        {
             return;
         }
         tracing::debug!(hover, active, "pointer state changed");
-        self.button.set_states(
-            PseudoStates {
-                hover,
-                active,
-                ..PseudoStates::default()
-            },
-            &self.sheet,
-            &self.fonts,
-        );
+        let mut states = PseudoStates::empty();
+        states.set(PseudoStates::HOVER, hover);
+        states.set(PseudoStates::ACTIVE, active);
+        self.button.set_states(states, &self.sheet, &self.fonts);
         self.dirty = true;
     }
 }
@@ -655,7 +652,7 @@ mod tests {
     };
     use crate::BUNDLED_ADWAITA_LIGHT;
     use crate::css::cascade::CompiledSheet;
-    use crate::css::select::{CssNode, PseudoStates};
+    use crate::css::node::{Node, PseudoStates};
     use crate::shm::{BufferSlot, Slot, SlotPool};
     use crate::text::FontStack;
     use crate::widget::button::Button;
@@ -666,8 +663,8 @@ mod tests {
     fn state() -> AppState {
         let sheet = CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT);
         let fonts = FontStack::system().expect("system font");
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        let mut button = Button::new("Click me", &[], window);
+        let window = Node::with_classes("window", &["background"]);
+        let mut button = Button::new("Click me", &[], &window);
         button.restyle(&sheet, &fonts);
         AppState::new(sheet, fonts, button)
     }
@@ -740,18 +737,21 @@ mod tests {
         // scroll-wheel click pressed the widget.
         let mut state = state();
         state.on_pointer_motion(INSIDE.0, INSIDE.1);
-        assert!(state.button.states().hover);
+        assert!(state.button.states().contains(PseudoStates::HOVER));
 
         for button in [0x111u32, 0x112, 0x113] {
             state.on_pointer_button(button, true);
             assert!(
-                !state.button.states().active,
+                !state.button.states().contains(PseudoStates::ACTIVE),
                 "button {button:#x} armed :active"
             );
         }
 
         state.on_pointer_button(BTN_LEFT, true);
-        assert!(state.button.states().active, "BTN_LEFT did not press it");
+        assert!(
+            state.button.states().contains(PseudoStates::ACTIVE),
+            "BTN_LEFT did not press it"
+        );
     }
 
     #[test]
@@ -761,19 +761,19 @@ mod tests {
         let mut state = state();
         state.on_pointer_motion(INSIDE.0, INSIDE.1);
         state.on_pointer_button(BTN_LEFT, true);
-        assert!(state.button.states().active);
+        assert!(state.button.states().contains(PseudoStates::ACTIVE));
 
         // Drag off: the visual state drops, the press does not.
         state.on_pointer_motion(OUTSIDE.0, OUTSIDE.1);
-        assert!(!state.button.states().hover);
-        assert!(!state.button.states().active);
+        assert!(!state.button.states().contains(PseudoStates::HOVER));
+        assert!(!state.button.states().contains(PseudoStates::ACTIVE));
         assert!(state.held, "dragging off must not end the press");
 
         // Drag back on: `:active` comes back.
         state.on_pointer_motion(INSIDE.0, INSIDE.1);
-        assert!(state.button.states().hover);
+        assert!(state.button.states().contains(PseudoStates::HOVER));
         assert!(
-            state.button.states().active,
+            state.button.states().contains(PseudoStates::ACTIVE),
             "re-entering while held did not re-arm :active"
         );
     }
@@ -785,8 +785,8 @@ mod tests {
         state.on_pointer_button(BTN_LEFT, true);
 
         state.on_pointer_leave();
-        assert!(!state.button.states().hover);
-        assert!(!state.button.states().active);
+        assert!(!state.button.states().contains(PseudoStates::HOVER));
+        assert!(!state.button.states().contains(PseudoStates::ACTIVE));
         assert!(state.held);
     }
 
@@ -801,9 +801,9 @@ mod tests {
         assert!(!state.held, "a release off the widget must still end it");
 
         state.on_pointer_motion(INSIDE.0, INSIDE.1);
-        assert!(state.button.states().hover);
+        assert!(state.button.states().contains(PseudoStates::HOVER));
         assert!(
-            !state.button.states().active,
+            !state.button.states().contains(PseudoStates::ACTIVE),
             "re-entering after the release re-armed a press that had ended"
         );
     }
@@ -813,7 +813,7 @@ mod tests {
         let mut state = state();
         state.on_pointer_motion(OUTSIDE.0, OUTSIDE.1);
         state.on_pointer_button(BTN_LEFT, true);
-        assert!(!state.button.states().active);
+        assert!(!state.button.states().contains(PseudoStates::ACTIVE));
         assert!(state.held);
     }
 
@@ -823,14 +823,17 @@ mod tests {
         // pointer left the widget stuck in whatever state it was showing.
         let mut state = state();
         state.update_states(true, true);
-        assert!(state.button.states().hover && state.button.states().active);
+        assert!(
+            state.button.states().contains(PseudoStates::HOVER)
+                && state.button.states().contains(PseudoStates::ACTIVE)
+        );
         state.dirty = false;
 
         state.held = true;
         state.on_pointer_gone();
         assert!(!state.held, "the press cannot outlive the pointer");
-        assert!(!state.button.states().hover);
-        assert!(!state.button.states().active);
+        assert!(!state.button.states().contains(PseudoStates::HOVER));
+        assert!(!state.button.states().contains(PseudoStates::ACTIVE));
         assert!(state.dirty, "clearing hover must schedule a repaint");
     }
 

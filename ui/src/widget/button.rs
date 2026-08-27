@@ -4,7 +4,7 @@ use skia_rs_safe::canvas::Surface;
 
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::ComputedStyle;
-use crate::css::select::{CssNode, PseudoStates};
+use crate::css::node::{Node, PseudoStates};
 use crate::layout::{Allocation, ButtonLayout};
 use crate::paint::paint_button;
 use crate::text::{FontStack, ShapedText};
@@ -21,7 +21,11 @@ use crate::text::{FontStack, ShapedText};
 /// * the `taffy` tree.
 pub struct Button {
     label: String,
-    node: CssNode,
+    /// The node's root ancestor, held so the tree stays alive: `Node::parent`
+    /// is a `Weak`, so nothing but a strong handle keeps the window -- and
+    /// therefore this button's inherited style -- reachable.
+    _root: Node,
+    node: Node,
     style: ComputedStyle,
     allocation: Allocation,
     /// The label shaped at `shaped_size`; invalidated when either changes.
@@ -56,10 +60,13 @@ impl Button {
     /// The style and allocation are the type's defaults until
     /// [`restyle`](Self::restyle) runs.
     #[must_use]
-    pub fn new(label: &str, classes: &[&str], parent: CssNode) -> Self {
+    pub fn new(label: &str, classes: &[&str], parent: &Node) -> Self {
+        let node = Node::with_classes("button", classes);
+        parent.append_child(&node);
         Self {
             label: label.to_string(),
-            node: CssNode::new("button", classes, PseudoStates::default(), Some(parent)),
+            _root: parent.root(),
+            node,
             style: ComputedStyle::default(),
             allocation: Allocation {
                 width: 0.0,
@@ -113,7 +120,7 @@ impl Button {
 
     /// Replace the pseudo-class state and restyle.
     pub fn set_states(&mut self, states: PseudoStates, sheet: &CompiledSheet, fonts: &FontStack) {
-        self.node = self.node.with_states(states);
+        self.node.set_states(states);
         self.restyle(sheet, fonts);
     }
 
@@ -180,14 +187,14 @@ mod tests {
     use super::Button;
     use crate::BUNDLED_ADWAITA_LIGHT;
     use crate::css::cascade::CompiledSheet;
-    use crate::css::select::{CssNode, PseudoStates};
+    use crate::css::node::{Node, PseudoStates};
     use crate::text::FontStack;
 
     fn fixture(css: &str, label: &str) -> (CompiledSheet, FontStack, Button) {
         let sheet = CompiledSheet::compile(css);
         let fonts = FontStack::system().expect("system font");
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        let mut button = Button::new(label, &[], window);
+        let window = Node::with_classes("window", &["background"]);
+        let mut button = Button::new(label, &[], &window);
         button.restyle(&sheet, &fonts);
         (sheet, fonts, button)
     }
@@ -204,14 +211,7 @@ mod tests {
         let narrow = button.allocation().width;
         assert_eq!(button.style().font_size, 14.0);
 
-        button.set_states(
-            PseudoStates {
-                hover: true,
-                ..PseudoStates::default()
-            },
-            &sheet,
-            &fonts,
-        );
+        button.set_states(PseudoStates::HOVER, &sheet, &fonts);
         assert_eq!(button.style().font_size, 30.0);
         assert!(
             button.allocation().width > narrow,
@@ -246,14 +246,7 @@ mod tests {
         let (sheet, fonts, mut button) = fixture(css, "x");
         assert_eq!(button.style().color, skia_rs_safe::core::Color(0xFFFF_0000));
 
-        button.set_states(
-            PseudoStates {
-                hover: true,
-                ..PseudoStates::default()
-            },
-            &sheet,
-            &fonts,
-        );
+        button.set_states(PseudoStates::HOVER, &sheet, &fonts);
         assert_eq!(
             button.style().color,
             skia_rs_safe::core::Color(0xFFFF_0000),
@@ -275,8 +268,8 @@ mod tests {
         let blue_sheet = CompiledSheet::compile(blue_css);
         let fonts = FontStack::system().expect("system font");
 
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        let mut button = Button::new("x", &[], window);
+        let window = Node::with_classes("window", &["background"]);
+        let mut button = Button::new("x", &[], &window);
 
         button.restyle(&red_sheet, &fonts);
         let red_border = button.style().border_color;

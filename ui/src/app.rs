@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use crate::BUNDLED_ADWAITA_LIGHT;
 use crate::css::cascade::CompiledSheet;
+use crate::css::node::Node;
 use crate::css::parse::{Stylesheet, parse_stylesheet_with_base};
-use crate::css::select::{CssNode, PseudoStates};
 use crate::layout::Allocation;
 use crate::text::FontStack;
 use crate::wayland::{LayerWindow, LayerWindowError};
@@ -221,8 +221,8 @@ pub fn compile_theme(source: &ThemeSource) -> CompiledSheet {
 
 /// The `window > button` node tree the M1 slice styles.
 fn button_node(label: &str, classes: &[&str]) -> Button {
-    let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-    Button::new(label, classes, window)
+    let window = Node::with_classes("window", &["background"]);
+    Button::new(label, classes, &window)
 }
 
 /// Build and style the M1 button, returning it with its font stack.
@@ -279,7 +279,7 @@ pub fn run_themed_button(
 mod tests {
     use super::{ThemeEnv, ThemeSource, compile_theme, load_layered_stylesheet};
     use crate::css::computed::ComputedStyle;
-    use crate::css::select::{CssNode, PseudoStates};
+    use crate::css::node::Node;
     use skia_rs_safe::core::Color;
     use std::path::Path;
 
@@ -289,14 +289,16 @@ mod tests {
     }
 
     fn button_style(sheet: &crate::css::cascade::CompiledSheet) -> ComputedStyle {
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        let button = CssNode::new("button", &[], PseudoStates::default(), Some(window));
+        let window = Node::with_classes("window", &["background"]);
+        let button = Node::new("button");
+        window.append_child(&button);
         ComputedStyle::resolve(sheet, &button)
     }
 
     fn headerbar_min_height(sheet: &crate::css::cascade::CompiledSheet) -> f32 {
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        let headerbar = CssNode::new("headerbar", &[], PseudoStates::default(), Some(window));
+        let window = Node::with_classes("window", &["background"]);
+        let headerbar = Node::new("headerbar");
+        window.append_child(&headerbar);
         ComputedStyle::resolve(sheet, &headerbar).min_height
     }
 

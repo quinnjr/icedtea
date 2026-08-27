@@ -143,7 +143,7 @@ mod tests {
     use super::paint_button;
     use crate::css::cascade::CompiledSheet;
     use crate::css::computed::ComputedStyle;
-    use crate::css::select::{CssNode, PseudoStates};
+    use crate::css::node::Node;
     use crate::layout::Allocation;
     use skia_rs_safe::canvas::Surface;
     use skia_rs_safe::core::Color;
@@ -151,8 +151,9 @@ mod tests {
     /// Paint one 40x20 square button with `css` applied and read a pixel back.
     fn painted(css: &str) -> Surface {
         let sheet = CompiledSheet::compile(css);
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        let node = CssNode::new("button", &[], PseudoStates::default(), Some(window));
+        let window = Node::with_classes("window", &["background"]);
+        let node = Node::new("button");
+        window.append_child(&node);
         let style = ComputedStyle::resolve(&sheet, &node);
         let allocation = Allocation {
             width: 40.0,

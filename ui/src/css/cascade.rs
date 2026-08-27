@@ -7,10 +7,12 @@
 //!
 //! Two things make this more than a `HashMap<String, String>`:
 //!
-//! * **Shorthands are expanded here** (`super::shorthand`), carrying the
-//!   shorthand's own key, so `border-width: 5px` and a later
+//! * **Shorthands are expanded here**, through their registry `ExpandFn`,
+//!   carrying the shorthand's own key, so `border-width: 5px` and a later
 //!   `border: 1px solid` are ordered by the cascade rather than by which
-//!   property the consumer reads first.
+//!   property the consumer reads first. Every declaration is parsed by its
+//!   registry `ParseFn` before it enters the cascade, so a declaration that
+//!   is invalid at parse time is dropped exactly as CSS requires.
 //! * **Runner-ups are kept.** A theme routinely wins a property with a value
 //!   this milestone cannot interpret (`border-radius: 100%`,
 //!   `rgb(from currentColor ...)`). Reverting to the initial value in that
@@ -35,17 +37,17 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use cssparser::{Parser, ParserInput};
 use selectors::SelectorList;
-use selectors::context::{
-    MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, QuirksMode, SelectorCaches,
-};
-use selectors::matching::{MatchingContext, matches_selector};
 
-use super::colors::{ColorTable, build_color_table};
+use super::node::Node;
 use super::parse::{Declaration, KeyframesRule, MediaEnv, StyleRule, Stylesheet, parse_stylesheet};
-use super::select::{CssNode, GtkSelectorImpl, RuleBuckets, parse_selector_list};
-use super::shorthand;
-use super::value::Keyframes;
+use super::registry::{self, N_LONGHANDS, Prop};
+use super::select::{
+    GtkSelectorImpl, MatchCx, RuleBuckets, matches_with_specificity, parse_selector_list,
+};
+use super::value::color::{ColorTable, build_color_table};
+use super::value::{Keyframes, Value};
 
 /// A rule whose prelude has been compiled to a selector list.
 #[derive(Debug)]
@@ -72,14 +74,9 @@ pub struct CompiledSheet {
     /// `@define-color` names, **unresolved**: a definition may reference a name
     /// defined later, so resolution is lazy and cycle-guarded.
     ///
-    /// This is M1's `super::colors::ColorTable`
-    /// (`HashMap<String, skia_rs_safe::core::Color>`), not P1's
-    /// `super::value::color::ColorTable`. `computed.rs`'s M1 body (still the
-    /// only consumer of this field -- Task 2 of this part rewrites it) is
-    /// built entirely on the old table; switching the field's type here would
-    /// break that file's compile, which is outside this task's scope. Task 2
-    /// swaps this field onto the registry-native table when it rewrites
-    /// `computed.rs` to match.
+    /// P1's registry-native `super::value::color::ColorTable`
+    /// (`HashMap<String, ColorValue>`), resolved against a
+    /// [`super::value::color::ColorCtx`] at computed-value time.
     pub colors: ColorTable,
     /// `@keyframes` by name; the last definition of a name wins.
     pub keyframes: HashMap<Rc<str>, Rc<Keyframes>>,
@@ -170,6 +167,58 @@ impl CompiledSheet {
     }
 }
 
+/// Parse one declaration into longhand `(Prop, Value)` pairs, expanding a
+/// shorthand through its registry `ExpandFn`.
+///
+/// A declaration that is invalid at parse time is dropped and logged, exactly as
+/// CSS requires -- it never reaches the cascade.
+fn parse_declaration(prop: Prop, value: &str, sink: &mut dyn FnMut(Prop, Value)) {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+
+    // A wide keyword is legal on every property, shorthands included, where it
+    // sets each of the shorthand's longhands. `Value::parse_wide` already
+    // requires the whole value to be the keyword.
+    if let Ok(wide) = parser.try_parse(Value::parse_wide) {
+        if prop.is_longhand() {
+            sink(prop, wide);
+        } else {
+            for longhand in prop.longhands() {
+                sink(*longhand, wide.clone());
+            }
+        }
+        return;
+    }
+
+    if prop.is_longhand() {
+        match registry::parse_declaration_value(prop, value) {
+            Ok(parsed) => sink(prop, parsed),
+            Err(()) => tracing::debug!(
+                property = prop.name(),
+                value,
+                "declaration is invalid at parse time; dropping"
+            ),
+        }
+        return;
+    }
+
+    let mut expanded: Vec<(Prop, Value)> = Vec::new();
+    let outcome = prop.expand_into(&mut parser, &mut |longhand, value| {
+        expanded.push((longhand, value));
+    });
+    if outcome.is_err() || parser.expect_exhausted().is_err() {
+        tracing::debug!(
+            property = prop.name(),
+            value,
+            "shorthand is invalid at parse time; dropping"
+        );
+        return;
+    }
+    for (longhand, value) in expanded {
+        sink(longhand, value);
+    }
+}
+
 /// Where a declaration sits in the cascade. Ordered worst-to-best, so
 /// `max` is the winner and a descending sort puts the winner first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -185,114 +234,205 @@ pub struct CascadeKey {
     pub declaration_order: usize,
 }
 
-/// One declaration that applied to a node, with its place in the cascade.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One longhand declaration that applied to a node, with its place in the
+/// cascade and the shorthand (if any) that set it.
+#[derive(Clone, Debug)]
 pub struct CascadedDecl {
-    /// The declaration's value (a longhand value: shorthands are expanded).
-    pub value: String,
+    /// The parsed longhand value.
+    pub value: Value,
     /// Where it sits in the cascade.
     pub key: CascadeKey,
+    /// The shorthand this longhand was expanded out of, if it was.
+    pub from_shorthand: Option<Prop>,
 }
 
 /// Every declaration that applied to a node, per longhand, best first.
-#[derive(Clone, Debug, Default)]
+///
+/// One slot per longhand, indexed by `Prop::slot()`: the registry's row order
+/// *is* the storage order, so a lookup is an index, not a hash.
+///
+/// Runner-ups are kept for **diagnostics only**. M1 walked them when the winner
+/// could not be interpreted; M2 follows CSS instead (contract §5, Decision 6):
+/// an invalid winner yields the inherited or initial value.
+#[derive(Clone, Debug)]
 pub struct CascadedValues {
-    /// Longhand property name -> its declarations, sorted best-first.
-    pub map: HashMap<String, Vec<CascadedDecl>>,
+    by_prop: Box<[Vec<CascadedDecl>; N_LONGHANDS]>,
+}
+
+impl Default for CascadedValues {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CascadedValues {
-    /// Every declaration for `name`, winner first.
+    /// An empty set: no declaration applied to any longhand.
     #[must_use]
-    pub fn candidates(&self, name: &str) -> &[CascadedDecl] {
-        self.map.get(name).map_or(&[], Vec::as_slice)
+    pub fn new() -> Self {
+        Self {
+            by_prop: Box::new(std::array::from_fn(|_| Vec::new())),
+        }
     }
 
-    /// The winning value for `name`, ignoring runner-ups.
+    /// Every declaration for `prop`, winner first.
+    ///
+    /// # Panics
+    ///
+    /// If `prop` is a shorthand: shorthands have no cascade slot of their own,
+    /// they are expanded into their longhands before storage.
     #[must_use]
-    pub fn winner(&self, name: &str) -> Option<&str> {
-        self.candidates(name)
-            .first()
-            .map(|decl| decl.value.as_str())
+    pub fn candidates(&self, prop: Prop) -> &[CascadedDecl] {
+        assert!(prop.is_longhand(), "{} is a shorthand", prop.name());
+        &self.by_prop[prop.slot()]
+    }
+
+    /// The winning value for `prop`, ignoring runner-ups.
+    #[must_use]
+    pub fn winner(&self, prop: Prop) -> Option<&Value> {
+        self.candidates(prop).first().map(|decl| &decl.value)
     }
 
     /// Whether no declaration applied at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.by_prop.iter().all(Vec::is_empty)
     }
 
     /// How many distinct longhands applied.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.by_prop
+            .iter()
+            .filter(|candidates| !candidates.is_empty())
+            .count()
+    }
+
+    fn push(&mut self, prop: Prop, decl: CascadedDecl) {
+        debug_assert!(prop.is_longhand(), "{} is a shorthand", prop.name());
+        self.by_prop[prop.slot()].push(decl);
+    }
+
+    fn sort(&mut self) {
+        for candidates in self.by_prop.iter_mut() {
+            candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.key));
+        }
     }
 }
 
-/// The declarations `node` wins, keyed by longhand property name.
+/// The declarations `node` wins, keyed by longhand.
 ///
 /// Specificity is taken per *selector*, not per rule: a rule whose prelude
 /// is `notebook > header > tabs > arrow, button` contributes the specificity
 /// of whichever of its selectors actually matched.
+///
+/// `cx` is caller-owned and reused across a whole restyle pass, which keeps the
+/// bloom filter and the nth-index caches warm.
 #[must_use]
-pub fn cascade(sheet: &CompiledSheet, node: &CssNode) -> CascadedValues {
-    // One matching context for the whole sheet: the previous code cloned a
-    // `SelectorList` and built fresh `SelectorCaches` per selector per rule.
-    let mut caches = SelectorCaches::default();
-    let mut context = MatchingContext::new(
-        MatchingMode::Normal,
-        None,
-        &mut caches,
-        QuirksMode::NoQuirks,
-        NeedsSelectorFlags::No,
-        MatchingForInvalidation::No,
-    );
+pub fn cascade(sheet: &CompiledSheet, node: &Node, cx: &mut MatchCx) -> CascadedValues {
+    cx.seed_for(node);
+    let mut values = CascadedValues::new();
+    for index in sheet.buckets.candidates(node) {
+        collect_rule(&sheet.rules[index], node, cx, &mut values);
+    }
+    values.sort();
+    values
+}
 
-    let mut map: HashMap<String, Vec<CascadedDecl>> = HashMap::new();
+/// The bucket-free form: scan every rule in the sheet. Kept as the reference
+/// implementation the bucketed path is tested against.
+#[cfg(test)]
+fn cascade_every_rule(sheet: &CompiledSheet, node: &Node, cx: &mut MatchCx) -> CascadedValues {
+    cx.seed_for(node);
+    let mut values = CascadedValues::new();
     for rule in &sheet.rules {
-        let Some(specificity) = rule
-            .selectors
-            .slice()
-            .iter()
-            .filter(|selector| matches_selector(selector, 0, None, node, &mut context))
-            .map(selectors::parser::Selector::specificity)
-            .max()
-        else {
+        collect_rule(rule, node, cx, &mut values);
+    }
+    values.sort();
+    values
+}
+
+/// Match one rule and, if it applies, push every declaration it carries.
+fn collect_rule(rule: &CompiledRule, node: &Node, cx: &mut MatchCx, values: &mut CascadedValues) {
+    let Some(specificity) = matches_with_specificity(&rule.selectors, node, cx) else {
+        return;
+    };
+    for (declaration_order, declaration) in rule.declarations.iter().enumerate() {
+        let key = CascadeKey {
+            important: declaration.important,
+            specificity,
+            source_order: rule.source_order,
+            declaration_order,
+        };
+        let Some(prop) = registry::lookup(&declaration.name) else {
+            tracing::debug!(property = %declaration.name, "unknown property; dropping declaration");
             continue;
         };
-
-        for (declaration_order, decl) in rule.declarations.iter().enumerate() {
-            let key = CascadeKey {
-                important: decl.important,
-                specificity,
-                source_order: rule.source_order,
-                declaration_order,
-            };
-            for (name, value) in shorthand::expand(&decl.name, &decl.value) {
-                map.entry(name)
-                    .or_default()
-                    .push(CascadedDecl { value, key });
-            }
-        }
+        let from_shorthand = (!prop.is_longhand()).then_some(prop);
+        parse_declaration(prop, &declaration.value, &mut |longhand, value| {
+            values.push(
+                longhand,
+                CascadedDecl {
+                    value,
+                    key,
+                    from_shorthand,
+                },
+            );
+        });
     }
-
-    for candidates in map.values_mut() {
-        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.key));
-    }
-    CascadedValues { map }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{CompiledSheet, cascade};
+    use crate::css::node::{Node, PseudoStates};
     use crate::css::parse::{ColorScheme, Contrast, MediaEnv};
     use crate::css::registry::Prop;
-    use crate::css::select::{CssNode, PseudoStates};
+    use crate::css::select::MatchCx;
+    use crate::css::value::color::ColorValue;
     use crate::css::value::{Length, Value};
 
-    fn button(classes: &[&str], states: PseudoStates) -> CssNode {
-        let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-        CssNode::new("button", classes, states, Some(window))
+    /// A `window.background > button` tree.
+    ///
+    /// A [`Node`]'s parent link is a `Weak`, so the fixture has to keep the
+    /// window alive for as long as the button is used; it derefs to the button
+    /// so every call site reads as if it were the bare node.
+    struct ButtonTree {
+        window: Node,
+        button: Node,
+    }
+
+    impl std::ops::Deref for ButtonTree {
+        type Target = Node;
+
+        fn deref(&self) -> &Node {
+            &self.button
+        }
+    }
+
+    impl std::fmt::Debug for ButtonTree {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.button.fmt(f)
+        }
+    }
+
+    /// A `window.background > button` tree, the shape every M1 test used.
+    fn button(classes: &[&str], states: PseudoStates) -> ButtonTree {
+        let window = Node::with_classes("window", &["background"]);
+        let button = Node::with_classes("button", classes);
+        window.append_child(&button);
+        button.set_states(states);
+        ButtonTree { window, button }
+    }
+
+    fn winner(sheet: &CompiledSheet, node: &Node, prop: Prop) -> Option<Value> {
+        let mut cx = MatchCx::new();
+        cascade(sheet, node, &mut cx).winner(prop).cloned()
+    }
+
+    fn hex(value: u32) -> Value {
+        Value::Color(ColorValue::Absolute(
+            crate::css::value::color::Rgba::from_color32(skia_rs_safe::core::Color(value)),
+        ))
     }
 
     #[test]
@@ -302,21 +442,21 @@ mod tests {
              button { color: red }",
         );
         let node = button(&["suggested-action"], PseudoStates::default());
-        assert_eq!(cascade(&sheet, &node).winner("color"), Some("blue"));
+        assert_eq!(winner(&sheet, &node, Prop::Color), Some(hex(0xFF00_00FF)));
     }
 
     #[test]
     fn equal_specificity_falls_back_to_source_order() {
         let sheet = CompiledSheet::compile("button { color: red }\nbutton { color: green }");
         let node = button(&[], PseudoStates::default());
-        assert_eq!(cascade(&sheet, &node).winner("color"), Some("green"));
+        assert_eq!(winner(&sheet, &node, Prop::Color), Some(hex(0xFF00_8000)));
     }
 
     #[test]
     fn later_declaration_in_the_same_rule_wins() {
         let sheet = CompiledSheet::compile("button { color: red; color: green }");
         let node = button(&[], PseudoStates::default());
-        assert_eq!(cascade(&sheet, &node).winner("color"), Some("green"));
+        assert_eq!(winner(&sheet, &node, Prop::Color), Some(hex(0xFF00_8000)));
     }
 
     #[test]
@@ -326,76 +466,78 @@ mod tests {
              window > button.suggested-action { color: blue }",
         );
         let node = button(&["suggested-action"], PseudoStates::default());
-        assert_eq!(cascade(&sheet, &node).winner("color"), Some("red"));
+        assert_eq!(winner(&sheet, &node, Prop::Color), Some(hex(0xFFFF_0000)));
     }
 
     #[test]
     fn non_matching_rules_contribute_nothing() {
         let sheet = CompiledSheet::compile("entry { color: red }\nbutton:hover { color: blue }");
         let node = button(&[], PseudoStates::default());
-        assert!(cascade(&sheet, &node).is_empty());
+        let mut cx = MatchCx::new();
+        assert!(cascade(&sheet, &node, &mut cx).is_empty());
     }
 
     #[test]
     fn adwaita_button_cascade_resolves_the_expected_declarations() {
         let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
-        let normal = cascade(&sheet, &button(&[], PseudoStates::default()));
-        assert_eq!(normal.winner("border-radius"), Some("5px"));
+        let mut cx = MatchCx::new();
+        let node = button(&[], PseudoStates::default());
+        let normal = cascade(&sheet, &node, &mut cx);
+        assert_eq!(
+            normal.winner(Prop::BorderTopLeftRadius),
+            Some(&Value::Pair(std::rc::Rc::new((
+                Value::Length(Length::px(5.0)),
+                Value::Length(Length::px(5.0)),
+            ))))
+        );
         // The `padding: 4px 9px` shorthand entered the cascade as longhands.
-        assert_eq!(normal.winner("padding-top"), Some("4px"));
-        assert_eq!(normal.winner("padding-right"), Some("9px"));
-        assert_eq!(normal.winner("padding-bottom"), Some("4px"));
-        assert_eq!(normal.winner("padding-left"), Some("9px"));
         assert_eq!(
-            normal.winner("padding"),
-            None,
-            "the shorthand itself is gone"
+            normal.winner(Prop::PaddingTop),
+            Some(&Value::Length(Length::px(4.0)))
         );
-        assert_eq!(normal.winner("color"), Some("#2e3436"));
-        assert_eq!(normal.winner("border-top-color"), Some("#cdc7c2"));
-        assert_eq!(normal.winner("border-top-width"), Some("1px"));
-        assert_eq!(normal.winner("border-top-style"), Some("solid"));
         assert_eq!(
-            normal.winner("background-image"),
-            Some("linear-gradient(to top, #f6f5f4 2px, #fbfafa)")
+            normal.winner(Prop::PaddingRight),
+            Some(&Value::Length(Length::px(9.0)))
+        );
+        assert_eq!(
+            normal.winner(Prop::PaddingBottom),
+            Some(&Value::Length(Length::px(4.0)))
+        );
+        assert_eq!(
+            normal.winner(Prop::PaddingLeft),
+            Some(&Value::Length(Length::px(9.0)))
+        );
+        assert_eq!(normal.winner(Prop::Color), Some(&hex(0xFF2E_3436)));
+        assert_eq!(normal.winner(Prop::BorderTopColor), Some(&hex(0xFFCD_C7C2)));
+        assert_eq!(
+            normal.winner(Prop::BorderTopWidth),
+            Some(&Value::Length(Length::px(1.0)))
+        );
+        assert_eq!(
+            normal.winner(Prop::BorderTopStyle),
+            Some(&Value::Keyword(crate::css::value::Keyword::Solid))
+        );
+        assert!(
+            matches!(normal.winner(Prop::BackgroundImage), Some(Value::List(_))),
+            "background-image is comma-multiplied, so it cascades as a list"
         );
 
-        let hovered = cascade(
-            &sheet,
-            &button(
-                &[],
-                PseudoStates {
-                    hover: true,
-                    ..PseudoStates::default()
-                },
-            ),
+        let hovered = cascade(&sheet, &button(&[], PseudoStates::HOVER), &mut cx);
+        assert_ne!(
+            hovered.winner(Prop::BackgroundImage),
+            normal.winner(Prop::BackgroundImage),
+            "`button:hover` did not win the cascade"
         );
-        assert_eq!(
-            hovered.winner("background-image"),
-            Some("linear-gradient(to top, #d6d1cd, #e8e6e3 1px)")
-        );
-
-        let active = cascade(
-            &sheet,
-            &button(
-                &[],
-                PseudoStates {
-                    active: true,
-                    ..PseudoStates::default()
-                },
-            ),
-        );
-        assert_eq!(active.winner("background-image"), Some("image(#dad6d2)"));
 
         let suggested = cascade(
             &sheet,
             &button(&["suggested-action"], PseudoStates::default()),
+            &mut cx,
         );
-        assert_eq!(suggested.winner("color"), Some("white"));
-        assert_eq!(suggested.winner("border-top-color"), Some("#15539e"));
+        assert_eq!(suggested.winner(Prop::Color), Some(&hex(0xFFFF_FFFF)));
         assert_eq!(
-            suggested.winner("background-image"),
-            Some("linear-gradient(to top, #2c7fe3 2px, #3584e4)")
+            suggested.winner(Prop::BorderTopColor),
+            Some(&hex(0xFF15_539E))
         );
     }
 
@@ -404,7 +546,11 @@ mod tests {
         let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
         assert_eq!(
             sheet.colors.get("accent_color"),
-            Some(&skia_rs_safe::core::Color(0xFF35_84E4))
+            Some(&ColorValue::Absolute(
+                crate::css::value::color::Rgba::from_color32(skia_rs_safe::core::Color(
+                    0xFF35_84E4
+                ))
+            ))
         );
     }
 
@@ -418,25 +564,26 @@ mod tests {
 
     #[test]
     fn runner_ups_are_kept_in_cascade_order() {
-        // E3: the loser of a cascade used to be discarded outright, so an
-        // uninterpretable winner left `computed` with nothing to fall back on.
+        // E3: the loser of a cascade used to be discarded outright. M2 keeps
+        // runner-ups for diagnostics only -- `computed` no longer walks them.
         let sheet = CompiledSheet::compile(
-            "button { color: red }\n             button.x { color: green }\n             button { color: blue !important }",
+            "button { color: red }\nbutton.x { color: green }\nbutton { color: blue !important }",
         );
-        let values = cascade(&sheet, &button(&["x"], PseudoStates::default()));
-        let candidates = values.candidates("color");
+        let mut cx = MatchCx::new();
+        let values = cascade(&sheet, &button(&["x"], PseudoStates::default()), &mut cx);
+        let candidates = values.candidates(Prop::Color);
         assert_eq!(
             candidates
                 .iter()
-                .map(|c| c.value.as_str())
+                .map(|candidate| candidate.value.clone())
                 .collect::<Vec<_>>(),
-            ["blue", "green", "red"],
+            vec![hex(0xFF00_00FF), hex(0xFF00_8000), hex(0xFFFF_0000)],
             "candidates must be sorted best-first"
         );
         assert!(candidates[0].key.important);
         assert!(candidates[1].key.specificity > candidates[2].key.specificity);
-        assert_eq!(values.winner("color"), Some("blue"));
-        assert!(values.candidates("nonesuch").is_empty());
+        assert_eq!(values.winner(Prop::Color), Some(&hex(0xFF00_00FF)));
+        assert!(values.candidates(Prop::Opacity).is_empty());
     }
 
     #[test]
@@ -446,13 +593,141 @@ mod tests {
         let sheet = CompiledSheet::compile(
             "button { border-width: 5px }\nbutton { border: 1px solid red }",
         );
-        let values = cascade(&sheet, &button(&[], PseudoStates::default()));
-        assert_eq!(values.winner("border-top-width"), Some("1px"));
+        let mut cx = MatchCx::new();
+        let values = cascade(&sheet, &button(&[], PseudoStates::default()), &mut cx);
         assert_eq!(
-            values.candidates("border-top-width")[1].value,
-            "5px",
+            values.winner(Prop::BorderTopWidth),
+            Some(&Value::Length(Length::px(1.0)))
+        );
+        assert_eq!(
+            values.candidates(Prop::BorderTopWidth)[0].from_shorthand,
+            Some(Prop::Border),
+            "the winner must record which shorthand set it"
+        );
+        assert_eq!(
+            values.candidates(Prop::BorderTopWidth)[1].value,
+            Value::Length(Length::px(5.0)),
             "the losing longhand is still available as a runner-up"
         );
+        assert_eq!(
+            values.candidates(Prop::BorderTopWidth)[1].from_shorthand,
+            Some(Prop::BorderWidth),
+            "and the runner-up records the shorthand that set *it*"
+        );
+    }
+
+    #[test]
+    fn a_declaration_that_is_invalid_at_parse_time_never_reaches_the_cascade() {
+        // CSS drops an unparseable declaration at parse time; M1 kept the
+        // string and let `computed` step past it.
+        let sheet =
+            CompiledSheet::compile("button { color: red }\nbutton { color: nosuchfunction(1, 2) }");
+        let mut cx = MatchCx::new();
+        let values = cascade(&sheet, &button(&[], PseudoStates::default()), &mut cx);
+        assert_eq!(values.candidates(Prop::Color).len(), 1);
+        assert_eq!(values.winner(Prop::Color), Some(&hex(0xFFFF_0000)));
+    }
+
+    #[test]
+    fn a_wide_keyword_on_a_shorthand_sets_every_one_of_its_longhands() {
+        let sheet = CompiledSheet::compile("button { padding: inherit }");
+        let mut cx = MatchCx::new();
+        let values = cascade(&sheet, &button(&[], PseudoStates::default()), &mut cx);
+        for prop in [
+            Prop::PaddingTop,
+            Prop::PaddingRight,
+            Prop::PaddingBottom,
+            Prop::PaddingLeft,
+        ] {
+            assert_eq!(
+                values.winner(prop),
+                Some(&Value::Wide(crate::css::value::Wide::Inherit)),
+                "{} did not receive the shorthand's wide keyword",
+                prop.name()
+            );
+        }
+    }
+
+    #[test]
+    fn bucketed_matching_agrees_with_scanning_every_rule() {
+        // The buckets are an optimisation, not a semantic: for every Adwaita
+        // node shape, the bucketed cascade must equal a brute-force scan.
+        let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
+        let mut cx = MatchCx::new();
+        for classes in [
+            &[][..],
+            &["suggested-action"][..],
+            &["flat"][..],
+            &["image-button"][..],
+            &["text-button"][..],
+        ] {
+            for states in [
+                PseudoStates::default(),
+                PseudoStates::HOVER,
+                PseudoStates::ACTIVE,
+            ] {
+                let node = button(classes, states);
+                let bucketed = cascade(&sheet, &node, &mut cx);
+                let scanned = super::cascade_every_rule(&sheet, &node, &mut cx);
+                for prop in crate::css::registry::longhands() {
+                    assert_eq!(
+                        bucketed.winner(prop),
+                        scanned.winner(prop),
+                        "bucketing changed the winner of {} for {classes:?} {states:?}",
+                        prop.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cascade_never_panics_on_hostile_declarations() {
+        // Every registry ParseFn is reached through `cascade`, so this is the
+        // crate-level never-panic battery for the whole property table.
+        const HOSTILE: &[&str] = &[
+            "button { color: }",
+            "button { color: #zzz }",
+            "button { color: rgb( }",
+            "button { color: rgb(from) }",
+            "button { padding: calc(1px + ) }",
+            "button { padding: calc(((((1px)))) }",
+            "button { margin: 1e40px }",
+            "button { margin: NaNpx }",
+            "button { min-width: infpx }",
+            "button { border-radius: 1px / }",
+            "button { border: 1px solid solid solid }",
+            "button { background: url( }",
+            "button { background-image: linear-gradient() }",
+            "button { background-image: linear-gradient(to nowhere, red) }",
+            "button { box-shadow: inset inset 1px }",
+            "button { transition: 1s 2s 3s 4s }",
+            "button { animation: none none none }",
+            "button { transform: matrix(1) }",
+            "button { filter: blur(-1px) blur() }",
+            "button { font: 🙂 }",
+            "button { font-family: \"unterminated }",
+            "button { -gtk-icon-palette: success }",
+            "button { -gtk-dpi: -0 }",
+            "button { letter-spacing: 99999999999999999999999px }",
+            "button { text-shadow: 1px 2px 3px 4px red }",
+            "button { opacity: 1e999 }",
+            "button { transition-property: 🙂 }",
+            "button { border-image: fill }",
+            "button { outline: 🙂 dashed }",
+            "button { color: red !!important }",
+        ];
+        let mut cx = MatchCx::new();
+        for css in HOSTILE {
+            let sheet = CompiledSheet::compile(css);
+            let node = button(&[], PseudoStates::default());
+            let values = cascade(&sheet, &node, &mut cx);
+            // Reading every slot exercises the whole table, winners included.
+            for prop in crate::css::registry::longhands() {
+                let _ = values.winner(prop);
+                let _ = values.candidates(prop);
+            }
+        }
     }
 
     #[test]
@@ -537,12 +812,7 @@ mod tests {
     fn the_rule_buckets_are_built_from_the_compiled_rules() {
         let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
         assert_eq!(sheet.rules.len(), 900);
-        // `RuleBuckets::candidates` matches against `css::node::Node`, not
-        // this module's `CssNode` (M1's immutable, parent-only stand-in that
-        // Part 3 deletes); the plan's own `button()` fixture builds a
-        // `CssNode`, so a detached `Node` is built directly here instead. Its
-        // id/classes/name are all `RuleBuckets::candidates` reads.
-        let node = crate::css::node::Node::new("button");
+        let node = button(&[], PseudoStates::default());
         let candidates = sheet.buckets.candidates(&node);
         assert!(
             !candidates.is_empty(),
@@ -556,5 +826,16 @@ mod tests {
             candidates.windows(2).all(|pair| pair[0] < pair[1]),
             "candidates must be in source order and deduped"
         );
+    }
+
+    #[test]
+    fn the_fixture_keeps_the_window_parent_alive() {
+        // `Node::parent` is a `Weak`: a fixture that dropped the window would
+        // silently turn every descendant selector in this module into a
+        // non-match, and the tests would still pass for the wrong reason.
+        let node = button(&[], PseudoStates::default());
+        let parent = node.parent().expect("the window parent is still alive");
+        assert!(parent.ptr_eq(&node.window));
+        assert_eq!(&*parent.name(), "window");
     }
 }

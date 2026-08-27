@@ -10,7 +10,7 @@
 use icedtea_ui::BUNDLED_ADWAITA_LIGHT;
 use icedtea_ui::css::cascade::CompiledSheet;
 use icedtea_ui::css::computed::{Background, BackgroundClip, ComputedStyle, GradientStop};
-use icedtea_ui::css::select::{CssNode, PseudoStates};
+use icedtea_ui::css::node::{Node, PseudoStates};
 use icedtea_ui::text::FontStack;
 use icedtea_ui::widget::button::Button;
 use skia_rs_safe::canvas::Surface;
@@ -31,8 +31,8 @@ fn labelled_fixture(label: &str, classes: &[&str]) -> (CompiledSheet, FontStack,
     let sheet = CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT);
     let fonts =
         FontStack::system().expect("no system font found; install dejavu/liberation/noto sans");
-    let window = CssNode::new("window", &["background"], PseudoStates::default(), None);
-    let mut button = Button::new(label, classes, window);
+    let window = Node::with_classes("window", &["background"]);
+    let mut button = Button::new(label, classes, &window);
     button.restyle(&sheet, &fonts);
     (sheet, fonts, button)
 }
@@ -155,14 +155,7 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
     );
 
     // --- 3. Toggling :hover changes computed style AND pixels ----------
-    button.set_states(
-        PseudoStates {
-            hover: true,
-            ..PseudoStates::default()
-        },
-        &sheet,
-        &fonts,
-    );
+    button.set_states(PseudoStates::HOVER, &sheet, &fonts);
     let hovered = *button.style();
     assert_eq!(
         hovered.background,
@@ -189,14 +182,7 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
     );
 
     // --- 4. Toggling :active: a flat `image(<color>)` background --------
-    button.set_states(
-        PseudoStates {
-            active: true,
-            ..PseudoStates::default()
-        },
-        &sheet,
-        &fonts,
-    );
+    button.set_states(PseudoStates::ACTIVE, &sheet, &fonts);
     assert_eq!(
         button.style().background,
         Background::Solid(Color(0xFFDA_D6D2)),
