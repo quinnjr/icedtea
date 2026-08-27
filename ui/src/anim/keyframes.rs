@@ -105,6 +105,11 @@ pub struct ActiveAnimation {
     props: Vec<Prop>,
     /// Clock milliseconds at which this animation's delay began.
     start_ms: f64,
+    /// Local milliseconds at which `animation-play-state: paused` froze it.
+    ///
+    /// `Some` also means "asks for no more frames": a paused animation's
+    /// sample cannot change until something un-pauses it.
+    paused_at: Option<f64>,
 }
 
 /// CSS's `animation-direction` applied to one iteration's progress.
@@ -147,6 +152,7 @@ impl ActiveAnimation {
             keyframes,
             props,
             start_ms: now_ms,
+            paused_at: None,
         }
     }
 
@@ -185,11 +191,9 @@ impl ActiveAnimation {
         }
     }
 
-    /// Milliseconds since this animation's delay began.
-    ///
-    /// Task 6b makes this freeze while `animation-play-state: paused`.
+    /// Milliseconds since this animation's delay began, frozen while paused.
     fn local_ms(&self, now_ms: f64) -> f64 {
-        now_ms - self.start_ms
+        self.paused_at.unwrap_or(now_ms - self.start_ms)
     }
 
     /// Milliseconds since the *active* interval began; negative during delay.
@@ -212,15 +216,41 @@ impl ActiveAnimation {
         }
     }
 
+    /// The final `(iteration, progress)` an animation rests at.
+    fn end_iteration(&self) -> (u64, f32) {
+        let iterations = self.iterations();
+        if !iterations.is_finite() {
+            // Unreachable in practice: an infinite animation is never `After`.
+            return (u64::MAX, 1.0);
+        }
+        if iterations <= 0.0 {
+            return (0, 0.0);
+        }
+        let whole = iterations.floor();
+        let fraction = iterations - whole;
+        if fraction <= 0.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let index = (whole as u64).saturating_sub(1);
+            (index, 1.0)
+        } else {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let index = whole as u64;
+            #[allow(clippy::cast_possible_truncation)]
+            (index, fraction as f32)
+        }
+    }
+
     /// `(iteration index, progress through it)` at `now_ms`, or `None` when
-    /// the animation is not affecting the style at all.
-    ///
-    /// Task 6b widens the `Before`/`After` arms, which fill modes turn from
-    /// "no contribution" into "hold the first/last value".
+    /// the animation is not affecting the style at all (outside its active
+    /// interval with an `animation-fill-mode` that does not fill that side).
     #[must_use]
     pub fn iteration_progress(&self, now_ms: f64) -> Option<(u64, f32)> {
         match self.phase(now_ms) {
-            Phase::Before | Phase::After => None,
+            Phase::Before => {
+                matches!(self.spec.fill, Keyword::Backwards | Keyword::Both).then_some((0, 0.0))
+            }
+            Phase::After => matches!(self.spec.fill, Keyword::Forwards | Keyword::Both)
+                .then(|| self.end_iteration()),
             Phase::Active => {
                 let duration = self.duration_ms();
                 let active = self.active_ms(now_ms);
@@ -262,7 +292,7 @@ impl ActiveAnimation {
     /// Whether this animation still needs frames.
     #[must_use]
     pub fn is_active(&self, now_ms: f64) -> bool {
-        if self.props.is_empty() {
+        if self.paused_at.is_some() || self.props.is_empty() {
             return false;
         }
         !matches!(self.phase(now_ms), Phase::After)
@@ -272,10 +302,35 @@ impl ActiveAnimation {
     /// `f64::INFINITY` when this animation will never change again.
     #[must_use]
     pub fn next_change_ms(&self, now_ms: f64) -> f64 {
+        if self.paused_at.is_some() {
+            return f64::INFINITY;
+        }
         match self.phase(now_ms) {
             Phase::Before => self.start_ms + self.delay_ms(),
             Phase::Active => now_ms,
             Phase::After => f64::INFINITY,
+        }
+    }
+
+    /// Adopt a new spec and keyframe set without restarting: a restyle that
+    /// leaves `animation-name` alone must not rewind a running animation.
+    pub fn rebind(&mut self, spec: AnimationSpec, keyframes: Rc<Keyframes>) {
+        self.props = keyframes.properties();
+        self.keyframes = keyframes;
+        self.spec = spec;
+    }
+
+    /// Freeze or resume according to the spec's `animation-play-state`.
+    ///
+    /// Resuming shifts `start_ms` so the animation continues from the local
+    /// time it was frozen at rather than jumping forward by the pause.
+    pub fn apply_play_state(&mut self, now_ms: f64) {
+        if self.spec.play_state == Keyword::Paused {
+            if self.paused_at.is_none() {
+                self.paused_at = Some(now_ms - self.start_ms);
+            }
+        } else if let Some(local) = self.paused_at.take() {
+            self.start_ms = now_ms - local;
         }
     }
 }
@@ -601,5 +656,175 @@ mod tests {
         assert!(anim.is_active(1_000_000.0));
         assert_eq!(anim.phase(1_000_000.0), Phase::Active);
         assert_eq!(opacity_at(&anim, 1_000_250.0, &base), Some(0.25));
+    }
+
+    // THE GATE (spec §7: `fill-mode: forwards`).
+    // Mutation check: treat every fill mode as filling and the
+    // `Keyword::None` case starts reporting 1.0 after the end.
+    #[test]
+    fn fill_mode_decides_whether_the_end_value_sticks() {
+        let base = base();
+        let none = ActiveAnimation::start(
+            spec(
+                200.0,
+                0.0,
+                IterationCount::Count(1.0),
+                Keyword::Normal,
+                Keyword::None,
+            ),
+            Rc::from("fade"),
+            fade(),
+            0.0,
+        );
+        assert_eq!(opacity_at(&none, 100.0, &base), Some(0.5));
+        assert_eq!(
+            opacity_at(&none, 500.0, &base),
+            None,
+            "`fill-mode: none` stops overriding once the animation ends"
+        );
+
+        let forwards = ActiveAnimation::start(
+            spec(
+                200.0,
+                0.0,
+                IterationCount::Count(1.0),
+                Keyword::Normal,
+                Keyword::Forwards,
+            ),
+            Rc::from("fade"),
+            fade(),
+            0.0,
+        );
+        assert_eq!(opacity_at(&forwards, 500.0, &base), Some(1.0));
+    }
+
+    // Mutation check: apply the backwards fill during the delay unconditionally
+    // and the `Keyword::None` case reports 0.0 instead of None at 50 ms.
+    #[test]
+    fn fill_mode_backwards_applies_the_start_value_during_the_delay() {
+        let base = base();
+        let none = ActiveAnimation::start(
+            spec(
+                200.0,
+                100.0,
+                IterationCount::Count(1.0),
+                Keyword::Normal,
+                Keyword::None,
+            ),
+            Rc::from("fade"),
+            fade(),
+            0.0,
+        );
+        assert_eq!(opacity_at(&none, 50.0, &base), None);
+        assert_eq!(
+            opacity_at(&none, 200.0, &base),
+            Some(0.5),
+            "100 ms into a 200 ms run"
+        );
+
+        let backwards = ActiveAnimation::start(
+            spec(
+                200.0,
+                100.0,
+                IterationCount::Count(1.0),
+                Keyword::Normal,
+                Keyword::Backwards,
+            ),
+            Rc::from("fade"),
+            fade(),
+            0.0,
+        );
+        assert_eq!(opacity_at(&backwards, 50.0, &base), Some(0.0));
+        assert_eq!(backwards.phase(50.0), Phase::Before);
+    }
+
+    // Mutation check: round the fractional iteration count up and the
+    // end progress becomes 1.0 instead of 0.5.
+    #[test]
+    fn a_fractional_iteration_count_ends_part_way_through_its_last_iteration() {
+        let base = base();
+        let anim = ActiveAnimation::start(
+            spec(
+                1000.0,
+                0.0,
+                IterationCount::Count(2.5),
+                Keyword::Normal,
+                Keyword::Forwards,
+            ),
+            Rc::from("fade"),
+            fade(),
+            0.0,
+        );
+        assert_eq!(opacity_at(&anim, 5000.0, &base), Some(0.5));
+    }
+
+    // Mutation check: ignore `paused_at` in `local_ms` and the paused sample
+    // advances with the clock instead of freezing.
+    #[test]
+    fn play_state_paused_freezes_the_animation_where_it_stood() {
+        let base = base();
+        let mut anim = ActiveAnimation::start(
+            spec(
+                1000.0,
+                0.0,
+                IterationCount::Infinite,
+                Keyword::Normal,
+                Keyword::None,
+            ),
+            Rc::from("fade"),
+            fade(),
+            0.0,
+        );
+        assert_eq!(opacity_at(&anim, 250.0, &base), Some(0.25));
+
+        anim.spec.play_state = Keyword::Paused;
+        anim.apply_play_state(250.0);
+        assert_eq!(
+            opacity_at(&anim, 900.0, &base),
+            Some(0.25),
+            "frozen while paused"
+        );
+        assert!(
+            !anim.is_active(900.0),
+            "a paused animation asks for no frames"
+        );
+
+        anim.spec.play_state = Keyword::Running;
+        anim.apply_play_state(900.0);
+        assert_eq!(
+            opacity_at(&anim, 1150.0, &base),
+            Some(0.5),
+            "resuming continues from 250 ms of local time, not from 900 ms"
+        );
+    }
+
+    // Mutation check: have `rebind` reset `start_ms` to the restyle time and
+    // the resumed sample restarts at 0.0 instead of continuing at 0.5.
+    #[test]
+    fn rebinding_an_animation_keeps_it_running_from_where_it_was() {
+        let base = base();
+        let mut anim = ActiveAnimation::start(
+            spec(
+                1000.0,
+                0.0,
+                IterationCount::Infinite,
+                Keyword::Normal,
+                Keyword::None,
+            ),
+            Rc::from("fade"),
+            fade(),
+            0.0,
+        );
+        anim.rebind(
+            spec(
+                1000.0,
+                0.0,
+                IterationCount::Infinite,
+                Keyword::Normal,
+                Keyword::None,
+            ),
+            fade(),
+        );
+        assert_eq!(opacity_at(&anim, 500.0, &base), Some(0.5));
     }
 }
