@@ -471,6 +471,98 @@ mod tests {
         assert_eq!(pixel(&surface, 20, 1).alpha(), 0);
     }
 
+    /// A 3x3 source image -- red corners, green edges, blue centre -- written
+    /// as a real PNG to a temp file, for a `border-image` slice of `1 1 1 1`
+    /// where each source pixel becomes exactly one nine-slice slot.
+    fn three_by_three_border_image() -> tempfile::TempPath {
+        use skia_rs_safe::codec::{Image as CodecImage, ImageEncoder, ImageInfo, PngEncoder};
+        use skia_rs_safe::core::{AlphaType, ColorType};
+
+        const RED: [u8; 4] = [0xFF, 0x00, 0x00, 0xFF];
+        const GREEN: [u8; 4] = [0x00, 0xFF, 0x00, 0xFF];
+        const BLUE: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
+        // Row-major, top-left to bottom-right: corners red, edges green,
+        // centre blue.
+        let pixels: [[u8; 4]; 9] = [
+            RED, GREEN, RED, //
+            GREEN, BLUE, GREEN, //
+            RED, GREEN, RED,
+        ];
+        let mut bytes = Vec::with_capacity(9 * 4);
+        for pixel in pixels {
+            bytes.extend_from_slice(&pixel);
+        }
+        let info = ImageInfo::new(3, 3, ColorType::Rgba8888, AlphaType::Unpremul);
+        let image =
+            CodecImage::from_raster_data_owned(info, bytes, 3 * 4).expect("3x3 image builds");
+        let encoded = PngEncoder::new()
+            .encode_bytes(&image)
+            .expect("3x3 image encodes to PNG");
+        let mut file = tempfile::NamedTempFile::with_suffix(".png").expect("temp file");
+        std::io::Write::write_all(&mut file, &encoded).expect("write PNG bytes");
+        file.into_temp_path()
+    }
+
+    #[test]
+    fn a_nine_slice_border_image_paints_its_corner_and_edge_colours() {
+        // Positive companion to the two `false`-path tests above: a real,
+        // decodable border-image actually reaches the canvas with the right
+        // pixels in the right nine-slice slots.
+        //
+        // Mutation check: swapping the `st`/`sr`/`sb`/`sl` slice assignments,
+        // or the src/dst rects any nine-slice slot is built from, moves one
+        // of red/green/blue into the wrong slot and fails one of the three
+        // assertions below.
+        let path = three_by_three_border_image();
+        let env = ResolveEnv::default();
+        let colors = HashMap::new();
+        let mut fonts = FontDatabase::probe_only();
+        let mut images = ImageCache::new();
+        let mut cx = PaintCx {
+            env: &env,
+            colors: &colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let mut surface = Surface::new_raster_n32_premul(40, 40).expect("raster surface");
+        surface.canvas().clear(Color::TRANSPARENT);
+        let url: std::rc::Rc<str> = std::rc::Rc::from(path.to_str().expect("utf8 temp path"));
+        let painted;
+        {
+            let mut canvas = surface.canvas();
+            painted = paint_border_image(
+                &mut canvas,
+                &alloc(40.0, 40.0, [4.0; 4]),
+                &Image::Url(url),
+                &BorderImageSlice {
+                    sides: [NumberOrPercent::Number(1.0); 4],
+                    fill: true,
+                },
+                &[
+                    BorderImageWidthSide::Number(1.0),
+                    BorderImageWidthSide::Number(1.0),
+                    BorderImageWidthSide::Number(1.0),
+                    BorderImageWidthSide::Number(1.0),
+                ],
+                RepeatStyle {
+                    x: Keyword::Stretch,
+                    y: Keyword::Stretch,
+                },
+                &mut cx,
+            );
+        }
+        assert!(painted, "a decodable border-image must report true");
+
+        // Corner slot: dt == dl == 4px (Number(1.0) * used border 4px), so
+        // (1, 1) sits inside the stretched top-left corner -- red.
+        assert_eq!(pixel(&surface, 1, 1), Color(0xFFFF_0000));
+        // Top edge slot: stretched across x in [4, 36), y in [0, 4) -- green.
+        assert_eq!(pixel(&surface, 20, 1), Color(0xFF00_FF00));
+        // Filled centre slot: stretched across the whole middle -- blue.
+        assert_eq!(pixel(&surface, 20, 20), Color(0xFF00_00FF));
+    }
+
     #[test]
     fn a_uniform_border_paints_adwaitas_exact_edge_colour() {
         // The M1 gate's `pixel(cx, 0) == 0xFFCDC7C2`, as a unit test. The
