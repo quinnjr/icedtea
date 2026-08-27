@@ -206,3 +206,108 @@ fn the_three_sheets_are_three_different_themes() {
     assert!(ADWAITA_DARK.contains("@define-color theme_bg_color #353535"));
     assert!(ADWAITA_HC.contains("@define-color theme_bg_color #fdfdfc"));
 }
+
+use icedtea_ui::css::value::color::{ColorCtx, Rgba, build_color_table};
+
+/// Resolve every `@define-color` in a sheet, returning the names that did not
+/// resolve. Definitions inside `@media` blocks count too.
+fn unresolved_colors(sheet: &Stylesheet) -> Vec<String> {
+    let mut definitions = sheet.color_definitions.clone();
+    for block in &sheet.media_blocks {
+        definitions.extend(block.color_definitions.iter().cloned());
+    }
+    let table = build_color_table(&definitions);
+    let ctx = ColorCtx {
+        table: &table,
+        // `@define-color` bodies are resolved outside any element, so
+        // `currentColor` has nothing to be but the initial colour.
+        current: Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        },
+        depth: 0,
+    };
+    let mut unresolved = Vec::new();
+    for (name, _source) in &definitions {
+        match table.get(name) {
+            Some(value) => {
+                if value.resolve(&ctx).is_none() {
+                    unresolved.push(name.clone());
+                }
+            }
+            None => unresolved.push(name.clone()),
+        }
+    }
+    unresolved
+}
+
+/// One sheet, walked end to end: the whole gate for that sheet.
+fn assert_sheet_is_fully_covered(name: &str, css: &str) {
+    let (coverage, sheet) = Coverage::walk(css);
+    assert!(
+        coverage.rules > 500 && coverage.declarations > 850,
+        "{name}: only {} rules / {} declarations walked — the sheet did not parse",
+        coverage.rules,
+        coverage.declarations
+    );
+    coverage.assert_complete(name);
+
+    let definitions = sheet.color_definitions.len();
+    assert_eq!(
+        definitions, 37,
+        "{name}: {definitions} @define-color declarations reached the sheet, GTK 4.22 has 37"
+    );
+    let unresolved = unresolved_colors(&sheet);
+    assert!(
+        unresolved.is_empty(),
+        "{name}: {}/37 @define-colors resolved; these did not: {unresolved:#?}",
+        37 - unresolved.len()
+    );
+}
+
+#[test]
+fn adwaita_light_resolves_all_37_define_colors() {
+    // M1 pinned 29/37: the eight relative-colour definitions
+    // (`hsl(from … calc(s * 1.8) …)`, `rgb(from black r g b / calc(alpha * .35))`)
+    // were recorded unresolved rather than fabricated. Resolving all 37 is an
+    // M2 deliverable (spec Decision 6 / contract section 2.4), not a regression.
+    let sheet = parse_stylesheet(icedtea_ui::BUNDLED_ADWAITA_LIGHT);
+    assert_eq!(sheet.color_definitions.len(), 37);
+    assert!(
+        sheet
+            .color_definitions
+            .iter()
+            .any(|(name, value)| name == "wm_title" && value.contains("hsl(from")),
+        "the relative-colour definitions are not in the sheet this test claims to cover"
+    );
+    assert!(unresolved_colors(&sheet).is_empty());
+}
+
+#[test]
+fn a_definition_may_reference_a_name_defined_later() {
+    // Lazy, order-independent resolution — M1 required earlier-only.
+    let sheet = parse_stylesheet(
+        "@define-color a alpha(@b, 0.5); @define-color b #3584e4; button { color: @a; }",
+    );
+    assert!(
+        unresolved_colors(&sheet).is_empty(),
+        "a forward reference did not resolve"
+    );
+}
+
+#[test]
+fn a_colour_cycle_is_broken_not_hung() {
+    let sheet = parse_stylesheet("@define-color a shade(@b, 1.1); @define-color b shade(@a, 1.1);");
+    // The point is that this returns at all; both names are legitimately
+    // unresolvable, and neither may hang or overflow the stack.
+    assert_eq!(unresolved_colors(&sheet).len(), 2);
+}
+
+#[test]
+fn the_m2_gate_adwaita_light_dark_and_high_contrast() {
+    assert_sheet_is_fully_covered("Adwaita light", icedtea_ui::BUNDLED_ADWAITA_LIGHT);
+    assert_sheet_is_fully_covered("Adwaita dark", ADWAITA_DARK);
+    assert_sheet_is_fully_covered("Adwaita high-contrast", ADWAITA_HC);
+}
