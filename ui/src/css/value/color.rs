@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use cssparser::{Parser, Token};
+use cssparser::{Parser, ParserInput, Token};
 use skia_rs_safe::core::{Color, hsl_to_rgb, rgb_to_hsl};
 
 use super::calc::{CalcNode, parse_angle, parse_math_function};
@@ -198,6 +198,9 @@ impl ChannelExpr {
         match self {
             ChannelExpr::Keep(channel) => vars.get(usize::from(*channel)).copied(),
             ChannelExpr::Number(value) => Some(match (space, index) {
+                // The alpha channel is always a bare 0..1 fraction, in any
+                // space -- it is never sRGB-byte- or degree-scaled.
+                (_, 3) => *value,
                 // In an HSL-space relative colour, hue is degrees and
                 // saturation/lightness are already fractions.
                 (ColorSpace::Hsl, _) => *value,
@@ -597,6 +600,52 @@ fn parse_color_function(name: &str, input: &mut Parser<'_, '_>) -> Result<ColorV
         Color::from_css(&text)
             .map(|color| ColorValue::Absolute(Rgba::from_color32(color)))
             .ok_or(())
+    } else if name.eq_ignore_ascii_case("color-mix") {
+        nested(input, parse_color_mix_body)
+    } else if name.eq_ignore_ascii_case("alpha") {
+        nested(input, |inner| {
+            let color = ColorValue::parse(inner)?;
+            eat_comma(inner);
+            let factor = parse_number(inner)?;
+            require_exhausted(inner)?;
+            Ok(ColorValue::Legacy(Rc::new(LegacyColorFn::Alpha(
+                color, factor,
+            ))))
+        })
+    } else if name.eq_ignore_ascii_case("shade") {
+        nested(input, |inner| {
+            let color = ColorValue::parse(inner)?;
+            eat_comma(inner);
+            let factor = parse_number(inner)?;
+            require_exhausted(inner)?;
+            Ok(ColorValue::Legacy(Rc::new(LegacyColorFn::Shade(
+                color, factor,
+            ))))
+        })
+    } else if name.eq_ignore_ascii_case("mix") {
+        nested(input, |inner| {
+            let a = ColorValue::parse(inner)?;
+            eat_comma(inner);
+            let b = ColorValue::parse(inner)?;
+            eat_comma(inner);
+            let factor = parse_number(inner)?;
+            require_exhausted(inner)?;
+            Ok(ColorValue::Legacy(Rc::new(LegacyColorFn::Mix(
+                a, b, factor,
+            ))))
+        })
+    } else if name.eq_ignore_ascii_case("lighter") {
+        nested(input, |inner| {
+            let color = ColorValue::parse(inner)?;
+            require_exhausted(inner)?;
+            Ok(ColorValue::Legacy(Rc::new(LegacyColorFn::Lighter(color))))
+        })
+    } else if name.eq_ignore_ascii_case("darker") {
+        nested(input, |inner| {
+            let color = ColorValue::parse(inner)?;
+            require_exhausted(inner)?;
+            Ok(ColorValue::Legacy(Rc::new(LegacyColorFn::Darker(color))))
+        })
     } else {
         Err(())
     }
@@ -625,6 +674,9 @@ fn require_exhausted(input: &mut Parser<'_, '_>) -> Result<(), ()> {
 }
 
 fn parse_rgb_body(input: &mut Parser<'_, '_>) -> Result<ColorValue, ()> {
+    if let Some(relative) = try_parse_relative(input, ColorSpace::Srgb)? {
+        return Ok(relative);
+    }
     let r = parse_channel(input)?;
     eat_comma(input);
     let g = parse_channel(input)?;
@@ -644,6 +696,9 @@ fn parse_rgb_body(input: &mut Parser<'_, '_>) -> Result<ColorValue, ()> {
 }
 
 fn parse_hsl_body(input: &mut Parser<'_, '_>) -> Result<ColorValue, ()> {
+    if let Some(relative) = try_parse_relative(input, ColorSpace::Hsl)? {
+        return Ok(relative);
+    }
     let hue = parse_angle_or_number(input)?;
     eat_comma(input);
     let saturation = parse_channel(input)?;
@@ -712,6 +767,200 @@ fn parse_angle_or_number(input: &mut Parser<'_, '_>) -> Result<f32, ()> {
         Token::Number { value, .. } if value.is_finite() => Ok(value),
         _ => Err(()),
     }
+}
+
+/// `<number>` / `<percentage>` / math function, as a bare number.
+fn parse_number(input: &mut Parser<'_, '_>) -> Result<f32, ()> {
+    let token = input.next().map_err(|_| ())?.clone();
+    match token {
+        Token::Number { value, .. } if value.is_finite() => Ok(value),
+        Token::Percentage { unit_value, .. } if unit_value.is_finite() => Ok(unit_value),
+        Token::Function(ref name) => {
+            let name = name.clone();
+            parse_math_function(&name, input)?
+                .resolve_number()
+                .ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// The channel names each space binds. Only sRGB and HSL are modelled
+/// channel-wise; a relative colour in any other space is rejected at parse
+/// time rather than silently mis-bound.
+fn channel_index(name: &str, space: ColorSpace) -> Option<u8> {
+    let names: [&str; 3] = match space {
+        ColorSpace::Srgb | ColorSpace::SrgbLinear => ["r", "g", "b"],
+        ColorSpace::Hsl => ["h", "s", "l"],
+        _ => return None,
+    };
+    if name.eq_ignore_ascii_case("alpha") {
+        return Some(3);
+    }
+    names
+        .iter()
+        .position(|channel| name.eq_ignore_ascii_case(channel))
+        .and_then(|index| u8::try_from(index).ok())
+}
+
+fn parse_channel_expr(
+    input: &mut Parser<'_, '_>,
+    space: ColorSpace,
+    index: usize,
+) -> Result<ChannelExpr, ()> {
+    let state = input.state();
+    let token = input.next().map_err(|_| ())?.clone();
+    match token {
+        Token::Number { value, .. } if value.is_finite() => Ok(ChannelExpr::Number(value)),
+        Token::Percentage { unit_value, .. } if unit_value.is_finite() => {
+            Ok(ChannelExpr::Percent(unit_value))
+        }
+        Token::Dimension { .. } if space == ColorSpace::Hsl && index == 0 => {
+            input.reset(&state);
+            parse_angle(input).map(ChannelExpr::Number)
+        }
+        Token::Ident(ref name) => channel_index(name, space).map(ChannelExpr::Keep).ok_or(()),
+        Token::Function(ref name) => {
+            let name = name.clone();
+            Ok(ChannelExpr::Calc(Rc::new(parse_math_function(
+                &name, input,
+            )?)))
+        }
+        _ => {
+            input.reset(&state);
+            Err(())
+        }
+    }
+}
+
+/// `from <origin> c0 c1 c2 [/ alpha]` inside `rgb()`/`hsl()`.
+/// `Ok(None)` means "this is not a relative colour"; the caller falls
+/// through to the ordinary grammar with the parser rewound.
+fn try_parse_relative(
+    input: &mut Parser<'_, '_>,
+    space: ColorSpace,
+) -> Result<Option<ColorValue>, ()> {
+    let state = input.state();
+    let is_from =
+        matches!(input.next(), Ok(Token::Ident(name)) if name.eq_ignore_ascii_case("from"));
+    if !is_from {
+        input.reset(&state);
+        return Ok(None);
+    }
+    let origin = ColorValue::parse(input)?;
+    let channels = [
+        parse_channel_expr(input, space, 0)?,
+        parse_channel_expr(input, space, 1)?,
+        parse_channel_expr(input, space, 2)?,
+    ];
+    let alpha_state = input.state();
+    let has_alpha = matches!(input.next(), Ok(Token::Delim('/')) | Ok(Token::Comma));
+    let alpha = if has_alpha {
+        Some(parse_channel_expr(input, space, 3)?)
+    } else {
+        input.reset(&alpha_state);
+        None
+    };
+    require_exhausted(input)?;
+    Ok(Some(ColorValue::Relative {
+        space,
+        origin: Rc::new(origin),
+        channels,
+        alpha,
+    }))
+}
+
+fn parse_color_mix_body(input: &mut Parser<'_, '_>) -> Result<ColorValue, ()> {
+    let in_keyword =
+        matches!(input.next(), Ok(Token::Ident(name)) if name.eq_ignore_ascii_case("in"));
+    if !in_keyword {
+        return Err(());
+    }
+    let space_name = input.expect_ident().map_err(|_| ())?.as_ref().to_string();
+    let space = ColorSpace::from_str_ascii_ci(&space_name).ok_or(())?;
+    // Skip the optional hue-interpolation clause (`shorter hue`, ...) up to
+    // the comma that ends the space specifier.
+    loop {
+        let state = input.state();
+        let token = input.next().map_err(|_| ())?.clone();
+        match token {
+            Token::Comma => break,
+            Token::Ident(_) => continue,
+            _ => {
+                input.reset(&state);
+                return Err(());
+            }
+        }
+    }
+    let (a, wa) = parse_mix_operand(input)?;
+    input.expect_comma().map_err(|_| ())?;
+    let (b, wb) = parse_mix_operand(input)?;
+    require_exhausted(input)?;
+    Ok(ColorValue::Mix {
+        space,
+        a: Rc::new(a),
+        wa,
+        b: Rc::new(b),
+        wb,
+    })
+}
+
+/// `<color> <percentage>?` or `<percentage> <color>`.
+fn parse_mix_operand(input: &mut Parser<'_, '_>) -> Result<(ColorValue, Option<f32>), ()> {
+    let state = input.state();
+    let leading = match input.next() {
+        Ok(Token::Percentage { unit_value, .. }) if unit_value.is_finite() => Some(*unit_value),
+        _ => None,
+    };
+    if leading.is_none() {
+        input.reset(&state);
+    }
+    let color = ColorValue::parse(input)?;
+    if leading.is_some() {
+        return Ok((color, leading));
+    }
+    let state = input.state();
+    let trailing = match input.next() {
+        Ok(Token::Percentage { unit_value, .. }) if unit_value.is_finite() => Some(*unit_value),
+        _ => None,
+    };
+    if trailing.is_none() {
+        input.reset(&state);
+    }
+    Ok((color, trailing))
+}
+
+/// Build the `@define-color` table.
+///
+/// Order-preserving and **lazy**: every definition is parsed but nothing is
+/// resolved, so a definition may reference a name defined later in the
+/// sheet (M1 required earlier-only). Cycles are broken by
+/// [`ColorCtx::MAX_DEPTH`] at resolution time. A later definition of the
+/// same name replaces an earlier one, as GTK does.
+#[must_use]
+pub fn build_color_table(definitions: &[(String, String)]) -> ColorTable {
+    let mut table = ColorTable::with_capacity(definitions.len());
+    for (name, text) in definitions {
+        let mut source = ParserInput::new(text);
+        let mut parser = Parser::new(&mut source);
+        let parsed = ColorValue::parse(&mut parser).and_then(|value| {
+            parser.skip_whitespace();
+            if parser.is_exhausted() {
+                Ok(value)
+            } else {
+                Err(())
+            }
+        });
+        match parsed {
+            Ok(value) => {
+                table.insert(name.clone(), value);
+            }
+            Err(()) => {
+                tracing::debug!(%name, value = %text, "unparseable @define-color; skipping");
+            }
+        }
+    }
+    table
 }
 
 #[cfg(test)]
@@ -957,6 +1206,194 @@ mod tests {
         let table = ColorTable::new();
         for input in crate::css::value::FUZZ_INPUTS {
             let _ = color_value(input, &table);
+        }
+    }
+
+    use super::build_color_table;
+    use crate::css::parse::parse_stylesheet;
+
+    fn adwaita_table() -> ColorTable {
+        build_color_table(&parse_stylesheet(crate::BUNDLED_ADWAITA_LIGHT).color_definitions)
+    }
+
+    fn resolved(table: &ColorTable, name: &str) -> Option<Color> {
+        let ctx = ColorCtx {
+            table,
+            current: Rgba::TRANSPARENT,
+            depth: 0,
+        };
+        table.get(name)?.resolve(&ctx).map(Rgba::to_color32)
+    }
+
+    #[test]
+    fn resolves_adwaita_named_colors() {
+        let table = adwaita_table();
+        assert_eq!(resolved(&table, "theme_fg_color"), Some(Color(0xFF2E_3436)));
+        assert_eq!(resolved(&table, "borders"), Some(Color(0xFFCD_C7C2)));
+        assert_eq!(resolved(&table, "accent_color"), Some(Color(0xFF35_84E4)));
+        assert_eq!(
+            resolved(&table, "theme_text_color"),
+            Some(Color(0xFF00_0000))
+        );
+        // rgba(255, 255, 255, 0.8) -> alpha 204 (0.8 * 255, rounded).
+        assert_eq!(resolved(&table, "wm_highlight"), Some(Color(0xCCFF_FFFF)));
+    }
+
+    #[test]
+    fn relative_color_syntax_resolves() {
+        // M1 recorded these as unresolved and pinned the table at 29 of 37.
+        // Modelling CSS Color 5 relative syntax is an M2 deliverable: the
+        // fingerprint moves to 37, and this test inverts.
+        let table = adwaita_table();
+        assert_eq!(table.len(), 37);
+        // `rgb(from black r g b / calc(alpha * 0.35))`
+        // -> black at 35% alpha; 0.35 * 255 rounds to 89 (0x59).
+        assert_eq!(resolved(&table, "wm_shadow"), Some(Color(0x5900_0000)));
+        // `rgb(from black r g b / calc(alpha * 0.18))` -> 0.18 * 255 -> 46.
+        assert_eq!(resolved(&table, "wm_border"), Some(Color(0x2E00_0000)));
+        // The five `hsl(from ... h calc(s * k) calc(l * k))` entries all
+        // resolve to opaque colours.
+        for name in [
+            "wm_title",
+            "wm_bg_a",
+            "wm_button_hover_color_a",
+            "wm_button_active_color_a",
+            "wm_button_active_color_b",
+            "wm_button_active_color_c",
+        ] {
+            let color = resolved(&table, name).unwrap_or_else(|| panic!("{name} did not resolve"));
+            assert_eq!(color.alpha(), 0xFF, "{name} lost its alpha");
+        }
+    }
+
+    #[test]
+    fn at_name_references_resolve_through_the_table() {
+        let table = build_color_table(&[
+            ("borders".to_string(), "#cdc7c2".to_string()),
+            ("edge".to_string(), "@borders".to_string()),
+        ]);
+        assert_eq!(resolved(&table, "edge"), Some(Color(0xFFCD_C7C2)));
+        assert_eq!(color_value("@edge", &table), Some(Color(0xFFCD_C7C2)));
+        assert_eq!(color_value("@nope", &table), None);
+    }
+
+    #[test]
+    fn a_definition_may_reference_a_name_defined_later() {
+        // M1's table was built incrementally, so a forward reference was
+        // silently dropped. Lazy resolution makes source order irrelevant.
+        let table = build_color_table(&[
+            ("edge".to_string(), "@borders".to_string()),
+            ("borders".to_string(), "#cdc7c2".to_string()),
+        ]);
+        assert_eq!(resolved(&table, "edge"), Some(Color(0xFFCD_C7C2)));
+    }
+
+    #[test]
+    fn gtk_legacy_colour_functions_resolve() {
+        let table = ColorTable::new();
+        // alpha() multiplies alpha: 0.5 * 255 -> 128 (0x80).
+        assert_eq!(
+            color_value("alpha(#ff0000, 0.5)", &table),
+            Some(Color(0x80FF_0000))
+        );
+        // shade(c, 0) drives lightness (and saturation) to zero: black.
+        assert_eq!(
+            color_value("shade(#ff0000, 0)", &table),
+            Some(Color(0xFF00_0000))
+        );
+        // shade(c, 1) is the identity.
+        assert_eq!(
+            color_value("shade(#ff0000, 1)", &table),
+            Some(Color(0xFFFF_0000))
+        );
+        // mix(a, b, 0) is a, mix(a, b, 1) is b, and 0.5 is the midpoint.
+        assert_eq!(
+            color_value("mix(#000000, #ffffff, 0)", &table),
+            Some(Color(0xFF00_0000))
+        );
+        assert_eq!(
+            color_value("mix(#000000, #ffffff, 1)", &table),
+            Some(Color(0xFFFF_FFFF))
+        );
+        assert_eq!(
+            color_value("mix(#000000, #ffffff, 0.5)", &table),
+            Some(Color(0xFF80_8080))
+        );
+        // lighter/darker are shade(c, 1.3) / shade(c, 0.7); nesting works.
+        assert!(color_value("lighter(#808080)", &table).is_some());
+        assert_eq!(
+            color_value("darker(#808080)", &table),
+            color_value("shade(#808080, 0.7)", &table)
+        );
+        assert!(color_value("alpha(shade(@nope, 0.5), 0.5)", &table).is_none());
+    }
+
+    #[test]
+    fn color_mix_normalizes_its_weights() {
+        let table = ColorTable::new();
+        assert_eq!(
+            color_value("color-mix(in srgb, #000000, #ffffff)", &table),
+            Some(Color(0xFF80_8080))
+        );
+        assert_eq!(
+            color_value("color-mix(in srgb, #000000 100%, #ffffff)", &table),
+            Some(Color(0xFF00_0000))
+        );
+        assert_eq!(
+            color_value("color-mix(in srgb, #000000 0%, #ffffff)", &table),
+            Some(Color(0xFFFF_FFFF))
+        );
+        // Both weights given and not summing to 100% still normalizes.
+        assert_eq!(
+            color_value("color-mix(in srgb, #000000 25%, #ffffff 25%)", &table),
+            Some(Color(0xFF80_8080))
+        );
+        assert_eq!(
+            color_value("color-mix(in srgb, #000000 0%, #ffffff 0%)", &table),
+            None
+        );
+        assert_eq!(color_value("color-mix(#000000, #ffffff)", &table), None);
+    }
+
+    #[test]
+    fn relative_syntax_survives_parse_unresolved() {
+        // A relative colour over an @name must not be resolved at parse time.
+        let value = parse_entirely_with("rgb(from @accent r g b / 0.5)", ColorValue::parse)
+            .expect("relative syntax parses");
+        assert!(matches!(value, ColorValue::Relative { .. }));
+        let empty = ColorTable::new();
+        let ctx = ColorCtx {
+            table: &empty,
+            current: Rgba::TRANSPARENT,
+            depth: 0,
+        };
+        assert_eq!(value.resolve(&ctx), None);
+        let table = table_with("accent", "#3584e4");
+        let ctx = ColorCtx {
+            table: &table,
+            current: Rgba::TRANSPARENT,
+            depth: 0,
+        };
+        assert_eq!(
+            value.resolve(&ctx).map(Rgba::to_color32),
+            Some(Color(0x8035_84E4))
+        );
+    }
+
+    #[test]
+    fn the_colour_table_never_panics_on_hostile_definitions() {
+        let definitions: Vec<(String, String)> = crate::css::value::FUZZ_INPUTS
+            .iter()
+            .map(|input| ((*input).to_string(), (*input).to_string()))
+            .collect();
+        let table = build_color_table(&definitions);
+        let ctx = ColorCtx {
+            table: &table,
+            current: Rgba::TRANSPARENT,
+            depth: 0,
+        };
+        for value in table.values() {
+            let _ = value.resolve(&ctx);
         }
     }
 }
