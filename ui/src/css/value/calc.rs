@@ -49,6 +49,17 @@ pub enum CalcNode {
     Var(u8),
 }
 
+/// How many `+`/`-`/`*`/`/` operands one expression may chain before the
+/// parse is refused.
+///
+/// The AST is left-deep, so a chain of *n* terms is *n* frames deep in
+/// [`CalcNode::eval`], in the derived `PartialEq`, and in `Rc`'s drop glue;
+/// it also costs O(n^2) to parse, because every `*` re-evaluates its left
+/// operand to test whether it is a scalar. Nothing a human authors or a GTK
+/// theme ships comes near 64 terms, and past the cap the value is refused as
+/// an ordinary parse error rather than aborting the process.
+pub const MAX_TERMS: usize = 64;
+
 /// What an expression evaluates to. Kinds never mix.
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum CalcValue {
@@ -111,6 +122,41 @@ impl CalcNode {
         }
     }
 
+    /// Whether this expression's CSS *type* is `<number>`: only then may it
+    /// be used as the scalar operand of `*` or `/`.
+    #[must_use]
+    pub fn is_number_typed(&self) -> bool {
+        self.type_is(&|node| matches!(node, CalcNode::Number(_) | CalcNode::Var(_)))
+    }
+
+    /// Whether this expression's CSS type is `<percentage>`.
+    #[must_use]
+    pub fn is_percent_typed(&self) -> bool {
+        self.type_is(&|node| matches!(node, CalcNode::Percent(_)))
+    }
+
+    /// This expression as a scalar multiplier, or `None` if it is not
+    /// `<number>`-typed.
+    fn scalar_multiplier(&self) -> Option<f32> {
+        self.is_number_typed().then(|| self.resolve_number())?
+    }
+
+    /// Structural type test: every leaf that carries the expression's type
+    /// (a product's scalar right operand does not) must satisfy `leaf`.
+    fn type_is(&self, leaf: &dyn Fn(&CalcNode) -> bool) -> bool {
+        match self {
+            CalcNode::Sum(a, b) | CalcNode::Difference(a, b) => a.type_is(leaf) && b.type_is(leaf),
+            CalcNode::Product(a, _) | CalcNode::Quotient(a, _) => a.type_is(leaf),
+            CalcNode::Min(list) | CalcNode::Max(list) => {
+                !list.is_empty() && list.iter().all(|node| node.type_is(leaf))
+            }
+            CalcNode::Clamp(lo, value, hi) => {
+                lo.type_is(leaf) && value.type_is(leaf) && hi.type_is(leaf)
+            }
+            other => leaf(other),
+        }
+    }
+
     fn eval(&self, ctx: Option<&LengthCtx>, vars: Option<&[f32; 4]>) -> Option<CalcValue> {
         match self {
             CalcNode::Number(n) => Some(CalcValue::Number(*n)),
@@ -145,8 +191,12 @@ impl CalcNode {
                 let lo = lo.eval(ctx, vars)?;
                 let value = value.eval(ctx, vars)?;
                 let hi = hi.eval(ctx, vars)?;
-                let clamped = combine(value, lo, f32::max)?;
-                combine(clamped, hi, f32::min)
+                // CSS Values 4 defines `clamp(MIN, VAL, MAX)` as
+                // `max(MIN, min(VAL, MAX))` -- *not* `min(max(VAL, MIN), MAX)`.
+                // The two agree whenever MIN <= MAX and disagree when the
+                // bounds are inverted, where the spec makes MIN win.
+                let upper = combine(value, hi, f32::min)?;
+                combine(upper, lo, f32::max)
             }
         }
     }
@@ -171,17 +221,17 @@ fn rewrap(kind: CalcValue, scalar: f32) -> CalcValue {
     }
 }
 
-/// Combine two values of the *same* kind. A number combines with anything
-/// (CSS's `<number>` is unit-neutral only for `*`/`/`, but a `calc(2 + 3)`
-/// inside a length context must still work), and any other mismatch fails.
+/// Combine two values of the *same* kind.
+///
+/// `+`, `-`, `min()`, `max()` and `clamp()` are unit-preserving in CSS
+/// Values 4: both operands must have the same type. A bare `<number>` is
+/// **not** unit-neutral here -- `calc(4px + 2)` is invalid and the whole
+/// declaration is dropped -- so a kind mismatch, `<number>` included, fails.
 fn combine(a: CalcValue, b: CalcValue, op: fn(f32, f32) -> f32) -> Option<CalcValue> {
-    let kind = match (a, b) {
-        (CalcValue::Number(_), other) => other,
-        (other, CalcValue::Number(_)) => other,
-        (x, y) if std::mem::discriminant(&x) == std::mem::discriminant(&y) => x,
-        _ => return None,
-    };
-    Some(rewrap(kind, op(scalar(a), scalar(b))))
+    if std::mem::discriminant(&a) != std::mem::discriminant(&b) {
+        return None;
+    }
+    Some(rewrap(a, op(scalar(a), scalar(b))))
 }
 
 fn scale(value: CalcValue, k: f32) -> CalcValue {
@@ -267,7 +317,11 @@ fn parse_argument_list<'i>(
 
 fn parse_sum(input: &mut Parser<'_, '_>) -> Result<CalcNode, ()> {
     let mut left = parse_product(input)?;
+    let mut terms = 1_usize;
     loop {
+        if terms > MAX_TERMS {
+            return Err(());
+        }
         let state = input.state();
         let token = match input.next() {
             Ok(token) => token.clone(),
@@ -279,10 +333,12 @@ fn parse_sum(input: &mut Parser<'_, '_>) -> Result<CalcNode, ()> {
         match token {
             Token::Delim('+') => {
                 let right = parse_product(input)?;
+                terms += 1;
                 left = CalcNode::Sum(Rc::new(left), Rc::new(right));
             }
             Token::Delim('-') => {
                 let right = parse_product(input)?;
+                terms += 1;
                 left = CalcNode::Difference(Rc::new(left), Rc::new(right));
             }
             other => {
@@ -300,6 +356,7 @@ fn parse_sum(input: &mut Parser<'_, '_>) -> Result<CalcNode, ()> {
                     return Ok(left);
                 }
                 let right = parse_product(input)?;
+                terms += 1;
                 left = CalcNode::Sum(Rc::new(left), Rc::new(right));
             }
         }
@@ -308,7 +365,11 @@ fn parse_sum(input: &mut Parser<'_, '_>) -> Result<CalcNode, ()> {
 
 fn parse_product(input: &mut Parser<'_, '_>) -> Result<CalcNode, ()> {
     let mut left = parse_unary(input)?;
+    let mut terms = 1_usize;
     loop {
+        if terms > MAX_TERMS {
+            return Err(());
+        }
         let state = input.state();
         let token = match input.next() {
             Ok(token) => token.clone(),
@@ -320,7 +381,13 @@ fn parse_product(input: &mut Parser<'_, '_>) -> Result<CalcNode, ()> {
         match token {
             Token::Delim('*') => {
                 let right = parse_unary(input)?;
-                left = match (right.resolve_number(), left.resolve_number()) {
+                terms += 1;
+                // Only a *number-typed* operand is a scalar multiplier. A
+                // percentage resolves to a bare fraction through
+                // `resolve_number`, but CSS types it as `<percentage>`, so
+                // `calc(2 * 50%)` must stay a percentage (not become `1`) and
+                // `calc(3px * 50%)` must be invalid.
+                left = match (right.scalar_multiplier(), left.scalar_multiplier()) {
                     (Some(k), _) => CalcNode::Product(Rc::new(left), k),
                     (None, Some(k)) => CalcNode::Product(Rc::new(right), k),
                     (None, None) => return Err(()),
@@ -328,7 +395,8 @@ fn parse_product(input: &mut Parser<'_, '_>) -> Result<CalcNode, ()> {
             }
             Token::Delim('/') => {
                 let right = parse_unary(input)?;
-                let k = right.resolve_number().ok_or(())?;
+                terms += 1;
+                let k = right.scalar_multiplier().ok_or(())?;
                 if k == 0.0 || !k.is_finite() {
                     return Err(());
                 }
@@ -607,5 +675,105 @@ mod tests {
         parens.push_str(&")".repeat(2000));
         let wrapped = format!("calc{parens}");
         assert_eq!(calc(&wrapped), None);
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{CalcNode, MAX_TERMS};
+    use crate::css::value::length::{Length, LengthCtx};
+    use crate::css::value::parse_entirely_with;
+
+    fn px(text: &str) -> Option<f32> {
+        parse_entirely_with(text, Length::parse)
+            .ok()?
+            .resolve(&LengthCtx {
+                percent_basis: Some(200.0),
+                ..LengthCtx::default()
+            })
+    }
+
+    // F22: CSS Values 4 defines `clamp(MIN, VAL, MAX)` as
+    // `max(MIN, min(VAL, MAX))`, so an inverted pair (MIN > MAX) resolves to
+    // MIN. The old order -- `min(max(VAL, MIN), MAX)` -- returned MAX.
+    #[test]
+    fn an_inverted_clamp_resolves_to_its_minimum_not_its_maximum() {
+        assert_eq!(px("clamp(10px, 5px, 2px)"), Some(10.0));
+        // The ordinary, non-inverted cases must not move.
+        assert_eq!(px("clamp(10px, 5px, 20px)"), Some(10.0));
+        assert_eq!(px("clamp(1px, 5px, 20px)"), Some(5.0));
+        assert_eq!(px("clamp(1px, 50px, 20px)"), Some(20.0));
+    }
+
+    // F23: `<length> + <number>` is invalid in CSS; the declaration must be
+    // dropped rather than silently adopting the length's unit.
+    #[test]
+    fn a_bare_number_never_inherits_the_other_operands_unit() {
+        assert_eq!(px("calc(4px + 2)"), None);
+        assert_eq!(px("calc(100% - 20)"), None);
+        assert_eq!(px("calc(2 + 4px)"), None);
+        assert_eq!(px("min(4px, 2)"), None);
+        // A pure-number sum inside a length still has no unit and is invalid
+        // as a length, but must not be mistaken for one either.
+        assert_eq!(px("calc(2 + 3)"), None);
+        // Compatible units keep working.
+        assert_eq!(px("calc(4px + 2px)"), Some(6.0));
+        assert_eq!(px("calc(100% - 20px)"), Some(180.0));
+    }
+
+    // F24: multiplication by a percentage is invalid, and multiplication by a
+    // number must be commutative.
+    #[test]
+    fn a_percentage_is_never_demoted_to_a_bare_multiplier() {
+        // 50% of the 200px basis is 100px; doubled that is 200px, whichever
+        // side the scalar sits on.
+        assert_eq!(px("calc(2 * 50%)"), Some(200.0));
+        assert_eq!(px("calc(50% * 2)"), Some(200.0));
+        assert_eq!(px("calc(3px * 50%)"), None);
+        assert_eq!(px("calc(2px / 50%)"), None);
+        assert_eq!(px("calc(4px * 2)"), Some(8.0));
+        assert_eq!(px("calc(4px / 2)"), Some(2.0));
+    }
+
+    // Priority item: an unbounded operand chain recursed once per term in
+    // `eval`, in the derived `PartialEq`, and in `Rc`'s drop glue, and cost
+    // O(n^2) to parse. The term cap turns all four into a parse failure.
+    #[test]
+    fn an_unbounded_operand_chain_is_refused_rather_than_overflowing_the_stack() {
+        let mut text = String::from("calc(1px");
+        for _ in 0..MAX_TERMS + 8 {
+            text.push_str(" + 1px");
+        }
+        text.push(')');
+        assert_eq!(px(&text), None);
+
+        // A chain just inside the cap still parses and evaluates.
+        let mut ok = String::from("calc(1px");
+        for _ in 0..MAX_TERMS - 1 {
+            ok.push_str(" + 1px");
+        }
+        ok.push(')');
+        assert_eq!(px(&ok), Some(MAX_TERMS as f32));
+    }
+
+    #[test]
+    fn number_typing_classifies_nested_nodes() {
+        let node = |text: &str| {
+            parse_entirely_with(text, |i| {
+                let token = i.next().map_err(|_| ())?.clone();
+                match token {
+                    cssparser::Token::Function(ref name) => {
+                        let name = name.clone();
+                        super::parse_math_function(&name, i)
+                    }
+                    _ => Err(()),
+                }
+            })
+            .ok()
+        };
+        assert!(node("calc(2 * 3)").is_some_and(|n: CalcNode| n.is_number_typed()));
+        assert!(node("calc(50% * 2)").is_some_and(|n: CalcNode| n.is_percent_typed()));
+        assert!(!node("calc(50% * 2)").is_some_and(|n: CalcNode| n.is_number_typed()));
+        assert!(!node("calc(2px * 2)").is_some_and(|n: CalcNode| n.is_number_typed()));
     }
 }
