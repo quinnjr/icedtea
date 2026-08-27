@@ -570,6 +570,40 @@ mod tests {
         }
     }
 
+    // Mutation check: drop `sample`'s `if eased.is_finite() { eased } else
+    // { t }` fallback and this panics (unwrapping a NaN-tainted opacity into
+    // an assertion, or -- once bezier's binary search's `x > t` comparison
+    // is on a NaN -- possibly hangs, since every branch of that comparison
+    // is false) instead of returning the plain-linear-`t` sample.
+    #[test]
+    fn a_degenerate_bezier_falls_back_to_linear_progress_instead_of_nan() {
+        let base = base();
+        let degenerate = TimingFunction::CubicBezier(f32::NAN, f32::NAN, f32::NAN, f32::NAN);
+        let frames = Rc::new(Keyframes {
+            name: Rc::from("fade"),
+            frames: Rc::from(vec![
+                timed_frame(&[0.0], Prop::Opacity, Value::Number(0.0), degenerate),
+                frame(&[1.0], Prop::Opacity, Value::Number(1.0)),
+            ]),
+        });
+        let anim = ActiveAnimation::start(
+            spec(
+                1000.0,
+                0.0,
+                IterationCount::Count(1.0),
+                Keyword::Normal,
+                Keyword::None,
+            ),
+            Rc::from("fade"),
+            frames,
+            0.0,
+        );
+        // 250 ms into a 1000 ms linear-opacity animation: `t == 0.25`. A
+        // sound bezier would move this off 0.25; the NaN guard's job is
+        // specifically to fall back to the un-eased `t` instead of NaN.
+        assert_eq!(opacity_at(&anim, 250.0, &base), Some(0.25));
+    }
+
     // THE GATE (spec §7: manual-clock exactness).
     // Mutation check: floor the iteration index with `round` and the 250 ms
     // sample of a 1000 ms animation stays 0.25 but the 1250 ms sample of
