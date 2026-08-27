@@ -1110,4 +1110,122 @@ button { opacity: 1; animation: fade 1000ms linear infinite; }
             let _ = state.sample(now);
         }
     }
+
+    use crate::BUNDLED_ADWAITA_LIGHT;
+    use crate::css::computed::FromValue;
+    use crate::css::value::color::Rgba;
+
+    // THE GATE (spec §7: "Adwaita's button `transition` sampled at 100 ms").
+    //
+    // Mutation check: change `transitioned_props` so a shorthand is pushed
+    // verbatim instead of expanded, and `outline-width` (which Adwaita lists
+    // separately) still transitions but `outline-style` does not -- so the
+    // sharper mutation is to make `transitioned_props` keep the *first* spec
+    // rather than the last: the duration reverts to the shorthand's 200 ms
+    // and the width at 100 ms becomes ~1.44 px, outside the window below.
+    #[test]
+    fn adwaitas_button_outline_transition_is_exact_at_100ms() {
+        let sheet = CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT);
+        let normal = style_of(&sheet, PseudoStates::default());
+        let focused = style_of(&sheet, PseudoStates::FOCUS);
+
+        // The theme's declared start and end values.
+        assert_eq!(f32::from_value(normal.raw(Prop::OutlineWidth)), 0.0);
+        assert_eq!(f32::from_value(focused.raw(Prop::OutlineWidth)), 2.0);
+        assert_eq!(f32::from_value(normal.raw(Prop::OutlineOffset)), 4.0);
+        assert_eq!(f32::from_value(focused.raw(Prop::OutlineOffset)), -2.0);
+
+        let mut state = AnimationState::new();
+        state.restyle(None, &normal, Duration::ZERO, &sheet);
+        state.restyle(Some(&normal), &focused, Duration::ZERO, &sheet);
+
+        let sampled = state.sample(Duration::from_millis(100));
+
+        // 2 px * cubic-bezier(0.25, 0.46, 0.45, 0.94) at x = 1/3 (= 0.5790).
+        let width = f32::from_value(
+            sampled
+                .get(Prop::OutlineWidth)
+                .expect("outline-width is one of Adwaita's transitioned properties"),
+        );
+        assert!(
+            (1.10..1.21).contains(&width),
+            "outline-width at 100 ms of Adwaita's 300 ms outline transition is \
+             1.158 px, got {width}"
+        );
+
+        // 4 px + (-6 px) * 0.5790 = 0.526 px.
+        let offset = f32::from_value(
+            sampled
+                .get(Prop::OutlineOffset)
+                .expect("outline-offset is transitioned"),
+        );
+        assert!(
+            (0.45..0.62).contains(&offset),
+            "outline-offset at 100 ms is 0.526 px, got {offset}"
+        );
+
+        // transparent -> rgba(53, 132, 228, 0.5), premultiplied (GTK's rule).
+        let color = Rgba::from_value(
+            sampled
+                .get(Prop::OutlineColor)
+                .expect("outline-color is transitioned"),
+        );
+        assert!(
+            (0.27..0.31).contains(&color.a),
+            "alpha at 100 ms is 0.5 * 0.5790 = 0.2895, got {}",
+            color.a
+        );
+        assert!(
+            (color.r - 53.0 / 255.0).abs() < 0.02
+                && (color.g - 132.0 / 255.0).abs() < 0.02
+                && (color.b - 228.0 / 255.0).abs() < 0.02,
+            "premultiplied interpolation keeps the accent hue at every alpha; \
+             got {color:?}, and an unpremultiplied lerp from transparent black \
+             would have given r = 0.120"
+        );
+
+        // Adwaita does not transition its background, so hovering paints
+        // instantly even though `transition: all` appears earlier in the rule.
+        assert!(
+            sampled.get(Prop::BackgroundImage).is_none(),
+            "background-image is not in Adwaita's transition-property list"
+        );
+
+        assert!(state.is_active(Duration::from_millis(299)));
+        assert!(state.sample(Duration::from_millis(300)).is_empty());
+    }
+
+    // Mutation check: make `update_animations` skip specs whose iteration
+    // count is Infinite (an easy "guard against runaway work" mistake) and
+    // `animation_count` reports 0 -- the spinner would never spin.
+    #[test]
+    fn adwaitas_spinner_binds_its_infinite_keyframes_animation() {
+        let sheet = CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT);
+        assert!(
+            sheet.keyframes("spin").is_some(),
+            "Adwaita declares `@keyframes spin`"
+        );
+
+        let window = Node::with_classes("window", &["background"]);
+        let spinner = Node::new("spinner");
+        window.append_child(&spinner);
+        spinner.set_state(PseudoStates::CHECKED, true);
+        let mut cx = MatchCx::new();
+        let style = ComputedStyle::resolve_chain(&sheet, &spinner, &ResolveEnv::default(), &mut cx);
+
+        let mut state = AnimationState::new();
+        state.restyle(None, &style, Duration::ZERO, &sheet);
+        assert_eq!(state.animation_count(), 1);
+
+        let sampled = state.sample(Duration::from_millis(250));
+        assert!(
+            sampled.get(Prop::Transform).is_some(),
+            "`@keyframes spin` animates `transform`, so a quarter of the way \
+             through its 1 s iteration the transform must be overridden"
+        );
+        assert!(
+            state.is_active(Duration::from_secs(600)),
+            "`infinite` means the spinner still asks for frames ten minutes in"
+        );
+    }
 }
