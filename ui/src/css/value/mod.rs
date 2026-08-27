@@ -17,6 +17,7 @@ pub mod color;
 pub mod filter;
 pub mod font;
 pub mod image;
+pub mod interpolate;
 pub mod keyword;
 pub mod length;
 pub mod shadow;
