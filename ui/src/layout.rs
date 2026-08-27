@@ -457,6 +457,128 @@ impl LayoutTree {
     }
 }
 
+/// Intrinsic size for a leaf node.
+///
+/// `known` and `available` come straight from taffy: `known` carries the
+/// dimensions already fixed by the parent, `available` the space offered.
+pub trait Measure {
+    /// Measure `node`.
+    fn measure(
+        &mut self,
+        node: &Node,
+        style: &ComputedStyle,
+        known: taffy::Size<Option<f32>>,
+        available: taffy::Size<taffy::AvailableSpace>,
+    ) -> taffy::Size<f32>;
+}
+
+/// A [`Measure`] that reports the same size for every leaf.
+///
+/// Useful for layout tests and for trees whose leaves have no text.
+pub struct FixedMeasure(pub taffy::Size<f32>);
+
+impl Measure for FixedMeasure {
+    fn measure(
+        &mut self,
+        _node: &Node,
+        _style: &ComputedStyle,
+        known: taffy::Size<Option<f32>>,
+        _available: taffy::Size<taffy::AvailableSpace>,
+    ) -> taffy::Size<f32> {
+        taffy::Size {
+            width: known.width.unwrap_or(self.0.width),
+            height: known.height.unwrap_or(self.0.height),
+        }
+    }
+}
+
+impl LayoutTree {
+    /// Lay the whole tree out.
+    ///
+    /// # Errors
+    ///
+    /// [`LayoutError::Unsynced`] if `root` is not in the tree, or
+    /// [`LayoutError::Taffy`] if `taffy` fails.
+    pub fn compute(
+        &mut self,
+        root: &Node,
+        available: taffy::Size<taffy::AvailableSpace>,
+        measure: &mut dyn Measure,
+    ) -> Result<(), LayoutError> {
+        let root_id = *self.ids.get(&root.opaque()).ok_or(LayoutError::Unsynced)?;
+        // `taffy`'s own dirty tracking only fires from `set_style`: a leaf's
+        // measured content can change (a new label, a new `Measure` impl)
+        // with the node's `Style` untouched, and taffy's per-node layout
+        // cache would then hand back the previous frame's answer. `compute`
+        // is a whole-tree pass, so every node is dirtied unconditionally on
+        // entry; `mark_dirty` short-circuits once a node is already dirty
+        // (`taffy-0.14.0/src/tree/taffy_tree.rs:865`), so this stays cheap
+        // for a tree that never reuses a stale measurement.
+        for &id in self.ids.values() {
+            self.tree.mark_dirty(id)?;
+        }
+        self.tree
+            .compute_layout_with_measure(root_id, available, |inputs, _id, ctx, style| {
+                taffy::compute_leaf_layout(
+                    inputs,
+                    style,
+                    |_, _| 0.0,
+                    |known, avail| match ctx {
+                        Some(ctx) => measure.measure(&ctx.node, &ctx.style, known, avail),
+                        None => taffy::Size::ZERO,
+                    },
+                )
+            })?;
+        Ok(())
+    }
+
+    /// `node`'s allocation in absolute, tree-origin coordinates.
+    ///
+    /// taffy reports each node's `location` relative to its parent, so this
+    /// walks the taffy parent chain and accumulates the offsets.
+    #[must_use]
+    pub fn allocation(&self, node: &Node) -> Option<Allocation> {
+        let id = *self.ids.get(&node.opaque())?;
+        let layout = self.tree.layout(id).ok()?;
+
+        let (mut abs_x, mut abs_y) = (layout.location.x, layout.location.y);
+        let mut cursor = id;
+        while let Some(parent) = self.tree.parent(cursor) {
+            let parent_layout = self.tree.layout(parent).ok()?;
+            abs_x += parent_layout.location.x;
+            abs_y += parent_layout.location.y;
+            cursor = parent;
+        }
+
+        let border = [
+            layout.border.top,
+            layout.border.right,
+            layout.border.bottom,
+            layout.border.left,
+        ];
+        let padding = [
+            layout.padding.top,
+            layout.padding.right,
+            layout.padding.bottom,
+            layout.padding.left,
+        ];
+        let border_box = Rect::new(abs_x, abs_y, layout.size.width, layout.size.height);
+        let content_box = border_box.inset([
+            border[0] + padding[0],
+            border[1] + padding[1],
+            border[2] + padding[2],
+            border[3] + padding[3],
+        ]);
+
+        Some(Allocation {
+            border_box,
+            content_box,
+            border,
+            padding,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Allocation, Rect};
@@ -688,5 +810,259 @@ mod tests {
         let mut tree = LayoutTree::new();
         tree.set_style(&orphan, &style, Container::Leaf, &ResolveEnv::default());
         assert!(tree.taffy_style(&orphan).is_none());
+    }
+
+    use super::{FixedMeasure, Measure};
+    use taffy::prelude::{AvailableSpace, Size};
+
+    /// M1's Adwaita-like button CSS, as a stylesheet rather than a struct
+    /// literal: `ComputedStyle`'s fields no longer exist.
+    const ADWAITA_LIKE: &str = "button { padding: 4px 9px; \
+        border: 1px solid #cdc7c2; border-radius: 5px; \
+        min-width: 16px; min-height: 24px; font-size: 14px; \
+        background-color: #dad6d2; color: #2e3436 }";
+
+    /// Every `label` leaf measures `w` x `h`; everything else is zero.
+    struct LabelSize(f32, f32);
+
+    impl Measure for LabelSize {
+        fn measure(
+            &mut self,
+            node: &Node,
+            _style: &ComputedStyle,
+            _known: Size<Option<f32>>,
+            _available: Size<AvailableSpace>,
+        ) -> Size<f32> {
+            if &*node.name() == "label" {
+                Size {
+                    width: self.0,
+                    height: self.1,
+                }
+            } else {
+                Size::ZERO
+            }
+        }
+    }
+
+    /// `window > button > label`, laid out with the M1 button CSS.
+    fn button_layout(css: &str, label: (f32, f32)) -> (LayoutTree, Node, Node) {
+        let window = Node::new("window");
+        let button = Node::new("button");
+        let label_node = Node::new("label");
+        window.append_child(&button);
+        button.append_child(&label_node);
+
+        let sheet = CompiledSheet::compile(css);
+        let env = ResolveEnv::default();
+        let mut cx = MatchCx::new();
+        let button_style = ComputedStyle::resolve_chain(&sheet, &button, &env, &mut cx);
+        let label_style = ComputedStyle::resolve_chain(&sheet, &label_node, &env, &mut cx);
+        let window_style = ComputedStyle::resolve_chain(&sheet, &window, &env, &mut cx);
+
+        let mut tree = LayoutTree::new();
+        tree.sync(&window).expect("sync");
+        tree.set_style(&window, &window_style, Container::default(), &env);
+        tree.set_style(
+            &button,
+            &button_style,
+            Container::Box {
+                direction: BoxDirection::Row,
+            },
+            &env,
+        );
+        tree.set_style(&label_node, &label_style, Container::Leaf, &env);
+        tree.compute(
+            &window,
+            Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+            &mut LabelSize(label.0, label.1),
+        )
+        .expect("compute");
+        (tree, button, label_node)
+    }
+
+    #[test]
+    fn allocation_is_text_plus_padding_plus_border() {
+        // M1's number, preserved: content max(60, min-width 16) = 60, + 9 + 9
+        // + 1 + 1 = 80; content max(18, min-height 24) = 24, + 4 + 4 + 1 + 1.
+        // Mutation check: dropping BoxSizing::ContentBox gives 34 -> 27.
+        let (tree, button, label) = button_layout(ADWAITA_LIKE, (60.0, 18.0));
+        let a = tree.allocation(&button).expect("button allocation");
+        assert_eq!(a.border_box.width, 80.0);
+        assert_eq!(a.border_box.height, 34.0);
+        let l = tree.allocation(&label).expect("label allocation");
+        assert_eq!(
+            l.border_box.x - a.border_box.x,
+            10.0,
+            "border 1 + padding-left 9"
+        );
+        assert_eq!(
+            l.border_box.y - a.border_box.y,
+            8.0,
+            "border 1 + padding-top 4 + (24 - 18) / 2 centring"
+        );
+    }
+
+    #[test]
+    fn min_size_is_a_content_box_minimum_not_a_border_box_one() {
+        // A2, M1's reviewer scenario, preserved: an empty Adwaita button is
+        // 36x34, not 20x27.
+        let (tree, button, _label) = button_layout(ADWAITA_LIKE, (0.0, 6.0));
+        let a = tree.allocation(&button).expect("button allocation");
+        assert_eq!(a.border_box.width, 36.0, "max(0, 16) + 9 + 9 + 1 + 1 == 36");
+        assert_eq!(
+            a.border_box.height, 34.0,
+            "max(6, 24) + 4 + 4 + 1 + 1 == 34"
+        );
+    }
+
+    #[test]
+    fn an_intrinsic_size_above_the_minimum_still_wins() {
+        // The clamp is `max`, not "always the minimum".
+        let (tree, button, _label) = button_layout(ADWAITA_LIKE, (200.0, 40.0));
+        let a = tree.allocation(&button).expect("button allocation");
+        assert_eq!(a.border_box.width, 220.0);
+        assert_eq!(a.border_box.height, 50.0);
+    }
+
+    #[test]
+    fn a_borderless_paddingless_button_is_exactly_the_label() {
+        let css = "button { padding: 0; border: 0 solid #000; \
+                   min-width: 0; min-height: 0 }";
+        let (tree, button, label) = button_layout(css, (42.0, 17.0));
+        let a = tree.allocation(&button).expect("button allocation");
+        assert_eq!(a.border_box.width, 42.0);
+        assert_eq!(a.border_box.height, 17.0);
+        let l = tree.allocation(&label).expect("label allocation");
+        assert_eq!(l.border_box.x - a.border_box.x, 0.0);
+        assert_eq!(l.border_box.y - a.border_box.y, 0.0);
+    }
+
+    #[test]
+    fn the_label_is_centred_when_min_size_grows_the_button() {
+        // The content box is min-height 24 tall; a 6-tall label centres at 9
+        // inside it, i.e. 1 (border) + 4 (padding) + 9 == 14 from the top.
+        let (tree, button, label) = button_layout(ADWAITA_LIKE, (0.0, 6.0));
+        let a = tree.allocation(&button).expect("button allocation");
+        let l = tree.allocation(&label).expect("label allocation");
+        assert_eq!(l.border_box.y - a.border_box.y, 14.0);
+    }
+
+    #[test]
+    fn one_tree_reused_gives_the_same_answer_as_a_fresh_one() {
+        // A8, preserved: a second layout must not inherit anything from the
+        // first. Mutation check: caching the first allocation and returning
+        // it unconditionally makes `small` equal `tall`.
+        let (tree_tall, tall_button, _l) = button_layout(ADWAITA_LIKE, (200.0, 40.0));
+        let tall = tree_tall.allocation(&tall_button).expect("tall");
+
+        let window = Node::new("window");
+        let button = Node::new("button");
+        let label_node = Node::new("label");
+        window.append_child(&button);
+        button.append_child(&label_node);
+        let sheet = CompiledSheet::compile(ADWAITA_LIKE);
+        let env = ResolveEnv::default();
+        let mut cx = MatchCx::new();
+        let bs = ComputedStyle::resolve_chain(&sheet, &button, &env, &mut cx);
+        let ls = ComputedStyle::resolve_chain(&sheet, &label_node, &env, &mut cx);
+        let ws = ComputedStyle::resolve_chain(&sheet, &window, &env, &mut cx);
+        let mut tree = LayoutTree::new();
+        tree.sync(&window).expect("sync");
+        tree.set_style(&window, &ws, Container::default(), &env);
+        tree.set_style(
+            &button,
+            &bs,
+            Container::Box {
+                direction: BoxDirection::Row,
+            },
+            &env,
+        );
+        tree.set_style(&label_node, &ls, Container::Leaf, &env);
+        let space = Size {
+            width: AvailableSpace::MaxContent,
+            height: AvailableSpace::MaxContent,
+        };
+        tree.compute(&window, space, &mut LabelSize(200.0, 40.0))
+            .expect("first");
+        assert_eq!(tree.allocation(&button).expect("first alloc"), tall);
+        tree.compute(&window, space, &mut LabelSize(0.0, 6.0))
+            .expect("second");
+        let small = tree.allocation(&button).expect("second alloc");
+        assert_eq!(small.border_box.width, 36.0);
+        assert_eq!(small.border_box.height, 34.0);
+        tree.compute(&window, space, &mut LabelSize(200.0, 40.0))
+            .expect("third");
+        assert_eq!(
+            tree.allocation(&button).expect("third alloc"),
+            tall,
+            "the tree did not go back to the larger layout"
+        );
+    }
+
+    #[test]
+    fn allocation_coordinates_are_absolute_not_parent_relative() {
+        // Mutation check: returning taffy's raw `location` (parent-relative)
+        // puts the label at x == 10 instead of 10 plus the button's own x.
+        let css = "window { padding: 12px } button { padding: 4px 9px; \
+                   border: 1px solid #000; min-width: 0; min-height: 0 }";
+        let (tree, button, label) = button_layout(css, (30.0, 12.0));
+        let b = tree.allocation(&button).expect("button");
+        let l = tree.allocation(&label).expect("label");
+        assert_eq!(
+            b.border_box.x, 12.0,
+            "the window's padding offsets the button"
+        );
+        assert_eq!(l.border_box.x, 12.0 + 10.0);
+    }
+
+    #[test]
+    fn allocation_reports_used_border_and_padding_and_the_content_box() {
+        // Mutation check: reading padding from the CSS rather than taffy's
+        // used values silently ignores any clamping taffy applied.
+        let (tree, button, _label) = button_layout(ADWAITA_LIKE, (60.0, 18.0));
+        let a = tree.allocation(&button).expect("button");
+        assert_eq!(a.border, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(a.padding, [4.0, 9.0, 4.0, 9.0]);
+        assert_eq!(a.content_box.width, 80.0 - 2.0 - 18.0);
+        assert_eq!(a.content_box.height, 34.0 - 2.0 - 8.0);
+        assert_eq!(a.content_box.x, a.border_box.x + 10.0);
+        assert_eq!(a.padding_box().width, 78.0);
+    }
+
+    #[test]
+    fn allocation_of_an_unknown_node_is_none() {
+        let (tree, _button, _label) = button_layout(ADWAITA_LIKE, (10.0, 10.0));
+        assert!(tree.allocation(&Node::new("popover")).is_none());
+    }
+
+    #[test]
+    fn fixed_measure_reports_its_size_for_every_leaf() {
+        let window = Node::new("window");
+        let leaf = Node::new("label");
+        window.append_child(&leaf);
+        let env = ResolveEnv::default();
+        let initial = ComputedStyle::initial(&env);
+        let mut tree = LayoutTree::new();
+        tree.sync(&window).expect("sync");
+        tree.set_style(&window, &initial, Container::default(), &env);
+        tree.set_style(&leaf, &initial, Container::Leaf, &env);
+        tree.compute(
+            &window,
+            Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+            &mut FixedMeasure(Size {
+                width: 33.0,
+                height: 11.0,
+            }),
+        )
+        .expect("compute");
+        let a = tree.allocation(&leaf).expect("leaf");
+        assert_eq!(a.border_box.width, 33.0);
+        assert_eq!(a.border_box.height, 11.0);
     }
 }
