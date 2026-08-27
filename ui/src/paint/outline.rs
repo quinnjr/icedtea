@@ -14,6 +14,32 @@ use crate::paint::border::is_visible_border_style;
 use crate::paint::fill_paint;
 use crate::paint::geometry::{inner_radii, rounded_rect_path, rounded_ring_path};
 
+/// The smallest rectangle containing `border_box` and the outline this
+/// `width`, `offset`, `color` and `style` would paint.
+///
+/// `outline-offset` puts the ring *outside* the border box, so a buffer
+/// sized to the border box clips a focus ring away entirely.
+#[must_use]
+pub fn outline_ink_rect(
+    border_box: Rect,
+    width: f32,
+    offset: f32,
+    color: Rgba,
+    style: Keyword,
+) -> Rect {
+    if !width.is_finite() || width <= 0.0 || !is_visible_border_style(style) || color.a <= 0.0 {
+        return border_box;
+    }
+    let offset = if offset.is_finite() { offset } else { 0.0 };
+    let grow = (offset + width).max(0.0);
+    Rect::new(
+        border_box.x - grow,
+        border_box.y - grow,
+        border_box.width + grow * 2.0,
+        border_box.height + grow * 2.0,
+    )
+}
+
 /// Paint one outline around `alloc`.
 pub fn paint_outline(
     canvas: &mut Canvas<'_>,

@@ -77,6 +77,40 @@ pub fn paint_box_shadows(
     }
 }
 
+/// The smallest rectangle containing `border_box` and every *outset*
+/// shadow in `shadows`.
+///
+/// A surface sized to the border box alone clips its own drop shadows away:
+/// the shadow is painted, but into pixels the buffer does not have. Callers
+/// that own a buffer (the layer window) size and damage against this.
+#[must_use]
+pub fn outset_shadow_ink_rect(border_box: Rect, shadows: &[Shadow], ctx: &LengthCtx) -> Rect {
+    let mut ink = border_box;
+    for shadow in shadows {
+        if shadow.inset {
+            continue;
+        }
+        let dx = px(&shadow.offset_x, ctx, 0.0);
+        let dy = px(&shadow.offset_y, ctx, 0.0);
+        let blur = px(&shadow.blur, ctx, 0.0).max(0.0);
+        let spread = px(&shadow.spread, ctx, 0.0);
+        // The blur's reach, capped exactly as `blit_blurred` caps it, so the
+        // ink rect matches what actually gets painted.
+        let reach = blur_reach(sigma_within_pad(sigma_for_blur_radius(blur), MAX_BLUR_PAD));
+        let grow = spread + reach;
+        let shape = Rect::new(
+            border_box.x + dx - grow,
+            border_box.y + dy - grow,
+            border_box.width + grow * 2.0,
+            border_box.height + grow * 2.0,
+        );
+        if shape.x.is_finite() && shape.y.is_finite() && !shape.is_empty() {
+            ink = bounding(ink, shape);
+        }
+    }
+    ink
+}
+
 /// One outset shadow: the border box, offset, spread and blurred.
 #[allow(
     clippy::too_many_arguments,

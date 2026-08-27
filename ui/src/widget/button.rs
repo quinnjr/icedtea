@@ -9,6 +9,7 @@ use crate::anim::{AnimationState, Clock, MonotonicClock, Overrides};
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::{ComputedStyle, ResolveEnv};
 use crate::css::node::{Node, PseudoStates};
+use crate::css::registry::Prop;
 use crate::css::select::MatchCx;
 use crate::layout::{Allocation, BoxDirection, Container, LayoutTree, Measure};
 use crate::paint::{ImageCache, PaintCx, paint_node, paint_node_with_children};
@@ -280,6 +281,40 @@ impl Button {
     #[must_use]
     pub fn label_allocation(&self) -> Allocation {
         self.label_allocation
+    }
+
+    /// Every pixel this widget can ink, in tree-absolute coordinates.
+    ///
+    /// The border box plus whatever paints *outside* it: an outset
+    /// `box-shadow`'s offset, spread and blur reach, and an `outline` pushed
+    /// out by `outline-offset`. A buffer sized to the border box alone
+    /// clips its own drop shadow and focus ring away -- the paint calls run,
+    /// into pixels the surface does not have.
+    ///
+    /// Never smaller than the border box, so a caller can size and damage
+    /// against it unconditionally.
+    #[must_use]
+    pub fn ink_rect(&self) -> crate::layout::Rect {
+        let style = self.style.with_overrides(&self.overrides);
+        let ctx = style.length_ctx(&self.env, None);
+        let border_box = self.allocation.border_box;
+        let ink =
+            crate::paint::shadow::outset_shadow_ink_rect(border_box, &style.box_shadows(), &ctx);
+        let outline = crate::paint::outline::outline_ink_rect(
+            border_box,
+            style.get(Prop::OutlineWidth),
+            style.get(Prop::OutlineOffset),
+            style.get(Prop::OutlineColor),
+            style.get(Prop::OutlineStyle),
+        );
+        let x = ink.x.min(outline.x);
+        let y = ink.y.min(outline.y);
+        crate::layout::Rect::new(
+            x,
+            y,
+            ink.right().max(outline.right()) - x,
+            ink.bottom().max(outline.bottom()) - y,
+        )
     }
 
     /// Resolve this widget's relative `url()` images against `dir`.
@@ -719,5 +754,87 @@ label { min-width: 20px; min-height: 20px; background-color: rgb(0 255 0); }
         );
         assert_eq!(size.height, 60.0, "the used line-height sizes the leaf");
         assert_eq!(size.width, 0.0, "with no glyphs there is no width");
+    }
+    #[test]
+    fn the_ink_rect_covers_an_outset_shadow_and_an_offset_outline() {
+        // The layer window's buffer used to be the border box exactly, so a
+        // drop shadow and a focus ring were painted into pixels the surface
+        // did not have. Mutation check: return `self.allocation.border_box`
+        // from `ink_rect` and every assertion below fails.
+        let (_, _, button) = fixture(
+            "button { min-width: 40px; min-height: 20px; padding: 0; \
+             border: 0 solid transparent; \
+             box-shadow: 4px 6px 0 2px rgba(0, 0, 0, 0.5); \
+             outline: 2px solid #f00; outline-offset: 3px }",
+            "",
+        );
+        let border = button.allocation().border_box;
+        let ink = button.ink_rect();
+
+        // outline: 2 + 3 = 5px on every side. shadow: offset (4, 6) with
+        // spread 2 and no blur, so it reaches 6px right and 8px down but
+        // only 2px left and up -- the outline wins on those sides.
+        assert!(
+            ink.x <= border.x - 5.0,
+            "ink starts left of the border box: {ink:?}"
+        );
+        assert!(ink.y <= border.y - 5.0, "ink starts above it: {ink:?}");
+        assert!(
+            ink.right() >= border.right() + 6.0,
+            "ink extends past the shadow's right reach: {ink:?}"
+        );
+        assert!(
+            ink.bottom() >= border.bottom() + 8.0,
+            "ink extends past the shadow's bottom reach: {ink:?}"
+        );
+    }
+
+    #[test]
+    fn the_ink_rect_is_the_border_box_when_nothing_paints_outside_it() {
+        // A widget with no outset shadow and no outline must not grow its
+        // buffer: the surface would carry transparent margins for nothing,
+        // and the hit test would shift with them.
+        let (_, _, button) = fixture(
+            "button { min-width: 40px; min-height: 20px; padding: 0; \
+             border: 0 solid transparent; box-shadow: inset 0 1px #fff; \
+             outline: 0 }",
+            "",
+        );
+        assert_eq!(button.ink_rect(), button.allocation().border_box);
+    }
+
+    #[test]
+    fn the_hit_test_follows_the_render_origin() {
+        // The tree is shifted onto the buffer by the negation of the ink
+        // rect's origin, so `contains` has to be asked with the same shift.
+        // Mutation check: pass `(0.0, 0.0)` in `AppState::on_pointer_motion`
+        // and a click on the button's own top-left corner misses by exactly
+        // the shadow's reach.
+        let (_, _, button) = fixture(
+            "button { min-width: 40px; min-height: 20px; padding: 0; \
+             border: 0 solid transparent; outline: 2px solid #f00; \
+             outline-offset: 3px }",
+            "",
+        );
+        let ink = button.ink_rect();
+        let origin = (-ink.x, -ink.y);
+        assert!(
+            origin.0 > 0.0 && origin.1 > 0.0,
+            "the ink rect really is offset"
+        );
+
+        let border = button.allocation().border_box;
+        let on_the_corner = (
+            f64::from(border.x + origin.0) + 0.5,
+            f64::from(border.y + origin.1) + 0.5,
+        );
+        assert!(
+            button.contains(origin, on_the_corner.0, on_the_corner.1),
+            "the button's own top-left pixel is inside it"
+        );
+        assert!(
+            !button.contains(origin, 0.5, 0.5),
+            "and the outline's margin is not"
+        );
     }
 }

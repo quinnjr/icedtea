@@ -132,6 +132,14 @@ pub struct AppState {
     frame: Option<PendingFrame>,
     /// The generation the next `wl_surface.frame` request will carry.
     next_frame_generation: u64,
+    /// Where the widget tree's origin sits on the surface.
+    ///
+    /// The buffer covers the widget's *ink* rect, which can start left of or
+    /// above its border box (an outset shadow, a positive `outline-offset`),
+    /// so the tree is shifted by the negation of the ink rect's origin. The
+    /// hit test has to use the same shift or the pointer lands in the wrong
+    /// place by exactly the shadow's reach.
+    render_origin: (f32, f32),
 }
 
 /// One outstanding `wl_surface.frame` callback.
@@ -177,6 +185,7 @@ impl AppState {
             clock,
             frame: None,
             next_frame_generation: 0,
+            render_origin: (0.0, 0.0),
         }
     }
 
@@ -193,7 +202,7 @@ impl AppState {
 
     /// The pointer is at `(x, y)` in surface coordinates.
     fn on_pointer_motion(&mut self, x: f64, y: f64) {
-        let inside = self.button.contains((0.0, 0.0), x, y);
+        let inside = self.button.contains(self.render_origin, x, y);
         self.update_states(inside, inside && self.held);
     }
 
@@ -383,10 +392,24 @@ impl LayerWindow {
         mut button: Button,
     ) -> Result<Self, LayerWindowError> {
         button.restyle(&sheet, &mut fonts);
-        let allocation = button.allocation();
-        let width = allocation.border_box.width.ceil().max(1.0) as i32;
-        let height = allocation.border_box.height.ceil().max(1.0) as i32;
-        tracing::info!(width, height, "opening layer window");
+        // The buffer covers every pixel the widget can ink, not just its
+        // border box: an outset `box-shadow`'s offset, spread and blur, and
+        // an `outline` pushed out by `outline-offset`, all paint *outside*
+        // the border box, and a border-box-sized surface simply clipped them
+        // away. `render_origin` shifts the tree's coordinates so an ink rect
+        // that starts left of or above the border box still lands on the
+        // buffer, and the hit test shifts with it.
+        let ink = button.ink_rect();
+        let render_origin = (-ink.x, -ink.y);
+        let width = ink.width.ceil().max(1.0) as i32;
+        let height = ink.height.ceil().max(1.0) as i32;
+        tracing::info!(
+            width,
+            height,
+            ink_x = ink.x,
+            ink_y = ink.y,
+            "opening layer window"
+        );
 
         let conn = Connection::connect_to_env().map_err(LayerWindowError::Connect)?;
         let display = conn.display();
@@ -395,6 +418,7 @@ impl LayerWindow {
         display.get_registry(&qh, ());
 
         let mut state = AppState::new(sheet, fonts, button);
+        state.render_origin = render_origin;
         queue
             .roundtrip(&mut state)
             .map_err(LayerWindowError::Dispatch)?;
@@ -507,9 +531,10 @@ impl LayerWindow {
 
         let (width, height) = self.buffers.size();
         self.skia.canvas().clear(Color::TRANSPARENT);
+        let render_origin = self.state.render_origin;
         self.state.button.render(
             &mut self.skia,
-            (0.0, 0.0),
+            render_origin,
             &self.state.sheet,
             &mut self.state.fonts,
         );
