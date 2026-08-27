@@ -380,6 +380,169 @@ impl Node {
         }
     }
 
+    /// This node's parent, if it is attached.
+    #[must_use]
+    pub fn parent(&self) -> Option<Node> {
+        self.0.parent.borrow().upgrade().map(Node)
+    }
+
+    /// This node's children, in order.
+    #[must_use]
+    pub fn children(&self) -> Vec<Node> {
+        self.0.children.borrow().clone()
+    }
+
+    /// The child at `index`, if any.
+    #[must_use]
+    pub fn child(&self, index: usize) -> Option<Node> {
+        self.0.children.borrow().get(index).cloned()
+    }
+
+    /// How many children this node has.
+    #[must_use]
+    pub fn child_count(&self) -> usize {
+        self.0.children.borrow().len()
+    }
+
+    /// This node's position among its parent's children; `None` when detached.
+    #[must_use]
+    pub fn index_in_parent(&self) -> Option<usize> {
+        let parent = self.parent()?;
+        parent
+            .0
+            .children
+            .borrow()
+            .iter()
+            .position(|child| child.ptr_eq(self))
+    }
+
+    /// The topmost ancestor, or this node when it is detached.
+    #[must_use]
+    pub fn root(&self) -> Node {
+        let mut current = self.clone();
+        while let Some(parent) = current.parent() {
+            current = parent;
+        }
+        current
+    }
+
+    /// This node's ancestors, parent first, excluding self.
+    pub fn ancestors(&self) -> impl Iterator<Item = Node> {
+        Ancestors {
+            current: self.parent(),
+        }
+    }
+
+    /// This node's descendants in pre-order, excluding self.
+    pub fn descendants(&self) -> impl Iterator<Item = Node> {
+        let mut stack: Vec<Node> = self.0.children.borrow().clone();
+        stack.reverse();
+        Descendants { stack }
+    }
+
+    /// Whether `other` is inside this node's subtree (strictly below it).
+    #[must_use]
+    pub fn is_ancestor_of(&self, other: &Node) -> bool {
+        other.ancestors().any(|ancestor| ancestor.ptr_eq(self))
+    }
+
+    /// Append `child`, reparenting it if it is attached elsewhere.
+    pub fn append_child(&self, child: &Node) {
+        self.insert_child(self.child_count(), child);
+    }
+
+    /// Insert `child` at `index` (clamped to the end), reparenting if needed.
+    ///
+    /// Inserting a node into itself or into its own descendant would build an
+    /// `Rc` cycle — every tree walk would then never terminate — so it is
+    /// refused and logged rather than honoured.
+    pub fn insert_child(&self, index: usize, child: &Node) {
+        if self.ptr_eq(child) || child.is_ancestor_of(self) {
+            tracing::debug!(
+                parent = self.0.name.as_str(),
+                child = child.0.name.as_str(),
+                "refusing to insert a node into itself or into its own descendant"
+            );
+            return;
+        }
+        child.detach();
+
+        {
+            let mut children = self.0.children.borrow_mut();
+            let index = index.min(children.len());
+            children.insert(index, child.clone());
+        }
+        *child.0.parent.borrow_mut() = Rc::downgrade(&self.0);
+
+        let token = self.0.tree.borrow().clone();
+        adopt_tree(child, &token);
+
+        let focused = child.0.focus_count.get();
+        if focused > 0 {
+            self.add_focus_count(focused);
+        }
+        self.touch();
+        child.touch();
+    }
+
+    /// Remove `child`. `false` if it was not a child of this node.
+    pub fn remove_child(&self, child: &Node) -> bool {
+        let position = self
+            .0
+            .children
+            .borrow()
+            .iter()
+            .position(|candidate| candidate.ptr_eq(child));
+        let Some(position) = position else {
+            return false;
+        };
+        self.0.children.borrow_mut().remove(position);
+        *child.0.parent.borrow_mut() = Weak::new();
+
+        let focused = child.0.focus_count.get();
+        if focused > 0 {
+            self.sub_focus_count(focused);
+        }
+
+        // The removed subtree becomes a tree of its own, starting past both
+        // trees' counters so no handle ever sees a generation go backwards.
+        let token = Rc::new(Cell::new(self.0.tree.borrow().get() + 1));
+        adopt_tree(child, &token);
+
+        self.touch();
+        child.touch();
+        true
+    }
+
+    /// Remove this node from its parent, if it has one.
+    pub fn detach(&self) {
+        if let Some(parent) = self.parent() {
+            parent.remove_child(self);
+        }
+    }
+
+    /// Add `delta` focused nodes to this node and every ancestor.
+    fn add_focus_count(&self, delta: u32) {
+        let mut current = Some(self.clone());
+        while let Some(node) = current {
+            node.0.focus_count.set(node.0.focus_count.get() + delta);
+            node.touch();
+            current = node.parent();
+        }
+    }
+
+    /// Remove `delta` focused nodes from this node and every ancestor.
+    fn sub_focus_count(&self, delta: u32) {
+        let mut current = Some(self.clone());
+        while let Some(node) = current {
+            node.0
+                .focus_count
+                .set(node.0.focus_count.get().saturating_sub(delta));
+            node.touch();
+            current = node.parent();
+        }
+    }
+
     /// Bump the tree generation and stamp it onto this node.
     fn touch(&self) {
         let generation = {
@@ -389,6 +552,53 @@ impl Node {
             next
         };
         self.0.self_generation.set(generation);
+    }
+}
+
+/// Iterator over a node's ancestors, parent first.
+struct Ancestors {
+    current: Option<Node>,
+}
+
+impl Iterator for Ancestors {
+    type Item = Node;
+
+    fn next(&mut self) -> Option<Node> {
+        let node = self.current.take()?;
+        self.current = node.parent();
+        Some(node)
+    }
+}
+
+/// Pre-order iterator over a node's descendants.
+struct Descendants {
+    stack: Vec<Node>,
+}
+
+impl Iterator for Descendants {
+    type Item = Node;
+
+    fn next(&mut self) -> Option<Node> {
+        let node = self.stack.pop()?;
+        let children = node.0.children.borrow();
+        for child in children.iter().rev() {
+            self.stack.push(child.clone());
+        }
+        drop(children);
+        Some(node)
+    }
+}
+
+/// Move `node`'s whole subtree onto `token`, carrying the counter forward so a
+/// generation is monotonic for every handle involved.
+fn adopt_tree(node: &Node, token: &Rc<Cell<u64>>) {
+    let previous = node.0.tree.borrow().get();
+    if token.get() < previous {
+        token.set(previous);
+    }
+    *node.0.tree.borrow_mut() = Rc::clone(token);
+    for child in node.0.children.borrow().iter() {
+        adopt_tree(child, token);
     }
 }
 
@@ -536,5 +746,177 @@ mod tests {
         assert_eq!(Direction::parse("sideways"), None);
         assert_eq!(Direction::default(), Direction::Ltr);
         assert_eq!(PseudoStates::default(), PseudoStates::empty());
+    }
+
+    fn names(nodes: &[Node]) -> Vec<String> {
+        nodes.iter().map(|n| n.name().to_string()).collect()
+    }
+
+    #[test]
+    fn children_are_ordered_and_reachable_from_both_ends() {
+        let box_node = Node::new("box");
+        let first = Node::new("label");
+        let second = Node::new("button");
+        let third = Node::new("image");
+        box_node.append_child(&first);
+        box_node.append_child(&second);
+        box_node.append_child(&third);
+
+        assert_eq!(box_node.child_count(), 3);
+        assert_eq!(
+            names(&box_node.children()),
+            vec!["label", "button", "image"]
+        );
+        assert!(box_node.child(1).expect("second child").ptr_eq(&second));
+        assert!(box_node.child(3).is_none());
+        assert_eq!(second.index_in_parent(), Some(1));
+        assert!(second.parent().expect("parent").ptr_eq(&box_node));
+        assert!(box_node.parent().is_none());
+        assert_eq!(box_node.index_in_parent(), None);
+    }
+
+    #[test]
+    fn insert_child_places_the_node_at_the_index() {
+        let box_node = Node::new("box");
+        let a = Node::new("a");
+        let b = Node::new("b");
+        let c = Node::new("c");
+        box_node.append_child(&a);
+        box_node.append_child(&c);
+        box_node.insert_child(1, &b);
+        assert_eq!(names(&box_node.children()), vec!["a", "b", "c"]);
+
+        // An out-of-range index appends rather than panicking: the widget layer
+        // must never be able to crash the engine with a stale index.
+        let d = Node::new("d");
+        box_node.insert_child(99, &d);
+        assert_eq!(names(&box_node.children()), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn appending_an_attached_child_reparents_it() {
+        let left = Node::new("box");
+        let right = Node::new("box");
+        let child = Node::new("button");
+        left.append_child(&child);
+        assert_eq!(left.child_count(), 1);
+
+        right.append_child(&child);
+        assert_eq!(left.child_count(), 0, "the old parent must lose the child");
+        assert_eq!(right.child_count(), 1);
+        assert!(child.parent().expect("parent").ptr_eq(&right));
+    }
+
+    #[test]
+    fn remove_and_detach_report_and_orphan() {
+        let box_node = Node::new("box");
+        let child = Node::new("button");
+        let stranger = Node::new("label");
+        box_node.append_child(&child);
+
+        assert!(
+            !box_node.remove_child(&stranger),
+            "removing a non-child reports false"
+        );
+        assert!(box_node.remove_child(&child));
+        assert!(child.parent().is_none());
+        assert_eq!(box_node.child_count(), 0);
+
+        box_node.append_child(&child);
+        child.detach();
+        assert!(child.parent().is_none());
+        assert_eq!(box_node.child_count(), 0);
+        child.detach(); // detaching an orphan is a no-op, not a panic
+    }
+
+    #[test]
+    fn ancestors_and_descendants_walk_the_whole_tree() {
+        let window = Node::new("window");
+        let headerbar = Node::new("headerbar");
+        let box_node = Node::new("box");
+        let button = Node::new("button");
+        let label = Node::new("label");
+        window.append_child(&headerbar);
+        headerbar.append_child(&box_node);
+        box_node.append_child(&button);
+        button.append_child(&label);
+
+        assert_eq!(
+            names(&label.ancestors().collect::<Vec<_>>()),
+            vec!["button", "box", "headerbar", "window"],
+            "ancestors are parent-first and exclude self"
+        );
+        assert_eq!(
+            names(&window.descendants().collect::<Vec<_>>()),
+            vec!["headerbar", "box", "button", "label"],
+            "descendants are pre-order and exclude self"
+        );
+        assert!(label.root().ptr_eq(&window));
+        assert!(window.root().ptr_eq(&window));
+        assert!(window.is_ancestor_of(&label));
+        assert!(!label.is_ancestor_of(&window));
+        assert!(
+            !window.is_ancestor_of(&window),
+            "a node is not its own ancestor"
+        );
+    }
+
+    #[test]
+    fn a_node_cannot_be_inserted_into_itself_or_its_own_descendant() {
+        let window = Node::new("window");
+        let button = Node::new("button");
+        window.append_child(&button);
+
+        button.append_child(&window); // would build an Rc cycle and hang every walk
+        assert_eq!(button.child_count(), 0, "the cycle must be refused");
+        assert!(window.child(0).expect("button").ptr_eq(&button));
+
+        window.append_child(&window);
+        assert_eq!(
+            window.child_count(),
+            1,
+            "a node may not become its own child"
+        );
+    }
+
+    #[test]
+    fn structural_mutation_bumps_the_generation_for_every_handle() {
+        let window = Node::new("window");
+        let button = Node::new("button");
+        let before = window.generation();
+        window.append_child(&button);
+        assert!(window.generation() > before);
+        assert_eq!(
+            button.generation(),
+            window.generation(),
+            "an attached node shares its tree's generation"
+        );
+        assert!(button.self_generation() > 0);
+
+        let attached = window.generation();
+        window.remove_child(&button);
+        assert!(window.generation() > attached);
+        assert!(
+            button.generation() > attached,
+            "a detached subtree keeps counting forward, never backwards"
+        );
+    }
+
+    #[test]
+    fn adopting_a_subtree_never_moves_a_generation_backwards() {
+        let busy = Node::new("window");
+        for index in 0..10 {
+            busy.add_class(&format!("c{index}"));
+        }
+        let quiet = Node::new("box");
+        let busy_generation = busy.generation();
+        assert!(busy_generation > quiet.generation());
+
+        quiet.append_child(&busy);
+        assert!(
+            busy.generation() > busy_generation,
+            "the adopting tree's counter must jump past the adoptee's"
+        );
+        assert_eq!(quiet.generation(), busy.generation());
     }
 }
