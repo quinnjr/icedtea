@@ -193,25 +193,46 @@ pub enum ChannelExpr {
     Calc(Rc<CalcNode>),
 }
 
+/// The CSS *reference range* of one channel: the number a full-strength
+/// (`100%`) channel is written as in the function's own syntax.
+///
+/// Everything in this module stores colours as 0..1 fractions (and hue in
+/// degrees), so a channel written in CSS units is divided by this to get
+/// there, and a channel variable is multiplied by it to get back.
+///
+/// This is what makes a *literal* inside a relative-colour `calc()` mean
+/// what CSS says it means: `rgb(from black calc(128) 0 0)` is mid-red
+/// because 128 is read on the same 0..255 scale as the `r` variable it
+/// could have been added to, and `hsl(from c h calc(s * 1.8) l)` is
+/// unchanged because a pure scaling is invariant under the round trip.
+fn channel_scale(space: ColorSpace, index: usize) -> f32 {
+    match (space, index) {
+        // Alpha is a bare 0..1 fraction in every space.
+        (_, 3) => 1.0,
+        // HSL hue is degrees; saturation and lightness run 0..100.
+        (ColorSpace::Hsl, 0) => 1.0,
+        (ColorSpace::Hsl, _) => 100.0,
+        // Every other space this engine models channel-wise is sRGB, 0..255.
+        _ => 255.0,
+    }
+}
+
 impl ChannelExpr {
     fn resolve(&self, vars: &[f32; 4], space: ColorSpace, index: usize) -> Option<f32> {
+        let scale = channel_scale(space, index);
         match self {
-            ChannelExpr::Keep(channel) => vars.get(usize::from(*channel)).copied(),
-            ChannelExpr::Number(value) => Some(match (space, index) {
-                // The alpha channel is always a bare 0..1 fraction, in any
-                // space -- it is never sRGB-byte- or degree-scaled.
-                (_, 3) => *value,
-                // In an HSL-space relative colour, hue is degrees and
-                // saturation/lightness are already fractions.
-                (ColorSpace::Hsl, _) => *value,
-                // Everywhere else a bare number is an 0..255 sRGB channel.
-                _ => value / 255.0,
-            }),
+            // `vars` are in CSS units so that literals inside a `Calc` are
+            // commensurate with them; a bare `Keep` scales straight back.
+            ChannelExpr::Keep(channel) => {
+                let source = usize::from(*channel);
+                Some(vars.get(source).copied()? / channel_scale(space, source))
+            }
+            ChannelExpr::Number(value) => Some(value / scale),
             ChannelExpr::Percent(fraction) => Some(match (space, index) {
                 (ColorSpace::Hsl, 0) => fraction * 360.0,
                 _ => *fraction,
             }),
-            ChannelExpr::Calc(node) => node.resolve_number_with(vars),
+            ChannelExpr::Calc(node) => Some(node.resolve_number_with(vars)? / scale),
         }
     }
 }
@@ -282,7 +303,23 @@ impl ColorValue {
                 let a_rgba = a.resolve(&deeper)?;
                 let b_rgba = b.resolve(&deeper)?;
                 let (pa, pb) = normalize_weights(*wa, *wb)?;
-                Some(mix_in_space(*space, a_rgba, b_rgba, pb / (pa + pb)))
+                let mixed = mix_in_space(*space, a_rgba, b_rgba, pb / (pa + pb));
+                // CSS Color 5 section 3.2 step 5: when the two percentages
+                // were both given and sum to less than 100%, the result's
+                // alpha is multiplied by that sum.
+                let sum = pa + pb;
+                let scale = if wa.is_some() && wb.is_some() && sum < 1.0 {
+                    sum
+                } else {
+                    1.0
+                };
+                Some(
+                    Rgba {
+                        a: mixed.a * scale,
+                        ..mixed
+                    }
+                    .clamped(),
+                )
             }
             ColorValue::Relative {
                 space,
@@ -292,12 +329,19 @@ impl ColorValue {
             } => {
                 let deeper = ctx.deeper()?;
                 let origin = origin.resolve(&deeper)?.clamped();
+                // In CSS units, so a literal written inside a channel
+                // `calc()` is on the same scale as the variable it meets.
                 let vars = match space {
                     ColorSpace::Hsl => {
                         let (h, s, l) = rgb_to_hsl(origin.r, origin.g, origin.b);
-                        [h, s, l, origin.a]
+                        [h, s * 100.0, l * 100.0, origin.a]
                     }
-                    _ => [origin.r, origin.g, origin.b, origin.a],
+                    _ => [
+                        origin.r * 255.0,
+                        origin.g * 255.0,
+                        origin.b * 255.0,
+                        origin.a,
+                    ],
                 };
                 let mut out = [0.0_f32; 3];
                 for (index, expr) in channels.iter().enumerate() {
@@ -305,7 +349,7 @@ impl ColorValue {
                 }
                 let a = match alpha {
                     Some(expr) => expr.resolve(&vars, *space, 3)?,
-                    None => vars[3],
+                    None => vars[3] / channel_scale(*space, 3),
                 };
                 let rgba = match space {
                     ColorSpace::Hsl => {
@@ -407,28 +451,35 @@ fn mix_in_space(space: ColorSpace, a: Rgba, b: Rgba, t: f32) -> Rgba {
         } else if delta < -180.0 {
             delta += 360.0;
         }
-        let (r, g, blue) = hsl_to_rgb(
-            (ha + delta * t).rem_euclid(360.0),
-            sa + (sb - sa) * t,
-            la + (lb - la) * t,
-        );
+        // CSS Color 4 section 12.3: every non-hue component interpolates
+        // *premultiplied*, in polar spaces exactly as in rectangular ones.
+        // Without this a transparent operand drags saturation and lightness
+        // toward zero, so `color-mix(in hsl, red, transparent)` comes out a
+        // dark muted red rather than red at 50% alpha.
+        let alpha = a.a + (b.a - a.a) * t;
+        let (sa, la) = (sa * a.a, la * a.a);
+        let (sb, lb) = (sb * b.a, lb * b.a);
+        let (mut s, mut l) = (sa + (sb - sa) * t, la + (lb - la) * t);
+        if alpha > 0.0 {
+            s /= alpha;
+            l /= alpha;
+        }
+        let (r, g, blue) = hsl_to_rgb((ha + delta * t).rem_euclid(360.0), s, l);
         return Rgba {
             r,
             g,
             b: blue,
-            a: a.a + (b.a - a.a) * t,
+            a: alpha,
         }
         .clamped();
     }
     // Every non-HSL space (including the Lab/Oklab family, which this
-    // engine does not model channel-wise) mixes in premultiplied sRGB.
-    let pa = a.premultiplied();
-    let pb = b.premultiplied();
-    let mut out = [0.0_f32; 4];
-    for (index, slot) in out.iter_mut().enumerate() {
-        *slot = pa[index] + (pb[index] - pa[index]) * t;
-    }
-    Rgba::from_premultiplied(out).clamped()
+    // engine does not model channel-wise) mixes in premultiplied sRGB --
+    // which is exactly what the registry's colour interpolator does, so the
+    // contract's "a 50/50 color-mix and a transition halfway between the
+    // same two colours agree" holds by construction rather than by two
+    // independent loops happening to round the same way.
+    super::interpolate::lerp_rgba(a, b, t)
 }
 
 /// CSS `color-mix()` weight normalization: both omitted == 50/50; one given
@@ -516,10 +567,15 @@ fn parse_channel(input: &mut Parser<'_, '_>) -> Result<Channel, ()> {
         }
         Token::Function(ref name) => {
             let name = name.clone();
-            let number = parse_math_function(&name, input)?
-                .resolve_number()
-                .ok_or(())?;
-            Ok(Channel::Number(number))
+            let node = parse_math_function(&name, input)?;
+            let value = node.resolve_number().ok_or(())?;
+            // A math function that resolved a *percentage* is still a
+            // percentage: `rgb(calc(50%) 0 0)` is #800000, not #000000.
+            Ok(if node.is_percent_typed() {
+                Channel::Percent(value)
+            } else {
+                Channel::Number(value)
+            })
         }
         _ => {
             input.reset(&state);
@@ -564,9 +620,20 @@ fn rgb_channel(channel: Channel) -> f32 {
     }
 }
 
+/// An `<alpha-value>`: a number already runs 0..1, a percentage 0..100%.
 fn unit_channel(channel: Channel) -> f32 {
     match channel {
         Channel::Number(value) => value,
+        Channel::Percent(fraction) => fraction,
+    }
+}
+
+/// An `hsl()` saturation/lightness or an `hwb()` whiteness/blackness: CSS
+/// writes these on a 0..100 scale in *both* the number and the percentage
+/// form, so a bare number is a percentage without its sign.
+fn hundred_channel(channel: Channel) -> f32 {
+    match channel {
+        Channel::Number(value) => value / 100.0,
         Channel::Percent(fraction) => fraction,
     }
 }
@@ -708,8 +775,8 @@ fn parse_hsl_body(input: &mut Parser<'_, '_>) -> Result<ColorValue, ()> {
     require_exhausted(input)?;
     let (r, g, b) = hsl_to_rgb(
         hue.rem_euclid(360.0),
-        unit_channel(saturation).clamp(0.0, 1.0),
-        unit_channel(lightness).clamp(0.0, 1.0),
+        hundred_channel(saturation).clamp(0.0, 1.0),
+        hundred_channel(lightness).clamp(0.0, 1.0),
     );
     Ok(ColorValue::Absolute(
         Rgba {
@@ -725,9 +792,9 @@ fn parse_hsl_body(input: &mut Parser<'_, '_>) -> Result<ColorValue, ()> {
 fn parse_hwb_body(input: &mut Parser<'_, '_>) -> Result<ColorValue, ()> {
     let hue = parse_angle_or_number(input)?;
     eat_comma(input);
-    let whiteness = unit_channel(parse_channel(input)?).clamp(0.0, 1.0);
+    let whiteness = hundred_channel(parse_channel(input)?).clamp(0.0, 1.0);
     eat_comma(input);
-    let blackness = unit_channel(parse_channel(input)?).clamp(0.0, 1.0);
+    let blackness = hundred_channel(parse_channel(input)?).clamp(0.0, 1.0);
     let alpha = parse_optional_alpha(input)?;
     require_exhausted(input)?;
     let a = alpha.map_or(1.0, unit_channel);
@@ -1343,10 +1410,21 @@ mod tests {
             color_value("color-mix(in srgb, #000000 0%, #ffffff)", &table),
             Some(Color(0xFFFF_FFFF))
         );
-        // Both weights given and not summing to 100% still normalizes.
+        // Both weights given and not summing to 100% still normalizes the
+        // *ratio* -- 25:25 is a 50/50 mix, so the colour is mid-grey -- and,
+        // per CSS Color 5 section 3.2 step 5, additionally multiplies the
+        // result's alpha by the sum: 0.25 + 0.25 = 0.5, so alpha is 0x80.
+        // (Pin updated from 0xFF80_8080 with F26; browsers agree, e.g.
+        // `color-mix(in srgb, red 25%, blue 25%)` is `rgb(128 0 128 / 0.5)`.)
         assert_eq!(
             color_value("color-mix(in srgb, #000000 25%, #ffffff 25%)", &table),
-            Some(Color(0xFF80_8080))
+            Some(Color(0x8080_8080))
+        );
+        // A single weight below 100% is *not* rescaled: the other operand's
+        // weight is its complement, so the pair already sums to 100%.
+        assert_eq!(
+            color_value("color-mix(in srgb, #000000 25%, #ffffff)", &table),
+            Some(Color(0xFFBF_BFBF))
         );
         assert_eq!(
             color_value("color-mix(in srgb, #000000 0%, #ffffff 0%)", &table),
@@ -1395,5 +1473,75 @@ mod tests {
         for value in table.values() {
             let _ = value.resolve(&ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{ColorCtx, ColorTable, ColorValue, Rgba};
+    use crate::css::value::parse_entirely_with;
+
+    fn hex(text: &str) -> Option<u32> {
+        let value = parse_entirely_with(text, ColorValue::parse).ok()?;
+        let ctx = ColorCtx {
+            table: &ColorTable::new(),
+            current: Rgba::TRANSPARENT,
+            depth: 0,
+        };
+        value.resolve(&ctx).map(|rgba| rgba.to_color32().0)
+    }
+
+    // F25: a literal inside a relative-colour `calc()` is written in the
+    // channel's own CSS units (0..255 for sRGB, 0..100 for HSL s/l), not in
+    // the 0..1 fractions this module stores.
+    #[test]
+    fn a_literal_inside_a_relative_channel_calc_is_read_in_css_units() {
+        assert_eq!(hex("rgb(from black calc(128) 0 0)"), Some(0xFF80_0000));
+        assert_eq!(hex("rgb(from red r g calc(b + 30))"), Some(0xFFFF_001E));
+        assert_eq!(hex("hsl(from red h calc(s - 50) l)"), Some(0xFFBF_4040));
+        // The purely multiplicative forms every GTK theme actually ships are
+        // invariant under the scaling, so the vendored sheets do not move.
+        assert_eq!(
+            hex("rgb(from #3584e4 r g b / calc(alpha * 0.25))"),
+            hex("rgba(53, 132, 228, 0.25)")
+        );
+        assert_eq!(
+            hex("hsl(from #f6f5f4 h calc(s * 0.9) calc(l * 0.9))"),
+            Some(0xFFE0_DCD9)
+        );
+        // A bare `Keep` still round-trips its origin exactly.
+        assert_eq!(hex("rgb(from #3584e4 r g b)"), Some(0xFF35_84E4));
+        assert_eq!(hex("hsl(from #3584e4 h s l)"), Some(0xFF35_84E4));
+    }
+
+    // F27: CSS Color 4 section 12.3 premultiplies every non-hue component,
+    // so a transparent operand must not drag saturation and lightness down.
+    #[test]
+    fn an_hsl_mix_with_a_transparent_operand_keeps_the_other_operands_hue_and_chroma() {
+        // Pure red at 50% alpha, not a dark muted red.
+        assert_eq!(
+            hex("color-mix(in hsl, red, transparent)"),
+            Some(0x80FF_0000)
+        );
+        // The fully-opaque case is unchanged by premultiplication.
+        assert_eq!(hex("color-mix(in hsl, red, red)"), Some(0xFFFF_0000));
+    }
+
+    // F29: a math function that resolved a percentage is still a percentage.
+    #[test]
+    fn a_calc_that_resolves_a_percentage_is_a_percentage_channel() {
+        assert_eq!(hex("rgb(calc(50%) 0 0)"), Some(0xFF80_0000));
+        assert_eq!(hex("rgb(calc(128) 0 0)"), Some(0xFF80_0000));
+    }
+
+    // F30/F31: `hsl()` saturation/lightness and `hwb()` whiteness/blackness
+    // are on a 0..100 scale in the bare-number form too.
+    #[test]
+    fn bare_numbers_in_hsl_and_hwb_are_on_the_hundred_scale() {
+        assert_eq!(hex("hsl(120 100 50)"), Some(0xFF00_FF00));
+        assert_eq!(hex("hsl(120, 100%, 50%)"), Some(0xFF00_FF00));
+        assert_eq!(hex("hwb(120 30 40)"), Some(0xFF4D_994D));
+        // Alpha stays a 0..1 number.
+        assert_eq!(hex("hsl(120 100 50 / 0.5)"), Some(0x8000_FF00));
     }
 }

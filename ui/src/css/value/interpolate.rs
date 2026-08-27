@@ -77,7 +77,10 @@ pub fn length(a: &Value, b: &Value, t: f32) -> Value {
     }
 }
 
-fn lerp_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
+/// Two colours interpolated in premultiplied sRGB, the one definition
+/// `color-mix()` and every colour transition share.
+#[must_use]
+pub fn lerp_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
     let pa = a.premultiplied();
     let pb = b.premultiplied();
     let mut out = [0.0_f32; 4];
