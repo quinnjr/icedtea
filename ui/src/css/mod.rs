@@ -5,6 +5,7 @@ pub mod cascade;
 pub mod colors;
 pub mod computed;
 pub mod parse;
+pub mod registry;
 pub mod select;
 pub mod shorthand;
 pub mod tokens;
