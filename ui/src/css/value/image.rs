@@ -10,6 +10,7 @@ use skia_rs_safe::core::Point;
 use super::calc::parse_angle;
 use super::color::{ColorCtx, ColorValue, Rgba};
 use super::length::{Length, LengthCtx};
+use crate::css::depth_guard::DepthGuard;
 
 /// A `<position>`: `background-position` and `transform-origin`.
 #[derive(Clone, Debug, PartialEq)]
@@ -267,7 +268,12 @@ pub enum Image {
 
 impl Image {
     /// Parse a whole `<image>`.
+    ///
+    /// This is the single choke point every recursive `<image>` (a
+    /// `cross-fade()` layer, a `-gtk-recolor()`/`-gtk-scaled()` source) comes
+    /// back through, so guarding recursion here bounds it for all of them.
     pub fn parse(input: &mut Parser<'_, '_>) -> Result<Image, ()> {
+        let _guard = DepthGuard::enter().ok_or(())?;
         let token = input.next().map_err(|_| ())?.clone();
         match token {
             Token::Ident(ref name) if name.eq_ignore_ascii_case("none") => Ok(Image::None),
@@ -1009,6 +1015,18 @@ mod tests {
             let _ = parse_entirely_with(input, Image::parse);
             let _ = parse_entirely_with(input, Position::parse);
         }
+    }
+
+    #[test]
+    fn deeply_nested_gtk_recolor_returns_none_instead_of_overflowing_the_stack() {
+        // Mutation check: remove the `DepthGuard::enter()` call added to
+        // `Image::parse` and this input overflows the stack (an abort, not
+        // something a `#[test]` can observe as a failure) instead of
+        // returning `None`.
+        let mut nested = "-gtk-recolor(".repeat(2000);
+        nested.push_str("url(\"a.svg\")");
+        nested.push_str(&")".repeat(2000));
+        assert_eq!(image(&nested), None);
     }
 
     use crate::css::value::color::{ColorCtx, ColorTable, Rgba};

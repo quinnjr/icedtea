@@ -10,6 +10,7 @@ use cssparser::{ParseError, Parser, Token};
 
 use super::length::{Length, LengthCtx, LengthUnit};
 use super::timing::Time;
+use crate::css::depth_guard::DepthGuard;
 
 /// A parsed math expression. Nothing is resolved: units, percentages and
 /// relative-colour channel variables all survive until a context exists.
@@ -204,7 +205,14 @@ fn fold(
 /// Parse a math function whose `Token::Function` name has already been
 /// consumed. Returns `Err(())` for anything that is not `calc`, `min`,
 /// `max` or `clamp`.
+///
+/// This is the single choke point every `calc()`/`min()`/`max()`/`clamp()`
+/// body passes through, whether reached through [`parse_unary`]'s own
+/// `Function` arm or directly from another value type's parser (`Length`,
+/// `Time`, colour channels, ...); guarding it here bounds recursion for both
+/// without needing a guard at every call site.
 pub fn parse_math_function(name: &str, input: &mut Parser<'_, '_>) -> Result<CalcNode, ()> {
+    let _guard = DepthGuard::enter().ok_or(())?;
     if name.eq_ignore_ascii_case("calc") {
         input.parse_nested_block(parse_sum_entirely).map_err(|_| ())
     } else if name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max") {
@@ -373,7 +381,12 @@ fn parse_unary(input: &mut Parser<'_, '_>) -> Result<CalcNode, ()> {
             }
         }
         Token::Ident(ref name) => channel_var(name).map(CalcNode::Var).ok_or(()),
-        Token::ParenthesisBlock => input.parse_nested_block(parse_sum_entirely).map_err(|_| ()),
+        Token::ParenthesisBlock => {
+            // A bare grouping `(...)`, not a function call, so it does not
+            // pass through `parse_math_function`'s guard -- it needs its own.
+            let _guard = DepthGuard::enter().ok_or(())?;
+            input.parse_nested_block(parse_sum_entirely).map_err(|_| ())
+        }
         Token::Function(ref name) => {
             let name = name.clone();
             parse_math_function(&name, input)
@@ -576,5 +589,23 @@ mod tests {
             let _ = parse_entirely_with(input, CalcNode::parse);
             let _ = parse_entirely_with(input, parse_angle);
         }
+    }
+
+    #[test]
+    fn deeply_nested_calc_returns_err_instead_of_overflowing_the_stack() {
+        // Mutation check: remove either `DepthGuard::enter()` call added to
+        // `parse_math_function`/`parse_unary`'s `ParenthesisBlock` arm and
+        // this input overflows the stack (an abort, not something a
+        // `#[test]` can observe as a failure) instead of returning `Err`.
+        let mut nested = "calc(".repeat(2000);
+        nested.push_str("1px");
+        nested.push_str(&")".repeat(2000));
+        assert_eq!(calc(&nested), None);
+
+        let mut parens = "(".repeat(2000);
+        parens.push_str("1px");
+        parens.push_str(&")".repeat(2000));
+        let wrapped = format!("calc{parens}");
+        assert_eq!(calc(&wrapped), None);
     }
 }

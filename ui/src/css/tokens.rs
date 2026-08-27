@@ -13,7 +13,16 @@
 
 use cssparser::{Parser, ParserInput, ToCss, Token};
 
+use super::depth_guard::DepthGuard;
+
 /// Append a single already-consumed `token` -- recursing into blocks -- to `out`.
+///
+/// Recursion depth is bounded by [`DepthGuard`]: past the limit a nested
+/// block's tokens are consumed (so the outer parser stays synchronised) but
+/// not serialized, rather than growing the stack further. Ordinary CSS never
+/// gets close to the limit; only a pathological, deliberately deep input
+/// does, and for that input an under-serialized value is a correct outcome
+/// (the declaration ends up unparseable downstream), not a panic.
 fn write_token(token: &Token<'_>, input: &mut Parser<'_, '_>, out: &mut String) {
     match token {
         Token::Function(name) => {
@@ -21,10 +30,18 @@ fn write_token(token: &Token<'_>, input: &mut Parser<'_, '_>, out: &mut String) 
             out.push('(');
             // A function's block must be consumed through `parse_nested_block`
             // or the outer parser desynchronises.
-            let _ = input.parse_nested_block(|inner| {
-                write_component_values(inner, out);
-                Ok::<(), cssparser::ParseError<'_, ()>>(())
-            });
+            match DepthGuard::enter() {
+                Some(_guard) => {
+                    let _ = input.parse_nested_block(|inner| {
+                        write_component_values(inner, out);
+                        Ok::<(), cssparser::ParseError<'_, ()>>(())
+                    });
+                }
+                None => {
+                    let _ = input
+                        .parse_nested_block(|_inner| Ok::<(), cssparser::ParseError<'_, ()>>(()));
+                }
+            }
             trim_trailing_space(out);
             out.push(')');
         }
@@ -35,10 +52,18 @@ fn write_token(token: &Token<'_>, input: &mut Parser<'_, '_>, out: &mut String) 
                 _ => ('{', '}'),
             };
             out.push(open);
-            let _ = input.parse_nested_block(|inner| {
-                write_component_values(inner, out);
-                Ok::<(), cssparser::ParseError<'_, ()>>(())
-            });
+            match DepthGuard::enter() {
+                Some(_guard) => {
+                    let _ = input.parse_nested_block(|inner| {
+                        write_component_values(inner, out);
+                        Ok::<(), cssparser::ParseError<'_, ()>>(())
+                    });
+                }
+                None => {
+                    let _ = input
+                        .parse_nested_block(|_inner| Ok::<(), cssparser::ParseError<'_, ()>>(()));
+                }
+            }
             trim_trailing_space(out);
             out.push(close);
         }
@@ -179,5 +204,25 @@ mod tests {
     fn an_empty_value_has_no_components() {
         assert!(component_values("").is_empty());
         assert!(component_values("   ").is_empty());
+    }
+
+    #[test]
+    fn deeply_nested_functions_never_overflow_the_stack() {
+        // Mutation check: remove either `DepthGuard::enter()` call in
+        // `write_token` and this input overflows the stack (an abort, not a
+        // panic `#[test]` can catch) instead of returning a value.
+        let mut nested = String::new();
+        for _ in 0..2000 {
+            nested.push_str("calc(");
+        }
+        nested.push_str("1px");
+        for _ in 0..2000 {
+            nested.push(')');
+        }
+        nested.push_str(" red");
+        // Must return, not overflow. What it returns past the depth limit is
+        // secondary to that.
+        let parts = component_values(&nested);
+        assert!(!parts.is_empty());
     }
 }

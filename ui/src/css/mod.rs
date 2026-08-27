@@ -3,6 +3,7 @@
 
 pub mod cascade;
 pub mod computed;
+pub(crate) mod depth_guard;
 pub mod node;
 pub mod parse;
 pub mod registry;
