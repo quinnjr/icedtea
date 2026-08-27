@@ -4,18 +4,27 @@ A pure-Rust, GTK4-theme-compatible widget layer: no `gtk4`, `gio`, `glib`,
 `pango`, `cairo` or `gdk`, and no Smithay. See
 [the design spec](../docs/superpowers/specs/2026-08-20-pure-rust-gtk-ui-design.md).
 
-## What M1 covers
+## What this crate covers
 
-One themed `button`, end to end:
+M1 proved one themed `button` end to end. M2 widened the CSS layer to the whole
+GTK 4.22 property table: every property in GTK's CSS reference parses, cascades,
+inherits, computes, paints and animates on a widget-independent styled-node
+tree.
 
 | Layer | Crate |
 |---|---|
 | Wayland + layer shell | `wayland-client`, `wayland-protocols-wlr` (hand-rolled, no sctk/calloop) |
 | 2D paint | `skia-rs-safe` (pure Rust) |
-| Text | `skia-rs-text` — `Typeface::from_data` + `rustybuzz` shaping (**not** `cosmic-text`) |
+| Text shaping | `skia-rs-text` — `Typeface::from_data` + `rustybuzz` (**not** `cosmic-text`) |
+| Font discovery | `fontconfig` — real `fc-match` parity |
 | Layout | `taffy` |
 | CSS parse / match | Servo's `cssparser` + `selectors` |
-| Widget | bespoke — `CssNode` wears GTK's node identity |
+| Widget | bespoke — a `css::node::Node` tree wearing GTK's node identity |
+
+The property registry (`css/registry.rs`) is the spine: one static table of
+114 rows — 95 longhands, 19 shorthands — drives parsing, shorthand expansion,
+inheritance, computed values and interpolation. Nothing outside that module
+names a property string.
 
 ## Running it
 
@@ -72,28 +81,21 @@ Notes that are load-bearing for anyone reading computed values:
   per-side `-width`/`-style`/`-color` longhands (resetting what they omit to
   `medium`/`none`/`currentColor`, so `border: none` zeroes an earlier
   width); `background` becomes `background-color` + `background-image`.
-  `ComputedStyle` still paints a *uniform* border and takes the top side for
-  all four -- M2 widens it to four sides.
-- **Multi-layer `background` keeps only the first image**, which is the one
-  CSS paints on top. The colour is taken from the final layer, as CSS
-  requires; if no layer but an earlier one declares a colour it is still
-  accepted (GTK's own themes are lax here -- Adwaita's `junction` puts the
-  colour first), and two or more candidate colours fall back to the final
-  layer's. The `background` shorthand does **not** set `background-clip` or
-  `background-origin`; declare those longhands directly.
-- **Runner-ups are kept.** `cascade` returns `CascadedValues`: per longhand,
-  every declaration that applied, sorted best-first. When the winner is a
-  value this engine cannot interpret (Adwaita's
-  `button.sidebar-button { border-radius: 100% }`), the next applicable
-  declaration is used and the fallback is logged at debug. CSS proper would
-  use the inherited or initial value here; falling back is a deliberate M1
-  divergence, chosen because the property coverage is still narrow enough
-  that reverting to an initial value loses more than it protects. The
-  consequence in the other direction is a known divergence too: an
-  unparseable *later* value does not leave the property at its initial value,
-  it leaves it at whatever an earlier rule declared -- `background:
-  nosuch(1)` layered over a working `background-image`, or Adwaita's
-  `cross-fade(...)`, keeps painting the older background rather than nothing.
+  Per-side borders and per-corner radii are first-class: `ComputedStyle`
+  carries all four sides and all four corners, and the painter fills each
+  side as a path between the outer and inner rounded rects, so mixed widths
+  and colours join the way GTK's do.
+- `background` is a full layer list. Every comma-separated layer carries its
+  own image, position, size, repeat, origin, clip and blend mode; layers
+  paint top-first, as CSS requires, and the colour comes from the last
+  layer.
+- **Invalid at computed-value time follows CSS.** `cascade` still returns
+  `CascadedValues` — per longhand, every declaration that applied, sorted
+  best-first — but the runner-ups are now diagnostics only. When the winning
+  declaration cannot be interpreted (an unknown `@name`, a colour cycle, a
+  percentage with no basis, a non-finite `calc()`), the property takes the
+  inherited value if it is an inherited property and its initial value
+  otherwise. M1 fell back to the runner-up; that divergence is closed.
 - **`color` and `font-size` inherit**, resolved by walking the node's
   ancestor chain (`ComputedStyle::resolve`, or `resolve_with_parent` when
   the caller already has the parent). `currentColor` resolves to the
@@ -109,12 +111,56 @@ Notes that are load-bearing for anyone reading computed values:
   `content-box`). `background-origin` stays at its CSS default
   (padding-box), so a gradient is sized against the padding box however the
   clip is set.
+- **All 37 `@define-color`s resolve.** The colour table is built unresolved and
+  resolved lazily with a depth guard, so a definition may reference a name
+  defined later and a cycle terminates instead of hanging. GTK's legacy
+  `alpha()`/`shade()`/`mix()`/`lighter()`/`darker()` and CSS Color 5 relative
+  syntax (`hsl(from … calc(s * 1.8) …)`) are all understood; M1 resolved 29 of
+  37 and recorded the rest as absent.
+- **`@media` blocks are parsed once and evaluated per environment.**
+  `prefers-color-scheme` and `prefers-contrast` are modelled; an unknown feature
+  parses and never matches; `prefers-reduced-motion` parses and always evaluates
+  false. One parse can therefore be compiled under several environments, which
+  is how the coverage gate compiles light, dark and high-contrast.
 - **Colour values are parsed from tokens**, ASCII-case-insensitively, in
   both CSS Color 3 comma syntax and CSS Color 4 space syntax with
   percentages and `/ <alpha>`. Hex literals are validated before slicing, so
   no theme input can panic the parser.
 - **Negative lengths clamp to 0** for padding, border widths, radii and
   minimums.
+
+## Fonts and text
+
+- **Font discovery is real fontconfig.** `text::FontDatabase` builds one
+  `FcPattern` per query carrying the whole `font-family` list in priority order
+  plus `FC_WEIGHT`/`FC_SLANT`/`FC_WIDTH`/`FC_PIXEL_SIZE`, and calls
+  `FcFontMatch` — so generic families, user aliases and everything in
+  `~/.config/fontconfig` resolve exactly as `fc-match` resolves them. The tests
+  assert that `sans-serif` resolves to *something*, never to a fixed family, and
+  compare against the `fc-match` binary where it is installed.
+- **The CSS and fontconfig scales are not the same scale.** `font-weight` 700 is
+  `FC_WEIGHT` 200 and 400 is 80; `font-stretch: 87.5%` is `FC_WIDTH` 87. The
+  conversions are table lookups with piecewise-linear interpolation
+  (`css_weight_to_fc`, `css_stretch_to_fc`, `css_style_to_fc_slant`), not casts.
+- **`FontDatabase::probe_only()` is the fallback**, and the whole of what M1
+  had: the fixed `FONT_CANDIDATES` path list. It is used when `FcInit` fails
+  (a stripped container, a machine with no fontconfig), so the UI still has a
+  face.
+- **Three caches, dropped together by `clear_caches`:** query → `FontFace`,
+  `(path, index)` → `Typeface`, and `ShapeKey` → `ShapedText`. A shaping key
+  covers the text, face, size, letter-spacing, feature and variation settings
+  and `text-transform` — every input that can change the run.
+- **`text-transform` runs before shaping**, as it does in GTK, including
+  `full-width` and `full-size-kana`. `letter-spacing` is added after every
+  glyph (CSS 2.1's rule, so the trailing step is part of the measured width) via
+  `TextBlobBuilder::add_positioned_run`.
+- **Known limits of this shaper stack**, warned once at runtime rather than
+  silently dropped: `font-feature-settings` and `font-variation-settings` cannot
+  reach `rustybuzz` through `skia-rs-text` 0.4.0 (its `Shaper` passes an empty
+  feature slice and exposes no variation axes), and a face index inside a font
+  collection cannot be selected (`Typeface::from_data` takes no index). Both
+  values still parse, compute and enter the shaping key, so the day the shaper
+  grows the API the cache is already keyed correctly.
 
 ## Layout, paint and Wayland behaviour
 
@@ -168,19 +214,35 @@ cargo test -p icedtea-ui
   from `themed-button --print-allocation` rather than hardcoding it.
 - `tests/support/mod.rs` holds the shared child reaper, the hermetic
   `themed-button` command and the allocation probe.
+- `tests/adwaita_coverage.rs` is the **M2 gate**: GTK 4.22's Adwaita light, dark
+  and high-contrast, walked declaration by declaration — including the ones
+  inside `@keyframes` and `@media` — through the property registry, asserting
+  **0 unknown properties, 0 unparseable declarations and 37/37 `@define-color`s
+  resolved** on each sheet. It names what it cannot read rather than counting,
+  and carries negative controls so that a green run means something.
+- `tests/gtk4_property_reference.rs` pins the registry against a vendored
+  fixture of the GTK 4.22 property table: 114 rows of name, longhand/shorthand
+  kind and inherited flag, asserted both ways — nothing missing, nothing
+  invented — in registry order.
 
-## Deliberately not covered by M1
+## Deliberately not covered by M2
 
-More than one widget; a real element tree (siblings, children, nth-index);
-full selector and `-gtk-*` property coverage; per-side borders and
-per-corner radii (the cascade carries the longhands, the computed style
-reads the top side); box-shadows, radial gradients, `url()` images; GTK's
-`alpha()`/`shade()`/`mix()` color functions and CSS relative color syntax;
-RTL (`:dir()` matches a field nothing sets); icons; animations and
-transitions; accessibility; input methods; fractional scale; surface
-resize; the app framework. See the spec's M2–M6.
+Icon *drawing* — every `-gtk-icon-*` value parses, computes and is stored, but
+nothing rasterizes an icon yet (M4). Widgets beyond the button behaviour that
+carries the M1 gate, the focus/event model, grid and centre layouts, and text
+editing (M3). Accessibility, input methods, drag and drop (M6). `url()` images
+beyond PNG, and SVG only where `skia-rs-svg` decodes it — anything else is
+recorded unresolved and paints nothing rather than erroring. `@media` features
+beyond `prefers-color-scheme` and `prefers-contrast`. Fractional scale and
+surface resize. `font-feature-settings`/`font-variation-settings` reaching the
+shaper, and font-collection face indices (see **Fonts and text** above). See the
+spec's M3–M6.
 
 ## Vendored files
 
-`themes/adwaita-light.css` is GTK 4's default light theme, redistributed
-under the LGPL-2.1-or-later. See [`themes/README.md`](themes/README.md).
+`themes/adwaita-light.css`, `themes/adwaita-dark.css` and
+`themes/adwaita-hc.css` are GTK 4's default light, dark and high-contrast
+themes, redistributed under the LGPL-2.1-or-later. See
+[`themes/README.md`](themes/README.md). `tests/fixtures/gtk4.22-css-properties.txt`
+is a transcription of GTK 4.22's CSS property reference, with the doc URL in its
+header.
