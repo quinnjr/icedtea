@@ -223,7 +223,10 @@ fn paint_text_shadow(
         text.metrics.width,
         text.metrics.ascent + text.metrics.descent,
     );
-    blit_blurred(canvas, ink, blur, |offscreen, offset, _surface| {
+    // Not cached: the key would have to describe the shaped run, and a
+    // `TextBlob` has no content identity to hash. `paint::shadow`'s box
+    // shapes do.
+    blit_blurred(canvas, ink, blur, None, |offscreen, offset, _surface| {
         offscreen.draw_text_blob(blob, bx - offset.0, by - offset.1, &fill_paint(color));
     });
 }

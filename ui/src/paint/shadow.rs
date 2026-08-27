@@ -153,18 +153,34 @@ fn paint_outset(
         canvas.restore_to_count(save);
         return;
     }
-    blit_blurred(canvas, shape, blur, |offscreen_canvas, offset, _surface| {
-        let local = Rect::new(
-            shape.x - offset.0,
-            shape.y - offset.1,
-            shape.width,
-            shape.height,
-        );
-        offscreen_canvas.draw_path(
-            &rounded_rect_path(local, &shape_radii),
-            &hard_fill_paint(color),
-        );
-    });
+    let key = blur_key(
+        0,
+        &[
+            rect_parts(shape).as_slice(),
+            radii_parts(&shape_radii).as_slice(),
+            color_parts(color).as_slice(),
+            &[blur],
+        ]
+        .concat(),
+    );
+    blit_blurred(
+        canvas,
+        shape,
+        blur,
+        Some(key),
+        |offscreen_canvas, offset, _surface| {
+            let local = Rect::new(
+                shape.x - offset.0,
+                shape.y - offset.1,
+                shape.width,
+                shape.height,
+            );
+            offscreen_canvas.draw_path(
+                &rounded_rect_path(local, &shape_radii),
+                &hard_fill_paint(color),
+            );
+        },
+    );
     canvas.restore_to_count(save);
 }
 
@@ -245,20 +261,38 @@ fn paint_inset(
         let outside = rounded_ring_path(field, &[[0.0, 0.0]; 4], hole, &hole_radii);
         canvas.draw_path(&outside, &fill_paint(color));
     } else {
-        blit_blurred(canvas, outer, blur, |offscreen_canvas, offset, surface| {
-            let local_hole = Rect::new(
-                hole.x - offset.0,
-                hole.y - offset.1,
-                hole.width,
-                hole.height,
-            );
-            // The whole offscreen surface, minus the hole: the padded
-            // margin has to be *inked* so the blur reaching in from it is
-            // at full alpha at the padding box's own edge.
-            let field = bounding(surface, local_hole.outset([1.0; 4]));
-            let outside = rounded_ring_path(field, &[[0.0, 0.0]; 4], local_hole, &hole_radii);
-            offscreen_canvas.draw_path(&outside, &hard_fill_paint(color));
-        });
+        let key = blur_key(
+            1,
+            &[
+                rect_parts(outer).as_slice(),
+                radii_parts(&outer_radii).as_slice(),
+                rect_parts(hole).as_slice(),
+                radii_parts(&hole_radii).as_slice(),
+                color_parts(color).as_slice(),
+                &[blur],
+            ]
+            .concat(),
+        );
+        blit_blurred(
+            canvas,
+            outer,
+            blur,
+            Some(key),
+            |offscreen_canvas, offset, surface| {
+                let local_hole = Rect::new(
+                    hole.x - offset.0,
+                    hole.y - offset.1,
+                    hole.width,
+                    hole.height,
+                );
+                // The whole offscreen surface, minus the hole: the padded
+                // margin has to be *inked* so the blur reaching in from it is
+                // at full alpha at the padding box's own edge.
+                let field = bounding(surface, local_hole.outset([1.0; 4]));
+                let outside = rounded_ring_path(field, &[[0.0, 0.0]; 4], local_hole, &hole_radii);
+                offscreen_canvas.draw_path(&outside, &hard_fill_paint(color));
+            },
+        );
     }
     canvas.restore_to_count(save);
 }
@@ -286,6 +320,7 @@ pub(crate) fn blit_blurred(
     canvas: &mut Canvas<'_>,
     shape: Rect,
     blur: f32,
+    key: Option<u64>,
     draw: impl FnOnce(&mut Canvas<'_>, (f32, f32), Rect),
 ) {
     let sigma = sigma_within_pad(sigma_for_blur_radius(blur), MAX_BLUR_PAD);
@@ -304,13 +339,105 @@ pub(crate) fn blit_blurred(
     {
         return;
     }
+    if let Some(key) = key
+        && let Some(image) = cached_blur(key)
+    {
+        canvas.draw_image(&image, ox, oy, None);
+        return;
+    }
     let local = Rect::new(0.0, 0.0, w, h);
     let Some(image) = blurred_image(w as i32, h as i32, sigma, |offscreen| {
         draw(offscreen, (ox, oy), local);
     }) else {
         return;
     };
+    if let Some(key) = key {
+        remember_blur(key, &image);
+    }
     canvas.draw_image(&image, ox, oy, None);
+}
+
+/// How many blurred shadow bitmaps are kept.
+///
+/// A shadow is re-rasterised from scratch on every frame it is painted --
+/// an offscreen allocation, a fill and six box passes -- even when nothing
+/// about it changed, which is every frame of an animation that is
+/// transitioning some *other* property. Sixteen is far more than the handful
+/// of distinct shadows one widget tree paints, and each entry is one
+/// already-allocated `Arc`'d bitmap.
+const BLUR_CACHE_CAPACITY: usize = 16;
+
+thread_local! {
+    /// The blurred bitmaps painted recently, most-recent last.
+    ///
+    /// Content-addressed: the key is a hash of *everything* the offscreen
+    /// content depends on -- the shape, its radii, the hole, the colour and
+    /// the sigma -- so an entry can never be stale and needs no generation
+    /// counter to invalidate it. Thread-local because this crate's paint
+    /// path is single-threaded by construction (see `text::FontDatabase`).
+    static BLUR_CACHE: std::cell::RefCell<Vec<(u64, skia_rs_safe::codec::Image)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The cached bitmap for `key`, if it is still held.
+fn cached_blur(key: u64) -> Option<skia_rs_safe::codec::Image> {
+    BLUR_CACHE.with_borrow(|cache| {
+        cache
+            .iter()
+            .find(|(cached, _)| *cached == key)
+            .map(|(_, image)| image.clone())
+    })
+}
+
+/// Remember `image` under `key`, evicting the oldest entry past
+/// [`BLUR_CACHE_CAPACITY`].
+fn remember_blur(key: u64, image: &skia_rs_safe::codec::Image) {
+    BLUR_CACHE.with_borrow_mut(|cache| {
+        cache.retain(|(cached, _)| *cached != key);
+        if cache.len() >= BLUR_CACHE_CAPACITY {
+            cache.remove(0);
+        }
+        cache.push((key, image.clone()));
+    });
+}
+
+/// A content hash of everything one blurred shadow's offscreen depends on.
+///
+/// `tag` separates the outset and inset shapes, which take different
+/// geometry; `parts` is that geometry, hashed by bit pattern so a NaN is
+/// stable rather than never-equal.
+fn blur_key(tag: u8, parts: &[f32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tag.hash(&mut hasher);
+    for part in parts {
+        part.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// The four corner radii, flattened for [`blur_key`].
+fn radii_parts(radii: &[[f32; 2]; 4]) -> [f32; 8] {
+    [
+        radii[0][0],
+        radii[0][1],
+        radii[1][0],
+        radii[1][1],
+        radii[2][0],
+        radii[2][1],
+        radii[3][0],
+        radii[3][1],
+    ]
+}
+
+/// A rect and a colour, flattened for [`blur_key`].
+fn rect_parts(rect: Rect) -> [f32; 4] {
+    [rect.x, rect.y, rect.width, rect.height]
+}
+
+/// `color`'s four channels, flattened for [`blur_key`].
+fn color_parts(color: Rgba) -> [f32; 4] {
+    [color.r, color.g, color.b, color.a]
 }
 
 #[cfg(test)]
@@ -609,5 +736,38 @@ mod tests {
             let _ = painted(&[shadow(v, v, v, v, false)], false);
             let _ = painted(&[shadow(v, v, v, v, true)], true);
         }
+    }
+    #[test]
+    fn an_identical_blurred_shadow_is_rasterised_once_and_reused() {
+        // A blurred shadow was re-rasterised from scratch every frame it was
+        // painted -- an offscreen allocation, a fill and six box passes --
+        // even when nothing about it had changed, which is every frame of an
+        // animation transitioning some *other* property.
+        //
+        // Mutation check: pass `None` for the key at both call sites and the
+        // second paint takes as long as the first, failing the ratio below.
+        let shadows = [shadow(0.0, 0.0, 40.0, 0.0, false)];
+        // Warm: the first paint pays for the rasterisation.
+        let first = std::time::Instant::now();
+        let cold = painted(&shadows, false);
+        let cold_elapsed = first.elapsed();
+
+        let second = std::time::Instant::now();
+        let warm = painted(&shadows, false);
+        let warm_elapsed = second.elapsed();
+
+        // Same pixels, either way -- the cache is content-addressed.
+        for (x, y) in [(20, 12), (30, 20), (5, 5), (55, 35)] {
+            assert_eq!(
+                pixel(&cold, x, y),
+                pixel(&warm, x, y),
+                "the cached blit differs at ({x}, {y})"
+            );
+        }
+        assert!(
+            warm_elapsed * 2 < cold_elapsed,
+            "the second paint of an identical shadow took {warm_elapsed:?} \
+             against a cold {cold_elapsed:?}: it was rasterised again"
+        );
     }
 }
