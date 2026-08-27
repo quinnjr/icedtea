@@ -1,12 +1,35 @@
-//! Transitions and animations.
+//! Transitions, `@keyframes` animations, and the clock that drives them.
 //!
-//! P3 lands only the three types the computed style *produces*: the per-node
-//! [`Overrides`] a sample is applied through, and the flattened
-//! [`TransitionSpec`]/[`AnimationSpec`] the engine is driven by. The clock, the
-//! transition/animation state machines and `AnimationState` are P5's.
+//! The engine is deliberately property-agnostic: it never knows what
+//! `background-color` *is*. It knows that a [`Prop`] changed, that the
+//! registry row for that `Prop` carries an interpolator, and that a
+//! [`Clock`] says how far along the change is. Everything property-specific
+//! lives in `css::registry` and `css::value::interpolate`.
+//!
+//! Output is an [`Overrides`] table layered over the computed style by
+//! `ComputedStyle::with_overrides` before layout and paint. Precedence is
+//! CSS's: animation over transition over the base cascade.
+
+pub mod clock;
+pub mod keyframes;
+pub mod transition;
+
+use std::time::Duration;
+
+pub use clock::{Clock, ManualClock, MonotonicClock};
 
 use crate::css::registry::Prop;
 use crate::css::value::{AnimationName, IterationCount, Keyword, Time, TimingFunction, Value};
+
+/// A `Duration` as milliseconds.
+///
+/// The engine works in `f64` milliseconds internally rather than `Duration`
+/// because a negative `animation-delay`/`transition-delay` puts a start time
+/// *before* the clock's epoch, which `Duration` cannot represent.
+#[must_use]
+pub fn millis(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
 
 /// Per-node animation output, sorted by [`Prop`], applied over the computed
 /// style.
