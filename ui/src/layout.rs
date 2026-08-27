@@ -91,8 +91,11 @@ impl ButtonLayout {
     /// entirely from finite lengths means a bug in this function, not bad
     /// input.
     pub fn compute(&mut self, style: &ComputedStyle, label: &TextMetrics) -> Allocation {
-        let [pad_top, pad_right, pad_bottom, pad_left] = style.padding;
-        let border = style.border_width;
+        let [pad_top, pad_right, pad_bottom, pad_left] = style.padding(0.0);
+        // M1 paints one uniform border; the top side is the one taffy is given.
+        // P4 replaces this whole module with a per-side `LayoutTree`.
+        let border = style.border_widths()[0];
+        let (min_width, min_height) = style.min_size((0.0, 0.0));
 
         self.tree
             .set_style(
@@ -116,8 +119,8 @@ impl ButtonLayout {
                     // Content-box minimums, converted to the border-box
                     // minimums taffy wants: see this module's header.
                     min_size: Size {
-                        width: length(style.min_width + pad_left + pad_right + border * 2.0),
-                        height: length(style.min_height + pad_top + pad_bottom + border * 2.0),
+                        width: length(min_width + pad_left + pad_right + border * 2.0),
+                        height: length(min_height + pad_top + pad_bottom + border * 2.0),
                     },
                     padding: taffy::geometry::Rect {
                         left: length(pad_left),

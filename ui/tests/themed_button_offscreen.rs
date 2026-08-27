@@ -9,8 +9,10 @@
 
 use icedtea_ui::BUNDLED_ADWAITA_LIGHT;
 use icedtea_ui::css::cascade::CompiledSheet;
-use icedtea_ui::css::computed::{Background, BackgroundClip, ComputedStyle, GradientStop};
+use icedtea_ui::css::computed::ComputedStyle;
 use icedtea_ui::css::node::{Node, PseudoStates};
+use icedtea_ui::css::value::color::ColorValue;
+use icedtea_ui::css::value::{Image, Keyword, Length};
 use icedtea_ui::text::FontStack;
 use icedtea_ui::widget::button::Button;
 use skia_rs_safe::canvas::Surface;
@@ -19,11 +21,37 @@ use skia_rs_safe::core::Color;
 const SURFACE_W: i32 = 240;
 const SURFACE_H: i32 = 80;
 
-fn stop(color: u32, position_px: Option<f32>) -> GradientStop {
-    GradientStop {
-        color: Color(color),
-        position_px,
-    }
+/// The topmost background layer's gradient stops, as `(colour, position px)`.
+fn gradient_stops(style: &ComputedStyle) -> Vec<(Color, Option<f32>)> {
+    let layers = style.background_layers();
+    let Some(Image::Gradient(gradient)) = layers.first().map(|layer| layer.image.clone()) else {
+        panic!("the topmost background layer is not a gradient: {layers:?}");
+    };
+    gradient
+        .stops
+        .iter()
+        .map(|stop| {
+            let ColorValue::Absolute(rgba) = &stop.color else {
+                panic!("a computed gradient stop must carry a resolved colour");
+            };
+            let position = stop.position.as_ref().map(|length| match length {
+                Length::Abs { value, .. } => *value,
+                other => panic!("a computed stop position must be absolute: {other:?}"),
+            });
+            (rgba.to_color32(), position)
+        })
+        .collect()
+}
+
+/// The topmost background layer as a flat fill -- GTK's `image(<color>)`.
+fn solid_background(style: &ComputedStyle) -> Color {
+    let layers = style.background_layers();
+    let Some(Image::Solid(ColorValue::Absolute(rgba))) =
+        layers.first().map(|layer| layer.image.clone())
+    else {
+        panic!("the topmost background layer is not a flat fill: {layers:?}");
+    };
+    rgba.to_color32()
 }
 
 /// A window > button node tree, a compiled Adwaita sheet and a system font.
@@ -66,27 +94,23 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
     // `button` (line 215 of the vendored sheet).
     let normal = button.style().clone();
     assert_eq!(
-        normal.background,
-        Background::LinearGradientToTop {
-            from: stop(0xFFF6_F5F4, Some(2.0)),
-            to: stop(0xFFFB_FAFA, None),
-        },
+        gradient_stops(&normal),
+        vec![(Color(0xFFF6_F5F4), Some(2.0)), (Color(0xFFFB_FAFA), None)],
         "Adwaita's base button background did not resolve"
     );
-    assert_eq!(normal.color, Color(0xFF2E_3436));
-    assert_eq!(normal.border_color, Color(0xFFCD_C7C2));
-    assert_eq!(normal.border_width, 1.0);
-    assert_eq!(normal.border_radius, 5.0);
-    assert_eq!(normal.padding, [4.0, 9.0, 4.0, 9.0]);
-    assert_eq!(normal.min_width, 16.0);
-    assert_eq!(normal.min_height, 24.0);
-    assert_eq!(normal.font_size, ComputedStyle::DEFAULT_FONT_SIZE);
+    assert_eq!(normal.color().to_color32(), Color(0xFF2E_3436));
+    assert_eq!(normal.border_colors()[0].to_color32(), Color(0xFFCD_C7C2));
+    assert_eq!(normal.border_widths(), [1.0; 4]);
+    assert_eq!(normal.border_radii(78.0, 34.0), [[5.0, 5.0]; 4]);
+    assert_eq!(normal.padding(0.0), [4.0, 9.0, 4.0, 9.0]);
+    assert_eq!(normal.min_size((0.0, 0.0)), (16.0, 24.0));
+    assert_eq!(normal.font_size_px(), 14.0);
     // Adwaita sets no `background-clip` on `button`, so the background fills
     // the border box -- CSS's and GTK's default. The opaque #cdc7c2 border
     // is painted over it, which is why the border-pixel assertion below
     // still reads the border colour and the corner outside the radius is
     // still transparent.
-    assert_eq!(normal.background_clip, BackgroundClip::BorderBox);
+    assert_eq!(normal.background_layers()[0].clip, Keyword::BorderBox);
 
     let allocation = button.allocation();
     assert!(
@@ -158,14 +182,11 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
     button.set_states(PseudoStates::HOVER, &sheet, &fonts);
     let hovered = button.style().clone();
     assert_eq!(
-        hovered.background,
-        Background::LinearGradientToTop {
-            from: stop(0xFFD6_D1CD, None),
-            to: stop(0xFFE8_E6E3, Some(1.0)),
-        },
+        gradient_stops(&hovered),
+        vec![(Color(0xFFD6_D1CD), None), (Color(0xFFE8_E6E3), Some(1.0))],
         "`button:hover` did not win the cascade"
     );
-    assert_ne!(hovered.background, normal.background);
+    assert_ne!(gradient_stops(&hovered), gradient_stops(&normal));
 
     let hovered_surface = render(&button);
     // The second stop sits 1px above the bottom edge, so everything above
@@ -184,8 +205,8 @@ fn adwaita_button_computed_style_and_pixels_match_the_theme() {
     // --- 4. Toggling :active: a flat `image(<color>)` background --------
     button.set_states(PseudoStates::ACTIVE, &sheet, &fonts);
     assert_eq!(
-        button.style().background,
-        Background::Solid(Color(0xFFDA_D6D2)),
+        solid_background(button.style()),
+        Color(0xFFDA_D6D2),
         "`button:active`'s image(#dad6d2) did not resolve to a flat fill"
     );
     let active_surface = render(&button);
@@ -202,18 +223,15 @@ fn suggested_action_button_is_adwaitas_accent_blue() {
     let (_sheet, _fonts, button) = fixture(&["suggested-action"]);
     let style = button.style().clone();
     assert_eq!(
-        style.background,
-        Background::LinearGradientToTop {
-            from: stop(0xFF2C_7FE3, Some(2.0)),
-            to: stop(0xFF35_84E4, None),
-        }
+        gradient_stops(&style),
+        vec![(Color(0xFF2C_7FE3), Some(2.0)), (Color(0xFF35_84E4), None)]
     );
     assert_eq!(
-        style.color,
+        style.color().to_color32(),
         Color(0xFFFF_FFFF),
         "suggested-action text is white"
     );
-    assert_eq!(style.border_color, Color(0xFF15_539E));
+    assert_eq!(style.border_colors()[0].to_color32(), Color(0xFF15_539E));
 
     let allocation = button.allocation();
     // Same padding-gutter sampling as the gate test: the button's centre

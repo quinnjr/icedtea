@@ -1,16 +1,20 @@
 //! Skia paint for one themed button.
 //!
 //! Backgrounds are painted row-band by row-band under a rounded-rect clip
-//! rather than through a gradient shader: `Background::color_at` is then the
+//! rather than through a gradient shader: `Fill::color_at` is then the
 //! single definition of what color lands on any given row, so a pixel
 //! assertion is derivable straight from the theme's declaration.
 
 use skia_rs_safe::canvas::{ClipOp, Surface};
-use skia_rs_safe::core::Rect;
+use skia_rs_safe::core::{Color, Rect};
 use skia_rs_safe::paint::{Paint, Style};
 use skia_rs_safe::path::PathBuilder;
 
-use crate::css::computed::{Background, BackgroundClip, ComputedStyle};
+use crate::css::computed::ComputedStyle;
+use crate::css::registry::Prop;
+use crate::css::value::color::{ColorValue, Rgba};
+use crate::css::value::image::{ColorStop, GradientKind, LinearDirection, SideOrCorner};
+use crate::css::value::{Gradient, Image, Keyword, Length};
 use crate::layout::Allocation;
 use crate::text::ShapedText;
 
@@ -27,8 +31,9 @@ pub fn paint_button(
     label: Option<&ShapedText>,
 ) {
     let (ox, oy) = origin;
-    let radius = style.border_radius;
-    let border = style.border_width;
+    let radius = style.border_radii(allocation.width, allocation.height)[0][0];
+    let border = style.border_widths()[0];
+    let fill = Fill::of(style);
 
     // `background-origin` stays at its CSS default (padding-box): that is
     // the box a gradient is *sized* against. `background-clip` only decides
@@ -42,14 +47,10 @@ pub fn paint_button(
     );
     let origin_height = origin_box.bottom - origin_box.top;
 
-    let (clip, clip_radius) = match style.background_clip {
-        BackgroundClip::BorderBox => (
-            Rect::from_xywh(ox, oy, allocation.width, allocation.height),
-            radius,
-        ),
-        BackgroundClip::PaddingBox => (origin_box, (radius - border).max(0.0)),
-        BackgroundClip::ContentBox => {
-            let [top, right, bottom, left] = style.padding;
+    let (clip, clip_radius) = match style.get::<Keyword>(Prop::BackgroundClip) {
+        Keyword::PaddingBox => (origin_box, (radius - border).max(0.0)),
+        Keyword::ContentBox => {
+            let [top, right, bottom, left] = style.padding(allocation.width);
             (
                 Rect::from_xywh(
                     origin_box.left + left,
@@ -60,11 +61,16 @@ pub fn paint_button(
                 (radius - border - top.max(left)).max(0.0),
             )
         }
+        // `border-box` and anything else: the whole element.
+        _ => (
+            Rect::from_xywh(ox, oy, allocation.width, allocation.height),
+            radius,
+        ),
     };
 
-    match style.background {
-        Background::Transparent => {}
-        Background::Solid(color) => {
+    match fill {
+        Fill::None => {}
+        Fill::Solid(color) => {
             let mut paint = Paint::new();
             paint.set_color32(color);
             paint.set_style(Style::Fill);
@@ -73,7 +79,7 @@ pub fn paint_button(
                 .canvas()
                 .draw_round_rect(&clip, clip_radius, clip_radius, &paint);
         }
-        Background::LinearGradientToTop { .. } => {
+        Fill::ToTop { .. } => {
             let mut canvas = surface.canvas();
             let save = canvas.save();
             // Clip to the rounded background-clip box, then fill 1px bands.
@@ -85,9 +91,7 @@ pub fn paint_button(
                 let y = clip.top + row as f32;
                 // Sampled against the origin box, not the clip box: rows
                 // outside it clamp to the end stops, as CSS requires.
-                let color = style
-                    .background
-                    .color_at(origin_height, y - origin_box.top + 0.5);
+                let color = fill.color_at(origin_height, y - origin_box.top + 0.5);
                 let mut paint = Paint::new();
                 paint.set_color32(color);
                 paint.set_style(Style::Fill);
@@ -102,7 +106,8 @@ pub fn paint_button(
     }
 
     // --- border: stroked on the centre line of the border ---------------
-    if border > 0.0 && style.border_color.alpha() > 0 {
+    let border_color = style.border_colors()[0].to_color32();
+    if border > 0.0 && border_color.alpha() > 0 {
         let half = border / 2.0;
         let outline = Rect::from_xywh(
             ox + half,
@@ -112,7 +117,7 @@ pub fn paint_button(
         );
         let outline_radius = (radius - half).max(0.0);
         let mut paint = Paint::new();
-        paint.set_color32(style.border_color);
+        paint.set_color32(border_color);
         paint.set_style(Style::Stroke);
         paint.set_stroke_width(border);
         paint.set_anti_alias(true);
@@ -126,7 +131,7 @@ pub fn paint_button(
         && let Some(blob) = label.blob.as_ref()
     {
         let mut paint = Paint::new();
-        paint.set_color32(style.color);
+        paint.set_color32(style.color().to_color32());
         paint.set_style(Style::Fill);
         paint.set_anti_alias(true);
         surface.canvas().draw_text_blob(
@@ -135,6 +140,120 @@ pub fn paint_button(
             oy + allocation.label_y + label.metrics.ascent,
             &paint,
         );
+    }
+}
+
+/// The one background shape this module paints.
+///
+/// A **P3 shim**: it recognises exactly what M1's `Background` did -- a flat
+/// fill and a two-stop `linear-gradient(to top, ...)` -- out of the computed
+/// background layers, so the offscreen gate's pinned bytes are reproduced
+/// without depending on the general gradient sampler. P4 deletes it along with
+/// this whole module.
+enum Fill {
+    None,
+    Solid(Color),
+    ToTop {
+        from: (Color, f32),
+        to: (Color, Option<f32>),
+    },
+}
+
+/// Round-to-nearest linear interpolation between two bytes.
+///
+/// Deliberately *not* `Color4f::lerp`: that round-trips each channel through
+/// `x / 255.0` and back, so it is not bit-identical to rounding the byte-space
+/// interpolation once. The offscreen gate asserts exact pixel equality against
+/// values derived straight from the theme's declarations.
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let a = f32::from(a);
+    let b = f32::from(b);
+    (a + (b - a) * t).round().clamp(0.0, 255.0) as u8
+}
+
+impl Fill {
+    /// The topmost background layer, or the background colour behind it.
+    fn of(style: &ComputedStyle) -> Self {
+        let layers = style.background_layers();
+        if let Some(layer) = layers.first() {
+            match &layer.image {
+                Image::Solid(ColorValue::Absolute(rgba)) => return Self::Solid(rgba.to_color32()),
+                Image::Gradient(gradient) => {
+                    if let Some(fill) = Self::from_gradient(gradient) {
+                        return fill;
+                    }
+                    tracing::debug!("gradient shape is beyond M1's painter; painting nothing");
+                }
+                other => {
+                    tracing::debug!(image = ?other, "image kind is beyond M1's painter");
+                }
+            }
+        }
+        let color = style.get::<Rgba>(Prop::BackgroundColor);
+        if color.a <= 0.0 {
+            Self::None
+        } else {
+            Self::Solid(color.to_color32())
+        }
+    }
+
+    fn from_gradient(gradient: &Gradient) -> Option<Self> {
+        if gradient.repeating {
+            return None;
+        }
+        let GradientKind::Linear {
+            direction: LinearDirection::Side(SideOrCorner::Top),
+        } = gradient.kind
+        else {
+            return None;
+        };
+        let [from, to] = gradient.stops.as_ref() else {
+            return None;
+        };
+        let color = |stop: &ColorStop| match &stop.color {
+            ColorValue::Absolute(rgba) => Some(rgba.to_color32()),
+            _ => None,
+        };
+        let position = |stop: &ColorStop| match stop.position.as_ref() {
+            Some(Length::Abs { value, .. }) => Some(Some(*value)),
+            None => Some(None),
+            Some(_) => None,
+        };
+        Some(Self::ToTop {
+            from: (color(from)?, position(from)?.unwrap_or(0.0)),
+            to: (color(to)?, position(to)?),
+        })
+    }
+
+    /// The colour this fill paints at `y_from_top` in a box `height` tall.
+    ///
+    /// `to top` gradients are sampled along a line whose origin is the
+    /// *bottom* edge, so this converts. Positions before the first stop and
+    /// after the last clamp to that stop's colour, per CSS.
+    fn color_at(&self, height: f32, y_from_top: f32) -> Color {
+        match self {
+            Self::None => Color::TRANSPARENT,
+            Self::Solid(color) => *color,
+            Self::ToTop { from, to } => {
+                let line = height.max(1.0);
+                let p0 = from.1;
+                let p1 = to.1.unwrap_or(line);
+                let y = (line - y_from_top).clamp(0.0, line);
+                if y <= p0 || (p1 - p0).abs() < f32::EPSILON {
+                    return from.0;
+                }
+                if y >= p1 {
+                    return to.0;
+                }
+                let t = (y - p0) / (p1 - p0);
+                Color::from_argb(
+                    lerp_u8(from.0.alpha(), to.0.alpha(), t),
+                    lerp_u8(from.0.red(), to.0.red(), t),
+                    lerp_u8(from.0.green(), to.0.green(), t),
+                    lerp_u8(from.0.blue(), to.0.blue(), t),
+                )
+            }
+        }
     }
 }
 
@@ -227,5 +346,39 @@ mod tests {
         assert_eq!(pixel(&clipped, 0, 0).alpha(), 0);
         assert_ne!(pixel(&full, 0, 0).alpha(), 0);
         assert_eq!(pixel(&full, 20, 10), pixel(&clipped, 20, 10));
+    }
+
+    #[test]
+    fn gradient_sampling_follows_to_top_semantics() {
+        // to top => the gradient line starts at the bottom edge.
+        let hover = super::Fill::ToTop {
+            from: (Color(0xFFD6_D1CD), 0.0),
+            to: (Color(0xFFE8_E6E3), Some(1.0)),
+        };
+        let h = 30.0;
+        // The bottom edge itself is the first stop.
+        assert_eq!(hover.color_at(h, h), Color(0xFFD6_D1CD));
+        // The bottom pixel row's centre sits halfway through the 1px stop
+        // band, so it is the midpoint of the two stops, not either of them.
+        assert_eq!(hover.color_at(h, h - 0.5), Color(0xFFDF_DCD8));
+        // Anything above 1px from the bottom is past the second stop.
+        assert_eq!(hover.color_at(h, h / 2.0), Color(0xFFE8_E6E3));
+        assert_eq!(hover.color_at(h, 0.5), Color(0xFFE8_E6E3));
+
+        let normal = super::Fill::ToTop {
+            from: (Color(0xFFF6_F5F4), 2.0),
+            to: (Color(0xFFFB_FAFA), None),
+        };
+        // Below the 2px first stop the fill is flat.
+        assert_eq!(normal.color_at(h, h - 0.5), Color(0xFFF6_F5F4));
+        assert_eq!(normal.color_at(h, h - 1.5), Color(0xFFF6_F5F4));
+        // The top edge is the second stop.
+        assert_eq!(normal.color_at(h, 0.0), Color(0xFFFB_FAFA));
+        // The middle is strictly between the two.
+        let mid = normal.color_at(h, h / 2.0);
+        assert!(mid != Color(0xFFF6_F5F4) && mid != Color(0xFFFB_FAFA));
+        assert!((0xF6..=0xFB).contains(&mid.red()));
+        assert!((0xF5..=0xFA).contains(&mid.green()));
+        assert!((0xF4..=0xFA).contains(&mid.blue()));
     }
 }
