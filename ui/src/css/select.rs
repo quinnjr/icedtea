@@ -794,10 +794,12 @@ impl Element for Node {
         self.parent().is_none()
     }
 
-    fn add_element_unique_hashes(&self, _filter: &mut BloomFilter) -> bool {
-        // Task 7 fills this in; a `false` here makes the filter a permanent
-        // no-op, which is only correct while nothing seeds it.
-        false
+    fn add_element_unique_hashes(&self, filter: &mut BloomFilter) -> bool {
+        // Name, id and every class. `selectors` masks its queries with
+        // `BLOOM_HASH_MASK` (matching.rs:161), so the hashes are pre-masked in
+        // `Node::for_each_identity_hash` and the two sides agree exactly.
+        self.for_each_identity_hash(|hash| filter.insert_hash(hash));
+        true
     }
 }
 
@@ -805,6 +807,31 @@ impl Element for Node {
 #[must_use]
 pub fn matches(list: &SelectorList<GtkSelectorImpl>, node: &Node, cx: &mut MatchCx) -> bool {
     matches_with_specificity(list, node, cx).is_some()
+}
+
+/// [`matches`] with the ancestor filter switched off.
+///
+/// The bloom filter may only ever *reject* selectors that could not match;
+/// this is the reference implementation that claim is tested against, and the
+/// escape hatch for a caller that cannot position a filter.
+#[must_use]
+pub fn matches_unfiltered(
+    list: &SelectorList<GtkSelectorImpl>,
+    node: &Node,
+    cx: &mut MatchCx,
+) -> bool {
+    let MatchCx { caches, .. } = cx;
+    let mut context = MatchingContext::new(
+        MatchingMode::Normal,
+        None,
+        caches,
+        QuirksMode::NoQuirks,
+        NeedsSelectorFlags::No,
+        MatchingForInvalidation::No,
+    );
+    list.slice()
+        .iter()
+        .any(|selector| matches_selector(selector, 0, None, node, &mut context))
 }
 
 /// The highest specificity among the selectors in `list` that match `node`, or
@@ -1227,6 +1254,101 @@ mod tests {
             super::match_pseudo_class_name("hover-ish"),
             GtkPseudoClass::Other(_)
         ));
+    }
+
+    #[test]
+    fn unique_hashes_are_inserted_and_reported() {
+        use selectors::Element;
+        use selectors::bloom::{BLOOM_HASH_MASK, BloomFilter};
+
+        let node = Node::with_classes("button", &["flat"]);
+        node.set_id(Some("close"));
+        let mut filter = BloomFilter::new();
+        assert!(
+            node.add_element_unique_hashes(&mut filter),
+            "returning false makes the ancestor filter a permanent no-op"
+        );
+        for text in ["button", "flat", "close"] {
+            assert!(
+                filter
+                    .might_contain_hash(crate::css::node::fnv1a(text.as_bytes()) & BLOOM_HASH_MASK),
+                "`{text}` must be in the filter"
+            );
+        }
+    }
+
+    #[test]
+    fn push_and_pop_ancestor_are_exact_inverses() {
+        let window = Node::with_classes("window", &["background"]);
+        let button = Node::new("button");
+        window.append_child(&button);
+
+        let mut cx = MatchCx::new();
+        cx.push_ancestor(&window);
+        assert!(hits("window.background > button", &button));
+        cx.pop_ancestor(&window);
+        cx.reset();
+        assert!(
+            hits("window.background > button", &button),
+            "a popped filter must leave no residue that rejects a real match"
+        );
+    }
+
+    #[test]
+    fn the_bloom_filter_never_changes_an_answer() {
+        // The filter may only *fast-reject* selectors that could not match. Any
+        // rule it rejects that actually matches is a silently lost style.
+        use crate::css::cascade::CompiledSheet;
+
+        let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
+        let window = Node::with_classes("window", &["background", "csd"]);
+        let headerbar = Node::with_classes("headerbar", &["titlebar"]);
+        // The bundled Adwaita subset only reaches a bare `box` through
+        // `headerbar > windowhandle > box` (adwaita-light.css:620); there is no
+        // rule with `box` as a rightmost compound one level under `headerbar`
+        // directly, so `windowhandle` is threaded in to give `box_node` a real
+        // rule to match, matching upstream GTK's own headerbar structure.
+        let windowhandle = Node::new("windowhandle");
+        let box_node = Node::with_classes("box", &["linked", "horizontal"]);
+        let button = Node::with_classes("button", &["suggested-action", "text-button"]);
+        let label = Node::new("label");
+        window.append_child(&headerbar);
+        headerbar.append_child(&windowhandle);
+        windowhandle.append_child(&box_node);
+        box_node.append_child(&Node::new("entry"));
+        box_node.append_child(&button);
+        button.append_child(&label);
+        button.set_states(PseudoStates::HOVER);
+
+        let mut with_filter = MatchCx::new();
+        for node in [&window, &headerbar, &box_node, &button, &label] {
+            let mut filtered = Vec::new();
+            let mut unfiltered = Vec::new();
+            for (index, rule) in sheet.rules.iter().enumerate() {
+                if matches(&rule.selectors, node, &mut with_filter) {
+                    filtered.push(index);
+                }
+                // A fresh context that has never been seeded still holds an empty
+                // filter, so re-seed it per node to compare like with like: the
+                // reference answer comes from matching every selector directly.
+                let mut plain = MatchCx::new();
+                plain.seed_for(node);
+                if super::matches_unfiltered(&rule.selectors, node, &mut plain) {
+                    unfiltered.push(index);
+                }
+            }
+            assert_eq!(
+                filtered,
+                unfiltered,
+                "the bloom filter changed the answer for {:?}",
+                node.name()
+            );
+            assert!(
+                !filtered.is_empty(),
+                "{:?} must match something",
+                node.name()
+            );
+        }
     }
 
     #[test]
