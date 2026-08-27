@@ -21,6 +21,7 @@ pub mod interpolate;
 pub mod keyword;
 pub mod length;
 pub mod shadow;
+pub mod shorthand;
 pub mod text;
 pub mod timing;
 pub mod transform;
