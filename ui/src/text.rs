@@ -135,11 +135,12 @@ static FEATURES_WARNED: Once = Once::new();
 /// Single-threaded by construction: fontconfig's own objects are `!Send`
 /// and `!Sync`, and Part 6 will own one `Fontconfig` for the process.
 pub struct FontDatabase {
-    fontconfig: bool,
-    typefaces: HashMap<(PathBuf, i32), Arc<Typeface>>,
+    fontconfig: Option<fontconfig::Fontconfig>,
+    typefaces: HashMap<(PathBuf, i32), Option<Arc<Typeface>>>,
     faces: HashMap<String, Option<FontFace>>,
     shapes: HashMap<OwnedShapeKey, Rc<ShapedText>>,
     shaper: Shaper,
+    warned_collection_index: bool,
 }
 
 impl Default for FontDatabase {
@@ -156,103 +157,91 @@ impl FontDatabase {
         Self::probe_only()
     }
 
-    /// M1's fixed `FONT_CANDIDATES` path probe -- the no-fontconfig fallback.
+    /// The fontconfig-free database: M1's fixed [`FONT_CANDIDATES`] probe.
+    ///
+    /// This is the CI / stripped-container fallback, and what
+    /// [`FontDatabase::new`] degrades to when `FcInit` fails.
     #[must_use]
     pub fn probe_only() -> Self {
         Self {
-            fontconfig: false,
+            fontconfig: None,
             typefaces: HashMap::new(),
             faces: HashMap::new(),
             shapes: HashMap::new(),
             shaper: Shaper::new(),
+            warned_collection_index: false,
         }
     }
 
     /// Whether real fontconfig matching is in play.
     #[must_use]
     pub fn has_fontconfig(&self) -> bool {
-        self.fontconfig
+        self.fontconfig.is_some()
     }
 
-    /// Resolve a CSS font query to one face.
+    /// Resolve `query` to a face, with `fc-match` parity when fontconfig is
+    /// available (a later task wires that in) and the [`FONT_CANDIDATES`]
+    /// probe otherwise.
     ///
-    /// The probe-only body ignores weight, style and stretch: it returns the
-    /// first readable, parseable entry of [`FONT_CANDIDATES`]. Part 6
-    /// replaces this body with `FcPattern` + `FcFontMatch`.
+    /// Cached per query; a query that resolves to nothing is cached as
+    /// nothing, so a missing font costs one lookup, not one per restyle.
     pub fn match_face(&mut self, query: &FontQuery<'_>) -> Option<FontFace> {
-        let cache_key = Self::query_cache_key(query);
-        if let Some(cached) = self.faces.get(&cache_key) {
+        let key = match_cache_key(query);
+        if let Some(cached) = self.faces.get(&key) {
             return cached.clone();
         }
-        let mut found = None;
-        for candidate in FONT_CANDIDATES {
-            let path = PathBuf::from(candidate);
-            if let Some(typeface) = Self::load(&path) {
-                found = Some(FontFace {
-                    family: typeface.family_name().to_owned(),
-                    path: path.clone(),
-                    index: 0,
-                });
-                self.typefaces.insert((path, 0), typeface);
-                break;
-            }
-        }
-        if found.is_none() {
-            tracing::warn!(candidates = FONT_CANDIDATES.len(), "no UI typeface found");
-        }
-        self.faces.insert(cache_key, found.clone());
-        found
-    }
-
-    /// A stable cache key for a query.
-    fn query_cache_key(query: &FontQuery<'_>) -> String {
-        use std::fmt::Write as _;
-
-        let mut key = String::new();
-        for family in query.families {
-            match family {
-                FontFamily::Named(name) => key.push_str(name),
-                FontFamily::Generic(generic) => key.push_str(match generic {
-                    GenericFamily::Serif => "serif",
-                    GenericFamily::SansSerif => "sans-serif",
-                    GenericFamily::Monospace => "monospace",
-                    GenericFamily::Cursive => "cursive",
-                    GenericFamily::Fantasy => "fantasy",
-                    GenericFamily::SystemUi => "system-ui",
-                }),
-            }
-            key.push(',');
-        }
-        let _ = write!(
-            key,
-            "|{}|{}|{}",
-            css_weight_to_fc(query.weight),
-            css_style_to_fc_slant(query.style),
-            css_stretch_to_fc(query.stretch)
-        );
-        key
-    }
-
-    fn load(path: &Path) -> Option<Arc<Typeface>> {
-        let data = std::fs::read(path).ok()?;
-        Typeface::from_data(data).map(Arc::new)
+        let face = probe_face(query);
+        self.faces.insert(key, face.clone());
+        face
     }
 
     /// The loaded typeface for `face`, cached by `(path, index)`.
+    ///
+    /// `index` is kept even though `skia-rs-text` 0.4.0's `Typeface::from_data`
+    /// cannot select a face inside a collection: it is part of the cache
+    /// identity and of `fc-match` parity, so this warns once when it is
+    /// non-zero rather than pretending the right face was loaded.
     pub fn typeface(&mut self, face: &FontFace) -> Option<Arc<Typeface>> {
         let key = (face.path.clone(), face.index);
-        if let Some(typeface) = self.typefaces.get(&key) {
-            return Some(Arc::clone(typeface));
+        if let Some(cached) = self.typefaces.get(&key) {
+            return cached.clone();
         }
-        let typeface = Self::load(&face.path)?;
-        self.typefaces.insert(key, Arc::clone(&typeface));
-        Some(typeface)
+        if face.index != 0 && !self.warned_collection_index {
+            self.warned_collection_index = true;
+            tracing::warn!(
+                path = %face.path.display(),
+                index = face.index,
+                "skia-rs-text 0.4.0 cannot select a face index inside a font collection; \
+                 loading face 0 instead"
+            );
+        }
+        let loaded = load_typeface(&face.path);
+        self.typefaces.insert(key, loaded.clone());
+        loaded
     }
 
     /// A `Font` for `face` at `size_px`.
     pub fn font(&mut self, face: &FontFace, size_px: f32) -> Option<Font> {
         let typeface = self.typeface(face)?;
         Some(Font::new(typeface, size_px))
+    }
+
+    /// x-height ÷ em for `face`, the `ex` unit's basis.
+    ///
+    /// Falls back to the CSS-recommended `0.5` when the face has no usable
+    /// `x_height` (`LengthCtx::ex_ratio`'s documented default), and when the
+    /// face cannot be loaded at all.
+    pub fn ex_ratio(&mut self, face: &FontFace) -> f32 {
+        const PROBE_SIZE: f32 = 100.0;
+        let Some(font) = self.font(face, PROBE_SIZE) else {
+            return 0.5;
+        };
+        let x_height = font.metrics().x_height;
+        if x_height.is_finite() && x_height > 0.0 {
+            x_height / PROBE_SIZE
+        } else {
+            0.5
+        }
     }
 
     /// Shape and measure a run, cached.
@@ -348,6 +337,90 @@ impl FontDatabase {
         self.faces.clear();
         self.shapes.clear();
     }
+}
+
+/// A stable string identity for a query — `FontFamily` is not `Hash` and the
+/// numeric fields are floats, so [`FontDatabase::match_face`]'s cache is keyed
+/// by this rather than by the query itself.
+fn match_cache_key(query: &FontQuery<'_>) -> String {
+    use std::fmt::Write as _;
+
+    let mut key = String::new();
+    for family in query.families {
+        for name in family_names(family) {
+            key.push_str(name);
+            key.push('\u{1}');
+        }
+    }
+    let _ = write!(
+        key,
+        "\u{2}{}\u{2}{}\u{2}{}\u{2}{}",
+        query.weight.to_bits(),
+        css_style_to_fc_slant(query.style),
+        query.stretch.to_bits(),
+        query.size_px.to_bits()
+    );
+    key
+}
+
+/// The fontconfig family strings for one CSS family, in the order they should
+/// be offered. `system-ui` is offered with `sans-serif` behind it because not
+/// every fontconfig configuration aliases it.
+fn family_names(family: &FontFamily) -> Vec<&str> {
+    match family {
+        FontFamily::Named(name) => vec![name.as_ref()],
+        FontFamily::Generic(GenericFamily::Serif) => vec!["serif"],
+        FontFamily::Generic(GenericFamily::SansSerif) => vec!["sans-serif"],
+        FontFamily::Generic(GenericFamily::Monospace) => vec!["monospace"],
+        FontFamily::Generic(GenericFamily::Cursive) => vec!["cursive"],
+        FontFamily::Generic(GenericFamily::Fantasy) => vec!["fantasy"],
+        FontFamily::Generic(GenericFamily::SystemUi) => vec!["system-ui", "sans-serif"],
+    }
+}
+
+/// The no-fontconfig path: a named family that is itself a readable font file
+/// wins (so tests can name a file directly), then M1's fixed
+/// [`FONT_CANDIDATES`] list.
+fn probe_face(query: &FontQuery<'_>) -> Option<FontFace> {
+    for family in query.families {
+        if let FontFamily::Named(name) = family {
+            let path = Path::new(name.as_ref());
+            if path.is_file()
+                && let Some(face) = face_from_file(path)
+            {
+                return Some(face);
+            }
+        }
+    }
+    for candidate in FONT_CANDIDATES {
+        if let Some(face) = face_from_file(Path::new(candidate)) {
+            tracing::debug!(font = candidate, "probed UI typeface");
+            return Some(face);
+        }
+    }
+    tracing::warn!(
+        candidates = FONT_CANDIDATES.len(),
+        "no UI typeface found in the probe list"
+    );
+    None
+}
+
+/// Read and parse `path` just far enough to report its family name; the
+/// [`Typeface`] itself is not kept here -- [`FontDatabase::typeface`] owns
+/// that cache.
+fn face_from_file(path: &Path) -> Option<FontFace> {
+    let typeface = load_typeface(path)?;
+    Some(FontFace {
+        path: path.to_path_buf(),
+        index: 0,
+        family: typeface.family_name().to_string(),
+    })
+}
+
+/// Read and parse one font file into a [`Typeface`], with no caching.
+fn load_typeface(path: &Path) -> Option<Arc<Typeface>> {
+    let data = std::fs::read(path).ok()?;
+    Typeface::from_data(data).map(Arc::new)
 }
 
 /// Apply CSS `text-transform` to a string.
@@ -817,6 +890,121 @@ mod tests {
     #[test]
     fn a_probe_only_database_reports_no_fontconfig() {
         assert!(!FontDatabase::probe_only().has_fontconfig());
+    }
+
+    #[test]
+    fn the_probe_only_database_resolves_a_face_without_fontconfig() {
+        // Mutation check: making `has_fontconfig` return `true` unconditionally
+        // passes the first assertion regardless of `probe_only`'s body.
+        let mut db = db();
+        assert!(
+            !db.has_fontconfig(),
+            "probe_only must not initialise fontconfig"
+        );
+        let families = sans();
+        let face = db
+            .match_face(&FontQuery {
+                families: &families,
+                weight: 400.0,
+                style: FontStyle::Normal,
+                stretch: 100.0,
+                size_px: 14.0,
+            })
+            .expect(
+                "no font found among FONT_CANDIDATES; install adwaita-fonts/dejavu/liberation/noto",
+            );
+        assert!(
+            face.path.is_file(),
+            "{} is not a readable file",
+            face.path.display()
+        );
+        assert!(
+            !face.family.is_empty(),
+            "the probed face reported no family name"
+        );
+        assert_eq!(face.index, 0, "the probe list only ever loads face 0");
+    }
+
+    #[test]
+    fn a_typeface_is_loaded_once_per_face_and_cached() {
+        // Mutation check: skipping the cache insert in `typeface` fails the
+        // `Arc::ptr_eq` assertion because a fresh allocation is loaded each call.
+        let mut db = db();
+        let families = sans();
+        let face = db
+            .match_face(&FontQuery {
+                families: &families,
+                weight: 400.0,
+                style: FontStyle::Normal,
+                stretch: 100.0,
+                size_px: 14.0,
+            })
+            .expect("system font");
+        let first = db.typeface(&face).expect("typeface");
+        let second = db.typeface(&face).expect("typeface");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the typeface cache handed out two different allocations for one face"
+        );
+        assert_eq!(first.family_name(), face.family);
+
+        db.clear_caches();
+        let third = db.typeface(&face).expect("typeface");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &third),
+            "clear_caches did not drop the typeface cache"
+        );
+    }
+
+    #[test]
+    fn a_font_carries_the_requested_size_and_an_x_height_ratio() {
+        // Mutation check: returning `x_height / PROBE_SIZE` unconditionally in
+        // `ex_ratio` (dropping the finite/positive guard) still passes this
+        // test on a real face, but fails
+        // `an_unreadable_face_resolves_to_nothing_rather_than_panicking` below.
+        let mut db = db();
+        let families = sans();
+        let face = db
+            .match_face(&FontQuery {
+                families: &families,
+                weight: 400.0,
+                style: FontStyle::Normal,
+                stretch: 100.0,
+                size_px: 14.0,
+            })
+            .expect("system font");
+        let font = db.font(&face, 28.0).expect("font");
+        let metrics = font.metrics();
+        assert!(
+            metrics.line_height() > 14.0,
+            "28px face reported a {}px line height",
+            metrics.line_height()
+        );
+        let ratio = db.ex_ratio(&face);
+        assert!(
+            (0.2..=0.9).contains(&ratio),
+            "x-height/em ratio {ratio} is outside every real UI face's range"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_face_resolves_to_nothing_rather_than_panicking() {
+        // Mutation check: making `ex_ratio` unconditionally compute
+        // `x_height / PROBE_SIZE` panics here on the `None` font instead of
+        // returning the documented 0.5 fallback.
+        let mut db = db();
+        let missing = FontFace {
+            path: std::path::PathBuf::from("/nonexistent/font/does-not-exist.ttf"),
+            index: 0,
+            family: String::from("Nothing"),
+        };
+        assert!(db.typeface(&missing).is_none());
+        assert!(db.font(&missing, 14.0).is_none());
+        assert_eq!(
+            db.ex_ratio(&missing),
+            0.5,
+            "the documented ex-ratio fallback"
+        );
     }
 
     #[test]
