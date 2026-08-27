@@ -12,6 +12,7 @@
 //! with a one-time warning rather than silently ignored.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -150,11 +151,31 @@ impl Default for FontDatabase {
 }
 
 impl FontDatabase {
-    /// The production database. Part 6 initialises fontconfig here and falls
-    /// back to [`probe_only`](Self::probe_only) when `FcInit` fails.
+    /// The production database: `FcInit` once for this process, falling back
+    /// to [`probe_only`](Self::probe_only) when it fails.
+    ///
+    /// The handle is never dropped-and-recreated: the `fontconfig` crate
+    /// deliberately never calls `FcFini`, so one database should live for the
+    /// lifetime of the UI thread.
     #[must_use]
     pub fn new() -> Self {
-        Self::probe_only()
+        match fontconfig::Fontconfig::new() {
+            Some(fc) => {
+                tracing::debug!("fontconfig initialised");
+                Self {
+                    fontconfig: Some(fc),
+                    typefaces: HashMap::new(),
+                    faces: HashMap::new(),
+                    shapes: HashMap::new(),
+                    shaper: Shaper::new(),
+                    warned_collection_index: false,
+                }
+            }
+            None => {
+                tracing::warn!("FcInit failed; falling back to the FONT_CANDIDATES probe list");
+                Self::probe_only()
+            }
+        }
     }
 
     /// The fontconfig-free database: M1's fixed [`FONT_CANDIDATES`] probe.
@@ -190,7 +211,12 @@ impl FontDatabase {
         if let Some(cached) = self.faces.get(&key) {
             return cached.clone();
         }
-        let face = probe_face(query);
+        let face = match self.fontconfig.as_ref() {
+            // A fontconfig miss still falls through to the probe list: a
+            // configured-but-empty fontconfig must not leave the UI textless.
+            Some(fc) => fc_match(fc, query).or_else(|| probe_face(query)),
+            None => probe_face(query),
+        };
         self.faces.insert(key, face.clone());
         face
     }
@@ -331,6 +357,11 @@ impl FontDatabase {
         }
     }
 
+    #[cfg(test)]
+    fn match_cache_len(&self) -> usize {
+        self.faces.len()
+    }
+
     /// Drop every cached face, typeface and shaped run.
     pub fn clear_caches(&mut self) {
         self.typefaces.clear();
@@ -376,6 +407,59 @@ fn family_names(family: &FontFamily) -> Vec<&str> {
         FontFamily::Generic(GenericFamily::Fantasy) => vec!["fantasy"],
         FontFamily::Generic(GenericFamily::SystemUi) => vec!["system-ui", "sans-serif"],
     }
+}
+
+/// One `FcPattern` carrying the whole family list in priority order plus
+/// `FC_WEIGHT`/`FC_SLANT`/`FC_WIDTH`/`FC_PIXEL_SIZE`, then `FcFontMatch` — the
+/// same path `fc-match` takes, so aliases, generic families and user rules in
+/// `~/.config/fontconfig` are honoured without any special-casing here.
+fn fc_match(fc: &fontconfig::Fontconfig, query: &FontQuery<'_>) -> Option<FontFace> {
+    let mut pattern = fontconfig::Pattern::new(fc).ok()?;
+    for family in query.families {
+        for name in family_names(family) {
+            // A family with an embedded NUL cannot reach fontconfig; skip that
+            // one name rather than abandoning the whole query.
+            match CString::new(name) {
+                Ok(value) => {
+                    if let Err(error) = pattern.add_string(fontconfig::FC_FAMILY, &value) {
+                        tracing::debug!(family = name, ?error, "FcPatternAddString failed");
+                    }
+                }
+                Err(_) => tracing::debug!(family = name, "font family contains a NUL byte"),
+            }
+        }
+    }
+    let _ = pattern.add_integer(fontconfig::FC_WEIGHT, css_weight_to_fc(query.weight));
+    let _ = pattern.add_integer(fontconfig::FC_SLANT, css_style_to_fc_slant(query.style));
+    let _ = pattern.add_integer(fontconfig::FC_WIDTH, css_stretch_to_fc(query.stretch));
+    if query.size_px.is_finite() && query.size_px > 0.0 {
+        let _ = pattern.add_integer(
+            fontconfig::FC_PIXEL_SIZE,
+            query.size_px.round().clamp(1.0, 4096.0) as i32,
+        );
+    }
+
+    // `font_match` runs FcConfigSubstitute + FcDefaultSubstitute itself, and
+    // the pattern it returns borrows this one -- copy everything out here.
+    let matched = match pattern.font_match() {
+        Ok(matched) => matched,
+        Err(error) => {
+            tracing::debug!(?error, "FcFontMatch found nothing");
+            return None;
+        }
+    };
+    let path = PathBuf::from(matched.filename().ok()?);
+    let index = matched.face_index().unwrap_or(0);
+    let family = matched
+        .get_string(fontconfig::FC_FAMILY)
+        .or_else(|_| matched.name())
+        .map(str::to_owned)
+        .unwrap_or_default();
+    Some(FontFace {
+        path,
+        index,
+        family,
+    })
 }
 
 /// The no-fontconfig path: a named family that is itself a readable font file
@@ -567,6 +651,16 @@ mod tests {
 
     fn sans() -> Vec<FontFamily> {
         vec![FontFamily::Generic(GenericFamily::SansSerif)]
+    }
+
+    fn query(families: &[FontFamily]) -> FontQuery<'_> {
+        FontQuery {
+            families,
+            weight: 400.0,
+            style: FontStyle::Normal,
+            stretch: 100.0,
+            size_px: 14.0,
+        }
     }
 
     #[test]
@@ -1097,5 +1191,110 @@ mod tests {
         assert_eq!(css_weight_to_fc(f32::NAN), 80);
         assert_eq!(css_stretch_to_fc(f32::NAN), 100);
         assert_eq!(css_style_to_fc_slant(FontStyle::Oblique(f32::NAN)), 110);
+    }
+
+    use std::process::Command;
+
+    /// `fc-match`'s answer for a pattern, or `None` when fc-match is absent.
+    fn fc_match_file(pattern: &str) -> Option<String> {
+        let output = Command::new("fc-match")
+            .arg("--format=%{file}")
+            .arg(pattern)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let file = String::from_utf8(output.stdout).ok()?;
+        (!file.trim().is_empty()).then(|| file.trim().to_string())
+    }
+
+    #[test]
+    fn a_generic_family_resolves_to_something() {
+        let mut db = FontDatabase::new();
+        let families = sans();
+        let face = db
+            .match_face(&query(&families))
+            .expect("sans-serif resolved to no face at all");
+        // Deliberately NOT a fixed family: which face `sans-serif` means is the
+        // machine's business (spec section 6).
+        assert!(
+            face.path.is_file(),
+            "{} is not readable",
+            face.path.display()
+        );
+        assert!(!face.family.is_empty());
+    }
+
+    #[test]
+    fn the_query_matches_what_fc_match_would_pick() {
+        let mut db = FontDatabase::new();
+        if !db.has_fontconfig() {
+            eprintln!("fontconfig unavailable; parity check skipped");
+            return;
+        }
+        let Some(expected) = fc_match_file("sans-serif:weight=200:slant=0:width=100:pixelsize=14")
+        else {
+            eprintln!("fc-match unavailable; parity check skipped");
+            return;
+        };
+        let families = [FontFamily::Generic(GenericFamily::SansSerif)];
+        let bold = FontQuery {
+            families: &families,
+            weight: 700.0,
+            style: FontStyle::Normal,
+            stretch: 100.0,
+            size_px: 14.0,
+        };
+        let face = db.match_face(&bold).expect("bold sans-serif");
+        assert_eq!(
+            face.path.to_string_lossy(),
+            expected,
+            "our FcPattern disagrees with fc-match for bold sans-serif"
+        );
+    }
+
+    #[test]
+    fn a_named_family_is_offered_before_the_generic_fallback() {
+        let mut db = FontDatabase::new();
+        if !db.has_fontconfig() {
+            eprintln!("fontconfig unavailable; family-order check skipped");
+            return;
+        }
+        let Some(expected) = fc_match_file("monospace") else {
+            eprintln!("fc-match unavailable; family-order check skipped");
+            return;
+        };
+        let families = [
+            FontFamily::Named("Definitely Not An Installed Family".into()),
+            FontFamily::Generic(GenericFamily::Monospace),
+        ];
+        let face = db.match_face(&query(&families)).expect("monospace");
+        assert_eq!(
+            face.path.to_string_lossy(),
+            expected,
+            "an unknown first family must fall through to the next one, not abort the match"
+        );
+    }
+
+    #[test]
+    fn matches_are_cached_per_query() {
+        let mut db = FontDatabase::new();
+        let families = sans();
+        let first = db.match_face(&query(&families));
+        let second = db.match_face(&query(&families));
+        assert_eq!(first, second, "two identical queries disagreed");
+
+        let mut heavier = query(&families);
+        heavier.weight = 900.0;
+        // A different query must not be served from the first one's slot; it
+        // may legitimately resolve to the same file on a one-weight system, so
+        // assert on the cache size, not on the face.
+        let _ = db.match_face(&heavier);
+        assert_eq!(
+            db.match_cache_len(),
+            2,
+            "the weight is not part of the cache key"
+        );
     }
 }
