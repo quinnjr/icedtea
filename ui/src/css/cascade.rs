@@ -60,6 +60,8 @@ pub struct CompiledRule {
     pub declarations: Vec<Declaration>,
     /// Index of this rule in the source sheet.
     pub source_order: usize,
+    /// Which layer the rule came from; see [`CascadeKey::origin`].
+    pub origin: u8,
 }
 
 /// A stylesheet ready for matching, under one [`MediaEnv`].
@@ -109,7 +111,18 @@ impl CompiledSheet {
     pub fn compile_with_env(sheet: &Stylesheet, env: &MediaEnv) -> Self {
         let mut style_rules: Vec<&StyleRule> = sheet.rules.iter().collect();
         let mut keyframe_rules: Vec<&KeyframesRule> = sheet.keyframes.iter().collect();
-        let mut definitions: Vec<(String, String)> = sheet.color_definitions.clone();
+        // `(source_order, name, value)`, so a definition inside a matching
+        // `@media` block is *spliced* at the block's own position rather
+        // than appended after every top-level one -- otherwise
+        // `@media (...) { @define-color bg black }` always beat a later
+        // top-level `@define-color bg white`, where GTK's last-wins rule
+        // gives the top-level one.
+        let mut definitions: Vec<(usize, &String, &String)> = sheet
+            .color_definitions
+            .iter()
+            .zip(sheet.color_definition_orders.iter().copied())
+            .map(|((name, value), order)| (order, name, value))
+            .collect();
         for block in &sheet.media_blocks {
             if !block.query.evaluate(env) {
                 tracing::debug!(query = ?block.query, "media block does not match; dropping");
@@ -117,8 +130,19 @@ impl CompiledSheet {
             }
             style_rules.extend(block.rules.iter());
             keyframe_rules.extend(block.keyframes.iter());
-            definitions.extend(block.color_definitions.iter().cloned());
+            definitions.extend(
+                block
+                    .color_definitions
+                    .iter()
+                    .zip(block.color_definition_orders.iter().copied())
+                    .map(|((name, value), order)| (order, name, value)),
+            );
         }
+        definitions.sort_by_key(|(order, _, _)| *order);
+        let definitions: Vec<(String, String)> = definitions
+            .into_iter()
+            .map(|(_, name, value)| (name.clone(), value.clone()))
+            .collect();
         // Splice, do not append: a media rule's source order is the position it
         // occupied in the outer sheet.
         style_rules.sort_by_key(|rule| rule.source_order);
@@ -131,6 +155,7 @@ impl CompiledSheet {
                     selectors,
                     declarations: rule.declarations.clone(),
                     source_order: rule.source_order,
+                    origin: rule.origin,
                 }),
                 None => {
                     tracing::debug!(prelude = %rule.selector_text, "unparseable selector list; dropping rule");
@@ -221,10 +246,29 @@ fn parse_declaration(prop: Prop, value: &str, sink: &mut dyn FnMut(Prop, Value))
 
 /// Where a declaration sits in the cascade. Ordered worst-to-best, so
 /// `max` is the winner and a descending sort puts the winner first.
+///
+/// Field order *is* the sort order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CascadeKey {
     /// Whether the declaration carried `!important`.
     pub important: bool,
+    /// Which layer the declaration came from: 0 is the base sheet, and each
+    /// [`super::parse::Stylesheet::append_layer`] adds one.
+    ///
+    /// This outranks specificity, which is the whole point. GTK loads the
+    /// user's `gtk.css` at `GTK_STYLE_PROVIDER_PRIORITY_USER` (800) over the
+    /// theme's 200, and a higher-priority provider wins *regardless* of
+    /// specificity. Folding the layer into `source_order` -- which ranks
+    /// below specificity -- meant a user `button { background-color: #f00 }`
+    /// (0,0,1) lost to Adwaita's `button:hover` (0,1,1), so the override
+    /// applied only in the base state and `!important` had no origin to
+    /// reverse against.
+    ///
+    /// This is GTK's model, not CSS's: CSS ranks the user origin *below* the
+    /// author's for normal declarations and reverses origin order for
+    /// `!important`. GTK does neither, so `important` stays the outermost
+    /// key and origins never reverse.
+    pub origin: u8,
     /// The specificity of the selector that actually matched.
     pub specificity: u32,
     /// The rule's index in the sheet.
@@ -359,6 +403,7 @@ fn collect_rule(rule: &CompiledRule, node: &Node, cx: &mut MatchCx, values: &mut
     for (declaration_order, declaration) in rule.declarations.iter().enumerate() {
         let key = CascadeKey {
             important: declaration.important,
+            origin: rule.origin,
             specificity,
             source_order: rule.source_order,
             declaration_order,
@@ -837,5 +882,129 @@ mod tests {
         let parent = node.parent().expect("the window parent is still alive");
         assert!(parent.ptr_eq(&node.window));
         assert_eq!(&*parent.name(), "window");
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{CompiledSheet, cascade};
+    use crate::css::node::{Node, PseudoStates};
+    use crate::css::parse::{ColorScheme, MediaEnv, parse_stylesheet};
+    use crate::css::registry::Prop;
+    use crate::css::select::MatchCx;
+    use crate::css::value::Value;
+    use crate::css::value::color::{ColorCtx, ColorValue, Rgba};
+
+    fn hovered_button() -> Node {
+        let button = Node::new("button");
+        button.set_states(PseudoStates::HOVER);
+        button
+    }
+
+    fn winning_color(sheet: &CompiledSheet, node: &Node, prop: Prop) -> Option<Rgba> {
+        let mut cx = MatchCx::new();
+        let values = cascade(sheet, node, &mut cx);
+        let ctx = ColorCtx {
+            table: &sheet.colors,
+            current: Rgba::TRANSPARENT,
+            depth: 0,
+        };
+        match values.winner(prop)? {
+            Value::Color(color) => color.resolve(&ctx),
+            _ => None,
+        }
+    }
+
+    // F4: a user `gtk.css` layer is a higher cascade *origin*, which outranks
+    // any specificity -- GTK's USER (800) over THEME (200) rule. Folding the
+    // layer into `source_order`, which ranks below specificity, let a
+    // higher-specificity theme rule keep winning.
+    #[test]
+    fn a_later_layer_beats_a_higher_specificity_rule_from_an_earlier_one() {
+        let mut sheet = parse_stylesheet("button:hover { color: #00ff00 }");
+        sheet.append_layer(parse_stylesheet("button { color: #ff0000 }"));
+        let compiled = CompiledSheet::from_stylesheet(sheet);
+        assert_eq!(
+            winning_color(&compiled, &hovered_button(), Prop::Color),
+            Some(Rgba {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0
+            }),
+            "the user layer's low-specificity rule must still win"
+        );
+
+        // Within one layer, specificity still decides.
+        let one_layer =
+            CompiledSheet::compile("button:hover { color: #00ff00 } button { color: #ff0000 }");
+        assert_eq!(
+            winning_color(&one_layer, &hovered_button(), Prop::Color),
+            Some(Rgba {
+                r: 0.0,
+                g: 1.0,
+                b: 0.0,
+                a: 1.0
+            }),
+            "specificity must still decide inside a layer"
+        );
+    }
+
+    // `!important` stays the outermost key: it is not reversed by origin,
+    // because GTK does not reverse provider priority for it either.
+    #[test]
+    fn important_still_outranks_a_later_layer() {
+        let mut sheet = parse_stylesheet("button { color: #00ff00 !important }");
+        sheet.append_layer(parse_stylesheet("button { color: #ff0000 }"));
+        let compiled = CompiledSheet::from_stylesheet(sheet);
+        assert_eq!(
+            winning_color(&compiled, &Node::new("button"), Prop::Color),
+            Some(Rgba {
+                r: 0.0,
+                g: 1.0,
+                b: 0.0,
+                a: 1.0
+            })
+        );
+    }
+
+    // F3: a `@define-color` inside a matching `@media` block is spliced at
+    // the block's own source position, so a *later* top-level definition of
+    // the same name still wins, as it does in GTK.
+    #[test]
+    fn a_media_block_define_color_is_spliced_not_appended() {
+        let css = "@media (prefers-color-scheme: dark) { @define-color bg #000000; }\n\
+                   @define-color bg #ffffff;\n\
+                   button { color: @bg }";
+        let dark = MediaEnv {
+            color_scheme: ColorScheme::Dark,
+            ..MediaEnv::default()
+        };
+        let sheet = CompiledSheet::compile_with_env(&parse_stylesheet(css), &dark);
+        assert_eq!(
+            sheet.colors.get("bg"),
+            Some(&ColorValue::Absolute(Rgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0
+            })),
+            "the later top-level definition must win"
+        );
+
+        // The other order still lets the media block win, which is the whole
+        // reason the block's definitions are collected at all.
+        let reversed = "@define-color bg #ffffff;\n\
+                        @media (prefers-color-scheme: dark) { @define-color bg #000000; }";
+        let sheet = CompiledSheet::compile_with_env(&parse_stylesheet(reversed), &dark);
+        assert_eq!(
+            sheet.colors.get("bg"),
+            Some(&ColorValue::Absolute(Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0
+            }))
+        );
     }
 }

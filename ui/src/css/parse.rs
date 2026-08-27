@@ -44,8 +44,16 @@ pub struct StyleRule {
     pub selector_text: String,
     /// The rule's declarations, in source order.
     pub declarations: Vec<Declaration>,
-    /// 0-based index of this rule in the sheet; the cascade's final tiebreak.
+    /// 0-based position of this rule among the sheet's *items* -- rules,
+    /// `@keyframes` and `@define-color`s all draw from one counter -- which
+    /// is the cascade's final tiebreak. Only the ordering is meaningful; the
+    /// numbers are not a rule index.
     pub source_order: usize,
+    /// Which layer this rule came from: 0 is the base sheet, and each
+    /// [`Stylesheet::append_layer`] adds one. The cascade ranks a higher
+    /// origin above *any* specificity, the way GTK ranks a
+    /// `GTK_STYLE_PROVIDER_PRIORITY_USER` provider above a theme one.
+    pub origin: u8,
 }
 
 /// The viewer state `@media` queries evaluate against.
@@ -174,6 +182,10 @@ pub struct MediaBlock {
     pub keyframes: Vec<KeyframesRule>,
     /// Its `@define-color`s.
     pub color_definitions: Vec<(String, String)>,
+    /// The source-order slot of each entry of `color_definitions`, parallel
+    /// to it. Kept alongside rather than folded into the tuple so the pair
+    /// stays `(name, value)` for every existing consumer.
+    pub color_definition_orders: Vec<usize>,
 }
 
 /// One `@keyframes` rule, with raw declarations; compiled in `cascade.rs`.
@@ -194,6 +206,14 @@ pub struct Stylesheet {
     pub rules: Vec<StyleRule>,
     /// `(name, value)` for every `@define-color`, in source order.
     pub color_definitions: Vec<(String, String)>,
+    /// The source-order slot of each entry of `color_definitions`, parallel
+    /// to it.
+    ///
+    /// A definition inside a matching `@media` block has to be spliced back
+    /// in at *its own* position, not appended after every top-level one, or
+    /// `@media (...) { @define-color bg black }` beats a later top-level
+    /// `@define-color bg white` that GTK would have let win.
+    pub color_definition_orders: Vec<usize>,
     /// Every `@keyframes`, in source order.
     pub keyframes: Vec<KeyframesRule>,
     /// Every `@media` block, unevaluated.
@@ -206,8 +226,23 @@ impl Stylesheet {
     pub fn append_layer(&mut self, layer: Stylesheet) {
         let offset = next_source_order(self);
         let mut base = layer;
+        let origin = self
+            .rules
+            .iter()
+            .map(|rule| rule.origin)
+            .chain(
+                self.media_blocks
+                    .iter()
+                    .flat_map(|block| block.rules.iter().map(|rule| rule.origin)),
+            )
+            .max()
+            .map_or(1, |highest| highest.saturating_add(1));
         for rule in &mut base.rules {
             rule.source_order += offset;
+            rule.origin = origin;
+        }
+        for order in &mut base.color_definition_orders {
+            *order += offset;
         }
         for keyframes in &mut base.keyframes {
             keyframes.source_order += offset;
@@ -215,13 +250,19 @@ impl Stylesheet {
         for block in &mut base.media_blocks {
             for rule in &mut block.rules {
                 rule.source_order += offset;
+                rule.origin = origin;
             }
             for keyframes in &mut block.keyframes {
                 keyframes.source_order += offset;
             }
+            for order in &mut block.color_definition_orders {
+                *order += offset;
+            }
         }
         self.rules.extend(base.rules);
         self.color_definitions.extend(base.color_definitions);
+        self.color_definition_orders
+            .extend(base.color_definition_orders);
         self.keyframes.extend(base.keyframes);
         self.media_blocks.extend(base.media_blocks);
     }
@@ -233,6 +274,18 @@ impl Stylesheet {
 /// rules inside `@media` blocks, so splicing a matching block back in at
 /// compile time restores document order exactly.
 fn next_source_order(sheet: &Stylesheet) -> usize {
+    let colors = sheet
+        .color_definition_orders
+        .iter()
+        .chain(
+            sheet
+                .media_blocks
+                .iter()
+                .flat_map(|block| block.color_definition_orders.iter()),
+        )
+        .map(|order| order + 1)
+        .max()
+        .unwrap_or(0);
     let rules = sheet
         .rules
         .iter()
@@ -257,7 +310,7 @@ fn next_source_order(sheet: &Stylesheet) -> usize {
         })
         .max()
         .unwrap_or(0);
-    rules.max(keyframes).max(nested)
+    rules.max(keyframes).max(nested).max(colors)
 }
 
 /// Parses a single declaration block.
@@ -410,6 +463,7 @@ impl<'i> QualifiedRuleParser<'i> for SheetParser {
             declarations,
             // Filled in by `parse_into`, which knows the index.
             source_order: 0,
+            origin: 0,
         }))
     }
 }
@@ -529,6 +583,9 @@ impl<'i> AtRuleParser<'i> for SheetParser {
                     rules: nested.rules,
                     keyframes: nested.keyframes,
                     color_definitions: nested.color_definitions,
+                    // Filled in by the caller, which knows where the block
+                    // itself sits in the outer sheet.
+                    color_definition_orders: Vec::new(),
                 }))
             }
             // `@import`/`@define-color` carry no block, so a block means the
@@ -863,7 +920,11 @@ fn parse_into(
                 rule.source_order = next_source_order(out);
                 out.rules.push(rule);
             }
-            Ok(SheetItem::Color(name, value)) => out.color_definitions.push((name, value)),
+            Ok(SheetItem::Color(name, value)) => {
+                let order = next_source_order(out);
+                out.color_definitions.push((name, value));
+                out.color_definition_orders.push(order);
+            }
             Ok(SheetItem::Import(url)) => resolve_import(&url, base_dir, depth, visited, out),
             Ok(SheetItem::Keyframes(mut frames)) => {
                 frames.source_order = next_source_order(out);
@@ -877,6 +938,13 @@ fn parse_into(
                 for (index, keyframes) in block.keyframes.iter_mut().enumerate() {
                     keyframes.source_order = base + block.rules.len() + index;
                 }
+                // A definition inside the block sits where the *block*
+                // sits, after its rules and keyframes, so an earlier
+                // top-level definition loses to it and a later one wins.
+                let after = base + block.rules.len() + block.keyframes.len();
+                block.color_definition_orders = (0..block.color_definitions.len())
+                    .map(|index| after + index)
+                    .collect();
                 out.media_blocks.push(block);
             }
             Ok(SheetItem::Ignored) => {}
@@ -1109,9 +1177,12 @@ mod tests {
         assert_eq!(sheet.rules.len(), 2);
         assert_eq!(sheet.rules[0].selector_text, "button");
         assert_eq!(decl(&sheet.rules[0].declarations, "color"), "@accent");
-        assert_eq!(sheet.rules[0].source_order, 0);
+        // Slot 0 is the imported `@define-color`, which now draws from the
+        // same counter so a `@media` block's definitions can be spliced back
+        // in at their own position (F3); the rules follow it in order.
+        assert_eq!(sheet.rules[0].source_order, 1);
         assert_eq!(decl(&sheet.rules[1].declarations, "padding"), "1px");
-        assert_eq!(sheet.rules[1].source_order, 1);
+        assert_eq!(sheet.rules[1].source_order, 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
