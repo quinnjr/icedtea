@@ -1,11 +1,22 @@
-//! GTK's CSS node model expressed through Servo's `selectors` crate.
+//! Selector matching over the node tree, through Servo's `selectors` crate.
 //!
-//! GTK widgets are not a DOM: nodes have an element name (`window`,
-//! `button`, `label`), style classes, pseudo-class state, and a parent --
-//! and nothing else. No ids, no attributes, no namespaces, no siblings that
-//! M1 needs. `CssNode` models exactly that and implements
-//! [`selectors::Element`], so the upstream matcher drives selection with no
-//! fork and no shim.
+//! GTK widgets are not a DOM, but they are a tree: [`crate::css::node::Node`]
+//! has an element name, an optional id, style classes, pseudo-class state, a
+//! writing direction, a parent and ordered children — and nothing else (no
+//! attributes, no namespaces, no shadow roots). `Node` implements
+//! [`selectors::Element`] completely over that model, so the upstream matcher
+//! drives selection with no fork and no shim: combinators (descendant, `>`,
+//! `+`, `~`), the whole `:nth-*` family, `:root`, `:empty`, ids, classes, and
+//! GTK's pseudo-class set including `:focus-within`, `:indeterminate` and
+//! `:dir()`.
+//!
+//! [`MatchCx`] carries the state a restyle pass reuses — the nth-index caches
+//! and an ancestor bloom filter — and drops it when the tree generation moves.
+//! [`RuleBuckets`] narrows a stylesheet to the rules a node could match, which
+//! `selectors` itself does not provide.
+//!
+//! M1's `CssNode` (immutable, parent-only) is still here because the rest of the
+//! crate has not been migrated onto `Node` yet; Part 3 of M2 deletes it.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -1605,5 +1616,173 @@ mod tests {
                 node.name()
             );
         }
+    }
+
+    /// The rules M1 could not match: a two-node chain made `:first-child`,
+    /// `:last-child` and `:only-child` match everything and `:not(:first-child)`
+    /// match nothing. Derived from the vendored sheet with
+    /// `grep -c -E ':(first|last|only)-child' ui/themes/adwaita-light.css`.
+    const ADWAITA_TREE_STRUCTURAL_RULES: usize = 44;
+
+    #[test]
+    fn adwaitas_tree_structural_rules_are_all_present_and_parse() {
+        use crate::css::parse::parse_stylesheet;
+
+        let sheet = parse_stylesheet(crate::BUNDLED_ADWAITA_LIGHT);
+        let structural: Vec<&str> = sheet
+            .rules
+            .iter()
+            .map(|rule| rule.selector_text.as_str())
+            .filter(|text| {
+                text.contains(":first-child")
+                    || text.contains(":last-child")
+                    || text.contains(":only-child")
+            })
+            .collect();
+        assert_eq!(
+            structural.len(),
+            ADWAITA_TREE_STRUCTURAL_RULES,
+            "the vendored Adwaita sheet's tree-structural rule count moved"
+        );
+        for text in &structural {
+            assert!(
+                parse_selector_list(text).is_some(),
+                "a tree-structural prelude must survive the selector parser: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn adwaitas_tree_structural_selectors_match_a_real_tree() {
+        // Each of these is a verbatim selector from the vendored sheet. Under
+        // M1's constant-stub Element they all answered wrongly.
+        let list_box = Node::with_classes("box", &["boxed-list"]);
+        let first = Node::new("row");
+        let middle = Node::new("row");
+        let last = Node::new("row");
+        for row in [&first, &middle, &last] {
+            list_box.append_child(row);
+        }
+        assert!(hits(".boxed-list > row:first-child", &first));
+        assert!(!hits(".boxed-list > row:first-child", &middle));
+        assert!(hits(".boxed-list > row:last-child", &last));
+        assert!(!hits(".boxed-list > row:last-child", &middle));
+
+        // `.linked.vertical > button:not(:first-child)`
+        let linked = Node::with_classes("box", &["linked", "vertical"]);
+        let top = Node::new("button");
+        let bottom = Node::new("button");
+        linked.append_child(&top);
+        linked.append_child(&bottom);
+        assert!(!hits(".linked.vertical > button:not(:first-child)", &top));
+        assert!(hits(".linked.vertical > button:not(:first-child)", &bottom));
+        assert!(hits(".linked.vertical > button:not(:last-child)", &top));
+
+        // `notebook > header.top > tabs:not(:only-child)`
+        let notebook = Node::new("notebook");
+        let header = Node::with_classes("header", &["top"]);
+        let tabs = Node::new("tabs");
+        let arrow = Node::new("arrow");
+        notebook.append_child(&header);
+        header.append_child(&tabs);
+        assert!(
+            !hits("notebook > header.top > tabs:not(:only-child)", &tabs),
+            "an only child must not match :not(:only-child)"
+        );
+        header.append_child(&arrow);
+        assert!(hits("notebook > header.top > tabs:not(:only-child)", &tabs));
+        assert!(hits(
+            "notebook > header.top > tabs:not(:only-child):first-child",
+            &tabs
+        ));
+
+        // `dropdown.linked button:nth-child(2):dir(ltr)`
+        let dropdown = Node::with_classes("dropdown", &["linked"]);
+        let one = Node::new("button");
+        let two = Node::new("button");
+        dropdown.append_child(&one);
+        dropdown.append_child(&two);
+        assert!(!hits("dropdown.linked button:nth-child(2):dir(ltr)", &one));
+        assert!(hits("dropdown.linked button:nth-child(2):dir(ltr)", &two));
+        dropdown.set_direction(Some(Direction::Rtl));
+        assert!(!hits("dropdown.linked button:nth-child(2):dir(ltr)", &two));
+        assert!(hits("dropdown.linked button:nth-child(2):dir(rtl)", &two));
+
+        // `.linked.vertical > entry:drop(active):not(:only-child) + button`
+        let vertical = Node::with_classes("box", &["linked", "vertical"]);
+        let entry = Node::new("entry");
+        let button = Node::new("button");
+        vertical.append_child(&entry);
+        vertical.append_child(&button);
+        assert!(!hits(
+            ".linked.vertical > entry:drop(active):not(:only-child) + button",
+            &button
+        ));
+        entry.set_state(PseudoStates::DROP_ACTIVE, true);
+        assert!(hits(
+            ".linked.vertical > entry:drop(active):not(:only-child) + button",
+            &button
+        ));
+
+        // `colorswatch#add-color-button:only-child`
+        let grid = Node::new("colorchooser");
+        let swatch = Node::new("colorswatch");
+        swatch.set_id(Some("add-color-button"));
+        grid.append_child(&swatch);
+        assert!(hits("colorswatch#add-color-button:only-child", &swatch));
+        grid.append_child(&Node::new("colorswatch"));
+        assert!(!hits("colorswatch#add-color-button:only-child", &swatch));
+
+        // `textview > text > selection:focus-within`
+        let textview = Node::new("textview");
+        let text = Node::new("text");
+        let selection = Node::new("selection");
+        let caret = Node::new("cursor");
+        textview.append_child(&text);
+        text.append_child(&selection);
+        selection.append_child(&caret);
+        assert!(!hits(
+            "textview > text > selection:focus-within",
+            &selection
+        ));
+        caret.set_state(PseudoStates::FOCUS, true);
+        assert!(hits("textview > text > selection:focus-within", &selection));
+    }
+
+    #[test]
+    fn a_real_adwaita_tree_matches_more_rules_than_a_flat_one() {
+        // The end-to-end proof that the tree is load-bearing: the same button
+        // node, once given real siblings and ancestors, matches a strictly
+        // larger set of Adwaita rules than it does standing alone.
+        use crate::css::cascade::CompiledSheet;
+
+        let sheet = CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
+        let mut cx = MatchCx::new();
+
+        let lonely = Node::new("button");
+        let lonely_hits = sheet
+            .rules
+            .iter()
+            .filter(|rule| matches(&rule.selectors, &lonely, &mut cx))
+            .count();
+
+        let window = Node::with_classes("window", &["background"]);
+        let box_node = Node::with_classes("box", &["linked"]);
+        let sibling = Node::new("button");
+        let button = Node::new("button");
+        window.append_child(&box_node);
+        box_node.append_child(&sibling);
+        box_node.append_child(&button);
+        let embedded_hits = sheet
+            .rules
+            .iter()
+            .filter(|rule| matches(&rule.selectors, &button, &mut cx))
+            .count();
+
+        assert!(
+            embedded_hits > lonely_hits,
+            "a button inside a linked box must match more rules ({embedded_hits}) \
+             than a detached one ({lonely_hits})"
+        );
     }
 }
