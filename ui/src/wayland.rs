@@ -664,7 +664,7 @@ mod tests {
         let sheet = CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT);
         let fonts = FontStack::system().expect("system font");
         let window = Node::with_classes("window", &["background"]);
-        let mut button = Button::new("Click me", &[], &window);
+        let mut button = Button::new("Click me", &[], window);
         button.restyle(&sheet, &fonts);
         AppState::new(sheet, fonts, button)
     }

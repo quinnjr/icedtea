@@ -222,7 +222,7 @@ pub fn compile_theme(source: &ThemeSource) -> CompiledSheet {
 /// The `window > button` node tree the M1 slice styles.
 fn button_node(label: &str, classes: &[&str]) -> Button {
     let window = Node::with_classes("window", &["background"]);
-    Button::new(label, classes, &window)
+    Button::new(label, classes, window)
 }
 
 /// Build and style the M1 button, returning it with its font stack.

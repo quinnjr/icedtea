@@ -32,7 +32,7 @@ fn labelled_fixture(label: &str, classes: &[&str]) -> (CompiledSheet, FontStack,
     let fonts =
         FontStack::system().expect("no system font found; install dejavu/liberation/noto sans");
     let window = Node::with_classes("window", &["background"]);
-    let mut button = Button::new(label, classes, &window);
+    let mut button = Button::new(label, classes, window);
     button.restyle(&sheet, &fonts);
     (sheet, fonts, button)
 }
