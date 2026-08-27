@@ -20,11 +20,15 @@ use std::rc::Rc;
 
 use selectors::Element as _;
 use selectors::OpaqueElement;
-use taffy::prelude::{Style, TaffyTree};
+use taffy::prelude::{
+    AlignItems, BoxSizing, Dimension, Display, FlexDirection, JustifyContent, LengthPercentageAuto,
+    Size, Style, TaffyAuto as _, TaffyTree, auto, length,
+};
 
 use crate::css::computed::{ComputedStyle, ResolveEnv};
 use crate::css::node::Node;
-use crate::css::value::Keyword;
+use crate::css::registry::Prop;
+use crate::css::value::{Keyword, Value};
 
 /// An axis-aligned box in absolute, tree-origin coordinates.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -322,6 +326,135 @@ impl LayoutTree {
         }
         Ok(id)
     }
+
+    /// The taffy `Style` currently attached to `node`, if it is in the tree.
+    ///
+    /// Exposed for tests and for callers that want to inspect what the CSS
+    /// box model turned into.
+    #[must_use]
+    pub fn taffy_style(&self, node: &Node) -> Option<&Style> {
+        let id = *self.ids.get(&node.opaque())?;
+        self.tree.style(id).ok()
+    }
+
+    /// Write one node's CSS box into taffy.
+    ///
+    /// `container` decides the display mode; `env` supplies the DPI and root
+    /// font size that percentage and relative lengths resolve against.
+    /// Nodes that are not in the tree are ignored: a widget may restyle
+    /// before it is attached.
+    ///
+    /// `taffy::TaffyTree::set_style` marks the node (and its ancestors)
+    /// dirty itself, so no `mark_dirty` call follows this one.
+    pub fn set_style(
+        &mut self,
+        node: &Node,
+        style: &ComputedStyle,
+        container: Container,
+        env: &ResolveEnv,
+    ) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_style on an unsynced node");
+            return;
+        };
+
+        // CSS resolves *every* percentage in the box model against the
+        // containing block's inline size, so one basis serves all sides.
+        // taffy resolves its own percentages, so a basis of 0.0 here only
+        // affects values this crate resolves eagerly.
+        let basis = 0.0_f32;
+        let [pad_top, pad_right, pad_bottom, pad_left] = style.padding(basis);
+        let [bt, br, bb, bl] = style.border_widths();
+        let margin = style.margin(basis);
+        let (min_w, min_h) = style.min_size((basis, basis));
+        let (gap_x, gap_y) = Self::border_spacing_px(style, env);
+
+        let (display, flex_direction) = match container {
+            Container::Box { direction } => (
+                Display::Flex,
+                match direction {
+                    BoxDirection::Row => FlexDirection::Row,
+                    BoxDirection::Column => FlexDirection::Column,
+                },
+            ),
+            Container::Leaf => (Display::Flex, FlexDirection::Row),
+        };
+
+        let to_margin = |v: Option<f32>| -> LengthPercentageAuto { v.map_or_else(auto, length) };
+
+        let taffy_style = Style {
+            display,
+            flex_direction,
+            // GTK's box centres its children on both axes; per-child
+            // alignment arrives with the widget layer in M3.
+            align_items: Some(AlignItems::CENTER),
+            justify_content: Some(JustifyContent::CENTER),
+            // GTK's min-width/min-height floor the CONTENT box.
+            box_sizing: BoxSizing::ContentBox,
+            size: Size {
+                width: Dimension::AUTO,
+                height: Dimension::AUTO,
+            },
+            min_size: Size {
+                width: length(min_w),
+                height: length(min_h),
+            },
+            margin: taffy::geometry::Rect {
+                top: to_margin(margin[0]),
+                right: to_margin(margin[1]),
+                bottom: to_margin(margin[2]),
+                left: to_margin(margin[3]),
+            },
+            padding: taffy::geometry::Rect {
+                top: length(pad_top),
+                right: length(pad_right),
+                bottom: length(pad_bottom),
+                left: length(pad_left),
+            },
+            border: taffy::geometry::Rect {
+                top: length(bt),
+                right: length(br),
+                bottom: length(bb),
+                left: length(bl),
+            },
+            gap: Size {
+                width: length(gap_x),
+                height: length(gap_y),
+            },
+            ..Style::default()
+        };
+
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            ctx.style = Rc::new(style.clone());
+        }
+        if let Err(err) = self.tree.set_style(id, taffy_style) {
+            tracing::debug!(node = %node.name(), %err, "taffy rejected a style");
+        }
+    }
+
+    /// `border-spacing` as `(column-gap, row-gap)` in px.
+    ///
+    /// The computed value is a `Value::Pair` of two lengths (a single value
+    /// is stored duplicated by the registry's parser). Anything else -- an
+    /// unresolvable calc, a wide keyword that survived -- is 0, matching the
+    /// property's initial value.
+    fn border_spacing_px(style: &ComputedStyle, env: &ResolveEnv) -> (f32, f32) {
+        let ctx = style.length_ctx(env, None);
+        let px = |v: &Value| -> f32 {
+            match v {
+                Value::Length(len) => len.resolve(&ctx).unwrap_or(0.0),
+                Value::Number(n) if n.is_finite() => *n,
+                _ => 0.0,
+            }
+        };
+        match style.raw(Prop::BorderSpacing) {
+            Value::Pair(pair) => (px(&pair.0), px(&pair.1)),
+            other => {
+                let v = px(other);
+                (v, v)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -453,5 +586,107 @@ mod tests {
         container.remove_child(&a);
         tree.sync(&window).expect("resync after removal");
         assert_eq!(tree.node_count(), 4);
+    }
+
+    use super::{BoxDirection, Container};
+    use crate::css::cascade::CompiledSheet;
+    use crate::css::computed::{ComputedStyle, ResolveEnv};
+    use crate::css::select::MatchCx;
+    use taffy::prelude::{BoxSizing, Display, FlexDirection};
+
+    /// Resolve `node` against `css` the way a real restyle would.
+    fn style_of(css: &str, root: &Node, node: &Node) -> ComputedStyle {
+        let sheet = CompiledSheet::compile(css);
+        let mut cx = MatchCx::new();
+        let _ = root;
+        ComputedStyle::resolve_chain(&sheet, node, &ResolveEnv::default(), &mut cx)
+    }
+
+    #[test]
+    fn set_style_writes_the_css_box_into_taffy_as_a_content_box() {
+        // Mutation check: switching to `BoxSizing::BorderBox`, or dropping
+        // any of the four padding/border sides, changes one of these
+        // assertions -- and would reintroduce M1's 27px-tall button bug.
+        let window = Node::new("window");
+        let button = Node::new("button");
+        window.append_child(&button);
+        let css = "button { padding: 4px 9px; border: 1px solid #000; \
+                   min-width: 16px; min-height: 24px }";
+        let style = style_of(css, &window, &button);
+
+        let mut tree = LayoutTree::new();
+        tree.sync(&window).expect("sync");
+        tree.set_style(
+            &button,
+            &style,
+            Container::Box {
+                direction: BoxDirection::Row,
+            },
+            &ResolveEnv::default(),
+        );
+
+        let taffy_style = tree.taffy_style(&button).expect("styled");
+        assert_eq!(taffy_style.box_sizing, BoxSizing::ContentBox);
+        assert_eq!(taffy_style.display, Display::Flex);
+        assert_eq!(taffy_style.flex_direction, FlexDirection::Row);
+        assert_eq!(taffy_style.padding.top, taffy::prelude::length(4.0));
+        assert_eq!(taffy_style.padding.left, taffy::prelude::length(9.0));
+        assert_eq!(taffy_style.border.top, taffy::prelude::length(1.0));
+        assert_eq!(taffy_style.min_size.width, taffy::prelude::length(16.0));
+        assert_eq!(taffy_style.min_size.height, taffy::prelude::length(24.0));
+    }
+
+    #[test]
+    fn border_spacing_becomes_the_containers_gap() {
+        // Mutation check: reading only the first half of the `border-spacing`
+        // pair puts 3px in the row gap too, and the second assertion fails.
+        let window = Node::new("window");
+        let css = "window { border-spacing: 3px 7px }";
+        let style = style_of(css, &window, &window);
+
+        let mut tree = LayoutTree::new();
+        tree.sync(&window).expect("sync");
+        tree.set_style(
+            &window,
+            &style,
+            Container::default(),
+            &ResolveEnv::default(),
+        );
+
+        let taffy_style = tree.taffy_style(&window).expect("styled");
+        assert_eq!(taffy_style.gap.width, taffy::prelude::length(3.0));
+        assert_eq!(taffy_style.gap.height, taffy::prelude::length(7.0));
+    }
+
+    #[test]
+    fn an_auto_margin_reaches_taffy_as_auto() {
+        // Mutation check: mapping `None` to `length(0.0)` instead of `auto()`
+        // silently disables centring for every `margin: auto` in a theme.
+        let window = Node::new("window");
+        let css = "window { margin-left: auto; margin-right: 5px }";
+        let style = style_of(css, &window, &window);
+
+        let mut tree = LayoutTree::new();
+        tree.sync(&window).expect("sync");
+        tree.set_style(
+            &window,
+            &style,
+            Container::default(),
+            &ResolveEnv::default(),
+        );
+
+        let taffy_style = tree.taffy_style(&window).expect("styled");
+        assert_eq!(taffy_style.margin.left, taffy::prelude::auto());
+        assert_eq!(taffy_style.margin.right, taffy::prelude::length(5.0));
+    }
+
+    #[test]
+    fn set_style_on_an_unsynced_node_is_ignored_rather_than_panicking() {
+        // A widget may restyle before it is attached; that must not abort.
+        let orphan = Node::new("button");
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        let mut tree = LayoutTree::new();
+        tree.set_style(&orphan, &style, Container::Leaf, &ResolveEnv::default());
+        assert!(tree.taffy_style(&orphan).is_none());
     }
 }
