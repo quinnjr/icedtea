@@ -1,0 +1,129 @@
+# GTK 4.22 CSS property reference — vendored fixture for
+# tests/gtk4_property_reference.rs.
+#
+# Source: https://docs.gtk.org/gtk4/css-properties.html, checked against the
+# GTK 4.22.4 build installed on this machine (/usr/lib/libgtk-4.so.1).
+# Captured 2026-08-26.
+#
+# The GTK page publishes each property's reference standard and GTK's
+# divergences from it, but not the inherited flag; that column comes from the
+# cited W3C spec, with GTK's notes applied as overrides (see
+# .superpowers/m2-plan-notes/gtk-css-semantics.md section 1).
+#
+# Format: <property>|<L longhand | S shorthand>|<inherited: yes|no>
+# Order is the registry's row order: longhands first, then shorthands.
+# Shorthands have no inherited flag of their own (they inherit per longhand),
+# so they are recorded as `no`, matching `Prop::is_inherited`.
+color|L|yes
+opacity|L|no
+filter|L|no
+font-family|L|yes
+font-size|L|yes
+font-style|L|yes
+font-variant|L|yes
+font-weight|L|yes
+font-width|L|yes
+font-stretch|L|yes
+font-kerning|L|yes
+font-variant-ligatures|L|yes
+font-variant-position|L|yes
+font-variant-caps|L|yes
+font-variant-numeric|L|yes
+font-variant-alternates|L|yes
+font-variant-east-asian|L|yes
+font-feature-settings|L|yes
+font-variation-settings|L|yes
+-gtk-dpi|L|yes
+caret-color|L|yes
+-gtk-secondary-caret-color|L|yes
+letter-spacing|L|yes
+text-transform|L|yes
+line-height|L|yes
+text-decoration-line|L|no
+text-decoration-color|L|no
+text-decoration-style|L|no
+text-shadow|L|yes
+-gtk-icon-source|L|no
+-gtk-icon-size|L|yes
+-gtk-icon-style|L|yes
+-gtk-icon-transform|L|yes
+-gtk-icon-palette|L|yes
+-gtk-icon-shadow|L|yes
+-gtk-icon-filter|L|yes
+-gtk-icon-weight|L|yes
+transform|L|no
+transform-origin|L|no
+min-width|L|no
+min-height|L|no
+margin-top|L|no
+margin-right|L|no
+margin-bottom|L|no
+margin-left|L|no
+padding-top|L|no
+padding-right|L|no
+padding-bottom|L|no
+padding-left|L|no
+border-top-width|L|no
+border-right-width|L|no
+border-bottom-width|L|no
+border-left-width|L|no
+border-top-style|L|no
+border-right-style|L|no
+border-bottom-style|L|no
+border-left-style|L|no
+border-top-left-radius|L|no
+border-top-right-radius|L|no
+border-bottom-right-radius|L|no
+border-bottom-left-radius|L|no
+border-top-color|L|no
+border-right-color|L|no
+border-bottom-color|L|no
+border-left-color|L|no
+border-image-source|L|no
+border-image-repeat|L|no
+border-image-slice|L|no
+border-image-width|L|no
+outline-style|L|no
+outline-width|L|no
+outline-color|L|no
+outline-offset|L|no
+background-color|L|no
+background-clip|L|no
+background-origin|L|no
+background-size|L|no
+background-position|L|no
+background-repeat|L|no
+background-image|L|no
+box-shadow|L|no
+background-blend-mode|L|no
+transition-property|L|no
+transition-duration|L|no
+transition-timing-function|L|no
+transition-delay|L|no
+animation-name|L|no
+animation-duration|L|no
+animation-timing-function|L|no
+animation-iteration-count|L|no
+animation-direction|L|no
+animation-play-state|L|no
+animation-delay|L|no
+animation-fill-mode|L|no
+border-spacing|L|yes
+font|S|no
+text-decoration|S|no
+margin|S|no
+padding|S|no
+border-width|S|no
+border-style|S|no
+border-color|S|no
+border-top|S|no
+border-right|S|no
+border-bottom|S|no
+border-left|S|no
+border|S|no
+border-radius|S|no
+border-image|S|no
+outline|S|no
+background|S|no
+transition|S|no
+animation|S|no
