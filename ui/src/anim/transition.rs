@@ -131,6 +131,44 @@ impl Transition {
     pub fn is_finished(&self, now_ms: f64) -> bool {
         now_ms >= self.end_ms()
     }
+
+    /// CSS Transitions §3.1 step 3: this transition is being sent back to the
+    /// value it started from, so the new run is shortened in proportion to
+    /// how far it actually got.
+    ///
+    /// Without this, tapping in and out of `:hover` faster than the duration
+    /// makes each reversal take the full time from wherever it happened to
+    /// be, which reads as lag that compounds.
+    #[must_use]
+    pub fn reverse(&self, to: Value, spec: &TransitionSpec, now_ms: f64) -> Transition {
+        let eased = self.eased(now_ms);
+        let old_factor = self.reversing_shortening_factor;
+        let factor = {
+            let raw = eased.mul_add(old_factor, 1.0 - old_factor).abs();
+            if raw.is_finite() {
+                raw.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        };
+        let delay = delay_ms_of(spec);
+        // A negative delay is scaled with the run; a positive one is not.
+        let delay = if delay >= 0.0 {
+            delay
+        } else {
+            delay * f64::from(factor)
+        };
+        Transition {
+            prop: self.prop,
+            from: self.value_at(now_ms),
+            reversing_adjusted_start: self.to.clone(),
+            to,
+            reversing_shortening_factor: factor,
+            start_ms: now_ms + delay,
+            duration_ms: duration_ms_of(spec) * f64::from(factor),
+            timing: spec.timing,
+        }
+    }
 }
 
 /// Every longhand the computed `transition-*` declarations govern, each
