@@ -291,9 +291,13 @@ pub fn expand_border(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), (
 /// `border-radius`, including the `/` elliptical form.
 pub fn expand_border_radius(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), ()> {
     let horizontal = box_sides(input, Length::parse)?;
+    let before_slash = input.state();
     let vertical = if input.expect_delim('/').is_ok() {
         box_sides(input, Length::parse)?
     } else {
+        // A failed `expect_delim` has already consumed the token it
+        // rejected; put it back so the caller still sees it.
+        input.reset(&before_slash);
         horizontal.clone()
     };
     require_exhausted(input)?;
@@ -335,8 +339,11 @@ pub fn expand_border_image(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result
         if slice.is_none() {
             if let Ok(parsed) = BorderImageSlice::parse(input) {
                 slice = Some(parsed);
+                let before_slash = input.state();
                 if input.expect_delim('/').is_ok() {
                     widths = Some(box_sides(input, BorderImageWidthSide::parse)?);
+                } else {
+                    input.reset(&before_slash);
                 }
                 continue;
             }
@@ -465,8 +472,11 @@ fn parse_background_layer(input: &mut Parser<'_, '_>) -> Result<BackgroundLayerP
             if let Ok(parsed) = Position::parse(input) {
                 parts.position = Some(parsed);
                 seen = true;
+                let before_slash = input.state();
                 if input.expect_delim('/').is_ok() {
                     parts.size = Some(BgSize::parse(input)?);
+                } else {
+                    input.reset(&before_slash);
                 }
                 continue;
             }
@@ -698,9 +708,11 @@ pub fn expand_font(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), ()>
         break;
     }
     let size = parse_font_size(input)?;
+    let before_slash = input.state();
     let line_height = if input.expect_delim('/').is_ok() {
         Some(LineHeight::parse(input)?)
     } else {
+        input.reset(&before_slash);
         None
     };
     let families = parse_family_list(input)?;
@@ -1221,6 +1233,43 @@ mod tests {
             expanded(expand_border_image, "url(\"b.png\") 30% / 2px round").expect("expands");
         assert!(get(&image, Prop::BorderImageSource).is_some());
         assert!(get(&image, Prop::BorderImageRepeat).is_some());
+    }
+
+    /// A failed `expect_delim('/')` consumes the token it rejected, so
+    /// every optional `/` component must restore the parser state before
+    /// the next component is read.
+    #[test]
+    fn an_absent_slash_component_does_not_swallow_the_next_token() {
+        let font = expanded(expand_font, "14px Cantarell").expect("expands");
+        assert_eq!(get(&font, Prop::FontSize), Some(&px(14.0)));
+        assert_eq!(
+            get(&font, Prop::LineHeight),
+            Some(&Value::LineHeight(LineHeight::Normal))
+        );
+        assert!(get(&font, Prop::FontFamily).is_some());
+
+        let image = expanded(expand_border_image, "url(\"b.png\") 30% round").expect("expands");
+        assert_eq!(
+            get(&image, Prop::BorderImageRepeat),
+            Some(&Value::Repeat(RepeatStyle {
+                x: Keyword::Round,
+                y: Keyword::Round,
+            }))
+        );
+
+        let background =
+            expanded(expand_background, "url(\"b.png\") center no-repeat").expect("expands");
+        assert_eq!(
+            get(&background, Prop::BackgroundRepeat),
+            Some(&Value::List(Rc::from(vec![Value::Repeat(RepeatStyle {
+                x: Keyword::NoRepeat,
+                y: Keyword::NoRepeat,
+            })])))
+        );
+
+        // `border-radius` has nothing after the radii, so a trailing token
+        // must survive to be rejected by `require_exhausted`.
+        assert!(expanded(expand_border_radius, "5px solid").is_err());
     }
 
     #[test]
