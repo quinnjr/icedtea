@@ -107,6 +107,9 @@ macro_rules! props {
                 match self { $( Prop::$lh => $lname, )+ $( Prop::$sh => $sname, )+ }
             }
         }
+
+        /// Every longhand, in registry order -- the `all` shorthand's reset set.
+        const ALL_LONGHANDS: &[Prop] = &[ $( Prop::$lh, )+ ];
     };
 }
 
@@ -198,6 +201,7 @@ props! {
         BorderImage => "border-image",
         Outline => "outline", Background => "background",
         Transition => "transition", Animation => "animation",
+        All => "all",
     }
 }
 
@@ -1770,6 +1774,10 @@ pub static PROPERTIES: [PropertyDef; N_PROPS] = [
         TRANSITION_LONGHANDS,
     ),
     sh("animation", sh_fns::expand_animation, ANIMATION_LONGHANDS),
+    // `all` accepts only a CSS-wide keyword (spec: <https://drafts.csswg.org/css-cascade/#all-shorthand>);
+    // its longhand set is every longhand the registry has, so cascade.rs's
+    // generic wide-keyword interception resets the whole computed style.
+    sh("all", sh_fns::expand_all, ALL_LONGHANDS),
 ];
 
 impl Prop {
@@ -1813,13 +1821,28 @@ impl Prop {
 
     /// Expand a shorthand into `sink`. `Err(())` for a longhand or for a
     /// value the shorthand cannot parse.
+    ///
+    /// A CSS-wide keyword (`inherit` / `initial` / `unset`) is legal on
+    /// *any* shorthand and sets every one of its longhands to it -- this is
+    /// handled here, once, generically, rather than in each `ExpandFn`
+    /// (`cascade.rs`'s `parse_declaration` special-cases it too, ahead of
+    /// this call, for the same reason: it needs the winning value before it
+    /// has committed to an `ExpandFn` at all).
     pub fn expand_into(
         self,
         input: &mut Parser<'_, '_>,
         sink: &mut dyn FnMut(Prop, Value),
     ) -> Result<(), ()> {
         match self.def().kind {
-            PropertyKind::Shorthand { expand, .. } => expand(input, sink),
+            PropertyKind::Shorthand { expand, longhands } => {
+                if let Ok(wide) = input.try_parse(Value::parse_wide) {
+                    for longhand in longhands {
+                        sink(*longhand, wide.clone());
+                    }
+                    return Ok(());
+                }
+                expand(input, sink)
+            }
             PropertyKind::Longhand { .. } => Err(()),
         }
     }
@@ -1872,11 +1895,11 @@ mod tests {
     #[test]
     fn the_discriminants_partition_longhands_from_shorthands() {
         assert_eq!(N_LONGHANDS, 95);
-        assert_eq!(N_PROPS, 113);
+        assert_eq!(N_PROPS, 114);
         assert_eq!(Prop::Color as usize, 0);
         assert_eq!(Prop::BorderSpacing as usize, N_LONGHANDS - 1);
         assert_eq!(Prop::Font as usize, N_LONGHANDS);
-        assert_eq!(Prop::Animation as usize, N_PROPS - 1);
+        assert_eq!(Prop::All as usize, N_PROPS - 1);
         assert!(Prop::BorderSpacing.is_longhand());
         assert!(!Prop::Font.is_longhand());
         assert_eq!(Prop::PaddingLeft.slot(), Prop::PaddingLeft as usize);

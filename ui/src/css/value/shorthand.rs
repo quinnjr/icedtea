@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use cssparser::{Parser, Token};
 
-use crate::css::registry::Prop;
+use crate::css::registry::{Prop, longhands};
 
 use super::Value;
 use super::border::{
@@ -979,6 +979,21 @@ pub fn expand_animation(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<()
     Ok(())
 }
 
+/// `all`. The only value CSS gives this shorthand is a wide keyword
+/// (`inherit` / `initial` / `unset`); it resets every longhand to it.
+///
+/// `cascade.rs`'s `parse_declaration` already intercepts a wide keyword on
+/// *any* shorthand before reaching its `ExpandFn` (via `Prop::longhands()`),
+/// so in the live cascade this function is a backstop; the coverage
+/// instrument in `tests/adwaita_coverage.rs` calls it directly.
+pub fn expand_all(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), ()> {
+    let wide = Value::parse_wide(input)?;
+    for prop in longhands() {
+        sink(prop, wide.clone());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1148,24 @@ mod tests {
         // simply is not a shorthand.
         assert!(Prop::MinHeight.is_longhand());
         assert!(!Prop::BorderRadius.is_longhand());
+    }
+
+    #[test]
+    fn all_resets_every_longhand_to_the_wide_keyword() {
+        // `all: unset` is GTK-real (Adwaita's
+        // `progressbar > trough.empty > progress { all: unset; }`) and its
+        // longhand set is every longhand the registry has.
+        // Mutation check: swap `longhands()` for a partial list (say,
+        // `FONT_LONGHANDS`) and the count assertion below fails.
+        let out = expanded(expand_all, "unset").expect("`all: unset` expands");
+        assert_eq!(out.len(), crate::css::registry::longhands().count());
+        assert!(
+            out.iter()
+                .all(|(_, value)| *value == Value::Wide(crate::css::value::Wide::Unset))
+        );
+        // Only a wide keyword is valid: anything else is a parse error, not
+        // a silently-dropped declaration.
+        assert!(expanded(expand_all, "1px").is_err());
     }
 
     #[test]
@@ -1293,6 +1326,7 @@ mod tests {
             expand_background,
             expand_transition,
             expand_animation,
+            expand_all,
         ];
         for input in crate::css::value::FUZZ_INPUTS {
             for expand in EXPANDERS {

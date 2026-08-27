@@ -14,6 +14,13 @@
 # Order is the registry's row order: longhands first, then shorthands.
 # Shorthands have no inherited flag of their own (they inherit per longhand),
 # so they are recorded as `no`, matching `Prop::is_inherited`.
+#
+# `all` (added Task 9, M2 Part 6): not on the docs.gtk.org table, but present
+# in the vendored Adwaita light source itself
+# (`progressbar > trough.empty > progress { all: unset; }`), which is stronger
+# evidence than the doc page for what GTK 4.22's own CSS parser accepts. It is
+# CSS's standard `all` shorthand (only a wide keyword is valid), resetting
+# every longhand -- see `css::value::shorthand::expand_all`.
 color|L|yes
 opacity|L|no
 filter|L|no
@@ -127,3 +134,4 @@ outline|S|no
 background|S|no
 transition|S|no
 animation|S|no
+all|S|no
