@@ -25,7 +25,7 @@ use super::value::{
 
 /// The environment a computed style resolves against: the values GTK reads
 /// from the desktop rather than from CSS.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ResolveEnv {
     /// Screen resolution, seeding `-gtk-dpi`. Physical units (`pt pc in cm mm`)
     /// convert through this, **not** CSS's fixed 96.
@@ -73,6 +73,15 @@ pub const EX_RATIO: f32 = 0.5;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComputedStyle {
     values: Box<[Value; N_LONGHANDS]>,
+    /// The environment this style was resolved under.
+    ///
+    /// Percentages survive computed time, and a `calc()` that mixes one with
+    /// a `rem` or an `ex` therefore has to resolve *both* at used time. The
+    /// used-value accessors used to rebuild a `ResolveEnv::default()` at that
+    /// point, so `calc(100% - 1rem)` measured the rem against 14px whatever
+    /// the caller's root font size was, and `calc(50% - 2ex)` against the
+    /// 0.5 placeholder even when a matched face had fed a real x-height in.
+    env: ResolveEnv,
 }
 
 impl ComputedStyle {
@@ -93,7 +102,45 @@ impl ComputedStyle {
         }
         values[Prop::GtkDpi.slot()] = Value::Number(env.dpi);
         values[Prop::FontSize.slot()] = Value::Length(Length::px(env.root_font_size));
-        Rc::new(Self { values })
+
+        // The registry's initial values are *unresolved*: `caret-color`'s is
+        // `currentColor`, `-gtk-icon-palette`'s carries `@name`s. Left that
+        // way, an inherited property whose initial is unresolved never got
+        // resolved at all -- the root's fallback copies `parent.raw(prop)`
+        // verbatim, so every descendant inherited a `currentColor` that
+        // `get::<Rgba>` then read as transparent, and the table broke the
+        // invariant that it never holds `@name` or `currentColor`.
+        let length = LengthCtx {
+            font_size_px: env.root_font_size,
+            root_font_size_px: env.root_font_size,
+            ex_ratio: env.ex_ratio,
+            dpi: env.dpi,
+            percent_basis: None,
+        };
+        let table = super::value::color::ColorTable::new();
+        let current = {
+            let color = crate::css::value::color::ColorCtx {
+                table: &table,
+                current: Rgba::TRANSPARENT,
+                depth: 0,
+            };
+            resolve_value(&Prop::Color.initial(), &length, &color)
+                .as_ref()
+                .map_or(Rgba::TRANSPARENT, Rgba::from_value)
+        };
+        let color = ColorCtx {
+            table: &table,
+            current,
+            depth: 0,
+        };
+        for prop in registry::longhands() {
+            let slot = prop.slot();
+            if let Some(resolved) = resolve_value(&values[slot], &length, &color) {
+                values[slot] = resolved;
+            }
+        }
+
+        Rc::new(Self { values, env: *env })
     }
 
     /// This longhand's computed value.
@@ -158,7 +205,7 @@ impl ComputedStyle {
 
     /// The default-environment context the accessors below use.
     fn used_ctx(&self, percent_basis: Option<f32>) -> LengthCtx {
-        self.length_ctx(&ResolveEnv::default(), percent_basis)
+        self.length_ctx(&self.env, percent_basis)
     }
 
     /// One longhand as a used length in px, or `None` if it is not a length.
@@ -624,7 +671,7 @@ impl ComputedStyle {
             values[prop.slot()] = compute_one(prop, &cascaded, parent, &length_ctx, &color_ctx);
         }
 
-        ComputedStyle { values }
+        ComputedStyle { values, env: *env }
     }
 
     /// Resolve `node` by walking its whole ancestor chain from the root down --
@@ -733,7 +780,16 @@ fn resolve_value(value: &Value, length: &LengthCtx, color: &ColorCtx<'_>) -> Opt
             resolve_length(y, length)?,
         )),
         Value::LineHeight(LineHeight::Length(inner)) => {
-            Value::LineHeight(LineHeight::Length(resolve_length(inner, length)?))
+            // A `line-height` percentage's basis is the element's *own*
+            // computed `font-size`, which is already in hand here (CSS
+            // Inline 3). Leaving it as a percentage meant the text stack --
+            // whose `absolute_px` only accepts px -- silently dropped it and
+            // used the face's own line height instead.
+            let own = LengthCtx {
+                percent_basis: Some(length.font_size_px),
+                ..*length
+            };
+            Value::LineHeight(LineHeight::Length(resolve_length(inner, &own)?))
         }
         Value::Transform(list) => {
             let mut out = Vec::with_capacity(list.len());
@@ -1001,10 +1057,16 @@ impl ComputedStyle {
             let (prop, all) = match property {
                 Value::Keyword(Keyword::All) => (None, true),
                 Value::Keyword(Keyword::None) => continue,
+                // A shorthand is a legal `transition-property` entry -- it
+                // means every longhand it governs, which is what
+                // `anim::transition::transitioned_props` already expands.
+                // Dropping it here made that branch unreachable and left
+                // Adwaita's `transition-property: color, background` never
+                // transitioning `background`.
                 Value::AnimationName(AnimationName::Named(name)) => match registry::lookup(name) {
-                    Some(prop) if prop.is_longhand() => (Some(prop), false),
-                    _ => {
-                        tracing::debug!(%name, "transition-property names no longhand");
+                    Some(prop) => (Some(prop), false),
+                    None => {
+                        tracing::debug!(%name, "transition-property names no known property");
                         continue;
                     }
                 },
@@ -1625,15 +1687,48 @@ mod tests {
         let env = ResolveEnv::default();
         let initial = ComputedStyle::initial(&env);
         for prop in crate::css::registry::longhands() {
-            // Every slot is readable and holds that row's initial value.
-            let expected = match prop {
+            // Every slot is readable and holds that row's initial value, as
+            // *resolved* -- `caret-color`'s initial is `currentColor` and
+            // `-gtk-icon-palette`'s carries `@name`s, and the table's
+            // invariant is that neither ever reaches it (F6). An inherited
+            // property whose initial was left unresolved was copied verbatim
+            // down the whole tree and then read as transparent.
+            let declared = match prop {
                 // ResolveEnv seeds these two so it reaches the root of a chain.
                 Prop::GtkDpi => Value::Number(env.dpi),
                 Prop::FontSize => Value::Length(Length::px(env.root_font_size)),
                 other => other.initial(),
             };
+            let length = LengthCtx {
+                font_size_px: env.root_font_size,
+                root_font_size_px: env.root_font_size,
+                ex_ratio: env.ex_ratio,
+                dpi: env.dpi,
+                percent_basis: None,
+            };
+            let table = crate::css::value::color::ColorTable::new();
+            let color = crate::css::value::color::ColorCtx {
+                table: &table,
+                current: initial.color(),
+                depth: 0,
+            };
+            let expected = super::resolve_value(&declared, &length, &color).unwrap_or(declared);
             assert_eq!(initial.raw(prop), &expected, "{}", prop.name());
+            assert!(
+                !matches!(
+                    initial.raw(prop),
+                    Value::Color(ColorValue::CurrentColor | ColorValue::Named(_))
+                ),
+                "{} left an unresolved colour in the table",
+                prop.name()
+            );
         }
+        // The specific rows the finding names.
+        assert_eq!(
+            initial.get::<Rgba>(Prop::CaretColor),
+            initial.color(),
+            "caret-color's currentColor initial must resolve to the initial colour"
+        );
         let custom = ComputedStyle::initial(&ResolveEnv {
             dpi: 192.0,
             root_font_size: 16.0,
@@ -2315,5 +2410,161 @@ mod tests {
 
         let fresh = ComputedStyle::resolve_chain(&sheet, &node, &env, &mut MatchCx::new());
         assert_eq!(first, fresh, "a warm MatchCx disagrees with a cold one");
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{ComputedStyle, ResolveEnv};
+    use crate::css::cascade::CompiledSheet;
+    use crate::css::node::Node;
+    use crate::css::registry::Prop;
+    use crate::css::select::MatchCx;
+    use crate::css::value::font::LineHeight;
+    use crate::css::value::length::Length;
+    use crate::css::value::{Keyword, Value};
+
+    fn styled(css: &str, env: &ResolveEnv) -> ComputedStyle {
+        let sheet = CompiledSheet::compile(css);
+        let mut cx = MatchCx::new();
+        ComputedStyle::resolve(&sheet, &Node::new("button"), None, env, &mut cx)
+    }
+
+    // F5: the used-value accessors rebuilt a default environment, so a `rem`
+    // or an `ex` inside a calc that also carries a percentage -- and so
+    // survives computed time -- resolved against the wrong bases.
+    #[test]
+    fn a_used_time_calc_resolves_rem_and_ex_against_the_real_environment() {
+        let env = ResolveEnv {
+            dpi: 96.0,
+            root_font_size: 20.0,
+            ex_ratio: 0.6,
+        };
+        let style = styled("button { padding-top: calc(100% - 1rem) }", &env);
+        // 100% of a 200px basis, less one 20px rem.
+        assert_eq!(style.padding(200.0)[0], 180.0);
+
+        let ex = styled("button { padding-top: calc(50% - 2ex) }", &env);
+        // font-size is the 20px root size, so 1ex = 20 * 0.6 = 12px.
+        assert_eq!(ex.padding(200.0)[0], 100.0 - 24.0);
+
+        // The default environment still gives the old answers.
+        let default = styled(
+            "button { padding-top: calc(100% - 1rem) }",
+            &ResolveEnv::default(),
+        );
+        assert_eq!(default.padding(200.0)[0], 200.0 - 14.0);
+    }
+
+    // F7: `line-height: <percentage>` resolves against the element's own
+    // computed font-size at computed time; it used to survive as a
+    // percentage that the text stack then silently dropped.
+    #[test]
+    fn a_line_height_percentage_is_absolute_by_computed_time() {
+        let style = styled(
+            "button { font-size: 20px; line-height: 150% }",
+            &ResolveEnv::default(),
+        );
+        assert_eq!(
+            style.raw(Prop::LineHeight),
+            &Value::LineHeight(LineHeight::Length(Length::px(30.0))),
+            "150% of a 20px font-size is 30px"
+        );
+        // The other forms are untouched.
+        let number = styled("button { line-height: 1.5 }", &ResolveEnv::default());
+        assert!(matches!(
+            number.raw(Prop::LineHeight),
+            Value::LineHeight(LineHeight::Number(_))
+        ));
+        let normal = styled("button { line-height: normal }", &ResolveEnv::default());
+        assert_eq!(
+            normal.raw(Prop::LineHeight),
+            &Value::LineHeight(LineHeight::Normal)
+        );
+    }
+
+    // F8/F9: a shorthand is a legal `transition-property` entry and expands
+    // to every longhand it governs.
+    #[test]
+    fn transition_property_accepts_a_shorthand() {
+        let style = styled(
+            "button { transition: background 200ms }",
+            &ResolveEnv::default(),
+        );
+        let specs = style.transition_specs();
+        assert_eq!(specs.len(), 1, "the shorthand entry must survive");
+        assert_eq!(specs[0].prop, Some(Prop::Background));
+        assert!(!specs[0].all);
+        let governed = crate::anim::transition::transitioned_props(&specs);
+        assert!(
+            governed
+                .iter()
+                .any(|(prop, _)| *prop == Prop::BackgroundColor),
+            "the shorthand must expand to background-color"
+        );
+
+        // An ident that names nothing at all is still dropped.
+        let unknown = styled(
+            "button { transition: nosuchproperty 200ms }",
+            &ResolveEnv::default(),
+        );
+        assert!(unknown.transition_specs().is_empty());
+        // `none` still governs nothing.
+        let none = styled(
+            "button { transition-property: none; transition-duration: 200ms }",
+            &ResolveEnv::default(),
+        );
+        assert!(none.transition_specs().is_empty());
+    }
+
+    // F6: an inherited property whose registry initial is unresolved must
+    // still be resolved before it reaches the table, and before it is
+    // inherited down the tree.
+    #[test]
+    fn an_inherited_unresolved_initial_is_resolved_before_it_is_inherited() {
+        use crate::css::value::color::{ColorValue, Rgba};
+        let red = Rgba {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let sheet = CompiledSheet::compile(
+            "window { color: #ff0000; caret-color: currentColor } button {}",
+        );
+        let mut cx = MatchCx::new();
+        let env = ResolveEnv::default();
+        let window = Node::new("window");
+        let button = Node::new("button");
+        window.append_child(&button);
+        let parent = ComputedStyle::resolve(&sheet, &window, None, &env, &mut cx);
+        let child = ComputedStyle::resolve(&sheet, &button, Some(&parent), &env, &mut cx);
+
+        // The declared `currentColor` resolves against the element's own
+        // colour, and the inherited copy is that resolved colour -- never a
+        // `currentColor` a reader would decode as transparent.
+        assert_eq!(
+            parent.raw(Prop::CaretColor),
+            &Value::Color(ColorValue::Absolute(red))
+        );
+        assert_eq!(
+            child.raw(Prop::CaretColor),
+            &Value::Color(ColorValue::Absolute(red))
+        );
+        assert_eq!(child.get::<Rgba>(Prop::CaretColor), red);
+
+        // With nothing declared anywhere the chain still ends at a resolved
+        // colour rather than the unresolved `currentColor` the registry
+        // initial carries, which `get::<Rgba>` decoded as transparent -- an
+        // invisible caret, and the hole the table invariant forbids.
+        let bare = CompiledSheet::compile("button { }");
+        let alone = ComputedStyle::resolve(&bare, &Node::new("button"), None, &env, &mut cx);
+        assert!(matches!(
+            alone.raw(Prop::CaretColor),
+            Value::Color(ColorValue::Absolute(_))
+        ));
+        assert_ne!(alone.get::<Rgba>(Prop::CaretColor), Rgba::TRANSPARENT);
+        assert_eq!(alone.get::<Rgba>(Prop::CaretColor), alone.color());
+        let _ = Keyword::None;
     }
 }
