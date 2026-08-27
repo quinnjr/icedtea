@@ -149,22 +149,6 @@ fn parse_file(path: &Path) -> Option<Stylesheet> {
     Some(parse_stylesheet_with_base(&css, path.parent()))
 }
 
-/// Append `layer`'s rules after `base`'s, renumbering source order so the
-/// cascade sees one sheet in which the later layer wins ties.
-fn append_layer(base: &mut Stylesheet, layer: Stylesheet) {
-    let offset = base
-        .rules
-        .iter()
-        .map(|rule| rule.source_order + 1)
-        .max()
-        .unwrap_or(0);
-    for mut rule in layer.rules {
-        rule.source_order += offset;
-        base.rules.push(rule);
-    }
-    base.color_definitions.extend(layer.color_definitions);
-}
-
 /// GTK's theme stack for `env`: the base theme, then the user's override.
 ///
 /// The base is the first readable [`ThemeEnv::base_theme_candidates`] entry,
@@ -194,7 +178,7 @@ pub fn load_layered_stylesheet(env: &ThemeEnv) -> Stylesheet {
             rules = overrides.rules.len(),
             "layering the user's gtk.css over the theme"
         );
-        append_layer(&mut sheet, overrides);
+        sheet.append_layer(overrides);
     }
     sheet
 }
