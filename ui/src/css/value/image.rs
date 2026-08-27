@@ -664,7 +664,30 @@ impl Gradient {
     /// exactly the theme's declared hex.
     #[must_use]
     pub fn color_at(&self, t: f32, ctx: &ColorCtx<'_>, len_ctx: &LengthCtx) -> Rgba {
-        let positions = self.stop_positions(len_ctx);
+        self.color_at_on_line(t, ctx, len_ctx, len_ctx.percent_basis.unwrap_or(0.0))
+    }
+
+    /// [`Gradient::color_at`] with the gradient-*line* length given
+    /// explicitly.
+    ///
+    /// An absolute stop position (`#f6f5f4 2px`) is a distance **along the
+    /// gradient line**, so turning it into a fraction divides by that line's
+    /// length -- [`Gradient::line_length_for_box`] -- and *not* by the box's
+    /// width. Callers that pass a `LengthCtx` whose `percent_basis` is the
+    /// box width place every stop of a non-horizontal gradient at the wrong
+    /// fraction: `linear-gradient(to top, #f6f5f4 2px, #fbfafa)` on a 40x20
+    /// box has a line 20px long, so the 2px band is a tenth of it, not a
+    /// twentieth.
+    #[must_use]
+    pub fn color_at_on_line(
+        &self,
+        t: f32,
+        ctx: &ColorCtx<'_>,
+        len_ctx: &LengthCtx,
+        line_length_px: f32,
+    ) -> Rgba {
+        let positions = self.stop_positions_for_line(len_ctx, line_length_px);
+        let hints = self.hint_positions(len_ctx, line_length_px, &positions);
         let colors: Vec<Rgba> = self
             .stops
             .iter()
@@ -696,7 +719,26 @@ impl Gradient {
                 if (b - a).abs() <= f32::EPSILON {
                     return colors[window + 1];
                 }
-                let local = (t - a) / (b - a);
+                let mut local = (t - a) / (b - a);
+                // CSS Images 4: a colour-interpolation hint moves the
+                // segment's 50% point to the hint's position. `H` is that
+                // point as a fraction of the segment; the exponent makes
+                // `local == H` map to exactly 0.5. Ignoring the hint made
+                // `linear-gradient(red, 20%, blue)` render identically to
+                // `linear-gradient(red, blue)`.
+                if let Some(hint) = hints[window + 1] {
+                    let h = (hint - a) / (b - a);
+                    if h > 0.0 && h < 1.0 && (h - 0.5).abs() > 1e-6 {
+                        let exponent = (0.5_f32).ln() / h.ln();
+                        if exponent.is_finite() && exponent > 0.0 {
+                            local = local.clamp(0.0, 1.0).powf(exponent);
+                        }
+                    } else if h <= 0.0 {
+                        local = 1.0;
+                    } else if h >= 1.0 {
+                        local = 0.0;
+                    }
+                }
                 let pa = colors[window].premultiplied();
                 let pb = colors[window + 1].premultiplied();
                 let mut out = [0.0_f32; 4];
@@ -709,25 +751,36 @@ impl Gradient {
         colors[colors.len() - 1]
     }
 
-    /// Every stop's position as a gradient-line fraction, with omitted
-    /// positions distributed evenly between their fixed neighbours and the
-    /// sequence made non-decreasing (CSS Images L3 §color-stop fixup).
-    fn stop_positions(&self, len_ctx: &LengthCtx) -> Vec<f32> {
+    /// Every stop's position as a fraction of a gradient line
+    /// `line_length_px` long, with omitted positions distributed evenly
+    /// between their fixed neighbours and the sequence made non-decreasing
+    /// (CSS Images L3 §color-stop fixup).
+    ///
+    /// This is the resolution the painter must use: see
+    /// [`Gradient::color_at_on_line`] for why the box width is the wrong
+    /// divisor.
+    #[must_use]
+    pub fn stop_positions_for_line(&self, len_ctx: &LengthCtx, line_length_px: f32) -> Vec<f32> {
         let count = self.stops.len();
+        let along = |length: &Length| -> Option<f32> {
+            match length {
+                Length::Percent(fraction) => Some(*fraction),
+                other => {
+                    if !line_length_px.is_finite() || line_length_px == 0.0 {
+                        return None;
+                    }
+                    let ctx = LengthCtx {
+                        percent_basis: Some(line_length_px),
+                        ..*len_ctx
+                    };
+                    other.resolve(&ctx).map(|px| px / line_length_px)
+                }
+            }
+        };
         let mut positions: Vec<Option<f32>> = self
             .stops
             .iter()
-            .map(|stop| {
-                stop.position.as_ref().and_then(|length| match length {
-                    Length::Percent(fraction) => Some(*fraction),
-                    other => {
-                        let basis = len_ctx.percent_basis?;
-                        (basis != 0.0)
-                            .then(|| other.resolve(len_ctx))?
-                            .map(|px| px / basis)
-                    }
-                })
-            })
+            .map(|stop| stop.position.as_ref().and_then(along))
             .collect();
         if count == 0 {
             return Vec::new();
@@ -766,6 +819,50 @@ impl Gradient {
         out
     }
 
+    /// Each stop's preceding colour-interpolation hint, as a gradient-line
+    /// fraction, clamped into its own segment. `None` where there is no hint
+    /// or it does not resolve.
+    fn hint_positions(
+        &self,
+        len_ctx: &LengthCtx,
+        line_length_px: f32,
+        positions: &[f32],
+    ) -> Vec<Option<f32>> {
+        self.stops
+            .iter()
+            .enumerate()
+            .map(|(index, stop)| {
+                let hint = stop.hint.as_ref()?;
+                if index == 0 {
+                    return None;
+                }
+                let resolved = match hint {
+                    Length::Percent(fraction) => *fraction,
+                    other => {
+                        if !line_length_px.is_finite() || line_length_px == 0.0 {
+                            return None;
+                        }
+                        let ctx = LengthCtx {
+                            percent_basis: Some(line_length_px),
+                            ..*len_ctx
+                        };
+                        other.resolve(&ctx)? / line_length_px
+                    }
+                };
+                let (low, high) = (positions[index - 1], positions[index]);
+                (low < high).then(|| resolved.clamp(low, high))
+            })
+            .collect()
+    }
+
+    /// The gradient line's length for a `w` x `h` box: the divisor an
+    /// absolute stop position is measured against.
+    #[must_use]
+    pub fn line_length_for_box(&self, w: f32, h: f32, ctx: &LengthCtx) -> f32 {
+        let (start, end) = self.line_for_box(w, h, ctx);
+        (end.x - start.x).hypot(end.y - start.y)
+    }
+
     /// The gradient line's endpoints for a `w` x `h` box, per CSS Images L3.
     /// The box's origin is its top-left; y grows downwards.
     #[must_use]
@@ -779,15 +876,37 @@ impl Gradient {
                 LinearDirection::Angle(degrees) => *degrees,
                 LinearDirection::Side(side) => side_angle(*side, w, h),
             },
-            GradientKind::Radial { position, .. } | GradientKind::Conic { position, .. } => {
+            GradientKind::Radial {
+                shape,
+                extent,
+                position,
+            } => {
                 let x = position.x.resolve(&with_basis(ctx, w)).unwrap_or(w / 2.0);
                 let y = position.y.resolve(&with_basis(ctx, h)).unwrap_or(h / 2.0);
                 let centre = Point { x, y };
-                let radius = (w.max(h)) / 2.0;
+                // The gradient "line" of a radial gradient runs from its
+                // centre to the edge of its ending shape, so its length is
+                // the horizontal radius -- which depends on the extent
+                // keyword and the centre offset, not on `max(w, h) / 2`.
+                let (rx, _) = radial_radii(*shape, extent, centre, w, h, ctx);
                 return (
                     centre,
                     Point {
-                        x: centre.x + radius,
+                        x: centre.x + rx,
+                        y: centre.y,
+                    },
+                );
+            }
+            GradientKind::Conic { position, .. } => {
+                let x = position.x.resolve(&with_basis(ctx, w)).unwrap_or(w / 2.0);
+                let y = position.y.resolve(&with_basis(ctx, h)).unwrap_or(h / 2.0);
+                let centre = Point { x, y };
+                // A conic gradient's stops are angular: its line is the
+                // full turn, and CSS gives it unit length.
+                return (
+                    centre,
+                    Point {
+                        x: centre.x + 1.0,
                         y: centre.y,
                     },
                 );
@@ -826,6 +945,52 @@ fn with_basis(ctx: &LengthCtx, basis: f32) -> LengthCtx {
     LengthCtx {
         percent_basis: Some(basis),
         ..*ctx
+    }
+}
+
+/// The x and y radii of a radial gradient's ending shape, per CSS Images L3.
+///
+/// `centre` is already resolved in device pixels. This is the one definition
+/// of the ending shape; the painter's own sampler must use it too, or its
+/// `t` and this module's stop fractions disagree.
+#[must_use]
+pub fn radial_radii(
+    shape: RadialShape,
+    extent: &RadialExtent,
+    centre: Point,
+    w: f32,
+    h: f32,
+    ctx: &LengthCtx,
+) -> (f32, f32) {
+    let (left, right, top, bottom) = (centre.x, w - centre.x, centre.y, h - centre.y);
+    let (sx, sy) = (left.abs().min(right.abs()), top.abs().min(bottom.abs()));
+    let (fx, fy) = (left.abs().max(right.abs()), top.abs().max(bottom.abs()));
+    let (rx, ry) = match extent {
+        RadialExtent::ClosestSide => (sx, sy),
+        RadialExtent::FarthestSide => (fx, fy),
+        RadialExtent::ClosestCorner => {
+            let d = sx.hypot(sy);
+            (d, d)
+        }
+        RadialExtent::FarthestCorner => {
+            let d = fx.hypot(fy);
+            (d, d)
+        }
+        RadialExtent::Explicit(x, y) => (
+            x.resolve(&with_basis(ctx, w)).unwrap_or(0.0),
+            y.resolve(&with_basis(ctx, h)).unwrap_or(0.0),
+        ),
+    };
+    match shape {
+        RadialShape::Circle => {
+            let r = match extent {
+                RadialExtent::ClosestSide => sx.min(sy),
+                RadialExtent::FarthestSide => fx.max(fy),
+                _ => rx,
+            };
+            (r, r)
+        }
+        RadialShape::Ellipse => (rx, ry),
     }
 }
 
@@ -1104,5 +1269,109 @@ mod tests {
         let (start, end) = right.line_for_box(100.0, 40.0, &ctx);
         assert_eq!((start.x, start.y), (0.0, 20.0));
         assert_eq!((end.x, end.y), (100.0, 20.0));
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{Gradient, Image, RadialExtent, RadialShape, radial_radii};
+    use crate::css::value::color::{ColorCtx, ColorTable, Rgba};
+    use crate::css::value::length::LengthCtx;
+    use crate::css::value::parse_entirely_with;
+
+    fn gradient(text: &str) -> Gradient {
+        match parse_entirely_with(text, Image::parse).expect("gradient parses") {
+            Image::Gradient(found) => (*found).clone(),
+            other => panic!("expected a gradient, got {other:?}"),
+        }
+    }
+
+    fn sample(gradient: &Gradient, t: f32, line: f32) -> Rgba {
+        let table = ColorTable::new();
+        let ctx = ColorCtx {
+            table: &table,
+            current: Rgba::TRANSPARENT,
+            depth: 0,
+        };
+        gradient.color_at_on_line(t, &ctx, &LengthCtx::default(), line)
+    }
+
+    // F40: an absolute stop position is a distance along the *gradient line*,
+    // so the divisor is the line's length, never the box width. On a 40x20
+    // box a `to top` gradient's line is 20px, so a 2px stop sits at 0.10.
+    #[test]
+    fn an_absolute_stop_is_a_fraction_of_the_gradient_line_not_the_box_width() {
+        let g = gradient("linear-gradient(to top, #f6f5f4 2px, #fbfafa)");
+        let ctx = LengthCtx::default();
+        assert_eq!(g.line_length_for_box(40.0, 20.0, &ctx), 20.0);
+        let stops = g.stop_positions_for_line(&ctx, 20.0);
+        assert!((stops[0] - 0.10).abs() < 1e-6, "{stops:?}");
+        // Against the box width the same stop lands at 0.05 -- the bug.
+        let wrong = g.stop_positions_for_line(&ctx, 40.0);
+        assert!((wrong[0] - 0.05).abs() < 1e-6, "{wrong:?}");
+        // A horizontal gradient's line *is* the width, which is why the
+        // painter's mistake was invisible there.
+        let across = gradient("linear-gradient(to right, #000 2px, #fff)");
+        assert_eq!(across.line_length_for_box(40.0, 20.0, &ctx), 40.0);
+    }
+
+    // F39: a colour-interpolation hint moves the segment's 50% point.
+    #[test]
+    fn a_colour_interpolation_hint_moves_the_midpoint() {
+        let hinted = gradient("linear-gradient(red, 20%, blue)");
+        let plain = gradient("linear-gradient(red, blue)");
+        // At the hint's own position the mix is exactly half way.
+        let at_hint = sample(&hinted, 0.2, 100.0);
+        assert!(
+            (at_hint.r - 0.5).abs() < 0.02 && (at_hint.b - 0.5).abs() < 0.02,
+            "{at_hint:?}"
+        );
+        // Which is *not* what the unhinted gradient does there.
+        let unhinted = sample(&plain, 0.2, 100.0);
+        assert!((unhinted.r - 0.8).abs() < 0.02, "{unhinted:?}");
+        // The endpoints are untouched either way.
+        assert_eq!(sample(&hinted, 0.0, 100.0), sample(&plain, 0.0, 100.0));
+        assert_eq!(sample(&hinted, 1.0, 100.0), sample(&plain, 1.0, 100.0));
+        // And a gradient with no hint still samples exactly as before.
+        assert_eq!(sample(&plain, 0.5, 100.0), sample(&plain, 0.5, 100.0));
+    }
+
+    // F41: the radial branch of `line_for_box` honours the extent keyword and
+    // the centre offset instead of hardcoding `max(w, h) / 2`.
+    #[test]
+    fn a_radial_gradients_line_follows_its_extent_and_centre() {
+        let ctx = LengthCtx::default();
+        let closest = gradient("radial-gradient(closest-side at 0 0, red, blue)");
+        assert_eq!(closest.line_length_for_box(100.0, 40.0, &ctx), 0.0);
+        let default = gradient("radial-gradient(red, blue)");
+        let length = default.line_length_for_box(100.0, 40.0, &ctx);
+        assert!(
+            (length - 50.0_f32.hypot(20.0)).abs() < 1e-4,
+            "farthest-corner on 100x40 is {length}"
+        );
+        // The helper itself, against the values CSS gives.
+        let centre = super::Point { x: 0.0, y: 0.0 };
+        assert_eq!(
+            radial_radii(
+                RadialShape::Circle,
+                &RadialExtent::ClosestSide,
+                centre,
+                100.0,
+                40.0,
+                &ctx
+            ),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            radial_radii(
+                RadialShape::Ellipse,
+                &RadialExtent::FarthestSide,
+                centre,
+                100.0,
+                40.0,
+                &ctx
+            ),
+            (100.0, 40.0)
+        );
     }
 }
