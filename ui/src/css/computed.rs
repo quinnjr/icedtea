@@ -22,8 +22,8 @@ use super::value::color::{ColorCtx, ColorTable, ColorValue, Rgba};
 use super::value::image::ColorStop;
 use super::value::{
     AnimationName, BgSize, CalcNode, FilterFn, FontFamily, FontStyle, FontWeight, Gradient, Image,
-    IterationCount, Keyword, Length, LengthCtx, LengthUnit, LineHeight, Position, Shadow, Time,
-    TimingFunction, TransformFn, Value, Wide,
+    IterationCount, Keyword, Length, LengthCtx, LengthUnit, LineHeight, Position, RepeatStyle,
+    Shadow, Time, TimingFunction, TransformFn, Value, Wide,
 };
 
 /// One gradient stop: a color and an optional absolute position, measured in
@@ -1261,6 +1261,109 @@ fn resolve_filter(
     })
 }
 
+/// One resolved `background-*` layer.
+///
+/// Layers are **top-first**: CSS paints the first listed layer closest to the
+/// viewer, with `background-color` behind all of them. Each layer carries its
+/// own position/size/repeat/origin/clip/blend, shorter lists having been
+/// repeated to the `background-image` list's length.
+#[derive(Clone, Debug)]
+pub struct BackgroundLayer {
+    /// The layer's image.
+    pub image: Image,
+    /// `background-position`.
+    pub position: Position,
+    /// `background-size`.
+    pub size: BgSize,
+    /// `background-repeat`.
+    pub repeat: RepeatStyle,
+    /// `background-origin`: the box the image is positioned and sized against.
+    pub origin: Keyword,
+    /// `background-clip`: the box the painted result is clipped to.
+    pub clip: Keyword,
+    /// `background-blend-mode`, blending this layer with the ones below it.
+    pub blend: Keyword,
+}
+
+impl ComputedStyle {
+    /// Every painted background layer, top-first.
+    ///
+    /// `background-image: none` contributes no layer; `background-color` is not
+    /// a layer at all -- it is one colour, painted once, behind everything.
+    #[must_use]
+    pub fn background_layers(&self) -> Vec<BackgroundLayer> {
+        let images = comma_list(self.raw(Prop::BackgroundImage));
+        let positions = comma_list(self.raw(Prop::BackgroundPosition));
+        let sizes = comma_list(self.raw(Prop::BackgroundSize));
+        let repeats = comma_list(self.raw(Prop::BackgroundRepeat));
+        let origins = comma_list(self.raw(Prop::BackgroundOrigin));
+        let clips = comma_list(self.raw(Prop::BackgroundClip));
+        let blends = comma_list(self.raw(Prop::BackgroundBlendMode));
+
+        let mut layers = Vec::with_capacity(images.len());
+        for (index, image) in images.iter().enumerate() {
+            let Value::Image(image) = image else {
+                continue;
+            };
+            if matches!(image, Image::None) {
+                continue;
+            }
+            layers.push(BackgroundLayer {
+                image: image.clone(),
+                position: match cycle(&positions, index) {
+                    Some(Value::Position(position)) => position.clone(),
+                    _ => Position::center(),
+                },
+                size: match cycle(&sizes, index) {
+                    Some(Value::BgSize(size)) => size.clone(),
+                    _ => BgSize::Auto,
+                },
+                repeat: match cycle(&repeats, index) {
+                    Some(Value::Repeat(repeat)) => *repeat,
+                    _ => RepeatStyle {
+                        x: Keyword::Repeat,
+                        y: Keyword::Repeat,
+                    },
+                },
+                origin: keyword_or(cycle(&origins, index), Keyword::PaddingBox),
+                clip: keyword_or(cycle(&clips, index), Keyword::BorderBox),
+                blend: keyword_or(cycle(&blends, index), Keyword::Normal),
+            });
+        }
+        layers
+    }
+
+    /// The `box-shadow` list, first listed on top. Empty for `none`.
+    #[must_use]
+    pub fn box_shadows(&self) -> Rc<[Shadow]> {
+        self.get::<Rc<[Shadow]>>(Prop::BoxShadow)
+    }
+}
+
+/// A comma-multiplied value as a slice of its entries. A non-list value is one
+/// entry; `none` is still one entry, and the caller decides what that means.
+fn comma_list(value: &Value) -> Vec<&Value> {
+    match value {
+        Value::List(items) => items.iter().collect(),
+        other => vec![other],
+    }
+}
+
+/// CSS's repeat-to-longest rule: shorter `background-*` lists cycle.
+fn cycle<'a>(list: &[&'a Value], index: usize) -> Option<&'a Value> {
+    if list.is_empty() {
+        return None;
+    }
+    Some(list[index % list.len()])
+}
+
+fn keyword_or(value: Option<&Value>, fallback: Keyword) -> Keyword {
+    match value {
+        Some(Value::Keyword(keyword)) => *keyword,
+        _ => fallback,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Background, ComputedStyle, GradientStop};
@@ -1270,7 +1373,7 @@ mod tests {
     use crate::css::registry::Prop;
     use crate::css::select::MatchCx;
     use crate::css::value::color::Rgba;
-    use crate::css::value::{Keyword, Length, Value};
+    use crate::css::value::{Image, Keyword, Length, Value};
     use skia_rs_safe::core::Color;
 
     fn adwaita() -> CompiledSheet {
@@ -2042,5 +2145,99 @@ mod tests {
         assert_eq!(style.border_radii(100.0, 100.0), [[50.0, 50.0]; 4]);
         // Big enough box: no scaling at all.
         assert_eq!(style.border_radii(400.0, 400.0), [[60.0, 60.0]; 4]);
+    }
+
+    #[test]
+    fn adwaitas_button_is_one_layer_clipped_to_the_border_box() {
+        let style = resolve(&adwaita(), &button(&[], PseudoStates::default()));
+        let layers = style.background_layers();
+        assert_eq!(layers.len(), 1);
+        assert!(matches!(layers[0].image, Image::Gradient(_)));
+        // Adwaita sets no `background-clip`/`-origin`, so both are at their
+        // CSS initials -- and they differ, which is why a translucent border
+        // shows the element's own background.
+        assert_eq!(layers[0].clip, Keyword::BorderBox);
+        assert_eq!(layers[0].origin, Keyword::PaddingBox);
+        assert_eq!(layers[0].blend, Keyword::Normal);
+    }
+
+    #[test]
+    fn multiple_layers_are_top_first_and_the_shorter_lists_cycle() {
+        let sheet = CompiledSheet::compile(
+            "button { background-image: image(#ff0000), image(#00ff00), image(#0000ff); \
+             background-clip: content-box, padding-box; \
+             background-repeat: no-repeat }",
+        );
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        let layers = style.background_layers();
+        assert_eq!(layers.len(), 3, "the image list drives the layer count");
+        assert_eq!(
+            layers[0].image,
+            Image::Solid(crate::css::value::color::ColorValue::Absolute(
+                Rgba::from_color32(Color(0xFFFF_0000))
+            )),
+            "the first listed layer is the topmost"
+        );
+        // CSS repeats the shorter lists to the image list's length.
+        assert_eq!(layers[0].clip, Keyword::ContentBox);
+        assert_eq!(layers[1].clip, Keyword::PaddingBox);
+        assert_eq!(layers[2].clip, Keyword::ContentBox);
+        assert_eq!(layers[2].repeat.x, Keyword::NoRepeat);
+    }
+
+    #[test]
+    fn a_style_with_no_background_image_still_reports_no_layers() {
+        let sheet = CompiledSheet::compile("button { background-color: #112233 }");
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        assert!(
+            style.background_layers().is_empty(),
+            "`background-image: none` paints no layer; the colour is not a layer"
+        );
+        assert_eq!(
+            style.get::<Rgba>(Prop::BackgroundColor).to_color32(),
+            Color(0xFF11_2233)
+        );
+    }
+
+    #[test]
+    fn box_shadows_keep_their_order_and_resolve_their_colours() {
+        let sheet = CompiledSheet::compile(
+            "button { color: #ff0000; \
+             box-shadow: 1px 2px 3px 4px #00ff00, inset 5px 6px }",
+        );
+        let style = resolve(&sheet, &button(&[], PseudoStates::default()));
+        let shadows = style.box_shadows();
+        assert_eq!(shadows.len(), 2);
+        assert_eq!(shadows[0].offset_x, Length::px(1.0));
+        assert_eq!(shadows[0].offset_y, Length::px(2.0));
+        assert_eq!(shadows[0].blur, Length::px(3.0));
+        assert_eq!(shadows[0].spread, Length::px(4.0));
+        assert!(!shadows[0].inset);
+        assert!(shadows[1].inset);
+        // An omitted shadow colour is `currentColor`, resolved at computed time
+        // so an interpolator never needs a paint context.
+        assert_eq!(
+            shadows[1].color,
+            Some(crate::css::value::color::ColorValue::Absolute(
+                Rgba::from_color32(Color(0xFFFF_0000))
+            ))
+        );
+        // Reconciliation (Task 6): the plan's fixture assumed Adwaita's plain
+        // button has no `box-shadow`, but the vendored sheet gives it a real
+        // one-layer drop shadow -- `box-shadow: 0 1px 2px rgba(0, 0, 0, 0.07)`
+        // on the shared `button` rule (adwaita-light.css:215). `box_shadows()`
+        // must report it, not swallow it.
+        let adwaita_shadows =
+            resolve(&adwaita(), &button(&[], PseudoStates::default())).box_shadows();
+        assert_eq!(adwaita_shadows.len(), 1);
+        assert!(!adwaita_shadows[0].inset);
+        assert_eq!(adwaita_shadows[0].offset_x, Length::zero());
+        assert_eq!(adwaita_shadows[0].offset_y, Length::px(1.0));
+        assert_eq!(adwaita_shadows[0].blur, Length::px(2.0));
+        assert_eq!(adwaita_shadows[0].spread, Length::zero());
+        assert!(matches!(
+            adwaita_shadows[0].color,
+            Some(crate::css::value::color::ColorValue::Absolute(_))
+        ));
     }
 }
