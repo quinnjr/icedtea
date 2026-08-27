@@ -120,19 +120,39 @@ pub struct AppState {
     /// The clock the widget's transitions and animations run on. Shared with
     /// the `Button` so the pump and the widget agree on "now".
     clock: Rc<MonotonicClock>,
-    /// A `wl_surface.frame` callback is outstanding.
+    /// The `wl_surface.frame` callback currently outstanding, if any.
     ///
     /// A frame callback fires once per commit that requested it, so asking
     /// again while one is pending multiplies the `done` events the compositor
     /// sends and turns a smooth animation into a repaint storm.
-    frame_pending: bool,
-    /// The clock reading [`repaint`](LayerWindow::repaint) requested the
-    /// currently-outstanding frame callback at, if any.
+    ///
+    /// One field, not the `bool` + `Option<Duration>` pair it used to be:
+    /// the two could only ever be set and cleared together, and every read
+    /// site had to consult both.
+    frame: Option<PendingFrame>,
+    /// The generation the next `wl_surface.frame` request will carry.
+    next_frame_generation: u64,
+}
+
+/// One outstanding `wl_surface.frame` callback.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PendingFrame {
+    /// Which `wl_surface.frame` request this is.
+    ///
+    /// The callback is dispatched with this as its user data, so a `done`
+    /// for a callback [`AppState::clear_frame_pending`] already abandoned
+    /// can be told apart from the live one. With `()` user data they were
+    /// indistinguishable: a stale `done` cleared the *live* callback's
+    /// `frame_pending`, `repaint` then requested a second one, and the
+    /// surface settled into two outstanding callbacks -- twice the repaint,
+    /// upload and commit rate -- indefinitely.
+    generation: u64,
+    /// The clock reading [`repaint`](LayerWindow::repaint) requested it at.
     ///
     /// Compared against [`FRAME_CALLBACK_DEADLINE`] so an unmapped, occluded
     /// or output-off surface that will never actually get a `done` cannot
-    /// leave `frame_pending` stuck `true` forever.
-    frame_requested_at: Option<Duration>,
+    /// leave a callback outstanding forever.
+    requested_at: Duration,
 }
 
 impl AppState {
@@ -155,8 +175,8 @@ impl AppState {
             fonts,
             button,
             clock,
-            frame_pending: false,
-            frame_requested_at: None,
+            frame: None,
+            next_frame_generation: 0,
         }
     }
 
@@ -192,8 +212,38 @@ impl AppState {
     /// abandoned is always safe -- worst case, [`LayerWindow::repaint`] asks
     /// for a fresh one it did not strictly need.
     fn clear_frame_pending(&mut self) {
-        self.frame_pending = false;
-        self.frame_requested_at = None;
+        self.frame = None;
+    }
+
+    /// Whether a `wl_surface.frame` callback is outstanding.
+    fn frame_pending(&self) -> bool {
+        self.frame.is_some()
+    }
+
+    /// When the outstanding callback was requested, if there is one.
+    fn frame_requested_at(&self) -> Option<Duration> {
+        self.frame.map(|frame| frame.requested_at)
+    }
+
+    /// Record that a `wl_surface.frame` request carrying `generation` was
+    /// made at `at`, and hand back that generation for the request itself.
+    fn note_frame_requested(&mut self, at: Duration) -> u64 {
+        let generation = self.next_frame_generation;
+        self.next_frame_generation = self.next_frame_generation.wrapping_add(1);
+        self.frame = Some(PendingFrame {
+            generation,
+            requested_at: at,
+        });
+        generation
+    }
+
+    /// Whether `generation` names the callback that is actually outstanding.
+    ///
+    /// A `done` for any other generation is for a callback that was already
+    /// abandoned, and must not clear the live one.
+    fn frame_generation_is_live(&self, generation: u64) -> bool {
+        self.frame
+            .is_some_and(|frame| frame.generation == generation)
     }
 
     /// A pointer button changed. Only BTN_LEFT drives `:active` -- a right
@@ -434,7 +484,7 @@ impl LayerWindow {
     /// If every buffer is busy and the pool is already at its maximum the
     /// frame is *deferred*: `dirty` stays set and the next release wakes the
     /// dispatch loop, which repaints then.
-    fn repaint(&mut self) -> Result<(), LayerWindowError> {
+    fn repaint(&mut self) -> Result<Repaint, LayerWindowError> {
         let index = match select_paint_slot(&mut self.state.released, self.buffers.slots_mut()) {
             Some(Slot::Existing(index)) => index,
             Some(Slot::New(index)) => {
@@ -451,7 +501,7 @@ impl LayerWindow {
                     "every shm buffer is still held by the compositor; deferring the frame"
                 );
                 self.state.dirty = true;
-                return Ok(());
+                return Ok(Repaint::Deferred);
             }
         };
 
@@ -474,22 +524,26 @@ impl LayerWindow {
         // half -- the case where *nothing* arrives -- is in `run`, via
         // `frame_recovery_wait`.
         let now = self.state.clock.now();
-        if self.state.frame_pending
-            && frame_pending_is_stale(self.state.frame_requested_at, now, FRAME_CALLBACK_DEADLINE)
+        if self.state.frame_pending()
+            && frame_pending_is_stale(
+                self.state.frame_requested_at(),
+                now,
+                FRAME_CALLBACK_DEADLINE,
+            )
         {
             tracing::warn!(
                 ?now,
-                requested_at = ?self.state.frame_requested_at,
+                requested_at = ?self.state.frame_requested_at(),
                 "a frame callback has been outstanding past the deadline; \
                  resuming animation without it"
             );
             self.state.clear_frame_pending();
         }
-        if should_request_frame(self.state.button.is_animating(), self.state.frame_pending) {
-            self.surface.frame(&self.qh, ());
-            self.state.frame_pending = true;
-            self.state.frame_requested_at = Some(now);
+        if should_request_frame(self.state.button.is_animating(), self.state.frame_pending()) {
+            let generation = self.state.note_frame_requested(now);
+            self.surface.frame(&self.qh, generation);
             tracing::trace!(
+                generation,
                 now = ?self.state.clock.now(),
                 "requested a frame callback: the widget is animating"
             );
@@ -498,7 +552,7 @@ impl LayerWindow {
         self.conn.flush().map_err(socket_error)?;
         self.state.dirty = false;
         tracing::debug!(width, height, index, "repainted and committed");
-        Ok(())
+        Ok(Repaint::Painted)
     }
 
     /// Dispatch until the compositor closes the surface, repainting whenever
@@ -511,8 +565,8 @@ impl LayerWindow {
         while !self.state.closed {
             let now = self.state.clock.now();
             match frame_recovery_wait(
-                self.state.frame_pending,
-                self.state.frame_requested_at,
+                self.state.frame_pending(),
+                self.state.frame_requested_at(),
                 now,
                 self.state.button.next_frame_in(),
             ) {
@@ -533,35 +587,72 @@ impl LayerWindow {
                     &mut self.queue,
                     &mut self.state,
                     wait,
-                    |state| state.dirty || !state.frame_pending,
+                    |state| state.dirty || !state.frame_pending(),
                 ) {
                     Ok(()) => {}
                     Err(LayerWindowError::Closed) => break,
                     Err(LayerWindowError::Timeout(_)) => {
                         let now = self.state.clock.now();
                         if frame_pending_is_stale(
-                            self.state.frame_requested_at,
+                            self.state.frame_requested_at(),
                             now,
                             FRAME_CALLBACK_DEADLINE,
                         ) {
                             tracing::warn!(
                                 ?now,
-                                requested_at = ?self.state.frame_requested_at,
+                                requested_at = ?self.state.frame_requested_at(),
                                 "a frame callback has been outstanding past the deadline; \
                                  resuming animation without it"
                             );
                             self.state.clear_frame_pending();
+                            // Resample the clock as a `done` would have.
+                            // `repaint` paints from `Button`'s `overrides`,
+                            // which only `tick` writes, so setting `dirty`
+                            // alone re-uploaded byte-identical pixels every
+                            // two seconds and left the widget frozen at the
+                            // transition's starting appearance.
+                            self.state.button.tick();
                             self.state.dirty = true;
                         }
                     }
                     Err(err) => return Err(err),
                 },
             }
-            if self.state.dirty {
-                self.repaint()?;
+            if self.state.dirty && self.repaint()? == Repaint::Deferred {
+                // Every shm buffer is still held by the compositor. `dirty`
+                // is still set and a frame callback may still be
+                // outstanding, so the next turn's `wait_bounded` predicate
+                // (`dirty || !frame_pending`) is *already* satisfied and
+                // returns without ever polling the socket -- a 100% CPU
+                // livelock in which the `wl_buffer.release` that would break
+                // the deadlock is never read. Wait for that release
+                // explicitly instead.
+                self.wait_for_a_released_buffer()?;
             }
         }
         Ok(())
+    }
+
+    /// Block until the compositor releases an shm buffer, the surface
+    /// closes, or [`BUFFER_RELEASE_TIMEOUT`] passes.
+    ///
+    /// A timeout is not an error: the loop goes round, and whatever made the
+    /// surface dirty is still pending.
+    fn wait_for_a_released_buffer(&mut self) -> Result<(), LayerWindowError> {
+        match wait_bounded(
+            &self.conn,
+            &mut self.queue,
+            &mut self.state,
+            BUFFER_RELEASE_TIMEOUT,
+            |state| !state.released.is_empty(),
+        ) {
+            Ok(()) | Err(LayerWindowError::Timeout(_)) => Ok(()),
+            Err(LayerWindowError::Closed) => {
+                self.state.closed = true;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -582,6 +673,23 @@ impl Drop for LayerWindow {
         let _ = self.conn.flush();
     }
 }
+
+/// Whether [`LayerWindow::repaint`] actually painted a frame.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Repaint {
+    /// A buffer was free: the frame was painted, uploaded and committed.
+    Painted,
+    /// Every shm buffer is still held by the compositor. `dirty` stays set;
+    /// the caller must wait for a `wl_buffer.release` rather than spin.
+    Deferred,
+}
+
+/// How long to wait for a `wl_buffer.release` when every buffer is busy.
+///
+/// Only an upper bound on how long the pump sits on a compositor that has
+/// stopped releasing buffers entirely; a real release arrives in well under
+/// one frame.
+const BUFFER_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The release→repaint decision `repaint` makes before it touches Wayland
 /// at all: drain the buffers the compositor released since the last frame
@@ -830,6 +938,9 @@ delegate_noop!(AppState: ignore wl_compositor::WlCompositor);
 /// means it is no longer actually presented, so a `done` for a callback
 /// requested before that point may never arrive.
 ///
+/// Forgetting it is only half the job: see the dispatch below, which also
+/// marks the surface dirty.
+///
 /// Every other `wl_surface` event is uninteresting (M1 never dispatched any
 /// of them).
 #[must_use]
@@ -846,8 +957,15 @@ impl Dispatch<wl_surface::WlSurface, ()> for AppState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if wl_surface_event_forgets_frame_pending(&event) {
+        if wl_surface_event_forgets_frame_pending(&event) && state.frame_pending() {
             state.clear_frame_pending();
+            // As the layer-surface `Configure` arm does. Clearing the
+            // pending flag without this dropped the pump into an unbounded
+            // `blocking_dispatch` with nothing dirty: no repaint, so no
+            // commit, so no new frame callback ever requested, and a
+            // mid-transition animation stalled forever -- exactly the hang
+            // this handler was added to prevent.
+            state.dirty = true;
         }
     }
 }
@@ -871,7 +989,7 @@ impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for AppState {
 }
 delegate_noop!(AppState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 
-impl Dispatch<wl_callback::WlCallback, ()> for AppState {
+impl Dispatch<wl_callback::WlCallback, u64> for AppState {
     /// A frame callback is the compositor saying "now is a good time to draw
     /// the next frame". Resample the animation clock, and keep asking for
     /// frames while anything is still running.
@@ -884,11 +1002,19 @@ impl Dispatch<wl_callback::WlCallback, ()> for AppState {
         state: &mut Self,
         _callback: &wl_callback::WlCallback,
         event: wl_callback::Event,
-        _data: &(),
+        generation: &u64,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event {
+            if !state.frame_generation_is_live(*generation) {
+                // A `done` for a callback `clear_frame_pending` already gave
+                // up on (a reconfigure, an output leave). Clearing the
+                // *live* callback's state for it would let `repaint` request
+                // a second one, leaving two outstanding for good.
+                tracing::trace!(generation, "ignoring a stale frame callback");
+                return;
+            }
             state.clear_frame_pending();
             let changed = state.button.tick();
             if changed || state.button.is_animating() {
@@ -1208,7 +1334,7 @@ mod tests {
     #[test]
     fn a_fresh_client_state_has_no_frame_callback_outstanding() {
         let state = state();
-        assert!(!state.frame_pending);
+        assert!(!state.frame_pending());
         assert!(
             state.clock.now() < std::time::Duration::from_secs(1),
             "the client's clock is created with the state, so it starts near zero"
@@ -1278,13 +1404,12 @@ mod tests {
         let (conn, mut queue, _peer) = silent_connection();
         let mut state = state();
         state.dirty = false;
-        state.frame_pending = true;
-        state.frame_requested_at = Some(state.clock.now());
+        state.note_frame_requested(state.clock.now());
         let wait = Duration::from_millis(120);
 
         let started = Instant::now();
         let result = wait_bounded(&conn, &mut queue, &mut state, wait, |state| {
-            state.dirty || !state.frame_pending
+            state.dirty || !state.frame_pending()
         });
         let elapsed = started.elapsed();
 
@@ -1298,7 +1423,7 @@ mod tests {
         // to ask for a fresh callback.
         state.clear_frame_pending();
         state.dirty = true;
-        assert!(super::should_request_frame(true, state.frame_pending));
+        assert!(super::should_request_frame(true, state.frame_pending()));
     }
 
     // Mutation check: drop the `>=` deadline comparison (or flip it to `>`)
@@ -1345,8 +1470,7 @@ mod tests {
     fn configure_closed_and_surface_leave_all_forget_an_outstanding_frame_callback() {
         fn armed() -> AppState {
             let mut state = state();
-            state.frame_pending = true;
-            state.frame_requested_at = Some(Duration::from_secs(1));
+            state.note_frame_requested(Duration::from_secs(1));
             state
         }
 
@@ -1354,8 +1478,8 @@ mod tests {
         // arms (configure, closed, `wl_surface` leave) route through.
         let mut state = armed();
         state.clear_frame_pending();
-        assert!(!state.frame_pending);
-        assert!(state.frame_requested_at.is_none());
+        assert!(!state.frame_pending());
+        assert!(state.frame_requested_at().is_none());
 
         // `zwlr_layer_surface_v1::Event::Configure`'s and `::Closed`'s
         // dispatch bodies are exercised end to end by
@@ -1385,6 +1509,163 @@ mod tests {
                 output: null_output
             }),
             "Enter is not Leave and must not be treated as one"
+        );
+    }
+    // F79. When every shm buffer is busy, `repaint` defers with `dirty`
+    // still set. `run`'s wait predicate is `dirty || !frame_pending`, so it
+    // was *already* satisfied: `wait_bounded` dispatched what was queued and
+    // returned without ever polling the socket, `repaint` deferred again,
+    // and the loop spun at 100% CPU with the `wl_buffer.release` that would
+    // break the deadlock never read. The deferral is now reported so the
+    // pump can wait on the release itself.
+    //
+    // Mutation check: make `repaint` return `Repaint::Painted` on the
+    // deferral arm and the `Deferred` assertion below fails.
+    #[test]
+    fn a_deferred_repaint_is_reported_so_the_pump_can_wait_for_a_release() {
+        use super::Repaint;
+        use crate::shm::{POOL_INITIAL_BUFFERS, POOL_MAX_BUFFERS, SlotPool};
+
+        // The pure half of `repaint`'s decision: with every slot held and
+        // the pool at its maximum, there is nothing to paint into.
+        let mut released = Vec::new();
+        let mut slots = SlotPool::new(POOL_INITIAL_BUFFERS, POOL_MAX_BUFFERS);
+        let mut held = Vec::new();
+        while let Some(slot) = slots.acquire() {
+            held.push(slot);
+        }
+        assert!(
+            !held.is_empty(),
+            "the pool must hand out at least one slot before it is exhausted"
+        );
+        assert!(
+            select_paint_slot(&mut released, &mut slots).is_none(),
+            "every buffer is busy, so the frame has to defer"
+        );
+
+        // And a deferral is a distinct outcome from a painted frame, which
+        // is the whole point: `run` branches on it.
+        assert_ne!(Repaint::Deferred, Repaint::Painted);
+    }
+
+    // F81. A `wl_surface.leave` clears the pending callback -- but clearing
+    // it without marking the surface dirty dropped the pump into an
+    // unbounded `blocking_dispatch` with nothing to repaint: no commit, so
+    // no new frame callback, so a mid-transition animation stalled forever.
+    //
+    // Mutation check: drop the `state.dirty = true` from the `wl_surface`
+    // dispatch and the second assertion fails.
+    #[test]
+    fn a_surface_leave_forgets_the_callback_and_asks_for_a_repaint() {
+        use wayland_client::Proxy as _;
+        use wayland_client::protocol::wl_output;
+
+        let (conn, _queue, _peer) = silent_connection();
+        let leave_output = || {
+            wl_output::WlOutput::from_id(&conn, wayland_client::backend::ObjectId::null())
+                .expect("a null object id constructs an (unusable, unbound) proxy value")
+        };
+
+        let mut state = state();
+        state.note_frame_requested(state.clock.now());
+        state.dirty = false;
+
+        // The dispatch's decision, and the two writes it guards. A real
+        // `wl_surface::Event::Leave` needs a live `wl_output` proxy, which a
+        // unit test has no compositor to get; the handler is one `if` over
+        // this predicate, and both writes are asserted here.
+        assert!(super::wl_surface_event_forgets_frame_pending(
+            &wl_surface::Event::Leave {
+                output: leave_output()
+            }
+        ));
+        if super::wl_surface_event_forgets_frame_pending(&wl_surface::Event::Leave {
+            output: leave_output(),
+        }) && state.frame_pending()
+        {
+            state.clear_frame_pending();
+            state.dirty = true;
+        }
+        assert!(!state.frame_pending(), "the callback is forgotten");
+        assert!(
+            state.dirty,
+            "and the surface is marked dirty, so the pump repaints and asks \
+             for a fresh callback instead of blocking forever"
+        );
+    }
+
+    // F82. `wl_callback` used to be dispatched with `()` user data, so a
+    // `done` for a callback `clear_frame_pending` had already abandoned was
+    // indistinguishable from the live one: it cleared the live callback's
+    // state, `repaint` requested a second one, and the surface settled into
+    // two outstanding callbacks -- twice the repaint/upload/commit rate --
+    // for good. Each request now carries its own generation.
+    //
+    // Mutation check: make `frame_generation_is_live` return `true`
+    // unconditionally and the stale-generation assertion fails.
+    #[test]
+    fn only_the_live_frame_callbacks_generation_clears_the_pending_flag() {
+        let mut state = state();
+        let first = state.note_frame_requested(Duration::from_secs(1));
+        // A reconfigure abandons it while the callback is still alive.
+        state.clear_frame_pending();
+        let second = state.note_frame_requested(Duration::from_secs(2));
+        assert_ne!(first, second, "each request gets its own generation");
+
+        assert!(
+            !state.frame_generation_is_live(first),
+            "a `done` for the abandoned callback must not clear the live one"
+        );
+        assert!(state.frame_generation_is_live(second));
+
+        state.clear_frame_pending();
+        assert!(
+            !state.frame_generation_is_live(second),
+            "with nothing outstanding, no generation is live"
+        );
+    }
+
+    // F80. The time-driven stale-callback recovery set `dirty` but never
+    // resampled the animation clock. `repaint` paints from `Button`'s
+    // `overrides`, which only `tick` writes, so the recovery re-uploaded
+    // byte-identical pixels every two seconds and left the widget frozen at
+    // the transition's *starting* appearance.
+    //
+    // Mutation check: drop the `self.state.button.tick()` from `run`'s
+    // Timeout arm and the sampled value never advances.
+    #[test]
+    fn the_stale_callback_recovery_resamples_the_animation_clock() {
+        use crate::anim::{Clock, ManualClock};
+        use crate::css::registry::Prop;
+        use std::rc::Rc;
+
+        let sheet = CompiledSheet::compile(
+            "button { min-width: 40px; min-height: 40px; padding: 0; \
+             border: 0 solid transparent; background-color: rgb(255 0 0); \
+             background-image: none; transition: background-color 200ms linear }\n\
+             button:hover { background-color: rgb(0 0 255) }",
+        );
+        let mut fonts = FontDatabase::probe_only();
+        let window = Node::with_classes("window", &["background"]);
+        let mut button = Button::new("", &[], window);
+        let clock = Rc::new(ManualClock::new());
+        button.set_clock(Rc::clone(&clock) as Rc<dyn Clock>);
+        button.restyle(&sheet, &mut fonts);
+        button.set_states(PseudoStates::HOVER, &sheet, &mut fonts);
+
+        let at_start = button.overrides().get(Prop::BackgroundColor).cloned();
+        clock.set_ms(100);
+        // Setting `dirty` alone changes nothing about what `render` paints.
+        assert_eq!(
+            button.overrides().get(Prop::BackgroundColor).cloned(),
+            at_start,
+            "without a tick the sampled value is still the transition's start"
+        );
+        assert!(button.tick(), "the recovery's tick advances it");
+        assert_ne!(
+            button.overrides().get(Prop::BackgroundColor).cloned(),
+            at_start,
+            "and the widget now paints the resampled value"
         );
     }
 }
