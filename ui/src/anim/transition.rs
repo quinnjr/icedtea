@@ -133,6 +133,47 @@ impl Transition {
     }
 }
 
+/// Every longhand the computed `transition-*` declarations govern, each
+/// paired with the spec that applies to it, sorted by `Prop`.
+///
+/// Three expansions happen here, in this order of precedence (later specs
+/// overwrite earlier ones, per CSS Transitions' "if a property is listed more
+/// than once, the last entry wins"):
+///
+/// * `all` becomes every animatable longhand — never every longhand, so a
+///   `transition: all` does not put a 100 ms discrete flip on `font-family`;
+/// * a shorthand `Prop` becomes its longhands (Adwaita's base `button` rule
+///   lists `outline`, a shorthand, alongside three of its own longhands);
+/// * `prop: None` with `all: false` — `transition-property: none`, or an
+///   ident the registry does not know — governs nothing.
+#[must_use]
+pub fn transitioned_props(specs: &[TransitionSpec]) -> Vec<(Prop, TransitionSpec)> {
+    fn put(table: &mut Vec<(Prop, TransitionSpec)>, prop: Prop, spec: &TransitionSpec) {
+        match table.binary_search_by_key(&prop, |(p, _)| *p) {
+            Ok(index) => table[index].1 = spec.clone(),
+            Err(index) => table.insert(index, (prop, spec.clone())),
+        }
+    }
+
+    let mut table: Vec<(Prop, TransitionSpec)> = Vec::new();
+    for spec in specs {
+        if spec.all {
+            for prop in crate::css::registry::animatable_longhands() {
+                put(&mut table, prop, spec);
+            }
+        } else if let Some(prop) = spec.prop {
+            if prop.is_longhand() {
+                put(&mut table, prop, spec);
+            } else {
+                for &longhand in prop.longhands() {
+                    put(&mut table, longhand, spec);
+                }
+            }
+        }
+    }
+    table
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Transition, combined_ms, delay_ms_of, duration_ms_of};
@@ -249,5 +290,100 @@ mod tests {
         assert_eq!(t.reversing_shortening_factor, 1.0);
         assert_eq!(t.start_ms, 0.0);
         assert_eq!(t.end_ms(), 200.0);
+    }
+
+    fn named(prop: Option<Prop>, all: bool, duration_ms: f32) -> TransitionSpec {
+        TransitionSpec {
+            prop,
+            all,
+            duration: Time(duration_ms / 1000.0),
+            delay: Time(0.0),
+            timing: TimingFunction::Linear,
+        }
+    }
+
+    fn governed(specs: &[TransitionSpec]) -> Vec<Prop> {
+        super::transitioned_props(specs)
+            .into_iter()
+            .map(|(prop, _)| prop)
+            .collect()
+    }
+
+    // Mutation check: expand `all` through `registry::longhands()` instead of
+    // `animatable_longhands()` and FontFamily (non-animatable) appears in the
+    // list, failing the second assertion.
+    #[test]
+    fn transition_property_all_expands_to_every_animatable_longhand() {
+        let props = governed(&[named(None, true, 200.0)]);
+        assert!(props.contains(&Prop::BackgroundColor));
+        assert!(
+            !props.contains(&Prop::FontFamily),
+            "`all` must not pick up a non-animatable longhand"
+        );
+        let expected: Vec<Prop> = crate::css::registry::animatable_longhands().collect();
+        assert_eq!(props.len(), expected.len());
+    }
+
+    // Mutation check: drop the `is_longhand` branch so shorthands are pushed
+    // verbatim, and Prop::Outline (a shorthand) appears where its four
+    // longhands should -- the assertion on OutlineWidth then fails.
+    #[test]
+    fn a_shorthand_in_transition_property_expands_to_its_longhands() {
+        let props = governed(&[named(Some(Prop::Outline), false, 300.0)]);
+        for expected in Prop::Outline.longhands() {
+            assert!(
+                props.contains(expected),
+                "{expected:?} is one of `outline`'s longhands and must be transitioned"
+            );
+        }
+        assert!(
+            !props.contains(&Prop::Outline),
+            "the shorthand itself is never a transitioned property"
+        );
+        assert!(props.contains(&Prop::OutlineWidth));
+    }
+
+    // Mutation check: make `transitioned_props` insert-if-absent instead of
+    // insert-or-replace and the winning duration stays 200 ms.
+    #[test]
+    fn the_last_spec_naming_a_property_wins() {
+        let specs = vec![
+            named(None, true, 200.0),
+            named(Some(Prop::Opacity), false, 50.0),
+        ];
+        let table = super::transitioned_props(&specs);
+        let (_, spec) = table
+            .iter()
+            .find(|(prop, _)| *prop == Prop::Opacity)
+            .expect("opacity is governed");
+        assert_eq!(
+            duration_ms_of(spec),
+            50.0,
+            "the later, more specific spec must win for opacity"
+        );
+        let (_, other) = table
+            .iter()
+            .find(|(prop, _)| *prop == Prop::BackgroundColor)
+            .expect("background-color is still governed by `all`");
+        assert_eq!(duration_ms_of(other), 200.0);
+    }
+
+    // Mutation check: return every spec's props even when `prop` is None and
+    // `all` is false, and this returns a non-empty list.
+    #[test]
+    fn transition_property_none_governs_nothing() {
+        assert!(governed(&[named(None, false, 200.0)]).is_empty());
+        assert!(governed(&[]).is_empty());
+    }
+
+    // Mutation check: drop the final sort and the pairs come back in spec
+    // order, failing the sorted-window assertion.
+    #[test]
+    fn the_governed_table_is_sorted_by_prop_so_lookups_can_binary_search() {
+        let table = super::transitioned_props(&[named(None, true, 200.0)]);
+        assert!(
+            table.windows(2).all(|w| w[0].0 < w[1].0),
+            "transitioned_props must return a strictly ascending Prop table"
+        );
     }
 }
