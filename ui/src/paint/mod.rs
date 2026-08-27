@@ -172,6 +172,36 @@ pub fn paint_node(
     overrides: Option<&Overrides>,
     cx: &mut PaintCx<'_>,
 ) {
+    paint_node_with_children(canvas, node, style, alloc, overrides, cx, |_, _| {});
+}
+
+/// Paint one node, then its children, inside the node's own effect layer.
+///
+/// `opacity`, `transform` and `filter` are one save-layer, and a save-layer
+/// only affects what is drawn while it is open. [`paint_node`] opens and
+/// closes it around *this node's* boxes, so a caller that paints the
+/// children afterwards paints them onto a fresh canvas: `button { opacity:
+/// .5 }` left the label fully opaque, a hover `translateY` moved the
+/// background out from under a stationary label, and a `grayscale()` filter
+/// missed the label entirely.
+///
+/// `children` runs with the layer still open, immediately after this node's
+/// own paint and before the layer is popped, which is the tree order CSS
+/// wants. It receives the canvas and the paint context so a child can paint
+/// its own text and images.
+#[allow(
+    unused_variables,
+    reason = "`node` is contract §8's signature and M3's tree-walk hook"
+)]
+pub fn paint_node_with_children<'cx>(
+    canvas: &mut Canvas<'_>,
+    node: &Node,
+    style: &ComputedStyle,
+    alloc: &Allocation,
+    overrides: Option<&Overrides>,
+    cx: &mut PaintCx<'cx>,
+    children: impl FnOnce(&mut Canvas<'_>, &mut PaintCx<'cx>),
+) {
     let owned;
     let style: &ComputedStyle = match overrides {
         Some(o) if !o.is_empty() => {
@@ -246,14 +276,10 @@ pub fn paint_node(
     );
 
     if let Some(shaped) = cx.text {
-        text::paint_text(
-            canvas,
-            shaped,
-            (alloc.content_box.x, alloc.content_box.y),
-            style,
-            &len_ctx,
-        );
+        text::paint_text(canvas, shaped, alloc.content_box, style, &len_ctx);
     }
+
+    children(canvas, cx);
 
     effects::end_effects(canvas, save);
 }

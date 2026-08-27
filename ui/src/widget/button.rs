@@ -11,7 +11,7 @@ use crate::css::computed::{ComputedStyle, ResolveEnv};
 use crate::css::node::{Node, PseudoStates};
 use crate::css::select::MatchCx;
 use crate::layout::{Allocation, BoxDirection, Container, LayoutTree, Measure};
-use crate::paint::{ImageCache, PaintCx, paint_node};
+use crate::paint::{ImageCache, PaintCx, paint_node, paint_node_with_children};
 use crate::text::{FontDatabase, ShapedText, TextMetrics, TextStyle};
 
 /// A themed button: a `button` node with a `label` child.
@@ -68,13 +68,28 @@ impl Measure for LabelMeasure<'_> {
         _known: taffy::Size<Option<f32>>,
         _available: taffy::Size<taffy::AvailableSpace>,
     ) -> taffy::Size<f32> {
-        match (&*node.name(), self.shaped) {
-            ("label", Some(shaped)) => taffy::Size {
-                width: shaped.metrics.width,
-                height: self.line_height,
-            },
-            _ => taffy::Size::ZERO,
+        if &*node.name() != "label" {
+            return taffy::Size::ZERO;
         }
+        // `letter-spacing` is added after *every* glyph, the last one
+        // included, so a large negative value can drive the shaped run's
+        // width below zero. taffy takes a leaf size at face value, so an
+        // unclamped negative width flowed straight into layout and put the
+        // glyphs over the left border.
+        let width = self
+            .shaped
+            .map_or(0.0, |shaped| shaped.metrics.width)
+            .max(0.0);
+        // With no face matched there is nothing to measure and `normal`
+        // resolves to 0 -- but a numeric or length `line-height` still gives
+        // the leaf a height, which is what `restyle` computed
+        // `self.line_height` for.
+        let height = if self.line_height.is_finite() {
+            self.line_height.max(0.0)
+        } else {
+            0.0
+        };
+        taffy::Size { width, height }
     }
 }
 
@@ -320,6 +335,9 @@ impl Button {
     ) {
         let alloc = translated(self.allocation, origin);
         let label_alloc = translated(self.label_allocation, origin);
+        let shaped = self.shaped.as_deref();
+        let label_node = &self.label_node;
+        let label_style = &self.label_style;
         let mut cx = PaintCx {
             env: &self.env,
             colors: &sheet.colors,
@@ -327,31 +345,30 @@ impl Button {
             images: &mut self.images,
             text: None,
         };
-        {
-            let mut canvas = surface.canvas();
-            paint_node(
-                &mut canvas,
-                &self.node,
-                &self.style,
-                &alloc,
-                Some(&self.overrides),
-                &mut cx,
-            );
-        }
-        cx.text = self.shaped.as_deref();
         let mut canvas = surface.canvas();
+        // The label is painted *inside* the button's effect layer, not after
+        // it: `opacity`, `transform` and `filter` are one save-layer, and a
+        // layer only affects what is drawn while it is open. Painting the
+        // label in a second top-level `paint_node` left it fully opaque
+        // under `button { opacity: .5 }`, stationary under a hover
+        // `translateY`, and uncoloured by a `filter`.
+        //
         // The label never transitions anything of its own -- the widget's
         // `AnimationState` only ever diffs `self.style` (see `restyle`) -- so
         // it must not receive the button's overrides too, or it would paint
         // with a property (e.g. an animating `background-color`) it never
         // computed for itself.
-        paint_node(
+        paint_node_with_children(
             &mut canvas,
-            &self.label_node,
-            &self.label_style,
-            &label_alloc,
-            None,
+            &self.node,
+            &self.style,
+            &alloc,
+            Some(&self.overrides),
             &mut cx,
+            |canvas, cx| {
+                cx.text = shaped;
+                paint_node(canvas, label_node, label_style, &label_alloc, None, cx);
+            },
         );
     }
 
@@ -609,5 +626,82 @@ label { min-width: 20px; min-height: 20px; background-color: rgb(0 255 0); }
              transitions; it must stay that colour instead of picking up the \
              button's mid-transition fill (pixel: {color:?})"
         );
+    }
+    #[test]
+    fn the_buttons_opacity_applies_to_its_label_too() {
+        // F67/F86. `opacity`/`transform`/`filter` are one save-layer, and a
+        // save-layer only affects what is drawn while it is open. Painting
+        // the label in a second top-level `paint_node`, after the button's
+        // `end_effects` had popped the layer, left the label fully opaque
+        // over a half-transparent button.
+        //
+        // Mutation check: paint the label with its own `paint_node` after
+        // the button's and the sampled label pixel comes back opaque green.
+        let css = "\
+button { min-width: 80px; min-height: 40px; padding: 0; border: 0 solid transparent; \
+border-radius: 0; background-color: rgb(255 0 0); background-image: none; opacity: 0.5; }
+label { min-width: 20px; min-height: 20px; background-color: rgb(0 255 0); }
+";
+        let (sheet, mut fonts, mut button) = fixture(css, "");
+        let label_alloc = translated(button.label_allocation, (0.0, 0.0));
+        let x = label_alloc.border_box.x as i32 + 5;
+        let y = label_alloc.border_box.y as i32 + 5;
+
+        let mut surface = Surface::new_raster_n32_premul(120, 60).expect("surface");
+        surface
+            .canvas()
+            .clear(skia_rs_safe::core::Color::TRANSPARENT);
+        button.render(&mut surface, (0.0, 0.0), &sheet, &mut fonts);
+        let color = pixel(&surface, x, y);
+        assert!(
+            color.alpha() > 0 && color.alpha() < 0xFF,
+            "the label is inside the button's opacity layer (pixel: {color:?})"
+        );
+    }
+
+    #[test]
+    fn a_negative_letter_spacing_cannot_give_the_label_a_negative_width() {
+        // F83. `letter-spacing` is added after every glyph including the
+        // last, so a large negative value drives the shaped run's width
+        // below zero; handing that to taffy flowed a negative leaf width
+        // into layout and painted the glyphs over the left border.
+        // Mutation check: hand `shaped.metrics.width` through unclamped and
+        // the measured width goes negative.
+        let (_, _, button) = fixture("label { font-size: 14px; letter-spacing: -20px }", "Hi");
+        assert!(
+            button.label_allocation.border_box.width >= 0.0,
+            "label width {} went negative",
+            button.label_allocation.border_box.width
+        );
+    }
+
+    #[test]
+    fn a_line_height_still_sizes_the_leaf_with_no_matched_face() {
+        // F85. `restyle`'s own comment says a numeric or length
+        // `line-height` still gives the leaf a height with no face matched,
+        // but `LabelMeasure` returned `Size::ZERO` whenever `shaped` was
+        // `None`, throwing `self.line_height` away.
+        // Mutation check: restore the `_ => ZERO` arm and this is 0.
+        let mut measure = LabelMeasure {
+            shaped: None,
+            line_height: 60.0,
+        };
+        let node = Node::new("label");
+        let env = ResolveEnv::default();
+        let style = (*ComputedStyle::initial(&env)).clone();
+        let size = measure.measure(
+            &node,
+            &style,
+            taffy::Size {
+                width: None,
+                height: None,
+            },
+            taffy::Size {
+                width: taffy::AvailableSpace::MaxContent,
+                height: taffy::AvailableSpace::MaxContent,
+            },
+        );
+        assert_eq!(size.height, 60.0, "the used line-height sizes the leaf");
+        assert_eq!(size.width, 0.0, "with no glyphs there is no width");
     }
 }
