@@ -79,8 +79,13 @@ fn box_radii_for_gauss(sigma: f32) -> [i32; 3] {
 /// Three box passes per axis, sized by [`box_radii_for_gauss`] rather than
 /// one radius repeated three times: three passes of the *same full* radius
 /// would sum their reach to `3 * radius` (each pass's reach adds, since
-/// they run in sequence), tripling the intended spread. Edges are clamped
-/// (the buffer is assumed to already carry the padding the caller wants).
+/// they run in sequence), tripling the intended spread.
+///
+/// At the two ends of each pass the window *shrinks* to the samples that
+/// exist and the divisor shrinks with it -- the edge sample is not repeated
+/// -- so a uniform region stays uniform right up to the buffer edge. The
+/// buffer is assumed to already carry whatever padding the caller wants
+/// the blur to spread into.
 pub fn blur_premul_rgba(pixels: &mut [u8], width: i32, height: i32, stride: usize, sigma: f32) {
     let radii = box_radii_for_gauss(sigma);
     if radii == [0, 0, 0] || width <= 0 || height <= 0 {
@@ -99,52 +104,98 @@ pub fn blur_premul_rgba(pixels: &mut [u8], width: i32, height: i32, stride: usiz
     }
 }
 
+/// Add the four channels at `src[o..o + 4]` into the running window sum.
+///
+/// The slice is read as one `[u8; 4]` rather than four indexed bytes: a
+/// single bounds check per sample, which is the whole per-pixel cost of the
+/// pass in an unoptimised build.
+#[inline]
+fn add(sum: &mut [u32; 4], src: &[u8], o: usize) {
+    let px: [u8; 4] = src[o..o + 4].try_into().unwrap_or([0; 4]);
+    for c in 0..4 {
+        sum[c] += u32::from(px[c]);
+    }
+}
+
+/// Remove the four channels at `src[o..o + 4]` from the running window sum.
+#[inline]
+fn sub(sum: &mut [u32; 4], src: &[u8], o: usize) {
+    let px: [u8; 4] = src[o..o + 4].try_into().unwrap_or([0; 4]);
+    for c in 0..4 {
+        sum[c] -= u32::from(px[c]);
+    }
+}
+
+/// Write `sum / count`, rounded to nearest, into `dst[o..o + 4]`.
+#[inline]
+fn write_mean(dst: &mut [u8], o: usize, sum: &[u32; 4], count: u32) {
+    let px: [u8; 4] = std::array::from_fn(|c| ((sum[c] + count / 2) / count) as u8);
+    dst[o..o + 4].copy_from_slice(&px);
+}
+
 /// One horizontal box pass, `src` -> `dst`.
+///
+/// A running sum, not a fresh `2r + 1` sum per pixel: the window only ever
+/// gains one sample on the right and loses one on the left, so the pass is
+/// `O(w * h)` and independent of the radius. Re-summing per pixel made a
+/// large-radius `box-shadow` (`0 8px 200px` on a 600x400 box) take a minute
+/// and a half in a debug build.
+///
+/// The window is exactly `[x - r, x + r]` intersected with the row, and the
+/// divisor is the number of samples the window actually holds -- so it
+/// *shrinks* at the two edges rather than clamping the edge sample, which
+/// is what keeps a uniform region uniform (the flat-core rule). Because the
+/// sums are exact integers, this produces byte-identical output to the
+/// per-pixel version it replaces.
 fn box_pass_horizontal(src: &[u8], dst: &mut [u8], w: usize, h: usize, stride: usize, r: usize) {
     for y in 0..h {
         let row = y * stride;
+        let mut sum = [0u32; 4];
+        let mut lo = 0usize;
+        let mut hi = r.min(w - 1);
+        for sx in 0..=hi {
+            add(&mut sum, src, row + sx * 4);
+        }
         for x in 0..w {
-            let lo = x.saturating_sub(r);
-            let hi = (x + r).min(w - 1);
-            let mut sum = [0u32; 4];
-            for sx in lo..=hi {
-                let o = row + sx * 4;
-                sum[0] += u32::from(src[o]);
-                sum[1] += u32::from(src[o + 1]);
-                sum[2] += u32::from(src[o + 2]);
-                sum[3] += u32::from(src[o + 3]);
+            let want_lo = x.saturating_sub(r);
+            let want_hi = (x + r).min(w - 1);
+            while lo < want_lo {
+                sub(&mut sum, src, row + lo * 4);
+                lo += 1;
             }
-            // Edge pixels see a shorter window: the divisor is deliberately
-            // the number of samples actually taken, not the constant `2r+1`,
-            // so a uniform region stays uniform (the flat-core rule).
-            let count = (hi - lo + 1) as u32;
-            let o = row + x * 4;
-            for c in 0..4 {
-                dst[o + c] = ((sum[c] + count / 2) / count) as u8;
+            while hi < want_hi {
+                hi += 1;
+                add(&mut sum, src, row + hi * 4);
             }
+            write_mean(dst, row + x * 4, &sum, (want_hi - want_lo + 1) as u32);
         }
     }
 }
 
 /// One vertical box pass, `src` -> `dst`.
+///
+/// The same running sum as [`box_pass_horizontal`], walking a column.
 fn box_pass_vertical(src: &[u8], dst: &mut [u8], w: usize, h: usize, stride: usize, r: usize) {
     for x in 0..w {
+        let col = x * 4;
+        let mut sum = [0u32; 4];
+        let mut lo = 0usize;
+        let mut hi = r.min(h - 1);
+        for sy in 0..=hi {
+            add(&mut sum, src, sy * stride + col);
+        }
         for y in 0..h {
-            let lo = y.saturating_sub(r);
-            let hi = (y + r).min(h - 1);
-            let mut sum = [0u32; 4];
-            for sy in lo..=hi {
-                let o = sy * stride + x * 4;
-                sum[0] += u32::from(src[o]);
-                sum[1] += u32::from(src[o + 1]);
-                sum[2] += u32::from(src[o + 2]);
-                sum[3] += u32::from(src[o + 3]);
+            let want_lo = y.saturating_sub(r);
+            let want_hi = (y + r).min(h - 1);
+            while lo < want_lo {
+                sub(&mut sum, src, lo * stride + col);
+                lo += 1;
             }
-            let count = (hi - lo + 1) as u32;
-            let o = y * stride + x * 4;
-            for c in 0..4 {
-                dst[o + c] = ((sum[c] + count / 2) / count) as u8;
+            while hi < want_hi {
+                hi += 1;
+                add(&mut sum, src, hi * stride + col);
             }
+            write_mean(dst, y * stride + col, &sum, (want_hi - want_lo + 1) as u32);
         }
     }
 }
@@ -281,5 +332,97 @@ mod tests {
         blur_premul_rgba(&mut empty, 0, 0, stride, 2.0);
         assert!(blurred_image(0, 0, 2.0, |_| {}).is_none());
         assert!(blurred_image(-4, 8, 2.0, |_| {}).is_none());
+    }
+
+    /// The sliding window must be *exactly* the window the per-pixel version
+    /// summed, edges included: same shrinking window, same divisor, same
+    /// rounding. This reimplements the old body as a reference and demands
+    /// byte-identical output, so the rewrite cannot have quietly changed a
+    /// single shadow pixel.
+    #[test]
+    fn the_sliding_window_matches_a_naive_per_pixel_sum_byte_for_byte() {
+        // A pattern with hard edges, a ramp and a lone spike, so an
+        // off-by-one anywhere in the window bookkeeping shows up.
+        let (w, h) = (37usize, 23usize);
+        let stride = w * 4;
+        let mut src = vec![0u8; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * stride + x * 4;
+                src[o] = (x * 7 % 256) as u8;
+                src[o + 1] = (y * 11 % 256) as u8;
+                src[o + 2] = u8::from(!(5..=30).contains(&x)) * 255;
+                src[o + 3] = if (x, y) == (18, 11) { 255 } else { 3 };
+            }
+        }
+        // Radii either side of, and far past, both dimensions.
+        for r in [0usize, 1, 2, 5, 18, 36, 40, 200] {
+            let mut horizontal = vec![0u8; stride * h];
+            super::box_pass_horizontal(&src, &mut horizontal, w, h, stride, r);
+            let mut vertical = vec![0u8; stride * h];
+            super::box_pass_vertical(&src, &mut vertical, w, h, stride, r);
+
+            for y in 0..h {
+                for x in 0..w {
+                    // The old body, verbatim, for both axes.
+                    let (hlo, hhi) = (x.saturating_sub(r), (x + r).min(w - 1));
+                    let (vlo, vhi) = (y.saturating_sub(r), (y + r).min(h - 1));
+                    let mut hsum = [0u32; 4];
+                    for sx in hlo..=hhi {
+                        let o = y * stride + sx * 4;
+                        for (c, slot) in hsum.iter_mut().enumerate() {
+                            *slot += u32::from(src[o + c]);
+                        }
+                    }
+                    let mut vsum = [0u32; 4];
+                    for sy in vlo..=vhi {
+                        let o = sy * stride + x * 4;
+                        for (c, slot) in vsum.iter_mut().enumerate() {
+                            *slot += u32::from(src[o + c]);
+                        }
+                    }
+                    let hcount = (hhi - hlo + 1) as u32;
+                    let vcount = (vhi - vlo + 1) as u32;
+                    let o = y * stride + x * 4;
+                    for c in 0..4 {
+                        assert_eq!(
+                            horizontal[o + c],
+                            ((hsum[c] + hcount / 2) / hcount) as u8,
+                            "horizontal pass differs at ({x}, {y}) channel {c}, r = {r}"
+                        );
+                        assert_eq!(
+                            vertical[o + c],
+                            ((vsum[c] + vcount / 2) / vcount) as u8,
+                            "vertical pass differs at ({x}, {y}) channel {c}, r = {r}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The box passes must be independent of the radius. Each pass used to
+    /// re-sum its whole `2r + 1` window per pixel, so this buffer at
+    /// sigma 100 (radius ~100, three passes per axis) took seconds in a
+    /// debug build; a running sum makes it a few tens of milliseconds.
+    ///
+    /// The bound is a complexity guard with a wide margin, not a latency
+    /// budget.
+    #[test]
+    fn a_large_sigma_blur_costs_no_more_than_a_small_one() {
+        let (w, h) = (400i32, 300i32);
+        let (mut px, stride) = buffer(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                set(&mut px, stride, x, y, [255, 255, 255, 255]);
+            }
+        }
+        let started = std::time::Instant::now();
+        blur_premul_rgba(&mut px, w, h, stride, 100.0);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "a sigma-100 blur of {w}x{h} took {elapsed:?}; the box passes are not O(w * h)"
+        );
     }
 }

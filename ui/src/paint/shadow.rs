@@ -342,6 +342,62 @@ mod tests {
         assert_eq!(pixel(&surface, 35, 20).alpha(), 0);
     }
 
+    /// A large-radius `box-shadow` must not take a user-visible amount of
+    /// time to paint. The box passes used to re-sum the whole `2r + 1`
+    /// window per pixel -- `O(w * h * r)` -- so `0 8px 200px` on a 600x400
+    /// box (a 1200x1000 offscreen, radius ~100) took minutes in a debug
+    /// build. The sliding-window passes are `O(w * h)`, radius-independent.
+    ///
+    /// The bound is deliberately generous: this is a "did the complexity
+    /// regress" guard, not a latency budget. A debug build's floor for the
+    /// two offscreens this paints (1200x1000 and 1624x1424, three box passes
+    /// per axis each) is a few seconds of pure per-pixel work no correct
+    /// `O(w * h)` implementation can go under; the radius-independence of
+    /// the passes themselves is pinned tightly in
+    /// `blur::tests::a_large_sigma_blur_costs_no_more_than_a_small_one`.
+    #[test]
+    fn a_large_radius_shadow_paints_in_bounded_time() {
+        let big = Rect::new(0.0, 0.0, 600.0, 400.0);
+        let alloc = Allocation {
+            border_box: big,
+            content_box: big,
+            border: [0.0; 4],
+            padding: [0.0; 4],
+        };
+        let mut surface = Surface::new_raster_n32_premul(600, 400).expect("raster surface");
+        surface.canvas().clear(Color::TRANSPARENT);
+        let started = std::time::Instant::now();
+        {
+            let mut canvas = surface.canvas();
+            paint_box_shadows(
+                &mut canvas,
+                &[shadow(0.0, 8.0, 200.0, 0.0, false)],
+                false,
+                &alloc,
+                &[[0.0, 0.0]; 4],
+                black(),
+                &ctx(),
+            );
+            // The pathological inset case from the review: a blur and spread
+            // far larger than the box, which must be bounded by the same
+            // offscreen surface cap the outset path uses.
+            paint_box_shadows(
+                &mut canvas,
+                &[shadow(0.0, 0.0, 999_999.0, 999_999.0, true)],
+                true,
+                &alloc,
+                &[[0.0, 0.0]; 4],
+                black(),
+                &ctx(),
+            );
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "a large-radius box-shadow took {elapsed:?}; the box blur is not O(w * h)"
+        );
+    }
+
     #[test]
     fn shadow_painting_never_panics_on_hostile_lengths() {
         for &v in &[f32::NAN, f32::INFINITY, -1.0e9, 1.0e9] {
