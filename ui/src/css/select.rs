@@ -491,9 +491,12 @@ impl Element for Node {
             GtkPseudoClass::FocusWithin => states.contains(PseudoStates::FOCUS_WITHIN),
             GtkPseudoClass::Backdrop => states.contains(PseudoStates::BACKDROP),
             GtkPseudoClass::Selected => states.contains(PseudoStates::SELECTED),
-            // GTK never sets these; the bits exist so the grammar is complete.
-            GtkPseudoClass::Link => states.contains(PseudoStates::LINK),
-            GtkPseudoClass::Visited => states.contains(PseudoStates::VISITED),
+            // GTK has no links, so it never sets these and they never match
+            // -- which is what the spec and `PseudoStates`' own docs say.
+            // The bits exist only so the grammar is complete; honouring them
+            // here would have let a caller conjure a state GTK cannot
+            // produce.
+            GtkPseudoClass::Link | GtkPseudoClass::Visited => false,
             GtkPseudoClass::Dir(direction) => self.direction() == *direction,
             GtkPseudoClass::Drop(argument) => {
                 argument.as_str().eq_ignore_ascii_case("active")
@@ -1039,6 +1042,21 @@ mod tests {
             matches(&list, &first, &mut cx),
             "the surviving child is now the last one"
         );
+    }
+
+    // Mutation check: match the `LINK`/`VISITED` bits instead of `false` and
+    // this fails on both selectors.
+    #[test]
+    fn link_and_visited_never_match_even_with_their_bits_set() {
+        // GTK has no links: the bits exist so `:link`/`:visited` *parse*,
+        // never so they select. Nothing in the tree sets them, and a caller
+        // that sets them by hand still gets no match.
+        let button = window_button(&[], PseudoStates::LINK | PseudoStates::VISITED);
+        assert!(hits("button", &button), "the fixture itself must match");
+        assert!(!hits("button:link", &button));
+        assert!(!hits("button:visited", &button));
+        assert!(!hits(":link", &button));
+        assert!(!hits(":visited", &button));
     }
 
     #[test]

@@ -589,10 +589,12 @@ impl ComputedStyle {
                 value,
                 unit: LengthUnit::Px,
             }) if value.is_finite() && *value >= 0.0 => *value,
-            // `font-size: medium` is the initial size; every other keyword form
-            // is out of the registry's grammar and is invalid at computed-value
-            // time, which for an inherited property means the parent's size.
-            Value::Keyword(Keyword::Medium) => env.root_font_size,
+            // `parse_font_size` resolves every absolute- and relative-size
+            // keyword (`medium`, `large`, `smaller`, ...) to a `Length` at
+            // parse time, so nothing else can be a valid computed
+            // `font-size`. Anything that reaches here is invalid at
+            // computed-value time, which for an inherited property means the
+            // parent's size.
             _ => parent_font_size,
         };
         values[Prop::FontSize.slot()] = Value::Length(Length::px(font_size));
