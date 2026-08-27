@@ -326,7 +326,17 @@ enum SheetItem {
 }
 
 /// Top-level rule-list parser.
-struct SheetParser;
+///
+/// `inside_media` says whether this parser is already running *inside* an
+/// `@media` block. A nested `@media` carries nothing (the engine does not
+/// model one, and its whole block has always been dropped), so instead of
+/// recursing into it -- `parse_block` -> `StyleSheetParser` -> `parse_block`,
+/// once per level, which a hostile `gtk.css` could drive until the stack
+/// overflowed and the process *aborted* -- the nested block's tokens are
+/// skipped without ever growing the stack.
+struct SheetParser {
+    inside_media: bool,
+}
 
 impl<'i> QualifiedRuleParser<'i> for SheetParser {
     type Prelude = String;
@@ -442,9 +452,20 @@ impl<'i> AtRuleParser<'i> for SheetParser {
                     source_order: 0,
                 }))
             }
+            AtPrelude::Media(_) if self.inside_media => {
+                // A nested `@media` is not modelled, and its block has always
+                // been dropped whole. Skipping its tokens here -- rather than
+                // parsing them through another `StyleSheetParser` first --
+                // keeps the result identical while making the depth of the
+                // nesting cost no stack at all: `@media (...) {` repeated a
+                // few hundred times used to overflow the stack and abort.
+                tracing::debug!("nested @media is not modelled; dropping the block");
+                while input.next().is_ok() {}
+                Ok(SheetItem::Ignored)
+            }
             AtPrelude::Media(query) => {
                 let mut nested = Stylesheet::default();
-                let mut sheet_parser = SheetParser;
+                let mut sheet_parser = SheetParser { inside_media: true };
                 for item in StyleSheetParser::new(input, &mut sheet_parser) {
                     match item {
                         Ok(SheetItem::Rule(rule)) => nested.rules.push(rule),
@@ -452,13 +473,13 @@ impl<'i> AtRuleParser<'i> for SheetParser {
                             nested.color_definitions.push((name, value));
                         }
                         Ok(SheetItem::Keyframes(frames)) => nested.keyframes.push(frames),
-                        Ok(SheetItem::Media(_)) => {
-                            tracing::debug!("nested @media is not modelled; dropping the block");
-                        }
                         Ok(SheetItem::Import(url)) => {
                             tracing::debug!(%url, "@import inside @media; skipping");
                         }
-                        Ok(SheetItem::Ignored) => {}
+                        // A nested `@media` arrives as `Ignored`: this
+                        // parser has `inside_media` set, so it skipped the
+                        // block rather than building a `Media` item from it.
+                        Ok(SheetItem::Ignored | SheetItem::Media(_)) => {}
                         Err((err, slice)) => {
                             tracing::debug!(?err, rule = %slice.chars().take(80).collect::<String>(), "skipping invalid CSS rule inside @media");
                         }
@@ -718,7 +739,9 @@ fn parse_into(
 ) {
     let mut input = ParserInput::new(css);
     let mut parser = Parser::new(&mut input);
-    let mut sheet_parser = SheetParser;
+    let mut sheet_parser = SheetParser {
+        inside_media: false,
+    };
     for item in StyleSheetParser::new(&mut parser, &mut sheet_parser) {
         match item {
             Ok(SheetItem::Rule(mut rule)) => {
@@ -1187,5 +1210,36 @@ mod tests {
         assert_eq!(sheet.rules.len(), 1);
         assert!(sheet.keyframes.is_empty());
         assert!(sheet.media_blocks.is_empty());
+    }
+
+    /// Nested `@media` used to recurse `parse_block -> StyleSheetParser ->
+    /// parse_block` with no depth limit of its own, so a hostile `gtk.css`
+    /// with a few hundred `@media (...) {` in a row overflowed the stack and
+    /// *aborted* the process -- an uncatchable failure, not a parse error.
+    /// A nested `@media` block was always dropped whole, so it is now
+    /// skipped at the token level instead of being parsed by another
+    /// recursive `StyleSheetParser`: the result is the same and the nesting
+    /// costs no stack at all.
+    #[test]
+    fn deeply_nested_media_blocks_are_refused_instead_of_overflowing_the_stack() {
+        const DEPTH: usize = 2000;
+        let mut css = String::new();
+        for _ in 0..DEPTH {
+            css.push_str("@media (prefers-color-scheme: dark) {\n");
+        }
+        css.push_str("button { color: red }\n");
+        for _ in 0..DEPTH {
+            css.push_str("}\n");
+        }
+        css.push_str("headerbar { min-height: 33px }\n");
+
+        let sheet = parse_stylesheet(&css);
+        // The top-level rule *after* the hostile block is still there, and
+        // the outermost `@media` is kept -- carrying nothing, because its
+        // one child was a nested `@media`, which is dropped.
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selector_text, "headerbar");
+        assert_eq!(sheet.media_blocks.len(), 1);
+        assert!(sheet.media_blocks[0].rules.is_empty());
     }
 }
