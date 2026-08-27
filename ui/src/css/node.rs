@@ -321,6 +321,46 @@ impl Node {
         self.touch();
     }
 
+    /// This node's pseudo-class state, derived flags included.
+    #[must_use]
+    pub fn states(&self) -> PseudoStates {
+        let mut states = self.0.own_states.get();
+        if self.0.focus_count.get() > 0 {
+            states |= PseudoStates::DERIVED;
+        }
+        states
+    }
+
+    /// Replace this node's own state flags.
+    ///
+    /// [`PseudoStates::DERIVED`] is masked out of `states`: `:focus-within` and
+    /// `:focus-visible` are maintained by the tree from `FOCUS`, never set by a
+    /// caller.
+    pub fn set_states(&self, states: PseudoStates) {
+        let states = states.difference(PseudoStates::DERIVED);
+        let previous = self.0.own_states.get();
+        if previous == states {
+            return;
+        }
+        self.0.own_states.set(states);
+        match (
+            previous.contains(PseudoStates::FOCUS),
+            states.contains(PseudoStates::FOCUS),
+        ) {
+            (false, true) => self.add_focus_count(1),
+            (true, false) => self.sub_focus_count(1),
+            _ => {}
+        }
+        self.touch();
+    }
+
+    /// Turn one state flag on or off, leaving the others alone.
+    pub fn set_state(&self, flag: PseudoStates, on: bool) {
+        let mut states = self.0.own_states.get();
+        states.set(flag.difference(PseudoStates::DERIVED), on);
+        self.set_states(states);
+    }
+
     /// The tree-wide generation: any mutation anywhere in this tree bumps it.
     #[must_use]
     pub fn generation(&self) -> u64 {
@@ -918,5 +958,134 @@ mod tests {
             "the adopting tree's counter must jump past the adoptee's"
         );
         assert_eq!(quiet.generation(), busy.generation());
+    }
+
+    #[test]
+    fn own_states_round_trip_and_derived_flags_are_masked_out() {
+        let node = Node::new("button");
+        node.set_states(PseudoStates::HOVER | PseudoStates::CHECKED);
+        assert_eq!(node.states(), PseudoStates::HOVER | PseudoStates::CHECKED);
+
+        node.set_states(PseudoStates::FOCUS_WITHIN | PseudoStates::FOCUS_VISIBLE);
+        assert_eq!(
+            node.states(),
+            PseudoStates::empty(),
+            "derived flags may not be set directly"
+        );
+
+        node.set_state(PseudoStates::DISABLED, true);
+        assert!(node.states().contains(PseudoStates::DISABLED));
+        node.set_state(PseudoStates::DISABLED, false);
+        assert!(!node.states().contains(PseudoStates::DISABLED));
+    }
+
+    #[test]
+    fn focus_derives_focus_within_and_focus_visible_up_the_chain() {
+        let window = Node::new("window");
+        let box_node = Node::new("box");
+        let entry = Node::new("entry");
+        let sibling = Node::new("button");
+        window.append_child(&box_node);
+        box_node.append_child(&entry);
+        window.append_child(&sibling);
+
+        entry.set_state(PseudoStates::FOCUS, true);
+        assert!(entry.states().contains(PseudoStates::FOCUS));
+        for ancestor in [&entry, &box_node, &window] {
+            assert!(
+                ancestor.states().contains(PseudoStates::FOCUS_WITHIN),
+                "focus-within must reach {:?}",
+                ancestor.name()
+            );
+            assert!(
+                ancestor.states().contains(PseudoStates::FOCUS_VISIBLE),
+                "contract 3: focus-visible propagates with focus-within"
+            );
+        }
+        assert!(
+            !sibling.states().contains(PseudoStates::FOCUS_WITHIN),
+            "a sibling of the focused node is not focus-within"
+        );
+        assert!(
+            !window.states().contains(PseudoStates::FOCUS),
+            "focus itself does not propagate"
+        );
+
+        entry.set_state(PseudoStates::FOCUS, false);
+        for ancestor in [&entry, &box_node, &window] {
+            assert!(!ancestor.states().contains(PseudoStates::FOCUS_WITHIN));
+            assert!(!ancestor.states().contains(PseudoStates::FOCUS_VISIBLE));
+        }
+    }
+
+    #[test]
+    fn focus_within_follows_a_subtree_across_reparenting() {
+        let left = Node::new("window");
+        let right = Node::new("window");
+        let box_node = Node::new("box");
+        let entry = Node::new("entry");
+        left.append_child(&box_node);
+        box_node.append_child(&entry);
+        entry.set_state(PseudoStates::FOCUS, true);
+        assert!(left.states().contains(PseudoStates::FOCUS_WITHIN));
+
+        right.append_child(&box_node);
+        assert!(
+            !left.states().contains(PseudoStates::FOCUS_WITHIN),
+            "the old ancestor chain must lose focus-within"
+        );
+        assert!(
+            right.states().contains(PseudoStates::FOCUS_WITHIN),
+            "the new ancestor chain must gain it"
+        );
+
+        box_node.detach();
+        assert!(!right.states().contains(PseudoStates::FOCUS_WITHIN));
+        assert!(box_node.states().contains(PseudoStates::FOCUS_WITHIN));
+    }
+
+    #[test]
+    fn two_focused_descendants_do_not_cancel_each_other() {
+        // Nothing forbids the widget layer from focusing two nodes in different
+        // branches; a boolean would clear the ancestor flag when the first one
+        // blurs, a count does not.
+        let window = Node::new("window");
+        let a = Node::new("entry");
+        let b = Node::new("entry");
+        window.append_child(&a);
+        window.append_child(&b);
+        a.set_state(PseudoStates::FOCUS, true);
+        b.set_state(PseudoStates::FOCUS, true);
+        a.set_state(PseudoStates::FOCUS, false);
+        assert!(
+            window.states().contains(PseudoStates::FOCUS_WITHIN),
+            "b is still focused"
+        );
+        b.set_state(PseudoStates::FOCUS, false);
+        assert!(!window.states().contains(PseudoStates::FOCUS_WITHIN));
+    }
+
+    #[test]
+    fn a_state_change_bumps_the_ancestors_self_generation() {
+        let window = Node::new("window");
+        let entry = Node::new("entry");
+        window.append_child(&entry);
+        let window_self = window.self_generation();
+        let tree = window.generation();
+
+        entry.set_state(PseudoStates::FOCUS, true);
+        assert!(
+            window.self_generation() > window_self,
+            "a restyle pass keys off self_generation to find the ancestors it must redo"
+        );
+        assert!(window.generation() > tree);
+
+        let unchanged = window.generation();
+        entry.set_state(PseudoStates::FOCUS, true);
+        assert_eq!(
+            unchanged,
+            window.generation(),
+            "setting a flag twice is not a change"
+        );
     }
 }
