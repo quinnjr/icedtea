@@ -361,6 +361,30 @@ impl Node {
         self.set_states(states);
     }
 
+    /// Set this node's writing direction, or `None` to inherit the parent's.
+    pub fn set_direction(&self, direction: Option<Direction>) {
+        if self.0.direction.get() == direction {
+            return;
+        }
+        self.0.direction.set(direction);
+        self.touch();
+    }
+
+    /// The direction `:dir()` matches against: this node's own, else the nearest
+    /// ancestor that sets one, else [`Direction::Ltr`].
+    #[must_use]
+    pub fn direction(&self) -> Direction {
+        if let Some(direction) = self.0.direction.get() {
+            return direction;
+        }
+        for ancestor in self.ancestors() {
+            if let Some(direction) = ancestor.0.direction.get() {
+                return direction;
+            }
+        }
+        Direction::default()
+    }
+
     /// The tree-wide generation: any mutation anywhere in this tree bumps it.
     #[must_use]
     pub fn generation(&self) -> u64 {
@@ -1086,6 +1110,95 @@ mod tests {
             unchanged,
             window.generation(),
             "setting a flag twice is not a change"
+        );
+    }
+
+    #[test]
+    fn direction_is_inherited_until_a_node_sets_its_own() {
+        let window = Node::new("window");
+        let box_node = Node::new("box");
+        let button = Node::new("button");
+        window.append_child(&box_node);
+        box_node.append_child(&button);
+
+        assert_eq!(button.direction(), Direction::Ltr, "the default is ltr");
+
+        window.set_direction(Some(Direction::Rtl));
+        assert_eq!(
+            button.direction(),
+            Direction::Rtl,
+            "inherited from the window"
+        );
+        assert_eq!(box_node.direction(), Direction::Rtl);
+
+        box_node.set_direction(Some(Direction::Ltr));
+        assert_eq!(
+            button.direction(),
+            Direction::Ltr,
+            "the nearest setter wins"
+        );
+        assert_eq!(window.direction(), Direction::Rtl);
+
+        box_node.set_direction(None);
+        assert_eq!(
+            button.direction(),
+            Direction::Rtl,
+            "None goes back to inheriting"
+        );
+    }
+
+    #[test]
+    fn setting_a_direction_bumps_the_generation_only_when_it_changes() {
+        let node = Node::new("window");
+        let before = node.generation();
+        node.set_direction(Some(Direction::Rtl));
+        assert!(node.generation() > before);
+
+        let unchanged = node.generation();
+        node.set_direction(Some(Direction::Rtl));
+        assert_eq!(
+            node.generation(),
+            unchanged,
+            "re-setting the same direction is not a change"
+        );
+    }
+
+    #[test]
+    fn direction_parse_never_panics_on_odd_input() {
+        // `:dir()`'s argument reaches this parser straight from a theme file, so
+        // it must survive anything a stylesheet can contain.
+        for text in [
+            "",
+            " ",
+            "l",
+            "ltr ",
+            " rtl",
+            "LTR",
+            "rtl;",
+            "ltr(",
+            "\u{0}",
+            "\u{feff}ltr",
+            "ltr\nrtl",
+            "🙂",
+            "auto",
+            "inherit",
+            "ltrltrltrltrltrltrltrltrltrltrltrltrltrltrltrltrltrltrltrltr",
+            "-1",
+            "0",
+            "\\",
+            "\"rtl\"",
+        ] {
+            let parsed = Direction::parse(text);
+            assert!(
+                parsed.is_none() || matches!(parsed, Some(Direction::Ltr) | Some(Direction::Rtl)),
+                "`{text}` produced something impossible"
+            );
+        }
+        assert_eq!(Direction::parse("LtR"), Some(Direction::Ltr));
+        assert_eq!(
+            Direction::parse("ltr "),
+            None,
+            "whole-value only, no trimming"
         );
     }
 }
