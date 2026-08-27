@@ -200,6 +200,35 @@ pub fn gradient_t(
     }
 }
 
+/// The length of `gradient`'s gradient line over a `w` x `h` box, in px.
+///
+/// What an absolute `<length>` stop position is measured against. For a
+/// linear gradient that is the line CSS Images L3 constructs; for a radial
+/// one it is the ending shape's radius along the x axis, which is what
+/// [`gradient_t`] normalises by. A conic gradient's stops are angles, so a
+/// `<length>` there is invalid CSS -- the box's inline size is kept as the
+/// basis rather than inventing one.
+#[must_use]
+pub fn gradient_line_length(gradient: &Gradient, w: f32, h: f32, ctx: &LengthCtx) -> f32 {
+    match &gradient.kind {
+        GradientKind::Linear { .. } => {
+            let (p0, p1) = gradient.line_for_box(w, h, ctx);
+            let length = (p1.x - p0.x).hypot(p1.y - p0.y);
+            if length.is_finite() { length } else { 0.0 }
+        }
+        GradientKind::Radial {
+            shape,
+            extent,
+            position,
+        } => {
+            let (cx, cy) = resolve_position(position, w, h, ctx);
+            let (rx, _) = radial_radii(*shape, extent, cx, cy, w, h, ctx);
+            if rx.is_finite() { rx } else { 0.0 }
+        }
+        GradientKind::Conic { .. } => w,
+    }
+}
+
 /// The x and y radii of a radial gradient's ending shape.
 fn radial_radii(
     shape: RadialShape,
@@ -316,9 +345,18 @@ pub fn paint_gradient(
     let Some(clip) = intersect(clip, bounds) else {
         return;
     };
+    // An absolute stop position (`#f6f5f4 2px`) is a distance along the
+    // *gradient line*, not along the box's inline axis. Using `origin.width`
+    // as the basis put every non-horizontal gradient's px stops at the wrong
+    // fraction: `linear-gradient(to top, #f6f5f4 2px, #fbfafa)` on a 40x20
+    // box has a 20px line, so the 2px band is 0.10 of it and was read as
+    // 0.05. Only the *percentage basis* moves; `em`/`rem`/`ex` inside a stop
+    // position still resolve against the same environment.
+    let base_ctx = cx.base_length_ctx();
+    let line_length = gradient_line_length(gradient, origin.width, origin.height, &base_ctx);
     let len_ctx = &LengthCtx {
-        percent_basis: Some(origin.width),
-        ..cx.base_length_ctx()
+        percent_basis: Some(line_length),
+        ..base_ctx
     };
     let color_ctx = cx.color_ctx(current);
     let (x0, x1) = (clip.x.floor() as i32, clip.right().ceil() as i32);
@@ -811,6 +849,37 @@ mod tests {
         let middle = pixel(&surface, 20, 10);
         assert!(middle != Color(0xFFF6_F5F4) && middle != Color(0xFFFB_FAFA));
         assert!((0xF6..=0xFB).contains(&middle.red()));
+    }
+
+    #[test]
+    fn an_absolute_stop_is_measured_along_the_gradient_line_not_the_box_width() {
+        // F40. A `<length>` stop position is a distance along the *gradient
+        // line*. The basis used to be `origin.width`, so on a 40x20 box a
+        // `to top` gradient's 10px stop landed at 0.25 of a line that is
+        // 20px long instead of at 0.50 -- the flat band came out half as
+        // tall as declared, and on Adwaita's 200x34 buttons a 2px band
+        // collapsed to 0.34px.
+        //
+        // Row 12's gradient-line parameter is (20 - 12.5) / 20 = 0.375:
+        // inside a 0.50 stop, outside a 0.25 one. Mutation check: put
+        // `origin.width` back and this pixel is an interpolated purple.
+        let surface = painted_flat(
+            "button { background-image: linear-gradient(to top, #ff0000 10px, #0000ff); \
+             border-radius: 0; border: 0 solid transparent; padding: 0 }",
+        );
+        assert_eq!(
+            pixel(&surface, 20, 12),
+            Color(0xFFFF_0000),
+            "row 12 is inside the 10px flat band of a 20px gradient line"
+        );
+        // Row 0's parameter is 0.975, i.e. 95% of the way from the 0.50
+        // stop to the last one, so it is nearly -- not exactly -- the last
+        // stop's colour.
+        let far = pixel(&surface, 20, 0);
+        assert!(
+            far.blue() > 0xE0 && far.red() < 0x20,
+            "the far end has almost reached the last stop: {far:?}"
+        );
     }
 
     #[test]
