@@ -218,12 +218,22 @@ const VARIANT_KEYWORDS: &[(&str, FontVariantFlags)] = &[
 
 /// `normal | <keyword>+`, restricted to `allowed` so each longhand rejects
 /// the other longhands' keywords.
+///
+/// Two rules the `font` shorthand depends on:
+///
+/// * `normal` is **exclusive** -- `font-variant: normal small-caps` is
+///   invalid, in either order, not "small-caps with a redundant normal";
+/// * an ident that is not a variant keyword **stops** the run rather than
+///   failing it, so `font: italic small-caps bold 16px cursive` can hand the
+///   `bold` on to the next slot. A longhand still rejects the leftovers,
+///   because every longhand parser runs under `parse_entirely_with`.
 pub fn parse_variant_flags(
     input: &mut Parser<'_, '_>,
     allowed: FontVariantFlags,
 ) -> Result<FontVariantFlags, ()> {
     let mut flags = FontVariantFlags::empty();
     let mut count = 0_u32;
+    let mut normal = false;
     loop {
         let state = input.state();
         let name = match input.expect_ident() {
@@ -237,15 +247,19 @@ pub fn parse_variant_flags(
             if count > 0 {
                 return Err(());
             }
+            normal = true;
             count += 1;
             continue;
         }
         let flag = VARIANT_KEYWORDS
             .iter()
             .find(|(spelling, _)| name.eq_ignore_ascii_case(spelling))
-            .map(|(_, flag)| *flag)
-            .ok_or(())?;
-        if !allowed.contains(flag) || flags.contains(flag) {
+            .map(|(_, flag)| *flag);
+        let Some(flag) = flag else {
+            input.reset(&state);
+            break;
+        };
+        if normal || !allowed.contains(flag) || flags.contains(flag) {
             return Err(());
         }
         flags |= flag;
@@ -638,5 +652,43 @@ mod tests {
             let _ = parse_entirely_with(input, parse_variation_settings);
             let _ = parse_entirely_with(input, |p| parse_variant_flags(p, FontVariantFlags::all()));
         }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{FontVariantFlags, parse_variant_flags};
+    use crate::css::value::parse_entirely_with;
+
+    fn variant(text: &str) -> Option<FontVariantFlags> {
+        parse_entirely_with(text, |input| {
+            parse_variant_flags(input, FontVariantFlags::all())
+        })
+        .ok()
+    }
+
+    // F33/F34: `normal` is exclusive in `font-variant`, in either order.
+    #[test]
+    fn normal_is_exclusive_among_the_font_variant_keywords() {
+        assert_eq!(variant("normal"), Some(FontVariantFlags::empty()));
+        assert_eq!(variant("small-caps"), Some(FontVariantFlags::SMALL_CAPS));
+        assert_eq!(variant("normal small-caps"), None);
+        assert_eq!(variant("small-caps normal"), None);
+    }
+
+    // F35/F36: a non-variant ident stops the run instead of failing it, so
+    // the `font` shorthand can hand the token on to its next slot. A
+    // longhand still rejects it, because it parses under `parse_entirely_with`.
+    #[test]
+    fn a_non_variant_ident_stops_the_run_but_still_fails_the_longhand() {
+        assert_eq!(variant("small-caps bold"), None);
+        let mut source = cssparser::ParserInput::new("small-caps bold");
+        let mut parser = cssparser::Parser::new(&mut source);
+        assert_eq!(
+            parse_variant_flags(&mut parser, FontVariantFlags::all()),
+            Ok(FontVariantFlags::SMALL_CAPS),
+            "the run itself must stop, not fail"
+        );
+        assert!(parser.expect_ident_matching("bold").is_ok());
     }
 }

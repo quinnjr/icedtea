@@ -285,6 +285,17 @@ pub fn expand_border(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), (
     ] {
         emit_border_side(sink, props, &components);
     }
+    // CSS Backgrounds 3: `border` also resets `border-image-*`. Emitting the
+    // registry's own initial values keeps the reset in one place -- there is
+    // no second spelling of "no border image" to drift from.
+    for prop in [
+        Prop::BorderImageSource,
+        Prop::BorderImageSlice,
+        Prop::BorderImageWidth,
+        Prop::BorderImageRepeat,
+    ] {
+        sink(prop, prop.initial());
+    }
     Ok(())
 }
 
@@ -412,6 +423,19 @@ struct BackgroundLayerParts {
     clip: Option<Keyword>,
 }
 
+impl BackgroundLayerParts {
+    /// Whether this layer carries a colour and nothing else at all.
+    fn is_colour_only(&self) -> bool {
+        self.color.is_some()
+            && self.image.is_none()
+            && self.position.is_none()
+            && self.size.is_none()
+            && self.repeat.is_none()
+            && self.origin.is_none()
+            && self.clip.is_none()
+    }
+}
+
 fn parse_box_keyword(input: &mut Parser<'_, '_>) -> Result<Keyword, ()> {
     let name = input.expect_ident().map_err(|_| ())?.as_ref().to_string();
     for keyword in [
@@ -522,10 +546,21 @@ pub fn expand_background(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(
         if let Some(parsed) = &layer.color {
             color = Some(parsed.clone());
         }
-        let Some(image) = &layer.image else {
+        // A layer that is *nothing but* a colour still contributes no image
+        // layer -- that is the GTK divergence documented above, and what
+        // keeps "the first image is the one painted on top" true for
+        // Adwaita:1359's leading colour.
+        //
+        // A layer that carries a colour *and* something else is a different
+        // matter: its position, size, repeat, origin and clip apply to that
+        // colour, so it becomes an explicit `none` image layer rather than
+        // being dropped with all five components. Without this,
+        // `background: red content-box` painted red over the padding and
+        // border, and `background: #fff no-repeat` came out repeating.
+        if layer.is_colour_only() {
             continue;
-        };
-        images.push(Value::Image(image.clone()));
+        }
+        images.push(Value::Image(layer.image.clone().unwrap_or(Image::None)));
         positions.push(Value::Position(layer.position.clone().unwrap_or(
             Position {
                 x: Length::Percent(0.0),
@@ -538,9 +573,12 @@ pub fn expand_background(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(
             x: Keyword::Repeat,
             y: Keyword::Repeat,
         })));
-        let origin = layer.origin.unwrap_or(Keyword::PaddingBox);
-        origins.push(Value::Keyword(origin));
-        clips.push(Value::Keyword(layer.clip.unwrap_or(Keyword::BorderBox)));
+        // CSS Backgrounds 3: one `<box>` sets *both* longhands; only when a
+        // second one is given do origin and clip differ.
+        origins.push(Value::Keyword(layer.origin.unwrap_or(Keyword::PaddingBox)));
+        clips.push(Value::Keyword(
+            layer.clip.or(layer.origin).unwrap_or(Keyword::BorderBox),
+        ));
     }
     if images.is_empty() {
         images.push(Value::Image(Image::None));
@@ -666,45 +704,42 @@ pub fn expand_font(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), ()>
     let mut weight = None;
     let mut variant = None;
     let mut stretch = None;
+    // Each slot is filled at most once, so an explicit initial value --
+    // `normal`, `400`, `100%` -- is *consumed* rather than rejected: it fills
+    // the first slot that accepts it and the next `normal` moves on to the
+    // next slot. Refusing it left the token unconsumed, `parse_font_size` then
+    // saw the ident, and the whole `font: normal 12px sans-serif` was dropped.
     loop {
         let state = input.state();
-        if style.is_none() {
-            if let Ok(parsed) = FontStyle::parse(input)
-                && parsed != FontStyle::Normal
-            {
-                style = Some(parsed);
-                continue;
-            }
-            input.reset(&state);
+        if style.is_none()
+            && let Ok(parsed) = FontStyle::parse(input)
+        {
+            style = Some(parsed);
+            continue;
         }
-        if weight.is_none() {
-            if let Ok(parsed) = FontWeight::parse(input)
-                && parsed != FontWeight::Absolute(400.0)
-            {
-                weight = Some(parsed);
-                continue;
-            }
-            input.reset(&state);
+        input.reset(&state);
+        if weight.is_none()
+            && let Ok(parsed) = FontWeight::parse(input)
+        {
+            weight = Some(parsed);
+            continue;
         }
-        if variant.is_none() {
-            if let Ok(parsed) =
+        input.reset(&state);
+        if variant.is_none()
+            && let Ok(parsed) =
                 super::font::parse_variant_flags(input, FontVariantFlags::SMALL_CAPS)
-                && !parsed.is_empty()
-            {
-                variant = Some(parsed);
-                continue;
-            }
-            input.reset(&state);
+        {
+            variant = Some(parsed);
+            continue;
         }
-        if stretch.is_none() {
-            if let Ok(parsed) = parse_stretch(input)
-                && parsed != 100.0
-            {
-                stretch = Some(parsed);
-                continue;
-            }
-            input.reset(&state);
+        input.reset(&state);
+        if stretch.is_none()
+            && let Ok(parsed) = parse_stretch(input)
+        {
+            stretch = Some(parsed);
+            continue;
         }
+        input.reset(&state);
         break;
     }
     let size = parse_font_size(input)?;
@@ -729,10 +764,12 @@ pub fn expand_font(input: &mut Parser<'_, '_>, sink: Sink<'_>) -> Result<(), ()>
         Prop::FontWeight,
         Value::FontWeight(weight.unwrap_or(FontWeight::Absolute(400.0))),
     );
-    sink(
-        Prop::FontStretch,
-        Value::Percentage(stretch.unwrap_or(100.0) / 100.0),
-    );
+    // `font-width` is `font-stretch`'s CSS Fonts 4 name and the one
+    // `text.rs` reads first, so the shorthand has to reset both or a stale
+    // `font-width` survives a later `font:` and picks a condensed face.
+    let stretch = Value::Percentage(stretch.unwrap_or(100.0) / 100.0);
+    sink(Prop::FontStretch, stretch.clone());
+    sink(Prop::FontWidth, stretch);
     sink(Prop::FontSize, Value::Length(size));
     sink(
         Prop::LineHeight,
@@ -1338,5 +1375,201 @@ mod tests {
                 let _ = expanded(*expand, input);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{expand_background, expand_border, expand_font};
+    use crate::css::registry::{ExpandFn, Prop};
+    use crate::css::value::Value;
+    use crate::css::value::font::{FontStyle, FontWeight};
+    use crate::css::value::image::Image;
+    use crate::css::value::keyword::Keyword;
+
+    fn expanded(expand: ExpandFn, text: &str) -> Result<Vec<(Prop, Value)>, ()> {
+        let mut source = cssparser::ParserInput::new(text);
+        let mut parser = cssparser::Parser::new(&mut source);
+        let mut out: Vec<(Prop, Value)> = Vec::new();
+        {
+            let mut sink = |prop: Prop, value: Value| out.push((prop, value));
+            expand(&mut parser, &mut sink)?;
+        }
+        parser.skip_whitespace();
+        if parser.is_exhausted() {
+            Ok(out)
+        } else {
+            Err(())
+        }
+    }
+
+    fn get(pairs: &[(Prop, Value)], prop: Prop) -> Option<&Value> {
+        pairs
+            .iter()
+            .find(|(key, _)| *key == prop)
+            .map(|(_, value)| value)
+    }
+
+    // F54/F55: an explicit initial value in a `font` slot must be consumed,
+    // not rejected -- rejecting it left the ident for `parse_font_size`,
+    // which errored and dropped the whole declaration.
+    #[test]
+    fn the_font_shorthand_accepts_an_explicit_normal_400_or_100_percent() {
+        for text in [
+            "normal 12px sans-serif",
+            "400 14px serif",
+            "100% 14px serif",
+            "normal normal normal 12px sans-serif",
+            "normal 400 12px/1.5 sans-serif",
+        ] {
+            let pairs = expanded(expand_font, text).unwrap_or_else(|()| {
+                panic!("`font: {text}` must expand");
+            });
+            assert_eq!(
+                get(&pairs, Prop::FontStyle),
+                Some(&Value::FontStyle(FontStyle::Normal)),
+                "`font: {text}`"
+            );
+            assert_eq!(
+                get(&pairs, Prop::FontWeight),
+                Some(&Value::FontWeight(FontWeight::Absolute(400.0))),
+                "`font: {text}`"
+            );
+        }
+        // The non-initial forms must still work.
+        let pairs = expanded(expand_font, "italic bold 16px cursive").expect("expands");
+        assert_eq!(
+            get(&pairs, Prop::FontStyle),
+            Some(&Value::FontStyle(FontStyle::Italic))
+        );
+        assert_eq!(
+            get(&pairs, Prop::FontWeight),
+            Some(&Value::FontWeight(FontWeight::Absolute(700.0)))
+        );
+    }
+
+    // F35/F36: `small-caps` followed by another ident used to poison the
+    // whole shorthand, because the variant run hard-errored on `bold`.
+    #[test]
+    fn small_caps_may_be_followed_by_another_font_component() {
+        for text in [
+            "italic small-caps bold 16px/2 cursive",
+            "small-caps bold 12px serif",
+            "small-caps 12px serif",
+        ] {
+            assert!(
+                expanded(expand_font, text).is_ok(),
+                "`font: {text}` must expand"
+            );
+        }
+    }
+
+    // F16: `font` resets `font-width`, which `text.rs` reads before
+    // `font-stretch`.
+    #[test]
+    fn the_font_shorthand_resets_font_width_as_well_as_font_stretch() {
+        let pairs = expanded(expand_font, "14px Cantarell").expect("expands");
+        assert_eq!(
+            get(&pairs, Prop::FontWidth),
+            Some(&Value::Percentage(1.0)),
+            "font-width must be reset to its initial 100%"
+        );
+        assert_eq!(
+            get(&pairs, Prop::FontStretch),
+            Some(&Value::Percentage(1.0))
+        );
+        let condensed = expanded(expand_font, "condensed 14px Cantarell").expect("expands");
+        assert_eq!(
+            get(&condensed, Prop::FontWidth),
+            get(&condensed, Prop::FontStretch),
+            "the two spellings must always agree"
+        );
+    }
+
+    // F17: `border` resets `border-image-*`.
+    #[test]
+    fn the_border_shorthand_resets_every_border_image_longhand() {
+        let pairs = expanded(expand_border, "1px solid red").expect("expands");
+        for prop in [
+            Prop::BorderImageSource,
+            Prop::BorderImageSlice,
+            Prop::BorderImageWidth,
+            Prop::BorderImageRepeat,
+        ] {
+            assert_eq!(
+                get(&pairs, prop),
+                Some(&prop.initial()),
+                "{} must be reset to its initial value",
+                prop.name()
+            );
+        }
+    }
+
+    // F52/F53: one `<box>` in `background` sets origin *and* clip.
+    #[test]
+    fn one_background_box_keyword_sets_both_origin_and_clip() {
+        let pairs = expanded(expand_background, "url(\"a.png\") content-box").expect("expands");
+        assert_eq!(
+            get(&pairs, Prop::BackgroundOrigin),
+            Some(&Value::List(std::rc::Rc::from(vec![Value::Keyword(
+                Keyword::ContentBox
+            )])))
+        );
+        assert_eq!(
+            get(&pairs, Prop::BackgroundClip),
+            Some(&Value::List(std::rc::Rc::from(vec![Value::Keyword(
+                Keyword::ContentBox
+            )]))),
+            "one <box> sets both longhands"
+        );
+        // Two boxes still set them separately, origin first.
+        let two =
+            expanded(expand_background, "url(\"a.png\") content-box padding-box").expect("expands");
+        assert_eq!(
+            get(&two, Prop::BackgroundOrigin),
+            Some(&Value::List(std::rc::Rc::from(vec![Value::Keyword(
+                Keyword::ContentBox
+            )])))
+        );
+        assert_eq!(
+            get(&two, Prop::BackgroundClip),
+            Some(&Value::List(std::rc::Rc::from(vec![Value::Keyword(
+                Keyword::PaddingBox
+            )])))
+        );
+    }
+
+    // F51: a layer that carries a colour *and* other components keeps them.
+    #[test]
+    fn a_coloured_layer_that_also_carries_components_keeps_them() {
+        let pairs = expanded(expand_background, "red content-box").expect("expands");
+        assert_eq!(
+            get(&pairs, Prop::BackgroundOrigin),
+            Some(&Value::List(std::rc::Rc::from(vec![Value::Keyword(
+                Keyword::ContentBox
+            )]))),
+            "the layer's own origin must survive"
+        );
+        assert_eq!(
+            get(&pairs, Prop::BackgroundClip),
+            Some(&Value::List(std::rc::Rc::from(vec![Value::Keyword(
+                Keyword::ContentBox
+            )])))
+        );
+        match get(&pairs, Prop::BackgroundImage) {
+            Some(Value::List(items)) => {
+                assert_eq!(items.len(), 1);
+                assert!(matches!(items[0], Value::Image(Image::None)));
+            }
+            other => panic!("expected a one-entry image list, got {other:?}"),
+        }
+        // A bare colour is still nothing but a colour: no layer.
+        let bare = expanded(expand_background, "red").expect("expands");
+        assert_eq!(
+            get(&bare, Prop::BackgroundOrigin),
+            Some(&Value::List(std::rc::Rc::from(vec![Value::Keyword(
+                Keyword::PaddingBox
+            )])))
+        );
     }
 }

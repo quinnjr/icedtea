@@ -447,6 +447,7 @@ fn p_border_image_width(input: &mut Parser<'_, '_>) -> Result<Value, ()> {
     })
 }
 
+/// `background-clip`: the three boxes plus CSS Backgrounds 4's `text`.
 fn p_box_list(input: &mut Parser<'_, '_>) -> Result<Value, ()> {
     wide(input, |i| {
         Value::parse_list(i, |item| {
@@ -458,6 +459,20 @@ fn p_box_list(input: &mut Parser<'_, '_>) -> Result<Value, ()> {
                     Keyword::ContentBox,
                     Keyword::TextBox,
                 ],
+            )?))
+        })
+    })
+}
+
+/// `background-origin`: the three boxes only. `text` is a `background-clip`
+/// value; accepting it here let an invalid declaration win the cascade and
+/// suppress a valid lower-specificity one.
+fn p_origin_box_list(input: &mut Parser<'_, '_>) -> Result<Value, ()> {
+    wide(input, |i| {
+        Value::parse_list(i, |item| {
+            Ok(Value::Keyword(keyword_in(
+                item,
+                &[Keyword::BorderBox, Keyword::PaddingBox, Keyword::ContentBox],
             )?))
         })
     })
@@ -953,6 +968,10 @@ const FONT_LONGHANDS: &[Prop] = &[
     Prop::FontVariant,
     Prop::FontWeight,
     Prop::FontStretch,
+    // `font-width` is `font-stretch`'s CSS Fonts 4 name, and `text.rs` reads
+    // it *first*; the shorthand has to reset it too or a stale `font-width`
+    // outlives the `font:` that was meant to replace it.
+    Prop::FontWidth,
     Prop::FontSize,
     Prop::LineHeight,
     Prop::FontFamily,
@@ -1012,6 +1031,10 @@ const BORDER_LEFT_LONGHANDS: &[Prop] = &[
     Prop::BorderLeftStyle,
     Prop::BorderLeftColor,
 ];
+/// CSS Backgrounds 3: the `border` shorthand also resets every
+/// `border-image-*` longhand to its initial value. Without them a
+/// `border-image` declared earlier keeps painting and the solid border the
+/// later `border:` asked for never appears.
 const BORDER_LONGHANDS: &[Prop] = &[
     Prop::BorderTopWidth,
     Prop::BorderTopStyle,
@@ -1025,6 +1048,10 @@ const BORDER_LONGHANDS: &[Prop] = &[
     Prop::BorderLeftWidth,
     Prop::BorderLeftStyle,
     Prop::BorderLeftColor,
+    Prop::BorderImageSource,
+    Prop::BorderImageSlice,
+    Prop::BorderImageWidth,
+    Prop::BorderImageRepeat,
 ];
 const BORDER_RADIUS_LONGHANDS: &[Prop] = &[
     Prop::BorderTopLeftRadius,
@@ -1566,7 +1593,7 @@ pub static PROPERTIES: [PropertyDef; N_PROPS] = [
     ),
     lh(
         "background-origin",
-        p_box_list,
+        p_origin_box_list,
         i_origin_padding_list,
         false,
         None,
@@ -2077,7 +2104,10 @@ mod tests {
                 Prop::MarginLeft
             ]
         );
-        assert_eq!(Prop::Border.longhands().len(), 12);
+        // 12 width/style/colour rows (4 sides x 3) plus the four
+        // `border-image-*` longhands CSS Backgrounds 3 makes `border` reset
+        // (F17; the pin was 12 while that reset was missing).
+        assert_eq!(Prop::Border.longhands().len(), 16);
         assert_eq!(Prop::Animation.longhands().len(), 8);
     }
 
@@ -2178,6 +2208,25 @@ mod tests {
             for input in crate::css::value::FUZZ_INPUTS {
                 let _ = parse_declaration_value(*prop, input);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::{Prop, parse_declaration_value};
+
+    // F19: `text` is a `background-clip` value, not a `background-origin`
+    // one. Accepting it let an invalid declaration win the cascade and
+    // suppress a valid lower-specificity `background-origin`.
+    #[test]
+    fn background_origin_rejects_the_background_clip_only_text_keyword() {
+        assert!(parse_declaration_value(Prop::BackgroundClip, "text").is_ok());
+        assert!(parse_declaration_value(Prop::BackgroundOrigin, "text").is_err());
+        // The three real boxes still parse on both.
+        for box_keyword in ["border-box", "padding-box", "content-box"] {
+            assert!(parse_declaration_value(Prop::BackgroundOrigin, box_keyword).is_ok());
+            assert!(parse_declaration_value(Prop::BackgroundClip, box_keyword).is_ok());
         }
     }
 }
