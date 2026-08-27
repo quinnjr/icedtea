@@ -5,9 +5,11 @@ use std::rc::Rc;
 
 use cssparser::{Parser, Token};
 
+use skia_rs_safe::core::Point;
+
 use super::calc::parse_angle;
-use super::color::ColorValue;
-use super::length::Length;
+use super::color::{ColorCtx, ColorValue, Rgba};
+use super::length::{Length, LengthCtx};
 
 /// A `<position>`: `background-position` and `transform-origin`.
 #[derive(Clone, Debug, PartialEq)]
@@ -646,6 +648,196 @@ fn require_exhausted(input: &mut Parser<'_, '_>) -> Result<(), ()> {
     }
 }
 
+impl Gradient {
+    /// The colour at gradient-line parameter `t`, already normalised for
+    /// the box (`0` at the line start, `1` at its end).
+    ///
+    /// This is the sampler Part 4's pixel tests derive expected colours
+    /// from: interpolation is component-wise premultiplied sRGB and the
+    /// result rounds to the nearest byte, so an assertion at a stop is
+    /// exactly the theme's declared hex.
+    #[must_use]
+    pub fn color_at(&self, t: f32, ctx: &ColorCtx<'_>, len_ctx: &LengthCtx) -> Rgba {
+        let positions = self.stop_positions(len_ctx);
+        let colors: Vec<Rgba> = self
+            .stops
+            .iter()
+            .map(|stop| stop.color.resolve(ctx).unwrap_or(Rgba::TRANSPARENT))
+            .collect();
+        if colors.is_empty() {
+            return Rgba::TRANSPARENT;
+        }
+        if colors.len() == 1 {
+            return colors[0];
+        }
+        let first = positions[0];
+        let last = positions[positions.len() - 1];
+        let span = last - first;
+        let t = if self.repeating && span > 0.0 {
+            first + (t - first).rem_euclid(span)
+        } else {
+            t
+        };
+        if t <= first {
+            return colors[0];
+        }
+        if t >= last {
+            return colors[colors.len() - 1];
+        }
+        for window in 0..positions.len() - 1 {
+            let (a, b) = (positions[window], positions[window + 1]);
+            if t >= a && t <= b {
+                if (b - a).abs() <= f32::EPSILON {
+                    return colors[window + 1];
+                }
+                let local = (t - a) / (b - a);
+                let pa = colors[window].premultiplied();
+                let pb = colors[window + 1].premultiplied();
+                let mut out = [0.0_f32; 4];
+                for channel in 0..4 {
+                    out[channel] = pa[channel] + (pb[channel] - pa[channel]) * local;
+                }
+                return Rgba::from_premultiplied(out).clamped();
+            }
+        }
+        colors[colors.len() - 1]
+    }
+
+    /// Every stop's position as a gradient-line fraction, with omitted
+    /// positions distributed evenly between their fixed neighbours and the
+    /// sequence made non-decreasing (CSS Images L3 §color-stop fixup).
+    fn stop_positions(&self, len_ctx: &LengthCtx) -> Vec<f32> {
+        let count = self.stops.len();
+        let mut positions: Vec<Option<f32>> = self
+            .stops
+            .iter()
+            .map(|stop| {
+                stop.position.as_ref().and_then(|length| match length {
+                    Length::Percent(fraction) => Some(*fraction),
+                    other => {
+                        let basis = len_ctx.percent_basis?;
+                        (basis != 0.0)
+                            .then(|| other.resolve(len_ctx))?
+                            .map(|px| px / basis)
+                    }
+                })
+            })
+            .collect();
+        if count == 0 {
+            return Vec::new();
+        }
+        if positions[0].is_none() {
+            positions[0] = Some(0.0);
+        }
+        if positions[count - 1].is_none() {
+            positions[count - 1] = Some(1.0);
+        }
+        let mut index = 0;
+        while index < count {
+            if positions[index].is_some() {
+                index += 1;
+                continue;
+            }
+            let start = index - 1;
+            let mut end = index;
+            while positions[end].is_none() {
+                end += 1;
+            }
+            let from = positions[start].unwrap_or(0.0);
+            let to = positions[end].unwrap_or(1.0);
+            let steps = (end - start) as f32;
+            for (gap, position) in positions.iter_mut().enumerate().take(end).skip(start + 1) {
+                *position = Some(from + (to - from) * ((gap - start) as f32) / steps);
+            }
+            index = end;
+        }
+        let mut out: Vec<f32> = positions.iter().map(|p| p.unwrap_or(0.0)).collect();
+        for index in 1..out.len() {
+            if out[index] < out[index - 1] {
+                out[index] = out[index - 1];
+            }
+        }
+        out
+    }
+
+    /// The gradient line's endpoints for a `w` x `h` box, per CSS Images L3.
+    /// The box's origin is its top-left; y grows downwards.
+    #[must_use]
+    pub fn line_for_box(&self, w: f32, h: f32, ctx: &LengthCtx) -> (Point, Point) {
+        let centre = Point {
+            x: w / 2.0,
+            y: h / 2.0,
+        };
+        let angle = match &self.kind {
+            GradientKind::Linear { direction } => match direction {
+                LinearDirection::Angle(degrees) => *degrees,
+                LinearDirection::Side(side) => side_angle(*side, w, h),
+            },
+            GradientKind::Radial { position, .. } | GradientKind::Conic { position, .. } => {
+                let x = position.x.resolve(&with_basis(ctx, w)).unwrap_or(w / 2.0);
+                let y = position.y.resolve(&with_basis(ctx, h)).unwrap_or(h / 2.0);
+                let centre = Point { x, y };
+                let radius = (w.max(h)) / 2.0;
+                return (
+                    centre,
+                    Point {
+                        x: centre.x + radius,
+                        y: centre.y,
+                    },
+                );
+            }
+        };
+        // CSS angles run clockwise from "up". `f32::sin_cos` on an angle
+        // meant to be an exact multiple of 90 degrees (every `to <side>`
+        // direction, and any hand-authored `0deg`/`90deg`/...) leaves a
+        // residue on the order of 1e-7/1e-8 rather than a true zero; left
+        // alone that residue is amplified by `half` into a few-pixel error
+        // at the opposite, supposedly-exact axis, so it is snapped to zero
+        // before use.
+        let radians = angle.to_radians();
+        let (mut sin, mut cos) = radians.sin_cos();
+        if sin.abs() < 1e-6 {
+            sin = 0.0;
+        }
+        if cos.abs() < 1e-6 {
+            cos = 0.0;
+        }
+        let length = (w * sin).abs() + (h * cos).abs();
+        let half = length / 2.0;
+        let start = Point {
+            x: centre.x - sin * half,
+            y: centre.y + cos * half,
+        };
+        let end = Point {
+            x: centre.x + sin * half,
+            y: centre.y - cos * half,
+        };
+        (start, end)
+    }
+}
+
+fn with_basis(ctx: &LengthCtx, basis: f32) -> LengthCtx {
+    LengthCtx {
+        percent_basis: Some(basis),
+        ..*ctx
+    }
+}
+
+fn side_angle(side: SideOrCorner, w: f32, h: f32) -> f32 {
+    match side {
+        SideOrCorner::Top => 0.0,
+        SideOrCorner::Right => 90.0,
+        SideOrCorner::Bottom => 180.0,
+        SideOrCorner::Left => 270.0,
+        // Corner gradients aim the line so the corner's perpendicular
+        // passes through it (CSS Images L3 §linear-gradient).
+        SideOrCorner::TopRight => h.atan2(w).to_degrees(),
+        SideOrCorner::TopLeft => 360.0 - h.atan2(w).to_degrees(),
+        SideOrCorner::BottomRight => 180.0 - h.atan2(w).to_degrees(),
+        SideOrCorner::BottomLeft => 180.0 + h.atan2(w).to_degrees(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -817,5 +1009,82 @@ mod tests {
             let _ = parse_entirely_with(input, Image::parse);
             let _ = parse_entirely_with(input, Position::parse);
         }
+    }
+
+    use crate::css::value::color::{ColorCtx, ColorTable, Rgba};
+    use crate::css::value::length::LengthCtx;
+    use skia_rs_safe::core::Color;
+
+    fn sample(text: &str, t: f32, basis: f32) -> Color {
+        let gradient = gradient(text).expect("gradient parses");
+        let table = ColorTable::new();
+        let color_ctx = ColorCtx {
+            table: &table,
+            current: Rgba::TRANSPARENT,
+            depth: 0,
+        };
+        let len_ctx = LengthCtx {
+            percent_basis: Some(basis),
+            ..LengthCtx::default()
+        };
+        gradient.color_at(t, &color_ctx, &len_ctx).to_color32()
+    }
+
+    #[test]
+    fn adwaitas_button_gradient_samples_exactly_at_and_beyond_its_stops() {
+        // 34px tall button, `to top`: the gradient line runs bottom -> top,
+        // so t is the distance from the bottom edge. `#f6f5f4 2px` means
+        // everything at or below 2px from the bottom is the flat first stop.
+        let text = "linear-gradient(to top, #f6f5f4 2px, #fbfafa)";
+        assert_eq!(sample(text, 0.0, 34.0), Color(0xFFF6_F5F4));
+        assert_eq!(sample(text, 2.0 / 34.0, 34.0), Color(0xFFF6_F5F4));
+        assert_eq!(sample(text, 1.0, 34.0), Color(0xFFFB_FAFA));
+        // Before the first stop and after the last one, the ends are flat.
+        assert_eq!(sample(text, -1.0, 34.0), Color(0xFFF6_F5F4));
+        assert_eq!(sample(text, 2.0, 34.0), Color(0xFFFB_FAFA));
+    }
+
+    #[test]
+    fn a_two_stop_gradient_interpolates_linearly_at_its_midpoint() {
+        assert_eq!(
+            sample("linear-gradient(#000000, #ffffff)", 0.5, 100.0),
+            Color(0xFF80_8080)
+        );
+        assert_eq!(
+            sample("linear-gradient(#000000, #ffffff)", 0.25, 100.0),
+            Color(0xFF40_4040)
+        );
+    }
+
+    #[test]
+    fn omitted_stop_positions_are_distributed_evenly() {
+        let text = "linear-gradient(#000000, #ff0000, #ffffff)";
+        assert_eq!(sample(text, 0.5, 100.0), Color(0xFFFF_0000));
+    }
+
+    #[test]
+    fn a_repeating_gradient_wraps_its_parameter() {
+        let text = "repeating-linear-gradient(#000000 0%, #ffffff 50%)";
+        assert_eq!(sample(text, 0.25, 100.0), Color(0xFF80_8080));
+        assert_eq!(sample(text, 0.75, 100.0), Color(0xFF80_8080));
+    }
+
+    #[test]
+    fn the_gradient_line_matches_css_for_the_four_sides() {
+        let table = ColorTable::new();
+        let _ = table;
+        let ctx = LengthCtx::default();
+        let up = gradient("linear-gradient(to top, red, blue)").expect("parses");
+        let (start, end) = up.line_for_box(100.0, 40.0, &ctx);
+        assert_eq!((start.x, start.y), (50.0, 40.0));
+        assert_eq!((end.x, end.y), (50.0, 0.0));
+        let down = gradient("linear-gradient(red, blue)").expect("parses");
+        let (start, end) = down.line_for_box(100.0, 40.0, &ctx);
+        assert_eq!((start.x, start.y), (50.0, 0.0));
+        assert_eq!((end.x, end.y), (50.0, 40.0));
+        let right = gradient("linear-gradient(to right, red, blue)").expect("parses");
+        let (start, end) = right.line_for_box(100.0, 40.0, &ctx);
+        assert_eq!((start.x, start.y), (0.0, 20.0));
+        assert_eq!((end.x, end.y), (100.0, 20.0));
     }
 }
