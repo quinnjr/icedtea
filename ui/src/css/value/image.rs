@@ -1,6 +1,7 @@
 //! `<image>`: gradients, `url()`, `image()`, `cross-fade()` and GTK's
 //! `-gtk-icontheme()`/`-gtk-recolor()`/`-gtk-scaled()`.
 
+use std::f32::consts::SQRT_2;
 use std::rc::Rc;
 
 use cssparser::{Parser, Token};
@@ -666,6 +667,30 @@ impl Gradient {
         len_ctx: &LengthCtx,
         line_length_px: f32,
     ) -> Rgba {
+        self.color_at_resolved(t, &self.resolve_stops_on_line(ctx, len_ctx, line_length_px))
+    }
+
+    /// Every stop resolved once, for a caller that samples one gradient at
+    /// many points.
+    ///
+    /// [`Gradient::color_at`] resolves the whole stop list on every call, so
+    /// a painter sampling a gradient per pixel allocated three `Vec`s per
+    /// pixel. Resolve once, then sample with
+    /// [`Gradient::color_at_resolved`].
+    #[must_use]
+    pub fn resolve_stops(&self, ctx: &ColorCtx<'_>, len_ctx: &LengthCtx) -> ResolvedStops {
+        self.resolve_stops_on_line(ctx, len_ctx, len_ctx.percent_basis.unwrap_or(0.0))
+    }
+
+    /// [`Gradient::resolve_stops`] with the gradient-*line* length given
+    /// explicitly -- see [`Gradient::color_at_on_line`].
+    #[must_use]
+    pub fn resolve_stops_on_line(
+        &self,
+        ctx: &ColorCtx<'_>,
+        len_ctx: &LengthCtx,
+        line_length_px: f32,
+    ) -> ResolvedStops {
         let positions = self.stop_positions_for_line(len_ctx, line_length_px);
         let hints = self.hint_positions(len_ctx, line_length_px, &positions);
         let colors: Vec<Rgba> = self
@@ -673,6 +698,45 @@ impl Gradient {
             .iter()
             .map(|stop| stop.color.resolve(ctx).unwrap_or(Rgba::TRANSPARENT))
             .collect();
+        ResolvedStops {
+            positions,
+            colors,
+            hints,
+            repeating: self.repeating,
+        }
+    }
+
+    /// The colour at gradient-line parameter `t`, against already-resolved
+    /// stops.
+    ///
+    /// Byte-for-byte what [`Gradient::color_at_on_line`] returns for the same
+    /// `t` and the same resolution inputs; it is the same code.
+    #[must_use]
+    #[allow(clippy::unused_self)]
+    pub fn color_at_resolved(&self, t: f32, stops: &ResolvedStops) -> Rgba {
+        stops.color_at(t)
+    }
+}
+
+/// A gradient's stop list resolved once: see [`Gradient::resolve_stops`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedStops {
+    /// Each stop's position as a fraction of the gradient line.
+    pub positions: Vec<f32>,
+    /// Each stop's absolute colour, parallel to `positions`.
+    pub colors: Vec<Rgba>,
+    /// The colour-interpolation hint *preceding* each stop, if it declared
+    /// one; parallel to `positions`.
+    pub hints: Vec<Option<f32>>,
+    /// Whether this came from a `repeating-*-gradient()`.
+    pub repeating: bool,
+}
+
+impl ResolvedStops {
+    /// The colour at gradient-line parameter `t`.
+    #[must_use]
+    pub fn color_at(&self, t: f32) -> Rgba {
+        let (positions, colors, hints) = (&self.positions, &self.colors, &self.hints);
         if colors.is_empty() {
             return Rgba::TRANSPARENT;
         }
@@ -730,7 +794,9 @@ impl Gradient {
         }
         colors[colors.len() - 1]
     }
+}
 
+impl Gradient {
     /// Every stop's position as a fraction of a gradient line
     /// `line_length_px` long, with omitted positions distributed evenly
     /// between their fixed neighbours and the sequence made non-decreasing
@@ -948,14 +1014,13 @@ pub fn radial_radii(
     let (rx, ry) = match extent {
         RadialExtent::ClosestSide => (sx, sy),
         RadialExtent::FarthestSide => (fx, fy),
-        RadialExtent::ClosestCorner => {
-            let d = sx.hypot(sy);
-            (d, d)
-        }
-        RadialExtent::FarthestCorner => {
-            let d = fx.hypot(fy);
-            (d, d)
-        }
+        // CSS Images L3 3.2: an *ellipse* sized to a corner has the same
+        // aspect ratio as the matching `-side` ellipse and passes through
+        // that corner, which works out to `side * sqrt(2)` per axis -- not
+        // one circular `hypot(sx, sy)` on both axes. The circle arm below
+        // still uses the true corner distance.
+        RadialExtent::ClosestCorner => (sx * SQRT_2, sy * SQRT_2),
+        RadialExtent::FarthestCorner => (fx * SQRT_2, fy * SQRT_2),
         RadialExtent::Explicit(x, y) => (
             x.resolve(&with_basis(ctx, w)).unwrap_or(0.0),
             y.resolve(&with_basis(ctx, h)).unwrap_or(0.0),
@@ -966,7 +1031,9 @@ pub fn radial_radii(
             let r = match extent {
                 RadialExtent::ClosestSide => sx.min(sy),
                 RadialExtent::FarthestSide => fx.max(fy),
-                _ => rx,
+                RadialExtent::ClosestCorner => sx.hypot(sy),
+                RadialExtent::FarthestCorner => fx.hypot(fy),
+                RadialExtent::Explicit(..) => rx,
             };
             (r, r)
         }
@@ -1254,7 +1321,7 @@ mod tests {
 
 #[cfg(test)]
 mod review_tests {
-    use super::{Gradient, Image, RadialExtent, RadialShape, radial_radii};
+    use super::{Gradient, Image, RadialExtent, RadialShape, SQRT_2, radial_radii};
     use crate::css::value::color::{ColorCtx, ColorTable, Rgba};
     use crate::css::value::length::LengthCtx;
     use crate::css::value::parse_entirely_with;
@@ -1274,6 +1341,70 @@ mod review_tests {
             depth: 0,
         };
         gradient.color_at_on_line(t, &ctx, &LengthCtx::default(), line)
+    }
+
+    /// H2: sampling a gradient many times resolves its stops once.
+    ///
+    /// `color_at_on_line` allocates three `Vec`s per call -- the positions,
+    /// the hints and the colours -- and the painter calls it once per pixel,
+    /// so a 100x100 gradient paid 30 000 allocations per frame. Asserting
+    /// "zero allocations" needs an allocator hook; this is the same guard
+    /// from the other side, self-calibrating against the unresolved path so
+    /// it does not encode a wall-clock constant.
+    ///
+    /// Mutation check: make `color_at_resolved` call
+    /// `self.color_at_on_line(..)` instead and the ratio collapses to 1.
+    #[test]
+    fn sampling_against_resolved_stops_beats_resolving_per_sample() {
+        let g = gradient("linear-gradient(#112233 2px, #445566 20%, #778899)");
+        let table = ColorTable::new();
+        let ctx = ColorCtx {
+            table: &table,
+            current: Rgba::TRANSPARENT,
+            depth: 0,
+        };
+        let len_ctx = LengthCtx::default();
+        const SAMPLES: usize = 100 * 100;
+        let ts: Vec<f32> = (0..SAMPLES).map(|i| i as f32 / SAMPLES as f32).collect();
+
+        // Identical colours, either way -- the fast path is the same code.
+        let stops = g.resolve_stops_on_line(&ctx, &len_ctx, 34.0);
+        for t in [0.0, 0.01, 0.2, 0.5, 0.99, 1.0] {
+            assert_eq!(
+                g.color_at_resolved(t, &stops),
+                g.color_at_on_line(t, &ctx, &len_ctx, 34.0),
+                "the resolved sampler disagrees at t = {t}"
+            );
+        }
+
+        let slow = {
+            let started = std::time::Instant::now();
+            let mut sink = Rgba::TRANSPARENT;
+            for &t in &ts {
+                sink = g.color_at_on_line(t, &ctx, &len_ctx, 34.0);
+            }
+            std::hint::black_box(sink);
+            started.elapsed()
+        };
+        // Best of three: a scheduler hiccup must not decide the verdict.
+        let fast = (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let stops = g.resolve_stops_on_line(&ctx, &len_ctx, 34.0);
+                let mut sink = Rgba::TRANSPARENT;
+                for &t in &ts {
+                    sink = g.color_at_resolved(t, &stops);
+                }
+                std::hint::black_box(sink);
+                started.elapsed()
+            })
+            .min()
+            .expect("three timings");
+        assert!(
+            fast * 2 < slow,
+            "{SAMPLES} samples took {fast:?} against {slow:?} resolving per \
+             sample: the stops are still being resolved per pixel"
+        );
     }
 
     // F40: an absolute stop position is a distance along the *gradient line*,
@@ -1325,8 +1456,12 @@ mod review_tests {
         assert_eq!(closest.line_length_for_box(100.0, 40.0, &ctx), 0.0);
         let default = gradient("radial-gradient(red, blue)");
         let length = default.line_length_for_box(100.0, 40.0, &ctx);
+        // The default ending shape is an *ellipse* sized `farthest-corner`:
+        // CSS Images L3 3.2 keeps the `farthest-side` aspect ratio and puts
+        // the corner on the curve, so each radius is its side times sqrt(2)
+        // -- 50*sqrt(2) here, not the corner distance `hypot(50, 20)`.
         assert!(
-            (length - 50.0_f32.hypot(20.0)).abs() < 1e-4,
+            (length - 50.0 * SQRT_2).abs() < 1e-4,
             "farthest-corner on 100x40 is {length}"
         );
         // The helper itself, against the values CSS gives.
@@ -1353,5 +1488,59 @@ mod review_tests {
             ),
             (100.0, 40.0)
         );
+        // A *circle* sized to a corner keeps the true corner distance.
+        assert_eq!(
+            radial_radii(
+                RadialShape::Circle,
+                &RadialExtent::FarthestCorner,
+                super::Point { x: 50.0, y: 20.0 },
+                100.0,
+                40.0,
+                &ctx
+            ),
+            (50.0_f32.hypot(20.0), 50.0_f32.hypot(20.0))
+        );
+    }
+
+    /// F41/H6: the painter's sampler and this module's stop fractions are
+    /// measured on the *same* ending shape.
+    ///
+    /// `paint::background::gradient_t` normalises a point by the ending
+    /// shape's radii and `line_length_for_box` divides an absolute stop by
+    /// its x radius; when the painter kept a private `radial_radii` the two
+    /// could drift, so a stop at the shape's edge would not land where `t`
+    /// said the edge was. There is one `radial_radii` now, and this pins the
+    /// consequence: a `radial-gradient` whose stop sits exactly at the
+    /// horizontal radius has stop fraction 1, and the point at that radius
+    /// has `t == 1`.
+    #[test]
+    fn the_sampler_and_the_stop_fractions_share_one_ending_shape() {
+        let ctx = LengthCtx::default();
+        let (w, h) = (100.0_f32, 40.0_f32);
+        for source in [
+            "radial-gradient(red, blue)",
+            "radial-gradient(circle, red, blue)",
+            "radial-gradient(closest-side, red, blue)",
+            "radial-gradient(farthest-side at 10px 30px, red, blue)",
+            "radial-gradient(circle closest-corner at 25px 5px, red, blue)",
+        ] {
+            let g = gradient(source);
+            let line = g.line_length_for_box(w, h, &ctx);
+            assert!(line > 0.0, "{source}");
+            // A stop declared at exactly the line length is the last stop,
+            // i.e. fraction 1.
+            let stops = gradient(&source.replace("red, blue", &format!("red, blue {line}px")))
+                .stop_positions_for_line(&ctx, line);
+            assert!(
+                (stops[stops.len() - 1] - 1.0).abs() < 1e-4,
+                "{source}: last stop at {:?}",
+                stops[stops.len() - 1]
+            );
+            // And the painter's `t` at the point one x-radius to the right of
+            // the centre is 1 as well, so that stop is exactly there.
+            let (centre, edge) = g.line_for_box(w, h, &ctx);
+            let t = crate::paint::background::gradient_t(&g, w, h, edge.x, centre.y, &ctx);
+            assert!((t - 1.0).abs() < 1e-4, "{source}: t at the edge is {t}");
+        }
     }
 }

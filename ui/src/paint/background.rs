@@ -5,12 +5,11 @@
 //! the *last* layer's `background-clip` -- CSS Backgrounds L3 §3.11.
 
 use skia_rs_safe::canvas::{Canvas, ClipOp};
+use skia_rs_safe::core::Point;
 use skia_rs_safe::paint::{BlendMode, Paint};
 
-use std::f32::consts::SQRT_2;
-
 use crate::css::computed::BackgroundLayer;
-use crate::css::value::image::{GradientKind, RadialExtent, RadialShape};
+use crate::css::value::image::{GradientKind, radial_radii};
 use crate::css::value::{BgSize, Gradient, Image, Keyword, LengthCtx, Position, RepeatStyle, Rgba};
 use crate::layout::{Allocation, Rect};
 use crate::paint::{PaintCx, fill_paint, radii_for_box, rounded_rect_path};
@@ -174,7 +173,7 @@ pub fn gradient_t(
             position,
         } => {
             let (cx, cy) = resolve_position(position, box_w, box_h, ctx);
-            let (rx, ry) = radial_radii(*shape, extent, cx, cy, box_w, box_h, ctx);
+            let (rx, ry) = radial_radii(*shape, extent, Point { x: cx, y: cy }, box_w, box_h, ctx);
             if !(rx.is_finite() && ry.is_finite()) || rx <= 0.0 || ry <= 0.0 {
                 return 1.0;
             }
@@ -197,84 +196,6 @@ pub fn gradient_t(
                 0.0
             }
         }
-    }
-}
-
-/// The length of `gradient`'s gradient line over a `w` x `h` box, in px.
-///
-/// What an absolute `<length>` stop position is measured against. For a
-/// linear gradient that is the line CSS Images L3 constructs; for a radial
-/// one it is the ending shape's radius along the x axis, which is what
-/// [`gradient_t`] normalises by. A conic gradient's stops are angles, so a
-/// `<length>` there is invalid CSS -- the box's inline size is kept as the
-/// basis rather than inventing one.
-#[must_use]
-pub fn gradient_line_length(gradient: &Gradient, w: f32, h: f32, ctx: &LengthCtx) -> f32 {
-    match &gradient.kind {
-        GradientKind::Linear { .. } => {
-            let (p0, p1) = gradient.line_for_box(w, h, ctx);
-            let length = (p1.x - p0.x).hypot(p1.y - p0.y);
-            if length.is_finite() { length } else { 0.0 }
-        }
-        GradientKind::Radial {
-            shape,
-            extent,
-            position,
-        } => {
-            let (cx, cy) = resolve_position(position, w, h, ctx);
-            let (rx, _) = radial_radii(*shape, extent, cx, cy, w, h, ctx);
-            if rx.is_finite() { rx } else { 0.0 }
-        }
-        GradientKind::Conic { .. } => w,
-    }
-}
-
-/// The x and y radii of a radial gradient's ending shape.
-fn radial_radii(
-    shape: RadialShape,
-    extent: &RadialExtent,
-    cx: f32,
-    cy: f32,
-    w: f32,
-    h: f32,
-    ctx: &LengthCtx,
-) -> (f32, f32) {
-    let (left, right, top, bottom) = (cx, w - cx, cy, h - cy);
-    let (sx, sy) = (left.abs().min(right.abs()), top.abs().min(bottom.abs()));
-    let (fx, fy) = (left.abs().max(right.abs()), top.abs().max(bottom.abs()));
-    let (rx, ry) = match extent {
-        RadialExtent::ClosestSide => (sx, sy),
-        RadialExtent::FarthestSide => (fx, fy),
-        // CSS Images L3 §3.2: an *ellipse* sized to a corner has the same
-        // aspect ratio as the matching `-side` ellipse and passes through
-        // that corner, which works out to `side * sqrt(2)` per axis --
-        // not one circular `hypot(sx, sy)` on both axes. The circle arm
-        // below still uses the true corner distance.
-        RadialExtent::ClosestCorner => (sx * SQRT_2, sy * SQRT_2),
-        RadialExtent::FarthestCorner => (fx * SQRT_2, fy * SQRT_2),
-        RadialExtent::Explicit(x, y) => {
-            let mut x_ctx = *ctx;
-            x_ctx.percent_basis = Some(w);
-            let mut y_ctx = *ctx;
-            y_ctx.percent_basis = Some(h);
-            (
-                x.resolve(&x_ctx).unwrap_or(0.0),
-                y.resolve(&y_ctx).unwrap_or(0.0),
-            )
-        }
-    };
-    match shape {
-        RadialShape::Circle => {
-            let r = match extent {
-                RadialExtent::ClosestSide => sx.min(sy),
-                RadialExtent::FarthestSide => fx.max(fy),
-                RadialExtent::ClosestCorner => sx.hypot(sy),
-                RadialExtent::FarthestCorner => fx.hypot(fy),
-                RadialExtent::Explicit(..) => rx,
-            };
-            (r, r)
-        }
-        RadialShape::Ellipse => (rx, ry),
     }
 }
 
@@ -353,12 +274,12 @@ pub fn paint_gradient(
     // 0.05. Only the *percentage basis* moves; `em`/`rem`/`ex` inside a stop
     // position still resolve against the same environment.
     let base_ctx = cx.base_length_ctx();
-    let line_length = gradient_line_length(gradient, origin.width, origin.height, &base_ctx);
-    let len_ctx = &LengthCtx {
-        percent_basis: Some(line_length),
-        ..base_ctx
-    };
+    let len_ctx = &base_ctx;
+    let line_length = gradient.line_length_for_box(origin.width, origin.height, len_ctx);
     let color_ctx = cx.color_ctx(current);
+    // Resolve the stop list once. `color_at_on_line` resolves it on every
+    // call, and this loop calls it once per pixel.
+    let stops = gradient.resolve_stops_on_line(&color_ctx, len_ctx, line_length);
     let (x0, x1) = (clip.x.floor() as i32, clip.right().ceil() as i32);
     let (y0, y1) = (clip.y.floor() as i32, clip.bottom().ceil() as i32);
 
@@ -388,7 +309,7 @@ pub fn paint_gradient(
         for row in y0..y1 {
             let py = row as f32 + 0.5 - origin.y;
             let t = gradient_t(gradient, origin.width, origin.height, 0.0, py, len_ctx);
-            let color = gradient.color_at(t, &color_ctx, len_ctx);
+            let color = gradient.color_at_resolved(t, &stops);
             band(
                 canvas,
                 Rect::new(clip.x, row as f32, clip.width, 1.0),
@@ -401,7 +322,7 @@ pub fn paint_gradient(
         for col in x0..x1 {
             let px = col as f32 + 0.5 - origin.x;
             let t = gradient_t(gradient, origin.width, origin.height, px, 0.0, len_ctx);
-            let color = gradient.color_at(t, &color_ctx, len_ctx);
+            let color = gradient.color_at_resolved(t, &stops);
             band(
                 canvas,
                 Rect::new(col as f32, clip.y, 1.0, clip.height),
@@ -421,7 +342,7 @@ pub fn paint_gradient(
         for col in x0..x1 {
             let px = col as f32 + 0.5 - origin.x;
             let t = gradient_t(gradient, origin.width, origin.height, px, py, len_ctx);
-            let color = gradient.color_at(t, &color_ctx, len_ctx);
+            let color = gradient.color_at_resolved(t, &stops);
             match run_color {
                 Some(previous) if previous == color => {}
                 Some(previous) => {
@@ -1068,6 +989,53 @@ mod tests {
         }
         // The surface is still a surface: nothing above wrote out of bounds.
         assert!(surface.pixel_buffer().get_pixel(7, 7).is_some());
+    }
+
+    /// H2: a per-pixel gradient paint is bounded, because the stops are
+    /// resolved once per paint rather than once per pixel.
+    ///
+    /// The diagonal keeps `paint_gradient` off both banded fast paths, so
+    /// every one of the 100x100 pixels goes through the sampler. The bound
+    /// is generous on purpose -- it is a "this is not doing 30 000
+    /// allocations" guard, in the shape of the blur guard, not a benchmark.
+    #[test]
+    fn a_per_pixel_gradient_paints_in_bounded_time() {
+        let env = ResolveEnv::default();
+        let sheet = CompiledSheet::compile("button { color: #000 }");
+        let mut fonts = FontDatabase::probe_only();
+        let mut images = ImageCache::new();
+        let mut cx = PaintCx {
+            env: &env,
+            colors: &sheet.colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let mut surface = Surface::new_raster_n32_premul(100, 100).expect("raster surface");
+        surface.canvas().clear(Color::TRANSPARENT);
+        let gradient =
+            gradient_of("linear-gradient(45deg, #112233 2px, #445566 20%, #778899 60%, #aabbcc)");
+        let box_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let started = std::time::Instant::now();
+        {
+            let mut canvas = surface.canvas();
+            for _ in 0..10 {
+                paint_gradient(
+                    &mut canvas,
+                    &gradient,
+                    box_rect,
+                    box_rect,
+                    &mut cx,
+                    Rgba::TRANSPARENT,
+                    BlendMode::SrcOver,
+                );
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "ten 100x100 per-pixel gradient paints took {elapsed:?}"
+        );
     }
 
     #[test]
