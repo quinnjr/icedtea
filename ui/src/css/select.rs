@@ -7,12 +7,10 @@
 //! [`selectors::Element`], so the upstream matcher drives selection with no
 //! fork and no shim.
 
-use std::borrow::Borrow;
 use std::fmt;
 use std::rc::Rc;
 
 use cssparser::{CowRcStr, Parser as CssParser, ParserInput, SourceLocation, ToCss};
-use precomputed_hash::PrecomputedHash;
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
 use selectors::bloom::BloomFilter;
 use selectors::context::{
@@ -24,112 +22,10 @@ use selectors::parser::{
 };
 use selectors::{Element, OpaqueElement, SelectorImpl, SelectorList};
 
-/// An interned CSS identifier with a cached hash.
-///
-/// `selectors` requires `PrecomputedHash` on its `Identifier`, `LocalName`
-/// and `NamespaceUrl` types; one newtype covers all of them.
-#[derive(Clone, Debug)]
-pub struct CssString {
-    text: String,
-    hash: u32,
-}
-
-/// FNV-1a, 32-bit. Cheap, stable, and adequate for the ancestor-hash
-/// filtering `selectors` uses it for.
-fn fnv1a(bytes: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811C_9DC5;
-    for &b in bytes {
-        hash ^= u32::from(b);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
-}
-
-impl CssString {
-    /// Intern `text`, computing its hash once.
-    #[must_use]
-    pub fn new(text: &str) -> Self {
-        Self {
-            text: text.to_string(),
-            hash: fnv1a(text.as_bytes()),
-        }
-    }
-
-    /// The underlying text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.text
-    }
-}
-
-impl PartialEq for CssString {
-    fn eq(&self, other: &Self) -> bool {
-        self.text == other.text
-    }
-}
-
-impl Eq for CssString {}
-
-impl Default for CssString {
-    fn default() -> Self {
-        Self::new("")
-    }
-}
-
-impl From<&str> for CssString {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl Borrow<str> for CssString {
-    fn borrow(&self) -> &str {
-        &self.text
-    }
-}
-
-impl PrecomputedHash for CssString {
-    fn precomputed_hash(&self) -> u32 {
-        self.hash
-    }
-}
-
-impl ToCss for CssString {
-    fn to_css<W: fmt::Write>(&self, dest: &mut W) -> fmt::Result {
-        dest.write_str(&self.text)
-    }
-}
-
-/// Writing direction, the argument `:dir()` matches against.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Direction {
-    /// Left-to-right. GTK's default, and this engine's.
-    #[default]
-    Ltr,
-    /// Right-to-left.
-    Rtl,
-}
-
-impl Direction {
-    /// Parse `ltr`/`rtl`, ASCII-case-insensitively.
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Self> {
-        if text.eq_ignore_ascii_case("ltr") {
-            Some(Self::Ltr)
-        } else if text.eq_ignore_ascii_case("rtl") {
-            Some(Self::Rtl)
-        } else {
-            None
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Ltr => "ltr",
-            Self::Rtl => "rtl",
-        }
-    }
-}
+// `CssString` and `Direction` live with the tree they describe (contract §3);
+// they are re-exported here because every M1 caller reaches them through
+// `css::select`, and `ui/tests/themed_button_offscreen.rs` may not be edited.
+pub use crate::css::node::{CssString, Direction};
 
 /// The pseudo-classes M1 models, plus a catch-all.
 ///
