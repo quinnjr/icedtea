@@ -7,6 +7,7 @@ pub mod border;
 pub mod geometry;
 pub mod outline;
 pub mod shadow;
+pub mod text;
 
 use std::collections::HashMap;
 
@@ -26,6 +27,7 @@ pub use geometry::{
 };
 pub use outline::paint_outline;
 pub use shadow::paint_box_shadows;
+pub use text::paint_text;
 
 /// Everything a paint pass needs beyond the node's own style and geometry.
 pub struct PaintCx<'a> {
