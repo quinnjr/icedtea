@@ -5,10 +5,11 @@
 //! the *last* layer's `background-clip` -- CSS Backgrounds L3 §3.11.
 
 use skia_rs_safe::canvas::{Canvas, ClipOp};
+use skia_rs_safe::paint::{BlendMode, Paint};
 
 use crate::css::computed::BackgroundLayer;
 use crate::css::value::image::{GradientKind, RadialExtent, RadialShape};
-use crate::css::value::{Gradient, Image, Keyword, LengthCtx, Position, Rgba};
+use crate::css::value::{BgSize, Gradient, Image, Keyword, LengthCtx, Position, RepeatStyle, Rgba};
 use crate::layout::{Allocation, Rect};
 use crate::paint::{PaintCx, fill_paint, radii_for_box, rounded_rect_path};
 
@@ -62,20 +63,47 @@ fn paint_layer(
                 let origin = alloc.box_for(layer.origin);
                 let mut paint = fill_paint(rgba);
                 paint.set_anti_alias(false);
+                paint.set_blend_mode(blend_mode_for(layer.blend));
                 canvas.draw_rect(&origin.to_skia(), &paint);
             }
         }
         Image::Gradient(gradient) => {
             let origin = alloc.box_for(layer.origin);
-            let len_ctx = LengthCtx {
-                percent_basis: Some(origin.width),
-                ..cx.base_length_ctx()
-            };
-            paint_gradient(canvas, gradient, origin, clip_rect, cx, current, &len_ctx);
+            paint_gradient(
+                canvas,
+                gradient,
+                origin,
+                clip_rect,
+                cx,
+                current,
+                blend_mode_for(layer.blend),
+            );
         }
-        // `url()`, `cross-fade()` and icon references land in Task 10;
-        // `-gtk-icon-*` never paints in M2.
-        Image::None | Image::Url(_) | Image::CrossFade(_) | Image::Icon(_) => {}
+        Image::Url(url) => {
+            let origin = alloc.box_for(layer.origin);
+            let len_ctx = cx.base_length_ctx();
+            let Some((iw, ih)) = cx
+                .images
+                .get(url)
+                .map(|img| (img.width() as f32, img.height() as f32))
+            else {
+                // Recorded unresolved: paints nothing, already logged once.
+                canvas.restore_to_count(save);
+                return;
+            };
+            let tile = layer_tile(layer, origin, Some((iw, ih)), &len_ctx);
+            let rects = tile_positions(&tile, clip_rect, layer.repeat);
+            let mut paint = Paint::new();
+            paint.set_blend_mode(blend_mode_for(layer.blend));
+            if let Some(image) = cx.images.get(url) {
+                for rect in rects {
+                    canvas.draw_image_rect(image, None, &rect.to_skia(), Some(&paint));
+                }
+            }
+        }
+        // `cross-fade()` and `-gtk-*` icon images are stored by the registry
+        // and drawn in M4; they paint nothing here (spec, Out of scope).
+        Image::None | Image::CrossFade(_) | Image::Icon(_) => {}
     }
 
     canvas.restore_to_count(save);
@@ -208,11 +236,15 @@ pub fn paint_gradient(
     clip: Rect,
     cx: &mut PaintCx<'_>,
     current: Rgba,
-    len_ctx: &LengthCtx,
+    blend: BlendMode,
 ) {
     if origin.is_empty() || clip.is_empty() {
         return;
     }
+    let len_ctx = &LengthCtx {
+        percent_basis: Some(origin.width),
+        ..cx.base_length_ctx()
+    };
     let color_ctx = cx.color_ctx(current);
     let (x0, x1) = (clip.x.floor() as i32, clip.right().ceil() as i32);
     let (y0, y1) = (clip.y.floor() as i32, clip.bottom().ceil() as i32);
@@ -235,6 +267,7 @@ pub fn paint_gradient(
     let band = |canvas: &mut Canvas<'_>, rect: Rect, color: Rgba| {
         let mut paint = fill_paint(color);
         paint.set_anti_alias(false);
+        paint.set_blend_mode(blend);
         canvas.draw_rect(&rect.to_skia(), &paint);
     };
 
@@ -276,19 +309,161 @@ pub fn paint_gradient(
     }
 }
 
+/// One placed copy of a background image, plus its repeat pitch.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Tile {
+    /// Where the first copy goes.
+    pub rect: Rect,
+    /// Horizontal distance between copies.
+    pub step_x: f32,
+    /// Vertical distance between copies.
+    pub step_y: f32,
+}
+
+/// Size and place one layer's image inside `origin`.
+///
+/// `intrinsic` is the image's own size when it has one (a decoded `url()`);
+/// gradients have none, so `auto` resolves to the whole origin box.
+#[must_use]
+pub fn layer_tile(
+    layer: &BackgroundLayer,
+    origin: Rect,
+    intrinsic: Option<(f32, f32)>,
+    ctx: &LengthCtx,
+) -> Tile {
+    let (iw, ih) = intrinsic.unwrap_or((origin.width, origin.height));
+    let mut w_ctx = *ctx;
+    w_ctx.percent_basis = Some(origin.width);
+    let mut h_ctx = *ctx;
+    h_ctx.percent_basis = Some(origin.height);
+
+    let (w, h) = match &layer.size {
+        BgSize::Auto => (iw, ih),
+        BgSize::Cover | BgSize::Contain => {
+            if iw <= 0.0 || ih <= 0.0 {
+                (origin.width, origin.height)
+            } else {
+                let sx = origin.width / iw;
+                let sy = origin.height / ih;
+                let s = if matches!(layer.size, BgSize::Cover) {
+                    sx.max(sy)
+                } else {
+                    sx.min(sy)
+                };
+                (iw * s, ih * s)
+            }
+        }
+        BgSize::Explicit(x, y) => (
+            x.resolve(&w_ctx).unwrap_or(iw),
+            y.resolve(&h_ctx).unwrap_or(ih),
+        ),
+    };
+    let (w, h) = (
+        if w.is_finite() && w > 0.0 { w } else { 0.0 },
+        if h.is_finite() && h > 0.0 { h } else { 0.0 },
+    );
+
+    // CSS resolves a background-position percentage against
+    // `container - image`, not against the container.
+    let mut px_ctx = *ctx;
+    px_ctx.percent_basis = Some(origin.width - w);
+    let mut py_ctx = *ctx;
+    py_ctx.percent_basis = Some(origin.height - h);
+    let x = layer.position.x.resolve(&px_ctx).unwrap_or(0.0);
+    let y = layer.position.y.resolve(&py_ctx).unwrap_or(0.0);
+
+    Tile {
+        rect: Rect::new(origin.x + x, origin.y + y, w, h),
+        step_x: w,
+        step_y: h,
+    }
+}
+
+/// Every copy of `tile` that intersects `clip`, per `repeat`.
+#[must_use]
+pub fn tile_positions(tile: &Tile, clip: Rect, repeat: RepeatStyle) -> Vec<Rect> {
+    let repeats = |axis: Keyword| matches!(axis, Keyword::Repeat | Keyword::Round | Keyword::Space);
+    let count = |start: f32, step: f32, lo: f32, hi: f32| -> (i32, i32) {
+        if !(step.is_finite() && step > 0.0) {
+            return (0, 0);
+        }
+        let first = ((lo - start) / step).floor() as i32;
+        // Not `.ceil()`: for a non-exact `(hi - start) / step` (e.g. a 40px
+        // clip tiled from x=5 in 10px steps -> 3.5), rounding up lands a
+        // whole extra step past `hi` with zero overlap. `.floor()` keeps the
+        // last index whose start is at-or-before `hi` (still touching-
+        // inclusive when the division is exact, e.g. the y axis below).
+        let last = ((hi - start) / step).floor() as i32;
+        (first, last.max(first))
+    };
+
+    let (ix0, ix1) = if repeats(repeat.x) {
+        count(tile.rect.x, tile.step_x, clip.x, clip.right())
+    } else {
+        (0, 0)
+    };
+    let (iy0, iy1) = if repeats(repeat.y) {
+        count(tile.rect.y, tile.step_y, clip.y, clip.bottom())
+    } else {
+        (0, 0)
+    };
+
+    let mut out = Vec::new();
+    for iy in iy0..=iy1 {
+        for ix in ix0..=ix1 {
+            out.push(Rect::new(
+                tile.step_x.mul_add(ix as f32, tile.rect.x),
+                tile.step_y.mul_add(iy as f32, tile.rect.y),
+                tile.rect.width,
+                tile.rect.height,
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push(tile.rect);
+    }
+    out
+}
+
+/// CSS `background-blend-mode` keyword -> `skia-rs` blend mode.
+#[must_use]
+pub fn blend_mode_for(keyword: Keyword) -> BlendMode {
+    match keyword {
+        Keyword::Multiply => BlendMode::Multiply,
+        Keyword::Screen => BlendMode::Screen,
+        Keyword::Overlay => BlendMode::Overlay,
+        Keyword::Darken => BlendMode::Darken,
+        Keyword::Lighten => BlendMode::Lighten,
+        Keyword::ColorDodge => BlendMode::ColorDodge,
+        Keyword::ColorBurn => BlendMode::ColorBurn,
+        Keyword::HardLight => BlendMode::HardLight,
+        Keyword::SoftLight => BlendMode::SoftLight,
+        Keyword::Difference => BlendMode::Difference,
+        Keyword::Exclusion => BlendMode::Exclusion,
+        Keyword::Hue => BlendMode::Hue,
+        Keyword::Saturation => BlendMode::Saturation,
+        Keyword::ColorBlend => BlendMode::Color,
+        Keyword::Luminosity => BlendMode::Luminosity,
+        _ => BlendMode::SrcOver,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{Tile, blend_mode_for, layer_tile, tile_positions};
     use crate::css::cascade::CompiledSheet;
     use crate::css::computed::{ComputedStyle, ResolveEnv};
     use crate::css::node::Node;
     use crate::css::registry::Prop;
     use crate::css::select::MatchCx;
+    use crate::css::value::RepeatStyle;
     use crate::css::value::{Keyword, Rgba};
     use crate::layout::{Allocation, Rect};
     use crate::paint::{ImageCache, PaintCx, paint_backgrounds, radii_for_box};
     use crate::text::FontDatabase;
     use skia_rs_safe::canvas::Surface;
     use skia_rs_safe::core::Color;
+    use skia_rs_safe::paint::BlendMode;
 
     /// A 40x20 node with a 4px border and 4px padding, painted from `css`.
     fn painted(css: &str) -> Surface {
@@ -495,5 +670,99 @@ mod tests {
         ] {
             let _ = painted(css);
         }
+    }
+
+    #[test]
+    fn a_sized_and_positioned_tile_lands_where_the_css_says() {
+        // `background-size: 10px 5px; background-position: right bottom` in a
+        // 40x20 origin box. Mutation check: resolving `right` as 100% of the
+        // box rather than `box - tile` puts the tile off the right edge.
+        let sheet = CompiledSheet::compile(
+            "button { background-image: image(#f00); background-size: 10px 5px; \
+             background-position: right bottom }",
+        );
+        let window = Node::new("window");
+        let button = Node::new("button");
+        window.append_child(&button);
+        let env = ResolveEnv::default();
+        let mut cx = MatchCx::new();
+        let style = ComputedStyle::resolve_chain(&sheet, &button, &env, &mut cx);
+        let layer = style.background_layers().pop().expect("one layer");
+        let ctx = style.length_ctx(&env, None);
+        let tile = layer_tile(&layer, Rect::new(0.0, 0.0, 40.0, 20.0), None, &ctx);
+        assert_eq!(tile.rect, Rect::new(30.0, 15.0, 10.0, 5.0));
+    }
+
+    #[test]
+    fn repeat_tiles_across_the_clip_and_no_repeat_paints_once() {
+        // Mutation check: stepping from the clip's origin instead of the
+        // tile's makes the first repeated rect land at x == 0 instead of -10.
+        let tile = Tile {
+            rect: Rect::new(5.0, 5.0, 10.0, 5.0),
+            step_x: 10.0,
+            step_y: 5.0,
+        };
+        let clip = Rect::new(0.0, 0.0, 40.0, 20.0);
+        let once = tile_positions(
+            &tile,
+            clip,
+            RepeatStyle {
+                x: Keyword::NoRepeat,
+                y: Keyword::NoRepeat,
+            },
+        );
+        assert_eq!(once, vec![tile.rect]);
+
+        let both = tile_positions(
+            &tile,
+            clip,
+            RepeatStyle {
+                x: Keyword::Repeat,
+                y: Keyword::Repeat,
+            },
+        );
+        assert!(both.contains(&Rect::new(-5.0, 0.0, 10.0, 5.0)));
+        assert!(both.contains(&Rect::new(35.0, 15.0, 10.0, 5.0)));
+        assert_eq!(both.len(), 5 * 5);
+
+        let x_only = tile_positions(
+            &tile,
+            clip,
+            RepeatStyle {
+                x: Keyword::Repeat,
+                y: Keyword::NoRepeat,
+            },
+        );
+        assert!(x_only.iter().all(|r| (r.y - 5.0).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn every_css_background_blend_mode_maps_to_a_skia_blend_mode() {
+        // Mutation check: mapping Keyword::ColorBlend to BlendMode::Color is
+        // the whole point of the ColorBlend rename; sending it to SrcOver
+        // silently disables the mode.
+        assert_eq!(blend_mode_for(Keyword::Normal), BlendMode::SrcOver);
+        assert_eq!(blend_mode_for(Keyword::Multiply), BlendMode::Multiply);
+        assert_eq!(blend_mode_for(Keyword::ColorDodge), BlendMode::ColorDodge);
+        assert_eq!(blend_mode_for(Keyword::ColorBlend), BlendMode::Color);
+        assert_eq!(blend_mode_for(Keyword::Luminosity), BlendMode::Luminosity);
+        assert_eq!(
+            blend_mode_for(Keyword::Auto),
+            BlendMode::SrcOver,
+            "unknown falls back"
+        );
+    }
+
+    #[test]
+    fn an_undecodable_url_paints_nothing_and_is_not_an_error() {
+        // Contract §2.5: `url()` that fails to decode is recorded-unresolved.
+        // Mutation check: treating it as an error would abort the whole
+        // background stack and lose the colour underneath.
+        let surface = painted(
+            "button { background-color: #112233; \
+             background-image: url(\"/nonexistent/icedtea-test.png\"); \
+             border-radius: 0; border: 0 solid transparent; padding: 0 }",
+        );
+        assert_eq!(pixel(&surface, 20, 10), Color(0xFF11_2233));
     }
 }
