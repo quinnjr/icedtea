@@ -719,6 +719,14 @@ fn a_non_grabbing_popup_never_moves_keyboard_focus() {
 /// to force a real re-send) to work around it from this repository. Fixing
 /// this needs either a wlr crate change or C-level wlroots investigation
 /// P2 cannot do from the compositor side alone -- see the task 10 report.
+///
+/// **Status (Task 10 fix round 1): escalated, awaiting a controller
+/// decision** between (A) a wlr crate fix / new forced-reconfigure API in
+/// the wlr-m3-popups worktree, routed through the controller's own
+/// patch/publish workflow per CONTROLLER NOTE 1, or (B) accepting this gap
+/// for the milestone with this test permanently `#[ignore]`d. Do not
+/// silently drop this note on a future edit of this file -- the decision is
+/// still open.
 #[ignore = "library-owned: a second real wlr_xdg_popup_unconstrain_from_box \
             call on an already-configured popup does not change the \
             client-visible configure, even though the model recomputes a \
