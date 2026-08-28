@@ -9,6 +9,7 @@
 //! keyboard state defined in the same module.
 
 use std::os::fd::OwnedFd;
+use std::time::Duration;
 
 use xkbcommon::xkb;
 
@@ -155,6 +156,17 @@ impl ModIndices {
     }
 }
 
+/// The key currently repeating, and when its next repeat is due.
+#[derive(Debug, Clone)]
+struct Repeat {
+    /// The event to re-emit, already marked `repeat: true`.
+    event: KeyEvent,
+    /// The clock reading the next repeat fires at.
+    next: Duration,
+    /// The gap between repeats, from `wl_keyboard.repeat_info`'s rate.
+    interval: Duration,
+}
+
 /// A compiled keymap, its live state, and the compose table.
 pub struct Keymap {
     /// Kept alive for the keymap and compose table that borrow it in C.
@@ -167,7 +179,12 @@ pub struct Keymap {
     state: xkb::State,
     compose: Option<xkb::compose::State>,
     mods: ModIndices,
-    // Repeat fields arrive in Task 5.
+    /// `wl_keyboard.repeat_info`'s rate, in characters per second. `<= 0`
+    /// disables repeat entirely.
+    repeat_rate: i32,
+    /// `wl_keyboard.repeat_info`'s delay before the first repeat, in ms.
+    repeat_delay: i32,
+    repeat: Option<Repeat>,
 }
 
 impl Keymap {
@@ -182,6 +199,9 @@ impl Keymap {
             state,
             compose,
             mods,
+            repeat_rate: 25,
+            repeat_delay: 600,
+            repeat: None,
         }
     }
 
@@ -334,6 +354,68 @@ impl Keymap {
     #[must_use]
     pub fn repeats(&self, keycode: u32) -> bool {
         self.keymap.key_repeats(xkb_keycode(keycode))
+    }
+
+    /// From `wl_keyboard.repeat_info`. `rate == 0` disables repeat entirely.
+    ///
+    /// Applied to the *next* armed key, not retroactively: a rate change
+    /// mid-hold is not something the protocol expects a client to interpolate.
+    pub fn set_repeat_info(&mut self, rate: i32, delay: i32) {
+        self.repeat_rate = rate;
+        self.repeat_delay = delay.max(0);
+        if rate <= 0 {
+            self.repeat = None;
+        }
+    }
+
+    /// Arm the repeat timer for a held key, or disarm it.
+    ///
+    /// A release, a key the keymap says never repeats, and a disabled rate all
+    /// disarm: `arm_repeat` is called for every key event so there is exactly
+    /// one place that decides.
+    pub fn arm_repeat(&mut self, ev: &KeyEvent, now: Duration) {
+        if !ev.pressed || self.repeat_rate <= 0 || !self.repeats(ev.keycode) {
+            self.repeat = None;
+            return;
+        }
+        let interval = Duration::from_secs_f64(1.0 / f64::from(self.repeat_rate));
+        let mut event = ev.clone();
+        event.repeat = true;
+        self.repeat = Some(Repeat {
+            event,
+            next: now + Duration::from_millis(u64::from(self.repeat_delay.unsigned_abs())),
+            interval,
+        });
+    }
+
+    /// Disarm. `wl_keyboard.leave` and a lost keyboard capability both call it:
+    /// a key held when focus left is not held any more as far as we can know.
+    pub fn clear_repeat(&mut self) {
+        self.repeat = None;
+    }
+
+    /// How long until the next repeat, or `None` if nothing is armed.
+    ///
+    /// `Duration::ZERO` is a legitimate "now" -- the caller polls with a zero
+    /// timeout and immediately gets the event from [`Self::repeat_due`]; it is
+    /// never a reason to spin.
+    #[must_use]
+    pub fn repeat_deadline(&self, now: Duration) -> Option<Duration> {
+        self.repeat.as_ref().map(|r| r.next.saturating_sub(now))
+    }
+
+    /// The synthetic repeat due at `now`, if any.
+    ///
+    /// At most one per call, and the next one is scheduled from `now`: a pump
+    /// that was blocked for seconds must not flush a burst of repeats into an
+    /// entry.
+    pub fn repeat_due(&mut self, now: Duration) -> Option<KeyEvent> {
+        let repeat = self.repeat.as_mut()?;
+        if now < repeat.next {
+            return None;
+        }
+        repeat.next = now + repeat.interval;
+        Some(repeat.event.clone())
     }
 
     /// Run the compose table over one keysym.
@@ -766,5 +848,128 @@ mod tests {
         assert_eq!(ctrl_a.effective_mods(), Mods::CTRL);
         assert!(ctrl_a.matches(xkb::Keysym::a, Mods::CTRL));
         assert!(!ctrl_a.matches(xkb::Keysym::a, Mods::empty()));
+    }
+
+    use std::time::Duration;
+
+    /// The defaults a compositor sends: 25 chars/sec after 600 ms.
+    fn repeating() -> Keymap {
+        let mut keymap = us();
+        keymap.set_repeat_info(25, 600);
+        keymap
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn a_held_key_repeats_after_the_delay_and_then_at_the_rate() {
+        let mut keymap = repeating();
+        let press = keymap.translate(KEY_A, true, 1, 0);
+        keymap.arm_repeat(&press, ms(1_000));
+
+        assert_eq!(
+            keymap.repeat_deadline(ms(1_000)),
+            Some(ms(600)),
+            "the delay comes first"
+        );
+        assert!(
+            keymap.repeat_due(ms(1_500)).is_none(),
+            "not yet: 600 ms have not passed"
+        );
+
+        let first = keymap
+            .repeat_due(ms(1_600))
+            .expect("the first repeat is due");
+        assert_eq!(first.keysym, xkb::Keysym::a);
+        assert_eq!(first.utf8.as_deref(), Some("a"));
+        assert!(first.repeat, "a synthesised repeat says so");
+        assert!(first.pressed);
+
+        // 25 chars/sec == one every 40 ms.
+        assert_eq!(keymap.repeat_deadline(ms(1_600)), Some(ms(40)));
+        assert!(keymap.repeat_due(ms(1_630)).is_none());
+        assert!(keymap.repeat_due(ms(1_640)).is_some());
+        assert!(keymap.repeat_due(ms(1_680)).is_some());
+    }
+
+    #[test]
+    fn a_key_up_and_a_focus_leave_both_disarm_the_repeat() {
+        let mut keymap = repeating();
+        let press = keymap.translate(KEY_A, true, 1, 0);
+        keymap.arm_repeat(&press, ms(0));
+        assert!(keymap.repeat_deadline(ms(0)).is_some());
+
+        let release = keymap.translate(KEY_A, false, 2, 10);
+        keymap.arm_repeat(&release, ms(10));
+        assert!(
+            keymap.repeat_deadline(ms(10)).is_none(),
+            "a release disarms"
+        );
+        assert!(keymap.repeat_due(ms(10_000)).is_none());
+
+        keymap.arm_repeat(&press, ms(20));
+        keymap.clear_repeat();
+        assert!(
+            keymap.repeat_deadline(ms(20)).is_none(),
+            "wl_keyboard.leave disarms"
+        );
+    }
+
+    #[test]
+    fn a_key_the_keymap_says_never_repeats_is_never_armed() {
+        let mut keymap = repeating();
+        let shift = keymap.translate(KEY_LEFTSHIFT, true, 1, 0);
+        keymap.arm_repeat(&shift, ms(0));
+        assert!(keymap.repeat_deadline(ms(0)).is_none());
+        assert!(keymap.repeat_due(ms(10_000)).is_none());
+    }
+
+    #[test]
+    fn a_zero_rate_disables_repeat_entirely() {
+        // `wl_keyboard.repeat_info` with rate 0 means "the client must not
+        // repeat" -- a compositor that owns repeat itself sends it.
+        let mut keymap = us();
+        keymap.set_repeat_info(0, 600);
+        let press = keymap.translate(KEY_A, true, 1, 0);
+        keymap.arm_repeat(&press, ms(0));
+        assert!(keymap.repeat_deadline(ms(0)).is_none());
+        assert!(keymap.repeat_due(ms(60_000)).is_none());
+        // And a negative rate, which the protocol types allow, behaves the same.
+        keymap.set_repeat_info(-5, 600);
+        keymap.arm_repeat(&press, ms(0));
+        assert!(keymap.repeat_due(ms(60_000)).is_none());
+    }
+
+    #[test]
+    fn a_late_pump_produces_one_repeat_not_a_burst() {
+        // The window was blocked for two seconds (a slow relayout, a stopped
+        // debugger). Emitting the 50 repeats that "should" have happened
+        // would dump 50 characters into an entry at once.
+        let mut keymap = repeating();
+        let press = keymap.translate(KEY_A, true, 1, 0);
+        keymap.arm_repeat(&press, ms(0));
+        assert!(
+            keymap.repeat_due(ms(3_000)).is_some(),
+            "the first catch-up fires"
+        );
+        assert!(keymap.repeat_due(ms(3_000)).is_none(), "and only one");
+        assert_eq!(
+            keymap.repeat_deadline(ms(3_000)),
+            Some(ms(40)),
+            "the next one is scheduled from now, not from the missed deadline"
+        );
+    }
+
+    #[test]
+    fn a_repeat_deadline_of_zero_means_now_and_never_spins() {
+        let mut keymap = repeating();
+        let press = keymap.translate(KEY_A, true, 1, 0);
+        keymap.arm_repeat(&press, ms(0));
+        // Exactly at the deadline: "now", not a negative duration, and the
+        // event is actually available.
+        assert_eq!(keymap.repeat_deadline(ms(600)), Some(Duration::ZERO));
+        assert!(keymap.repeat_due(ms(600)).is_some());
     }
 }
