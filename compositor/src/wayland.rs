@@ -49,6 +49,38 @@ impl ToplevelKey {
     }
 }
 
+/// Identifies one live client popup.
+///
+/// The popup twin of [`ToplevelKey`], and wrapped for the same reason: this
+/// file stays the only one that mentions the compositor library's own id
+/// types, so a key held past the popup's departure resolves to nothing rather
+/// than to freed memory or to a different popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PopupKey(pub(crate) wlr::PopupId);
+
+impl PopupKey {
+    /// Wrap a library id. Only the handler impls call this.
+    ///
+    /// `#[allow(dead_code)]`: no handler impl calls this yet -- Task 3 wires
+    /// the six `ToplevelHandler` popup methods that do. Task 2 (this commit)
+    /// only produces the seam; nothing in the plan's file split lets both
+    /// land in one commit.
+    #[allow(dead_code)]
+    pub(crate) fn new(id: wlr::PopupId) -> Self {
+        PopupKey(id)
+    }
+
+    /// A key that no live client can have, for tests that drive `State`'s
+    /// popup entry points without a client.
+    ///
+    /// Same contract as [`ToplevelKey::for_test`]: `n` only distinguishes one
+    /// test key from another, and a key built this way never resolves to a
+    /// live popup, so every outbound push through it is a no-op.
+    pub fn for_test(n: u64) -> Self {
+        PopupKey(wlr::PopupId::dangling_nth_for_test(n))
+    }
+}
+
 /// Which kind of client surface backs a model window — the one focus/
 /// stacking/SSD/geometry path serves both, and every outbound seam method
 /// dispatches on this (M2, XWayland design Decision 2). `Xdg` is a native
@@ -511,6 +543,100 @@ impl Wayland {
             }
             None => runtime.clear_keyboard_focus(),
         }
+    }
+
+    /// Unconstrain `popup` against `constraint` and answer its
+    /// `xdg_surface` with a configure.
+    ///
+    /// `constraint` is in the **root toplevel/layer surface's own coordinate
+    /// system**, not layout or output space -- `wlr_xdg_popup_unconstrain_from_box`'s
+    /// own header says so, and contract ruling R7 restates it. The caller
+    /// ([`crate::state::State::popup_constraint_box`]) does the translation;
+    /// this method only converts the model's `Rectangle` to the library's box.
+    ///
+    /// `false` on a miss (no runtime, popup gone, or the popup's surface not
+    /// `initialized` yet, in which case the library skips the configure rather
+    /// than tripping wlroots' own assert -- see contract §1.2's
+    /// `Popup::send_configure`).
+    /// `#[allow(dead_code)]`: no `state.rs` caller exists yet -- Task 3
+    /// wires `State::popup_constraint_box` and friends onto these six
+    /// methods. Unused only in this commit's isolation.
+    #[allow(dead_code)]
+    pub(crate) fn configure_popup(&self, popup: PopupKey, constraint: Rectangle) -> bool {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return false;
+        };
+        runtime.configure_popup(
+            popup.0,
+            &wlr::Box2D::new(
+                constraint.x,
+                constraint.y,
+                constraint.width,
+                constraint.height,
+            ),
+        )
+    }
+
+    /// Where `popup` currently *is*, in its chain root's surface coordinates:
+    /// `wlr_xdg_popup_get_toplevel_coords` for the origin,
+    /// `wlr_xdg_popup_state.geometry` for the size.
+    ///
+    /// Committed state, not scheduled: between a configure and the client's
+    /// ack this still names the old position, which is exactly right for
+    /// hit-testing -- a popup keeps taking clicks where it is drawn.
+    #[allow(dead_code)]
+    pub(crate) fn popup_geometry(&self, popup: PopupKey) -> Option<Rectangle> {
+        let runtime = self.runtime.as_ref()?;
+        let handle = runtime.popup(popup.0)?;
+        let (x, y) = handle.toplevel_coords(0, 0);
+        let geometry = handle.geometry();
+        Some(Rectangle {
+            x,
+            y,
+            width: geometry.width,
+            height: geometry.height,
+        })
+    }
+
+    /// Whether the client asked for its popup to be re-unconstrained whenever
+    /// the parent moves (`xdg_positioner.set_reactive`).
+    #[allow(dead_code)]
+    pub(crate) fn popup_is_reactive(&self, popup: PopupKey) -> bool {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.popup(popup.0))
+            .is_some_and(|handle| handle.is_reactive())
+    }
+
+    /// Whether the client sent `xdg_popup.grab` for this popup.
+    #[allow(dead_code)]
+    pub(crate) fn popup_is_grabbing(&self, popup: PopupKey) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.popup_is_grabbing(popup.0))
+    }
+
+    /// Send `xdg_popup.popup_done` to `popup` and, deepest-first, to every
+    /// popup under it. Returns how many were dismissed (`0` on any miss).
+    #[allow(dead_code)]
+    pub(crate) fn dismiss_popup(&self, popup: PopupKey) -> usize {
+        self.runtime
+            .as_ref()
+            .map_or(0, |runtime| runtime.dismiss_popup(popup.0))
+    }
+
+    /// Whether *some* explicit seat grab is in force right now -- an
+    /// xdg-popup grab or a drag-and-drop grab.
+    ///
+    /// The compositor never installs one of these itself: wlroots owns the
+    /// popup grab's whole lifetime (contract §1.6). This is the read that
+    /// tells `sync_seat_focus` to keep its hands off the seat's keyboard
+    /// while one is up.
+    #[allow(dead_code)]
+    pub(crate) fn has_explicit_grab(&self) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(wlr::Runtime::seat_has_explicit_grab)
     }
 
     /// Ask the client to close. `false` means there is no client, and the
@@ -1062,5 +1188,39 @@ mod tests {
             crate::decoration::button_rects(bar),
             crate::decoration::button_rects(frame)
         );
+    }
+
+    /// `PopupKey::for_test` mints distinct, dangling keys, and every seam
+    /// method is a silent no-op against a `Wayland` with no runtime attached
+    /// -- the property every unit test in `state.rs` relies on and the one
+    /// this file's module doc states for all of its outbound methods.
+    ///
+    /// Mutation check: make `configure_popup` `unwrap()` the runtime instead
+    /// of `?`-ing it and this test panics.
+    #[test]
+    fn popup_keys_are_distinct_and_every_popup_seam_method_no_ops_without_a_runtime() {
+        let a = PopupKey::for_test(1);
+        let b = PopupKey::for_test(2);
+        assert_eq!(a, PopupKey::for_test(1), "the same n gives the same key");
+        assert_ne!(a, b, "distinct n gives distinct keys");
+
+        let wayland = Wayland::new();
+        assert!(
+            !wayland.configure_popup(
+                a,
+                Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100
+                }
+            ),
+            "no runtime: configuring a popup reports failure rather than panicking"
+        );
+        assert_eq!(wayland.popup_geometry(a), None);
+        assert!(!wayland.popup_is_reactive(a));
+        assert!(!wayland.popup_is_grabbing(a));
+        assert_eq!(wayland.dismiss_popup(a), 0);
+        assert!(!wayland.has_explicit_grab());
     }
 }
