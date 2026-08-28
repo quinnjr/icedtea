@@ -10,14 +10,14 @@
 //!
 //! Contract: `docs/superpowers/plans/2026-08-27-m3-part0-contract.md` §2.4
 //! fixes these twelve names and this order.
-#![allow(unused_imports, dead_code)]
+#![allow(dead_code)]
 
 use std::time::Duration;
 
 use icedtea_contract::Rectangle;
 use icedtea_harness::{
     Compositor, PopupAnchor, PopupConstraint, PopupGravity, PopupSpec, SessionLockClient,
-    TestClient, VirtualKeyboardClient, VirtualPointerClient,
+    TestClient, VirtualPointerClient,
 };
 
 /// `BTN_LEFT`, the only button the compositor's decoration path acts on.
@@ -444,6 +444,21 @@ fn wait_for_focus(comp: &Compositor, app_id: &str, window: Duration) -> bool {
     }
 }
 
+/// Poll the model until it holds exactly `count` windows, or `window`
+/// elapses. Returns whether it ever did.
+fn wait_for_window_count(comp: &Compositor, count: usize, window: Duration) -> bool {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        if comp.snapshot().windows.len() == count {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// One click outside a grabbing chain dismisses the **whole** chain, not just
 /// its topmost level.
 ///
@@ -664,5 +679,276 @@ fn a_non_grabbing_popup_never_moves_keyboard_focus() {
     assert_eq!(focused_app_id(&comp).as_deref(), Some("b.app"));
 
     a.detach();
+    b.detach();
+}
+
+/// A **reactive** popup is re-placed when its parent moves.
+///
+/// The popup is anchored so that it overflows the bottom of the usable area
+/// and has to slide: how far it slides is a pure function of where the parent
+/// surface sits, so dragging the parent upward must change the configured `y`.
+/// A non-reactive popup would keep the placement it was given, which is why
+/// `reconstrain_popups` filters on the flag.
+///
+/// Mutation check: delete the `reconstrain_popups(PopupRoot::Window(id))` call
+/// from `State::sync_window_to_scene` and the `wait_until` below times out --
+/// the popup keeps its original `y` for the whole drag.
+///
+/// **Reconciliation (Task 10, P2): ignored, library-owned.** The model side
+/// is provably correct -- `reconstrain_popups` runs on every
+/// `sync_window_to_scene`, reads a freshly recomputed
+/// `popup_constraint_box` (confirmed by direct instrumentation: the box's
+/// `y` genuinely changes from the drag, e.g. `-28` to `-8` for a 20px move),
+/// and hands it to `Wayland::configure_popup`, which returns `true`. But the
+/// wire trace (`WAYLAND_DEBUG=1`) shows the client-visible
+/// `xdg_popup.configure` is byte-identical across every one of these calls,
+/// including the one after the real move -- confirmed with a second,
+/// independent repro that swaps the trigger for `arrange_layers`'s call to
+/// the same function (a layer panel changing the usable area after the
+/// popup already configured) and sees the same freeze. The crate's own pure
+/// `PositionerRules::unconstrain_box` -- the oracle this file's first test
+/// pins against wlroots' C implementation for a *single* call -- predicts
+/// the correct changed value (`492` -> `512`) for these exact numbers, so
+/// the live C `wlr_xdg_popup_unconstrain_from_box` disagrees with the
+/// crate's own model specifically on a *second* call against an
+/// already-configured popup with the same positioner. `Popup::unconstrain`'s
+/// own doc already records one past surprise in this exact area ("contrary
+/// to what an earlier draft of this doc claimed..."), and the crate exposes
+/// no compositor-side equivalent of `xdg_popup.reposition` (the one path
+/// that *is* proven, by `a_reposition_request_reconfigures_and_echoes_the_token`,
+/// to force a real re-send) to work around it from this repository. Fixing
+/// this needs either a wlr crate change or C-level wlroots investigation
+/// P2 cannot do from the compositor side alone -- see the task 10 report.
+#[ignore = "library-owned: a second real wlr_xdg_popup_unconstrain_from_box \
+            call on an already-configured popup does not change the \
+            client-visible configure, even though the model recomputes a \
+            genuinely different constraint box each time -- see this test's \
+            doc and docs/superpowers/sdd/m3-part2/task-10-report.md"]
+#[test]
+fn a_reactive_popup_is_reconfigured_when_its_parent_moves() {
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut a = TestClient::map_toplevel(&comp.socket, "popup.app", "popup");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+
+    let content = content_rect_of(&comp, "popup.app");
+    let (ow, oh) = comp.output_size();
+
+    const H: i32 = 200;
+    const DRAG: i32 = 20;
+    let ay = oh - content.y - 100;
+    assert!(
+        ay > H && content.y > DRAG,
+        "this output ({ow}x{oh}, content at y = {}) leaves no room to drag \
+         the parent upward and still overflow",
+        content.y
+    );
+
+    a.open_popup(
+        PopupSpec::new(64, H)
+            .anchor_rect(0, ay, 1, 1)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight)
+            .constraint(PopupConstraint::SlideY)
+            .reactive(true),
+    );
+    let (_, before, _, _) = a
+        .popup_configured()
+        .expect("the reactive popup never configured");
+
+    // Press and hold inside the parent, then drive an interactive move: the
+    // button must still be down when `xdg_toplevel.move` arrives.
+    let start = (
+        content.x + content.width / 2,
+        content.y + content.height / 2,
+    );
+    let enters = a.pointer_enters();
+    vp.motion_absolute(start.0 as f64, start.1 as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert!(a.wait_until(|c| c.pointer_enters() > enters));
+    let buttons = a.pointer_buttons().len();
+    vp.button(BTN_LEFT, true);
+    vp.frame();
+    assert!(a.wait_until(|c| c.pointer_buttons()[buttons..].contains(&(BTN_LEFT, true))));
+    let serial = a.last_pointer_serial().expect("the press minted a serial");
+
+    a.request_move(serial);
+    comp.settle();
+    vp.motion_absolute(
+        start.0 as f64,
+        (start.1 - DRAG) as f64,
+        ow as u32,
+        oh as u32,
+    );
+    vp.frame();
+
+    // The compositor commits an interactive move's geometry on release, not
+    // on every intermediate motion event (`State::handle_pointer_release`'s
+    // `DragResult::Moved` arm is the only `set_geometry` call on this path) --
+    // so the reconfigure this test is after cannot be observed until the
+    // button comes back up.
+    vp.button(BTN_LEFT, false);
+    vp.frame();
+    comp.settle();
+
+    assert!(
+        a.wait_until(|c| c.popup_configured().map(|g| g.1) != Some(before)),
+        "a reactive popup must be re-placed when its parent moves; it kept \
+         y = {before}"
+    );
+
+    let moved = content_rect_of(&comp, "popup.app");
+    assert!(
+        moved.y < content.y,
+        "the drag must actually have moved the parent up: {} -> {}",
+        content.y,
+        moved.y
+    );
+    let (_, after, _, ph) = a.popup_configured().expect("still configured");
+    assert!(
+        after + ph <= oh - moved.y,
+        "the re-placed popup must still fit inside the usable area: \
+         y = {after}, h = {ph}, bottom = {}",
+        oh - moved.y
+    );
+
+    a.destroy_popup();
+    a.detach();
+}
+
+/// A popup on a window the lock screen is covering receives no input at all
+/// while the session is locked.
+///
+/// The isolation is the library's -- its hit test is rooted at the lock band
+/// while locked, so a popup on a hidden window is unreachable by construction
+/// (contract §1.5) -- and the compositor adds no second gate. This test is the
+/// executable proof of that claim, with its own positive controls on both
+/// sides of the lock so it cannot pass by the popup simply never having taken
+/// input.
+///
+/// Mutation check: the guard lives in `wlr`'s `Runtime::leaf_surface_at`.
+/// Deleting its lock branch makes the middle assertion fail. The two controls
+/// are what make that mutation the *only* way this test can pass.
+#[test]
+fn a_popup_on_a_hidden_window_receives_no_input_while_the_session_is_locked() {
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut a = TestClient::map_toplevel(&comp.socket, "popup.app", "popup");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+
+    let content = content_rect_of(&comp, "popup.app");
+    a.open_popup(
+        PopupSpec::new(64, 48)
+            .anchor_rect(10, 10, 20, 20)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+    let (px, py, pw, ph) = a.popup_configured().expect("the popup never configured");
+    // The popup's centre, in output coordinates.
+    let on_popup = (content.x + px + pw / 2, content.y + py + ph / 2);
+
+    // Control 1: unlocked, the popup takes clicks.
+    let buttons = a.pointer_buttons().len();
+    click_at(&comp, &mut vp, on_popup);
+    assert!(
+        a.wait_until(|c| c.pointer_buttons().len() > buttons),
+        "the popup never took a click even before the lock -- the rest of \
+         this test would be vacuous"
+    );
+
+    let mut locker = SessionLockClient::spawn(&comp.socket);
+    locker.lock();
+    assert!(locker.wait_locked(), "session never reported locked");
+    assert!(
+        comp.session_locked(),
+        "compositor is_session_locked() is false"
+    );
+
+    // The load-bearing assertion: nothing reaches the popup while locked.
+    let buttons = a.pointer_buttons().len();
+    click_at(&comp, &mut vp, on_popup);
+    assert!(
+        !a.wait_until_timeout(Duration::from_millis(300), |c| c.pointer_buttons().len()
+            > buttons),
+        "a popup behind the lock screen received a click"
+    );
+
+    // Control 2: unlocking restores it, so the silence above was the lock and
+    // not the popup having quietly gone away.
+    locker.unlock();
+    assert!(!comp.session_locked(), "still locked after unlock");
+    let buttons = a.pointer_buttons().len();
+    click_at(&comp, &mut vp, on_popup);
+    assert!(
+        a.wait_until(|c| c.pointer_buttons().len() > buttons),
+        "the popup did not take clicks again after unlocking"
+    );
+
+    a.destroy_popup();
+    a.detach();
+}
+
+/// A client that dies with a live popup chain takes the whole chain down with
+/// it, and the compositor survives.
+///
+/// The client is dropped without destroying anything -- `wayland-client` 0.31
+/// proxies send no destroy on drop, so this is a bare socket close, which is
+/// the shape a crashed application has. wlroots then frees the parent's scene
+/// tree, and every popup subtree hanging off it, recursively; a compositor
+/// that also destroyed a popup's own tree would double-free here (contract
+/// §1.5's rule, which `forget_toplevel`'s own doc in the `wlr` crate
+/// explains).
+///
+/// Mutation checks, one per repo. `wlr`: reintroduce a
+/// `wlr_scene_node_destroy` on the popup's tree in `forget_popup` and the
+/// compositor aborts, so every assertion below times out. `icedtea`: delete
+/// the `forget_popups_of_root` call from `State::forget_toplevel` and
+/// `a_dying_root_prunes_every_popup_under_it` (state.rs's own unit test)
+/// fails -- this e2e cannot see the model's popup map, which is exactly why
+/// that unit test exists alongside it.
+#[test]
+fn destroying_a_parent_destroys_its_popup_chain_without_a_double_free() {
+    let comp = Compositor::spawn();
+    let mut a = TestClient::map_toplevel(&comp.socket, "popup.app", "popup");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+
+    a.open_popup(
+        PopupSpec::new(64, 48)
+            .anchor_rect(10, 10, 20, 20)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+    a.open_popup_from_popup(
+        PopupSpec::new(32, 24)
+            .anchor_rect(5, 5, 10, 10)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+    assert_eq!(a.popup_depth(), 2);
+    assert!(wait_for_window_count(&comp, 1, Duration::from_secs(5)));
+
+    // No `detach`, no `destroy_popup`: the socket just closes.
+    drop(a);
+
+    assert!(
+        wait_for_window_count(&comp, 0, Duration::from_secs(5)),
+        "the compositor never dropped the dead client's window -- it is \
+         wedged or gone"
+    );
+
+    // Still alive and still serving: a fresh client maps, opens its own popup,
+    // and is configured.
+    let mut b = TestClient::map_toplevel(&comp.socket, "after.app", "after");
+    assert!(
+        b.wait_until(|c| c.last_configure().is_some()),
+        "the compositor no longer configures toplevels after the teardown"
+    );
+    b.open_popup(
+        PopupSpec::new(64, 48)
+            .anchor_rect(10, 10, 20, 20)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+    assert_eq!(b.popup_configured(), Some((10, 30, 64, 48)));
     b.detach();
 }
