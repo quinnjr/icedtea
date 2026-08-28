@@ -694,44 +694,22 @@ fn a_non_grabbing_popup_never_moves_keyboard_focus() {
 /// from `State::sync_window_to_scene` and the `wait_until` below times out --
 /// the popup keeps its original `y` for the whole drag.
 ///
-/// **Reconciliation (Task 10, P2): ignored, library-owned.** The model side
-/// is provably correct -- `reconstrain_popups` runs on every
-/// `sync_window_to_scene`, reads a freshly recomputed
-/// `popup_constraint_box` (confirmed by direct instrumentation: the box's
-/// `y` genuinely changes from the drag, e.g. `-28` to `-8` for a 20px move),
-/// and hands it to `Wayland::configure_popup`, which returns `true`. But the
-/// wire trace (`WAYLAND_DEBUG=1`) shows the client-visible
-/// `xdg_popup.configure` is byte-identical across every one of these calls,
-/// including the one after the real move -- confirmed with a second,
-/// independent repro that swaps the trigger for `arrange_layers`'s call to
-/// the same function (a layer panel changing the usable area after the
-/// popup already configured) and sees the same freeze. The crate's own pure
-/// `PositionerRules::unconstrain_box` -- the oracle this file's first test
-/// pins against wlroots' C implementation for a *single* call -- predicts
-/// the correct changed value (`492` -> `512`) for these exact numbers, so
-/// the live C `wlr_xdg_popup_unconstrain_from_box` disagrees with the
-/// crate's own model specifically on a *second* call against an
-/// already-configured popup with the same positioner. `Popup::unconstrain`'s
-/// own doc already records one past surprise in this exact area ("contrary
-/// to what an earlier draft of this doc claimed..."), and the crate exposes
-/// no compositor-side equivalent of `xdg_popup.reposition` (the one path
-/// that *is* proven, by `a_reposition_request_reconfigures_and_echoes_the_token`,
-/// to force a real re-send) to work around it from this repository. Fixing
-/// this needs either a wlr crate change or C-level wlroots investigation
-/// P2 cannot do from the compositor side alone -- see the task 10 report.
+/// **Reconciliation (Task 10, P2).** Two departures from the plan's text,
+/// both about *when* the move becomes observable rather than about what is
+/// asserted. First, the assertion is made after the button comes back up:
+/// the compositor commits an interactive move's geometry on release, not on
+/// every intermediate motion (`State::handle_pointer_release`'s
+/// `DragResult::Moved` arm is the only `set_geometry` call on this path), so
+/// the reconfigure cannot be observed mid-drag. Second, `DRAG` is 20 rather
+/// than 120, which is all the slide needs: the configured `y` moves by
+/// exactly the drag distance (492 -> 512 here), and a shorter drag keeps the
+/// pointer inside the parent for the whole gesture.
 ///
-/// **Status (Task 10 fix round 1): escalated, awaiting a controller
-/// decision** between (A) a wlr crate fix / new forced-reconfigure API in
-/// the wlr-m3-popups worktree, routed through the controller's own
-/// patch/publish workflow per CONTROLLER NOTE 1, or (B) accepting this gap
-/// for the milestone with this test permanently `#[ignore]`d. Do not
-/// silently drop this note on a future edit of this file -- the decision is
-/// still open.
-#[ignore = "library-owned: a second real wlr_xdg_popup_unconstrain_from_box \
-            call on an already-configured popup does not change the \
-            client-visible configure, even though the model recomputes a \
-            genuinely different constraint box each time -- see this test's \
-            doc and docs/superpowers/sdd/m3-part2/task-10-report.md"]
+/// An earlier round of this task read the mid-drag silence as a `wlr` bug and
+/// shipped the test `#[ignore]`d; it is not one. With the release in place the
+/// second `wlr_xdg_popup_unconstrain_from_box` re-sends a genuinely different
+/// configure, and the named mutation below has been run and does kill the
+/// test with its own message.
 #[test]
 fn a_reactive_popup_is_reconfigured_when_its_parent_moves() {
     let comp = Compositor::spawn();
