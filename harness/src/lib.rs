@@ -110,6 +110,12 @@ pub use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_
 /// `wayland-protocols` itself.
 pub use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
 
+/// The `xdg_positioner` enums, re-exported so a test can name an anchor or a
+/// gravity without depending on `wayland-protocols` itself.
+pub use wayland_protocols::xdg::shell::client::xdg_positioner::{
+    Anchor as PopupAnchor, ConstraintAdjustment as PopupConstraint, Gravity as PopupGravity,
+};
+
 /// How long any "wait for the compositor to do a thing" helper waits before
 /// declaring the harness broken.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -1829,6 +1835,84 @@ impl Dispatch<zwlr_gamma_control_v1::ZwlrGammaControlV1, ()> for ClientState {
             zwlr_gamma_control_v1::Event::GammaSize { size } => state.gamma_size = Some(size),
             zwlr_gamma_control_v1::Event::Failed => state.gamma_failed = true,
             _ => {}
+        }
+    }
+}
+
+/// Everything an `xdg_positioner` needs, in one value, so a test that opens a
+/// popup reads as one statement rather than eight setter calls.
+///
+/// The fields are the protocol's own: `anchor_rect` is `(x, y, width, height)`
+/// in the **parent's window-geometry** coordinates, `size` is the popup's
+/// requested size, and `constraint_adjustment` is the bitmask the compositor
+/// is allowed to use when the unadjusted position would fall outside the
+/// constraint box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PopupSpec {
+    pub anchor_rect: (i32, i32, i32, i32),
+    pub size: (i32, i32),
+    pub anchor: PopupAnchor,
+    pub gravity: PopupGravity,
+    pub constraint_adjustment: PopupConstraint,
+    pub offset: (i32, i32),
+    /// `Some(serial)` sends `xdg_popup.grab(seat, serial)` **before** the
+    /// first commit, as xdg-shell requires. The serial must come from
+    /// [`TestClient::last_pointer_serial`] after a button press.
+    pub grab: Option<u32>,
+    pub reactive: bool,
+}
+
+impl PopupSpec {
+    /// A `w` x `h` popup anchored at `(0, 0, 1, 1)` with anchor and gravity
+    /// both `BottomLeft`, no constraint adjustment, no grab and not reactive
+    /// -- the shape most tests want, with every interesting knob left to the
+    /// builders below.
+    pub fn new(w: i32, h: i32) -> Self {
+        PopupSpec {
+            anchor_rect: (0, 0, 1, 1),
+            size: (w, h),
+            anchor: PopupAnchor::BottomLeft,
+            gravity: PopupGravity::BottomLeft,
+            constraint_adjustment: PopupConstraint::empty(),
+            offset: (0, 0),
+            grab: None,
+            reactive: false,
+        }
+    }
+
+    pub fn anchor_rect(self, x: i32, y: i32, w: i32, h: i32) -> Self {
+        PopupSpec {
+            anchor_rect: (x, y, w, h),
+            ..self
+        }
+    }
+
+    pub fn anchor(self, a: PopupAnchor) -> Self {
+        PopupSpec { anchor: a, ..self }
+    }
+
+    pub fn gravity(self, g: PopupGravity) -> Self {
+        PopupSpec { gravity: g, ..self }
+    }
+
+    pub fn constraint(self, c: PopupConstraint) -> Self {
+        PopupSpec {
+            constraint_adjustment: c,
+            ..self
+        }
+    }
+
+    pub fn grab(self, serial: u32) -> Self {
+        PopupSpec {
+            grab: Some(serial),
+            ..self
+        }
+    }
+
+    pub fn reactive(self, on: bool) -> Self {
+        PopupSpec {
+            reactive: on,
+            ..self
         }
     }
 }

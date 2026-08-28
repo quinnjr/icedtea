@@ -9,8 +9,6 @@
 //! here because a client actually mapped a surface, and the compositor
 //! actually ran the `mapped` path against a live toplevel.
 
-use std::time::Duration;
-
 use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
@@ -2739,10 +2737,11 @@ fn a_popup_grab_still_dismisses_on_a_click_outside_it() {
 
     a.open_grabbing_popup(serial, 64, 48);
     assert!(
-        !a.wait_until_timeout(Duration::from_millis(300), |c| c.popup_configured()),
-        "a popup was configured: the `wlr` crate has grown xdg-popup support, \
-         so this test should now map the popup properly rather than relying on \
-         the grab alone"
+        a.wait_until(|c| c.popup_configured()),
+        "a popup was never configured: wlr 0.20.28's default xdg-popup \
+         handling answers the initial commit even though the compositor has \
+         not implemented placement yet (contract §8.3 -- this assertion is \
+         inverted from the pre-0.20.28 negative)"
     );
 
     // A point on bare desktop: outside the parent's frame, and so outside
