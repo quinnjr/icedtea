@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use icedtea_contract::Rectangle;
 use icedtea_harness::{
     Compositor, PopupAnchor, PopupConstraint, PopupGravity, PopupSpec, SessionLockClient,
     TestClient, VirtualKeyboardClient, VirtualPointerClient,
@@ -21,6 +22,25 @@ use icedtea_harness::{
 
 /// `BTN_LEFT`, the only button the compositor's decoration path acts on.
 const BTN_LEFT: u32 = 0x110;
+
+/// The parent's **content** rect -- the origin of the `wl_surface` a popup's
+/// coordinates are expressed against, which for a server-decorated window is
+/// one title bar below the frame's top edge.
+///
+/// Read from the model's own snapshot rather than assumed, because the
+/// compositor chooses the placement: a test that hardcoded a position would
+/// silently stop testing constraint adjustment the day the layout changed.
+fn content_rect_of(comp: &Compositor, app_id: &str) -> Rectangle {
+    let geometry = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == app_id)
+        .unwrap_or_else(|| panic!("{app_id} is not in the model"))
+        .geometry;
+    let ssd = icedtea_compositor::decoration::has_ssd(app_id, None, false);
+    icedtea_compositor::decoration::content_rect(geometry, ssd)
+}
 
 /// The `wlr` crate really does expose the xdg-popup API this part is written
 /// against, and `wlr_xdg_positioner_rules` really does compute the geometry
@@ -114,6 +134,99 @@ fn a_popup_under_a_toplevel_is_configured_at_the_positioner_geometry() {
     a.detach();
 }
 
+/// A popup that would hang off the bottom of the output is flipped to the
+/// other side of its anchor when the client allowed `FLIP_Y`.
+///
+/// The anchor rect sits 100px above the bottom of the usable area and the
+/// popup is 200 tall, so the unadjusted placement overflows by 101. Flipping
+/// swaps anchor `Bottom*` for `Top*` and gravity `Bottom*` for `Top*`, which
+/// puts the popup's *bottom* on the anchor point: `y = anchor_y - height`.
+///
+/// Mutation check: pass `PopupConstraint::empty()` instead and the popup is
+/// configured at `ay + 1` -- proving the assertion below really measures the
+/// adjustment rather than the raw geometry.
+#[test]
+fn a_popup_that_would_leave_the_output_is_flipped_by_the_constraint_adjustment() {
+    let comp = Compositor::spawn();
+    let mut a = TestClient::map_toplevel(&comp.socket, "popup.app", "popup");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+    let content = content_rect_of(&comp, "popup.app");
+    let (_ow, oh) = comp.output_size();
+
+    const H: i32 = 200;
+    // 100px of room left below the anchor point: the popup overflows by 101.
+    let ay = oh - content.y - 100;
+    assert!(
+        ay > H,
+        "this output ({oh}px tall, content at y = {}) is too short to \
+         distinguish a flip from a clamp",
+        content.y
+    );
+
+    a.open_popup(
+        PopupSpec::new(64, H)
+            .anchor_rect(0, ay, 1, 1)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight)
+            .constraint(PopupConstraint::FlipY),
+    );
+
+    assert_eq!(
+        a.popup_configured(),
+        Some((0, ay - H, 64, H)),
+        "a flipped popup puts its bottom edge on the anchor point"
+    );
+    a.detach();
+}
+
+/// A popup that cannot flip is slid back inside the usable area instead.
+///
+/// Same geometry as the flip test, with only `SLIDE_Y` allowed: the popup
+/// keeps its size and its side of the anchor, and moves up just far enough to
+/// fit. The assertions are the property `SLIDE_Y` promises -- "no longer
+/// constrained, same size" -- rather than a hardcoded offset, so the test
+/// measures the behaviour rather than one implementation's arithmetic.
+///
+/// Mutation check: pass `PopupConstraint::empty()` and the "fits" assertion
+/// fails by exactly the 101px overflow.
+#[test]
+fn a_popup_that_cannot_flip_is_slid_back_inside_the_usable_area() {
+    let comp = Compositor::spawn();
+    let mut a = TestClient::map_toplevel(&comp.socket, "popup.app", "popup");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+    let content = content_rect_of(&comp, "popup.app");
+    let (_ow, oh) = comp.output_size();
+
+    const H: i32 = 200;
+    let ay = oh - content.y - 100;
+    assert!(ay > H, "output too short for this test");
+
+    a.open_popup(
+        PopupSpec::new(64, H)
+            .anchor_rect(0, ay, 1, 1)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight)
+            .constraint(PopupConstraint::SlideY),
+    );
+
+    let (px, py, pw, ph) = a.popup_configured().expect("the popup never configured");
+    assert_eq!((pw, ph), (64, H), "a slid popup keeps its size");
+    assert_eq!(px, 0, "nothing constrains x");
+    assert!(
+        py < ay + 1,
+        "the popup must have moved up from the unadjusted {} to fit",
+        ay + 1
+    );
+    // The constraint box's bottom edge, in the parent surface's coordinates.
+    assert!(
+        py + ph <= oh - content.y,
+        "the slid popup must end up inside the usable area: y = {py}, \
+         h = {ph}, bottom = {}",
+        oh - content.y
+    );
+    a.detach();
+}
+
 /// A popup opened by a layer-shell panel is clamped to the same working area
 /// windows get: the panel's own output `usable` rect, which the panel's
 /// exclusive zone has already carved.
@@ -160,6 +273,53 @@ fn a_popup_under_a_layer_panel_is_constrained_to_the_same_output() {
          height = {oh}"
     );
     assert_eq!(px, 0, "nothing constrains x, so it stays at the anchor");
+}
+
+/// Every level of a nested chain is configured against **its own parent**, not
+/// against the chain's root.
+///
+/// A submenu's positioner is written in its parent popup's coordinates; if the
+/// compositor answered in root coordinates instead, the second level here
+/// would come back offset by the first level's `(10, 30)`.
+///
+/// Mutation check: resolve `PopupHost::Popup` to the chain root in
+/// `new_popup` (drop the parent-scoped `new_popup` listener's answer and
+/// re-parent everything to the root) and the inner assertion reports
+/// `(15, 45, 32, 24)`.
+#[test]
+fn a_nested_popup_chain_configures_every_level_relative_to_its_parent() {
+    let comp = Compositor::spawn();
+    let mut a = TestClient::map_toplevel(&comp.socket, "popup.app", "popup");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+
+    a.open_popup(
+        PopupSpec::new(64, 48)
+            .anchor_rect(10, 10, 20, 20)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+    a.open_popup_from_popup(
+        PopupSpec::new(32, 24)
+            .anchor_rect(5, 5, 10, 10)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+
+    assert_eq!(a.popup_depth(), 2);
+    assert_eq!(a.popup_configured_at(0), Some((10, 30, 64, 48)));
+    assert_eq!(
+        a.popup_configured_at(1),
+        Some((5, 15, 32, 24)),
+        "the submenu is placed in its parent popup's coordinates"
+    );
+    assert!(!a.popup_done(), "nothing dismissed this chain");
+
+    // Unwinds in the order xdg-shell requires, without a protocol error.
+    a.destroy_popup();
+    assert_eq!(a.popup_depth(), 1);
+    a.destroy_popup();
+    assert_eq!(a.popup_depth(), 0);
+    a.detach();
 }
 
 /// `xdg_popup.reposition` re-runs placement and echoes the client's token
