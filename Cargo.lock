@@ -1688,6 +1688,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cssparser",
  "fontconfig",
+ "icedtea-compositor",
  "icedtea-harness",
  "precomputed-hash",
  "rustix 1.1.4",

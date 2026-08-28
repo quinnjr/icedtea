@@ -170,6 +170,88 @@ pub fn matches(px: (u8, u8, u8), expected: (u8, u8, u8)) -> bool {
 /// measures is dominated by the transition, long enough not to spin.
 pub const CAPTURE_POLL: Duration = Duration::from_millis(25);
 
+/// The background the probe's theme paints, and the colour every window
+/// e2e samples for "the client is on screen here".
+pub const PROBE_BG: (u8, u8, u8) = (0x33, 0x77, 0x22);
+/// The entry's own background, distinct from the window's.
+pub const PROBE_ENTRY_BG: (u8, u8, u8) = (0xEE, 0xEE, 0xEE);
+
+/// A complete theme with flat, unmistakable colours.
+///
+/// Not Adwaita: these tests assert "the client painted here", and a gradient
+/// with a 1px border is a bad probe for that.
+#[must_use]
+pub fn probe_theme() -> tempfile::NamedTempFile {
+    let mut file = tempfile::NamedTempFile::new().expect("theme file");
+    std::io::Write::write_all(
+        &mut file,
+        b"window { background-color: #337722; }
+          box { background-color: #337722; min-width: 380px; min-height: 60px; }
+          entry { background-color: #eeeeee; color: #101010; min-width: 200px; min-height: 34px; }
+          entry:focus-visible { background-color: #ffcc00; }
+          text { color: #101010; }
+          menubutton { background-color: #cccccc; min-width: 100px; min-height: 34px; }
+          label { color: #101010; }
+        ",
+    )
+    .expect("write the theme");
+    file
+}
+
+/// Spawn `window-probe` against `socket`, reaped when the guard drops.
+#[must_use]
+pub fn spawn_window_probe(
+    socket: &str,
+    mode: &str,
+    theme: &std::path::Path,
+    report: &std::path::Path,
+) -> Reaper {
+    Reaper(
+        Command::new(env!("CARGO_BIN_EXE_window-probe"))
+            .env("WAYLAND_DISPLAY", socket)
+            .env("ICEDTEA_UI_THEME", theme)
+            .env("ICEDTEA_PROBE_MODE", mode)
+            .env("ICEDTEA_PROBE_REPORT", report)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn window-probe"),
+    )
+}
+
+/// Every line the probe has reported so far.
+#[must_use]
+pub fn probe_report(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Poll the report until a line starting with `prefix` appears.
+///
+/// Polling a file, not a pipe: the probe is a separate process whose stdout
+/// buffering is not ours to control, and a test that reads a pipe has to keep
+/// draining it or deadlock the child.
+#[must_use]
+pub fn wait_for_report_line(
+    path: &std::path::Path,
+    prefix: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(line) = probe_report(path)
+            .into_iter()
+            .find(|l| l.starts_with(prefix))
+        {
+            return Some(line);
+        }
+        std::thread::sleep(CAPTURE_POLL);
+    }
+    None
+}
+
 /// Capture until `ready` accepts the pixel at `sample`, pumping `pointer` so
 /// the compositor keeps delivering, or until `timeout` passes.
 ///

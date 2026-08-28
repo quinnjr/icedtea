@@ -95,13 +95,38 @@ pub fn restyle(
     let mut cx = crate::css::select::MatchCx::new();
     let mut stack: Vec<(Node, Option<std::rc::Rc<ComputedStyle>>)> = vec![(root.clone(), None)];
     while let Some((node, parent)) = stack.pop() {
-        let computed = std::rc::Rc::new(ComputedStyle::resolve(
-            sheet,
-            &node,
-            parent.as_deref(),
-            env,
-            &mut cx,
-        ));
+        let mut computed = ComputedStyle::resolve(sheet, &node, parent.as_deref(), env, &mut cx);
+        // The root is the surface: a real GTK toplevel's own widget
+        // allocation is always exactly the compositor-configured size, never
+        // derived from its content -- and this registry has no `width`/
+        // `height` CSS property to express that with (deviations 9/10), so
+        // it is forced the same way the pointer.rs fixture's `window {
+        // min-width/min-height }` does it by hand: an `anim::Overrides` floor
+        // on `min-width`/`min-height`, which `box_sizing: ContentBox` (an
+        // AUTO size) turns into "at least the available space". A `Node`
+        // used only as a layout fixture (never restyled through `Window`,
+        // e.g. `pointer.rs`'s own tests) is unaffected when it already
+        // declares the same floor; one that does not now gets it for free,
+        // which is the point.
+        if parent.is_none() {
+            let mut root_floor = crate::anim::Overrides::default();
+            if let taffy::AvailableSpace::Definite(w) = available.width {
+                root_floor.set(
+                    crate::css::registry::Prop::MinWidth,
+                    crate::css::value::Value::Length(crate::css::value::Length::px(w)),
+                );
+            }
+            if let taffy::AvailableSpace::Definite(h) = available.height {
+                root_floor.set(
+                    crate::css::registry::Prop::MinHeight,
+                    crate::css::value::Value::Length(crate::css::value::Length::px(h)),
+                );
+            }
+            if !root_floor.is_empty() {
+                computed = computed.with_overrides(&root_floor).into_owned();
+            }
+        }
+        let computed = std::rc::Rc::new(computed);
         // M2's `Container` has exactly two variants; P6 widens it (contract
         // §3.6) and this is the one place that chooses. `Container::default()`
         // is `BoxDirection::Column`, which is right for a single-child
@@ -857,6 +882,13 @@ pub struct Window {
     next_popup_key: u64,
     /// Built lazily by [`Window::clipboard`] -- see its doc comment.
     clipboard: Option<Clipboard>,
+    /// The text a leaf node paints and measures, keyed by node identity.
+    ///
+    /// M2's `text.rs` is single-line and single-run and M3's `TextLayout` is
+    /// P5's, so this is deliberately the smallest thing that can put real
+    /// glyphs on a real surface: one shaped run per node. P5 deletes this
+    /// field in the commit that lands `TextLayout`.
+    texts: std::collections::HashMap<NodeAddr, String>,
 }
 
 /// How long [`Window::open`] waits for the first `configure`.
@@ -991,6 +1023,7 @@ impl Window {
             popups: Vec::new(),
             next_popup_key: 1,
             clipboard: None,
+            texts: std::collections::HashMap::new(),
         })
     }
 
@@ -1181,10 +1214,10 @@ impl Window {
             width: taffy::AvailableSpace::Definite(width as f32),
             height: taffy::AvailableSpace::Definite(height as f32),
         };
-        let mut measure = crate::layout::FixedMeasure(taffy::Size {
-            width: 0.0,
-            height: 0.0,
-        });
+        let mut measure = TextMeasure {
+            texts: &self.texts,
+            fonts: &mut self.fonts,
+        };
         if let Err(err) = restyle(
             &self.root,
             &self.sheet,
@@ -1210,6 +1243,7 @@ impl Window {
             &self.sheet,
             &mut self.fonts,
             &mut self.images,
+            &self.texts,
         );
         self.surface
             .commit_buffer(&mut self.skia, &mut self.buffers, &self.shm, &self.qh)?;
@@ -1228,6 +1262,18 @@ impl Window {
             "mark_dirty on a node from another tree"
         );
         self.dirty = true;
+    }
+
+    /// The text a leaf node paints and measures. P5's `TextLayout` replaces
+    /// it.
+    pub fn set_node_text(&mut self, node: &Node, text: &str) {
+        self.texts.insert(node_addr(node), text.to_owned());
+        self.dirty = true;
+    }
+
+    #[must_use]
+    pub fn node_text(&self, node: &Node) -> Option<&str> {
+        self.texts.get(&node_addr(node)).map(String::as_str)
     }
 
     /// The soonest of the animation clock's next deadline and the keyboard
@@ -1537,6 +1583,7 @@ impl Window {
                 &self.sheet,
                 &mut self.fonts,
                 &mut self.images,
+                &self.texts,
             );
             commit_buffer_to(
                 popup.popup.wl_surface(),
@@ -1580,6 +1627,43 @@ fn release_matches(slot_of: Option<usize>, slot: usize) -> bool {
     slot_of == Some(slot)
 }
 
+/// Measures a leaf from its text, or to nothing.
+struct TextMeasure<'a> {
+    texts: &'a std::collections::HashMap<NodeAddr, String>,
+    fonts: &'a mut FontDatabase,
+}
+
+impl crate::layout::Measure for TextMeasure<'_> {
+    fn measure(
+        &mut self,
+        node: &Node,
+        style: &crate::css::computed::ComputedStyle,
+        known: taffy::Size<Option<f32>>,
+        _available: taffy::Size<taffy::AvailableSpace>,
+    ) -> taffy::Size<f32> {
+        let Some(text) = self.texts.get(&node_addr(node)) else {
+            return taffy::Size {
+                width: known.width.unwrap_or(0.0),
+                height: known.height.unwrap_or(0.0),
+            };
+        };
+        let text_style = crate::text::TextStyle::from_computed(style);
+        let Some(face) = self.fonts.match_face(&text_style.query()) else {
+            return taffy::Size {
+                width: 0.0,
+                height: 0.0,
+            };
+        };
+        let shaped = self.fonts.shape(&text_style.shape_key(text, &face));
+        taffy::Size {
+            width: known.width.unwrap_or(shaped.metrics.width),
+            height: known
+                .height
+                .unwrap_or_else(|| text_style.line_height_px(&shaped.metrics)),
+        }
+    }
+}
+
 /// Paint the whole tree, depth first, each node inside its own effect layer.
 ///
 /// This is the caller `paint::paint_node_with_children` was shaped for and
@@ -1604,7 +1688,26 @@ fn paint_tree(
     sheet: &CompiledSheet,
     fonts: &mut FontDatabase,
     images: &mut crate::paint::ImageCache,
+    texts: &std::collections::HashMap<NodeAddr, String>,
 ) {
+    // Shaped up front, once per node, into a map that outlives the whole
+    // recursive walk: `PaintCx::text` borrows into it, and a `Rc<ShapedText>`
+    // freshly shaped inside a single `paint_subtree` call would not live
+    // long enough to satisfy that borrow across sibling/child calls.
+    let mut shaped_texts: std::collections::HashMap<
+        NodeAddr,
+        std::rc::Rc<crate::text::ShapedText>,
+    > = std::collections::HashMap::new();
+    for (addr, text) in texts {
+        let Some(style) = styles.get(addr) else {
+            continue;
+        };
+        let text_style = crate::text::TextStyle::from_computed(style);
+        let Some(face) = fonts.match_face(&text_style.query()) else {
+            continue;
+        };
+        shaped_texts.insert(*addr, fonts.shape(&text_style.shape_key(text, &face)));
+    }
     let mut cx = crate::paint::PaintCx {
         env,
         colors: &sheet.colors,
@@ -1621,17 +1724,20 @@ fn paint_tree(
         Some(overrides),
         &mut cx,
         0,
+        &shaped_texts,
     );
 }
 
-fn paint_subtree(
+#[allow(clippy::too_many_arguments)]
+fn paint_subtree<'a>(
     canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
     node: &Node,
     layout: &crate::layout::LayoutTree,
     styles: &StyleMap,
     overrides: Option<&crate::anim::Overrides>,
-    cx: &mut crate::paint::PaintCx<'_>,
+    cx: &mut crate::paint::PaintCx<'a>,
     depth: usize,
+    shaped_texts: &'a std::collections::HashMap<NodeAddr, std::rc::Rc<crate::text::ShapedText>>,
 ) {
     if depth >= pointer::MAX_HIT_DEPTH {
         return;
@@ -1640,6 +1746,7 @@ fn paint_subtree(
         return;
     };
     let children = node.children();
+    cx.text = shaped_texts.get(&node_addr(node)).map(std::rc::Rc::as_ref);
     crate::paint::paint_node_with_children(
         canvas,
         node,
@@ -1648,10 +1755,20 @@ fn paint_subtree(
         overrides,
         cx,
         |canvas, cx| {
+            cx.text = None;
             for child in children {
                 // Only the root carries the window's sampled overrides: a
                 // child never computed those properties for itself.
-                paint_subtree(canvas, &child, layout, styles, None, cx, depth + 1);
+                paint_subtree(
+                    canvas,
+                    &child,
+                    layout,
+                    styles,
+                    None,
+                    cx,
+                    depth + 1,
+                    shaped_texts,
+                );
             }
         },
     );

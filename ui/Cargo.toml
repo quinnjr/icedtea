@@ -40,8 +40,13 @@ fontconfig = ["dep:fontconfig"]
 
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }
+icedtea-compositor = { path = "../compositor" }
 tempfile = "3"
 
 [[bin]]
 name = "themed-button"
 path = "src/bin/themed-button.rs"
+
+[[bin]]
+name = "window-probe"
+path = "src/bin/window-probe.rs"
