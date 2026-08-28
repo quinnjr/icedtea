@@ -210,8 +210,9 @@ impl Popup<'_> {
 
     /// `wlr_xdg_popup_unconstrain_from_box`. **`constraint` is in the ROOT
     /// TOPLEVEL PARENT surface's coordinate system**, not layout/output space —
-    /// the compositor translates. Rewrites `scheduled.geometry` from the rules;
-    /// does not send anything.
+    /// the compositor translates. Rewrites `scheduled.geometry` from the rules
+    /// AND schedules a configure — see E20; it is guarded on `initialized` and
+    /// does nothing on a popup that has not committed yet.
     pub fn unconstrain(&self, constraint: &Box2D);
 
     /// `wlr_xdg_popup_get_position` — position in the PARENT SURFACE's coords.
@@ -3189,3 +3190,30 @@ tested (`a_positioner_with_nonsense_enum_values_never_panics`); the logging half
 is dropped in `wlr` and **moves to P2**, which has logging and is where a
 malformed positioner first becomes an observable compositor decision.
 **Carried out by:** P1 (the silent mapping), P2 (the log).
+
+### E20 — `Popup::unconstrain` DOES send, and is guarded on `initialized`
+
+§1.2 says `unconstrain` "does not send anything". **That is factually wrong**,
+and the wrong sentence pointed a consumer at a process abort. Disassembling
+this distribution's shipped `libwlroots-0.20.so`:
+`wlr_xdg_popup_unconstrain_from_box` calls
+`wlr_xdg_positioner_rules_unconstrain_box` **and then**
+`wlr_xdg_surface_schedule_configure` unconditionally (call sites `0x8f20e`,
+`0x8f255`, `0x8f25e`). `wlr_xdg_surface_schedule_configure` contains
+`assert(surface->initialized)`, and this distribution ships wlroots **without
+`NDEBUG`**. §1.4's `ToplevelHandler::new_popup` is exactly where a consumer is
+told to place a popup, and `initialized` is still false there — no commit has
+happened — so `popup.unconstrain(&box)` from inside `new_popup` killed the
+whole compositor process.
+
+**Ruling:** §1.2's "does not send anything" is struck. `Popup::unconstrain`
+carries the same `base.is_null() || !(*base).initialized` early return
+`Popup::send_configure` already had, and **does nothing at all** on a
+not-yet-initialized popup rather than aborting; its signature is unchanged and
+the guard is invisible to any caller holding a live, committed popup.
+`Runtime::configure_popup` keeps its own `initialized` check, which is what
+lets it report `false` instead of silently succeeding. Pinned by
+`unconstraining_an_uninitialized_popup_is_a_no_op_rather_than_an_abort`
+(mutation-verified: deleting the guard kills the test binary).
+**Carried out by:** P1. **Consumed by:** P2 (may call `unconstrain` from a
+reactive-reposition pass without pre-checking initialization).
