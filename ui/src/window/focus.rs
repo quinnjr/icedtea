@@ -7,6 +7,8 @@
 
 use crate::css::node::{Direction, Node, PseudoStates};
 use crate::layout::LayoutTree;
+use crate::window::keyboard::{KeyEvent, Mods};
+use xkbcommon::xkb;
 
 /// Which way focus is moving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +122,219 @@ pub fn focus_sort(parent: &Node, tree: &LayoutTree, dir: FocusDirection) -> Vec<
 /// button and a 40px entry, far too little to merge two real rows.
 const ROW_EPSILON: f32 = 0.5;
 
+/// Why the focus moved. Drives GTK's `:focus-visible` policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusCause {
+    Keyboard,
+    Pointer,
+    Programmatic,
+}
+
+/// How deep [`navigate`] will descend, for the same reason
+/// [`super::pointer::MAX_HIT_DEPTH`] exists.
+pub const MAX_FOCUS_DEPTH: usize = 256;
+
+/// One focus owner per window; popups form a stack of these.
+#[derive(Debug)]
+pub struct FocusRing {
+    focus: Option<Node>,
+    focus_visible: bool,
+    default: Option<Node>,
+    /// The focus as it was when the current key went down, if one is down.
+    key_focus: Option<Option<Node>>,
+}
+
+impl Default for FocusRing {
+    /// `focus_visible` starts `true`, as GTK's does: a window opened by a
+    /// keyboard shortcut shows its focus ring immediately.
+    fn default() -> Self {
+        Self {
+            focus: None,
+            focus_visible: true,
+            default: None,
+            key_focus: None,
+        }
+    }
+}
+
+impl FocusRing {
+    #[must_use]
+    pub fn focus(&self) -> Option<Node> {
+        self.focus.clone()
+    }
+
+    /// Move `PseudoStates::FOCUS`, and with it M2's derived
+    /// `:focus-within`/`:focus-visible`.
+    pub fn set_focus(&mut self, node: Option<&Node>, cause: FocusCause) {
+        match cause {
+            FocusCause::Keyboard => self.focus_visible = true,
+            FocusCause::Pointer => self.focus_visible = false,
+            FocusCause::Programmatic => {}
+        }
+        if let Some(previous) = self.focus.take() {
+            previous.set_state(PseudoStates::FOCUS, false);
+        }
+        if let Some(node) = node {
+            node.set_state(PseudoStates::FOCUS, true);
+            node.set_tree_focus_visible(self.focus_visible);
+            self.focus = Some(node.clone());
+        }
+    }
+
+    /// Whether the focus ring is drawn.
+    #[must_use]
+    pub fn focus_visible(&self) -> bool {
+        self.focus_visible
+    }
+
+    /// Feed every key event, pressed and released.
+    ///
+    /// GTK's rule (`_gtk_window_update_focus_visible`), not CSS's: a press
+    /// remembers the focus; the matching release clears the flag only if the
+    /// focus did not move while the key was down, and sets it otherwise --
+    /// so `Tab` shows the ring and typing a letter hides it. `Alt` alone
+    /// forces it on, which is how a menu mnemonic reveals itself.
+    pub fn note_key(&mut self, ev: &KeyEvent) {
+        if matches!(ev.keysym, xkb::Keysym::Alt_L | xkb::Keysym::Alt_R) {
+            self.focus_visible = true;
+            self.apply_visible();
+            return;
+        }
+        if ev.pressed {
+            self.key_focus = Some(self.focus.clone());
+            return;
+        }
+        let Some(remembered) = self.key_focus.take() else {
+            return;
+        };
+        let moved = match (&remembered, &self.focus) {
+            (None, None) => false,
+            (Some(a), Some(b)) => !a.ptr_eq(b),
+            _ => true,
+        };
+        self.focus_visible = moved;
+        self.apply_visible();
+    }
+
+    pub fn set_default(&mut self, node: Option<&Node>) {
+        self.default = node.cloned();
+    }
+
+    #[must_use]
+    pub fn default(&self) -> Option<Node> {
+        self.default.clone()
+    }
+
+    /// Push the policy onto the tree the focus owner belongs to.
+    fn apply_visible(&self) {
+        if let Some(focus) = &self.focus {
+            focus.set_tree_focus_visible(self.focus_visible);
+        }
+    }
+}
+
+/// The next focus from `from` in `dir`, recursing into containers.
+///
+/// `None` at the end of the ring: wrapping is the caller's policy, because a
+/// popup's ring pops to its parent's instead of wrapping.
+#[must_use]
+pub fn navigate(
+    root: &Node,
+    tree: &LayoutTree,
+    from: Option<&Node>,
+    dir: FocusDirection,
+) -> Option<Node> {
+    let mut ring = Vec::new();
+    collect(root, tree, dir, &mut ring, 0);
+    let Some(from) = from else {
+        return ring.into_iter().next();
+    };
+    match ring.iter().position(|node| node.ptr_eq(from)) {
+        // The current focus is no longer in the ring (it was removed, or
+        // disabled): start over rather than trapping focus.
+        None => ring.into_iter().next(),
+        Some(index) => ring.into_iter().nth(index + 1),
+    }
+}
+
+/// Every focus candidate under `parent`, in `dir` order, depth first.
+fn collect(
+    parent: &Node,
+    tree: &LayoutTree,
+    dir: FocusDirection,
+    out: &mut Vec<Node>,
+    depth: usize,
+) {
+    if depth >= MAX_FOCUS_DEPTH {
+        tracing::warn!(depth, "focus walk stopped at the depth guard");
+        return;
+    }
+    for child in focus_sort(parent, tree, dir) {
+        if is_focusable(&child, tree) {
+            out.push(child.clone());
+        }
+        collect(&child, tree, dir, out, depth + 1);
+    }
+}
+
+/// A window-level key binding, applied before the focused node sees the event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    /// Move the focus.
+    Move(FocusDirection),
+    /// Activate the focused node (`Space`).
+    Activate,
+    /// Activate the window's default (`Return`).
+    ActivateDefault,
+    /// `Escape`: a popup destroys itself client-side; a window ignores it.
+    Dismiss,
+}
+
+/// The binding `ev` triggers, if any.
+///
+/// Contract §3.5's table exactly. `Ctrl` is allowed on the navigation keys
+/// (GTK's "move focus out of this container" variants) and ignored; `Alt` and
+/// `Logo` are not -- those belong to accelerators and to the compositor.
+/// `Caps`/`Num` are masked out: `Tab` with Caps Lock on is still `Tab`.
+#[must_use]
+pub fn window_binding(ev: &KeyEvent) -> Option<Binding> {
+    use FocusDirection::{Down, Left, Right, TabBackward, TabForward, Up};
+
+    if !ev.pressed {
+        return None;
+    }
+    let mods = ev.effective_mods().difference(Mods::CAPS | Mods::NUM);
+    if mods.intersects(Mods::ALT | Mods::LOGO) {
+        return None;
+    }
+    // `Shift+Tab` is `ISO_Left_Tab` on most layouts, but not all -- and where
+    // it is, the Shift was consumed, so `effective_mods` no longer shows it.
+    // Both spellings mean the same thing.
+    let shifted = ev.mods.contains(Mods::SHIFT);
+    let binding = match ev.keysym {
+        xkb::Keysym::ISO_Left_Tab => Binding::Move(TabBackward),
+        xkb::Keysym::Tab | xkb::Keysym::KP_Tab => {
+            Binding::Move(if shifted { TabBackward } else { TabForward })
+        }
+        xkb::Keysym::Up | xkb::Keysym::KP_Up => Binding::Move(Up),
+        xkb::Keysym::Down | xkb::Keysym::KP_Down => Binding::Move(Down),
+        xkb::Keysym::Left | xkb::Keysym::KP_Left => Binding::Move(Left),
+        xkb::Keysym::Right | xkb::Keysym::KP_Right => Binding::Move(Right),
+        xkb::Keysym::space | xkb::Keysym::KP_Space => Binding::Activate,
+        xkb::Keysym::Return | xkb::Keysym::ISO_Enter | xkb::Keysym::KP_Enter => {
+            Binding::ActivateDefault
+        }
+        xkb::Keysym::Escape => Binding::Dismiss,
+        _ => return None,
+    };
+    if mods.contains(Mods::CTRL) && !matches!(binding, Binding::Move(_)) {
+        // `Ctrl+Space` and `Ctrl+Return` are widget bindings (toggling a
+        // selection, inserting a newline), not window ones.
+        return None;
+    }
+    Some(binding)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FOCUSABLE_CLASS, FocusDirection, focus_sort, is_focusable};
@@ -187,6 +402,29 @@ mod tests {
             tree,
             styles,
         }
+    }
+
+    /// Re-run the style/layout pass after mutating the fixture's tree.
+    fn relayout(grid: &mut Grid) {
+        let sheet = CompiledSheet::compile(GRID_CSS);
+        let env = ResolveEnv::default();
+        let mut measure = FixedMeasure(taffy::Size {
+            width: 0.0,
+            height: 0.0,
+        });
+        restyle(
+            &grid.root,
+            &sheet,
+            &env,
+            &mut grid.styles,
+            &mut grid.tree,
+            taffy::Size {
+                width: taffy::AvailableSpace::Definite(300.0),
+                height: taffy::AvailableSpace::Definite(160.0),
+            },
+            &mut measure,
+        )
+        .expect("the grid re-lays out");
     }
 
     fn ids(nodes: &[Node]) -> Vec<String> {
@@ -375,5 +613,270 @@ mod tests {
             !is_focusable(&root, &tree),
             "an unsynced node is never focusable"
         );
+    }
+
+    use super::{Binding, FocusCause, FocusRing, navigate, window_binding};
+    use crate::window::keyboard::{KeyEvent, Mods};
+    use xkbcommon::xkb;
+
+    fn key(keysym: xkb::Keysym, mods: Mods, consumed: Mods, pressed: bool) -> KeyEvent {
+        KeyEvent {
+            keycode: 0,
+            keysym,
+            utf8: None,
+            mods,
+            consumed,
+            pressed,
+            repeat: false,
+            serial: 0,
+            time_ms: 0,
+        }
+    }
+
+    #[test]
+    fn navigate_walks_the_geometric_ring_and_stops_at_its_end() {
+        let grid = grid();
+        let order = ["b", "a", "d", "c"];
+        let mut current: Option<Node> = None;
+        for expected in order {
+            let next = navigate(
+                &grid.root,
+                &grid.tree,
+                current.as_ref(),
+                FocusDirection::TabForward,
+            )
+            .expect("another candidate");
+            assert_eq!(next.id().expect("an id").as_str(), expected);
+            current = Some(next);
+        }
+        assert!(
+            navigate(
+                &grid.root,
+                &grid.tree,
+                current.as_ref(),
+                FocusDirection::TabForward
+            )
+            .is_none(),
+            "the end of the ring is None; wrapping is the caller's policy"
+        );
+        // Backwards from the last is the reverse walk.
+        assert_eq!(
+            navigate(
+                &grid.root,
+                &grid.tree,
+                current.as_ref(),
+                FocusDirection::TabBackward
+            )
+            .expect("a candidate")
+            .id()
+            .expect("an id")
+            .as_str(),
+            "d"
+        );
+    }
+
+    #[test]
+    fn navigate_descends_into_containers_and_skips_non_candidates() {
+        let grid = grid();
+        // A nested box holding one focusable button, inserted first in tree
+        // order but laid out last (it has no width until it has a child).
+        let nested = Node::new("box");
+        let inner = Node::with_classes("button", &[FOCUSABLE_CLASS]);
+        inner.set_id(Some("inner"));
+        nested.append_child(&inner);
+        grid.container.append_child(&nested);
+        let mut grid = grid;
+        relayout(&mut grid);
+        let all: Vec<String> = std::iter::successors(
+            navigate(&grid.root, &grid.tree, None, FocusDirection::TabForward),
+            |from| {
+                navigate(
+                    &grid.root,
+                    &grid.tree,
+                    Some(from),
+                    FocusDirection::TabForward,
+                )
+            },
+        )
+        .map(|n| {
+            n.id()
+                .map_or_else(String::new, |id| id.as_str().to_string())
+        })
+        .collect();
+        assert!(
+            all.contains(&"inner".to_string()),
+            "a nested candidate is reached: {all:?}"
+        );
+        assert!(
+            !all.iter().any(String::is_empty),
+            "the containers themselves are not in the ring: {all:?}"
+        );
+    }
+
+    #[test]
+    fn setting_focus_moves_the_pseudo_state() {
+        let grid = grid();
+        let children = grid.container.children();
+        let (first, second) = (children[0].clone(), children[1].clone());
+        let mut ring = <FocusRing as Default>::default();
+        assert!(ring.focus().is_none());
+
+        ring.set_focus(Some(&first), FocusCause::Keyboard);
+        assert!(first.states().contains(PseudoStates::FOCUS));
+        assert!(
+            grid.container.states().contains(PseudoStates::FOCUS_WITHIN),
+            "M2 derives :focus-within up the chain"
+        );
+
+        ring.set_focus(Some(&second), FocusCause::Keyboard);
+        assert!(
+            !first.states().contains(PseudoStates::FOCUS),
+            "the old owner lost it"
+        );
+        assert!(second.states().contains(PseudoStates::FOCUS));
+
+        ring.set_focus(None, FocusCause::Programmatic);
+        assert!(!second.states().contains(PseudoStates::FOCUS));
+        assert!(!grid.container.states().contains(PseudoStates::FOCUS_WITHIN));
+    }
+
+    #[test]
+    fn focus_visible_follows_gtks_rule_and_reaches_the_selector() {
+        // Ruling R3, and contract deviation 11: the flag has to be visible to
+        // the cascade or `:focus-visible` in Adwaita is a no-op.
+        let grid = grid();
+        let children = grid.container.children();
+        let (first, second) = (children[0].clone(), children[1].clone());
+        let mut ring = <FocusRing as Default>::default();
+        assert!(ring.focus_visible(), "GTK defaults to visible");
+
+        // A pointer click focuses without a ring.
+        ring.set_focus(Some(&first), FocusCause::Pointer);
+        assert!(!ring.focus_visible());
+        assert!(first.states().contains(PseudoStates::FOCUS));
+        assert!(
+            !first.states().contains(PseudoStates::FOCUS_VISIBLE),
+            "a click must not draw the focus ring"
+        );
+
+        // A key press that moves the focus turns it back on.
+        ring.note_key(&key(xkb::Keysym::Tab, Mods::empty(), Mods::empty(), true));
+        ring.set_focus(Some(&second), FocusCause::Keyboard);
+        ring.note_key(&key(xkb::Keysym::Tab, Mods::empty(), Mods::empty(), false));
+        assert!(ring.focus_visible());
+        assert!(second.states().contains(PseudoStates::FOCUS_VISIBLE));
+
+        // A key press that does not move it turns it off again.
+        ring.note_key(&key(xkb::Keysym::a, Mods::empty(), Mods::empty(), true));
+        ring.note_key(&key(xkb::Keysym::a, Mods::empty(), Mods::empty(), false));
+        assert!(!ring.focus_visible(), "typing into a widget hides the ring");
+        assert!(!second.states().contains(PseudoStates::FOCUS_VISIBLE));
+
+        // Alt alone forces it on, press or release.
+        ring.note_key(&key(xkb::Keysym::Alt_L, Mods::empty(), Mods::empty(), true));
+        assert!(ring.focus_visible());
+        assert!(second.states().contains(PseudoStates::FOCUS_VISIBLE));
+    }
+
+    #[test]
+    fn the_window_default_is_separate_from_the_focus() {
+        let grid = grid();
+        let children = grid.container.children();
+        let mut ring = <FocusRing as Default>::default();
+        ring.set_default(Some(&children[2]));
+        ring.set_focus(Some(&children[0]), FocusCause::Keyboard);
+        assert!(ring.default().expect("a default").ptr_eq(&children[2]));
+        assert!(ring.focus().expect("a focus").ptr_eq(&children[0]));
+        ring.set_default(None);
+        assert!(ring.default().is_none());
+    }
+
+    #[test]
+    fn the_window_bindings_are_exactly_the_contracts_table() {
+        use FocusDirection::{Down, Left, Right, TabBackward, TabForward, Up};
+        let plain = Mods::empty();
+        let cases: Vec<(xkb::Keysym, Mods, Mods, Option<Binding>)> = vec![
+            (
+                xkb::Keysym::Tab,
+                plain,
+                plain,
+                Some(Binding::Move(TabForward)),
+            ),
+            (
+                xkb::Keysym::KP_Tab,
+                plain,
+                plain,
+                Some(Binding::Move(TabForward)),
+            ),
+            (
+                xkb::Keysym::Tab,
+                Mods::CTRL,
+                plain,
+                Some(Binding::Move(TabForward)),
+            ),
+            (
+                xkb::Keysym::ISO_Left_Tab,
+                Mods::SHIFT,
+                Mods::SHIFT,
+                Some(Binding::Move(TabBackward)),
+            ),
+            (
+                xkb::Keysym::Tab,
+                Mods::SHIFT,
+                plain,
+                Some(Binding::Move(TabBackward)),
+            ),
+            (xkb::Keysym::Up, plain, plain, Some(Binding::Move(Up))),
+            (
+                xkb::Keysym::KP_Up,
+                Mods::CTRL,
+                plain,
+                Some(Binding::Move(Up)),
+            ),
+            (xkb::Keysym::Down, plain, plain, Some(Binding::Move(Down))),
+            (xkb::Keysym::Left, plain, plain, Some(Binding::Move(Left))),
+            (
+                xkb::Keysym::KP_Right,
+                plain,
+                plain,
+                Some(Binding::Move(Right)),
+            ),
+            (xkb::Keysym::space, plain, plain, Some(Binding::Activate)),
+            (xkb::Keysym::KP_Space, plain, plain, Some(Binding::Activate)),
+            (
+                xkb::Keysym::Return,
+                plain,
+                plain,
+                Some(Binding::ActivateDefault),
+            ),
+            (
+                xkb::Keysym::ISO_Enter,
+                plain,
+                plain,
+                Some(Binding::ActivateDefault),
+            ),
+            (
+                xkb::Keysym::KP_Enter,
+                plain,
+                plain,
+                Some(Binding::ActivateDefault),
+            ),
+            (xkb::Keysym::Escape, plain, plain, Some(Binding::Dismiss)),
+            // Not bound: the letters, and anything with Alt or Logo held --
+            // those belong to accelerators and to the compositor.
+            (xkb::Keysym::a, plain, plain, None),
+            (xkb::Keysym::Tab, Mods::ALT, plain, None),
+            (xkb::Keysym::Up, Mods::LOGO, plain, None),
+            (xkb::Keysym::F1, plain, plain, None),
+        ];
+        for (keysym, mods, consumed, expected) in cases {
+            let ev = key(keysym, mods, consumed, true);
+            assert_eq!(window_binding(&ev), expected, "{keysym:?} with {mods:?}");
+            let released = key(keysym, mods, consumed, false);
+            assert_eq!(window_binding(&released), None, "a release binds nothing");
+        }
+        // Caps and Num lock are ignored: Tab with Caps on is still Tab.
+        let with_locks = key(xkb::Keysym::Tab, Mods::CAPS | Mods::NUM, plain, true);
+        assert_eq!(window_binding(&with_locks), Some(Binding::Move(TabForward)));
     }
 }

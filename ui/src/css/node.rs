@@ -196,6 +196,14 @@ static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
 struct TreeToken {
     id: u64,
     generation: Cell<u64>,
+    /// GTK's `:focus-visible` policy for this tree (ruling R3).
+    ///
+    /// `true` by default, which is both GTK's default and what keeps
+    /// `PseudoStates::DERIVED` behaving exactly as M2 left it. The window
+    /// layer clears it for a focus taken by a pointer click and sets it again
+    /// for one taken by a key, which is the only way that policy can reach a
+    /// `:focus-visible` selector: the flag is derived from `FOCUS`, never set.
+    focus_visible: Cell<bool>,
 }
 
 impl TreeToken {
@@ -203,6 +211,7 @@ impl TreeToken {
         Rc::new(TreeToken {
             id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
             generation: Cell::new(generation),
+            focus_visible: Cell::new(true),
         })
     }
 }
@@ -353,9 +362,35 @@ impl Node {
     pub fn states(&self) -> PseudoStates {
         let mut states = self.0.own_states.get();
         if self.0.focus_count.get() > 0 {
-            states |= PseudoStates::DERIVED;
+            states |= PseudoStates::FOCUS_WITHIN;
+            if self.0.tree.borrow().focus_visible.get() {
+                states |= PseudoStates::FOCUS_VISIBLE;
+            }
         }
         states
+    }
+
+    /// Whether `:focus-visible` is currently derived from `:focus` in this tree.
+    #[must_use]
+    pub fn tree_focus_visible(&self) -> bool {
+        self.0.tree.borrow().focus_visible.get()
+    }
+
+    /// Set GTK's `:focus-visible` policy for this whole tree.
+    ///
+    /// One focus owner per window means one flag per tree. A subtree split off
+    /// by [`Node::remove_child`] gets a fresh tree token and so a fresh `true`;
+    /// the window layer sets the flag again on the next focus change.
+    pub fn set_tree_focus_visible(&self, on: bool) {
+        {
+            let tree = self.0.tree.borrow();
+            if tree.focus_visible.get() == on {
+                return;
+            }
+            tree.focus_visible.set(on);
+        }
+        // Outside the borrow: `touch` takes the same `RefCell`.
+        self.touch();
     }
 
     /// Replace this node's own state flags.
