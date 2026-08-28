@@ -14,6 +14,7 @@ pub mod shm;
 pub mod text;
 pub mod wayland;
 pub mod widget;
+pub mod window;
 
 /// GTK 4's default light theme, vendored so tests are hermetic.
 ///
