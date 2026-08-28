@@ -60,12 +60,6 @@ pub struct PopupKey(pub(crate) wlr::PopupId);
 
 impl PopupKey {
     /// Wrap a library id. Only the handler impls call this.
-    ///
-    /// `#[allow(dead_code)]`: no handler impl calls this yet -- Task 3 wires
-    /// the six `ToplevelHandler` popup methods that do. Task 2 (this commit)
-    /// only produces the seam; nothing in the plan's file split lets both
-    /// land in one commit.
-    #[allow(dead_code)]
     pub(crate) fn new(id: wlr::PopupId) -> Self {
         PopupKey(id)
     }
