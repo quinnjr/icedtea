@@ -119,6 +119,258 @@ fn descend(
     true
 }
 
+use std::time::Duration;
+
+pub use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape as CursorShape;
+
+/// The client-side mirror of the compositor's implicit pointer grab.
+///
+/// Once a button goes down on a node, motion and the release go to that node
+/// regardless of what is under the pointer, until the *last* button is
+/// released. Without it, dragging a scale's slider off the widget stops moving
+/// it, and a press-drag-off-release never fires the click it should not fire.
+#[derive(Debug, Default)]
+pub struct ImplicitGrab {
+    target: Option<Node>,
+    /// Which buttons are down, as a bitmask over `button - BTN_LEFT`.
+    ///
+    /// A mask, not a count: the compositor can send a release for a button
+    /// pressed before this surface had focus, and a count would go negative
+    /// (or, unsigned, end a grab that is still live).
+    held: u32,
+}
+
+impl ImplicitGrab {
+    /// Record a press. `true` if this press began the grab.
+    pub fn press(&mut self, button: u32, target: &Node) -> bool {
+        let bit = button_bit(button);
+        let began = self.held == 0;
+        self.held |= bit;
+        if began {
+            self.target = Some(target.clone());
+        }
+        began
+    }
+
+    /// Record a release. `true` if this release ended the grab.
+    pub fn release(&mut self, button: u32) -> bool {
+        let bit = button_bit(button);
+        if self.held & bit == 0 {
+            return false;
+        }
+        self.held &= !bit;
+        if self.held == 0 {
+            self.target = None;
+            return true;
+        }
+        false
+    }
+
+    /// The node every motion and release currently goes to.
+    #[must_use]
+    pub fn target(&self) -> Option<Node> {
+        self.target.clone()
+    }
+
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.held != 0
+    }
+
+    /// Drop the grab outright: the pointer left, or the seat lost it.
+    pub fn clear(&mut self) {
+        self.target = None;
+        self.held = 0;
+    }
+}
+
+/// One bit per pointer button, saturating at the 32 the mask can hold.
+///
+/// `BTN_LEFT` is 0x110 and the codes run upward; a tablet or gaming mouse can
+/// report codes far above that, and shifting by more than 31 is undefined.
+fn button_bit(button: u32) -> u32 {
+    1u32 << button.saturating_sub(0x110).min(31)
+}
+
+/// One `wl_pointer.axis` frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scroll {
+    pub dx: f32,
+    pub dy: f32,
+    pub source: ScrollSource,
+    /// `wl_pointer.axis_stop` -- the finger left the touchpad, which is what
+    /// starts a kinetic coast.
+    pub stop: bool,
+    pub time_ms: u32,
+}
+
+/// `wl_pointer.axis_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollSource {
+    Wheel,
+    Finger,
+    Continuous,
+    WheelTilt,
+}
+
+/// The fraction of a coast's velocity left after one second.
+///
+/// Chosen to match GTK's `GtkKineticScrolling` feel: fast at first, visibly
+/// stopped within about a second.
+const DECAY_PER_SECOND: f32 = 0.05;
+
+/// Below this many pixels per second a coast is over.
+pub const MIN_VELOCITY: f32 = 20.0;
+
+/// Kinetic deceleration for finger scrolls.
+#[derive(Debug, Default)]
+pub struct Kinetic {
+    velocity: (f32, f32),
+    /// A motion delta received but not yet rated: `wl_pointer.axis` reports
+    /// distance already travelled, not a rate, so it takes the *next* event's
+    /// arrival time to know how long that distance took. Applied and cleared
+    /// on the following `feed` call, whether that call is more motion or the
+    /// stop.
+    pending: Option<(f32, f32, Duration)>,
+    last: Option<Duration>,
+    /// The delta `sample` last handed out, so a duplicate call at the same
+    /// timestamp (two callers racing the same frame, or a caller re-reading
+    /// after a spurious wakeup) hands back the same answer instead of a
+    /// fabricated zero that would make the *next* real sample look like an
+    /// increase.
+    last_delta: (f32, f32),
+    coasting: bool,
+}
+
+impl Kinetic {
+    /// Feed one scroll frame.
+    ///
+    /// While the finger is down this tracks velocity; `axis_stop` starts the
+    /// coast. Every other source cancels: a wheel click is a discrete step, and
+    /// coasting one would scroll a list on every notch.
+    pub fn feed(&mut self, scroll: &Scroll, now: Duration) {
+        if scroll.source != ScrollSource::Finger {
+            self.cancel();
+            return;
+        }
+        // Rate the previous event now that we know how long it took to reach
+        // this one.
+        if let Some((pdx, pdy, pending_at)) = self.pending.take() {
+            let dt = now.saturating_sub(pending_at).as_secs_f32();
+            // A zero or backwards step tells us nothing about velocity;
+            // keeping the previous estimate is the only finite answer.
+            if dt > f32::EPSILON {
+                let instant = (pdx / dt, pdy / dt);
+                if instant.0.is_finite() && instant.1.is_finite() {
+                    // Half old, half new: one jittery frame must not define
+                    // the flick, and the last frames before lift-off must
+                    // dominate.
+                    self.velocity = (
+                        self.velocity.0.mul_add(0.5, instant.0 * 0.5),
+                        self.velocity.1.mul_add(0.5, instant.1 * 0.5),
+                    );
+                }
+            }
+        }
+        if scroll.stop {
+            self.coasting = self.speed() >= MIN_VELOCITY;
+            self.last = Some(now);
+            return;
+        }
+        self.coasting = false;
+        self.pending = Some((scroll.dx, scroll.dy, now));
+    }
+
+    /// The delta to apply this frame; `None` once stopped.
+    pub fn sample(&mut self, now: Duration) -> Option<(f32, f32)> {
+        if !self.coasting {
+            return None;
+        }
+        let last = self.last?;
+        let dt = now.saturating_sub(last).as_secs_f32();
+        if dt <= 0.0 {
+            return Some(self.last_delta);
+        }
+        self.last = Some(now);
+        let delta = (self.velocity.0 * dt, self.velocity.1 * dt);
+        let decay = DECAY_PER_SECOND.powf(dt);
+        self.velocity = (self.velocity.0 * decay, self.velocity.1 * decay);
+        if !delta.0.is_finite() || !delta.1.is_finite() {
+            self.cancel();
+            return None;
+        }
+        self.last_delta = delta;
+        if self.speed() < MIN_VELOCITY {
+            self.coasting = false;
+        }
+        Some(delta)
+    }
+
+    /// Stop dead: a new touch, a new scroll, a focus change.
+    pub fn cancel(&mut self) {
+        self.velocity = (0.0, 0.0);
+        self.pending = None;
+        self.last = None;
+        self.last_delta = (0.0, 0.0);
+        self.coasting = false;
+    }
+
+    fn speed(&self) -> f32 {
+        self.velocity.0.hypot(self.velocity.1)
+    }
+}
+
+/// A CSS/GTK cursor name as a `wp_cursor_shape_v1` shape.
+///
+/// Contract deviation 9: this takes a *name*, not a `&ComputedStyle`. GTK 4 has
+/// no `cursor` CSS property -- M2's registry holds the 114 properties GTK
+/// actually parses and `ui/tests/gtk4_property_reference.rs` pins that count --
+/// so a widget declares its cursor by name, exactly as
+/// `gtk_widget_set_cursor_from_name` does.
+///
+/// Unknown names and `url()` values fall back to `Default`: client-side cursor
+/// themes are out of scope for M3, and icedtea supports `wp_cursor_shape_v1`.
+#[must_use]
+pub fn cursor_shape_for(name: &str) -> CursorShape {
+    let lowered = name.trim().to_ascii_lowercase();
+    match lowered.as_str() {
+        "context-menu" => CursorShape::ContextMenu,
+        "help" => CursorShape::Help,
+        "pointer" => CursorShape::Pointer,
+        "progress" => CursorShape::Progress,
+        "wait" => CursorShape::Wait,
+        "cell" => CursorShape::Cell,
+        "crosshair" => CursorShape::Crosshair,
+        "text" => CursorShape::Text,
+        "vertical-text" => CursorShape::VerticalText,
+        "alias" => CursorShape::Alias,
+        "copy" => CursorShape::Copy,
+        "move" => CursorShape::Move,
+        "no-drop" => CursorShape::NoDrop,
+        "not-allowed" => CursorShape::NotAllowed,
+        "grab" => CursorShape::Grab,
+        "grabbing" => CursorShape::Grabbing,
+        "e-resize" => CursorShape::EResize,
+        "n-resize" => CursorShape::NResize,
+        "ne-resize" => CursorShape::NeResize,
+        "nw-resize" => CursorShape::NwResize,
+        "s-resize" => CursorShape::SResize,
+        "se-resize" => CursorShape::SeResize,
+        "sw-resize" => CursorShape::SwResize,
+        "w-resize" => CursorShape::WResize,
+        "ew-resize" => CursorShape::EwResize,
+        "ns-resize" => CursorShape::NsResize,
+        "nesw-resize" => CursorShape::NeswResize,
+        "nwse-resize" => CursorShape::NwseResize,
+        "col-resize" => CursorShape::ColResize,
+        "row-resize" => CursorShape::RowResize,
+        "all-scroll" => CursorShape::AllScroll,
+        "zoom-in" => CursorShape::ZoomIn,
+        "zoom-out" => CursorShape::ZoomOut,
+        _ => CursorShape::Default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Hit, MAX_HIT_DEPTH, hit_chain, hit_test};
@@ -362,5 +614,210 @@ mod tests {
         // allocation for it.
         let hit = hit_test(&f.root, &f.tree, &f.styles, (10.0, 20.0), true).unwrap();
         assert_ne!(id_of(&hit), "orphan");
+    }
+
+    use super::{
+        CursorShape, ImplicitGrab, Kinetic, MIN_VELOCITY, Scroll, ScrollSource, cursor_shape_for,
+    };
+    use std::time::Duration;
+
+    const BTN_LEFT: u32 = 0x110;
+    const BTN_RIGHT: u32 = 0x111;
+
+    fn finger(dx: f32, dy: f32, stop: bool) -> Scroll {
+        Scroll {
+            dx,
+            dy,
+            source: ScrollSource::Finger,
+            stop,
+            time_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_press_captures_the_pointer_until_the_last_button_is_released() {
+        // The client-side mirror of the compositor's implicit grab (which the
+        // wlr crate's own `implicit_grab_tests` pin on the server side):
+        // motion and the release go to the pressed node, not to whatever is
+        // under the pointer now.
+        let pressed = Node::new("button");
+        let elsewhere = Node::new("label");
+        let mut grab = ImplicitGrab::default();
+        assert!(!grab.is_held());
+        assert!(grab.target().is_none());
+
+        assert!(
+            grab.press(BTN_LEFT, &pressed),
+            "the first press begins the grab"
+        );
+        assert!(grab.is_held());
+        assert!(grab.target().expect("a target").ptr_eq(&pressed));
+
+        assert!(
+            !grab.press(BTN_RIGHT, &elsewhere),
+            "a second button does not begin a new grab"
+        );
+        assert!(
+            grab.target().expect("a target").ptr_eq(&pressed),
+            "and does not move the target"
+        );
+
+        assert!(!grab.release(BTN_RIGHT), "one button left: still grabbed");
+        assert!(grab.is_held());
+        assert!(grab.release(BTN_LEFT), "the last release ends the grab");
+        assert!(!grab.is_held());
+        assert!(grab.target().is_none());
+    }
+
+    #[test]
+    fn a_release_of_a_button_that_was_never_pressed_is_ignored() {
+        // The compositor sends a release for a button pressed before we had
+        // focus; ending the grab on it would drop a real drag.
+        let pressed = Node::new("button");
+        let mut grab = ImplicitGrab::default();
+        grab.press(BTN_LEFT, &pressed);
+        assert!(!grab.release(BTN_RIGHT));
+        assert!(grab.is_held(), "an unrelated release must not end the grab");
+        grab.clear();
+        assert!(!grab.is_held(), "a pointer leave clears it outright");
+        assert!(
+            !grab.release(BTN_LEFT),
+            "and a late release afterwards is a no-op"
+        );
+    }
+
+    #[test]
+    fn only_a_finger_scroll_coasts() {
+        let mut kinetic = Kinetic::default();
+        for source in [
+            ScrollSource::Wheel,
+            ScrollSource::WheelTilt,
+            ScrollSource::Continuous,
+        ] {
+            kinetic.feed(
+                &Scroll {
+                    dx: 0.0,
+                    dy: -40.0,
+                    source,
+                    stop: false,
+                    time_ms: 0,
+                },
+                Duration::from_millis(0),
+            );
+            kinetic.feed(
+                &Scroll {
+                    dx: 0.0,
+                    dy: 0.0,
+                    source,
+                    stop: true,
+                    time_ms: 10,
+                },
+                Duration::from_millis(10),
+            );
+            assert!(
+                kinetic.sample(Duration::from_millis(20)).is_none(),
+                "{source:?} must not coast: a wheel click is a discrete step"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flicked_finger_scroll_coasts_and_then_stops() {
+        let mut kinetic = Kinetic::default();
+        // 100 px over 100 ms == 1000 px/s.
+        kinetic.feed(&finger(0.0, -50.0, false), Duration::from_millis(0));
+        kinetic.feed(&finger(0.0, -50.0, false), Duration::from_millis(50));
+        kinetic.feed(&finger(0.0, 0.0, true), Duration::from_millis(100));
+
+        let first = kinetic
+            .sample(Duration::from_millis(116))
+            .expect("it coasts");
+        assert!(
+            first.1 < 0.0,
+            "the coast continues in the flick's direction: {first:?}"
+        );
+        assert_eq!(
+            first.0, 0.0,
+            "a purely vertical flick has no horizontal coast"
+        );
+
+        let mut deltas = vec![first.1.abs()];
+        let mut now = 116u64;
+        while let Some(delta) = kinetic.sample(Duration::from_millis(now)) {
+            deltas.push(delta.1.abs());
+            now += 16;
+            assert!(now < 10_000, "the coast never stopped");
+        }
+        assert!(deltas.len() > 2, "one frame is not a coast: {deltas:?}");
+        assert!(
+            deltas.windows(2).all(|w| w[1] <= w[0] + 0.001),
+            "each frame must move no further than the last: {deltas:?}"
+        );
+        assert!(
+            kinetic.sample(Duration::from_millis(now + 16)).is_none(),
+            "once stopped it stays stopped"
+        );
+    }
+
+    #[test]
+    fn a_new_scroll_or_a_cancel_ends_the_coast() {
+        let mut kinetic = Kinetic::default();
+        kinetic.feed(&finger(0.0, -50.0, false), Duration::from_millis(0));
+        kinetic.feed(&finger(0.0, 0.0, true), Duration::from_millis(50));
+        assert!(kinetic.sample(Duration::from_millis(66)).is_some());
+        kinetic.cancel();
+        assert!(
+            kinetic.sample(Duration::from_millis(82)).is_none(),
+            "touching the list must stop it dead, as GTK does"
+        );
+    }
+
+    #[test]
+    // MIN_VELOCITY is a compile-time constant; clippy is right that this
+    // particular assertion can never fail, and it stays anyway as a guard
+    // against the constant itself regressing to a non-positive value.
+    #[allow(clippy::assertions_on_constants)]
+    fn a_zero_or_backwards_time_step_never_produces_nan() {
+        // `time_ms` comes from the compositor and the clock from us; neither
+        // is guaranteed monotonic across a suspend. A NaN delta would poison
+        // every scroll offset downstream.
+        let mut kinetic = Kinetic::default();
+        kinetic.feed(&finger(0.0, -50.0, false), Duration::from_millis(100));
+        kinetic.feed(&finger(0.0, -50.0, false), Duration::from_millis(100));
+        kinetic.feed(&finger(0.0, -50.0, false), Duration::from_millis(50));
+        kinetic.feed(&finger(0.0, 0.0, true), Duration::from_millis(100));
+        for at in [100u64, 100, 50, 200] {
+            if let Some((dx, dy)) = kinetic.sample(Duration::from_millis(at)) {
+                assert!(dx.is_finite() && dy.is_finite(), "{dx},{dy} is not finite");
+            }
+        }
+        assert!(MIN_VELOCITY > 0.0);
+    }
+
+    #[test]
+    fn cursor_names_map_to_the_protocols_shapes() {
+        // The CSS/GTK cursor names widgets actually use (contract deviation 9:
+        // this is a name, not a CSS property -- GTK 4 has neither).
+        assert_eq!(cursor_shape_for("default"), CursorShape::Default);
+        assert_eq!(cursor_shape_for("text"), CursorShape::Text);
+        assert_eq!(cursor_shape_for("pointer"), CursorShape::Pointer);
+        assert_eq!(cursor_shape_for("grab"), CursorShape::Grab);
+        assert_eq!(cursor_shape_for("grabbing"), CursorShape::Grabbing);
+        assert_eq!(cursor_shape_for("col-resize"), CursorShape::ColResize);
+        assert_eq!(cursor_shape_for("row-resize"), CursorShape::RowResize);
+        assert_eq!(cursor_shape_for("ew-resize"), CursorShape::EwResize);
+        assert_eq!(cursor_shape_for("ns-resize"), CursorShape::NsResize);
+        assert_eq!(cursor_shape_for("not-allowed"), CursorShape::NotAllowed);
+        assert_eq!(cursor_shape_for("progress"), CursorShape::Progress);
+        assert_eq!(cursor_shape_for("wait"), CursorShape::Wait);
+        assert_eq!(cursor_shape_for("crosshair"), CursorShape::Crosshair);
+        assert_eq!(cursor_shape_for("help"), CursorShape::Help);
+        assert_eq!(cursor_shape_for("context-menu"), CursorShape::ContextMenu);
+        // Case-insensitive, and anything unknown -- including the `url()` GTK
+        // themes use for custom cursors, which we do not support -- is Default.
+        assert_eq!(cursor_shape_for("TEXT"), CursorShape::Text);
+        assert_eq!(cursor_shape_for("url(hand.png)"), CursorShape::Default);
+        assert_eq!(cursor_shape_for(""), CursorShape::Default);
+        assert_eq!(cursor_shape_for("zoom-sideways"), CursorShape::Default);
     }
 }
