@@ -176,6 +176,63 @@ pub struct LayerEntry {
     pub margin: (i32, i32, i32, i32),
 }
 
+/// What a popup hangs off, in model terms.
+///
+/// The library's own `wlr::PopupParent` says the same thing in library terms;
+/// this is its model translation, made once in `new_popup` so nothing past
+/// the handler boundary has to resolve a `ToplevelId` again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PopupHost {
+    Window(WindowId),
+    Layer(wlr::LayerSurfaceId),
+    Popup(crate::wayland::PopupKey),
+}
+
+/// The bottom of a popup chain -- never a popup.
+///
+/// Every placement, focus and dismissal decision is taken against this rather
+/// than against the immediate host: a menu three levels deep is still
+/// constrained to *its window's* output, and focus still returns to *its
+/// window* when the chain ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PopupRoot {
+    Window(WindowId),
+    Layer(wlr::LayerSurfaceId),
+}
+
+/// The model's own record of one live xdg-popup.
+///
+/// Same reasoning as [`LayerEntry`]: the library's `wlr::Popup` handle only
+/// lives for the duration of one handler call, so everything a later,
+/// unrelated call needs (a window move re-running placement, a click looking
+/// for the topmost popup, a destroy deciding whether the chain has emptied)
+/// is copied out while the handle is live.
+pub struct PopupEntry {
+    /// The immediate parent -- a window, a layer surface, or another popup.
+    pub host: PopupHost,
+    /// The chain's bottom, resolved once at record time. Never re-derived:
+    /// the host may die before this popup does.
+    pub root: PopupRoot,
+    /// The model output index the root sits on, or [`NO_OUTPUT`] when the
+    /// root had no output at record time -- exactly [`LayerEntry::output`]'s
+    /// convention, and every reader treats a miss the same way.
+    pub output: u32,
+    /// This popup's position in a total, stable creation order across every
+    /// popup this compositor has ever announced. The z-order tiebreak among
+    /// siblings, and the sort key `popup_chain` orders by.
+    pub sequence: u64,
+    /// The client sent `xdg_popup.grab`. Observed, never driven: wlroots owns
+    /// the grab's whole lifetime (contract §1.6).
+    pub grabbing: bool,
+    /// Whether the popup currently has a buffer on screen.
+    pub mapped: bool,
+    /// Where the popup is, in its `root`'s surface coordinates. Committed
+    /// state, refreshed on map and after every reconfigure -- see
+    /// `Wayland::popup_geometry`'s doc for why that is the right reading for
+    /// `popup_at_point`.
+    pub geometry: Rectangle,
+}
+
 /// Shrink `rect` by one layer entry's positive exclusive zone along
 /// whichever single edge it is anchored to: `top`-anchored (regardless of
 /// whether `left`/`right` are also set -- "single edge or
@@ -873,6 +930,44 @@ pub struct State {
     /// Source of [`LayerEntry::sequence`]. Monotonic and never reused, the
     /// same shape as `next_title_generation`.
     next_layer_sequence: u64,
+    /// Every live popup's model-side bookkeeping, keyed by the library's own
+    /// id. Populated at `new_popup`, kept current on map/unmap/reposition,
+    /// removed at `popup_destroyed` -- and pruned wholesale when a chain's
+    /// root dies, since a root's death takes its popups with it and the
+    /// per-popup destroys may never be delivered.
+    popups: HashMap<crate::wayland::PopupKey, PopupEntry>,
+    /// Creation-ordered; the tail is the topmost popup.
+    ///
+    /// Z-order itself is the scene's (contract §2.2: a popup's scene subtree
+    /// hangs off its parent's, so it stacks with its parent for free and the
+    /// compositor never calls `wlr_scene_node_place_*` for a popup). This
+    /// exists for the two things the scene cannot answer from the model side:
+    /// hit-testing (`popup_at_point`) and dismissal order.
+    ///
+    /// `#[allow(dead_code)]`: only written by `record_popup`/`forget_popup`
+    /// in this commit's isolation -- Task 4's handler wiring and Task 6's
+    /// `popup_at_point` are what read it.
+    #[allow(dead_code)]
+    popup_stack: Vec<crate::wayland::PopupKey>,
+    /// Source of [`PopupEntry::sequence`]. Monotonic and never reused, the
+    /// same shape as `next_layer_sequence`.
+    ///
+    /// `#[allow(dead_code)]`: only `record_popup` reads this, and nothing
+    /// outside `mod tests` calls `record_popup` until Task 4's handlers do.
+    #[allow(dead_code)]
+    next_popup_sequence: u64,
+    /// Whom keyboard focus returns to when a **grabbing** chain ends.
+    ///
+    /// Set only when a chain's first popup grabs (contract deviation D3: a
+    /// non-grabbing popup never moves focus, so restoring one would be the
+    /// move rule 2 forbids). Taken -- not merely read -- by
+    /// `restore_focus_after_popups`, so a second chain cannot inherit the
+    /// first one's target.
+    ///
+    /// `#[allow(dead_code)]`: no reader exists until Task 6's
+    /// `restore_focus_after_popups`. Unused only in this commit's isolation.
+    #[allow(dead_code)]
+    focus_before_popup: Option<PopupRoot>,
     /// Rasterized button-glyph pixels, keyed by `(button index, width,
     /// height, fg)`. Unlike `title_rasters` this needs no per-window entry
     /// or generation counter: a glyph's pixels are a pure function of that
@@ -1054,6 +1149,10 @@ impl State {
             layers: HashMap::new(),
             layer_focus: None,
             next_layer_sequence: 0,
+            popups: HashMap::new(),
+            popup_stack: Vec::new(),
+            next_popup_sequence: 0,
+            focus_before_popup: None,
             button_glyph_cache: HashMap::new(),
             ssd_hover: None,
             ssd_press: None,
@@ -1587,6 +1686,146 @@ impl State {
 
         let (w, h) = (w.max(0) as u32, h.max(0) as u32);
         Some((w, h, x, y))
+    }
+
+    /// Announce a popup to the model.
+    ///
+    /// Drops the popup outright when its host is not something this
+    /// compositor models -- an unbound toplevel, a layer surface already
+    /// forgotten, or a parent popup that died between the two `new_popup`
+    /// signals. That is the untrusted-client posture the rest of this file
+    /// takes (contract §9): a client can drive any of the three, and none of
+    /// them is a reason to fabricate a root.
+    ///
+    /// `#[allow(dead_code)]`: no handler calls this yet -- Task 4's
+    /// `new_popup` is the first production caller. Unused only in this
+    /// commit's isolation; `mod tests` already exercises it.
+    #[allow(dead_code)]
+    pub(crate) fn record_popup(
+        &mut self,
+        popup: crate::wayland::PopupKey,
+        host: PopupHost,
+        grabbing: bool,
+    ) {
+        let Some(root) = self.popup_root_of_host(host) else {
+            tracing::debug!(
+                ?popup,
+                ?host,
+                "ignoring a popup whose host this compositor does not model"
+            );
+            return;
+        };
+        let output = self.popup_output_of_root(root);
+        let sequence = self.next_popup_sequence;
+        self.next_popup_sequence += 1;
+        // Read before the insert: "was this chain empty" must not count the
+        // popup being recorded.
+        let chain_was_empty = !self.popups.values().any(|entry| entry.root == root);
+        self.popups.insert(
+            popup,
+            PopupEntry {
+                host,
+                root,
+                output,
+                sequence,
+                grabbing,
+                // False until `popup_mapped`, exactly as `LayerEntry::mapped`
+                // is: a popup with no buffer yet is not on screen and must not
+                // answer `popup_at_point`.
+                mapped: false,
+                geometry: Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            },
+        );
+        self.popup_stack.push(popup);
+        // Deviation D3: only a grabbing chain parks a restore target, and only
+        // its first popup does -- a submenu opening over a menu must not
+        // overwrite the window the whole chain came from.
+        if grabbing && chain_was_empty {
+            self.focus_before_popup = Some(root);
+        }
+    }
+
+    /// Drop `popup` from the model. A no-op, panic-free, on a key this
+    /// compositor was never told about -- contract §1.3's caveat, which
+    /// `layer_surface_destroyed` already takes the same posture towards.
+    ///
+    /// `#[allow(dead_code)]`: no handler calls this yet -- Task 4's
+    /// `popup_destroyed` is the first production caller. Unused only in
+    /// this commit's isolation; `mod tests` already exercises it.
+    #[allow(dead_code)]
+    pub(crate) fn forget_popup(&mut self, popup: crate::wayland::PopupKey) {
+        self.popups.remove(&popup);
+        self.popup_stack.retain(|key| *key != popup);
+    }
+
+    /// The chain root `popup` belongs to, or `None` if it is not recorded.
+    pub fn popup_root(&self, popup: crate::wayland::PopupKey) -> Option<PopupRoot> {
+        self.popups.get(&popup).map(|entry| entry.root)
+    }
+
+    /// Every popup under `root`, deepest last.
+    ///
+    /// Sorted by `sequence` rather than by walking `host` links: a chain is
+    /// created bottom-up, so creation order *is* depth order, and a sort
+    /// cannot loop on a cycle a malicious client might otherwise build out of
+    /// `PopupHost::Popup` links.
+    pub fn popup_chain(&self, root: PopupRoot) -> Vec<crate::wayland::PopupKey> {
+        let mut chain: Vec<(u64, crate::wayland::PopupKey)> = self
+            .popups
+            .iter()
+            .filter(|(_, entry)| entry.root == root)
+            .map(|(key, entry)| (entry.sequence, *key))
+            .collect();
+        chain.sort_unstable_by_key(|(sequence, _)| *sequence);
+        chain.into_iter().map(|(_, key)| key).collect()
+    }
+
+    /// How many popups the model currently holds. Introspection for tests --
+    /// mirrors `ssd_rect_count()`.
+    pub fn popup_count(&self) -> usize {
+        self.popups.len()
+    }
+
+    /// Resolve a host to its chain root, or `None` when the host is not
+    /// modelled. A popup host resolves through the parent's own recorded
+    /// root, so the walk is one step deep however deep the chain is.
+    ///
+    /// `#[allow(dead_code)]`: reachable only through `record_popup`, itself
+    /// unused until Task 4. Unused only in this commit's isolation.
+    #[allow(dead_code)]
+    fn popup_root_of_host(&self, host: PopupHost) -> Option<PopupRoot> {
+        match host {
+            PopupHost::Window(id) => self
+                .window_manager
+                .get(id)
+                .map(|window| PopupRoot::Window(window.id)),
+            PopupHost::Layer(id) => self
+                .layers
+                .contains_key(&id)
+                .then_some(PopupRoot::Layer(id)),
+            PopupHost::Popup(parent) => self.popups.get(&parent).map(|entry| entry.root),
+        }
+    }
+
+    /// The model output index `root` sits on, or [`NO_OUTPUT`].
+    ///
+    /// `#[allow(dead_code)]`: reachable only through `record_popup`, itself
+    /// unused until Task 4. Unused only in this commit's isolation.
+    #[allow(dead_code)]
+    fn popup_output_of_root(&self, root: PopupRoot) -> u32 {
+        match root {
+            PopupRoot::Window(id) => self
+                .window_manager
+                .get(id)
+                .and_then(|window| self.output_for_window(window.geometry))
+                .unwrap_or(NO_OUTPUT),
+            PopupRoot::Layer(id) => self.layers.get(&id).map_or(NO_OUTPUT, |entry| entry.output),
+        }
     }
 
     /// Choose `id`'s layer surface's size and position for its output box
@@ -13106,5 +13345,128 @@ mod tests {
                  requester={requester:?} focused={focused:?}"
             );
         }
+    }
+
+    /// Recording a chain builds it root-first and `popup_chain` returns it
+    /// deepest-last, whatever order the map iterates in.
+    ///
+    /// The chain order is load-bearing twice over: `reconstrain_popups`
+    /// reconfigures parents before children (a child's own placement is
+    /// expressed against its parent), and `dismiss` order is the protocol's
+    /// reverse-creation requirement.
+    ///
+    /// Mutation check: drop the `sort_unstable_by_key` from `popup_chain` and
+    /// this fails -- `HashMap` iteration order is not creation order.
+    #[test]
+    fn a_recorded_popup_chain_reports_its_root_and_orders_itself_deepest_last() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        let window = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
+
+        let outer = crate::wayland::PopupKey::for_test(1);
+        let inner = crate::wayland::PopupKey::for_test(2);
+        let deepest = crate::wayland::PopupKey::for_test(3);
+        state.record_popup(outer, PopupHost::Window(window), false);
+        state.record_popup(inner, PopupHost::Popup(outer), false);
+        state.record_popup(deepest, PopupHost::Popup(inner), false);
+
+        let root = PopupRoot::Window(window);
+        assert_eq!(state.popup_root(outer), Some(root));
+        assert_eq!(
+            state.popup_root(deepest),
+            Some(root),
+            "a nested popup's root is the chain's bottom, not its parent"
+        );
+        assert_eq!(state.popup_chain(root), vec![outer, inner, deepest]);
+        assert_eq!(state.popup_count(), 3);
+
+        // A key nobody recorded is a miss, never a panic.
+        assert_eq!(
+            state.popup_root(crate::wayland::PopupKey::for_test(99)),
+            None
+        );
+        assert!(
+            state
+                .popup_chain(PopupRoot::Layer(wlr::LayerSurfaceId::dangling_for_test()))
+                .is_empty(),
+            "a root with no popups has an empty chain"
+        );
+    }
+
+    /// Forgetting a popup drops it from both the map and the stack, and
+    /// forgetting one nobody recorded is a no-op rather than a panic
+    /// (contract §1.3: a destroy may name an id this handler was never told
+    /// about).
+    ///
+    /// Mutation check: drop the `popup_stack.retain` from `forget_popup` and
+    /// the stack-length assertion fails -- a stale key would keep answering
+    /// `popup_at_point` after its popup was gone.
+    #[test]
+    fn forgetting_a_popup_clears_both_the_map_and_the_stack() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        let window = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+            },
+        );
+        let a = crate::wayland::PopupKey::for_test(1);
+        let b = crate::wayland::PopupKey::for_test(2);
+        state.record_popup(a, PopupHost::Window(window), false);
+        state.record_popup(b, PopupHost::Popup(a), false);
+
+        state.forget_popup(b);
+        assert_eq!(state.popup_chain(PopupRoot::Window(window)), vec![a]);
+        assert_eq!(state.popup_stack, vec![a]);
+
+        state.forget_popup(crate::wayland::PopupKey::for_test(99));
+        assert_eq!(state.popup_count(), 1, "an unknown key forgets nothing");
+
+        state.forget_popup(a);
+        assert_eq!(state.popup_count(), 0);
+        assert!(state.popup_stack.is_empty());
+    }
+
+    /// A popup whose host this compositor does not model is dropped rather
+    /// than recorded under a fabricated root -- the untrusted-client rule
+    /// (contract §9: a malformed value is dropped and logged, never a panic).
+    ///
+    /// Mutation check: make `popup_root_of_host` return
+    /// `Some(PopupRoot::Window(WindowId(0)))` on a miss and the count
+    /// assertion fails.
+    #[test]
+    fn a_popup_on_an_unmodelled_host_is_not_recorded() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        // A parent popup that was never recorded: the client raced its own
+        // destroy against the child's creation.
+        state.record_popup(
+            crate::wayland::PopupKey::for_test(1),
+            PopupHost::Popup(crate::wayland::PopupKey::for_test(50)),
+            true,
+        );
+        assert_eq!(state.popup_count(), 0);
+        assert!(state.popup_stack.is_empty());
+        assert_eq!(
+            state.focus_before_popup, None,
+            "a popup that was never recorded must not have parked a focus \
+             restore target"
+        );
     }
 }
