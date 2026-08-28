@@ -23,10 +23,8 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 
 use skia_rs_safe::canvas::Surface;
-use wayland_client::QueueHandle;
 use wayland_client::protocol::{wl_buffer, wl_shm, wl_shm_pool};
-
-use crate::wayland::AppState;
+use wayland_client::{Dispatch, QueueHandle};
 
 /// Convert Skia's physical RGBA-premultiplied bytes into `Argb8888` bytes.
 ///
@@ -187,13 +185,18 @@ impl ShmBuffer {
     /// Returns the underlying `memfd_create`/`ftruncate` error, or an
     /// `InvalidInput` error if `width`/`height` do not describe a positive
     /// buffer size.
-    pub fn new(
+    pub fn new<D>(
         shm: &wl_shm::WlShm,
-        qh: &QueueHandle<AppState>,
+        qh: &QueueHandle<D>,
         width: i32,
         height: i32,
         slot: BufferSlot,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Self>
+    where
+        D: Dispatch<wl_shm_pool::WlShmPool, ()>
+            + Dispatch<wl_buffer::WlBuffer, BufferSlot>
+            + 'static,
+    {
         let stride = width
             .checked_mul(4)
             .ok_or_else(|| io::Error::other("shm buffer stride overflows"))?;
@@ -258,6 +261,11 @@ impl Drop for ShmBuffer {
 }
 
 /// A double-buffered set of same-sized `wl_shm` buffers.
+///
+/// Generic over the dispatch state because M3 has four client states that all
+/// want one of these (the M1 `LayerWindow`, `window::Window`, and each popup's
+/// own pool); the M1 signatures named `AppState` outright, which no other
+/// client could satisfy.
 pub struct BufferPool {
     buffers: Vec<ShmBuffer>,
     slots: SlotPool,
@@ -271,12 +279,17 @@ impl BufferPool {
     /// # Errors
     ///
     /// Whatever [`ShmBuffer::new`] reports.
-    pub fn new(
+    pub fn new<D>(
         shm: &wl_shm::WlShm,
-        qh: &QueueHandle<AppState>,
+        qh: &QueueHandle<D>,
         width: i32,
         height: i32,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Self>
+    where
+        D: Dispatch<wl_shm_pool::WlShmPool, ()>
+            + Dispatch<wl_buffer::WlBuffer, BufferSlot>
+            + 'static,
+    {
         let mut pool = Self {
             buffers: Vec::with_capacity(POOL_MAX_BUFFERS),
             // `SlotPool::new` already starts every slot free; growing
@@ -303,11 +316,16 @@ impl BufferPool {
     /// # Errors
     ///
     /// Whatever [`ShmBuffer::new`] reports, when the pool has to grow.
-    pub fn acquire(
+    pub fn acquire<D>(
         &mut self,
         shm: &wl_shm::WlShm,
-        qh: &QueueHandle<AppState>,
-    ) -> io::Result<Option<usize>> {
+        qh: &QueueHandle<D>,
+    ) -> io::Result<Option<usize>>
+    where
+        D: Dispatch<wl_shm_pool::WlShmPool, ()>
+            + Dispatch<wl_buffer::WlBuffer, BufferSlot>
+            + 'static,
+    {
         match self.slots.acquire() {
             Some(Slot::Existing(index)) => Ok(Some(index)),
             Some(Slot::New(index)) => {
