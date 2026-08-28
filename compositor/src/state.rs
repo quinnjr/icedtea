@@ -6639,6 +6639,31 @@ impl wlr::ToplevelHandler for State {
             tracing::debug!(?key, "popup on a parent this compositor does not model");
             return;
         };
+        // Contract §11 E19: the crate folds an unrecognised
+        // `xdg_positioner_anchor`/`_gravity` into its `None` variant and binds
+        // no logging symbol of its own, so this is the first place a malformed
+        // positioner becomes an observable compositor decision -- and the only
+        // place it can be logged at all. What is recoverable is the whole
+        // ruleset the placement about to run is derived from; the raw wire
+        // value is *not*, because `PositionerAnchor::from_raw` /
+        // `PositionerGravity::from_raw` make an unknown value indistinguishable
+        // from a legitimate `NONE` before it ever reaches this crate (see the
+        // fix-report deviation this note is paired with). An `anchor: None` or
+        // `gravity: None` in this line is therefore "the client sent NONE, or
+        // sent something this protocol version does not define" -- which is
+        // exactly the pair of cases a reader debugging a mis-placed menu needs
+        // to see.
+        let rules = popup.positioner_rules();
+        tracing::debug!(
+            ?key,
+            ?host,
+            anchor = ?rules.anchor,
+            gravity = ?rules.gravity,
+            size = ?rules.size,
+            anchor_rect = ?rules.anchor_rect,
+            reactive = rules.reactive,
+            "placing a popup against its client's positioner"
+        );
         self.record_popup(key, host, popup.grab_requested());
         self.configure_popup_now(key);
     }
