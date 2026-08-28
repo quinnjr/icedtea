@@ -18,11 +18,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-    wl_surface, wl_touch,
+    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
+    wl_shm_pool, wl_surface, wl_touch,
 };
 use wayland_client::{
-    ConnectError, Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle,
+    ConnectError, Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, WEnum,
     delegate_noop,
 };
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1;
@@ -36,7 +36,7 @@ use crate::css::node::{Node, PseudoStates};
 use crate::shm::{BufferPool, BufferSlot};
 use crate::text::FontDatabase;
 use keyboard::{KeyEvent, Keymap};
-use pointer::Scroll;
+use pointer::{Scroll, ScrollSource};
 use popup::PopupKey;
 
 /// A node's identity, as a key for per-frame caches.
@@ -479,6 +479,11 @@ pub(crate) struct WindowState {
     /// Set by Task 14's popup dispatch.
     #[allow(dead_code)]
     pub(crate) popup_events: Vec<InputEvent>,
+    /// Which [`SurfaceTarget`] each of this window's `wl_surface`s is, so
+    /// `wl_pointer.enter`/`wl_keyboard.enter` (which only ever name a
+    /// surface) can be resolved back to one. Pushed by `Window::open` for the
+    /// main surface and by Task 14's `open_popup` for each popup.
+    pub(crate) surface_targets: Vec<(wayland_client::backend::ObjectId, SurfaceTarget)>,
 }
 
 impl WindowState {
@@ -504,6 +509,7 @@ impl WindowState {
             closed: false,
             axis: None,
             popup_events: Vec::new(),
+            surface_targets: Vec::new(),
         }
     }
 
@@ -522,6 +528,17 @@ impl WindowState {
         }
         self.closed = true;
         self.events.push(InputEvent::Close);
+    }
+
+    /// Which of this window's surfaces `surface` is.
+    ///
+    /// `wl_pointer.enter` names the surface; a popup is a different one, and
+    /// the whole point of [`SurfaceTarget`] is not to guess.
+    fn target_of(&self, surface: &wl_surface::WlSurface) -> SurfaceTarget {
+        self.surface_targets
+            .iter()
+            .find(|(id, _)| *id == surface.id())
+            .map_or(SurfaceTarget::Window, |(_, target)| *target)
     }
 }
 
@@ -675,6 +692,9 @@ impl Window {
             .clone()
             .ok_or(SurfaceError::MissingGlobal("wl_shm"))?;
         let wl_surface = compositor.create_surface(&qh, SurfaceTarget::Window);
+        state
+            .surface_targets
+            .push((wl_surface.id(), SurfaceTarget::Window));
         let width = i32::try_from(spec.size.0.max(1)).unwrap_or(i32::MAX);
         let height = i32::try_from(spec.size.1.max(1)).unwrap_or(i32::MAX);
 
@@ -859,7 +879,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WindowState {
             return;
         };
         match interface.as_str() {
-            "wl_compositor" => state.compositor = Some(registry.bind(name, version.min(4), qh, ())),
+            // Bound at 6 (not 4): `wl_surface.preferred_buffer_scale` is
+            // since-version 6, and a `wl_surface` created from a lower-bound
+            // `wl_compositor` never gets that event at all.
+            "wl_compositor" => state.compositor = Some(registry.bind(name, version.min(6), qh, ())),
             "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
             "xdg_wm_base" => state.wm_base = Some(registry.bind(name, version.min(5), qh, ())),
             "zwlr_layer_shell_v1" => {
@@ -955,16 +978,43 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WindowState {
 }
 
 impl Dispatch<wl_surface::WlSurface, SurfaceTarget> for WindowState {
-    /// `enter`/`leave`/`preferred_buffer_transform` are Task 11's and Task
-    /// 12's; the role's own surface has nothing to do with them here.
+    /// `enter`/`leave`/`preferred_buffer_transform` are Task 12's; only the
+    /// scale factor is this task's.
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &wl_surface::WlSurface,
-        _: wl_surface::Event,
+        event: wl_surface::Event,
         _: &SurfaceTarget,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let wl_surface::Event::PreferredBufferScale { factor } = event
+            && factor > 0
+            && factor != state.scale
+        {
+            state.scale = factor;
+            state.events.push(InputEvent::ScaleChanged(factor));
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, SurfaceTarget> for WindowState {
+    /// `wl_surface.frame`'s callback: the one clock-agnostic "you may draw
+    /// now" signal. `Window::render` (Task 12) fills in `now`; the state
+    /// holds no clock of its own.
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &SurfaceTarget,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_callback::Event::Done { .. }) {
+            state.events.push(InputEvent::Frame {
+                now: Duration::ZERO,
+            });
+        }
     }
 }
 
@@ -990,9 +1040,334 @@ delegate_noop!(WindowState: ignore wl_shm::WlShm);
 delegate_noop!(WindowState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(WindowState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(WindowState: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
-// Task 11 replaces this with the real capability handler and adds the pointer,
-// keyboard and touch dispatch.
-delegate_noop!(WindowState: ignore wl_seat::WlSeat);
+
+impl Dispatch<wl_seat::WlSeat, ()> for WindowState {
+    /// Capabilities are the seat's *whole* current set, not an addition.
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        else {
+            return;
+        };
+        sync_capability(
+            caps.contains(wl_seat::Capability::Pointer),
+            &mut state.pointer,
+            || seat.get_pointer(qh, ()),
+            |p| {
+                if p.version() >= 3 {
+                    p.release();
+                }
+            },
+        );
+        sync_capability(
+            caps.contains(wl_seat::Capability::Keyboard),
+            &mut state.keyboard,
+            || seat.get_keyboard(qh, ()),
+            |k| {
+                if k.version() >= 3 {
+                    k.release();
+                }
+            },
+        );
+        sync_capability(
+            caps.contains(wl_seat::Capability::Touch),
+            &mut state.touch,
+            || seat.get_touch(qh, ()),
+            |t| {
+                if t.version() >= 3 {
+                    t.release();
+                }
+            },
+        );
+        if state.keyboard.is_none() {
+            state.keymap = None;
+        }
+    }
+}
+
+/// Add or drop one seat capability's object, idempotently.
+///
+/// `wl_seat.capabilities` reports the seat's whole current set on every
+/// change, not a delta: a client that only ever adds keeps dispatching to a
+/// pointer the compositor took away.
+fn sync_capability<T>(
+    present: bool,
+    slot: &mut Option<T>,
+    create: impl FnOnce() -> T,
+    destroy: impl FnOnce(&T),
+) {
+    match (present, slot.take()) {
+        (true, Some(existing)) => *slot = Some(existing),
+        (true, None) => *slot = Some(create()),
+        (false, Some(existing)) => destroy(&existing),
+        (false, None) => {}
+    }
+}
+
+/// `wl_pointer.axis_source`.
+///
+/// An unknown source (a future protocol addition) reads as a wheel: the
+/// conservative choice, since a wheel scroll never coasts after the user
+/// stopped, while guessing `Finger` would make an unrecognised source coast
+/// forever.
+fn scroll_source_of(source: WEnum<wl_pointer::AxisSource>) -> ScrollSource {
+    match source {
+        WEnum::Value(wl_pointer::AxisSource::Finger) => ScrollSource::Finger,
+        WEnum::Value(wl_pointer::AxisSource::Continuous) => ScrollSource::Continuous,
+        WEnum::Value(wl_pointer::AxisSource::WheelTilt) => ScrollSource::WheelTilt,
+        _ => ScrollSource::Wheel,
+    }
+}
+
+/// Fold one `wl_pointer.axis` event into the scroll frame being assembled.
+///
+/// `axis`, `axis_source` and `axis_stop` are separate events that mean
+/// nothing apart: two axes reported within the same frame are one diagonal
+/// scroll, not two, so this accumulates rather than overwrites.
+fn accumulate_axis(
+    pending: &mut Option<Scroll>,
+    axis: WEnum<wl_pointer::Axis>,
+    value: f32,
+    time_ms: u32,
+) {
+    let scroll = pending.get_or_insert(Scroll {
+        dx: 0.0,
+        dy: 0.0,
+        source: ScrollSource::Wheel,
+        stop: false,
+        time_ms,
+    });
+    match axis {
+        WEnum::Value(wl_pointer::Axis::HorizontalScroll) => scroll.dx += value,
+        WEnum::Value(wl_pointer::Axis::VerticalScroll) => scroll.dy += value,
+        _ => {}
+    }
+    scroll.time_ms = time_ms;
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for WindowState {
+    fn event(
+        state: &mut Self,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter {
+                serial,
+                surface,
+                surface_x,
+                surface_y,
+            } => {
+                state.seat_serial = Some(serial);
+                let target = state.target_of(&surface);
+                state.events.push(InputEvent::PointerEnter {
+                    x: surface_x,
+                    y: surface_y,
+                    serial,
+                    target,
+                });
+            }
+            wl_pointer::Event::Motion {
+                time,
+                surface_x,
+                surface_y,
+            } => {
+                state.events.push(InputEvent::PointerMotion {
+                    x: surface_x,
+                    y: surface_y,
+                    time_ms: time,
+                });
+            }
+            wl_pointer::Event::Leave { serial, .. } => {
+                state.seat_serial = Some(serial);
+                state.events.push(InputEvent::PointerLeave);
+            }
+            wl_pointer::Event::Button {
+                serial,
+                time,
+                button,
+                state: pressed,
+            } => {
+                state.seat_serial = Some(serial);
+                state.events.push(InputEvent::PointerButton {
+                    button,
+                    pressed: matches!(pressed, WEnum::Value(wl_pointer::ButtonState::Pressed)),
+                    serial,
+                    time_ms: time,
+                });
+            }
+            wl_pointer::Event::Axis { time, axis, value } => {
+                accumulate_axis(&mut state.axis, axis, value as f32, time);
+            }
+            wl_pointer::Event::AxisSource { axis_source } => {
+                let source = scroll_source_of(axis_source);
+                state
+                    .axis
+                    .get_or_insert(Scroll {
+                        dx: 0.0,
+                        dy: 0.0,
+                        source,
+                        stop: false,
+                        time_ms: 0,
+                    })
+                    .source = source;
+            }
+            wl_pointer::Event::AxisStop { time, .. } => {
+                let scroll = state.axis.get_or_insert(Scroll {
+                    dx: 0.0,
+                    dy: 0.0,
+                    source: ScrollSource::Finger,
+                    stop: true,
+                    time_ms: time,
+                });
+                scroll.stop = true;
+                scroll.time_ms = time;
+            }
+            // One `frame` is one logical scroll: the axis, its source and its
+            // stop arrive as separate events and mean nothing apart.
+            wl_pointer::Event::Frame => {
+                if let Some(scroll) = state.axis.take() {
+                    state.events.push(InputEvent::Scroll(scroll));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Keymap { format, fd, size } => {
+                if !matches!(format, WEnum::Value(wl_keyboard::KeymapFormat::XkbV1)) {
+                    tracing::warn!(?format, "ignoring a keymap in an unknown format");
+                    return;
+                }
+                match Keymap::from_fd(fd, size as usize) {
+                    Ok(keymap) => state.keymap = Some(keymap),
+                    // Untrusted input: a compositor that hands us a keymap we
+                    // cannot compile leaves us keyboardless, not dead.
+                    Err(err) => tracing::error!(%err, "the compositor's keymap did not compile"),
+                }
+            }
+            wl_keyboard::Event::Enter {
+                serial, surface, ..
+            } => {
+                state.seat_serial = Some(serial);
+                let target = state.target_of(&surface);
+                state
+                    .events
+                    .push(InputEvent::KeyboardEnter { serial, target });
+            }
+            wl_keyboard::Event::Leave { serial, .. } => {
+                state.seat_serial = Some(serial);
+                if let Some(keymap) = state.keymap.as_mut() {
+                    keymap.clear_repeat();
+                }
+                state.events.push(InputEvent::KeyboardLeave);
+            }
+            wl_keyboard::Event::Key {
+                serial,
+                time,
+                key,
+                state: key_state,
+            } => {
+                state.seat_serial = Some(serial);
+                let pressed = matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed));
+                let Some(keymap) = state.keymap.as_mut() else {
+                    return;
+                };
+                let event = keymap.translate(key, pressed, serial, time);
+                // The repeat clock is the animation clock, which the state
+                // does not hold; `Window::pump` arms it from the event it sees.
+                state.events.push(InputEvent::Key(event));
+            }
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                if let Some(keymap) = state.keymap.as_mut() {
+                    keymap.update_mask(mods_depressed, mods_latched, mods_locked, group);
+                }
+            }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                if let Some(keymap) = state.keymap.as_mut() {
+                    keymap.set_repeat_info(rate, delay);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WindowState {
+    fn event(
+        state: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_touch::Event::Down {
+                serial,
+                time,
+                id,
+                x,
+                y,
+                ..
+            } => {
+                state.seat_serial = Some(serial);
+                state.events.push(InputEvent::TouchDown {
+                    id,
+                    x,
+                    y,
+                    serial,
+                    time_ms: time,
+                });
+            }
+            wl_touch::Event::Motion { time, id, x, y } => {
+                state.events.push(InputEvent::TouchMotion {
+                    id,
+                    x,
+                    y,
+                    time_ms: time,
+                });
+            }
+            wl_touch::Event::Up { serial, time, id } => {
+                state.seat_serial = Some(serial);
+                state.events.push(InputEvent::TouchUp {
+                    id,
+                    serial,
+                    time_ms: time,
+                });
+            }
+            _ => {}
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1231,6 +1606,123 @@ mod tests {
         assert_ne!(
             SurfaceTarget::Window,
             SurfaceTarget::Popup(crate::window::popup::PopupKey(1))
+        );
+    }
+
+    #[test]
+    fn a_scroll_is_assembled_across_its_parts_and_emitted_whole() {
+        // `axis`, `axis_source` and `axis_stop` are separate events and mean
+        // nothing apart: two axes in one frame are one diagonal scroll, not two.
+        use super::accumulate_axis;
+        use wayland_client::WEnum;
+        use wayland_client::protocol::wl_pointer;
+
+        let mut pending = None;
+        accumulate_axis(
+            &mut pending,
+            WEnum::Value(wl_pointer::Axis::VerticalScroll),
+            -10.0,
+            5,
+        );
+        accumulate_axis(
+            &mut pending,
+            WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+            4.0,
+            5,
+        );
+        accumulate_axis(
+            &mut pending,
+            WEnum::Value(wl_pointer::Axis::VerticalScroll),
+            -6.0,
+            7,
+        );
+        let scroll = pending.take().expect("a pending scroll");
+        assert_eq!(scroll.dy, -16.0, "the two vertical steps accumulate");
+        assert_eq!(scroll.dx, 4.0);
+        assert_eq!(scroll.time_ms, 7, "the latest timestamp wins");
+        assert!(pending.is_none(), "taking the frame clears it");
+    }
+
+    #[test]
+    fn an_unknown_axis_or_source_is_ignored_rather_than_guessed() {
+        use super::{accumulate_axis, scroll_source_of};
+        use crate::window::pointer::ScrollSource;
+        use wayland_client::WEnum;
+        use wayland_client::protocol::wl_pointer;
+
+        assert_eq!(
+            scroll_source_of(WEnum::Value(wl_pointer::AxisSource::Finger)),
+            ScrollSource::Finger
+        );
+        assert_eq!(
+            scroll_source_of(WEnum::Value(wl_pointer::AxisSource::Wheel)),
+            ScrollSource::Wheel
+        );
+        assert_eq!(
+            scroll_source_of(WEnum::Value(wl_pointer::AxisSource::WheelTilt)),
+            ScrollSource::WheelTilt
+        );
+        assert_eq!(
+            scroll_source_of(WEnum::Unknown(99)),
+            ScrollSource::Wheel,
+            "an unknown source must not coast: a wheel is the conservative reading"
+        );
+        let mut pending = None;
+        accumulate_axis(&mut pending, WEnum::Unknown(7), 10.0, 1);
+        assert!(
+            pending.as_ref().is_none_or(|s| s.dx == 0.0 && s.dy == 0.0),
+            "an unknown axis moved something"
+        );
+    }
+
+    #[test]
+    fn a_seat_capability_is_created_once_and_destroyed_once() {
+        // `wl_seat.capabilities` is the seat's whole current set, not a delta:
+        // a client that only ever adds keeps dispatching to a pointer the
+        // compositor took away.
+        use super::sync_capability;
+        let (mut created, mut destroyed) = (0, 0);
+        let mut slot: Option<i32> = None;
+        for present in [true, true, true] {
+            sync_capability(
+                present,
+                &mut slot,
+                || {
+                    created += 1;
+                    7
+                },
+                |_| destroyed += 1,
+            );
+        }
+        assert_eq!(
+            (created, destroyed),
+            (1, 0),
+            "an unchanged capability is not recreated"
+        );
+        sync_capability(
+            false,
+            &mut slot,
+            || {
+                created += 1;
+                7
+            },
+            |_| destroyed += 1,
+        );
+        assert_eq!((created, destroyed), (1, 1));
+        assert!(slot.is_none());
+        sync_capability(
+            false,
+            &mut slot,
+            || {
+                created += 1;
+                7
+            },
+            |_| destroyed += 1,
+        );
+        assert_eq!(
+            (created, destroyed),
+            (1, 1),
+            "losing what we never had does nothing"
         );
     }
 
