@@ -1828,6 +1828,116 @@ impl State {
         }
     }
 
+    /// The origin of `root`'s own `wl_surface`, in frame (output-logical)
+    /// space.
+    ///
+    /// For a window that is the **content** rect, not the frame: a
+    /// server-decorated window's client surface starts one `TITLE_BAR_HEIGHT`
+    /// below the frame's top edge (`decoration::content_rect`), and the scene
+    /// node the popup's subtree hangs off is placed there too. For a layer
+    /// surface it is the placement `compute_layer_placement` computes.
+    ///
+    /// `None`, panic-free, when the root or its output has vanished.
+    fn root_surface_origin(&self, root: PopupRoot) -> Option<(i32, i32)> {
+        match root {
+            PopupRoot::Window(id) => {
+                let window = self.window_manager.get(id)?;
+                let ssd = crate::decoration::has_ssd(
+                    &window.app_id,
+                    window.client_decorations_requested,
+                    window.fullscreen,
+                );
+                let content = crate::decoration::content_rect(window.geometry, ssd);
+                Some((content.x, content.y))
+            }
+            PopupRoot::Layer(id) => {
+                let (_, _, x, y) = self.compute_layer_placement(id)?;
+                Some((x, y))
+            }
+        }
+    }
+
+    /// The constraint box handed to the library's `configure_popup`, **in the
+    /// root toplevel/layer surface's coordinate system** (contract ruling R7).
+    ///
+    /// The box itself is the root's output `usable` rect
+    /// ([`OutputSurface::usable`]) -- the same working area tiling and
+    /// maximize read, so a panel's menu is clamped exactly where a window
+    /// would be -- translated by minus the root's surface origin.
+    ///
+    /// `None` if the popup is unknown, or its root or that root's output is
+    /// gone (including the [`NO_OUTPUT`] sentinel, which never resolves).
+    pub fn popup_constraint_box(&self, popup: crate::wayland::PopupKey) -> Option<Rectangle> {
+        let entry = self.popups.get(&popup)?;
+        let (origin_x, origin_y) = self.root_surface_origin(entry.root)?;
+        let usable = self.outputs.get(&entry.output)?.usable;
+        Some(Rectangle {
+            x: usable.x.saturating_sub(origin_x),
+            y: usable.y.saturating_sub(origin_y),
+            width: usable.width,
+            height: usable.height,
+        })
+    }
+
+    /// `Rectangle::contains`, but every addition saturates.
+    ///
+    /// `icedtea_contract::Rectangle::contains` computes `self.x + self.width`
+    /// (and the `y`/`height` equivalent) with plain arithmetic; a positioner
+    /// geometry with an `i32::MIN` origin and an `i32::MIN` extent -- both
+    /// reachable from a hostile client -- overflows there in a debug build.
+    /// `popup_at_point` is the only caller, and only for a `PopupEntry`
+    /// geometry, which is exactly that untrusted value.
+    fn rect_contains_saturating(rect: Rectangle, x: i32, y: i32) -> bool {
+        x >= rect.x
+            && x < rect.x.saturating_add(rect.width)
+            && y >= rect.y
+            && y < rect.y.saturating_add(rect.height)
+    }
+
+    /// The topmost mapped popup whose last-known geometry contains `point`
+    /// (frame space), or `None`.
+    ///
+    /// Searched back to front over `popup_stack`, so the most recently
+    /// created popup over a point wins -- which is also its scene order, since
+    /// a popup's subtree is created above its parent's existing children.
+    ///
+    /// `None` while the session is locked, matching every other model path
+    /// that answers input: the library's own hit test is already rooted at the
+    /// lock band while locked (contract §1.5), and this is the model-side
+    /// half of the same rule.
+    pub fn popup_at_point(&self, point: (i32, i32)) -> Option<crate::wayland::PopupKey> {
+        if self.session_locked {
+            return None;
+        }
+        self.popup_stack.iter().rev().copied().find(|key| {
+            let Some(entry) = self.popups.get(key) else {
+                return false;
+            };
+            if !entry.mapped {
+                return false;
+            }
+            let Some((origin_x, origin_y)) = self.root_surface_origin(entry.root) else {
+                return false;
+            };
+            // Saturating: both the point and the origin are ultimately
+            // client-controlled, and `Rectangle::contains` on a saturated
+            // coordinate is merely wrong, not a crash.
+            //
+            // Reconciliation (Task 4): `icedtea_contract::Rectangle::contains`
+            // itself computes `self.x + self.width` with plain arithmetic, so
+            // a hostile positioner's `i32::MIN` origin plus `i32::MIN` extent
+            // overflows there regardless of how the point is translated. This
+            // crate cannot edit the contract crate from this task, so
+            // `rect_contains_saturating` below is the same test with every
+            // addition also saturating.
+            Self::rect_contains_saturating(
+                entry.geometry,
+                point.0.saturating_sub(origin_x),
+                point.1.saturating_sub(origin_y),
+            )
+        })
+    }
+
     /// Choose `id`'s layer surface's size and position for its output box
     /// (the placement rule from task 20's brief) and answer with
     /// `configure_layer_surface` + `set_layer_surface_position`.
@@ -13468,5 +13578,245 @@ mod tests {
             "a popup that was never recorded must not have parked a focus \
              restore target"
         );
+    }
+    /// The constraint box is the root's output `usable` rect expressed in the
+    /// **root surface's own** coordinates -- contract ruling R7, and
+    /// `wlr_xdg_popup_unconstrain_from_box`'s own header. For a
+    /// server-decorated window that origin is the *content* rect, not the
+    /// frame: the client's surface starts one title bar below the frame's top
+    /// edge, so a box translated by the frame origin would let a popup ride
+    /// `TITLE_BAR_HEIGHT` past the bottom of the screen.
+    ///
+    /// Mutation check: translate by `w.geometry` instead of
+    /// `content_rect(w.geometry, ssd)` and the `y` assertion fails by exactly
+    /// `TITLE_BAR_HEIGHT`.
+    #[test]
+    fn a_popups_constraint_box_is_the_usable_area_in_root_surface_coordinates() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        // A 30px top exclusive zone, so `usable` is genuinely smaller than
+        // `geometry` and the test cannot pass by reading the wrong one.
+        if let Some(output) = state.outputs.get_mut(&0) {
+            output.usable = Rectangle {
+                x: 0,
+                y: 30,
+                width: 800,
+                height: 570,
+            };
+        }
+        // "app" is not GTK-style, so `has_ssd` gives it a title bar.
+        let window = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 100,
+                y: 50,
+                width: 300,
+                height: 200,
+            },
+        );
+        let ssd = crate::decoration::has_ssd("app", None, false);
+        assert!(ssd, "this test needs a server-decorated window");
+        let content = crate::decoration::content_rect(
+            Rectangle {
+                x: 100,
+                y: 50,
+                width: 300,
+                height: 200,
+            },
+            ssd,
+        );
+
+        let popup = crate::wayland::PopupKey::for_test(1);
+        state.record_popup(popup, PopupHost::Window(window), false);
+        assert_eq!(
+            state.popup_constraint_box(popup),
+            Some(Rectangle {
+                x: 0 - content.x,
+                y: 30 - content.y,
+                width: 800,
+                height: 570,
+            })
+        );
+
+        // A nested popup is constrained against the same root, not against
+        // its immediate parent.
+        let nested = crate::wayland::PopupKey::for_test(2);
+        state.record_popup(nested, PopupHost::Popup(popup), false);
+        assert_eq!(
+            state.popup_constraint_box(nested),
+            state.popup_constraint_box(popup)
+        );
+
+        // An unrecorded key, and a popup whose output vanished, are misses.
+        assert_eq!(
+            state.popup_constraint_box(crate::wayland::PopupKey::for_test(99)),
+            None
+        );
+        state.outputs.remove(&0);
+        assert_eq!(state.popup_constraint_box(popup), None);
+    }
+
+    /// `popup_at_point` searches the stack back to front, so the newest popup
+    /// over a point wins, and answers nothing at all while the session is
+    /// locked.
+    ///
+    /// Mutation check: drop the `.rev()` and the "topmost wins" assertion
+    /// fails; drop the `session_locked` gate and the locked assertion fails.
+    #[test]
+    fn popup_at_point_finds_the_topmost_mapped_popup_and_nothing_while_locked() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let window = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: 100,
+                y: 50,
+                width: 300,
+                height: 200,
+            },
+        );
+        let ssd = crate::decoration::has_ssd("app", None, false);
+        let content = crate::decoration::content_rect(
+            Rectangle {
+                x: 100,
+                y: 50,
+                width: 300,
+                height: 200,
+            },
+            ssd,
+        );
+
+        let under = crate::wayland::PopupKey::for_test(1);
+        let over = crate::wayland::PopupKey::for_test(2);
+        let unmapped = crate::wayland::PopupKey::for_test(3);
+        for key in [under, over, unmapped] {
+            state.record_popup(key, PopupHost::Window(window), false);
+        }
+        // All three cover the same root-surface rect; only the first two are
+        // mapped.
+        let rect = Rectangle {
+            x: 10,
+            y: 10,
+            width: 40,
+            height: 40,
+        };
+        for key in [under, over] {
+            if let Some(entry) = state.popups.get_mut(&key) {
+                entry.mapped = true;
+                entry.geometry = rect;
+            }
+        }
+        if let Some(entry) = state.popups.get_mut(&unmapped) {
+            entry.geometry = rect;
+        }
+
+        // Frame space: the root surface's origin plus the popup's own offset.
+        let inside = (content.x + 20, content.y + 20);
+        assert_eq!(
+            state.popup_at_point(inside),
+            Some(over),
+            "the newest popup over the point wins"
+        );
+        assert_eq!(
+            state.popup_at_point((content.x + 200, content.y + 200)),
+            None,
+            "a point outside every popup hits nothing"
+        );
+
+        // Unmapping the top one hands the point to the one below it, not to
+        // the unmapped third.
+        if let Some(entry) = state.popups.get_mut(&over) {
+            entry.mapped = false;
+        }
+        assert_eq!(state.popup_at_point(inside), Some(under));
+
+        state.session_locked = true;
+        assert_eq!(
+            state.popup_at_point(inside),
+            None,
+            "no popup answers input while the session is locked"
+        );
+    }
+
+    /// Hostile positioner geometry never panics.
+    ///
+    /// Every number in a `PopupEntry::geometry` originates in an
+    /// `xdg_positioner` the client wrote, so `i32::MIN`/`i32::MAX` extents and
+    /// origins are reachable from a malicious client, and so is a root whose
+    /// own geometry is degenerate. Contract §9: a malformed value is dropped,
+    /// never a panic -- in particular the coordinate translation
+    /// `point - origin` must not overflow.
+    ///
+    /// Mutation check: replace the `saturating_sub` in `popup_at_point` with
+    /// `-` and this test panics with "attempt to subtract with overflow" in a
+    /// debug build.
+    #[test]
+    fn hostile_popup_geometry_never_panics() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(icedtea_config::default_config(), tx);
+        state.create_output(
+            0,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+        let window = state.window_manager.add_window(
+            "app",
+            "t",
+            1,
+            Rectangle {
+                x: i32::MIN,
+                y: i32::MIN,
+                width: 1,
+                height: 1,
+            },
+        );
+        let popup = crate::wayland::PopupKey::for_test(1);
+        state.record_popup(popup, PopupHost::Window(window), false);
+        if let Some(entry) = state.popups.get_mut(&popup) {
+            entry.mapped = true;
+            entry.geometry = Rectangle {
+                x: i32::MIN,
+                y: i32::MAX,
+                width: i32::MIN,
+                height: i32::MAX,
+            };
+        }
+
+        for point in [
+            (0, 0),
+            (i32::MIN, i32::MIN),
+            (i32::MAX, i32::MAX),
+            (i32::MIN, i32::MAX),
+        ] {
+            let _ = state.popup_at_point(point);
+        }
+        let _ = state.popup_constraint_box(popup);
+        let _ = state.popup_chain(PopupRoot::Window(window));
     }
 }
