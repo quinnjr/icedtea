@@ -367,3 +367,302 @@ fn a_reposition_request_reconfigures_and_echoes_the_token() {
 
     a.detach();
 }
+
+/// Move the pointer to `point`, press and release `BTN_LEFT`.
+fn click_at(comp: &Compositor, vp: &mut VirtualPointerClient, point: (i32, i32)) {
+    let (ow, oh) = comp.output_size();
+    vp.motion_absolute(point.0 as f64, point.1 as f64, ow as u32, oh as u32);
+    vp.frame();
+    vp.button(BTN_LEFT, true);
+    vp.frame();
+    vp.button(BTN_LEFT, false);
+    vp.frame();
+}
+
+/// Press and release inside `client`'s surface at `point`, and return the
+/// serial the press minted -- the serial an `xdg_popup.grab` must cite.
+///
+/// Waits for the client's own `enter` and `button` rather than sleeping: the
+/// serial does not exist until the press has actually been delivered.
+fn mint_pointer_serial(
+    comp: &Compositor,
+    vp: &mut VirtualPointerClient,
+    client: &mut TestClient,
+    point: (i32, i32),
+) -> u32 {
+    let (ow, oh) = comp.output_size();
+    let enters = client.pointer_enters();
+    vp.motion_absolute(point.0 as f64, point.1 as f64, ow as u32, oh as u32);
+    vp.frame();
+    assert!(
+        client.wait_until(|c| c.pointer_enters() > enters),
+        "the client never got wl_pointer.enter at {point:?}"
+    );
+    let buttons = client.pointer_buttons().len();
+    vp.button(BTN_LEFT, true);
+    vp.frame();
+    assert!(
+        client.wait_until(|c| c.pointer_buttons()[buttons..].contains(&(BTN_LEFT, true))),
+        "the client never got the press that mints the grab serial"
+    );
+    let serial = client
+        .last_pointer_serial()
+        .expect("the press just delivered a serial");
+    let buttons = client.pointer_buttons().len();
+    vp.button(BTN_LEFT, false);
+    vp.frame();
+    assert!(
+        client.wait_until(|c| c.pointer_buttons()[buttons..].contains(&(BTN_LEFT, false))),
+        "the client never got the release"
+    );
+    serial
+}
+
+/// The `app_id` of whatever the model currently says is focused.
+fn focused_app_id(comp: &Compositor) -> Option<String> {
+    comp.snapshot()
+        .windows
+        .iter()
+        .find(|w| w.focused)
+        .map(|w| w.app_id.clone())
+}
+
+/// Poll the model's focus for up to `window`, returning whether it ever became
+/// `app_id`. A generous bound, not a wall-clock pin: focus changes here are
+/// driven by deferred handler events, so the only honest assertion is
+/// "eventually".
+fn wait_for_focus(comp: &Compositor, app_id: &str, window: Duration) -> bool {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        if focused_app_id(comp).as_deref() == Some(app_id) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// One click outside a grabbing chain dismisses the **whole** chain, not just
+/// its topmost level.
+///
+/// wlroots owns this: the compositor installs no grab of its own (contract
+/// §1.6), so what is under test is that the compositor still does the two
+/// things the popup grab needs from it -- clearing pointer focus on an
+/// out-of-client enter, and notifying the button -- with its own implicit
+/// pointer grab in the way.
+///
+/// Mutation check: skip `notify_button` under an explicit grab and
+/// `popup_done` never arrives. (This is the same mutation
+/// `client_protocol.rs`'s grab regression test records; re-run it here after
+/// the popup actually maps, since a mapped popup takes a different pointer
+/// focus path than the never-mapped one that test used to open.)
+#[test]
+fn a_grabbing_popup_chain_is_dismissed_whole_by_a_click_outside_it() {
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut a = TestClient::map_toplevel(&comp.socket, "popup.app", "popup");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+
+    let content = content_rect_of(&comp, "popup.app");
+    let inside = (
+        content.x + content.width / 2,
+        content.y + content.height / 2,
+    );
+    let serial = mint_pointer_serial(&comp, &mut vp, &mut a, inside);
+
+    a.open_popup(
+        PopupSpec::new(64, 48)
+            .anchor_rect(10, 10, 20, 20)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight)
+            .grab(serial),
+    );
+    a.open_popup_from_popup(
+        PopupSpec::new(32, 24)
+            .anchor_rect(5, 5, 10, 10)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+    assert_eq!(a.popup_depth(), 2, "both levels mapped");
+    assert!(!a.popup_done(), "nothing has dismissed the chain yet");
+
+    // Bare desktop: outside every surface this client owns.
+    let (ow, oh) = comp.output_size();
+    let outside = (ow - 2, oh - 2);
+    let frame = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == "popup.app")
+        .expect("the parent must be in the model")
+        .geometry;
+    assert!(
+        !frame.contains(outside.0, outside.1),
+        "{outside:?} is inside the parent {frame:?}, so the click would not \
+         be outside the popup's client"
+    );
+    click_at(&comp, &mut vp, outside);
+
+    assert!(
+        a.wait_until(|c| c.popup_done()),
+        "the chain was never dismissed by a click outside it"
+    );
+
+    // The client still owns both proxies; destroying them in reverse order
+    // after a popup_done must not be a protocol error.
+    a.destroy_popup();
+    a.destroy_popup();
+    a.detach();
+}
+
+/// When a grabbing chain ends, keyboard focus goes back to the chain's
+/// **parent**, not to whatever the dismissing click landed on.
+///
+/// Spec §2: "on destroy, focus returns to the parent, not the pointer
+/// position." The click that dismisses a menu here lands on a *second*
+/// window, so the compositor's own click-to-focus moves model focus to `b`
+/// first; `restore_focus_after_popups` is what puts it back on `a`.
+///
+/// Mutation check: delete the `restore_focus_after_popups()` call from
+/// `State::popup_destroyed` and the final assertion reports `b.app`.
+#[test]
+fn keyboard_focus_returns_to_the_parent_when_a_grabbing_chain_ends() {
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut a = TestClient::map_toplevel(&comp.socket, "a.app", "a");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+    let mut b = TestClient::map_toplevel(&comp.socket, "b.app", "b");
+    assert!(b.wait_until(|c| c.last_configure().is_some()));
+
+    let a_frame = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == "a.app")
+        .expect("a must be in the model")
+        .geometry;
+    let b_content = content_rect_of(&comp, "b.app");
+    // A point on `b` that `a`'s frame does not cover. The compositor cascades
+    // new windows by a fixed step, so this strip exists; assert it rather than
+    // assume it, and say why if it ever stops existing.
+    let on_b = (
+        a_frame.x + a_frame.width + 4,
+        b_content.y + b_content.height / 2,
+    );
+    assert!(
+        b_content.contains(on_b.0, on_b.1) && !a_frame.contains(on_b.0, on_b.1),
+        "{on_b:?} must be inside b's content {b_content:?} and outside a's \
+         frame {a_frame:?} -- the window cascade no longer leaves a strip of \
+         b uncovered, so this test needs a different outside point"
+    );
+
+    // Click into `a` to focus it and mint the grab serial. `b` cascades on
+    // top of `a` and is large enough to cover `a`'s content center, so the
+    // press has to land in the strip of `a` that `b`'s frame does not
+    // cover -- the same reasoning `on_b` above uses in the other direction.
+    let b_frame = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == "b.app")
+        .expect("b must be in the model")
+        .geometry;
+    let a_content = content_rect_of(&comp, "a.app");
+    let on_a = (a_content.x + 4, a_content.y + a_content.height / 2);
+    assert!(
+        a_content.contains(on_a.0, on_a.1) && !b_frame.contains(on_a.0, on_a.1),
+        "{on_a:?} must be inside a's content {a_content:?} and outside b's \
+         frame {b_frame:?} -- the window cascade no longer leaves a strip of \
+         a uncovered, so this test needs a different point to click into a"
+    );
+    let serial = mint_pointer_serial(&comp, &mut vp, &mut a, on_a);
+    assert!(
+        wait_for_focus(&comp, "a.app", Duration::from_secs(5)),
+        "clicking into a must focus it"
+    );
+
+    a.open_popup(
+        PopupSpec::new(64, 48)
+            .anchor_rect(10, 10, 20, 20)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight)
+            .grab(serial),
+    );
+
+    click_at(&comp, &mut vp, on_b);
+    assert!(
+        a.wait_until(|c| c.popup_done()),
+        "the click on b never dismissed the chain"
+    );
+    // `popup_done` only *asks* the client to tear down; wlroots' own grab
+    // does not forcibly free the `wlr_xdg_popup` (contract §1.6 -- it is not
+    // this compositor's grab to force), so the destroy signal that drives
+    // `restore_focus_after_popups` does not fire until the client actually
+    // sends `xdg_popup.destroy`, exactly as a real client is required to do
+    // the moment it receives `popup_done`. `a_grabbing_popup_chain_is_
+    // dismissed_whole_by_a_click_outside_it` above takes the same two-step
+    // shape (`wait_until(popup_done)` then `destroy_popup`); this test
+    // reconciles the same way so the focus check below is observing real
+    // destroy-driven restore rather than a race with an object that is
+    // still alive server-side.
+    a.destroy_popup();
+
+    assert!(
+        wait_for_focus(&comp, "a.app", Duration::from_secs(5)),
+        "focus must return to the popup's parent, not follow the pointer to \
+         b -- currently focused: {:?}",
+        focused_app_id(&comp)
+    );
+
+    a.detach();
+    b.detach();
+}
+
+/// A non-grabbing popup -- a tooltip, a non-modal popover -- never moves
+/// keyboard focus, at either end of its life.
+///
+/// Focus rule 2, and contract deviation D3's reason for existing: rule 3's
+/// restore must not fire for a chain that never took focus, or opening a
+/// tooltip on an unfocused window would steal the keyboard when the tooltip
+/// closed.
+///
+/// Mutation check: drop the `grabbing &&` guard in `State::record_popup` and
+/// the closing assertion reports `a.app`.
+#[test]
+fn a_non_grabbing_popup_never_moves_keyboard_focus() {
+    let comp = Compositor::spawn();
+    let mut a = TestClient::map_toplevel(&comp.socket, "a.app", "a");
+    assert!(a.wait_until(|c| c.last_configure().is_some()));
+    let mut b = TestClient::map_toplevel(&comp.socket, "b.app", "b");
+    assert!(b.wait_until(|c| c.last_configure().is_some()));
+    assert!(
+        wait_for_focus(&comp, "b.app", Duration::from_secs(5)),
+        "the most recently mapped window holds focus"
+    );
+
+    // `a` -- which is *not* focused -- opens a popup with no grab.
+    a.open_popup(
+        PopupSpec::new(64, 48)
+            .anchor_rect(10, 10, 20, 20)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+    assert!(a.popup_configured().is_some(), "the popup never configured");
+    assert!(
+        !wait_for_focus(&comp, "a.app", Duration::from_millis(300)),
+        "opening a non-grabbing popup must not move keyboard focus"
+    );
+    assert_eq!(focused_app_id(&comp).as_deref(), Some("b.app"));
+
+    a.destroy_popup();
+    assert!(
+        !wait_for_focus(&comp, "a.app", Duration::from_millis(300)),
+        "closing a non-grabbing popup must not move keyboard focus either"
+    );
+    assert_eq!(focused_app_id(&comp).as_deref(), Some("b.app"));
+
+    a.detach();
+    b.detach();
+}

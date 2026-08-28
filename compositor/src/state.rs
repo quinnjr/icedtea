@@ -224,6 +224,12 @@ pub struct PopupEntry {
     /// The client sent `xdg_popup.grab`. Observed, never driven: wlroots owns
     /// the grab's whole lifetime (contract §1.6).
     pub grabbing: bool,
+    /// Whether no other popup on this `root` was recorded yet when this one
+    /// was. Captured once, at record time, for `reconcile_popup_grab` to
+    /// finish the "only the chain's first popup parks a restore target"
+    /// decision `record_popup` starts -- see that field's use there for why
+    /// it cannot finish the decision itself.
+    chain_was_empty_at_record: bool,
     /// Whether the popup currently has a buffer on screen.
     pub mapped: bool,
     /// Where the popup is, in its `root`'s surface coordinates. Committed
@@ -1697,6 +1703,18 @@ impl State {
     /// takes (contract §9): a client can drive any of the three, and none of
     /// them is a reason to fabricate a root.
     ///
+    /// `grabbing` is whatever `new_popup`'s caller already knows, which in
+    /// production is `Popup::grab_requested()` read at `new_popup` time --
+    /// and that read is unreliable there. `xdg_popup.grab` (which is what
+    /// sets `wlr_xdg_popup.seat`, the field `grab_requested` reads) is a
+    /// *separate*, later protocol request than the `get_popup` request whose
+    /// processing fires `new_popup`, so a grabbing popup's very first
+    /// `record_popup` call always sees `grabbing == false` here even though
+    /// the client did send `grab` (xdg-shell only requires it to precede the
+    /// first *commit*, not `get_popup`). `reconcile_popup_grab`, called from
+    /// `popup_initial_commit`, is what corrects `grabbing` and finishes this
+    /// method's "only the chain's first popup parks a restore target"
+    /// decision once the grab request (if any) is guaranteed to have landed.
     pub(crate) fn record_popup(
         &mut self,
         popup: crate::wayland::PopupKey,
@@ -1725,6 +1743,7 @@ impl State {
                 output,
                 sequence,
                 grabbing,
+                chain_was_empty_at_record: chain_was_empty,
                 // False until `popup_mapped`, exactly as `LayerEntry::mapped`
                 // is: a popup with no buffer yet is not on screen and must not
                 // answer `popup_at_point`.
@@ -1742,6 +1761,34 @@ impl State {
         // its first popup does -- a submenu opening over a menu must not
         // overwrite the window the whole chain came from.
         if grabbing && chain_was_empty {
+            self.focus_before_popup = Some(root);
+        }
+    }
+
+    /// Finish `record_popup`'s grab bookkeeping once `Popup::grab_requested`
+    /// is actually trustworthy (see `record_popup`'s doc on why it cannot be
+    /// read at `new_popup` time). A no-op unless the popup both requested a
+    /// grab and `record_popup` has not already been corrected for it --
+    /// guards re-entry, since a popup can commit more than once.
+    fn reconcile_popup_grab(&mut self, popup: &wlr::Popup<'_>) {
+        if !popup.grab_requested() {
+            return;
+        }
+        let key = crate::wayland::PopupKey::new(popup.id());
+        let Some(entry) = self.popups.get(&key) else {
+            return;
+        };
+        if entry.grabbing {
+            return;
+        }
+        let root = entry.root;
+        let chain_was_empty = entry.chain_was_empty_at_record;
+        if let Some(entry) = self.popups.get_mut(&key) {
+            entry.grabbing = true;
+        }
+        // Same condition `record_popup` applies, just evaluated now that the
+        // grab is known for certain.
+        if chain_was_empty {
             self.focus_before_popup = Some(root);
         }
     }
@@ -6533,7 +6580,12 @@ impl wlr::ToplevelHandler for State {
     /// unconditionally right after this returns (contract §1.7) -- so this is
     /// the one moment at which the compositor's constraint box can reach the
     /// client's *first* configure rather than its second.
+    ///
+    /// Also where `reconcile_popup_grab` runs: xdg-shell requires `grab` to
+    /// precede this commit, so it is the first point at which
+    /// `Popup::grab_requested()` is trustworthy (see `record_popup`'s doc).
     fn popup_initial_commit(&mut self, popup: &wlr::Popup<'_>) {
+        self.reconcile_popup_grab(popup);
         self.configure_popup_now(crate::wayland::PopupKey::new(popup.id()));
     }
 
