@@ -41,6 +41,68 @@ pub fn node_addr(node: &Node) -> NodeAddr {
 /// [`pointer::hit_test`] by reference; P4 takes over producing it.
 pub type StyleMap = std::collections::HashMap<NodeAddr, std::rc::Rc<ComputedStyle>>;
 
+/// Cascade, compute and lay out the whole tree.
+///
+/// Iterative, not recursive: the tree comes from a reconciler and a widget
+/// author, and a 10,000-deep one must be a slow frame rather than a stack
+/// overflow. Each node is resolved against its parent's computed style
+/// (`ComputedStyle::resolve`, not `resolve_chain`) because the walk already
+/// holds it -- `resolve_chain` would re-walk the ancestors for every node,
+/// turning a linear pass quadratic.
+///
+/// `styles` is cleared first: a node removed since the last frame must not
+/// keep a stale entry that [`pointer::hit_test`] would then read.
+///
+/// # Errors
+///
+/// [`crate::layout::LayoutError`] from `LayoutTree::sync`/`compute`.
+pub fn restyle(
+    root: &Node,
+    sheet: &crate::css::cascade::CompiledSheet,
+    env: &crate::css::computed::ResolveEnv,
+    styles: &mut StyleMap,
+    tree: &mut crate::layout::LayoutTree,
+    available: taffy::Size<taffy::AvailableSpace>,
+    measure: &mut dyn crate::layout::Measure,
+) -> Result<(), crate::layout::LayoutError> {
+    styles.clear();
+    tree.sync(root)?;
+    let mut cx = crate::css::select::MatchCx::new();
+    let mut stack: Vec<(Node, Option<std::rc::Rc<ComputedStyle>>)> = vec![(root.clone(), None)];
+    while let Some((node, parent)) = stack.pop() {
+        let computed = std::rc::Rc::new(ComputedStyle::resolve(
+            sheet,
+            &node,
+            parent.as_deref(),
+            env,
+            &mut cx,
+        ));
+        // M2's `Container` has exactly two variants; P6 widens it (contract
+        // §3.6) and this is the one place that chooses. `Container::default()`
+        // is `BoxDirection::Column`, which is right for a single-child
+        // container (a `window`'s lone child), but GTK's own `GtkBox`
+        // defaults its `orientation` property to horizontal -- P6's
+        // `BoxC { orientation, .. }` (contract) will carry this explicitly;
+        // until then a node literally named `box` gets GTK's real default
+        // rather than this pass's generic one.
+        let container = if node.child_count() == 0 {
+            crate::layout::Container::Leaf
+        } else if &*node.name() == "box" {
+            crate::layout::Container::Box {
+                direction: crate::layout::BoxDirection::Row,
+            }
+        } else {
+            crate::layout::Container::default()
+        };
+        tree.set_style(&node, &computed, container, env);
+        styles.insert(node_addr(&node), std::rc::Rc::clone(&computed));
+        for child in node.children() {
+            stack.push((child, Some(std::rc::Rc::clone(&computed))));
+        }
+    }
+    tree.compute(root, available, measure)
+}
+
 bitflags::bitflags! {
     /// `xdg_toplevel.configure` states, plus the layer/popup analogues.
     ///
