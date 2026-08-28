@@ -126,6 +126,22 @@ pub enum DbCommand {
     DragIconPosition {
         reply: Sender<Option<(i32, i32)>>,
     },
+    /// Test-only: read `State::popups_dismissed` -- how many popups this
+    /// compositor has itself closed through `wlr::Runtime::dismiss_popup`
+    /// since boot. Not reachable from `CompositorInterface` -- only the test
+    /// harness sends this, same reasoning as `DragIconPosition`.
+    ///
+    /// The *count* rather than the order is what the harness needs, because
+    /// the order is not observable from a client: wlroots frees a popup's
+    /// children before the popup itself, so the `xdg_popup.popup_done` events
+    /// reach the wire deepest-first however the caller iterated. What a
+    /// shallow-first caller loses is rows -- it finds the deeper popups
+    /// already swept and under-counts. See
+    /// `compositor/tests/popups.rs`'s
+    /// `destroying_a_parent_destroys_its_popup_chain_without_a_double_free`.
+    PopupsDismissed {
+        reply: Sender<usize>,
+    },
     /// Test-only: read `wlr::Runtime::is_session_locked` via `wayland`'s
     /// runtime handle. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `DragIconPosition`.

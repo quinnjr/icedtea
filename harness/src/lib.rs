@@ -554,6 +554,17 @@ impl Compositor {
             .expect("compositor never answered DragIconPosition")
     }
 
+    /// How many popups the compositor has itself closed through
+    /// `wlr::Runtime::dismiss_popup` since boot. Blocks on the reply -- see
+    /// [`Self::inject_touch_down`]'s doc.
+    pub fn popups_dismissed(&self) -> usize {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::PopupsDismissed { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered PopupsDismissed")
+    }
+
     /// Whether the session is currently locked, via
     /// `wlr::Runtime::is_session_locked`. Blocks on the reply -- see
     /// [`Self::inject_touch_down`]'s doc.
@@ -849,6 +860,17 @@ struct ClientState {
     /// `xdg_popup.popup_done`. Set once and never cleared: a dismissed
     /// popup is gone for good.
     popup_done: bool,
+    /// The depth of every popup that has received `xdg_popup.popup_done`, in
+    /// the order the events arrived.
+    ///
+    /// `popup_done` alone cannot tell a whole-chain dismissal from a partial
+    /// one, nor deepest-first order from shallowest-first: any depth's event
+    /// latches the same bool. Recording the depths is what lets a nested
+    /// chain's dismissal *order* be asserted -- `[1, 0]` for a two-level
+    /// chain torn down deepest-first, which is what xdg-shell requires
+    /// (`xdg_popup.destroy` on a popup with live children is a protocol
+    /// error).
+    popup_done_depths: Vec<usize>,
     /// The geometry each live popup's last `xdg_popup.configure` carried,
     /// indexed by depth -- `[0]` is the outermost popup of the chain.
     ///
@@ -1192,8 +1214,13 @@ impl Dispatch<xdg_popup::XdgPopup, PopupRole> for ClientState {
                 state.popup_geometries[role.0] = Some((x, y, width, height));
             }
             // Latched, never cleared: a dismissed popup is gone for good, and
-            // a chain is dismissed whole.
-            xdg_popup::Event::PopupDone => state.popup_done = true,
+            // a chain is dismissed whole. The depth is appended in arrival
+            // order so the *order* of a chain's teardown is assertable too --
+            // see `popup_done_depths`.
+            xdg_popup::Event::PopupDone => {
+                state.popup_done = true;
+                state.popup_done_depths.push(role.0);
+            }
             xdg_popup::Event::Repositioned { token } => state.popup_repositioned = Some(token),
             _ => {}
         }
@@ -2879,6 +2906,16 @@ impl TestClient {
     /// `xdg_popup.popup_done`. Latched: a chain is dismissed whole.
     pub fn popup_done(&self) -> bool {
         self.state.popup_done
+    }
+
+    /// The depth of every popup that has received `xdg_popup.popup_done`, in
+    /// arrival order -- `[1, 0]` for a two-level chain torn down deepest-first.
+    ///
+    /// [`popup_done`](Self::popup_done) is a single latched bool and so cannot
+    /// distinguish a whole-chain dismissal from a partial one, nor
+    /// deepest-first order from shallowest-first. This can.
+    pub fn popup_done_depths(&self) -> &[usize] {
+        &self.state.popup_done_depths
     }
 
     /// How many popups this client currently has open.

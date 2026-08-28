@@ -951,6 +951,16 @@ pub struct State {
     /// hit-testing (`popup_at_point`) and dismissal order.
     ///
     popup_stack: Vec<crate::wayland::PopupKey>,
+    /// How many popups this compositor has itself closed through
+    /// `Wayland::dismiss_popup` since boot, summed over every call.
+    ///
+    /// Introspection for `compositor/tests/popups.rs`, which cannot see this
+    /// number any other way: the client-visible `popup_done` order is
+    /// wlroots' (it frees a popup's children before the popup), so the count
+    /// is the only place a shallow-first dismissal shows up -- it finds the
+    /// deeper rows already swept and under-counts. Read through
+    /// `DbCommand::PopupsDismissed`.
+    popups_dismissed: usize,
     /// Source of [`PopupEntry::sequence`]. Monotonic and never reused, the
     /// same shape as `next_layer_sequence`.
     ///
@@ -1149,6 +1159,7 @@ impl State {
             next_layer_sequence: 0,
             popups: HashMap::new(),
             popup_stack: Vec::new(),
+            popups_dismissed: 0,
             next_popup_sequence: 0,
             focus_before_popup: None,
             button_glyph_cache: HashMap::new(),
@@ -2076,6 +2087,54 @@ impl State {
         }
         if self.focus_before_popup == Some(root) {
             self.focus_before_popup = None;
+        }
+    }
+
+    /// Dismiss every popup chain whose root window the compositor has just
+    /// taken off screen -- minimized, moved to another workspace, or left
+    /// behind by a workspace switch.
+    ///
+    /// A menu is otherwise only ever closed by its own client (Escape is
+    /// client-side, contract focus rule 5), by wlroots' popup grab on a press
+    /// outside a *grabbing* chain (§1.6), or by its parent dying
+    /// (`forget_popups_of_root`). None of those fires when the **compositor**
+    /// hides the parent: the popup's scene subtree goes invisible with it, but
+    /// the popup is still alive, the client still believes its menu is open,
+    /// and a grabbing chain keeps wlroots' seat grab up over a surface nobody
+    /// can see or click. So the compositor closes them itself -- which is the
+    /// decision `Wayland::dismiss_popup` exists for, and the only path in this
+    /// compositor that reaches `Runtime::dismiss_popup`.
+    ///
+    /// Deepest-first is the library's job and non-negotiable:
+    /// `xdg_popup.destroy` on a popup with live children is a protocol error.
+    /// `compositor/tests/popups.rs`'s
+    /// `destroying_a_parent_destroys_its_popup_chain_without_a_double_free`
+    /// is what proves the order end to end, per contract §2.4.
+    ///
+    /// Idempotent, and safe to call from a handler: an already-dismissed chain
+    /// is a lookup miss inside the library, and the model rows are pruned by
+    /// the `popup_destroyed` events this queues (the library defers a handler
+    /// callback raised from inside a handler rather than re-entering).
+    fn dismiss_popups_of_hidden_roots(&mut self) {
+        let active = self.window_manager.active_workspace();
+        for root in self.popup_roots() {
+            let PopupRoot::Window(id) = root else {
+                continue;
+            };
+            let visible = self
+                .window_manager
+                .get(id)
+                .is_some_and(|w| w.mapped && !w.minimized && w.workspace == active);
+            if visible {
+                continue;
+            }
+            // Shallow-first over the chain: the first call takes the whole
+            // subtree under it, and the rest are misses. Iterating the chain
+            // rather than dismissing only its head is what covers a root with
+            // more than one chain hanging off it.
+            for popup in self.popup_chain(root) {
+                self.popups_dismissed += self.wayland.dismiss_popup(popup);
+            }
         }
     }
 
@@ -4300,13 +4359,20 @@ impl State {
                 self.sync_focus_change(previous);
             }
             DbCommand::Close(id) => self.request_close(id),
-            DbCommand::Minimize(id, value) => self.set_minimized_and_reconcile(id, value)?,
+            DbCommand::Minimize(id, value) => {
+                self.set_minimized_and_reconcile(id, value)?;
+                self.dismiss_popups_of_hidden_roots();
+            }
             DbCommand::Maximize(id, value) => self.set_maximized_target(id, value)?,
             DbCommand::Fullscreen(id, value) => self.set_fullscreen_target(id, value)?,
             DbCommand::SetWorkspace(id) => {
                 self.switch_workspace(id)?;
+                self.dismiss_popups_of_hidden_roots();
             }
-            DbCommand::MoveToWorkspace(id, workspace) => self.move_to_workspace(id, workspace)?,
+            DbCommand::MoveToWorkspace(id, workspace) => {
+                self.move_to_workspace(id, workspace)?;
+                self.dismiss_popups_of_hidden_roots();
+            }
             DbCommand::GetState(reply_tx) => {
                 let _ = reply_tx.send(self.window_manager.snapshot());
                 // No model mutation happened; nothing new to flush. Return
@@ -4364,6 +4430,10 @@ impl State {
                     .runtime()
                     .and_then(|rt| rt.drag_icon_position());
                 let _ = reply.send(pos);
+                return Some(());
+            }
+            DbCommand::PopupsDismissed { reply } => {
+                let _ = reply.send(self.popups_dismissed);
                 return Some(());
             }
             DbCommand::SessionLocked { reply } => {

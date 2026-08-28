@@ -612,7 +612,9 @@ impl Wayland {
 
     /// Send `xdg_popup.popup_done` to `popup` and, deepest-first, to every
     /// popup under it. Returns how many were dismissed (`0` on any miss).
-    #[allow(dead_code)]
+    ///
+    /// Called from `State::dismiss_popups_of_hidden_roots` -- see that method
+    /// for why the compositor closes a menu whose parent it has just hidden.
     pub(crate) fn dismiss_popup(&self, popup: PopupKey) -> usize {
         self.runtime
             .as_ref()

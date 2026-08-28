@@ -524,6 +524,22 @@ fn a_grabbing_popup_chain_is_dismissed_whole_by_a_click_outside_it() {
         a.wait_until(|c| c.popup_done()),
         "the chain was never dismissed by a click outside it"
     );
+    // *Which* levels were told, recorded rather than assumed. wlroots owns
+    // this path, and what it actually does (observed on the wire) is send
+    // `popup_done` on the **grabbing root only** -- twice, once from ending
+    // the grab and once from destroying the popup -- while the nested level's
+    // role is destroyed with its parent, silently. The chain does come down
+    // whole; the client simply never hears about depth 1. So this test cannot
+    // speak to teardown *order*, and does not pretend to:
+    // `destroying_a_parent_destroys_its_popup_chain_without_a_double_free` is
+    // where deepest-first is pinned, on the compositor's own
+    // `Runtime::dismiss_popup` path.
+    assert!(
+        a.popup_done_depths().iter().all(|depth| *depth == 0),
+        "a grabbing chain's popup_done is addressed to its root, not to the \
+         nested level; got depths {:?}",
+        a.popup_done_depths()
+    );
 
     // The client still owns both proxies; destroying them in reverse order
     // after a popup_done must not be a protocol error.
@@ -874,8 +890,41 @@ fn a_popup_on_a_hidden_window_receives_no_input_while_the_session_is_locked() {
     a.detach();
 }
 
-/// A client that dies with a live popup chain takes the whole chain down with
-/// it, and the compositor survives.
+/// A popup chain comes down whole, deepest-first, whichever end tears it down
+/// -- the **compositor** hiding the parent, or the parent's client dying.
+///
+/// Half 1 (the compositor end). Minimizing a window takes it off screen, and
+/// `State::dismiss_popups_of_hidden_roots` closes the menus hanging off it:
+/// the popup's scene subtree would otherwise merely go invisible while the
+/// client still believed its menu was open. This is the only path in this
+/// compositor that reaches `wlr::Runtime::dismiss_popup`, whose deepest-first
+/// rule this half is what pins -- `xdg_popup.destroy` on a popup with live
+/// children is an xdg-shell protocol error, so a shallow-first teardown is a
+/// real bug, not a style preference. The `wlr` crate's own
+/// `dismissal_is_deepest_first` (`runtime.rs`) is `#[ignore]`d and names
+/// *this* test as its replacement, so these assertions are the whole of that
+/// claim's backing.
+///
+/// **The dismissed count, not the event order, is what catches a shallow-first
+/// dismissal**, and that is a fact about wlroots rather than a choice: it
+/// frees a popup's children before the popup itself, so the two
+/// `xdg_popup.popup_done` events reach the wire deepest-first however
+/// `dismiss_popup` iterated (verified on the wire with `WAYLAND_DEBUG=1`
+/// against a `.rev()`-less build). What a shallow-first caller loses is
+/// *rows*: destroying the outer popup sweeps the inner one out of the
+/// library's registry, so the next iteration misses and the call reports 1
+/// instead of 2. Both are asserted below -- the order because a client
+/// observing anything else would be seeing a protocol violation, the count
+/// because it is the half that can actually fail.
+///
+/// Mutation checks for half 1, both run. `wlr`: drop the `.rev()` from
+/// `Runtime::dismiss_popup` and `comp.popups_dismissed()` reports 1, not 2
+/// (the depths are unchanged, per the paragraph above). `icedtea`: delete the
+/// `dismiss_popups_of_hidden_roots()` call from `handle_command`'s `Minimize`
+/// arm and no `popup_done` arrives at all.
+///
+/// Half 2 (the client end). A client that dies with a live popup chain takes
+/// the whole chain down with it, and the compositor survives.
 ///
 /// The client is dropped without destroying anything -- `wayland-client` 0.31
 /// proxies send no destroy on drop, so this is a bare socket close, which is
@@ -895,6 +944,65 @@ fn a_popup_on_a_hidden_window_receives_no_input_while_the_session_is_locked() {
 #[test]
 fn destroying_a_parent_destroys_its_popup_chain_without_a_double_free() {
     let comp = Compositor::spawn();
+
+    // --- Half 1: the compositor hides the parent -------------------------
+    let mut hidden = TestClient::map_toplevel(&comp.socket, "hidden.app", "hidden");
+    assert!(hidden.wait_until(|c| c.last_configure().is_some()));
+    hidden.open_popup(
+        PopupSpec::new(64, 48)
+            .anchor_rect(10, 10, 20, 20)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+    hidden.open_popup_from_popup(
+        PopupSpec::new(32, 24)
+            .anchor_rect(5, 5, 10, 10)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+    assert_eq!(hidden.popup_depth(), 2, "both levels mapped");
+    assert!(
+        hidden.popup_done_depths().is_empty(),
+        "nothing has dismissed this chain yet"
+    );
+
+    let hidden_id = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == "hidden.app")
+        .expect("the parent must be in the model")
+        .id;
+    comp.send(icedtea_compositor::dbus::DbCommand::Minimize(
+        hidden_id, true,
+    ));
+
+    assert!(
+        hidden.wait_until(|c| c.popup_done_depths().len() == 2),
+        "minimizing the parent did not dismiss its whole popup chain (got \
+         popup_done for depths {:?})",
+        hidden.popup_done_depths()
+    );
+    assert_eq!(
+        hidden.popup_done_depths(),
+        [1, 0],
+        "the chain must reach the client deepest-first -- a shallow-first \
+         destroy is an xdg-shell protocol error"
+    );
+    assert_eq!(
+        comp.popups_dismissed(),
+        2,
+        "the compositor must have closed both levels; 1 means dismissal ran \
+         shallow-first and lost the row it had already swept"
+    );
+    // The client still owns both proxies; destroying them topmost-first after
+    // a popup_done must not be a protocol error.
+    hidden.destroy_popup();
+    hidden.destroy_popup();
+    hidden.detach();
+    assert!(wait_for_window_count(&comp, 0, Duration::from_secs(5)));
+
+    // --- Half 2: the parent's client dies --------------------------------
     let mut a = TestClient::map_toplevel(&comp.socket, "popup.app", "popup");
     assert!(a.wait_until(|c| c.last_configure().is_some()));
 
