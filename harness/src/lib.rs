@@ -2896,6 +2896,35 @@ impl TestClient {
         }
     }
 
+    /// Send `xdg_popup.reposition(positioner, token)` for the topmost popup.
+    ///
+    /// The old positioner is destroyed and replaced: xdg-shell discards every
+    /// parameter the previous one set, so keeping it alive would only leak an
+    /// object. Panics if there is no popup open.
+    ///
+    /// This only *sends* the request; the answer arrives asynchronously as
+    /// `xdg_popup.repositioned` + `xdg_popup.configure`. Wait for it with
+    /// `wait_until(|c| c.popup_repositioned() == Some(token))`.
+    pub fn reposition_popup(&mut self, spec: PopupSpec, token: u32) {
+        assert!(
+            !self.popups.is_empty(),
+            "reposition_popup with no popup open"
+        );
+        let positioner = self.positioner_for(spec);
+        let handles = self.popups.last_mut().expect("just checked above");
+        handles.popup.reposition(&positioner, token);
+        let previous = std::mem::replace(&mut handles.positioner, positioner);
+        previous.destroy();
+        self.conn.flush().expect("flush reposition");
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// The token echoed by the most recent `xdg_popup.repositioned`, or
+    /// `None` if no reposition has completed.
+    pub fn popup_repositioned(&self) -> Option<u32> {
+        self.state.popup_repositioned
+    }
+
     /// Open a grabbing popup at the default positioner.
     ///
     /// Kept for `client_protocol.rs`'s implicit-vs-explicit grab regression
@@ -3382,7 +3411,13 @@ pub struct LayerPanelClient {
     _shm_file: std::fs::File,
     state: ClientState,
     queue: EventQueue<ClientState>,
+    /// Kept so popups can be created after `spawn` returns -- every proxy
+    /// this client makes later needs it.
+    qh: QueueHandle<ClientState>,
     conn: Connection,
+    /// The popup opened by [`LayerPanelClient::open_popup`], if any. Same
+    /// caveat as [`PopupHandles`]: dropping it does not destroy it.
+    popup: Option<PopupHandles>,
 }
 
 impl LayerPanelClient {
@@ -3460,7 +3495,9 @@ impl LayerPanelClient {
             _shm_file: shm_file,
             state,
             queue,
+            qh,
             conn,
+            popup: None,
         }
     }
 
@@ -3543,6 +3580,102 @@ impl LayerPanelClient {
     /// [`Self::layer_configure`] instead.
     pub fn layer_configure_count(&self) -> u32 {
         self.state.layer_configures
+    }
+
+    /// Open an `xdg_popup` parented to this panel and drive it to mapped.
+    ///
+    /// The layer-shell dance, per `zwlr_layer_shell_v1`'s own protocol xml:
+    /// the popup is created with `xdg_surface.get_popup(None, …)` -- a NULL
+    /// xdg parent -- and then reparented with
+    /// `zwlr_layer_surface_v1.get_popup`, before the popup's initial commit.
+    ///
+    /// Panics if a popup is already live, on a non-positive size, or if the
+    /// compositor never configures within [`TIMEOUT`].
+    pub fn open_popup(&mut self, spec: PopupSpec) {
+        assert!(
+            self.popup.is_none(),
+            "open_popup called with a previous popup still live"
+        );
+        let (w, h) = spec.size;
+        assert!(w > 0 && h > 0, "popup size ({w}, {h}) must be positive");
+
+        let compositor = self.state.compositor.clone().expect("no wl_compositor");
+        let shm = self.state.shm.clone().expect("no wl_shm");
+        let wm_base = self
+            .state
+            .wm_base
+            .clone()
+            .expect("compositor did not advertise xdg_wm_base");
+
+        let positioner = wm_base.create_positioner(&self.qh, ());
+        positioner.set_size(w, h);
+        let (ax, ay, aw, ah) = spec.anchor_rect;
+        positioner.set_anchor_rect(ax, ay, aw, ah);
+        positioner.set_anchor(spec.anchor);
+        positioner.set_gravity(spec.gravity);
+        positioner.set_constraint_adjustment(spec.constraint_adjustment);
+        positioner.set_offset(spec.offset.0, spec.offset.1);
+        if spec.reactive {
+            positioner.set_reactive();
+        }
+
+        let surface = compositor.create_surface(&self.qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &self.qh, PopupRole(0));
+        // NULL xdg parent, then reparented onto the layer surface.
+        let popup = xdg_surface.get_popup(None, &positioner, &self.qh, PopupRole(0));
+        self.layer_surface.get_popup(&popup);
+        if let Some(serial) = spec.grab {
+            let seat = self.state.seat.clone().expect("no wl_seat");
+            popup.grab(&seat, serial);
+        }
+        self.state.ensure_popup_depth(0);
+        self.state.popup_geometries[0] = None;
+        self.state.popup_acked[0] = false;
+        surface.commit();
+        self.conn.flush().expect("flush panel popup create");
+
+        let deadline = Instant::now() + TIMEOUT;
+        while !(self.state.popup_acked[0] && self.state.popup_geometries[0].is_some()) {
+            assert!(
+                Instant::now() < deadline,
+                "no popup configure for a layer-shell popup within {TIMEOUT:?}"
+            );
+            self.queue
+                .roundtrip(&mut self.state)
+                .expect("panel popup configure roundtrip");
+        }
+
+        let (_, _, cw, ch) = self.state.popup_geometries[0].expect("just checked above");
+        let (bw, bh) = if cw > 0 && ch > 0 { (cw, ch) } else { (w, h) };
+        let (shm_file, pool, buffer) = create_shm_buffer(&shm, &self.qh, bw, bh);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, bw, bh);
+        surface.commit();
+        self.conn.flush().expect("flush panel popup map");
+        self.queue
+            .roundtrip(&mut self.state)
+            .expect("panel popup map roundtrip");
+
+        self.popup = Some(PopupHandles {
+            popup,
+            xdg_surface,
+            surface,
+            positioner,
+            buffer,
+            pool,
+            _shm_file: shm_file,
+        });
+    }
+
+    /// `(x, y, width, height)` from this panel's popup's last
+    /// `xdg_popup.configure`, in the **panel surface's** coordinates.
+    pub fn popup_configured(&self) -> Option<(i32, i32, i32, i32)> {
+        self.state.popup_geometries.first().copied().flatten()
+    }
+
+    /// Whether this panel's popup has received `xdg_popup.popup_done`.
+    pub fn popup_done(&self) -> bool {
+        self.state.popup_done
     }
 
     /// Map again after [`Self::unmap`], following the protocol's own
