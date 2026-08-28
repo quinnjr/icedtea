@@ -3217,3 +3217,12 @@ lets it report `false` instead of silently succeeding. Pinned by
 (mutation-verified: deleting the guard kills the test binary).
 **Carried out by:** P1. **Consumed by:** P2 (may call `unconstrain` from a
 reactive-reposition pass without pre-checking initialization).
+
+### E21 — `wlr_xdg_popup_unconstrain_from_box` is incremental; `Popup::unconstrain` reseeds first
+wlroots 0.20's unconstrain uses `scheduled.geometry` as an in/out box and returns early when the
+already-adjusted box fits the new constraint, so compositor-driven re-placement of a reactive popup
+re-sent stale geometry. `Popup::unconstrain` now reseeds `scheduled.geometry` from the positioner
+rules (`wlr_xdg_positioner_rules_get_geometry`) before unconstraining — wlroots' own reposition
+path — so repeat calls with a different constraint box yield the correct configure. Fixed in
+wlr 0.20.28 (commit 02b1c90 on feature/wlr-xdg-popup). P2's
+`a_reactive_popup_is_reconfigured_when_its_parent_moves` is the end-to-end proof.
