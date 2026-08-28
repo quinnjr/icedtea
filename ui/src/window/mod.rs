@@ -28,7 +28,9 @@ use wayland_client::{
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::anim::{AnimationState, Clock, MonotonicClock};
@@ -39,7 +41,7 @@ use crate::shm::{BufferPool, BufferSlot};
 use crate::text::FontDatabase;
 use keyboard::{KeyEvent, Keymap};
 use pointer::{CursorShape, Scroll, ScrollSource};
-use popup::PopupKey;
+use popup::{Popup, PopupAnchorPoint, PopupKey, PopupWindow, Positioner};
 
 /// A node's identity, as a key for per-frame caches.
 ///
@@ -475,21 +477,42 @@ impl Surface {
         shm: &wl_shm::WlShm,
         qh: &QueueHandle<WindowState>,
     ) -> Result<(), SurfaceError> {
-        let Some(index) = buffers.acquire(shm, qh).map_err(SurfaceError::Shm)? else {
-            // Every buffer is still held: the frame is deferred, exactly as
-            // M1's `LayerWindow::repaint` defers it, and the next release
-            // repaints.
-            tracing::debug!("every shm buffer is still held; deferring this frame");
-            return Ok(());
-        };
-        let (width, height) = buffers.size();
-        buffers.upload(index, skia).map_err(SurfaceError::Shm)?;
-        let wl_surface = self.wl_surface();
-        wl_surface.attach(Some(buffers.wl_buffer(index)), 0, 0);
-        wl_surface.damage_buffer(0, 0, width, height);
-        wl_surface.commit();
-        Ok(())
+        commit_buffer_to(self.wl_surface(), skia, buffers, shm, qh)
     }
+}
+
+/// Upload, attach, damage and commit onto `wl_surface`, requesting a frame
+/// callback.
+///
+/// The [`Surface`]-shaped half of a commit, factored out so a popup's own
+/// `wl_surface` (which is not a [`Surface`] -- a window can have several
+/// popups, each with its own pool, and `Surface` is one-per-window) can share
+/// it with [`Surface::commit_buffer`] rather than duplicating the sequence.
+///
+/// # Errors
+///
+/// [`SurfaceError::Shm`] if no buffer is free and the pool cannot grow, or if
+/// the upload fails.
+pub(crate) fn commit_buffer_to(
+    wl_surface: &wl_surface::WlSurface,
+    skia: &mut skia_rs_safe::canvas::Surface,
+    buffers: &mut BufferPool,
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<WindowState>,
+) -> Result<(), SurfaceError> {
+    let Some(index) = buffers.acquire(shm, qh).map_err(SurfaceError::Shm)? else {
+        // Every buffer is still held: the frame is deferred, exactly as
+        // M1's `LayerWindow::repaint` defers it, and the next release
+        // repaints.
+        tracing::debug!("every shm buffer is still held; deferring this frame");
+        return Ok(());
+    };
+    let (width, height) = buffers.size();
+    buffers.upload(index, skia).map_err(SurfaceError::Shm)?;
+    wl_surface.attach(Some(buffers.wl_buffer(index)), 0, 0);
+    wl_surface.damage_buffer(0, 0, width, height);
+    wl_surface.commit();
+    Ok(())
 }
 
 /// Everything the window layer hands upward. One flat enum; the reactive layer
@@ -582,6 +605,9 @@ impl InputEvent {
     }
 }
 
+/// One `xdg_popup.configure`: which popup, its new position, its new size.
+pub(crate) type PopupConfigure = (PopupKey, (i32, i32), (u32, u32));
+
 /// Everything the dispatch handlers write and [`Window`] reads.
 pub(crate) struct WindowState {
     compositor: Option<wl_compositor::WlCompositor>,
@@ -631,6 +657,11 @@ pub(crate) struct WindowState {
     /// Set by Task 14's popup dispatch.
     #[allow(dead_code)]
     pub(crate) popup_events: Vec<InputEvent>,
+    /// `xdg_popup.configure`'s position and size, per popup, since the last
+    /// drain. `Window::render` folds these into the matching `PopupWindow`
+    /// before it paints; a popup's own `xdg_surface.configure` (which only
+    /// carries a serial) is acked generically above and does not need one.
+    pub(crate) popup_configures: Vec<PopupConfigure>,
     /// Which [`SurfaceTarget`] each of this window's `wl_surface`s is, so
     /// `wl_pointer.enter`/`wl_keyboard.enter` (which only ever name a
     /// surface) can be resolved back to one. Pushed by `Window::open` for the
@@ -661,6 +692,7 @@ impl WindowState {
             closed: false,
             axis: None,
             popup_events: Vec::new(),
+            popup_configures: Vec::new(),
             surface_targets: Vec::new(),
         }
     }
@@ -797,6 +829,14 @@ pub struct Window {
     /// `Window::render` gates its first attach on this.
     phase: MapPhase,
     dirty: bool,
+    /// Open popups, innermost (most recently opened) last -- the order
+    /// `close_popup` must tear down in, and the order a nested `get_popup`
+    /// picks its parent from.
+    popups: Vec<PopupWindow>,
+    /// The next [`PopupKey`] to mint. Never reused, so a stale event that
+    /// names an already-closed popup is silently ignored rather than
+    /// mistaken for a new one.
+    next_popup_key: u64,
 }
 
 /// How long [`Window::open`] waits for the first `configure`.
@@ -928,6 +968,8 @@ impl Window {
             clock: Rc::new(MonotonicClock::new()),
             phase: MapPhase::Configured,
             dirty: true,
+            popups: Vec::new(),
+            next_popup_key: 1,
         })
     }
 
@@ -1060,6 +1102,19 @@ impl Window {
     /// if the raster surface cannot be reallocated after a resize.
     pub fn render(&mut self) -> Result<bool, SurfaceError> {
         let now = self.clock.now();
+        let mut painted = self.render_main(now)?;
+        // Popups are rendered whether or not the main surface just repainted:
+        // a menu opened this frame is dirty on its own, and the main window
+        // may well be idle underneath it.
+        painted |= self.render_popups(now)?;
+        if painted {
+            self.conn.flush().map_err(socket_error)?;
+        }
+        Ok(painted)
+    }
+
+    /// The main surface's half of [`Window::render`].
+    fn render_main(&mut self, now: Duration) -> Result<bool, SurfaceError> {
         let overrides = self.anim.sample(now);
         if !should_paint(self.dirty, self.anim.is_active(now)) {
             return Ok(false);
@@ -1107,7 +1162,6 @@ impl Window {
         );
         self.surface
             .commit_buffer(&mut self.skia, &mut self.buffers, &self.shm, &self.qh)?;
-        self.conn.flush().map_err(socket_error)?;
         self.dirty = false;
         Ok(true)
     }
@@ -1156,10 +1210,17 @@ impl Window {
                 (0..self.buffers.slots().len()).find(|&i| self.buffers.wl_buffer(i).id() == id);
             if release_matches(slot_of, slot.0) {
                 self.buffers.release(slot);
+                continue;
             }
-            // A release for a pool this window does not (yet) recognise --
-            // once Task 14's popups have their own pools, an unmatched
-            // release routes to them instead of being dropped here.
+            // Not the main pool's buffer: a popup's own pool (Task 14) may
+            // recognise it instead.
+            if let Some(popup) = self
+                .popups
+                .iter_mut()
+                .find(|p| (0..p.buffers.slots().len()).any(|i| p.buffers.wl_buffer(i).id() == id))
+            {
+                popup.buffers.release(slot);
+            }
         }
     }
 
@@ -1181,6 +1242,262 @@ impl Window {
         self.skia = skia_rs_safe::canvas::Surface::new_raster_n32_premul(want_w, want_h)
             .ok_or(SurfaceError::Render("the raster surface to paint into"))?;
         Ok(())
+    }
+
+    /// Open a popup anchored to a node or a rect of this window.
+    ///
+    /// Sequencing, per xdg-shell: positioner -> `get_popup` -> [`grab`] ->
+    /// commit with no buffer -> configure -> ack -> attach. The grab, if any,
+    /// uses the window's most recent input serial.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Protocol`] for an invalid positioner or an anchor node
+    /// with no allocation, [`SurfaceError::MissingGlobal`] without
+    /// `xdg_wm_base`, [`SurfaceError::Shm`]/[`SurfaceError::Render`] for the
+    /// popup's own backing store.
+    pub fn open_popup(
+        &mut self,
+        parent: PopupAnchorPoint,
+        mut positioner: Positioner,
+    ) -> Result<PopupKey, SurfaceError> {
+        if let PopupAnchorPoint::Node(node) = &parent {
+            let alloc = self.layout.allocation(node).ok_or(SurfaceError::Protocol(
+                "the popup's anchor node is not laid out",
+            ))?;
+            positioner.anchor_rect = alloc.border_box;
+        } else if let PopupAnchorPoint::Rect(rect) = &parent {
+            positioner.anchor_rect = *rect;
+        }
+        positioner.validate()?;
+        let wm_base = self
+            .state
+            .wm_base
+            .clone()
+            .ok_or(SurfaceError::MissingGlobal("xdg_wm_base"))?;
+        let key = PopupKey(self.next_popup_key);
+        self.next_popup_key += 1;
+
+        let xdg_positioner = wm_base.create_positioner(&self.qh, ());
+        positioner.apply(&xdg_positioner);
+        let wl_surface = self
+            .state
+            .compositor
+            .clone()
+            .ok_or(SurfaceError::MissingGlobal("wl_compositor"))?
+            .create_surface(&self.qh, SurfaceTarget::Popup(key));
+        let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &self.qh, SurfaceTarget::Popup(key));
+        // The parent is the topmost popup if there is one: a nested menu
+        // hangs off its opener, not off the window. A layer surface has no
+        // `xdg_surface` of its own -- xdg-shell's answer for that case is a
+        // `None` parent here plus `zwlr_layer_surface_v1.get_popup` below,
+        // sent before this popup's own first commit.
+        let parent_xdg = self
+            .popups
+            .last()
+            .map(|p| p.popup.xdg_surface.clone())
+            .or_else(|| self.xdg_surface_of_window());
+        let xdg_popup = xdg_surface.get_popup(
+            parent_xdg.as_ref(),
+            &xdg_positioner,
+            &self.qh,
+            SurfaceTarget::Popup(key),
+        );
+        if parent_xdg.is_none()
+            && self.popups.is_empty()
+            && let Surface::Layer(layer) = &self.surface
+        {
+            layer.layer_surface().get_popup(&xdg_popup);
+        }
+        let popup = Popup {
+            key,
+            wl_surface: wl_surface.clone(),
+            xdg_surface,
+            xdg_popup,
+            position: (0, 0),
+            size: positioner.size,
+            scale: 1,
+        };
+        if let (Some(seat), Some(serial)) = (&self.state.seat, self.state.seat_serial) {
+            // A menu takes the seat: a click outside dismisses the whole chain
+            // and keyboard focus returns to the parent, which is the
+            // compositor's job once the grab exists.
+            popup.grab(seat, serial);
+        }
+        wl_surface.commit();
+        xdg_positioner.destroy();
+        self.conn.flush().map_err(socket_error)?;
+        self.state
+            .surface_targets
+            .push((wl_surface.id(), SurfaceTarget::Popup(key)));
+
+        let (w, h) = (
+            i32::try_from(positioner.size.0).unwrap_or(1).max(1),
+            i32::try_from(positioner.size.1).unwrap_or(1).max(1),
+        );
+        self.popups.push(PopupWindow {
+            popup,
+            root: Node::with_classes("popup", &["background"]),
+            layout: crate::layout::LayoutTree::new(),
+            styles: StyleMap::new(),
+            anim: AnimationState::new(),
+            buffers: BufferPool::new(&self.shm, &self.qh, w, h).map_err(SurfaceError::Shm)?,
+            skia: skia_rs_safe::canvas::Surface::new_raster_n32_premul(w, h)
+                .ok_or(SurfaceError::Render("the popup's raster surface"))?,
+            dirty: true,
+        });
+        Ok(key)
+    }
+
+    /// Destroy `key` and every popup above it, topmost first.
+    ///
+    /// The protocol requires reverse-creation order; destroying a popup with
+    /// children alive is `xdg_wm_base.error.not_the_topmost_popup`, which kills
+    /// the client.
+    pub fn close_popup(&mut self, key: PopupKey) {
+        let Some(index) = self.popups.iter().position(|p| p.popup.key == key) else {
+            return;
+        };
+        while self.popups.len() > index {
+            let removed = self.popups.pop().expect("the index is in range");
+            let id = removed.popup.wl_surface.id();
+            self.state.surface_targets.retain(|(got, _)| *got != id);
+            self.state
+                .pending_ack
+                .retain(|(t, _)| *t != SurfaceTarget::Popup(removed.popup.key));
+            self.state
+                .popup_configures
+                .retain(|(k, ..)| *k != removed.popup.key);
+        }
+        let _ = self.conn.flush();
+    }
+
+    #[must_use]
+    pub fn popup_root(&self, key: PopupKey) -> Option<Node> {
+        self.popups
+            .iter()
+            .find(|p| p.popup.key == key)
+            .map(|p| p.root.clone())
+    }
+
+    pub fn popup_layout(&mut self, key: PopupKey) -> Option<&mut crate::layout::LayoutTree> {
+        self.popups
+            .iter_mut()
+            .find(|p| p.popup.key == key)
+            .map(|p| &mut p.layout)
+    }
+
+    pub fn popup_animations(&mut self, key: PopupKey) -> Option<&mut AnimationState> {
+        self.popups
+            .iter_mut()
+            .find(|p| p.popup.key == key)
+            .map(|p| &mut p.anim)
+    }
+
+    pub fn popup_mark_dirty(&mut self, key: PopupKey) {
+        if let Some(p) = self.popups.iter_mut().find(|p| p.popup.key == key) {
+            p.dirty = true;
+        }
+    }
+
+    /// The main surface's own `xdg_surface`, for a nested `get_popup`'s
+    /// parent -- `None` for a layer-shell root, which has no `xdg_surface` at
+    /// all (`open_popup` takes a different path for that case).
+    fn xdg_surface_of_window(&self) -> Option<xdg_surface::XdgSurface> {
+        match &self.surface {
+            Surface::Toplevel(t) => Some(t.xdg_surface.clone()),
+            Surface::Layer(_) => None,
+        }
+    }
+
+    /// Fold any `xdg_popup.configure`s that arrived since the last render
+    /// into their popups, and repaint every dirty one that has a real
+    /// `xdg_surface.configure` to attach against.
+    ///
+    /// A popup that has never been configured must not have a buffer
+    /// attached -- `xdg_surface.error.unconfigured_buffer` kills the client
+    /// -- so this checks `pending_ack` (populated for every surface, not
+    /// just the window's) rather than assuming a freshly opened popup is
+    /// ready the moment `render` is next called.
+    fn render_popups(&mut self, now: Duration) -> Result<bool, SurfaceError> {
+        for (key, position, size) in std::mem::take(&mut self.state.popup_configures) {
+            if let Some(popup) = self.popups.iter_mut().find(|p| p.popup.key == key) {
+                popup.popup.position = position;
+                popup.popup.size = size;
+                popup.dirty = true;
+            }
+        }
+        let mut painted_any = false;
+        for popup in &mut self.popups {
+            let configured = self
+                .state
+                .pending_ack
+                .iter()
+                .any(|(t, _)| *t == SurfaceTarget::Popup(popup.popup.key));
+            if !configured {
+                continue;
+            }
+            let overrides = popup.anim.sample(now);
+            if !should_paint(popup.dirty, popup.anim.is_active(now)) {
+                continue;
+            }
+            let (width, height) = popup.popup.size;
+            let (w, h) = (
+                i32::try_from(width).unwrap_or(1).max(1),
+                i32::try_from(height).unwrap_or(1).max(1),
+            );
+            if popup.buffers.size() != (w, h) {
+                popup.buffers =
+                    BufferPool::new(&self.shm, &self.qh, w, h).map_err(SurfaceError::Shm)?;
+                popup.skia = skia_rs_safe::canvas::Surface::new_raster_n32_premul(w, h)
+                    .ok_or(SurfaceError::Render("the popup's raster surface"))?;
+            }
+            let available = taffy::Size {
+                width: taffy::AvailableSpace::Definite(w as f32),
+                height: taffy::AvailableSpace::Definite(h as f32),
+            };
+            let mut measure = crate::layout::FixedMeasure(taffy::Size {
+                width: 0.0,
+                height: 0.0,
+            });
+            if let Err(err) = restyle(
+                &popup.root,
+                &self.sheet,
+                &self.env,
+                &mut popup.styles,
+                &mut popup.layout,
+                available,
+                &mut measure,
+            ) {
+                tracing::error!(%err, "popup layout failed; keeping the previous frame");
+                continue;
+            }
+            popup
+                .skia
+                .canvas()
+                .clear(skia_rs_safe::core::Color::TRANSPARENT);
+            paint_tree(
+                &mut popup.skia,
+                &popup.root,
+                &popup.layout,
+                &popup.styles,
+                &overrides,
+                &self.env,
+                &self.sheet,
+                &mut self.fonts,
+                &mut self.images,
+            );
+            commit_buffer_to(
+                popup.popup.wl_surface(),
+                &mut popup.skia,
+                &mut popup.buffers,
+                &self.shm,
+                &self.qh,
+            )?;
+            popup.dirty = false;
+            painted_any = true;
+        }
+        Ok(painted_any)
     }
 }
 
@@ -1366,6 +1683,60 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceTarget> for WindowState {
                     states: state.states,
                 });
             }
+        }
+    }
+}
+
+impl Dispatch<xdg_positioner::XdgPositioner, ()> for WindowState {
+    fn event(
+        _: &mut Self,
+        _: &xdg_positioner::XdgPositioner,
+        _: xdg_positioner::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<xdg_popup::XdgPopup, SurfaceTarget> for WindowState {
+    fn event(
+        state: &mut Self,
+        _: &xdg_popup::XdgPopup,
+        event: xdg_popup::Event,
+        target: &SurfaceTarget,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let SurfaceTarget::Popup(key) = target else {
+            return;
+        };
+        match event {
+            xdg_popup::Event::Configure {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                state.popup_configures.push((
+                    *key,
+                    (x, y),
+                    (
+                        u32::try_from(width).unwrap_or(1).max(1),
+                        u32::try_from(height).unwrap_or(1).max(1),
+                    ),
+                ));
+            }
+            // The compositor dismissed it (a click outside a grab, the parent
+            // going away). The client must destroy it; `Window` does that when
+            // the app acts on the event.
+            xdg_popup::Event::PopupDone => state.events.push(InputEvent::PopupDone(*key)),
+            xdg_popup::Event::Repositioned { token } => {
+                state
+                    .events
+                    .push(InputEvent::Repositioned { key: *key, token });
+            }
+            _ => {}
         }
     }
 }

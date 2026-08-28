@@ -1782,6 +1782,15 @@ impl Layer {
         &self.wl_surface
     }
 
+    /// The role object itself, for the one request `xdg_surface` cannot make
+    /// on a layer surface's behalf: `zwlr_layer_surface_v1.get_popup`, which
+    /// assigns a popup created with a `None` parent (Task 14) to this layer
+    /// surface instead.
+    #[must_use]
+    pub(crate) fn layer_surface(&self) -> &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1 {
+        &self.layer_surface
+    }
+
     #[must_use]
     pub fn size(&self) -> (u32, u32) {
         self.size
