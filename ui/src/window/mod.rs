@@ -14,12 +14,13 @@ pub mod popup;
 pub mod selection;
 pub mod toplevel;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-    wl_shm_pool, wl_surface, wl_touch,
+    wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_keyboard, wl_pointer,
+    wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface, wl_touch,
 };
 use wayland_client::{
     ConnectError, Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, WEnum,
@@ -28,6 +29,7 @@ use wayland_client::{
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
+use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_manager_v1;
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
@@ -42,6 +44,7 @@ use crate::text::FontDatabase;
 use keyboard::{KeyEvent, Keymap};
 use pointer::{CursorShape, Scroll, ScrollSource};
 use popup::{Popup, PopupAnchorPoint, PopupKey, PopupWindow, Positioner};
+use selection::{Clipboard, ClipboardShared};
 
 /// A node's identity, as a key for per-frame caches.
 ///
@@ -629,6 +632,18 @@ pub(crate) struct WindowState {
     /// Read by Task 12's `Surface::set_cursor_shape`.
     #[allow(dead_code)]
     cursor_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
+    /// Read by `Window::clipboard`.
+    data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
+    /// Read by `Window::clipboard`; primary selection is a convenience some
+    /// compositors omit, so its absence is not fatal (deviation-free reading
+    /// of contract §3.8 -- only `wl_data_device_manager` is fail-fast).
+    primary_manager:
+        Option<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1>,
+    /// The offer/source bookkeeping [`selection::Clipboard`]'s `Dispatch`
+    /// impls write into. `None` until [`Window::clipboard`] builds the
+    /// device(s) that can ever receive such events -- nothing arrives before
+    /// then.
+    clipboard_shared: Option<Rc<RefCell<ClipboardShared>>>,
     /// Compiled from `wl_keyboard.keymap`; `None` until it arrives.
     keymap: Option<Keymap>,
     /// The events `pump` will hand up, in arrival order.
@@ -681,6 +696,9 @@ impl WindowState {
             keyboard: None,
             touch: None,
             cursor_manager: None,
+            data_device_manager: None,
+            primary_manager: None,
+            clipboard_shared: None,
             keymap: None,
             events: Vec::new(),
             released: Vec::new(),
@@ -837,6 +855,8 @@ pub struct Window {
     /// names an already-closed popup is silently ignored rather than
     /// mistaken for a new one.
     next_popup_key: u64,
+    /// Built lazily by [`Window::clipboard`] -- see its doc comment.
+    clipboard: Option<Clipboard>,
 }
 
 /// How long [`Window::open`] waits for the first `configure`.
@@ -970,6 +990,7 @@ impl Window {
             dirty: true,
             popups: Vec::new(),
             next_popup_key: 1,
+            clipboard: None,
         })
     }
 
@@ -1067,6 +1088,36 @@ impl Window {
     #[must_use]
     pub fn seat_serial(&self) -> Option<u32> {
         self.state.seat_serial
+    }
+
+    /// The clipboard and primary selection, building the `wl_data_device`
+    /// (and, if advertised, the primary-selection device) the first time this
+    /// is called.
+    ///
+    /// # Panics
+    ///
+    /// If the compositor never advertised `wl_data_device_manager` (contract
+    /// §3.8's and `harness/src/lib.rs`'s own fail-fast contract for it) or
+    /// never advertised a `wl_seat`.
+    pub fn clipboard(&mut self) -> &mut Clipboard {
+        if self.clipboard.is_none() {
+            let seat = self
+                .state
+                .seat
+                .clone()
+                .expect("compositor did not advertise wl_seat");
+            let shared = Rc::new(RefCell::new(ClipboardShared::default()));
+            self.state.clipboard_shared = Some(Rc::clone(&shared));
+            self.clipboard = Some(Clipboard::new(
+                self.conn.clone(),
+                self.qh.clone(),
+                self.state.data_device_manager.clone(),
+                &seat,
+                self.state.primary_manager.clone(),
+                shared,
+            ));
+        }
+        self.clipboard.as_mut().expect("just initialized above")
     }
 
     #[must_use]
@@ -1637,7 +1688,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WindowState {
             "wp_cursor_shape_manager_v1" => {
                 state.cursor_manager = Some(registry.bind(name, version.min(2), qh, ()));
             }
-            // Task 15 binds the two selection managers here.
+            "wl_data_device_manager" => {
+                state.data_device_manager = Some(registry.bind(name, version.min(3), qh, ()));
+            }
+            "zwp_primary_selection_device_manager_v1" => {
+                state.primary_manager = Some(registry.bind(name, version.min(1), qh, ()));
+            }
             _ => {}
         }
     }
