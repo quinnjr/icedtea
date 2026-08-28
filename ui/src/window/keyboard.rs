@@ -291,7 +291,18 @@ impl Keymap {
         let key = xkb_keycode(keycode);
         let raw_sym = self.state.key_get_one_sym(key);
         let mods = self.mods();
-        let consumed = self.mods.decode(self.state.key_get_consumed_mods(key));
+        // `xkb_state_key_get_consumed_mods` is XKB-mode consumption (this
+        // binding exposes no GTK-mode variant): for any two-level alphabetic
+        // key it reports both Shift *and* Lock as consumed unconditionally,
+        // because Lock also flips the level. That is correct for xkb's own
+        // definition but wrong for accelerator matching -- xkbcommon's own
+        // docs recommend masking consumed mods down to the "significant"
+        // set (Shift/Ctrl/Alt/Super) before using them, since Caps/Num Lock
+        // must never make an accelerator fail to match.
+        let consumed = self
+            .mods
+            .decode(self.state.key_get_consumed_mods(key))
+            .intersection(Mods::SHIFT | Mods::CTRL | Mods::ALT | Mods::LOGO);
         let (utf8, keysym) = if pressed {
             self.compose(key, raw_sym)
         } else {
@@ -361,6 +372,52 @@ impl Keymap {
     #[cfg(test)]
     fn mod_index_for_test(&self, name: &str) -> xkb::ModIndex {
         self.keymap.mod_get_index(name)
+    }
+
+    /// Replace the compose table with an explicit one.
+    ///
+    /// The locale's table is the default (`Keymap::wrap`); this is for a
+    /// hermetic test, or a user-configured compose file. A table that does
+    /// not compile leaves the previous one in place.
+    ///
+    /// # Errors
+    ///
+    /// [`KeymapError::Compile`] if `table` is not a Compose(5) table.
+    pub fn set_compose_table(&mut self, table: &str) -> Result<(), KeymapError> {
+        let compiled = xkb::compose::Table::new_from_buffer(
+            &self.context,
+            table.as_bytes(),
+            "en_US.UTF-8",
+            xkb::compose::FORMAT_TEXT_V1,
+            xkb::compose::COMPILE_NO_FLAGS,
+        )
+        .map_err(|()| KeymapError::Compile)?;
+        self.compose = Some(xkb::compose::State::new(
+            &compiled,
+            xkb::compose::STATE_NO_FLAGS,
+        ));
+        Ok(())
+    }
+
+    /// Feed one keysym straight to the compose table, reporting the text a
+    /// completed sequence produced. For sequences whose keys are not on the
+    /// loaded layout (`Multi_key`).
+    #[cfg(test)]
+    fn feed_keysym_for_test(&mut self, keysym: xkb::Keysym) -> Option<String> {
+        let compose = self.compose.as_mut()?;
+        compose.feed(keysym);
+        match compose.status() {
+            xkb::Status::Composed => {
+                let text = compose.utf8();
+                compose.reset();
+                text
+            }
+            xkb::Status::Cancelled => {
+                compose.reset();
+                None
+            }
+            _ => None,
+        }
     }
 }
 
@@ -584,5 +641,130 @@ mod tests {
             Some("a")
         );
         assert_eq!(named.translate(KEY_B, true, 0, 0).keysym, xkb::Keysym::b);
+    }
+
+    const KEY_E: u32 = 18;
+    const KEY_APOSTROPHE: u32 = 40;
+    const KEY_O: u32 = 24;
+    fn us_intl_composing() -> Keymap {
+        let mut keymap =
+            Keymap::from_string(include_str!("../../tests/fixtures/keymaps/us-intl.xkb"))
+                .expect("the vendored us(intl) keymap compiles");
+        keymap
+            .set_compose_table(include_str!("../../tests/fixtures/keymaps/compose.us"))
+            .expect("the vendored compose table compiles");
+        keymap
+    }
+
+    #[test]
+    fn a_dead_key_sequence_yields_one_composed_character() {
+        let mut keymap = us_intl_composing();
+        let dead = keymap.translate(KEY_APOSTROPHE, true, 1, 0);
+        assert_eq!(dead.keysym, xkb::Keysym::dead_acute);
+        assert!(
+            dead.utf8.is_none(),
+            "a dead key must insert nothing, not an acute accent: {:?}",
+            dead.utf8
+        );
+        let composed = keymap.translate(KEY_E, true, 2, 10);
+        assert_eq!(composed.utf8.as_deref(), Some("é"));
+        assert_eq!(composed.keysym, xkb::Keysym::eacute);
+        // The table is reset afterwards: the next `e` is a plain `e`.
+        assert_eq!(
+            keymap.translate(KEY_E, true, 3, 20).utf8.as_deref(),
+            Some("e")
+        );
+    }
+
+    #[test]
+    fn an_abandoned_compose_sequence_inserts_nothing() {
+        // `dead_acute` then a key with no sequence cancels: xkb reports
+        // Cancelled, and neither the accent nor the letter is inserted.
+        let mut keymap = us_intl_composing();
+        assert!(keymap.translate(KEY_APOSTROPHE, true, 1, 0).utf8.is_none());
+        let cancelled = keymap.translate(KEY_O, true, 2, 10);
+        assert!(
+            cancelled.utf8.is_none(),
+            "a cancelled sequence must insert nothing: {:?}",
+            cancelled.utf8
+        );
+        // And the state recovers rather than staying stuck.
+        assert_eq!(
+            keymap.translate(KEY_O, true, 3, 20).utf8.as_deref(),
+            Some("o")
+        );
+    }
+
+    #[test]
+    fn a_multi_key_sequence_composes_across_three_keystrokes() {
+        let mut keymap = us_intl_composing();
+        // `Multi_key` is not on the us(intl) layout by default, so drive the
+        // table directly through the keysym path a compositor-provided layout
+        // with a compose key would reach.
+        assert!(
+            keymap
+                .feed_keysym_for_test(xkb::Keysym::Multi_key)
+                .is_none()
+        );
+        assert!(keymap.feed_keysym_for_test(xkb::Keysym::o).is_none());
+        assert_eq!(
+            keymap.feed_keysym_for_test(xkb::Keysym::c).as_deref(),
+            Some("©")
+        );
+    }
+
+    #[test]
+    fn a_malformed_compose_table_is_an_error_and_never_a_panic() {
+        let mut keymap = us();
+        for table in [
+            "<dead_acute",
+            "\0\0\0",
+            "<nosuchkeysym> <e> : \"x\"",
+            &"<".repeat(50_000),
+        ] {
+            // Either it compiles to something harmless or it reports an
+            // error; what it must never do is panic or abort.
+            let _ = keymap.set_compose_table(table);
+        }
+        // Whatever happened, the keymap still translates.
+        assert_eq!(
+            keymap.translate(KEY_A, true, 0, 0).utf8.as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn an_accelerator_matches_on_the_modifiers_the_keysym_did_not_consume() {
+        let mut keymap = us();
+        keymap.update_key(KEY_LEFTSHIFT, true);
+        let bang = keymap.translate(KEY_1, true, 1, 0);
+        assert_eq!(bang.keysym, xkb::Keysym::exclam);
+        assert_eq!(bang.mods, Mods::SHIFT, "shift really is held");
+        assert_eq!(
+            bang.consumed,
+            Mods::SHIFT,
+            "shift was consumed to reach `!`"
+        );
+        assert_eq!(bang.effective_mods(), Mods::empty());
+        assert!(bang.matches(xkb::Keysym::exclam, Mods::empty()));
+        assert!(
+            !bang.matches(xkb::Keysym::exclam, Mods::SHIFT),
+            "`Shift+!` must not match a plain `!` accelerator"
+        );
+        keymap.update_key(KEY_LEFTSHIFT, false);
+
+        keymap.update_key(KEY_LEFTCTRL, true);
+        let ctrl_a = keymap.translate(KEY_A, true, 2, 0);
+        // A two-level alphabetic key's `Shift` is canonically consumed by
+        // xkb's own definition even when it is not held -- Lock could have
+        // chosen the same level -- but `Ctrl` never is.
+        assert!(
+            !ctrl_a.consumed.contains(Mods::CTRL),
+            "Ctrl is never consumed by a level: {:?}",
+            ctrl_a.consumed
+        );
+        assert_eq!(ctrl_a.effective_mods(), Mods::CTRL);
+        assert!(ctrl_a.matches(xkb::Keysym::a, Mods::CTRL));
+        assert!(!ctrl_a.matches(xkb::Keysym::a, Mods::empty()));
     }
 }

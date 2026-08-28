@@ -1,0 +1,6 @@
+# ui/tests/fixtures/keymaps/compose.us
+# A minimal Compose table, vendored so the dead-key test does not depend on
+# the build host's locale data. Format: libX11 Compose(5).
+<dead_acute> <e> : "é" eacute
+<dead_acute> <a> : "á" aacute
+<Multi_key> <o> <c> : "©" copyright
