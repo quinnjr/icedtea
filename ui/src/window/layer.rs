@@ -1708,3 +1708,179 @@ mod tests {
         );
     }
 }
+
+use crate::window::{LayerSpec, SurfaceError, SurfaceTarget, WindowState};
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1;
+
+/// A `zwlr_layer_surface_v1` on the general [`Window`](crate::window::Window)
+/// path.
+///
+/// Not to be confused with [`LayerWindow`] above, which is M1's one-button
+/// demo client and stays exactly as it was.
+pub struct Layer {
+    wl_surface: wl_surface::WlSurface,
+    layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    pub(crate) size: (u32, u32),
+    pub(crate) scale: i32,
+    /// Reserved for a per-surface pool the way [`popup::Popup`](crate::window::popup::Popup)
+    /// owns one: `Window::open` still commits through the one `BufferPool`
+    /// it owns for its primary surface (`Toplevel` or `Layer` alike), so
+    /// this stays `None` until a later task gives a `Layer` its own.
+    #[allow(dead_code)]
+    pub(crate) buffers: Option<BufferPool>,
+    pub(crate) cursor: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
+}
+
+impl Layer {
+    /// Create the role object and set every double-buffered property.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::MissingGlobal`] without `zwlr_layer_shell_v1`.
+    pub(crate) fn create(
+        state: &WindowState,
+        qh: &QueueHandle<WindowState>,
+        wl_surface: &wl_surface::WlSurface,
+        spec: &LayerSpec,
+        size: (i32, i32),
+        namespace: &str,
+    ) -> Result<Self, SurfaceError> {
+        let shell = state
+            .layer_shell
+            .clone()
+            .ok_or(SurfaceError::MissingGlobal("zwlr_layer_shell_v1"))?;
+        let layer_surface = shell.get_layer_surface(
+            wl_surface,
+            None,
+            spec.layer,
+            namespace.to_owned(),
+            qh,
+            SurfaceTarget::Window,
+        );
+        layer_surface.set_anchor(spec.anchor);
+        layer_surface.set_size(size.0.max(1) as u32, size.1.max(1) as u32);
+        layer_surface.set_margin(
+            spec.margin[0],
+            spec.margin[1],
+            spec.margin[2],
+            spec.margin[3],
+        );
+        layer_surface.set_exclusive_zone(spec.exclusive_zone);
+        layer_surface.set_keyboard_interactivity(spec.keyboard);
+        Ok(Self {
+            wl_surface: wl_surface.clone(),
+            layer_surface,
+            size: (size.0.max(1) as u32, size.1.max(1) as u32),
+            scale: 1,
+            buffers: None,
+            cursor: None,
+        })
+    }
+
+    #[must_use]
+    pub fn wl_surface(&self) -> &wl_surface::WlSurface {
+        &self.wl_surface
+    }
+
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    #[must_use]
+    pub fn scale(&self) -> i32 {
+        self.scale
+    }
+
+    pub fn set_size(&mut self, size: (u32, u32)) {
+        self.size = (size.0.max(1), size.1.max(1));
+        self.layer_surface.set_size(self.size.0, self.size.1);
+    }
+
+    pub fn set_anchor(&self, anchor: zwlr_layer_surface_v1::Anchor) {
+        self.layer_surface.set_anchor(anchor);
+    }
+
+    pub fn set_exclusive_zone(&self, zone: i32) {
+        self.layer_surface.set_exclusive_zone(zone);
+    }
+
+    pub fn set_margin(&self, margin: [i32; 4]) {
+        self.layer_surface
+            .set_margin(margin[0], margin[1], margin[2], margin[3]);
+    }
+
+    pub fn set_keyboard_interactivity(&self, mode: zwlr_layer_surface_v1::KeyboardInteractivity) {
+        self.layer_surface.set_keyboard_interactivity(mode);
+    }
+}
+
+impl Drop for Layer {
+    fn drop(&mut self) {
+        self.layer_surface.destroy();
+        self.wl_surface.destroy();
+    }
+}
+
+/// The size a layer `configure` actually asks for.
+///
+/// A zero dimension means "you chose this one yourself" -- an unanchored edge
+/// keeps the size the client requested. Taking the zero literally maps a
+/// zero-sized surface, which is `zwlr_layer_surface_v1.error.invalid_size`.
+#[must_use]
+pub(crate) fn configured_size(requested: (u32, u32), width: u32, height: u32) -> (u32, u32) {
+    (
+        if width == 0 { requested.0 } else { width },
+        if height == 0 { requested.1 } else { height },
+    )
+}
+
+#[cfg(test)]
+mod layer_role_tests {
+    use crate::window::{LayerSpec, Role, SurfaceSpec};
+    use wayland_protocols_wlr::layer_shell::v1::client::{
+        zwlr_layer_shell_v1, zwlr_layer_surface_v1,
+    };
+
+    #[test]
+    fn a_panel_spec_carries_every_double_buffered_layer_property() {
+        // All of these must be set before the first commit: they are
+        // double-buffered role state, and a panel that sets its exclusive zone
+        // after mapping has already had its neighbours laid out around zero.
+        let spec = SurfaceSpec {
+            role: Role::Layer(LayerSpec {
+                layer: zwlr_layer_shell_v1::Layer::Top,
+                anchor: zwlr_layer_surface_v1::Anchor::Top | zwlr_layer_surface_v1::Anchor::Left,
+                margin: [4, 0, 0, 4],
+                exclusive_zone: 32,
+                keyboard: zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand,
+            }),
+            size: (320, 32),
+            title: "icedtea-panel".into(),
+            app_id: "org.icedtea.Shell".into(),
+        };
+        let Role::Layer(layer) = &spec.role else {
+            panic!("the role is a layer");
+        };
+        assert_eq!(layer.exclusive_zone, 32);
+        assert_eq!(layer.margin, [4, 0, 0, 4]);
+        assert_eq!(layer.layer, zwlr_layer_shell_v1::Layer::Top);
+        assert_eq!(
+            layer.keyboard,
+            zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand,
+            "a panel with a search entry needs on-demand keyboard focus"
+        );
+    }
+
+    #[test]
+    fn a_layer_configure_of_zero_keeps_the_requested_size() {
+        // zwlr_layer_surface_v1.configure reports 0 for a dimension the client
+        // chose itself (an unanchored edge). Taking it literally maps a
+        // zero-sized surface, which is a protocol error.
+        use crate::window::layer::configured_size;
+        assert_eq!(configured_size((320, 32), 0, 0), (320, 32));
+        assert_eq!(configured_size((320, 32), 1920, 0), (1920, 32));
+        assert_eq!(configured_size((320, 32), 0, 48), (320, 48));
+        assert_eq!(configured_size((320, 32), 1920, 48), (1920, 48));
+    }
+}

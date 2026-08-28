@@ -342,6 +342,12 @@ fn sync_surface_from_state(surface: &mut Surface, state: &WindowState) {
             t.states = state.states;
             t.scale = state.scale;
         }
+        Surface::Layer(l) => {
+            if let Some(size) = state.configured {
+                l.size = size;
+            }
+            l.scale = state.scale;
+        }
     }
 }
 
@@ -360,6 +366,7 @@ pub(crate) fn apply_configure_states(root: &Node, states: SurfaceStates) {
 /// their own arms of each accessor.
 pub enum Surface {
     Toplevel(toplevel::Toplevel),
+    Layer(layer::Layer),
 }
 
 impl Surface {
@@ -367,6 +374,7 @@ impl Surface {
     pub fn wl_surface(&self) -> &wl_surface::WlSurface {
         match self {
             Self::Toplevel(t) => &t.wl_surface,
+            Self::Layer(l) => l.wl_surface(),
         }
     }
 
@@ -375,6 +383,7 @@ impl Surface {
     pub fn size(&self) -> (u32, u32) {
         match self {
             Self::Toplevel(t) => t.size,
+            Self::Layer(l) => l.size(),
         }
     }
 
@@ -382,6 +391,7 @@ impl Surface {
     pub fn scale(&self) -> i32 {
         match self {
             Self::Toplevel(t) => t.scale,
+            Self::Layer(l) => l.scale(),
         }
     }
 
@@ -389,6 +399,11 @@ impl Surface {
     pub fn states(&self) -> SurfaceStates {
         match self {
             Self::Toplevel(t) => t.states,
+            // A layer surface carries no `xdg_toplevel.state`; the dispatch
+            // in `impl Dispatch<zwlr_layer_surface_v1::...>` always reports
+            // ACTIVATED on configure, which keeps the root out of
+            // `:backdrop`.
+            Self::Layer(_) => SurfaceStates::ACTIVATED,
         }
     }
 
@@ -413,6 +428,7 @@ impl Surface {
                 let height = i32::try_from(size.1).unwrap_or(i32::MAX);
                 t.set_window_geometry(0, 0, width, height);
             }
+            Self::Layer(l) => l.set_size(size),
         }
         Ok(())
     }
@@ -859,14 +875,17 @@ impl Window {
                 toplevel.set_app_id(&spec.app_id);
                 Surface::Toplevel(toplevel)
             }
-            // Task 13 maps `zwlr_layer_shell_v1` onto `Surface::Layer`. Until
-            // it does, a layer request is refused locally rather than
-            // half-mapped: `LayerWindow` is still the working layer client.
-            Role::Layer(_) => {
-                wl_surface.destroy();
-                return Err(SurfaceError::Protocol(
-                    "the zwlr_layer_shell_v1 role is not mapped by Window yet",
-                ));
+            Role::Layer(layer_spec) => {
+                let mut layer = layer::Layer::create(
+                    &state,
+                    &qh,
+                    &wl_surface,
+                    layer_spec,
+                    (width, height),
+                    &spec.title,
+                )?;
+                layer.cursor = cursor;
+                Surface::Layer(layer)
             }
         };
         // The empty commit: role state is double-buffered, and no buffer may
@@ -1022,6 +1041,7 @@ impl Window {
     pub fn set_cursor_shape(&mut self, shape: CursorShape, serial: u32) {
         let device = match &self.surface {
             Surface::Toplevel(t) => t.cursor.as_ref(),
+            Surface::Layer(l) => l.cursor.as_ref(),
         };
         if let Some(device) = device {
             device.set_shape(serial, shape);
@@ -1346,6 +1366,39 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceTarget> for WindowState {
                     states: state.states,
                 });
             }
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, SurfaceTarget> for WindowState {
+    fn event(
+        state: &mut Self,
+        layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &SurfaceTarget,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                layer_surface.ack_configure(serial);
+                let requested = state.configured.unwrap_or((width.max(1), height.max(1)));
+                let size = layer::configured_size(requested, width, height);
+                state.configured = Some(size);
+                // A layer surface has no `xdg_toplevel.state`; ACTIVATED keeps
+                // the root out of `:backdrop`.
+                state.states = SurfaceStates::ACTIVATED;
+                state.events.push(InputEvent::Configure {
+                    size,
+                    states: state.states,
+                });
+            }
+            zwlr_layer_surface_v1::Event::Closed => state.close(),
+            _ => {}
         }
     }
 }
