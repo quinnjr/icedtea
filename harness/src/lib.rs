@@ -849,9 +849,18 @@ struct ClientState {
     /// `xdg_popup.popup_done`. Set once and never cleared: a dismissed
     /// popup is gone for good.
     popup_done: bool,
-    /// Whether the popup's own `xdg_surface.configure` has arrived, which
-    /// is what says the popup may attach a buffer and map.
-    popup_configured: bool,
+    /// The geometry each live popup's last `xdg_popup.configure` carried,
+    /// indexed by depth -- `[0]` is the outermost popup of the chain.
+    ///
+    /// A `Vec` rather than a scalar because a nested menu chain has one
+    /// configure per level and every level is separately assertable
+    /// (`popup_configured_at`).
+    popup_geometries: Vec<Option<(i32, i32, i32, i32)>>,
+    /// Whether each depth's popup `xdg_surface.configure` has arrived, which
+    /// is what says that popup may legally attach a buffer and map.
+    popup_acked: Vec<bool>,
+    /// The token echoed by the most recent `xdg_popup.repositioned`.
+    popup_repositioned: Option<u32>,
     /// The surface-local coordinates the most recent `wl_pointer.enter`
     /// carried.
     ///
@@ -958,6 +967,18 @@ struct ClientState {
     /// Set true on the gamma control's `failed` event -- what wlroots sends
     /// instead of `gamma_size` for an output whose gamma LUT size is 0.
     gamma_failed: bool,
+}
+
+impl ClientState {
+    /// Grow `popup_geometries`/`popup_acked` so `depth` is addressable.
+    fn ensure_popup_depth(&mut self, depth: usize) {
+        if self.popup_geometries.len() <= depth {
+            self.popup_geometries.resize(depth + 1, None);
+        }
+        if self.popup_acked.len() <= depth {
+            self.popup_acked.resize(depth + 1, false);
+        }
+    }
 }
 
 /// The two terminal `wp_presentation_feedback` events. Task 9's brief: the
@@ -1122,45 +1143,59 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for ClientState {
     }
 }
 
-/// Marker user-data for a **popup's** `xdg_surface`, so its configures are
-/// acked and counted separately from the toplevel's.
+/// Marker user-data for a popup's `xdg_surface` **and** its `xdg_popup`,
+/// carrying the popup's depth in its client's chain (`0` = outermost).
 ///
-/// Without it both roles would share `Dispatch<XdgSurface, ()>` and a popup
-/// configure would advance [`TestClient::configure_count`], quietly breaking
-/// every test that waits on that counter to observe a toplevel change.
-pub(crate) struct PopupRole;
+/// Without the marker both roles would share `Dispatch<XdgSurface, ()>` and a
+/// popup configure would advance [`TestClient::configure_count`], quietly
+/// breaking every test that waits on that counter to observe a toplevel
+/// change. The depth is what lets a nested chain's levels be asserted
+/// separately.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PopupRole(pub(crate) usize);
 
 impl Dispatch<xdg_surface::XdgSurface, PopupRole> for ClientState {
     fn event(
         state: &mut Self,
         surface: &xdg_surface::XdgSurface,
         event: xdg_surface::Event,
-        _: &PopupRole,
+        role: &PopupRole,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         // Acked here for the same reason the toplevel's is -- see that impl.
         if let xdg_surface::Event::Configure { serial } = event {
             surface.ack_configure(serial);
-            state.popup_configured = true;
+            state.ensure_popup_depth(role.0);
+            state.popup_acked[role.0] = true;
         }
     }
 }
 
-impl Dispatch<xdg_popup::XdgPopup, ()> for ClientState {
+impl Dispatch<xdg_popup::XdgPopup, PopupRole> for ClientState {
     fn event(
         state: &mut Self,
         _: &xdg_popup::XdgPopup,
         event: xdg_popup::Event,
-        _: &(),
+        role: &PopupRole,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // `Configure` carries the geometry the compositor chose; this
-        // harness maps at whatever it asked for and never repositions, so
-        // only the dismissal matters.
-        if let xdg_popup::Event::PopupDone = event {
-            state.popup_done = true;
+        match event {
+            xdg_popup::Event::Configure {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                state.ensure_popup_depth(role.0);
+                state.popup_geometries[role.0] = Some((x, y, width, height));
+            }
+            // Latched, never cleared: a dismissed popup is gone for good, and
+            // a chain is dismissed whole.
+            xdg_popup::Event::PopupDone => state.popup_done = true,
+            xdg_popup::Event::Repositioned { token } => state.popup_repositioned = Some(token),
+            _ => {}
         }
     }
 }
@@ -1926,25 +1961,30 @@ impl PopupSpec {
 /// server-side until the connection itself closes. To retire a popup
 /// deliberately, call [`PopupHandles::destroy`] (or go through
 /// [`TestClient::detach`], which does so for you). `popup_done` -- what
-/// [`TestClient::popup_dismissed`] watches for -- is sent by the compositor
+/// [`TestClient::popup_done`] watches for -- is sent by the compositor
 /// on its own initiative; nothing this struct does triggers it.
 ///
-/// No buffer or pool: the popup is never configured and so never legally
-/// attaches one. See [`TestClient::open_grabbing_popup`].
+/// The popup is driven all the way to mapped, so it owns a real shm buffer
+/// at the size the compositor configured it to.
 pub(crate) struct PopupHandles {
     popup: xdg_popup::XdgPopup,
     xdg_surface: xdg_surface::XdgSurface,
     surface: wl_surface::WlSurface,
     positioner: xdg_positioner::XdgPositioner,
+    buffer: wl_buffer::WlBuffer,
+    pool: wl_shm_pool::WlShmPool,
+    /// The shm file stays open for as long as the pool refers to it.
+    _shm_file: std::fs::File,
 }
 
 impl PopupHandles {
     /// Destroy every object backing this popup, child-to-parent as
-    /// xdg-shell requires: the `xdg_popup` role object, then its
-    /// `xdg_surface`, then the `wl_surface` it was assigned to, then the
-    /// `xdg_positioner` that placed it (order-independent, but destroyed
-    /// alongside the rest rather than leaked).
+    /// xdg-shell requires: the buffer and its pool, then the `xdg_popup`
+    /// role object, then its `xdg_surface`, then the `wl_surface` it was
+    /// assigned to, then the `xdg_positioner` that placed it.
     pub(crate) fn destroy(self) {
+        self.buffer.destroy();
+        self.pool.destroy();
         self.popup.destroy();
         self.xdg_surface.destroy();
         self.surface.destroy();
@@ -1977,12 +2017,10 @@ pub struct TestClient {
         wl_shm_pool::WlShmPool,
         std::fs::File,
     )>,
-    /// The popup opened by [`TestClient::open_grabbing_popup`] and every
-    /// object backing it, held so the popup outlives that call. `None`
-    /// until that method has been called; see [`PopupHandles`] for why
-    /// simply dropping this does not tear the popup down, and
-    /// [`TestClient::detach`] for where it actually is destroyed.
-    popup: Option<PopupHandles>,
+    /// Every live popup this client has opened, outermost first -- the chain
+    /// `open_popup`/`open_popup_from_popup` build and `destroy_popup` unwinds.
+    /// `TestClient::detach` destroys them topmost-first, as xdg-shell requires.
+    popups: Vec<PopupHandles>,
     state: ClientState,
     queue: EventQueue<ClientState>,
     qh: QueueHandle<ClientState>,
@@ -2464,7 +2502,7 @@ impl TestClient {
             surface,
             shm_file,
             icon: None,
-            popup: None,
+            popups: Vec::new(),
             state,
             queue,
             qh,
@@ -2636,9 +2674,9 @@ impl TestClient {
     /// connection goes away.
     pub fn detach(self) {
         let mut this = self;
-        // The popup (if any) is a child of `this.xdg_surface`; xdg-shell
-        // requires children destroyed before their parent.
-        if let Some(popup) = this.popup.take() {
+        // Topmost-first: xdg-shell requires a popup's children destroyed
+        // before it.
+        while let Some(popup) = this.popups.pop() {
             popup.destroy();
         }
         if let Some(decoration) = &this.decoration {
@@ -2689,89 +2727,185 @@ impl TestClient {
         self.state.data_device.is_some()
     }
 
-    /// Open a child `xdg_popup` of this client's toplevel and take an
-    /// **explicit** popup grab on it with `serial`.
-    ///
-    /// `serial` must be one the seat issued this client's `wl_pointer` --
-    /// [`TestClient::last_pointer_serial`] after a button press. The grab is
-    /// requested before the popup's first commit, as xdg-shell requires.
-    ///
-    /// The popup is created and grabbed but never mapped -- see
-    /// [`TestClient::popup_configured`] for why, and why that costs this
-    /// nothing. Panics if called while a previous popup from this method is
-    /// still live; see [`TestClient::detach`] and [`PopupHandles::destroy`]
-    /// for the only supported way to retire one.
-    pub fn open_grabbing_popup(&mut self, serial: u32, w: i32, h: i32) {
-        assert!(
-            self.popup.is_none(),
-            "open_grabbing_popup called with a previous popup still live -- \
-             destroy it first (PopupHandles::destroy) before opening another"
-        );
-        assert!(
-            w > 0 && h > 0,
-            "popup size ({w}, {h}) must be positive -- xdg-shell rejects a \
-             zero-sized positioner outright"
-        );
+    /// Build the `xdg_positioner` `spec` describes.
+    fn positioner_for(&self, spec: PopupSpec) -> xdg_positioner::XdgPositioner {
         let wm_base = self
             .state
             .wm_base
             .clone()
             .expect("compositor did not advertise xdg_wm_base");
+        let positioner = wm_base.create_positioner(&self.qh, ());
+        let (w, h) = spec.size;
+        positioner.set_size(w, h);
+        let (ax, ay, aw, ah) = spec.anchor_rect;
+        positioner.set_anchor_rect(ax, ay, aw, ah);
+        positioner.set_anchor(spec.anchor);
+        positioner.set_gravity(spec.gravity);
+        positioner.set_constraint_adjustment(spec.constraint_adjustment);
+        positioner.set_offset(spec.offset.0, spec.offset.1);
+        if spec.reactive {
+            positioner.set_reactive();
+        }
+        positioner
+    }
+
+    /// Open an `xdg_popup` on this client's toplevel and drive it to mapped.
+    ///
+    /// Sequence, exactly as xdg-shell requires: positioner → `get_popup` →
+    /// optional `grab` (before the first commit) → an empty commit → wait for
+    /// `xdg_popup.configure` + `xdg_surface.configure` → ack (inside the
+    /// `Dispatch` impl) → attach a real shm buffer at the configured size →
+    /// commit.
+    ///
+    /// Panics if a popup from this client is already live (use
+    /// [`TestClient::open_popup_from_popup`] for a nested one), on a
+    /// non-positive size, or if the compositor never configures within
+    /// [`TIMEOUT`].
+    pub fn open_popup(&mut self, spec: PopupSpec) {
+        assert!(
+            self.popups.is_empty(),
+            "open_popup called with a previous popup still live -- destroy it \
+             first (TestClient::destroy_popup) or use open_popup_from_popup"
+        );
+        let parent = self.xdg_surface.clone();
+        self.push_popup(&parent, spec);
+    }
+
+    /// Open a child popup of this client's current topmost popup, so a test
+    /// can build a nested menu chain.
+    ///
+    /// Panics if there is no popup to hang it off.
+    pub fn open_popup_from_popup(&mut self, spec: PopupSpec) {
+        let parent = self
+            .popups
+            .last()
+            .expect("open_popup_from_popup with no popup open")
+            .xdg_surface
+            .clone();
+        self.push_popup(&parent, spec);
+    }
+
+    /// The shared body of both `open_popup` entry points.
+    fn push_popup(&mut self, parent: &xdg_surface::XdgSurface, spec: PopupSpec) {
+        let (w, h) = spec.size;
+        assert!(
+            w > 0 && h > 0,
+            "popup size ({w}, {h}) must be positive -- xdg-shell rejects a \
+             zero-sized positioner outright"
+        );
+        let depth = self.popups.len();
         let compositor = self
             .state
             .compositor
             .clone()
             .expect("compositor did not advertise wl_compositor");
-        let seat = self.state.seat.clone().expect("no wl_seat");
+        let shm = self
+            .state
+            .shm
+            .clone()
+            .expect("compositor did not advertise wl_shm");
+        let wm_base = self
+            .state
+            .wm_base
+            .clone()
+            .expect("compositor did not advertise xdg_wm_base");
 
-        let positioner = wm_base.create_positioner(&self.qh, ());
-        positioner.set_size(w, h);
-        positioner.set_anchor_rect(0, 0, w, h);
-
+        let positioner = self.positioner_for(spec);
         let surface = compositor.create_surface(&self.qh, ());
-        let xdg_surface = wm_base.get_xdg_surface(&surface, &self.qh, PopupRole);
-        let popup = xdg_surface.get_popup(Some(&self.xdg_surface), &positioner, &self.qh, ());
-        // Before the first commit, per xdg-shell.
-        popup.grab(&seat, serial);
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &self.qh, PopupRole(depth));
+        let popup = xdg_surface.get_popup(Some(parent), &positioner, &self.qh, PopupRole(depth));
+        if let Some(serial) = spec.grab {
+            let seat = self.state.seat.clone().expect("no wl_seat");
+            // Before the first commit, per xdg-shell.
+            popup.grab(&seat, serial);
+        }
+        self.state.ensure_popup_depth(depth);
+        self.state.popup_geometries[depth] = None;
+        self.state.popup_acked[depth] = false;
         surface.commit();
         self.conn.flush().expect("flush popup create");
+
+        // `roundtrip`, not `blocking_dispatch`, for the reason `map` gives:
+        // a roundtrip always returns, so the deadline stays honest against a
+        // compositor that has nothing to say.
+        let deadline = Instant::now() + TIMEOUT;
+        while !(self.state.popup_acked[depth] && self.state.popup_geometries[depth].is_some()) {
+            assert!(
+                Instant::now() < deadline,
+                "no xdg_popup.configure + xdg_surface.configure within {TIMEOUT:?}"
+            );
+            self.queue
+                .roundtrip(&mut self.state)
+                .expect("popup configure roundtrip");
+        }
+
+        let (_, _, cw, ch) = self.state.popup_geometries[depth].expect("just checked above");
+        // A configure of 0x0 would mean the compositor chose nothing; the
+        // positioner's own size is the honest fallback.
+        let (bw, bh) = if cw > 0 && ch > 0 { (cw, ch) } else { (w, h) };
+        let (shm_file, pool, buffer) = create_shm_buffer(&shm, &self.qh, bw, bh);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, bw, bh);
+        surface.commit();
+        self.conn.flush().expect("flush popup map");
         self.queue
             .roundtrip(&mut self.state)
-            .expect("roundtrip after opening the grabbing popup");
+            .expect("popup map roundtrip");
 
-        self.popup = Some(PopupHandles {
+        self.popups.push(PopupHandles {
             popup,
             xdg_surface,
             surface,
             positioner,
+            buffer,
+            pool,
+            _shm_file: shm_file,
         });
     }
 
-    /// Whether the popup's own `xdg_surface.configure` has arrived.
-    ///
-    /// `false` today for every popup this harness opens: the `wlr` crate has
-    /// no xdg-popup support yet (every `wlr_xdg_popup*` symbol is still
-    /// `not-yet` in its coverage ledger), so nothing ever answers the
-    /// popup's `xdg_surface` with a configure and it cannot legally attach a
-    /// buffer or map. That does not weaken a popup *grab*, though: the seat
-    /// grab is not the compositor's to install one for -- wlroots' own
-    /// xdg-shell implementation keeps a `wlr_xdg_popup_grab` per seat and
-    /// starts it from the popup's `grab` request itself, so the grab is
-    /// live regardless of whether the popup ever configures.
-    ///
-    /// Asserted `false` by the popup-grab test so the day this changes is
-    /// the day that test tells someone. Kept as an accessor rather than
-    /// deleted because it is the executable record of the gap. Every other
-    /// place this project notes the same gap should link here rather than
-    /// restate it.
-    pub fn popup_configured(&self) -> bool {
-        self.state.popup_configured
+    /// `(x, y, width, height)` from the outermost popup's last
+    /// `xdg_popup.configure`, in the parent's window-geometry coordinates.
+    /// `None` until one has arrived.
+    pub fn popup_configured(&self) -> Option<(i32, i32, i32, i32)> {
+        self.popup_configured_at(0)
     }
 
-    /// Whether the popup opened by [`TestClient::open_grabbing_popup`] has
-    /// been dismissed with `xdg_popup.popup_done`.
-    pub fn popup_dismissed(&self) -> bool {
+    /// Per-depth: `popup_configured_at(0)` is the outermost popup.
+    pub fn popup_configured_at(&self, depth: usize) -> Option<(i32, i32, i32, i32)> {
+        self.state.popup_geometries.get(depth).copied().flatten()
+    }
+
+    /// Whether *any* popup of this client has received
+    /// `xdg_popup.popup_done`. Latched: a chain is dismissed whole.
+    pub fn popup_done(&self) -> bool {
         self.state.popup_done
+    }
+
+    /// How many popups this client currently has open.
+    pub fn popup_depth(&self) -> usize {
+        self.popups.len()
+    }
+
+    /// Destroy the topmost popup -- the reverse-creation order xdg-shell
+    /// requires. A no-op when there is none.
+    pub fn destroy_popup(&mut self) {
+        if let Some(popup) = self.popups.pop() {
+            popup.destroy();
+            self.conn.flush().expect("flush popup destroy");
+            let _ = self.queue.roundtrip(&mut self.state);
+        }
+    }
+
+    /// Open a grabbing popup at the default positioner.
+    ///
+    /// Kept for `client_protocol.rs`'s implicit-vs-explicit grab regression
+    /// test, which predates [`PopupSpec`]; it is exactly
+    /// `open_popup(PopupSpec::new(w, h).grab(serial))`.
+    ///
+    /// `serial` must be one the seat issued this client's `wl_pointer` --
+    /// [`TestClient::last_pointer_serial`] after a button press.
+    pub fn open_grabbing_popup(&mut self, serial: u32, w: i32, h: i32) {
+        self.open_popup(PopupSpec::new(w, h).grab(serial));
     }
 
     pub fn start_drag_text(&mut self, mime: &str, payload: &[u8], serial: u32) {

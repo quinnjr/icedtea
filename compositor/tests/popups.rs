@@ -72,3 +72,44 @@ fn the_wlr_crate_exposes_the_xdg_popup_api_part_2_is_written_against() {
         wlr::Box2D::new(10, 30, 64, 48)
     );
 }
+
+/// A popup under a toplevel is configured at exactly the geometry its
+/// positioner asks for, when nothing constrains it.
+///
+/// `(10, 10, 20, 20)` anchored `BottomLeft` with gravity `BottomRight` puts
+/// the popup's top-left corner at `(10, 30)` in the parent's window-geometry
+/// coordinates -- the arithmetic
+/// `the_wlr_crate_exposes_the_xdg_popup_api_part_2_is_written_against` pins
+/// against wlroots itself. The window is nowhere near an output edge, so no
+/// constraint adjustment can apply and the configure must be the raw geometry.
+///
+/// Mutation check: make `State::configure_popup_now` return early and the
+/// popup is never configured, so `open_popup` times out waiting to map.
+#[test]
+fn a_popup_under_a_toplevel_is_configured_at_the_positioner_geometry() {
+    let comp = Compositor::spawn();
+    let mut a = TestClient::map_toplevel(&comp.socket, "popup.app", "popup");
+    assert!(
+        a.wait_until(|c| c.last_configure().is_some()),
+        "the parent never configured"
+    );
+
+    a.open_popup(
+        PopupSpec::new(64, 48)
+            .anchor_rect(10, 10, 20, 20)
+            .anchor(PopupAnchor::BottomLeft)
+            .gravity(PopupGravity::BottomRight),
+    );
+
+    assert_eq!(
+        a.popup_configured(),
+        Some((10, 30, 64, 48)),
+        "the popup must be configured at the unconstrained positioner geometry"
+    );
+    assert_eq!(a.popup_depth(), 1);
+    assert!(!a.popup_done(), "nothing dismissed this popup");
+
+    a.destroy_popup();
+    assert_eq!(a.popup_depth(), 0);
+    a.detach();
+}
