@@ -25,7 +25,9 @@ use wayland_client::{
     ConnectError, Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, WEnum,
     delegate_noop,
 };
-use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1;
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
@@ -36,7 +38,7 @@ use crate::css::node::{Node, PseudoStates};
 use crate::shm::{BufferPool, BufferSlot};
 use crate::text::FontDatabase;
 use keyboard::{KeyEvent, Keymap};
-use pointer::{Scroll, ScrollSource};
+use pointer::{CursorShape, Scroll, ScrollSource};
 use popup::PopupKey;
 
 /// A node's identity, as a key for per-frame caches.
@@ -324,6 +326,25 @@ pub fn may_attach(phase: MapPhase) -> bool {
 /// `!ACTIVATED` is `:backdrop`, which is the only one of the nine that GTK's
 /// stylesheet reads. The rest are the app's business (a maximised window hides
 /// its resize grip) and reach it through `InputEvent::Configure`.
+/// Copy `state`'s configure-derived fields onto the active surface.
+///
+/// Dispatch handlers (`impl Dispatch<_, _> for WindowState`) only ever see
+/// `&mut WindowState`, never the `Surface` a live `Window` wraps it in, so
+/// nothing else can keep `Surface::{size, scale, states}` current. Called
+/// once after `Window::open`'s first configure and again from every
+/// `Window::pump` that saw a `Configure` or `ScaleChanged` event.
+fn sync_surface_from_state(surface: &mut Surface, state: &WindowState) {
+    match surface {
+        Surface::Toplevel(t) => {
+            if let Some(size) = state.configured {
+                t.size = size;
+            }
+            t.states = state.states;
+            t.scale = state.scale;
+        }
+    }
+}
+
 pub(crate) fn apply_configure_states(root: &Node, states: SurfaceStates) {
     root.set_state(
         PseudoStates::BACKDROP,
@@ -333,11 +354,126 @@ pub(crate) fn apply_configure_states(root: &Node, states: SurfaceStates) {
 
 /// One of the three surface roles.
 ///
-/// Task 12 adds `Layer` and `Popup` together with the role-shared accessors
-/// (`wl_surface`, `size`, `scale`, `states`, `resize`, `commit_buffer`); Task
-/// 10 needs only the role it maps.
+/// Task 12 adds the role-shared accessors (`wl_surface`, `size`, `scale`,
+/// `states`, `resize`, `set_cursor_shape`, `commit_buffer`) over the one role
+/// mapped so far; Task 13 adds `Layer` and Task 14 adds `Popup` alongside
+/// their own arms of each accessor.
 pub enum Surface {
     Toplevel(toplevel::Toplevel),
+}
+
+impl Surface {
+    #[must_use]
+    pub fn wl_surface(&self) -> &wl_surface::WlSurface {
+        match self {
+            Self::Toplevel(t) => &t.wl_surface,
+        }
+    }
+
+    /// The configured size in surface-local pixels.
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Toplevel(t) => t.size,
+        }
+    }
+
+    #[must_use]
+    pub fn scale(&self) -> i32 {
+        match self {
+            Self::Toplevel(t) => t.scale,
+        }
+    }
+
+    #[must_use]
+    pub fn states(&self) -> SurfaceStates {
+        match self {
+            Self::Toplevel(t) => t.states,
+        }
+    }
+
+    /// Ask for a new size.
+    ///
+    /// Honoured for a toplevel (`set_window_geometry`); Task 13's layer role
+    /// honours it through `set_size`, and Task 14's popup ignores it -- its
+    /// size is the positioner's until a reposition.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Protocol`] for a zero dimension, which every role
+    /// rejects.
+    pub fn resize(&mut self, size: (u32, u32)) -> Result<(), SurfaceError> {
+        if size.0 == 0 || size.1 == 0 {
+            return Err(SurfaceError::Protocol("a surface size must be positive"));
+        }
+        match self {
+            Self::Toplevel(t) => {
+                t.size = size;
+                let width = i32::try_from(size.0).unwrap_or(i32::MAX);
+                let height = i32::try_from(size.1).unwrap_or(i32::MAX);
+                t.set_window_geometry(0, 0, width, height);
+            }
+        }
+        Ok(())
+    }
+
+    /// Name the cursor for this surface's pointer.
+    ///
+    /// A no-op without `wp_cursor_shape_v1`; client-side cursor themes are out
+    /// of scope, so there is no fallback path to a `wl_surface` cursor.
+    ///
+    /// The device is a parameter rather than a field this reads off `self`:
+    /// there is exactly one `wl_pointer`/cursor-shape device per window
+    /// (Task 10's `WindowState` owns it, since only a `Dispatch` impl over
+    /// `WindowState` ever sees `wl_seat.capabilities`), and the shape it draws
+    /// does not depend on which of the window's surfaces has focus. See
+    /// `Window::set_cursor_shape`.
+    pub fn set_cursor_shape(
+        &mut self,
+        shape: CursorShape,
+        serial: u32,
+        device: Option<&wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
+    ) {
+        if let Some(device) = device {
+            device.set_shape(serial, shape);
+        }
+    }
+
+    /// Upload, attach, damage and commit, requesting a frame callback.
+    ///
+    /// `buffers`, `shm` and `qh` are parameters rather than fields `self`
+    /// owns: `WindowState`'s own doc comment already settles this -- "the
+    /// pools live on `Window`, and one window has several" -- so a `Surface`
+    /// borrows the pool for the duration of one commit rather than owning it.
+    /// `pub(crate)`, not `pub`, because `QueueHandle<WindowState>` is
+    /// unnameable outside this crate.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Shm`] if no buffer is free and the pool cannot grow, or
+    /// if the upload fails.
+    pub(crate) fn commit_buffer(
+        &mut self,
+        skia: &mut skia_rs_safe::canvas::Surface,
+        buffers: &mut BufferPool,
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<WindowState>,
+    ) -> Result<(), SurfaceError> {
+        let Some(index) = buffers.acquire(shm, qh).map_err(SurfaceError::Shm)? else {
+            // Every buffer is still held: the frame is deferred, exactly as
+            // M1's `LayerWindow::repaint` defers it, and the next release
+            // repaints.
+            tracing::debug!("every shm buffer is still held; deferring this frame");
+            return Ok(());
+        };
+        let (width, height) = buffers.size();
+        buffers.upload(index, skia).map_err(SurfaceError::Shm)?;
+        let wl_surface = self.wl_surface();
+        wl_surface.attach(Some(buffers.wl_buffer(index)), 0, 0);
+        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.commit();
+        Ok(())
+    }
 }
 
 /// Everything the window layer hands upward. One flat enum; the reactive layer
@@ -621,34 +757,29 @@ fn socket_error(err: wayland_client::backend::WaylandError) -> SurfaceError {
 pub struct Window {
     conn: Connection,
     queue: EventQueue<WindowState>,
-    /// Task 12 reallocates the buffer pool through this on a resize.
-    #[allow(dead_code)]
+    /// `Window::render` reallocates the buffer pool through this on a resize.
     qh: QueueHandle<WindowState>,
     state: WindowState,
     surface: Surface,
-    /// Task 12 reallocates the buffer pool through this on a resize.
-    #[allow(dead_code)]
+    /// `Window::render` reallocates the buffer pool through this on a resize.
     shm: wl_shm::WlShm,
-    #[allow(dead_code)]
+    /// The main surface's buffer pool. Owned here, not on `Surface`: one
+    /// window can have several pools once popups exist (Task 14), and
+    /// `WindowState`'s own doc comment already settles that they live on
+    /// `Window`.
     buffers: BufferPool,
-    #[allow(dead_code)]
     skia: skia_rs_safe::canvas::Surface,
     root: Node,
     layout: crate::layout::LayoutTree,
     styles: StyleMap,
     anim: AnimationState,
-    /// Task 12's restyle pass resolves against these.
-    #[allow(dead_code)]
     env: crate::css::computed::ResolveEnv,
-    #[allow(dead_code)]
     images: crate::paint::ImageCache,
     sheet: CompiledSheet,
     fonts: FontDatabase,
     clock: Rc<dyn Clock>,
-    /// Task 12's render gates its first attach on this.
-    #[allow(dead_code)]
+    /// `Window::render` gates its first attach on this.
     phase: MapPhase,
-    #[allow(dead_code)]
     dirty: bool,
 }
 
@@ -698,7 +829,16 @@ impl Window {
         let width = i32::try_from(spec.size.0.max(1)).unwrap_or(i32::MAX);
         let height = i32::try_from(spec.size.1.max(1)).unwrap_or(i32::MAX);
 
-        let surface = match &spec.role {
+        // One cursor-shape device per window, not per surface: there is
+        // exactly one `wl_pointer`, bound already if the seat advertised the
+        // capability in the roundtrips above.
+        let cursor = state
+            .cursor_manager
+            .as_ref()
+            .zip(state.pointer.as_ref())
+            .map(|(manager, pointer)| manager.get_pointer(pointer, &qh, ()));
+
+        let mut surface = match &spec.role {
             Role::Toplevel => {
                 let wm_base = state
                     .wm_base
@@ -710,6 +850,10 @@ impl Window {
                     wl_surface: wl_surface.clone(),
                     xdg_surface,
                     xdg_toplevel,
+                    size: spec.size,
+                    scale: 1,
+                    states: SurfaceStates::empty(),
+                    cursor,
                 };
                 toplevel.set_title(&spec.title);
                 toplevel.set_app_id(&spec.app_id);
@@ -739,6 +883,7 @@ impl Window {
                 i32::try_from(h.max(1)).unwrap_or(height),
             )
         });
+        sync_surface_from_state(&mut surface, &state);
 
         let buffers = BufferPool::new(&shm, &qh, width, height).map_err(SurfaceError::Shm)?;
         let skia = skia_rs_safe::canvas::Surface::new_raster_n32_premul(width, height)
@@ -801,8 +946,16 @@ impl Window {
         // `:backdrop` is the one configure state the stylesheet reads, and the
         // root has to carry it before the caller restyles off this batch.
         for event in &batch {
-            if let InputEvent::Configure { states, .. } = event {
-                apply_configure_states(&self.root, *states);
+            match event {
+                InputEvent::Configure { states, .. } => {
+                    apply_configure_states(&self.root, *states);
+                    sync_surface_from_state(&mut self.surface, &self.state);
+                    self.dirty = true;
+                }
+                InputEvent::ScaleChanged(_) => {
+                    sync_surface_from_state(&mut self.surface, &self.state);
+                }
+                _ => {}
             }
         }
         Ok(batch)
@@ -859,6 +1012,261 @@ impl Window {
     pub fn is_closed(&self) -> bool {
         self.state.closed
     }
+
+    /// Name the cursor for whichever surface currently has pointer focus.
+    ///
+    /// The convenience entry point over [`Surface::set_cursor_shape`]: the
+    /// cursor-shape device lives on the surface role (there is one per
+    /// window, set at `open` time), but the pointer's most recent enter
+    /// serial lives on `WindowState`, and only `Window` holds both.
+    pub fn set_cursor_shape(&mut self, shape: CursorShape, serial: u32) {
+        let device = match &self.surface {
+            Surface::Toplevel(t) => t.cursor.as_ref(),
+        };
+        if let Some(device) = device {
+            device.set_shape(serial, shape);
+        }
+    }
+
+    /// Restyle the dirty tree, relayout, repaint, attach and commit.
+    ///
+    /// Returns whether anything was actually painted, so a caller can tell an
+    /// idle frame from a real one.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Shm`] for a failed buffer allocation or upload,
+    /// [`SurfaceError::Socket`] for a failed flush, [`SurfaceError::Render`]
+    /// if the raster surface cannot be reallocated after a resize.
+    pub fn render(&mut self) -> Result<bool, SurfaceError> {
+        let now = self.clock.now();
+        let overrides = self.anim.sample(now);
+        if !should_paint(self.dirty, self.anim.is_active(now)) {
+            return Ok(false);
+        }
+        if !may_attach(self.phase) {
+            // Nothing to paint into yet; the first configure will mark dirty.
+            return Ok(false);
+        }
+        self.drain_releases();
+        self.resize_backing()?;
+        let (width, height) = self.surface.size();
+        let available = taffy::Size {
+            width: taffy::AvailableSpace::Definite(width as f32),
+            height: taffy::AvailableSpace::Definite(height as f32),
+        };
+        let mut measure = crate::layout::FixedMeasure(taffy::Size {
+            width: 0.0,
+            height: 0.0,
+        });
+        if let Err(err) = restyle(
+            &self.root,
+            &self.sheet,
+            &self.env,
+            &mut self.styles,
+            &mut self.layout,
+            available,
+            &mut measure,
+        ) {
+            tracing::error!(%err, "layout failed; keeping the previous frame");
+            return Ok(false);
+        }
+        self.skia
+            .canvas()
+            .clear(skia_rs_safe::core::Color::TRANSPARENT);
+        paint_tree(
+            &mut self.skia,
+            &self.root,
+            &self.layout,
+            &self.styles,
+            &overrides,
+            &self.env,
+            &self.sheet,
+            &mut self.fonts,
+            &mut self.images,
+        );
+        self.surface
+            .commit_buffer(&mut self.skia, &mut self.buffers, &self.shm, &self.qh)?;
+        self.conn.flush().map_err(socket_error)?;
+        self.dirty = false;
+        Ok(true)
+    }
+
+    /// Mark `node`'s tree as needing a repaint.
+    ///
+    /// Node-level granularity is P4's; M3's window repaints the whole surface,
+    /// because a partial repaint needs a damage rect per node and P4 owns the
+    /// walker that could compute one.
+    pub fn mark_dirty(&mut self, node: &Node) {
+        debug_assert!(
+            node.root().ptr_eq(&self.root.root()),
+            "mark_dirty on a node from another tree"
+        );
+        self.dirty = true;
+    }
+
+    /// The soonest of the animation clock's next deadline and the keyboard
+    /// repeat's.
+    ///
+    /// `Duration::ZERO` is "now", never "spin": a continuously interpolating
+    /// transition honestly has no later deadline than this instant.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<Duration> {
+        let now = self.clock.now();
+        fold_deadlines(
+            self.anim.next_deadline(now),
+            self.state
+                .keymap
+                .as_ref()
+                .and_then(|keymap| keymap.repeat_deadline(now)),
+        )
+    }
+
+    /// Move any `wl_buffer.release`s that belong to the active surface's pool
+    /// out of `WindowState`'s pending queue and back into it.
+    ///
+    /// The plan's `acquire_from_state` folded into this: `WindowState` is the
+    /// only thing a `Dispatch` impl can reach, so the release is recorded
+    /// there by `wl_buffer` id; only `Window` can match that id back to the
+    /// pool it belongs to and hand the slot back.
+    fn drain_releases(&mut self) {
+        let released = std::mem::take(&mut self.state.released);
+        for (id, slot) in released {
+            let slot_of =
+                (0..self.buffers.slots().len()).find(|&i| self.buffers.wl_buffer(i).id() == id);
+            if release_matches(slot_of, slot.0) {
+                self.buffers.release(slot);
+            }
+            // A release for a pool this window does not (yet) recognise --
+            // once Task 14's popups have their own pools, an unmatched
+            // release routes to them instead of being dropped here.
+        }
+    }
+
+    /// Reallocate the buffer pool and the raster surface after a configure
+    /// changed the size.
+    fn resize_backing(&mut self) -> Result<(), SurfaceError> {
+        let (width, height) = self.surface.size();
+        let (want_w, want_h) = (
+            i32::try_from(width.max(1)).unwrap_or(i32::MAX),
+            i32::try_from(height.max(1)).unwrap_or(i32::MAX),
+        );
+        if self.buffers.size() == (want_w, want_h) {
+            return Ok(());
+        }
+        // A fresh pool, not a resized one: the compositor may still hold the
+        // old buffers, and a `wl_shm_pool` cannot shrink.
+        self.buffers =
+            BufferPool::new(&self.shm, &self.qh, want_w, want_h).map_err(SurfaceError::Shm)?;
+        self.skia = skia_rs_safe::canvas::Surface::new_raster_n32_premul(want_w, want_h)
+            .ok_or(SurfaceError::Render("the raster surface to paint into"))?;
+        Ok(())
+    }
+}
+
+/// Whether the window should paint this frame.
+///
+/// Both halves matter: an idle window that repaints anyway burns a buffer, a
+/// commit and a frame callback per frame forever, and an animating one that
+/// does not repaint stalls at its first frame.
+#[must_use]
+fn should_paint(dirty: bool, animating: bool) -> bool {
+    dirty || animating
+}
+
+/// The sooner of two deadlines.
+///
+/// `Duration::ZERO` means "now" and is a real answer, so this is a `min` over
+/// the `Some`s, never an `or`.
+#[must_use]
+pub fn fold_deadlines(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (some, None) | (None, some) => some,
+    }
+}
+
+/// Whether a `wl_buffer.release` belongs to the pool that reports `slot_of`.
+#[must_use]
+fn release_matches(slot_of: Option<usize>, slot: usize) -> bool {
+    slot_of == Some(slot)
+}
+
+/// Paint the whole tree, depth first, each node inside its own effect layer.
+///
+/// This is the caller `paint::paint_node_with_children` was shaped for and
+/// M2's `#[allow(unused_variables)]` on its `node` parameter anticipated. P4
+/// replaces it with the reconciler-aware walker that also carries per-node
+/// animation overrides; until then the window's own `Overrides` apply to the
+/// root, which is where M3's window-level transitions live.
+// Nine parameters over clippy's default seven: this is `Window::render`'s
+// only caller, threading through exactly the borrows a single frame needs
+// (the raster target, the tree, the two per-frame maps, the sampled
+// animation overrides and the three caches `PaintCx` wraps) with no `self`
+// to hang them on -- P4's reconciler-aware walker replaces this whole
+// function rather than growing a context struct for one caller.
+#[allow(clippy::too_many_arguments)]
+fn paint_tree(
+    skia: &mut skia_rs_safe::canvas::Surface,
+    root: &Node,
+    layout: &crate::layout::LayoutTree,
+    styles: &StyleMap,
+    overrides: &crate::anim::Overrides,
+    env: &crate::css::computed::ResolveEnv,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    images: &mut crate::paint::ImageCache,
+) {
+    let mut cx = crate::paint::PaintCx {
+        env,
+        colors: &sheet.colors,
+        fonts,
+        images,
+        text: None,
+    };
+    let mut canvas = skia.canvas();
+    paint_subtree(
+        &mut canvas,
+        root,
+        layout,
+        styles,
+        Some(overrides),
+        &mut cx,
+        0,
+    );
+}
+
+fn paint_subtree(
+    canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+    node: &Node,
+    layout: &crate::layout::LayoutTree,
+    styles: &StyleMap,
+    overrides: Option<&crate::anim::Overrides>,
+    cx: &mut crate::paint::PaintCx<'_>,
+    depth: usize,
+) {
+    if depth >= pointer::MAX_HIT_DEPTH {
+        return;
+    }
+    let (Some(alloc), Some(style)) = (layout.allocation(node), styles.get(&node_addr(node))) else {
+        return;
+    };
+    let children = node.children();
+    crate::paint::paint_node_with_children(
+        canvas,
+        node,
+        style,
+        &alloc,
+        overrides,
+        cx,
+        |canvas, cx| {
+            for child in children {
+                // Only the root carries the window's sampled overrides: a
+                // child never computed those properties for itself.
+                paint_subtree(canvas, &child, layout, styles, None, cx, depth + 1);
+            }
+        },
+    );
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for WindowState {
@@ -1040,6 +1448,7 @@ delegate_noop!(WindowState: ignore wl_shm::WlShm);
 delegate_noop!(WindowState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(WindowState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(WindowState: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
+delegate_noop!(WindowState: ignore wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
 
 impl Dispatch<wl_seat::WlSeat, ()> for WindowState {
     /// Capabilities are the seat's *whole* current set, not an addition.
@@ -1736,5 +2145,46 @@ mod tests {
         let conn = wayland_client::Connection::from_socket(ours).expect("connection");
         let queue = conn.new_event_queue();
         (conn, queue, theirs)
+    }
+
+    #[test]
+    fn deadlines_fold_to_the_soonest_and_zero_means_now() {
+        use super::fold_deadlines;
+        let ms = Duration::from_millis;
+        assert_eq!(fold_deadlines(None, None), None);
+        assert_eq!(fold_deadlines(Some(ms(16)), None), Some(ms(16)));
+        assert_eq!(fold_deadlines(None, Some(ms(16))), Some(ms(16)));
+        assert_eq!(fold_deadlines(Some(ms(40)), Some(ms(16))), Some(ms(16)));
+        assert_eq!(
+            fold_deadlines(Some(Duration::ZERO), Some(ms(16))),
+            Some(Duration::ZERO),
+            "ZERO is a legitimate `now`, not a missing answer"
+        );
+    }
+
+    #[test]
+    fn a_dirty_tree_and_a_live_animation_are_the_only_reasons_to_paint() {
+        use super::should_paint;
+        assert!(should_paint(true, false), "a dirty tree paints");
+        assert!(should_paint(false, true), "a live animation paints");
+        assert!(should_paint(true, true));
+        assert!(
+            !should_paint(false, false),
+            "an idle window must not repaint: every commit costs a buffer and a frame callback"
+        );
+    }
+
+    #[test]
+    fn a_released_buffer_is_matched_to_its_own_pool() {
+        // One window has a pool per surface, and `BufferSlot` indices collide
+        // across them: releasing slot 0 of a popup's pool must not free slot 0
+        // of the window's.
+        use super::release_matches;
+        assert!(release_matches(Some(7), 7));
+        assert!(!release_matches(Some(7), 8));
+        assert!(
+            !release_matches(None, 7),
+            "a slot the pool never had is not ours"
+        );
     }
 }
