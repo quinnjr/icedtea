@@ -3154,3 +3154,38 @@ the layer they landed; P7 appends nothing; P8 owns the file as a whole and does
 the M3 pass — the widget table, the module map and the status line — reconciling
 whatever the earlier parts wrote. P8's added test
 `the_readme_widget_table_lists_every_kind` (P8 D8) is what keeps it honest.
+
+### E17 — `ConstraintAdjustment` is hand-rolled, not a `bitflags` type
+
+§1.1 spells `ConstraintAdjustment` with `bitflags::bitflags!`. The `wlr` crate
+has no `bitflags` dependency and declines one twice in its own source
+(`buffer.rs:386` for `DataPtrAccess`, and `BufferCaps` before it), pinning the
+bit values with a test instead. **Ruling:** P1 hand-rolls it —
+`pub struct ConstraintAdjustment(u32)` with six associated consts, `BitOr`,
+`BitOrAssign`, `contains` and `bits`. Every call site spells identically
+(`ConstraintAdjustment::FLIP_X | ConstraintAdjustment::SLIDE_Y`,
+`.contains(...)`), so no other part is affected. **Carried out by:** P1.
+
+### E18 — `PopupId` gains the two dangling constructors
+
+§1.1 lists only `PopupId`'s derives. `ToplevelId` and `LayerSurfaceId` both
+carry `dangling_for_test` (and `ToplevelId` also `dangling_nth_for_test`), and
+without them the "an unknown id misses rather than dereferencing" promise cannot
+be tested by a consumer — `crates/wlr/tests/popups.rs` and P2's `State` unit
+tests both need it. **Ruling:** additive; P1 adds
+`PopupId::{dangling_for_test, dangling_nth_for_test}` mirroring `ToplevelId`'s
+exactly, including the 2^32 band. **Carried out by:** P1. **Consumed by:** P2
+(`PopupKey::for_test` can wrap `PopupId::dangling_nth_for_test`).
+
+### E19 — an unknown positioner enum value is dropped silently, not logged
+
+§1.1 and the spec's §7 both say an unknown `xdg_positioner_anchor`/`_gravity`
+value "maps to `None` and is logged once, never panics". The `wlr` crate binds
+**no** Rust-side logging symbol and says so in its own source
+(`runtime.rs:8741-8744`): wlroots' `wlr_log` is a `static inline` macro over
+an unbound `_wlr_log`, and the crate deliberately has no `log`/`tracing`
+dependency. **Ruling:** the never-panic half stands in full and is directly
+tested (`a_positioner_with_nonsense_enum_values_never_panics`); the logging half
+is dropped in `wlr` and **moves to P2**, which has logging and is where a
+malformed positioner first becomes an observable compositor decision.
+**Carried out by:** P1 (the silent mapping), P2 (the log).
