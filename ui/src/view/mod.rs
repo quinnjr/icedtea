@@ -781,9 +781,369 @@ impl Kind {
     }
 }
 
+/// A child's identity across frames.
+///
+/// Identity is what keeps a row's animation, focus, shaping cache and
+/// attached popup alive when the list around it is edited. The three
+/// constructors are deliberately distinct variants: `Key::from(3usize)` and
+/// `Key::from(3u64)` are different keys, so a positional index can never
+/// alias a model id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Key {
+    /// A positional index the caller assigned explicitly.
+    Index(usize),
+    /// A model identity.
+    Id(u64),
+    /// A name.
+    Name(Rc<str>),
+}
+
+impl From<usize> for Key {
+    fn from(value: usize) -> Self {
+        Key::Index(value)
+    }
+}
+impl From<u64> for Key {
+    fn from(value: u64) -> Self {
+        Key::Id(value)
+    }
+}
+impl From<&str> for Key {
+    fn from(value: &str) -> Self {
+        Key::Name(Rc::from(value))
+    }
+}
+impl From<String> for Key {
+    fn from(value: String) -> Self {
+        Key::Name(Rc::from(value.as_str()))
+    }
+}
+
+/// The events a widget can produce a message from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum EventKind {
+    Click,
+    Activate,
+    Toggle,
+    Change,
+    Selected,
+    ValueChanged,
+    PageChanged,
+    Expanded,
+    Scrolled,
+    Close,
+    Response,
+    FocusIn,
+    FocusOut,
+    KeyPressed,
+    ActivateLink,
+    Reordered,
+    Search,
+    DateSelected,
+}
+
+impl EventKind {
+    /// Every event kind, in declaration order.
+    pub const ALL: &'static [EventKind] = &[
+        EventKind::Click,
+        EventKind::Activate,
+        EventKind::Toggle,
+        EventKind::Change,
+        EventKind::Selected,
+        EventKind::ValueChanged,
+        EventKind::PageChanged,
+        EventKind::Expanded,
+        EventKind::Scrolled,
+        EventKind::Close,
+        EventKind::Response,
+        EventKind::FocusIn,
+        EventKind::FocusOut,
+        EventKind::KeyPressed,
+        EventKind::ActivateLink,
+        EventKind::Reordered,
+        EventKind::Search,
+        EventKind::DateSelected,
+    ];
+}
+
+/// How one event turns into a message.
+///
+/// Contract deviation D13: the six variants are §4.4's, verbatim. §5's
+/// Calendar (`(i32, u32, u32)`) and Notebook (`(usize, usize)`) handler
+/// shapes have no variant to live in, so `on_date_selected` uses `Text` with
+/// an ISO-8601 `YYYY-MM-DD` payload and `on_reordered` uses `Index` with the
+/// destination index.
+#[allow(
+    clippy::type_complexity,
+    reason = "Handler::Key's closure type names KeyEvent and Option<Msg>; a \
+              type alias would need its own Msg parameter and add a layer \
+              of indirection for a single variant"
+)]
+pub enum Handler<Msg> {
+    /// A constant message, cloned on every fire.
+    Unit(Msg),
+    /// From the widget's text.
+    Text(Rc<dyn Fn(&str) -> Msg>),
+    /// From a boolean state.
+    Bool(Rc<dyn Fn(bool) -> Msg>),
+    /// From an index into a model or a page list.
+    Index(Rc<dyn Fn(usize) -> Msg>),
+    /// From a numeric value.
+    Float(Rc<dyn Fn(f64) -> Msg>),
+    /// From a key event; `None` means "not mine, keep bubbling".
+    Key(Rc<dyn Fn(&crate::window::keyboard::KeyEvent) -> Option<Msg>>),
+}
+
+impl<Msg> Clone for Handler<Msg>
+where
+    Msg: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Handler::Unit(msg) => Handler::Unit(msg.clone()),
+            Handler::Text(f) => Handler::Text(Rc::clone(f)),
+            Handler::Bool(f) => Handler::Bool(Rc::clone(f)),
+            Handler::Index(f) => Handler::Index(Rc::clone(f)),
+            Handler::Float(f) => Handler::Float(Rc::clone(f)),
+            Handler::Key(f) => Handler::Key(Rc::clone(f)),
+        }
+    }
+}
+
+impl<Msg: std::fmt::Debug> std::fmt::Debug for Handler<Msg> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Handler::Unit(msg) => f.debug_tuple("Unit").field(msg).finish(),
+            Handler::Text(_) => f.write_str("Text(..)"),
+            Handler::Bool(_) => f.write_str("Bool(..)"),
+            Handler::Index(_) => f.write_str("Index(..)"),
+            Handler::Float(_) => f.write_str("Float(..)"),
+            Handler::Key(_) => f.write_str("Key(..)"),
+        }
+    }
+}
+
+/// A widget's event-to-message bindings, sorted by [`EventKind`].
+///
+/// The reconciler replaces the whole set every frame (contract §4.7):
+/// handlers close over the current model, so diffing them would be both
+/// impossible and pointless.
+pub struct Handlers<Msg>(Vec<(EventKind, Handler<Msg>)>);
+
+impl<Msg> Default for Handlers<Msg> {
+    // Not `#[derive]`: that would demand `Msg: Default`.
+    fn default() -> Self {
+        Handlers(Vec::new())
+    }
+}
+
+impl<Msg: Clone> Clone for Handlers<Msg> {
+    fn clone(&self) -> Self {
+        Handlers(self.0.clone())
+    }
+}
+
+impl<Msg: std::fmt::Debug> std::fmt::Debug for Handlers<Msg> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.iter()).finish()
+    }
+}
+
+impl<Msg: Clone + 'static> Handlers<Msg> {
+    /// Bind `kind`, replacing any previous binding.
+    pub fn set(&mut self, kind: EventKind, handler: Handler<Msg>) {
+        match self.0.binary_search_by_key(&kind, |(k, _)| *k) {
+            Ok(index) => self.0[index].1 = handler,
+            Err(index) => self.0.insert(index, (kind, handler)),
+        }
+    }
+
+    /// Whether `kind` is bound at all.
+    #[must_use]
+    pub fn has(&self, kind: EventKind) -> bool {
+        self.get(kind).is_some()
+    }
+
+    /// How many events are bound.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether nothing is bound.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn get(&self, kind: EventKind) -> Option<&Handler<Msg>> {
+        self.0
+            .binary_search_by_key(&kind, |(k, _)| *k)
+            .ok()
+            .map(|index| &self.0[index].1)
+    }
+
+    /// Fire a parameterless event. `None` when nothing is bound, or when
+    /// what is bound wants a value this call cannot supply.
+    #[must_use]
+    pub fn fire_unit(&self, kind: EventKind) -> Option<Msg> {
+        match self.get(kind)? {
+            Handler::Unit(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+
+    /// Fire a text event.
+    #[must_use]
+    pub fn fire_text(&self, kind: EventKind, value: &str) -> Option<Msg> {
+        match self.get(kind)? {
+            Handler::Text(f) => Some(f(value)),
+            Handler::Unit(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+
+    /// Fire a boolean event.
+    #[must_use]
+    pub fn fire_bool(&self, kind: EventKind, value: bool) -> Option<Msg> {
+        match self.get(kind)? {
+            Handler::Bool(f) => Some(f(value)),
+            Handler::Unit(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+
+    /// Fire an index event.
+    #[must_use]
+    pub fn fire_index(&self, kind: EventKind, value: usize) -> Option<Msg> {
+        match self.get(kind)? {
+            Handler::Index(f) => Some(f(value)),
+            Handler::Unit(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+
+    /// Fire a numeric event.
+    #[must_use]
+    pub fn fire_float(&self, kind: EventKind, value: f64) -> Option<Msg> {
+        match self.get(kind)? {
+            Handler::Float(f) => Some(f(value)),
+            Handler::Unit(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+
+    /// Fire a key event. `None` both when nothing is bound and when the
+    /// bound closure declined the key, so the caller keeps bubbling.
+    #[must_use]
+    pub fn fire_key(&self, kind: EventKind, ev: &crate::window::keyboard::KeyEvent) -> Option<Msg> {
+        match self.get(kind)? {
+            Handler::Key(f) => f(ev),
+            Handler::Unit(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum TestMsg {
+        Ok,
+        Named(String),
+        Toggled(bool),
+        Picked(usize),
+        Moved(u64),
+    }
+
+    #[test]
+    fn keys_convert_from_the_three_identity_shapes() {
+        assert_eq!(Key::from(3usize), Key::Index(3));
+        assert_eq!(Key::from(9_u64), Key::Id(9));
+        assert_eq!(Key::from("row-a"), Key::Name(Rc::from("row-a")));
+        // Distinct constructors never collide, even at the same number.
+        assert_ne!(Key::from(3usize), Key::from(3_u64));
+    }
+
+    #[test]
+    fn a_unit_handler_clones_its_message_on_every_fire() {
+        let mut handlers: Handlers<TestMsg> = Handlers::default();
+        handlers.set(EventKind::Click, Handler::Unit(TestMsg::Ok));
+        assert_eq!(handlers.fire_unit(EventKind::Click), Some(TestMsg::Ok));
+        assert_eq!(handlers.fire_unit(EventKind::Click), Some(TestMsg::Ok));
+        assert_eq!(handlers.fire_unit(EventKind::Activate), None);
+    }
+
+    #[test]
+    fn typed_fires_only_match_their_own_handler_variant() {
+        let mut handlers: Handlers<TestMsg> = Handlers::default();
+        handlers.set(
+            EventKind::Change,
+            Handler::Text(Rc::new(|s: &str| TestMsg::Named(s.to_owned()))),
+        );
+        handlers.set(EventKind::Toggle, Handler::Bool(Rc::new(TestMsg::Toggled)));
+        handlers.set(
+            EventKind::Selected,
+            Handler::Index(Rc::new(TestMsg::Picked)),
+        );
+        handlers.set(
+            EventKind::ValueChanged,
+            Handler::Float(Rc::new(|v: f64| TestMsg::Moved(v as u64))),
+        );
+
+        assert_eq!(
+            handlers.fire_text(EventKind::Change, "hi"),
+            Some(TestMsg::Named("hi".into()))
+        );
+        assert_eq!(
+            handlers.fire_bool(EventKind::Toggle, true),
+            Some(TestMsg::Toggled(true))
+        );
+        assert_eq!(
+            handlers.fire_index(EventKind::Selected, 2),
+            Some(TestMsg::Picked(2))
+        );
+        assert_eq!(
+            handlers.fire_float(EventKind::ValueChanged, 5.0),
+            Some(TestMsg::Moved(5))
+        );
+
+        // A mismatched fire is a controller bug and yields nothing rather
+        // than firing the wrong message.
+        assert_eq!(handlers.fire_unit(EventKind::Change), None);
+        assert_eq!(handlers.fire_bool(EventKind::Change, true), None);
+    }
+
+    #[test]
+    fn setting_the_same_event_twice_replaces_rather_than_stacks() {
+        let mut handlers: Handlers<TestMsg> = Handlers::default();
+        handlers.set(EventKind::Click, Handler::Unit(TestMsg::Ok));
+        handlers.set(
+            EventKind::Click,
+            Handler::Unit(TestMsg::Named("second".into())),
+        );
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(
+            handlers.fire_unit(EventKind::Click),
+            Some(TestMsg::Named("second".into()))
+        );
+        assert!(handlers.has(EventKind::Click));
+        assert!(!handlers.has(EventKind::Close));
+    }
+
+    #[test]
+    fn the_event_kind_table_is_the_contract_s_eighteen() {
+        assert_eq!(EventKind::ALL.len(), 18);
+        assert_eq!(EventKind::ALL[0], EventKind::Click);
+        assert_eq!(EventKind::ALL[17], EventKind::DateSelected);
+        let mut sorted = EventKind::ALL.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 18);
+    }
 
     #[test]
     fn props_are_kept_sorted_and_set_overwrites_in_place() {
