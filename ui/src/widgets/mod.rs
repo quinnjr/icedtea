@@ -26,6 +26,7 @@ pub use crate::view::ListItem;
 
 pub mod button;
 pub mod calendar;
+pub mod check_button;
 pub mod drawing_area;
 pub mod image;
 pub mod info_bar;
@@ -40,6 +41,7 @@ pub mod scrollbar;
 pub mod separator;
 pub mod spinner;
 pub mod statusbar;
+pub mod switch;
 pub mod text_view;
 pub mod toggle_button;
 pub mod window_controls;
@@ -658,6 +660,10 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::LinkButton => Box::new(<link_button::LinkButtonC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::CheckButton => Box::new(<check_button::CheckButtonC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::Switch => Box::new(<switch::SwitchC as Controller<Msg>>::build(node, props, cx)),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {

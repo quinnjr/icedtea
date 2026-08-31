@@ -317,3 +317,48 @@ fn the_three_button_kinds_share_the_button_node_and_differ_by_class() {
     assert!(node_tree_of(Kind::LinkButton, &link).contains("button.link"));
     check(Kind::LinkButton, "link_button", &link);
 }
+
+#[test]
+fn a_check_button_names_its_indicator_check_and_switches_builtin_when_grouped() {
+    // mutation: return Builtin::Check unconditionally from CheckButtonC::builtin
+    // and the grouped assertion fails.
+    use icedtea_ui::icons::builtin::Builtin;
+    use icedtea_ui::widgets::check_button::CheckButtonC;
+
+    let mut props = Props::default();
+    props.set(PropName::Label, Prop::Str("Enable".into()));
+    check(Kind::CheckButton, "check_button", &props);
+    let rendered = node_tree_of(Kind::CheckButton, &props);
+    assert!(
+        rendered.starts_with("checkbutton.text-button"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("check"), "{rendered}");
+
+    props.set(PropName::Group, Prop::Str("mode".into()));
+    let grouped = node_tree_of(Kind::CheckButton, &props);
+    assert!(
+        grouped.contains("checkbutton.text-button.grouped"),
+        "{grouped}"
+    );
+    // GTK keeps the node named `check` and swaps the *builtin* to a radio.
+    assert!(grouped.contains("check"), "{grouped}");
+    assert_eq!(CheckButtonC::builtin_for(true, false), Builtin::Radio);
+    assert_eq!(CheckButtonC::builtin_for(false, false), Builtin::Check);
+    assert_eq!(
+        CheckButtonC::builtin_for(false, true),
+        Builtin::CheckIndeterminate
+    );
+    check(Kind::CheckButton, "check_button", &props);
+}
+
+#[test]
+fn a_switch_has_two_images_and_a_slider() {
+    // mutation: build one image and this fails with "fixture requires a node at
+    // 'switch/image'" only after both are gone — so drop the slider instead to
+    // see the failure immediately.
+    check(Kind::Switch, "switch", &Props::default());
+    let rendered = node_tree_of(Kind::Switch, &Props::default());
+    assert_eq!(rendered.matches("image").count(), 2, "{rendered}");
+    assert!(rendered.contains("slider"), "{rendered}");
+}

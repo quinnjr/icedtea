@@ -157,6 +157,7 @@ impl<Msg: Clone + 'static> View<Msg> {
 // builder is reachable as `view::builders::<name>`.
 pub use crate::widgets::button::{ButtonExt, button, button_from};
 pub use crate::widgets::calendar::{CalendarExt, calendar};
+pub use crate::widgets::check_button::{CheckButtonExt, check_button};
 pub use crate::widgets::drawing_area::{DrawingAreaExt, drawing_area};
 pub use crate::widgets::image::{ImageExt, image, image_named};
 pub use crate::widgets::info_bar::{InfoBarExt, info_bar};
@@ -171,6 +172,7 @@ pub use crate::widgets::scrollbar::{ScrollbarExt, scrollbar};
 pub use crate::widgets::separator::separator;
 pub use crate::widgets::spinner::{SpinnerExt, spinner};
 pub use crate::widgets::statusbar::{StatusbarExt, statusbar};
+pub use crate::widgets::switch::{SwitchExt, switch};
 pub use crate::widgets::text_view::{TextViewExt, text_view};
 pub use crate::widgets::toggle_button::{ToggleButtonExt, toggle_button};
 pub use crate::widgets::window_controls::{WindowControlsExt, window_controls};

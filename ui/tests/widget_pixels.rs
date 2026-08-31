@@ -918,3 +918,57 @@ fn toggling_a_toggle_button_paints_the_checked_state() {
     };
     assert_ne!(row(0), row(1), ":checked must repaint the button");
 }
+
+#[test]
+fn flipping_a_switch_animates_the_slider_to_the_other_end() {
+    // mutation: set `slide` straight to its target in SwitchC::set_prop and the
+    // mid-animation capture matches the final one.
+    use icedtea_ui::view::builders::switch;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Flip(bool);
+
+    let frames = run(
+        false,
+        |model: &mut bool, Flip(on): Flip| {
+            *model = on;
+            Cmd::None
+        },
+        |model: &bool| switch(*model).on_toggle(Flip),
+        (64, 40),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Message(Flip(true)),
+            ScriptStep::Advance(Duration::from_millis(60)),
+            ScriptStep::Capture,
+            ScriptStep::Advance(Duration::from_millis(400)),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..64)
+            .map(|x| frames.pixel(frame, x, 20))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(2), "the slider ends at the other end");
+    assert_ne!(
+        row(1),
+        row(2),
+        "and passes through an intermediate position"
+    );
+}
+
+#[test]
+#[ignore = "P7 fills in Builtin::path (contract §9, plan D9)"]
+fn a_check_button_paints_the_builtin_check_glyph() {
+    use icedtea_ui::view::builders::check_button;
+    use icedtea_ui::widgets::check_button::CheckButtonExt;
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| check_button("On").active(true),
+        (120, 40),
+        vec![ScriptStep::Capture],
+    );
+    assert!(has_ink(&frames, 0, (120, 40)), "the check glyph must ink");
+}
