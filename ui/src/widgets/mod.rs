@@ -24,6 +24,7 @@ use crate::window::focus::FOCUSABLE_CLASS;
 #[doc(inline)]
 pub use crate::view::ListItem;
 
+pub mod label;
 pub mod separator;
 
 /// A widget-local enum carried through `Prop::Enum(u16)`.
@@ -546,6 +547,7 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::Separator => Box::new(<separator::SeparatorC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::Label => Box::new(<label::LabelC as Controller<Msg>>::build(node, props, cx)),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {

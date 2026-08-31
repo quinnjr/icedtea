@@ -5,7 +5,7 @@
 //! extends this file with its own kinds; P8 only wires the whole set into the
 //! gallery gate.
 
-use icedtea_ui::view::{Kind, PropName, Props};
+use icedtea_ui::view::{Kind, Prop, PropName, Props};
 use icedtea_ui::widgets::{Orientation, WidgetEnum, fixture_matches, node_tree_of};
 
 fn fixture(name: &str) -> String {
@@ -62,4 +62,23 @@ fn the_matcher_rejects_a_renamed_or_missing_subnode() {
         fixture_matches("box\n╰── <child>", "box\n╰── grid\n    ╰── label").is_ok(),
         "<child> admits an arbitrary subtree"
     );
+}
+
+#[test]
+fn a_label_renders_one_node_and_a_selection_subnode_only_when_selected() {
+    // mutation: build the `selection` node unconditionally in LabelC::build and
+    // the first assertion sees it in a non-selectable label.
+    let mut plain = Props::default();
+    plain.set(PropName::Label, Prop::Str("hello".into()));
+    check(Kind::Label, "label", &plain);
+    assert_eq!(node_tree_of(Kind::Label, &plain).trim(), "label");
+
+    let mut selectable = plain.clone();
+    selectable.set(PropName::Selectable, Prop::Bool(true));
+    let rendered = node_tree_of(Kind::Label, &selectable);
+    assert!(
+        rendered.contains("selection"),
+        "a selectable label gets one: {rendered}"
+    );
+    check(Kind::Label, "label", &selectable);
 }

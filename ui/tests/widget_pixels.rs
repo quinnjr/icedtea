@@ -93,3 +93,65 @@ fn a_separator_ignores_every_pointer_event() {
     let after: Vec<_> = (0..120).map(|x| frames.pixel(1, x, 20)).collect();
     assert_eq!(before, after, "a separator has no interactive state");
 }
+
+#[test]
+fn a_label_inks_its_glyphs_at_rest_in_adwaita_light() {
+    // mutation: skip `layout.draw` in LabelC::paint and the frame is one flat
+    // colour.
+    use icedtea_ui::view::builders::label;
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| label("Hello"),
+        (160, 40),
+        vec![ScriptStep::Capture],
+    );
+    assert!(has_ink(&frames, 0, (160, 40)), "the label must draw glyphs");
+}
+
+#[test]
+fn clicking_a_link_in_a_label_fires_activate_link_with_its_uri() {
+    // mutation: drop the hit-test against `links` in LabelC::on_event and no
+    // message arrives.
+    use icedtea_ui::view::builders::label;
+    use icedtea_ui::widgets::label::LabelExt;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Opened(String);
+
+    let frames = run(
+        Vec::<String>::new(),
+        |model: &mut Vec<String>, Opened(uri): Opened| {
+            model.push(uri);
+            Cmd::None
+        },
+        |_m: &Vec<String>| {
+            label("go to <a href=\"https://gtk.org\">GTK</a> now")
+                .markup(true)
+                .on_activate_link(|uri| Opened(uri.to_owned()))
+        },
+        (240, 40),
+        vec![
+            ScriptStep::Event(InputEvent::PointerEnter {
+                x: 40.0,
+                y: 14.0,
+                serial: 1,
+                target: icedtea_ui::window::SurfaceTarget::Window,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 8,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    assert_eq!(frames.len(), 1, "the script captured once");
+}
