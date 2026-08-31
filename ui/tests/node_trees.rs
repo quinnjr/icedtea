@@ -156,3 +156,17 @@ fn a_scrollbar_nests_range_trough_and_slider_and_takes_its_orientation_class() {
     check(Kind::Scrollbar, "scrollbar", &props);
     assert!(node_tree_of(Kind::Scrollbar, &props).starts_with("scrollbar.vertical"));
 }
+
+#[test]
+fn an_image_takes_its_icon_size_class_and_a_picture_takes_none() {
+    // mutation: always add `.large-icons` and the Normal case fails.
+    use icedtea_ui::widgets::IconSize;
+    let mut props = Props::default();
+    props.set(PropName::IconSize, IconSize::Large.to_prop());
+    assert!(node_tree_of(Kind::Image, &props).starts_with("image.large-icons"));
+    check(Kind::Image, "image", &props);
+
+    props.set(PropName::IconSize, IconSize::Inherit.to_prop());
+    assert_eq!(node_tree_of(Kind::Image, &props).trim(), "image");
+    check(Kind::Picture, "picture", &Props::default());
+}

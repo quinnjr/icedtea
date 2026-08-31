@@ -491,3 +491,61 @@ fn dragging_a_scrollbar_slider_reports_the_new_value() {
         "the drag ran to completion without panicking"
     );
 }
+
+#[test]
+fn a_picture_decodes_and_draws_an_embedded_png() {
+    // mutation: skip `canvas.draw_image_rect` in PictureC::paint and the frame
+    // is one flat colour.
+    use icedtea_ui::view::builders::picture_from_bytes;
+    // A 2x2 opaque red PNG, embedded so the test needs no file on disk.
+    const RED_2X2: &[u8] = include_bytes!("fixtures/images/red-2x2.png");
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| picture_from_bytes(RED_2X2).hexpand(true).vexpand(true),
+        (64, 64),
+        vec![ScriptStep::Capture],
+    );
+    assert!(has_ink(&frames, 0, (64, 64)), "the decoded PNG must ink");
+}
+
+#[test]
+fn a_picture_with_an_undecodable_source_draws_nothing_and_does_not_panic() {
+    // mutation: unwrap the decode result in PictureC::build and this panics.
+    use icedtea_ui::view::builders::picture_from_bytes;
+    // `run`'s `view` parameter is a plain `fn`, not a closure, so the varying
+    // input rides through the model rather than being captured (plan
+    // reconciliation: the plan's `move |_m: &()| ...` cannot coerce to `fn`).
+    fn view(bytes: &&'static [u8]) -> View<()> {
+        picture_from_bytes(bytes).hexpand(true).vexpand(true)
+    }
+    for junk in [&b""[..], b"not a png", &[0xffu8; 4096][..]] {
+        let frames = run(
+            junk,
+            |_m: &mut &'static [u8], _msg: ()| Cmd::None,
+            view,
+            (32, 32),
+            vec![ScriptStep::Capture],
+        );
+        assert_eq!(
+            frames.len(),
+            1,
+            "an undecodable source still renders a frame"
+        );
+    }
+}
+
+#[test]
+#[ignore = "P7 fills in IconTheme::render (contract §9, plan D9)"]
+fn an_image_paints_its_resolved_icon() {
+    use icedtea_ui::view::builders::image_named;
+    use icedtea_ui::widgets::image::ImageExt;
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| image_named("image-missing").pixel_size(32),
+        (48, 48),
+        vec![ScriptStep::Capture],
+    );
+    assert!(has_ink(&frames, 0, (48, 48)), "the resolved icon must ink");
+}

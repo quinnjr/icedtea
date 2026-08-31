@@ -24,9 +24,11 @@ use crate::window::focus::FOCUSABLE_CLASS;
 #[doc(inline)]
 pub use crate::view::ListItem;
 
+pub mod image;
 pub mod info_bar;
 pub mod label;
 pub mod level_bar;
+pub mod picture;
 pub mod progress_bar;
 pub mod scrollbar;
 pub mod separator;
@@ -618,6 +620,10 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Scrollbar => Box::new(<scrollbar::ScrollbarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::Image => Box::new(<image::ImageC as Controller<Msg>>::build(node, props, cx)),
+        Kind::Picture => Box::new(<picture::PictureC as Controller<Msg>>::build(
             node, props, cx,
         )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
