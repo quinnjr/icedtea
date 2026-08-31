@@ -18,7 +18,7 @@ pub mod render;
 pub use builders::widget;
 pub use cmd::Cmd;
 pub use controller::{Controller, Event, EventCx, Phase};
-pub use reconcile::{BuildCx, Op};
+pub use reconcile::{BuildCx, Instance, Op, containers_of, reconcile};
 pub use render::{Animations, NodeAddr, StyleMap, node_addr};
 
 /// A typed property name, never a string — contract §0's "nothing names a

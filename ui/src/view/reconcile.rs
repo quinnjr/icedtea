@@ -289,7 +289,7 @@ pub fn reconcile<Msg: Clone + 'static>(
                 instance.props = view.props;
                 instance.handlers = view.handlers;
                 ops.push(Op::SetHandlers { index });
-                if !stable.contains(&from) {
+                if from != index && !stable.contains(&from) {
                     ops.push(Op::Move { from, to: index });
                 }
                 let node = instance.node.clone();
