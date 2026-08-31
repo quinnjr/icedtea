@@ -254,3 +254,36 @@ fn a_drawing_area_is_one_widget_node() {
     // at 'drawingarea' is not in the fixture".
     check(Kind::DrawingArea, "drawing_area", &Props::default());
 }
+
+#[test]
+fn a_calendar_builds_its_header_and_a_grid_of_day_labels() {
+    // mutation: emit 28 day labels regardless of month and the March
+    // assertion below reports 31 != 28.
+    use icedtea_ui::widgets::calendar::CalendarC;
+    assert_eq!(CalendarC::days_in_month(2024, 2), 29, "2024 is a leap year");
+    assert_eq!(CalendarC::days_in_month(1900, 2), 28, "1900 is not");
+    assert_eq!(CalendarC::days_in_month(2026, 3), 31);
+    assert_eq!(
+        CalendarC::days_in_month(2026, 13),
+        31,
+        "an out-of-range month clamps"
+    );
+    assert_eq!(
+        CalendarC::first_weekday(2026, 1),
+        3,
+        "1 Jan 2026 is a Thursday"
+    );
+
+    let mut props = Props::default();
+    props.set(PropName::Row, Prop::Int(2026));
+    props.set(PropName::Column, Prop::Int(3));
+    props.set(PropName::Value, Prop::Float(15.0));
+    check(Kind::Calendar, "calendar", &props);
+    let rendered = node_tree_of(Kind::Calendar, &props);
+    assert!(rendered.starts_with("calendar.view"), "{rendered}");
+    assert_eq!(
+        rendered.matches("label.day-number").count(),
+        31,
+        "{rendered}"
+    );
+}

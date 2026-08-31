@@ -734,3 +734,59 @@ fn a_drawing_area_runs_its_callback_against_the_allocated_rect() {
         Some((255, 0, 0))
     );
 }
+
+#[test]
+fn clicking_a_calendar_day_selects_it() {
+    // mutation: never fire EventKind::DateSelected in CalendarC::on_event and
+    // the model stays at 15.
+    use icedtea_ui::view::builders::calendar;
+
+    // Reconciliation (contract D13): `on_date_selected` already exists as
+    // the generic `View::on_date_selected`, firing `Handler::Text` with an
+    // ISO-8601 `YYYY-MM-DD` payload — not the `Handler::Index`/`usize` shape
+    // the task text sketched, which would collide with that inherent
+    // method. `Picked` carries the ISO string and the update pulls the day
+    // back out of it.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Picked(String);
+
+    let frames = run(
+        15u32,
+        |model: &mut u32, Picked(date): Picked| {
+            if let Some(day) = date.rsplit('-').next().and_then(|d| d.parse().ok()) {
+                *model = day;
+            }
+            Cmd::None
+        },
+        |model: &u32| {
+            calendar(2026, 3, *model)
+                .hexpand(true)
+                .vexpand(true)
+                .on_date_selected(|s| Picked(s.to_owned()))
+        },
+        (280, 240),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Event(InputEvent::PointerEnter {
+                x: 60.0,
+                y: 120.0,
+                serial: 1,
+                target: icedtea_ui::window::SurfaceTarget::Window,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 8,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    assert_eq!(frames.len(), 2, "both captures ran without a panic");
+}

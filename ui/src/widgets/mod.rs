@@ -24,6 +24,7 @@ use crate::window::focus::FOCUSABLE_CLASS;
 #[doc(inline)]
 pub use crate::view::ListItem;
 
+pub mod calendar;
 pub mod drawing_area;
 pub mod image;
 pub mod info_bar;
@@ -640,6 +641,9 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::WindowControls => {
             Box::new(<window_controls::WindowControlsC as Controller<Msg>>::build(node, props, cx))
         }
+        Kind::Calendar => Box::new(<calendar::CalendarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {
