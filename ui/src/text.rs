@@ -1677,6 +1677,83 @@ impl TextLayout {
     }
 }
 
+impl TextLayout {
+    /// The cluster boundary after `byte`. Clamped to the end of the text; a
+    /// `byte` inside a cluster moves to the end of that cluster.
+    #[must_use]
+    pub fn next_grapheme(&self, byte: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = byte.min(self.text.len());
+        for (offset, cluster) in self.text.grapheme_indices(true) {
+            if offset + cluster.len() > byte {
+                return offset + cluster.len();
+            }
+        }
+        self.text.len()
+    }
+
+    /// The cluster boundary before `byte`. Clamped to 0; a `byte` inside a
+    /// cluster moves to the start of that cluster.
+    #[must_use]
+    pub fn prev_grapheme(&self, byte: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = byte.min(self.text.len());
+        let mut previous = 0usize;
+        for (offset, cluster) in self.text.grapheme_indices(true) {
+            if offset >= byte {
+                break;
+            }
+            if offset + cluster.len() >= byte {
+                return offset;
+            }
+            previous = offset;
+        }
+        previous
+    }
+
+    /// The start of the next word after `byte` — where `Ctrl+Right` lands.
+    ///
+    /// GTK moves to the *start* of the following word, not the end of the
+    /// current one, so trailing whitespace is consumed with the move.
+    #[must_use]
+    pub fn next_word(&self, byte: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = byte.min(self.text.len());
+        let mut seen_current = false;
+        for (offset, word) in self.text.split_word_bound_indices() {
+            if offset < byte {
+                continue;
+            }
+            let is_word = word.chars().any(|c| !c.is_whitespace());
+            if !is_word {
+                continue;
+            }
+            if offset > byte || seen_current {
+                return offset;
+            }
+            seen_current = true;
+        }
+        self.text.len()
+    }
+
+    /// The start of the word at or before `byte` — where `Ctrl+Left` lands.
+    #[must_use]
+    pub fn prev_word(&self, byte: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = byte.min(self.text.len());
+        let mut best = 0usize;
+        for (offset, word) in self.text.split_word_bound_indices() {
+            if offset >= byte {
+                break;
+            }
+            if word.chars().any(|c| !c.is_whitespace()) {
+                best = offset;
+            }
+        }
+        best
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3002,5 +3079,65 @@ mod tests {
         assert!(across[0].width > 0.0 && across[1].width > 0.0);
         // An out-of-range end must be clamped, not panic.
         assert_eq!(layout.selection_rects(0..99_999).len(), 2);
+    }
+
+    #[test]
+    fn grapheme_movement_steps_over_combining_marks_and_clamps_at_the_ends() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        // "e" + combining acute, then a flag (two regional indicators).
+        let text = "e\u{0301}x\u{1F1EF}\u{1F1F5}";
+        let layout = super::TextLayout::build(
+            text,
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+
+        assert_eq!(layout.next_grapheme(0), 3, "e + U+0301 is one cluster");
+        assert_eq!(layout.next_grapheme(3), 4, "then the ASCII x");
+        assert_eq!(
+            layout.next_grapheme(4),
+            text.len(),
+            "the flag is one cluster"
+        );
+        assert_eq!(layout.next_grapheme(text.len()), text.len(), "clamped");
+
+        assert_eq!(layout.prev_grapheme(text.len()), 4);
+        assert_eq!(layout.prev_grapheme(4), 3);
+        assert_eq!(layout.prev_grapheme(3), 0);
+        assert_eq!(layout.prev_grapheme(0), 0, "clamped");
+
+        // A byte in the middle of a cluster must not panic and must not slice
+        // through a char boundary.
+        assert_eq!(layout.next_grapheme(1), 3);
+        assert_eq!(layout.prev_grapheme(2), 0);
+    }
+
+    #[test]
+    fn word_movement_lands_on_word_starts_the_way_ctrl_arrow_does() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let text = "alpha  bravo charlie";
+        let layout = super::TextLayout::build(
+            text,
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+
+        assert_eq!(layout.next_word(0), 7, "past 'alpha' and both spaces");
+        assert_eq!(layout.next_word(7), 13, "to 'charlie'");
+        assert_eq!(layout.next_word(13), text.len(), "to the end");
+        assert_eq!(layout.next_word(text.len()), text.len(), "clamped");
+
+        assert_eq!(layout.prev_word(text.len()), 13);
+        assert_eq!(layout.prev_word(13), 7);
+        assert_eq!(layout.prev_word(7), 0);
+        assert_eq!(layout.prev_word(0), 0, "clamped");
     }
 }
