@@ -365,20 +365,69 @@ fn clicking_an_info_bars_close_button_fires_close() {
     assert_eq!(frames.len(), 1);
 }
 
+/// Bundled Adwaita layered under a rule that paints the bare `infobar` node
+/// itself and blanks it on `:disabled` — the pseudo-state `InfoBarC::apply`
+/// actually flips for `revealed`.
+///
+/// Adwaita only paints `infobar > revealer > box` and `infobar .close`,
+/// neither of which exists in this task's flat `infobar -> [button.close]`
+/// tree (contract ruling R1), so against the bare theme a revealed/unrevealed
+/// info bar pixel test would pass regardless of whether `revealed` is
+/// honoured — see the task-11 review. Layering onto the real sheet (rather
+/// than replacing it, as a from-scratch minimal sheet leaves the window's own
+/// child sizing unresolved) keeps the rest of the layout Adwaita-driven and
+/// gives just this one mutation something to kill.
+fn info_bar_probe_sheet() -> CompiledSheet {
+    CompiledSheet::compile(&format!(
+        "{BUNDLED_ADWAITA_LIGHT}\ninfobar {{ min-width: 20px; min-height: 20px; background-color: #ff0000; }}\ninfobar:disabled {{ background-color: transparent; }}"
+    ))
+}
+
 #[test]
 fn an_unrevealed_info_bar_inks_nothing() {
     // mutation: ignore `revealed` in InfoBarC and the frame inks the bar.
     use icedtea_ui::view::builders::info_bar;
     use icedtea_ui::widgets::info_bar::InfoBarExt;
-    let frames = run(
-        (),
-        |_m: &mut (), _msg: ()| Cmd::None,
-        |_m: &()| info_bar().revealed(false).hexpand(true),
-        (300, 48),
-        vec![ScriptStep::Capture],
-    );
+    fn view(_m: &()) -> View<()> {
+        info_bar().revealed(false).hexpand(true)
+    }
+    let app =
+        App::new((), |_m: &mut (), _msg: ()| Cmd::None, view).with_sheet(info_bar_probe_sheet());
+    let frames = app
+        .run_offscreen(
+            (300, 48),
+            Rc::new(ManualClock::new()),
+            vec![ScriptStep::Capture],
+        )
+        .expect("the offscreen app must run");
     assert!(
         !has_ink(&frames, 0, (300, 48)),
         "a hidden info bar draws nothing"
+    );
+}
+
+#[test]
+fn a_revealed_info_bar_inks_the_bar() {
+    // Companion to `an_unrevealed_info_bar_inks_nothing`: with the same
+    // stylesheet, a revealed info bar must ink — this is what proves the
+    // unrevealed test is actually exercising `InfoBarC::apply`'s
+    // `revealed` handling rather than passing vacuously either way.
+    use icedtea_ui::view::builders::info_bar;
+    use icedtea_ui::widgets::info_bar::InfoBarExt;
+    fn view(_m: &()) -> View<()> {
+        info_bar().revealed(true).hexpand(true)
+    }
+    let app =
+        App::new((), |_m: &mut (), _msg: ()| Cmd::None, view).with_sheet(info_bar_probe_sheet());
+    let frames = app
+        .run_offscreen(
+            (300, 48),
+            Rc::new(ManualClock::new()),
+            vec![ScriptStep::Capture],
+        )
+        .expect("the offscreen app must run");
+    assert!(
+        has_ink(&frames, 0, (300, 48)),
+        "a revealed info bar draws its background"
     );
 }
