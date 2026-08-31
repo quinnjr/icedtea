@@ -9,6 +9,7 @@ use skia_rs_safe::canvas::Canvas;
 use crate::css::value::image::IconRef;
 use crate::layout::{Align, Rect};
 
+pub mod app;
 pub mod builders;
 pub mod cmd;
 pub mod controller;
