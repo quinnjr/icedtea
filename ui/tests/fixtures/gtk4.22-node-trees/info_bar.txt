@@ -1,0 +1,2 @@
+infobar[.info][.warning][.error][.question]
+╰── [button.close]

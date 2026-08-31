@@ -24,6 +24,7 @@ use crate::window::focus::FOCUSABLE_CLASS;
 #[doc(inline)]
 pub use crate::view::ListItem;
 
+pub mod info_bar;
 pub mod label;
 pub mod level_bar;
 pub mod progress_bar;
@@ -562,6 +563,9 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::ProgressBar => Box::new(<progress_bar::ProgressBarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::InfoBar => Box::new(<info_bar::InfoBarC as Controller<Msg>>::build(
             node, props, cx,
         )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),

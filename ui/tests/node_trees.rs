@@ -130,3 +130,19 @@ fn a_progress_bar_shows_its_text_subnode_only_when_asked() {
     assert!(node_tree_of(Kind::ProgressBar, &props).contains("text"));
     check(Kind::ProgressBar, "progress_bar", &props);
 }
+
+#[test]
+fn an_info_bar_carries_its_message_type_class_and_a_close_button() {
+    // mutation: stop adding the message-type class and the `.warning`
+    // assertion fails.
+    use icedtea_ui::widgets::MessageType;
+    let mut props = Props::default();
+    props.set(PropName::MessageType, MessageType::Warning.to_prop());
+    let rendered = node_tree_of(Kind::InfoBar, &props);
+    assert!(rendered.starts_with("infobar.warning"), "{rendered}");
+    check(Kind::InfoBar, "info_bar", &props);
+
+    props.set(PropName::Buttons, Prop::Bool(true));
+    let with_close = node_tree_of(Kind::InfoBar, &props);
+    assert!(with_close.contains("button.close"), "{with_close}");
+}

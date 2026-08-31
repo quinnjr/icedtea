@@ -320,3 +320,65 @@ fn a_discrete_level_bars_fill_widens_with_its_value() {
         "value 4.0 must fill more of the bar than 1.0"
     );
 }
+
+#[test]
+fn clicking_an_info_bars_close_button_fires_close() {
+    // mutation: never set `handled` / never fire EventKind::Close in
+    // InfoBarC::on_event and the model stays at 0.
+    use icedtea_ui::view::builders::info_bar;
+    use icedtea_ui::widgets::info_bar::InfoBarExt;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Closed;
+
+    let frames = run(
+        0u32,
+        |model: &mut u32, _msg: Closed| {
+            *model += 1;
+            Cmd::None
+        },
+        |_m: &u32| {
+            info_bar()
+                .show_close_button(true)
+                .revealed(true)
+                .hexpand(true)
+                .on_close(Closed)
+        },
+        (300, 48),
+        vec![
+            ScriptStep::Event(InputEvent::pointer_enter(285.0, 24.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 8,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    assert_eq!(frames.len(), 1);
+}
+
+#[test]
+fn an_unrevealed_info_bar_inks_nothing() {
+    // mutation: ignore `revealed` in InfoBarC and the frame inks the bar.
+    use icedtea_ui::view::builders::info_bar;
+    use icedtea_ui::widgets::info_bar::InfoBarExt;
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| info_bar().revealed(false).hexpand(true),
+        (300, 48),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        !has_ink(&frames, 0, (300, 48)),
+        "a hidden info bar draws nothing"
+    );
+}
