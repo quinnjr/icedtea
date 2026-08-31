@@ -9,6 +9,10 @@ use skia_rs_safe::canvas::Canvas;
 use crate::css::value::image::IconRef;
 use crate::layout::{Align, Rect};
 
+pub mod builders;
+
+pub use builders::widget;
+
 /// A typed property name, never a string — contract §0's "nothing names a
 /// property string" rule, extended from CSS properties to widget props.
 ///
