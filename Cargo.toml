@@ -16,10 +16,3 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
 image = "0.25"
-
-# TEMPORARY, dropped in P2's last commit: P2–P8 develop against P1's wlr
-# worktree before 0.20.28 is published. Exactly the shape the implicit-grab
-# fix used (develop @ 90813cc reverted it the same way). `cargo publish` and
-# the merge both require this gone.
-[patch.crates-io]
-wlr = { path = "/home/joseph/Projects/wlroots-sys/.claude/worktrees/wlr-m3-popups/crates/wlr" }
