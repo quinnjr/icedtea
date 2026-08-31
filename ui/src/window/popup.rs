@@ -3,6 +3,7 @@
 
 use wayland_client::Proxy;
 use wayland_client::protocol::wl_surface;
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1;
 use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface};
 
 pub use xdg_positioner::{Anchor, ConstraintAdjustment, Gravity};
@@ -134,6 +135,17 @@ pub struct Popup {
     pub(crate) position: (i32, i32),
     pub(crate) size: (u32, u32),
     pub(crate) scale: i32,
+    /// A handle on the *window's* cursor-shape device, cloned so that
+    /// [`Surface::set_cursor_shape`](crate::window::Surface::set_cursor_shape)
+    /// can answer for every role from `self` alone, which is the contract's
+    /// two-argument signature.
+    ///
+    /// Deliberately **not** destroyed in [`Drop`]: there is one
+    /// `wp_cursor_shape_device_v1` per `wl_pointer`, owned by the window's
+    /// own role object ([`Toplevel`](crate::window::toplevel::Toplevel) or
+    /// [`Layer`](crate::window::layer::Layer)), and destroying it a second
+    /// time when a menu closes would be a protocol error.
+    pub(crate) cursor: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
 }
 
 impl Popup {
@@ -182,8 +194,17 @@ impl Drop for Popup {
 }
 
 /// A popup and the retained tree it shows.
+///
+/// The role object is held as a [`Surface`](crate::window::Surface) rather
+/// than as a bare [`Popup`], so that a popup goes through exactly the same
+/// `wl_surface`/`size`/`scale`/`states`/`commit_buffer` accessors the other
+/// two roles do -- contract §3.1's third `Surface` variant is the one the
+/// window layer itself uses, not a decorative arm.
 pub(crate) struct PopupWindow {
-    pub(crate) popup: Popup,
+    /// Duplicated out of `surface` so that the many `find(|p| p.key == key)`
+    /// lookups do not have to pattern-match a role they already know.
+    pub(crate) key: PopupKey,
+    pub(crate) surface: crate::window::Surface,
     pub(crate) root: Node,
     pub(crate) layout: crate::layout::LayoutTree,
     pub(crate) styles: crate::window::StyleMap,
@@ -191,6 +212,28 @@ pub(crate) struct PopupWindow {
     pub(crate) buffers: crate::shm::BufferPool,
     pub(crate) skia: skia_rs_safe::canvas::Surface,
     pub(crate) dirty: bool,
+}
+
+impl PopupWindow {
+    /// The `xdg_popup` role inside `self.surface`.
+    ///
+    /// Infallible in practice -- `Window::open_popup` is the only constructor
+    /// and always stores `Surface::Popup` -- but an `Option` rather than a
+    /// panic, so a future role mix-up degrades to "this popup has no
+    /// geometry" instead of killing the client.
+    pub(crate) fn popup(&self) -> Option<&Popup> {
+        match &self.surface {
+            crate::window::Surface::Popup(popup) => Some(popup),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn popup_mut(&mut self) -> Option<&mut Popup> {
+        match &mut self.surface {
+            crate::window::Surface::Popup(popup) => Some(popup),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

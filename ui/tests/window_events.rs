@@ -81,6 +81,34 @@ fn a_toplevel_maps_under_server_side_decorations() {
 }
 
 #[test]
+fn a_committed_frame_asks_for_a_callback_and_the_callback_is_dated() {
+    // `commit_buffer_to` requests `wl_surface.frame` on every commit, and
+    // `Window::pump` stamps the resulting `InputEvent::Frame` with a reading
+    // of the window's own clock. Without the request the event never fires at
+    // all; without the stamp it arrives permanently dated `Duration::ZERO`.
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let _probe = spawn_window_probe(
+        &compositor.socket_path().to_string_lossy(),
+        "entry",
+        theme.path(),
+        report.path(),
+    );
+    let line = wait_for_report_line(report.path(), "frame ", Duration::from_secs(10))
+        .expect("no frame callback ever reached the client");
+    let micros: u128 = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|f| f.parse().ok())
+        .expect("the frame line carries a timestamp");
+    assert!(
+        micros > 0,
+        "the frame was handed up still dated Duration::ZERO: {line}"
+    );
+}
+
+#[test]
 fn a_configure_resize_relayouts_and_repaints() {
     let compositor = Compositor::spawn();
     let theme = probe_theme();

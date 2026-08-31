@@ -378,6 +378,10 @@ fn sync_surface_from_state(surface: &mut Surface, state: &WindowState) {
             }
             l.scale = state.scale;
         }
+        // A popup's geometry never comes from `WindowState::configured` --
+        // `xdg_popup.configure` carries its own position and size, which
+        // `Window::render_popups` folds in per popup.
+        Surface::Popup(_) => {}
     }
 }
 
@@ -390,13 +394,15 @@ pub(crate) fn apply_configure_states(root: &Node, states: SurfaceStates) {
 
 /// One of the three surface roles.
 ///
-/// Task 12 adds the role-shared accessors (`wl_surface`, `size`, `scale`,
-/// `states`, `resize`, `set_cursor_shape`, `commit_buffer`) over the one role
-/// mapped so far; Task 13 adds `Layer` and Task 14 adds `Popup` alongside
-/// their own arms of each accessor.
+/// Every role answers the same seven accessors (`wl_surface`, `size`, `scale`,
+/// `states`, `resize`, `set_cursor_shape`, `commit_buffer`); a window's own
+/// surface is a `Toplevel` or a `Layer`, and each of its open popups is a
+/// `Popup` held by a
+/// [`PopupWindow`](crate::window::popup::PopupWindow).
 pub enum Surface {
     Toplevel(toplevel::Toplevel),
     Layer(layer::Layer),
+    Popup(popup::Popup),
 }
 
 impl Surface {
@@ -405,6 +411,7 @@ impl Surface {
         match self {
             Self::Toplevel(t) => &t.wl_surface,
             Self::Layer(l) => l.wl_surface(),
+            Self::Popup(p) => p.wl_surface(),
         }
     }
 
@@ -414,6 +421,7 @@ impl Surface {
         match self {
             Self::Toplevel(t) => t.size,
             Self::Layer(l) => l.size(),
+            Self::Popup(p) => p.size(),
         }
     }
 
@@ -422,6 +430,7 @@ impl Surface {
         match self {
             Self::Toplevel(t) => t.scale,
             Self::Layer(l) => l.scale(),
+            Self::Popup(p) => p.scale(),
         }
     }
 
@@ -429,24 +438,27 @@ impl Surface {
     pub fn states(&self) -> SurfaceStates {
         match self {
             Self::Toplevel(t) => t.states,
-            // A layer surface carries no `xdg_toplevel.state`; the dispatch
-            // in `impl Dispatch<zwlr_layer_surface_v1::...>` always reports
-            // ACTIVATED on configure, which keeps the root out of
-            // `:backdrop`.
-            Self::Layer(_) => SurfaceStates::ACTIVATED,
+            // Neither a layer surface nor a popup carries an
+            // `xdg_toplevel.state`; the dispatch in
+            // `impl Dispatch<zwlr_layer_surface_v1::...>` always reports
+            // ACTIVATED on configure, and a mapped popup is by definition the
+            // thing the user is interacting with -- both keep their root out
+            // of `:backdrop`.
+            Self::Layer(_) | Self::Popup(_) => SurfaceStates::ACTIVATED,
         }
     }
 
     /// Ask for a new size.
     ///
-    /// Honoured for a toplevel (`set_window_geometry`); Task 13's layer role
-    /// honours it through `set_size`, and Task 14's popup ignores it -- its
-    /// size is the positioner's until a reposition.
+    /// Honoured for a toplevel (`set_window_geometry`) and for a layer surface
+    /// (`set_size`); **ignored for a popup**, whose size is the positioner's
+    /// until a reposition (contract §3.1).
     ///
     /// # Errors
     ///
     /// [`SurfaceError::Protocol`] for a zero dimension, which every role
-    /// rejects.
+    /// rejects -- including the popup, so that a caller learns its request was
+    /// nonsense rather than merely inapplicable.
     pub fn resize(&mut self, size: (u32, u32)) -> Result<(), SurfaceError> {
         if size.0 == 0 || size.1 == 0 {
             return Err(SurfaceError::Protocol("a surface size must be positive"));
@@ -459,8 +471,18 @@ impl Surface {
                 t.set_window_geometry(0, 0, width, height);
             }
             Self::Layer(l) => l.set_size(size),
+            Self::Popup(_) => {}
         }
         Ok(())
+    }
+
+    /// Which of a window's surfaces this is, for the `Dispatch` user-data a
+    /// frame callback and an `xdg_surface.configure` are routed by.
+    pub(crate) fn target(&self) -> SurfaceTarget {
+        match self {
+            Self::Toplevel(_) | Self::Layer(_) => SurfaceTarget::Window,
+            Self::Popup(p) => SurfaceTarget::Popup(p.key),
+        }
     }
 
     /// Name the cursor for this surface's pointer.
@@ -468,18 +490,17 @@ impl Surface {
     /// A no-op without `wp_cursor_shape_v1`; client-side cursor themes are out
     /// of scope, so there is no fallback path to a `wl_surface` cursor.
     ///
-    /// The device is a parameter rather than a field this reads off `self`:
-    /// there is exactly one `wl_pointer`/cursor-shape device per window
-    /// (Task 10's `WindowState` owns it, since only a `Dispatch` impl over
-    /// `WindowState` ever sees `wl_seat.capabilities`), and the shape it draws
-    /// does not depend on which of the window's surfaces has focus. See
-    /// `Window::set_cursor_shape`.
-    pub fn set_cursor_shape(
-        &mut self,
-        shape: CursorShape,
-        serial: u32,
-        device: Option<&wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
-    ) {
+    /// There is exactly one `wp_cursor_shape_device_v1` per window (one
+    /// `wl_pointer`, bound by `Window::open`), and the shape it draws does not
+    /// depend on which of the window's surfaces has focus; each role holds a
+    /// handle on it so that this can read the device off `self`, and only the
+    /// window's own role destroys it. See [`Window::set_cursor_shape`].
+    pub fn set_cursor_shape(&mut self, shape: CursorShape, serial: u32) {
+        let device = match self {
+            Self::Toplevel(t) => t.cursor.as_ref(),
+            Self::Layer(l) => l.cursor.as_ref(),
+            Self::Popup(p) => p.cursor.as_ref(),
+        };
         if let Some(device) = device {
             device.set_shape(serial, shape);
         }
@@ -492,7 +513,9 @@ impl Surface {
     /// pools live on `Window`, and one window has several" -- so a `Surface`
     /// borrows the pool for the duration of one commit rather than owning it.
     /// `pub(crate)`, not `pub`, because `QueueHandle<WindowState>` is
-    /// unnameable outside this crate.
+    /// unnameable outside this crate. Both departures from contract §3.1's
+    /// `pub fn commit_buffer(&mut self, skia)` are recorded as amendment
+    /// **P3-A** in the M3 Part 0 contract's §10.
     ///
     /// # Errors
     ///
@@ -505,7 +528,8 @@ impl Surface {
         shm: &wl_shm::WlShm,
         qh: &QueueHandle<WindowState>,
     ) -> Result<(), SurfaceError> {
-        commit_buffer_to(self.wl_surface(), skia, buffers, shm, qh)
+        let target = self.target();
+        commit_buffer_to(self.wl_surface(), target, skia, buffers, shm, qh)
     }
 }
 
@@ -523,6 +547,7 @@ impl Surface {
 /// the upload fails.
 pub(crate) fn commit_buffer_to(
     wl_surface: &wl_surface::WlSurface,
+    target: SurfaceTarget,
     skia: &mut skia_rs_safe::canvas::Surface,
     buffers: &mut BufferPool,
     shm: &wl_shm::WlShm,
@@ -539,6 +564,12 @@ pub(crate) fn commit_buffer_to(
     buffers.upload(index, skia).map_err(SurfaceError::Shm)?;
     wl_surface.attach(Some(buffers.wl_buffer(index)), 0, 0);
     wl_surface.damage_buffer(0, 0, width, height);
+    // The frame request is double-buffered like the attach, so it is only
+    // sent on the path that actually commits: a deferred frame (above) must
+    // not leave a request queued that the *next* commit would then apply
+    // twice. `target` is what routes the callback back to the surface that
+    // asked for it -- `InputEvent::Frame`'s only producer.
+    wl_surface.frame(qh, target);
     wl_surface.commit();
     Ok(())
 }
@@ -685,6 +716,14 @@ pub(crate) struct WindowState {
     #[allow(dead_code)]
     pending_ack: Vec<(SurfaceTarget, u32)>,
     configured: Option<(u32, u32)>,
+    /// The size the client asked for, from `SurfaceSpec::size`.
+    ///
+    /// The fallback for a `configure` with a zero dimension, which every
+    /// xdg-shell compositor is entitled to send and which means "you choose".
+    /// Without it the *first* such configure has no previous size to keep and
+    /// collapses the window to 1x1 -- the size `Window::open`'s `.max(1)`
+    /// floor produces from a `Some((0, 0))`.
+    default_size: (u32, u32),
     states: SurfaceStates,
     /// Task 11 updates this from `wl_surface.preferred_buffer_scale`.
     #[allow(dead_code)]
@@ -730,6 +769,7 @@ impl WindowState {
             seat_serial: None,
             pending_ack: Vec::new(),
             configured: None,
+            default_size: (1, 1),
             states: SurfaceStates::empty(),
             scale: 1,
             closed: false,
@@ -914,6 +954,9 @@ impl Window {
         let qh = queue.handle();
         conn.display().get_registry(&qh, ());
         let mut state = WindowState::new();
+        // Recorded before anything can configure us: a `configure` with a zero
+        // dimension means "you choose", and this is the choice.
+        state.default_size = (spec.size.0.max(1), spec.size.1.max(1));
         // Two roundtrips: `wl_seat.capabilities` arrives after the bind.
         queue
             .roundtrip(&mut state)
@@ -1057,7 +1100,13 @@ impl Window {
         {
             self.state.events.push(InputEvent::Key(event));
         }
-        let batch = std::mem::take(&mut self.state.events);
+        let mut batch = std::mem::take(&mut self.state.events);
+        // A `wl_callback.done` carries a compositor timestamp in an unrelated
+        // clock domain, so the dispatch pushes `Frame { now: Duration::ZERO }`
+        // and the reading of *our* clock -- the one `AnimationState` and the
+        // repeat timer are sampled against -- is stamped in here, where a
+        // clock exists.
+        stamp_frames(&mut batch, now);
         // `:backdrop` is the one configure state the stylesheet reads, and the
         // root has to carry it before the caller restyles off this batch.
         for event in &batch {
@@ -1171,18 +1220,12 @@ impl Window {
 
     /// Name the cursor for whichever surface currently has pointer focus.
     ///
-    /// The convenience entry point over [`Surface::set_cursor_shape`]: the
-    /// cursor-shape device lives on the surface role (there is one per
-    /// window, set at `open` time), but the pointer's most recent enter
-    /// serial lives on `WindowState`, and only `Window` holds both.
+    /// The convenience entry point over [`Surface::set_cursor_shape`], for a
+    /// caller that holds the `Window` rather than the role: the serial to pass
+    /// is the pointer's most recent enter/motion serial, which
+    /// [`Window::seat_serial`] reports.
     pub fn set_cursor_shape(&mut self, shape: CursorShape, serial: u32) {
-        let device = match &self.surface {
-            Surface::Toplevel(t) => t.cursor.as_ref(),
-            Surface::Layer(l) => l.cursor.as_ref(),
-        };
-        if let Some(device) = device {
-            device.set_shape(serial, shape);
-        }
+        self.surface.set_cursor_shape(shape, serial);
     }
 
     /// Restyle the dirty tree, relayout, repaint, attach and commit.
@@ -1287,20 +1330,26 @@ impl Window {
         self.texts.get(&node_addr(node)).map(String::as_str)
     }
 
-    /// The soonest of the animation clock's next deadline and the keyboard
-    /// repeat's.
+    /// The soonest of the main tree's animation deadline, the keyboard
+    /// repeat's, and **every open popup's own animation deadline**.
+    ///
+    /// A popup has its own `AnimationState` and `render_popups` paints it on
+    /// its own schedule, so a caller that sleeps for `pump(next_deadline())`
+    /// would otherwise never be woken by an animating menu -- its transition
+    /// would stall at its first frame until some unrelated event arrived.
     ///
     /// `Duration::ZERO` is "now", never "spin": a continuously interpolating
     /// transition honestly has no later deadline than this instant.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Duration> {
         let now = self.clock.now();
-        fold_deadlines(
+        next_deadline_of(
             self.anim.next_deadline(now),
             self.state
                 .keymap
                 .as_ref()
                 .and_then(|keymap| keymap.repeat_deadline(now)),
+            self.popups.iter().map(|p| p.anim.next_deadline(now)),
         )
     }
 
@@ -1403,7 +1452,7 @@ impl Window {
         let parent_xdg = self
             .popups
             .last()
-            .map(|p| p.popup.xdg_surface.clone())
+            .and_then(|p| p.popup().map(|popup| popup.xdg_surface.clone()))
             .or_else(|| self.xdg_surface_of_window());
         let xdg_popup = xdg_surface.get_popup(
             parent_xdg.as_ref(),
@@ -1425,6 +1474,14 @@ impl Window {
             position: (0, 0),
             size: positioner.size,
             scale: 1,
+            // A shared handle on the window's one cursor-shape device, so a
+            // popup can answer `Surface::set_cursor_shape` from `self`. Only
+            // the window's own role destroys it -- see `Popup::cursor`.
+            cursor: match &self.surface {
+                Surface::Toplevel(t) => t.cursor.clone(),
+                Surface::Layer(l) => l.cursor.clone(),
+                Surface::Popup(p) => p.cursor.clone(),
+            },
         };
         if let (Some(seat), Some(serial)) = (&self.state.seat, self.state.seat_serial) {
             // A menu takes the seat: a click outside dismisses the whole chain
@@ -1444,7 +1501,8 @@ impl Window {
             i32::try_from(positioner.size.1).unwrap_or(1).max(1),
         );
         self.popups.push(PopupWindow {
-            popup,
+            key,
+            surface: Surface::Popup(popup),
             root: Node::with_classes("popup", &["background"]),
             layout: crate::layout::LayoutTree::new(),
             styles: StyleMap::new(),
@@ -1463,19 +1521,19 @@ impl Window {
     /// children alive is `xdg_wm_base.error.not_the_topmost_popup`, which kills
     /// the client.
     pub fn close_popup(&mut self, key: PopupKey) {
-        let Some(index) = self.popups.iter().position(|p| p.popup.key == key) else {
+        let Some(index) = self.popups.iter().position(|p| p.key == key) else {
             return;
         };
         while self.popups.len() > index {
             let removed = self.popups.pop().expect("the index is in range");
-            let id = removed.popup.wl_surface.id();
+            let id = removed.surface.wl_surface().id();
             self.state.surface_targets.retain(|(got, _)| *got != id);
             self.state
                 .pending_ack
-                .retain(|(t, _)| *t != SurfaceTarget::Popup(removed.popup.key));
+                .retain(|(t, _)| *t != SurfaceTarget::Popup(removed.key));
             self.state
                 .popup_configures
-                .retain(|(k, ..)| *k != removed.popup.key);
+                .retain(|(k, ..)| *k != removed.key);
         }
         let _ = self.conn.flush();
     }
@@ -1484,26 +1542,26 @@ impl Window {
     pub fn popup_root(&self, key: PopupKey) -> Option<Node> {
         self.popups
             .iter()
-            .find(|p| p.popup.key == key)
+            .find(|p| p.key == key)
             .map(|p| p.root.clone())
     }
 
     pub fn popup_layout(&mut self, key: PopupKey) -> Option<&mut crate::layout::LayoutTree> {
         self.popups
             .iter_mut()
-            .find(|p| p.popup.key == key)
+            .find(|p| p.key == key)
             .map(|p| &mut p.layout)
     }
 
     pub fn popup_animations(&mut self, key: PopupKey) -> Option<&mut AnimationState> {
         self.popups
             .iter_mut()
-            .find(|p| p.popup.key == key)
+            .find(|p| p.key == key)
             .map(|p| &mut p.anim)
     }
 
     pub fn popup_mark_dirty(&mut self, key: PopupKey) {
-        if let Some(p) = self.popups.iter_mut().find(|p| p.popup.key == key) {
+        if let Some(p) = self.popups.iter_mut().find(|p| p.key == key) {
             p.dirty = true;
         }
     }
@@ -1514,7 +1572,9 @@ impl Window {
     fn xdg_surface_of_window(&self) -> Option<xdg_surface::XdgSurface> {
         match &self.surface {
             Surface::Toplevel(t) => Some(t.xdg_surface.clone()),
-            Surface::Layer(_) => None,
+            // A layer surface has no `xdg_surface`, and a `Window`'s own
+            // surface is never a popup (only its `PopupWindow`s are).
+            Surface::Layer(_) | Surface::Popup(_) => None,
         }
     }
 
@@ -1529,9 +1589,11 @@ impl Window {
     /// ready the moment `render` is next called.
     fn render_popups(&mut self, now: Duration) -> Result<bool, SurfaceError> {
         for (key, position, size) in std::mem::take(&mut self.state.popup_configures) {
-            if let Some(popup) = self.popups.iter_mut().find(|p| p.popup.key == key) {
-                popup.popup.position = position;
-                popup.popup.size = size;
+            if let Some(popup) = self.popups.iter_mut().find(|p| p.key == key)
+                && let Some(role) = popup.popup_mut()
+            {
+                role.position = position;
+                role.size = size;
                 popup.dirty = true;
             }
         }
@@ -1541,7 +1603,7 @@ impl Window {
                 .state
                 .pending_ack
                 .iter()
-                .any(|(t, _)| *t == SurfaceTarget::Popup(popup.popup.key));
+                .any(|(t, _)| *t == SurfaceTarget::Popup(popup.key));
             if !configured {
                 continue;
             }
@@ -1549,7 +1611,7 @@ impl Window {
             if !should_paint(popup.dirty, popup.anim.is_active(now)) {
                 continue;
             }
-            let (width, height) = popup.popup.size;
+            let (width, height) = popup.surface.size();
             let (w, h) = (
                 i32::try_from(width).unwrap_or(1).max(1),
                 i32::try_from(height).unwrap_or(1).max(1),
@@ -1596,8 +1658,7 @@ impl Window {
                 &mut self.images,
                 &self.texts,
             );
-            commit_buffer_to(
-                popup.popup.wl_surface(),
+            popup.surface.commit_buffer(
                 &mut popup.skia,
                 &mut popup.buffers,
                 &self.shm,
@@ -1629,6 +1690,55 @@ pub fn fold_deadlines(a: Option<Duration>, b: Option<Duration>) -> Option<Durati
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (some, None) | (None, some) => some,
+    }
+}
+
+/// The size a `configure` with a possibly-zero dimension actually asks for.
+///
+/// A zero means "you choose": keep the size the compositor last chose, and on
+/// the *first* configure -- when there is none -- fall back to the size the
+/// client asked for in its [`SurfaceSpec`]. Taking the zero literally maps a
+/// 1x1 surface, because `Window::open` floors what it gets at 1.
+///
+/// Shared by the `xdg_toplevel` and `zwlr_layer_surface_v1` dispatches: the
+/// rule is the protocols' own and is identical in both.
+#[must_use]
+pub(crate) fn configured_size_with_default(
+    previous: Option<(u32, u32)>,
+    default: (u32, u32),
+    width: u32,
+    height: u32,
+) -> (u32, u32) {
+    layer::configured_size(previous.unwrap_or(default), width, height)
+}
+
+/// Fold the window's own two deadlines together with one per open popup.
+///
+/// Separated from [`Window::next_deadline`] so the fold can be tested without
+/// a live Wayland connection: a `Window` needs a compositor, an
+/// `Option<Duration>` does not.
+#[must_use]
+pub(crate) fn next_deadline_of(
+    anim: Option<Duration>,
+    repeat: Option<Duration>,
+    popups: impl IntoIterator<Item = Option<Duration>>,
+) -> Option<Duration> {
+    popups
+        .into_iter()
+        .fold(fold_deadlines(anim, repeat), fold_deadlines)
+}
+
+/// Stamp every [`InputEvent::Frame`] in `batch` with `now`.
+///
+/// `wl_callback.done`'s own timestamp is in the compositor's clock domain and
+/// its `Dispatch` impl has no clock to read, so the dispatch pushes a
+/// placeholder and the pump -- which does have one -- fills it in. Separated
+/// from [`Window::pump`] for the same reason as [`next_deadline_of`].
+pub(crate) fn stamp_frames(batch: &mut [InputEvent], now: Duration) {
+    for event in batch {
+        if let InputEvent::Frame { now: slot } = event {
+            *slot = now;
+        }
     }
 }
 
@@ -1861,7 +1971,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceTarget> for WindowState {
             state.pending_ack.retain(|(t, _)| t != target);
             state.pending_ack.push((*target, serial));
             if *target == SurfaceTarget::Window {
-                let size = state.configured.unwrap_or((0, 0));
+                let size = state.configured.unwrap_or(state.default_size);
                 state.events.push(InputEvent::Configure {
                     size,
                     states: state.states,
@@ -1941,8 +2051,16 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, SurfaceTarget> for Wind
                 height,
             } => {
                 layer_surface.ack_configure(serial);
-                let requested = state.configured.unwrap_or((width.max(1), height.max(1)));
-                let size = layer::configured_size(requested, width, height);
+                // "You choose" falls back to the last configured size, or --
+                // on the *first* configure, when there is none -- to the size
+                // the client asked for in its `SurfaceSpec`. Taking the
+                // event's own zero here would map a 1x1 surface.
+                let size = configured_size_with_default(
+                    state.configured,
+                    state.default_size,
+                    width,
+                    height,
+                );
                 state.configured = Some(size);
                 // A layer surface has no `xdg_toplevel.state`; ACTIVATED keeps
                 // the root out of `:backdrop`.
@@ -1973,15 +2091,22 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WindowState {
                 height,
                 states,
             } => {
-                // A zero dimension means "you choose": keep what we have.
+                // A zero dimension means "you choose": keep what we have, and
+                // on the *first* configure -- when there is nothing to keep --
+                // fall back to the size the client asked for in its
+                // `SurfaceSpec`, not to zero. A compositor sending 0x0 so the
+                // client can pick its own size is the ordinary xdg-shell case,
+                // and `Window::open`'s `.max(1)` would turn a `Some((0, 0))`
+                // into a 1x1 buffer.
                 let (w, h) = (
                     u32::try_from(width).unwrap_or(0),
                     u32::try_from(height).unwrap_or(0),
                 );
-                let previous = state.configured.unwrap_or((0, 0));
-                state.configured = Some((
-                    if w == 0 { previous.0 } else { w },
-                    if h == 0 { previous.1 } else { h },
+                state.configured = Some(configured_size_with_default(
+                    state.configured,
+                    state.default_size,
+                    w,
+                    h,
                 ));
                 state.states = SurfaceStates::from_wire(&states);
             }
@@ -2779,6 +2904,107 @@ mod tests {
         assert!(
             !should_paint(false, false),
             "an idle window must not repaint: every commit costs a buffer and a frame callback"
+        );
+    }
+
+    #[test]
+    fn a_first_configure_with_a_zero_dimension_falls_back_to_the_requested_size() {
+        // "You choose" is the ordinary xdg-shell first configure: a compositor
+        // that has no opinion sends 0x0. There is no previous size to keep at
+        // that point, and taking the zero literally collapses the window --
+        // `Window::open`'s `.max(1)` floor turns `Some((0, 0))` into a 1x1
+        // buffer. The client's own `SurfaceSpec::size` is the fallback, for
+        // the toplevel role exactly as for the layer one.
+        use super::configured_size_with_default;
+        let spec = (800, 600);
+        assert_eq!(
+            configured_size_with_default(None, spec, 0, 0),
+            (800, 600),
+            "0x0 on the first configure means the size we asked for"
+        );
+        assert_eq!(
+            configured_size_with_default(None, spec, 1024, 0),
+            (1024, 600)
+        );
+        assert_eq!(configured_size_with_default(None, spec, 0, 480), (800, 480));
+        assert_eq!(
+            configured_size_with_default(None, spec, 1024, 480),
+            (1024, 480),
+            "a concrete configure still wins outright"
+        );
+        // And a *later* zero keeps what the compositor last chose, not the
+        // spec: `previous` is `state.configured` once there is one.
+        assert_eq!(
+            configured_size_with_default(Some((1024, 480)), spec, 0, 0),
+            (1024, 480)
+        );
+    }
+
+    #[test]
+    fn an_animating_popup_gets_the_window_woken_for_it() {
+        // A popup has its own `AnimationState` and `render_popups` paints it
+        // on its own schedule. If its deadline never reaches `next_deadline`,
+        // a caller sleeping for `pump(window.next_deadline())` stalls the
+        // menu's transition at its first frame until something unrelated
+        // arrives.
+        use super::next_deadline_of;
+        let ms = Duration::from_millis;
+        assert_eq!(
+            next_deadline_of(None, None, [Some(ms(8))]),
+            Some(ms(8)),
+            "an idle window with an animating popup still has a deadline"
+        );
+        assert_eq!(
+            next_deadline_of(Some(ms(50)), None, [Some(ms(8)), None]),
+            Some(ms(8)),
+            "the soonest of the window's and every popup's wins"
+        );
+        assert_eq!(
+            next_deadline_of(Some(ms(4)), Some(ms(20)), [Some(ms(8))]),
+            Some(ms(4)),
+            "and the window's own can still be the soonest"
+        );
+        assert_eq!(
+            next_deadline_of(None, None, [None, None]),
+            None,
+            "idle popups add no deadline at all"
+        );
+        assert_eq!(
+            next_deadline_of(None, None, [Some(Duration::ZERO)]),
+            Some(Duration::ZERO),
+            "ZERO is a real answer -- \"now\" -- not \"no deadline\""
+        );
+    }
+
+    #[test]
+    fn a_frame_callback_is_stamped_with_the_pump_s_own_clock() {
+        // `wl_callback.done`'s timestamp is in the compositor's clock domain
+        // and the `Dispatch` impl has no clock at all, so it pushes a
+        // placeholder. A `Frame` that reached the caller still holding
+        // `Duration::ZERO` would tell an animation it is forever at time zero.
+        use super::{InputEvent, stamp_frames};
+        let now = Duration::from_millis(1234);
+        let mut batch = vec![
+            InputEvent::Frame {
+                now: Duration::ZERO,
+            },
+            InputEvent::PointerLeave,
+            InputEvent::Frame {
+                now: Duration::ZERO,
+            },
+        ];
+        stamp_frames(&mut batch, now);
+        let stamped: Vec<Duration> = batch
+            .iter()
+            .filter_map(|e| match e {
+                InputEvent::Frame { now } => Some(*now),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamped, vec![now, now], "every Frame in the batch is dated");
+        assert!(
+            matches!(batch[1], InputEvent::PointerLeave),
+            "and nothing else in the batch is touched"
         );
     }
 

@@ -81,6 +81,10 @@ fn main() {
     let mut focus = <FocusRing as Default>::default();
     let mut typed = String::new();
     let mut popup = None;
+    // The first few `wl_surface.frame` callbacks only. A commit requests one
+    // callback and the probe only commits when it is dirty, so the stream is
+    // bounded anyway; the cap keeps the report file bounded regardless.
+    let mut frames = 0_u32;
     loop {
         if window.render().is_err() {
             break;
@@ -146,6 +150,12 @@ fn main() {
                             report("popup-open");
                         }
                         Err(err) => report(&format!("popup-error {err}")),
+                    }
+                }
+                InputEvent::Frame { now } => {
+                    if frames < 3 {
+                        frames += 1;
+                        report(&format!("frame {}", now.as_micros()));
                     }
                 }
                 InputEvent::PopupDone(key) => {

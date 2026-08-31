@@ -2825,6 +2825,57 @@ rustfmt-clean); `cargo doc -D warnings`.
 `### E<n> — <one-line ruling>` with the conflicting texts quoted, the ruling,
 and which part carries it out — the same shape as the M2 contract's §12.)*
 
+### P3-A — `Surface::commit_buffer` is `pub(crate)` and borrows the pool, the shm and the queue handle
+
+**Carried out by:** P3 (`ui/src/window/mod.rs`). **Added:** 2026-08-31, in the
+Part 3 whole-part fix wave.
+
+**Contract §3.1 says:**
+
+```rust
+pub fn commit_buffer(&mut self, skia: &mut skia_rs_safe::canvas::Surface) -> Result<(), SurfaceError>;
+```
+
+**As shipped:**
+
+```rust
+pub(crate) fn commit_buffer(
+    &mut self,
+    skia: &mut skia_rs_safe::canvas::Surface,
+    buffers: &mut BufferPool,
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<WindowState>,
+) -> Result<(), SurfaceError>;
+```
+
+**Ruling.** Two departures, both forced, both kept:
+
+1. **The three extra parameters.** The contract's own §3.1 note on `WindowState`
+   settles where the pools live — "the pools live on `Window`, and one window
+   has several" — and P3's `Window` does exactly that: one `BufferPool` for the
+   window's own surface plus one per open popup, reallocated together by
+   `Window::render`'s `resize_backing`. A `Surface` that owned its pool would
+   have to own a `wl_shm` and a `QueueHandle<WindowState>` as well, in all
+   three role structs, and `PopupWindow` would then hold the pool twice. The
+   `Surface` borrows the pool for the duration of one commit instead.
+2. **`pub(crate)` rather than `pub`.** `QueueHandle<WindowState>` names a
+   crate-private type, so the signature above is unnameable outside the crate
+   whatever its visibility marker says. P4 lives in the same crate
+   (`ui/src/view/**`) and can call it; no out-of-crate consumer could have.
+
+`Surface::set_cursor_shape` had drifted the same way (a third
+`device: Option<&WpCursorShapeDeviceV1>` parameter) and is **not** amended: it
+was restored to the contract's `(&mut self, shape, serial)` in the same fix
+wave, by giving each role — including `Popup` — a handle on the window's one
+`wp_cursor_shape_device_v1` so the method can read the device off `self`. Only
+the window's own role object destroys that device.
+
+**Everything else in §3.1 is delivered verbatim,** including
+`Surface::Popup(popup::Popup)`, which the window layer itself uses:
+`PopupWindow` holds its role as a `Surface`, so a popup goes through the same
+`wl_surface`/`size`/`scale`/`states`/`commit_buffer` accessors the other two
+roles do.
+
 ---
 
 ## 11. Execution notes — cross-part consistency check (E1–E16)
