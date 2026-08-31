@@ -82,3 +82,15 @@ fn a_label_renders_one_node_and_a_selection_subnode_only_when_selected() {
     );
     check(Kind::Label, "label", &selectable);
 }
+
+#[test]
+fn a_spinner_and_a_statusbar_render_their_single_nodes() {
+    // mutation: append any subnode in SpinnerC::build and this fails with
+    // "rendered node at 'spinner/…' is not in the fixture".
+    check(Kind::Spinner, "spinner", &Props::default());
+    assert_eq!(
+        node_tree_of(Kind::Spinner, &Props::default()).trim(),
+        "spinner"
+    );
+    check(Kind::Statusbar, "statusbar", &Props::default());
+}

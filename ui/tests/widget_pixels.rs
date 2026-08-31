@@ -155,3 +155,52 @@ fn clicking_a_link_in_a_label_fires_activate_link_with_its_uri() {
     );
     assert_eq!(frames.len(), 1, "the script captured once");
 }
+
+#[test]
+fn a_spinner_carries_checked_while_spinning_and_advances_its_phase() {
+    // mutation: drop the CHECKED state in SpinnerC::apply and the two frames
+    // become identical; drop the `phase` advance in `tick` and they do too.
+    use icedtea_ui::view::builders::spinner;
+    use icedtea_ui::widgets::spinner::SpinnerExt;
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| spinner().spinning(true),
+        (48, 48),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Advance(Duration::from_millis(500)),
+            ScriptStep::Capture,
+        ],
+    );
+    let first: Vec<_> = (0..48).map(|x| frames.pixel(0, x, 24)).collect();
+    let second: Vec<_> = (0..48).map(|x| frames.pixel(1, x, 24)).collect();
+    assert_ne!(first, second, "the spinner arc must have rotated");
+}
+
+#[test]
+fn a_statusbar_shows_the_top_of_its_message_stack() {
+    // mutation: push instead of replace in StatusbarC::set_prop and the second
+    // frame still shows the first message.
+    use icedtea_ui::view::builders::statusbar;
+    use icedtea_ui::widgets::statusbar::StatusbarExt;
+    let frames = run(
+        0u32,
+        |model: &mut u32, _msg: ()| {
+            *model += 1;
+            Cmd::None
+        },
+        |model: &u32| statusbar().text(if *model == 0 { "" } else { "Saved" }),
+        (200, 32),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Message(()),
+            ScriptStep::Capture,
+        ],
+    );
+    assert!(
+        !has_ink(&frames, 0, (200, 32)),
+        "an empty statusbar inks nothing"
+    );
+    assert!(has_ink(&frames, 1, (200, 32)), "the pushed message shows");
+}

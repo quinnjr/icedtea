@@ -26,6 +26,8 @@ pub use crate::view::ListItem;
 
 pub mod label;
 pub mod separator;
+pub mod spinner;
+pub mod statusbar;
 
 /// A widget-local enum carried through `Prop::Enum(u16)`.
 ///
@@ -548,6 +550,12 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Label => Box::new(<label::LabelC as Controller<Msg>>::build(node, props, cx)),
+        Kind::Spinner => Box::new(<spinner::SpinnerC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::Statusbar => Box::new(<statusbar::StatusbarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {

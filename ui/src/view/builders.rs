@@ -157,6 +157,8 @@ impl<Msg: Clone + 'static> View<Msg> {
 // builder is reachable as `view::builders::<name>`.
 pub use crate::widgets::label::{LabelExt, label};
 pub use crate::widgets::separator::separator;
+pub use crate::widgets::spinner::{SpinnerExt, spinner};
+pub use crate::widgets::statusbar::{StatusbarExt, statusbar};
 
 #[cfg(test)]
 mod tests {
