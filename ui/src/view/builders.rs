@@ -162,6 +162,7 @@ pub use crate::widgets::info_bar::{InfoBarExt, info_bar};
 pub use crate::widgets::label::{LabelExt, label};
 pub use crate::widgets::level_bar::{LevelBarExt, level_bar};
 pub use crate::widgets::picture::{PictureExt, picture, picture_from_bytes};
+pub use crate::widgets::popover::{PopoverExt, popover};
 pub use crate::widgets::progress_bar::{ProgressBarExt, progress_bar};
 pub use crate::widgets::scale::{ScaleExt, scale};
 pub use crate::widgets::scrollbar::{ScrollbarExt, scrollbar};

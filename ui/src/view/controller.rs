@@ -156,7 +156,12 @@ impl<Msg> EventCx<'_, Msg> {
 /// Behaviour, and the state the model should not own: press state, entry
 /// cursor / selection / undo stack, scroll offset, expander progress,
 /// dropdown open state, spin repeat timer.
-pub trait Controller<Msg>: 'static {
+// `Any` as a supertrait (rather than a defaulted `as_any` method) is what
+// lets [`crate::widgets::child_slot`] downcast a `&dyn Controller<Msg>` to a
+// concrete controller like `PopoverC`: trait-object upcasting coerces
+// `&dyn Controller<Msg>` straight to `&dyn Any` at the call site, so no
+// per-implementor boilerplate is needed.
+pub trait Controller<Msg>: std::any::Any {
     /// Which widget this controller implements.
     fn kind(&self) -> Kind;
 

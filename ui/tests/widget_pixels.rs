@@ -790,3 +790,25 @@ fn clicking_a_calendar_day_selects_it() {
     );
     assert_eq!(frames.len(), 2, "both captures ran without a panic");
 }
+
+#[test]
+fn an_autohide_popovers_positioner_anchors_to_its_parent_rect() {
+    // mutation: return `Anchor::Top` unconditionally from PopoverC::positioner
+    // and the Bottom case reports the wrong gravity.
+    use icedtea_ui::layout::Rect;
+    use icedtea_ui::widgets::{Position, popover::PopoverC};
+    use icedtea_ui::window::popup::{Anchor, Gravity};
+
+    let mut controller = PopoverC::for_test(Position::Bottom, true, true);
+    let positioner = controller.positioner(Rect::new(10.0, 20.0, 40.0, 24.0), (200, 120));
+    assert_eq!(positioner.size, (200, 120));
+    assert_eq!(positioner.anchor_rect, Rect::new(10.0, 20.0, 40.0, 24.0));
+    assert_eq!(positioner.anchor, Anchor::Bottom);
+    assert_eq!(positioner.gravity, Gravity::Bottom);
+    assert!(positioner.reactive, "a popover follows its parent");
+
+    controller = PopoverC::for_test(Position::Top, true, true);
+    let positioner = controller.positioner(Rect::new(0.0, 0.0, 10.0, 10.0), (50, 50));
+    assert_eq!(positioner.anchor, Anchor::Top);
+    assert_eq!(positioner.gravity, Gravity::Top);
+}

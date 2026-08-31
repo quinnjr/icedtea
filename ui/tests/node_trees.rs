@@ -287,3 +287,15 @@ fn a_calendar_builds_its_header_and_a_grid_of_day_labels() {
         "{rendered}"
     );
 }
+
+#[test]
+fn a_popover_always_carries_background_and_wraps_its_child_in_contents() {
+    // mutation: append the child directly to the popover node instead of to
+    // `contents` and this fails with "rendered node at 'popover/label' is not
+    // in the fixture".
+    check(Kind::Popover, "popover", &Props::default());
+    let rendered = node_tree_of(Kind::Popover, &Props::default());
+    assert!(rendered.starts_with("popover.background"), "{rendered}");
+    assert!(rendered.contains("arrow"), "{rendered}");
+    assert!(rendered.contains("contents"), "{rendered}");
+}

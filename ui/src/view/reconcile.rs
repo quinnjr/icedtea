@@ -151,6 +151,8 @@ impl<Msg: Clone + 'static> Instance<Msg> {
 fn build_instance<Msg: Clone + 'static>(view: View<Msg>, cx: &mut BuildCx<'_>) -> Instance<Msg> {
     let node = Node::new(view.kind.css_name());
     let controller = build_controller::<Msg>(view.kind, &node, &view.props, cx);
+    let attach =
+        crate::widgets::child_slot(view.kind, &*controller).unwrap_or_else(|| node.clone());
     let mut instance = Instance {
         node,
         kind: view.kind,
@@ -160,8 +162,7 @@ fn build_instance<Msg: Clone + 'static>(view: View<Msg>, cx: &mut BuildCx<'_>) -
         controller,
         children: Vec::new(),
     };
-    let node = instance.node.clone();
-    reconcile(&node, &mut instance.children, view.children, cx);
+    reconcile(&attach, &mut instance.children, view.children, cx);
     instance
 }
 
@@ -292,8 +293,9 @@ pub fn reconcile<Msg: Clone + 'static>(
                 if from != index && !stable.contains(&from) {
                     ops.push(Op::Move { from, to: index });
                 }
-                let node = instance.node.clone();
-                if !reconcile(&node, &mut instance.children, view.children, cx).is_empty() {
+                let attach = crate::widgets::child_slot(instance.kind, &*instance.controller)
+                    .unwrap_or_else(|| instance.node.clone());
+                if !reconcile(&attach, &mut instance.children, view.children, cx).is_empty() {
                     ops.push(Op::Recurse { index });
                 }
                 built.push(instance);

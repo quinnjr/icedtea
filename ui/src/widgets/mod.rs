@@ -31,6 +31,7 @@ pub mod info_bar;
 pub mod label;
 pub mod level_bar;
 pub mod picture;
+pub mod popover;
 pub mod progress_bar;
 pub mod scale;
 pub mod scrollbar;
@@ -644,12 +645,31 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::Calendar => Box::new(<calendar::CalendarC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::Popover => Box::new(<popover::PopoverC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {
         boxed.set_prop(node, name, value, cx);
     }
     boxed
+}
+
+/// Where a kind's application children are attached.
+///
+/// Most kinds take children on their own node. A few nest them in a subnode
+/// GTK's own tree names — `popover > contents` is P5's only case; P6 adds
+/// `frame > box`, `expander-widget > box` and the scrolled window's viewport.
+/// P4's reconciler calls this before `Node::append_child`.
+#[must_use]
+pub fn child_slot(kind: Kind, controller: &dyn std::any::Any) -> Option<Node> {
+    match kind {
+        Kind::Popover => controller
+            .downcast_ref::<popover::PopoverC>()
+            .map(|c| c.contents.clone()),
+        _ => None,
+    }
 }
 
 /// Build `kind` in isolation and render its retained subtree in GTK notation.
