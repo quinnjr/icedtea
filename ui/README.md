@@ -178,7 +178,23 @@ App::new(Model { n: 0 }, update, view).run(window)?;
 ```
 
 Messages are queued and folded one at a time — an `update` that produces a
-`Cmd` producing a `Msg` enqueues it; the fold never re-enters.
+`Cmd` producing a `Msg` enqueues it; the fold never re-enters. Commands run
+where they can: the clipboard, timer and focus ones inside the fold, the
+window-bound ones (`SetTitle`, `Minimize`, `ToggleMaximized`, `OpenPopup`,
+`ClosePopup`) on the way back out of it, so a `Cmd` an `update` returns reaches
+the toplevel just as a controller's does.
+
+Events dispatch in GTK's three phases, capture → target → bubble, and a
+controller that sets `cx.handled` consumes the event: it is the last node the
+event reaches, whichever phase it was in. Focus moves — from a click, from
+`Cmd::Focus`, from a keyboard binding — are announced once as `FocusOut` on the
+old node then `FocusIn` on the new one, which is what `on_focus_in`/
+`on_focus_out` fire on. Whether a node can take focus at all comes from
+`Kind::is_focusable_by_default`, overridable per view with `.focusable(bool)`;
+it reaches `window::focus` as the `focusable` class, which is what the Tab ring
+walks.
+
+
 `App::run_offscreen` runs the identical loop against a raster surface with no
 compositor, driven by a `Vec<ScriptStep<Msg>>` on a `ManualClock`; that is
 what `ui/tests/counter_app.rs` and every controller unit test use.

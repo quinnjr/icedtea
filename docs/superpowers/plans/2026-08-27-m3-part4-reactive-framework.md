@@ -41,6 +41,12 @@ conflicting text and the ruling. Each becomes a `§10` amendment
   `Node::addr` is `pub(crate)` (`css/node.rs:445`) and §9 forbids P4 from
   touching `css/**`. `Element::opaque` is the public equivalent and is what
   `LayoutTree` (`layout.rs:225`) already keys on.
+  **Superseded in part by contract §11 E2**, which P3 discharged first: P3
+  already ships that alias, `node_addr` and `StyleMap` in
+  `ui/src/window/mod.rs`, and `hit_test`/`hit_chain` take P3's. So
+  `view/render.rs` re-exports them —
+  `pub use crate::window::{NodeAddr, StyleMap, node_addr};` — and declares
+  only `Animations` and the walkers. One public spelling, not two.
 - **D7 — P4 defines `ListItem`.** §4.3's `Prop::Items(Rc<[ListItem]>)`
   references a type the contract never defines.
 - **D8 — P4 adds `layout::Align` to `ui/src/layout.rs`.** Additive only; §3.6
@@ -86,6 +92,30 @@ conflicting text and the ruling. Each becomes a `§10` amendment
 - **D18 — `Op::SetHandlers` is emitted for kept instances only.** A freshly
   built instance's `Insert` already carries its handlers; emitting both would
   fail §4.5's "minimal" requirement as read by the op-minimality test.
+- **D19 — `cx.handled` ends the whole dispatch, not just its phase.** §4.6
+  (quoted by D5) says a controller that sets `cx.handled = true` "stops the
+  phase it is in". Taken literally that is self-contradictory: capture, target
+  and bubble run over one path, so "capture stops descending" and "the target
+  still gets the event" cannot both hold — a capture that stopped only its own
+  phase would hand the event straight to the node it just intercepted. P4
+  ships `handled` as "the node that set it is the last one this event
+  reaches": a handled capture suppresses target and bubble, a handled target
+  suppresses bubble. `Phase` (D5) is unaffected. `view::app::deliver`'s
+  rustdoc states this, not the contract's wording.
+- **D20 — `CompiledRule`, `CompiledSheet` and `RuleBuckets` gain
+  `#[derive(Clone)]`.** §9 tells P4 not to touch `css/**`; these three added
+  derives are the one exception, needed because `App::run` must own a sheet
+  (`window.sheet().clone()`) while `window` stays mutably borrowed for
+  `pump`/`paint_with` across the same loop body. Purely additive: no field, no
+  signature and no behaviour changes, and no `css` test moves. The alternatives
+  both cost more — borrowing the sheet fails the borrow checker, and changing
+  `Window::sheet`'s return type would edit a P3 signature, which D2 forbids.
+- **D21 — P4 adds four more `Window` methods and one re-export.** D2 declared
+  `Window::paint_with`; `App::run` also needs `Window::{size, set_title,
+  minimize, toggle_maximized}`, and `view::controller` needs
+  `pub use layer::BTN_LEFT;` at `window`'s root to name the left button
+  without reaching into a submodule. Same rule as D2: additive only, no
+  existing signature touched, `ui/src/window/mod.rs` otherwise unmodified.
 
 ---
 
@@ -178,7 +208,8 @@ consumed API; §8 migration; §9 P4 boundary).
 | `ui/src/icons/theme.rs` | create (D9) | `IconTheme` constructors, name, inheritance chain, `clear_caches` |
 | `ui/src/layout.rs` | modify (D8) | `+ pub enum Align` — additive, nothing else touched |
 | `ui/src/paint/mod.rs` | modify (D12) | the two `#[allow(unused_variables, reason = …)]` reason strings |
-| `ui/src/window/mod.rs` | modify (D2) | `+ Window::paint_with` |
+| `ui/src/window/mod.rs` | modify (D2, D21) | `+ Window::{paint_with, size, set_title, minimize, toggle_maximized}`, `+ pub use layer::BTN_LEFT` |
+| `ui/src/css/{cascade,select}.rs` | modify (D20) | `+ #[derive(Clone)]` on `CompiledRule`, `CompiledSheet`, `RuleBuckets` |
 | `ui/src/window/selection.rs` | modify (D10) | `+ Clipboard::offscreen` |
 | `ui/src/lib.rs` | modify | `pub mod icons; pub mod view;` |
 | `ui/tests/reconcile_props.rs` | create | reconciler property tests (identity, minimality, drop-once) |
@@ -2577,11 +2608,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
   `crate::css::computed::{ComputedStyle, ResolveEnv}`;
   `crate::css::select::MatchCx`; `crate::anim::{AnimationState, Overrides,
   Clock}`; `selectors::Element`.
-- Produces:
+- Produces (amended by contract §11 E2 — P3's three are canonical, P4
+  re-exports rather than redeclares them):
   ```rust
-  pub type NodeAddr = selectors::OpaqueElement;
-  pub fn node_addr(node: &Node) -> NodeAddr;
-  pub type StyleMap = std::collections::HashMap<NodeAddr, Rc<ComputedStyle>>;
+  pub use crate::window::{NodeAddr, StyleMap, node_addr};
   pub struct Animations(HashMap<NodeAddr, AnimationState>);
   impl Animations {
       pub fn new() -> Self;

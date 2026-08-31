@@ -2876,6 +2876,88 @@ the window's own role object destroys that device.
 `wl_surface`/`size`/`scale`/`states`/`commit_buffer` accessors the other two
 roles do.
 
+### P4-D19 — `cx.handled` ends the whole dispatch, not just the phase it was set in
+
+**Carried out by:** P4 (`ui/src/view/app.rs::deliver`). **Added:** 2026-08-31,
+in the Part 4 whole-part fix wave.
+
+**Contract §4.6 says** a controller that sets `cx.handled = true` "stops the
+phase it is in".
+
+**As shipped:** the node that sets `handled` is the last node the event
+reaches. A handled capture suppresses both target and bubble; a handled target
+suppresses bubble; a handled bubble stops climbing.
+
+**Ruling.** The contract's wording is self-contradictory for the capture leg.
+Capture, target and bubble run over one path, so "capture stops descending" and
+"the target still receives the event" cannot both hold: a capture that stopped
+only its own phase would hand the event straight to the node that just
+intercepted it, which is the opposite of what intercepting means. Whole-
+dispatch stopping is also what P4's own literal dispatch test asserts and what
+GTK's `GTK_EVENT_SEQUENCE_CLAIMED` does. `EventCx::phase` (P4 D5) is
+unaffected — a controller still sees which leg it is in. `deliver`'s rustdoc
+states the shipped rule; P5 and P6 write their controllers against that
+rustdoc, not against §4.6's sentence.
+
+---
+
+### P4-D20 — `CompiledRule`, `CompiledSheet` and `RuleBuckets` gain `#[derive(Clone)]`
+
+**Carried out by:** P4 (`ui/src/css/cascade.rs`, `ui/src/css/select.rs`).
+**Added:** 2026-08-31, in the Part 4 whole-part fix wave.
+
+**Contract §9 says** P4 "must not touch: `window/**` internals …, `css/**`,
+`widget/button.rs`".
+
+**As shipped:** three `#[derive(Debug)]` became `#[derive(Debug, Clone)]`.
+Nothing else in `css/**` changed — no field, no signature, no behaviour, no
+test.
+
+**Ruling.** Declared, not reverted. `App::run` must own a `CompiledSheet`
+(`self.sheet.take().unwrap_or_else(|| window.sheet().clone())`) because the
+same loop body holds `window` mutably borrowed for `pump`, `clipboard` and
+`paint_with`; borrowing the sheet out of the window instead does not borrow-
+check. The other alternative — handing out an `Rc<CompiledSheet>` from
+`Window::sheet` — would change an existing P3 signature, which P4 D2 forbids
+in as many words. Three additive derives are the smallest change that works,
+and this amendment is the ledger entry §9 exists to demand. P5–P8 keep the
+`css/**` prohibition in full: this is a closed, enumerated exception, not a
+precedent for further edits.
+
+---
+
+### P4-D21 — `ui/src/window/mod.rs` gains four more `Window` methods and one re-export
+
+**Carried out by:** P4 (`ui/src/window/mod.rs`). **Added:** 2026-08-31, in the
+Part 4 whole-part fix wave.
+
+**P4 D2 declared** one additive item on this P3-owned file,
+`Window::paint_with`.
+
+**As shipped,** five:
+
+```rust
+impl Window {
+    pub fn paint_with(...);          // D2
+    pub fn size(&self) -> (u32, u32);
+    pub fn set_title(&mut self, title: &str);
+    pub fn minimize(&mut self);
+    pub fn toggle_maximized(&mut self);
+}
+pub use layer::BTN_LEFT;
+```
+
+**Ruling.** Kept and declared. `App::run` needs `size` for the layout pass and
+the other three to execute `Cmd::{SetTitle, Minimize, ToggleMaximized}`; §3.1
+exposes no other route to any of them, and the loop is §4.7's, so the methods
+have to exist somewhere. `BTN_LEFT` is re-exported at `window`'s root because
+`view::controller` and P5's controllers name the left mouse button constantly
+and `window::layer` is a role module, not a button vocabulary. All five are
+additive: no existing signature is touched, which is the same rule D2 stated.
+The file stays P3-owned; a later part adding to it needs its own amendment.
+
+---
+
 ---
 
 ## 11. Execution notes — cross-part consistency check (E1–E16)
