@@ -24,12 +24,14 @@ use crate::window::focus::FOCUSABLE_CLASS;
 #[doc(inline)]
 pub use crate::view::ListItem;
 
+pub mod button;
 pub mod calendar;
 pub mod drawing_area;
 pub mod image;
 pub mod info_bar;
 pub mod label;
 pub mod level_bar;
+pub mod link_button;
 pub mod picture;
 pub mod popover;
 pub mod progress_bar;
@@ -39,6 +41,7 @@ pub mod separator;
 pub mod spinner;
 pub mod statusbar;
 pub mod text_view;
+pub mod toggle_button;
 pub mod window_controls;
 
 /// Re-express a pointer event given in the root node's space in `rect`'s space.
@@ -646,6 +649,13 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Popover => Box::new(<popover::PopoverC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::Button => Box::new(<button::ButtonC as Controller<Msg>>::build(node, props, cx)),
+        Kind::ToggleButton => Box::new(<toggle_button::ToggleButtonC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::LinkButton => Box::new(<link_button::LinkButtonC as Controller<Msg>>::build(
             node, props, cx,
         )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),

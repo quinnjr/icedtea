@@ -728,14 +728,17 @@ mod tests {
             .iter()
             .map(|c| c.as_str().to_owned())
             .collect();
-        // Base classes, then the `Classes` prop's, then P3's focus-ring
-        // marker because `ToggleButton::is_focusable_by_default`.
+        // Base classes, then P3's focus-ring marker (`ToggleButtonC`'s
+        // `Universal::new` adds it at build time, ahead of the props loop —
+        // unlike `GenericC`, which rewrites the whole class list on every
+        // change and so always reports base/extra/focusable in that order),
+        // then the `Classes` prop's.
         assert_eq!(
             classes,
             vec![
                 "toggle".to_owned(),
+                FOCUSABLE_CLASS.to_owned(),
                 "flat".to_owned(),
-                FOCUSABLE_CLASS.to_owned()
             ]
         );
         assert_eq!(
@@ -790,7 +793,10 @@ mod tests {
             .iter()
             .map(|c| c.as_str().to_owned())
             .collect();
-        assert_eq!(classes, vec!["flat".to_owned(), FOCUSABLE_CLASS.to_owned()]);
+        // `ButtonC` (unlike `GenericC`) applies `Universal` incrementally, so
+        // the marker already on the node stays ahead of a class a later
+        // `Classes` prop appends.
+        assert_eq!(classes, vec![FOCUSABLE_CLASS.to_owned(), "flat".to_owned()]);
 
         // A non-focusable kind given `focusable(true)` joins the ring.
         c.set_prop(&button, PropName::Focusable, &Prop::Bool(false), &mut cx);
@@ -905,6 +911,11 @@ mod tests {
     #[test]
     fn a_press_released_outside_the_node_does_not_click() {
         let (sheet, mut fonts, mut icons, clock, env) = build_cx_fixture();
+        // `Kind::MenuButton` (still `GenericC`, unlike `Kind::Button` since
+        // Task 19): this exercises GenericC's own hover-flag click tracking,
+        // which — unlike `PointerState`'s allocation-based one P5/P6 widgets
+        // share — has no allocation to consult in this test's bare
+        // `LayoutTree::new()`.
         let node = Node::new("button");
         let mut handlers: Handlers<Msg> = Handlers::default();
         handlers.set(
@@ -919,7 +930,7 @@ mod tests {
                 clock: &clock,
                 env: &env,
             };
-            build_controller::<Msg>(Kind::Button, &node, &Props::default(), &mut cx)
+            build_controller::<Msg>(Kind::MenuButton, &node, &Props::default(), &mut cx)
         };
         let tree = LayoutTree::new();
         let styles = StyleMap::new();

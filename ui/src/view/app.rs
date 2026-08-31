@@ -1483,12 +1483,16 @@ mod tests {
                 clock: &clock,
                 env: &env,
             };
+            // `Kind::MenuButton`: still `GenericC` (unlike `Kind::Button`
+            // since Task 19), whose fallback focus handling this test means
+            // to exercise — no P5/P6 widget controller forwards
+            // `FocusIn`/`FocusOut` on its own.
             reconcile(
                 &root,
                 &mut instances,
                 vec![
-                    widget::<F>(Kind::Button).key("a").on_focus_out(F::Out),
-                    widget::<F>(Kind::Button).key("b").on_focus_in(F::In),
+                    widget::<F>(Kind::MenuButton).key("a").on_focus_out(F::Out),
+                    widget::<F>(Kind::MenuButton).key("b").on_focus_in(F::In),
                 ],
                 &mut cx,
             );

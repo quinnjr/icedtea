@@ -812,3 +812,109 @@ fn an_autohide_popovers_positioner_anchors_to_its_parent_rect() {
     assert_eq!(positioner.anchor, Anchor::Top);
     assert_eq!(positioner.gravity, Gravity::Top);
 }
+
+#[test]
+fn clicking_a_button_fires_its_message_and_paints_the_active_state() {
+    // mutation: never set PseudoStates::ACTIVE in PointerState::observe and the
+    // pressed capture matches the resting one.
+    use icedtea_ui::view::builders::button;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Clicked;
+
+    let frames = run(
+        0u32,
+        |model: &mut u32, _msg: Clicked| {
+            *model += 1;
+            Cmd::None
+        },
+        |_m: &u32| button("Ok").on_click(Clicked),
+        (120, 48),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Event(InputEvent::PointerEnter {
+                x: 40.0,
+                y: 24.0,
+                serial: 1,
+                target: icedtea_ui::window::SurfaceTarget::Window,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Capture,
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 8,
+            }),
+            // Leave too, so the final capture is the true unhovered rest
+            // state — Adwaita's `:hover` fill would otherwise persist and
+            // make row(0) != row(2) even with `:active` correctly cleared.
+            ScriptStep::Event(InputEvent::PointerLeave),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..120)
+            .map(|x| frames.pixel(frame, x, 24))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), ":active must repaint the button");
+    assert_eq!(row(0), row(2), "release restores the resting appearance");
+}
+
+#[test]
+fn toggling_a_toggle_button_paints_the_checked_state() {
+    // mutation: skip PseudoStates::CHECKED in ToggleButtonC::apply and the two
+    // captures match.
+    use icedtea_ui::view::builders::toggle_button;
+    use icedtea_ui::widgets::toggle_button::ToggleButtonExt;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Toggled(bool);
+
+    let frames = run(
+        false,
+        |model: &mut bool, Toggled(on): Toggled| {
+            *model = on;
+            Cmd::None
+        },
+        |model: &bool| toggle_button("Bold").active(*model).on_toggle(Toggled),
+        (120, 48),
+        vec![
+            ScriptStep::Capture,
+            // x=60 is the window's horizontal centre, where the box lays the
+            // button out regardless of its exact (narrower, `.toggle`) width
+            // — unlike the plain button, whose wider box also covers x=40.
+            ScriptStep::Event(InputEvent::PointerEnter {
+                x: 60.0,
+                y: 24.0,
+                serial: 1,
+                target: icedtea_ui::window::SurfaceTarget::Window,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 8,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..120)
+            .map(|x| frames.pixel(frame, x, 24))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), ":checked must repaint the button");
+}

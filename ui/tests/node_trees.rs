@@ -299,3 +299,21 @@ fn a_popover_always_carries_background_and_wraps_its_child_in_contents() {
     assert!(rendered.contains("arrow"), "{rendered}");
     assert!(rendered.contains("contents"), "{rendered}");
 }
+
+#[test]
+fn the_three_button_kinds_share_the_button_node_and_differ_by_class() {
+    // mutation: stop adding `.text-button` from the content and the first
+    // assertion fails — GTK sets it from what the button actually contains.
+    let mut labelled = Props::default();
+    labelled.set(PropName::Label, Prop::Str("Ok".into()));
+    assert!(node_tree_of(Kind::Button, &labelled).starts_with("button.text-button"));
+    check(Kind::Button, "button", &labelled);
+
+    assert!(node_tree_of(Kind::ToggleButton, &labelled).starts_with("button.toggle"));
+    check(Kind::ToggleButton, "toggle_button", &labelled);
+
+    let mut link = labelled.clone();
+    link.set(PropName::Uri, Prop::Str("https://gtk.org".into()));
+    assert!(node_tree_of(Kind::LinkButton, &link).contains("button.link"));
+    check(Kind::LinkButton, "link_button", &link);
+}
