@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use selectors::Element;
-
 use crate::anim::{AnimationState, Overrides};
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::{ComputedStyle, ResolveEnv};
@@ -24,23 +22,13 @@ use crate::css::select::MatchCx;
 /// orders of magnitude past anything real.
 pub const MAX_TREE_DEPTH: usize = 512;
 
-/// A stable per-node identity for caches.
+/// P3's node identity, cache key and style map, re-exported unchanged.
 ///
-/// Contract deviation D6: §3.4 says "keyed by `Node::addr()`", which is
-/// `pub(crate)` (`css/node.rs:445`) and off-limits to P4 (§9 forbids
-/// touching `css/**`). `Element::opaque` is the public equivalent and is
-/// what `LayoutTree` already keys on (`layout.rs:225`).
-pub type NodeAddr = selectors::OpaqueElement;
-
-/// `node`'s cache key.
-#[must_use]
-pub fn node_addr(node: &Node) -> NodeAddr {
-    Element::opaque(node)
-}
-
-/// Every live node's computed style. P3's `hit_test`/`hit_chain` take this
-/// by reference and never build one (contract §3.4).
-pub type StyleMap = HashMap<NodeAddr, Rc<ComputedStyle>>;
+/// Contract §11 E2: P3's `window::{NodeAddr, node_addr, StyleMap}` are
+/// canonical — `hit_test`/`hit_chain` (§3.4) take P3's — so P4 re-exports
+/// them rather than declaring a second public spelling of the same identity.
+/// (This supersedes deviation D6, which had P4 defining its own.)
+pub use crate::window::{NodeAddr, StyleMap, node_addr};
 
 /// One [`AnimationState`] per node.
 ///

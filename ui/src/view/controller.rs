@@ -17,7 +17,7 @@ use crate::view::reconcile::BuildCx;
 use crate::view::render::StyleMap;
 use crate::view::{Handlers, Kind, Prop, PropName, Props};
 use crate::window::SurfaceStates;
-use crate::window::focus::{FocusCause, FocusRing};
+use crate::window::focus::{FOCUSABLE_CLASS, FocusCause, FocusRing};
 use crate::window::keyboard::KeyEvent;
 use crate::window::pointer::Scroll;
 use crate::window::selection::Clipboard;
@@ -29,7 +29,9 @@ pub use crate::paint::PaintCx;
 ///
 /// Contract deviation D5: §4.6 requires "capture → target → bubble" and says
 /// a controller that sets `cx.handled = true` "stops the phase it is in" —
-/// which a controller cannot honour without seeing the phase.
+/// which a controller cannot honour without seeing the phase. What `handled`
+/// actually stops is the whole dispatch (deviation D19, on
+/// [`crate::view::app::deliver`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
     /// Root → target, before the target sees the event.
@@ -131,7 +133,9 @@ pub struct EventCx<'a, Msg> {
     pub cmds: &'a mut Vec<Cmd<Msg>>,
     /// Which dispatch leg is running (deviation D5).
     pub phase: Phase,
-    /// Set to `true` to stop this phase.
+    /// Set to `true` to consume the event: dispatch ends here and no further
+    /// node or phase sees it (deviation D19, on
+    /// [`crate::view::app::deliver`]).
     pub handled: bool,
 }
 
@@ -227,6 +231,11 @@ pub struct GenericC {
     shaped: Option<Rc<crate::text::ShapedText>>,
     pressed: bool,
     hovered: bool,
+    /// Whether the node carries [`crate::window::focus::FOCUSABLE_CLASS`].
+    focusable: bool,
+    /// The `Classes` prop's extra classes, kept so the class list can be
+    /// rewritten whenever `focusable` changes.
+    extra_classes: Vec<Rc<str>>,
 }
 
 impl std::fmt::Debug for GenericC {
@@ -278,15 +287,39 @@ impl GenericC {
         self.style = Some(style);
     }
 
+    /// Rewrite the node's whole class list: the kind's base classes, then the
+    /// `Classes` prop's, then [`FOCUSABLE_CLASS`] when the node takes focus.
+    ///
+    /// One function writes all three because `Node::set_classes` replaces the
+    /// list wholesale, so `Classes` and `Focusable` arriving in either prop
+    /// order must produce the same result.
+    fn sync_classes(&self, node: &Node) {
+        let mut list: Vec<&str> = self.kind.base_classes().to_vec();
+        list.extend(self.extra_classes.iter().map(|c| &**c));
+        if self.focusable && !list.contains(&FOCUSABLE_CLASS) {
+            list.push(FOCUSABLE_CLASS);
+        }
+        node.set_classes(&list);
+    }
+
     /// Write one universal prop onto the node.
-    fn apply_universal(node: &Node, kind: Kind, name: PropName, value: &Prop) -> bool {
+    fn apply_universal(&mut self, node: &Node, name: PropName, value: &Prop) -> bool {
         match name {
             PropName::Classes => {
-                let mut list: Vec<&str> = kind.base_classes().to_vec();
-                if let Prop::Classes(extra) = value {
-                    list.extend(extra.iter().map(|c| &**c));
-                }
-                node.set_classes(&list);
+                self.extra_classes = match value {
+                    Prop::Classes(extra) => extra.to_vec(),
+                    _ => Vec::new(),
+                };
+                self.sync_classes(node);
+                true
+            }
+            PropName::Focusable => {
+                // Absent restores the kind's GTK default.
+                self.focusable = match value {
+                    Prop::Bool(on) => *on,
+                    _ => self.kind.is_focusable_by_default(),
+                };
+                self.sync_classes(node);
                 true
             }
             PropName::Id => {
@@ -346,13 +379,16 @@ impl<Msg: Clone + 'static> Controller<Msg> for GenericC {
             shaped: None,
             pressed: false,
             hovered: false,
+            // `build_controller` sets the real default once it has set `kind`.
+            focusable: false,
+            extra_classes: Vec::new(),
         };
         me.reshape(node, cx);
         me
     }
 
     fn set_prop(&mut self, node: &Node, name: PropName, value: &Prop, cx: &mut BuildCx<'_>) {
-        if GenericC::apply_universal(node, self.kind, name, value) {
+        if self.apply_universal(node, name, value) {
             return;
         }
         if matches!(name, PropName::Label | PropName::Text) {
@@ -496,6 +532,12 @@ pub fn build_controller<Msg: Clone + 'static>(
     node.set_classes(kind.base_classes());
     let mut generic = <GenericC as Controller<Msg>>::build(node, props, cx);
     generic.kind = kind;
+    // GTK's focusability default reaches P3's focus ring as a class
+    // (`window::focus::FOCUSABLE_CLASS`); without this line no reconciled node
+    // is ever a Tab stop. A `PropName::Focusable` in the loop below overrides
+    // it, in either prop order.
+    generic.focusable = kind.is_focusable_by_default();
+    generic.sync_classes(node);
 
     let mut boxed: Box<dyn Controller<Msg>> = Box::new(generic);
     for (name, value) in props.iter() {
@@ -670,12 +712,77 @@ mod tests {
             .iter()
             .map(|c| c.as_str().to_owned())
             .collect();
-        assert_eq!(classes, vec!["toggle".to_owned(), "flat".to_owned()]);
+        // Base classes, then the `Classes` prop's, then P3's focus-ring
+        // marker because `ToggleButton::is_focusable_by_default`.
+        assert_eq!(
+            classes,
+            vec![
+                "toggle".to_owned(),
+                "flat".to_owned(),
+                FOCUSABLE_CLASS.to_owned()
+            ]
+        );
         assert_eq!(
             node.id().map(|i| i.as_str().to_owned()),
             Some("go".to_owned())
         );
         assert!(node.states().contains(PseudoStates::DISABLED));
+    }
+
+    /// P3's focus ring only walks nodes carrying `FOCUSABLE_CLASS`, so
+    /// without this every reconciled tree has zero Tab stops.
+    #[test]
+    fn focusability_reaches_the_focus_ring_as_a_class_in_either_prop_order() {
+        let (sheet, mut fonts, mut icons, clock, env) = build_cx_fixture();
+        let mut cx = BuildCx {
+            sheet: &sheet,
+            fonts: &mut fonts,
+            icons: &mut icons,
+            clock: &clock,
+            env: &env,
+        };
+        let has = |node: &Node| node.classes().iter().any(|c| c.as_str() == FOCUSABLE_CLASS);
+
+        // The kind's GTK default, with no prop at all.
+        let button = Node::new("button");
+        let mut c: Box<dyn Controller<Msg>> =
+            build_controller(Kind::Button, &button, &Props::default(), &mut cx);
+        assert!(has(&button));
+        let label = Node::new("label");
+        let _: Box<dyn Controller<Msg>> =
+            build_controller(Kind::Label, &label, &Props::default(), &mut cx);
+        assert!(!has(&label));
+
+        // `View::focusable(false)` overrides it, and `Prop::None` (a removed
+        // prop) restores the default.
+        c.set_prop(&button, PropName::Focusable, &Prop::Bool(false), &mut cx);
+        assert!(!has(&button));
+        c.set_prop(&button, PropName::Focusable, &Prop::None, &mut cx);
+        assert!(has(&button));
+
+        // A later `Classes` prop must not wipe the marker, and an earlier one
+        // must not be wiped by it: `set_classes` replaces the whole list.
+        c.set_prop(
+            &button,
+            PropName::Classes,
+            &Prop::Classes(std::rc::Rc::from([std::rc::Rc::from("flat")])),
+            &mut cx,
+        );
+        assert!(has(&button));
+        let classes: Vec<String> = button
+            .classes()
+            .iter()
+            .map(|c| c.as_str().to_owned())
+            .collect();
+        assert_eq!(classes, vec!["flat".to_owned(), FOCUSABLE_CLASS.to_owned()]);
+
+        // A non-focusable kind given `focusable(true)` joins the ring.
+        c.set_prop(&button, PropName::Focusable, &Prop::Bool(false), &mut cx);
+        assert!(!has(&button));
+        let mut lc: Box<dyn Controller<Msg>> =
+            build_controller(Kind::Label, &label, &Props::default(), &mut cx);
+        lc.set_prop(&label, PropName::Focusable, &Prop::Bool(true), &mut cx);
+        assert!(has(&label));
     }
 
     #[test]

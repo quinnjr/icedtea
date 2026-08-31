@@ -20,7 +20,7 @@ use crate::view::render::{
     Animations, NodeAddr, NodePainter, StyleMap, layout_tree, paint_tree, restyle_tree,
 };
 use crate::view::{Kind, View};
-use crate::window::focus::FocusRing;
+use crate::window::focus::{FocusCause, FocusRing};
 use crate::window::pointer::{ImplicitGrab, hit_chain};
 use crate::window::selection::Clipboard;
 use crate::window::{InputEvent, SurfaceError};
@@ -83,10 +83,21 @@ pub fn path_to<Msg: Clone + 'static>(roots: &[Instance<Msg>], target: &Node) -> 
 /// Deliver `event` along `path` in GTK's three phases: capture from the
 /// outermost node inward, then the target, then bubble back out.
 ///
-/// A controller that sets `cx.handled` stops **the phase it is in**
-/// (deviation D5): capture stops descending, bubble stops climbing, and a
-/// handled target simply ends the target phase. Messages come back in the
-/// order they were produced.
+/// A controller that sets `cx.handled` ends **the whole dispatch**, not just
+/// the phase it is in: the node that set it is the last one this event
+/// reaches. A handled capture therefore suppresses both target and bubble and
+/// the target never sees the event; a handled target suppresses bubble; a
+/// handled bubble stops climbing. Messages come back in the order they were
+/// produced.
+///
+/// This is deviation **D19**, which supersedes the contract §4.6 wording D5
+/// quotes ("stops the phase it is in"). Per-phase stopping is unimplementable
+/// as written: the phases run outermost-in then innermost-out over the same
+/// path, so "capture stops descending" and "the event still reaches the
+/// target" contradict each other — a capture that stopped only its own phase
+/// would hand the event to the very node it just intercepted. `cx.phase` (D5)
+/// still tells a controller which phase it is in; what changed is the reach of
+/// `handled`.
 pub fn deliver<Msg: Clone + 'static>(
     roots: &mut [Instance<Msg>],
     path: &[Node],
@@ -134,11 +145,10 @@ pub fn deliver<Msg: Clone + 'static>(
                 handled: false,
             };
             out.extend(controller.on_event(event, &mut ecx));
-            // `cx.handled` stops the phase it is set in (deviation D5), and
-            // since dispatch never revisits a phase once left, that handled
-            // node is also the last one this event reaches: a handled
-            // capture never lets the event descend to the target, and a
-            // handled target never lets it bubble.
+            // `cx.handled` ends the whole dispatch (deviation D19, recorded in
+            // §10 as P4-D19): the node that set it is the last one this event
+            // reaches, so a handled capture never lets the event descend to
+            // the target and a handled target never lets it bubble.
             if ecx.handled {
                 break 'phases;
             }
@@ -343,6 +353,12 @@ struct Runtime<Msg> {
     focus: FocusRing,
     grab: ImplicitGrab,
     hovered: Option<Node>,
+    /// The node the last `Event::FocusIn` was delivered to.
+    ///
+    /// `FocusRing` records who holds the focus but not that the change has
+    /// been announced; this is the announced half, and the difference between
+    /// the two is exactly one `FocusOut`/`FocusIn` pair (see [`sync_focus`]).
+    focused: Option<Node>,
     /// The last pointer position in window-frame space, so a button event
     /// (which carries none) can be aimed and localised.
     last_pointer: (f32, f32),
@@ -507,6 +523,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             focus: <FocusRing as Default>::default(),
             grab: ImplicitGrab::default(),
             hovered: None,
+            focused: None,
             last_pointer: (0.0, 0.0),
             queue: VecDeque::new(),
             cmds: Vec::new(),
@@ -586,7 +603,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 }
             }
 
-            drain(
+            for other in drain(
                 &mut self,
                 &mut rt,
                 &sheet,
@@ -595,7 +612,22 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 &mut clipboard,
                 &dyn_clock,
                 clock.now(),
+            ) {
+                // Offscreen there is no surface to title, minimise or open a
+                // popup on, so the window-bound commands are logged and
+                // dropped.
+                tracing::debug!(?other, "command has no effect offscreen");
+            }
+            // `Cmd::Focus` moves the ring inside `drain`; announce it too.
+            let moved = sync_focus(
+                &mut rt,
+                FocusCause::Programmatic,
+                &mut fonts,
+                &mut icons,
+                &mut clipboard,
+                &dyn_clock,
             );
+            rt.queue.extend(moved);
             render_once(
                 &mut rt,
                 &sheet,
@@ -703,6 +735,62 @@ fn render_once<Msg: Clone + 'static>(
         &mut painter,
     );
     Ok(())
+}
+
+/// Announce a focus move as `Event::FocusOut` then `Event::FocusIn`.
+///
+/// Nothing else constructs those two events: the focus can move from a
+/// controller (`EventCx::set_focus`), from `Cmd::Focus` or from a keyboard
+/// binding, and all three go through `FocusRing`, which changes
+/// `PseudoStates::FOCUS` but sends no message. This compares the ring's owner
+/// against the last one announced and dispatches the pair when they differ, so
+/// `View::on_focus_in`/`on_focus_out` fire once per real move whatever moved
+/// it.
+///
+/// `cause` is the input that moved it, which `FocusRing` does not retain.
+fn sync_focus<Msg: Clone + 'static>(
+    rt: &mut Runtime<Msg>,
+    cause: FocusCause,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clipboard: &mut Clipboard,
+    clock: &Rc<dyn Clock>,
+) -> Vec<Msg> {
+    let current = rt.focus.focus();
+    let same = match (rt.focused.as_ref(), current.as_ref()) {
+        (Some(old), Some(new)) => old.ptr_eq(new),
+        (None, None) => true,
+        _ => false,
+    };
+    if same {
+        return Vec::new();
+    }
+    let mut pending: Vec<(Node, Event)> = Vec::new();
+    if let Some(old) = rt.focused.take() {
+        pending.push((old, Event::FocusOut));
+    }
+    if let Some(new) = current {
+        pending.push((new.clone(), Event::FocusIn { cause }));
+        rt.focused = Some(new);
+    }
+
+    let mut out = Vec::new();
+    for (node, ev) in pending {
+        let path = path_to(&rt.instances, &node);
+        let mut cx = Dispatch {
+            styles: &rt.styles,
+            tree: &rt.layout,
+            focus: &mut rt.focus,
+            clipboard,
+            icons,
+            fonts,
+            clock,
+            env: &rt.env,
+            cmds: &mut rt.cmds,
+        };
+        out.extend(deliver(&mut rt.instances, &path, &ev, &mut cx));
+    }
+    out
 }
 
 /// Turn one `InputEvent` into controller events and return the messages.
@@ -844,11 +932,31 @@ fn route<Msg: Clone + 'static>(
         };
         out.extend(deliver(&mut rt.instances, &path, &ev, &mut cx));
     }
+
+    // A controller may have moved the focus while handling the event above
+    // (`GenericC` does, on every left press); announce it in the same pass so
+    // `on_focus_in`/`on_focus_out` land in this frame's message batch.
+    let cause = match event {
+        InputEvent::Key(_) => FocusCause::Keyboard,
+        InputEvent::PointerButton { .. }
+        | InputEvent::PointerEnter { .. }
+        | InputEvent::PointerMotion { .. }
+        | InputEvent::PointerLeave => FocusCause::Pointer,
+        _ => FocusCause::Programmatic,
+    };
+    out.extend(sync_focus(rt, cause, fonts, icons, clipboard, clock));
     out
 }
 
 /// Fold every queued message, run the commands they produced, and rebuild
 /// the view **once** per drained batch (contract §4.7).
+///
+/// Returns the flattened commands `drain` itself cannot execute -- the
+/// window-bound ones (`SetTitle`, `Minimize`, `ToggleMaximized`, `OpenPopup`,
+/// `ClosePopup`). [`App::run`] applies them to its `Window`; `run_offscreen`
+/// has no surface and logs them. They must be *returned* rather than dropped
+/// here: `drain` is what calls `update`, so a `Cmd` an `update` returns first
+/// exists inside this function, and a filter run before it never sees one.
 #[allow(
     clippy::too_many_arguments,
     reason = "one fold pass threading the whole per-frame context"
@@ -862,11 +970,12 @@ fn drain<M: 'static, Msg: Clone + 'static>(
     clipboard: &mut Clipboard,
     clock: &Rc<dyn Clock>,
     now: Duration,
-) {
+) -> Vec<Cmd<Msg>> {
     if rt.queue.is_empty() && rt.cmds.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut folded = false;
+    let mut unhandled = Vec::new();
     // A bound, so an `update` that enqueues on every message cannot wedge
     // the loop: the rest is carried to the next frame.
     for _ in 0..1024 {
@@ -897,15 +1006,16 @@ fn drain<M: 'static, Msg: Clone + 'static>(
                 .focus
                 .set_focus(Some(&node), crate::window::focus::FocusCause::Programmatic),
             Cmd::Quit | Cmd::CloseWindow => rt.quit = true,
-            // The window-bound commands are `run`'s (Task 17); offscreen
-            // there is no surface to title, minimise or open a popup on, so
-            // they are recorded and ignored.
-            other => tracing::debug!(?other, "command has no effect offscreen"),
+            // The window-bound commands are `run`'s (Task 17): only it has a
+            // surface to title, minimise or open a popup on. They are handed
+            // back to the caller rather than dropped here.
+            other => unhandled.push(other),
         }
     }
     if folded {
         rebuild(app, rt, sheet, fonts, icons, clock);
     }
+    unhandled
 }
 
 /// The shortest of the four things that could want the next frame.
@@ -962,6 +1072,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             focus: <FocusRing as Default>::default(),
             grab: ImplicitGrab::default(),
             hovered: None,
+            focused: None,
             last_pointer: (0.0, 0.0),
             queue: VecDeque::new(),
             cmds: Vec::new(),
@@ -1024,49 +1135,46 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             };
             rt.queue.extend(ticked);
 
-            // Window-bound commands the offscreen loop ignores.
-            let window_cmds: Vec<Cmd<Msg>> = std::mem::take(&mut rt.cmds)
-                .into_iter()
-                .flat_map(Cmd::flatten)
-                .filter_map(|cmd| match cmd {
-                    Cmd::SetTitle(title) => {
-                        window.set_title(&title);
-                        None
-                    }
-                    Cmd::Minimize => {
-                        window.minimize();
-                        None
-                    }
-                    Cmd::ToggleMaximized => {
-                        window.toggle_maximized();
-                        None
-                    }
-                    Cmd::CloseWindow => {
-                        rt.quit = true;
-                        None
-                    }
+            // The window-bound pass runs *after* `drain`, not before it:
+            // `drain` is what calls `update`, so a `Cmd::SetTitle` an `update`
+            // returns comes into existence inside `drain` and a filter placed
+            // ahead of it would never see one. Controller-emitted commands
+            // (`EventCx::cmds`) are already in `rt.cmds` and `drain` returns
+            // them by the same path.
+            let window_cmds = {
+                let clipboard = window.clipboard();
+                drain(
+                    &mut self, &mut rt, &sheet, &mut fonts, &mut icons, clipboard, &clock, now,
+                )
+            };
+            for cmd in window_cmds {
+                match cmd {
+                    Cmd::SetTitle(title) => window.set_title(&title),
+                    Cmd::Minimize => window.minimize(),
+                    Cmd::ToggleMaximized => window.toggle_maximized(),
                     Cmd::OpenPopup {
                         anchor, positioner, ..
                     } => {
                         if let Err(error) = window.open_popup(anchor, positioner) {
                             tracing::warn!(?error, "opening a popup failed");
                         }
-                        None
                     }
-                    Cmd::ClosePopup(key) => {
-                        window.close_popup(key);
-                        None
-                    }
-                    other => Some(other),
-                })
-                .collect();
-            rt.cmds = window_cmds;
-
+                    Cmd::ClosePopup(key) => window.close_popup(key),
+                    other => tracing::debug!(?other, "command not applicable to a window"),
+                }
+            }
             {
+                // `Cmd::Focus` moves the ring inside `drain`; announce it too.
                 let clipboard = window.clipboard();
-                drain(
-                    &mut self, &mut rt, &sheet, &mut fonts, &mut icons, clipboard, &clock, now,
+                let moved = sync_focus(
+                    &mut rt,
+                    FocusCause::Programmatic,
+                    &mut fonts,
+                    &mut icons,
+                    clipboard,
+                    &clock,
                 );
+                rt.queue.extend(moved);
             }
 
             let (w, h) = window.size();
@@ -1325,6 +1433,161 @@ mod tests {
         // second.
         let out = deliver(&mut instances, &path, &Event::Activate, &mut cx);
         assert_eq!(out.first(), Some(&Msg::Inner));
+    }
+
+    /// A `Runtime` over `root`/`instances` with everything else empty.
+    fn runtime<Msg>(root: Node, instances: Vec<Instance<Msg>>) -> Runtime<Msg> {
+        Runtime {
+            root,
+            instances,
+            styles: StyleMap::new(),
+            anims: Animations::new(),
+            containers: HashMap::new(),
+            layout: LayoutTree::new(),
+            focus: <FocusRing as Default>::default(),
+            grab: ImplicitGrab::default(),
+            hovered: None,
+            focused: None,
+            last_pointer: (0.0, 0.0),
+            queue: VecDeque::new(),
+            cmds: Vec::new(),
+            timers: Vec::new(),
+            images: ImageCache::new(),
+            env: ResolveEnv::default(),
+            quit: false,
+        }
+    }
+
+    /// Nothing but [`sync_focus`] constructs `Event::FocusIn`/`FocusOut`, so
+    /// without it `View::on_focus_in`/`on_focus_out` can never fire.
+    #[test]
+    fn moving_the_focus_fires_focus_out_then_focus_in() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum F {
+            In,
+            Out,
+        }
+
+        let sheet = CompiledSheet::compile("button { color: #000; }");
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", vec![]);
+        let clock: Rc<dyn Clock> = Rc::new(crate::anim::ManualClock::new());
+        let env = ResolveEnv::default();
+        let root = Node::new("window");
+        let mut instances: Vec<Instance<F>> = Vec::new();
+        {
+            let mut cx = BuildCx {
+                sheet: &sheet,
+                fonts: &mut fonts,
+                icons: &mut icons,
+                clock: &clock,
+                env: &env,
+            };
+            reconcile(
+                &root,
+                &mut instances,
+                vec![
+                    widget::<F>(Kind::Button).key("a").on_focus_out(F::Out),
+                    widget::<F>(Kind::Button).key("b").on_focus_in(F::In),
+                ],
+                &mut cx,
+            );
+        }
+        let a = instances[0].node.clone();
+        let b = instances[1].node.clone();
+        let mut rt = runtime(root, instances);
+        let mut clipboard = crate::window::selection::Clipboard::offscreen();
+
+        // No move yet: nothing is announced.
+        assert!(
+            sync_focus(
+                &mut rt,
+                FocusCause::Programmatic,
+                &mut fonts,
+                &mut icons,
+                &mut clipboard,
+                &clock,
+            )
+            .is_empty()
+        );
+
+        rt.focus.set_focus(Some(&a), FocusCause::Keyboard);
+        let first = sync_focus(
+            &mut rt,
+            FocusCause::Keyboard,
+            &mut fonts,
+            &mut icons,
+            &mut clipboard,
+            &clock,
+        );
+        // `a` binds only `on_focus_out`, so entering it says nothing.
+        assert!(first.is_empty());
+
+        rt.focus.set_focus(Some(&b), FocusCause::Keyboard);
+        let moved = sync_focus(
+            &mut rt,
+            FocusCause::Keyboard,
+            &mut fonts,
+            &mut icons,
+            &mut clipboard,
+            &clock,
+        );
+        // Out of the old node first, then into the new one.
+        assert_eq!(moved, vec![F::Out, F::In]);
+
+        // Announced once, not once per call.
+        assert!(
+            sync_focus(
+                &mut rt,
+                FocusCause::Keyboard,
+                &mut fonts,
+                &mut icons,
+                &mut clipboard,
+                &clock,
+            )
+            .is_empty()
+        );
+    }
+
+    /// `drain` is what calls `update`, so a window command an `update` returns
+    /// only exists once `drain` is running: it must come back out, not be
+    /// dropped with a "no effect offscreen" log.
+    #[test]
+    fn a_window_command_returned_by_update_survives_drain() {
+        #[derive(Debug, Clone, PartialEq)]
+        struct Title;
+
+        fn update(_model: &mut (), _msg: Title) -> Cmd<Title> {
+            Cmd::Batch(vec![Cmd::SetTitle("counted".into()), Cmd::Minimize])
+        }
+        fn view(_model: &()) -> crate::view::View<Title> {
+            widget::<Title>(Kind::Box).key("root")
+        }
+
+        let mut app = App::new((), update, view);
+        let sheet = CompiledSheet::compile("box { color: #000; }");
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", vec![]);
+        let clock: Rc<dyn Clock> = Rc::new(crate::anim::ManualClock::new());
+        let mut clipboard = crate::window::selection::Clipboard::offscreen();
+        let mut rt = runtime(Node::new("window"), Vec::new());
+        rt.queue.push_back(Title);
+
+        let unhandled = drain(
+            &mut app,
+            &mut rt,
+            &sheet,
+            &mut fonts,
+            &mut icons,
+            &mut clipboard,
+            &clock,
+            Duration::ZERO,
+        );
+        assert!(
+            matches!(unhandled.as_slice(), [Cmd::SetTitle(t), Cmd::Minimize] if &**t == "counted")
+        );
+        // And the ones `drain` can run are still consumed there.
+        assert!(rt.cmds.is_empty());
     }
 
     #[derive(Debug, Clone, PartialEq)]
