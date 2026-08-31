@@ -184,3 +184,26 @@ fn a_text_view_builds_its_four_borders_and_a_text_node() {
     assert!(rendered.starts_with("textview.view"), "{rendered}");
     assert_eq!(rendered.matches("border").count(), 4, "{rendered}");
 }
+
+#[test]
+fn a_scale_builds_a_trough_with_a_highlight_and_one_mark_node_per_mark() {
+    // mutation: skip the `indicator` subnode under each mark and this fails
+    // with "fixture requires a node at 'scale/marks/mark/indicator'".
+    let mut props = Props::default();
+    props.set(PropName::Lower, Prop::Float(0.0));
+    props.set(PropName::Upper, Prop::Float(100.0));
+    props.set(PropName::Value, Prop::Float(50.0));
+    check(Kind::Scale, "scale", &props);
+
+    props.set(
+        PropName::MarksTop,
+        Prop::Classes(std::rc::Rc::from(vec![
+            std::rc::Rc::from("0=Min"),
+            std::rc::Rc::from("100=Max"),
+        ])),
+    );
+    let rendered = node_tree_of(Kind::Scale, &props);
+    assert_eq!(rendered.matches("mark\n").count(), 2, "{rendered}");
+    assert!(rendered.starts_with("scale.marks-before"), "{rendered}");
+    check(Kind::Scale, "scale", &props);
+}

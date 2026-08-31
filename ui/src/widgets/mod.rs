@@ -30,6 +30,7 @@ pub mod label;
 pub mod level_bar;
 pub mod picture;
 pub mod progress_bar;
+pub mod scale;
 pub mod scrollbar;
 pub mod separator;
 pub mod spinner;
@@ -630,6 +631,7 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::TextView => Box::new(<text_view::TextViewC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::Scale => Box::new(<scale::ScaleC as Controller<Msg>>::build(node, props, cx)),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {

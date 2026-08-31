@@ -620,6 +620,71 @@ fn typing_into_a_text_view_inserts_at_the_cursor_and_reports_the_change() {
 }
 
 #[test]
+fn dragging_a_scale_moves_the_slider_and_reports_the_value() {
+    // mutation: return early from ScaleC::on_event's PointerMotion arm and the
+    // model stays at 0.0.
+    use icedtea_ui::view::builders::scale;
+    use icedtea_ui::widgets::scale::ScaleExt;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Set(f64);
+
+    let frames = run(
+        0.0f64,
+        |model: &mut f64, Set(v): Set| {
+            *model = v;
+            Cmd::None
+        },
+        |model: &f64| {
+            scale(0.0, 100.0)
+                .value(*model)
+                .hexpand(true)
+                .on_value_changed(Set)
+        },
+        (200, 32),
+        vec![
+            ScriptStep::Capture,
+            // `ScaleC` reports its own intrinsic content size (150x18, see
+            // `ScaleC::measure`) since its `trough` has no taffy box of its
+            // own to size against; centred in a 200-wide window with 12px of
+            // Adwaita padding on every side, the content box runs x 25..175,
+            // y 12..30 — these points must land inside it, unlike the
+            // window-relative coordinates a real hexpand would allow.
+            ScriptStep::Event(InputEvent::PointerEnter {
+                x: 30.0,
+                y: 16.0,
+                serial: 1,
+                target: icedtea_ui::window::SurfaceTarget::Window,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerMotion {
+                x: 170.0,
+                y: 16.0,
+                time_ms: 16,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 32,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..200)
+            .map(|x| frames.pixel(frame, x, 16))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), "the slider must have moved right");
+}
+
+#[test]
 #[ignore = "P7 fills in IconTheme::render (contract §9, plan D9)"]
 fn an_image_paints_its_resolved_icon() {
     use icedtea_ui::view::builders::image_named;
