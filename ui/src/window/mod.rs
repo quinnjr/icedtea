@@ -1228,6 +1228,40 @@ impl Window {
         self.surface.set_cursor_shape(shape, serial);
     }
 
+    /// The main surface's configured size in surface-local pixels.
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        self.surface.size()
+    }
+
+    /// Set the toplevel's title.
+    ///
+    /// A no-op for a layer surface or a popup -- neither has an
+    /// `xdg_toplevel` to name (contract §3.2's requests table is a
+    /// toplevel-only one).
+    pub fn set_title(&self, title: &str) {
+        if let Surface::Toplevel(toplevel) = &self.surface {
+            toplevel.set_title(title);
+        }
+    }
+
+    /// Minimise the toplevel. A no-op for a layer surface or a popup.
+    pub fn minimize(&self) {
+        if let Surface::Toplevel(toplevel) = &self.surface {
+            toplevel.set_minimized();
+        }
+    }
+
+    /// Flip the toplevel's maximised state, read off its last-known
+    /// `xdg_toplevel.configure` states. A no-op for a layer surface or a
+    /// popup.
+    pub fn toggle_maximized(&self) {
+        if let Surface::Toplevel(toplevel) = &self.surface {
+            let now_maximized = self.surface.states().contains(SurfaceStates::MAXIMIZED);
+            toplevel.set_maximized(!now_maximized);
+        }
+    }
+
     /// Restyle the dirty tree, relayout, repaint, attach and commit.
     ///
     /// Returns whether anything was actually painted, so a caller can tell an
@@ -1301,6 +1335,73 @@ impl Window {
         );
         self.surface
             .commit_buffer(&mut self.skia, &mut self.buffers, &self.shm, &self.qh)?;
+        self.dirty = false;
+        Ok(true)
+    }
+
+    /// Paint one frame with `f` and commit it.
+    ///
+    /// Acquires a free buffer from the pool, clears the window's own skia
+    /// surface, runs `f` against it, uploads the result and commits.
+    /// `Ok(false)` means every buffer was still held by the compositor and
+    /// nothing was painted -- the caller retries on the next frame callback.
+    ///
+    /// Contract deviation D2: `Window::render` paints the window's own tree,
+    /// but §9 gives the recursive paint walker to P4, so the reactive layer
+    /// needs a way to paint *its* tree through the same buffer machinery.
+    ///
+    /// Reconciliation: the contract's sketch names a pre-existing
+    /// `acquire_slot`/`upload_and_commit` pair on `Window`; P3 instead factored
+    /// that sequence as the free functions [`commit_buffer_to`] and
+    /// [`Surface::commit_buffer`], which paint a *known* tree rather than
+    /// accepting an arbitrary closure and give no way to learn whether a
+    /// buffer was actually acquired. `paint_with` inlines the same
+    /// acquire/upload/attach/damage/commit sequence those helpers already use,
+    /// so the `Ok(false)` contract (`BufferPool::acquire` returning `None`)
+    /// stays visible to the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Shm`] if the buffer pool cannot grow or the upload
+    /// fails, [`SurfaceError::Closed`] if the surface is gone,
+    /// [`SurfaceError::Render`] if the raster surface cannot be reallocated
+    /// after a resize, [`SurfaceError::Socket`] if the flush fails.
+    pub fn paint_with(
+        &mut self,
+        f: impl FnOnce(&mut skia_rs_safe::canvas::Surface),
+    ) -> Result<bool, SurfaceError> {
+        if self.is_closed() {
+            return Err(SurfaceError::Closed);
+        }
+        if !may_attach(self.phase) {
+            // Nothing to paint into yet; the first configure will mark dirty.
+            return Ok(false);
+        }
+        self.drain_releases();
+        self.resize_backing()?;
+        let Some(index) = self
+            .buffers
+            .acquire(&self.shm, &self.qh)
+            .map_err(SurfaceError::Shm)?
+        else {
+            tracing::debug!("every shm buffer is still held; deferring this frame");
+            return Ok(false);
+        };
+        self.skia
+            .canvas()
+            .clear(skia_rs_safe::core::Color::TRANSPARENT);
+        f(&mut self.skia);
+        let (width, height) = self.buffers.size();
+        self.buffers
+            .upload(index, &self.skia)
+            .map_err(SurfaceError::Shm)?;
+        let wl_surface = self.surface.wl_surface().clone();
+        let target = self.surface.target();
+        wl_surface.attach(Some(self.buffers.wl_buffer(index)), 0, 0);
+        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.frame(&self.qh, target);
+        wl_surface.commit();
+        self.conn.flush().map_err(socket_error)?;
         self.dirty = false;
         Ok(true)
     }

@@ -579,7 +579,7 @@ impl Element for Node {
 /// `selectors` 0.40 has no bucketing of its own (research/cssparser-selectors.md
 /// §7); this is built on `Selector::iter()`, whose first sequence is exactly the
 /// rightmost compound.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RuleBuckets {
     by_id: HashMap<String, Vec<usize>>,
     by_class: HashMap<String, Vec<usize>>,

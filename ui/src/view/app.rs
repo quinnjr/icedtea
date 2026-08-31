@@ -908,6 +908,235 @@ fn drain<M: 'static, Msg: Clone + 'static>(
     }
 }
 
+/// The shortest of the four things that could want the next frame.
+///
+/// `Duration::ZERO` is a legitimate "now" -- an interpolating transition or
+/// an already-due timer -- and must never be read as "spin".
+fn frame_deadline<T>(
+    window: Option<Duration>,
+    animation: Option<Duration>,
+    timers: &[(Duration, T)],
+    controllers: Option<Duration>,
+    now: Duration,
+) -> Option<Duration> {
+    let soonest_timer = timers.iter().map(|(at, _)| at.saturating_sub(now)).min();
+    [window, animation, soonest_timer, controllers]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
+    /// Run the loop against a live `Window`.
+    ///
+    /// Contract deviation D1: §4.7 writes `run(self, surface: Surface)`, but
+    /// `Window` -- not `Surface` -- owns `pump`, `next_deadline`,
+    /// `open_popup`, `clipboard` and the root node the loop needs, and there
+    /// is no public way to get one from the other.
+    ///
+    /// Each iteration: wait up to [`frame_deadline`] for events, route them
+    /// to controllers, fold the messages one at a time, run their commands,
+    /// rebuild the view once, then restyle, relayout and repaint the dirty
+    /// tree into the window's next buffer.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Surface`] on a protocol or buffer failure,
+    /// [`AppError::Layout`] if taffy fails.
+    pub fn run(mut self, mut window: crate::window::Window) -> Result<(), AppError> {
+        let sheet = self.sheet.take().unwrap_or_else(|| window.sheet().clone());
+        let mut fonts = self
+            .fonts
+            .take()
+            .unwrap_or_else(|| std::mem::take(window.fonts()));
+        let mut icons = self.icons.take().unwrap_or_else(IconTheme::from_env);
+        let clock: Rc<dyn Clock> = Rc::clone(window.clock());
+
+        let mut rt = Runtime {
+            root: window.root().clone(),
+            instances: Vec::new(),
+            styles: StyleMap::new(),
+            anims: Animations::new(),
+            containers: HashMap::new(),
+            layout: LayoutTree::new(),
+            focus: <FocusRing as Default>::default(),
+            grab: ImplicitGrab::default(),
+            hovered: None,
+            last_pointer: (0.0, 0.0),
+            queue: VecDeque::new(),
+            cmds: Vec::new(),
+            timers: Vec::new(),
+            images: ImageCache::new(),
+            env: ResolveEnv::default(),
+            quit: false,
+        };
+
+        rebuild(&mut self, &mut rt, &sheet, &mut fonts, &mut icons, &clock);
+
+        while !rt.quit && !window.is_closed() {
+            let now = clock.now();
+            let wait = frame_deadline(
+                window.next_deadline(),
+                rt.anims.next_deadline(now),
+                &rt.timers,
+                next_controller_deadline(&rt.instances, now),
+                now,
+            );
+            let events = window.pump(wait)?;
+
+            for event in &events {
+                if matches!(event, InputEvent::Close) {
+                    rt.quit = true;
+                }
+                let produced = {
+                    let clipboard = window.clipboard();
+                    route(
+                        &mut rt, event, &sheet, &mut fonts, &mut icons, clipboard, &clock,
+                    )
+                };
+                rt.queue.extend(produced);
+            }
+
+            let now = clock.now();
+            let due: Vec<Msg> = {
+                let (fired, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut rt.timers)
+                    .into_iter()
+                    .partition(|(at, _)| *at <= now);
+                rt.timers = pending;
+                fired.into_iter().map(|(_, f)| f()).collect()
+            };
+            rt.queue.extend(due);
+
+            let ticked = {
+                let clipboard = window.clipboard();
+                let mut cx = Dispatch {
+                    styles: &rt.styles,
+                    tree: &rt.layout,
+                    focus: &mut rt.focus,
+                    clipboard,
+                    icons: &mut icons,
+                    fonts: &mut fonts,
+                    clock: &clock,
+                    env: &rt.env,
+                    cmds: &mut rt.cmds,
+                };
+                tick_all(&mut rt.instances, now, &mut cx)
+            };
+            rt.queue.extend(ticked);
+
+            // Window-bound commands the offscreen loop ignores.
+            let window_cmds: Vec<Cmd<Msg>> = std::mem::take(&mut rt.cmds)
+                .into_iter()
+                .flat_map(Cmd::flatten)
+                .filter_map(|cmd| match cmd {
+                    Cmd::SetTitle(title) => {
+                        window.set_title(&title);
+                        None
+                    }
+                    Cmd::Minimize => {
+                        window.minimize();
+                        None
+                    }
+                    Cmd::ToggleMaximized => {
+                        window.toggle_maximized();
+                        None
+                    }
+                    Cmd::CloseWindow => {
+                        rt.quit = true;
+                        None
+                    }
+                    Cmd::OpenPopup {
+                        anchor, positioner, ..
+                    } => {
+                        if let Err(error) = window.open_popup(anchor, positioner) {
+                            tracing::warn!(?error, "opening a popup failed");
+                        }
+                        None
+                    }
+                    Cmd::ClosePopup(key) => {
+                        window.close_popup(key);
+                        None
+                    }
+                    other => Some(other),
+                })
+                .collect();
+            rt.cmds = window_cmds;
+
+            {
+                let clipboard = window.clipboard();
+                drain(
+                    &mut self, &mut rt, &sheet, &mut fonts, &mut icons, clipboard, &clock, now,
+                );
+            }
+
+            let (w, h) = window.size();
+            restyle_tree(
+                &rt.root,
+                &sheet,
+                &rt.env,
+                &mut rt.styles,
+                &mut rt.anims,
+                now,
+            );
+            {
+                let mut measure = ControllerMeasure {
+                    instances: &mut rt.instances,
+                    sheet: &sheet,
+                    fonts: &mut fonts,
+                    icons: &mut icons,
+                    clock: &clock,
+                    env: &rt.env,
+                };
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "a surface is never 2^24 px on a side"
+                )]
+                layout_tree(
+                    &rt.root,
+                    &rt.styles,
+                    &rt.containers,
+                    &mut rt.layout,
+                    &rt.env,
+                    (Some(w as f32), Some(h as f32)),
+                    &mut measure,
+                )?;
+            }
+
+            let styles = &rt.styles;
+            let layout = &rt.layout;
+            let anims = &mut rt.anims;
+            let images = &mut rt.images;
+            let instances = &mut rt.instances;
+            let root = &rt.root;
+            let env = &rt.env;
+            let fonts_ref = &mut fonts;
+            window.paint_with(|surface| {
+                let mut cx = PaintCx {
+                    env,
+                    colors: &sheet.colors,
+                    fonts: fonts_ref,
+                    images,
+                    text: None,
+                };
+                let mut painter = ControllerPainter { instances };
+                let mut canvas = surface.canvas();
+                paint_tree(
+                    &mut canvas,
+                    root,
+                    styles,
+                    layout,
+                    anims,
+                    now,
+                    (0.0, 0.0),
+                    &mut cx,
+                    &mut painter,
+                );
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// Copy the surface out as tightly packed RGBA.
 fn read_rgba(surface: &skia_rs_safe::canvas::Surface, size: (u32, u32)) -> Vec<u8> {
     let buffer = surface.pixel_buffer();
@@ -1261,6 +1490,32 @@ mod tests {
         };
         assert_ne!(row(0), row(1), "the second Inc did not wait for the clock");
         assert_ne!(row(1), row(2), "the third Inc did not wait for the clock");
+    }
+
+    #[test]
+    fn the_frame_deadline_folds_animations_timers_and_controllers() {
+        // `App::run`'s wait is `min(window deadline, animation deadline,
+        // timer deadline, controller deadline)`. The pure computation is
+        // exercised here; the socket half is Task 18's e2e.
+        let now = Duration::from_millis(100);
+        assert_eq!(
+            frame_deadline(
+                Some(Duration::from_millis(16)),
+                Some(Duration::from_millis(8)),
+                &[(Duration::from_millis(150), ())],
+                Some(Duration::from_millis(30)),
+                now,
+            ),
+            Some(Duration::from_millis(8))
+        );
+        // A timer already due is "now", not "spin": ZERO is a legitimate
+        // answer and the loop must not treat it as an error.
+        assert_eq!(
+            frame_deadline(None, None, &[(Duration::from_millis(50), ())], None, now),
+            Some(Duration::ZERO)
+        );
+        // Nothing pending: block until an event arrives.
+        assert_eq!(frame_deadline::<()>(None, None, &[], None, now), None);
     }
 
     #[test]
