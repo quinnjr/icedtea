@@ -380,6 +380,166 @@ fn write_styles(
     }
 }
 
+use crate::layout::Allocation;
+use crate::paint::{PaintCx, paint_node_with_children};
+use skia_rs_safe::canvas::Canvas;
+
+/// The seam between the generic paint walk and per-widget content.
+///
+/// `App` implements this over the `Instance` tree so a node's own
+/// [`Controller::paint`](crate::view::Controller::paint) runs inside that
+/// node's effect layer. Keeping it a trait is what lets [`paint_tree`] know
+/// nothing about `Instance`s.
+pub trait NodePainter {
+    /// Paint `node`'s own content, after M2's box painting and before its
+    /// children. `true` if anything was drawn.
+    fn paint_content(
+        &mut self,
+        node: &Node,
+        canvas: &mut Canvas<'_>,
+        alloc: &Allocation,
+        style: &ComputedStyle,
+        cx: &mut PaintCx<'_>,
+    ) -> bool;
+}
+
+/// A [`NodePainter`] that paints nothing — boxes, borders and backgrounds only.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoContent;
+
+impl NodePainter for NoContent {
+    fn paint_content(
+        &mut self,
+        _node: &Node,
+        _canvas: &mut Canvas<'_>,
+        _alloc: &Allocation,
+        _style: &ComputedStyle,
+        _cx: &mut PaintCx<'_>,
+    ) -> bool {
+        false
+    }
+}
+
+/// Paint the whole retained tree, root first, each node inside its own
+/// effect layer.
+///
+/// This is contract §9's "recursive paint walker": M2 shipped
+/// [`paint_node_with_children`] correct for one node and never called it over
+/// a tree (`paint/mod.rs:245`'s own comment says so). `origin` translates the
+/// tree into surface space, exactly as `Button::render` does.
+///
+/// Returns the number of nodes painted; a node with no allocation (never laid
+/// out, or below [`MAX_TREE_DEPTH`]) is skipped along with its subtree.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one recursive walker threading the whole per-frame paint context"
+)]
+pub fn paint_tree(
+    canvas: &mut Canvas<'_>,
+    root: &Node,
+    styles: &StyleMap,
+    tree: &LayoutTree,
+    anims: &mut Animations,
+    now: Duration,
+    origin: (f32, f32),
+    cx: &mut PaintCx<'_>,
+    painter: &mut dyn NodePainter,
+) -> usize {
+    let mut painted = 0usize;
+    paint_one(
+        canvas,
+        root,
+        styles,
+        tree,
+        anims,
+        now,
+        origin,
+        cx,
+        painter,
+        &mut painted,
+        0,
+    );
+    painted
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the recursive half of `paint_tree`"
+)]
+fn paint_one(
+    canvas: &mut Canvas<'_>,
+    node: &Node,
+    styles: &StyleMap,
+    tree: &LayoutTree,
+    anims: &mut Animations,
+    now: Duration,
+    origin: (f32, f32),
+    cx: &mut PaintCx<'_>,
+    painter: &mut dyn NodePainter,
+    painted: &mut usize,
+    depth: usize,
+) {
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
+    let Some(style) = styles.get(&node_addr(node)) else {
+        return;
+    };
+    let Some(alloc) = tree.allocation(node) else {
+        return;
+    };
+    let alloc = Allocation {
+        border_box: crate::layout::Rect::new(
+            alloc.border_box.x + origin.0,
+            alloc.border_box.y + origin.1,
+            alloc.border_box.width,
+            alloc.border_box.height,
+        ),
+        content_box: crate::layout::Rect::new(
+            alloc.content_box.x + origin.0,
+            alloc.content_box.y + origin.1,
+            alloc.content_box.width,
+            alloc.content_box.height,
+        ),
+        border: alloc.border,
+        padding: alloc.padding,
+    };
+
+    let overrides = anims.sample(node, now);
+    *painted += 1;
+    let children = node.children();
+
+    paint_node_with_children(
+        canvas,
+        node,
+        style,
+        &alloc,
+        Some(&overrides),
+        cx,
+        |canvas, cx| {
+            // The node's own content first, then its children — GTK's order,
+            // and both inside the layer `paint_node_with_children` opened, so
+            // `opacity`, `transform` and `filter` reach all of it.
+            painter.paint_content(node, canvas, &alloc, style, cx);
+            for child in children {
+                paint_one(
+                    canvas,
+                    &child,
+                    styles,
+                    tree,
+                    anims,
+                    now,
+                    origin,
+                    cx,
+                    painter,
+                    painted,
+                    depth + 1,
+                );
+            }
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,5 +895,252 @@ mod tests {
             .expect("spawn")
             .join()
             .expect("the test thread panicked");
+    }
+
+    /// Paint a solid rect wherever the node has a `content` marker class, so
+    /// the test can prove `Controller::paint`'s seam runs *inside* the
+    /// node's effect layer.
+    struct MarkerPainter;
+
+    impl NodePainter for MarkerPainter {
+        fn paint_content(
+            &mut self,
+            node: &Node,
+            canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+            alloc: &crate::layout::Allocation,
+            _style: &ComputedStyle,
+            _cx: &mut crate::paint::PaintCx<'_>,
+        ) -> bool {
+            if !node.classes().iter().any(|c| c.as_str() == "content") {
+                return false;
+            }
+            let mut paint = skia_rs_safe::paint::Paint::default();
+            paint.set_color(skia_rs_safe::core::Color(0xFF00_FF00).into());
+            canvas.draw_rect(&alloc.content_box.to_skia(), &paint);
+            true
+        }
+    }
+
+    fn paint_fixture() -> (CompiledSheet, ResolveEnv, Node, Node) {
+        let sheet = CompiledSheet::compile(
+            "window { background-color: #ff0000; }
+             box { background-color: #0000ff; opacity: 0.5; }",
+        );
+        let env = ResolveEnv::default();
+        let window = Node::with_classes("window", &["background"]);
+        let inner = Node::with_classes("box", &["content"]);
+        window.append_child(&inner);
+        (sheet, env, window, inner)
+    }
+
+    #[test]
+    fn paint_tree_paints_every_node_once_root_first() {
+        let (sheet, env, window, inner) = paint_fixture();
+        let mut styles = StyleMap::new();
+        let mut anims = Animations::new();
+        restyle_tree(
+            &window,
+            &sheet,
+            &env,
+            &mut styles,
+            &mut anims,
+            Duration::ZERO,
+        );
+
+        let mut containers: HashMap<NodeAddr, Container> = HashMap::new();
+        containers.insert(
+            node_addr(&window),
+            Container::Box {
+                direction: BoxDirection::Column,
+            },
+        );
+        containers.insert(node_addr(&inner), Container::Leaf);
+        let mut tree = LayoutTree::new();
+        let mut measure = crate::layout::FixedMeasure(taffy::Size {
+            width: 30.0,
+            height: 20.0,
+        });
+        layout_tree(
+            &window,
+            &styles,
+            &containers,
+            &mut tree,
+            &env,
+            (Some(60.0), Some(40.0)),
+            &mut measure,
+        )
+        .expect("lays out");
+
+        let mut surface =
+            skia_rs_safe::canvas::Surface::new_raster_n32_premul(60, 40).expect("raster surface");
+        surface
+            .canvas()
+            .clear(skia_rs_safe::core::Color::TRANSPARENT);
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut images = crate::paint::ImageCache::new();
+        let mut cx = crate::paint::PaintCx {
+            env: &env,
+            colors: &sheet.colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let painted = {
+            let mut canvas = surface.canvas();
+            paint_tree(
+                &mut canvas,
+                &window,
+                &styles,
+                &tree,
+                &mut anims,
+                Duration::ZERO,
+                (0.0, 0.0),
+                &mut cx,
+                &mut MarkerPainter,
+            )
+        };
+        assert_eq!(painted, 2);
+
+        let pixel = surface
+            .pixel_buffer()
+            .get_pixel(20, 15)
+            .expect("pixel in range");
+        // The inner box is 50% opaque green content over 50% opaque blue
+        // over opaque red — the exact blend is M2's business; what this
+        // pins is that all three layers ran, so no channel is saturated at
+        // the pure red the window alone would leave.
+        assert_ne!(pixel, skia_rs_safe::core::Color(0xFFFF_0000));
+
+        let outside = surface
+            .pixel_buffer()
+            .get_pixel(59, 39)
+            .expect("pixel in range");
+        assert_eq!(
+            outside,
+            skia_rs_safe::core::Color(0xFFFF_0000),
+            "the window background did not reach its own bottom-right corner"
+        );
+    }
+
+    #[test]
+    fn the_content_painter_runs_inside_the_node_s_own_effect_layer() {
+        // `opacity: 0.5` on the box must dim the green content the painter
+        // draws. If the content were painted after the layer closed, the
+        // green would be fully opaque.
+        let (sheet, env, window, inner) = paint_fixture();
+        let mut styles = StyleMap::new();
+        let mut anims = Animations::new();
+        restyle_tree(
+            &window,
+            &sheet,
+            &env,
+            &mut styles,
+            &mut anims,
+            Duration::ZERO,
+        );
+        let mut containers: HashMap<NodeAddr, Container> = HashMap::new();
+        containers.insert(
+            node_addr(&window),
+            Container::Box {
+                direction: BoxDirection::Column,
+            },
+        );
+        containers.insert(node_addr(&inner), Container::Leaf);
+        let mut tree = LayoutTree::new();
+        let mut measure = crate::layout::FixedMeasure(taffy::Size {
+            width: 60.0,
+            height: 40.0,
+        });
+        layout_tree(
+            &window,
+            &styles,
+            &containers,
+            &mut tree,
+            &env,
+            (Some(60.0), Some(40.0)),
+            &mut measure,
+        )
+        .expect("lays out");
+
+        let mut surface =
+            skia_rs_safe::canvas::Surface::new_raster_n32_premul(60, 40).expect("raster surface");
+        surface
+            .canvas()
+            .clear(skia_rs_safe::core::Color::TRANSPARENT);
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut images = crate::paint::ImageCache::new();
+        let mut cx = crate::paint::PaintCx {
+            env: &env,
+            colors: &sheet.colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        {
+            let mut canvas = surface.canvas();
+            paint_tree(
+                &mut canvas,
+                &window,
+                &styles,
+                &tree,
+                &mut anims,
+                Duration::ZERO,
+                (0.0, 0.0),
+                &mut cx,
+                &mut MarkerPainter,
+            );
+        }
+        let skia_rs_safe::core::Color(argb) = surface
+            .pixel_buffer()
+            .get_pixel(30, 20)
+            .expect("pixel in range");
+        let g = ((argb >> 8) & 0xFF) as u8;
+        assert!(
+            g > 0 && g < 0xFF,
+            "the content green was not dimmed by the node's opacity: {g:#04x}"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_allocation_is_skipped_not_unwrapped() {
+        let (sheet, env, window, _inner) = paint_fixture();
+        let mut styles = StyleMap::new();
+        let mut anims = Animations::new();
+        restyle_tree(
+            &window,
+            &sheet,
+            &env,
+            &mut styles,
+            &mut anims,
+            Duration::ZERO,
+        );
+        // No `layout_tree` call at all: the LayoutTree is empty.
+        let tree = LayoutTree::new();
+        let mut surface =
+            skia_rs_safe::canvas::Surface::new_raster_n32_premul(10, 10).expect("raster surface");
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut images = crate::paint::ImageCache::new();
+        let mut cx = crate::paint::PaintCx {
+            env: &env,
+            colors: &sheet.colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            text: None,
+        };
+        let painted = {
+            let mut canvas = surface.canvas();
+            paint_tree(
+                &mut canvas,
+                &window,
+                &styles,
+                &tree,
+                &mut anims,
+                Duration::ZERO,
+                (0.0, 0.0),
+                &mut cx,
+                &mut NoContent,
+            )
+        };
+        assert_eq!(painted, 0);
     }
 }

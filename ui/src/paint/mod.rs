@@ -242,7 +242,8 @@ pub fn radii_for_box(radii: &[[f32; 2]; 4], alloc: &Allocation, k: Keyword) -> [
 /// children -- is the caller this function is shaped for.
 #[allow(
     unused_variables,
-    reason = "`node` is contract §8's signature and M3's tree-walk hook"
+    reason = "`node` is contract §8's signature; the tree walk that passes it \
+              is `view::render::paint_tree` (M3 P4)"
 )]
 pub fn paint_node(
     canvas: &mut Canvas<'_>,
@@ -271,7 +272,8 @@ pub fn paint_node(
 /// its own text and images.
 #[allow(
     unused_variables,
-    reason = "`node` is contract §8's signature and M3's tree-walk hook"
+    reason = "`node` is contract §8's signature; the tree walk that passes it \
+              is `view::render::paint_tree` (M3 P4)"
 )]
 pub fn paint_node_with_children<'cx>(
     canvas: &mut Canvas<'_>,
