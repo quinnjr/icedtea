@@ -1754,6 +1754,312 @@ impl TextLayout {
     }
 }
 
+/// One attributed run produced by [`parse_markup`], indexed into the plain text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkupSpan {
+    /// Byte range in the returned plain string.
+    pub range: std::ops::Range<usize>,
+    /// `<b>` was open over this run.
+    pub bold: bool,
+    /// `<i>` was open over this run.
+    pub italic: bool,
+    /// `<span foreground="…">`.
+    pub color: Option<Rgba>,
+    /// `<span weight="…">`, 1..=1000.
+    pub weight: Option<f32>,
+    /// `<span size="…">`, in px.
+    pub size_px: Option<f32>,
+}
+
+/// How deep `parse_markup` will nest before it stops opening spans.
+///
+/// Hostile markup is a string a theme or an app model can supply; an
+/// unbounded stack here is a stack overflow waiting for `"<b>".repeat(n)`.
+const MARKUP_MAX_DEPTH: usize = 64;
+
+static MARKUP_WARNED: Once = Once::new();
+
+/// Parse the `<b>`, `<i>` and `<span foreground|weight|size>` subset.
+///
+/// Everything else — any other tag, any other attribute, a malformed entity, a
+/// stray angle bracket — is dropped and logged once. This never panics and
+/// never returns a span that is not on a char boundary of the returned string:
+/// markup reaches here from application models and stylesheets, which are
+/// untrusted input (contract §9, cross-cutting rules).
+#[must_use]
+pub fn parse_markup(text: &str) -> (String, Vec<MarkupSpan>) {
+    #[derive(Clone, Copy, Default)]
+    struct Frame {
+        bold: bool,
+        italic: bool,
+        color: Option<Rgba>,
+        weight: Option<f32>,
+        size_px: Option<f32>,
+    }
+
+    let mut plain = String::with_capacity(text.len());
+    let mut spans: Vec<MarkupSpan> = Vec::new();
+    let mut stack: Vec<(Frame, usize)> = Vec::new();
+    let mut current = Frame::default();
+    let mut run_start = 0usize;
+    let mut warned = false;
+
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'<' => {
+                let Some(close) = text[i..].find('>').map(|o| i + o) else {
+                    // A lone '<' with no '>': copy it through as text.
+                    plain.push('<');
+                    i += 1;
+                    continue;
+                };
+                let tag = &text[i + 1..close];
+                // Flush the run that ends here.
+                if plain.len() > run_start
+                    && (current.bold
+                        || current.italic
+                        || current.color.is_some()
+                        || current.weight.is_some()
+                        || current.size_px.is_some())
+                {
+                    spans.push(MarkupSpan {
+                        range: run_start..plain.len(),
+                        bold: current.bold,
+                        italic: current.italic,
+                        color: current.color,
+                        weight: current.weight,
+                        size_px: current.size_px,
+                    });
+                }
+                run_start = plain.len();
+
+                let (closing, name_and_attrs) = match tag.strip_prefix('/') {
+                    Some(rest) => (true, rest),
+                    None => (false, tag),
+                };
+                let name = name_and_attrs
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+
+                match (closing, name.as_str()) {
+                    (false, "b" | "i" | "span") => {
+                        if stack.len() < MARKUP_MAX_DEPTH {
+                            stack.push((current, plain.len()));
+                            let mut next = current;
+                            match name.as_str() {
+                                "b" => next.bold = true,
+                                "i" => next.italic = true,
+                                _ => apply_span_attrs(
+                                    name_and_attrs[name.len()..].trim_start(),
+                                    &mut next.color,
+                                    &mut next.weight,
+                                    &mut next.size_px,
+                                ),
+                            }
+                            current = next;
+                        } else {
+                            warned = true;
+                        }
+                    }
+                    (true, "b" | "i" | "span") => match stack.pop() {
+                        Some((frame, _)) => current = frame,
+                        None => warned = true,
+                    },
+                    _ => warned = true,
+                }
+                i = close + 1;
+            }
+            b'&' => {
+                let (decoded, consumed) = decode_entity(&text[i..]);
+                match decoded {
+                    Some(ch) => plain.push(ch),
+                    None => {
+                        warned = true;
+                        plain.push('&');
+                    }
+                }
+                i += consumed;
+            }
+            _ => {
+                let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+                plain.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+
+    if plain.len() > run_start
+        && (current.bold
+            || current.italic
+            || current.color.is_some()
+            || current.weight.is_some()
+            || current.size_px.is_some())
+    {
+        spans.push(MarkupSpan {
+            range: run_start..plain.len(),
+            bold: current.bold,
+            italic: current.italic,
+            color: current.color,
+            weight: current.weight,
+            size_px: current.size_px,
+        });
+    }
+    if warned {
+        MARKUP_WARNED.call_once(|| {
+            tracing::warn!(
+                "markup outside the <b>/<i>/<span foreground|weight|size> subset was dropped"
+            );
+        });
+    }
+    (plain, spans)
+}
+
+/// Read `foreground`, `weight` and `size` off a `<span …>` attribute list.
+/// An attribute that does not parse is dropped, never defaulted to nonsense.
+fn apply_span_attrs(
+    attrs: &str,
+    color: &mut Option<Rgba>,
+    weight: &mut Option<f32>,
+    size_px: &mut Option<f32>,
+) {
+    let mut rest = attrs;
+    while let Some(eq) = rest.find('=') {
+        let name = rest[..eq].trim().to_ascii_lowercase();
+        let after = &rest[eq + 1..];
+        let trimmed = after.trim_start();
+        let (value, consumed) = match trimmed.chars().next() {
+            Some(quote @ ('"' | '\'')) => match trimmed[1..].find(quote) {
+                Some(end) => (&trimmed[1..1 + end], 1 + end + 1),
+                None => return,
+            },
+            Some(_) => {
+                let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+                (&trimmed[..end], end)
+            }
+            None => return,
+        };
+        match name.as_str() {
+            "foreground" | "color" => {
+                if let Some(rgba) = parse_markup_color(value) {
+                    *color = Some(rgba);
+                }
+            }
+            "weight" => {
+                if let Ok(w) = value.parse::<f32>() {
+                    if w.is_finite() && (1.0..=1000.0).contains(&w) {
+                        *weight = Some(w);
+                    }
+                } else {
+                    *weight = match value.to_ascii_lowercase().as_str() {
+                        "bold" => Some(700.0),
+                        "normal" => Some(400.0),
+                        _ => *weight,
+                    };
+                }
+            }
+            "size" => {
+                if let Ok(s) = value.parse::<f32>()
+                    && s.is_finite()
+                    && s > 0.0
+                {
+                    *size_px = Some(s);
+                }
+            }
+            _ => {}
+        }
+        let offset = eq + 1 + (after.len() - trimmed.len()) + consumed;
+        rest = &rest[offset.min(rest.len())..];
+    }
+}
+
+/// `#rgb`, `#rrggbb` and the sixteen HTML colour names Pango markup uses.
+fn parse_markup_color(value: &str) -> Option<Rgba> {
+    let value = value.trim();
+    if let Some(hex) = value.strip_prefix('#') {
+        let expand = |c: u8| -> f32 { f32::from(c) / 255.0 };
+        let byte = |s: &str| u8::from_str_radix(s, 16).ok();
+        return match hex.len() {
+            3 => {
+                let mut it = hex.chars();
+                let mut nibble = || {
+                    let c = it.next()?;
+                    let v = c.to_digit(16)? as u8;
+                    Some(expand(v * 17))
+                };
+                Some(Rgba {
+                    r: nibble()?,
+                    g: nibble()?,
+                    b: nibble()?,
+                    a: 1.0,
+                })
+            }
+            6 => Some(Rgba {
+                r: expand(byte(&hex[0..2])?),
+                g: expand(byte(&hex[2..4])?),
+                b: expand(byte(&hex[4..6])?),
+                a: 1.0,
+            }),
+            _ => None,
+        };
+    }
+    let named = |r: f32, g: f32, b: f32| Some(Rgba { r, g, b, a: 1.0 });
+    match value.to_ascii_lowercase().as_str() {
+        "black" => named(0.0, 0.0, 0.0),
+        "white" => named(1.0, 1.0, 1.0),
+        "red" => named(1.0, 0.0, 0.0),
+        "green" => named(0.0, 0.5019608, 0.0),
+        "blue" => named(0.0, 0.0, 1.0),
+        "yellow" => named(1.0, 1.0, 0.0),
+        "cyan" | "aqua" => named(0.0, 1.0, 1.0),
+        "magenta" | "fuchsia" => named(1.0, 0.0, 1.0),
+        "gray" | "grey" => named(0.5019608, 0.5019608, 0.5019608),
+        "silver" => named(0.7529412, 0.7529412, 0.7529412),
+        "maroon" => named(0.5019608, 0.0, 0.0),
+        "olive" => named(0.5019608, 0.5019608, 0.0),
+        "lime" => named(0.0, 1.0, 0.0),
+        "teal" => named(0.0, 0.5019608, 0.5019608),
+        "navy" => named(0.0, 0.0, 0.5019608),
+        "purple" => named(0.5019608, 0.0, 0.5019608),
+        _ => None,
+    }
+}
+
+/// Decode one XML entity at the head of `s`, returning `(char, bytes consumed)`.
+/// A malformed entity consumes exactly one byte and decodes to `None`, so the
+/// caller copies the `&` through and continues.
+fn decode_entity(s: &str) -> (Option<char>, usize) {
+    let Some(semi) = s[..s.len().min(12)].find(';') else {
+        return (None, 1);
+    };
+    let body = &s[1..semi];
+    let decoded = match body {
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "amp" => Some('&'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => body.strip_prefix('#').and_then(|num| {
+            let code = match num.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => num.parse::<u32>().ok()?,
+            };
+            char::from_u32(code)
+        }),
+    };
+    match decoded {
+        Some(ch) => (Some(ch), semi + 1),
+        None => (None, 1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3139,5 +3445,78 @@ mod tests {
         assert_eq!(layout.prev_word(13), 7);
         assert_eq!(layout.prev_word(7), 0);
         assert_eq!(layout.prev_word(0), 0, "clamped");
+    }
+
+    #[test]
+    fn markup_extracts_bold_italic_and_span_attributes() {
+        let (plain, spans) = super::parse_markup(
+            "a<b>bold</b>c<i>it</i><span foreground=\"#ff0000\" weight=\"700\" \
+             size=\"20\">red</span>",
+        );
+        assert_eq!(plain, "aboldcitred", "tags are removed from the text");
+
+        let bold = spans.iter().find(|s| s.bold).expect("a bold span");
+        assert_eq!(bold.range, 1..5, "'bold' at bytes 1..5");
+        assert!(!bold.italic);
+
+        let italic = spans.iter().find(|s| s.italic).expect("an italic span");
+        assert_eq!(italic.range, 6..8);
+
+        let coloured = spans
+            .iter()
+            .find(|s| s.color.is_some())
+            .expect("a coloured span");
+        assert_eq!(coloured.range, 8..11);
+        assert_eq!(
+            coloured.color.map(|c| (c.r, c.g, c.b)),
+            Some((1.0, 0.0, 0.0))
+        );
+        assert_eq!(coloured.weight, Some(700.0));
+        assert_eq!(coloured.size_px, Some(20.0));
+    }
+
+    #[test]
+    fn markup_entities_are_decoded_and_unknown_tags_are_dropped() {
+        let (plain, spans) = super::parse_markup("5 &lt; 6 &amp; <u>x</u>&gt;");
+        assert_eq!(plain, "5 < 6 & x>", "entities decode, unknown tags vanish");
+        assert!(
+            spans
+                .iter()
+                .all(|s| !s.bold && !s.italic && s.color.is_none()),
+            "an unknown tag contributes no span"
+        );
+    }
+
+    #[test]
+    fn markup_never_panics_on_hostile_input() {
+        // Unclosed, mismatched, nested past any sane depth, invalid attribute
+        // values, lone angle brackets, and a non-ASCII payload — none of these
+        // may panic or slice through a char boundary.
+        let hostile = [
+            "<b>",
+            "</b>",
+            "<b><i></b></i>",
+            "<span foreground=\"not-a-colour\" size=\"NaN\" weight=\"-3\">x</span>",
+            "<span foreground=>x",
+            "a < b > c",
+            "&notanentity; &#; &#xZZ;",
+            "<b>\u{00e9}\u{0301}\u{1F1EF}\u{1F1F5}</b>",
+            &"<b>".repeat(5_000),
+            &format!("<b>{}</b>", "\u{00e9}".repeat(10_000)),
+        ];
+        for input in hostile {
+            let (plain, spans) = super::parse_markup(input);
+            assert!(plain.is_char_boundary(plain.len()));
+            for span in &spans {
+                assert!(
+                    span.range.start <= span.range.end && span.range.end <= plain.len(),
+                    "span {:?} out of range for {:?}",
+                    span.range,
+                    plain
+                );
+                assert!(plain.is_char_boundary(span.range.start));
+                assert!(plain.is_char_boundary(span.range.end));
+            }
+        }
     }
 }
