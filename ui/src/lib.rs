@@ -8,6 +8,7 @@
 pub mod anim;
 pub mod app;
 pub mod css;
+pub mod icons;
 pub mod layout;
 pub mod paint;
 pub mod shm;
