@@ -204,4 +204,72 @@ impl<Msg: Clone + 'static> Controller<Msg> for LevelBarC {
     fn on_event(&mut self, _ev: &Event, _cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         Vec::new()
     }
+
+    fn measure(
+        &mut self,
+        _available: (Option<f32>, Option<f32>),
+        _cx: &mut BuildCx<'_>,
+    ) -> Option<(f32, f32)> {
+        // `trough`/`block` are subnodes this controller owns directly rather
+        // than `View` children (see `ProgressBarC::measure`'s own note on
+        // the identical gap): they never get a taffy box of their own, so
+        // this leaf's own intrinsic size has to stand in for the trough's
+        // CSS minimum directly, or the whole bar collapses to zero.
+        // Continuous bars use `levelbar.horizontal trough > block`'s 9px
+        // min-height, with no min-width rule at all in Adwaita — mirror
+        // `ProgressBar`'s own 150px trough-minimum convention for the
+        // horizontal extent. Discrete bars use
+        // `levelbar.horizontal.discrete trough > block`'s 2px min-height
+        // plus 1px top/bottom margins (4px), and 24px min-width plus 1px
+        // left/right margins (26px) per block.
+        if self.discrete {
+            let steps = self.blocks.len().max(1) as f32;
+            Some((steps * 26.0, 4.0))
+        } else {
+            Some((150.0, 9.0))
+        }
+    }
+
+    fn paint(
+        &mut self,
+        canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+        alloc: &crate::layout::Allocation,
+        style: &crate::css::computed::ComputedStyle,
+        _cx: &mut crate::view::controller::PaintCx<'_>,
+    ) -> bool {
+        // Same gap `ProgressBarC::paint` closes: `trough`/`block` never
+        // reach the layout tree, so this is the only place any of a level
+        // bar's blocks actually get drawn. Blocks split the content box
+        // evenly (with a 2px gap between them in discrete mode, matching
+        // Adwaita's 1px margin on each side of a block); a block's own
+        // `.filled`/`.empty` class (set in `apply`) picks full- or
+        // reduced-alpha of the widget's own resolved colour, the same
+        // "read colour off `style`, not off the subnode" convention
+        // `ProgressBarC::paint` uses for its fill.
+        let content = alloc.content_box;
+        if content.is_empty() || self.blocks.is_empty() {
+            return false;
+        }
+        let steps = self.blocks.len() as f32;
+        let gap = if self.discrete { 2.0 } else { 0.0 };
+        let block_width = ((content.width - gap * (steps - 1.0).max(0.0)) / steps).max(0.0);
+        let filled_color = style.color();
+        let empty_color = crate::css::value::Rgba {
+            a: filled_color.a * 0.3,
+            ..filled_color
+        };
+        let mut painted = false;
+        let mut x = content.x;
+        for block in &self.blocks {
+            let is_filled = block.classes().iter().any(|c| c.as_str() == "filled");
+            let rect = crate::layout::Rect::new(x, content.y, block_width, content.height);
+            if !rect.is_empty() {
+                let color = if is_filled { filled_color } else { empty_color };
+                canvas.draw_rect(&rect.to_skia(), &crate::paint::fill_paint(color));
+                painted = true;
+            }
+            x += block_width + gap;
+        }
+        painted
+    }
 }

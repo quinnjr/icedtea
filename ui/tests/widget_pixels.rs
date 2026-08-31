@@ -255,3 +255,68 @@ fn a_pulsing_progress_bar_moves_its_block_on_the_clock() {
     };
     assert_ne!(row(0), row(1), "the pulse block must have moved");
 }
+
+#[test]
+fn a_level_bar_inks_its_blocks_at_rest() {
+    // mutation: drop LevelBarC's `measure`/`paint` overrides (its pre-fix
+    // state) and the bar collapses to a zero-size leaf that inks nothing.
+    use icedtea_ui::view::builders::level_bar;
+    let frames = run(
+        0.5f64,
+        |_model: &mut f64, _msg: ()| Cmd::None,
+        |model: &f64| level_bar(*model).hexpand(true),
+        (200, 24),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        has_ink(&frames, 0, (200, 24)),
+        "the level bar must ink something"
+    );
+}
+
+#[test]
+fn a_discrete_level_bars_fill_widens_with_its_value() {
+    // mutation: ignore `value` when deciding a block's `.filled`/`.empty`
+    // class (or never paint blocks at all) and both frames end up with the
+    // same number of filled-colour columns.
+    use icedtea_ui::view::builders::level_bar;
+    use icedtea_ui::widgets::level_bar::LevelBarExt;
+    let frames = run(
+        1.0f64,
+        |model: &mut f64, _msg: ()| {
+            *model = 4.0;
+            Cmd::None
+        },
+        |model: &f64| {
+            level_bar(*model)
+                .max_value(4.0)
+                .mode(icedtea_ui::widgets::LevelBarMode::Discrete)
+                .hexpand(true)
+        },
+        (200, 24),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Message(()),
+            ScriptStep::Capture,
+        ],
+    );
+    // The trough's total width doesn't change with `value` (block count is
+    // fixed by `min`/`max`), only how many of its blocks are `.filled` — so
+    // compare how many columns carry the *darkest* colour in the frame
+    // (filled blocks paint at full alpha; empty blocks are the same colour
+    // blended at 30% over the background, always lighter) rather than how
+    // far the paint reaches across the bar.
+    let filled_count = |frame: usize| {
+        let darkest = (0..200)
+            .filter_map(|x| frames.pixel(frame, x, 12))
+            .min_by_key(|(r, g, b, _)| *r as u32 + *g as u32 + *b as u32)
+            .expect("the frame has pixels");
+        (0..200)
+            .filter(|x| frames.pixel(frame, *x, 12) == Some(darkest))
+            .count()
+    };
+    assert!(
+        filled_count(1) > filled_count(0),
+        "value 4.0 must fill more of the bar than 1.0"
+    );
+}
