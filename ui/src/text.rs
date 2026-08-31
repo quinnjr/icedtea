@@ -21,6 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Once;
 
+use skia_rs_safe::canvas::Canvas;
 use skia_rs_safe::core::Point;
 use skia_rs_safe::text::{Font, Shaper, TextBlob, TextBlobBuilder, Typeface};
 
@@ -28,7 +29,7 @@ use crate::css::computed::ComputedStyle;
 use crate::css::registry::Prop;
 use crate::css::value::{
     FeatureSetting, FontFamily, FontStyle, FontWeight, GenericFamily, Keyword, Length, LengthUnit,
-    LineHeight, Value, VariationSetting,
+    LineHeight, Rgba, Value, VariationSetting,
 };
 
 /// Well-known UI sans-serif faces, in preference order.
@@ -1042,6 +1043,285 @@ fn stretch_percent(value: &Value) -> f32 {
     }
 }
 
+/// How a paragraph that does not fit its width is shortened.
+///
+/// GTK's `PangoEllipsizeMode`. `None` lets the text overflow; the other three
+/// replace a run of clusters with `…` at that end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ellipsize {
+    /// Never shorten; overflow instead.
+    None,
+    /// Drop leading clusters.
+    Start,
+    /// Drop clusters from the middle.
+    Middle,
+    /// Drop trailing clusters.
+    End,
+}
+
+/// How a paragraph that does not fit its width is broken.
+///
+/// GTK's `PangoWrapMode`: `Word` breaks only at UAX #14 opportunities,
+/// `Char` breaks between any two grapheme clusters, `WordChar` prefers a word
+/// break and falls back to a character break for a word wider than the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapMode {
+    /// Never break; overflow instead.
+    None,
+    /// Break at word boundaries only.
+    Word,
+    /// Break between grapheme clusters.
+    Char,
+    /// Word boundaries, falling back to clusters.
+    WordChar,
+}
+
+/// One laid-out line of a [`TextLayout`].
+struct ShapedLine {
+    /// Byte range of this line within the layout's own `text`.
+    ///
+    /// Unread until a later task's `byte_at`/`caret_rect` land; kept now so
+    /// [`TextLayout::shape_line`] doesn't have to be re-plumbed to add it.
+    #[allow(dead_code)]
+    range: std::ops::Range<usize>,
+    /// The shaped run for `text[range]` (already ellipsized, if it was).
+    shaped: Rc<ShapedText>,
+    /// One entry per grapheme boundary in `range`, as
+    /// `(byte offset in the layout's text, x advance from the line's left edge)`.
+    /// The first entry is `(range.start, 0.0)` and the last
+    /// `(range.end, line width)`, so a caret query is a lookup, never a reshape.
+    ///
+    /// Unread until a later task's `byte_at`/`caret_rect` land (same reason).
+    #[allow(dead_code)]
+    carets: Vec<(usize, f32)>,
+    /// Top of the line box, relative to the layout's origin.
+    top: f32,
+    /// Line box height.
+    height: f32,
+    /// Baseline offset from `top`.
+    baseline: f32,
+    /// Inked width.
+    width: f32,
+}
+
+/// A wrapped, ellipsized, cursor-aware paragraph over [`FontDatabase::shape`].
+///
+/// M2's [`ShapedText`] is one run of one line. `TextLayout` is the multi-line,
+/// editable-text layer every M3 widget that shows more than a fixed label needs:
+/// `Label`'s wrapping and ellipsizing, `TextView`'s cursor and selection, and
+/// the whole entry family's caret arithmetic. Caret positions are precomputed
+/// at build time so [`TextLayout::caret_rect`] and [`TextLayout::byte_at`] can
+/// take `&self` and never reach the font database again.
+pub struct TextLayout {
+    text: String,
+    lines: Vec<ShapedLine>,
+    width: f32,
+    height: f32,
+    /// The face every line was shaped with; `None` when no face loaded.
+    face: Option<FontFace>,
+}
+
+impl TextLayout {
+    /// Lay `text` out.
+    ///
+    /// `width` is the available inline size; `None` means unbounded, which is
+    /// also what a non-finite or negative width is treated as. A face that will
+    /// not load yields empty runs rather than a panic — a missing font must not
+    /// take the widget tree down.
+    pub fn build(
+        text: &str,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        width: Option<f32>,
+        wrap: WrapMode,
+        ellipsize: Ellipsize,
+    ) -> Self {
+        let limit = width.filter(|w| w.is_finite() && *w > 0.0);
+        let face = fonts.match_face(&style.query());
+        let mut layout = TextLayout {
+            text: text.to_owned(),
+            lines: Vec::new(),
+            width: 0.0,
+            height: 0.0,
+            face: face.clone(),
+        };
+
+        // Paragraphs first: a hard newline always breaks, whatever `wrap` says.
+        let mut para_start = 0usize;
+        let mut pieces: Vec<std::ops::Range<usize>> = Vec::new();
+        for (idx, ch) in text.char_indices() {
+            if ch == '\n' {
+                pieces.push(para_start..idx);
+                para_start = idx + ch.len_utf8();
+            }
+        }
+        pieces.push(para_start..text.len());
+
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for para in pieces {
+            layout.break_paragraph(para, style, fonts, limit, wrap, &mut ranges);
+        }
+
+        let mut top = 0.0f32;
+        for range in ranges {
+            let line = layout.shape_line(range, style, fonts, limit, ellipsize, top);
+            top += line.height;
+            layout.width = layout.width.max(line.width);
+            layout.lines.push(line);
+        }
+        layout.height = top;
+        layout
+    }
+
+    /// Shape one already-broken line and precompute its caret table.
+    fn shape_line(
+        &self,
+        range: std::ops::Range<usize>,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        limit: Option<f32>,
+        ellipsize: Ellipsize,
+        top: f32,
+    ) -> ShapedLine {
+        let source = &self.text[range.clone()];
+        let (display, carets) =
+            Self::ellipsize_line(source, range.start, style, fonts, limit, ellipsize);
+        let shaped = self.shape_str(&display, style, fonts);
+        let line_height = style.line_height_px(&shaped.metrics);
+        let leading =
+            ((line_height - shaped.metrics.ascent.max(0.0) - shaped.metrics.descent.max(0.0))
+                / 2.0)
+                .max(0.0);
+        ShapedLine {
+            range,
+            width: shaped.metrics.width.max(0.0),
+            baseline: leading + shaped.metrics.ascent.max(0.0),
+            height: line_height.max(0.0),
+            top,
+            carets,
+            shaped,
+        }
+    }
+
+    /// Shape one string with this layout's face, or an empty run if none loaded.
+    fn shape_str(&self, s: &str, style: &TextStyle, fonts: &mut FontDatabase) -> Rc<ShapedText> {
+        match self.face.as_ref() {
+            Some(face) => fonts.shape(&style.shape_key(s, face)),
+            None => Rc::new(ShapedText {
+                blob: None,
+                metrics: TextMetrics {
+                    width: 0.0,
+                    ascent: style.size_px * 0.8,
+                    descent: style.size_px * 0.2,
+                    line_height: style.size_px * 1.2,
+                },
+                face: FontFace {
+                    path: PathBuf::new(),
+                    index: 0,
+                    family: String::new(),
+                },
+                size_px: style.size_px,
+            }),
+        }
+    }
+
+    /// Total inked width and total height, in px.
+    #[must_use]
+    pub fn size(&self) -> (f32, f32) {
+        (self.width, self.height)
+    }
+
+    /// Number of laid-out lines. Always at least 1.
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// The source text this layout was built from.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Draw every line, `origin` being the top-left of the layout's box.
+    pub fn draw(&self, canvas: &mut Canvas<'_>, origin: (f32, f32), color: Rgba) {
+        let (ox, oy) = (
+            if origin.0.is_finite() { origin.0 } else { 0.0 },
+            if origin.1.is_finite() { origin.1 } else { 0.0 },
+        );
+        let paint = crate::paint::fill_paint(color);
+        for line in &self.lines {
+            if let Some(blob) = line.shaped.blob.as_ref() {
+                canvas.draw_text_blob(blob, ox, oy + line.top + line.baseline, &paint);
+            }
+        }
+    }
+}
+
+impl TextLayout {
+    /// Break one paragraph into line ranges. Task 2 replaces the body with the
+    /// real wrapping; `WrapMode::None` is final and is what this emits.
+    fn break_paragraph(
+        &self,
+        para: std::ops::Range<usize>,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        limit: Option<f32>,
+        wrap: WrapMode,
+        out: &mut Vec<std::ops::Range<usize>>,
+    ) {
+        let _ = (style, fonts, limit, wrap);
+        out.push(para);
+    }
+
+    /// Shorten one line to `limit` and return `(display string, caret table)`.
+    /// Task 3 replaces the body with the real ellipsizing; `Ellipsize::None` is
+    /// final and is what this returns.
+    fn ellipsize_line(
+        source: &str,
+        base: usize,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        limit: Option<f32>,
+        ellipsize: Ellipsize,
+    ) -> (String, Vec<(usize, f32)>) {
+        let _ = (limit, ellipsize);
+        let carets = Self::caret_table(source, base, source, style, fonts);
+        (source.to_owned(), carets)
+    }
+
+    /// One `(byte, x)` pair per grapheme boundary of `display`, with byte
+    /// offsets taken from `source` (they differ once an ellipsis is inserted).
+    ///
+    /// Prefix widths come from re-shaping each prefix; `FontDatabase::shape`
+    /// memoizes, so a caret table costs one cache miss per cluster once.
+    fn caret_table(
+        source: &str,
+        base: usize,
+        display: &str,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+    ) -> Vec<(usize, f32)> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let face = fonts.match_face(&style.query());
+        let mut out = vec![(base, 0.0f32)];
+        let mut byte = 0usize;
+        for cluster in display.graphemes(true) {
+            byte += cluster.len();
+            let width = match face.as_ref() {
+                Some(face) => fonts
+                    .shape(&style.shape_key(&display[..byte], face))
+                    .metrics
+                    .width
+                    .max(0.0),
+                None => 0.0,
+            };
+            out.push((base + byte.min(source.len()), width));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2042,5 +2322,69 @@ mod tests {
             let long = "aあ ".repeat(5_000);
             let _ = apply_text_transform(&long, transform);
         }
+    }
+
+    fn ui_style(css: &str) -> TextStyle {
+        TextStyle::from_computed(&style_for(css))
+    }
+
+    #[test]
+    fn a_paragraph_lays_out_one_line_per_newline_and_sizes_to_the_widest() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "Hello\nHello world",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+
+        assert_eq!(layout.line_count(), 2, "one line per newline");
+        assert_eq!(layout.text(), "Hello\nHello world");
+
+        let (w, h) = layout.size();
+        assert!(w > 0.0 && h > 0.0, "a non-empty paragraph has extents");
+
+        let short = super::TextLayout::build(
+            "Hello",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        assert!(
+            w > short.size().0,
+            "the paragraph is as wide as its widest line ({w} vs {})",
+            short.size().0
+        );
+        assert!(
+            (h - short.size().1 * 2.0).abs() < 0.51,
+            "two lines are two line boxes tall: {h} vs {}",
+            short.size().1 * 2.0
+        );
+    }
+
+    #[test]
+    fn an_empty_string_lays_out_as_one_zero_width_line() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        assert_eq!(
+            layout.line_count(),
+            1,
+            "an empty label still has a line box"
+        );
+        assert_eq!(layout.size().0, 0.0);
+        assert!(layout.size().1 > 0.0, "the line box keeps its height");
     }
 }

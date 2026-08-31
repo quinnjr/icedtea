@@ -1698,6 +1698,8 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "unicode-linebreak",
+ "unicode-segmentation",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
