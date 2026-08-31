@@ -1119,6 +1119,10 @@ pub struct TextLayout {
     height: f32,
     /// The face every line was shaped with; `None` when no face loaded.
     face: Option<FontFace>,
+    /// The string each line actually shaped — the source text for a line that
+    /// was not ellipsized, and the shortened form for one that was. Diagnostics
+    /// and tests only; painting goes through the shaped blob.
+    line_display: Vec<String>,
 }
 
 impl TextLayout {
@@ -1144,6 +1148,7 @@ impl TextLayout {
             width: 0.0,
             height: 0.0,
             face: face.clone(),
+            line_display: Vec::new(),
         };
 
         // Paragraphs first: a hard newline always breaks, whatever `wrap` says.
@@ -1164,17 +1169,20 @@ impl TextLayout {
 
         let mut top = 0.0f32;
         for range in ranges {
-            let line = layout.shape_line(range, style, fonts, limit, ellipsize, top);
+            let (display, line) =
+                layout.shape_line_with_display(range, style, fonts, limit, ellipsize, top);
             top += line.height;
             layout.width = layout.width.max(line.width);
+            layout.line_display.push(display);
             layout.lines.push(line);
         }
         layout.height = top;
         layout
     }
 
-    /// Shape one already-broken line and precompute its caret table.
-    fn shape_line(
+    /// Shape one already-broken line and precompute its caret table, also
+    /// returning the display string it was actually shaped from.
+    fn shape_line_with_display(
         &self,
         range: std::ops::Range<usize>,
         style: &TextStyle,
@@ -1182,7 +1190,7 @@ impl TextLayout {
         limit: Option<f32>,
         ellipsize: Ellipsize,
         top: f32,
-    ) -> ShapedLine {
+    ) -> (String, ShapedLine) {
         let source = &self.text[range.clone()];
         let (display, carets) =
             Self::ellipsize_line(source, range.start, style, fonts, limit, ellipsize);
@@ -1192,7 +1200,7 @@ impl TextLayout {
             ((line_height - shaped.metrics.ascent.max(0.0) - shaped.metrics.descent.max(0.0))
                 / 2.0)
                 .max(0.0);
-        ShapedLine {
+        let line = ShapedLine {
             range,
             width: shaped.metrics.width.max(0.0),
             baseline: leading + shaped.metrics.ascent.max(0.0),
@@ -1200,7 +1208,8 @@ impl TextLayout {
             top,
             carets,
             shaped,
-        }
+        };
+        (display, line)
     }
 
     /// Shape one string with this layout's face, or an empty run if none loaded.
@@ -1241,6 +1250,14 @@ impl TextLayout {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The string line `index` actually shapes — the source text for a line
+    /// that was not ellipsized, and the shortened form for one that was.
+    /// Diagnostics and tests only; painting goes through the shaped blob.
+    #[must_use]
+    pub fn display_line(&self, index: usize) -> String {
+        self.line_display.get(index).cloned().unwrap_or_default()
     }
 
     /// Draw every line, `origin` being the top-left of the layout's box.
@@ -1400,9 +1417,16 @@ impl TextLayout {
         out
     }
 
-    /// Shorten one line to `limit` and return `(display string, caret table)`.
-    /// Task 3 replaces the body with the real ellipsizing; `Ellipsize::None` is
-    /// final and is what this returns.
+    /// The character Pango and GTK use for every ellipsis.
+    const ELLIPSIS: &'static str = "\u{2026}";
+
+    /// Shorten `source` to `limit` at the end named by `ellipsize`.
+    ///
+    /// Returns the string that is actually shaped plus the caret table, whose
+    /// byte offsets always point back into the *source* text: a caret query on
+    /// an ellipsized label must land on a real byte offset, never inside the
+    /// ellipsis. Clusters swallowed by the ellipsis collapse onto the offset of
+    /// the first cluster the ellipsis replaced.
     fn ellipsize_line(
         source: &str,
         base: usize,
@@ -1411,9 +1435,116 @@ impl TextLayout {
         limit: Option<f32>,
         ellipsize: Ellipsize,
     ) -> (String, Vec<(usize, f32)>) {
-        let _ = (limit, ellipsize);
-        let carets = Self::caret_table(source, base, source, style, fonts);
-        (source.to_owned(), carets)
+        let plain = |fonts: &mut FontDatabase| {
+            (
+                source.to_owned(),
+                Self::caret_table(source, base, source, style, fonts),
+            )
+        };
+        let Some(limit) = limit.filter(|_| ellipsize != Ellipsize::None) else {
+            return plain(fonts);
+        };
+        let face = fonts.match_face(&style.query());
+        let Some(face) = face else {
+            return plain(fonts);
+        };
+        let measure = |fonts: &mut FontDatabase, s: &str| {
+            fonts
+                .shape(&style.shape_key(s, &face))
+                .metrics
+                .width
+                .max(0.0)
+        };
+        if measure(fonts, source) <= limit {
+            return plain(fonts);
+        }
+
+        let clusters = Self::cluster_breaks(source);
+        let ellipsis_w = measure(fonts, Self::ELLIPSIS);
+        if ellipsis_w > limit {
+            // Even the ellipsis does not fit; show it anyway rather than
+            // nothing, which is what GTK renders.
+            let display = Self::ELLIPSIS.to_owned();
+            return (
+                display,
+                vec![(base, 0.0), (base + source.len(), ellipsis_w)],
+            );
+        }
+        let budget = limit - ellipsis_w;
+
+        let display = match ellipsize {
+            Ellipsize::None => unreachable!("guarded above"),
+            Ellipsize::End => {
+                let mut keep = 0usize;
+                for &offset in &clusters {
+                    if measure(fonts, &source[..offset]) <= budget {
+                        keep = offset;
+                    } else {
+                        break;
+                    }
+                }
+                format!("{}{}", &source[..keep], Self::ELLIPSIS)
+            }
+            Ellipsize::Start => {
+                let mut keep = source.len();
+                for &offset in clusters.iter().rev() {
+                    if measure(fonts, &source[offset..]) <= budget {
+                        keep = offset;
+                    } else {
+                        break;
+                    }
+                }
+                format!("{}{}", Self::ELLIPSIS, &source[keep..])
+            }
+            Ellipsize::Middle => {
+                let (mut head, mut tail) = (0usize, source.len());
+                loop {
+                    let next_head = clusters.iter().copied().find(|&o| o > head);
+                    let next_tail = clusters.iter().rev().copied().find(|&o| o < tail);
+                    let grown = match (next_head, next_tail) {
+                        (Some(h), Some(t)) if h <= t => (h, t),
+                        _ => break,
+                    };
+                    let candidate = format!("{}{}", &source[..grown.0], &source[grown.1..]);
+                    if measure(fonts, &candidate) > budget {
+                        break;
+                    }
+                    head = grown.0;
+                    tail = grown.1;
+                    // Shrink the tail on the next pass, not the head, so both
+                    // ends grow evenly.
+                    if let Some(t) = clusters.iter().rev().copied().find(|&o| o < tail) {
+                        let candidate = format!("{}{}", &source[..head], &source[t..]);
+                        if measure(fonts, &candidate) <= budget {
+                            tail = t;
+                        }
+                    }
+                }
+                format!("{}{}{}", &source[..head], Self::ELLIPSIS, &source[tail..])
+            }
+        };
+
+        // Rebuild the caret table over the *display* string, then remap every
+        // offset that fell inside the ellipsis onto the source byte the
+        // ellipsis stands for.
+        let mut table = Self::caret_table(&display, 0, &display, style, fonts);
+        let ellipsis_at = display.find(Self::ELLIPSIS).unwrap_or(0);
+        for entry in &mut table {
+            let byte = entry.0;
+            entry.0 = base
+                + if byte <= ellipsis_at {
+                    match ellipsize {
+                        Ellipsize::Start => 0,
+                        _ => byte,
+                    }
+                } else if byte >= ellipsis_at + Self::ELLIPSIS.len() {
+                    let after = byte - (ellipsis_at + Self::ELLIPSIS.len());
+                    source.len() - (display.len() - ellipsis_at - Self::ELLIPSIS.len()) + after
+                } else {
+                    ellipsis_at
+                };
+        }
+        (display, table)
     }
 
     /// One `(byte, x)` pair per grapheme boundary of `display`, with byte
@@ -2602,5 +2733,91 @@ mod tests {
             super::Ellipsize::None,
         );
         assert!(ch.line_count() > 1, "Char always breaks between clusters");
+    }
+
+    #[test]
+    fn ellipsizing_fits_the_limit_and_keeps_the_named_end() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let source = "alpha bravo charlie delta";
+        let full = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        let limit = full.size().0 * 0.5;
+
+        for mode in [
+            super::Ellipsize::Start,
+            super::Ellipsize::Middle,
+            super::Ellipsize::End,
+        ] {
+            let cut = super::TextLayout::build(
+                source,
+                &style,
+                &mut db,
+                Some(limit),
+                super::WrapMode::None,
+                mode,
+            );
+            assert_eq!(cut.line_count(), 1, "{mode:?} does not add lines");
+            assert!(
+                cut.size().0 <= limit + 0.01,
+                "{mode:?} must fit {limit}px, got {}",
+                cut.size().0
+            );
+            assert_eq!(cut.text(), source, "{mode:?} leaves the source intact");
+            assert!(
+                cut.display_line(0).contains('\u{2026}'),
+                "{mode:?} inserts an ellipsis: {:?}",
+                cut.display_line(0)
+            );
+        }
+
+        let end = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            Some(limit),
+            super::WrapMode::None,
+            super::Ellipsize::End,
+        );
+        assert!(
+            end.display_line(0).starts_with("alpha"),
+            "End keeps the head: {:?}",
+            end.display_line(0)
+        );
+        let start = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            Some(limit),
+            super::WrapMode::None,
+            super::Ellipsize::Start,
+        );
+        assert!(
+            start.display_line(0).ends_with("delta"),
+            "Start keeps the tail: {:?}",
+            start.display_line(0)
+        );
+    }
+
+    #[test]
+    fn a_limit_narrower_than_the_ellipsis_yields_the_ellipsis_alone() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let cut = super::TextLayout::build(
+            "alpha bravo",
+            &style,
+            &mut db,
+            Some(0.5),
+            super::WrapMode::None,
+            super::Ellipsize::End,
+        );
+        assert_eq!(cut.display_line(0), "\u{2026}", "never an empty display");
+        assert_eq!(cut.line_count(), 1);
     }
 }
