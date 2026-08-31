@@ -11,7 +11,7 @@ mod support;
 use std::time::Duration;
 
 use icedtea_compositor::dbus::DbCommand;
-use icedtea_harness::{Compositor, ScreencopyClient, VirtualKeyboardClient};
+use icedtea_harness::{Compositor, ScreencopyClient, VirtualKeyboardClient, VirtualPointerClient};
 use support::{
     PROBE_BG, PROBE_ENTRY_BG, matches, pixel_at, probe_report, probe_theme, spawn_window_probe,
     wait_for_report_line,
@@ -405,5 +405,99 @@ fn a_held_key_repeats_through_pump_and_types_more_than_one_glyph() {
     assert!(
         last.chars().all(|c| c == 'h'),
         "every repeated glyph should be `h`: {last:?}"
+    );
+}
+
+const BTN_LEFT: u32 = 0x110;
+
+#[test]
+fn a_popup_opened_from_a_menubutton_takes_the_grab_and_is_dismissed_outside_it() {
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let socket = compositor.socket_path().to_string_lossy().to_string();
+    // The virtual pointer must exist *before* the probe connects: a headless
+    // seat has no `wl_seat.pointer` capability until an input device shows up,
+    // and the probe binds `wl_pointer` only from the `wl_seat.capabilities`
+    // event it gets during `Window::open`'s own opening roundtrips. Spawning
+    // the pointer first (as every compositor-side popup test already does,
+    // e.g. `compositor/tests/popups.rs`'s own tests) means that capability is
+    // already advertised by the probe's first roundtrip, so its `wl_pointer`
+    // exists before any click can race it. Spawning it after, as this test
+    // originally did, loses that race deterministically: the click's button
+    // reaches the compositor and is delivered against the seat's focused
+    // client before the probe has dispatched the *second*, late
+    // `wl_seat.capabilities` the new device triggers and called
+    // `get_pointer` in response, so the client's `pointers` list is still
+    // empty when `wlr_seat_pointer_notify_button` looks it up and the button
+    // is silently dropped -- confirmed with a throwaway
+    // `ICEDTEA_DEBUG_POINTER_BUTTON` probe in the `wlr` crate's
+    // `on_pointer_button` (reverted, not part of this change) that printed
+    // `pointers_in_client=0` for exactly this ordering.
+    let (output_w, output_h) = compositor.output_size();
+    let mut pointer = VirtualPointerClient::spawn(&socket);
+    let _probe = spawn_window_probe(&socket, "menu", theme.path(), report.path());
+    wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
+        .expect("a first configure");
+    let window = compositor
+        .snapshot()
+        .windows
+        .into_iter()
+        .find(|w| w.app_id == "org.icedtea.WindowProbe")
+        .expect("the probe's window");
+    compositor.send(DbCommand::Focus(window.id));
+
+    // Click on the menubutton: the probe opens its popup with the serial that
+    // press mints, which is what makes the grab legal.
+    //
+    // Reconciled from the plan's literal `width - 50, TITLE_BAR_HEIGHT + 17`:
+    // that assumed the menubutton sits flush against the box's trailing
+    // edge, but the retained tree's default `box` lays out two
+    // natural-width children (`entry`, `menubutton`) as a centered group
+    // rather than stretching the entry to fill the row, so the menubutton
+    // lands well short of the frame's right edge. Measured directly from the
+    // probe's own `LayoutTree::allocation` for this theme and node tree: a
+    // content-relative border box of `(370, 169, 100, 34)`; click its
+    // center.
+    let click = (
+        f64::from(window.geometry.x + 420),
+        f64::from(window.geometry.y + TITLE_BAR_HEIGHT + 186),
+    );
+    pointer.motion_absolute(click.0, click.1, output_w as u32, output_h as u32);
+    pointer.frame();
+    pointer.button(BTN_LEFT, true);
+    pointer.frame();
+    pointer.button(BTN_LEFT, false);
+    pointer.frame();
+    pointer.pump();
+
+    let opened = wait_for_report_line(report.path(), "popup-", Duration::from_secs(10))
+        .expect("the probe never reported a popup");
+    assert_eq!(
+        opened,
+        "popup-open",
+        "opening the popup failed: {:?}",
+        probe_report(report.path())
+    );
+
+    // A click well outside the popup dismisses it: the compositor owns that
+    // rule for a grabbing popup, and the client learns about it through
+    // xdg_popup.popup_done.
+    pointer.motion_absolute(
+        4.0,
+        f64::from(output_h - 4),
+        output_w as u32,
+        output_h as u32,
+    );
+    pointer.frame();
+    pointer.button(BTN_LEFT, true);
+    pointer.frame();
+    pointer.button(BTN_LEFT, false);
+    pointer.frame();
+    pointer.pump();
+    assert!(
+        wait_for_report_line(report.path(), "popup-done", Duration::from_secs(10)).is_some(),
+        "the grab did not dismiss the popup: {:?}",
+        probe_report(report.path())
     );
 }

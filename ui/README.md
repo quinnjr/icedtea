@@ -287,3 +287,31 @@ themes, redistributed under the LGPL-2.1-or-later. See
 [`themes/README.md`](themes/README.md). `tests/fixtures/gtk4.22-css-properties.txt`
 is a transcription of GTK 4.22's CSS property reference, with the doc URL in its
 header.
+
+## M3 Part 3 — the window and event layer
+
+`icedtea_ui::window` is one Wayland client per window: a `Surface` in one of
+three roles (`xdg_toplevel`, `zwlr_layer_surface_v1`, `xdg_popup`), a retained
+`Node` tree with its `LayoutTree`, `AnimationState` and `StyleMap`, and a
+bounded pump that hands up a flat `InputEvent` stream.
+
+- **Keyboard** — `window::keyboard` compiles the compositor's keymap with
+  `libxkbcommon`, runs the compose table, reports the modifiers a keysym
+  consumed (so `!` matches a plain-`!` accelerator), and owns the repeat timer
+  xkbcommon does not have.
+- **Pointer** — `window::pointer` hit-tests the retained tree in reverse paint
+  order, mirrors the compositor's implicit grab client-side, and coasts finger
+  scrolls kinetically.
+- **Focus** — `window::focus` sorts candidates *geometrically*, as GTK's
+  `gtk_widget_focus_sort` does, and implements GTK's `:focus-visible` rule:
+  visible by default, hidden by a pointer click, shown again by a key that
+  moved the focus.
+- **Selection** — `window::selection` offers and reads
+  `text/plain;charset=utf-8` on `wl_data_device` and the primary selection.
+
+M1's `LayerWindow` is unchanged, at `window::layer` and still reachable as
+`wayland::LayerWindow`; the `themed-button` demo and its pixel gate run on it
+exactly as before.
+
+Not here: widgets (P5/P6), the reactive loop (P4), icons (P7), IME, drag and
+drop, client-side cursor themes.
