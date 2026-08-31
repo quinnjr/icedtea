@@ -1259,8 +1259,14 @@ impl TextLayout {
 }
 
 impl TextLayout {
-    /// Break one paragraph into line ranges. Task 2 replaces the body with the
-    /// real wrapping; `WrapMode::None` is final and is what this emits.
+    /// Break one paragraph into line ranges that respect `limit`.
+    ///
+    /// `Word` breaks only at UAX #14 opportunities (`unicode_linebreak`), which
+    /// is what Pango does; `Char` breaks between grapheme clusters; `WordChar`
+    /// prefers a word break and falls back to clusters for a word that cannot
+    /// fit a whole line on its own. Trailing whitespace at a break is dropped
+    /// from the line's inked range, as Pango does, so a wrapped line's width is
+    /// measured without it.
     fn break_paragraph(
         &self,
         para: std::ops::Range<usize>,
@@ -1270,8 +1276,128 @@ impl TextLayout {
         wrap: WrapMode,
         out: &mut Vec<std::ops::Range<usize>>,
     ) {
-        let _ = (style, fonts, limit, wrap);
-        out.push(para);
+        let Some(limit) = limit.filter(|_| wrap != WrapMode::None) else {
+            out.push(para);
+            return;
+        };
+        let source = &self.text[para.clone()];
+        if source.is_empty() {
+            out.push(para);
+            return;
+        }
+
+        // Candidate break offsets, relative to `source`, ascending, always
+        // ending at `source.len()`.
+        let candidates: Vec<usize> = match wrap {
+            WrapMode::None => unreachable!("guarded above"),
+            WrapMode::Char => Self::cluster_breaks(source),
+            WrapMode::Word | WrapMode::WordChar => unicode_linebreak::linebreaks(source)
+                .map(|(offset, _)| offset)
+                .collect(),
+        };
+
+        let mut start = 0usize;
+        let mut last_fit: Option<usize> = None;
+        for &candidate in &candidates {
+            if candidate <= start {
+                continue;
+            }
+            let piece = source[start..candidate].trim_end();
+            let width = self.shape_str(piece, style, fonts).metrics.width.max(0.0);
+            if width <= limit {
+                last_fit = Some(candidate);
+                continue;
+            }
+            match last_fit.take() {
+                // A break that fits: take it and retry this candidate.
+                Some(fit) => {
+                    out.push(para.start + start..para.start + source[..fit].trim_end().len());
+                    start = fit;
+                    // Re-measure this candidate against the new line.
+                    let piece = source[start..candidate].trim_end();
+                    let width = self.shape_str(piece, style, fonts).metrics.width.max(0.0);
+                    if width <= limit {
+                        last_fit = Some(candidate);
+                    } else if wrap == WrapMode::WordChar {
+                        start = self.break_overlong(
+                            source, start, candidate, para.start, style, fonts, limit, out,
+                        );
+                    } else {
+                        out.push(para.start + start..para.start + candidate);
+                        start = candidate;
+                    }
+                }
+                // No break fits: the run from `start` is wider than a whole line.
+                None if wrap == WrapMode::WordChar => {
+                    start = self.break_overlong(
+                        source, start, candidate, para.start, style, fonts, limit, out,
+                    );
+                }
+                None => {
+                    out.push(para.start + start..para.start + candidate);
+                    start = candidate;
+                }
+            }
+        }
+        if start < source.len() || out.is_empty() {
+            out.push(para.start + start..para.end);
+        }
+    }
+
+    /// Emit cluster-broken lines for `source[start..end]`, which does not fit
+    /// `limit` at any word boundary. Returns the new `start`.
+    #[allow(clippy::too_many_arguments)]
+    fn break_overlong(
+        &self,
+        source: &str,
+        start: usize,
+        end: usize,
+        base: usize,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        limit: f32,
+        out: &mut Vec<std::ops::Range<usize>>,
+    ) -> usize {
+        let mut cursor = start;
+        let clusters = Self::cluster_breaks(&source[start..end]);
+        let mut last_fit = cursor;
+        for offset in clusters {
+            let candidate = start + offset;
+            let width = self
+                .shape_str(&source[cursor..candidate], style, fonts)
+                .metrics
+                .width
+                .max(0.0);
+            if width <= limit {
+                last_fit = candidate;
+                continue;
+            }
+            // Always consume at least one cluster, or this loops forever.
+            let take = if last_fit > cursor {
+                last_fit
+            } else {
+                candidate
+            };
+            out.push(base + cursor..base + take);
+            cursor = take;
+            last_fit = cursor;
+        }
+        cursor
+    }
+
+    /// Grapheme-cluster boundaries of `s`, ascending, ending at `s.len()`.
+    fn cluster_breaks(s: &str) -> Vec<usize> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let mut out = Vec::new();
+        let mut byte = 0usize;
+        for cluster in s.graphemes(true) {
+            byte += cluster.len();
+            out.push(byte);
+        }
+        if out.last() != Some(&s.len()) {
+            out.push(s.len());
+        }
+        out
     }
 
     /// Shorten one line to `limit` and return `(display string, caret table)`.
@@ -2386,5 +2512,95 @@ mod tests {
         );
         assert_eq!(layout.size().0, 0.0);
         assert!(layout.size().1 > 0.0, "the line box keeps its height");
+    }
+
+    #[test]
+    fn word_wrapping_breaks_at_spaces_and_never_exceeds_the_limit() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let one = super::TextLayout::build(
+            "wrap",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        // Four short words, at a limit that fits about two of them.
+        let limit = one.size().0 * 2.6;
+        let wrapped = super::TextLayout::build(
+            "wrap wrap wrap wrap",
+            &style,
+            &mut db,
+            Some(limit),
+            super::WrapMode::Word,
+            super::Ellipsize::None,
+        );
+        assert!(
+            wrapped.line_count() >= 2,
+            "four words must not fit on one line at {limit}px"
+        );
+        assert!(
+            wrapped.size().0 <= limit + 0.01,
+            "no line may exceed the limit: {} > {limit}",
+            wrapped.size().0
+        );
+        assert_eq!(
+            wrapped.text(),
+            "wrap wrap wrap wrap",
+            "the source is intact"
+        );
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_stays_whole_under_word_and_breaks_under_word_char() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let long = "abcdefghijklmnopqrstuvwxyz";
+        let narrow = super::TextLayout::build(
+            "abcd",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        )
+        .size()
+        .0;
+
+        let word = super::TextLayout::build(
+            long,
+            &style,
+            &mut db,
+            Some(narrow),
+            super::WrapMode::Word,
+            super::Ellipsize::None,
+        );
+        assert_eq!(word.line_count(), 1, "Word never breaks inside a word");
+        assert!(word.size().0 > narrow, "so it overflows instead");
+
+        let word_char = super::TextLayout::build(
+            long,
+            &style,
+            &mut db,
+            Some(narrow),
+            super::WrapMode::WordChar,
+            super::Ellipsize::None,
+        );
+        assert!(
+            word_char.line_count() > 1,
+            "WordChar falls back to a cluster break"
+        );
+        assert!(word_char.size().0 <= narrow + 0.01);
+
+        let ch = super::TextLayout::build(
+            long,
+            &style,
+            &mut db,
+            Some(narrow),
+            super::WrapMode::Char,
+            super::Ellipsize::None,
+        );
+        assert!(ch.line_count() > 1, "Char always breaks between clusters");
     }
 }
