@@ -3858,6 +3858,23 @@ impl VirtualKeyboardClient {
         self.conn.flush().expect("flush key_press");
     }
 
+    /// Press `key` and hold it -- no matching release -- + flush. Pairs with
+    /// [`Self::key_up`]; a caller wanting to exercise repeat-while-held has
+    /// to hold, not press-and-release, since `key_press` never leaves a key
+    /// down long enough for a client's repeat timer to fire.
+    pub fn key_down(&mut self, key: u32) {
+        let time = self.next_time();
+        self.vk.key(time, key, KEY_STATE_PRESSED);
+        self.conn.flush().expect("flush key_down");
+    }
+
+    /// Release a key previously held with [`Self::key_down`] + flush.
+    pub fn key_up(&mut self, key: u32) {
+        let time = self.next_time();
+        self.vk.key(time, key, KEY_STATE_RELEASED);
+        self.conn.flush().expect("flush key_up");
+    }
+
     /// One roundtrip, to keep the injector responsive during a test.
     pub fn pump(&mut self) {
         let _ = self.queue.roundtrip(&mut self.state);

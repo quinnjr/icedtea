@@ -1073,6 +1073,17 @@ impl Window {
                 _ => {}
             }
         }
+        // The repeat clock is ours (see `wl_keyboard::Event::Key`'s dispatch
+        // comment): arm it here, from the last Key event in the batch, so a
+        // held key actually starts repeating. A synthetic repeat event pushed
+        // above by `repeat_due` must not re-arm from itself.
+        if let Some(event) = batch.iter().rev().find_map(|event| match event {
+            InputEvent::Key(key) if !key.repeat => Some(key),
+            _ => None,
+        }) && let Some(keymap) = self.state.keymap.as_mut()
+        {
+            keymap.arm_repeat(event, now);
+        }
         Ok(batch)
     }
 

@@ -344,3 +344,66 @@ fn tab_moves_the_focus_ring_and_it_is_only_visible_after_a_key() {
         "the ring's last reported state should still be the Tab's: {lines:?}"
     );
 }
+
+/// Fix for the Task 17 review finding: `Window::pump` must arm the repeat
+/// timer from the last `Key` event in a batch (`keymap.arm_repeat`), or a
+/// held key never repeats no matter how long it stays down. `key_press`
+/// above always presses-and-releases in one shot, so it can never surface
+/// this; only a real hold (`key_down` without a matching `key_up` until the
+/// end) does.
+#[test]
+fn a_held_key_repeats_through_pump_and_types_more_than_one_glyph() {
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let socket = compositor.socket_path().to_string_lossy().to_string();
+    let _probe = spawn_window_probe(&socket, "entry", theme.path(), report.path());
+    wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
+        .expect("a first configure");
+    let window = compositor
+        .snapshot()
+        .windows
+        .into_iter()
+        .find(|w| w.app_id == "org.icedtea.WindowProbe")
+        .expect("the probe's window");
+
+    // Keyboard capability must exist on the seat before Focus can deliver
+    // `keyboard-enter` (see reconciliation 1 above) -- spawn first.
+    let mut keyboard = VirtualKeyboardClient::spawn(&socket);
+    compositor.send(DbCommand::Focus(window.id));
+    wait_for_report_line(report.path(), "keyboard-enter", Duration::from_secs(10))
+        .expect("the probe never got keyboard focus");
+
+    // The compositor's virtual keyboard gets `wl_keyboard.repeat_info` of
+    // rate 25/delay 600ms (wlr's default, set on every new keyboard device).
+    // Hold `H` well past the initial delay plus a few repeat intervals, so
+    // the probe's `Window::pump` has every chance to arm and then re-fire
+    // the repeat timer.
+    keyboard.key_down(KEY_H);
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        keyboard.pump();
+        std::thread::sleep(Duration::from_millis(50));
+        last = probe_report(report.path())
+            .into_iter()
+            .rev()
+            .find_map(|l| l.strip_prefix("typed ").map(str::to_owned))
+            .unwrap_or_default();
+        if last.len() > 1 {
+            break;
+        }
+    }
+    keyboard.key_up(KEY_H);
+    keyboard.pump();
+
+    assert!(
+        last.len() > 1,
+        "a held key must repeat more than one glyph through Window::pump, got {last:?}: {:?}",
+        probe_report(report.path())
+    );
+    assert!(
+        last.chars().all(|c| c == 'h'),
+        "every repeated glyph should be `h`: {last:?}"
+    );
+}
