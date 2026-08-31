@@ -165,6 +165,43 @@ fn build_instance<Msg: Clone + 'static>(view: View<Msg>, cx: &mut BuildCx<'_>) -
     instance
 }
 
+/// Indices into `values` of a longest strictly-increasing subsequence.
+///
+/// The classic patience-sorting solution: `tails[len - 1]` holds the index of
+/// the smallest possible tail of an increasing run of length `len`, and
+/// `prev` threads each element back to its predecessor so the run can be
+/// reconstructed. O(n log n), which matters for a `ListView` model with
+/// thousands of rows.
+pub(crate) fn longest_increasing_subsequence(values: &[usize]) -> Vec<usize> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut tails: Vec<usize> = Vec::with_capacity(values.len());
+    let mut back: Vec<usize> = vec![usize::MAX; values.len()];
+    for (index, &value) in values.iter().enumerate() {
+        let position = tails.partition_point(|&tail| values[tail] < value);
+        if position > 0 {
+            back[index] = tails[position - 1];
+        }
+        if position == tails.len() {
+            tails.push(index);
+        } else {
+            tails[position] = index;
+        }
+    }
+    let mut out = Vec::with_capacity(tails.len());
+    let mut cursor = *tails.last().expect("values is non-empty");
+    loop {
+        out.push(cursor);
+        if back[cursor] == usize::MAX {
+            break;
+        }
+        cursor = back[cursor];
+    }
+    out.reverse();
+    out
+}
+
 /// Reconcile one level: diff `next` against `prev`, mutating `prev` in place
 /// into this frame's instance list, and return the ops applied **at this
 /// level** (a `Recurse` stands for the whole child call).
@@ -226,6 +263,16 @@ pub fn reconcile<Msg: Clone + 'static>(
         }
     }
 
+    // Which reused children need no `Move`: the longest run whose previous
+    // positions are already ascending. Everything outside it moves, and
+    // that is the minimum — `Op::Move` is the expensive op, because
+    // `Node::insert_child` reparents and dirties a restyle.
+    let reused: Vec<usize> = matches.iter().flatten().copied().collect();
+    let stable: std::collections::HashSet<usize> = longest_increasing_subsequence(&reused)
+        .into_iter()
+        .map(|position| reused[position])
+        .collect();
+
     // 3. Build this frame's list.
     let mut built: Vec<Instance<Msg>> = Vec::with_capacity(next.len());
     for (index, view) in next.into_iter().enumerate() {
@@ -242,7 +289,7 @@ pub fn reconcile<Msg: Clone + 'static>(
                 instance.props = view.props;
                 instance.handlers = view.handlers;
                 ops.push(Op::SetHandlers { index });
-                if from != index {
+                if !stable.contains(&from) {
                     ops.push(Op::Move { from, to: index });
                 }
                 let node = instance.node.clone();
@@ -645,5 +692,114 @@ mod tests {
             .expect("the nested instance is findable");
         assert_eq!(found.kind, Kind::Label);
         assert!(prev[0].find(&Node::new("stranger")).is_none());
+    }
+
+    #[test]
+    fn lis_returns_the_longest_run_and_prefers_the_earlier_one_on_a_tie() {
+        assert_eq!(longest_increasing_subsequence(&[]), Vec::<usize>::new());
+        assert_eq!(longest_increasing_subsequence(&[5]), vec![0]);
+        assert_eq!(
+            longest_increasing_subsequence(&[0, 1, 2, 3]),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(longest_increasing_subsequence(&[3, 2, 1, 0]), vec![3]);
+        // 2, 3, 5 (indices 1, 2, 4) is the longest run in 4 2 3 1 5.
+        assert_eq!(
+            longest_increasing_subsequence(&[4, 2, 3, 1, 5]),
+            vec![1, 2, 4]
+        );
+    }
+
+    #[test]
+    fn moving_one_child_to_the_front_emits_exactly_one_move() {
+        let mut f = Fixture::new();
+        let parent = Node::new("window");
+        let mut prev: Vec<Instance<Msg>> = Vec::new();
+        let rows = |order: [&str; 3]| {
+            order
+                .into_iter()
+                .map(|k| labelled(Kind::Label, k, k))
+                .collect::<Vec<_>>()
+        };
+        reconcile(&parent, &mut prev, rows(["a", "b", "c"]), &mut f.cx());
+        let a = prev[0].node.clone();
+        let b = prev[1].node.clone();
+        let c = prev[2].node.clone();
+
+        let ops = reconcile(&parent, &mut prev, rows(["c", "a", "b"]), &mut f.cx());
+        let moves: Vec<&Op> = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Move { .. }))
+            .collect();
+        assert_eq!(
+            moves,
+            vec![&Op::Move { from: 2, to: 0 }],
+            "a rotation by one must cost one Move, not three: {ops:?}"
+        );
+        // Identity survived, and the node order followed.
+        assert!(prev[0].node.ptr_eq(&c));
+        assert!(prev[1].node.ptr_eq(&a));
+        assert!(prev[2].node.ptr_eq(&b));
+        assert_eq!(
+            parent
+                .children()
+                .iter()
+                .map(|n| n.ptr_eq(&c) as u8 * 3 + n.ptr_eq(&a) as u8 + n.ptr_eq(&b) as u8 * 2)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
+    }
+
+    #[test]
+    fn a_reversal_moves_everything_but_one() {
+        let mut f = Fixture::new();
+        let parent = Node::new("window");
+        let mut prev: Vec<Instance<Msg>> = Vec::new();
+        let rows = |order: [&str; 4]| {
+            order
+                .into_iter()
+                .map(|k| labelled(Kind::Label, k, k))
+                .collect::<Vec<_>>()
+        };
+        reconcile(&parent, &mut prev, rows(["a", "b", "c", "d"]), &mut f.cx());
+        let ops = reconcile(&parent, &mut prev, rows(["d", "c", "b", "a"]), &mut f.cx());
+        let moves = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Move { .. }))
+            .count();
+        assert_eq!(moves, 3, "a full reversal keeps exactly one child in place");
+    }
+
+    #[test]
+    fn a_pure_insertion_in_the_middle_moves_nothing() {
+        let mut f = Fixture::new();
+        let parent = Node::new("window");
+        let mut prev: Vec<Instance<Msg>> = Vec::new();
+        reconcile(
+            &parent,
+            &mut prev,
+            vec![
+                labelled(Kind::Label, "a", "a"),
+                labelled(Kind::Label, "c", "c"),
+            ],
+            &mut f.cx(),
+        );
+        let ops = reconcile(
+            &parent,
+            &mut prev,
+            vec![
+                labelled(Kind::Label, "a", "a"),
+                labelled(Kind::Label, "b", "b"),
+                labelled(Kind::Label, "c", "c"),
+            ],
+            &mut f.cx(),
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, Op::Move { .. })),
+            "an insertion emitted a Move: {ops:?}"
+        );
+        assert!(ops.contains(&Op::Insert { index: 1 }));
+        assert_eq!(prev.len(), 3);
+        assert_eq!(names(&parent).len(), 3);
     }
 }
