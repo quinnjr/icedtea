@@ -223,9 +223,340 @@ fn styles_equal(a: &ComputedStyle, b: &ComputedStyle) -> bool {
     crate::css::registry::longhands().all(|prop| a.raw(prop) == b.raw(prop))
 }
 
+use crate::layout::{BoxDirection, Container, LayoutError, LayoutTree, Measure};
+use crate::view::{Kind, Prop, PropName, Props};
+
+/// `PropName::Orientation`'s `Prop::Enum` discriminant for horizontal.
+pub const ORIENTATION_HORIZONTAL: u16 = 0;
+/// `PropName::Orientation`'s `Prop::Enum` discriminant for vertical.
+pub const ORIENTATION_VERTICAL: u16 = 1;
+
+/// The layout container a kind's node uses.
+///
+/// M2's `Container` has exactly `Box` and `Leaf`; P6 (contract §3.6) adds
+/// `Grid` and `Center` and rewires `Grid`/`CenterBox` here. Until then every
+/// container is a box, which is what GTK's own `GtkBoxLayout` gives most of
+/// them anyway.
+#[must_use]
+pub fn container_for(kind: Kind, props: &Props, has_children: bool) -> Container {
+    if !has_children {
+        return Container::Leaf;
+    }
+    let default = match kind {
+        // Everything that stacks its children top to bottom in GTK.
+        Kind::Window
+        | Kind::ShortcutsWindow
+        | Kind::AboutDialog
+        | Kind::AlertDialog
+        | Kind::ColorDialog
+        | Kind::FontDialog
+        | Kind::Popover
+        | Kind::PopoverMenu
+        | Kind::PopoverMenuItem
+        | Kind::ListBox
+        | Kind::ListBoxRow
+        | Kind::ListView
+        | Kind::ColumnView
+        | Kind::Notebook
+        | Kind::NotebookTab
+        | Kind::Stack
+        | Kind::StackPage
+        | Kind::StackSidebar
+        | Kind::ScrolledWindow
+        | Kind::Frame
+        | Kind::Overlay
+        | Kind::Expander
+        | Kind::SearchBar
+        | Kind::TextView
+        | Kind::Calendar
+        | Kind::InfoBar
+        | Kind::DropDown
+        | Kind::EditableLabel => BoxDirection::Column,
+        // GtkBox, GtkHeaderBar, GtkActionBar, GtkCenterBox, the button
+        // family and the entry family are all horizontal by default.
+        _ => BoxDirection::Row,
+    };
+    let direction = match props.get(PropName::Orientation) {
+        Some(Prop::Enum(ORIENTATION_HORIZONTAL)) => BoxDirection::Row,
+        Some(Prop::Enum(ORIENTATION_VERTICAL)) => BoxDirection::Column,
+        _ => default,
+    };
+    Container::Box { direction }
+}
+
+/// Sync the retained tree into taffy, write every node's box, and compute.
+///
+/// `available` is the surface's content box: `Some` fixes that axis,
+/// `None` asks for the intrinsic size (`MaxContent`), which is how a popup
+/// or a `width_request`-free toplevel gets measured.
+///
+/// A node with no entry in `styles` is skipped rather than unwrapped: the
+/// restyle walker stops at [`MAX_TREE_DEPTH`], so a pathological tree has
+/// styled and unstyled halves and layout must survive both.
+///
+/// # Errors
+///
+/// [`LayoutError::Unsynced`] if `root` never made it into the tree, or
+/// [`LayoutError::Taffy`] if taffy fails.
+pub fn layout_tree(
+    root: &Node,
+    styles: &StyleMap,
+    containers: &HashMap<NodeAddr, Container>,
+    tree: &mut LayoutTree,
+    env: &ResolveEnv,
+    available: (Option<f32>, Option<f32>),
+    measure: &mut dyn Measure,
+) -> Result<(), LayoutError> {
+    tree.sync(root)?;
+    write_styles(root, styles, containers, tree, env, 0, available);
+    let space = taffy::Size {
+        width: available.0.map_or(
+            taffy::AvailableSpace::MaxContent,
+            taffy::AvailableSpace::Definite,
+        ),
+        height: available.1.map_or(
+            taffy::AvailableSpace::MaxContent,
+            taffy::AvailableSpace::Definite,
+        ),
+    };
+    tree.compute(root, space, measure)
+}
+
+fn write_styles(
+    node: &Node,
+    styles: &StyleMap,
+    containers: &HashMap<NodeAddr, Container>,
+    tree: &mut LayoutTree,
+    env: &ResolveEnv,
+    depth: usize,
+    available: (Option<f32>, Option<f32>),
+) {
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
+    let addr = node_addr(node);
+    if let Some(style) = styles.get(&addr) {
+        let children = node.children();
+        let fallback = if children.is_empty() {
+            Container::Leaf
+        } else {
+            Container::Box {
+                direction: BoxDirection::Row,
+            }
+        };
+        let container = containers.get(&addr).copied().unwrap_or(fallback);
+        // The root is the surface: its allocation is always exactly the
+        // caller-supplied available space, never derived from its content
+        // -- there is no `width`/`height` CSS property to express that
+        // with, so it is floored the same way `window::restyle` does it: a
+        // `min-width`/`min-height` override that `box_sizing: ContentBox`
+        // (an AUTO size) turns into "at least the available space".
+        if depth == 0 {
+            let mut root_floor = crate::anim::Overrides::default();
+            if let Some(w) = available.0 {
+                root_floor.set(
+                    crate::css::registry::Prop::MinWidth,
+                    crate::css::value::Value::Length(crate::css::value::Length::px(w)),
+                );
+            }
+            if let Some(h) = available.1 {
+                root_floor.set(
+                    crate::css::registry::Prop::MinHeight,
+                    crate::css::value::Value::Length(crate::css::value::Length::px(h)),
+                );
+            }
+            if root_floor.is_empty() {
+                tree.set_style(node, style, container, env);
+            } else {
+                let floored = style.with_overrides(&root_floor).into_owned();
+                tree.set_style(node, &floored, container, env);
+            }
+        } else {
+            tree.set_style(node, style, container, env);
+        }
+        for child in children {
+            write_styles(&child, styles, containers, tree, env, depth + 1, available);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_childless_node_is_a_leaf_whatever_its_kind() {
+        use crate::view::Kind;
+        assert_eq!(
+            container_for(Kind::Box, &crate::view::Props::default(), false),
+            Container::Leaf
+        );
+        assert_eq!(
+            container_for(Kind::Label, &crate::view::Props::default(), false),
+            Container::Leaf
+        );
+    }
+
+    #[test]
+    fn gtk_s_default_orientations_are_reproduced_and_overridable() {
+        use crate::view::{Kind, Prop, PropName, Props};
+        let empty = Props::default();
+        // GtkBox is horizontal by default.
+        assert_eq!(
+            container_for(Kind::Box, &empty, true),
+            Container::Box {
+                direction: BoxDirection::Row
+            }
+        );
+        // A window stacks its children.
+        assert_eq!(
+            container_for(Kind::Window, &empty, true),
+            Container::Box {
+                direction: BoxDirection::Column
+            }
+        );
+        assert_eq!(
+            container_for(Kind::ListBox, &empty, true),
+            Container::Box {
+                direction: BoxDirection::Column
+            }
+        );
+
+        let mut vertical = Props::default();
+        vertical.set(PropName::Orientation, Prop::Enum(ORIENTATION_VERTICAL));
+        assert_eq!(
+            container_for(Kind::Box, &vertical, true),
+            Container::Box {
+                direction: BoxDirection::Column
+            }
+        );
+
+        let mut horizontal = Props::default();
+        horizontal.set(PropName::Orientation, Prop::Enum(ORIENTATION_HORIZONTAL));
+        assert_eq!(
+            container_for(Kind::Window, &horizontal, true),
+            Container::Box {
+                direction: BoxDirection::Row
+            }
+        );
+    }
+
+    #[test]
+    fn the_layout_walker_allocates_every_styled_node() {
+        let (sheet, env, window, button, label) = fixture();
+        let mut styles = StyleMap::new();
+        let mut anims = Animations::new();
+        restyle_tree(
+            &window,
+            &sheet,
+            &env,
+            &mut styles,
+            &mut anims,
+            Duration::ZERO,
+        );
+
+        let mut containers: HashMap<NodeAddr, Container> = HashMap::new();
+        containers.insert(
+            node_addr(&window),
+            Container::Box {
+                direction: BoxDirection::Column,
+            },
+        );
+        containers.insert(
+            node_addr(&button),
+            Container::Box {
+                direction: BoxDirection::Row,
+            },
+        );
+        containers.insert(node_addr(&label), Container::Leaf);
+
+        let mut tree = LayoutTree::new();
+        let mut measure = crate::layout::FixedMeasure(taffy::Size {
+            width: 40.0,
+            height: 16.0,
+        });
+        layout_tree(
+            &window,
+            &styles,
+            &containers,
+            &mut tree,
+            &env,
+            (Some(200.0), None),
+            &mut measure,
+        )
+        .expect("the tree lays out");
+
+        let window_alloc = tree.allocation(&window).expect("window allocation");
+        let button_alloc = tree.allocation(&button).expect("button allocation");
+        let label_alloc = tree.allocation(&label).expect("label allocation");
+        assert!((window_alloc.border_box.width - 200.0).abs() < 0.5);
+        assert!(label_alloc.border_box.width >= 40.0);
+        assert!(
+            button_alloc.border_box.height >= label_alloc.border_box.height,
+            "the label overflowed its button"
+        );
+        // Allocations are absolute, so a nested node is offset by its parent.
+        assert!(label_alloc.border_box.y >= button_alloc.border_box.y);
+    }
+
+    #[test]
+    fn a_node_missing_from_the_container_map_is_laid_out_as_a_leaf() {
+        let (sheet, env, window, _button, _label) = fixture();
+        let mut styles = StyleMap::new();
+        let mut anims = Animations::new();
+        restyle_tree(
+            &window,
+            &sheet,
+            &env,
+            &mut styles,
+            &mut anims,
+            Duration::ZERO,
+        );
+
+        // An empty map: nothing has been reconciled yet. This must not panic
+        // and must still produce a laid-out tree.
+        let containers: HashMap<NodeAddr, Container> = HashMap::new();
+        let mut tree = LayoutTree::new();
+        let mut measure = crate::layout::FixedMeasure(taffy::Size {
+            width: 8.0,
+            height: 8.0,
+        });
+        layout_tree(
+            &window,
+            &styles,
+            &containers,
+            &mut tree,
+            &env,
+            (Some(100.0), Some(50.0)),
+            &mut measure,
+        )
+        .expect("an unmapped tree still lays out");
+        assert!(tree.allocation(&window).is_some());
+    }
+
+    #[test]
+    fn an_unstyled_root_is_an_error_not_a_panic() {
+        let env = ResolveEnv::default();
+        let orphan = Node::new("window");
+        let styles = StyleMap::new();
+        let containers: HashMap<NodeAddr, Container> = HashMap::new();
+        let mut tree = LayoutTree::new();
+        let mut measure = crate::layout::FixedMeasure(taffy::Size::ZERO);
+        // `sync` inserts the node, so this succeeds; what must not happen is
+        // an unwrap on a missing style.
+        assert!(
+            layout_tree(
+                &orphan,
+                &styles,
+                &containers,
+                &mut tree,
+                &env,
+                (None, None),
+                &mut measure,
+            )
+            .is_ok()
+        );
+    }
     use crate::anim::ManualClock;
     use crate::css::node::{Node, PseudoStates};
     use crate::css::registry::Prop as CssProp;
