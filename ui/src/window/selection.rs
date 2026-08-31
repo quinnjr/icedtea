@@ -106,7 +106,24 @@ pub(crate) struct ClipboardShared {
 /// Built lazily by [`super::Window::clipboard`] rather than eagerly by
 /// `Window::open`: a headless/offscreen test harness that never touches the
 /// clipboard should never pay for (or fail on) a global it does not need.
+///
+/// A [`Clipboard::offscreen`] instance has no transport at all: it keeps the
+/// same four methods over two in-process slots, for `App::run_offscreen`,
+/// which has no compositor to talk to (contract deviation D10).
 pub struct Clipboard {
+    transport: Transport,
+}
+
+/// Where a [`Clipboard`]'s text actually lives.
+enum Transport {
+    /// A real connection: sources, offers and pipes.
+    Wayland(Wayland),
+    /// No connection: two in-process slots.
+    Offscreen(Offscreen),
+}
+
+/// The Wayland objects a connected clipboard drives.
+struct Wayland {
     conn: Connection,
     qh: QueueHandle<WindowState>,
     manager: wl_data_device_manager::WlDataDeviceManager,
@@ -115,6 +132,13 @@ pub struct Clipboard {
         Option<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1>,
     primary_device: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
     shared: Rc<RefCell<ClipboardShared>>,
+}
+
+/// The two slots a compositor-less clipboard round-trips through.
+#[derive(Default)]
+struct Offscreen {
+    selection: Option<String>,
+    primary: Option<String>,
 }
 
 impl Clipboard {
@@ -139,13 +163,28 @@ impl Clipboard {
             .as_ref()
             .map(|manager| manager.get_device(seat, &qh, ()));
         Self {
-            conn,
-            qh,
-            manager,
-            device,
-            primary_manager,
-            primary_device,
-            shared,
+            transport: Transport::Wayland(Wayland {
+                conn,
+                qh,
+                manager,
+                device,
+                primary_manager,
+                primary_device,
+                shared,
+            }),
+        }
+    }
+
+    /// A clipboard with no Wayland connection: an in-process buffer that
+    /// `copy`/`paste`/`set_primary`/`primary` round-trip through.
+    ///
+    /// `App::run_offscreen` (contract §4.7) runs the whole loop with no
+    /// compositor, and every `EventCx` requires a `&mut Clipboard`. Each
+    /// method keeps its signature; only the transport changes.
+    #[must_use]
+    pub fn offscreen() -> Clipboard {
+        Clipboard {
+            transport: Transport::Offscreen(Offscreen::default()),
         }
     }
 
@@ -153,25 +192,36 @@ impl Clipboard {
     /// [`TEXT_MIME`], hold `text` to answer its `Send`, and `set_selection` it
     /// with `serial`.
     pub fn copy(&mut self, text: &str, serial: u32) {
-        let source = self.manager.create_data_source(&self.qh, ());
+        let wl = match &mut self.transport {
+            Transport::Wayland(wl) => wl,
+            Transport::Offscreen(slots) => {
+                slots.selection = Some(text.to_string());
+                return;
+            }
+        };
+        let source = wl.manager.create_data_source(&wl.qh, ());
         source.offer(TEXT_MIME.to_string());
-        self.device.set_selection(Some(&source), serial);
+        wl.device.set_selection(Some(&source), serial);
         {
-            let mut shared = self.shared.borrow_mut();
+            let mut shared = wl.shared.borrow_mut();
             shared.payload = text.to_string();
             shared.source = Some(source);
         }
-        let _ = self.conn.flush();
+        let _ = wl.conn.flush();
     }
 
     /// Read the current clipboard offer, if any, blocking on its pipe until
     /// EOF or `deadline`.
     #[must_use]
     pub fn paste(&mut self, deadline: Duration) -> Option<String> {
-        let offer = self.shared.borrow().offer.clone()?;
+        let wl = match &mut self.transport {
+            Transport::Wayland(wl) => wl,
+            Transport::Offscreen(slots) => return slots.selection.clone(),
+        };
+        let offer = wl.shared.borrow().offer.clone()?;
         let (read, write) = std::io::pipe().ok()?;
         offer.receive(TEXT_MIME.to_string(), write.as_fd());
-        let _ = self.conn.flush();
+        let _ = wl.conn.flush();
         drop(write);
         read_offer_fd(read.into(), deadline)
     }
@@ -181,28 +231,39 @@ impl Clipboard {
     /// `zwp_primary_selection_device_manager_v1`: unlike the clipboard proper,
     /// primary selection is a convenience some compositors omit.
     pub fn set_primary(&mut self, text: &str, serial: u32) {
-        let (Some(manager), Some(device)) = (&self.primary_manager, &self.primary_device) else {
+        let wl = match &mut self.transport {
+            Transport::Wayland(wl) => wl,
+            Transport::Offscreen(slots) => {
+                slots.primary = Some(text.to_string());
+                return;
+            }
+        };
+        let (Some(manager), Some(device)) = (&wl.primary_manager, &wl.primary_device) else {
             tracing::warn!("no zwp_primary_selection_device_manager_v1; set_primary is a no-op");
             return;
         };
-        let source = manager.create_source(&self.qh, ());
+        let source = manager.create_source(&wl.qh, ());
         source.offer(TEXT_MIME.to_string());
         device.set_selection(Some(&source), serial);
         {
-            let mut shared = self.shared.borrow_mut();
+            let mut shared = wl.shared.borrow_mut();
             shared.primary_payload = text.to_string();
             shared.primary_source = Some(source);
         }
-        let _ = self.conn.flush();
+        let _ = wl.conn.flush();
     }
 
     /// As [`Clipboard::paste`], but for the primary selection.
     #[must_use]
     pub fn primary(&mut self, deadline: Duration) -> Option<String> {
-        let offer = self.shared.borrow().primary_offer.clone()?;
+        let wl = match &mut self.transport {
+            Transport::Wayland(wl) => wl,
+            Transport::Offscreen(slots) => return slots.primary.clone(),
+        };
+        let offer = wl.shared.borrow().primary_offer.clone()?;
         let (read, write) = std::io::pipe().ok()?;
         offer.receive(TEXT_MIME.to_string(), write.as_fd());
-        let _ = self.conn.flush();
+        let _ = wl.conn.flush();
         drop(write);
         read_offer_fd(read.into(), deadline)
     }
@@ -210,14 +271,20 @@ impl Clipboard {
     /// Whether a clipboard offer is currently available to [`Clipboard::paste`].
     #[must_use]
     pub fn has_selection(&self) -> bool {
-        self.shared.borrow().offer.is_some()
+        match &self.transport {
+            Transport::Wayland(wl) => wl.shared.borrow().offer.is_some(),
+            Transport::Offscreen(slots) => slots.selection.is_some(),
+        }
     }
 
     /// Whether a primary-selection offer is currently available to
     /// [`Clipboard::primary`].
     #[must_use]
     pub fn has_primary(&self) -> bool {
-        self.shared.borrow().primary_offer.is_some()
+        match &self.transport {
+            Transport::Wayland(wl) => wl.shared.borrow().primary_offer.is_some(),
+            Transport::Offscreen(slots) => slots.primary.is_some(),
+        }
     }
 }
 

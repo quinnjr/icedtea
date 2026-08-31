@@ -10,9 +10,15 @@ use crate::css::value::image::IconRef;
 use crate::layout::{Align, Rect};
 
 pub mod builders;
+pub mod cmd;
+pub mod controller;
+pub mod reconcile;
 pub mod render;
 
 pub use builders::widget;
+pub use cmd::Cmd;
+pub use controller::{Controller, Event, EventCx, Phase};
+pub use reconcile::{BuildCx, Op};
 pub use render::{Animations, NodeAddr, StyleMap, node_addr};
 
 /// A typed property name, never a string — contract §0's "nothing names a
