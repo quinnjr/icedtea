@@ -31,6 +31,7 @@ use crate::css::value::{
     FeatureSetting, FontFamily, FontStyle, FontWeight, GenericFamily, Keyword, Length, LengthUnit,
     LineHeight, Rgba, Value, VariationSetting,
 };
+use crate::layout::Rect;
 
 /// Well-known UI sans-serif faces, in preference order.
 pub const FONT_CANDIDATES: &[&str] = &[
@@ -1079,10 +1080,6 @@ pub enum WrapMode {
 /// One laid-out line of a [`TextLayout`].
 struct ShapedLine {
     /// Byte range of this line within the layout's own `text`.
-    ///
-    /// Unread until a later task's `byte_at`/`caret_rect` land; kept now so
-    /// [`TextLayout::shape_line`] doesn't have to be re-plumbed to add it.
-    #[allow(dead_code)]
     range: std::ops::Range<usize>,
     /// The shaped run for `text[range]` (already ellipsized, if it was).
     shaped: Rc<ShapedText>,
@@ -1090,9 +1087,6 @@ struct ShapedLine {
     /// `(byte offset in the layout's text, x advance from the line's left edge)`.
     /// The first entry is `(range.start, 0.0)` and the last
     /// `(range.end, line width)`, so a caret query is a lookup, never a reshape.
-    ///
-    /// Unread until a later task's `byte_at`/`caret_rect` land (same reason).
-    #[allow(dead_code)]
     carets: Vec<(usize, f32)>,
     /// Top of the line box, relative to the layout's origin.
     top: f32,
@@ -1272,6 +1266,110 @@ impl TextLayout {
                 canvas.draw_text_blob(blob, ox, oy + line.top + line.baseline, &paint);
             }
         }
+    }
+
+    /// Which line `byte` sits on. Clamped to the last line.
+    #[must_use]
+    pub fn line_of(&self, byte: usize) -> usize {
+        for (index, line) in self.lines.iter().enumerate() {
+            if byte < line.range.end {
+                return index;
+            }
+        }
+        self.lines.len().saturating_sub(1)
+    }
+
+    /// The caret rectangle for `byte`: a zero-width, line-box-tall sliver at
+    /// the cluster boundary at or before `byte`.
+    ///
+    /// A `byte` inside a cluster snaps to that cluster's start, which is what
+    /// every caret consumer wants — a caret never sits inside a grapheme.
+    #[must_use]
+    pub fn caret_rect(&self, byte: usize) -> Rect {
+        let index = self.line_of(byte);
+        let Some(line) = self.lines.get(index) else {
+            return Rect::zero();
+        };
+        let mut x = 0.0f32;
+        for &(at, advance) in &line.carets {
+            if at <= byte {
+                x = advance;
+            } else {
+                break;
+            }
+        }
+        Rect::new(x, line.top, 0.0, line.height)
+    }
+
+    /// The byte offset nearest `point`, in the layout's own coordinate space.
+    ///
+    /// A point above the first line lands on byte 0, below the last on the end
+    /// of the text; horizontally it snaps to the nearer of the two cluster
+    /// boundaries it falls between, which is what a click in the right half of
+    /// a glyph means.
+    #[must_use]
+    pub fn byte_at(&self, point: (f32, f32)) -> usize {
+        let (x, y) = (
+            if point.0.is_finite() { point.0 } else { 0.0 },
+            if point.1.is_finite() { point.1 } else { 0.0 },
+        );
+        let Some(line) = self
+            .lines
+            .iter()
+            .find(|line| y < line.top + line.height)
+            .or_else(|| self.lines.last())
+        else {
+            return 0;
+        };
+        let mut best = line.carets.first().map_or(0, |entry| entry.0);
+        let mut best_delta = f32::INFINITY;
+        for &(at, advance) in &line.carets {
+            let delta = (advance - x).abs();
+            if delta < best_delta {
+                best_delta = delta;
+                best = at;
+            }
+        }
+        best
+    }
+
+    /// One rectangle per line covered by `range`, top-first.
+    ///
+    /// An inverted or out-of-range `range` is clamped rather than rejected —
+    /// selection ranges come from pointer drags and key repeats and must never
+    /// panic.
+    #[must_use]
+    pub fn selection_rects(&self, range: std::ops::Range<usize>) -> Vec<Rect> {
+        let start = range.start.min(range.end).min(self.text.len());
+        let end = range.end.max(range.start).min(self.text.len());
+        if start == end {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for line in &self.lines {
+            let from = start.max(line.range.start);
+            let to = end.min(line.range.end);
+            if from >= to {
+                continue;
+            }
+            let x0 = self.advance_in(line, from);
+            let x1 = self.advance_in(line, to);
+            out.push(Rect::new(x0, line.top, (x1 - x0).max(0.0), line.height));
+        }
+        out
+    }
+
+    /// x advance of `byte` within `line`, snapped to a cluster boundary.
+    fn advance_in(&self, line: &ShapedLine, byte: usize) -> f32 {
+        let mut x = 0.0f32;
+        for &(at, advance) in &line.carets {
+            if at <= byte {
+                x = advance;
+            } else {
+                break;
+            }
+        }
+        x
     }
 }
 
@@ -2819,5 +2917,90 @@ mod tests {
         );
         assert_eq!(cut.display_line(0), "\u{2026}", "never an empty display");
         assert_eq!(cut.line_count(), 1);
+    }
+
+    #[test]
+    fn a_caret_round_trips_through_its_own_rect() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "Hello world",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+
+        let zero = layout.caret_rect(0);
+        assert_eq!(zero.x, 0.0, "the caret before the first byte sits at x=0");
+        assert!(zero.height > 0.0, "a caret is a line-height-tall sliver");
+
+        let end = layout.caret_rect("Hello world".len());
+        assert!(
+            (end.x - layout.size().0).abs() < 0.51,
+            "the caret past the last byte sits at the line's width: {} vs {}",
+            end.x,
+            layout.size().0
+        );
+
+        for byte in [0usize, 1, 5, 6, 11] {
+            let rect = layout.caret_rect(byte);
+            let back = layout.byte_at((rect.x + 0.01, rect.y + rect.height / 2.0));
+            assert_eq!(back, byte, "byte_at must invert caret_rect at {byte}");
+        }
+    }
+
+    #[test]
+    fn a_point_past_the_end_of_a_line_lands_on_that_lines_last_byte() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "ab\ncd",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        let first = layout.caret_rect(0);
+        assert_eq!(
+            layout.byte_at((10_000.0, first.y + 1.0)),
+            2,
+            "end of line 1"
+        );
+        assert_eq!(layout.byte_at((-5.0, first.y + 1.0)), 0, "before line 1");
+        assert_eq!(
+            layout.byte_at((10_000.0, 10_000.0)),
+            5,
+            "below everything is the last byte"
+        );
+        assert_eq!(layout.line_of(4), 1, "byte 4 is on the second line");
+    }
+
+    #[test]
+    fn a_selection_yields_one_rect_per_covered_line() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "abc\ndef",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        assert_eq!(
+            layout.selection_rects(0..0).len(),
+            0,
+            "an empty range is empty"
+        );
+        assert_eq!(layout.selection_rects(1..2).len(), 1, "within one line");
+        let across = layout.selection_rects(1..6);
+        assert_eq!(across.len(), 2, "one rect per covered line");
+        assert!(across[0].y < across[1].y, "top-first");
+        assert!(across[0].width > 0.0 && across[1].width > 0.0);
+        // An out-of-range end must be clamped, not panic.
+        assert_eq!(layout.selection_rects(0..99_999).len(), 2);
     }
 }
