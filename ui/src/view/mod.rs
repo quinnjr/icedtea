@@ -495,6 +495,292 @@ impl Props {
     }
 }
 
+/// One variant per in-scope widget, plus the sub-kinds GTK renders as their
+/// own CSS node. Declaration order is contract §5's catalogue order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Kind {
+    // P5 · display
+    Label,
+    Spinner,
+    Statusbar,
+    LevelBar,
+    ProgressBar,
+    InfoBar,
+    Scrollbar,
+    Image,
+    Picture,
+    Separator,
+    TextView,
+    Scale,
+    DrawingArea,
+    WindowControls,
+    Calendar,
+    Popover,
+    // P5 · buttons
+    Button,
+    ToggleButton,
+    LinkButton,
+    CheckButton,
+    MenuButton,
+    Switch,
+    DropDown,
+    ColorDialogButton,
+    ColorDialog,
+    FontDialogButton,
+    FontDialog,
+    // P5 · entries
+    Entry,
+    SearchEntry,
+    PasswordEntry,
+    SpinButton,
+    EditableLabel,
+    // P6 · containers
+    Box,
+    Grid,
+    CenterBox,
+    ScrolledWindow,
+    Paned,
+    Frame,
+    Expander,
+    SearchBar,
+    ActionBar,
+    HeaderBar,
+    Notebook,
+    NotebookTab,
+    Overlay,
+    Stack,
+    StackPage,
+    StackSwitcher,
+    StackSidebar,
+    // P6 · lists
+    ListBox,
+    ListBoxRow,
+    FlowBox,
+    FlowBoxChild,
+    ListView,
+    GridView,
+    ColumnView,
+    ColumnViewColumn,
+    // P6 · menus
+    PopoverMenu,
+    PopoverMenuBar,
+    PopoverMenuItem,
+    // P6 · windows
+    Window,
+    ShortcutsWindow,
+    AboutDialog,
+    AlertDialog,
+}
+
+impl Kind {
+    /// The CSS node name this kind's **root** node carries.
+    ///
+    /// Several kinds share one (`Button`/`ToggleButton`/`LinkButton` →
+    /// `button`; `Box`/`CenterBox` → `box`; the four window kinds →
+    /// `window`), so node-tree fixtures key on `Kind`, never on this string.
+    ///
+    /// Contract deviation D15: §5 names no node for `StackPage` and
+    /// `ColumnViewColumn` (GTK renders neither as a node of its own), so P4
+    /// pins `stackpage` and `button`; P6 may amend via §10.
+    #[must_use]
+    pub fn css_name(self) -> &'static str {
+        match self {
+            Kind::Label => "label",
+            Kind::Spinner => "spinner",
+            Kind::Statusbar => "statusbar",
+            Kind::LevelBar => "levelbar",
+            Kind::ProgressBar => "progressbar",
+            Kind::InfoBar => "infobar",
+            Kind::Scrollbar => "scrollbar",
+            Kind::Image => "image",
+            Kind::Picture => "picture",
+            Kind::Separator => "separator",
+            Kind::TextView => "textview",
+            Kind::Scale => "scale",
+            // GTK sets no CSS name on GtkDrawingArea; the node is
+            // GtkWidget's default.
+            Kind::DrawingArea => "widget",
+            Kind::WindowControls => "windowcontrols",
+            Kind::Calendar => "calendar",
+            Kind::Popover | Kind::PopoverMenu => "popover",
+            Kind::Button | Kind::ToggleButton | Kind::LinkButton => "button",
+            Kind::CheckButton => "checkbutton",
+            Kind::MenuButton => "menubutton",
+            Kind::Switch => "switch",
+            Kind::DropDown => "dropdown",
+            Kind::ColorDialogButton => "colorbutton",
+            Kind::FontDialogButton => "fontbutton",
+            Kind::ColorDialog
+            | Kind::FontDialog
+            | Kind::Window
+            | Kind::ShortcutsWindow
+            | Kind::AboutDialog
+            | Kind::AlertDialog => "window",
+            Kind::Entry | Kind::SearchEntry | Kind::PasswordEntry => "entry",
+            Kind::SpinButton => "spinbutton",
+            Kind::EditableLabel => "editablelabel",
+            Kind::Box | Kind::CenterBox => "box",
+            Kind::Grid => "grid",
+            Kind::ScrolledWindow => "scrolledwindow",
+            Kind::Paned => "paned",
+            Kind::Frame => "frame",
+            Kind::Expander => "expander-widget",
+            Kind::SearchBar => "searchbar",
+            Kind::ActionBar => "actionbar",
+            Kind::HeaderBar => "headerbar",
+            Kind::Notebook => "notebook",
+            Kind::NotebookTab => "tab",
+            Kind::Overlay => "overlay",
+            Kind::Stack => "stack",
+            Kind::StackPage => "stackpage",
+            Kind::StackSwitcher => "stackswitcher",
+            Kind::StackSidebar => "stacksidebar",
+            Kind::ListBox => "list",
+            Kind::ListBoxRow => "row",
+            Kind::FlowBox => "flowbox",
+            Kind::FlowBoxChild => "flowboxchild",
+            Kind::ListView => "listview",
+            Kind::GridView => "gridview",
+            Kind::ColumnView => "columnview",
+            Kind::ColumnViewColumn | Kind::PopoverMenuItem => "button",
+            Kind::PopoverMenuBar => "menubar",
+        }
+    }
+
+    /// Style classes the kind always adds, on top of `css_name`.
+    #[must_use]
+    pub fn base_classes(self) -> &'static [&'static str] {
+        match self {
+            Kind::ToggleButton => &["toggle"],
+            Kind::LinkButton => &["link"],
+            Kind::SearchEntry => &["search"],
+            Kind::PasswordEntry => &["password"],
+            Kind::ColorDialog | Kind::FontDialog => &["dialog"],
+            Kind::AlertDialog => &["dialog", "message"],
+            Kind::Window => &["background"],
+            Kind::ShortcutsWindow => &["shortcuts"],
+            Kind::AboutDialog => &["aboutdialog"],
+            Kind::Popover => &["background"],
+            Kind::PopoverMenu => &["background", "menu"],
+            Kind::PopoverMenuItem => &["model"],
+            Kind::StackSwitcher => &["stack-switcher"],
+            Kind::StackSidebar => &["sidebar"],
+            Kind::Calendar => &["view"],
+            _ => &[],
+        }
+    }
+
+    /// GTK's `focusable` default for this widget class.
+    ///
+    /// A `View` may override it with [`View::focusable`]; this is only the
+    /// starting value the controller writes when the node is built.
+    #[must_use]
+    pub fn is_focusable_by_default(self) -> bool {
+        matches!(
+            self,
+            Kind::Button
+                | Kind::ToggleButton
+                | Kind::LinkButton
+                | Kind::CheckButton
+                | Kind::MenuButton
+                | Kind::Switch
+                | Kind::DropDown
+                | Kind::ColorDialogButton
+                | Kind::FontDialogButton
+                | Kind::Entry
+                | Kind::SearchEntry
+                | Kind::PasswordEntry
+                | Kind::SpinButton
+                | Kind::EditableLabel
+                | Kind::TextView
+                | Kind::Scale
+                | Kind::Calendar
+                | Kind::Expander
+                | Kind::Paned
+                | Kind::Notebook
+                | Kind::NotebookTab
+                | Kind::ListBoxRow
+                | Kind::FlowBoxChild
+                | Kind::ListView
+                | Kind::GridView
+                | Kind::ColumnView
+                | Kind::PopoverMenuItem
+        )
+    }
+
+    /// Every kind, in declaration order.
+    #[must_use]
+    pub fn all() -> &'static [Kind] {
+        &[
+            Kind::Label,
+            Kind::Spinner,
+            Kind::Statusbar,
+            Kind::LevelBar,
+            Kind::ProgressBar,
+            Kind::InfoBar,
+            Kind::Scrollbar,
+            Kind::Image,
+            Kind::Picture,
+            Kind::Separator,
+            Kind::TextView,
+            Kind::Scale,
+            Kind::DrawingArea,
+            Kind::WindowControls,
+            Kind::Calendar,
+            Kind::Popover,
+            Kind::Button,
+            Kind::ToggleButton,
+            Kind::LinkButton,
+            Kind::CheckButton,
+            Kind::MenuButton,
+            Kind::Switch,
+            Kind::DropDown,
+            Kind::ColorDialogButton,
+            Kind::ColorDialog,
+            Kind::FontDialogButton,
+            Kind::FontDialog,
+            Kind::Entry,
+            Kind::SearchEntry,
+            Kind::PasswordEntry,
+            Kind::SpinButton,
+            Kind::EditableLabel,
+            Kind::Box,
+            Kind::Grid,
+            Kind::CenterBox,
+            Kind::ScrolledWindow,
+            Kind::Paned,
+            Kind::Frame,
+            Kind::Expander,
+            Kind::SearchBar,
+            Kind::ActionBar,
+            Kind::HeaderBar,
+            Kind::Notebook,
+            Kind::NotebookTab,
+            Kind::Overlay,
+            Kind::Stack,
+            Kind::StackPage,
+            Kind::StackSwitcher,
+            Kind::StackSidebar,
+            Kind::ListBox,
+            Kind::ListBoxRow,
+            Kind::FlowBox,
+            Kind::FlowBoxChild,
+            Kind::ListView,
+            Kind::GridView,
+            Kind::ColumnView,
+            Kind::ColumnViewColumn,
+            Kind::PopoverMenu,
+            Kind::PopoverMenuBar,
+            Kind::PopoverMenuItem,
+            Kind::Window,
+            Kind::ShortcutsWindow,
+            Kind::AboutDialog,
+            Kind::AlertDialog,
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,5 +873,77 @@ mod tests {
     #[test]
     fn align_defaults_to_fill() {
         assert_eq!(crate::layout::Align::default(), crate::layout::Align::Fill);
+    }
+
+    #[test]
+    fn every_kind_is_in_all_exactly_once() {
+        // Contract deviation D14: §8.4 R1 estimates "~59"; §4.2's own
+        // enumeration is 64, and the enumeration is the normative one.
+        assert_eq!(Kind::all().len(), 64);
+        let mut seen: Vec<Kind> = Kind::all().to_vec();
+        seen.sort_unstable_by_key(|k| *k as usize);
+        seen.dedup();
+        assert_eq!(seen.len(), 64, "Kind::all has a duplicate");
+        assert_eq!(Kind::all()[0], Kind::Label);
+        assert_eq!(Kind::all()[63], Kind::AlertDialog);
+    }
+
+    #[test]
+    fn kinds_that_share_a_css_name_are_told_apart_by_their_base_classes() {
+        assert_eq!(Kind::Button.css_name(), "button");
+        assert_eq!(Kind::ToggleButton.css_name(), "button");
+        assert_eq!(Kind::LinkButton.css_name(), "button");
+        assert_eq!(Kind::Button.base_classes(), &[] as &[&str]);
+        assert_eq!(Kind::ToggleButton.base_classes(), &["toggle"]);
+        assert_eq!(Kind::LinkButton.base_classes(), &["link"]);
+
+        assert_eq!(Kind::Box.css_name(), "box");
+        assert_eq!(Kind::CenterBox.css_name(), "box");
+
+        assert_eq!(Kind::Entry.css_name(), "entry");
+        assert_eq!(Kind::SearchEntry.base_classes(), &["search"]);
+        assert_eq!(Kind::PasswordEntry.base_classes(), &["password"]);
+
+        assert_eq!(Kind::Window.css_name(), "window");
+        assert_eq!(Kind::Window.base_classes(), &["background"]);
+        assert_eq!(Kind::AlertDialog.base_classes(), &["dialog", "message"]);
+        assert_eq!(Kind::PopoverMenu.base_classes(), &["background", "menu"]);
+    }
+
+    #[test]
+    fn no_css_name_is_empty_and_none_carries_a_dot_or_a_space() {
+        for kind in Kind::all() {
+            let name = kind.css_name();
+            assert!(!name.is_empty(), "{kind:?} has no CSS node name");
+            assert!(
+                !name.contains('.') && !name.contains(' '),
+                "{kind:?}'s node name {name:?} smuggles a class in"
+            );
+            for class in kind.base_classes() {
+                assert!(
+                    !class.is_empty() && !class.starts_with('.'),
+                    "{kind:?} base class {class:?} must be bare"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_focusable_default_follows_gtk_not_the_node_name() {
+        assert!(Kind::Button.is_focusable_by_default());
+        assert!(Kind::Entry.is_focusable_by_default());
+        assert!(Kind::ListBoxRow.is_focusable_by_default());
+        // Contract §3.5: WindowControls' three buttons are never candidates.
+        assert!(!Kind::WindowControls.is_focusable_by_default());
+        assert!(!Kind::Label.is_focusable_by_default());
+        assert!(!Kind::Box.is_focusable_by_default());
+        assert!(!Kind::ListBox.is_focusable_by_default());
+        assert_eq!(
+            Kind::all()
+                .iter()
+                .filter(|k| k.is_focusable_by_default())
+                .count(),
+            27
+        );
     }
 }
