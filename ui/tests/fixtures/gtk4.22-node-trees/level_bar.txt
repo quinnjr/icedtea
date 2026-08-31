@@ -1,0 +1,6 @@
+levelbar[.discrete]
+╰── trough
+    ├── block.filled.level-name
+    ┊
+    ├── block.empty
+    ┊

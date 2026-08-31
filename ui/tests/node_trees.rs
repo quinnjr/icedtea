@@ -94,3 +94,39 @@ fn a_spinner_and_a_statusbar_render_their_single_nodes() {
     );
     check(Kind::Statusbar, "statusbar", &Props::default());
 }
+
+#[test]
+fn a_level_bar_builds_a_trough_of_filled_and_empty_blocks() {
+    // mutation: emit one block instead of one per discrete step and the
+    // discrete case renders a single `block` where the fixture wants both.
+    use icedtea_ui::widgets::LevelBarMode;
+    let mut props = Props::default();
+    props.set(PropName::Value, Prop::Float(0.5));
+    check(Kind::LevelBar, "level_bar", &props);
+
+    let mut discrete = props.clone();
+    discrete.set(PropName::Model, LevelBarMode::Discrete.to_prop());
+    discrete.set(PropName::Upper, Prop::Float(4.0));
+    let rendered = node_tree_of(Kind::LevelBar, &discrete);
+    assert!(rendered.contains("levelbar.discrete"), "{rendered}");
+    assert_eq!(
+        rendered.matches("block").count(),
+        4,
+        "one block per step: {rendered}"
+    );
+    check(Kind::LevelBar, "level_bar", &discrete);
+}
+
+#[test]
+fn a_progress_bar_shows_its_text_subnode_only_when_asked() {
+    // mutation: build the `text` node unconditionally and the first assertion
+    // finds it with show_text off.
+    let mut props = Props::default();
+    props.set(PropName::Fraction, Prop::Float(0.25));
+    assert!(!node_tree_of(Kind::ProgressBar, &props).contains("text"));
+    check(Kind::ProgressBar, "progress_bar", &props);
+
+    props.set(PropName::ShowText, Prop::Bool(true));
+    assert!(node_tree_of(Kind::ProgressBar, &props).contains("text"));
+    check(Kind::ProgressBar, "progress_bar", &props);
+}

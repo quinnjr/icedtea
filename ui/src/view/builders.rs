@@ -156,6 +156,8 @@ impl<Msg: Clone + 'static> View<Msg> {
 // `crate::widgets` (contract §11 E5); this module re-exports them so every
 // builder is reachable as `view::builders::<name>`.
 pub use crate::widgets::label::{LabelExt, label};
+pub use crate::widgets::level_bar::{LevelBarExt, level_bar};
+pub use crate::widgets::progress_bar::{ProgressBarExt, progress_bar};
 pub use crate::widgets::separator::separator;
 pub use crate::widgets::spinner::{SpinnerExt, spinner};
 pub use crate::widgets::statusbar::{StatusbarExt, statusbar};

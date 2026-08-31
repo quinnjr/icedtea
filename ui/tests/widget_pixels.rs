@@ -204,3 +204,54 @@ fn a_statusbar_shows_the_top_of_its_message_stack() {
     );
     assert!(has_ink(&frames, 1, (200, 32)), "the pushed message shows");
 }
+
+#[test]
+fn a_progress_bars_fill_widens_with_its_fraction() {
+    // mutation: ignore `fraction` when sizing the `progress` node and both
+    // frames ink the same width.
+    use icedtea_ui::view::builders::progress_bar;
+    let frames = run(
+        0.1f64,
+        |model: &mut f64, _msg: ()| {
+            *model = 0.9;
+            Cmd::None
+        },
+        |model: &f64| progress_bar(*model).hexpand(true),
+        (200, 24),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Message(()),
+            ScriptStep::Capture,
+        ],
+    );
+    let inked = |frame: usize| {
+        (0..200)
+            .filter(|x| frames.pixel(frame, *x, 12) != frames.pixel(frame, 199, 12))
+            .count()
+    };
+    assert!(inked(1) > inked(0), "0.9 must ink wider than 0.1");
+}
+
+#[test]
+fn a_pulsing_progress_bar_moves_its_block_on_the_clock() {
+    // mutation: make `tick` a no-op and the two frames match.
+    use icedtea_ui::view::builders::progress_bar;
+    use icedtea_ui::widgets::progress_bar::ProgressBarExt;
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| progress_bar(f64::NAN).pulse_step(0.1).hexpand(true),
+        (200, 24),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Advance(Duration::from_millis(300)),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..200)
+            .map(|x| frames.pixel(frame, x, 12))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), "the pulse block must have moved");
+}

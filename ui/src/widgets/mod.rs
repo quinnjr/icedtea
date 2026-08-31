@@ -25,6 +25,8 @@ use crate::window::focus::FOCUSABLE_CLASS;
 pub use crate::view::ListItem;
 
 pub mod label;
+pub mod level_bar;
+pub mod progress_bar;
 pub mod separator;
 pub mod spinner;
 pub mod statusbar;
@@ -556,6 +558,12 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::Statusbar => Box::new(<statusbar::StatusbarC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::LevelBar => Box::new(<level_bar::LevelBarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::ProgressBar => Box::new(<progress_bar::ProgressBarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {
@@ -755,21 +763,39 @@ pub fn fixture_matches(fixture: &str, rendered: &str) -> Result<(), String> {
         {
             continue;
         }
-        let Some(fixture_index) = fixture_paths
+        let candidates: Vec<usize> = fixture_paths
             .iter()
-            .find(|(fixture_path, _)| fixture_path == path)
+            .filter(|(fixture_path, _)| fixture_path == path)
             .map(|(_, i)| *i)
-        else {
+            .collect();
+        if candidates.is_empty() {
             return Err(format!("rendered node at '{path}' is not in the fixture"));
-        };
-        let expected = &fixture_lines[fixture_index];
+        }
+        // Two or more fixture lines can share a path — e.g. `block.filled`
+        // and `block.empty` at `levelbar/trough/block` — to describe
+        // mutually exclusive variants a repeated child can take. The
+        // rendered node only needs to satisfy one of them.
         let actual = &rendered_lines[*index];
-        for class in &expected.required {
-            if !actual.required.contains(class) {
-                return Err(format!(
-                    "required class '{class}' missing from rendered node at '{path}'"
-                ));
+        let mut missing: Option<&str> = None;
+        let matched = candidates.iter().any(|fixture_index| {
+            let expected = &fixture_lines[*fixture_index];
+            match expected
+                .required
+                .iter()
+                .find(|c| !actual.required.contains(*c))
+            {
+                Some(class) => {
+                    missing.get_or_insert(class.as_str());
+                    false
+                }
+                None => true,
             }
+        });
+        if !matched {
+            let class = missing.unwrap_or("");
+            return Err(format!(
+                "required class '{class}' missing from rendered node at '{path}'"
+            ));
         }
     }
 
