@@ -698,3 +698,39 @@ fn an_image_paints_its_resolved_icon() {
     );
     assert!(has_ink(&frames, 0, (48, 48)), "the resolved icon must ink");
 }
+
+#[test]
+fn a_drawing_area_runs_its_callback_against_the_allocated_rect() {
+    // mutation: never call `self.draw` in DrawingAreaC::paint and the frame is
+    // one flat colour.
+    use icedtea_ui::css::value::Rgba;
+    use icedtea_ui::view::builders::drawing_area;
+    use icedtea_ui::widgets::drawing_area::DrawingAreaExt;
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| {
+            drawing_area(|canvas, rect| {
+                canvas.draw_rect(
+                    &rect.to_skia(),
+                    &icedtea_ui::paint::fill_paint(Rgba {
+                        r: 1.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                );
+            })
+            .content_width(64)
+            .content_height(64)
+            .hexpand(true)
+            .vexpand(true)
+        },
+        (64, 64),
+        vec![ScriptStep::Capture],
+    );
+    assert_eq!(
+        frames.pixel(0, 32, 32).map(|p| (p.0, p.1, p.2)),
+        Some((255, 0, 0))
+    );
+}

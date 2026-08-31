@@ -24,6 +24,7 @@ use crate::window::focus::FOCUSABLE_CLASS;
 #[doc(inline)]
 pub use crate::view::ListItem;
 
+pub mod drawing_area;
 pub mod image;
 pub mod info_bar;
 pub mod label;
@@ -36,6 +37,7 @@ pub mod separator;
 pub mod spinner;
 pub mod statusbar;
 pub mod text_view;
+pub mod window_controls;
 
 /// Re-express a pointer event given in the root node's space in `rect`'s space.
 ///
@@ -632,6 +634,12 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Scale => Box::new(<scale::ScaleC as Controller<Msg>>::build(node, props, cx)),
+        Kind::DrawingArea => Box::new(<drawing_area::DrawingAreaC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::WindowControls => {
+            Box::new(<window_controls::WindowControlsC as Controller<Msg>>::build(node, props, cx))
+        }
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {

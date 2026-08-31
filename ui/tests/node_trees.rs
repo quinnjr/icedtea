@@ -207,3 +207,50 @@ fn a_scale_builds_a_trough_with_a_highlight_and_one_mark_node_per_mark() {
     assert!(rendered.starts_with("scale.marks-before"), "{rendered}");
     check(Kind::Scale, "scale", &props);
 }
+
+#[test]
+fn window_controls_follow_the_decoration_layout_rule_verbatim() {
+    // mutation: stop splitting the layout on ':' and the `start` side emits the
+    // right-hand buttons too, failing the `close` assertion below.
+    use icedtea_ui::widgets::{Side, WindowButton, window_controls::WindowControlsC};
+    assert_eq!(
+        WindowControlsC::tokens("menu:minimize,maximize,close", Side::Start),
+        Vec::<WindowButton>::new(),
+        "`menu` produces no child in 4.22.4 and nothing else is on the left"
+    );
+    assert_eq!(
+        WindowControlsC::tokens("menu:minimize,maximize,close", Side::End),
+        vec![
+            WindowButton::Minimize,
+            WindowButton::Maximize,
+            WindowButton::Close
+        ],
+    );
+    assert_eq!(
+        WindowControlsC::tokens("icon,close:", Side::Start),
+        vec![WindowButton::Icon, WindowButton::Close],
+        "tokens are walked in order"
+    );
+
+    let mut props = Props::default();
+    props.set(PropName::Side, Side::End.to_prop());
+    props.set(
+        PropName::Decoration,
+        Prop::Str("menu:minimize,maximize,close".into()),
+    );
+    let rendered = node_tree_of(Kind::WindowControls, &props);
+    assert!(rendered.contains("button.close"), "{rendered}");
+    assert!(!rendered.contains(".empty"), "{rendered}");
+    check(Kind::WindowControls, "window_controls", &props);
+
+    props.set(PropName::Decoration, Prop::Str("menu:".into()));
+    let empty = node_tree_of(Kind::WindowControls, &props);
+    assert!(empty.starts_with("windowcontrols.end.empty"), "{empty}");
+}
+
+#[test]
+fn a_drawing_area_is_one_widget_node() {
+    // mutation: name the node "drawingarea" and this fails with "rendered node
+    // at 'drawingarea' is not in the fixture".
+    check(Kind::DrawingArea, "drawing_area", &Props::default());
+}

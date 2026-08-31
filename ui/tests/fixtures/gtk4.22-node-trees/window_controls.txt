@@ -1,0 +1,5 @@
+windowcontrols[.start][.end][.empty][.native]
+├── [image.icon]
+├── [button.minimize]
+├── [button.maximize]
+╰── [button.close]

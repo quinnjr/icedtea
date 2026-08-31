@@ -155,6 +155,7 @@ impl<Msg: Clone + 'static> View<Msg> {
 // The per-widget builders themselves live beside their controllers under
 // `crate::widgets` (contract §11 E5); this module re-exports them so every
 // builder is reachable as `view::builders::<name>`.
+pub use crate::widgets::drawing_area::{DrawingAreaExt, drawing_area};
 pub use crate::widgets::image::{ImageExt, image, image_named};
 pub use crate::widgets::info_bar::{InfoBarExt, info_bar};
 pub use crate::widgets::label::{LabelExt, label};
@@ -167,6 +168,7 @@ pub use crate::widgets::separator::separator;
 pub use crate::widgets::spinner::{SpinnerExt, spinner};
 pub use crate::widgets::statusbar::{StatusbarExt, statusbar};
 pub use crate::widgets::text_view::{TextViewExt, text_view};
+pub use crate::widgets::window_controls::{WindowControlsExt, window_controls};
 
 #[cfg(test)]
 mod tests {
