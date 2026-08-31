@@ -10,8 +10,10 @@ use crate::css::value::image::IconRef;
 use crate::layout::{Align, Rect};
 
 pub mod builders;
+pub mod render;
 
 pub use builders::widget;
+pub use render::{Animations, NodeAddr, StyleMap, node_addr};
 
 /// A typed property name, never a string — contract §0's "nothing names a
 /// property string" rule, extended from CSS properties to widget props.
