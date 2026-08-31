@@ -16,6 +16,7 @@ pub mod controller;
 pub mod reconcile;
 pub mod render;
 
+pub use app::{App, AppError, Frames, ScriptStep};
 pub use builders::widget;
 pub use cmd::Cmd;
 pub use controller::{Controller, Event, EventCx, Phase};

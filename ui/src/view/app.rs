@@ -1,21 +1,29 @@
 //! The loop: events in, messages folded, a new view reconciled, the dirty
 //! parts restyled, relaid out and repainted.
 
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::anim::Clock;
+use crate::anim::{Clock, ManualClock};
+use crate::css::cascade::CompiledSheet;
 use crate::css::computed::ResolveEnv;
 use crate::css::node::Node;
 use crate::icons::IconTheme;
-use crate::layout::LayoutTree;
+use crate::layout::{Container, LayoutError, LayoutTree, Measure};
+use crate::paint::{ImageCache, PaintCx};
 use crate::text::FontDatabase;
 use crate::view::cmd::Cmd;
 use crate::view::controller::{Event, EventCx, Phase};
-use crate::view::reconcile::Instance;
-use crate::view::render::StyleMap;
+use crate::view::reconcile::{BuildCx, Instance, containers_of, reconcile};
+use crate::view::render::{
+    Animations, NodeAddr, NodePainter, StyleMap, layout_tree, paint_tree, restyle_tree,
+};
+use crate::view::{Kind, View};
 use crate::window::focus::FocusRing;
+use crate::window::pointer::{ImplicitGrab, hit_chain};
 use crate::window::selection::Clipboard;
+use crate::window::{InputEvent, SurfaceError};
 
 /// The borrows one dispatch pass needs, minus the per-node ones.
 pub struct Dispatch<'a, Msg> {
@@ -211,6 +219,713 @@ pub fn next_controller_deadline<Msg: Clone + 'static>(
     best
 }
 
+/// One step of an offscreen script.
+pub enum ScriptStep<Msg> {
+    /// Feed an input event, exactly as a `Window::pump` would have.
+    Event(InputEvent),
+    /// Move the `ManualClock` forward and run one frame.
+    Advance(Duration),
+    /// Inject a message as if a controller had produced it.
+    Message(Msg),
+    /// Render and keep the resulting RGBA frame.
+    Capture,
+}
+
+impl<Msg: std::fmt::Debug> std::fmt::Debug for ScriptStep<Msg> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScriptStep::Event(ev) => f.debug_tuple("Event").field(ev).finish(),
+            ScriptStep::Advance(d) => f.debug_tuple("Advance").field(d).finish(),
+            ScriptStep::Message(m) => f.debug_tuple("Message").field(m).finish(),
+            ScriptStep::Capture => f.write_str("Capture"),
+        }
+    }
+}
+
+/// The frames a script captured.
+#[derive(Debug, Default)]
+pub struct Frames {
+    size: (u32, u32),
+    frames: Vec<Vec<u8>>,
+}
+
+impl Frames {
+    /// How many frames were captured.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Whether nothing was captured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// The surface size every frame shares.
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// One pixel, as `(r, g, b, a)` straight out of skia's N32 buffer;
+    /// `None` when the frame or the point is out of range.
+    #[must_use]
+    pub fn pixel(&self, frame: usize, x: u32, y: u32) -> Option<(u8, u8, u8, u8)> {
+        let (w, h) = self.size;
+        if x >= w || y >= h {
+            return None;
+        }
+        let buffer = self.frames.get(frame)?;
+        let offset = ((y as usize) * (w as usize) + (x as usize)) * 4;
+        let bytes = buffer.get(offset..offset + 4)?;
+        Some((bytes[0], bytes[1], bytes[2], bytes[3]))
+    }
+}
+
+/// What can go wrong running an app.
+#[derive(Debug)]
+pub enum AppError {
+    /// The surface or its connection failed.
+    Surface(SurfaceError),
+    /// Layout failed.
+    Layout(LayoutError),
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppError::Surface(e) => write!(f, "surface: {e}"),
+            AppError::Layout(e) => write!(f, "layout: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
+
+impl From<SurfaceError> for AppError {
+    fn from(value: SurfaceError) -> Self {
+        AppError::Surface(value)
+    }
+}
+impl From<LayoutError> for AppError {
+    fn from(value: LayoutError) -> Self {
+        AppError::Layout(value)
+    }
+}
+
+/// The Elm loop over a retained tree.
+pub struct App<M, Msg> {
+    model: M,
+    update: fn(&mut M, Msg) -> Cmd<Msg>,
+    view: fn(&M) -> View<Msg>,
+    sheet: Option<CompiledSheet>,
+    fonts: Option<FontDatabase>,
+    icons: Option<IconTheme>,
+}
+
+impl<M: std::fmt::Debug, Msg> std::fmt::Debug for App<M, Msg> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("App")
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The mutable half of a running app, shared by `run` and `run_offscreen`.
+struct Runtime<Msg> {
+    root: Node,
+    instances: Vec<Instance<Msg>>,
+    styles: StyleMap,
+    anims: Animations,
+    containers: HashMap<NodeAddr, Container>,
+    layout: LayoutTree,
+    focus: FocusRing,
+    grab: ImplicitGrab,
+    hovered: Option<Node>,
+    /// The last pointer position in window-frame space, so a button event
+    /// (which carries none) can be aimed and localised.
+    last_pointer: (f32, f32),
+    queue: VecDeque<Msg>,
+    cmds: Vec<Cmd<Msg>>,
+    timers: Vec<(Duration, Rc<dyn Fn() -> Msg>)>,
+    images: ImageCache,
+    env: ResolveEnv,
+    quit: bool,
+}
+
+/// Bridges `Controller::measure` into taffy.
+struct ControllerMeasure<'a, Msg> {
+    instances: &'a mut Vec<Instance<Msg>>,
+    sheet: &'a CompiledSheet,
+    fonts: &'a mut FontDatabase,
+    icons: &'a mut IconTheme,
+    clock: &'a Rc<dyn Clock>,
+    env: &'a ResolveEnv,
+}
+
+impl<Msg: Clone + 'static> Measure for ControllerMeasure<'_, Msg> {
+    fn measure(
+        &mut self,
+        node: &Node,
+        _style: &crate::css::computed::ComputedStyle,
+        known: taffy::Size<Option<f32>>,
+        available: taffy::Size<taffy::AvailableSpace>,
+    ) -> taffy::Size<f32> {
+        let cap = |known: Option<f32>, space: taffy::AvailableSpace| match (known, space) {
+            (Some(v), _) => Some(v),
+            (None, taffy::AvailableSpace::Definite(v)) => Some(v),
+            _ => None,
+        };
+        let mut cx = BuildCx {
+            sheet: self.sheet,
+            fonts: self.fonts,
+            icons: self.icons,
+            clock: self.clock,
+            env: self.env,
+        };
+        let measured = self
+            .instances
+            .iter_mut()
+            .find_map(|root| root.find_mut(node))
+            .and_then(|instance| {
+                instance.controller.measure(
+                    (
+                        cap(known.width, available.width),
+                        cap(known.height, available.height),
+                    ),
+                    &mut cx,
+                )
+            });
+        match measured {
+            Some((w, h)) => taffy::Size {
+                width: known.width.unwrap_or(w),
+                height: known.height.unwrap_or(h),
+            },
+            None => taffy::Size {
+                width: known.width.unwrap_or(0.0),
+                height: known.height.unwrap_or(0.0),
+            },
+        }
+    }
+}
+
+/// Bridges `Controller::paint` into `paint_tree`.
+struct ControllerPainter<'a, Msg> {
+    instances: &'a mut Vec<Instance<Msg>>,
+}
+
+impl<Msg: Clone + 'static> NodePainter for ControllerPainter<'_, Msg> {
+    fn paint_content(
+        &mut self,
+        node: &Node,
+        canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+        alloc: &crate::layout::Allocation,
+        style: &crate::css::computed::ComputedStyle,
+        cx: &mut PaintCx<'_>,
+    ) -> bool {
+        self.instances
+            .iter_mut()
+            .find_map(|root| root.find_mut(node))
+            .is_some_and(|instance| instance.controller.paint(canvas, alloc, style, cx))
+    }
+}
+
+impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
+    /// A new app over `model`, folded by `update`, described by `view`.
+    #[must_use]
+    pub fn new(model: M, update: fn(&mut M, Msg) -> Cmd<Msg>, view: fn(&M) -> View<Msg>) -> Self {
+        App {
+            model,
+            update,
+            view,
+            sheet: None,
+            fonts: None,
+            icons: None,
+        }
+    }
+
+    /// The compiled theme `run_offscreen` styles with (deviation D11).
+    /// `run` takes the window's instead.
+    #[must_use]
+    pub fn with_sheet(mut self, sheet: CompiledSheet) -> Self {
+        self.sheet = Some(sheet);
+        self
+    }
+
+    /// The font database `run_offscreen` shapes with (deviation D11).
+    #[must_use]
+    pub fn with_fonts(mut self, fonts: FontDatabase) -> Self {
+        self.fonts = Some(fonts);
+        self
+    }
+
+    /// The icon theme both loops resolve icons through (deviation D11).
+    #[must_use]
+    pub fn with_icons(mut self, icons: IconTheme) -> Self {
+        self.icons = Some(icons);
+        self
+    }
+
+    /// The current model — what an offscreen test asserts on besides pixels.
+    #[must_use]
+    pub fn model(&self) -> &M {
+        &self.model
+    }
+
+    /// Run the whole loop against an offscreen raster surface with no
+    /// Wayland connection, driven by `script` on a [`ManualClock`].
+    ///
+    /// This is how the counter-app test and every controller unit test run.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Surface`] if the raster surface cannot be created;
+    /// [`AppError::Layout`] if taffy fails.
+    pub fn run_offscreen(
+        mut self,
+        size: (u32, u32),
+        clock: Rc<ManualClock>,
+        script: Vec<ScriptStep<Msg>>,
+    ) -> Result<Frames, AppError> {
+        let sheet = self
+            .sheet
+            .take()
+            .unwrap_or_else(|| CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT));
+        let mut fonts = self.fonts.take().unwrap_or_default();
+        let mut icons = self.icons.take().unwrap_or_else(IconTheme::from_env);
+        let mut clipboard = Clipboard::offscreen();
+        let dyn_clock: Rc<dyn Clock> = clock.clone();
+
+        let mut rt = Runtime {
+            root: Node::with_classes(Kind::Window.css_name(), Kind::Window.base_classes()),
+            instances: Vec::new(),
+            styles: StyleMap::new(),
+            anims: Animations::new(),
+            containers: HashMap::new(),
+            layout: LayoutTree::new(),
+            focus: <FocusRing as Default>::default(),
+            grab: ImplicitGrab::default(),
+            hovered: None,
+            last_pointer: (0.0, 0.0),
+            queue: VecDeque::new(),
+            cmds: Vec::new(),
+            timers: Vec::new(),
+            images: ImageCache::new(),
+            env: ResolveEnv::default(),
+            quit: false,
+        };
+
+        let mut surface = skia_rs_safe::canvas::Surface::new_raster_n32_premul(
+            i32::try_from(size.0).unwrap_or(i32::MAX),
+            i32::try_from(size.1).unwrap_or(i32::MAX),
+        )
+        .ok_or(SurfaceError::Render("offscreen raster surface"))?;
+        let mut frames = Frames {
+            size,
+            frames: Vec::new(),
+        };
+
+        rebuild(
+            &mut self, &mut rt, &sheet, &mut fonts, &mut icons, &dyn_clock,
+        );
+        render_once(
+            &mut rt,
+            &sheet,
+            &mut fonts,
+            &mut icons,
+            &dyn_clock,
+            size,
+            &mut surface,
+        )?;
+
+        for step in script {
+            let mut capture = false;
+            match step {
+                ScriptStep::Capture => capture = true,
+                ScriptStep::Message(msg) => rt.queue.push_back(msg),
+                ScriptStep::Event(ev) => {
+                    let produced = route(
+                        &mut rt,
+                        &ev,
+                        &sheet,
+                        &mut fonts,
+                        &mut icons,
+                        &mut clipboard,
+                        &dyn_clock,
+                    );
+                    rt.queue.extend(produced);
+                }
+                ScriptStep::Advance(delta) => {
+                    let before = clock.now();
+                    clock.set_ms(u64::try_from((before + delta).as_millis()).unwrap_or(u64::MAX));
+                    let now = clock.now();
+                    let due: Vec<Rc<dyn Fn() -> Msg>> = {
+                        let (fired, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut rt.timers)
+                            .into_iter()
+                            .partition(|(at, _)| *at <= now);
+                        rt.timers = pending;
+                        fired.into_iter().map(|(_, f)| f).collect()
+                    };
+                    rt.queue.extend(due.iter().map(|f| f()));
+                    let ticked = {
+                        let mut cx = Dispatch {
+                            styles: &rt.styles,
+                            tree: &rt.layout,
+                            focus: &mut rt.focus,
+                            clipboard: &mut clipboard,
+                            icons: &mut icons,
+                            fonts: &mut fonts,
+                            clock: &dyn_clock,
+                            env: &rt.env,
+                            cmds: &mut rt.cmds,
+                        };
+                        tick_all(&mut rt.instances, now, &mut cx)
+                    };
+                    rt.queue.extend(ticked);
+                }
+            }
+
+            drain(
+                &mut self,
+                &mut rt,
+                &sheet,
+                &mut fonts,
+                &mut icons,
+                &mut clipboard,
+                &dyn_clock,
+                clock.now(),
+            );
+            render_once(
+                &mut rt,
+                &sheet,
+                &mut fonts,
+                &mut icons,
+                &dyn_clock,
+                size,
+                &mut surface,
+            )?;
+
+            if capture {
+                frames.frames.push(read_rgba(&surface, size));
+            }
+            if rt.quit {
+                break;
+            }
+        }
+        Ok(frames)
+    }
+}
+
+/// Run `view`, reconcile it into the retained tree, and refresh the
+/// container map the layout walker reads.
+fn rebuild<M: 'static, Msg: Clone + 'static>(
+    app: &mut App<M, Msg>,
+    rt: &mut Runtime<Msg>,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clock: &Rc<dyn Clock>,
+) {
+    let described = (app.view)(&app.model);
+    let mut cx = BuildCx {
+        sheet,
+        fonts,
+        icons,
+        clock,
+        env: &rt.env,
+    };
+    reconcile(&rt.root, &mut rt.instances, vec![described], &mut cx);
+    rt.containers.clear();
+    rt.containers.insert(
+        crate::view::render::node_addr(&rt.root),
+        Container::Box {
+            direction: crate::layout::BoxDirection::Column,
+        },
+    );
+    containers_of(&rt.instances, &mut rt.containers);
+}
+
+/// Restyle, relayout and repaint into `surface`.
+fn render_once<Msg: Clone + 'static>(
+    rt: &mut Runtime<Msg>,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clock: &Rc<dyn Clock>,
+    size: (u32, u32),
+    surface: &mut skia_rs_safe::canvas::Surface,
+) -> Result<(), AppError> {
+    let now = clock.now();
+    restyle_tree(&rt.root, sheet, &rt.env, &mut rt.styles, &mut rt.anims, now);
+    {
+        let mut measure = ControllerMeasure {
+            instances: &mut rt.instances,
+            sheet,
+            fonts,
+            icons,
+            clock,
+            env: &rt.env,
+        };
+        layout_tree(
+            &rt.root,
+            &rt.styles,
+            &rt.containers,
+            &mut rt.layout,
+            &rt.env,
+            (Some(size.0 as f32), Some(size.1 as f32)),
+            &mut measure,
+        )?;
+    }
+    surface
+        .canvas()
+        .clear(skia_rs_safe::core::Color::TRANSPARENT);
+    let mut cx = PaintCx {
+        env: &rt.env,
+        colors: &sheet.colors,
+        fonts,
+        images: &mut rt.images,
+        text: None,
+    };
+    let mut painter = ControllerPainter {
+        instances: &mut rt.instances,
+    };
+    let mut canvas = surface.canvas();
+    paint_tree(
+        &mut canvas,
+        &rt.root,
+        &rt.styles,
+        &rt.layout,
+        &mut rt.anims,
+        now,
+        (0.0, 0.0),
+        &mut cx,
+        &mut painter,
+    );
+    Ok(())
+}
+
+/// Turn one `InputEvent` into controller events and return the messages.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one routing pass threading the whole per-frame context"
+)]
+fn route<Msg: Clone + 'static>(
+    rt: &mut Runtime<Msg>,
+    event: &InputEvent,
+    _sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clipboard: &mut Clipboard,
+    clock: &Rc<dyn Clock>,
+) -> Vec<Msg> {
+    // The node an event is aimed at, and the point in its own space.
+    let aim = |rt: &Runtime<Msg>, x: f32, y: f32| -> Option<(Node, (f32, f32))> {
+        if let Some(target) = rt.grab.target() {
+            let local = rt
+                .layout
+                .allocation(&target)
+                .map_or((x, y), |a| (x - a.border_box.x, y - a.border_box.y));
+            return Some((target, local));
+        }
+        let chain = hit_chain(&rt.root, &rt.layout, &rt.styles, (x, y));
+        chain.last().map(|hit| (hit.node.clone(), hit.local))
+    };
+
+    let mut pending: Vec<(Node, Event)> = Vec::new();
+    match event {
+        InputEvent::PointerEnter { x, y, .. } | InputEvent::PointerMotion { x, y, .. } => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "surface coordinates are within f32 exactly"
+            )]
+            let point = (*x as f32, *y as f32);
+            rt.last_pointer = point;
+            let target = aim(rt, point.0, point.1);
+            let same = match (rt.hovered.as_ref(), target.as_ref()) {
+                (Some(old), Some((new, _))) => old.ptr_eq(new),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                if let Some(old) = rt.hovered.take() {
+                    pending.push((old, Event::PointerLeave));
+                }
+                if let Some((node, local)) = target.clone() {
+                    pending.push((node.clone(), Event::PointerEnter { local }));
+                    rt.hovered = Some(node);
+                }
+            }
+            if let Some((node, local)) = target {
+                pending.push((node, Event::PointerMotion { local }));
+            }
+        }
+        InputEvent::PointerLeave => {
+            if let Some(old) = rt.hovered.take() {
+                pending.push((old, Event::PointerLeave));
+            }
+        }
+        InputEvent::PointerButton {
+            button,
+            pressed,
+            serial,
+            ..
+        } => {
+            // `wl_pointer.button` carries no coordinates: the position is
+            // the last motion's, and the target is the grab's while one is
+            // held, exactly as the compositor's implicit grab decides it.
+            let (x, y) = rt.last_pointer;
+            if let Some((node, local)) = aim(rt, x, y) {
+                if *pressed {
+                    rt.grab.press(*button, &node);
+                    pending.push((
+                        node,
+                        Event::PointerDown {
+                            button: *button,
+                            local,
+                            serial: *serial,
+                        },
+                    ));
+                } else {
+                    rt.grab.release(*button);
+                    pending.push((
+                        node,
+                        Event::PointerUp {
+                            button: *button,
+                            local,
+                            serial: *serial,
+                        },
+                    ));
+                }
+            }
+        }
+        InputEvent::Scroll(scroll) => {
+            if let Some(node) = rt.hovered.clone() {
+                pending.push((node, Event::Scroll(*scroll)));
+            }
+        }
+        InputEvent::Key(key) => {
+            if let Some(node) = rt.focus.focus() {
+                pending.push((node, Event::Key(key.clone())));
+            }
+        }
+        InputEvent::Configure { size, states } => {
+            for instance in &rt.instances {
+                pending.push((
+                    instance.node.clone(),
+                    Event::Configure {
+                        size: *size,
+                        states: *states,
+                    },
+                ));
+            }
+        }
+        InputEvent::PopupDone(_) => {
+            if let Some(node) = rt.focus.focus() {
+                pending.push((node, Event::PopupDone));
+            }
+        }
+        _ => {}
+    }
+
+    let mut out = Vec::new();
+    for (node, ev) in pending {
+        let path = path_to(&rt.instances, &node);
+        let mut cx = Dispatch {
+            styles: &rt.styles,
+            tree: &rt.layout,
+            focus: &mut rt.focus,
+            clipboard,
+            icons,
+            fonts,
+            clock,
+            env: &rt.env,
+            cmds: &mut rt.cmds,
+        };
+        out.extend(deliver(&mut rt.instances, &path, &ev, &mut cx));
+    }
+    out
+}
+
+/// Fold every queued message, run the commands they produced, and rebuild
+/// the view **once** per drained batch (contract §4.7).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one fold pass threading the whole per-frame context"
+)]
+fn drain<M: 'static, Msg: Clone + 'static>(
+    app: &mut App<M, Msg>,
+    rt: &mut Runtime<Msg>,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clipboard: &mut Clipboard,
+    clock: &Rc<dyn Clock>,
+    now: Duration,
+) {
+    if rt.queue.is_empty() && rt.cmds.is_empty() {
+        return;
+    }
+    let mut folded = false;
+    // A bound, so an `update` that enqueues on every message cannot wedge
+    // the loop: the rest is carried to the next frame.
+    for _ in 0..1024 {
+        let Some(msg) = rt.queue.pop_front() else {
+            break;
+        };
+        let cmd = (app.update)(&mut app.model, msg);
+        rt.cmds.push(cmd);
+        folded = true;
+    }
+    for cmd in std::mem::take(&mut rt.cmds)
+        .into_iter()
+        .flat_map(Cmd::flatten)
+    {
+        match cmd {
+            Cmd::After(delay, f) => rt.timers.push((now + delay, f)),
+            Cmd::Copy(text) => clipboard.copy(&text, 0),
+            Cmd::Paste(f) => {
+                let value = clipboard.paste(Duration::from_millis(50));
+                rt.queue.push_back(f(value));
+            }
+            Cmd::SetPrimary(text) => clipboard.set_primary(&text, 0),
+            Cmd::Primary(f) => {
+                let value = clipboard.primary(Duration::from_millis(50));
+                rt.queue.push_back(f(value));
+            }
+            Cmd::Focus(node) => rt
+                .focus
+                .set_focus(Some(&node), crate::window::focus::FocusCause::Programmatic),
+            Cmd::Quit | Cmd::CloseWindow => rt.quit = true,
+            // The window-bound commands are `run`'s (Task 17); offscreen
+            // there is no surface to title, minimise or open a popup on, so
+            // they are recorded and ignored.
+            other => tracing::debug!(?other, "command has no effect offscreen"),
+        }
+    }
+    if folded {
+        rebuild(app, rt, sheet, fonts, icons, clock);
+    }
+}
+
+/// Copy the surface out as tightly packed RGBA.
+fn read_rgba(surface: &skia_rs_safe::canvas::Surface, size: (u32, u32)) -> Vec<u8> {
+    let buffer = surface.pixel_buffer();
+    let mut out = Vec::with_capacity((size.0 as usize) * (size.1 as usize) * 4);
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            let skia_rs_safe::core::Color(argb) = buffer
+                .get_pixel(i32::try_from(x).unwrap_or(0), i32::try_from(y).unwrap_or(0))
+                .unwrap_or(skia_rs_safe::core::Color(0));
+            out.push(((argb >> 16) & 0xFF) as u8);
+            out.push(((argb >> 8) & 0xFF) as u8);
+            out.push((argb & 0xFF) as u8);
+            out.push(((argb >> 24) & 0xFF) as u8);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +1096,222 @@ mod tests {
         // second.
         let out = deliver(&mut instances, &path, &Event::Activate, &mut cx);
         assert_eq!(out.first(), Some(&Msg::Inner));
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Count {
+        Inc,
+        #[expect(
+            dead_code,
+            reason = "the plan's third message: `update` folds it, no test sends it"
+        )]
+        Dec,
+        Set(i32),
+    }
+
+    #[derive(Debug)]
+    struct Model {
+        n: i32,
+    }
+
+    fn update(model: &mut Model, msg: Count) -> Cmd<Count> {
+        match msg {
+            Count::Inc => model.n += 1,
+            Count::Dec => model.n -= 1,
+            Count::Set(v) => model.n = v,
+        }
+        Cmd::None
+    }
+
+    fn counter_view(model: &Model) -> crate::view::View<Count> {
+        widget::<Count>(Kind::Box)
+            .key("root")
+            .child(
+                widget::<Count>(Kind::Button)
+                    .key("plus")
+                    .prop(PropName::Label, "+")
+                    .on_click(Count::Inc),
+            )
+            .child(
+                widget::<Count>(Kind::Label)
+                    .key("value")
+                    .prop(PropName::Label, model.n.to_string()),
+            )
+    }
+
+    fn counter_app() -> App<Model, Count> {
+        App::new(Model { n: 0 }, update, counter_view)
+            .with_sheet(CompiledSheet::compile(
+                "window { background-color: #ffffff; }
+                 box { background-color: #ffffff; }
+                 button { background-color: #3584e4; min-width: 20px; min-height: 20px; }
+                 label { color: #000000; }",
+            ))
+            .with_fonts(crate::text::FontDatabase::probe_only())
+            .with_icons(crate::icons::IconTheme::with_name_and_roots(
+                "hicolor",
+                vec![],
+            ))
+    }
+
+    #[test]
+    fn a_scripted_message_folds_through_update_and_reaches_the_view() {
+        let clock = Rc::new(crate::anim::ManualClock::new());
+        let frames = counter_app()
+            .run_offscreen(
+                (80, 40),
+                Rc::clone(&clock),
+                vec![
+                    ScriptStep::Capture,
+                    ScriptStep::Message(Count::Set(7)),
+                    ScriptStep::Capture,
+                ],
+            )
+            .expect("the offscreen loop runs");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.size(), (80, 40));
+        // Two different models must not paint identical frames.
+        let a: Vec<Option<(u8, u8, u8, u8)>> = (0..80).map(|x| frames.pixel(0, x, 20)).collect();
+        let b: Vec<Option<(u8, u8, u8, u8)>> = (0..80).map(|x| frames.pixel(1, x, 20)).collect();
+        assert_ne!(a, b, "the label did not repaint after the model changed");
+    }
+
+    #[test]
+    fn identical_models_paint_identical_pixels() {
+        let run = || {
+            counter_app()
+                .run_offscreen(
+                    (60, 30),
+                    Rc::new(crate::anim::ManualClock::new()),
+                    vec![ScriptStep::Message(Count::Set(3)), ScriptStep::Capture],
+                )
+                .expect("runs")
+        };
+        let first = run();
+        let second = run();
+        for y in 0..30 {
+            for x in 0..60 {
+                assert_eq!(
+                    first.pixel(0, x, y),
+                    second.pixel(0, x, y),
+                    "pixel ({x}, {y}) differed between two runs of one model"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_produced_by_update_is_queued_never_folded_re_entrantly() {
+        // `Cmd::After(ZERO)` fires on the next clock advance, not inside
+        // `update` — the contract's "queued, never nested".
+        fn update_after(model: &mut Model, msg: Count) -> Cmd<Count> {
+            match msg {
+                Count::Inc => {
+                    model.n += 1;
+                    if model.n < 3 {
+                        return Cmd::After(Duration::ZERO, Rc::new(|| Count::Inc));
+                    }
+                    Cmd::None
+                }
+                Count::Dec => {
+                    model.n -= 1;
+                    Cmd::None
+                }
+                Count::Set(v) => {
+                    model.n = v;
+                    Cmd::None
+                }
+            }
+        }
+
+        let app = App::new(Model { n: 0 }, update_after, counter_view)
+            .with_sheet(CompiledSheet::compile("box { color: #000; }"))
+            .with_fonts(crate::text::FontDatabase::probe_only())
+            .with_icons(crate::icons::IconTheme::with_name_and_roots(
+                "hicolor",
+                vec![],
+            ));
+        let frames = app
+            .run_offscreen(
+                (40, 20),
+                Rc::new(crate::anim::ManualClock::new()),
+                // Reconciliation: the plan captured once at the end, and a
+                // frame count of 1 is the same whether the three `Inc`s were
+                // folded one per clock step or all three re-entrantly inside
+                // the first `update` — it cannot kill the mutation the plan
+                // asks for. Capturing after every step can: queued folding
+                // paints 1, then 2, then 3, so the three frames differ;
+                // re-entrant folding paints 3 three times.
+                vec![
+                    ScriptStep::Message(Count::Inc),
+                    ScriptStep::Capture,
+                    ScriptStep::Advance(Duration::from_millis(1)),
+                    ScriptStep::Capture,
+                    ScriptStep::Advance(Duration::from_millis(1)),
+                    ScriptStep::Capture,
+                ],
+            )
+            .expect("runs");
+        assert_eq!(frames.len(), 3);
+        let row = |frame: usize| -> Vec<Option<(u8, u8, u8, u8)>> {
+            (0..20)
+                .flat_map(|y| (0..40).map(move |x| (x, y)))
+                .map(|(x, y)| frames.pixel(frame, x, y))
+                .collect()
+        };
+        assert_ne!(row(0), row(1), "the second Inc did not wait for the clock");
+        assert_ne!(row(1), row(2), "the third Inc did not wait for the clock");
+    }
+
+    #[test]
+    fn a_synthetic_click_reaches_the_button_s_controller() {
+        let frames = counter_app()
+            .run_offscreen(
+                (80, 40),
+                Rc::new(crate::anim::ManualClock::new()),
+                vec![
+                    ScriptStep::Capture,
+                    // Reconciliation: the plan's (6, 10) is outside every
+                    // widget. M2's box centres its children, so in an 80x40
+                    // surface the button's border box is (26, 10)-(46, 30);
+                    // (30, 20) is inside it.
+                    ScriptStep::Event(crate::window::InputEvent::PointerEnter {
+                        x: 30.0,
+                        y: 20.0,
+                        serial: 1,
+                        target: crate::window::SurfaceTarget::Window,
+                    }),
+                    ScriptStep::Event(crate::window::InputEvent::PointerButton {
+                        button: crate::window::layer::BTN_LEFT,
+                        pressed: true,
+                        serial: 2,
+                        time_ms: 0,
+                    }),
+                    ScriptStep::Event(crate::window::InputEvent::PointerButton {
+                        button: crate::window::layer::BTN_LEFT,
+                        pressed: false,
+                        serial: 3,
+                        time_ms: 10,
+                    }),
+                    ScriptStep::Capture,
+                ],
+            )
+            .expect("runs");
+        assert_eq!(frames.len(), 2);
+        // Reconciliation: the plan sampled row y = 30, which this layout
+        // leaves blank (the button owns y < 20 and the label's glyphs sit
+        // just under it). The whole frame is compared instead, which is a
+        // strictly stronger form of the same assertion.
+        let whole = |frame: usize| -> Vec<Option<(u8, u8, u8, u8)>> {
+            (0..40)
+                .flat_map(|y| (0..80).map(move |x| (x, y)))
+                .map(|(x, y)| frames.pixel(frame, x, y))
+                .collect()
+        };
+        assert_ne!(
+            whole(0),
+            whole(1),
+            "the click never incremented the counter"
+        );
     }
 }
