@@ -152,6 +152,11 @@ impl<Msg: Clone + 'static> View<Msg> {
     }
 }
 
+// The per-widget builders themselves live beside their controllers under
+// `crate::widgets` (contract §11 E5); this module re-exports them so every
+// builder is reachable as `view::builders::<name>`.
+pub use crate::widgets::separator::separator;
+
 #[cfg(test)]
 mod tests {
     use super::*;

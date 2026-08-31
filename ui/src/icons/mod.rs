@@ -7,6 +7,8 @@
 //! this module: `lookup`, `render`, `IconFile`, `DirKind`, `Palette`, the
 //! symbolic recolour path, the builtin shapes and the caches.
 
+pub mod builtin;
 pub mod theme;
 
+pub use builtin::Builtin;
 pub use theme::{IconTheme, theme_name_from_settings_ini};

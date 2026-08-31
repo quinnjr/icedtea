@@ -518,9 +518,11 @@ impl<Msg: Clone + 'static> Controller<Msg> for GenericC {
 
 /// Build the controller for `kind`.
 ///
-/// This single `match` is the seam P5 and P6 extend: each arm they add
-/// replaces a [`GenericC`] with the kind's real controller, and nothing else
-/// in the framework changes.
+/// One definition, one fallback (contract §11 E1): the dispatch table lives
+/// beside the widgets in [`crate::widgets::build_controller`], and this is the
+/// name [`crate::view::reconcile`]'s `Insert` arm calls. A kind no part has
+/// written a controller for still lands on [`GenericC`], never on an inert
+/// stub.
 #[must_use]
 pub fn build_controller<Msg: Clone + 'static>(
     kind: Kind,
@@ -528,22 +530,31 @@ pub fn build_controller<Msg: Clone + 'static>(
     props: &Props,
     cx: &mut BuildCx<'_>,
 ) -> Box<dyn Controller<Msg>> {
-    // Identity first, so a `Classes` prop lands on top of the base classes.
-    node.set_classes(kind.base_classes());
+    crate::widgets::build_controller(kind, node, props, cx)
+}
+
+/// [`GenericC`], configured for `kind` — the catch-all
+/// [`crate::widgets::build_controller`] falls back to.
+///
+/// The caller has already written `kind.base_classes()` onto `node` and is
+/// responsible for the `set_prop` pass over `props`; this only builds the
+/// controller and gives it its identity.
+#[must_use]
+pub fn generic_controller<Msg: Clone + 'static>(
+    kind: Kind,
+    node: &Node,
+    props: &Props,
+    cx: &mut BuildCx<'_>,
+) -> Box<dyn Controller<Msg>> {
     let mut generic = <GenericC as Controller<Msg>>::build(node, props, cx);
     generic.kind = kind;
     // GTK's focusability default reaches P3's focus ring as a class
     // (`window::focus::FOCUSABLE_CLASS`); without this line no reconciled node
-    // is ever a Tab stop. A `PropName::Focusable` in the loop below overrides
-    // it, in either prop order.
+    // is ever a Tab stop. A `PropName::Focusable` in the caller's prop loop
+    // overrides it, in either prop order.
     generic.focusable = kind.is_focusable_by_default();
     generic.sync_classes(node);
-
-    let mut boxed: Box<dyn Controller<Msg>> = Box::new(generic);
-    for (name, value) in props.iter() {
-        boxed.set_prop(node, name, value, cx);
-    }
-    boxed
+    Box::new(generic)
 }
 
 #[cfg(test)]
