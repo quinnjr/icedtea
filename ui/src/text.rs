@@ -2036,7 +2036,11 @@ fn parse_markup_color(value: &str) -> Option<Rgba> {
 /// A malformed entity consumes exactly one byte and decodes to `None`, so the
 /// caller copies the `&` through and continues.
 fn decode_entity(s: &str) -> (Option<char>, usize) {
-    let Some(semi) = s[..s.len().min(12)].find(';') else {
+    let mut cap = s.len().min(12);
+    while !s.is_char_boundary(cap) {
+        cap -= 1;
+    }
+    let Some(semi) = s[..cap].find(';') else {
         return (None, 1);
     };
     let body = &s[1..semi];
@@ -3488,6 +3492,20 @@ mod tests {
     }
 
     #[test]
+    fn decode_entity_truncation_stays_on_a_char_boundary() {
+        // 13 bytes: '&' followed by six 2-byte 'é' characters, no ';' present.
+        // Byte offset 12 (the old fixed truncation length) lands mid-'é'; the
+        // truncation must snap back to a char boundary instead of panicking.
+        let hostile = format!("&{}", "\u{00e9}".repeat(6));
+        let (plain, spans) = super::parse_markup(&hostile);
+        assert_eq!(
+            plain, hostile,
+            "stray '&' with no entity is copied through verbatim"
+        );
+        assert!(spans.is_empty());
+    }
+
+    #[test]
     fn markup_never_panics_on_hostile_input() {
         // Unclosed, mismatched, nested past any sane depth, invalid attribute
         // values, lone angle brackets, and a non-ASCII payload — none of these
@@ -3501,6 +3519,7 @@ mod tests {
             "a < b > c",
             "&notanentity; &#; &#xZZ;",
             "<b>\u{00e9}\u{0301}\u{1F1EF}\u{1F1F5}</b>",
+            "&\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9}",
             &"<b>".repeat(5_000),
             &format!("<b>{}</b>", "\u{00e9}".repeat(10_000)),
         ];
