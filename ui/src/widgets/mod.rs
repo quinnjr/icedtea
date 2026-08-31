@@ -34,6 +34,7 @@ pub mod scrollbar;
 pub mod separator;
 pub mod spinner;
 pub mod statusbar;
+pub mod text_view;
 
 /// Re-express a pointer event given in the root node's space in `rect`'s space.
 ///
@@ -624,6 +625,9 @@ pub fn build_controller<Msg: Clone + 'static>(
         )),
         Kind::Image => Box::new(<image::ImageC as Controller<Msg>>::build(node, props, cx)),
         Kind::Picture => Box::new(<picture::PictureC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::TextView => Box::new(<text_view::TextViewC as Controller<Msg>>::build(
             node, props, cx,
         )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),

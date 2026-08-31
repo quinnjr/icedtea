@@ -165,6 +165,7 @@ pub use crate::widgets::scrollbar::{ScrollbarExt, scrollbar};
 pub use crate::widgets::separator::separator;
 pub use crate::widgets::spinner::{SpinnerExt, spinner};
 pub use crate::widgets::statusbar::{StatusbarExt, statusbar};
+pub use crate::widgets::text_view::{TextViewExt, text_view};
 
 #[cfg(test)]
 mod tests {

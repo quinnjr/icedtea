@@ -170,3 +170,17 @@ fn an_image_takes_its_icon_size_class_and_a_picture_takes_none() {
     assert_eq!(node_tree_of(Kind::Image, &props).trim(), "image");
     check(Kind::Picture, "picture", &Props::default());
 }
+
+#[test]
+fn a_text_view_builds_its_four_borders_and_a_text_node() {
+    // mutation: build three borders instead of four and this fails with
+    // "fixture requires a node at 'textview/border'" for the missing side —
+    // the four `border` nodes share a path, so drop the `.bottom` class
+    // instead to see "required class 'bottom' missing".
+    let mut props = Props::default();
+    props.set(PropName::Text, Prop::Str("hello\nworld".into()));
+    check(Kind::TextView, "text_view", &props);
+    let rendered = node_tree_of(Kind::TextView, &props);
+    assert!(rendered.starts_with("textview.view"), "{rendered}");
+    assert_eq!(rendered.matches("border").count(), 4, "{rendered}");
+}

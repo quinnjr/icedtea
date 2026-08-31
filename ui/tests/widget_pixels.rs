@@ -535,6 +535,90 @@ fn a_picture_with_an_undecodable_source_draws_nothing_and_does_not_panic() {
     }
 }
 
+/// A synthetic pressed `KeyEvent` carrying one character.
+pub fn key_char(ch: char, keycode: u32) -> icedtea_ui::window::keyboard::KeyEvent {
+    icedtea_ui::window::keyboard::KeyEvent {
+        keycode,
+        keysym: xkbcommon::xkb::Keysym::from(u32::from(ch)),
+        utf8: Some(ch.to_string()),
+        mods: icedtea_ui::window::keyboard::Mods::empty(),
+        consumed: icedtea_ui::window::keyboard::Mods::empty(),
+        pressed: true,
+        repeat: false,
+        serial: 10 + keycode,
+        time_ms: keycode,
+    }
+}
+
+#[test]
+fn typing_into_a_text_view_inserts_at_the_cursor_and_reports_the_change() {
+    // mutation: ignore `utf8` in TextViewC::on_event and the model stays empty.
+    //
+    // Plan reconciliation: the plan's script opens with `KeyboardEnter` alone
+    // and no click. `KeyboardEnter` only tells the app which surface holds
+    // the wl_keyboard (`InputEvent::KeyboardEnter` has no handler in
+    // `view::app::route` beyond its wildcard arm — P4's window/focus.rs
+    // grants focus only from a click, `Cmd::Focus`, or a keyboard binding,
+    // never from a raw keyboard-enter), so no widget ever holds
+    // `FocusRing::focus` and the `Key` events that follow have nowhere to
+    // go. A click grants it — `TextViewC::on_event` now does that itself,
+    // matching `GenericC`'s own click-focuses-the-node behaviour (also a
+    // reconciliation: the plan's `on_event` never calls `cx.focus.set_focus`
+    // at all, so it could not receive focus by any means as written).
+    //
+    // A second, compounding gap: an empty buffer measures to zero width, and
+    // `window/pointer.rs::descend` skips a zero-area node outright, so an
+    // empty `TextView` was unclickable regardless — `TextViewC::measure` now
+    // floors its width at a caret's worth of pixels. The click below lands
+    // at that floored box's centre, which a bare (unboxed, non-hexpanding)
+    // root widget centres in the window.
+    use icedtea_ui::view::builders::text_view;
+    use icedtea_ui::widgets::text_view::TextViewExt;
+    use icedtea_ui::window::BTN_LEFT;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Edited(String);
+
+    let frames = run(
+        String::new(),
+        |model: &mut String, Edited(text): Edited| {
+            *model = text;
+            Cmd::None
+        },
+        |model: &String| {
+            text_view(model)
+                .editable(true)
+                .on_change(|t| Edited(t.to_owned()))
+        },
+        (200, 80),
+        vec![
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 35.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 1,
+            }),
+            ScriptStep::Capture,
+            ScriptStep::Event(InputEvent::Key(key_char('h', 43))),
+            ScriptStep::Event(InputEvent::Key(key_char('i', 31))),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..200)
+            .map(|x| frames.pixel(frame, x, 35))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), "the typed glyphs must appear");
+}
+
 #[test]
 #[ignore = "P7 fills in IconTheme::render (contract §9, plan D9)"]
 fn an_image_paints_its_resolved_icon() {
