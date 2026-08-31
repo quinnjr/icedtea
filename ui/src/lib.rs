@@ -12,6 +12,7 @@ pub mod layout;
 pub mod paint;
 pub mod shm;
 pub mod text;
+pub mod view;
 pub mod wayland;
 pub mod widget;
 pub mod window;

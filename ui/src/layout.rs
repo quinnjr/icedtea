@@ -157,6 +157,26 @@ pub enum BoxDirection {
     Column,
 }
 
+/// GTK's per-child alignment (`halign`/`valign`).
+///
+/// P6 (contract §3.6) makes `LayoutTree::set_style` read this through a
+/// `ChildLayout`; P4 needs only the enum, because `view::Prop::Align` and
+/// `View::halign`/`View::valign` carry it (contract deviation D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Align {
+    /// Fill the whole allocation — GTK's default.
+    #[default]
+    Fill,
+    /// Pack at the start edge (left under LTR).
+    Start,
+    /// Pack at the end edge.
+    End,
+    /// Centre in the allocation.
+    Center,
+    /// Align on the first baseline; falls back to `Start` where there is none.
+    Baseline,
+}
+
 /// How a node lays its children out.
 ///
 /// M2 has exactly two: GTK's box, and a leaf whose size comes from a
