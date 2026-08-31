@@ -28,9 +28,58 @@ pub mod info_bar;
 pub mod label;
 pub mod level_bar;
 pub mod progress_bar;
+pub mod scrollbar;
 pub mod separator;
 pub mod spinner;
 pub mod statusbar;
+
+/// Re-express a pointer event given in the root node's space in `rect`'s space.
+///
+/// Controllers own their subnodes and hit-test against them; `EventCx` hands
+/// coordinates local to the controller's own root node, so every subnode
+/// gesture starts by subtracting that subnode's offset within the root.
+pub(crate) fn shift_event(ev: &Event, rect: Rect) -> Event {
+    let map = |local: (f32, f32)| (local.0 - rect.x, local.1 - rect.y);
+    match ev {
+        Event::PointerEnter { local } => Event::PointerEnter { local: map(*local) },
+        Event::PointerMotion { local } => Event::PointerMotion { local: map(*local) },
+        Event::PointerDown {
+            button,
+            local,
+            serial,
+        } => Event::PointerDown {
+            button: *button,
+            local: map(*local),
+            serial: *serial,
+        },
+        Event::PointerUp {
+            button,
+            local,
+            serial,
+        } => Event::PointerUp {
+            button: *button,
+            local: map(*local),
+            serial: *serial,
+        },
+        other => other.clone(),
+    }
+}
+
+/// A subnode's rectangle in its controller root's own space.
+pub(crate) fn local_rect(
+    tree: &crate::layout::LayoutTree,
+    root: &Node,
+    sub: &Node,
+) -> Option<Rect> {
+    let root_box = tree.allocation(root)?.border_box;
+    let sub_box = tree.allocation(sub)?.border_box;
+    Some(Rect::new(
+        sub_box.x - root_box.x,
+        sub_box.y - root_box.y,
+        sub_box.width,
+        sub_box.height,
+    ))
+}
 
 /// A widget-local enum carried through `Prop::Enum(u16)`.
 ///
@@ -566,6 +615,9 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::InfoBar => Box::new(<info_bar::InfoBarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::Scrollbar => Box::new(<scrollbar::ScrollbarC as Controller<Msg>>::build(
             node, props, cx,
         )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),

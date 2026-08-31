@@ -18,7 +18,7 @@ use crate::css::node::{Node, PseudoStates};
 use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
-use crate::widgets::{MessageType, PointerState, WidgetEnum};
+use crate::widgets::{MessageType, PointerState, WidgetEnum, local_rect, shift_event};
 
 /// A `GtkInfoBar`, hidden.
 #[must_use]
@@ -132,19 +132,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for InfoBarC {
         let Some(button) = self.close_button.as_ref() else {
             return Vec::new();
         };
-        let Some(alloc) = cx.tree.allocation(button) else {
+        let Some(local) = local_rect(cx.tree, cx.node, button) else {
             return Vec::new();
         };
-        let root = cx.tree.allocation(cx.node).map(|a| a.border_box);
-        let local = root.map_or(alloc.border_box, |root| {
-            Rect::new(
-                alloc.border_box.x - root.x,
-                alloc.border_box.y - root.y,
-                alloc.border_box.width,
-                alloc.border_box.height,
-            )
-        });
-        let shifted = shift(ev, local);
+        let shifted = shift_event(ev, local);
         if self.pointer.observe(
             button,
             &shifted,
@@ -156,33 +147,5 @@ impl<Msg: Clone + 'static> Controller<Msg> for InfoBarC {
             }
         }
         Vec::new()
-    }
-}
-
-/// Re-express a root-local pointer event in `rect`'s own space.
-fn shift(ev: &Event, rect: Rect) -> Event {
-    let map = |local: (f32, f32)| (local.0 - rect.x, local.1 - rect.y);
-    match ev {
-        Event::PointerEnter { local } => Event::PointerEnter { local: map(*local) },
-        Event::PointerMotion { local } => Event::PointerMotion { local: map(*local) },
-        Event::PointerDown {
-            button,
-            local,
-            serial,
-        } => Event::PointerDown {
-            button: *button,
-            local: map(*local),
-            serial: *serial,
-        },
-        Event::PointerUp {
-            button,
-            local,
-            serial,
-        } => Event::PointerUp {
-            button: *button,
-            local: map(*local),
-            serial: *serial,
-        },
-        other => other.clone(),
     }
 }

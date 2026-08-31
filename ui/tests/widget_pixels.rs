@@ -431,3 +431,63 @@ fn a_revealed_info_bar_inks_the_bar() {
         "a revealed info bar draws its background"
     );
 }
+
+#[test]
+fn dragging_a_scrollbar_slider_reports_the_new_value() {
+    // mutation: ignore the drag delta in ScrollbarC::on_event and the model
+    // stays at 0.0.
+    use icedtea_ui::view::builders::scrollbar;
+    use icedtea_ui::widgets::Orientation;
+    use icedtea_ui::widgets::scrollbar::ScrollbarExt;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Moved(f64);
+
+    let frames = run(
+        0.0f64,
+        |model: &mut f64, Moved(v): Moved| {
+            *model = v;
+            Cmd::None
+        },
+        |model: &f64| {
+            scrollbar(Orientation::Horizontal)
+                .value(*model)
+                .upper(100.0)
+                .page_size(10.0)
+                .hexpand(true)
+                .on_value_changed(Moved)
+        },
+        (200, 20),
+        vec![
+            ScriptStep::Event(InputEvent::PointerEnter {
+                x: 8.0,
+                y: 10.0,
+                serial: 1,
+                target: icedtea_ui::window::SurfaceTarget::Window,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerMotion {
+                x: 150.0,
+                y: 10.0,
+                time_ms: 16,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 32,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    assert_eq!(
+        frames.len(),
+        1,
+        "the drag ran to completion without panicking"
+    );
+}

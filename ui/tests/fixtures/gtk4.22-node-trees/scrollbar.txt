@@ -1,0 +1,4 @@
+scrollbar
+╰── range[.fine-tune]
+    ╰── trough
+        ╰── slider

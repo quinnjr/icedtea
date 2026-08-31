@@ -146,3 +146,13 @@ fn an_info_bar_carries_its_message_type_class_and_a_close_button() {
     let with_close = node_tree_of(Kind::InfoBar, &props);
     assert!(with_close.contains("button.close"), "{with_close}");
 }
+
+#[test]
+fn a_scrollbar_nests_range_trough_and_slider_and_takes_its_orientation_class() {
+    // mutation: drop the `trough` node and this fails with "fixture requires a
+    // node at 'scrollbar/range/trough'".
+    let mut props = Props::default();
+    props.set(PropName::Orientation, Orientation::Vertical.to_prop());
+    check(Kind::Scrollbar, "scrollbar", &props);
+    assert!(node_tree_of(Kind::Scrollbar, &props).starts_with("scrollbar.vertical"));
+}
