@@ -1046,6 +1046,199 @@ impl<Msg: Clone + 'static> Handlers<Msg> {
     }
 }
 
+/// An immutable description of one widget and its subtree.
+///
+/// A `view(&Model) -> View<Msg>` is pure: it allocates a fresh tree every
+/// frame and the reconciler (`view::reconcile`) diffs it into the retained
+/// [`Node`](crate::css::node::Node)s, so identity — animation, focus,
+/// shaping caches, attached popups — lives in the `Instance` tree, never here.
+pub struct View<Msg> {
+    /// Which widget.
+    pub kind: Kind,
+    /// The identity that survives an edit of the surrounding list.
+    pub key: Option<Key>,
+    /// Typed properties.
+    pub props: Props,
+    /// Child views, in order.
+    pub children: Vec<View<Msg>>,
+    /// Event-to-message bindings.
+    pub handlers: Handlers<Msg>,
+}
+
+impl<Msg: std::fmt::Debug> std::fmt::Debug for View<Msg> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("View")
+            .field("kind", &self.kind)
+            .field("key", &self.key)
+            .field("props", &self.props)
+            .field("handlers", &self.handlers)
+            .field("children", &self.children)
+            .finish()
+    }
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// An empty view of `kind`.
+    #[must_use]
+    pub fn new(kind: Kind) -> Self {
+        View {
+            kind,
+            key: None,
+            props: Props::default(),
+            children: Vec::new(),
+            handlers: Handlers::default(),
+        }
+    }
+
+    /// Give this view an identity for keyed reconciliation.
+    #[must_use]
+    pub fn key(mut self, key: impl Into<Key>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    /// Append one child.
+    #[must_use]
+    pub fn child(mut self, child: View<Msg>) -> Self {
+        self.children.push(child);
+        self
+    }
+
+    /// Append many children, in iteration order.
+    #[must_use]
+    pub fn children(mut self, children: impl IntoIterator<Item = View<Msg>>) -> Self {
+        self.children.extend(children);
+        self
+    }
+
+    /// Set one property.
+    #[must_use]
+    pub fn prop(mut self, name: PropName, value: impl Into<Prop>) -> Self {
+        self.props.set(name, value.into());
+        self
+    }
+
+    /// Bind one event.
+    #[must_use]
+    pub fn on(mut self, event: EventKind, handler: Handler<Msg>) -> Self {
+        self.handlers.set(event, handler);
+        self
+    }
+
+    /// Append one CSS class, after anything `classes` already added.
+    #[must_use]
+    pub fn class(mut self, class: &str) -> Self {
+        let mut list: Vec<Rc<str>> = match self.props.get(PropName::Classes) {
+            Some(Prop::Classes(existing)) => existing.to_vec(),
+            _ => Vec::new(),
+        };
+        list.push(Rc::from(class));
+        self.props
+            .set(PropName::Classes, Prop::Classes(Rc::from(list)));
+        self
+    }
+
+    /// Append several CSS classes, in order.
+    #[must_use]
+    pub fn classes(mut self, classes: &[&str]) -> Self {
+        let mut list: Vec<Rc<str>> = match self.props.get(PropName::Classes) {
+            Some(Prop::Classes(existing)) => existing.to_vec(),
+            _ => Vec::new(),
+        };
+        list.extend(classes.iter().map(|c| Rc::from(*c)));
+        self.props
+            .set(PropName::Classes, Prop::Classes(Rc::from(list)));
+        self
+    }
+
+    /// Set the CSS id.
+    #[must_use]
+    pub fn id(self, id: &str) -> Self {
+        self.prop(PropName::Id, id)
+    }
+
+    /// GTK's `visible`. An invisible widget keeps its `Node` and its
+    /// controller but is skipped by layout, paint and hit-testing.
+    #[must_use]
+    pub fn visible(self, on: bool) -> Self {
+        self.prop(PropName::Visible, on)
+    }
+
+    /// GTK's `sensitive`. Insensitive sets `PseudoStates::DISABLED` and
+    /// takes the node out of the focus ring and the hit-test.
+    #[must_use]
+    pub fn sensitive(self, on: bool) -> Self {
+        self.prop(PropName::Sensitive, on)
+    }
+
+    /// Override [`Kind::is_focusable_by_default`].
+    #[must_use]
+    pub fn focusable(self, on: bool) -> Self {
+        self.prop(PropName::Focusable, on)
+    }
+
+    /// Tooltip text.
+    #[must_use]
+    pub fn tooltip(self, text: &str) -> Self {
+        self.prop(PropName::Tooltip, text)
+    }
+
+    /// Horizontal alignment within the parent's allocation.
+    #[must_use]
+    pub fn halign(self, a: Align) -> Self {
+        self.prop(PropName::Halign, a)
+    }
+
+    /// Vertical alignment within the parent's allocation.
+    #[must_use]
+    pub fn valign(self, a: Align) -> Self {
+        self.prop(PropName::Valign, a)
+    }
+
+    /// Take any extra horizontal space the parent has.
+    #[must_use]
+    pub fn hexpand(self, on: bool) -> Self {
+        self.prop(PropName::Hexpand, on)
+    }
+
+    /// Take any extra vertical space the parent has.
+    #[must_use]
+    pub fn vexpand(self, on: bool) -> Self {
+        self.prop(PropName::Vexpand, on)
+    }
+
+    /// Margins, in px, in CSS order.
+    #[must_use]
+    pub fn margin(self, top: i32, right: i32, bottom: i32, left: i32) -> Self {
+        self.prop(PropName::Margin, Prop::Edges([top, right, bottom, left]))
+    }
+
+    /// GTK's `width-request` — a minimum, not a fixed size.
+    #[must_use]
+    pub fn width_request(self, px: i32) -> Self {
+        self.prop(PropName::WidthRequest, px)
+    }
+
+    /// GTK's `height-request`.
+    #[must_use]
+    pub fn height_request(self, px: i32) -> Self {
+        self.prop(PropName::HeightRequest, px)
+    }
+
+    /// A CSS `cursor` keyword; mapped to a `wp_cursor_shape_v1` name by
+    /// `window::pointer::cursor_shape_for`.
+    #[must_use]
+    pub fn cursor(self, name: &str) -> Self {
+        self.prop(PropName::Cursor, name)
+    }
+
+    /// Widget opacity, `0.0..=1.0`, applied as an inline style override.
+    #[must_use]
+    pub fn opacity(self, value: f64) -> Self {
+        self.prop(PropName::Opacity, value.clamp(0.0, 1.0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1286,6 +1479,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_new_view_carries_only_its_kind() {
+        let v: View<TestMsg> = View::new(Kind::Button);
+        assert_eq!(v.kind, Kind::Button);
+        assert_eq!(v.key, None);
+        assert!(v.props.is_empty());
+        assert!(v.children.is_empty());
+        assert!(v.handlers.is_empty());
+    }
+
+    #[test]
+    fn universal_setters_write_the_props_they_are_named_for() {
+        let v: View<TestMsg> = View::new(Kind::Label)
+            .id("title")
+            .classes(&["heading", "dim-label"])
+            .class("extra")
+            .visible(false)
+            .sensitive(false)
+            .focusable(true)
+            .tooltip("a tip")
+            .halign(crate::layout::Align::Start)
+            .valign(crate::layout::Align::Center)
+            .hexpand(true)
+            .vexpand(false)
+            .margin(1, 2, 3, 4)
+            .width_request(120)
+            .height_request(24)
+            .cursor("pointer")
+            .opacity(0.5);
+
+        assert_eq!(v.props.str(PropName::Id), Some("title"));
+        let Some(Prop::Classes(classes)) = v.props.get(PropName::Classes) else {
+            panic!("classes were not stored as Prop::Classes");
+        };
+        assert_eq!(
+            classes.iter().map(|c| &**c).collect::<Vec<_>>(),
+            vec!["heading", "dim-label", "extra"],
+            "`class` appends to `classes`, in call order"
+        );
+        assert!(!v.props.bool(PropName::Visible, true));
+        assert!(!v.props.bool(PropName::Sensitive, true));
+        assert!(v.props.bool(PropName::Focusable, false));
+        assert_eq!(v.props.str(PropName::Tooltip), Some("a tip"));
+        assert_eq!(
+            v.props.get(PropName::Halign),
+            Some(&Prop::Align(crate::layout::Align::Start))
+        );
+        assert_eq!(
+            v.props.get(PropName::Valign),
+            Some(&Prop::Align(crate::layout::Align::Center))
+        );
+        assert!(v.props.bool(PropName::Hexpand, false));
+        assert!(!v.props.bool(PropName::Vexpand, true));
+        assert_eq!(
+            v.props.get(PropName::Margin),
+            Some(&Prop::Edges([1, 2, 3, 4]))
+        );
+        assert_eq!(v.props.int(PropName::WidthRequest, 0), 120);
+        assert_eq!(v.props.int(PropName::HeightRequest, 0), 24);
+        assert_eq!(v.props.str(PropName::Cursor), Some("pointer"));
+        assert!((v.props.float(PropName::Opacity, 1.0) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn children_and_keys_chain_in_order() {
+        let v: View<TestMsg> = View::new(Kind::Box)
+            .child(View::new(Kind::Label).key("a"))
+            .children([
+                View::new(Kind::Button).key("b"),
+                View::new(Kind::Button).key(7_u64),
+            ]);
+        assert_eq!(v.children.len(), 3);
+        assert_eq!(v.children[0].key, Some(Key::Name(Rc::from("a"))));
+        assert_eq!(v.children[1].key, Some(Key::Name(Rc::from("b"))));
+        assert_eq!(v.children[2].key, Some(Key::Id(7)));
+        assert_eq!(v.children[2].kind, Kind::Button);
+    }
+
+    #[test]
+    fn on_binds_a_handler_the_view_can_fire() {
+        let v: View<TestMsg> =
+            View::new(Kind::Button).on(EventKind::Click, Handler::Unit(TestMsg::Ok));
+        assert_eq!(v.handlers.fire_unit(EventKind::Click), Some(TestMsg::Ok));
+    }
+
+    #[test]
+    fn setting_a_universal_prop_twice_keeps_the_last_value() {
+        let v: View<TestMsg> = View::new(Kind::Label).tooltip("first").tooltip("second");
+        assert_eq!(v.props.str(PropName::Tooltip), Some("second"));
+        assert_eq!(v.props.len(), 1);
     }
 
     #[test]
