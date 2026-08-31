@@ -1,6 +1,29 @@
 //! The reactive framework: `View` description trees, keyed reconciliation
 //! into M2's retained [`Node`](crate::css::node::Node)s, per-kind
 //! controllers, and the `App` loop that folds their messages.
+//!
+//! ```text
+//! view(&Model) -> View<Msg>          pure, rebuilt every frame
+//!        │
+//!        ▼  reconcile (keyed LCS)
+//! Vec<Instance<Msg>>                 retained: Node + Controller + children
+//!        │
+//!        ├─ render::restyle_tree     cascade → ComputedStyle + AnimationState
+//!        ├─ render::layout_tree      taffy, through Controller::measure
+//!        └─ render::paint_tree       skia,  through Controller::paint
+//!        │
+//!        ▼  InputEvent → hit chain → capture/target/bubble
+//! Vec<Msg> → update(&mut Model, Msg) -> Cmd<Msg> → queued, never nested
+//! ```
+//!
+//! Identity is the point of the reconciler: a child matched by key and kind
+//! keeps its `Node`, and with it its running transitions, its focus, its
+//! shaping caches and any popup attached to it.
+//!
+//! Two loops share every stage: [`App::run`](app::App::run) over a live
+//! [`Window`](crate::window::Window), and
+//! [`App::run_offscreen`](app::App::run_offscreen) over a raster surface on a
+//! [`ManualClock`](crate::anim::ManualClock), which is how the tests drive it.
 
 use std::rc::Rc;
 

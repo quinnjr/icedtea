@@ -14,6 +14,8 @@ pub mod popup;
 pub mod selection;
 pub mod toplevel;
 
+pub use layer::BTN_LEFT;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};

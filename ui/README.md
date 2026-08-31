@@ -155,6 +155,37 @@ Notes that are load-bearing for anyone reading computed values:
 - **Negative lengths clamp to 0** for padding, border widths, radii and
   minimums.
 
+## Reactive framework (`view/`)
+
+`view(&Model) -> View<Msg>` describes the UI; the reconciler diffs it into
+the retained node tree from `css::node`, keeping identity — animations,
+focus, shaping caches — for every child whose key and kind survive.
+Behaviour lives in a `Controller` per widget kind, not in the model:
+
+```rust
+fn view(model: &Model) -> View<Msg> {
+    widget::<Msg>(Kind::Box)
+        .child(widget(Kind::Button).prop(PropName::Label, "+").on_click(Msg::Inc))
+        .child(widget(Kind::Label).prop(PropName::Label, model.n.to_string()))
+}
+
+fn update(model: &mut Model, msg: Msg) -> Cmd<Msg> {
+    match msg { Msg::Inc => model.n += 1 }
+    Cmd::None
+}
+
+App::new(Model { n: 0 }, update, view).run(window)?;
+```
+
+Messages are queued and folded one at a time — an `update` that produces a
+`Cmd` producing a `Msg` enqueues it; the fold never re-enters.
+`App::run_offscreen` runs the identical loop against a raster surface with no
+compositor, driven by a `Vec<ScriptStep<Msg>>` on a `ManualClock`; that is
+what `ui/tests/counter_app.rs` and every controller unit test use.
+
+Widget builders (`button("Ok")`, `label("Hi")`, …) arrive with P5 and P6;
+`view::builders`' module docs carry the naming rule they follow.
+
 ## Fonts and text
 
 - **Font discovery is real fontconfig.** `text::FontDatabase` builds one
