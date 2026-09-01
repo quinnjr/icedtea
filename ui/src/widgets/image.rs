@@ -4,19 +4,20 @@
 //! image[.normal-icons][.large-icons]
 //! ```
 //!
-//! An image is an `IconRef` resolved through the icon theme. P7 owns the
-//! resolution (`IconTheme::render`, contract §9, plan D9); until it lands
-//! `resolved` stays `None` and the node paints only its CSS box.
+//! An image is an `IconRef` resolved through the icon theme
+//! (`IconTheme::render`) and drawn through `paint::icon::paint_icon`, the
+//! single entry point contract §6 names.
 
 use std::path::Path;
 use std::rc::Rc;
 
 use skia_rs_safe::canvas::Canvas;
-use skia_rs_safe::paint::Paint;
 
 use crate::css::computed::ComputedStyle;
 use crate::css::node::Node;
+use crate::css::value::Rgba;
 use crate::css::value::image::IconRef;
+use crate::icons::Palette;
 use crate::layout::{Allocation, Rect};
 use crate::view::controller::{Controller, Event, EventCx, PaintCx};
 use crate::view::{BuildCx, Kind, Prop, PropName, Props, View};
@@ -83,7 +84,9 @@ impl<Msg: Clone + 'static> ImageExt<Msg> for View<Msg> {
 pub struct ImageC {
     /// What to draw.
     pub icon: IconRef,
-    /// The rasterized icon, once P7's theme can produce one.
+    /// The rasterised icon, prefetched at build time and refreshed by the
+    /// last paint (which is the first moment the node's `color` — and so its
+    /// symbolic palette — is known).
     pub resolved: Option<Rc<skia_rs_safe::codec::Image>>,
     /// Requested size in px; 16 when unset, as GTK's `normal` icon size is.
     pub pixel_size: i32,
@@ -106,11 +109,34 @@ impl ImageC {
 
     /// Resolve `self.icon` through the icon theme.
     ///
-    /// `IconTheme::render` is P7's (contract §9, plan D9); `cx` is threaded
-    /// through today only so a future P7 fill-in is a body change here, not a
-    /// signature change at every call site.
-    fn resolve(&mut self, _cx: &mut BuildCx<'_>) {
-        self.resolved = None;
+    /// A build-time prefetch: it warms `IconTheme`'s lookup and rasterisation
+    /// caches (and tells `measure` whether there is anything to show) using
+    /// the default palette, because a node's computed `color` does not exist
+    /// until the restyle that follows. `paint` re-resolves against the real
+    /// palette; both hit the same memo table, so the second resolve is a hash
+    /// probe.
+    fn resolve(&mut self, cx: &mut BuildCx<'_>) {
+        let size = self.pixel_size.clamp(1, 512) as u32;
+        let scale = cx.icons.scale();
+        let palette = Palette::for_color(Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        });
+        self.resolved = match &self.icon {
+            IconRef::Theme { name } => {
+                let symbolic = name.ends_with("-symbolic");
+                cx.icons.render(name, size, scale, symbolic, &palette)
+            }
+            IconRef::Recolor { url, .. } => {
+                let path = std::path::PathBuf::from(url.as_ref());
+                cx.icons.render_path(path, size, scale, true, &palette)
+            }
+            // `-gtk-scaled()` picks its arm from the output scale, which is a
+            // paint-time decision; nothing is prefetched for one.
+            IconRef::Scaled { .. } => None,
+        };
     }
 }
 
@@ -191,21 +217,38 @@ impl<Msg: Clone + 'static> Controller<Msg> for ImageC {
         &mut self,
         canvas: &mut Canvas<'_>,
         alloc: &Allocation,
-        _style: &ComputedStyle,
-        _cx: &mut PaintCx<'_>,
+        style: &ComputedStyle,
+        cx: &mut PaintCx<'_>,
     ) -> bool {
-        let Some(icon) = self.resolved.as_ref() else {
-            return false;
-        };
         let content = alloc.content_box;
-        let size = content.width.min(content.height);
+        // The requested pixel size, clipped to what was actually allocated:
+        // GTK never stretches an icon past its box.
+        let size = (self.pixel_size.clamp(1, 512) as f32)
+            .min(content.width)
+            .min(content.height);
+        if !(size.is_finite() && size > 0.0) {
+            return false;
+        }
         let rect = Rect::new(
             content.x + (content.width - size) / 2.0,
             content.y + (content.height - size) / 2.0,
             size,
             size,
         );
-        canvas.draw_image_rect(icon, None, &rect.to_skia(), Some(&Paint::new()));
+        // Re-resolve against the node's real palette before drawing, so
+        // `resolved` is what was last shown rather than what the build-time
+        // prefetch guessed, and so a symbolic icon follows `color`.
+        #[allow(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "`size` is finite, positive and at most 512 by the clamp above"
+        )]
+        let px = size as u32;
+        self.resolved = crate::paint::icon::resolve_icon(&self.icon, px, style, cx);
+        if self.resolved.is_none() {
+            return false;
+        }
+        crate::paint::icon::paint_icon(canvas, &self.icon, rect, style, cx);
         true
     }
 }

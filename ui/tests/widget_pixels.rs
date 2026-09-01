@@ -15,6 +15,13 @@ use icedtea_ui::view::{Cmd, View};
 use icedtea_ui::window::InputEvent;
 
 /// Run one view offscreen against Adwaita light and return the captured frames.
+///
+/// The icon theme is deliberately hermetic — `"hicolor"` with no roots, so
+/// every lookup misses — because these are pixel assertions and the machine's
+/// installed icon set is not part of the toolkit under test (contract §6:
+/// Adwaita is "exercised only when present"). A test that needs a real icon
+/// builds its own `App` with `with_icons` and the checked-in mini fixture;
+/// `an_image_paints_its_resolved_icon` is the one that does.
 pub fn run<M: 'static, Msg: Clone + 'static>(
     model: M,
     update: fn(&mut M, Msg) -> Cmd<Msg>,
@@ -25,6 +32,10 @@ pub fn run<M: 'static, Msg: Clone + 'static>(
     let clock = Rc::new(ManualClock::new());
     App::new(model, update, view)
         .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+        .with_icons(icedtea_ui::icons::IconTheme::with_name_and_roots(
+            "hicolor",
+            Vec::new(),
+        ))
         .run_offscreen(size, clock, script)
         .expect("the offscreen app must run")
 }
@@ -886,17 +897,33 @@ fn dragging_a_scale_moves_the_slider_and_reports_the_value() {
 }
 
 #[test]
-#[ignore = "P7 fills in IconTheme::render (contract §9, plan D9)"]
 fn an_image_paints_its_resolved_icon() {
+    // mutation: `self.resolved = None` in `ImageC::paint` (P5's own body) and
+    // the frame is one flat colour. Un-ignored by P7 (contract §10 P5-D31):
+    // `ImageC` resolves through `IconTheme::render` and draws through
+    // `paint::icon::paint_icon`.
+    //
+    // Hermetic on purpose: the theme is the checked-in mini fixture, not the
+    // machine's, so this asserts the toolkit rather than whether Adwaita
+    // happens to be installed (contract §6's "exercised only when present").
+    use icedtea_ui::icons::IconTheme;
     use icedtea_ui::view::builders::image_named;
     use icedtea_ui::widgets::image::ImageExt;
-    let frames = run(
+    let fixture =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini-icon-theme");
+    let clock = Rc::new(ManualClock::new());
+    let frames = App::new(
         (),
         |_m: &mut (), _msg: ()| Cmd::None,
-        |_m: &()| image_named("image-missing").pixel_size(32),
-        (48, 48),
-        vec![ScriptStep::Capture],
-    );
+        |_m: &()| image_named("document-open").pixel_size(32),
+    )
+    .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+    .with_icons(IconTheme::with_name_and_roots(
+        "MiniTheme",
+        vec![fixture.join("root-a"), fixture.join("root-b")],
+    ))
+    .run_offscreen((48, 48), clock, vec![ScriptStep::Capture])
+    .expect("the offscreen app must run");
     assert!(has_ink(&frames, 0, (48, 48)), "the resolved icon must ink");
 }
 
@@ -1160,8 +1187,10 @@ fn flipping_a_switch_animates_the_slider_to_the_other_end() {
 }
 
 #[test]
-#[ignore = "P7 fills in Builtin::path (contract §9, plan D9)"]
 fn a_check_button_paints_the_builtin_check_glyph() {
+    // mutation: `return false` at the top of `CheckButtonC::paint` and the
+    // frame loses the tick. Un-ignored by P7 (contract §10 P5-D31): the
+    // glyph is real geometry now, drawn through `paint::icon::paint_builtin`.
     use icedtea_ui::view::builders::check_button;
     use icedtea_ui::widgets::check_button::CheckButtonExt;
     let frames = run(

@@ -59,6 +59,15 @@ impl<Msg: Clone + 'static> CheckButtonExt<Msg> for View<Msg> {
     }
 }
 
+/// The indicator's edge, in px.
+///
+/// Adwaita states it as `check { -gtk-icon-size: 14px }`
+/// (`themes/adwaita-light.css:1062`), but `-gtk-icon-size` is not a layout
+/// property and `layout.rs` never sees the `check` subnode's own style, so
+/// the intrinsic size a `CheckButton` reports has to name it here. Without
+/// it the indicator lays out 0x0 and the glyph has no box to draw into.
+const INDICATOR_PX: f32 = 14.0;
+
 /// `Kind::CheckButton`'s controller.
 pub struct CheckButtonC {
     /// `GtkCheckButton:active`.
@@ -170,21 +179,29 @@ impl<Msg: Clone + 'static> Controller<Msg> for CheckButtonC {
             .map_or_else(Vec::new, |m| vec![m])
     }
 
+    fn measure(
+        &mut self,
+        _available: (Option<f32>, Option<f32>),
+        _cx: &mut BuildCx<'_>,
+    ) -> Option<(f32, f32)> {
+        Some((INDICATOR_PX, INDICATOR_PX))
+    }
+
     fn paint(
         &mut self,
         canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
         alloc: &crate::layout::Allocation,
         style: &crate::css::computed::ComputedStyle,
-        _cx: &mut crate::view::controller::PaintCx<'_>,
+        cx: &mut crate::view::controller::PaintCx<'_>,
     ) -> bool {
         if !self.active && !self.inconsistent {
             return false;
         }
-        // The indicator's own allocation is the `check` node's; the builtin is
-        // drawn into it. P7 replaces Builtin::path's geometry (plan D9).
-        let _ = alloc;
-        self.builtin()
-            .draw(canvas, alloc.content_box, style.color());
+        // The indicator's own allocation is the `check` node's, and the glyph
+        // goes through `paint_builtin` rather than `Builtin::draw` so it
+        // honours the same `-gtk-icon-transform`/`-gtk-icon-filter`/
+        // `-gtk-icon-shadow` stack an icon file does (contract §6).
+        crate::paint::icon::paint_builtin(canvas, self.builtin(), alloc.content_box, style, cx);
         true
     }
 }

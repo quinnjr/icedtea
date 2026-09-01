@@ -465,6 +465,47 @@ pub fn paint_builtin(
     });
 }
 
+/// Draw whatever `-gtk-icon-source` puts on `node`, if anything.
+///
+/// This is the production reader of [`Prop::GtkIconSource`] and the third of
+/// the three doors contract §6 names (the other two being
+/// `background-image: -gtk-icontheme(…)` and the `Image` widget). It is
+/// called once per node from
+/// [`paint_node_with_children`](crate::paint::paint_node_with_children), so
+/// every `check`, `radio`, `arrow` and `expander` subnode in the tree draws
+/// its glyph from its own computed style — including the
+/// `-gtk-icon-transform: rotate(…)` an expander's arrow turns on.
+///
+/// Returns whether anything was drawn.
+pub fn paint_icon_source(
+    canvas: &mut Canvas<'_>,
+    node: &crate::css::node::Node,
+    rect: Rect,
+    style: &ComputedStyle,
+    cx: &mut PaintCx<'_>,
+) -> bool {
+    // The initial value is `none` and the property does not inherit, so an
+    // unspecified declaration must cost one flag test, not an icon lookup.
+    if !style.is_specified(Prop::GtkIconSource) {
+        return false;
+    }
+    match style.raw(Prop::GtkIconSource) {
+        Value::Image(CssImage::Icon(icon)) => {
+            let icon = std::rc::Rc::clone(icon);
+            paint_icon(canvas, &icon, rect, style, cx);
+            true
+        }
+        Value::Keyword(Keyword::Builtin) => {
+            let Some(builtin) = Builtin::for_node(node) else {
+                return false;
+            };
+            paint_builtin(canvas, builtin, rect, style, cx);
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{icon_size_px, paint_icon, resolve_icon};

@@ -408,14 +408,19 @@ impl<Msg: Clone + 'static> Controller<Msg> for SpinButtonC {
         canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
         alloc: &crate::layout::Allocation,
         style: &crate::css::computed::ComputedStyle,
-        _cx: &mut crate::view::controller::PaintCx<'_>,
+        cx: &mut crate::view::controller::PaintCx<'_>,
     ) -> bool {
         let content = alloc.content_box;
         self.edit
             .layout
             .draw(canvas, (content.x, content.y), style.color());
-        // The steppers' builtin glyphs; P7 fills in the real geometry (D9).
-        let _ = (Builtin::SpinPlus, Builtin::SpinMinus);
+        // The steppers' builtin glyphs, drawn into the same hit boxes
+        // `stepper_rects` gives the pointer, through the `-gtk-icon-*` stack.
+        let border = alloc.border_box;
+        let (up, down) = self.stepper_rects(border.width, border.height);
+        let shift = |r: Rect| Rect::new(border.x + r.x, border.y + r.y, r.width, r.height);
+        crate::paint::icon::paint_builtin(canvas, Builtin::SpinPlus, shift(up), style, cx);
+        crate::paint::icon::paint_builtin(canvas, Builtin::SpinMinus, shift(down), style, cx);
         true
     }
 }

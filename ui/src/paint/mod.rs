@@ -38,7 +38,9 @@ pub use effects::{begin_effects, end_effects};
 pub use geometry::{
     Side, clamp_radii, inner_radii, rounded_rect_path, rounded_ring_path, side_wedge_path,
 };
-pub use icon::{icon_size_px, paint_builtin, paint_icon, paint_icon_image, resolve_icon};
+pub use icon::{
+    icon_size_px, paint_builtin, paint_icon, paint_icon_image, paint_icon_source, resolve_icon,
+};
 pub use outline::paint_outline;
 pub use shadow::paint_box_shadows;
 pub use text::paint_text;
@@ -289,11 +291,6 @@ pub fn paint_node(
 /// own paint and before the layer is popped, which is the tree order CSS
 /// wants. It receives the canvas and the paint context so a child can paint
 /// its own text and images.
-#[allow(
-    unused_variables,
-    reason = "`node` is contract §8's signature; the tree walk that passes it \
-              is `view::render::paint_tree` (M3 P4)"
-)]
 pub fn paint_node_with_children<'cx>(
     canvas: &mut Canvas<'_>,
     node: &Node,
@@ -375,6 +372,12 @@ pub fn paint_node_with_children<'cx>(
         outline_style,
         &radii,
     );
+
+    // `-gtk-icon-source` is the node's own glyph, drawn over its box and
+    // under its children -- the one place `node` is read at paint time, and
+    // what makes `check`, `radio`, `arrow` and `expander` subnodes draw
+    // anything at all.
+    icon::paint_icon_source(canvas, node, alloc.content_box, style, cx);
 
     if let Some(shaped) = cx.text {
         text::paint_text(canvas, shaped, alloc.content_box, style, &len_ctx);

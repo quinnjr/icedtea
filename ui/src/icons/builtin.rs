@@ -229,6 +229,53 @@ impl Builtin {
             Builtin::SpinMinus => "spin-minus",
         }
     }
+
+    /// The shape a CSS node means when its style says
+    /// `-gtk-icon-source: builtin`.
+    ///
+    /// The keyword alone does not name a shape: GTK picks it from the node
+    /// itself, so `checkbutton > check` draws a tick, `radiobutton > radio`
+    /// draws a dot, and an `arrow`'s direction class picks one of the four
+    /// triangles. `None` for a node that has no builtin shape at all, which
+    /// is every node the theme never puts the keyword on.
+    #[must_use]
+    pub fn for_node(node: &crate::css::node::Node) -> Option<Builtin> {
+        use crate::css::node::PseudoStates;
+        use std::borrow::Borrow;
+
+        let mixed = node.states().contains(PseudoStates::INDETERMINATE);
+        let classes = node.classes();
+        let has = |wanted: &str| {
+            classes
+                .iter()
+                .any(|class| Borrow::<str>::borrow(class) == wanted)
+        };
+        match &*node.name() {
+            "check" => Some(if mixed {
+                Builtin::CheckIndeterminate
+            } else {
+                Builtin::Check
+            }),
+            "radio" => Some(if mixed {
+                Builtin::RadioIndeterminate
+            } else {
+                Builtin::Radio
+            }),
+            "expander" => Some(Builtin::Expander),
+            "arrow" => Some(if has("up") {
+                Builtin::ArrowUp
+            } else if has("left") {
+                Builtin::ArrowLeft
+            } else if has("right") {
+                Builtin::ArrowRight
+            } else {
+                // GTK's own default direction for a bare `arrow` node, and
+                // the one Adwaita's `.down` class agrees with.
+                Builtin::ArrowDown
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
