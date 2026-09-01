@@ -53,55 +53,6 @@ pub struct IconTheme {
 }
 
 impl IconTheme {
-    /// Read the theme name from `$XDG_CONFIG_HOME/gtk-4.0/settings.ini`
-    /// (falling back to `$HOME/.config/...`), defaulting to `Adwaita`, and
-    /// build the standard root list: `$XDG_DATA_HOME/icons`, `$HOME/.icons`,
-    /// each `$XDG_DATA_DIRS/icons`, with `/usr/share/pixmaps` as the flat,
-    /// non-themed fallback (deviation 4: kept separate from the themed
-    /// roots, not appended to them).
-    ///
-    /// A missing or unreadable `settings.ini` is not an error — it is the
-    /// normal case on a machine with no GTK configuration.
-    #[must_use]
-    pub fn from_env() -> Self {
-        let home = std::env::var("HOME").ok();
-        let config_home = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|h| PathBuf::from(h).join(".config")));
-
-        let name = config_home
-            .as_ref()
-            .map(|dir| dir.join("gtk-4.0").join("settings.ini"))
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| theme_name_from_settings_ini(&text))
-            .unwrap_or_else(|| DEFAULT_THEME.to_owned());
-
-        let mut roots: Vec<PathBuf> = Vec::new();
-        if let Some(data_home) = std::env::var("XDG_DATA_HOME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|h| PathBuf::from(h).join(".local/share")))
-        {
-            roots.push(data_home.join("icons"));
-        }
-        if let Some(home) = home.as_ref() {
-            roots.push(PathBuf::from(home).join(".icons"));
-        }
-        let data_dirs = std::env::var("XDG_DATA_DIRS")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/usr/local/share:/usr/share".to_owned());
-        for dir in data_dirs.split(':').filter(|s| !s.is_empty()) {
-            roots.push(PathBuf::from(dir).join("icons"));
-        }
-        let pixmaps = vec![PathBuf::from("/usr/share/pixmaps")];
-
-        IconTheme::with_name_roots_and_pixmaps(&name, roots, pixmaps)
-    }
-
     /// Hermetic construction for tests: no environment reads at all, and no
     /// flat `/usr/share/pixmaps` fallback (see
     /// [`with_name_roots_and_pixmaps`](Self::with_name_roots_and_pixmaps)).
@@ -627,6 +578,168 @@ impl ThemeIndex {
     }
 }
 
+/// The environment `IconTheme::from_env` reads, as data.
+///
+/// A struct rather than direct `std::env::var` calls so the resolution rules
+/// are testable without mutating process-global state — `std::env::set_var`
+/// is `unsafe` in edition 2024 and racy across the test harness's threads.
+/// Same shape [`crate::app::ThemeEnv`] uses for the same reason.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IconEnv {
+    /// `$XDG_DATA_HOME`.
+    pub xdg_data_home: Option<String>,
+    /// `$XDG_DATA_DIRS`, `:`-separated.
+    pub xdg_data_dirs: Option<String>,
+    /// `$HOME`.
+    pub home: Option<String>,
+    /// `$XDG_CONFIG_HOME`.
+    pub xdg_config_home: Option<String>,
+}
+
+/// Read `name`, treating an empty value as unset — which is what
+/// `XDG_DATA_DIRS=""` means.
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// One `key=value` from one group of an INI file.
+///
+/// Never fails and never panics: `settings.ini` is a file on disk that
+/// anything may have written. Values keep their quotes, as GTK's own
+/// key-file reader does for an unquoted-string key.
+#[must_use]
+pub(crate) fn ini_value(text: &str, group: &str, key: &str) -> Option<String> {
+    let mut in_group = false;
+    for raw in text.lines() {
+        let line = raw.trim_matches(|c: char| c == '\r' || c == '\u{0}').trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let Some(name) = rest.strip_suffix(']') else {
+                continue;
+            };
+            in_group = name.trim() == group;
+            continue;
+        }
+        if !in_group {
+            continue;
+        }
+        let Some((found, value)) = line.split_once('=') else {
+            continue;
+        };
+        if found.trim() == key {
+            return Some(value.trim().to_owned());
+        }
+    }
+    None
+}
+
+impl IconEnv {
+    /// Read the four variables from the process environment.
+    #[must_use]
+    pub fn from_env() -> IconEnv {
+        IconEnv {
+            xdg_data_home: env_var("XDG_DATA_HOME"),
+            xdg_data_dirs: env_var("XDG_DATA_DIRS"),
+            home: env_var("HOME"),
+            xdg_config_home: env_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    /// `$XDG_CONFIG_HOME`, falling back to `$HOME/.config`.
+    #[must_use]
+    pub fn config_dir(&self) -> Option<PathBuf> {
+        self.xdg_config_home
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.home
+                    .as_ref()
+                    .map(|home| Path::new(home).join(".config"))
+            })
+    }
+
+    /// The themed roots, in the spec's search order:
+    /// `$XDG_DATA_HOME/icons` (default `~/.local/share/icons`),
+    /// `$HOME/.icons`, then each `$XDG_DATA_DIRS` entry + `/icons`
+    /// (default `/usr/local/share:/usr/share`).
+    #[must_use]
+    pub fn roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        match (&self.xdg_data_home, &self.home) {
+            (Some(data), _) => roots.push(Path::new(data).join("icons")),
+            (None, Some(home)) => roots.push(Path::new(home).join(".local/share/icons")),
+            (None, None) => {}
+        }
+        if let Some(home) = &self.home {
+            roots.push(Path::new(home).join(".icons"));
+        }
+        let dirs = self
+            .xdg_data_dirs
+            .clone()
+            .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+        for dir in dirs.split(':').map(str::trim).filter(|d| !d.is_empty()) {
+            roots.push(Path::new(dir).join("icons"));
+        }
+        roots
+    }
+
+    /// The flat, non-themed last resort.
+    #[must_use]
+    pub fn pixmaps(&self) -> Vec<PathBuf> {
+        vec![PathBuf::from("/usr/share/pixmaps")]
+    }
+
+    /// `gtk-icon-theme-name` from `<config>/gtk-4.0/settings.ini`'s
+    /// `[Settings]` group, or `Adwaita`.
+    ///
+    /// A value that is not a usable directory name is ignored rather than
+    /// joined onto a root; [`IconTheme::with_name_roots_and_pixmaps`] would
+    /// reject it anyway, and rejecting it here keeps the log message about
+    /// the setting rather than about the theme.
+    #[must_use]
+    pub fn theme_name(&self) -> String {
+        let Some(config) = self.config_dir() else {
+            return DEFAULT_THEME.to_string();
+        };
+        let path = config.join("gtk-4.0").join("settings.ini");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return DEFAULT_THEME.to_string();
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        match ini_value(&text, "Settings", "gtk-icon-theme-name") {
+            Some(name) if is_safe_theme_name(&name) => name,
+            Some(name) => {
+                tracing::debug!(
+                    setting = %name,
+                    path = %path.display(),
+                    "gtk-icon-theme-name is not a usable theme directory name; using the default"
+                );
+                DEFAULT_THEME.to_string()
+            }
+            None => DEFAULT_THEME.to_string(),
+        }
+    }
+}
+
+impl IconTheme {
+    /// The theme this environment selects, with the spec's roots.
+    #[must_use]
+    pub fn from_icon_env(env: &IconEnv) -> IconTheme {
+        Self::with_name_roots_and_pixmaps(&env.theme_name(), env.roots(), env.pixmaps())
+    }
+
+    /// `gtk-icon-theme-name` from `$XDG_CONFIG_HOME/gtk-4.0/settings.ini`
+    /// (`[Settings]`), default `Adwaita`. Roots, in order:
+    /// `$XDG_DATA_HOME/icons`, `$HOME/.icons`, each `$XDG_DATA_DIRS/icons`,
+    /// then `/usr/share/pixmaps` (flat, non-themed, last resort only).
+    #[must_use]
+    pub fn from_env() -> IconTheme {
+        Self::from_icon_env(&IconEnv::from_env())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +1129,142 @@ Type=Fixed
         assert_eq!(with_flat.pixmap_dirs(), pixmaps().as_slice());
         assert_eq!(with_flat.roots(), roots().as_slice());
         let _: &[PathBuf] = hermetic.roots();
+    }
+
+    use super::{IconEnv, ini_value};
+
+    // The spec's root order: $XDG_DATA_HOME/icons, $HOME/.icons, then each
+    // $XDG_DATA_DIRS entry + /icons. `/usr/share/pixmaps` is not a root: it
+    // is the flat last resort, and it comes back from `pixmaps()`.
+    // Mutation check: move `$HOME/.icons` ahead of `$XDG_DATA_HOME/icons`
+    // and the vector comparison fails.
+    #[test]
+    fn the_search_roots_are_the_specs_in_the_specs_order() {
+        let env = IconEnv {
+            xdg_data_home: Some("/data".to_string()),
+            xdg_data_dirs: Some("/one:/two".to_string()),
+            home: Some("/home/u".to_string()),
+            xdg_config_home: None,
+        };
+        assert_eq!(
+            env.roots(),
+            vec![
+                PathBuf::from("/data/icons"),
+                PathBuf::from("/home/u/.icons"),
+                PathBuf::from("/one/icons"),
+                PathBuf::from("/two/icons"),
+            ]
+        );
+        assert_eq!(env.pixmaps(), vec![PathBuf::from("/usr/share/pixmaps")]);
+    }
+
+    // Unset variables take the XDG defaults: $HOME/.local/share for
+    // XDG_DATA_HOME, /usr/local/share:/usr/share for XDG_DATA_DIRS.
+    // Mutation check: drop the XDG_DATA_DIRS default and the last two
+    // entries disappear -- taking /usr/share/icons, i.e. every installed
+    // theme, with them.
+    #[test]
+    fn unset_variables_take_the_xdg_defaults() {
+        let env = IconEnv {
+            xdg_data_home: None,
+            xdg_data_dirs: None,
+            home: Some("/home/u".to_string()),
+            xdg_config_home: None,
+        };
+        assert_eq!(
+            env.roots(),
+            vec![
+                PathBuf::from("/home/u/.local/share/icons"),
+                PathBuf::from("/home/u/.icons"),
+                PathBuf::from("/usr/local/share/icons"),
+                PathBuf::from("/usr/share/icons"),
+            ]
+        );
+    }
+
+    // With no $HOME at all there is still a usable system search path.
+    // Mutation check: `unwrap()` the home and this panics.
+    #[test]
+    fn an_environment_with_nothing_set_still_searches_the_system_dirs() {
+        let env = IconEnv::default();
+        assert_eq!(
+            env.roots(),
+            vec![
+                PathBuf::from("/usr/local/share/icons"),
+                PathBuf::from("/usr/share/icons"),
+            ]
+        );
+        assert_eq!(env.theme_name(), "Adwaita");
+    }
+
+    // GTK reads gtk-icon-theme-name from the [Settings] group of
+    // $XDG_CONFIG_HOME/gtk-4.0/settings.ini, and defaults to Adwaita.
+    // Mutation check: read the key from any group and the "wrong group"
+    // case returns Papirus.
+    #[test]
+    fn the_theme_name_comes_from_gtk_fours_settings_ini() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gtk4 = dir.path().join("gtk-4.0");
+        std::fs::create_dir_all(&gtk4).expect("mkdir");
+        std::fs::write(
+            gtk4.join("settings.ini"),
+            "# generated\n[Settings]\ngtk-theme-name=Adwaita\ngtk-icon-theme-name = Papirus \n",
+        )
+        .expect("write");
+        let env = IconEnv {
+            xdg_config_home: Some(dir.path().display().to_string()),
+            ..IconEnv::default()
+        };
+        assert_eq!(env.theme_name(), "Papirus");
+
+        std::fs::write(
+            gtk4.join("settings.ini"),
+            "[Other]\ngtk-icon-theme-name=Papirus\n",
+        )
+        .expect("write");
+        assert_eq!(env.theme_name(), "Adwaita");
+    }
+
+    // settings.ini is untrusted, and so is the value in it.
+    // Mutation check: stop validating the name and the traversal case comes
+    // back as "../../etc" instead of Adwaita.
+    #[test]
+    fn a_hostile_settings_ini_never_panics_and_never_escapes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gtk4 = dir.path().join("gtk-4.0");
+        std::fs::create_dir_all(&gtk4).expect("mkdir");
+        let env = IconEnv {
+            xdg_config_home: Some(dir.path().display().to_string()),
+            ..IconEnv::default()
+        };
+        for (text, expected) in [
+            ("", "Adwaita"),
+            ("[Settings]", "Adwaita"),
+            ("[Settings]\ngtk-icon-theme-name=\n", "Adwaita"),
+            ("[Settings]\ngtk-icon-theme-name=../../etc\n", "Adwaita"),
+            ("[Settings]\ngtk-icon-theme-name=a/b\n", "Adwaita"),
+            ("[Settings]\ngtk-icon-theme-name=Papirus\n", "Papirus"),
+            ("\0\0\0[Settings]\0", "Adwaita"),
+            ("[Settings]\r\ngtk-icon-theme-name=Papirus\r\n", "Papirus"),
+        ] {
+            std::fs::write(gtk4.join("settings.ini"), text).expect("write");
+            let theme = IconTheme::from_icon_env(&env);
+            assert_eq!(theme.name(), expected, "settings.ini: {text:?}");
+        }
+    }
+
+    // The INI reader is shared with nothing and does one job.
+    // Mutation check: return the value trimmed of quotes as well and the
+    // quoted case comes back without them, which GTK does not do.
+    #[test]
+    fn the_ini_reader_finds_a_key_in_its_own_group_only() {
+        let text = "[A]\nk=1\n[B]\nk = 2 \nj=\"q\"\n";
+        assert_eq!(ini_value(text, "A", "k").as_deref(), Some("1"));
+        assert_eq!(ini_value(text, "B", "k").as_deref(), Some("2"));
+        assert_eq!(ini_value(text, "B", "j").as_deref(), Some("\"q\""));
+        assert_eq!(ini_value(text, "C", "k"), None);
+        assert_eq!(ini_value(text, "A", "j"), None);
+        assert_eq!(ini_value("", "A", "k"), None);
     }
 }
 
