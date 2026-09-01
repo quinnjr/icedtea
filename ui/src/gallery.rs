@@ -670,9 +670,216 @@ pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
         ),
         Kind::FontDialog => Sample::Own(w::font_dialog("Cantarell 11")),
 
-        // Tasks 3 and 4 replace this arm with the remaining 37.
+        // ---- P5 · entries ------------------------------------------------
+        //
+        // Reconciliation: several P5/P6 traits share a method name over an
+        // unconstrained `impl<Msg> Trait for View<Msg>` (EntryExt::
+        // placeholder / SearchEntryExt::placeholder / PasswordEntryExt::
+        // placeholder; SpinButtonExt::{digits,wrap,page,orientation} against
+        // LabelExt/ScaleExt/NotebookExt), so bringing every one of those
+        // traits into this file's scope at once (as the task text's plain
+        // `.method()` chains assume) makes plain dot calls ambiguous --
+        // `cargo build` reports E0034 at each collision, including on
+        // pre-existing P5 arms the collision never touched before. Rather
+        // than import the traits and disambiguate every call, no new trait
+        // is `use`-imported here: each one is named by its full path at the
+        // call site (`crate::widgets::entry::EntryExt::placeholder(..)`, or
+        // `w::BoxExt::spacing(..)` for a `view::builders` trait, since `w`
+        // is that module's alias), which resolves unambiguously without
+        // touching any other arm's scope.
+        Kind::Entry => Sample::Own(
+            crate::widgets::entry::EntryExt::width_chars(
+                crate::widgets::entry::EntryExt::placeholder(
+                    w::entry(model.text(Kind::Entry)),
+                    "Type here",
+                ),
+                16,
+            )
+            .on_change(|t: &str| GalleryMsg::Changed(Kind::Entry, t.to_string()))
+            .on_activate(GalleryMsg::Activated(Kind::Entry)),
+        ),
+        Kind::SearchEntry => Sample::Own(
+            crate::widgets::search_entry::SearchEntryExt::placeholder(
+                w::search_entry(model.text(Kind::SearchEntry)),
+                "Search",
+            )
+            .on_search(|t: &str| GalleryMsg::Search(t.to_string()))
+            .on_change(|t: &str| GalleryMsg::Changed(Kind::SearchEntry, t.to_string())),
+        ),
+        Kind::PasswordEntry => Sample::Own(
+            crate::widgets::password_entry::PasswordEntryExt::show_peek_icon(
+                w::password_entry(model.text(Kind::PasswordEntry)),
+                true,
+            )
+            .on_change(|t: &str| GalleryMsg::Changed(Kind::PasswordEntry, t.to_string())),
+        ),
+        Kind::SpinButton => Sample::Own(
+            crate::widgets::spin_button::SpinButtonExt::digits(
+                crate::widgets::spin_button::SpinButtonExt::step(
+                    w::spin_button(model.value(Kind::SpinButton), 0.0, 10.0),
+                    1.0,
+                ),
+                0,
+            )
+            .on_value_changed(|v| GalleryMsg::ValueChanged(Kind::SpinButton, v)),
+        ),
+        Kind::EditableLabel => Sample::Own(
+            w::editable_label(model.text(Kind::EditableLabel))
+                .on_change(|t: &str| GalleryMsg::Changed(Kind::EditableLabel, t.to_string())),
+        ),
+
+        // ---- P6 · containers ---------------------------------------------
+        Kind::Box => Sample::Own(w::BoxExt::spacing(
+            w::box_(
+                Orientation::Horizontal,
+                [w::label("One"), w::label("Two"), w::label("Three")],
+            ),
+            6,
+        )),
+        Kind::Grid => Sample::Own(w::GridExt::column_spacing(
+            w::GridExt::row_spacing(
+                w::grid([
+                    w::GridExt::at(w::label("0,0"), 0, 0),
+                    w::GridExt::at(w::label("1,0"), 1, 0),
+                    w::GridExt::span(w::GridExt::at(w::label("wide"), 0, 1), 2, 1),
+                ]),
+                6,
+            ),
+            6,
+        )),
+        Kind::CenterBox => Sample::Own(
+            w::center_box(w::label("start"), w::label("centre"), w::label("end"))
+                .prop(crate::view::PropName::Orientation, Orientation::Horizontal)
+                .width_request(240),
+        ),
+        Kind::ScrolledWindow => Sample::Own(w::ScrolledWindowExt::min_content_height(
+            w::ScrolledWindowExt::min_content_width(
+                w::scrolled_window(w::box_(
+                    Orientation::Vertical,
+                    (0..12).map(|i| w::label(&format!("Row {i}")).key(i as usize)),
+                )),
+                180,
+            ),
+            80,
+        )),
+        Kind::Paned => Sample::Own(
+            w::PanedExt::position(
+                w::paned(Orientation::Horizontal, w::label("left"), w::label("right")),
+                90,
+            )
+            .width_request(200)
+            .height_request(60),
+        ),
+        Kind::Frame => Sample::Own(crate::widgets::button::ButtonExt::label(
+            w::frame(w::label("Framed")),
+            "Frame",
+        )),
+        Kind::Expander => Sample::Own(
+            crate::widgets::expander::ExpanderExt::expanded(
+                w::expander("Expander", w::label("Revealed")),
+                model.expanded,
+            )
+            .on_expanded(GalleryMsg::Expanded),
+        ),
+        Kind::SearchBar => Sample::Own(
+            crate::widgets::search_bar::SearchBarExt::search_mode(
+                w::search_bar(w::search_entry("")),
+                true,
+            )
+            .width_request(240),
+        ),
+        Kind::ActionBar => Sample::Own(
+            w::PackExt::pack_end(
+                w::PackExt::pack_start(
+                    crate::widgets::action_bar::ActionBarExt::revealed(w::action_bar(), true),
+                    w::button("Start").on_click(GalleryMsg::Clicked(Kind::ActionBar)),
+                ),
+                w::button("End").on_click(GalleryMsg::Clicked(Kind::ActionBar)),
+            )
+            .width_request(240),
+        ),
+        Kind::HeaderBar => Sample::Own(
+            w::PackExt::pack_start(
+                w::HeaderBarExt::subtitle(w::HeaderBarExt::title(w::header_bar(), "Header"), "bar"),
+                w::button("Back").on_click(GalleryMsg::Clicked(Kind::HeaderBar)),
+            )
+            .width_request(280),
+        ),
+        Kind::Notebook => Sample::Own(
+            w::NotebookExt::page(
+                w::notebook([
+                    w::notebook_tab("One", w::label("Page one")).key(0usize),
+                    w::notebook_tab("Two", w::label("Page two")).key(1usize),
+                ]),
+                model.page,
+            )
+            .on_page_changed(GalleryMsg::PageChanged)
+            .width_request(240)
+            .height_request(100),
+        ),
+        Kind::NotebookTab => Sample::Within(Kind::Notebook),
+        Kind::Overlay => Sample::Own(
+            w::OverlayExt::overlay(
+                w::overlay(w::label("Under")),
+                w::label("Over").halign(crate::layout::Align::End),
+            )
+            .width_request(160)
+            .height_request(48),
+        ),
+        Kind::Stack => Sample::Own(
+            w::StackExt::transition_duration(
+                w::StackExt::transition_type(
+                    w::StackExt::visible_child(
+                        w::stack([
+                            w::stack_page("one", "One", w::label("Page one")).key("one"),
+                            w::stack_page("two", "Two", w::label("Page two")).key("two"),
+                        ]),
+                        if model.page == 0 { "one" } else { "two" },
+                    ),
+                    crate::widgets::types::StackTransition::SlideLeftRight,
+                ),
+                120,
+            )
+            .on_change(|name: &str| GalleryMsg::PageChanged(usize::from(name == "two")))
+            .width_request(200)
+            .height_request(60),
+        ),
+        Kind::StackPage => Sample::Within(Kind::Stack),
+        Kind::StackSwitcher => Sample::Own(
+            w::StackPagesExt::selected(w::stack_switcher(stack_pages()), model.page)
+                .on_selected(GalleryMsg::PageChanged),
+        ),
+        Kind::StackSidebar => Sample::Own(
+            w::StackPagesExt::selected(w::stack_sidebar(stack_pages()), model.page)
+                .on_selected(GalleryMsg::PageChanged)
+                .width_request(120)
+                .height_request(80),
+        ),
+
+        // Task 4 replaces this arm with the remaining 15.
         _ => Sample::Within(Kind::Box),
     }
+}
+
+/// The two pages `StackSwitcher` and `StackSidebar` present.
+fn stack_pages() -> Rc<[crate::widgets::types::StackPageInfo]> {
+    Rc::from(
+        [
+            crate::widgets::types::StackPageInfo {
+                name: Rc::from("one"),
+                title: Rc::from("One"),
+                icon: None,
+                needs_attention: false,
+            },
+            crate::widgets::types::StackPageInfo {
+                name: Rc::from("two"),
+                title: Rc::from("Two"),
+                icon: None,
+                needs_attention: false,
+            },
+        ]
+        .as_slice(),
+    )
 }
 
 /// Whether a kind is its own gallery entry or only ever a sub-node of another.
@@ -941,5 +1148,66 @@ mod tests {
         // Idempotent: asking twice neither panics nor changes the bytes.
         let again = sample_png_path();
         assert_eq!(again, path);
+    }
+
+    #[test]
+    fn every_entry_and_container_kind_has_a_sample() {
+        let model = GalleryModel::new(Theme::Light, None);
+        let own = [
+            Kind::Entry,
+            Kind::SearchEntry,
+            Kind::PasswordEntry,
+            Kind::SpinButton,
+            Kind::EditableLabel,
+            Kind::Box,
+            Kind::Grid,
+            Kind::CenterBox,
+            Kind::ScrolledWindow,
+            Kind::Paned,
+            Kind::Frame,
+            Kind::Expander,
+            Kind::SearchBar,
+            Kind::ActionBar,
+            Kind::HeaderBar,
+            Kind::Notebook,
+            Kind::Overlay,
+            Kind::Stack,
+            Kind::StackSwitcher,
+            Kind::StackSidebar,
+        ];
+        for kind in own {
+            match sample(kind, &model) {
+                Sample::Own(view) => assert_eq!(view.kind, kind, "{}", kind_name(kind)),
+                Sample::Within(p) => panic!("{} must be its own entry, got {p:?}", kind_name(kind)),
+            }
+        }
+        for (child, parent) in [
+            (Kind::NotebookTab, Kind::Notebook),
+            (Kind::StackPage, Kind::Stack),
+        ] {
+            match sample(child, &model) {
+                Sample::Within(got) => assert_eq!(got, parent),
+                Sample::Own(_) => panic!("{} is a sub-kind", kind_name(child)),
+            }
+        }
+    }
+
+    /// The samples must *read* the model, or no interaction could ever change
+    /// a pixel.
+    ///
+    /// Mutation check: make the `Entry` arm pass a literal `"Entry"` instead
+    /// of `model.text(Kind::Entry)`; this test fails. Restore.
+    #[test]
+    fn an_entrys_sample_reflects_the_models_text() {
+        let mut model = GalleryModel::new(Theme::Light, None);
+        update(&mut model, GalleryMsg::Changed(Kind::Entry, "typed".into()));
+        let Sample::Own(view) = sample(Kind::Entry, &model) else {
+            panic!("entry is its own entry");
+        };
+        assert_eq!(
+            view.props.str(crate::view::PropName::Text),
+            Some("typed"),
+            "the entry sample did not read the model"
+        );
     }
 }
