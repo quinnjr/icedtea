@@ -325,6 +325,80 @@ impl<Msg: Clone + 'static> View<Msg> {
     }
 }
 
+/// `GtkScrolledWindow` wrapping `child`.
+#[must_use]
+pub fn scrolled_window<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
+    View::new(Kind::ScrolledWindow).child(child)
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// `GtkScrolledWindow:hscrollbar-policy`.
+    #[must_use]
+    pub fn hscrollbar_policy(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::HscrollbarPolicy, v)
+    }
+
+    /// `GtkScrolledWindow:vscrollbar-policy`.
+    #[must_use]
+    pub fn vscrollbar_policy(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::VscrollbarPolicy, v)
+    }
+
+    /// `GtkScrolledWindow:has-frame`.
+    #[must_use]
+    pub fn has_frame(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::HasFrame, v)
+    }
+
+    /// `GtkScrolledWindow:min-content-width`.
+    #[must_use]
+    pub fn min_content_width(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MinContentWidth, v)
+    }
+
+    /// `GtkScrolledWindow:min-content-height`.
+    #[must_use]
+    pub fn min_content_height(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MinContentHeight, v)
+    }
+
+    /// `GtkScrolledWindow:max-content-width`.
+    #[must_use]
+    pub fn max_content_width(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MaxContentWidth, v)
+    }
+
+    /// `GtkScrolledWindow:max-content-height`.
+    #[must_use]
+    pub fn max_content_height(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MaxContentHeight, v)
+    }
+
+    /// `GtkScrolledWindow:propagate-natural-width`.
+    #[must_use]
+    pub fn propagate_natural_width(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::PropagateNaturalWidth, v)
+    }
+
+    /// `GtkScrolledWindow:propagate-natural-height`.
+    #[must_use]
+    pub fn propagate_natural_height(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::PropagateNaturalHeight, v)
+    }
+
+    /// `GtkScrolledWindow:kinetic-scrolling`.
+    #[must_use]
+    pub fn kinetic_scrolling(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Kinetic, v)
+    }
+
+    /// `GtkScrolledWindow:overlay-scrolling`.
+    #[must_use]
+    pub fn overlay_scrolling(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::OverlayScrolling, v)
+    }
+}
+
 impl<Msg: Clone + 'static> View<Msg> {
     /// `GtkBox:spacing`, `GtkGrid` row/column spacing's shorthand.
     #[must_use]

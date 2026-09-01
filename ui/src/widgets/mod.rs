@@ -77,6 +77,7 @@ pub mod popover;
 pub mod progress_bar;
 pub mod scale;
 pub mod scrollbar;
+pub mod scrolled_window;
 pub mod search_entry;
 pub mod separator;
 pub mod spin_button;
@@ -974,6 +975,9 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Paned => Box::new(<paned::PanedC as Controller<Msg>>::build(node, props, cx)),
+        Kind::ScrolledWindow => {
+            Box::new(<scrolled_window::ScrolledWindowC as Controller<Msg>>::build(node, props, cx))
+        }
         Kind::Separator => Box::new(<separator::SeparatorC as Controller<Msg>>::build(
             node, props, cx,
         )),

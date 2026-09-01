@@ -102,6 +102,43 @@ impl ScrollbarC {
         self.value = self.adj.value;
     }
 
+    /// Build one directly under `node`, with no `Props` and no `BuildCx`.
+    ///
+    /// `ScrolledWindow` creates and destroys its bars at runtime as the
+    /// policy and extent demand, outside the normal reconciled-child path
+    /// every other embedder of a widget goes through, so it has no `Props`
+    /// to build one from and no `BuildCx` in scope wherever the extent
+    /// changes (a plain method call, not a `Controller::set_prop`). This
+    /// is `Controller::build`'s body with that dependency dropped — `build`
+    /// never reads its own `_cx` parameter either.
+    #[must_use]
+    pub fn for_node(node: &Node, vertical: bool) -> Self {
+        let range = Node::new("range");
+        node.append_child(&range);
+        let trough = Node::new("trough");
+        range.append_child(&trough);
+        let slider = Node::new("slider");
+        trough.append_child(&slider);
+        let this = ScrollbarC {
+            value: 0.0,
+            adj: Adjustment::default(),
+            drag: None,
+            fine_tune: false,
+            range,
+            trough,
+            slider,
+            orientation: if vertical {
+                Orientation::Vertical
+            } else {
+                Orientation::Horizontal
+            },
+            inverted: false,
+            pointer: PointerState::default(),
+        };
+        this.apply(node);
+        this
+    }
+
     /// Where the slider sits inside `trough`.
     ///
     /// The slider's length is the page's share of the range, floored at 20px so

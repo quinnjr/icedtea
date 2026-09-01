@@ -666,6 +666,18 @@ fn expander_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn scrolled_window_matches_its_gtk_fixture() {
+    // Default policy is `Automatic` on both axes and the default extent is
+    // zero/zero, so neither bar nor the junction is wanted -- every
+    // optional node in the fixture is legitimately absent here.
+    assert_fixture(
+        icedtea_ui::view::Kind::ScrolledWindow,
+        &icedtea_ui::view::Props::default(),
+        "scrolled_window",
+    );
+}
+
+#[test]
 fn no_p5_kind_falls_through_to_the_unimplemented_controller() {
     // mutation: remove any dispatch arm from build_controller and that kind's
     // tree renders as a bare node, failing its fixture's required subnodes.
