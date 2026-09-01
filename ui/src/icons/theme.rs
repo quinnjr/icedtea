@@ -160,6 +160,112 @@ pub fn theme_name_from_settings_ini(text: &str) -> Option<String> {
     None
 }
 
+/// How a subdirectory of an icon theme relates requested sizes to the icons
+/// it holds: the spec's `Type` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirKind {
+    /// `Type=Fixed`: a match only at exactly `Size`.
+    Fixed {
+        /// The directory's declared `Size`.
+        size: u32,
+    },
+    /// `Type=Scalable`: a match anywhere in `[MinSize, MaxSize]`.
+    Scalable {
+        /// `MinSize`, defaulting to `Size`.
+        min: u32,
+        /// `MaxSize`, defaulting to `Size`.
+        max: u32,
+    },
+    /// `Type=Threshold` (the spec's default): a match within
+    /// `Size ± Threshold`.
+    Threshold {
+        /// The directory's declared `Size`.
+        size: u32,
+        /// `Threshold`, defaulting to 2.
+        threshold: u32,
+    },
+}
+
+/// `a * b` in `u64`, so a hostile `Size=4294967295` in an `index.theme`
+/// cannot overflow the arithmetic below.
+const fn mul(a: u32, b: u32) -> u64 {
+    (a as u64) * (b as u64)
+}
+
+/// `|a - b|`, saturated into a `u32`.
+const fn diff(a: u64, b: u64) -> u32 {
+    let d = a.abs_diff(b);
+    if d > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        d as u32
+    }
+}
+
+impl DirKind {
+    /// The spec's `DirectoryMatchesSize`.
+    ///
+    /// `dir_scale` is the subdirectory's own `Scale` key; a directory only
+    /// ever matches a request at its own scale, which is why a `scale=2`
+    /// lookup in a theme with no `Scale=2` directories (Adwaita, as
+    /// installed) matches nothing and falls to [`distance`](Self::distance).
+    #[must_use]
+    pub const fn matches(self, dir_scale: u32, size: u32, scale: u32) -> bool {
+        if dir_scale != scale {
+            return false;
+        }
+        match self {
+            DirKind::Fixed { size: fixed } => fixed == size,
+            DirKind::Scalable { min, max } => min <= size && size <= max,
+            DirKind::Threshold {
+                size: nominal,
+                threshold,
+            } => {
+                nominal.saturating_sub(threshold) <= size
+                    && size <= nominal.saturating_add(threshold)
+            }
+        }
+    }
+
+    /// The spec's `DirectorySizeDistance`, in device pixels.
+    ///
+    /// Zero while the request is inside the directory's range: the caller
+    /// only reaches this when [`matches`](Self::matches) already failed, so a
+    /// zero here means "right size, wrong scale" and still competes.
+    #[must_use]
+    pub const fn distance(self, dir_scale: u32, size: u32, scale: u32) -> u32 {
+        let want = mul(size, scale);
+        match self {
+            DirKind::Fixed { size: fixed } => diff(mul(fixed, dir_scale), want),
+            DirKind::Scalable { min, max } => {
+                let lo = mul(min, dir_scale);
+                let hi = mul(max, dir_scale);
+                if want < lo {
+                    diff(lo, want)
+                } else if want > hi {
+                    diff(want, hi)
+                } else {
+                    0
+                }
+            }
+            DirKind::Threshold {
+                size: nominal,
+                threshold,
+            } => {
+                let lo = mul(nominal.saturating_sub(threshold), dir_scale);
+                let hi = mul(nominal.saturating_add(threshold), dir_scale);
+                if want < lo {
+                    diff(lo, want)
+                } else if want > hi {
+                    diff(want, hi)
+                } else {
+                    0
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +343,123 @@ mod tests {
         theme.clear_caches();
         assert_eq!(theme.name(), "Papirus");
         assert_eq!(theme.roots().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::DirKind;
+
+    // The spec's `DirectoryMatchesSize` for `Type=Fixed`: a match at exactly
+    // `Size`, and only at the directory's own `Scale`.
+    // Mutation check: relax the scale equality to `true` and the third
+    // assertion passes when it must not.
+    #[test]
+    fn a_fixed_directory_matches_only_its_exact_size_and_scale() {
+        let dir = DirKind::Fixed { size: 16 };
+        assert!(dir.matches(1, 16, 1));
+        assert!(!dir.matches(1, 17, 1));
+        assert!(!dir.matches(1, 16, 2));
+        assert!(dir.matches(2, 16, 2));
+    }
+
+    // `Type=Scalable` matches anywhere in `[MinSize, MaxSize]`, at its scale.
+    // Mutation check: make the bounds exclusive (`min < size`) and the
+    // `matches(1, 8, 1)` boundary assertion fails.
+    #[test]
+    fn a_scalable_directory_matches_its_whole_range_inclusive() {
+        let dir = DirKind::Scalable { min: 8, max: 512 };
+        assert!(dir.matches(1, 8, 1));
+        assert!(dir.matches(1, 128, 1));
+        assert!(dir.matches(1, 512, 1));
+        assert!(!dir.matches(1, 7, 1));
+        assert!(!dir.matches(1, 513, 1));
+    }
+
+    // `Type=Threshold` matches `Size ± Threshold`.
+    // Mutation check: drop the `+ threshold` half and `matches(1, 26, 1)`
+    // fails.
+    #[test]
+    fn a_threshold_directory_matches_size_plus_or_minus_threshold() {
+        let dir = DirKind::Threshold {
+            size: 24,
+            threshold: 2,
+        };
+        assert!(dir.matches(1, 22, 1));
+        assert!(dir.matches(1, 24, 1));
+        assert!(dir.matches(1, 26, 1));
+        assert!(!dir.matches(1, 21, 1));
+        assert!(!dir.matches(1, 27, 1));
+    }
+
+    // `DirectorySizeDistance`, which is what picks the *closest* directory
+    // once no directory matched exactly. Distances are in device pixels:
+    // `size * scale` against the directory's `Size * Scale`.
+    // Mutation check: compare `size` against `Size` without multiplying
+    // either by its scale and the `(2, 16, 1)` assertion returns 0.
+    #[test]
+    fn size_distance_is_measured_in_device_pixels() {
+        assert_eq!(DirKind::Fixed { size: 16 }.distance(1, 32, 1), 16);
+        assert_eq!(DirKind::Fixed { size: 16 }.distance(1, 8, 1), 8);
+        assert_eq!(DirKind::Fixed { size: 16 }.distance(2, 16, 1), 16);
+        assert_eq!(
+            DirKind::Scalable { min: 8, max: 512 }.distance(1, 600, 1),
+            88
+        );
+        assert_eq!(DirKind::Scalable { min: 8, max: 512 }.distance(1, 4, 1), 4);
+        assert_eq!(
+            DirKind::Scalable { min: 8, max: 512 }.distance(1, 128, 1),
+            0
+        );
+        assert_eq!(
+            DirKind::Threshold {
+                size: 24,
+                threshold: 2
+            }
+            .distance(1, 30, 1),
+            4
+        );
+        assert_eq!(
+            DirKind::Threshold {
+                size: 24,
+                threshold: 2
+            }
+            .distance(1, 10, 1),
+            12
+        );
+    }
+
+    // `index.theme` is untrusted: `Size=4294967295` is a legal-looking line.
+    // Mutation check: do the arithmetic in `u32` instead of `u64` and this
+    // panics with "attempt to multiply with overflow" in a debug build.
+    #[test]
+    fn hostile_sizes_saturate_instead_of_overflowing() {
+        let huge = DirKind::Fixed { size: u32::MAX };
+        assert_eq!(huge.distance(u32::MAX, 1, 1), u32::MAX);
+        // Reconciliation (Task 1): the plan's own assertion here negated
+        // this call, but `Fixed { size: u32::MAX }.matches(u32::MAX,
+        // u32::MAX, u32::MAX)` is an exact size-and-scale match by
+        // `DirectoryMatchesSize`'s own rule (dir_scale == scale, and
+        // fixed == size) — the correct read of a hostile-but-consistent
+        // input is "matches", not "doesn't". Corrected to match the
+        // (unmodified) implementation above, which is the spec-exact one.
+        assert!(huge.matches(u32::MAX, u32::MAX, u32::MAX));
+        let scalable = DirKind::Scalable {
+            min: u32::MAX,
+            max: 0,
+        };
+        assert_eq!(scalable.distance(u32::MAX, u32::MAX, u32::MAX), u32::MAX);
+        assert!(!scalable.matches(1, u32::MAX, 1));
+        let threshold = DirKind::Threshold {
+            size: 0,
+            threshold: u32::MAX,
+        };
+        // Reconciliation (Task 1): the plan's assertion here expected `0`,
+        // but `want = size * scale = u32::MAX * u32::MAX` (computed in u64,
+        // no overflow) vastly exceeds `hi = nominal.saturating_add(threshold)
+        // = u32::MAX`, so the correctly-saturated distance is `u32::MAX`,
+        // consistent with the `huge`/`scalable` cases just above — not `0`.
+        assert_eq!(threshold.distance(1, u32::MAX, u32::MAX), u32::MAX);
+        assert!(threshold.matches(1, 0, 1));
     }
 }
