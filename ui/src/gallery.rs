@@ -23,7 +23,9 @@ use crate::view::builders::{
 };
 use crate::view::cmd::Cmd;
 use crate::view::{Kind, View};
-use crate::widgets::types::{MessageType, Orientation, Side};
+use crate::widgets::types::{
+    ItemFactory, ListItem, MessageType, Orientation, RowContent, SelectionMode, Side,
+};
 use crate::{BUNDLED_ADWAITA_DARK, BUNDLED_ADWAITA_HC, BUNDLED_ADWAITA_LIGHT};
 
 /// Which bundled Adwaita sheet the gallery compiles, and under which
@@ -856,9 +858,253 @@ pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
                 .height_request(80),
         ),
 
-        // Task 4 replaces this arm with the remaining 15.
-        _ => Sample::Within(Kind::Box),
+        // ---- P6 · lists ---------------------------------------------------
+        Kind::ListBox => Sample::Own(
+            w::ListBoxExt::show_separators(
+                w::ListBoxExt::selection_mode(
+                    w::list_box([
+                        w::ListBoxExt::activatable(
+                            w::list_box_row(w::label("Row 0")).key(0usize),
+                            true,
+                        ),
+                        w::ListBoxExt::activatable(
+                            w::list_box_row(w::label("Row 1")).key(1usize),
+                            true,
+                        ),
+                        w::ListBoxExt::activatable(
+                            w::list_box_row(w::label("Row 2")).key(2usize),
+                            true,
+                        ),
+                    ]),
+                    SelectionMode::Single,
+                ),
+                true,
+            )
+            .on_selected(|i| GalleryMsg::Selected(Kind::ListBox, i))
+            .width_request(200),
+        ),
+        Kind::ListBoxRow => Sample::Within(Kind::ListBox),
+        Kind::FlowBox => Sample::Own(
+            w::ListBoxExt::selection_mode(
+                w::FlowBoxExt::max_children_per_line(
+                    w::FlowBoxExt::min_children_per_line(
+                        // Reconciliation: there is no separate `flow_box_child`
+                        // builder -- `flow_box` already wraps each child in
+                        // its own `Kind::FlowBoxChild` (its own doc comment),
+                        // so the children passed here are the row content
+                        // directly.
+                        w::flow_box((0..6).map(|i| w::label(&format!("{i}")).key(i as usize))),
+                        3,
+                    ),
+                    3,
+                ),
+                SelectionMode::Single,
+            )
+            .on_selected(|i| GalleryMsg::Selected(Kind::FlowBox, i))
+            .width_request(200),
+        ),
+        Kind::FlowBoxChild => Sample::Within(Kind::FlowBox),
+        Kind::ListView => Sample::Own(
+            w::ListBoxExt::selection_mode(
+                w::list_view(items(LIST_ROWS), row_factory()),
+                SelectionMode::Single,
+            )
+            .selected(model.selection(Kind::ListView))
+            .on_selected(|i| GalleryMsg::Selected(Kind::ListView, i))
+            .width_request(200)
+            .height_request(120),
+        ),
+        Kind::GridView => Sample::Own(
+            w::GridViewExt::max_columns(
+                w::GridViewExt::min_columns(w::grid_view(items(LIST_ROWS), row_factory()), 2),
+                2,
+            )
+            .on_selected(|i| GalleryMsg::Selected(Kind::GridView, i))
+            .width_request(200)
+            .height_request(120),
+        ),
+        Kind::ColumnView => Sample::Own(
+            w::ColumnViewExt::show_column_separators(
+                w::ColumnViewExt::show_row_separators(
+                    w::column_view(
+                        items(LIST_ROWS),
+                        [
+                            w::ColumnViewExt::resizable(
+                                w::column_view_column("Name", row_factory()),
+                                true,
+                            ),
+                            w::ColumnViewExt::expand(
+                                w::column_view_column("Value", row_factory()),
+                                true,
+                            ),
+                        ],
+                    ),
+                    true,
+                ),
+                true,
+            )
+            .on_selected(|i| GalleryMsg::Selected(Kind::ColumnView, i))
+            .width_request(240)
+            .height_request(120),
+        ),
+        Kind::ColumnViewColumn => Sample::Within(Kind::ColumnView),
+
+        // ---- P6 · menus -----------------------------------------------
+        //
+        // Reconciliation: the task text binds `PopoverMenu`/`PopoverMenuBar`'s
+        // selection with `.on_activate(|i| ..)`, but `View::on_activate` (the
+        // only `on_activate` in scope) takes a plain `Msg`, not an
+        // `Fn(usize) -> Msg` -- it is `Handler::Unit`'s zero-argument setter.
+        // The index-carrying setter both controllers actually fire
+        // (`EventCx::fire_index(EventKind::Activate, ..)`, per
+        // `popover_menu.rs`/`popover_menu_bar.rs`) is
+        // `View::on_item_activated`, so both arms below call that instead.
+        Kind::PopoverMenu => Sample::Own(
+            w::popover_menu([
+                w::PopoverMenuItemExt::accel(w::popover_menu_item("Open").key("open"), "<Ctrl>O"),
+                w::PopoverMenuItemExt::accel(w::popover_menu_item("Save").key("save"), "<Ctrl>S"),
+                w::popover_menu_item("Quit").key("quit"),
+            ])
+            .autohide(false)
+            .on_item_activated(|i| GalleryMsg::Selected(Kind::PopoverMenu, i)),
+        ),
+        Kind::PopoverMenuBar => Sample::Own(
+            w::PopoverMenuBarExt::menu(
+                w::popover_menu_bar([w::popover_menu_item("File").key("file")]),
+                "File",
+                w::label("File menu"),
+            )
+            .on_item_activated(|i| GalleryMsg::Selected(Kind::PopoverMenuBar, i))
+            .width_request(200),
+        ),
+        Kind::PopoverMenuItem => Sample::Within(Kind::PopoverMenu),
+
+        // ---- P6 · windows -------------------------------------------------
+        // The window-ish kinds are node trees like any other: the gallery
+        // embeds them in the page rather than mapping four more surfaces.
+        //
+        // Reconciliation: `Window` has no `.title()` of its own (`WindowExt`
+        // covers `titlebar`/`resizable`/`modal`/`deletable`/`decorated`/
+        // `default_size`/`icon_name`, but not a plain window title) --
+        // `PropName::Title` is the prop `WindowC::build` reads for it
+        // (`window.rs`'s own `"Files"` fixture sets it the same way), and the
+        // only setter over that prop in scope is `HeaderBarExt::title`, so
+        // that is what is called here, by full path to avoid claiming
+        // `HeaderBar`'s trait for this whole file.
+        Kind::Window => Sample::Own(
+            w::HeaderBarExt::title(w::window(w::label("Window content")), "Window")
+                .width_request(220)
+                .height_request(80),
+        ),
+        Kind::ShortcutsWindow => Sample::Own(
+            w::ShortcutsSectionExt::view_name(
+                w::ShortcutsSectionExt::section_name(
+                    w::shortcuts_window([w::label("Ctrl+Q — Quit")]),
+                    "general",
+                ),
+                "main",
+            )
+            .width_request(220)
+            .height_request(80),
+        ),
+        Kind::AboutDialog => Sample::Own(
+            w::AboutDialogExt::comments(
+                w::AboutDialogExt::version(w::about_dialog("icedtea"), "0.1.0"),
+                "A pure-Rust GTK-themed toolkit",
+            )
+            .width_request(220)
+            .height_request(100),
+        ),
+        Kind::AlertDialog => Sample::Own(
+            w::AlertDialogExt::buttons(
+                w::AlertDialogExt::detail(
+                    w::alert_dialog("Delete everything?"),
+                    "This cannot be undone.",
+                ),
+                ["Cancel", "Delete"],
+            )
+            .on_response(|i| GalleryMsg::Selected(Kind::AlertDialog, i))
+            .width_request(240),
+        ),
     }
+}
+
+/// The rows every list-ish sample shows. Ten, so `ListView` has more rows than
+/// fit its 120 px viewport and the scroll interaction actually recycles.
+const LIST_ROWS: &[&str] = &[
+    "Row 0", "Row 1", "Row 2", "Row 3", "Row 4", "Row 5", "Row 6", "Row 7", "Row 8", "Row 9",
+];
+
+/// A list model from plain strings.
+///
+/// Reconciliation: the task's "Produces" section assumed `ListItem::text`,
+/// but the real constructor is `ListItem::new(id, text)` (§4.3/D7's `id` is
+/// the stable identity a keyed row uses) -- the row's own index doubles as
+/// its id here, since these are static fixtures with no reordering.
+#[must_use]
+pub fn items(labels: &[&str]) -> Rc<[ListItem]> {
+    labels
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ListItem::new(i as u64, t))
+        .collect()
+}
+
+/// The factory every list-ish sample binds its rows with: one label per item.
+///
+/// Reconciliation: the task's "Produces" section assumed the `factory`
+/// parameter of `list_view`/`grid_view`/`column_view_column` was
+/// `Rc<dyn Fn(usize, &ListItem) -> View<Msg>>`, but the real type is
+/// `crate::widgets::types::ItemFactory`, wrapping `Fn(usize, &ListItem) ->
+/// RowContent` -- deliberately `Msg`-free (`RowContent`'s own doc comment:
+/// "rebinding a pooled row must not allocate a view subtree"), so this binds
+/// `RowContent::from_label` instead of building a `View`.
+fn row_factory() -> ItemFactory {
+    ItemFactory::new(|_index, item: &ListItem| RowContent::from_label(&item.text))
+}
+
+/// Every kind that gets its own framed entry, in `Kind::all()` order.
+#[must_use]
+pub fn own_kinds() -> Vec<Kind> {
+    Kind::all()
+        .iter()
+        .copied()
+        .filter(|&k| sample_shape(k) == SampleShape::Own)
+        .collect()
+}
+
+/// The gallery's whole view.
+///
+/// In `--widget` mode it is the bare sample, at the origin, so the interaction
+/// gate's coordinates are the widget's own. Otherwise it is one vertical box of
+/// frames, one per own kind, in `Kind::all()` order, built by *iterating*
+/// `Kind::all()` — that iteration is what makes a missing entry impossible.
+#[must_use]
+pub fn page(model: &GalleryModel) -> View<GalleryMsg> {
+    if let Some(kind) = model.only {
+        return match sample(kind, model) {
+            Sample::Own(view) => view
+                .halign(crate::layout::Align::Start)
+                .valign(crate::layout::Align::Start),
+            // Unreachable through `Options::parse`, which rejects a sub-kind.
+            Sample::Within(parent) => w::label(&format!(
+                "{} is rendered inside {}",
+                kind_name(kind),
+                kind_name(parent)
+            )),
+        };
+    }
+    let frames = own_kinds().into_iter().map(|kind| {
+        let Sample::Own(view) = sample(kind, model) else {
+            unreachable!("own_kinds() filtered to Sample::Own");
+        };
+        crate::widgets::button::ButtonExt::label(w::frame(view), kind_name(kind))
+            .key(kind_name(kind))
+            .halign(crate::layout::Align::Start)
+    });
+    w::BoxExt::spacing(w::box_(Orientation::Vertical, frames), 12)
+        .margin(12, 12, 12, 12)
+        .class("gallery")
 }
 
 /// The two pages `StackSwitcher` and `StackSidebar` present.
@@ -1209,5 +1455,78 @@ mod tests {
             Some("typed"),
             "the entry sample did not read the model"
         );
+    }
+
+    /// The completeness assertion the whole M3 gate rests on.
+    ///
+    /// Mutation check: add a `Sample::Within(Kind::Box)` arm for `Kind::Label`;
+    /// this test fails naming `label`. Restore.
+    #[test]
+    fn sample_is_total_and_every_sub_kind_names_a_real_parent() {
+        let model = GalleryModel::new(Theme::Light, None);
+        for &kind in Kind::all() {
+            match sample(kind, &model) {
+                Sample::Own(view) => {
+                    assert_eq!(view.kind, kind, "{}'s sample root", kind_name(kind));
+                    assert_eq!(sample_shape(kind), SampleShape::Own, "{}", kind_name(kind));
+                }
+                Sample::Within(parent) => {
+                    assert_ne!(parent, kind, "{} cannot contain itself", kind_name(kind));
+                    assert_eq!(
+                        sample_shape(kind),
+                        SampleShape::Within(parent),
+                        "sample() and sample_shape() disagree about {}",
+                        kind_name(kind)
+                    );
+                    assert!(
+                        matches!(sample(parent, &model), Sample::Own(_)),
+                        "{}'s parent {} must be its own entry",
+                        kind_name(kind),
+                        kind_name(parent)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_page_holds_one_frame_per_own_kind_in_kind_order() {
+        let model = GalleryModel::new(Theme::Light, None);
+        let page = page(&model);
+        let expected = own_kinds();
+        assert_eq!(
+            page.children.len(),
+            expected.len(),
+            "one frame per own kind"
+        );
+        for (frame, kind) in page.children.iter().zip(&expected) {
+            assert_eq!(
+                frame.kind,
+                Kind::Frame,
+                "{} is not framed",
+                kind_name(*kind)
+            );
+            assert_eq!(
+                frame.props.str(crate::view::PropName::Label),
+                Some(kind_name(*kind)),
+                "the frame's label is the widget's name"
+            );
+            assert_eq!(frame.children.len(), 1);
+            assert_eq!(frame.children[0].kind, *kind);
+        }
+    }
+
+    #[test]
+    fn the_page_in_widget_mode_is_the_bare_sample() {
+        let model = GalleryModel::new(Theme::Light, Some(Kind::CheckButton));
+        let page = page(&model);
+        assert_eq!(page.kind, Kind::CheckButton, "no frame, no siblings");
+    }
+
+    #[test]
+    fn scrolling_shifts_the_page_and_never_the_isolated_widget() {
+        let model = GalleryModel::new(Theme::Light, None);
+        let page = page(&model);
+        assert_eq!(page.kind, Kind::Box, "the page is one vertical box");
     }
 }
