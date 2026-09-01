@@ -484,3 +484,23 @@ fn a_packed_colour_round_trips_exactly() {
     let _ = ColorDialogC::unpack(-1.0);
     let _ = ColorDialogC::unpack(f64::MAX);
 }
+
+#[test]
+fn an_entry_renders_the_shared_text_subtree_and_its_optional_icons() {
+    // mutation: skip the `placeholder` node in TextEditState::build and this
+    // fails with "fixture requires a node at 'entry/text/placeholder'".
+    let mut props = Props::default();
+    props.set(PropName::Text, Prop::Str("hello".into()));
+    check(Kind::Entry, "entry", &props);
+    let bare = node_tree_of(Kind::Entry, &props);
+    assert!(bare.contains("undershoot.left"), "{bare}");
+    assert!(
+        !bare.contains("progress"),
+        "no progress node until asked: {bare}"
+    );
+
+    props.set(PropName::Fraction, Prop::Float(0.4));
+    let with_progress = node_tree_of(Kind::Entry, &props);
+    assert!(with_progress.contains("progress"), "{with_progress}");
+    check(Kind::Entry, "entry", &props);
+}

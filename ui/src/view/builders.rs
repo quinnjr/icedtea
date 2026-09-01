@@ -163,6 +163,7 @@ pub use crate::widgets::color_dialog::{
 };
 pub use crate::widgets::drawing_area::{DrawingAreaExt, drawing_area};
 pub use crate::widgets::drop_down::{DropDownExt, drop_down, drop_down_from};
+pub use crate::widgets::entry::{EntryExt, entry};
 pub use crate::widgets::font_dialog::{
     FontDialogButtonExt, FontDialogExt, font_dialog, font_dialog_button,
 };

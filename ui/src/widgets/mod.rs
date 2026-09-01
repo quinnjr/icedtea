@@ -50,6 +50,7 @@ pub mod color_dialog;
 pub mod drawing_area;
 pub mod drop_down;
 pub mod edit;
+pub mod entry;
 pub mod font_dialog;
 pub mod image;
 pub mod info_bar;
@@ -706,6 +707,7 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::FontDialog => Box::new(<font_dialog::FontDialogC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::Entry => Box::new(<entry::EntryC as Controller<Msg>>::build(node, props, cx)),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {

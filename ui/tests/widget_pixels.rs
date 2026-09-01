@@ -620,6 +620,61 @@ fn typing_into_a_text_view_inserts_at_the_cursor_and_reports_the_change() {
 }
 
 #[test]
+fn typing_into_an_entry_shows_the_glyphs_and_moves_the_caret() {
+    // mutation: return EditOutcome::Ignored for printable keys in
+    // TextEditState::key and the two captures match.
+    //
+    // Plan reconciliation: the plan's script opens with `KeyboardEnter` alone
+    // and no click. As `typing_into_a_text_view_inserts_at_the_cursor_and_reports_the_change`
+    // above already found, `InputEvent::KeyboardEnter` grants no keyboard
+    // focus by itself (`view/app.rs::route` has no handler for it beyond its
+    // wildcard arm; `FocusRing` only moves from a click, `Cmd::Focus`, or a
+    // keyboard binding), so the `Key` events that followed a bare
+    // `KeyboardEnter` had nowhere to go and the model never changed. A click
+    // grants it, matching that same test.
+    use icedtea_ui::view::builders::entry;
+    use icedtea_ui::window::BTN_LEFT;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Typed(String);
+
+    let frames = run(
+        String::new(),
+        |model: &mut String, Typed(text): Typed| {
+            *model = text;
+            Cmd::None
+        },
+        |model: &String| entry(model).on_change(|t| Typed(t.to_owned())),
+        (200, 40),
+        vec![
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 1,
+            }),
+            ScriptStep::Capture,
+            ScriptStep::Event(InputEvent::Key(key_char('a', 38))),
+            ScriptStep::Event(InputEvent::Key(key_char('b', 56))),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..200)
+            .map(|x| frames.pixel(frame, x, 20))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), "the typed glyphs must appear");
+}
+
+#[test]
 fn dragging_a_scale_moves_the_slider_and_reports_the_value() {
     // mutation: return early from ScaleC::on_event's PointerMotion arm and the
     // model stays at 0.0.
