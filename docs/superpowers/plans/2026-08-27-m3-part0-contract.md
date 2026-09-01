@@ -2989,6 +2989,62 @@ into §10 itself.
 
 ---
 
+### P5-D23 — `ColorDialogButton`'s colour rides `Handler::Float` as a packed `0xAARRGGBB`; all four dialog kinds gain a `sink` node
+
+**Carried out by:** P5 (Task 22, `ui/src/widgets/color_dialog.rs`,
+`ui/src/widgets/font_dialog.rs`). **Added:** 2026-08-31.
+
+**Contract §5.2 types** `ColorDialogButton`'s change handler as
+`on_change(|Rgba| Msg)` and `FontDialogC.list` as `ListViewC`.
+
+**As shipped:**
+
+1. `Handler` has no `Rgba` variant (only `Unit`/`Text`/`Bool`/`Index`/`Float`/
+   `Key`), so `ColorDialogButtonExt::on_change` and `ColorDialogExt::on_change`
+   both take `impl Fn(f64) -> Msg`, fired via `Handler::Float` with the colour
+   packed 8 bits per channel into an `f64` (`ColorDialogC::pack`/`unpack`,
+   exact up to `2^32`, which every `f64` represents losslessly). Task 22's own
+   Interfaces section specified this, matching Task 21's `FontDialogC.list`
+   precedent below.
+2. `FontDialogC.list` is a plain `Node` (the `fontchooser` subnode), not a
+   `ListViewC` — `Kind::ListView` is a P6 kind. Identical deviation and
+   identical P6 migration path to P5-D22's `DropDownC.list`.
+3. (Not anticipated by Task 22's text.) `ColorDialogButtonC`, `ColorDialogC`,
+   `FontDialogButtonC` and `FontDialogC` each gained a `pub sink: Node` field,
+   wired into `widgets::child_slot`. None of the four take application
+   children, so `reconcile.rs`'s no-application-children cleanup — which walks
+   `child_slot(kind, controller).unwrap_or(root)` and detaches everything past
+   position zero — was detaching each controller's own `button`/`colorchooser`/
+   `fontchooser` subnode on every single reconcile, leaving every one of the
+   four kinds a permanently zero-sized, unstyled, unpaintable root. `sink` is
+   the identical fix `DropDownC` (Task 21) already carries for the same
+   reason; `widgets::mod.rs`'s own doc comment on `child_slot` names this
+   exact failure mode as "fatal" and prescribes this exact fix.
+
+**Ruling.** All three declared, not reverted. (1) and (2) are exactly what
+Task 22's Interfaces section instructed recording here. (3) is a correctness
+fix, not a scope expansion: without it every one of this task's four `Kind`s
+renders nothing and hit-tests nothing, which is not an alternate valid
+implementation of the plan's node trees, just a bug the plan's code sample
+did not have to face because it was written before Task 21 discovered
+`child_slot`. P6 tasks building further no-application-children widgets whose
+chrome lives on a subnode (any future `menubutton`/`dropdown`/`colorbutton`-
+shaped kind) should check `child_slot` from the start rather than rediscover
+this by a zero-sized widget in a pixel test.
+
+**Also recorded here:** `clicking_a_colour_button_opens_its_dialog_and_repaints_the_swatch`
+in `ui/tests/widget_pixels.rs` is `#[ignore]`d for the same framework bug
+already covered by `opening_a_drop_down_and_picking_an_item_updates_the_button`
+(P5-D22's neighbour, `route`'s `aim` in `ui/src/view/app.rs` never resolving to
+the innermost `Instance` when a kind's chrome lives on a nested, non-zero-sized
+subnode). Confirmed directly: an inline `eprintln!` at the top of
+`ColorDialogButtonC::on_event` never fires under the test's click script, even
+once (3) above gave the subnode real layout geometry. Not fixable inside P5's
+boundary (`view/app.rs` is D5 File Structure); unignore alongside the
+`DropDown` test once `aim` is fixed.
+
+---
+
 ## 11. Execution notes — cross-part consistency check (E1–E16)
 
 Added 2026-08-27 by the consistency checker after all eight part plans were
