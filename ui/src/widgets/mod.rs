@@ -60,6 +60,7 @@ pub mod edit;
 pub mod editable_label;
 pub mod entry;
 pub mod font_dialog;
+pub mod grid;
 pub mod image;
 pub mod info_bar;
 pub mod label;
@@ -689,12 +690,70 @@ struct Pending {
     gap: Option<(f32, Orientation)>,
     homogeneous: Option<(bool, Orientation)>,
     child_layout: Option<ChildLayout>,
+    /// This node is a [`Container::Grid`]; re-derive every child's cell from
+    /// its own recorded props on every flush, the same way `homogeneous`
+    /// re-applies to whatever children the node currently has. A `Grid`
+    /// controller builds before the reconciler attaches its children (M2's
+    /// `build_instance` order), so it cannot loop over `node.children()`
+    /// itself -- there are none yet -- and defers the loop to here instead.
+    grid_from_children: bool,
     node: Option<Node>,
 }
 
 thread_local! {
     static PENDING: RefCell<HashMap<OpaqueElement, Pending>> = RefCell::new(HashMap::new());
     static CONTAINERS: RefCell<HashMap<OpaqueElement, Container>> = RefCell::new(HashMap::new());
+    static NODE_PROPS: RefCell<HashMap<OpaqueElement, Props>> = RefCell::new(HashMap::new());
+    static NODE_CHILD: RefCell<HashMap<OpaqueElement, ChildLayout>> = RefCell::new(HashMap::new());
+}
+
+/// The prop names [`record_props`] keeps; every other prop is dropped on the
+/// way in.
+///
+/// A full `Props` clone would retain whatever a caller last set through it
+/// forever -- `Prop::Draw`'s `Rc<dyn Fn>` included -- because this table has
+/// no removal path (`reconcile`'s `Remove` op drops the `Instance`, not this
+/// side entry). Grid placement is the only reader today and every value it
+/// needs is a `Prop::Int`, cheap to keep and inert to clone, so `record_props`
+/// keeps only these four rather than whatever the caller happened to pass.
+const RECORDED_PROP_NAMES: [PropName; 4] = [
+    PropName::Column,
+    PropName::Row,
+    PropName::ColumnSpan,
+    PropName::RowSpan,
+];
+
+/// Record the subset of `props` a container controller can re-derive a
+/// child's placement from. Called from the reconciler's `Insert`/`SetProp`
+/// arms with that instance's just-applied `Props`.
+pub(crate) fn record_props(node: &Node, props: &Props) {
+    let mut kept = Props::default();
+    for name in RECORDED_PROP_NAMES {
+        if let Some(value) = props.get(name) {
+            kept.set(name, value.clone());
+        }
+    }
+    NODE_PROPS.with(|m| m.borrow_mut().insert(node.opaque(), kept));
+}
+
+/// The props last applied to `node`, or an empty set.
+///
+/// A container controller (e.g. [`grid::GridC`]) has no `&mut Instance` of
+/// its own child -- only the child's [`Node`] -- so it re-derives a child's
+/// placement from here instead of owning the child's instance.
+#[must_use]
+pub(crate) fn props_of(node: &Node) -> Props {
+    NODE_PROPS
+        .with(|m| m.borrow().get(&node.opaque()).cloned())
+        .unwrap_or_default()
+}
+
+/// The child layout last recorded for `node`.
+#[must_use]
+pub(crate) fn child_layout_of(node: &Node) -> ChildLayout {
+    NODE_CHILD
+        .with(|m| m.borrow().get(&node.opaque()).copied())
+        .unwrap_or_default()
 }
 
 /// Record `node`'s container, for later [`flush_layout`] and for the
@@ -705,6 +764,18 @@ pub(crate) fn set_container(node: &Node, container: Container) {
         let mut p = p.borrow_mut();
         let entry = p.entry(node.opaque()).or_default();
         entry.container = Some(container);
+        entry.node = Some(node.clone());
+    });
+}
+
+/// Mark `node` (a [`Container::Grid`]) so [`flush_layout`] re-derives every
+/// child's [`crate::layout::GridPlacement`] from that child's own recorded
+/// `Column`/`Row`/`ColumnSpan`/`RowSpan` props each frame.
+pub(crate) fn mark_grid_children(node: &Node) {
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let entry = p.entry(node.opaque()).or_default();
+        entry.grid_from_children = true;
         entry.node = Some(node.clone());
     });
 }
@@ -732,6 +803,7 @@ pub(crate) fn set_child_layout(node: &Node, layout: ChildLayout) {
         entry.child_layout = Some(layout);
         entry.node = Some(node.clone());
     });
+    NODE_CHILD.with(|m| m.borrow_mut().insert(node.opaque(), layout));
 }
 
 /// Record a gap floor for `node`'s main axis, keyed by `orientation`.
@@ -797,6 +869,16 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
                     } else {
                         cl.vexpand = on;
                     }
+                    tree.set_child_layout(&child, cl);
+                }
+            }
+            if pending.grid_from_children {
+                for child in node.children() {
+                    let Some(place) = grid::GridC::placement_of(&props_of(&child)) else {
+                        continue;
+                    };
+                    let mut cl = tree.child_layout(&child).unwrap_or_default();
+                    cl.grid = Some(place);
                     tree.set_child_layout(&child, cl);
                 }
             }
@@ -883,6 +965,7 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::CenterBox => Box::new(<center_box::CenterBoxC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::Grid => Box::new(<grid::GridC as Controller<Msg>>::build(node, props, cx)),
         Kind::Separator => Box::new(<separator::SeparatorC as Controller<Msg>>::build(
             node, props, cx,
         )),

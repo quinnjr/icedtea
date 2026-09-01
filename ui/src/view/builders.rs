@@ -72,6 +72,66 @@ pub fn center_box<Msg: Clone + 'static>(
     ])
 }
 
+/// `GtkGrid`.
+///
+/// `GridC::build` has no `View` to derive track counts from -- only the
+/// retained `Node` and `Props` -- so this builder is where the children's
+/// own placements raise `Columns`/`Rows` before the props ever reach the
+/// controller (`GridC::extent_of`'s doc comment).
+#[must_use]
+pub fn grid<Msg: Clone + 'static>(children: impl IntoIterator<Item = View<Msg>>) -> View<Msg> {
+    let view = View::new(Kind::Grid).children(children);
+    let (columns, _rows) = crate::widgets::grid::GridC::extent_of(&view);
+    view.prop(PropName::Columns, i64::from(columns))
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// `GtkGrid:row-spacing`.
+    #[must_use]
+    pub fn row_spacing(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::RowSpacing, v)
+    }
+
+    /// `GtkGrid:column-spacing`.
+    #[must_use]
+    pub fn column_spacing(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ColumnSpacing, v)
+    }
+
+    /// `GtkGrid:row-homogeneous`.
+    #[must_use]
+    pub fn row_homogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::RowHomogeneous, v)
+    }
+
+    /// `GtkGrid:column-homogeneous`.
+    #[must_use]
+    pub fn column_homogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ColumnHomogeneous, v)
+    }
+
+    /// `GtkGrid:baseline-row`.
+    #[must_use]
+    pub fn baseline_row(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::BaselineRow, v)
+    }
+
+    /// This child's grid cell, zero-based (`gtk_grid_attach`'s first two
+    /// arguments).
+    #[must_use]
+    pub fn at(self, column: u16, row: u16) -> Self {
+        self.prop(PropName::Column, i64::from(column))
+            .prop(PropName::Row, i64::from(row))
+    }
+
+    /// How many cells this child covers (`gtk_grid_attach`'s last two).
+    #[must_use]
+    pub fn span(self, columns: u16, rows: u16) -> Self {
+        self.prop(PropName::ColumnSpan, i64::from(columns.max(1)))
+            .prop(PropName::RowSpan, i64::from(rows.max(1)))
+    }
+}
+
 /// Contract deviation (Task 4): every P6 setter takes `impl Into<Prop>`
 /// rather than a concrete type. `View<Msg>` has one inherent-method
 /// namespace across the whole widget catalogue, and GTK gives `position`

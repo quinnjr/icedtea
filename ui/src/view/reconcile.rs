@@ -288,6 +288,7 @@ pub fn reconcile<Msg: Clone + 'static>(
                     ops.push(Op::SetProp { index, name });
                 }
                 instance.props = view.props;
+                crate::widgets::record_props(&instance.node, &instance.props);
                 instance.handlers = view.handlers;
                 ops.push(Op::SetHandlers { index });
                 if from != index && !stable.contains(&from) {
@@ -301,7 +302,9 @@ pub fn reconcile<Msg: Clone + 'static>(
                 built.push(instance);
             }
             None => {
-                built.push(build_instance(view, cx));
+                let instance = build_instance(view, cx);
+                crate::widgets::record_props(&instance.node, &instance.props);
+                built.push(instance);
                 ops.push(Op::Insert { index });
             }
         }
