@@ -1,0 +1,9 @@
+actionbar
+╰── revealer
+    ╰── box
+        ├── box.start
+        │   ╰── <child>
+        ├── box.center
+        │   ╰── <child>
+        ╰── box.end
+            ╰── <child>

@@ -48,6 +48,7 @@ impl ListItem {
     }
 }
 
+pub mod action_bar;
 pub mod box_;
 pub mod button;
 pub mod calendar;
@@ -78,6 +79,7 @@ pub mod progress_bar;
 pub mod scale;
 pub mod scrollbar;
 pub mod scrolled_window;
+pub mod search_bar;
 pub mod search_entry;
 pub mod separator;
 pub mod spin_button;
@@ -523,6 +525,85 @@ pub enum PictureSource {
     Bytes(Rc<[u8]>),
 }
 
+/// A GTK revealer: a child subtree whose visibility animates between hidden
+/// and shown.
+///
+/// `GtkSearchBar` and `GtkActionBar` both own one, so the timing, the
+/// progress bookkeeping and the `next_deadline` rule live in one place
+/// instead of being copied. Unlike a real `GtkRevealer` this does not scale
+/// or clip anything by itself: nothing in the paint walker reads a per-node
+/// transform yet (`ExpanderC`'s own `progress`/`content_scale` is the same
+/// shape, tracked but not yet wired to a visual effect), so `progress` is a
+/// value a controller's own `paint`/hit-testing can consult, not something
+/// this type applies to `node` on its own.
+pub struct Revealer {
+    /// The `revealer` node.
+    pub node: Node,
+    /// Target state.
+    pub revealed: bool,
+    /// `0.0` hidden .. `1.0` shown.
+    pub progress: f32,
+    /// When the running animation started; `None` when at rest.
+    started: Option<Duration>,
+    duration: Duration,
+}
+
+impl Revealer {
+    /// Build a `revealer` node under `parent`.
+    #[must_use]
+    pub fn build(parent: &Node, revealed: bool) -> Self {
+        let node = Node::new("revealer");
+        parent.append_child(&node);
+        Self {
+            node,
+            revealed,
+            progress: if revealed { 1.0 } else { 0.0 },
+            started: None,
+            duration: Duration::from_millis(250),
+        }
+    }
+
+    /// Ask for a new target; a no-op when it is already the target.
+    pub fn set_revealed(&mut self, revealed: bool, now: Duration) {
+        if self.revealed == revealed {
+            return;
+        }
+        self.revealed = revealed;
+        self.started = Some(now);
+    }
+
+    /// Advance the animation.
+    pub fn tick(&mut self, now: Duration) {
+        let Some(started) = self.started else {
+            return;
+        };
+        let t = if self.duration.is_zero() {
+            1.0
+        } else {
+            (now.saturating_sub(started).as_secs_f32() / self.duration.as_secs_f32())
+                .clamp(0.0, 1.0)
+        };
+        self.progress = if self.revealed { t } else { 1.0 - t };
+        if t >= 1.0 {
+            self.started = None;
+        }
+    }
+
+    /// The next frame this wants, or `None` at rest. `Duration::ZERO` means
+    /// "now", never "spin": `tick` clears `started` at the end.
+    #[must_use]
+    pub fn next_deadline(&self, now: Duration) -> Option<Duration> {
+        self.started.map(|started| {
+            let end = started + self.duration;
+            if now >= end {
+                Duration::ZERO
+            } else {
+                end - now
+            }
+        })
+    }
+}
+
 /// The `GtkWidget`-universal prop bookkeeping every widget controller shares.
 ///
 /// [`crate::view::controller::GenericC`] applies contract §4.3's fifteen
@@ -717,14 +798,17 @@ thread_local! {
 /// A full `Props` clone would retain whatever a caller last set through it
 /// forever -- `Prop::Draw`'s `Rc<dyn Fn>` included -- because this table has
 /// no removal path (`reconcile`'s `Remove` op drops the `Instance`, not this
-/// side entry). Grid placement is the only reader today and every value it
-/// needs is a `Prop::Int`, cheap to keep and inert to clone, so `record_props`
-/// keeps only these four rather than whatever the caller happened to pass.
-const RECORDED_PROP_NAMES: [PropName; 4] = [
+/// side entry). Grid placement was the only reader before P6 Task 11, and
+/// every value it needs is a `Prop::Int`, cheap to keep and inert to clone;
+/// `action_bar::ActionBarC::place` is the second reader, over `Section`
+/// (a `Prop::Str`, equally cheap) -- both re-derive a child's placement from
+/// the child's own node rather than owning that child's `Instance`.
+const RECORDED_PROP_NAMES: [PropName; 5] = [
     PropName::Column,
     PropName::Row,
     PropName::ColumnSpan,
     PropName::RowSpan,
+    PropName::Section,
 ];
 
 /// Record the subset of `props` a container controller can re-derive a
@@ -978,6 +1062,12 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::ScrolledWindow => {
             Box::new(<scrolled_window::ScrolledWindowC as Controller<Msg>>::build(node, props, cx))
         }
+        Kind::SearchBar => Box::new(<search_bar::SearchBarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::ActionBar => Box::new(<action_bar::ActionBarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         Kind::Separator => Box::new(<separator::SeparatorC as Controller<Msg>>::build(
             node, props, cx,
         )),
@@ -1102,6 +1192,9 @@ pub fn child_slot(kind: Kind, controller: &dyn std::any::Any) -> Option<Node> {
         Kind::Expander => controller
             .downcast_ref::<expander::ExpanderC>()
             .map(|c| c.content.clone()),
+        Kind::SearchBar => controller
+            .downcast_ref::<search_bar::SearchBarC>()
+            .map(|c| c.contents.clone()),
         Kind::MenuButton => controller
             .downcast_ref::<menu_button::MenuButtonC>()
             .map(|c| c.popover.contents.clone()),

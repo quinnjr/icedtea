@@ -666,6 +666,25 @@ fn expander_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn search_bar_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::ShowCloseButton,
+        icedtea_ui::view::Prop::Bool(true),
+    );
+    assert_fixture(icedtea_ui::view::Kind::SearchBar, &props, "search_bar");
+}
+
+#[test]
+fn action_bar_matches_its_gtk_fixture() {
+    assert_fixture(
+        icedtea_ui::view::Kind::ActionBar,
+        &icedtea_ui::view::Props::default(),
+        "action_bar",
+    );
+}
+
+#[test]
 fn scrolled_window_matches_its_gtk_fixture() {
     // Default policy is `Automatic` on both axes and the default extent is
     // zero/zero, so neither bar nor the junction is wanted -- every

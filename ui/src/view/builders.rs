@@ -325,6 +325,43 @@ impl<Msg: Clone + 'static> View<Msg> {
     }
 }
 
+/// `GtkSearchBar` wrapping `child`.
+#[must_use]
+pub fn search_bar<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
+    View::new(Kind::SearchBar).child(child)
+}
+
+/// `GtkActionBar`, empty until [`View::pack_start`]/[`View::pack_end`]/
+/// [`View::center`] fill it.
+#[must_use]
+pub fn action_bar<Msg: Clone + 'static>() -> View<Msg> {
+    View::new(Kind::ActionBar)
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// Pack a child at the leading end (`gtk_action_bar_pack_start`,
+    /// `gtk_header_bar_pack_start`).
+    #[must_use]
+    pub fn pack_start(mut self, view: View<Msg>) -> Self {
+        self.children.push(slot(view, "start"));
+        self
+    }
+
+    /// Pack a child at the trailing end.
+    #[must_use]
+    pub fn pack_end(mut self, view: View<Msg>) -> Self {
+        self.children.push(slot(view, "end"));
+        self
+    }
+
+    /// The centre widget.
+    #[must_use]
+    pub fn center(mut self, view: View<Msg>) -> Self {
+        self.children.push(slot(view, "center"));
+        self
+    }
+}
+
 /// `GtkScrolledWindow` wrapping `child`.
 #[must_use]
 pub fn scrolled_window<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
@@ -547,6 +584,7 @@ impl<Msg: Clone + 'static> View<Msg> {
 // The per-widget builders themselves live beside their controllers under
 // `crate::widgets` (contract §11 E5); this module re-exports them so every
 // builder is reachable as `view::builders::<name>`.
+pub use crate::widgets::action_bar::ActionBarExt;
 pub use crate::widgets::button::{ButtonExt, button, button_from};
 pub use crate::widgets::calendar::{CalendarExt, calendar};
 pub use crate::widgets::check_button::{CheckButtonExt, check_button};
@@ -572,6 +610,7 @@ pub use crate::widgets::popover::{PopoverExt, popover};
 pub use crate::widgets::progress_bar::{ProgressBarExt, progress_bar};
 pub use crate::widgets::scale::{ScaleExt, scale};
 pub use crate::widgets::scrollbar::{ScrollbarExt, scrollbar};
+pub use crate::widgets::search_bar::SearchBarExt;
 pub use crate::widgets::search_entry::{SearchEntryExt, search_entry};
 pub use crate::widgets::separator::separator;
 pub use crate::widgets::spin_button::{SpinButtonExt, spin_button};
