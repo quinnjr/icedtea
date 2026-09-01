@@ -692,6 +692,132 @@ fn typing_into_an_entry_shows_the_glyphs_and_moves_the_caret() {
 }
 
 #[test]
+fn a_text_view_model_swap_that_lands_the_caret_mid_codepoint_never_panics() {
+    // mutation: replace both of `TextViewC`'s `clamp_to_boundary` calls —
+    // `set_prop`'s Text arm and `selection_range` — with
+    // `.min(self.buffer.len())` and this aborts the process at
+    // `String::replace_range` in `TextViewC::apply_key` ("start of range
+    // should be a character boundary"). Both together, because either clamp
+    // alone still floors the range at a boundary. `TextViewC` carries its own
+    // copy of the entry engine's caret handling, so it needs its own test.
+    //
+    // `End` rather than a second click places the caret: a click into a
+    // non-empty `TextView` is consumed before `TextViewC`'s `PointerDown` arm
+    // in this offscreen setup, so only the keyboard can move the caret off 0
+    // here — the click below is still needed, to grant focus.
+    use icedtea_ui::view::builders::text_view;
+    use icedtea_ui::widgets::text_view::TextViewExt;
+    use icedtea_ui::window::BTN_LEFT;
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Msg {
+        Swap,
+        Edited(String),
+    }
+
+    let frames = run(
+        "abc".to_owned(),
+        |model: &mut String, msg: Msg| {
+            match msg {
+                Msg::Swap => *model = "a\u{1F600}c".to_owned(),
+                Msg::Edited(text) => *model = text,
+            }
+            Cmd::None
+        },
+        |model: &String| {
+            text_view(model)
+                .editable(true)
+                .on_change(|t| Msg::Edited(t.to_owned()))
+        },
+        (200, 80),
+        vec![
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 40.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 1,
+            }),
+            ScriptStep::Event(InputEvent::Key(key_named(
+                xkbcommon::xkb::keysyms::KEY_End,
+                115,
+            ))),
+            ScriptStep::Message(Msg::Swap),
+            ScriptStep::Event(InputEvent::Key(key_char('z', 52))),
+            ScriptStep::Capture,
+        ],
+    );
+    assert!(
+        has_ink(&frames, 0, (200, 80)),
+        "the text view must still paint after surviving the swap"
+    );
+}
+
+#[test]
+fn a_model_swap_that_lands_the_caret_mid_codepoint_never_panics() {
+    // mutation: replace both of `TextEditState`'s `clamp_to_boundary` calls —
+    // `set_text` and `selection` — with `.min(self.buffer.len())` and this
+    // aborts the process at `String::replace_range` in
+    // `TextEditState::insert` ("start of range should be a character
+    // boundary"). Both together, because either clamp alone still floors the
+    // replaced range at a boundary.
+    //
+    // The caret is a byte offset into the buffer it was placed in. Clicking
+    // at x=100 puts it past "abc", at byte 3; the model then swaps the text
+    // for "a<4-byte emoji>c", whose byte 3 is inside the emoji. The next
+    // printable key replaces `selection()` and would split the codepoint.
+    use icedtea_ui::view::builders::entry;
+    use icedtea_ui::window::BTN_LEFT;
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Msg {
+        Swap,
+        Typed(String),
+    }
+
+    let frames = run(
+        "abc".to_owned(),
+        |model: &mut String, msg: Msg| {
+            match msg {
+                Msg::Swap => *model = "a\u{1F600}c".to_owned(),
+                Msg::Typed(text) => *model = text,
+            }
+            Cmd::None
+        },
+        |model: &String| entry(model).on_change(|t| Msg::Typed(t.to_owned())),
+        (200, 40),
+        vec![
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 1,
+            }),
+            ScriptStep::Message(Msg::Swap),
+            ScriptStep::Event(InputEvent::Key(key_char('z', 52))),
+            ScriptStep::Capture,
+        ],
+    );
+    assert!(
+        has_ink(&frames, 0, (200, 40)),
+        "the entry must still paint after surviving the swap"
+    );
+}
+
+#[test]
 fn dragging_a_scale_moves_the_slider_and_reports_the_value() {
     // mutation: return early from ScaleC::on_event's PointerMotion arm and the
     // model stays at 0.0.
@@ -1046,24 +1172,21 @@ fn a_check_button_paints_the_builtin_check_glyph() {
 }
 
 #[test]
-#[ignore = "blocked on a framework bug outside P5's boundary: `route`'s `aim` \
-            (ui/src/view/app.rs) takes the geometrically deepest `hit_chain` \
-            node, which for a widget whose chrome lives on a nested, \
-            non-zero-sized subnode (`MenuButton`/`DropDown`'s `button.toggle`) \
-            is never an `Instance`, so `path_to` returns an empty path and \
-            `deliver` drops the event. Flat widgets are unaffected: their \
-            content nodes measure to (0, 0), so the deepest hit is their own \
-            `Instance` root. The part plan marks view/app.rs untouched (D5, \
-            File Structure), so this is raised for the plan owner rather than \
-            fixed here; unignore once `aim` resolves to the innermost \
-            `Instance` in the chain. The interaction itself is covered \
-            meanwhile by the in-crate unit test \
-            `widgets::drop_down::tests::opening_a_drop_down_and_clicking_a_row_selects_that_item`, \
-            which drives the same open -> click-row -> Selected path over a \
-            really laid-out tree."]
 fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
-    // mutation: never fire EventKind::Selected in DropDownC::on_event and the
-    // model stays at 0.
+    // mutation: `return Vec::new()` at the top of `DropDownC::on_event` and
+    // the two captures match -- the click reaches the controller only because
+    // `route`'s `aim` now resolves to the innermost `Instance` in the hit
+    // chain (contract P5-D33) rather than the geometrically deepest node,
+    // which for a `DropDown` is the controller-owned `button.toggle` subnode.
+    //
+    // Scope, honestly stated: the offscreen app has no popup surface to paint
+    // the opened list into (`Cmd::OpenPopup` drops its view payload -- P5-D34,
+    // deferred to P6/P7), so the *row click* half of this criterion cannot be
+    // driven from here. It is covered over a really laid-out tree by
+    // `widgets::drop_down::tests::opening_a_drop_down_and_clicking_a_row_selects_that_item`,
+    // which drives open -> click-row -> `EventKind::Selected` end to end. What
+    // this test now pins that nothing else did is that the button's own click
+    // reaches `DropDownC` at all.
     use icedtea_ui::view::builders::drop_down;
     use icedtea_ui::widgets::drop_down::DropDownExt;
 
@@ -1117,18 +1240,14 @@ fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
 }
 
 #[test]
-#[ignore = "blocked on the same framework bug as \
-            `opening_a_drop_down_and_picking_an_item_updates_the_button` above: \
-            `ColorDialogButton`'s chrome lives on the nested, non-zero-sized \
-            `button.color` subnode, so `route`'s `aim` (ui/src/view/app.rs) \
-            never lands on an `Instance` and `deliver` drops the event before \
-            `ColorDialogButtonC::on_event` ever runs. Confirmed with an inline \
-            eprintln! in on_event that never fires. Not fixable from P5's \
-            boundary (view/app.rs is D5 File Structure); unignore once `aim` \
-            resolves to the innermost `Instance` in the chain."]
 fn clicking_a_colour_button_opens_its_dialog_and_repaints_the_swatch() {
-    // mutation: never set `dialog_open` in ColorDialogButtonC::on_event and the
-    // two captures match.
+    // mutation: `return Vec::new()` at the top of
+    // `ColorDialogButtonC::on_event` and the two captures match. As with the
+    // drop-down above, the click only reaches the controller because `route`'s
+    // `aim` resolves to the innermost `Instance` (contract P5-D33); the
+    // chrome lives on the nested `button.color` subnode. Flipping only
+    // `dialog_open` is not a sufficient mutation: the repaint this asserts is
+    // the button's own pressed/hover state, which the same handler drives.
     use icedtea_ui::css::value::Rgba;
     use icedtea_ui::view::builders::color_dialog_button;
     use icedtea_ui::window::BTN_LEFT;

@@ -23,7 +23,7 @@ use crate::layout::Rect;
 use crate::text::{Ellipsize, TextLayout, TextStyle, WrapMode};
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
-use crate::widgets::edit::UndoStack;
+use crate::widgets::edit::{UndoStack, clamp_to_boundary};
 use crate::widgets::{PointerState, local_rect, shift_event};
 use crate::window::keyboard::Mods;
 use crate::window::pointer::Kinetic;
@@ -177,7 +177,7 @@ impl TextViewC {
             keysyms::KEY_z if ctrl && !shift => match self.undo.undo() {
                 Some((buffer, cursor)) => {
                     self.buffer = buffer;
-                    self.cursor = cursor.min(self.buffer.len());
+                    self.cursor = clamp_to_boundary(&self.buffer, cursor);
                     self.anchor = None;
                     true
                 }
@@ -186,7 +186,7 @@ impl TextViewC {
             keysyms::KEY_y | keysyms::KEY_Z if ctrl => match self.undo.redo() {
                 Some((buffer, cursor)) => {
                     self.buffer = buffer;
-                    self.cursor = cursor.min(self.buffer.len());
+                    self.cursor = clamp_to_boundary(&self.buffer, cursor);
                     self.anchor = None;
                     true
                 }
@@ -279,8 +279,8 @@ impl TextViewC {
 
     /// The ordered, clamped selection range; empty when there is no selection.
     fn selection_range(&self) -> std::ops::Range<usize> {
-        let anchor = self.anchor.unwrap_or(self.cursor).min(self.buffer.len());
-        let cursor = self.cursor.min(self.buffer.len());
+        let anchor = clamp_to_boundary(&self.buffer, self.anchor.unwrap_or(self.cursor));
+        let cursor = clamp_to_boundary(&self.buffer, self.cursor);
         anchor.min(cursor)..anchor.max(cursor)
     }
 }
@@ -337,7 +337,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
             (PropName::Text, Prop::Str(text)) => {
                 if self.buffer.as_str() != text.as_ref() {
                     self.buffer = text.to_string();
-                    self.cursor = self.cursor.min(self.buffer.len());
+                    self.cursor = clamp_to_boundary(&self.buffer, self.cursor);
                     self.anchor = None;
                     self.reshape(cx, None);
                     self.sync_selection();
@@ -375,7 +375,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
                 Some(Rect::new(0.0, 0.0, rect.width, rect.height)),
             );
             if let Event::PointerDown { local, .. } = shifted {
-                self.cursor = self.layout.byte_at(local);
+                self.cursor = clamp_to_boundary(&self.buffer, self.layout.byte_at(local));
                 self.anchor = None;
                 self.sync_selection();
                 cx.handled = true;

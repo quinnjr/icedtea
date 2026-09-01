@@ -29,6 +29,23 @@ use crate::view::cmd::Cmd;
 use crate::view::controller::EventCx;
 use crate::window::keyboard::{KeyEvent, Mods};
 
+/// Clamp `offset` into `s`, walking *down* to the nearest `char` boundary.
+///
+/// A caret is a byte offset into the buffer it was placed in. When the model
+/// swaps the text underneath it, `offset.min(s.len())` keeps the caret inside
+/// the new string but can leave it inside a multi-byte codepoint — and the
+/// next `String::replace_range` over a range starting there panics. Untrusted
+/// input never panics (part-5 global constraint), so every clamp of a caret,
+/// an anchor or a hit-tested offset goes through here.
+#[must_use]
+pub fn clamp_to_boundary(s: &str, offset: usize) -> usize {
+    let mut n = offset.min(s.len());
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    n
+}
+
 /// What one key did, so the embedding controller knows what to emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditOutcome {
@@ -214,7 +231,7 @@ impl TextEditState {
             return;
         }
         self.buffer = text.to_owned();
-        self.cursor = self.cursor.min(self.buffer.len());
+        self.cursor = clamp_to_boundary(&self.buffer, self.cursor);
         self.anchor = None;
         self.reshape(cx);
         self.sync_selection_node();
@@ -263,7 +280,7 @@ impl TextEditState {
     pub fn buffer_offset_at(&self, local: (f32, f32)) -> usize {
         let display_offset = self.layout.byte_at(local);
         if self.visibility {
-            return display_offset.min(self.buffer.len());
+            return clamp_to_boundary(&self.buffer, display_offset);
         }
         let display = self.display();
         let chars = display
@@ -278,8 +295,8 @@ impl TextEditState {
     /// The ordered, clamped selection range.
     #[must_use]
     pub fn selection(&self) -> std::ops::Range<usize> {
-        let anchor = self.anchor.unwrap_or(self.cursor).min(self.buffer.len());
-        let cursor = self.cursor.min(self.buffer.len());
+        let anchor = clamp_to_boundary(&self.buffer, self.anchor.unwrap_or(self.cursor));
+        let cursor = clamp_to_boundary(&self.buffer, self.cursor);
         anchor.min(cursor)..anchor.max(cursor)
     }
 
@@ -391,7 +408,7 @@ impl TextEditState {
             keysyms::KEY_z if ctrl && !shift => match self.undo.undo() {
                 Some((buffer, cursor)) => {
                     self.buffer = buffer;
-                    self.cursor = cursor.min(self.buffer.len());
+                    self.cursor = clamp_to_boundary(&self.buffer, cursor);
                     self.anchor = None;
                     EditOutcome::Changed
                 }
@@ -400,7 +417,7 @@ impl TextEditState {
             keysyms::KEY_y | keysyms::KEY_Z if ctrl => match self.undo.redo() {
                 Some((buffer, cursor)) => {
                     self.buffer = buffer;
-                    self.cursor = cursor.min(self.buffer.len());
+                    self.cursor = clamp_to_boundary(&self.buffer, cursor);
                     self.anchor = None;
                     EditOutcome::Changed
                 }
@@ -501,8 +518,27 @@ impl TextEditState {
 
 #[cfg(test)]
 mod tests {
-    use super::UndoStack;
+    use super::{UndoStack, clamp_to_boundary};
     use std::time::Duration;
+
+    #[test]
+    fn a_caret_landing_inside_a_codepoint_walks_back_to_its_start() {
+        // mutation: return `offset.min(s.len())` from clamp_to_boundary and
+        // the three multi-byte cases below all report a mid-codepoint offset,
+        // which is exactly the offset `String::replace_range` panics on.
+        let s = "a\u{1F600}c"; // 'a', a four-byte emoji at 1..5, 'c'
+        assert_eq!(clamp_to_boundary(s, 3), 1, "mid-emoji walks back to 1");
+        assert_eq!(clamp_to_boundary(s, 4), 1);
+        assert_eq!(clamp_to_boundary(s, 5), 5, "a real boundary stands");
+        assert_eq!(clamp_to_boundary(s, 99), s.len(), "past the end clamps");
+        assert_eq!(clamp_to_boundary("", 7), 0, "an empty buffer has only 0");
+        for n in 0..=s.len() + 4 {
+            let at = clamp_to_boundary(s, n);
+            assert!(s.is_char_boundary(at), "{n} -> {at} must be splittable");
+            let mut owned = s.to_owned();
+            owned.replace_range(at..at, "z"); // must never panic
+        }
+    }
 
     #[test]
     fn consecutive_single_character_insertions_coalesce_into_one_undo_step() {
