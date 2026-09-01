@@ -1151,6 +1151,7 @@ fn typing_into_a_search_entry_fires_one_search_after_the_delay() {
     // mutation: fire EventKind::Search on every keystroke and the count is 3.
     use icedtea_ui::view::builders::search_entry;
     use icedtea_ui::widgets::search_entry::SearchEntryExt;
+    use std::cell::RefCell;
 
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
@@ -1158,31 +1159,64 @@ fn typing_into_a_search_entry_fires_one_search_after_the_delay() {
         Searched(String),
     }
 
+    // Independent of `Frames`/the model: the on_search closure records every
+    // fire here directly, so this test can tell "fired once" (debounced),
+    // "fired three times" (the named mutation: search on every keystroke),
+    // and "never fired" (e.g. focus never granted) apart, which
+    // `frames.len()` alone cannot. `view` must be a bare `fn` pointer (see
+    // `run`'s signature), so the log is threaded through the model itself
+    // rather than captured from the test's scope.
+    let searches: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
     let frames = run(
-        (String::new(), 0u32),
-        |model: &mut (String, u32), msg: Msg| {
+        (String::new(), 0u32, searches.clone()),
+        |model: &mut (String, u32, Rc<RefCell<Vec<String>>>), msg: Msg| {
             match msg {
                 Msg::Typed(text) => model.0 = text,
                 Msg::Searched(_) => model.1 += 1,
             }
             Cmd::None
         },
-        |model: &(String, u32)| {
+        |model: &(String, u32, Rc<RefCell<Vec<String>>>)| {
+            let searches_recorder = model.2.clone();
             search_entry(&model.0)
                 .search_delay(150)
                 .on_change(|t| Msg::Typed(t.to_owned()))
-                .on_search(|t| Msg::Searched(t.to_owned()))
+                .on_search(move |t| {
+                    searches_recorder.borrow_mut().push(t.to_owned());
+                    Msg::Searched(t.to_owned())
+                })
         },
         (200, 40),
         vec![
-            // Plan reconciliation: the plan's script builds `InputEvent::KeyboardEnter
-            // { serial: 1 }` and `InputEvent::PointerEnter { x, y, serial }` as bare
-            // struct literals, but both variants also carry a `target: SurfaceTarget`
-            // field (contract deviation 6) that the plan's literals omit. The crate's
-            // own `InputEvent::keyboard_enter`/`pointer_enter` convenience
-            // constructors fill it with `SurfaceTarget::Window`, matching every other
-            // test in this file, so those are used here instead of the bare literals.
-            ScriptStep::Event(InputEvent::keyboard_enter(1)),
+            // Plan reconciliation: the plan's script opens with a bare
+            // `InputEvent::KeyboardEnter { serial: 1 }` and no click. As
+            // `typing_into_a_text_view_inserts_at_the_cursor_and_reports_the_change`
+            // and `typing_into_an_entry_shows_the_glyphs_and_moves_the_caret`
+            // above already found, `KeyboardEnter` grants no keyboard focus
+            // by itself (`view/app.rs::route` has no handler for it beyond
+            // its wildcard arm; `FocusRing` only moves from a click,
+            // `Cmd::Focus`, or a keyboard binding) — so the `Key` events
+            // that followed had nowhere to go and, unlike those two tests'
+            // weaker assertions, this test's new `searches` log now proves
+            // it: the fix below (a click, as those tests use) is required
+            // for `on_search`/`on_change` to fire at all. It also carries
+            // the same `target: SurfaceTarget` field (contract deviation 6)
+            // those tests' own `InputEvent::pointer_enter` convenience
+            // constructor fills in.
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 1,
+            }),
             ScriptStep::Event(InputEvent::Key(key_char('a', 38))),
             ScriptStep::Advance(Duration::from_millis(40)),
             ScriptStep::Event(InputEvent::Key(key_char('b', 56))),
@@ -1193,6 +1227,11 @@ fn typing_into_a_search_entry_fires_one_search_after_the_delay() {
         ],
     );
     assert_eq!(frames.len(), 1, "the script ran to completion");
+    assert_eq!(
+        searches.borrow().as_slice(),
+        ["abc"],
+        "search must fire exactly once, after the debounce delay, with the final text"
+    );
 }
 
 #[test]
