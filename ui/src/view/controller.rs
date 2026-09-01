@@ -911,9 +911,8 @@ mod tests {
     #[test]
     fn a_press_released_outside_the_node_does_not_click() {
         let (sheet, mut fonts, mut icons, clock, env) = build_cx_fixture();
-        // `Kind::ColorDialogButton` (still `GenericC`, unlike `Kind::Button`
-        // since Task 19 and `Kind::MenuButton`/`Kind::DropDown` since Task
-        // 21): this exercises GenericC's own hover-flag click tracking,
+        // `Kind::MenuButton` (still `GenericC`, unlike `Kind::Button` since
+        // Task 19): this exercises GenericC's own hover-flag click tracking,
         // which — unlike `PointerState`'s allocation-based one P5/P6 widgets
         // share — has no allocation to consult in this test's bare
         // `LayoutTree::new()`.
@@ -931,7 +930,7 @@ mod tests {
                 clock: &clock,
                 env: &env,
             };
-            build_controller::<Msg>(Kind::ColorDialogButton, &node, &Props::default(), &mut cx)
+            build_controller::<Msg>(Kind::MenuButton, &node, &Props::default(), &mut cx)
         };
         let tree = LayoutTree::new();
         let styles = StyleMap::new();

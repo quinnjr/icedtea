@@ -24,6 +24,25 @@ use crate::window::focus::FOCUSABLE_CLASS;
 #[doc(inline)]
 pub use crate::view::ListItem;
 
+/// `ListItem`'s widget-facing constructor.
+///
+/// The type is declared in `view::mod` (contract deviation D7) and this part
+/// may not edit `view/**`, so the inherent `impl` lives beside the re-export
+/// every widget and test already uses. Same crate, so it is the same
+/// `ListItem::new` a caller would get either way.
+impl ListItem {
+    /// A row with `text` and no subtitle or icon.
+    #[must_use]
+    pub fn new(id: u64, text: &str) -> Self {
+        ListItem {
+            id,
+            text: std::rc::Rc::from(text),
+            subtitle: None,
+            icon: None,
+        }
+    }
+}
+
 pub mod button;
 pub mod calendar;
 pub mod check_button;

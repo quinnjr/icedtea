@@ -278,19 +278,6 @@ pub struct ListItem {
     pub icon: Option<IconRef>,
 }
 
-impl ListItem {
-    /// A row with `text` and no subtitle or icon.
-    #[must_use]
-    pub fn new(id: u64, text: &str) -> Self {
-        ListItem {
-            id,
-            text: Rc::from(text),
-            subtitle: None,
-            icon: None,
-        }
-    }
-}
-
 /// A property value.
 ///
 /// `Draw` compares by [`Rc::ptr_eq`] (contract §4.3): two closures are the

@@ -24,7 +24,7 @@ use crate::css::node::{Node, PseudoStates};
 use crate::css::value::image::IconRef;
 use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
-use crate::view::{BuildCx, Kind, Prop, PropName, Props, View};
+use crate::view::{BuildCx, EventKind, Kind, Prop, PropName, Props, View};
 use crate::widgets::popover::PopoverC;
 use crate::widgets::{ArrowDirection, PointerState, Position, WidgetEnum, local_rect, shift_event};
 use crate::window::popup::PopupAnchorPoint;
@@ -130,6 +130,27 @@ impl<Msg: Clone + 'static> Controller<Msg> for MenuButtonC {
             self.open = false;
             self.button.set_state(PseudoStates::CHECKED, false);
             return Vec::new();
+        }
+        // Focus in/out is a widget-level signal, not a `MenuButton` one:
+        // `GenericC` forwards it for every kind still on the fallback, so a
+        // kind that takes its own controller has to keep forwarding it or an
+        // `on_focus_in`/`on_focus_out` handler silently stops firing.
+        match ev {
+            Event::FocusIn { .. } => {
+                return cx
+                    .handlers
+                    .fire_unit(EventKind::FocusIn)
+                    .into_iter()
+                    .collect();
+            }
+            Event::FocusOut => {
+                return cx
+                    .handlers
+                    .fire_unit(EventKind::FocusOut)
+                    .into_iter()
+                    .collect();
+            }
+            _ => {}
         }
         let Some(rect) = local_rect(cx.tree, cx.node, &self.button) else {
             return Vec::new();

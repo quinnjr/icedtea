@@ -974,6 +974,17 @@ fn a_check_button_paints_the_builtin_check_glyph() {
 }
 
 #[test]
+#[ignore = "blocked on a framework bug outside P5's boundary: `route`'s `aim` \
+            (ui/src/view/app.rs) takes the geometrically deepest `hit_chain` \
+            node, which for a widget whose chrome lives on a nested, \
+            non-zero-sized subnode (`MenuButton`/`DropDown`'s `button.toggle`) \
+            is never an `Instance`, so `path_to` returns an empty path and \
+            `deliver` drops the event. Flat widgets are unaffected: their \
+            content nodes measure to (0, 0), so the deepest hit is their own \
+            `Instance` root. The part plan marks view/app.rs untouched (D5, \
+            File Structure), so this is raised for the plan owner rather than \
+            fixed here; unignore once `aim` resolves to the innermost \
+            `Instance` in the chain."]
 fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
     // mutation: never fire EventKind::Selected in DropDownC::on_event and the
     // model stays at 0.

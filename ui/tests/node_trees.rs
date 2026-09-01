@@ -381,7 +381,10 @@ fn a_menu_button_wraps_a_toggle_button_and_a_drop_down_holds_a_popover_list() {
     );
     check(Kind::DropDown, "drop_down", &props);
     let dropdown = node_tree_of(Kind::DropDown, &props);
-    assert_eq!(dropdown.matches("row").count(), 2, "{dropdown}");
+    // Reconciliation: the plan counts the bare substring "row", but "arrow"
+    // ends in "row" and `GtkDropDown:show-arrow` defaults to TRUE, so the
+    // row count is taken off the row node's own full name instead.
+    assert_eq!(dropdown.matches("row.activatable").count(), 2, "{dropdown}");
     assert!(dropdown.contains("popover.background.menu"), "{dropdown}");
 }
 

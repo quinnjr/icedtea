@@ -165,13 +165,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
         let button = Node::with_classes("button", &["toggle"]);
         node.append_child(&button);
         button.append_child(&Node::new("label"));
-        // Reconciliation: real `GtkDropDown:show-arrow` defaults to `TRUE`,
-        // but the conformance test counts literal occurrences of the
-        // substring "row" in the rendered tree to check the row count, and
-        // "arrow" ends in "row" — so an always-on arrow would make that count
-        // wrong without ever being wrong about rows. Default to off here;
-        // `.show_arrow(true)` still renders it exactly the same way.
-        if props.bool(PropName::ShowArrow, false) {
+        // `GtkDropDown:show-arrow` defaults to `TRUE`.
+        if props.bool(PropName::ShowArrow, true) {
             button.append_child(&Node::with_classes("arrow", &["down"]));
         }
         let popover_node = Node::with_classes("popover", &["background", "menu"]);
@@ -235,6 +230,26 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
             self.open = false;
             self.button.set_state(PseudoStates::CHECKED, false);
             return Vec::new();
+        }
+        // Same widget-level focus forwarding `MenuButtonC` does: taking a
+        // controller of one's own must not silently drop `on_focus_in` /
+        // `on_focus_out`, which `GenericC` fires for every fallback kind.
+        match ev {
+            Event::FocusIn { .. } => {
+                return cx
+                    .handlers
+                    .fire_unit(EventKind::FocusIn)
+                    .into_iter()
+                    .collect();
+            }
+            Event::FocusOut => {
+                return cx
+                    .handlers
+                    .fire_unit(EventKind::FocusOut)
+                    .into_iter()
+                    .collect();
+            }
+            _ => {}
         }
         // A row click selects and closes.
         for (position, row) in self.rows.iter().enumerate() {
