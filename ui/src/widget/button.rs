@@ -11,6 +11,7 @@ use crate::css::computed::{ComputedStyle, ResolveEnv};
 use crate::css::node::{Node, PseudoStates};
 use crate::css::registry::Prop;
 use crate::css::select::MatchCx;
+use crate::icons::IconTheme;
 use crate::layout::{Allocation, BoxDirection, Container, LayoutTree, Measure};
 use crate::paint::{ImageCache, PaintCx, paint_node, paint_node_with_children};
 use crate::text::{FontDatabase, ShapedText, TextMetrics, TextStyle};
@@ -383,6 +384,7 @@ impl Button {
         origin: (f32, f32),
         sheet: &CompiledSheet,
         fonts: &mut FontDatabase,
+        icons: &mut IconTheme,
     ) {
         let alloc = translated(self.allocation, origin);
         let label_alloc = translated(self.label_allocation, origin);
@@ -394,6 +396,7 @@ impl Button {
             colors: &sheet.colors,
             fonts,
             images: &mut self.images,
+            icons,
             text: None,
         };
         let mut canvas = surface.canvas();
@@ -612,12 +615,14 @@ button:hover { background-color: rgb(0 0 255); }
         button.set_states(PseudoStates::HOVER, &sheet, &mut fonts);
 
         let mut start = Surface::new_raster_n32_premul(60, 60).expect("surface");
-        button.render(&mut start, (0.0, 0.0), &sheet, &mut fonts);
+        let mut icons = IconTheme::with_name_and_roots("hicolor", Vec::new());
+        button.render(&mut start, (0.0, 0.0), &sheet, &mut fonts, &mut icons);
 
         clock.set_ms(100);
         button.tick();
         let mut middle = Surface::new_raster_n32_premul(60, 60).expect("surface");
-        button.render(&mut middle, (0.0, 0.0), &sheet, &mut fonts);
+        let mut icons = IconTheme::with_name_and_roots("hicolor", Vec::new());
+        button.render(&mut middle, (0.0, 0.0), &sheet, &mut fonts, &mut icons);
 
         assert_ne!(
             pixel(&start, 5, 5),
@@ -667,7 +672,8 @@ label { min-width: 20px; min-height: 20px; background-color: rgb(0 255 0); }
         let y = label_alloc.border_box.y as i32 + 5;
 
         let mut surface = Surface::new_raster_n32_premul(120, 60).expect("surface");
-        button.render(&mut surface, (0.0, 0.0), &sheet, &mut fonts);
+        let mut icons = IconTheme::with_name_and_roots("hicolor", Vec::new());
+        button.render(&mut surface, (0.0, 0.0), &sheet, &mut fonts, &mut icons);
         let color = pixel(&surface, x, y);
 
         assert_eq!(
@@ -702,7 +708,8 @@ label { min-width: 20px; min-height: 20px; background-color: rgb(0 255 0); }
         surface
             .canvas()
             .clear(skia_rs_safe::core::Color::TRANSPARENT);
-        button.render(&mut surface, (0.0, 0.0), &sheet, &mut fonts);
+        let mut icons = IconTheme::with_name_and_roots("hicolor", Vec::new());
+        button.render(&mut surface, (0.0, 0.0), &sheet, &mut fonts, &mut icons);
         let color = pixel(&surface, x, y);
         assert!(
             color.alpha() > 0 && color.alpha() < 0xFF,

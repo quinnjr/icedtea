@@ -796,6 +796,7 @@ fn render_once<Msg: Clone + 'static>(
         colors: &sheet.colors,
         fonts,
         images: &mut rt.images,
+        icons,
         text: None,
     };
     let mut painter = ControllerPainter {
@@ -955,6 +956,7 @@ fn render_popups<Msg: Clone + 'static>(
             colors: &sheet.colors,
             fonts,
             images,
+            icons,
             text: None,
         };
         let mut painter = ControllerPainter {
@@ -1494,12 +1496,14 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             let root = &rt.root;
             let env = &rt.env;
             let fonts_ref = &mut fonts;
+            let icons_ref = &mut icons;
             window.paint_with(|surface| {
                 let mut cx = PaintCx {
                     env,
                     colors: &sheet.colors,
                     fonts: fonts_ref,
                     images,
+                    icons: icons_ref,
                     text: None,
                 };
                 let mut painter = ControllerPainter { instances };

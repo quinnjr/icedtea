@@ -26,6 +26,7 @@ use crate::css::value::{
     BorderImageSlice, BorderImageWidthSide, ColorCtx, ColorTable, Image, Keyword, LengthCtx,
     RepeatStyle, Rgba, Value,
 };
+use crate::icons::IconTheme;
 use crate::layout::Allocation;
 use crate::text::{FontDatabase, ShapedText};
 
@@ -50,6 +51,11 @@ pub struct PaintCx<'a> {
     pub fonts: &'a mut FontDatabase,
     /// Decoded `url()` images.
     pub images: &'a mut ImageCache,
+    /// Icon-theme lookup, rasterisation and the output scale.
+    ///
+    /// The only field M3 adds to this struct (contract §8.1): every other
+    /// paint signature is byte for byte M2's.
+    pub icons: &'a mut IconTheme,
     /// This node's own label, already shaped.
     pub text: Option<&'a ShapedText>,
 }
@@ -153,6 +159,17 @@ impl ImageCache {
         } else {
             self.base_dir.join(path)
         }
+    }
+
+    /// The path `url` names, resolved against the base directory.
+    ///
+    /// Public because `-gtk-recolor(url(...))` has to resolve a URL exactly
+    /// as `background-image: url()` does, and it does not go through the
+    /// decode cache: an icon is re-rasterised per palette, and the icon
+    /// caches live on `IconTheme`.
+    #[must_use]
+    pub fn resolve_path(&self, url: &str) -> PathBuf {
+        self.resolve(url)
     }
 
     /// Forget every recorded miss, as [`IMAGE_MISS_COOLDOWN`] passing does.
@@ -393,11 +410,13 @@ mod tests {
         };
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut paint_cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(80, 60).expect("raster surface");
@@ -486,11 +505,13 @@ mod tests {
         let style = ComputedStyle::resolve_chain(&sheet, &node, &env, &mut cx);
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut paint_cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(8, 8).expect("raster surface");
@@ -578,4 +599,56 @@ mod tests {
         0xcf, 0xc0, 0xf0, 0x1f, 0x86, 0x19, 0x70, 0x72, 0x00, 0x5d, 0xd7, 0x11, 0xef, 0xdc, 0x4f,
         0x31, 0x10, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
+}
+
+#[cfg(test)]
+mod paint_cx_tests {
+    use super::{ImageCache, PaintCx};
+    use crate::css::computed::ResolveEnv;
+    use crate::css::value::ColorTable;
+    use crate::icons::IconTheme;
+    use crate::text::FontDatabase;
+    use std::path::PathBuf;
+
+    // Contract §8.1: `icons` is the only field M3 adds to `PaintCx`, and a
+    // hermetic `IconTheme` is what every paint fixture uses.
+    // Mutation check: remove the field and this stops compiling, which is
+    // the whole assertion.
+    #[test]
+    fn a_paint_context_carries_an_icon_theme() {
+        let env = ResolveEnv::default();
+        let colors = ColorTable::new();
+        let mut fonts = FontDatabase::probe_only();
+        let mut images = ImageCache::new();
+        let mut icons = IconTheme::with_name_and_roots("hicolor", Vec::new());
+        let cx = PaintCx {
+            env: &env,
+            colors: &colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            icons: &mut icons,
+            text: None,
+        };
+        assert_eq!(cx.icons.name(), "hicolor");
+        assert_eq!(cx.icons.scale(), 1);
+    }
+
+    // `-gtk-recolor(url(...))` needs the same stylesheet-relative resolution
+    // `background-image: url()` gets (deviation 9).
+    // Mutation check: return the URL verbatim and the relative case fails.
+    #[test]
+    fn image_cache_resolves_relative_urls_against_its_base_dir() {
+        let mut cache = ImageCache::new();
+        assert_eq!(
+            cache.resolve_path("/abs/a.svg"),
+            PathBuf::from("/abs/a.svg")
+        );
+        assert_eq!(cache.resolve_path("a.svg"), PathBuf::from("a.svg"));
+        cache.set_base_dir("/theme");
+        assert_eq!(cache.resolve_path("a.svg"), PathBuf::from("/theme/a.svg"));
+        assert_eq!(
+            cache.resolve_path("/abs/a.svg"),
+            PathBuf::from("/abs/a.svg")
+        );
+    }
 }

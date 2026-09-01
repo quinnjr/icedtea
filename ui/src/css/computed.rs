@@ -107,7 +107,8 @@ impl ComputedStyle {
         values[Prop::FontSize.slot()] = Value::Length(Length::px(env.root_font_size));
 
         // The registry's initial values are *unresolved*: `caret-color`'s is
-        // `currentColor`, `-gtk-icon-palette`'s carries `@name`s. Left that
+        // `currentColor`, `-gtk-icon-palette`'s carries `@name`s (its
+        // resolved reader is `crate::icons::Palette::from_style`). Left that
         // way, an inherited property whose initial is unresolved never got
         // resolved at all -- the root's fallback copies `parent.raw(prop)`
         // verbatim, so every descendant inherited a `currentColor` that

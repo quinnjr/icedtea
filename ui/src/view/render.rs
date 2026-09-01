@@ -972,11 +972,13 @@ mod tests {
             .clear(skia_rs_safe::core::Color::TRANSPARENT);
         let mut fonts = crate::text::FontDatabase::probe_only();
         let mut images = crate::paint::ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = crate::paint::PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let painted = {
@@ -1063,11 +1065,13 @@ mod tests {
             .clear(skia_rs_safe::core::Color::TRANSPARENT);
         let mut fonts = crate::text::FontDatabase::probe_only();
         let mut images = crate::paint::ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = crate::paint::PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         {
@@ -1114,11 +1118,13 @@ mod tests {
             skia_rs_safe::canvas::Surface::new_raster_n32_premul(10, 10).expect("raster surface");
         let mut fonts = crate::text::FontDatabase::probe_only();
         let mut images = crate::paint::ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = crate::paint::PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let painted = {

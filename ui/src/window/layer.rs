@@ -61,6 +61,10 @@ pub struct AppState {
     released: Vec<BufferSlot>,
     sheet: CompiledSheet,
     fonts: FontDatabase,
+    /// Hermetic icon-theme lookup for `Button::render`'s `PaintCx` (contract
+    /// §8.1): this window paints a fixed, name-only theme, same as every
+    /// other M3 paint fixture.
+    icons: crate::icons::IconTheme,
     button: Button,
     /// The clock the widget's transitions and animations run on. Shared with
     /// the `Button` so the pump and the widget agree on "now".
@@ -126,6 +130,7 @@ impl AppState {
             released: Vec::new(),
             sheet,
             fonts,
+            icons: crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new()),
             button,
             clock,
             frame: None,
@@ -481,6 +486,7 @@ impl LayerWindow {
             render_origin,
             &self.state.sheet,
             &mut self.state.fonts,
+            &mut self.state.icons,
         );
         self.buffers
             .upload(index, &self.skia)

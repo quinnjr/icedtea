@@ -13,6 +13,7 @@ use icedtea_ui::css::computed::ComputedStyle;
 use icedtea_ui::css::node::{Node, PseudoStates};
 use icedtea_ui::css::value::color::ColorValue;
 use icedtea_ui::css::value::{Image, Keyword, Length};
+use icedtea_ui::icons::IconTheme;
 use icedtea_ui::text::FontDatabase;
 use icedtea_ui::widget::button::Button;
 use skia_rs_safe::canvas::Surface;
@@ -73,7 +74,8 @@ fn fixture(classes: &[&str]) -> (CompiledSheet, FontDatabase, Button) {
 fn render(sheet: &CompiledSheet, fonts: &mut FontDatabase, button: &mut Button) -> Surface {
     let mut surface = Surface::new_raster_n32_premul(SURFACE_W, SURFACE_H).expect("raster surface");
     surface.canvas().clear(Color::TRANSPARENT);
-    button.render(&mut surface, (0.0, 0.0), sheet, fonts);
+    let mut icons = IconTheme::with_name_and_roots("hicolor", Vec::new());
+    button.render(&mut surface, (0.0, 0.0), sheet, fonts, &mut icons);
     surface
 }
 

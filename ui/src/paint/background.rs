@@ -124,8 +124,9 @@ fn paint_layer(
                 }
             }
         }
-        // `cross-fade()` and `-gtk-*` icon images are stored by the registry
-        // and drawn in M4; they paint nothing here (spec, Out of scope).
+        // `cross-fade()` is stored by the registry and still paints nothing.
+        // `-gtk-*` icon images are drawn by `paint::icon::paint_icon`, which
+        // Task 15 routes this arm into.
         Image::None | Image::CrossFade(_) | Image::Icon(_) => {}
     }
 
@@ -642,11 +643,13 @@ mod tests {
         let layers = style.background_layers();
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut paint_cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(40, 20).expect("raster surface");
@@ -902,11 +905,13 @@ mod tests {
         let sheet = CompiledSheet::compile("button { color: #000 }");
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let len_ctx = cx.base_length_ctx();
@@ -947,11 +952,13 @@ mod tests {
         let sheet = CompiledSheet::compile("button { color: #000 }");
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(8, 8).expect("raster surface");
@@ -1004,11 +1011,13 @@ mod tests {
         let sheet = CompiledSheet::compile("button { color: #000 }");
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(100, 100).expect("raster surface");

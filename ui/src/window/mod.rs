@@ -910,6 +910,12 @@ pub struct Window {
     images: crate::paint::ImageCache,
     sheet: CompiledSheet,
     fonts: FontDatabase,
+    /// Icon-theme lookup and rasterisation for `-gtk-icontheme()` etc.
+    ///
+    /// Hermetic (contract §8.1's `PaintCx` field): real theme selection is
+    /// wired by a later task, so this window paints against a fixed,
+    /// name-only theme the way every M3 paint fixture does.
+    icons: crate::icons::IconTheme,
     clock: Rc<dyn Clock>,
     /// `Window::render` gates its first attach on this.
     phase: MapPhase,
@@ -1062,6 +1068,7 @@ impl Window {
             images: crate::paint::ImageCache::new(),
             sheet,
             fonts,
+            icons: crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new()),
             clock: Rc::new(MonotonicClock::new()),
             phase: MapPhase::Configured,
             dirty: true,
@@ -1333,6 +1340,7 @@ impl Window {
             &self.sheet,
             &mut self.fonts,
             &mut self.images,
+            &mut self.icons,
             &self.texts,
         );
         self.surface
@@ -1759,6 +1767,7 @@ impl Window {
                 &self.sheet,
                 &mut self.fonts,
                 &mut self.images,
+                &mut self.icons,
                 &self.texts,
             );
             popup.surface.commit_buffer(
@@ -1912,6 +1921,7 @@ fn paint_tree(
     sheet: &CompiledSheet,
     fonts: &mut FontDatabase,
     images: &mut crate::paint::ImageCache,
+    icons: &mut crate::icons::IconTheme,
     texts: &std::collections::HashMap<NodeAddr, String>,
 ) {
     // Shaped up front, once per node, into a map that outlives the whole
@@ -1937,6 +1947,7 @@ fn paint_tree(
         colors: &sheet.colors,
         fonts,
         images,
+        icons,
         text: None,
     };
     let mut canvas = skia.canvas();
