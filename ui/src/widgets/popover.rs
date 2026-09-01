@@ -148,17 +148,38 @@ impl PopoverC {
         }
     }
 
-    /// Open against `anchor`.
+    /// Open against `anchor`, showing `content` on the popup surface.
+    ///
+    /// `content` is [`crate::view::cmd::Cmd::OpenPopup`]'s payload: the view
+    /// the compositor-side surface is built from. `None` means *this
+    /// popover's content is already retained in the parent window's own
+    /// tree* — which is the case for every popover this crate embeds
+    /// (`MenuButton`, `DropDown`, `PopoverMenu`, `ColorDialogButton`,
+    /// `FontDialogButton` all append their contents under the widget's own
+    /// node) — and then no compositor surface is asked for at all. That is
+    /// the point of the parameter: passing a stub payload opened a *blank*
+    /// popup over content that was already on screen (contract §10 P6-D39,
+    /// limit 1), and opening nothing is both correct and cheaper.
+    ///
+    /// A caller whose content is not in the parent tree — an application
+    /// building a popover's body as a `View` — passes `Some`, and gets a real
+    /// `xdg_popup` with that view reconciled into its own surface.
     pub fn open<Msg: Clone + 'static>(
         &mut self,
         anchor: PopupAnchorPoint,
         size: (u32, u32),
+        content: Option<Rc<dyn Fn() -> View<Msg>>>,
         cx: &mut EventCx<'_, Msg>,
     ) {
         if self.open {
             return;
         }
         self.open = true;
+        let Some(content) = content else {
+            // Nothing to build a surface from: the body is in the parent
+            // window's tree and is painted there.
+            return;
+        };
         if !self.autohide {
             // A non-autohide popover renders in the parent window; nothing to
             // ask the compositor for.
@@ -174,7 +195,7 @@ impl PopoverC {
         cx.cmds.push(Cmd::OpenPopup {
             anchor,
             positioner: self.positioner(anchor_rect, size),
-            view: Rc::new(|| View::new(Kind::Popover)),
+            view: content,
         });
     }
 

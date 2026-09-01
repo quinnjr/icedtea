@@ -184,6 +184,8 @@ impl PopoverMenuBarC {
         self.menus[index].popover.open(
             PopupAnchorPoint::Node(self.items[index].clone()),
             (width as u32, 200),
+            // The menu's items are this bar's own subnodes.
+            None,
             cx,
         );
     }

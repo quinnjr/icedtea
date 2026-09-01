@@ -169,6 +169,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for MenuButtonC {
                 self.popover.open(
                     PopupAnchorPoint::Node(self.button.clone()),
                     (rect.width.max(1.0) as u32, 200),
+                    // The menu's contents are the `MenuButton`'s own
+                    // children, already retained in the parent tree.
+                    None,
                     cx,
                 );
                 self.open = true;

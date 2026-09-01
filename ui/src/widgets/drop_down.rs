@@ -319,6 +319,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
                 self.popover.open(
                     PopupAnchorPoint::Node(self.button.clone()),
                     (rect.width.max(1.0) as u32, 240),
+                    // The list lives under this widget's own `popover`
+                    // node in the parent tree; a popup surface would
+                    // duplicate it.
+                    None,
                     cx,
                 );
                 self.open = true;
@@ -504,11 +508,16 @@ mod tests {
         );
         assert!(!controller.rows[0].states().contains(PseudoStates::SELECTED));
 
-        // The open leg asked the compositor for a popup; the close leg took
-        // it back down.
+        // No compositor surface is asked for: a `DropDown`'s list is retained
+        // under its own `popover > contents > listview` node in the parent
+        // tree and painted there, so `PopoverC::open` is handed `None` for
+        // its payload and a popup would only duplicate what is on screen
+        // (contract §10 P7-D54).
+        // Mutation check: pass `Some(...)` at `DropDownC`'s `popover.open`
+        // call and this fails.
         assert!(
-            !cmds.is_empty(),
-            "opening and closing both go through `cx.cmds`"
+            cmds.is_empty(),
+            "an embedded popover opens no compositor surface"
         );
     }
 }
