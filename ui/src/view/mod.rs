@@ -900,6 +900,79 @@ impl Kind {
         }
     }
 
+    /// The `snake_case` spelling of this kind's variant name — P6's fixture
+    /// filenames and P8's `--widget` flag both key on this, never on
+    /// [`Kind::css_name`], which several kinds share.
+    #[must_use]
+    pub fn snake_name(self) -> &'static str {
+        match self {
+            Kind::Label => "label",
+            Kind::Spinner => "spinner",
+            Kind::Statusbar => "statusbar",
+            Kind::LevelBar => "level_bar",
+            Kind::ProgressBar => "progress_bar",
+            Kind::InfoBar => "info_bar",
+            Kind::Scrollbar => "scrollbar",
+            Kind::Image => "image",
+            Kind::Picture => "picture",
+            Kind::Separator => "separator",
+            Kind::TextView => "text_view",
+            Kind::Scale => "scale",
+            Kind::DrawingArea => "drawing_area",
+            Kind::WindowControls => "window_controls",
+            Kind::Calendar => "calendar",
+            Kind::Popover => "popover",
+            Kind::Button => "button",
+            Kind::ToggleButton => "toggle_button",
+            Kind::LinkButton => "link_button",
+            Kind::CheckButton => "check_button",
+            Kind::MenuButton => "menu_button",
+            Kind::Switch => "switch",
+            Kind::DropDown => "drop_down",
+            Kind::ColorDialogButton => "color_dialog_button",
+            Kind::ColorDialog => "color_dialog",
+            Kind::FontDialogButton => "font_dialog_button",
+            Kind::FontDialog => "font_dialog",
+            Kind::Entry => "entry",
+            Kind::SearchEntry => "search_entry",
+            Kind::PasswordEntry => "password_entry",
+            Kind::SpinButton => "spin_button",
+            Kind::EditableLabel => "editable_label",
+            Kind::Box => "box",
+            Kind::Grid => "grid",
+            Kind::CenterBox => "center_box",
+            Kind::ScrolledWindow => "scrolled_window",
+            Kind::Paned => "paned",
+            Kind::Frame => "frame",
+            Kind::Expander => "expander",
+            Kind::SearchBar => "search_bar",
+            Kind::ActionBar => "action_bar",
+            Kind::HeaderBar => "header_bar",
+            Kind::Notebook => "notebook",
+            Kind::NotebookTab => "notebook_tab",
+            Kind::Overlay => "overlay",
+            Kind::Stack => "stack",
+            Kind::StackPage => "stack_page",
+            Kind::StackSwitcher => "stack_switcher",
+            Kind::StackSidebar => "stack_sidebar",
+            Kind::ListBox => "list_box",
+            Kind::ListBoxRow => "list_box_row",
+            Kind::FlowBox => "flow_box",
+            Kind::FlowBoxChild => "flow_box_child",
+            Kind::ListView => "list_view",
+            Kind::GridView => "grid_view",
+            Kind::ColumnView => "column_view",
+            Kind::ColumnViewColumn => "column_view_column",
+            Kind::PopoverMenu => "popover_menu",
+            Kind::PopoverMenuBar => "popover_menu_bar",
+            Kind::PopoverMenuItem => "popover_menu_item",
+            Kind::Window => "window",
+            Kind::ShortcutsWindow => "shortcuts_window",
+            Kind::AboutDialog => "about_dialog",
+            Kind::AlertDialog => "alert_dialog",
+        }
+    }
+
     /// Style classes the kind always adds, on top of `css_name`.
     #[must_use]
     pub fn base_classes(self) -> &'static [&'static str] {

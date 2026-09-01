@@ -939,3 +939,96 @@ fn no_p5_kind_falls_through_to_the_unimplemented_controller() {
         );
     }
 }
+
+/// The 27 kinds Part 6 owns, in catalogue order.
+const P6_KINDS: [icedtea_ui::view::Kind; 27] = {
+    use icedtea_ui::view::Kind::*;
+    [
+        Box,
+        Grid,
+        CenterBox,
+        ScrolledWindow,
+        Paned,
+        Frame,
+        Expander,
+        SearchBar,
+        ActionBar,
+        HeaderBar,
+        Notebook,
+        NotebookTab,
+        Overlay,
+        Stack,
+        StackPage,
+        StackSwitcher,
+        StackSidebar,
+        ListBox,
+        ListBoxRow,
+        FlowBox,
+        FlowBoxChild,
+        ListView,
+        GridView,
+        ColumnView,
+        ColumnViewColumn,
+        PopoverMenu,
+        PopoverMenuBar,
+    ]
+};
+
+#[test]
+fn every_p6_kind_has_a_controller_that_reports_it() {
+    // Mutation check: leaving a kind on the GenericC catch-all makes its
+    // controller report Kind::Box here, so a forgotten registration cannot
+    // reach the gallery gate four parts later.
+    for kind in P6_KINDS {
+        let built = icedtea_ui::widgets::build_widget::<()>(kind, &Default::default());
+        let reported = built.controller.kind();
+        let expected_generic = matches!(
+            kind,
+            icedtea_ui::view::Kind::NotebookTab
+                | icedtea_ui::view::Kind::ListBoxRow
+                | icedtea_ui::view::Kind::FlowBoxChild
+                | icedtea_ui::view::Kind::StackPage
+                | icedtea_ui::view::Kind::ColumnViewColumn
+                | icedtea_ui::view::Kind::PopoverMenuItem
+        );
+        if !expected_generic {
+            assert_eq!(reported, kind, "{kind:?} is still on the catch-all");
+        }
+        assert_eq!(
+            &*built.node.name(),
+            kind.css_name(),
+            "{kind:?} built the wrong CSS node"
+        );
+    }
+}
+
+#[test]
+fn every_p6_kind_and_the_three_window_presets_have_a_vendored_fixture() {
+    // Mutation check: deleting a fixture file makes this fail with the
+    // widget's name instead of failing a screencopy gate in Part 8 with a
+    // pixel diff nobody can read.
+    let mut names: Vec<String> = P6_KINDS
+        .iter()
+        .map(|k| k.snake_name().to_string())
+        .collect();
+    names.extend(["window", "shortcuts_window", "about_dialog", "alert_dialog"].map(String::from));
+    // Sub-kinds are rendered inside their parent's fixture, never alone.
+    names.retain(|n| {
+        !matches!(
+            n.as_str(),
+            "notebook_tab"
+                | "list_box_row"
+                | "flow_box_child"
+                | "stack_page"
+                | "column_view_column"
+        )
+    });
+    for name in names {
+        let path = format!(
+            "{}/tests/fixtures/gtk4.22-node-trees/{name}.txt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert!(!text.trim().is_empty(), "{name}.txt is empty");
+    }
+}
