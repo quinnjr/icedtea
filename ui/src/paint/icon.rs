@@ -9,17 +9,25 @@
 //! centred, at `-gtk-icon-size` when the style declares one — GTK's own
 //! rule, and the reason a 16 px icon in a 24 px button does not stretch.
 
-use skia_rs_safe::canvas::Canvas;
-use skia_rs_safe::core::Rect as SkRect;
-use skia_rs_safe::paint::Paint;
+use std::sync::Arc;
+
+use skia_rs_safe::canvas::{Canvas, SaveLayerFlags, SaveLayerRec};
+use skia_rs_safe::core::{Matrix, Rect as SkRect};
+use skia_rs_safe::paint::{ColorFilterRef, ColorMatrixFilter, Paint};
 
 use crate::css::computed::ComputedStyle;
 use crate::css::registry::Prop;
-use crate::css::value::{ColorCtx, ColorValue, IconRef, Image as CssImage, Keyword, Value};
-use crate::icons::{Handle, Palette};
+use crate::css::value::transform::transform_list_matrix;
+use crate::css::value::{
+    ColorCtx, ColorValue, FilterFn, IconRef, Image as CssImage, Keyword, Rgba, Shadow, TransformFn,
+    Value,
+};
+use crate::icons::{Builtin, Handle, Palette};
 use crate::layout::Rect;
 
 use super::PaintCx;
+use super::effects::color_matrix_for;
+use super::shadow::blit_blurred;
 
 /// How deep `-gtk-scaled()`/`-gtk-recolor()` nesting may go.
 ///
@@ -218,8 +226,189 @@ pub fn paint_icon(
     let Some(image) = resolve_icon(icon, size, style, cx) else {
         return;
     };
-    let paint = Paint::new();
-    canvas.draw_image_rect(&image, None, &dst, Some(&paint));
+    with_icon_effects(canvas, style, dst, cx, |canvas| {
+        let paint = Paint::new();
+        canvas.draw_image_rect(&image, None, &dst, Some(&paint));
+    });
+}
+
+/// `-gtk-icon-transform`, flattened about the icon box's own centre.
+///
+/// About the icon's centre, not the allocation's: a `rotate()` on a
+/// `-gtk-icon-transform` is how GTK4 turns the expander's arrow, and turning
+/// it about a widget-sized box would swing it out of view.
+#[must_use]
+pub(crate) fn icon_transform(
+    style: &ComputedStyle,
+    dst: SkRect,
+    cx: &PaintCx<'_>,
+) -> Option<Matrix> {
+    let Value::Transform(list) = style.raw(Prop::GtkIconTransform) else {
+        return None;
+    };
+    if list.is_empty() {
+        return None;
+    }
+    let functions: Vec<TransformFn> = list.to_vec();
+    let basis = (dst.width(), dst.height());
+    let origin = (dst.left + dst.width() / 2.0, dst.top + dst.height() / 2.0);
+    Some(transform_list_matrix(
+        &functions,
+        &cx.base_length_ctx(),
+        basis,
+        origin,
+    ))
+}
+
+/// The colour matrix `-gtk-icon-filter` composes to.
+fn icon_color_matrix(style: &ComputedStyle) -> Option<[f32; 20]> {
+    let Value::Filter(list) = style.raw(Prop::GtkIconFilter) else {
+        return None;
+    };
+    let filters: Vec<FilterFn> = list.to_vec();
+    color_matrix_for(&filters)
+}
+
+/// A colour matrix that replaces every pixel's colour with `color`, keeping
+/// the source's alpha (scaled by the colour's own).
+fn tint_matrix(color: Rgba) -> [f32; 20] {
+    [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        color.r, //
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        color.g, //
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        color.b, //
+        0.0,
+        0.0,
+        0.0,
+        color.a.clamp(0.0, 1.0),
+        0.0,
+    ]
+}
+
+/// Run `draw` inside a save-layer carrying `matrix` as its colour filter.
+fn with_color_matrix(canvas: &mut Canvas<'_>, matrix: [f32; 20], draw: &dyn Fn(&mut Canvas<'_>)) {
+    let mut paint = Paint::new();
+    let filter: ColorFilterRef = Arc::new(ColorMatrixFilter::new(matrix));
+    paint.set_color_filter(Some(filter));
+    let save = canvas.save_layer(&SaveLayerRec {
+        bounds: None,
+        paint: Some(&paint),
+        flags: SaveLayerFlags::NONE,
+    });
+    draw(canvas);
+    canvas.restore_to_count(save);
+}
+
+/// Every `-gtk-icon-shadow`, behind the icon, back to front.
+fn paint_icon_shadows(
+    canvas: &mut Canvas<'_>,
+    style: &ComputedStyle,
+    dst: SkRect,
+    cx: &PaintCx<'_>,
+    draw: &dyn Fn(&mut Canvas<'_>),
+) {
+    let shadows: std::rc::Rc<[Shadow]> = style.get(Prop::GtkIconShadow);
+    if shadows.is_empty() {
+        return;
+    }
+    let ctx = cx.base_length_ctx();
+    let current = style.color();
+    for shadow in shadows.iter().rev() {
+        // `computed` has already resolved `@name` and `currentColor` for a
+        // shadow colour that survived; `None` means currentColor.
+        let color = match shadow.color.as_ref() {
+            Some(ColorValue::Absolute(rgba)) => *rgba,
+            Some(_) | None => current,
+        };
+        if color.a <= 0.0 {
+            continue;
+        }
+        let px = |length: &crate::css::value::Length| {
+            length
+                .resolve(&ctx)
+                .filter(|value| value.is_finite())
+                .unwrap_or(0.0)
+        };
+        let (dx, dy) = (px(&shadow.offset_x), px(&shadow.offset_y));
+        let blur = px(&shadow.blur).max(0.0);
+        let matrix = tint_matrix(color);
+        if blur <= 0.0 {
+            let save = canvas.save();
+            canvas.concat(&Matrix::translate(dx, dy));
+            with_color_matrix(canvas, matrix, draw);
+            canvas.restore_to_count(save);
+            continue;
+        }
+        let shape = Rect::new(dst.left + dx, dst.top + dy, dst.width(), dst.height());
+        // `blit_blurred` owns the offscreen budget -- the padding, the sigma
+        // cap and the dimension ceiling that is the only defence against
+        // `-gtk-icon-shadow: 0 0 99999px`.
+        blit_blurred(canvas, shape, blur, None, |offscreen, offset, _| {
+            let save = offscreen.save();
+            offscreen.concat(&Matrix::translate(dx - offset.0, dy - offset.1));
+            with_color_matrix(offscreen, matrix, draw);
+            offscreen.restore_to_count(save);
+        });
+    }
+}
+
+/// Draw `draw` under the icon effect stack: shadows behind, then the
+/// transform and the colour filter around the icon itself.
+fn with_icon_effects(
+    canvas: &mut Canvas<'_>,
+    style: &ComputedStyle,
+    dst: SkRect,
+    cx: &PaintCx<'_>,
+    draw: impl Fn(&mut Canvas<'_>),
+) {
+    let draw: &dyn Fn(&mut Canvas<'_>) = &draw;
+    let save = canvas.save();
+    if let Some(matrix) = icon_transform(style, dst, cx) {
+        canvas.concat(&matrix);
+    }
+    paint_icon_shadows(canvas, style, dst, cx, draw);
+    match icon_color_matrix(style) {
+        Some(matrix) => with_color_matrix(canvas, matrix, draw),
+        None => draw(canvas),
+    }
+    canvas.restore_to_count(save);
+}
+
+/// `-gtk-icon-source: builtin`'s draw.
+///
+/// The registry parses the property as a bare keyword, so *which* shape is
+/// the CSS node's business: `checkbutton > check` passes `Builtin::Check`,
+/// `spinbutton button.up` passes `Builtin::SpinPlus`, and so on. The shape
+/// is drawn in the node's own `color`, through the same
+/// transform/filter/shadow stack an icon file goes through — which is what
+/// makes an expander's `-gtk-icon-transform: rotate(90deg)` work.
+pub fn paint_builtin(
+    canvas: &mut Canvas<'_>,
+    builtin: Builtin,
+    rect: Rect,
+    style: &ComputedStyle,
+    cx: &mut PaintCx<'_>,
+) {
+    let size = icon_size_px(style, rect, cx);
+    let Some(dst) = icon_box(rect, size) else {
+        return;
+    };
+    let color = style.color();
+    let box_rect = Rect::new(dst.left, dst.top, dst.width(), dst.height());
+    with_icon_effects(canvas, style, dst, &*cx, move |canvas| {
+        builtin.draw(canvas, box_rect, color);
+    });
 }
 
 #[cfg(test)]
@@ -538,5 +727,140 @@ mod tests {
             resolve_icon(&theme_icon("document-open"), 16, &style, &mut cx).expect("handle");
         assert!(Rc::ptr_eq(&first, &second));
         assert_eq!(first.width(), 16);
+    }
+
+    use super::paint_builtin;
+    use crate::icons::Builtin;
+
+    // `-gtk-icon-transform` moves the icon inside its allocation, about the
+    // icon box's own centre.
+    // Mutation check: apply the transform about the canvas origin and the
+    // `(1, 8)` assertion still holds but `(14, 8)` moves -- so assert both.
+    #[test]
+    fn gtk_icon_transform_moves_the_icon() {
+        let plain = painted_in(
+            "image { color: #000000; -gtk-icon-size: 8px }",
+            &theme_icon("document-open"),
+            16,
+            1,
+            Rect::new(0.0, 0.0, 16.0, 16.0),
+        );
+        assert_eq!(pixel(&plain, 8, 8), Color(0xFF1C_71D8));
+        assert_eq!(pixel(&plain, 14, 8), Color(0x0000_0000));
+
+        let moved = painted_in(
+            "image { color: #000000; -gtk-icon-size: 8px; \
+             -gtk-icon-transform: translate(4px, 0) }",
+            &theme_icon("document-open"),
+            16,
+            1,
+            Rect::new(0.0, 0.0, 16.0, 16.0),
+        );
+        assert_eq!(pixel(&moved, 14, 8), Color(0xFF1C_71D8));
+        assert_eq!(pixel(&moved, 2, 8), Color(0x0000_0000));
+    }
+
+    // `-gtk-icon-filter` is the same colour-matrix stack `filter` uses.
+    // Mutation check: skip the save-layer and the red channel stays 0xFF.
+    #[test]
+    fn gtk_icon_filter_applies_a_colour_matrix() {
+        let surface = painted(
+            "image { color: #000000; -gtk-icon-filter: grayscale(1) }",
+            &theme_icon("document-open"),
+            16,
+            1,
+        );
+        let color = pixel(&surface, 8, 8).0;
+        let (r, g, b) = ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+        assert_eq!(r, g, "grayscale left r != g");
+        assert_eq!(g, b, "grayscale left g != b");
+        assert!(r > 0 && r < 0xFF, "grayscale produced {r:#x}");
+    }
+
+    // `-gtk-icon-shadow` draws the icon's own silhouette, offset and tinted.
+    // Mutation check: draw the shadow *after* the icon and the `(8, 8)`
+    // assertion sees black instead of red.
+    #[test]
+    fn gtk_icon_shadow_draws_a_tinted_offset_silhouette() {
+        let surface = painted_in(
+            "image { color: #000000; -gtk-icon-size: 8px; \
+             -gtk-icon-shadow: 6px 0 #000000 }",
+            &theme_icon("document-open"),
+            24,
+            1,
+            Rect::new(0.0, 0.0, 24.0, 24.0),
+        );
+        assert_eq!(pixel(&surface, 12, 12), Color(0xFF1C_71D8));
+        assert_eq!(pixel(&surface, 18, 12), Color(0xFF00_0000));
+    }
+
+    // An omitted shadow colour is `currentColor`, as everywhere else in the
+    // engine.
+    // Mutation check: default it to black and this fails.
+    #[test]
+    fn an_icon_shadow_without_a_colour_is_current_color() {
+        let surface = painted_in(
+            "image { color: #3584e4; -gtk-icon-size: 8px; -gtk-icon-shadow: 6px 0 }",
+            &theme_icon("document-open"),
+            24,
+            1,
+            Rect::new(0.0, 0.0, 24.0, 24.0),
+        );
+        assert_eq!(pixel(&surface, 18, 12), Color(0xFF35_84E4));
+    }
+
+    // A shadow's blur radius comes from CSS and CSS can ask for a gigapixel
+    // buffer; `blit_blurred` owns that budget and refuses.
+    // Mutation check: allocate the offscreen here instead of through
+    // blit_blurred and this hangs or aborts.
+    #[test]
+    fn an_absurd_icon_shadow_blur_is_refused_not_allocated() {
+        let surface = painted(
+            "image { color: #000000; -gtk-icon-shadow: 0 0 99999px #000000 }",
+            &theme_icon("document-open"),
+            16,
+            1,
+        );
+        assert_eq!(pixel(&surface, 8, 8), Color(0xFFFF_0000));
+    }
+
+    // `paint_builtin` is `-gtk-icon-source: builtin`'s draw, and honours the
+    // same effect stack.
+    // Mutation check: paint the builtin in black instead of the node's
+    // colour and the first assertion fails.
+    #[test]
+    fn paint_builtin_draws_in_the_nodes_colour_through_the_same_stack() {
+        let sheet = CompiledSheet::compile(
+            "image { color: #3584e4; -gtk-icon-transform: translate(0, 0) }",
+        );
+        let node = Node::new("image");
+        let env = ResolveEnv::default();
+        let mut match_cx = MatchCx::new();
+        let style = ComputedStyle::resolve_chain(&sheet, &node, &env, &mut match_cx);
+        let mut fonts = FontDatabase::probe_only();
+        let mut images = ImageCache::new();
+        let mut icons = IconTheme::with_name_and_roots("MiniTheme", roots());
+        let mut cx = PaintCx {
+            env: &env,
+            colors: &sheet.colors,
+            fonts: &mut fonts,
+            images: &mut images,
+            icons: &mut icons,
+            text: None,
+        };
+        let mut surface = Surface::new_raster_n32_premul(16, 16).expect("surface");
+        {
+            let mut canvas = surface.canvas();
+            canvas.clear(Color::TRANSPARENT);
+            paint_builtin(
+                &mut canvas,
+                Builtin::Radio,
+                Rect::new(0.0, 0.0, 16.0, 16.0),
+                &style,
+                &mut cx,
+            );
+        }
+        assert_eq!(pixel(&surface, 8, 8), Color(0xFF35_84E4));
+        assert_eq!(pixel(&surface, 0, 0), Color(0x0000_0000));
     }
 }

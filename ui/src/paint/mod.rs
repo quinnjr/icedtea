@@ -38,7 +38,7 @@ pub use effects::{begin_effects, end_effects};
 pub use geometry::{
     Side, clamp_radii, inner_radii, rounded_rect_path, rounded_ring_path, side_wedge_path,
 };
-pub use icon::{icon_size_px, paint_icon, resolve_icon};
+pub use icon::{icon_size_px, paint_builtin, paint_icon, resolve_icon};
 pub use outline::paint_outline;
 pub use shadow::paint_box_shadows;
 pub use text::paint_text;
