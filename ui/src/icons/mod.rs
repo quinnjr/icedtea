@@ -18,8 +18,8 @@
 //! name and no client-side cursor theme is ever loaded.
 //!
 //! [`builtin::Builtin`] predates the rest of this module (P5 needed its
-//! shapes for `CheckButton`/`SpinButton` before P7 landed); P7 fills in its
-//! real geometry in a later task of this part.
+//! shapes for `CheckButton`/`SpinButton` before P7 landed); P7 has since
+//! filled in its real geometry.
 
 pub mod builtin;
 pub mod lookup;
