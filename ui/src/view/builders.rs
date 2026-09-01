@@ -254,6 +254,63 @@ impl<Msg: Clone + 'static> View<Msg> {
     }
 }
 
+/// `GtkPaned`: `start` and `end` flank the draggable separator, in that
+/// order.
+#[must_use]
+pub fn paned<Msg: Clone + 'static>(
+    orientation: Orientation,
+    start: View<Msg>,
+    end: View<Msg>,
+) -> View<Msg> {
+    View::new(Kind::Paned)
+        .prop(PropName::Orientation, orientation)
+        .children([start, end])
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// `GtkPaned:position`.
+    #[must_use]
+    pub fn position(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Position, v)
+    }
+
+    /// `GtkPaned:position-set`.
+    #[must_use]
+    pub fn position_set(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::PositionSet, v)
+    }
+
+    /// `GtkPaned:wide-handle`.
+    #[must_use]
+    pub fn wide_handle(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::WideHandle, v)
+    }
+
+    /// `GtkPaned:resize-start-child`.
+    #[must_use]
+    pub fn resize_start(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ResizeStart, v)
+    }
+
+    /// `GtkPaned:resize-end-child`.
+    #[must_use]
+    pub fn resize_end(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ResizeEnd, v)
+    }
+
+    /// `GtkPaned:shrink-start-child`.
+    #[must_use]
+    pub fn shrink_start(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShrinkStart, v)
+    }
+
+    /// `GtkPaned:shrink-end-child`.
+    #[must_use]
+    pub fn shrink_end(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShrinkEnd, v)
+    }
+}
+
 impl<Msg: Clone + 'static> View<Msg> {
     /// `GtkBox:spacing`, `GtkGrid` row/column spacing's shorthand.
     #[must_use]

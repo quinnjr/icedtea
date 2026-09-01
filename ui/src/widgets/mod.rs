@@ -69,6 +69,7 @@ pub mod level_bar;
 pub mod link_button;
 pub mod menu_button;
 pub mod node_tree;
+pub mod paned;
 pub mod password_entry;
 pub mod picture;
 pub mod popover;
@@ -968,6 +969,7 @@ pub fn build_controller<Msg: Clone + 'static>(
         )),
         Kind::Grid => Box::new(<grid::GridC as Controller<Msg>>::build(node, props, cx)),
         Kind::Frame => Box::new(<frame::FrameC as Controller<Msg>>::build(node, props, cx)),
+        Kind::Paned => Box::new(<paned::PanedC as Controller<Msg>>::build(node, props, cx)),
         Kind::Separator => Box::new(<separator::SeparatorC as Controller<Msg>>::build(
             node, props, cx,
         )),
@@ -1118,6 +1120,13 @@ pub struct Headless {
     icons: crate::icons::IconTheme,
     clock: Rc<dyn crate::anim::Clock>,
     env: crate::css::computed::ResolveEnv,
+    /// Backing storage for [`Headless::event_cx`]'s `tree`/`styles`/`focus`/
+    /// `clipboard` fields -- empty and unsynced, since no widget task's
+    /// `on_event` test hits an allocation-dependent path.
+    tree: crate::layout::LayoutTree,
+    styles: crate::view::StyleMap,
+    focus: crate::window::focus::FocusRing,
+    clipboard: crate::window::selection::Clipboard,
 }
 
 impl Headless {
@@ -1135,6 +1144,10 @@ impl Headless {
             icons: crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new()),
             clock: Rc::new(crate::anim::ManualClock::new()),
             env: crate::css::computed::ResolveEnv::default(),
+            tree: crate::layout::LayoutTree::new(),
+            styles: crate::view::StyleMap::new(),
+            focus: <crate::window::focus::FocusRing as Default>::default(),
+            clipboard: crate::window::selection::Clipboard::offscreen(),
         }
     }
 
@@ -1146,6 +1159,72 @@ impl Headless {
             icons: &mut self.icons,
             clock: &self.clock,
             env: &self.env,
+        }
+    }
+
+    /// An `EventCx` over `node`, with an empty focus ring and clipboard.
+    ///
+    /// `handlers` and `cmds` are the two fields an `EventCx` carries that
+    /// depend on `Msg`, which `Headless` itself is not generic over; each
+    /// call leaks a fresh, empty pair for them (`Box::leak`, never freed).
+    /// `Headless` is test/dev-only scaffolding built once per test and
+    /// dropped at its end, so the leak is a handful of bytes per call, not a
+    /// growing one -- the same trade the rest of this struct already makes
+    /// by never tearing down its font/icon caches either.
+    pub fn event_cx<'a, Msg: 'static>(
+        &'a mut self,
+        node: &'a Node,
+    ) -> crate::view::EventCx<'a, Msg> {
+        let handlers: &crate::view::Handlers<Msg> =
+            Box::leak(Box::new(crate::view::Handlers::default()));
+        let cmds: &mut Vec<crate::view::Cmd<Msg>> = Box::leak(Box::new(Vec::new()));
+        crate::view::EventCx {
+            node,
+            handlers,
+            tree: &self.tree,
+            styles: &self.styles,
+            focus: &mut self.focus,
+            clipboard: &mut self.clipboard,
+            icons: &mut self.icons,
+            fonts: &mut self.fonts,
+            clock: &self.clock,
+            env: &self.env,
+            cmds,
+            phase: crate::view::Phase::Target,
+            handled: false,
+        }
+    }
+
+    /// A synthetic, already-pressed key event for keysym `name` (an
+    /// xkbcommon keysym name, e.g. `"Right"`, `"Home"`), with no modifiers.
+    ///
+    /// Reconciliation: the task text describes this as going through
+    /// `Keymap::vendored_us().key_by_name(name)`, but neither exists --
+    /// `window::keyboard::Keymap` (P3's file, off limits to P6 except its
+    /// own registration lines) translates a *keycode* it already holds
+    /// (`Keymap::translate`) and has no reverse keysym-to-keycode lookup to
+    /// build one on. `KeyEvent`'s fields are all public, so this builds one
+    /// directly from `xkb::keysym_from_name` instead of inventing a P3 API
+    /// this task cannot add.
+    ///
+    /// Takes no `&self`: it needs none, and `event_cx`'s returned `EventCx`
+    /// already holds `Headless` mutably borrowed for as long as a test keeps
+    /// using it, which a `&self`/`&mut self` receiver here would collide
+    /// with on every call interleaved with `on_event` the way the widget
+    /// tests that use both actually call them.
+    #[must_use]
+    pub fn key(name: &str) -> crate::window::keyboard::KeyEvent {
+        let keysym = xkbcommon::xkb::keysym_from_name(name, xkbcommon::xkb::KEYSYM_NO_FLAGS);
+        crate::window::keyboard::KeyEvent {
+            keycode: 0,
+            keysym,
+            utf8: None,
+            mods: crate::window::keyboard::Mods::empty(),
+            consumed: crate::window::keyboard::Mods::empty(),
+            pressed: true,
+            repeat: false,
+            serial: 0,
+            time_ms: 0,
         }
     }
 }
