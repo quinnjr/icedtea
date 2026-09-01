@@ -72,6 +72,7 @@ pub mod info_bar;
 pub mod label;
 pub mod level_bar;
 pub mod link_button;
+pub mod list_box;
 pub mod menu_button;
 pub mod node_tree;
 pub mod notebook;
@@ -1228,6 +1229,9 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::EditableLabel => Box::new(
             <editable_label::EditableLabelC as Controller<Msg>>::build(node, props, cx),
         ),
+        Kind::ListBox => Box::new(<list_box::ListBoxC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {
@@ -1463,6 +1467,50 @@ impl Headless {
             };
         }
         event
+    }
+}
+
+impl Headless {
+    /// Lay `node`'s children out as fixed-height rows stacked in a column,
+    /// for a hit-testing test that needs real geometry without wanting to
+    /// stand up a full CSS layout pass.
+    ///
+    /// Runs a real (if minimal) layout: [`crate::layout::LayoutTree::sync`],
+    /// each child styled as a [`crate::layout::Container::Leaf`] so its
+    /// size comes only from the [`crate::layout::FixedMeasure`] this hands
+    /// `compute`, then [`crate::layout::LayoutTree::compute`]. The result
+    /// lands in `self.tree`, the same tree `Headless::event_cx`'s returned
+    /// `EventCx` borrows -- so a test that also wants an `EventCx` must call
+    /// this first: `event_cx`/`event_cx_with_handlers` take `&mut self` for
+    /// as long as the `EventCx` they return is alive, and a second call on
+    /// `self` (this one included) would not borrow-check afterwards.
+    pub fn place_rows(&mut self, node: &Node, row_height: f32) {
+        self.tree.sync(node).expect("place_rows: sync");
+        self.tree.set_container(
+            node,
+            crate::layout::Container::Box {
+                direction: crate::layout::BoxDirection::Column,
+            },
+        );
+        let style = crate::css::computed::ComputedStyle::initial(&self.env);
+        for child in node.children() {
+            self.tree
+                .set_style(&child, &style, crate::layout::Container::Leaf, &self.env);
+        }
+        let mut measure = crate::layout::FixedMeasure(taffy::Size {
+            width: 200.0,
+            height: row_height,
+        });
+        self.tree
+            .compute(
+                node,
+                taffy::Size {
+                    width: taffy::AvailableSpace::Definite(200.0),
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+                &mut measure,
+            )
+            .expect("place_rows: compute");
     }
 }
 

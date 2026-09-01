@@ -739,6 +739,16 @@ fn stack_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn list_box_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::ShowSeparators,
+        icedtea_ui::view::Prop::Bool(true),
+    );
+    assert_fixture(icedtea_ui::view::Kind::ListBox, &props, "list_box");
+}
+
+#[test]
 fn no_p5_kind_falls_through_to_the_unimplemented_controller() {
     // mutation: remove any dispatch arm from build_controller and that kind's
     // tree renders as a bare node, failing its fixture's required subnodes.

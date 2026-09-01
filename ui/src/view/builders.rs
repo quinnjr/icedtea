@@ -612,6 +612,18 @@ impl<Msg: Clone + 'static> StackPageExt<Msg> for View<Msg> {
     }
 }
 
+/// `GtkListBox` over `rows`, each a [`list_box_row`] view.
+#[must_use]
+pub fn list_box<Msg: Clone + 'static>(rows: impl IntoIterator<Item = View<Msg>>) -> View<Msg> {
+    View::new(Kind::ListBox).children(rows)
+}
+
+/// One `list_box`'s row.
+#[must_use]
+pub fn list_box_row<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
+    View::new(Kind::ListBoxRow).child(child)
+}
+
 impl<Msg: Clone + 'static> View<Msg> {
     /// `GtkBox:spacing`, `GtkGrid` row/column spacing's shorthand.
     #[must_use]
@@ -671,6 +683,30 @@ impl<Msg: Clone + 'static> View<Msg> {
     #[must_use]
     pub fn shrink_center_last(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::ShrinkCenterLast, v)
+    }
+
+    /// `GtkListBox:selection-mode`.
+    #[must_use]
+    pub fn selection_mode(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::SelectionMode, v)
+    }
+
+    /// `GtkListBox:show-separators`.
+    #[must_use]
+    pub fn show_separators(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShowSeparators, v)
+    }
+
+    /// `GtkListBox:activate-on-single-click`.
+    #[must_use]
+    pub fn activate_on_single_click(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ActivateOnSingleClick, v)
+    }
+
+    /// `GtkListBoxRow:activatable`.
+    #[must_use]
+    pub fn activatable(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Activatable, v)
     }
 }
 
@@ -749,6 +785,16 @@ impl<Msg: Clone + 'static> View<Msg> {
     #[must_use]
     pub fn on_selected(self, f: impl Fn(usize) -> Msg + 'static) -> Self {
         self.on(EventKind::Selected, Handler::Index(Rc::new(f)))
+    }
+
+    /// A list or menu row was activated (double-click, Enter, or a single
+    /// click under `activate-on-single-click`). Contract deviation 14: the
+    /// same `EventKind::Activate` [`on_activate`](Self::on_activate) binds,
+    /// renamed because that name already owns the zero-argument
+    /// `Handler::Unit` arity.
+    #[must_use]
+    pub fn on_item_activated(self, f: impl Fn(usize) -> Msg + 'static) -> Self {
+        self.on(EventKind::Activate, Handler::Index(Rc::new(f)))
     }
 
     /// A notebook or stack switched page.

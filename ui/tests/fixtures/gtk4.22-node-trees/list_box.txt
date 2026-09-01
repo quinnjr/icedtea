@@ -1,0 +1,2 @@
+list[.separators][.rich-list][.navigation-sidebar][.boxed-list]
+╰── row[.activatable]
