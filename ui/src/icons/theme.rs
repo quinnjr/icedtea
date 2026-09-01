@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use super::IconFormat;
+
 /// The theme GTK falls back to when `settings.ini` names none.
 const DEFAULT_THEME: &str = "Adwaita";
 
@@ -738,6 +740,29 @@ impl IconTheme {
     pub fn from_env() -> IconTheme {
         Self::from_icon_env(&IconEnv::from_env())
     }
+}
+
+/// One located icon file, with the geometry the directory it came from
+/// declared for it.
+///
+/// `nominal_size`/`scale`/`kind` are the *directory's* numbers, not the
+/// request's: they are what tells a renderer whether an upscale is expected
+/// (a Scalable SVG) or a compromise (a Fixed PNG asked for at the wrong
+/// size).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IconFile {
+    /// Absolute path to the file.
+    pub path: PathBuf,
+    /// The format its extension names.
+    pub format: IconFormat,
+    /// The subdir's declared `Size`.
+    pub nominal_size: u32,
+    /// The subdir's declared `Scale`.
+    pub scale: u32,
+    /// `true` for a `-symbolic` name or a file under a `symbolic/` subdir.
+    pub symbolic: bool,
+    /// The subdir's `Type` and the keys it reads.
+    pub kind: DirKind,
 }
 
 #[cfg(test)]

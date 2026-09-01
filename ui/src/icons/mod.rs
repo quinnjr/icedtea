@@ -32,7 +32,9 @@ use std::rc::Rc;
 // This line grows as items land; see the re-export table in Task 1's
 // idempotence note. `Builtin` was already re-exported here by P5.
 pub use builtin::Builtin;
-pub use theme::{DirKind, IconTheme, theme_name_from_settings_ini};
+pub use theme::{
+    DirKind, IconEnv, IconFile, IconTheme, SubDir, ThemeIndex, theme_name_from_settings_ini,
+};
 
 /// A rasterised icon, shared by every node that asked for it.
 ///
