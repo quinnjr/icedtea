@@ -101,7 +101,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for BoxC {
 mod tests {
     use super::BoxC;
     use crate::layout::{BoxDirection, Container};
-    use crate::view::builders::{box_, label};
+    use crate::view::builders::{BoxExt, box_, label};
     use crate::view::{Cmd, Kind, Prop, PropName, Props, ScriptStep, View};
     use crate::widgets::offscreen::{frames, px};
     use crate::widgets::types::Orientation;

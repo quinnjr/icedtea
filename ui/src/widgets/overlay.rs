@@ -188,7 +188,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for OverlayC {
 #[cfg(test)]
 mod tests {
     use crate::layout::Align;
-    use crate::view::builders::{label, overlay};
+    use crate::view::builders::{OverlayExt, label, overlay};
     use crate::view::{Cmd, Kind, Props, ScriptStep, View};
     use crate::widgets::offscreen::px;
     use crate::widgets::overlay::OverlayC;

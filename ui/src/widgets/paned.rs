@@ -391,7 +391,7 @@ mod tests {
     // Before that fix, the rest-state test below found no 5px run at all.
     mod pixels {
         use crate::view::app::ScriptStep;
-        use crate::view::builders::{label, paned};
+        use crate::view::builders::{PanedExt, label, paned};
         use crate::view::{Cmd, View};
         use crate::widgets::offscreen::{frames, px};
         use crate::widgets::types::Orientation;

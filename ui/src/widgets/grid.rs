@@ -158,7 +158,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for GridC {
 mod tests {
     use super::GridC;
     use crate::layout::Container;
-    use crate::view::builders::{grid, label};
+    use crate::view::builders::{GridExt, grid, label};
     use crate::view::{Cmd, Kind, Prop, PropName, Props, ScriptStep, View};
     use crate::widgets::offscreen::{frames, px};
     use crate::widgets::{build_widget, container_of, matches_fixture};

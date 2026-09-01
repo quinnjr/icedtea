@@ -181,7 +181,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for ActionBarC {
 
 #[cfg(test)]
 mod tests {
-    use crate::view::builders::{action_bar, button, label};
+    use crate::view::builders::{PackExt, action_bar, button, label};
     use crate::view::{Cmd, Kind, Prop, PropName, Props, ScriptStep, View};
     use crate::widgets::action_bar::ActionBarExt as _;
     use crate::widgets::offscreen::{frames, px};

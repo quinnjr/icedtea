@@ -39,6 +39,12 @@ const DURATION: Duration = Duration::from_millis(200);
 /// since an inherent method always wins over a trait one -- an
 /// action-at-a-distance this widget's own scoped trait avoids.
 pub trait ExpanderExt<Msg>: Sized {
+    /// `GtkExpander:expanded`.
+    ///
+    /// Moved here from an inherent `View::expanded` in the P6 fix wave: an
+    /// inherent setter shadows every same-named trait method (contract §11
+    /// E8).
+    fn expanded(self, v: impl Into<Prop>) -> Self;
     /// `GtkExpander:use-underline` (mnemonics; the underscore is stripped).
     fn use_underline(self, v: impl Into<Prop>) -> Self;
     /// `GtkExpander:resize-toplevel`.
@@ -46,6 +52,9 @@ pub trait ExpanderExt<Msg>: Sized {
 }
 
 impl<Msg: Clone + 'static> ExpanderExt<Msg> for View<Msg> {
+    fn expanded(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Expanded, v)
+    }
     fn use_underline(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::UseUnderline, v)
     }

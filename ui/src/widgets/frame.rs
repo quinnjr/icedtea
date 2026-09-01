@@ -111,8 +111,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for FrameC {
 
 #[cfg(test)]
 mod tests {
-    use crate::view::builders::{frame, label};
+    use crate::view::builders::{FrameExt, frame, label};
     use crate::view::{Cmd, Kind, Prop, PropName, Props, ScriptStep, View};
+    use crate::widgets::button::ButtonExt;
     use crate::widgets::offscreen::{frames, px};
     use crate::widgets::{build_widget, matches_fixture};
 

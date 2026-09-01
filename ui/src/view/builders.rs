@@ -86,48 +86,54 @@ pub fn grid<Msg: Clone + 'static>(children: impl IntoIterator<Item = View<Msg>>)
         .prop(PropName::Rows, i64::from(rows))
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
+/// `GtkGrid`'s own property setters, and the per-child placement setters
+/// `gtk_grid_attach` takes.
+pub trait GridExt<Msg>: Sized {
     /// `GtkGrid:row-spacing`.
     #[must_use]
-    pub fn row_spacing(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::RowSpacing, v)
-    }
-
+    fn row_spacing(self, v: impl Into<Prop>) -> Self;
     /// `GtkGrid:column-spacing`.
     #[must_use]
-    pub fn column_spacing(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::ColumnSpacing, v)
-    }
-
+    fn column_spacing(self, v: impl Into<Prop>) -> Self;
     /// `GtkGrid:row-homogeneous`.
     #[must_use]
-    pub fn row_homogeneous(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::RowHomogeneous, v)
-    }
-
+    fn row_homogeneous(self, v: impl Into<Prop>) -> Self;
     /// `GtkGrid:column-homogeneous`.
     #[must_use]
-    pub fn column_homogeneous(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::ColumnHomogeneous, v)
-    }
-
+    fn column_homogeneous(self, v: impl Into<Prop>) -> Self;
     /// `GtkGrid:baseline-row`.
     #[must_use]
-    pub fn baseline_row(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::BaselineRow, v)
-    }
-
+    fn baseline_row(self, v: impl Into<Prop>) -> Self;
     /// This child's grid cell, zero-based (`gtk_grid_attach`'s first two
     /// arguments).
     #[must_use]
-    pub fn at(self, column: u16, row: u16) -> Self {
+    fn at(self, column: u16, row: u16) -> Self;
+    /// How many cells this child covers (`gtk_grid_attach`'s last two).
+    #[must_use]
+    fn span(self, columns: u16, rows: u16) -> Self;
+}
+
+impl<Msg: Clone + 'static> GridExt<Msg> for View<Msg> {
+    fn row_spacing(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::RowSpacing, v)
+    }
+    fn column_spacing(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ColumnSpacing, v)
+    }
+    fn row_homogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::RowHomogeneous, v)
+    }
+    fn column_homogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ColumnHomogeneous, v)
+    }
+    fn baseline_row(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::BaselineRow, v)
+    }
+    fn at(self, column: u16, row: u16) -> Self {
         self.prop(PropName::Column, i64::from(column))
             .prop(PropName::Row, i64::from(row))
     }
-
-    /// How many cells this child covers (`gtk_grid_attach`'s last two).
-    #[must_use]
-    pub fn span(self, columns: u16, rows: u16) -> Self {
+    fn span(self, columns: u16, rows: u16) -> Self {
         self.prop(PropName::ColumnSpan, i64::from(columns.max(1)))
             .prop(PropName::RowSpan, i64::from(rows.max(1)))
     }
@@ -232,22 +238,29 @@ pub fn frame<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
     View::new(Kind::Frame).child(child)
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
-    /// `GtkFrame:label` (and every other widget's own `label` text prop).
-    #[must_use]
-    pub fn label(self, text: &str) -> Self {
-        self.prop(PropName::Label, Prop::Str(Rc::from(text)))
-    }
-
+/// `GtkFrame`'s own property setters.
+///
+/// There is deliberately no `label` here: the universal
+/// `PropName::Label` setter is P5's [`ButtonExt::label`], and a second
+/// trait method of that name would make every `.label(..)` call site with
+/// both traits in scope ambiguous. The inherent `View::label` this block
+/// used to carry is gone -- an inherent method silently shadows every
+/// same-named trait method, which is what hid `ButtonExt::label` for the
+/// whole of P5 (contract §11 E8).
+pub trait FrameExt<Msg>: Sized {
     /// `GtkFrame:label-xalign`.
     #[must_use]
-    pub fn label_xalign(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::LabelXalign, v)
-    }
-
+    fn label_xalign(self, v: impl Into<Prop>) -> Self;
     /// `GtkFrame:label-widget` -- a whole view instead of a text label.
     #[must_use]
-    pub fn label_widget(self, view: View<Msg>) -> Self {
+    fn label_widget(self, view: View<Msg>) -> Self;
+}
+
+impl<Msg: Clone + 'static> FrameExt<Msg> for View<Msg> {
+    fn label_xalign(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::LabelXalign, v)
+    }
+    fn label_widget(self, view: View<Msg>) -> Self {
         let mut me = self;
         me.children.insert(0, slot(view, "label"));
         me.prop(PropName::LabelWidget, Prop::Bool(true))
@@ -260,23 +273,29 @@ pub fn overlay<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
     View::new(Kind::Overlay).child(child)
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
+/// `GtkOverlay`'s own setters: the overlaid children and their per-child
+/// measure/clip flags.
+pub trait OverlayExt<Msg>: Sized {
     /// Add `v` as an overlay child, painted over the main child.
     #[must_use]
-    pub fn overlay(mut self, v: View<Msg>) -> Self {
+    fn overlay(self, v: View<Msg>) -> Self;
+    /// `GtkOverlay:measure` (per-child, via `gtk_overlay_set_measure_overlay`).
+    #[must_use]
+    fn measure_overlay(self, v: impl Into<Prop>) -> Self;
+    /// `GtkOverlay:clip-overlay` (per-child, via `gtk_overlay_set_clip_overlay`).
+    #[must_use]
+    fn clip_overlay(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> OverlayExt<Msg> for View<Msg> {
+    fn overlay(mut self, v: View<Msg>) -> Self {
         self.children.push(slot(v, "overlay"));
         self
     }
-
-    /// `GtkOverlay:measure` (per-child, via `gtk_overlay_set_measure_overlay`).
-    #[must_use]
-    pub fn measure_overlay(self, v: impl Into<Prop>) -> Self {
+    fn measure_overlay(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::MeasureOverlay, v)
     }
-
-    /// `GtkOverlay:clip-overlay` (per-child, via `gtk_overlay_set_clip_overlay`).
-    #[must_use]
-    pub fn clip_overlay(self, v: impl Into<Prop>) -> Self {
+    fn clip_overlay(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::ClipOverlay, v)
     }
 }
@@ -285,14 +304,6 @@ impl<Msg: Clone + 'static> View<Msg> {
 #[must_use]
 pub fn expander<Msg: Clone + 'static>(label: &str, child: View<Msg>) -> View<Msg> {
     View::new(Kind::Expander).label(label).child(child)
-}
-
-impl<Msg: Clone + 'static> View<Msg> {
-    /// `GtkExpander:expanded`.
-    #[must_use]
-    pub fn expanded(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::Expanded, v)
-    }
 }
 
 /// `GtkPaned`: `start` and `end` flank the draggable separator, in that
@@ -308,46 +319,61 @@ pub fn paned<Msg: Clone + 'static>(
         .children([start, end])
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
-    /// `GtkPaned:position`.
+/// `GtkPaned`'s own property setters.
+///
+/// `position` is E8's motivating case: `GtkPaned:position` is an `int` and
+/// `GtkPopover:position` a `GtkPositionType`, so the two live in two traits
+/// (`PopoverExt::position`) rather than one inherent method that would
+/// shadow both.
+pub trait PanedExt<Msg>: Sized {
+    /// `GtkPaned:position`, in px.
+    ///
+    /// Concretely typed, per contract §11 E8's own worked example: this is
+    /// `int` where [`crate::widgets::popover::PopoverExt::position`] is a
+    /// `GtkPositionType`, and the two are two trait methods rather than one
+    /// inherent `View::position` that would shadow both.
     #[must_use]
-    pub fn position(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::Position, v)
-    }
-
+    fn position(self, px: i32) -> Self;
     /// `GtkPaned:position-set`.
     #[must_use]
-    pub fn position_set(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::PositionSet, v)
-    }
-
+    fn position_set(self, v: impl Into<Prop>) -> Self;
     /// `GtkPaned:wide-handle`.
     #[must_use]
-    pub fn wide_handle(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::WideHandle, v)
-    }
-
+    fn wide_handle(self, v: impl Into<Prop>) -> Self;
     /// `GtkPaned:resize-start-child`.
     #[must_use]
-    pub fn resize_start(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::ResizeStart, v)
-    }
-
+    fn resize_start(self, v: impl Into<Prop>) -> Self;
     /// `GtkPaned:resize-end-child`.
     #[must_use]
-    pub fn resize_end(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::ResizeEnd, v)
-    }
-
+    fn resize_end(self, v: impl Into<Prop>) -> Self;
     /// `GtkPaned:shrink-start-child`.
     #[must_use]
-    pub fn shrink_start(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::ShrinkStart, v)
-    }
-
+    fn shrink_start(self, v: impl Into<Prop>) -> Self;
     /// `GtkPaned:shrink-end-child`.
     #[must_use]
-    pub fn shrink_end(self, v: impl Into<Prop>) -> Self {
+    fn shrink_end(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> PanedExt<Msg> for View<Msg> {
+    fn position(self, px: i32) -> Self {
+        self.prop(PropName::Position, Prop::Int(i64::from(px)))
+    }
+    fn position_set(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::PositionSet, v)
+    }
+    fn wide_handle(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::WideHandle, v)
+    }
+    fn resize_start(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ResizeStart, v)
+    }
+    fn resize_end(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ResizeEnd, v)
+    }
+    fn shrink_start(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShrinkStart, v)
+    }
+    fn shrink_end(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::ShrinkEnd, v)
     }
 }
@@ -365,25 +391,31 @@ pub fn action_bar<Msg: Clone + 'static>() -> View<Msg> {
     View::new(Kind::ActionBar)
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
+/// `gtk_action_bar_pack_start`/`_end` and `gtk_header_bar_pack_start`/`_end`,
+/// which `GtkActionBar` and `GtkHeaderBar` spell identically.
+pub trait PackExt<Msg>: Sized {
     /// Pack a child at the leading end (`gtk_action_bar_pack_start`,
     /// `gtk_header_bar_pack_start`).
     #[must_use]
-    pub fn pack_start(mut self, view: View<Msg>) -> Self {
+    fn pack_start(self, view: View<Msg>) -> Self;
+    /// Pack a child at the trailing end.
+    #[must_use]
+    fn pack_end(self, view: View<Msg>) -> Self;
+    /// The centre widget.
+    #[must_use]
+    fn center(self, view: View<Msg>) -> Self;
+}
+
+impl<Msg: Clone + 'static> PackExt<Msg> for View<Msg> {
+    fn pack_start(mut self, view: View<Msg>) -> Self {
         self.children.push(slot(view, "start"));
         self
     }
-
-    /// Pack a child at the trailing end.
-    #[must_use]
-    pub fn pack_end(mut self, view: View<Msg>) -> Self {
+    fn pack_end(mut self, view: View<Msg>) -> Self {
         self.children.push(slot(view, "end"));
         self
     }
-
-    /// The centre widget.
-    #[must_use]
-    pub fn center(mut self, view: View<Msg>) -> Self {
+    fn center(mut self, view: View<Msg>) -> Self {
         self.children.push(slot(view, "center"));
         self
     }
@@ -441,70 +473,75 @@ pub fn scrolled_window<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
     View::new(Kind::ScrolledWindow).child(child)
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
+/// `GtkScrolledWindow`'s own property setters.
+pub trait ScrolledWindowExt<Msg>: Sized {
     /// `GtkScrolledWindow:hscrollbar-policy`.
     #[must_use]
-    pub fn hscrollbar_policy(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::HscrollbarPolicy, v)
-    }
-
+    fn hscrollbar_policy(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:vscrollbar-policy`.
     #[must_use]
-    pub fn vscrollbar_policy(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::VscrollbarPolicy, v)
-    }
-
+    fn vscrollbar_policy(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:has-frame`.
     #[must_use]
-    pub fn has_frame(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::HasFrame, v)
-    }
-
+    fn has_frame(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:min-content-width`.
     #[must_use]
-    pub fn min_content_width(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::MinContentWidth, v)
-    }
-
+    fn min_content_width(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:min-content-height`.
     #[must_use]
-    pub fn min_content_height(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::MinContentHeight, v)
-    }
-
+    fn min_content_height(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:max-content-width`.
     #[must_use]
-    pub fn max_content_width(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::MaxContentWidth, v)
-    }
-
+    fn max_content_width(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:max-content-height`.
     #[must_use]
-    pub fn max_content_height(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::MaxContentHeight, v)
-    }
-
+    fn max_content_height(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:propagate-natural-width`.
     #[must_use]
-    pub fn propagate_natural_width(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::PropagateNaturalWidth, v)
-    }
-
+    fn propagate_natural_width(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:propagate-natural-height`.
     #[must_use]
-    pub fn propagate_natural_height(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::PropagateNaturalHeight, v)
-    }
-
+    fn propagate_natural_height(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:kinetic-scrolling`.
     #[must_use]
-    pub fn kinetic_scrolling(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::Kinetic, v)
-    }
-
+    fn kinetic_scrolling(self, v: impl Into<Prop>) -> Self;
     /// `GtkScrolledWindow:overlay-scrolling`.
     #[must_use]
-    pub fn overlay_scrolling(self, v: impl Into<Prop>) -> Self {
+    fn overlay_scrolling(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> ScrolledWindowExt<Msg> for View<Msg> {
+    fn hscrollbar_policy(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::HscrollbarPolicy, v)
+    }
+    fn vscrollbar_policy(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::VscrollbarPolicy, v)
+    }
+    fn has_frame(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::HasFrame, v)
+    }
+    fn min_content_width(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MinContentWidth, v)
+    }
+    fn min_content_height(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MinContentHeight, v)
+    }
+    fn max_content_width(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MaxContentWidth, v)
+    }
+    fn max_content_height(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MaxContentHeight, v)
+    }
+    fn propagate_natural_width(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::PropagateNaturalWidth, v)
+    }
+    fn propagate_natural_height(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::PropagateNaturalHeight, v)
+    }
+    fn kinetic_scrolling(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Kinetic, v)
+    }
+    fn overlay_scrolling(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::OverlayScrolling, v)
     }
 }
@@ -635,10 +672,15 @@ pub fn list_view<Msg: Clone + 'static>(
         .prop(PropName::ItemFactory, Prop::Factory(factory))
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
+/// `GtkListView`'s own property setters.
+pub trait ListViewExt<Msg>: Sized {
     /// `GtkListView:single-click-activate`.
     #[must_use]
-    pub fn single_click_activate(self, v: impl Into<Prop>) -> Self {
+    fn single_click_activate(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> ListViewExt<Msg> for View<Msg> {
+    fn single_click_activate(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::SingleClickActivate, v)
     }
 }
@@ -653,22 +695,27 @@ pub fn flow_box<Msg: Clone + 'static>(children: impl IntoIterator<Item = View<Ms
     )
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
+/// `GtkFlowBox`'s own property setters.
+pub trait FlowBoxExt<Msg>: Sized {
     /// `GtkFlowBox:min-children-per-line`.
     #[must_use]
-    pub fn min_children_per_line(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::MinChildrenPerLine, v)
-    }
-
+    fn min_children_per_line(self, v: impl Into<Prop>) -> Self;
     /// `GtkFlowBox:max-children-per-line`.
     #[must_use]
-    pub fn max_children_per_line(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::MaxChildrenPerLine, v)
-    }
-
+    fn max_children_per_line(self, v: impl Into<Prop>) -> Self;
     /// `GtkFlowBox:enable-rubberband`.
     #[must_use]
-    pub fn enable_rubberband(self, v: impl Into<Prop>) -> Self {
+    fn enable_rubberband(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> FlowBoxExt<Msg> for View<Msg> {
+    fn min_children_per_line(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MinChildrenPerLine, v)
+    }
+    fn max_children_per_line(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MaxChildrenPerLine, v)
+    }
+    fn enable_rubberband(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::EnableRubberband, v)
     }
 }
@@ -684,16 +731,21 @@ pub fn grid_view<Msg: Clone + 'static>(
         .prop(PropName::ItemFactory, Prop::Factory(factory))
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
+/// `GtkGridView`'s own property setters.
+pub trait GridViewExt<Msg>: Sized {
     /// `GtkGridView:min-columns`.
     #[must_use]
-    pub fn min_columns(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::MinColumns, v)
-    }
-
+    fn min_columns(self, v: impl Into<Prop>) -> Self;
     /// `GtkGridView:max-columns`.
     #[must_use]
-    pub fn max_columns(self, v: impl Into<Prop>) -> Self {
+    fn max_columns(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> GridViewExt<Msg> for View<Msg> {
+    fn min_columns(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MinColumns, v)
+    }
+    fn max_columns(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::MaxColumns, v)
     }
 }
@@ -828,88 +880,115 @@ impl<Msg: Clone + 'static> StackPagesExt<Msg> for View<Msg> {
     }
 }
 
-impl<Msg: Clone + 'static> View<Msg> {
+/// `GtkBox`'s own property setters (`GtkGrid` and `GtkCenterBox` share
+/// `baseline-position`).
+pub trait BoxExt<Msg>: Sized {
     /// `GtkBox:spacing`, `GtkGrid` row/column spacing's shorthand.
     #[must_use]
-    pub fn spacing(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::Spacing, v)
-    }
-
-    /// `GtkStack:visible-child-name`.
-    #[must_use]
-    pub fn visible_child(self, name: &str) -> Self {
-        self.prop(PropName::VisibleChild, Prop::Str(Rc::from(name)))
-    }
-
-    /// `GtkStack:transition-type`.
-    #[must_use]
-    pub fn transition_type(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::Transition, v)
-    }
-
-    /// `GtkStack:transition-duration`, ms.
-    #[must_use]
-    pub fn transition_duration(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::TransitionDuration, v)
-    }
-
-    /// `GtkStack:hhomogeneous`.
-    #[must_use]
-    pub fn hhomogeneous(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::Hhomogeneous, v)
-    }
-
-    /// `GtkStack:vhomogeneous`.
-    #[must_use]
-    pub fn vhomogeneous(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::Vhomogeneous, v)
-    }
-
-    /// `GtkStack:interpolate-size`.
-    #[must_use]
-    pub fn interpolate_size(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::InterpolateSize, v)
-    }
-
+    fn spacing(self, v: impl Into<Prop>) -> Self;
     /// `GtkBox:homogeneous`.
     #[must_use]
-    pub fn homogeneous(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::Homogeneous, v)
-    }
-
+    fn homogeneous(self, v: impl Into<Prop>) -> Self;
     /// `GtkBox:baseline-position`.
     #[must_use]
-    pub fn baseline_position(self, v: impl Into<Prop>) -> Self {
+    fn baseline_position(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> BoxExt<Msg> for View<Msg> {
+    fn spacing(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Spacing, v)
+    }
+    fn homogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Homogeneous, v)
+    }
+    fn baseline_position(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::BaselinePosition, v)
     }
+}
 
+/// `GtkStack`'s own property setters.
+pub trait StackExt<Msg>: Sized {
+    /// `GtkStack:visible-child-name`.
+    #[must_use]
+    fn visible_child(self, name: &str) -> Self;
+    /// `GtkStack:transition-type`.
+    #[must_use]
+    fn transition_type(self, v: impl Into<Prop>) -> Self;
+    /// `GtkStack:transition-duration`, ms.
+    #[must_use]
+    fn transition_duration(self, v: impl Into<Prop>) -> Self;
+    /// `GtkStack:hhomogeneous`.
+    #[must_use]
+    fn hhomogeneous(self, v: impl Into<Prop>) -> Self;
+    /// `GtkStack:vhomogeneous`.
+    #[must_use]
+    fn vhomogeneous(self, v: impl Into<Prop>) -> Self;
+    /// `GtkStack:interpolate-size`.
+    #[must_use]
+    fn interpolate_size(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> StackExt<Msg> for View<Msg> {
+    fn visible_child(self, name: &str) -> Self {
+        self.prop(PropName::VisibleChild, Prop::Str(Rc::from(name)))
+    }
+    fn transition_type(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Transition, v)
+    }
+    fn transition_duration(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::TransitionDuration, v)
+    }
+    fn hhomogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Hhomogeneous, v)
+    }
+    fn vhomogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Vhomogeneous, v)
+    }
+    fn interpolate_size(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::InterpolateSize, v)
+    }
+}
+
+/// `GtkCenterBox`'s own property setters.
+pub trait CenterBoxExt<Msg>: Sized {
     /// `GtkCenterBox:shrink-center-last`.
     #[must_use]
-    pub fn shrink_center_last(self, v: impl Into<Prop>) -> Self {
+    fn shrink_center_last(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> CenterBoxExt<Msg> for View<Msg> {
+    fn shrink_center_last(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::ShrinkCenterLast, v)
     }
+}
 
+/// `GtkListBox`'s own property setters, and `GtkListBoxRow:activatable`.
+pub trait ListBoxExt<Msg>: Sized {
     /// `GtkListBox:selection-mode`.
     #[must_use]
-    pub fn selection_mode(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::SelectionMode, v)
-    }
-
+    fn selection_mode(self, v: impl Into<Prop>) -> Self;
     /// `GtkListBox:show-separators`.
     #[must_use]
-    pub fn show_separators(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::ShowSeparators, v)
-    }
-
+    fn show_separators(self, v: impl Into<Prop>) -> Self;
     /// `GtkListBox:activate-on-single-click`.
     #[must_use]
-    pub fn activate_on_single_click(self, v: impl Into<Prop>) -> Self {
-        self.prop(PropName::ActivateOnSingleClick, v)
-    }
-
+    fn activate_on_single_click(self, v: impl Into<Prop>) -> Self;
     /// `GtkListBoxRow:activatable`.
     #[must_use]
-    pub fn activatable(self, v: impl Into<Prop>) -> Self {
+    fn activatable(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> ListBoxExt<Msg> for View<Msg> {
+    fn selection_mode(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::SelectionMode, v)
+    }
+    fn show_separators(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShowSeparators, v)
+    }
+    fn activate_on_single_click(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ActivateOnSingleClick, v)
+    }
+    fn activatable(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::Activatable, v)
     }
 }
@@ -1109,6 +1188,34 @@ mod tests {
         Index(usize),
         Value(u64),
         Flag(bool),
+    }
+
+    /// Contract §11 E8's motivating collision, both halves reachable.
+    ///
+    /// Mutation check: put either setter back on `View<Msg>` as an inherent
+    /// method and the *other* trait's method becomes unreachable public API
+    /// -- which is what P5's `PopoverExt::position` was, shadowed by an
+    /// inherent `View::position` that took `impl Into<Prop>`.
+    #[test]
+    fn paned_and_popover_each_keep_their_own_position_setter() {
+        use crate::widgets::Position;
+        use crate::widgets::popover::PopoverExt;
+
+        let p: View<Msg> = PanedExt::position(
+            paned(
+                crate::widgets::Orientation::Horizontal,
+                widget(Kind::Label),
+                widget(Kind::Label),
+            ),
+            120,
+        );
+        assert_eq!(p.props.get(PropName::Position), Some(&Prop::Int(120)));
+
+        let q: View<Msg> = PopoverExt::position(widget(Kind::Popover), Position::Bottom);
+        assert_eq!(
+            q.props.get(PropName::Position),
+            Some(&Position::Bottom.to_prop())
+        );
     }
 
     #[test]
