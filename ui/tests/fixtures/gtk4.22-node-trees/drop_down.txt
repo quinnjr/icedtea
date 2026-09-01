@@ -1,0 +1,10 @@
+dropdown
+├── button.toggle
+│   ├── [label]
+│   ╰── [arrow]
+╰── popover.background.menu
+    ╰── contents
+        ├── [entry.search]
+        ╰── listview
+            ╰── row[.activatable]
+            ┊

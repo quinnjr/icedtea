@@ -28,11 +28,13 @@ pub mod button;
 pub mod calendar;
 pub mod check_button;
 pub mod drawing_area;
+pub mod drop_down;
 pub mod image;
 pub mod info_bar;
 pub mod label;
 pub mod level_bar;
 pub mod link_button;
+pub mod menu_button;
 pub mod picture;
 pub mod popover;
 pub mod progress_bar;
@@ -664,6 +666,12 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Switch => Box::new(<switch::SwitchC as Controller<Msg>>::build(node, props, cx)),
+        Kind::MenuButton => Box::new(<menu_button::MenuButtonC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::DropDown => Box::new(<drop_down::DropDownC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {
@@ -678,12 +686,33 @@ pub fn build_controller<Msg: Clone + 'static>(
 /// GTK's own tree names — `popover > contents` is P5's only case; P6 adds
 /// `frame > box`, `expander-widget > box` and the scrolled window's viewport.
 /// P4's reconciler calls this before `Node::append_child`.
+///
+/// It also has to answer for every kind whose controller appends its *own*
+/// subnodes straight onto its root, because the reconciler's "no application
+/// children" cleanup (`reconcile`'s step 4, over whatever this returns) walks
+/// that same node and detaches anything under it beyond position zero —
+/// harmless for a kind whose visible chrome lives on the root itself (a
+/// plain `Button`'s padding/border still paints with its `label` child gone)
+/// or that paints its own content in `Controller::paint` regardless of its
+/// child nodes (`Switch`), fatal for one whose chrome lives entirely on a
+/// child the cleanup would otherwise strip on every single reconcile.
+/// `MenuButton` routes to its embedded popover's `contents` — the same node
+/// its "children become the popover content" is documented to use, and
+/// otherwise always empty — and `DropDown`, which takes no application
+/// children at all, to a dedicated, never-attached `sink` node so the
+/// cleanup has nothing real to touch.
 #[must_use]
 pub fn child_slot(kind: Kind, controller: &dyn std::any::Any) -> Option<Node> {
     match kind {
         Kind::Popover => controller
             .downcast_ref::<popover::PopoverC>()
             .map(|c| c.contents.clone()),
+        Kind::MenuButton => controller
+            .downcast_ref::<menu_button::MenuButtonC>()
+            .map(|c| c.popover.contents.clone()),
+        Kind::DropDown => controller
+            .downcast_ref::<drop_down::DropDownC>()
+            .map(|c| c.sink.clone()),
         _ => None,
     }
 }

@@ -362,3 +362,52 @@ fn a_switch_has_two_images_and_a_slider() {
     assert_eq!(rendered.matches("image").count(), 2, "{rendered}");
     assert!(rendered.contains("slider"), "{rendered}");
 }
+
+#[test]
+fn a_menu_button_wraps_a_toggle_button_and_a_drop_down_holds_a_popover_list() {
+    // mutation: name the menubutton's child `button` without `.toggle` and the
+    // matcher reports "required class 'toggle' missing".
+    check(Kind::MenuButton, "menu_button", &Props::default());
+    let rendered = node_tree_of(Kind::MenuButton, &Props::default());
+    assert!(rendered.contains("button.toggle"), "{rendered}");
+
+    let mut props = Props::default();
+    props.set(
+        PropName::Model,
+        Prop::Items(std::rc::Rc::from(vec![
+            icedtea_ui::widgets::ListItem::new(0, "One"),
+            icedtea_ui::widgets::ListItem::new(1, "Two"),
+        ])),
+    );
+    check(Kind::DropDown, "drop_down", &props);
+    let dropdown = node_tree_of(Kind::DropDown, &props);
+    assert_eq!(dropdown.matches("row").count(), 2, "{dropdown}");
+    assert!(dropdown.contains("popover.background.menu"), "{dropdown}");
+}
+
+#[test]
+fn a_drop_downs_search_filter_never_panics_and_honours_its_mode() {
+    // mutation: use `starts_with` for Substring and the Substring assertion
+    // returns an empty vec.
+    use icedtea_ui::widgets::drop_down::DropDownC;
+    use icedtea_ui::widgets::{ListItem, MatchMode};
+    let items = vec![
+        ListItem::new(0, "Alpha"),
+        ListItem::new(1, "beta"),
+        ListItem::new(2, "\u{00e9}clair"),
+    ];
+    assert_eq!(
+        DropDownC::filter(&items, "", MatchMode::Substring),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        DropDownC::filter(&items, "et", MatchMode::Substring),
+        vec![1]
+    );
+    assert_eq!(DropDownC::filter(&items, "be", MatchMode::Prefix), vec![1]);
+    assert_eq!(DropDownC::filter(&items, "beta", MatchMode::Exact), vec![1]);
+    assert!(DropDownC::filter(&items, "\u{00e9}", MatchMode::Prefix).contains(&2));
+    // Hostile input: a lone surrogate cannot exist in a &str, but a very long
+    // needle and a needle longer than every haystack must both be fine.
+    assert!(DropDownC::filter(&items, &"x".repeat(100_000), MatchMode::Substring).is_empty());
+}

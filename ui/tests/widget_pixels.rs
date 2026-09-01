@@ -972,3 +972,59 @@ fn a_check_button_paints_the_builtin_check_glyph() {
     );
     assert!(has_ink(&frames, 0, (120, 40)), "the check glyph must ink");
 }
+
+#[test]
+fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
+    // mutation: never fire EventKind::Selected in DropDownC::on_event and the
+    // model stays at 0.
+    use icedtea_ui::view::builders::drop_down;
+    use icedtea_ui::widgets::drop_down::DropDownExt;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Picked(usize);
+
+    let frames = run(
+        0usize,
+        |model: &mut usize, Picked(index): Picked| {
+            *model = index;
+            Cmd::None
+        },
+        |model: &usize| {
+            drop_down(&["One", "Two", "Three"])
+                .selected(*model)
+                .on_selected(Picked)
+        },
+        (200, 200),
+        vec![
+            ScriptStep::Capture,
+            // The window is 200x200; the dropdown's `button.toggle` (with no
+            // arrow shown) sits near the top-left of the dropdown's own box,
+            // around (67, 100), not centred in the full 200x200 window.
+            ScriptStep::Event(InputEvent::PointerEnter {
+                x: 67.0,
+                y: 100.0,
+                serial: 1,
+                target: icedtea_ui::window::SurfaceTarget::Window,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 8,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..200)
+            .map(|x| frames.pixel(frame, x, 100))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), "the button repaints when the list opens");
+}

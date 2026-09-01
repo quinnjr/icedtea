@@ -808,6 +808,15 @@ fn route<Msg: Clone + 'static>(
     clock: &Rc<dyn Clock>,
 ) -> Vec<Msg> {
     // The node an event is aimed at, and the point in its own space.
+    //
+    // `hit_chain` is purely geometric: it descends into whatever contains
+    // the point regardless of whether that node is a controller's own root
+    // or a subnode the controller built and appends directly under it (a
+    // `MenuButton`'s `button.toggle`, say). Only a root the reconciler
+    // tracks as an `Instance` has a controller `deliver` can call, so this
+    // walks the chain from the deepest hit outward and stops at the first
+    // one `path_to` actually finds — using that node's own local
+    // coordinates, not the original (deeper) hit's.
     let aim = |rt: &Runtime<Msg>, x: f32, y: f32| -> Option<(Node, (f32, f32))> {
         if let Some(target) = rt.grab.target() {
             let local = rt
@@ -817,7 +826,9 @@ fn route<Msg: Clone + 'static>(
             return Some((target, local));
         }
         let chain = hit_chain(&rt.root, &rt.layout, &rt.styles, (x, y));
-        chain.last().map(|hit| (hit.node.clone(), hit.local))
+        chain.iter().rev().find_map(|hit| {
+            (!path_to(&rt.instances, &hit.node).is_empty()).then(|| (hit.node.clone(), hit.local))
+        })
     };
 
     let mut pending: Vec<(Node, Event)> = Vec::new();
@@ -1483,16 +1494,21 @@ mod tests {
                 clock: &clock,
                 env: &env,
             };
-            // `Kind::MenuButton`: still `GenericC` (unlike `Kind::Button`
-            // since Task 19), whose fallback focus handling this test means
-            // to exercise — no P5/P6 widget controller forwards
-            // `FocusIn`/`FocusOut` on its own.
+            // `Kind::ColorDialogButton`: still `GenericC` (unlike
+            // `Kind::Button` since Task 19 and `Kind::MenuButton` since Task
+            // 21), whose fallback focus handling this test means to exercise
+            // — no P5/P6 widget controller forwards `FocusIn`/`FocusOut` on
+            // its own.
             reconcile(
                 &root,
                 &mut instances,
                 vec![
-                    widget::<F>(Kind::MenuButton).key("a").on_focus_out(F::Out),
-                    widget::<F>(Kind::MenuButton).key("b").on_focus_in(F::In),
+                    widget::<F>(Kind::ColorDialogButton)
+                        .key("a")
+                        .on_focus_out(F::Out),
+                    widget::<F>(Kind::ColorDialogButton)
+                        .key("b")
+                        .on_focus_in(F::In),
                 ],
                 &mut cx,
             );
