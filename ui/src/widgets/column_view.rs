@@ -294,6 +294,14 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColumnViewC {
                     self.sort = Some((column, order));
                 }
             }
+            PropName::SortOrder => {
+                let order = match value {
+                    Prop::Enum(raw) => SortOrder::from_u16(*raw),
+                    _ => SortOrder::default(),
+                };
+                let column = self.sort.map_or(0, |(c, _)| c);
+                self.sort = Some((column, order));
+            }
             PropName::Model | PropName::ItemFactory => {
                 // The embedded list owns `Model`; its own `ItemFactory`
                 // stays `label_only` (module doc), so only `Model` forwards.
@@ -446,5 +454,25 @@ mod tests {
             vec!["0:descending".to_string()]
         );
         assert_eq!(ColumnViewC::sort_of(&*c), Some((0, SortOrder::Descending)));
+    }
+
+    #[test]
+    fn sort_column_builder_prop_seeds_the_requested_order() {
+        // Regression: `ColumnViewExt::sort_column(index, order)` writes both
+        // `PropName::SortColumn` and `PropName::SortOrder`; before this
+        // fix, `SortOrder` had no `set_prop` arm at all (it fell through to
+        // `Universal::apply`, which dropped it), so the seeded order was
+        // always `Ascending` regardless of what the builder asked for.
+        let mut props = Props::default();
+        props.set(crate::view::PropName::SortColumn, crate::view::Prop::Int(1));
+        props.set(
+            crate::view::PropName::SortOrder,
+            crate::view::Prop::Enum(SortOrder::Descending.to_u16()),
+        );
+        let built = build_widget::<()>(Kind::ColumnView, &props);
+        assert_eq!(
+            ColumnViewC::sort_of(&*built.controller),
+            Some((1, SortOrder::Descending))
+        );
     }
 }
