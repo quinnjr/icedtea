@@ -23,8 +23,8 @@ use selectors::Element as _;
 use selectors::OpaqueElement;
 use taffy::prelude::{
     AlignItems, AlignSelf, BoxSizing, Dimension, Display, FlexDirection, JustifyContent,
-    JustifyItems, LengthPercentage, LengthPercentageAuto, Size, Style, TaffyAuto as _, TaffyTree,
-    auto, fr, length, line, percent, span,
+    JustifyItems, LengthPercentage, LengthPercentageAuto, Position, Size, Style, TaffyAuto as _,
+    TaffyTree, auto, fr, length, line, percent, span,
 };
 
 use crate::css::computed::{ComputedStyle, ResolveEnv};
@@ -249,6 +249,11 @@ pub struct ChildLayout {
     pub margin: [f32; 4],
     /// Explicit grid cell, when the parent is a [`Container::Grid`].
     pub grid: Option<GridPlacement>,
+    /// Out of flow, positioned by `halign`/`valign` alone over the whole
+    /// containing block instead of sharing a track's sizing with its
+    /// siblings -- `GtkOverlay`'s overlay children, which must not widen a
+    /// grid row/column the way an ordinary same-cell sibling would.
+    pub absolute: bool,
 }
 
 /// One child's cell in a [`Container::Grid`], zero-based.
@@ -649,8 +654,12 @@ impl LayoutTree {
     /// The parent's main axis has no per-child alignment in flexbox, so a
     /// main-axis [`Align`] becomes an auto margin on the free side -- the
     /// standard idiom, and exactly what GTK's own allocation does when a
-    /// child is smaller than its cell.
-    fn child_style(child: ChildLayout, parent_is_row: bool, out: &mut Style) {
+    /// child is smaller than its cell. A grid parent has no "main axis" at
+    /// all -- CSS Grid's `align-self`/`justify-self` are the block/inline
+    /// axes directly, independent of any row/column concept -- so a grid
+    /// child (Task 14's `Overlay`, stacking every child in one cell) skips
+    /// the flex cross/main split and auto-margin idiom entirely.
+    fn child_style(child: ChildLayout, parent_is_row: bool, parent_is_grid: bool, out: &mut Style) {
         fn to_self(a: Align) -> Option<AlignSelf> {
             Some(match a {
                 Align::Fill => AlignSelf::STRETCH,
@@ -660,39 +669,62 @@ impl LayoutTree {
                 Align::Baseline => AlignSelf::BASELINE,
             })
         }
-        let (cross, main) = if parent_is_row {
-            (child.valign, child.halign)
+        if child.absolute {
+            // Out of flow: every inset stays auto, so the item keeps its
+            // own (measured) size and `align_self`/`justify_self` place it
+            // within the whole containing block -- setting any inset to a
+            // definite `0` would instead *stretch* it edge to edge on that
+            // axis regardless of alignment, which is the one CSS pitfall
+            // this idiom exists to avoid. Never shares track/flex-line
+            // sizing with an in-flow sibling.
+            out.position = Position::Absolute;
+            out.align_self = to_self(child.valign);
+            out.justify_self = to_self(child.halign);
+        } else if parent_is_grid {
+            out.align_self = to_self(child.valign);
+            out.justify_self = to_self(child.halign);
+            let [mt, mr, mb, ml] = child.margin.map(finite);
+            out.margin = taffy::geometry::Rect {
+                top: length(mt),
+                right: length(mr),
+                bottom: length(mb),
+                left: length(ml),
+            };
         } else {
-            (child.halign, child.valign)
-        };
-        out.align_self = to_self(cross);
-        let [mt, mr, mb, ml] = child.margin.map(finite);
-        let (mut lead, mut trail) = (
-            length(if parent_is_row { ml } else { mt }),
-            length(if parent_is_row { mr } else { mb }),
-        );
-        match main {
-            Align::Fill | Align::Baseline | Align::Start => {}
-            Align::End => lead = auto(),
-            Align::Center => {
-                lead = auto();
-                trail = auto();
+            let (cross, main) = if parent_is_row {
+                (child.valign, child.halign)
+            } else {
+                (child.halign, child.valign)
+            };
+            out.align_self = to_self(cross);
+            let [mt, mr, mb, ml] = child.margin.map(finite);
+            let (mut lead, mut trail) = (
+                length(if parent_is_row { ml } else { mt }),
+                length(if parent_is_row { mr } else { mb }),
+            );
+            match main {
+                Align::Fill | Align::Baseline | Align::Start => {}
+                Align::End => lead = auto(),
+                Align::Center => {
+                    lead = auto();
+                    trail = auto();
+                }
             }
-        }
-        out.margin = taffy::geometry::Rect {
-            top: if parent_is_row { length(mt) } else { lead },
-            right: if parent_is_row { trail } else { length(mr) },
-            bottom: if parent_is_row { length(mb) } else { trail },
-            left: if parent_is_row { lead } else { length(ml) },
-        };
-        let expand = if parent_is_row {
-            child.hexpand
-        } else {
-            child.vexpand
-        };
-        if expand {
-            out.flex_grow = 1.0;
-            out.flex_basis = Dimension::length(0.0);
+            out.margin = taffy::geometry::Rect {
+                top: if parent_is_row { length(mt) } else { lead },
+                right: if parent_is_row { trail } else { length(mr) },
+                bottom: if parent_is_row { length(mb) } else { trail },
+                left: if parent_is_row { lead } else { length(ml) },
+            };
+            let expand = if parent_is_row {
+                child.hexpand
+            } else {
+                child.vexpand
+            };
+            if expand {
+                out.flex_grow = 1.0;
+                out.flex_basis = Dimension::length(0.0);
+            }
         }
         if let Some(g) = child.grid {
             let col = i16::try_from(g.column.min(1023)).unwrap_or(0) + 1;
@@ -726,9 +758,10 @@ impl LayoutTree {
         let mut taffy_style = Self::box_model_style(&style, &env, gap_floor);
         Self::container_style(container, node.direction(), &mut taffy_style);
         if let Some(child) = child {
-            let parent_is_row = node.parent().is_some_and(|p| {
-                matches!(
-                    self.container(&p),
+            let parent_container = node.parent().map(|p| self.container(&p));
+            let parent_is_row = matches!(
+                parent_container,
+                Some(
                     Container::Box {
                         direction: BoxDirection::Row
                     } | Container::Center {
@@ -736,8 +769,9 @@ impl LayoutTree {
                         ..
                     }
                 )
-            });
-            Self::child_style(child, parent_is_row, &mut taffy_style);
+            );
+            let parent_is_grid = matches!(parent_container, Some(Container::Grid { .. }));
+            Self::child_style(child, parent_is_row, parent_is_grid, &mut taffy_style);
         }
         if let Err(err) = self.tree.set_style(id, taffy_style) {
             tracing::debug!(node = %node.name(), %err, "taffy rejected a style");
@@ -1742,6 +1776,77 @@ mod tests {
             ab.border_box.y - aa.border_box.y,
             (100.0 - 6.0) / 2.0 + 6.0,
             "homogeneous rows plus the 6px row-spacing"
+        );
+    }
+
+    #[test]
+    fn an_absolute_grid_child_keeps_its_own_size_and_ignores_track_sizing() {
+        // Mutation check (Task 14's `Overlay`): setting an absolute child's
+        // `inset` to a definite `0` instead of leaving it auto stretches it
+        // edge to edge, hiding `Align::Start`'s natural-sized 10px result
+        // behind a wrongly-stretched 100px one; forgetting `absolute`
+        // entirely lets the second same-cell child fight the first for the
+        // single track's size, shrinking `a` from 100 to 90.
+        let (root, a, b, c) = three_children();
+        root.remove_child(&c);
+        let mut tree = LayoutTree::new();
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        tree.sync(&root).expect("sync");
+        for n in [&root, &a, &b] {
+            tree.set_style(n, &style, Container::Leaf, &ResolveEnv::default());
+        }
+        tree.set_container(
+            &root,
+            Container::Grid {
+                columns: 1,
+                rows: 1,
+                column_spacing: 0.0,
+                row_spacing: 0.0,
+                column_homogeneous: true,
+                row_homogeneous: true,
+            },
+        );
+        let pin = Some(GridPlacement {
+            column: 0,
+            row: 0,
+            column_span: 1,
+            row_span: 1,
+        });
+        tree.set_child_layout(
+            &a,
+            ChildLayout {
+                halign: Align::Fill,
+                valign: Align::Fill,
+                hexpand: true,
+                vexpand: true,
+                grid: pin,
+                ..ChildLayout::default()
+            },
+        );
+        tree.set_child_layout(
+            &b,
+            ChildLayout {
+                halign: Align::Fill,
+                valign: Align::Start,
+                grid: pin,
+                absolute: true,
+                ..ChildLayout::default()
+            },
+        );
+        lay_out(&mut tree, &root);
+        assert_eq!(
+            tree.allocation(&a).unwrap().border_box.height,
+            100.0,
+            "the in-flow main child fills the whole track, undiminished by its absolute sibling"
+        );
+        let ab = tree.allocation(&b).unwrap().border_box;
+        assert_eq!(
+            ab.height, 10.0,
+            "kept its own measured height, not stretched"
+        );
+        assert_eq!(
+            ab.y, 0.0,
+            "start-aligned to the top of the containing block"
         );
     }
 

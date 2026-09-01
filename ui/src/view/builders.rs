@@ -254,6 +254,33 @@ impl<Msg: Clone + 'static> View<Msg> {
     }
 }
 
+/// `GtkOverlay` wrapping `child` as its main child.
+#[must_use]
+pub fn overlay<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
+    View::new(Kind::Overlay).child(child)
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// Add `v` as an overlay child, painted over the main child.
+    #[must_use]
+    pub fn overlay(mut self, v: View<Msg>) -> Self {
+        self.children.push(slot(v, "overlay"));
+        self
+    }
+
+    /// `GtkOverlay:measure` (per-child, via `gtk_overlay_set_measure_overlay`).
+    #[must_use]
+    pub fn measure_overlay(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MeasureOverlay, v)
+    }
+
+    /// `GtkOverlay:clip-overlay` (per-child, via `gtk_overlay_set_clip_overlay`).
+    #[must_use]
+    pub fn clip_overlay(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ClipOverlay, v)
+    }
+}
+
 /// `GtkExpander` titled `label`, wrapping `child`.
 #[must_use]
 pub fn expander<Msg: Clone + 'static>(label: &str, child: View<Msg>) -> View<Msg> {

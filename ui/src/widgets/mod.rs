@@ -75,6 +75,7 @@ pub mod link_button;
 pub mod menu_button;
 pub mod node_tree;
 pub mod notebook;
+pub mod overlay;
 pub mod paned;
 pub mod password_entry;
 pub mod picture;
@@ -786,6 +787,11 @@ struct Pending {
     /// `build_instance` order), so it cannot loop over `node.children()`
     /// itself -- there are none yet -- and defers the loop to here instead.
     grid_from_children: bool,
+    /// This node is an [`Kind::Overlay`](crate::view::Kind::Overlay); classify
+    /// every child (positional CSS class, `ChildLayout`, one-cell grid pin)
+    /// from its own recorded props on every flush, for the same
+    /// build-order reason as `grid_from_children`.
+    overlay_from_children: bool,
     node: Option<Node>,
 }
 
@@ -805,14 +811,21 @@ thread_local! {
 /// side entry). Grid placement was the only reader before P6 Task 11, and
 /// every value it needs is a `Prop::Int`, cheap to keep and inert to clone;
 /// `action_bar::ActionBarC::place` is the second reader, over `Section`
-/// (a `Prop::Str`, equally cheap) -- both re-derive a child's placement from
-/// the child's own node rather than owning that child's `Instance`.
-const RECORDED_PROP_NAMES: [PropName; 5] = [
+/// (a `Prop::Str`, equally cheap); `overlay::classify_overlay_child` is
+/// the third, over `Halign`/`Valign` (`Prop::Align`, `Copy`) and
+/// `MeasureOverlay`/`ClipOverlay` (`Prop::Bool`) -- all four cheap, and all
+/// four re-derive a child's placement from the child's own node rather than
+/// owning that child's `Instance`.
+const RECORDED_PROP_NAMES: [PropName; 9] = [
     PropName::Column,
     PropName::Row,
     PropName::ColumnSpan,
     PropName::RowSpan,
     PropName::Section,
+    PropName::Halign,
+    PropName::Valign,
+    PropName::MeasureOverlay,
+    PropName::ClipOverlay,
 ];
 
 /// Record the subset of `props` a container controller can re-derive a
@@ -868,6 +881,18 @@ pub(crate) fn mark_grid_children(node: &Node) {
         let mut p = p.borrow_mut();
         let entry = p.entry(node.opaque()).or_default();
         entry.grid_from_children = true;
+        entry.node = Some(node.clone());
+    });
+}
+
+/// Mark `node` (a [`Kind::Overlay`](crate::view::Kind::Overlay)) so
+/// [`flush_layout`] re-derives every child's positional class, `ChildLayout`
+/// and one-cell grid pin from that child's own recorded props each frame.
+pub(crate) fn mark_overlay_children(node: &Node) {
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let entry = p.entry(node.opaque()).or_default();
+        entry.overlay_from_children = true;
         entry.node = Some(node.clone());
     });
 }
@@ -971,6 +996,12 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
                     };
                     let mut cl = tree.child_layout(&child).unwrap_or_default();
                     cl.grid = Some(place);
+                    tree.set_child_layout(&child, cl);
+                }
+            }
+            if pending.overlay_from_children {
+                for (index, child) in node.children().into_iter().enumerate() {
+                    let cl = overlay::classify_overlay_child(index, &child);
                     tree.set_child_layout(&child, cl);
                 }
             }
@@ -1115,6 +1146,9 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Notebook => Box::new(<notebook::NotebookC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::Overlay => Box::new(<overlay::OverlayC as Controller<Msg>>::build(
             node, props, cx,
         )),
         Kind::Popover => Box::new(<popover::PopoverC as Controller<Msg>>::build(
