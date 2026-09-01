@@ -34,7 +34,9 @@ use crate::view::{Instance, Kind, View};
 use crate::widgets::types::{
     ItemFactory, ListItem, MessageType, Orientation, RowContent, SelectionMode, Side,
 };
+use crate::window::{LayerSpec, Role, SurfaceSpec, Window};
 use crate::{BUNDLED_ADWAITA_DARK, BUNDLED_ADWAITA_HC, BUNDLED_ADWAITA_LIGHT};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 /// Which bundled Adwaita sheet the gallery compiles, and under which
 /// `@media` environment.
@@ -1383,6 +1385,45 @@ pub fn print_allocations(opts: &Options) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+/// Map the gallery as a layer-shell overlay and run the app loop.
+///
+/// A layer surface rather than an xdg-toplevel: probe coordinates are output
+/// coordinates, and only the layer role has a compositor-independent origin
+/// (anchored top-left, margin 0 — the M2 `themed-button` precedent). Keyboard
+/// interactivity is exclusive so the typing and Tab interactions have a
+/// focused keyboard.
+///
+/// Reconciliation: the task text's `SurfaceSpec::Layer { namespace, layer,
+/// anchor, size, margin, exclusive_zone, keyboard_interactivity, scale }`
+/// does not match this crate's real shape -- `SurfaceSpec` is a struct with
+/// `role: Role` (`Role::Toplevel` or `Role::Layer(LayerSpec)`), `size`,
+/// `title` and `app_id`, and the layer's namespace is `spec.title` (see
+/// `Layer::create`'s `namespace: &str` parameter, which `Window::open` feeds
+/// `&spec.title`). There is no `scale` field on either type: the live scale
+/// arrives over `InputEvent::ScaleChanged` and `App::run` already applies it
+/// to the icon theme it takes from the window, so `opts.scale` (meaningful
+/// only for the headless `--probe-points`/`--print-allocation` geometry
+/// paths `build` already serves) is not threaded through here.
+pub fn run(opts: &Options) -> Result<(), AppError> {
+    let mut model = GalleryModel::new(opts.theme, opts.widget);
+    model.scroll = opts.scroll;
+    let spec = SurfaceSpec {
+        role: Role::Layer(LayerSpec {
+            layer: zwlr_layer_shell_v1::Layer::Overlay,
+            anchor: zwlr_layer_surface_v1::Anchor::Top | zwlr_layer_surface_v1::Anchor::Left,
+            margin: [0, 0, 0, 0],
+            exclusive_zone: -1,
+            keyboard: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
+        }),
+        size: opts.size,
+        title: "icedtea-gallery".to_string(),
+        app_id: "org.icedtea.Gallery".to_string(),
+    };
+    let window =
+        Window::open(spec, compile_sheet(opts), FontDatabase::new()).map_err(AppError::Surface)?;
+    App::new(model, update, scrolled_page).run(window)
 }
 
 #[cfg(test)]

@@ -1474,15 +1474,32 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
 
         rebuild(&mut self, &mut rt, &sheet, &mut fonts, &mut icons, &clock);
 
+        // Bug fix (found while wiring `gallery::run`, the first real caller
+        // of this loop against a live compositor): a page with no running
+        // animation or key-repeat has `frame_deadline` return `None` on the
+        // very first iteration, since nothing has painted yet to arm a
+        // `wl_surface.frame` callback -- `window.next_deadline()` only knows
+        // about deadlines a *previous* frame already scheduled. `pump(None)`
+        // then blocks forever on a `configure` that already arrived inside
+        // `Window::open`, so the window never paints its first frame. A
+        // zero-duration wait on the first iteration only turns that block
+        // into an immediate, empty poll -- the rest of the iteration runs
+        // exactly as it would after any other real wakeup, restyles and
+        // paints once, and `paint_with`'s own `wl_surface.frame` request
+        // arms every iteration after this one.
+        let mut first_iteration = true;
         while !rt.quit && !window.is_closed() {
             let now = clock.now();
-            let wait = frame_deadline(
+            let mut wait = frame_deadline(
                 window.next_deadline(),
                 rt.anims.next_deadline(now),
                 &rt.timers,
                 next_controller_deadline(&rt.instances, now),
                 now,
             );
+            if std::mem::take(&mut first_iteration) {
+                wait = Some(wait.unwrap_or(Duration::ZERO));
+            }
             let events = window.pump(wait)?;
 
             for event in &events {

@@ -44,9 +44,7 @@ fn main() {
     } else if opts.print_allocation {
         icedtea_ui::gallery::print_allocations(&opts)
     } else {
-        // Task 6 fills this in.
-        eprintln!("gallery: nothing to do yet");
-        std::process::exit(2);
+        icedtea_ui::gallery::run(&opts)
     };
     if let Err(err) = result {
         eprintln!("gallery: {err:?}");

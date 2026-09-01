@@ -2384,7 +2384,7 @@ impl ScreencopyClient {
             .expect("screencopy sent no buffer event");
 
         // Allocate a matching shm buffer, zero-filled, and request the copy.
-        let (mmap_file, _pool, buffer) = create_shm_buffer_format(
+        let (mmap_file, pool, buffer) = create_shm_buffer_format(
             self.state.shm.as_ref().unwrap(),
             &self.qh,
             width as i32,
@@ -2419,6 +2419,22 @@ impl ScreencopyClient {
         file.seek(SeekFrom::Start(0)).expect("seek shm");
         let mut bytes = vec![0u8; (stride * height) as usize];
         file.read_exact(&mut bytes).expect("read shm pixels");
+
+        // Hand every per-capture object back. `wayland-client` proxies do not
+        // send a destroy request when the Rust value drops, so without this
+        // each `capture()` leaks a `zwlr_screencopy_frame_v1`, a
+        // `wl_shm_pool` and a `wl_buffer` server-side -- and, because the pool
+        // keeps the compositor's mapping of our memfd alive, one
+        // output-sized allocation *in both processes* per call. Three or four
+        // captures never showed it; `gallery_gate` polls at 40 Hz for as long
+        // as a debug-build first paint takes and leaked ~85 MB/s, which is
+        // enough to starve every other test binary `cargo test` runs
+        // alongside it.
+        buffer.destroy();
+        pool.destroy();
+        frame.destroy();
+        self.conn.flush().expect("flush destroy");
+
         CapturedFrame {
             width,
             height,

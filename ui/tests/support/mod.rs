@@ -282,3 +282,316 @@ pub fn capture_until(
     }
     (px, started.elapsed())
 }
+
+// ---------------------------------------------------------------------------
+// M3: the gallery
+// ---------------------------------------------------------------------------
+
+use std::io::{BufRead, BufReader};
+use std::sync::{Arc, Mutex};
+
+/// One `<widget> <label> <x> <y>` line from `gallery --probe-points`.
+///
+/// A local struct with owned fields, not `icedtea_ui::gallery::ProbePoint`:
+/// what comes back over a pipe is text, and the library type's `widget` is a
+/// `&'static str` that no parse can produce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbePoint {
+    pub widget: String,
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// One `<widget> <x> <y> <width> <height>` line from
+/// `gallery --print-allocation`: an entry's border box in page coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntryAllocation {
+    pub widget: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Parse one probe-point line. `None` for anything malformed — a child that
+/// crashed mid-line must fail an assertion, never panic the test harness.
+#[must_use]
+pub fn parse_probe_line(line: &str) -> Option<ProbePoint> {
+    let mut fields = line.split_whitespace();
+    let widget = fields.next()?.to_string();
+    let label = fields.next()?.to_string();
+    let x = fields.next()?.parse().ok()?;
+    let y = fields.next()?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(ProbePoint {
+        widget,
+        label,
+        x,
+        y,
+    })
+}
+
+/// Parse one allocation line, with the same total-or-`None` rule.
+#[must_use]
+pub fn parse_allocation_line(line: &str) -> Option<EntryAllocation> {
+    let mut fields = line.split_whitespace();
+    let widget = fields.next()?.to_string();
+    let x = fields.next()?.parse().ok()?;
+    let y = fields.next()?.parse().ok()?;
+    let width = fields.next()?.parse().ok()?;
+    let height = fields.next()?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(EntryAllocation {
+        widget,
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+/// A `gallery` command with the hermetic environment every test wants.
+fn gallery(theme: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gallery"));
+    command.arg("--theme").arg(theme);
+    command
+}
+
+/// Run `gallery --probe-points` (headless) and parse every line.
+///
+/// # Panics
+///
+/// If the binary cannot be run, exits non-zero, or prints a line the parser
+/// rejects — all three mean the gate cannot know where to sample.
+#[must_use]
+pub fn probe_points(theme: &str, widget: Option<&str>) -> Vec<ProbePoint> {
+    let mut command = gallery(theme);
+    if let Some(widget) = widget {
+        command.arg("--widget").arg(widget);
+    }
+    let output = command
+        .arg("--probe-points")
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to run gallery --probe-points");
+    assert!(
+        output.status.success(),
+        "gallery --probe-points exited with {}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).expect("probe points are not UTF-8");
+    stdout
+        .lines()
+        .map(|line| parse_probe_line(line).unwrap_or_else(|| panic!("bad probe line {line:?}")))
+        .collect()
+}
+
+/// Run `gallery --print-allocation` (headless) and parse every line.
+///
+/// # Panics
+///
+/// As [`probe_points`].
+#[must_use]
+pub fn entry_allocations(theme: &str) -> Vec<EntryAllocation> {
+    let output = gallery(theme)
+        .arg("--print-allocation")
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to run gallery --print-allocation");
+    assert!(
+        output.status.success(),
+        "gallery --print-allocation exited with {}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).expect("allocations are not UTF-8");
+    stdout
+        .lines()
+        .map(|line| {
+            parse_allocation_line(line).unwrap_or_else(|| panic!("bad allocation line {line:?}"))
+        })
+        .collect()
+}
+
+/// A running `gallery`, killed on drop, with its stdout captured.
+///
+/// The captured stdout is what makes §7's "screencopy **or model** assertions"
+/// possible: the app prints one flushed `msg <line>` per folded message, so
+/// the interaction gate can assert on the model without sharing memory with
+/// it.
+pub struct GalleryProc {
+    child: Child,
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+impl GalleryProc {
+    /// Every `msg` line seen so far, in order, without the `msg ` prefix.
+    ///
+    /// # Panics
+    ///
+    /// If the reader thread poisoned the lock, which only a panic there can do.
+    #[must_use]
+    pub fn messages(&self) -> Vec<String> {
+        self.messages.lock().expect("message log").clone()
+    }
+
+    /// Wait until some message line equals `needle`, or `timeout` passes.
+    #[must_use]
+    pub fn wait_msg(&self, needle: &str, timeout: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            if self.messages().iter().any(|line| line == needle) {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(CAPTURE_POLL);
+        }
+    }
+}
+
+impl Drop for GalleryProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn `command` against `socket` with its stdout drained by a reader
+/// thread, so a full pipe can never block the child.
+fn spawn_gallery_command(mut command: Command, socket: &str) -> GalleryProc {
+    let mut child = command
+        .env("WAYLAND_DISPLAY", socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn gallery");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&messages);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(msg) = line.strip_prefix("msg ") {
+                sink.lock().expect("message log").push(msg.to_string());
+            }
+        }
+    });
+    GalleryProc { child, messages }
+}
+
+/// The whole page, scrolled to `scroll`.
+#[must_use]
+pub fn spawn_gallery(socket: &str, theme: &str, scroll: i32) -> GalleryProc {
+    let mut command = gallery(theme);
+    command.arg("--scroll").arg(scroll.to_string());
+    spawn_gallery_command(command, socket)
+}
+
+/// One widget, alone, at the origin.
+#[must_use]
+pub fn spawn_gallery_widget(socket: &str, theme: &str, widget: &str) -> GalleryProc {
+    let mut command = gallery(theme);
+    command.arg("--widget").arg(widget);
+    spawn_gallery_command(command, socket)
+}
+
+/// How long a gallery gets to map and paint its first frame.
+///
+/// A generous complexity bound, not a wall-clock pin: it covers compiling a
+/// ~1,900-line Adwaita sheet, matching fonts and painting 64 widgets on a
+/// loaded CI box.
+///
+/// Reconciliation: the task text puts this at 20s. The gallery's first frame
+/// takes about two minutes, and the reason is now measured rather than
+/// guessed. Instrumenting `paint_node_with_children` (temporarily; the
+/// instrumentation is not committed) over a live first paint gives ~275ms per
+/// node in `paint_box_shadows` and ~195ms in `paint_backgrounds`. Drilling
+/// into `paint_outset` puts effectively all of that in the single
+/// `canvas.clip_path(.., ClipOp::Difference, true)` call, at **~4 seconds for
+/// one call**; `paint_backgrounds`' anti-aliased `clip_path(.., Intersect,
+/// true)` is the same cost in smaller form. `skia-rs-canvas` 0.4.0's
+/// `ClipStack::clip_path` builds `ClipMask::from_path_aa(path,
+/// device_bounds)` with `device_bounds = IRect::new(0, 0, canvas.width,
+/// canvas.height)` — the mask is rasterised over the *whole canvas* however
+/// small the path is — so the cost is O(surface area) per anti-aliased clip
+/// and no call-site change short of dropping anti-aliasing (which would
+/// change every pinned pixel in `themed_button_offscreen.rs` and
+/// `widget_pixels.rs`) can avoid it. Setting `opt-level = 2` for
+/// `icedtea-ui` and `skia-rs-safe` in the dev profile changed nothing,
+/// confirming it is algorithmic and not codegen.
+///
+/// So this is a real, reproducible cost and not a hang — every widget does
+/// eventually paint — and it belongs to a paint-pipeline task (or an upstream
+/// fix bounding that mask by the path), not to wiring `gallery::run`. The
+/// bound is set wide enough for a cold page on a machine that is also running
+/// the rest of `cargo test`, rather than narrowed to hide it.
+pub const GALLERY_MAP_TIMEOUT: Duration = Duration::from_secs(480);
+
+/// Capture until `probe` stops showing `before` — the gallery's first frame.
+///
+/// # Panics
+///
+/// If nothing changes within [`GALLERY_MAP_TIMEOUT`], which means the gallery
+/// never mapped.
+pub fn wait_for_gallery(
+    screencopy: &mut ScreencopyClient,
+    probe: (u32, u32),
+    before: (u8, u8, u8),
+) -> CapturedFrame {
+    let started = Instant::now();
+    loop {
+        let frame = screencopy.capture();
+        let px = pixel_at(&frame, probe.0, probe.1).expect("the probe is inside the frame");
+        if !matches(px, before) {
+            return frame;
+        }
+        assert!(
+            started.elapsed() < GALLERY_MAP_TIMEOUT,
+            "the gallery never painted: ({}, {}) is still {before:?}",
+            probe.0,
+            probe.1
+        );
+        std::thread::sleep(CAPTURE_POLL);
+    }
+}
+
+/// Whether anything inside `rect` differs from `background`.
+///
+/// Reconciliation: the task text samples a 5x5 grid inset one pixel from the
+/// border box, "dense enough to catch a widget that drew only a border". It is
+/// not: a 1px border is caught only when a sample column or row happens to
+/// land on it, which depends on `(w - 2) * col / 4` hitting `0` or `w - 3`.
+/// Measured against the real page, `action_bar` (124x47, 460 non-background
+/// pixels — a child button's border and its flat bar edge) is a false
+/// negative, while `toggle_button` (36x34, 140 non-background pixels of
+/// exactly the same kind) passes purely because its grid lands on the bottom
+/// and right border rows. A gate that reports "painted nothing" for something
+/// that plainly painted is worse than a slower one, so this scans every pixel
+/// of the border box instead. The whole page is ~59 rectangles totalling
+/// ~130k pixels per capture, which is noise next to one screencopy round trip.
+///
+/// The `w <= 2 || h <= 2` early return of the task text goes with it, for the
+/// same reason: it was there only because a 5x5 inset grid has nothing to
+/// sample in a 2px box. A full scan does, and both `separator` (1x1, one
+/// `#d8d4d0` pixel) and `calendar` (2x2, four `#cdc7c2` pixels) do paint.
+#[must_use]
+pub fn paints_something(
+    frame: &CapturedFrame,
+    rect: (i32, i32, i32, i32),
+    background: (u8, u8, u8),
+) -> bool {
+    let (x, y, w, h) = rect;
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    (y..y + h).any(|py| {
+        (x..x + w).any(|px| {
+            pixel_at(frame, px as u32, py as u32).is_some_and(|got| !matches(got, background))
+        })
+    })
+}
