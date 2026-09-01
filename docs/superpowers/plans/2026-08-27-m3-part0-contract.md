@@ -2958,6 +2958,108 @@ The file stays P3-owned; a later part adding to it needs its own amendment.
 
 ---
 
+### P5-D22 — `DropDownC.list` is a `Node`, not a `ListViewC`
+
+**Carried out by:** P5 (Task 21, `ui/src/widgets/drop_down.rs`). **Added:**
+2026-08-31, fixing Task 21's review round 1.
+
+**Contract §5.2 says:**
+
+```rust
+struct DropDownC { items: Rc<[ListItem]>, selected: usize, open: bool, search: String, filtered: Vec<usize>, button: Node, popover: PopoverC, list: ListViewC }
+```
+
+`ListViewC` is a P6 kind (`Kind::ListView`) landing after P5.
+
+**As shipped:** `DropDownC.list` is a plain `Node` — the `listview` subnode
+and its `row` children are built and reconciled directly by `DropDownC`
+itself, with no `ListViewC` controller involved.
+
+**Ruling.** Declared, not reverted, matching Task 21's own Interfaces section
+and the part plan's D10 (§ "Contract deviations"). P5 has no `ListViewC` to
+construct — `Kind::ListView` is one of P6's 32 kinds — so `DropDownC` builds
+the node and rows itself for this milestone. P6's Task 19, when it creates
+`ui/src/widgets/list_view.rs` and lands `Kind::ListView`, replaces this field
+with a real `ListViewC` and migrates `DropDownC`'s row-building logic onto it.
+`FontDialogC.list` (Task 22) carries the identical deviation and the identical
+P6 migration path; contract §11 E10 already covers the cross-part half of this
+ruling (P6's `on_scrolled`/`on_reordered` two-argument handlers), so this entry
+records the P5-side half that §11 assumed but that had not yet been written
+into §10 itself.
+
+---
+
+### P5-D23 — `child_slot` gains `Kind::MenuButton` and `Kind::DropDown` arms to route application children away from the controller's own chrome subnodes
+
+**Carried out by:** P5 (Task 21, `ui/src/widgets/mod.rs`). **Added:**
+2026-08-31, fixing Task 21's review round 1.
+
+**Task 21's plan text does not mention `child_slot`** — it specifies only the
+two new widget files, their dispatch arms in `build_controller`, and their
+fixtures/tests.
+
+**As shipped:** two new arms were added to `child_slot`:
+`Kind::MenuButton => &menu_button_c.popover.contents` and
+`Kind::DropDown => &drop_down_c.sink` (a new, never-attached `Node` field
+added to `DropDownC` for exactly this purpose).
+
+**Ruling.** Forced, and kept. `MenuButtonC`/`DropDownC` each append their own
+`button.toggle` subnode directly onto their controller's root node, the same
+shape `ButtonC`/`SwitchC`/`CheckButtonC` already use. Without a `child_slot`
+arm, `reconcile()`'s "no application children" cleanup detaches everything
+under the controller's root beyond position zero on every reconcile, wiping
+`button` (and, for `DropDown`, `popover`) immediately after `build()` returns.
+This is a latent bug shared by every P5 widget of this shape; it stays
+invisible for `Button`/`Switch`/`CheckButton`/`ToggleButton` because each of
+those paints its own chrome directly off its root node or off a field on the
+controller rather than off the wiped subnode (confirmed by instrumenting
+`SwitchC`, whose `paint` draws the thumb from its own `slide` field, never
+from the wiped `slider` node). `MenuButton` and `DropDown` have no chrome of
+their own on the root node — it lives entirely on the nested `button.toggle`
+— so the wipe left nothing to paint. The general reconciler cleanup itself is
+untouched (out of scope, high blast radius, and not flagged by the deferred-
+minors note carried into this task); the two `child_slot` arms are additive
+and route each kind's future application children to the one place each
+already reserves for them (`MenuButton`'s popover contents; `DropDown`'s new
+`sink`, kept separate so a real application child can never leak into the
+listview/rows that `popover.contents` also holds for `DropDown`). A later
+part touching this shape for a new widget kind should check `child_slot`
+for the same gap rather than assume the reconciler already redirects it.
+
+---
+
+### P5-D24 — `route()`'s `aim()` resolves to the nearest ancestor `path_to` can find, not to the geometrically deepest hit
+
+**Carried out by:** P5 (Task 21, `ui/src/view/app.rs`). **Added:** 2026-08-31,
+fixing Task 21's review round 1.
+
+**Task 21's plan text does not mention `route()` or `aim()`.**
+
+**As shipped:** `aim()` previously took `hit_chain(...).last()` — the
+geometrically deepest node under the pointer — as the event target
+unconditionally. It now walks `hit_chain`'s chain from the deepest hit
+outward and returns the first entry `path_to(&rt.instances, ...)` actually
+resolves, using that entry's own node-relative `local` coordinates.
+
+**Ruling.** Forced, and kept. `deliver()` calls `path_to(&rt.instances,
+target)`, which only succeeds when `target` is exactly some `Instance`'s own
+node; for any other node it returns an empty path and the event is silently
+dropped. For every P5 widget before `MenuButton`/`DropDown`, this never
+mattered: their content subnodes (`label`, `image`) always measure to
+`(0, 0)` with no controller of their own, so `descend()`'s zero-area skip
+means the deepest non-empty hit is always the flat widget's own root, which
+*is* the `Instance`. `MenuButtonC`/`DropDownC` nest a real, non-zero-sized
+`button.toggle` one level below their own `Instance` root, so the deepest hit
+was always that subnode — never an `Instance` — and every click on a
+`menu_button`/`drop_down` silently did nothing. The fix only changes behavior
+for hit chains that previously resolved to nothing; every existing
+click/drag/hover test for flat widgets still passes unchanged. This touches
+shared dispatch code (`ui/src/view/app.rs::route`) used by every widget kind,
+not just this task's two, so a later part should re-verify it when adding a
+kind with its own nested, non-zero-sized, non-`Instance` subnode.
+
+---
+
 ---
 
 ## 11. Execution notes — cross-part consistency check (E1–E16)
