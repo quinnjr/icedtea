@@ -163,6 +163,7 @@ pub use crate::widgets::color_dialog::{
 };
 pub use crate::widgets::drawing_area::{DrawingAreaExt, drawing_area};
 pub use crate::widgets::drop_down::{DropDownExt, drop_down, drop_down_from};
+pub use crate::widgets::editable_label::{EditableLabelExt, editable_label};
 pub use crate::widgets::entry::{EntryExt, entry};
 pub use crate::widgets::font_dialog::{
     FontDialogButtonExt, FontDialogExt, font_dialog, font_dialog_button,
@@ -181,6 +182,7 @@ pub use crate::widgets::scale::{ScaleExt, scale};
 pub use crate::widgets::scrollbar::{ScrollbarExt, scrollbar};
 pub use crate::widgets::search_entry::{SearchEntryExt, search_entry};
 pub use crate::widgets::separator::separator;
+pub use crate::widgets::spin_button::{SpinButtonExt, spin_button};
 pub use crate::widgets::spinner::{SpinnerExt, spinner};
 pub use crate::widgets::statusbar::{StatusbarExt, statusbar};
 pub use crate::widgets::switch::{SwitchExt, switch};

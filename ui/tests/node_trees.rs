@@ -519,3 +519,29 @@ fn the_search_and_password_entries_carry_their_classes_and_indicators() {
     assert!(password.starts_with("entry.password"), "{password}");
     assert!(password.contains("image.caps-lock-indicator"), "{password}");
 }
+
+#[test]
+fn a_spin_button_has_two_stepper_buttons_and_an_editable_label_has_a_stack() {
+    // mutation: name the steppers `button.up`/`button.down` in the wrong order
+    // and the fixture's `╰── button.up` last-child position fails.
+    use icedtea_ui::widgets::spin_button::SpinButtonC;
+    assert_eq!(SpinButtonC::format(1.5, 2), "1.50");
+    assert_eq!(SpinButtonC::format(1.5, 0), "2");
+    assert_eq!(
+        SpinButtonC::format(f64::NAN, 2),
+        "0.00",
+        "NaN never renders as NaN"
+    );
+
+    let mut props = Props::default();
+    props.set(PropName::Value, Prop::Float(3.0));
+    props.set(PropName::Lower, Prop::Float(0.0));
+    props.set(PropName::Upper, Prop::Float(10.0));
+    check(Kind::SpinButton, "spin_button", &props);
+
+    let mut label = Props::default();
+    label.set(PropName::Text, Prop::Str("Name".into()));
+    check(Kind::EditableLabel, "editable_label", &label);
+    let rendered = node_tree_of(Kind::EditableLabel, &label);
+    assert!(rendered.contains("stack"), "{rendered}");
+}

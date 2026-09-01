@@ -1,0 +1,10 @@
+spinbutton.horizontal
+├── text
+│   ├── placeholder
+│   ├── undershoot.left
+│   ├── undershoot.right
+│   ├── [selection]
+│   ├── [block-cursor]
+│   ╰── [window.popup]
+├── button.down
+╰── button.up

@@ -50,6 +50,7 @@ pub mod color_dialog;
 pub mod drawing_area;
 pub mod drop_down;
 pub mod edit;
+pub mod editable_label;
 pub mod entry;
 pub mod font_dialog;
 pub mod image;
@@ -66,6 +67,7 @@ pub mod scale;
 pub mod scrollbar;
 pub mod search_entry;
 pub mod separator;
+pub mod spin_button;
 pub mod spinner;
 pub mod statusbar;
 pub mod switch;
@@ -735,6 +737,12 @@ pub fn build_controller<Msg: Clone + 'static>(
         )),
         Kind::PasswordEntry => Box::new(
             <password_entry::PasswordEntryC as Controller<Msg>>::build(node, props, cx),
+        ),
+        Kind::SpinButton => Box::new(<spin_button::SpinButtonC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::EditableLabel => Box::new(
+            <editable_label::EditableLabelC as Controller<Msg>>::build(node, props, cx),
         ),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };

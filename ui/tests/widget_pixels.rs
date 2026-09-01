@@ -1352,3 +1352,128 @@ fn clicking_into_a_password_entry_places_the_caret_like_its_siblings() {
         "the insertion must land on a character boundary of the buffer"
     );
 }
+
+#[test]
+fn stepping_a_spin_button_repeats_while_the_button_is_held() {
+    // mutation: return None from SpinButtonC::next_deadline and the value
+    // advances once instead of several times.
+    use icedtea_ui::view::builders::spin_button;
+    use icedtea_ui::widgets::spin_button::SpinButtonExt;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Set(f64);
+
+    // Plan reconciliation: the plan clicked at `(130.0, 12.0)`, assuming the
+    // control fills most of the 140px-wide window. Nothing in this crate
+    // stretches a bare root widget to its window (every container centres
+    // its children on both axes with an `AUTO` size — `layout.rs`'s
+    // `taffy_style` — and `Prop::Hexpand` has no consumer anywhere in the
+    // layout code yet), so a value-0/digits-0 `SpinButton` measures to its
+    // content's natural, small width and sits centred. `SpinButtonC` had no
+    // `measure` at all in the plan (see [`STEPPER_SIZE`]'s doc comment), so
+    // this also depends on the `measure` this task adds; with it the control
+    // is `text_width + 2*STEPPER_SIZE` wide, centred, and `(85.0, 20.0)` is
+    // inside its `up` stepper for this window size.
+    let frames = run(
+        0.0f64,
+        |model: &mut f64, Set(v): Set| {
+            *model = v;
+            Cmd::None
+        },
+        |model: &f64| {
+            spin_button(*model, 0.0, 100.0)
+                .step(1.0)
+                .on_value_changed(Set)
+        },
+        (140, 40),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Event(InputEvent::pointer_enter(85.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Advance(Duration::from_millis(1_500)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 1_500,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..140)
+            .map(|x| frames.pixel(frame, x, 20))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), "the displayed value must have advanced");
+}
+
+#[test]
+fn an_editable_label_commits_on_enter_and_reverts_on_escape() {
+    // mutation: keep `editing` true after Enter and the `.editing` class stays
+    // on, changing the final capture.
+    //
+    // Plan reconciliation: the plan's script opens with a bare `KeyboardEnter`
+    // and no click. As `typing_into_a_text_view_inserts_at_the_cursor_and_reports_the_change`
+    // and `typing_into_an_entry_shows_the_glyphs_and_moves_the_caret` already
+    // found, `InputEvent::KeyboardEnter` grants no keyboard focus by itself —
+    // `view/app.rs::route` has no handler for it beyond its wildcard arm, and
+    // `FocusRing` only moves from a click, `Cmd::Focus`, or a keyboard binding
+    // — so the `Key` events that followed had nowhere to go. A click on the
+    // widget grants it, matching those same tests and `EditableLabelC`'s own
+    // added `PointerDown` focus grant.
+    use icedtea_ui::view::builders::editable_label;
+    use icedtea_ui::widgets::editable_label::EditableLabelExt;
+    use icedtea_ui::window::BTN_LEFT;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Renamed(String);
+
+    let frames = run(
+        "Name".to_owned(),
+        |model: &mut String, Renamed(text): Renamed| {
+            *model = text;
+            Cmd::None
+        },
+        |model: &String| {
+            editable_label(model)
+                .editing(true)
+                .on_change(|t| Renamed(t.to_owned()))
+        },
+        (200, 40),
+        vec![
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 1,
+            }),
+            ScriptStep::Event(InputEvent::keyboard_enter(4)),
+            ScriptStep::Capture,
+            ScriptStep::Event(InputEvent::Key(key_char('X', 53))),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..200)
+            .map(|x| frames.pixel(frame, x, 20))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(
+        row(0),
+        row(1),
+        "the typed character must show while editing"
+    );
+}
