@@ -824,6 +824,22 @@ fn stack_sidebar_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn popover_menu_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::Menus,
+        icedtea_ui::view::Prop::Classes(["_Open", "_Save"].iter().map(|s| (*s).into()).collect()),
+    );
+    props.set(
+        icedtea_ui::view::PropName::DisplayHint,
+        icedtea_ui::view::Prop::Enum(
+            icedtea_ui::widgets::types::DisplayHint::InlineButtons.to_u16(),
+        ),
+    );
+    assert_fixture(icedtea_ui::view::Kind::PopoverMenu, &props, "popover_menu");
+}
+
+#[test]
 fn no_p5_kind_falls_through_to_the_unimplemented_controller() {
     // mutation: remove any dispatch arm from build_controller and that kind's
     // tree renders as a bare node, failing its fixture's required subnodes.

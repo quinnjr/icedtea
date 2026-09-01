@@ -1075,6 +1075,9 @@ pub use crate::widgets::menu_button::{MenuButtonExt, menu_button};
 pub use crate::widgets::password_entry::{PasswordEntryExt, password_entry};
 pub use crate::widgets::picture::{PictureExt, picture, picture_from_bytes};
 pub use crate::widgets::popover::{PopoverExt, popover};
+pub use crate::widgets::popover_menu::{
+    PopoverMenuExt, PopoverMenuItemExt, popover_menu, popover_menu_item,
+};
 pub use crate::widgets::progress_bar::{ProgressBarExt, progress_bar};
 pub use crate::widgets::scale::{ScaleExt, scale};
 pub use crate::widgets::scrollbar::{ScrollbarExt, scrollbar};

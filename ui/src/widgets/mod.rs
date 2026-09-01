@@ -85,6 +85,7 @@ pub mod paned;
 pub mod password_entry;
 pub mod picture;
 pub mod popover;
+pub mod popover_menu;
 pub mod progress_bar;
 pub mod scale;
 pub mod scrollbar;
@@ -1272,6 +1273,9 @@ pub fn build_controller<Msg: Clone + 'static>(
         )),
         Kind::Stack => Box::new(<stack::StackC as Controller<Msg>>::build(node, props, cx)),
         Kind::Popover => Box::new(<popover::PopoverC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::PopoverMenu => Box::new(<popover_menu::PopoverMenuC as Controller<Msg>>::build(
             node, props, cx,
         )),
         Kind::Button => Box::new(<button::ButtonC as Controller<Msg>>::build(node, props, cx)),
