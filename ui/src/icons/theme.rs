@@ -1,33 +1,64 @@
 //! The icon theme handle: which theme, where its roots are, and what it
 //! inherits from.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// The theme GTK falls back to when `settings.ini` names none.
 const DEFAULT_THEME: &str = "Adwaita";
 
-/// The theme every chain ends at, per the Icon Theme Specification.
-const FALLBACK_THEME: &str = "hicolor";
+/// The spec-mandated backstop theme, where every chain terminates.
+pub(crate) const HICOLOR: &str = "hicolor";
 
-/// A resolved icon theme: its name, its search roots and its inheritance
-/// chain.
+/// The most themes one chain may contain.
 ///
-/// P7 grows this with `lookup`, `render` and their caches; P4 needs only
-/// enough for `BuildCx`/`EventCx` to carry one and for tests to build a
-/// hermetic instance with [`IconTheme::with_name_and_roots`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Adwaita's is three (`Adwaita`, `AdwaitaLegacy`, `hicolor`). The cap exists
+/// because `Inherits=` is untrusted and a chain is walked on every miss.
+pub(crate) const MAX_CHAIN: usize = 32;
+
+/// The largest `Scale` a surface is ever asked for.
+const MAX_SCALE: u32 = 4;
+
+/// `true` if `name` is a usable theme directory name: non-empty, no path
+/// separators, no `.`/`..`, no NUL.
+///
+/// The theme name comes from `settings.ini`, which is a file the user (or
+/// anything running as them) writes. Joining `../../etc` onto a root would
+/// walk out of it.
+fn is_safe_theme_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+/// One icon theme, its inheritance chain, its search roots and its caches.
+///
+/// Construct once per application and keep it: the caches are what make an
+/// icon lookup cost a hash probe rather than a directory walk on every frame.
 pub struct IconTheme {
     name: Rc<str>,
     roots: Vec<PathBuf>,
+    // Read only by `pixmap_dirs` below, which is itself unused until Task 6's
+    // lookup consumes the flat fallback — allowed here rather than deferred,
+    // since the plan places the field in this task.
+    #[allow(dead_code)]
+    pixmaps: Vec<PathBuf>,
     chain: Vec<Rc<str>>,
+    indexes: HashMap<Rc<str>, ThemeIndex>,
+    scale: u32,
 }
 
 impl IconTheme {
     /// Read the theme name from `$XDG_CONFIG_HOME/gtk-4.0/settings.ini`
     /// (falling back to `$HOME/.config/...`), defaulting to `Adwaita`, and
     /// build the standard root list: `$XDG_DATA_HOME/icons`, `$HOME/.icons`,
-    /// each `$XDG_DATA_DIRS/icons`, then `/usr/share/pixmaps` last.
+    /// each `$XDG_DATA_DIRS/icons`, with `/usr/share/pixmaps` as the flat,
+    /// non-themed fallback (deviation 4: kept separate from the themed
+    /// roots, not appended to them).
     ///
     /// A missing or unreadable `settings.ini` is not an error — it is the
     /// normal case on a machine with no GTK configuration.
@@ -66,54 +97,182 @@ impl IconTheme {
         for dir in data_dirs.split(':').filter(|s| !s.is_empty()) {
             roots.push(PathBuf::from(dir).join("icons"));
         }
-        // Flat, non-themed, last resort only.
-        roots.push(PathBuf::from("/usr/share/pixmaps"));
+        let pixmaps = vec![PathBuf::from("/usr/share/pixmaps")];
 
-        IconTheme::with_name_and_roots(&name, roots)
+        IconTheme::with_name_roots_and_pixmaps(&name, roots, pixmaps)
     }
 
-    /// Hermetic construction: no environment is read at all.
+    /// Hermetic construction for tests: no environment reads at all, and no
+    /// flat `/usr/share/pixmaps` fallback (see
+    /// [`with_name_roots_and_pixmaps`](Self::with_name_roots_and_pixmaps)).
     #[must_use]
-    pub fn with_name_and_roots(name: &str, roots: Vec<PathBuf>) -> Self {
-        let trimmed = name.trim();
-        let name: Rc<str> = if trimmed.is_empty() {
-            Rc::from(DEFAULT_THEME)
-        } else {
-            Rc::from(trimmed)
-        };
-        // P7 replaces this with the real `Inherits=` walk over each theme's
-        // `index.theme`; the invariant it must preserve is the one pinned
-        // here: the chain starts at `name` and ends at `hicolor`, once.
-        let mut chain = vec![Rc::clone(&name)];
-        if &*name != FALLBACK_THEME {
-            chain.push(Rc::from(FALLBACK_THEME));
-        }
-        IconTheme { name, roots, chain }
+    pub fn with_name_and_roots(name: &str, roots: Vec<PathBuf>) -> IconTheme {
+        Self::with_name_roots_and_pixmaps(name, roots, Vec::new())
     }
 
-    /// The theme's own name.
+    /// As [`with_name_and_roots`](Self::with_name_and_roots), plus the flat,
+    /// non-themed directories searched as a last resort.
+    ///
+    /// Split out because a flat directory is not a themed root — it has no
+    /// `index.theme` and no subdirectories — and because a hermetic test must
+    /// be able to exercise the fallback without reading `/usr`.
+    #[must_use]
+    pub fn with_name_roots_and_pixmaps(
+        name: &str,
+        roots: Vec<PathBuf>,
+        pixmaps: Vec<PathBuf>,
+    ) -> IconTheme {
+        let name: Rc<str> = if is_safe_theme_name(name) {
+            Rc::from(name)
+        } else {
+            if !name.is_empty() {
+                tracing::debug!(
+                    theme = name,
+                    "unusable icon theme name; falling back to hicolor"
+                );
+            }
+            Rc::from(HICOLOR)
+        };
+        let mut theme = IconTheme {
+            name,
+            roots,
+            pixmaps,
+            chain: Vec::new(),
+            indexes: HashMap::new(),
+            scale: 1,
+        };
+        theme.resolve_chain();
+        theme
+    }
+
+    /// The active theme's directory name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// The resolved inheritance chain: this theme first, `hicolor` last.
+    /// The resolved inheritance chain, base theme first, `hicolor` last.
+    ///
+    /// `hicolor` is appended implicitly when the base theme neither is it nor
+    /// names it, which is the convention every shipped theme relies on.
+    /// A theme with no `index.theme` on disk still appears here — the chain
+    /// is what was *declared*, and lookup simply finds nothing in it.
     #[must_use]
     pub fn chain(&self) -> &[Rc<str>] {
         &self.chain
     }
 
-    /// The search roots, in priority order.
+    /// The output scale icons are rasterised for, `1..=4`.
+    ///
+    /// Carried here rather than on `PaintCx` because contract §6 freezes
+    /// `PaintCx`'s only new field as `icons` (deviation 3). The window sets
+    /// it from `wl_surface.preferred_buffer_scale`.
     #[must_use]
-    pub fn roots(&self) -> &[PathBuf] {
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
+
+    /// Set the output scale. Zero and absurd values clamp into `1..=4`
+    /// rather than producing a zero-pixel or gigapixel surface.
+    pub fn set_scale(&mut self, scale: u32) {
+        let clamped = scale.clamp(1, MAX_SCALE);
+        if clamped != self.scale {
+            self.scale = clamped;
+            self.clear_caches();
+        }
+    }
+
+    /// The themed roots, in search order.
+    ///
+    /// Unused outside tests until Task 6's lookup consumes it — allowed here
+    /// rather than deferred, since the plan places the accessor in this task.
+    #[allow(dead_code)]
+    pub(crate) fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
 
-    /// Drop every memoized lookup and render.
+    /// The flat, non-themed last-resort directories.
+    #[allow(dead_code)]
+    pub(crate) fn pixmap_dirs(&self) -> &[PathBuf] {
+        &self.pixmaps
+    }
+
+    /// The parsed `index.theme` for one theme in the chain, if it has one.
+    #[allow(dead_code)]
+    pub(crate) fn index(&self, theme: &str) -> Option<&ThemeIndex> {
+        self.indexes.get(theme)
+    }
+
+    /// Read `<root>/<theme>/index.theme` from the first root that has one.
+    fn read_index(&self, theme: &str) -> Option<ThemeIndex> {
+        for root in &self.roots {
+            let path = root.join(theme).join("index.theme");
+            let Ok(text) = std::fs::read(&path) else {
+                continue;
+            };
+            // An index.theme need not be valid UTF-8; a lossy read keeps the
+            // ASCII keys intact, which is all the parser looks at.
+            let text = String::from_utf8_lossy(&text);
+            return Some(ThemeIndex::parse(theme, &text));
+        }
+        None
+    }
+
+    /// Walk `Inherits=` breadth-first into [`chain`](Self::chain), stopping
+    /// at [`MAX_CHAIN`], never revisiting a theme, and appending `hicolor`.
+    fn resolve_chain(&mut self) {
+        let mut chain: Vec<Rc<str>> = Vec::new();
+        let mut queue: Vec<Rc<str>> = vec![Rc::clone(&self.name)];
+        while let Some(theme) = queue.first().cloned() {
+            queue.remove(0);
+            if chain.len() >= MAX_CHAIN {
+                tracing::debug!(
+                    theme = &*self.name,
+                    "icon theme inheritance chain hit its cap; the tail is ignored"
+                );
+                break;
+            }
+            if chain.iter().any(|seen| **seen == *theme) {
+                continue;
+            }
+            chain.push(Rc::clone(&theme));
+            if let Some(index) = self.read_index(&theme) {
+                for parent in &index.inherits {
+                    if is_safe_theme_name(parent) {
+                        queue.push(Rc::clone(parent));
+                    }
+                }
+                self.indexes.insert(Rc::clone(&theme), index);
+            }
+        }
+        if !chain.iter().any(|theme| &**theme == HICOLOR) && chain.len() < MAX_CHAIN {
+            let hicolor: Rc<str> = Rc::from(HICOLOR);
+            if let Some(index) = self.read_index(HICOLOR) {
+                self.indexes.insert(Rc::clone(&hicolor), index);
+            }
+            chain.push(hicolor);
+        }
+        self.chain = chain;
+    }
+
+    /// Empty every memo table.
     ///
-    /// P4 holds no caches yet, so this is a no-op that P7 fills in; it exists
-    /// now because `App` calls it when the theme changes.
+    /// The chain and the parsed indexes are *not* caches: they are the
+    /// theme's identity, and re-reading them means constructing a new
+    /// `IconTheme`. Task 7 and Task 11 add the tables this clears.
     pub fn clear_caches(&mut self) {}
+
+    /// `<root>/<theme>/<subdir>/<name>.<ext>` for every root, in order.
+    ///
+    /// Unused until Task 6's lookup consumes it — allowed here rather than
+    /// deferred, since the plan places the accessor in this task.
+    #[allow(dead_code)]
+    pub(crate) fn candidate_paths(&self, theme: &str, subdir: &str, file: &str) -> Vec<PathBuf> {
+        self.roots
+            .iter()
+            .map(|root| Path::new(root).join(theme).join(subdir).join(file))
+            .collect()
+    }
 }
 
 /// `gtk-icon-theme-name` from a GTK `settings.ini`, or `None`.
@@ -492,10 +651,20 @@ mod tests {
         );
     }
 
+    // Reconciliation (Task 4): P4's `is_safe_theme_name` predecessor trimmed
+    // and treated an all-whitespace name as blank, defaulting to Adwaita.
+    // Task 4's `is_safe_theme_name` does not trim -- it only rejects empty,
+    // `.`/`..`, separators and NUL -- so three spaces is a literal (if
+    // useless) theme name that simply matches nothing on disk. Updated to
+    // assert the new, spec-driven behaviour rather than the old default.
     #[test]
-    fn a_blank_theme_name_falls_back_to_adwaita() {
+    fn a_whitespace_theme_name_is_taken_literally_and_matches_nothing() {
         let theme = IconTheme::with_name_and_roots("   ", vec![]);
-        assert_eq!(theme.name(), "Adwaita");
+        assert_eq!(theme.name(), "   ");
+        assert_eq!(
+            theme.chain().iter().map(|s| &**s).collect::<Vec<_>>(),
+            vec!["   ", "hicolor"]
+        );
     }
 
     #[test]
@@ -727,6 +896,126 @@ Type=Fixed
             let index = ThemeIndex::parse("T", &text);
             assert!(index.dirs.len() <= MAX_SUBDIRS);
         }
+    }
+
+    use super::{HICOLOR, IconTheme};
+    use crate::icons::test_support::{pixmaps, roots};
+
+    // The spec's chain: the base theme, then everything it Inherits
+    // transitively, then hicolor -- which is appended implicitly because a
+    // theme that is not hicolor and does not name it still has to terminate
+    // there.
+    // Mutation check: stop appending hicolor and the last assertion fails,
+    // taking `image-missing` (which only hicolor has) with it.
+    #[test]
+    fn the_chain_is_the_theme_its_parents_and_then_hicolor() {
+        let theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        let chain: Vec<&str> = theme.chain().iter().map(|s| &**s).collect();
+        assert_eq!(chain, vec!["MiniTheme", "MiniParent", HICOLOR]);
+        assert_eq!(theme.name(), "MiniTheme");
+    }
+
+    // hicolor is not appended to itself.
+    // Mutation check: drop the `name != HICOLOR` guard and the chain becomes
+    // ["hicolor", "hicolor"].
+    #[test]
+    fn hicolor_does_not_inherit_from_itself() {
+        let theme = IconTheme::with_name_and_roots(HICOLOR, roots());
+        let chain: Vec<&str> = theme.chain().iter().map(|s| &**s).collect();
+        assert_eq!(chain, vec![HICOLOR]);
+    }
+
+    // A cycle in Inherits= is a file on disk saying so; it must terminate.
+    // Mutation check: remove the `seen` set and this test hangs (which the
+    // harness reports as a timeout, not a failure -- so run it alone if it
+    // ever regresses).
+    #[test]
+    fn an_inheritance_cycle_terminates() {
+        let theme = IconTheme::with_name_and_roots("MiniLoopA", roots());
+        let chain: Vec<&str> = theme.chain().iter().map(|s| &**s).collect();
+        assert_eq!(chain, vec!["MiniLoopA", "MiniLoopB", HICOLOR]);
+    }
+
+    // A theme name that resolves to nothing on disk still produces a usable
+    // theme: the chain terminates at hicolor and every lookup misses.
+    // Mutation check: `unwrap()` the missing index and this panics.
+    #[test]
+    fn a_missing_theme_still_yields_a_terminating_chain() {
+        let theme = IconTheme::with_name_and_roots("NoSuchTheme", roots());
+        let chain: Vec<&str> = theme.chain().iter().map(|s| &**s).collect();
+        assert_eq!(chain, vec!["NoSuchTheme", HICOLOR]);
+        assert!(theme.index("NoSuchTheme").is_none());
+        assert!(theme.index("MiniParent").is_none());
+        assert!(theme.index(HICOLOR).is_some());
+    }
+
+    // An empty name is not a theme; GTK's own default is Adwaita and the
+    // spec's backstop is hicolor, and with nothing to go on hicolor is the
+    // honest answer.
+    // Mutation check: keep the empty name in the chain and the assertion
+    // finds a leading "".
+    #[test]
+    fn an_empty_theme_name_falls_back_to_hicolor() {
+        let theme = IconTheme::with_name_and_roots("", roots());
+        assert_eq!(theme.name(), HICOLOR);
+        let chain: Vec<&str> = theme.chain().iter().map(|s| &**s).collect();
+        assert_eq!(chain, vec![HICOLOR]);
+    }
+
+    // A theme name is untrusted (it comes from settings.ini): it must not be
+    // able to escape the roots.
+    // Mutation check: drop the separator/`..` rejection and the chain
+    // contains the traversal name, which then joins into a path outside the
+    // root.
+    #[test]
+    fn a_traversing_theme_name_is_refused() {
+        for hostile in ["../../etc", "a/b", "..", ".", "a\0b"] {
+            let theme = IconTheme::with_name_and_roots(hostile, roots());
+            assert_eq!(
+                theme.name(),
+                HICOLOR,
+                "{hostile:?} was accepted as a theme name"
+            );
+        }
+    }
+
+    // The chain is bounded even against a pathological on-disk theme graph.
+    // Mutation check: remove the MAX_CHAIN cap; this still passes on the
+    // fixture, which is why the bound is also asserted directly.
+    #[test]
+    fn the_chain_is_bounded() {
+        let theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        assert!(theme.chain().len() <= super::MAX_CHAIN);
+    }
+
+    // The output scale is carried here because `PaintCx` gains exactly one
+    // field and `ResolveEnv` has no scale (deviation 3).
+    // Mutation check: drop the clamp and `set_scale(0)` makes every render
+    // ask for a zero-pixel surface.
+    #[test]
+    fn the_output_scale_is_clamped_to_a_sane_range() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        assert_eq!(theme.scale(), 1);
+        theme.set_scale(2);
+        assert_eq!(theme.scale(), 2);
+        theme.set_scale(0);
+        assert_eq!(theme.scale(), 1);
+        theme.set_scale(u32::MAX);
+        assert_eq!(theme.scale(), 4);
+    }
+
+    // `with_name_and_roots` is the hermetic constructor: it reads no
+    // environment and, per deviation 4, no /usr/share/pixmaps either.
+    // Mutation check: have it fill `pixmaps` with the system path and the
+    // first assertion fails.
+    #[test]
+    fn the_hermetic_constructor_has_no_flat_fallback_and_the_other_one_does() {
+        let hermetic = IconTheme::with_name_and_roots("MiniTheme", roots());
+        assert!(hermetic.pixmap_dirs().is_empty());
+        let with_flat = IconTheme::with_name_roots_and_pixmaps("MiniTheme", roots(), pixmaps());
+        assert_eq!(with_flat.pixmap_dirs(), pixmaps().as_slice());
+        assert_eq!(with_flat.roots(), roots().as_slice());
+        let _: &[PathBuf] = hermetic.roots();
     }
 }
 
