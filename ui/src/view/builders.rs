@@ -1078,6 +1078,7 @@ pub use crate::widgets::popover::{PopoverExt, popover};
 pub use crate::widgets::popover_menu::{
     PopoverMenuExt, PopoverMenuItemExt, popover_menu, popover_menu_item,
 };
+pub use crate::widgets::popover_menu_bar::{PopoverMenuBarExt, popover_menu_bar};
 pub use crate::widgets::progress_bar::{ProgressBarExt, progress_bar};
 pub use crate::widgets::scale::{ScaleExt, scale};
 pub use crate::widgets::scrollbar::{ScrollbarExt, scrollbar};

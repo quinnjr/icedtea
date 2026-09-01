@@ -86,6 +86,7 @@ pub mod password_entry;
 pub mod picture;
 pub mod popover;
 pub mod popover_menu;
+pub mod popover_menu_bar;
 pub mod progress_bar;
 pub mod scale;
 pub mod scrollbar;
@@ -1278,6 +1279,9 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::PopoverMenu => Box::new(<popover_menu::PopoverMenuC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::PopoverMenuBar => {
+            Box::new(<popover_menu_bar::PopoverMenuBarC as Controller<Msg>>::build(node, props, cx))
+        }
         Kind::Button => Box::new(<button::ButtonC as Controller<Msg>>::build(node, props, cx)),
         Kind::ToggleButton => Box::new(<toggle_button::ToggleButtonC as Controller<Msg>>::build(
             node, props, cx,
@@ -1680,6 +1684,45 @@ impl Headless {
                 &mut measure,
             )
             .expect("place_columns: compute");
+    }
+
+    /// Lay `node`'s own direct children out as a row of fixed-`width`
+    /// columns.
+    ///
+    /// [`Headless::place_columns`]'s own approach, minus the nested
+    /// `header` indirection: that helper only puts its *header* child into
+    /// a row, leaving `node` itself a column (right for `ColumnView`, whose
+    /// header sits above a `listview`) -- a widget whose own direct
+    /// children already sit side by side (`PopoverMenuBar`'s `item`s under
+    /// `menubar`, no wrapper) needs `node` itself in `Row`. Same borrow
+    /// caveat: call this before `Headless::event_cx`/`event_cx_with_handlers`.
+    pub fn place_row(&mut self, node: &Node, width: f32) {
+        self.tree.sync(node).expect("place_row: sync");
+        self.tree.set_container(
+            node,
+            crate::layout::Container::Box {
+                direction: crate::layout::BoxDirection::Row,
+            },
+        );
+        let style = crate::css::computed::ComputedStyle::initial(&self.env);
+        for child in node.children() {
+            self.tree
+                .set_style(&child, &style, crate::layout::Container::Leaf, &self.env);
+        }
+        let mut measure = crate::layout::FixedMeasure(taffy::Size {
+            width,
+            height: 30.0,
+        });
+        self.tree
+            .compute(
+                node,
+                taffy::Size {
+                    width: taffy::AvailableSpace::MaxContent,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+                &mut measure,
+            )
+            .expect("place_row: compute");
     }
 }
 
