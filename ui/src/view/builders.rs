@@ -673,6 +673,96 @@ impl<Msg: Clone + 'static> View<Msg> {
     }
 }
 
+/// `GtkGridView` over an explicit model, rendering cells via `factory`.
+#[must_use]
+pub fn grid_view<Msg: Clone + 'static>(
+    model: Rc<[crate::view::ListItem]>,
+    factory: crate::widgets::types::ItemFactory,
+) -> View<Msg> {
+    View::new(Kind::GridView)
+        .prop(PropName::Model, Prop::Items(model))
+        .prop(PropName::ItemFactory, Prop::Factory(factory))
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// `GtkGridView:min-columns`.
+    #[must_use]
+    pub fn min_columns(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MinColumns, v)
+    }
+
+    /// `GtkGridView:max-columns`.
+    #[must_use]
+    pub fn max_columns(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MaxColumns, v)
+    }
+}
+
+/// `GtkColumnView` over `model`, with one `column_view_column` per column.
+#[must_use]
+pub fn column_view<Msg: Clone + 'static>(
+    model: Rc<[crate::view::ListItem]>,
+    columns: impl IntoIterator<Item = View<Msg>>,
+) -> View<Msg> {
+    View::new(Kind::ColumnView)
+        .prop(PropName::Model, Prop::Items(model))
+        .children(columns)
+}
+
+/// One `column_view`'s column: `title` is what its header shows, `factory`
+/// binds each row's cell in this column.
+#[must_use]
+pub fn column_view_column<Msg: Clone + 'static>(
+    title: &str,
+    factory: crate::widgets::types::ItemFactory,
+) -> View<Msg> {
+    View::new(Kind::ColumnViewColumn)
+        .prop(PropName::Title, Prop::Str(Rc::from(title)))
+        .prop(PropName::ItemFactory, Prop::Factory(factory))
+}
+
+/// [`column_view`]/[`column_view_column`]'s own props, chained after either.
+/// Scoped to its own trait for the same reason [`StackPageExt`]'s doc
+/// comment gives.
+pub trait ColumnViewExt<Msg>: Sized {
+    /// `GtkColumnView:show-row-separators`.
+    fn show_row_separators(self, v: impl Into<Prop>) -> Self;
+    /// `GtkColumnView:show-column-separators`.
+    fn show_column_separators(self, v: impl Into<Prop>) -> Self;
+    /// Sort by column `index`, in `order` -- `GtkColumnView`'s initial
+    /// `GtkColumnViewSorter` state, set programmatically rather than by a
+    /// header click.
+    fn sort_column(self, index: usize, order: crate::widgets::types::SortOrder) -> Self;
+    /// `GtkColumnViewColumn:resizable`.
+    fn resizable(self, v: impl Into<Prop>) -> Self;
+    /// `GtkColumnViewColumn:expand`.
+    fn expand(self, v: impl Into<Prop>) -> Self;
+    /// `GtkColumnViewColumn:sorter`.
+    fn sorter(self, sorter: crate::widgets::types::Sorter) -> Self;
+}
+
+impl<Msg: Clone + 'static> ColumnViewExt<Msg> for View<Msg> {
+    fn show_row_separators(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShowRowSeparators, v)
+    }
+    fn show_column_separators(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShowColumnSeparators, v)
+    }
+    fn sort_column(self, index: usize, order: crate::widgets::types::SortOrder) -> Self {
+        self.prop(PropName::SortColumn, Prop::Int(index as i64))
+            .prop(PropName::SortOrder, Prop::Enum(order.to_u16()))
+    }
+    fn resizable(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Resizable, v)
+    }
+    fn expand(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Expand, v)
+    }
+    fn sorter(self, sorter: crate::widgets::types::Sorter) -> Self {
+        self.prop(PropName::Sorter, Prop::Sorter(sorter))
+    }
+}
+
 /// `stack_switcher`/`stack_sidebar`'s shared prop pair: titles as
 /// `PropName::Pages`'s `Prop::Classes` (deviation 5's shape reused for a
 /// plain string list) and the flagged pages folded into `PropName::

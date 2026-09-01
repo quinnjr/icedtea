@@ -553,8 +553,13 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListViewC {
     }
 }
 
+// `pub(crate)`: Task 20's `grid_view` tests reuse this module's `props`
+// helper (`widgets::list_view::tests::props`) rather than duplicating a
+// model/props builder that is otherwise identical -- a private `mod tests`
+// is visible only inside this file, so both the module and the helper need
+// crate visibility to cross into `widgets::grid_view`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::rc::Rc;
 
     use crate::view::{Kind, Prop, PropName, Props};
@@ -568,7 +573,7 @@ mod tests {
             .collect()
     }
 
-    fn props(n: u64) -> Props {
+    pub(crate) fn props(n: u64) -> Props {
         let mut p = Props::default();
         p.set(PropName::Model, Prop::Items(model(n)));
         p.set(

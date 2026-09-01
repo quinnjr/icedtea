@@ -57,6 +57,7 @@ pub mod calendar;
 pub mod center_box;
 pub mod check_button;
 pub mod color_dialog;
+pub mod column_view;
 pub mod drawing_area;
 pub mod drop_down;
 pub mod edit;
@@ -67,6 +68,7 @@ pub mod flow_box;
 pub mod font_dialog;
 pub mod frame;
 pub mod grid;
+pub mod grid_view;
 pub mod header_bar;
 pub mod image;
 pub mod info_bar;
@@ -822,7 +824,7 @@ thread_local! {
 /// `MeasureOverlay`/`ClipOverlay` (`Prop::Bool`) -- all four cheap, and all
 /// four re-derive a child's placement from the child's own node rather than
 /// owning that child's `Instance`.
-const RECORDED_PROP_NAMES: [PropName; 12] = [
+const RECORDED_PROP_NAMES: [PropName; 16] = [
     PropName::Column,
     PropName::Row,
     PropName::ColumnSpan,
@@ -838,6 +840,16 @@ const RECORDED_PROP_NAMES: [PropName; 12] = [
     PropName::PageName,
     PropName::PageTitle,
     PropName::NeedsAttention,
+    // `column_view::ColumnViewC::place`'s reader (Task 20): a
+    // `column_view_column`'s title, resizability, expand flag and
+    // comparator, re-derived from the child's own node the same way every
+    // reader above already does -- `ColumnViewC` has no `&mut Instance` of
+    // its own column children either, only their `Node`s (via `child_slot`
+    // redirecting them into its `header`).
+    PropName::Title,
+    PropName::Resizable,
+    PropName::Expand,
+    PropName::Sorter,
 ];
 
 /// Record the subset of `props` a container controller can re-derive a
@@ -1313,6 +1325,12 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::FlowBox => Box::new(<flow_box::FlowBoxC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::GridView => Box::new(<grid_view::GridViewC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::ColumnView => Box::new(<column_view::ColumnViewC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         Kind::StackSwitcher => Box::new(
             <stack_switcher::StackSwitcherC as Controller<Msg>>::build(node, props, cx),
         ),
@@ -1380,6 +1398,9 @@ pub fn child_slot(kind: Kind, controller: &dyn std::any::Any) -> Option<Node> {
         Kind::FontDialog => controller
             .downcast_ref::<font_dialog::FontDialogC>()
             .map(|c| c.sink.clone()),
+        Kind::ColumnView => controller
+            .downcast_ref::<column_view::ColumnViewC>()
+            .map(|c| c.header.clone()),
         _ => None,
     }
 }
@@ -1598,6 +1619,63 @@ impl Headless {
                 &mut measure,
             )
             .expect("place_rows: compute");
+    }
+
+    /// Lay a `ColumnView`'s `header` node's children out as a row of
+    /// fixed-`width` columns, for a click test that needs to know which
+    /// column a point landed in without standing up a full CSS layout pass.
+    ///
+    /// [`Headless::place_rows`]'s own approach, over a different shape: the
+    /// passed `node` becomes a column box (so a header sits above whatever
+    /// follows it), its `header` child (if any) becomes a row box, and every
+    /// leaf -- the header's own columns, plus any other direct child of
+    /// `node` (e.g. the embedded `listview`) -- gets the same fixed
+    /// `(width, 30px)` measure. Same caveat as `place_rows`: this borrows
+    /// `self.tree` for as long as the `EventCx` a later `event_cx` call
+    /// returns is alive, so a test that wants both must call this first.
+    pub fn place_columns(&mut self, node: &Node, width: f32) {
+        self.tree.sync(node).expect("place_columns: sync");
+        self.tree.set_container(
+            node,
+            crate::layout::Container::Box {
+                direction: crate::layout::BoxDirection::Column,
+            },
+        );
+        let header = node.children().into_iter().find(|c| &*c.name() == "header");
+        if let Some(header) = &header {
+            self.tree.set_container(
+                header,
+                crate::layout::Container::Box {
+                    direction: crate::layout::BoxDirection::Row,
+                },
+            );
+        }
+        let style = crate::css::computed::ComputedStyle::initial(&self.env);
+        for child in node.children() {
+            if header.as_ref().is_some_and(|h| h.ptr_eq(&child)) {
+                for column in child.children() {
+                    self.tree
+                        .set_style(&column, &style, crate::layout::Container::Leaf, &self.env);
+                }
+            } else {
+                self.tree
+                    .set_style(&child, &style, crate::layout::Container::Leaf, &self.env);
+            }
+        }
+        let mut measure = crate::layout::FixedMeasure(taffy::Size {
+            width,
+            height: 30.0,
+        });
+        self.tree
+            .compute(
+                node,
+                taffy::Size {
+                    width: taffy::AvailableSpace::MaxContent,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+                &mut measure,
+            )
+            .expect("place_columns: compute");
     }
 }
 

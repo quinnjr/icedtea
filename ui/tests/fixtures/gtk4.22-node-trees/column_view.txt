@@ -1,0 +1,5 @@
+columnview[.column-separators][.rich-list][.navigation-sidebar][.data-table]
+├── header
+│   ╰── <column header>
+├── listview
+╰── [rubberband]

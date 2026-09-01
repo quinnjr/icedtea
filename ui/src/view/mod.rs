@@ -217,6 +217,13 @@ pub enum PropName {
     SortColumn,
     SortOrder,
     Expand,
+    /// A `ColumnViewColumn`'s comparator. Reconciliation: neither the
+    /// contract's §5.5 table nor this part's own `PropName` list names a slot
+    /// for `column_view_column`'s `.sorter()` -- every other name a sortable
+    /// column could plausibly reuse (`SortColumn`/`SortOrder`) already means
+    /// "the view's *current* sort", not "this column's comparator", so this
+    /// adds the one genuinely missing name rather than overloading either.
+    Sorter,
     // P6 · menus
     Flags,
     VisibleSubmenu,
@@ -422,6 +429,7 @@ impl PropName {
             SortColumn,
             SortOrder,
             Expand,
+            Sorter,
             Flags,
             VisibleSubmenu,
             Accel,
@@ -512,6 +520,9 @@ pub enum Prop {
     /// can live in the non-generic [`Props`], and compared by pointer exactly
     /// as `Draw` is.
     Factory(crate::widgets::types::ItemFactory),
+    /// A sortable column's comparator. `Msg`-free and pointer-compared, the
+    /// same trade `Factory` makes for the same reason.
+    Sorter(crate::widgets::types::Sorter),
     /// The property is absent — what [`Props::diff`] reports for a removal
     /// and what [`crate::view::controller::Controller::set_prop`] receives
     /// when a prop disappears.
@@ -535,6 +546,7 @@ impl std::fmt::Debug for Prop {
             // address, which is what `PartialEq` compares.
             Prop::Draw(rc) => write!(f, "Draw({:p})", Rc::as_ptr(rc)),
             Prop::Factory(factory) => f.debug_tuple("Factory").field(factory).finish(),
+            Prop::Sorter(sorter) => f.debug_tuple("Sorter").field(sorter).finish(),
             Prop::None => f.write_str("None"),
         }
     }
@@ -557,6 +569,7 @@ impl PartialEq for Prop {
             (Prop::Items(a), Prop::Items(b)) => a == b,
             (Prop::Draw(a), Prop::Draw(b)) => Rc::ptr_eq(a, b),
             (Prop::Factory(a), Prop::Factory(b)) => a.ptr_eq(b),
+            (Prop::Sorter(a), Prop::Sorter(b)) => a.ptr_eq(b),
             (Prop::None, Prop::None) => true,
             _ => false,
         }
@@ -1889,7 +1902,9 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "duplicate P6 PropName");
-        assert_eq!(names.len(), 89);
+        // Task 20 adds `PropName::Sorter` -- see its own doc comment for why
+        // no existing P6 name could carry a `ColumnViewColumn` comparator.
+        assert_eq!(names.len(), 90);
     }
 
     #[test]

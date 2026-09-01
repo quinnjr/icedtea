@@ -775,6 +775,27 @@ fn flow_box_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn grid_view_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::Model,
+        icedtea_ui::view::Prop::Items(std::rc::Rc::from(vec![icedtea_ui::view::ListItem::new(
+            0, "cell 0",
+        )])),
+    );
+    assert_fixture(icedtea_ui::view::Kind::GridView, &props, "grid_view");
+}
+
+#[test]
+fn column_view_matches_its_gtk_fixture() {
+    assert_fixture(
+        icedtea_ui::view::Kind::ColumnView,
+        &icedtea_ui::view::Props::default(),
+        "column_view",
+    );
+}
+
+#[test]
 fn stack_switcher_matches_its_gtk_fixture() {
     let mut props = icedtea_ui::view::Props::default();
     props.set(
