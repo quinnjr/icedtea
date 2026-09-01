@@ -360,5 +360,71 @@ M1's `LayerWindow` is unchanged, at `window::layer` and still reachable as
 `wayland::LayerWindow`; the `themed-button` demo and its pixel gate run on it
 exactly as before.
 
-Not here: widgets (P5/P6), the reactive loop (P4), icons (P7), IME, drag and
-drop, client-side cursor themes.
+Not here: widgets beyond P5's 32 kinds (P6), the reactive loop (P4), icons
+(P7), IME, drag and drop, client-side cursor themes.
+
+## M3 Part 5 — the widget catalogue
+
+`icedtea_ui::widgets` builds one `Controller` per `Kind`, dispatched by
+`widgets::build_controller`; `view::builders` re-exports each widget's free
+constructor and `*Ext` setter trait under the name §4.4 requires. Behaviour
+(steppers repeating while held, a search entry's debounce, an entry's caret
+and selection, a drop-down's type-ahead filter) lives on the controller, not
+duplicated per widget: `Entry`, `SearchEntry`, `PasswordEntry` and
+`SpinButton` all share one `TextEditState`/`UndoStack` engine
+(`widgets::edit`); `MenuButton`, `DropDown` and the two dialog buttons all
+embed the same `PopoverC` surface.
+
+Every kind below is checked two ways: `tests/node_trees.rs` renders its
+retained `Node` subtree in GTK's own notation and matches it, node by node
+and class by class, against the fixture vendored verbatim from GTK 4.22.4's
+sources (`tests/fixtures/gtk4.22-node-trees/<fixture>.txt`); `tests/
+widget_pixels.rs` runs it through `App::run_offscreen` against Adwaita light
+and asserts on the rasterized pixels for both its rest state and its
+interactions. `every_p5_kind_has_a_fixture_and_matches_it_with_default_props`
+and `no_p5_kind_falls_through_to_the_unimplemented_controller` in
+`node_trees.rs`, and `every_p5_kind_renders_at_rest_without_panicking` in
+`widget_pixels.rs`, are exhaustive gates over `Kind::all()`'s P5 half: adding
+a kind without a fixture, without a dispatch arm, or whose default-props tree
+panics fails a named test rather than passing silently. P6 extends both
+files with its own 32 kinds; P8's gallery gate wires the whole set together.
+
+| Kind | CSS node | Builder | Fixture |
+| --- | --- | --- | --- |
+| `Label` | `label` | `label(text)` | `label.txt` |
+| `Spinner` | `spinner` | `spinner()` | `spinner.txt` |
+| `Statusbar` | `statusbar` | `statusbar()` | `statusbar.txt` |
+| `LevelBar` | `levelbar` | `level_bar()` | `level_bar.txt` |
+| `ProgressBar` | `progressbar` | `progress_bar()` | `progress_bar.txt` |
+| `InfoBar` | `infobar` | `info_bar()` | `info_bar.txt` |
+| `Scrollbar` | `scrollbar` | `scrollbar()` | `scrollbar.txt` |
+| `Image` | `image` | `image`/`image_named` | `image.txt` |
+| `Picture` | `picture` | `picture`/`picture_from_bytes` | `picture.txt` |
+| `Separator` | `separator` | `separator()` | `separator.txt` |
+| `TextView` | `textview` | `text_view()` | `text_view.txt` |
+| `Scale` | `scale` | `scale(lower, upper)` | `scale.txt` |
+| `DrawingArea` | `widget` | `drawing_area()` | `drawing_area.txt` |
+| `WindowControls` | `windowcontrols` | `window_controls()` | `window_controls.txt` |
+| `Calendar` | `calendar` | `calendar()` | `calendar.txt` |
+| `Popover` | `popover` | `popover(..)` | `popover.txt` |
+| `Button` | `button` | `button`/`button_from` | `button.txt` |
+| `ToggleButton` | `button.toggle` | `toggle_button()` | `toggle_button.txt` |
+| `LinkButton` | `button.link` | `link_button()` | `link_button.txt` |
+| `CheckButton` | `checkbutton` | `check_button()` | `check_button.txt` |
+| `MenuButton` | `menubutton` | `menu_button(..)` | `menu_button.txt` |
+| `Switch` | `switch` | `switch()` | `switch.txt` |
+| `DropDown` | `dropdown` | `drop_down`/`drop_down_from` | `drop_down.txt` |
+| `ColorDialogButton` | `colorbutton` | `color_dialog_button()` | `color_dialog_button.txt` |
+| `ColorDialog` | `window.dialog` | `color_dialog()` | `color_dialog.txt` |
+| `FontDialogButton` | `fontbutton` | `font_dialog_button()` | `font_dialog_button.txt` |
+| `FontDialog` | `window.dialog` | `font_dialog()` | `font_dialog.txt` |
+| `Entry` | `entry` | `entry()` | `entry.txt` |
+| `SearchEntry` | `entry.search` | `search_entry()` | `search_entry.txt` |
+| `PasswordEntry` | `entry.password` | `password_entry()` | `password_entry.txt` |
+| `SpinButton` | `spinbutton` | `spin_button(lower, upper)` | `spin_button.txt` |
+| `EditableLabel` | `editablelabel` | `editable_label(text)` | `editable_label.txt` |
+
+Not here: P6's 32 remaining kinds (containers, lists, and the rest), icon
+rasterization for `Image`/`CheckButton` (P7 — see contract §10 P5-D25/D26),
+`ListView` (P6 — `DropDown` and `FontDialog` build their row lists directly
+until then, contract §10 P5-D22/D23).

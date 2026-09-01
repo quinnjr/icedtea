@@ -1546,3 +1546,53 @@ fn an_editable_label_commits_on_enter_and_reverts_on_escape() {
         "Escape must not fire on_change — the model never saw the reverted edit"
     );
 }
+
+#[test]
+fn every_p5_kind_renders_at_rest_without_panicking() {
+    // mutation: make any controller's `build` index a subnode it did not
+    // create and this test panics for that kind by name.
+    use icedtea_ui::view::{Kind, Props};
+    use icedtea_ui::widgets::node_tree_of;
+    for kind in Kind::all() {
+        // P6's kinds still resolve to the Unimplemented controller; skip them.
+        if !matches!(
+            kind,
+            Kind::Label
+                | Kind::Spinner
+                | Kind::Statusbar
+                | Kind::LevelBar
+                | Kind::ProgressBar
+                | Kind::InfoBar
+                | Kind::Scrollbar
+                | Kind::Image
+                | Kind::Picture
+                | Kind::Separator
+                | Kind::TextView
+                | Kind::Scale
+                | Kind::DrawingArea
+                | Kind::WindowControls
+                | Kind::Calendar
+                | Kind::Popover
+                | Kind::Button
+                | Kind::ToggleButton
+                | Kind::LinkButton
+                | Kind::CheckButton
+                | Kind::MenuButton
+                | Kind::Switch
+                | Kind::DropDown
+                | Kind::ColorDialogButton
+                | Kind::ColorDialog
+                | Kind::FontDialogButton
+                | Kind::FontDialog
+                | Kind::Entry
+                | Kind::SearchEntry
+                | Kind::PasswordEntry
+                | Kind::SpinButton
+                | Kind::EditableLabel
+        ) {
+            continue;
+        }
+        let rendered = node_tree_of(*kind, &Props::default());
+        assert!(!rendered.is_empty(), "{kind:?} rendered nothing");
+    }
+}

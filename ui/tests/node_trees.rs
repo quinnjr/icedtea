@@ -545,3 +545,82 @@ fn a_spin_button_has_two_stepper_buttons_and_an_editable_label_has_a_stack() {
     let rendered = node_tree_of(Kind::EditableLabel, &label);
     assert!(rendered.contains("stack"), "{rendered}");
 }
+
+/// Every kind P5 owns, in contract §5.1–§5.3 order.
+const P5_KINDS: &[(Kind, &str)] = &[
+    (Kind::Label, "label"),
+    (Kind::Spinner, "spinner"),
+    (Kind::Statusbar, "statusbar"),
+    (Kind::LevelBar, "level_bar"),
+    (Kind::ProgressBar, "progress_bar"),
+    (Kind::InfoBar, "info_bar"),
+    (Kind::Scrollbar, "scrollbar"),
+    (Kind::Image, "image"),
+    (Kind::Picture, "picture"),
+    (Kind::Separator, "separator"),
+    (Kind::TextView, "text_view"),
+    (Kind::Scale, "scale"),
+    (Kind::DrawingArea, "drawing_area"),
+    (Kind::WindowControls, "window_controls"),
+    (Kind::Calendar, "calendar"),
+    (Kind::Popover, "popover"),
+    (Kind::Button, "button"),
+    (Kind::ToggleButton, "toggle_button"),
+    (Kind::LinkButton, "link_button"),
+    (Kind::CheckButton, "check_button"),
+    (Kind::MenuButton, "menu_button"),
+    (Kind::Switch, "switch"),
+    (Kind::DropDown, "drop_down"),
+    (Kind::ColorDialogButton, "color_dialog_button"),
+    (Kind::ColorDialog, "color_dialog"),
+    (Kind::FontDialogButton, "font_dialog_button"),
+    (Kind::FontDialog, "font_dialog"),
+    (Kind::Entry, "entry"),
+    (Kind::SearchEntry, "search_entry"),
+    (Kind::PasswordEntry, "password_entry"),
+    (Kind::SpinButton, "spin_button"),
+    (Kind::EditableLabel, "editable_label"),
+];
+
+#[test]
+fn every_p5_kind_has_a_fixture_and_matches_it_with_default_props() {
+    // mutation: delete any entry from P5_KINDS and the count assertion fails;
+    // delete a fixture file and `fixture()` panics by name.
+    assert_eq!(
+        P5_KINDS.len(),
+        32,
+        "contract §5.1-§5.3 owns exactly 32 kinds"
+    );
+    for (kind, name) in P5_KINDS {
+        check(*kind, name, &Props::default());
+    }
+}
+
+#[test]
+fn no_p5_kind_falls_through_to_the_unimplemented_controller() {
+    // mutation: remove any dispatch arm from build_controller and that kind's
+    // tree renders as a bare node, failing its fixture's required subnodes.
+    // Kinds whose GTK tree really is one bare node are listed explicitly, so
+    // this test cannot be satisfied by accident.
+    const BARE: &[Kind] = &[
+        Kind::Label,
+        Kind::Spinner,
+        Kind::InfoBar,
+        Kind::WindowControls,
+        Kind::Separator,
+        Kind::Image,
+        Kind::Picture,
+        Kind::DrawingArea,
+        Kind::Button,
+        Kind::ToggleButton,
+    ];
+    for (kind, _) in P5_KINDS {
+        let rendered = node_tree_of(*kind, &Props::default());
+        let has_subnodes = rendered.lines().count() > 1;
+        assert_eq!(
+            has_subnodes,
+            !BARE.contains(kind),
+            "{kind:?} rendered:\n{rendered}"
+        );
+    }
+}

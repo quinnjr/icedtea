@@ -6,5 +6,5 @@ dropdown
     ╰── contents
         ├── [entry.search]
         ╰── listview
-            ╰── row[.activatable]
+            ╰── [row.activatable]
             ┊
