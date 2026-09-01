@@ -984,7 +984,11 @@ fn a_check_button_paints_the_builtin_check_glyph() {
             `Instance` root. The part plan marks view/app.rs untouched (D5, \
             File Structure), so this is raised for the plan owner rather than \
             fixed here; unignore once `aim` resolves to the innermost \
-            `Instance` in the chain."]
+            `Instance` in the chain. The interaction itself is covered \
+            meanwhile by the in-crate unit test \
+            `widgets::drop_down::tests::opening_a_drop_down_and_clicking_a_row_selects_that_item`, \
+            which drives the same open -> click-row -> Selected path over a \
+            really laid-out tree."]
 fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
     // mutation: never fire EventKind::Selected in DropDownC::on_event and the
     // model stays at 0.
