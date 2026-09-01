@@ -93,6 +93,20 @@ impl<Msg: Clone + 'static> Controller<Msg> for FrameC {
     fn on_event(&mut self, _ev: &Event, _cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         Vec::new()
     }
+
+    /// The `label` subnode occupies index 0, so the application child starts
+    /// at 1 whenever the frame is titled.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + usize::from(self.label.is_some())
+    }
+
+    /// ... and reconcile's trim step must know the label is there, or it
+    /// detaches it as soon as one real view child is reconciled in
+    /// (`reconcile_reserved`'s `trim_from`) -- the same chrome-eviction bug
+    /// `reserve` was introduced to fix, which this controller was missing.
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + usize::from(self.label.is_some())
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +195,33 @@ mod tests {
         assert!(
             before.ptr_eq(&after),
             "the label node survived the text change"
+        );
+    }
+
+    #[test]
+    fn reconciling_a_real_child_into_a_titled_frame_keeps_the_label() {
+        // Mutation check: drop `FrameC`'s `child_index`/`reserved_total` (as
+        // this module shipped) and reconcile puts the view child at index 0
+        // and then trims everything past index 0 -- the label node is
+        // detached the first frame a titled frame has a child, and every
+        // `frame > label` rule stops matching.
+        let mut hx = crate::widgets::Headless::new();
+        let root = crate::css::node::Node::new("window");
+        let mut instances: Vec<crate::view::reconcile::Instance<Msg>> = Vec::new();
+        {
+            let mut cx = hx.cx();
+            crate::view::reconcile::reconcile(&root, &mut instances, vec![view(&())], &mut cx);
+        }
+        let frame_node = root.child(0).expect("the frame instance's node");
+        let names: Vec<String> = frame_node
+            .children()
+            .iter()
+            .map(|n| n.name().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["label".to_owned(), "label".to_owned()],
+            "the frame's own label subnode, then the `label(\"body\")` child"
         );
     }
 }

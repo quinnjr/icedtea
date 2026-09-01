@@ -191,6 +191,57 @@ impl ScrolledWindowC {
 
     /// Create or remove the `scrollbar`/`junction` chrome nodes and keep
     /// their overlay class in step with `self.overlay`.
+    /// The chrome subnodes, in the sibling order GTK's own node block (this
+    /// module's doc comment) and `fixtures/gtk4.22-node-trees/
+    /// scrolled_window.txt` declare: overshoot, then the horizontal bar,
+    /// then the vertical bar, then the junction. (`undershoot` is never
+    /// built -- see the module doc.)
+    fn chrome_in_order(&self) -> Vec<Node> {
+        [
+            self.overshoot_x_node.clone(),
+            self.overshoot_y_node.clone(),
+            self.hbar_node.clone(),
+            self.vbar_node.clone(),
+            self.junction.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Move the chrome back behind the application child, in declared order.
+    ///
+    /// Chrome is *created* in whatever order the events that need it arrive
+    /// -- the bars and junction at build or on a policy change, an
+    /// `overshoot.<edge>` only the first time a drag pulls past an end --
+    /// so appending each one as it appears produces `<child>`,
+    /// `scrollbar.horizontal`, `scrollbar.vertical`, `junction`,
+    /// `overshoot.bottom`: not the order this widget's own doc block, its
+    /// fixture, or (since the paint walker treats node order as z-order) the
+    /// theme's painting expects. This re-appends the whole chrome run in the
+    /// declared order whenever it is not already in it, which is a no-op on
+    /// a steady frame -- reattaching dirties a restyle, so the comparison
+    /// comes first.
+    fn restack_chrome(&self) {
+        let want = self.chrome_in_order();
+        let children = self.root.children();
+        let tail = children.len().saturating_sub(want.len());
+        if children.len() >= want.len()
+            && children[tail..]
+                .iter()
+                .zip(&want)
+                .all(|(have, expect)| have.ptr_eq(expect))
+        {
+            return;
+        }
+        for node in &want {
+            node.detach();
+        }
+        for node in &want {
+            self.root.append_child(node);
+        }
+    }
+
     fn sync_bars(&mut self) {
         let (want_h, want_v) = self.visible_bars();
         self.sync_one_bar(want_h, false);
@@ -209,6 +260,7 @@ impl ScrolledWindowC {
             (true, Some(j)) => self.junction = Some(j),
             (false, None) => {}
         }
+        self.restack_chrome();
     }
 
     fn sync_one_bar(&mut self, want: bool, vertical: bool) {
@@ -291,6 +343,7 @@ impl ScrolledWindowC {
             "top",
             "bottom",
         );
+        self.restack_chrome();
     }
 
     fn sync_edge(root: &Node, slot: &mut Option<Node>, magnitude: f32, neg: &str, pos: &str) {
@@ -709,5 +762,63 @@ mod tests {
             let (x, y) = ScrolledWindowC::offset_of(c.as_ref());
             assert!(x.is_finite() && y.is_finite(), "offset stayed finite");
         }
+    }
+
+    #[test]
+    fn chrome_follows_the_application_child_in_gtks_declared_order() {
+        // The order this module's doc block and
+        // `fixtures/gtk4.22-node-trees/scrolled_window.txt` declare is
+        // `<child>`, overshoot, undershoot, scrollbar.horizontal,
+        // scrollbar.vertical, junction -- and the paint walker treats node
+        // order as z-order, so it is not cosmetic.
+        //
+        // Mutation check: drop `restack_chrome`'s two call sites (chrome
+        // appended in creation order, as this module shipped) and the
+        // overshoot node lands *after* the junction, because it is only
+        // created the first time a drag pulls past an end.
+        let mut p = props(false);
+        p.set(
+            PropName::HscrollbarPolicy,
+            Prop::Enum(Policy::Always.to_u16()),
+        );
+        p.set(
+            PropName::VscrollbarPolicy,
+            Prop::Enum(Policy::Always.to_u16()),
+        );
+        let built = build_widget::<()>(Kind::ScrolledWindow, &p);
+        // What `reconcile` does with the one view child: it lands at index
+        // 0, in front of the chrome `build` already attached.
+        let child = crate::css::node::Node::new("viewport");
+        built.node.insert_child(0, &child);
+
+        let mut c = built.controller;
+        let mut hx = Headless::new();
+        let mut cx = hx.event_cx(&built.node);
+        ScrolledWindowC::set_extent(c.as_mut(), (100.0, 200.0), (100.0, 100.0));
+        c.on_event(&Event::Scroll(Headless::scroll(0.0, 500.0)), &mut cx);
+
+        let order: Vec<String> = built
+            .node
+            .children()
+            .iter()
+            .map(|n| {
+                let mut name = n.name().to_string();
+                for class in n.classes() {
+                    name.push('.');
+                    name.push_str(class.as_str());
+                }
+                name
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "viewport".to_owned(),
+                "overshoot.bottom".to_owned(),
+                "scrollbar.overlay-indicator.horizontal".to_owned(),
+                "scrollbar.overlay-indicator.vertical".to_owned(),
+                "junction".to_owned(),
+            ]
+        );
     }
 }
