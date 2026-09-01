@@ -15,6 +15,7 @@
 //! table, which contract §5.3 makes the single source for the whole family.
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use crate::css::computed::ComputedStyle;
 use crate::css::node::Node;
@@ -22,6 +23,7 @@ use crate::layout::Rect;
 use crate::text::{Ellipsize, TextLayout, TextStyle, WrapMode};
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
+use crate::widgets::edit::UndoStack;
 use crate::widgets::{PointerState, local_rect, shift_event};
 use crate::window::keyboard::Mods;
 use crate::window::pointer::Kinetic;
@@ -120,6 +122,8 @@ pub struct TextViewC {
     pub text_node: Node,
     /// The `selection` subnode, present only while a selection exists.
     pub selection_node: Option<Node>,
+    /// The undo stack, honouring `GtkTextView:enable-undo`.
+    pub undo: UndoStack,
     editable: bool,
     wrap: WrapMode,
     pointer: PointerState,
@@ -154,7 +158,7 @@ impl TextViewC {
     }
 
     /// Apply one key to the buffer. Returns `true` if the buffer changed.
-    fn apply_key(&mut self, key: &crate::window::keyboard::KeyEvent) -> bool {
+    fn apply_key(&mut self, key: &crate::window::keyboard::KeyEvent, now: Duration) -> bool {
         use xkbcommon::xkb::keysyms;
         if !key.pressed {
             return false;
@@ -170,6 +174,24 @@ impl TextViewC {
             this.cursor = to;
         };
         match u32::from(key.keysym) {
+            keysyms::KEY_z if ctrl && !shift => match self.undo.undo() {
+                Some((buffer, cursor)) => {
+                    self.buffer = buffer;
+                    self.cursor = cursor.min(self.buffer.len());
+                    self.anchor = None;
+                    true
+                }
+                None => false,
+            },
+            keysyms::KEY_y | keysyms::KEY_Z if ctrl => match self.undo.redo() {
+                Some((buffer, cursor)) => {
+                    self.buffer = buffer;
+                    self.cursor = cursor.min(self.buffer.len());
+                    self.anchor = None;
+                    true
+                }
+                None => false,
+            },
             keysyms::KEY_Left => {
                 let to = if ctrl {
                     self.layout.prev_word(self.cursor)
@@ -203,6 +225,7 @@ impl TextViewC {
                 false
             }
             keysyms::KEY_BackSpace if self.editable => {
+                let before = self.buffer.clone();
                 let range = self.selection_range();
                 if range.is_empty() {
                     let from = self.layout.prev_grapheme(self.cursor);
@@ -216,9 +239,11 @@ impl TextViewC {
                     self.cursor = range.start;
                 }
                 self.anchor = None;
+                self.undo.record(&before, &self.buffer, self.cursor, now);
                 true
             }
             keysyms::KEY_Delete if self.editable => {
+                let before = self.buffer.clone();
                 let range = self.selection_range();
                 if range.is_empty() {
                     let to = self.layout.next_grapheme(self.cursor);
@@ -231,6 +256,7 @@ impl TextViewC {
                     self.cursor = range.start;
                 }
                 self.anchor = None;
+                self.undo.record(&before, &self.buffer, self.cursor, now);
                 true
             }
             _ => {
@@ -240,10 +266,12 @@ impl TextViewC {
                 if text.chars().all(|c| c.is_control() && c != '\n') {
                     return false;
                 }
+                let before = self.buffer.clone();
                 let range = self.selection_range();
                 self.buffer.replace_range(range.clone(), text);
                 self.cursor = range.start + text.len();
                 self.anchor = None;
+                self.undo.record(&before, &self.buffer, self.cursor, now);
                 true
             }
         }
@@ -290,6 +318,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
             kinetic: Kinetic::default(),
             text_node,
             selection_node: None,
+            undo: UndoStack::new(props.bool(PropName::EnableUndo, true)),
             editable: props.bool(PropName::Editable, true),
             wrap: match props.get(PropName::Wrap) {
                 Some(Prop::Enum(1)) => WrapMode::Word,
@@ -353,7 +382,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
             }
         }
         if let Event::Key(key) = ev {
-            let changed = self.apply_key(key);
+            let changed = self.apply_key(key, cx.clock.now());
             self.sync_selection();
             if changed {
                 cx.handled = true;

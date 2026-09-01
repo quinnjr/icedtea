@@ -49,6 +49,7 @@ pub mod check_button;
 pub mod color_dialog;
 pub mod drawing_area;
 pub mod drop_down;
+pub mod edit;
 pub mod font_dialog;
 pub mod image;
 pub mod info_bar;
