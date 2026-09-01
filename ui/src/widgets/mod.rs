@@ -21,7 +21,7 @@ use selectors::Element as _;
 use selectors::OpaqueElement;
 
 use crate::css::node::{Node, PseudoStates};
-use crate::layout::{Container, Rect};
+use crate::layout::{ChildLayout, Container, Rect};
 use crate::view::controller::{Controller, Event};
 use crate::view::{BuildCx, Kind, Prop, PropName, Props};
 use crate::window::focus::FOCUSABLE_CLASS;
@@ -51,6 +51,7 @@ impl ListItem {
 pub mod box_;
 pub mod button;
 pub mod calendar;
+pub mod center_box;
 pub mod check_button;
 pub mod color_dialog;
 pub mod drawing_area;
@@ -687,6 +688,7 @@ struct Pending {
     container: Option<Container>,
     gap: Option<(f32, Orientation)>,
     homogeneous: Option<(bool, Orientation)>,
+    child_layout: Option<ChildLayout>,
     node: Option<Node>,
 }
 
@@ -716,6 +718,20 @@ pub(crate) fn set_container(node: &Node, container: Container) {
 #[must_use]
 pub(crate) fn container_of(node: &Node) -> Container {
     CONTAINERS.with(|c| c.borrow().get(&node.opaque()).copied().unwrap_or_default())
+}
+
+/// Record `node`'s per-child layout (alignment/expansion), keyed by the
+/// *child* node itself rather than its parent -- a `Container::Center`'s
+/// three children each need a different [`ChildLayout`], which the
+/// one-entry-per-node `container`/`gap`/`homogeneous` fields above cannot
+/// express.
+pub(crate) fn set_child_layout(node: &Node, layout: ChildLayout) {
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let entry = p.entry(node.opaque()).or_default();
+        entry.child_layout = Some(layout);
+        entry.node = Some(node.clone());
+    });
 }
 
 /// Record a gap floor for `node`'s main axis, keyed by `orientation`.
@@ -762,6 +778,9 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
             let Some(node) = &pending.node else { continue };
             if let Some(container) = pending.container {
                 tree.set_container(node, container);
+            }
+            if let Some(child_layout) = pending.child_layout {
+                tree.set_child_layout(node, child_layout);
             }
             if let Some((gap, orientation)) = pending.gap {
                 // GTK's own gap property and CSS `border-spacing` both
@@ -861,6 +880,9 @@ pub fn build_controller<Msg: Clone + 'static>(
     node.set_classes(kind.base_classes());
     let mut boxed: Box<dyn Controller<Msg>> = match kind {
         Kind::Box => Box::new(<box_::BoxC as Controller<Msg>>::build(node, props, cx)),
+        Kind::CenterBox => Box::new(<center_box::CenterBoxC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         Kind::Separator => Box::new(<separator::SeparatorC as Controller<Msg>>::build(
             node, props, cx,
         )),

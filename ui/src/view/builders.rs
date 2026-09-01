@@ -58,6 +58,20 @@ pub fn slot<Msg: Clone + 'static>(view: View<Msg>, name: &str) -> View<Msg> {
     view.prop(PropName::Section, Prop::Str(Rc::from(name)))
 }
 
+/// `GtkCenterBox`: exactly three children, in `start`, `centre`, `end` order.
+#[must_use]
+pub fn center_box<Msg: Clone + 'static>(
+    start: View<Msg>,
+    center: View<Msg>,
+    end: View<Msg>,
+) -> View<Msg> {
+    View::new(Kind::CenterBox).children([
+        slot(start, "start"),
+        slot(center, "center"),
+        slot(end, "end"),
+    ])
+}
+
 /// Contract deviation (Task 4): every P6 setter takes `impl Into<Prop>`
 /// rather than a concrete type. `View<Msg>` has one inherent-method
 /// namespace across the whole widget catalogue, and GTK gives `position`
@@ -168,6 +182,12 @@ impl<Msg: Clone + 'static> View<Msg> {
     #[must_use]
     pub fn baseline_position(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::BaselinePosition, v)
+    }
+
+    /// `GtkCenterBox:shrink-center-last`.
+    #[must_use]
+    pub fn shrink_center_last(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShrinkCenterLast, v)
     }
 }
 
