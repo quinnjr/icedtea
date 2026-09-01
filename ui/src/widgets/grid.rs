@@ -242,6 +242,59 @@ mod tests {
     }
 
     #[test]
+    fn row_homogeneous_stretches_a_short_row_to_match_a_tall_one() {
+        // Mutation check: `grid()` forgetting to inject `PropName::Rows`
+        // (leaving the container's row count at its default of 1) turns
+        // row 1 into an implicit taffy track, which always sizes as `auto`
+        // (content-only) regardless of `row_homogeneous` -- `grid_auto_rows`
+        // is never set anywhere, so nothing tells that implicit track to
+        // match its homogeneous siblings. With only one explicit row
+        // template (the un-injected count), `row_homogeneous(true)` then
+        // has *no effect at all*: row 0 (one short label) still hugs its
+        // own tiny content height directly above row 1 (a taller
+        // three-label stack), the same as `row_homogeneous(false)` would.
+        //
+        // With the count injected, both rows are explicit `fr(1.0)` tracks,
+        // so `row_homogeneous(true)` stretches row 0's track to match row
+        // 1's much taller one -- opening up a wide blank gap between row
+        // 0's short label and row 1's stack that the un-fixed grid never
+        // has.
+        fn two_rows(_: &()) -> View<Msg> {
+            grid([
+                label("a").at(0, 0),
+                crate::view::builders::box_(
+                    crate::widgets::Orientation::Vertical,
+                    [label("x"), label("y"), label("z")],
+                )
+                .at(0, 1),
+            ])
+            .row_homogeneous(true)
+        }
+        let out = frames((), update, two_rows, (240, 200), vec![ScriptStep::Capture]);
+        let background = px(&out, 0, 239, 0);
+        let row_has_ink = |y: u32| (0..240).any(|x| px(&out, 0, x, y) != background);
+        let first_ink = (0..200u32).find(|&y| row_has_ink(y)).expect("some ink");
+        let blank_start = (first_ink..200u32)
+            .find(|&y| !row_has_ink(y))
+            .expect("row 0's ink ends before the surface does");
+        let row1_start = (blank_start..200u32)
+            .find(|&y| row_has_ink(y))
+            .expect("row 1 paints below the gap");
+        let gap = row1_start - blank_start;
+        // Measured (with the fix): row 0's short label sits at y=50..58,
+        // then a blank gap of ~49px before row 1's stack resumes at
+        // y=107..152. Without the fix, row 0 hugs row 1 with only the
+        // stack's own natural ~12px inter-row gap. 30px comfortably
+        // separates "stretched to match" from "hugging its own content".
+        assert!(
+            gap > 30,
+            "row_homogeneous(true) should open a wide gap between row 0's short \
+             content and row 1's tall content by stretching row 0's track to \
+             match row 1's -- got a {gap}px gap"
+        );
+    }
+
+    #[test]
     fn re_laying_out_after_a_span_change_keeps_the_same_nodes() {
         // Interaction test. Mutation check: rebuilding children on a span
         // change destroys node identity and the second frame differs in the

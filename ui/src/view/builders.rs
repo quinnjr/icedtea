@@ -81,8 +81,9 @@ pub fn center_box<Msg: Clone + 'static>(
 #[must_use]
 pub fn grid<Msg: Clone + 'static>(children: impl IntoIterator<Item = View<Msg>>) -> View<Msg> {
     let view = View::new(Kind::Grid).children(children);
-    let (columns, _rows) = crate::widgets::grid::GridC::extent_of(&view);
+    let (columns, rows) = crate::widgets::grid::GridC::extent_of(&view);
     view.prop(PropName::Columns, i64::from(columns))
+        .prop(PropName::Rows, i64::from(rows))
 }
 
 impl<Msg: Clone + 'static> View<Msg> {
