@@ -5,10 +5,25 @@
 //! the crate that defines it, and "a `Kind` with no gallery entry does not
 //! compile" is the completeness guarantee the M3 gate rests on.
 
+use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::PathBuf;
+use std::rc::Rc;
+
+use skia_rs_safe::core::Color;
+use skia_rs_safe::paint::Paint;
 
 use crate::css::parse::{ColorScheme, Contrast, MediaEnv};
-use crate::view::Kind;
+use crate::css::value::{IconRef, Rgba};
+use crate::layout::Rect;
+use crate::view::builders::{
+    self as w, CheckButtonExt, ColorDialogButtonExt, DropDownExt, ImageExt, InfoBarExt, LabelExt,
+    LevelBarExt, MenuButtonExt, PopoverExt, ProgressBarExt, ScaleExt, ScrollbarExt, SpinnerExt,
+    StatusbarExt, TextViewExt, ToggleButtonExt,
+};
+use crate::view::cmd::Cmd;
+use crate::view::{Kind, View};
+use crate::widgets::types::{MessageType, Orientation, Side};
 use crate::{BUNDLED_ADWAITA_DARK, BUNDLED_ADWAITA_HC, BUNDLED_ADWAITA_LIGHT};
 
 /// Which bundled Adwaita sheet the gallery compiles, and under which
@@ -310,6 +325,356 @@ pub fn kind_from_name(name: &str) -> Option<Kind> {
     Kind::all().iter().copied().find(|&k| kind_name(k) == name)
 }
 
+/// Everything the gallery's widgets can say. One variant per `EventKind` the
+/// samples bind, carrying the `Kind` that spoke so the interaction gate can
+/// name it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GalleryMsg {
+    /// A button-ish widget was clicked.
+    Clicked(Kind),
+    /// A toggle/check/switch changed state.
+    Toggled(Kind, bool),
+    /// An editable widget's text changed.
+    Changed(Kind, String),
+    /// A list-ish widget's selection changed.
+    Selected(Kind, usize),
+    /// A range widget's value changed.
+    ValueChanged(Kind, f64),
+    /// `EventKind::Activate` (Space/Enter, or a completed click).
+    Activated(Kind),
+    /// A `SearchEntry` fired after its delay.
+    Search(String),
+    /// A `Notebook`/`Stack` page changed.
+    PageChanged(usize),
+    /// An `Expander` opened or closed.
+    Expanded(bool),
+    /// A dialog-ish widget asked to close.
+    Closed(Kind),
+}
+
+impl GalleryMsg {
+    /// The one line this message prints on stdout.
+    ///
+    /// Flat ASCII-ish, whitespace-separated, newlines in payloads folded to
+    /// spaces: the interaction gate matches on substrings of these lines and a
+    /// payload must not be able to forge a second line.
+    #[must_use]
+    pub fn log_line(&self) -> String {
+        fn flat(text: &str) -> String {
+            text.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect()
+        }
+        match self {
+            GalleryMsg::Clicked(k) => format!("clicked {}", kind_name(*k)),
+            GalleryMsg::Toggled(k, on) => format!("toggled {} {on}", kind_name(*k)),
+            GalleryMsg::Changed(k, text) => format!("changed {} {}", kind_name(*k), flat(text)),
+            GalleryMsg::Selected(k, i) => format!("selected {} {i}", kind_name(*k)),
+            GalleryMsg::ValueChanged(k, v) => format!("value {} {v}", kind_name(*k)),
+            GalleryMsg::Activated(k) => format!("activated {}", kind_name(*k)),
+            GalleryMsg::Search(text) => format!("search {}", flat(text)),
+            GalleryMsg::PageChanged(i) => format!("page {i}"),
+            GalleryMsg::Expanded(on) => format!("expanded {on}"),
+            GalleryMsg::Closed(k) => format!("closed {}", kind_name(*k)),
+        }
+    }
+}
+
+/// The gallery's whole model: per-kind widget state plus the message log.
+///
+/// Keyed by [`kind_name`] rather than by `Kind` so a `BTreeMap` debug dump
+/// reads the way the gate's assertions do.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GalleryModel {
+    /// Which sheet is compiled; the samples do not read it, the runner does.
+    pub theme: Theme,
+    /// `--widget`'s kind, when the page holds exactly one widget.
+    pub only: Option<Kind>,
+    /// Checked/active state per kind.
+    pub toggles: BTreeMap<&'static str, bool>,
+    /// Editable text per kind.
+    pub texts: BTreeMap<&'static str, String>,
+    /// Range value per kind.
+    pub values: BTreeMap<&'static str, f64>,
+    /// Selected index per kind.
+    pub selected: BTreeMap<&'static str, usize>,
+    /// The visible `Notebook`/`Stack` page.
+    pub page: usize,
+    /// The `Expander`'s state.
+    pub expanded: bool,
+    /// `--scroll`, in px. Lives on the model because `App::new` takes a
+    /// `fn(&M) -> View<Msg>` pointer (§4.7), which cannot capture it.
+    pub scroll: i32,
+    /// Every folded message's [`GalleryMsg::log_line`], in order.
+    pub log: Vec<String>,
+}
+
+impl GalleryModel {
+    /// A model with every widget in its documented initial state.
+    #[must_use]
+    pub fn new(theme: Theme, only: Option<Kind>) -> Self {
+        let mut model = GalleryModel {
+            theme,
+            only,
+            toggles: BTreeMap::new(),
+            texts: BTreeMap::new(),
+            values: BTreeMap::new(),
+            selected: BTreeMap::new(),
+            page: 0,
+            expanded: false,
+            scroll: 0,
+            log: Vec::new(),
+        };
+        model
+            .texts
+            .insert(kind_name(Kind::Entry), "Entry".to_string());
+        model
+            .texts
+            .insert(kind_name(Kind::TextView), "Text view".to_string());
+        model
+            .texts
+            .insert(kind_name(Kind::PasswordEntry), "hunter2".to_string());
+        model
+            .texts
+            .insert(kind_name(Kind::EditableLabel), "Editable".to_string());
+        model.values.insert(kind_name(Kind::Scale), 40.0);
+        model.values.insert(kind_name(Kind::SpinButton), 3.0);
+        model
+    }
+
+    /// This kind's checked/active state; `false` until something toggles it.
+    #[must_use]
+    pub fn toggle(&self, kind: Kind) -> bool {
+        self.toggles.get(kind_name(kind)).copied().unwrap_or(false)
+    }
+
+    /// This kind's text; `""` until something sets it.
+    #[must_use]
+    pub fn text(&self, kind: Kind) -> &str {
+        self.texts.get(kind_name(kind)).map_or("", String::as_str)
+    }
+
+    /// This kind's range value; `0.0` until something sets it.
+    #[must_use]
+    pub fn value(&self, kind: Kind) -> f64 {
+        self.values.get(kind_name(kind)).copied().unwrap_or(0.0)
+    }
+
+    /// This kind's selected index; `0` until something selects.
+    #[must_use]
+    pub fn selection(&self, kind: Kind) -> usize {
+        self.selected.get(kind_name(kind)).copied().unwrap_or(0)
+    }
+}
+
+/// Fold one message into the model and print its log line.
+///
+/// The print is the whole reason the gate can make *model* assertions across
+/// a process boundary; stdout is block-buffered when piped, so every line is
+/// flushed immediately.
+pub fn update(model: &mut GalleryModel, msg: GalleryMsg) -> Cmd<GalleryMsg> {
+    let line = msg.log_line();
+    match msg {
+        GalleryMsg::Toggled(kind, on) => {
+            model.toggles.insert(kind_name(kind), on);
+        }
+        GalleryMsg::Changed(kind, text) => {
+            model.texts.insert(kind_name(kind), text);
+        }
+        GalleryMsg::ValueChanged(kind, value) => {
+            model.values.insert(kind_name(kind), value);
+        }
+        GalleryMsg::Selected(kind, index) => {
+            model.selected.insert(kind_name(kind), index);
+        }
+        GalleryMsg::PageChanged(index) => model.page = index,
+        GalleryMsg::Expanded(on) => model.expanded = on,
+        GalleryMsg::Clicked(_)
+        | GalleryMsg::Activated(_)
+        | GalleryMsg::Search(_)
+        | GalleryMsg::Closed(_) => {}
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "msg {line}");
+    let _ = out.flush();
+    model.log.push(line);
+    Cmd::None
+}
+
+/// A kind's place in the gallery.
+pub enum Sample {
+    /// Its own framed entry, rooted at a view of that kind.
+    Own(View<GalleryMsg>),
+    /// Rendered only inside the named parent kind's entry.
+    Within(Kind),
+}
+
+/// A 4x4 opaque `#e01b24` PNG, so the `Picture` sample has something real to
+/// decode without vendoring a binary fixture the gallery cannot find at
+/// runtime.
+pub const SAMPLE_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x06, 0x00, 0x00, 0x00, 0xa9, 0xf1, 0x9e,
+    0x7e, 0x00, 0x00, 0x00, 0x12, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x78, 0x20, 0xad, 0xf2,
+    0x1f, 0x19, 0x33, 0x90, 0x2e, 0x00, 0x00, 0x7d, 0x10, 0x21, 0xe1, 0xa6, 0x7b, 0xaf, 0xe4, 0x00,
+    0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// Where [`SAMPLE_PNG`] lives on disk, written on first ask.
+///
+/// A write failure is not fatal: `Picture` then shows nothing and only that
+/// one probe fails, which is a better failure than a dead gallery.
+#[must_use]
+pub fn sample_png_path() -> PathBuf {
+    let path = std::env::temp_dir().join("icedtea-gallery-sample.png");
+    let fresh = std::fs::read(&path)
+        .ok()
+        .is_none_or(|got| got != SAMPLE_PNG);
+    if fresh && let Err(err) = std::fs::write(&path, SAMPLE_PNG) {
+        tracing::warn!(path = %path.display(), %err, "cannot write the gallery's sample png");
+    }
+    path
+}
+
+/// The exhaustive sample table: one entry per `Kind`.
+///
+/// Exhaustive on purpose — a new `Kind` fails to compile here, which is how
+/// the gallery stays a completeness measure rather than a demo.
+#[must_use]
+pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
+    match kind {
+        // ---- P5 · display ------------------------------------------------
+        Kind::Label => Sample::Own(w::label("Label").wrap(true).xalign(0.0)),
+        Kind::Spinner => Sample::Own(w::spinner().spinning(true)),
+        Kind::Statusbar => Sample::Own(StatusbarExt::text(w::statusbar(), "Ready")),
+        Kind::LevelBar => Sample::Own(
+            w::level_bar(0.6)
+                .min_value(0.0)
+                .max_value(1.0)
+                .width_request(160),
+        ),
+        Kind::ProgressBar => Sample::Own(w::progress_bar(0.4).show_text(true).width_request(160)),
+        Kind::InfoBar => Sample::Own(
+            w::info_bar()
+                .message_type(MessageType::Info)
+                .revealed(true)
+                .show_close_button(true)
+                .on_close(GalleryMsg::Closed(Kind::InfoBar))
+                .child(w::label("An info bar")),
+        ),
+        Kind::Scrollbar => Sample::Own(
+            ScrollbarExt::value(w::scrollbar(Orientation::Horizontal), 0.3)
+                .lower(0.0)
+                .upper(1.0)
+                .page_size(0.25)
+                .width_request(160)
+                .on_value_changed(|v| GalleryMsg::ValueChanged(Kind::Scrollbar, v)),
+        ),
+        Kind::Image => Sample::Own(
+            w::image(IconRef::Theme {
+                name: Rc::from("folder"),
+            })
+            .pixel_size(32),
+        ),
+        Kind::Picture => Sample::Own(
+            w::picture(&sample_png_path())
+                .width_request(48)
+                .height_request(48),
+        ),
+        Kind::Separator => Sample::Own(w::separator(Orientation::Horizontal).width_request(160)),
+        Kind::TextView => Sample::Own(
+            w::text_view(model.text(Kind::TextView))
+                .editable(true)
+                .width_request(200)
+                .height_request(64)
+                .on_change(|t: &str| GalleryMsg::Changed(Kind::TextView, t.to_string())),
+        ),
+        Kind::Scale => Sample::Own(
+            ScaleExt::value(w::scale(0.0, 100.0), model.value(Kind::Scale))
+                .orientation(Orientation::Horizontal)
+                .width_request(200)
+                .on_value_changed(|v| GalleryMsg::ValueChanged(Kind::Scale, v)),
+        ),
+        Kind::DrawingArea => Sample::Own(
+            w::drawing_area(
+                |canvas: &mut skia_rs_safe::canvas::Canvas<'_>, rect: Rect| {
+                    let mut paint = Paint::new();
+                    paint.set_color32(Color(0xFF33_D17A));
+                    canvas.draw_rect(&rect.to_skia(), &paint);
+                },
+            )
+            .width_request(64)
+            .height_request(48),
+        ),
+        Kind::WindowControls => Sample::Own(w::window_controls(Side::End)),
+        Kind::Calendar => Sample::Own(
+            w::calendar(2026, 8, 27)
+                .on_date_selected(|iso: &str| GalleryMsg::Changed(Kind::Calendar, iso.to_string())),
+        ),
+        // A non-autohide popover renders into the parent window's own tree
+        // (§5.1's ruling), which is what gives it pixels at rest.
+        Kind::Popover => Sample::Own(
+            w::popover(w::label("Popover"))
+                .autohide(false)
+                .has_arrow(true),
+        ),
+
+        // ---- P5 · buttons ------------------------------------------------
+        Kind::Button => {
+            Sample::Own(w::button("Button").on_click(GalleryMsg::Clicked(Kind::Button)))
+        }
+        Kind::ToggleButton => Sample::Own(
+            ToggleButtonExt::active(w::toggle_button("Toggle"), model.toggle(Kind::ToggleButton))
+                .on_toggle(|on| GalleryMsg::Toggled(Kind::ToggleButton, on)),
+        ),
+        Kind::LinkButton => Sample::Own(
+            w::link_button("https://example.invalid/", "Link")
+                .on_activate_link(|_uri: &str| GalleryMsg::Clicked(Kind::LinkButton)),
+        ),
+        Kind::CheckButton => Sample::Own(
+            CheckButtonExt::active(w::check_button("Check"), model.toggle(Kind::CheckButton))
+                .on_toggle(|on| GalleryMsg::Toggled(Kind::CheckButton, on)),
+        ),
+        Kind::MenuButton => Sample::Own(
+            w::menu_button("Menu")
+                .always_show_arrow(true)
+                .child(w::label("Menu content")),
+        ),
+        Kind::Switch => Sample::Own(
+            w::switch(model.toggle(Kind::Switch))
+                .on_toggle(|on| GalleryMsg::Toggled(Kind::Switch, on)),
+        ),
+        Kind::DropDown => Sample::Own(
+            w::drop_down(&["One", "Two", "Three"])
+                .selected(model.selection(Kind::DropDown))
+                .on_selected(|i| GalleryMsg::Selected(Kind::DropDown, i)),
+        ),
+        Kind::ColorDialogButton => Sample::Own(ColorDialogButtonExt::on_change(
+            w::color_dialog_button(Rgba {
+                r: 0.21,
+                g: 0.52,
+                b: 0.89,
+                a: 1.0,
+            }),
+            |v: f64| GalleryMsg::ValueChanged(Kind::ColorDialogButton, v),
+        )),
+        Kind::ColorDialog => Sample::Own(w::color_dialog(Rgba {
+            r: 0.21,
+            g: 0.52,
+            b: 0.89,
+            a: 1.0,
+        })),
+        Kind::FontDialogButton => Sample::Own(
+            w::font_dialog_button("Cantarell 11")
+                .on_change(|s: &str| GalleryMsg::Changed(Kind::FontDialogButton, s.to_string())),
+        ),
+        Kind::FontDialog => Sample::Own(w::font_dialog("Cantarell 11")),
+
+        // Tasks 3 and 4 replace this arm with the remaining 37.
+        _ => Sample::Within(Kind::Box),
+    }
+}
+
 /// Whether a kind is its own gallery entry or only ever a sub-node of another.
 ///
 /// Task 2 gives this its real body; Task 1 needs only the `Own` answer for
@@ -477,5 +842,104 @@ mod tests {
         assert_ne!(Theme::Dark.sheet(), Theme::HighContrast.sheet());
         assert_eq!(Theme::Dark.media_env().color_scheme, ColorScheme::Dark);
         assert_eq!(Theme::HighContrast.media_env().contrast, Contrast::More);
+    }
+
+    #[test]
+    fn every_display_and_button_kind_has_its_own_sample() {
+        let model = GalleryModel::new(Theme::Light, None);
+        let covered = [
+            Kind::Label,
+            Kind::Spinner,
+            Kind::Statusbar,
+            Kind::LevelBar,
+            Kind::ProgressBar,
+            Kind::InfoBar,
+            Kind::Scrollbar,
+            Kind::Image,
+            Kind::Picture,
+            Kind::Separator,
+            Kind::TextView,
+            Kind::Scale,
+            Kind::DrawingArea,
+            Kind::WindowControls,
+            Kind::Calendar,
+            Kind::Popover,
+            Kind::Button,
+            Kind::ToggleButton,
+            Kind::LinkButton,
+            Kind::CheckButton,
+            Kind::MenuButton,
+            Kind::Switch,
+            Kind::DropDown,
+            Kind::ColorDialogButton,
+            Kind::ColorDialog,
+            Kind::FontDialogButton,
+            Kind::FontDialog,
+        ];
+        for kind in covered {
+            match sample(kind, &model) {
+                Sample::Own(view) => assert_eq!(
+                    view.kind,
+                    kind,
+                    "{}'s sample must be rooted at its own kind",
+                    kind_name(kind)
+                ),
+                Sample::Within(parent) => {
+                    panic!("{} is not a sub-kind of {parent:?}", kind_name(kind))
+                }
+            }
+        }
+    }
+
+    /// The model is what makes the interaction gate's assertions readable:
+    /// every interactive sample reads its state back out of it.
+    ///
+    /// Mutation check: make `update`'s `Toggled` arm ignore its `bool` and
+    /// always store `true`; this test fails on the second assertion. Restore.
+    #[test]
+    fn update_folds_state_and_records_one_log_line_per_message() {
+        let mut model = GalleryModel::new(Theme::Light, None);
+        assert!(!model.toggle(Kind::ToggleButton));
+        update(&mut model, GalleryMsg::Toggled(Kind::ToggleButton, true));
+        assert!(model.toggle(Kind::ToggleButton));
+        update(&mut model, GalleryMsg::Toggled(Kind::ToggleButton, false));
+        assert!(!model.toggle(Kind::ToggleButton));
+        update(&mut model, GalleryMsg::Changed(Kind::Entry, "hi".into()));
+        assert_eq!(model.text(Kind::Entry), "hi");
+        update(&mut model, GalleryMsg::ValueChanged(Kind::Scale, 42.0));
+        assert!((model.value(Kind::Scale) - 42.0).abs() < f64::EPSILON);
+        update(&mut model, GalleryMsg::Selected(Kind::DropDown, 2));
+        assert_eq!(model.selection(Kind::DropDown), 2);
+        assert_eq!(model.log.len(), 5, "one log line per folded message");
+        assert_eq!(model.log[0], "toggled toggle_button true");
+        assert_eq!(model.log[2], "changed entry hi");
+    }
+
+    #[test]
+    fn a_log_line_is_one_flat_ascii_line_per_message() {
+        let lines = [
+            GalleryMsg::Clicked(Kind::Button).log_line(),
+            GalleryMsg::Changed(Kind::Entry, "two\nlines".into()).log_line(),
+            GalleryMsg::Search("a b".into()).log_line(),
+            GalleryMsg::Expanded(true).log_line(),
+        ];
+        for line in &lines {
+            assert!(!line.contains('\n'), "{line:?} must be one line");
+            assert!(!line.is_empty());
+        }
+        assert_eq!(lines[0], "clicked button");
+        assert_eq!(lines[1], "changed entry two lines");
+        assert_eq!(lines[3], "expanded true");
+    }
+
+    #[test]
+    fn the_sample_png_is_a_decodable_png_written_once() {
+        assert_eq!(&SAMPLE_PNG[..8], b"\x89PNG\r\n\x1a\n");
+        let path = sample_png_path();
+        let written = std::fs::read(&path).expect("sample png is written on first ask");
+        assert_eq!(written, SAMPLE_PNG);
+        // Idempotent: asking twice neither panics nor changes the bytes.
+        let again = sample_png_path();
+        assert_eq!(again, path);
     }
 }
