@@ -11,12 +11,17 @@
 //! painting is M2's `paint_node_with_children` unless the widget draws
 //! something CSS cannot express.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
+use selectors::Element as _;
+use selectors::OpaqueElement;
+
 use crate::css::node::{Node, PseudoStates};
-use crate::layout::Rect;
+use crate::layout::{Container, Rect};
 use crate::view::controller::{Controller, Event};
 use crate::view::{BuildCx, Kind, Prop, PropName, Props};
 use crate::window::focus::FOCUSABLE_CLASS;
@@ -43,6 +48,7 @@ impl ListItem {
     }
 }
 
+pub mod box_;
 pub mod button;
 pub mod calendar;
 pub mod check_button;
@@ -77,6 +83,8 @@ pub mod toggle_button;
 pub mod types;
 pub mod window_controls;
 
+#[doc(inline)]
+pub use box_::BoxC;
 #[doc(inline)]
 pub use types::{
     BaselinePosition, Decoration, DisplayHint, ItemFactory, LicenseType, MenuFlags, Policy,
@@ -601,6 +609,182 @@ impl Universal {
     }
 }
 
+/// Read a `Prop` as a `u16` enum discriminant; any other shape is `default`.
+pub(crate) fn prop_u16(value: &Prop, default: u16) -> u16 {
+    match value {
+        Prop::Enum(v) => *v,
+        Prop::Int(v) => u16::try_from(*v).unwrap_or(default),
+        _ => default,
+    }
+}
+
+/// Read a `Prop` as an integer; a non-finite float is `default`.
+pub(crate) fn prop_i64(value: &Prop, default: i64) -> i64 {
+    match value {
+        Prop::Int(v) => *v,
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "widget props never reach 2^53"
+        )]
+        Prop::Float(v) if v.is_finite() => *v as i64,
+        Prop::Bool(v) => i64::from(*v),
+        _ => default,
+    }
+}
+
+/// Read a `Prop` as a float; non-finite becomes `default`.
+#[allow(
+    dead_code,
+    reason = "every P6 controller reads it; unused until one does"
+)]
+pub(crate) fn prop_f64(value: &Prop, default: f64) -> f64 {
+    match value {
+        Prop::Float(v) if v.is_finite() => *v,
+        #[allow(clippy::cast_precision_loss, reason = "widget props never reach 2^53")]
+        Prop::Int(v) => *v as f64,
+        _ => default,
+    }
+}
+
+/// Read a `Prop` as a bool. A string is *not* coerced: `Prop::Str("yes")`
+/// is a caller mistake, not `true`.
+pub(crate) fn prop_bool(value: &Prop, default: bool) -> bool {
+    match value {
+        Prop::Bool(v) => *v,
+        Prop::Int(v) => *v != 0,
+        _ => default,
+    }
+}
+
+/// Read a `Prop` as text; anything else is `""`.
+#[allow(
+    dead_code,
+    reason = "every P6 controller reads it; unused until one does"
+)]
+pub(crate) fn prop_str(value: &Prop) -> &str {
+    match value {
+        Prop::Str(s) => s,
+        _ => "",
+    }
+}
+
+/// One controller's not-yet-flushed layout decisions for one node.
+///
+/// A widget controller has no `&mut LayoutTree` of its own — the tree lives
+/// in the `App`'s `Runtime` (or, in a headless test, is never built at all)
+/// — so a container/gap/homogeneous/child-placement decision is recorded
+/// *on the node* here and folded into the real tree by [`flush_layout`].
+///
+/// Unlike a work queue, entries are **not** removed once applied: `App`
+/// reruns `write_styles` (which rebuilds a node's taffy style from its CSS
+/// alone) on every single frame, so a decision made once in `Controller::build`
+/// must still be there to reapply on the tenth frame, long after the
+/// `Props` value that produced it stopped changing. `homogeneous` is
+/// re-applied to *whatever children the node currently has* for the same
+/// reason: a child added after the prop was last set must still pick it up.
+#[derive(Default, Clone)]
+struct Pending {
+    container: Option<Container>,
+    gap: Option<(f32, Orientation)>,
+    homogeneous: Option<(bool, Orientation)>,
+    node: Option<Node>,
+}
+
+thread_local! {
+    static PENDING: RefCell<HashMap<OpaqueElement, Pending>> = RefCell::new(HashMap::new());
+    static CONTAINERS: RefCell<HashMap<OpaqueElement, Container>> = RefCell::new(HashMap::new());
+}
+
+/// Record `node`'s container, for later [`flush_layout`] and for the
+/// headless `container_of` test hook every container controller exposes.
+pub(crate) fn set_container(node: &Node, container: Container) {
+    CONTAINERS.with(|c| c.borrow_mut().insert(node.opaque(), container));
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let entry = p.entry(node.opaque()).or_default();
+        entry.container = Some(container);
+        entry.node = Some(node.clone());
+    });
+}
+
+/// This node's last recorded container, for a headless (`App`-less) test.
+///
+/// A real `App` derives a node's container independently, from its `Kind`
+/// and `Props` (`view::render::container_for`); this is a second, cheaper
+/// source of truth that lets a widget's own unit tests ask "what container
+/// did my controller build?" without standing up a `LayoutTree` at all.
+#[must_use]
+pub(crate) fn container_of(node: &Node) -> Container {
+    CONTAINERS.with(|c| c.borrow().get(&node.opaque()).copied().unwrap_or_default())
+}
+
+/// Record a gap floor for `node`'s main axis, keyed by `orientation`.
+pub(crate) fn set_gap(node: &Node, spacing: f32, orientation: Orientation) {
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let entry = p.entry(node.opaque()).or_default();
+        entry.gap = Some((
+            if spacing.is_finite() {
+                spacing.max(0.0)
+            } else {
+                0.0
+            },
+            orientation,
+        ));
+        entry.node = Some(node.clone());
+    });
+}
+
+/// Record that every child of `node` should expand on `orientation`'s axis
+/// while `on` holds, applied to whatever children `node` has when
+/// [`flush_layout`] next runs.
+pub(crate) fn set_homogeneous(node: &Node, on: bool, orientation: Orientation) {
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let entry = p.entry(node.opaque()).or_default();
+        entry.homogeneous = Some((on, orientation));
+        entry.node = Some(node.clone());
+    });
+}
+
+/// Apply every recorded decision to `tree`.
+///
+/// Called by the real render loop (`view::render::layout_tree`) immediately
+/// after `write_styles` and before `LayoutTree::compute`, and by any test
+/// that builds its own `LayoutTree`. Entries whose node never made it into
+/// `tree` are silent no-ops: `LayoutTree::set_container`/`set_gap_floor`/
+/// `set_child_layout` already ignore an unsynced node, which covers a
+/// controller that recorded a decision before its node was attached, or a
+/// node `reconcile` has since removed.
+pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
+    PENDING.with(|p| {
+        for pending in p.borrow().values() {
+            let Some(node) = &pending.node else { continue };
+            if let Some(container) = pending.container {
+                tree.set_container(node, container);
+            }
+            if let Some((gap, orientation)) = pending.gap {
+                // GTK's own gap property and CSS `border-spacing` both
+                // apply; the larger wins, which is what GtkBox does when a
+                // theme sets both.
+                tree.set_gap_floor(node, gap, orientation == Orientation::Horizontal);
+            }
+            if let Some((on, orientation)) = pending.homogeneous {
+                let horizontal = orientation == Orientation::Horizontal;
+                for child in node.children() {
+                    let mut cl = tree.child_layout(&child).unwrap_or_default();
+                    if horizontal {
+                        cl.hexpand = on;
+                    } else {
+                        cl.vexpand = on;
+                    }
+                    tree.set_child_layout(&child, cl);
+                }
+            }
+        }
+    });
+}
+
 /// The `:hover`/`:active` bookkeeping every pointer-reactive widget shares.
 ///
 /// Contract §5's preamble says every controller carries `pressed` and `hovered`
@@ -676,6 +860,7 @@ pub fn build_controller<Msg: Clone + 'static>(
     // Identity first, so a `Classes` prop lands on top of the base classes.
     node.set_classes(kind.base_classes());
     let mut boxed: Box<dyn Controller<Msg>> = match kind {
+        Kind::Box => Box::new(<box_::BoxC as Controller<Msg>>::build(node, props, cx)),
         Kind::Separator => Box::new(<separator::SeparatorC as Controller<Msg>>::build(
             node, props, cx,
         )),
@@ -1134,6 +1319,53 @@ pub fn fixture_matches(fixture: &str, rendered: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Offscreen `App` driving, for every widget's rest-state and interaction
+/// pixel tests. No Wayland connection, `ManualClock` time.
+#[cfg(test)]
+pub(crate) mod offscreen {
+    use std::rc::Rc;
+
+    use crate::anim::ManualClock;
+    use crate::view::{App, Cmd, Frames, ScriptStep, View};
+
+    /// Run `script` against a one-widget app and return its captured frames.
+    pub(crate) fn frames<M: 'static, Msg: Clone + 'static>(
+        model: M,
+        update: fn(&mut M, Msg) -> Cmd<Msg>,
+        view: fn(&M) -> View<Msg>,
+        size: (u32, u32),
+        script: Vec<ScriptStep<Msg>>,
+    ) -> Frames {
+        let clock = Rc::new(ManualClock::new());
+        App::new(model, update, view)
+            .run_offscreen(size, clock, script)
+            .expect("offscreen run")
+    }
+
+    /// One pixel, or a panic naming the coordinate.
+    pub(crate) fn px(frames: &Frames, frame: usize, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        frames
+            .pixel(frame, x, y)
+            .unwrap_or_else(|| panic!("no pixel at ({x}, {y}) in frame {frame}"))
+    }
+
+    /// The x of the first column between two painted children -- derived
+    /// from the frame, never hard-coded.
+    pub(crate) fn gap_column(frames: &Frames) -> u32 {
+        let background = px(frames, 0, 0, 0);
+        let mut seen_ink = false;
+        for x in 0..frames.width() {
+            let p = px(frames, 0, x, frames.height() / 2);
+            if p != background {
+                seen_ink = true;
+            } else if seen_ink {
+                return x;
+            }
+        }
+        panic!("no gap column: the children never separate");
+    }
 }
 
 #[cfg(test)]

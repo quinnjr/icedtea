@@ -297,6 +297,12 @@ pub fn layout_tree(
 ) -> Result<(), LayoutError> {
     tree.sync(root)?;
     write_styles(root, styles, containers, tree, env, 0, available);
+    // A container widget's own gap/expand decisions (`GtkBox:spacing`, …)
+    // are recorded by its controller on a side table (`widgets::set_gap`,
+    // …) because a controller has no `&mut LayoutTree` of its own; this is
+    // where they are folded into the styles `write_styles` just wrote,
+    // immediately before the axes they affect are computed.
+    crate::widgets::flush_layout(tree);
     let space = taffy::Size {
         width: available.0.map_or(
             taffy::AvailableSpace::MaxContent,

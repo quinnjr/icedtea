@@ -278,6 +278,18 @@ impl Frames {
         self.size
     }
 
+    /// The surface width every frame shares.
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.size.0
+    }
+
+    /// The surface height every frame shares.
+    #[must_use]
+    pub fn height(&self) -> u32 {
+        self.size.1
+    }
+
     /// One pixel, as `(r, g, b, a)` straight out of skia's N32 buffer;
     /// `None` when the frame or the point is out of range.
     #[must_use]

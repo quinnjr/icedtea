@@ -312,6 +312,10 @@ struct NodeCtx {
     /// The `ResolveEnv` the last `set_style` used, so `set_container` and
     /// `set_child_layout` can rewrite the taffy style without one.
     env: ResolveEnv,
+    /// A floor on the container's `(column, row)` gap in px, from a widget's
+    /// own gap property (`GtkBox:spacing`, …). CSS `border-spacing` still
+    /// applies; the larger of the two wins on each axis, matching GtkBox.
+    gap_floor: (f32, f32),
 }
 
 /// A `taffy` tree that mirrors one `css::node::Node` subtree.
@@ -421,6 +425,7 @@ impl LayoutTree {
                     child: None,
                     measure: None,
                     env: ResolveEnv::default(),
+                    gap_floor: (0.0, 0.0),
                 };
                 let id = self.tree.new_leaf_with_context(Style::default(), ctx)?;
                 self.ids.insert(key, id);
@@ -507,6 +512,29 @@ impl LayoutTree {
         };
         if let Some(ctx) = self.tree.get_node_context_mut(id) {
             ctx.child = Some(child);
+        }
+        self.write_taffy_style(id);
+    }
+
+    /// Raise the floor on `node`'s container gap, on one axis, to `px`.
+    ///
+    /// A widget's own gap property (`GtkBox:spacing`, `GtkGrid`'s row/column
+    /// spacing) and CSS `border-spacing` both apply; the larger wins, which
+    /// is what GTK does when a theme sets both. `px` is clamped to
+    /// non-negative and non-finite input floors at zero, so a hostile
+    /// `Props` value can never poison the taffy style with NaN.
+    pub fn set_gap_floor(&mut self, node: &Node, px: f32, horizontal: bool) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_gap_floor on an unsynced node");
+            return;
+        };
+        let px = if px.is_finite() { px.max(0.0) } else { 0.0 };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            if horizontal {
+                ctx.gap_floor.0 = px;
+            } else {
+                ctx.gap_floor.1 = px;
+            }
         }
         self.write_taffy_style(id);
     }
@@ -687,14 +715,15 @@ impl LayoutTree {
         let Some(ctx) = self.tree.get_node_context(id) else {
             return;
         };
-        let (node, style, container, child, env) = (
+        let (node, style, container, child, env, gap_floor) = (
             ctx.node.clone(),
             Rc::clone(&ctx.style),
             ctx.container,
             ctx.child,
             ctx.env,
+            ctx.gap_floor,
         );
-        let mut taffy_style = Self::box_model_style(&style, &env);
+        let mut taffy_style = Self::box_model_style(&style, &env, gap_floor);
         Self::container_style(container, node.direction(), &mut taffy_style);
         if let Some(child) = child {
             let parent_is_row = node.parent().is_some_and(|p| {
@@ -716,8 +745,10 @@ impl LayoutTree {
     }
 
     /// The CSS box model half of one node's taffy style: sizes, margins,
-    /// padding, border and the container gap. M2's `set_style` body, verbatim.
-    fn box_model_style(style: &ComputedStyle, env: &ResolveEnv) -> Style {
+    /// padding, border and the container gap. M2's `set_style` body, verbatim,
+    /// plus `gap_floor` (a widget's own gap property) raising the CSS
+    /// `border-spacing` gap on either axis when it is larger.
+    fn box_model_style(style: &ComputedStyle, env: &ResolveEnv, gap_floor: (f32, f32)) -> Style {
         // CSS resolves *every* percentage in the box model against the
         // containing block's inline size, and taffy is the only thing here
         // that knows what that is -- so a percentage must reach taffy *as* a
@@ -757,6 +788,8 @@ impl LayoutTree {
             declared_percent(style, prop).map_or_else(|| length(px), percent)
         };
         let (gap_x, gap_y) = Self::border_spacing_px(style, env);
+        let gap_x = gap_x.max(gap_floor.0);
+        let gap_y = gap_y.max(gap_floor.1);
 
         Style {
             // GTK's min-width/min-height floor the CONTENT box.

@@ -20,7 +20,9 @@
 //! * Every builder returns [`View<Msg>`], so §4.1's `.class()`, `.margin()`
 //!   and `.key()` chain after it.
 
-use crate::view::{EventKind, Handler, Kind, View};
+use crate::view::{EventKind, Handler, Kind, Prop, PropName, View};
+use crate::widgets::WidgetEnum as _;
+use crate::widgets::types::Orientation;
 use crate::window::keyboard::KeyEvent;
 use std::rc::Rc;
 
@@ -31,6 +33,142 @@ use std::rc::Rc;
 #[must_use]
 pub fn widget<Msg: Clone + 'static>(kind: Kind) -> View<Msg> {
     View::new(kind)
+}
+
+/// `GtkBox`. `box` is a keyword, hence the trailing underscore -- the one
+/// place the snake_case rule cannot be followed literally.
+#[must_use]
+pub fn box_<Msg: Clone + 'static>(
+    orientation: Orientation,
+    children: impl IntoIterator<Item = View<Msg>>,
+) -> View<Msg> {
+    View::new(Kind::Box)
+        .prop(PropName::Orientation, orientation)
+        .children(children)
+}
+
+/// Tag `view` as filling a named slot of its parent (`"start"`, `"end"`,
+/// `"center"`, `"overlay"`, `"titlebar"`, `"title"`, `"label"`).
+///
+/// One mechanism for every container that has more than one place to put a
+/// child: `HeaderBar`, `ActionBar`, `CenterBox`, `Overlay`, `Paned`,
+/// `Frame` and `Window` all read it.
+#[must_use]
+pub fn slot<Msg: Clone + 'static>(view: View<Msg>, name: &str) -> View<Msg> {
+    view.prop(PropName::Section, Prop::Str(Rc::from(name)))
+}
+
+/// Contract deviation (Task 4): every P6 setter takes `impl Into<Prop>`
+/// rather than a concrete type. `View<Msg>` has one inherent-method
+/// namespace across the whole widget catalogue, and GTK gives `position`
+/// an `int` on `GtkPaned` and a `GtkPositionType` on `GtkPopover` -- two
+/// different Rust types under one setter name, which only an `Into<Prop>`
+/// argument can host. These are the scalar conversions; one more
+/// `From<T> for Prop` follows per widget-local `#[repr(u16)]` enum.
+impl From<u32> for Prop {
+    fn from(v: u32) -> Self {
+        Prop::Int(i64::from(v))
+    }
+}
+impl From<f32> for Prop {
+    fn from(v: f32) -> Self {
+        Prop::Float(f64::from(v))
+    }
+}
+impl From<&[&str]> for Prop {
+    fn from(v: &[&str]) -> Self {
+        Prop::Classes(v.iter().map(|s| Rc::from(*s)).collect())
+    }
+}
+impl From<Orientation> for Prop {
+    fn from(v: Orientation) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::Position> for Prop {
+    fn from(v: crate::widgets::Position) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::Side> for Prop {
+    fn from(v: crate::widgets::Side) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::types::Policy> for Prop {
+    fn from(v: crate::widgets::types::Policy) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::types::BaselinePosition> for Prop {
+    fn from(v: crate::widgets::types::BaselinePosition) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::types::SelectionMode> for Prop {
+    fn from(v: crate::widgets::types::SelectionMode) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::types::StackTransition> for Prop {
+    fn from(v: crate::widgets::types::StackTransition) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::types::SortOrder> for Prop {
+    fn from(v: crate::widgets::types::SortOrder) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::types::DisplayHint> for Prop {
+    fn from(v: crate::widgets::types::DisplayHint) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::types::LicenseType> for Prop {
+    fn from(v: crate::widgets::types::LicenseType) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::types::Decoration> for Prop {
+    fn from(v: crate::widgets::types::Decoration) -> Self {
+        Prop::Enum(v.to_u16())
+    }
+}
+impl From<crate::widgets::types::MenuFlags> for Prop {
+    fn from(v: crate::widgets::types::MenuFlags) -> Self {
+        Prop::Int(i64::from(v.bits()))
+    }
+}
+impl From<crate::widgets::types::ItemFactory> for Prop {
+    fn from(v: crate::widgets::types::ItemFactory) -> Self {
+        Prop::Factory(v)
+    }
+}
+impl From<Rc<[crate::view::ListItem]>> for Prop {
+    fn from(v: Rc<[crate::view::ListItem]>) -> Self {
+        Prop::Items(v)
+    }
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// `GtkBox:spacing`, `GtkGrid` row/column spacing's shorthand.
+    #[must_use]
+    pub fn spacing(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Spacing, v)
+    }
+
+    /// `GtkBox:homogeneous`.
+    #[must_use]
+    pub fn homogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Homogeneous, v)
+    }
+
+    /// `GtkBox:baseline-position`.
+    #[must_use]
+    pub fn baseline_position(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::BaselinePosition, v)
+    }
 }
 
 impl<Msg: Clone + 'static> View<Msg> {
