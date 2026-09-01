@@ -28,7 +28,6 @@ fn check(kind: Kind, fixture_name: &str, props: &Props) {
 /// via `node_tree::matches_fixture`'s backtracking matcher (`<child>`,
 /// `name[.class]` and the `┊` repetition marker) rather than `check`'s
 /// path-based `fixture_matches`. P6's widgets use this one.
-#[allow(dead_code)]
 fn assert_fixture(kind: icedtea_ui::view::Kind, props: &icedtea_ui::view::Props, name: &str) {
     let built = icedtea_ui::widgets::build_widget::<()>(kind, props);
     if let Err(mismatch) = icedtea_ui::widgets::matches_fixture(&built.node, &fixture(name)) {
@@ -634,6 +633,16 @@ fn grid_matches_its_gtk_fixture() {
         &icedtea_ui::view::Props::default(),
         "grid",
     );
+}
+
+#[test]
+fn frame_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::Label,
+        icedtea_ui::view::Prop::Str("Group".into()),
+    );
+    assert_fixture(icedtea_ui::view::Kind::Frame, &props, "frame");
 }
 
 #[test]

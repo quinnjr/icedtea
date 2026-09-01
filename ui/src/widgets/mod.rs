@@ -60,6 +60,7 @@ pub mod edit;
 pub mod editable_label;
 pub mod entry;
 pub mod font_dialog;
+pub mod frame;
 pub mod grid;
 pub mod image;
 pub mod info_bar;
@@ -966,6 +967,7 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Grid => Box::new(<grid::GridC as Controller<Msg>>::build(node, props, cx)),
+        Kind::Frame => Box::new(<frame::FrameC as Controller<Msg>>::build(node, props, cx)),
         Kind::Separator => Box::new(<separator::SeparatorC as Controller<Msg>>::build(
             node, props, cx,
         )),

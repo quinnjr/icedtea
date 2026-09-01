@@ -226,6 +226,34 @@ impl From<Rc<[crate::view::ListItem]>> for Prop {
     }
 }
 
+/// `GtkFrame` wrapping `child`.
+#[must_use]
+pub fn frame<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
+    View::new(Kind::Frame).child(child)
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// `GtkFrame:label` (and every other widget's own `label` text prop).
+    #[must_use]
+    pub fn label(self, text: &str) -> Self {
+        self.prop(PropName::Label, Prop::Str(Rc::from(text)))
+    }
+
+    /// `GtkFrame:label-xalign`.
+    #[must_use]
+    pub fn label_xalign(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::LabelXalign, v)
+    }
+
+    /// `GtkFrame:label-widget` -- a whole view instead of a text label.
+    #[must_use]
+    pub fn label_widget(self, view: View<Msg>) -> Self {
+        let mut me = self;
+        me.children.insert(0, slot(view, "label"));
+        me.prop(PropName::LabelWidget, Prop::Bool(true))
+    }
+}
+
 impl<Msg: Clone + 'static> View<Msg> {
     /// `GtkBox:spacing`, `GtkGrid` row/column spacing's shorthand.
     #[must_use]
