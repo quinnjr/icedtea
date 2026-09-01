@@ -550,6 +550,23 @@ pub fn key_char(ch: char, keycode: u32) -> icedtea_ui::window::keyboard::KeyEven
     }
 }
 
+/// A synthetic pressed `KeyEvent` for a named (non-character) keysym, such as
+/// `Return` or `Escape` — no `utf8` payload, matching how a real compositor
+/// reports these keys.
+pub fn key_named(keysym: u32, keycode: u32) -> icedtea_ui::window::keyboard::KeyEvent {
+    icedtea_ui::window::keyboard::KeyEvent {
+        keycode,
+        keysym: xkbcommon::xkb::Keysym::from(keysym),
+        utf8: None,
+        mods: icedtea_ui::window::keyboard::Mods::empty(),
+        consumed: icedtea_ui::window::keyboard::Mods::empty(),
+        pressed: true,
+        repeat: false,
+        serial: 10 + keycode,
+        time_ms: keycode,
+    }
+}
+
 #[test]
 fn typing_into_a_text_view_inserts_at_the_cursor_and_reports_the_change() {
     // mutation: ignore `utf8` in TextViewC::on_event and the model stays empty.
@@ -1427,23 +1444,47 @@ fn an_editable_label_commits_on_enter_and_reverts_on_escape() {
     // — so the `Key` events that followed had nowhere to go. A click on the
     // widget grants it, matching those same tests and `EditableLabelC`'s own
     // added `PointerDown` focus grant.
+    //
+    // Review fix (round 1): the script below now also sends a `Return` to
+    // commit and an `Escape` to revert — the original script only clicked
+    // and typed, so `EditableLabelC`'s `Activated`-commit branch
+    // (`self.editing = false`, `committed.clone_from`, `on_change` firing)
+    // and its `Escape`-revert branch (`self.edit.buffer.clone_from(&self
+    // .committed)`) were never exercised by any event at all.
+    //
+    // `on_change` only fires on commit, not on every keystroke (unlike
+    // `Entry`/`TextView`), so pixel diffs alone can't distinguish "the
+    // buffer changed" from "a commit happened" — painting always draws
+    // `self.edit.layout` regardless of `self.editing`, and the `.editing`
+    // CSS class carries no rule that changes the glyph row sampled below.
+    // As in `clicking_into_a_password_entry_...` above, the log of
+    // `on_change` firings rides in the model since `view` is a bare `fn`
+    // pointer; that log is the direct evidence of the commit path, while
+    // the buffer's own text (visible through the label's rendered pixels)
+    // is the evidence of the revert path leaving no trace behind.
     use icedtea_ui::view::builders::editable_label;
     use icedtea_ui::widgets::editable_label::EditableLabelExt;
     use icedtea_ui::window::BTN_LEFT;
+    use std::cell::RefCell;
+    use xkbcommon::xkb::Keysym;
 
     #[derive(Clone, Debug, PartialEq)]
     struct Renamed(String);
 
+    let commits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
     let frames = run(
-        "Name".to_owned(),
-        |model: &mut String, Renamed(text): Renamed| {
-            *model = text;
+        ("Name".to_owned(), commits.clone()),
+        |model: &mut (String, Rc<RefCell<Vec<String>>>), Renamed(text): Renamed| {
+            model.0 = text;
             Cmd::None
         },
-        |model: &String| {
-            editable_label(model)
-                .editing(true)
-                .on_change(|t| Renamed(t.to_owned()))
+        |model: &(String, Rc<RefCell<Vec<String>>>)| {
+            let recorder = model.1.clone();
+            editable_label(&model.0).editing(true).on_change(move |t| {
+                recorder.borrow_mut().push(t.to_owned());
+                Renamed(t.to_owned())
+            })
         },
         (200, 40),
         vec![
@@ -1461,9 +1502,16 @@ fn an_editable_label_commits_on_enter_and_reverts_on_escape() {
                 time_ms: 1,
             }),
             ScriptStep::Event(InputEvent::keyboard_enter(4)),
-            ScriptStep::Capture,
+            ScriptStep::Capture, // 0: editing, buffer "Name", nothing typed yet
             ScriptStep::Event(InputEvent::Key(key_char('X', 53))),
-            ScriptStep::Capture,
+            ScriptStep::Capture, // 1: editing, buffer "NameX"
+            ScriptStep::Event(InputEvent::Key(key_named(u32::from(Keysym::Return), 36))),
+            ScriptStep::Capture, // 2: committed — editing off, label reads "NameX"
+            ScriptStep::Event(InputEvent::Key(key_named(u32::from(Keysym::Return), 36))),
+            ScriptStep::Event(InputEvent::Key(key_char('Y', 21))),
+            ScriptStep::Capture, // 3: editing again, buffer "NameXY"
+            ScriptStep::Event(InputEvent::Key(key_named(u32::from(Keysym::Escape), 9))),
+            ScriptStep::Capture, // 4: reverted — editing off, label reads "NameX" again
         ],
     );
     let row = |frame: usize| {
@@ -1475,5 +1523,26 @@ fn an_editable_label_commits_on_enter_and_reverts_on_escape() {
         row(0),
         row(1),
         "the typed character must show while editing"
+    );
+    assert_eq!(
+        commits.borrow().as_slice(),
+        ["NameX"],
+        "Enter must commit exactly once, firing on_change with the typed text"
+    );
+    assert_ne!(
+        row(2),
+        row(3),
+        "reopening for edit and typing must change the render again"
+    );
+    assert_eq!(
+        row(2),
+        row(4),
+        "Escape must revert exactly back to the last committed render, \
+         leaving the uncommitted 'Y' out of the buffer"
+    );
+    assert_eq!(
+        commits.borrow().as_slice(),
+        ["NameX"],
+        "Escape must not fire on_change — the model never saw the reverted edit"
     );
 }
