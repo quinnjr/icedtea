@@ -22,7 +22,7 @@ use crate::css::value::{
     ColorCtx, ColorValue, FilterFn, IconRef, Image as CssImage, Keyword, Rgba, Shadow, TransformFn,
     Value,
 };
-use crate::icons::{Builtin, Handle, Palette};
+use crate::icons::{Builtin, Handle, MAX_ICON_PX, Palette};
 use crate::layout::Rect;
 
 use super::PaintCx;
@@ -204,6 +204,60 @@ fn icon_box(rect: Rect, size: u32) -> Option<SkRect> {
         side,
         side,
     ))
+}
+
+/// Draw an icon into `rect` with an explicit palette and no style.
+///
+/// A `background-image` layer is painted by `paint_layer`, which has the
+/// node's `currentColor` but not its `ComputedStyle` (`paint/background.rs`,
+/// M2-frozen signature). This is that entry: the whole `-gtk-icon-*` stack
+/// is unavailable there — a background layer has `background-size` and
+/// `background-repeat` instead — so the layer's tile rectangle *is* the icon
+/// box, and the palette is the caller's.
+pub fn paint_icon_image(
+    canvas: &mut Canvas<'_>,
+    icon: &IconRef,
+    rect: Rect,
+    palette: &Palette,
+    cx: &mut PaintCx<'_>,
+) {
+    let Some(dst) = icon_box(rect, MAX_ICON_PX) else {
+        return;
+    };
+    let size = dst.width().max(1.0) as u32;
+    let symbolic = matches!(icon, IconRef::Recolor { .. })
+        || matches!(icon, IconRef::Theme { name } if name.ends_with("-symbolic"));
+    let scale = cx.icons.scale();
+    let image = match icon {
+        IconRef::Theme { name } => cx.icons.render(name, size, scale, symbolic, palette),
+        IconRef::Recolor {
+            url,
+            palette: overrides,
+        } => {
+            let path = cx.images.resolve_path(url);
+            let palette = palette_with_overrides(*palette, overrides.as_ref(), cx);
+            cx.icons.render_path(path, size, scale, true, &palette)
+        }
+        IconRef::Scaled { lo, hi } => {
+            let chosen = if scale >= 2 { hi } else { lo };
+            match chosen.as_ref() {
+                CssImage::Icon(inner) => {
+                    let inner = std::rc::Rc::clone(inner);
+                    return paint_icon_image(canvas, &inner, rect, palette, cx);
+                }
+                CssImage::Url(url) => {
+                    let path = cx.images.resolve_path(url);
+                    cx.icons.render_path(path, size, scale, false, palette)
+                }
+                _ => None,
+            }
+        }
+    };
+    let Some(image) = image else {
+        return;
+    };
+    let paint = Paint::new();
+    canvas.draw_image_rect(&image, None, &dst, Some(&paint));
 }
 
 /// The single entry point every icon-shaped paint goes through: CSS

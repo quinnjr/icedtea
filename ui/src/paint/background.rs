@@ -124,10 +124,19 @@ fn paint_layer(
                 }
             }
         }
+        Image::Icon(icon) => {
+            // `-gtk-icontheme()`, `-gtk-recolor()` and `-gtk-scaled()` as a
+            // background layer: each tile is one icon box, and the palette's
+            // foreground is the node's `currentColor` -- the only colour a
+            // background layer has (contract §6; `paint_layer` keeps its
+            // M2 signature).
+            let palette = crate::icons::Palette::for_color(current);
+            for rect in &rects {
+                crate::paint::icon::paint_icon_image(canvas, icon, *rect, &palette, cx);
+            }
+        }
         // `cross-fade()` is stored by the registry and still paints nothing.
-        // `-gtk-*` icon images are drawn by `paint::icon::paint_icon`, which
-        // Task 15 routes this arm into.
-        Image::None | Image::CrossFade(_) | Image::Icon(_) => {}
+        Image::None | Image::CrossFade(_) => {}
     }
 
     canvas.restore_to_count(save);
