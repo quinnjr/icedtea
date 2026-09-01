@@ -3544,6 +3544,372 @@ Two limits remain, both outside P6's file list:
 
 ---
 
+### P7-D40 — `Builtin::path` returns `skia_rs_safe::path::Path`, not `core::Path`
+
+**Carried out by:** P7 (`ui/src/icons/builtin.rs`). **Added:** 2026-09-01, in
+the P7 whole-part fix wave (recorded late; the code landed with the part).
+
+§6 prints `pub fn path(self, size: f32) -> skia_rs_safe::core::Path`. There is
+no `Path` in `skia_rs_safe::core`: the type lives in `skia_rs_safe::path`
+alongside `PathBuilder` and `FillType`, which is what `ui/src/paint/geometry.rs`
+already imports. **Ruling:** a spelling correction — same type, correct module
+path. No caller is affected.
+
+### P7-D41 — `icons::Handle` and `icons::IconSize` are defined in `icons/mod.rs`
+
+**Carried out by:** P7 (`ui/src/icons/mod.rs`). **Added:** 2026-09-01.
+
+§5.1's `ImageC { resolved: Option<icons::Handle>, .. }` and the `Image`
+builder's `.icon_size(IconSize)` name two types §6 never declares.
+**Ruling:** `pub type Handle = Rc<skia_rs_safe::codec::Image>;` — exactly what
+`IconTheme::render` returns — and `pub enum IconSize { Inherit, Normal, Large }`
+with `pixels(self, inherited: u32) -> u32` (16 / 32, GTK4's `GtkIconSize`).
+Additive; P5-D26 already types `ImageC.resolved` as the same `Rc<Image>`.
+
+### P7-D42 — `IconTheme` carries the output scale, and the window writes it
+
+**Carried out by:** P7 (`ui/src/icons/theme.rs`, `ui/src/window/mod.rs`,
+`ui/src/view/app.rs`). **Added:** 2026-09-01.
+
+§6's `paint_icon` doc says "HiDPI comes from `-gtk-scaled()` and the output
+scale on `cx`", but the same section freezes `PaintCx`'s only new field as
+`icons`, and neither `PaintCx` nor `ResolveEnv` has a scale. **Ruling:**
+`IconTheme` gains `scale() -> u32` and `set_scale(&mut self, scale: u32)`
+(clamped to `1..=4`, default `1`, cache-clearing on a real change);
+`paint_icon` reads `cx.icons.scale()`. `PaintCx` still gains exactly one field.
+
+**Both halves are wired.** `Window::open` seeds the scale from the
+`wl_surface.preferred_buffer_scale` the first configure round already
+delivered, and `Window::pump` calls `set_scale` on every later
+`InputEvent::ScaleChanged` (and marks the window dirty, so the next frame
+re-rasterises). `App::run` does the same for the theme it owns. `WindowState.scale`
+loses its `#[allow(dead_code)]` and its "Task 11 updates this" comment.
+
+### P7-D43 — hermetic themed roots are split from the flat pixmap fallback
+
+**Carried out by:** P7 (`ui/src/icons/theme.rs`). **Added:** 2026-09-01.
+
+§6 documents `with_name_and_roots(name, roots)` as "no env reads at all" and
+also lists `/usr/share/pixmaps` among the roots — but pixmaps is not a themed
+root (no `index.theme`, no subdirs) and a test built with
+`with_name_and_roots` must not read `/usr`. **Ruling:** `IconTheme` stores
+`roots: Vec<PathBuf>` (themed) and `pixmaps: Vec<PathBuf>` (flat) separately;
+`with_name_and_roots` fills `roots` and leaves `pixmaps` empty; `from_env`
+fills both; `with_name_roots_and_pixmaps(name, roots, pixmaps)` is added so the
+flat fallback is testable hermetically. `with_name_and_roots`'s frozen
+signature and semantics are unchanged.
+
+### P7-D44 — `IconEnv` exists so `from_env` is testable
+
+**Carried out by:** P7 (`ui/src/icons/theme.rs`). **Added:** 2026-09-01.
+
+`from_env()` reads the process environment, which a test cannot vary safely
+(`std::env::set_var` is `unsafe` in edition 2024 and racy across the harness's
+threads). **Ruling:** `pub struct IconEnv { xdg_data_home, xdg_data_dirs, home,
+xdg_config_home }` with `IconEnv::from_env()`, plus
+`IconTheme::from_icon_env(&IconEnv)`; `IconTheme::from_env()` is exactly
+`Self::from_icon_env(&IconEnv::from_env())`. The same shape `app::ThemeEnv`
+already uses for the same reason. Additive.
+
+### P7-D45 — XPM is looked up but never decoded
+
+**Carried out by:** P7 (`ui/src/icons/{lookup,render}.rs`). **Added:** 2026-09-01.
+
+§6's `IconFormat` has an `Xpm` variant and the spec's extension order is
+`png, svg, xpm`, but `skia-rs-codec` has no XPM decoder. **Ruling:** `lookup`
+returns `IconFormat::Xpm` when that is what the spec's search finds — the
+lookup stays spec-exact — and `render` returns `None` for it after a one-time
+log, so `IconTheme::render` falls through to `image-missing` exactly as it does
+for a corrupt PNG. Documented on both.
+
+### P7-D46 — `recolour` also neutralises what would undo it
+
+**Carried out by:** P7 (`ui/src/icons/symbolic.rs`). **Added:** 2026-09-01.
+
+`render_svg_in_container` re-applies `dom.stylesheet`, and `apply_stylesheet`
+applies each node's inline `style=` attribute *after* the sheet. A recolour
+that only ran a synthetic sheet over a clone would be undone at render time by
+any symbolic SVG carrying a `<style>` block or an inline `fill`. **Ruling:**
+`recolour` (a) applies the synthetic sheet to the clone, (b) appends the same
+rules to the clone's `stylesheet` so the re-application inside
+`render_svg_in_container` ends on ours, and (c) removes the `fill` declaration
+from the inline `style=` of every node it recoloured. All three operate on the
+clone: the cached parse is never mutated and the SVG source is never
+string-patched, which is what §6 forbids.
+
+### P7-D47 — `paint::icon::paint_builtin` is added beside `paint_icon`
+
+**Carried out by:** P7 (`ui/src/paint/icon.rs`). **Added:** 2026-09-01.
+
+`-gtk-icon-source: builtin` computes to `Value::Keyword(Keyword::Builtin)`,
+not to an `IconRef`, so `paint_icon(.., icon: &IconRef, ..)` cannot express it;
+and the keyword alone does not say *which* shape. **Ruling:**
+`pub fn paint_builtin(canvas, builtin: Builtin, rect: layout::Rect,
+style: &ComputedStyle, cx: &mut PaintCx<'_>)`, honouring the same
+`-gtk-icon-transform`/`-gtk-icon-filter`/`-gtk-icon-shadow` stack `paint_icon`
+does. Additive.
+
+### P7-D48 — `ImageCache::resolve_path` is added
+
+**Carried out by:** P7 (`ui/src/paint/mod.rs`). **Added:** 2026-09-01.
+
+`-gtk-recolor(url(...))` needs the same stylesheet-relative URL resolution
+`background-image: url()` gets, and `ImageCache::resolve` is private.
+**Ruling:** a two-line `pub fn resolve_path(&self, url: &str) -> PathBuf`
+wrapper over the existing private `resolve`. No behaviour changes and no
+existing signature moves.
+
+### P7-D49 — `Palette::for_color`, with the *vendored* sheet's status colours
+
+**Carried out by:** P7 (`ui/src/icons/theme.rs`). **Added:** 2026-09-01.
+
+`Palette::from_style` needs a `ComputedStyle`, but three call sites
+(`Builtin::draw`, the recolour unit tests, and `paint_icon`'s `-gtk-recolor()`
+palette override) only have a foreground `Rgba`. **Ruling:**
+`pub fn for_color(foreground: Rgba) -> Palette` returns the foreground with the
+theme's default success/warning/error, and `from_style` layers
+`-gtk-icon-palette` and the sheet's `ColorTable` over it.
+
+**Correction to the P7 plan's own text, recorded rather than silently kept.**
+The plan's deviation 10 names those defaults as `#26a269`, `#cd9309`,
+`#e01b24`. Those are the GNOME 42 palette. This tree's vendored sheet declares
+`@warning_color #f57900`, `@error_color #cc0000`, `@success_color #33d17a`
+(`ui/themes/adwaita-light.css:1918-1920`), and the shipped constants are those
+— which is the correct choice, because the whole point of the defaults is that
+"an icon rendered without a sheet in hand matches one rendered with it". The
+plan's three hexes are wrong for this tree and are superseded here.
+`render.rs`'s and `symbolic.rs`'s `test_palette()` deliberately keep the GNOME
+42 hexes, precisely *because* they differ from the defaults: a test that reads
+a slot back then proves the slot was used rather than that a default matched.
+Both now say so in a doc comment.
+
+### P7-D50 — `paint::icon::paint_icon_image` is added for background layers
+
+**Carried out by:** P7 (`ui/src/paint/{icon,background}.rs`). **Added:** 2026-09-01.
+
+`background-image: -gtk-icontheme(…)` is painted by `paint::background::
+paint_layer`, whose M2-frozen signature carries the node's `currentColor` but
+not its `ComputedStyle`, so it cannot call `paint_icon(.., style, ..)`.
+**Ruling:** a style-less sibling,
+`pub fn paint_icon_image(canvas, icon: &IconRef, rect: layout::Rect,
+palette: &Palette, cx: &mut PaintCx<'_>)`, takes the palette the caller built
+from `currentColor` and uses the layer's own tile rectangle as the icon box.
+The alternative — threading a `ComputedStyle` into `paint_layer` — would change
+an M2 paint signature §8 freezes.
+
+### P7-D51 — the additive items §6 does not print
+
+**Carried out by:** P7. **Added:** 2026-09-01.
+
+§6 freezes an interface, and a part "may add private items freely". These are
+the **public** additions P7 made that §6 does not print, listed so no later
+part mistakes one for frozen text:
+
+| item | file | why |
+|---|---|---|
+| `paint::icon::resolve_icon` | `paint/icon.rs` | the resolve half of `paint_icon`, so `ImageC` can keep a `Handle` between frames (§5.1's `resolved` field) |
+| `paint::icon::icon_size_px` | `paint/icon.rs` | `-gtk-icon-size`, or the largest square that fits; read by `paint_icon`, `paint_builtin` and `paint_icon_source` |
+| `paint::icon::paint_icon_source` | `paint/icon.rs` | the production reader of `Prop::GtkIconSource`; see P7-D52 |
+| `icons::Builtin::for_node` | `icons/builtin.rs` | which builtin shape a CSS node means; see P7-D52 |
+| `IconTheme::render_path` (`pub(crate)`) | `icons/theme.rs` | `-gtk-recolor(url(…))` names a file, not an icon name, and must share the caches |
+| `IconTheme::dom_for` (private) | `icons/theme.rs` | the `(path, mtime)` parse cache §6's "Cache keys" paragraph requires |
+| `Palette::key` (`pub(crate)`) | `icons/theme.rs` | the `[u32; 4]` hashable form of a palette, for `RenderKey` |
+| `icons::SubDir`, `icons::ThemeIndex` | `icons/theme.rs` | the parsed `index.theme`; §6 names `Directories`/`ScaledDirectories` semantics but no type |
+| `icons::MAX_ICON_PX` | `icons/mod.rs` | the untrusted-input ceiling the Global Constraints require |
+| `icons::Handle`, `icons::IconSize` | `icons/mod.rs` | see P7-D41 |
+
+### P7-D52 — P7 edits `ui/src/widgets/**`; the plan's Global Constraint yields to §9
+
+**Carried out by:** P7 (`ui/src/widgets/{image,check_button,spin_button,popover,drop_down,menu_button,popover_menu_bar}.rs`,
+`ui/src/paint/mod.rs`). **Added:** 2026-09-01, in the P7 whole-part fix wave.
+
+The P7 plan's Global Constraints say "P7 must not touch widget behaviour
+(`ui/src/widgets/**`)". §9's P5 boundary says a P5 pixel test that depends on
+real builtin geometry "is deferred to **P7's fix wave**", and §9's P8 boundary
+says P8 "must not touch any widget implementation". The two cannot both hold:
+the deferred work is *in* the widgets and no part after P7 may do it.
+**Ruling: §9 wins.** P7's fix wave makes the minimum widget edits that let
+§6's "single entry point every icon-shaped paint goes through" actually be one:
+
+1. **`paint_node_with_children` reads `node`** and calls the new
+   `paint::icon::paint_icon_source(canvas, node, alloc.content_box, style, cx)`
+   once per node, between the outline and the text. That is the third of §6's
+   three doors and the *only* production reader of `Prop::GtkIconSource`; it
+   covers `check`, `radio`, `arrow` and `expander` subnodes uniformly, from
+   each subnode's own computed style, which is what makes an expander's
+   `-gtk-icon-transform: rotate(90deg)` apply. `-gtk-icon-source: builtin`
+   picks its shape through `Builtin::for_node` (element name, plus
+   `:indeterminate` and an `arrow`'s direction class). It also closes §8.1's
+   "`paint_node`'s unused `node` param" row: the
+   `#[allow(unused_variables)]` on `paint_node_with_children` is **removed**.
+2. **`ImageC::resolve` really resolves** — a build-time prefetch through
+   `cx.icons.render`/`render_path` with the default palette — and
+   **`ImageC::paint` draws through `paint::icon::{resolve_icon, paint_icon}`**,
+   re-resolving against the node's real palette so a symbolic icon follows
+   `color`. Closes the "`IconTheme::render` is P7's" stub.
+3. **`CheckButtonC::paint` goes through `paint_builtin`**, not `Builtin::draw`,
+   so the indicator honours the `-gtk-icon-*` stack. It also gains a
+   `measure` returning `INDICATOR_PX` (14, Adwaita's
+   `check { -gtk-icon-size: 14px }`): `-gtk-icon-size` is not a layout
+   property and `layout.rs` never sees the `check` subnode's style, so without
+   an intrinsic size the indicator laid out 0x0 and no glyph could be drawn at
+   all.
+4. **`SpinButtonC::paint` draws its two steppers** through `paint_builtin`,
+   into the same rectangles `stepper_rects` gives the pointer. Replaces a dead
+   `let _ = (Builtin::SpinPlus, Builtin::SpinMinus);`.
+5. The popover payload edits, recorded separately as P7-D54.
+
+No widget's *event* behaviour changes, and no assertion in `node_trees.rs`
+moves.
+
+### P7-D53 — E14 is superseded: `Button::render` keeps its M2 signature
+
+**Carried out by:** P7 (`ui/src/widget/button.rs`, `ui/src/window/layer.rs`).
+**Added:** 2026-09-01, in the P7 whole-part fix wave.
+
+E14 authorised `ui/src/widget/button.rs`'s own `PaintCx { .. }` literals to
+gain an `icons` field, and stated that "the §8.2 gate is unaffected —
+`ui/tests/themed_button_offscreen.rs` … constructs no `PaintCx` and stays
+byte-identical". As first landed, P7 had instead given `Button::render` a
+fifth parameter, which forced an edit to the gate file. That is not what E14
+allows.
+
+**Ruling.** `Button` **owns** its icon theme: a private
+`icons: crate::icons::IconTheme` field, initialised
+`with_name_and_roots("hicolor", vec![])`, read as `&mut self.icons` inside
+`render`. `Button::render`'s M2 signature is restored byte for byte, and
+`ui/tests/themed_button_offscreen.rs` is reverted to its pre-P7 bytes. E14's
+last paragraph now holds as written. The M1 gate's button draws no icon, so a
+hermetic, root-less theme is the honest theme for it.
+
+Consequence: `window/layer.rs`'s `AppState` no longer needs an `icons` field at
+all, and it is removed — which also disposes of the "zero roots, so every
+lookup misses" half of the T13 sign-off note there.
+
+### P7-D54 — P6-D39 is closed: real popover payloads, and `Window::paint_popup_with`
+
+**Carried out by:** P7 (`ui/src/widgets/popover.rs` and its three callers,
+`ui/src/window/mod.rs`, `ui/src/view/app.rs`). **Added:** 2026-09-01, in the
+P7 whole-part fix wave. **Closes P6-D39 (both limits) and P5-D34 in full.**
+
+**Limit 1 — the stub payload.** `PopoverC::open` no longer hard-codes
+`|| View::new(Kind::Popover)`. It takes the payload explicitly:
+
+```rust
+pub fn open<Msg: Clone + 'static>(&mut self, anchor: PopupAnchorPoint,
+                                  size: (u32, u32),
+                                  content: Option<Rc<dyn Fn() -> View<Msg>>>,
+                                  cx: &mut EventCx<'_, Msg>);
+```
+
+`Some(view)` opens a real `xdg_popup` whose surface is reconciled from that
+view. `None` means **this popover's body is already retained in the parent
+window's own tree**, and then no compositor surface is asked for at all.
+
+That `None` is the honest answer for every popover this crate embeds, and it
+is why the blank popup existed in the first place: `MenuButtonC`'s contents are
+its own application children, `DropDownC` appends
+`popover > contents > listview > row…` under its own node, and
+`PopoverMenuBarC`'s menus are its own subnodes — all of them already laid out,
+hit-tested and painted in the parent tree (which is what
+`widgets::drop_down::tests::opening_a_drop_down_and_clicking_a_row_selects_that_item`
+drives end to end). A second surface carrying a *copy* of that content would
+double-draw it; a second surface carrying a stub drew a blank rectangle over
+it. Opening nothing is both correct and cheaper. The three call sites pass
+`None` with that reason stated inline, and the DropDown unit test's final
+assertion is inverted from "opening and closing both go through `cx.cmds`" to
+"an embedded popover opens no compositor surface", with its own mutation check.
+
+An application whose popover body is a `View` — not in the parent tree — passes
+`Some` and gets the full P6 machinery: `Cmd::OpenPopup`'s payload built into
+its own `PopupSurface`, composited offscreen and given a real buffer in a
+windowed run.
+
+**Limit 2 — the missing paint seam.** `ui/src/window/mod.rs` gains
+
+```rust
+pub fn paint_popup_with(&mut self, key: PopupKey,
+                        f: impl FnOnce(&mut skia_rs_safe::canvas::Surface))
+    -> Result<bool, SurfaceError>;
+pub fn popup_size(&self, key: PopupKey) -> Option<(u32, u32)>;
+```
+
+the popup equivalent of `Window::paint_with`: it folds any pending
+`xdg_popup.configure`, refuses to attach before the popup's first
+`xdg_surface.configure` (`Ok(false)`, never a protocol kill), grows the
+popup's own pool and raster surface, runs `f`, uploads and commits.
+`App::run` now restyles, relayouts and paints every open `PopupSurface`
+through it after each main-surface frame, at the popup's own `(0.0, 0.0)`
+origin. `Window::render`'s private `render_popups` is unchanged and still
+serves the non-reactive path.
+
+### P7-D55 — `Window` selects a real icon theme, and hands it to `App::run`
+
+**Carried out by:** P7 (`ui/src/window/mod.rs`, `ui/src/view/app.rs`).
+**Added:** 2026-09-01, in the P7 whole-part fix wave.
+
+As first landed, `Window`'s `icons` field was
+`with_name_and_roots("hicolor", vec![])` — zero roots, so every lookup missed,
+`image-missing` included — with no setter and no named later task. Any client
+driving a `Window` directly (the shell and settings clients this rebuild
+exists for) would have painted no icons, ever.
+
+**Ruling.** `Window::open` builds `IconTheme::from_env()` and seeds its scale
+from the first `preferred_buffer_scale` (P7-D42). Three accessors make the
+choice a client's:
+
+- `Window::icons(&mut self) -> &mut IconTheme`,
+- `Window::set_icon_theme(&mut self, IconTheme)` — keeps the announced scale,
+  marks the window dirty,
+- `Window::take_icon_theme(&mut self) -> IconTheme` — takes it, leaving the
+  hermetic placeholder.
+
+`App::run` uses `take_icon_theme` when the caller supplied none through
+`App::with_icons`, so the window and the reactive loop can never disagree
+about which theme is in use; what is left behind is only ever read by
+`Window::render`, which the reactive loop never calls.
+
+### P7-D56 — `RenderKey` includes `symbolic`
+
+**Carried out by:** P7 (`ui/src/icons/theme.rs`). **Added:** 2026-09-01, in the
+P7 whole-part fix wave.
+
+§6's "Cache keys" paragraph gives `IconTheme::render`'s memo key as
+`(IconFile.path, mtime, size, scale, palette)`. That is not sufficient:
+`render_path` takes `symbolic` as a parameter and `paint/icon.rs` calls it both
+ways for the same path — `true` for `-gtk-recolor(url(x.svg))`, `false` for a
+`url()` arm of `-gtk-scaled()`. A sheet using both at one size and palette got
+whichever rendered first, so the second was silently recoloured when it should
+have been verbatim, or verbatim when it should have been recoloured.
+**Ruling:** `symbolic: bool` joins the key. Pinned by
+`a_recoloured_render_and_a_verbatim_one_are_not_the_same_cache_entry`
+(mutation check stated in the test).
+
+### P7-D57 — P5-D31's two `#[ignore]`d pixel tests are un-ignored, hermetically
+
+**Carried out by:** P7 (`ui/tests/widget_pixels.rs`). **Added:** 2026-09-01, in
+the P7 whole-part fix wave. **Closes P5-D31.**
+
+`an_image_paints_its_resolved_icon` ("P7 fills in `IconTheme::render`") and
+`a_check_button_paints_the_builtin_check_glyph` ("P7 fills in `Builtin::path`")
+both name work P7 completed, and §9's P5 boundary makes P7's fix wave the last
+part permitted to close them. Both are un-ignored and both carry a mutation
+check.
+
+They are made **hermetic** in the process, which is a change to how the whole
+file runs: `widget_pixels.rs`'s shared `run` helper now passes
+`App::with_icons(IconTheme::with_name_and_roots("hicolor", Vec::new()))`
+instead of letting `run_offscreen` fall back to `IconTheme::from_env()`. Before
+P7 that fallback was inert (nothing drew icons); after P7 it would have made
+every pixel assertion in the file depend on the machine's installed icon set,
+which contradicts §6's "the installed Adwaita theme is exercised only when
+present". `an_image_paints_its_resolved_icon` builds its own `App` against the
+checked-in `tests/fixtures/mini-icon-theme` instead of asking for
+`image-missing` from the machine.
+
+
+---
+
 ## 11. Execution notes — cross-part consistency check (E1–E16)
 
 Added 2026-08-27 by the consistency checker after all eight part plans were
@@ -3869,6 +4235,15 @@ allows.* The §8.2 gate is unaffected —
 `PaintCx` and stays byte-identical.
 
 Carried out by: P7 (Task 13).
+
+**Superseded in part by §10 P7-D53 (2026-09-01).** P7's fix wave found that
+adding `icons` to the literals is not enough — `Button::render`'s *signature*
+had grown a fifth parameter, which forced an edit to the §8.2 gate file. It
+now owns its own `IconTheme` field instead, the M2 signature is restored, and
+`ui/tests/themed_button_offscreen.rs` is byte-identical again. §8.3's
+`ui/src/widget/button.rs` row reverts to plain "**not rewritten** …
+unchanged": the file gains one private field and nothing in its four tests
+moves.
 
 ### E15 — `has_frame` needs `PropName::HasFrame`, appended by P5
 

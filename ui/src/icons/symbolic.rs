@@ -192,6 +192,13 @@ mod tests {
         }
     }
 
+    /// A palette whose four slots are all *different from the defaults*.
+    ///
+    /// Deliberately not `Palette::for_color`: these are the GNOME 42
+    /// success/warning/error hexes, and the vendored Adwaita sheet this crate
+    /// ships uses different ones (`theme::DEFAULT_SUCCESS` and friends; contract §10
+    /// P7-D49). A test that reads a slot back therefore proves the slot was
+    /// actually used, rather than that a default happened to match.
     fn test_palette() -> Palette {
         Palette {
             foreground: rgba(0x35, 0x84, 0xe4),
