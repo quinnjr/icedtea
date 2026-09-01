@@ -576,11 +576,83 @@ impl<Msg: Clone + 'static> NotebookExt<Msg> for View<Msg> {
     }
 }
 
+/// `GtkStack` over `pages`, each a [`stack_page`] view.
+#[must_use]
+pub fn stack<Msg: Clone + 'static>(pages: impl IntoIterator<Item = View<Msg>>) -> View<Msg> {
+    View::new(Kind::Stack).children(pages)
+}
+
+/// One `stack`'s page: `name` is the value `visible_child` selects by,
+/// `title` is what a `StackSwitcher`/`StackSidebar` shows.
+#[must_use]
+pub fn stack_page<Msg: Clone + 'static>(name: &str, title: &str, child: View<Msg>) -> View<Msg> {
+    View::new(Kind::StackPage)
+        .prop(PropName::PageName, Prop::Str(Rc::from(name)))
+        .prop(PropName::PageTitle, Prop::Str(Rc::from(title)))
+        .child(child)
+}
+
+/// [`stack_page`]'s own two properties, chained after it. Scoped to its own
+/// trait for the same reason [`HeaderBarExt`]'s doc comment gives: `.icon`
+/// would otherwise collide with any future widget that wants the same name
+/// over a different `PropName`.
+pub trait StackPageExt<Msg>: Sized {
+    /// `GtkStackPage:icon-name`.
+    fn icon(self, v: impl Into<Prop>) -> Self;
+    /// `GtkStackPage:needs-attention`.
+    fn needs_attention(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> StackPageExt<Msg> for View<Msg> {
+    fn icon(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Icon, v)
+    }
+    fn needs_attention(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::NeedsAttention, v)
+    }
+}
+
 impl<Msg: Clone + 'static> View<Msg> {
     /// `GtkBox:spacing`, `GtkGrid` row/column spacing's shorthand.
     #[must_use]
     pub fn spacing(self, v: impl Into<Prop>) -> Self {
         self.prop(PropName::Spacing, v)
+    }
+
+    /// `GtkStack:visible-child-name`.
+    #[must_use]
+    pub fn visible_child(self, name: &str) -> Self {
+        self.prop(PropName::VisibleChild, Prop::Str(Rc::from(name)))
+    }
+
+    /// `GtkStack:transition-type`.
+    #[must_use]
+    pub fn transition_type(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Transition, v)
+    }
+
+    /// `GtkStack:transition-duration`, ms.
+    #[must_use]
+    pub fn transition_duration(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::TransitionDuration, v)
+    }
+
+    /// `GtkStack:hhomogeneous`.
+    #[must_use]
+    pub fn hhomogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Hhomogeneous, v)
+    }
+
+    /// `GtkStack:vhomogeneous`.
+    #[must_use]
+    pub fn vhomogeneous(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Vhomogeneous, v)
+    }
+
+    /// `GtkStack:interpolate-size`.
+    #[must_use]
+    pub fn interpolate_size(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::InterpolateSize, v)
     }
 
     /// `GtkBox:homogeneous`.

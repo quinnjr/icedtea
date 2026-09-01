@@ -89,6 +89,7 @@ pub mod search_entry;
 pub mod separator;
 pub mod spin_button;
 pub mod spinner;
+pub mod stack;
 pub mod statusbar;
 pub mod switch;
 pub mod text_view;
@@ -816,7 +817,7 @@ thread_local! {
 /// `MeasureOverlay`/`ClipOverlay` (`Prop::Bool`) -- all four cheap, and all
 /// four re-derive a child's placement from the child's own node rather than
 /// owning that child's `Instance`.
-const RECORDED_PROP_NAMES: [PropName; 9] = [
+const RECORDED_PROP_NAMES: [PropName; 12] = [
     PropName::Column,
     PropName::Row,
     PropName::ColumnSpan,
@@ -826,6 +827,12 @@ const RECORDED_PROP_NAMES: [PropName; 9] = [
     PropName::Valign,
     PropName::MeasureOverlay,
     PropName::ClipOverlay,
+    // `stack::StackC::place`'s fourth reader (Task 15): a page's `Str`
+    // name/title and `Bool` attention flag, all as cheap to keep as the
+    // nine above and re-derived the same way, from the child's own node.
+    PropName::PageName,
+    PropName::PageTitle,
+    PropName::NeedsAttention,
 ];
 
 /// Record the subset of `props` a container controller can re-derive a
@@ -859,6 +866,30 @@ pub(crate) fn child_layout_of(node: &Node) -> ChildLayout {
     NODE_CHILD
         .with(|m| m.borrow().get(&node.opaque()).copied())
         .unwrap_or_default()
+}
+
+thread_local! {
+    static TRANSITIONS: RefCell<HashMap<OpaqueElement, (types::StackTransition, f32)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Record `node`'s current stack-transition state.
+///
+/// Reconciliation (Task 15): the task text describes this as recording "the
+/// translate/opacity the paint walker applies for the named transition", but
+/// no such paint-walker hook exists yet -- M2's `paint_node_with_children`
+/// (this task's files do not touch `view/render.rs`/`paint.rs`) has no
+/// per-node transform/opacity override to plug into. This stores the value
+/// in the same kind of node-keyed thread-local table `set_container`/
+/// `record_props` already use, so [`StackC::tick`] has somewhere real to
+/// write it and a future paint task has somewhere real to read it from,
+/// without inventing paint-walker plumbing this part's file list excludes.
+pub(crate) fn set_transition_progress(
+    node: &Node,
+    transition: types::StackTransition,
+    progress: f32,
+) {
+    TRANSITIONS.with(|t| t.borrow_mut().insert(node.opaque(), (transition, progress)));
 }
 
 /// Record `node`'s container, for later [`flush_layout`] and for the
@@ -1151,6 +1182,7 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::Overlay => Box::new(<overlay::OverlayC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::Stack => Box::new(<stack::StackC as Controller<Msg>>::build(node, props, cx)),
         Kind::Popover => Box::new(<popover::PopoverC as Controller<Msg>>::build(
             node, props, cx,
         )),
