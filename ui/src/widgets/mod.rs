@@ -59,6 +59,7 @@ pub mod label;
 pub mod level_bar;
 pub mod link_button;
 pub mod menu_button;
+pub mod node_tree;
 pub mod password_entry;
 pub mod picture;
 pub mod popover;
@@ -81,6 +82,14 @@ pub use types::{
     BaselinePosition, Decoration, DisplayHint, ItemFactory, LicenseType, MenuFlags, Policy,
     RowContent, Selection, SelectionMode, SortOrder, Sorter, StackPageInfo, StackTransition,
 };
+
+// `node_tree::node_tree_of` is deliberately not re-exported here: P5 already
+// defined a `node_tree_of` at this same path (below), and `ui/tests/node_trees.rs`
+// imports it together with `fixture_matches`, its path-based sibling. Both
+// P5 functions stay untouched; `node_tree`'s `matches_fixture` is the richer,
+// backtracking matcher P6's new fixtures use instead.
+#[doc(inline)]
+pub use node_tree::{Mismatch, matches_fixture};
 
 /// Re-express a pointer event given in the root node's space in `rect`'s space.
 ///
@@ -806,6 +815,73 @@ pub fn child_slot(kind: Kind, controller: &dyn std::any::Any) -> Option<Node> {
             .map(|c| c.sink.clone()),
         _ => None,
     }
+}
+
+/// Everything `Controller::build` needs, with no Wayland connection and no
+/// application: the bundled Adwaita light sheet, a probe-only font database,
+/// a rootless icon theme and a `ManualClock` at zero.
+pub struct Headless {
+    sheet: crate::css::cascade::CompiledSheet,
+    fonts: crate::text::FontDatabase,
+    icons: crate::icons::IconTheme,
+    clock: Rc<dyn crate::anim::Clock>,
+    env: crate::css::computed::ResolveEnv,
+}
+
+impl Headless {
+    /// A context over `BUNDLED_ADWAITA_LIGHT`.
+    #[must_use]
+    pub fn new() -> Self {
+        let sheet = crate::css::cascade::CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT);
+        Self {
+            sheet,
+            fonts: crate::text::FontDatabase::new(),
+            // There is no `IconTheme::empty()`; `node_tree_of` below already
+            // stands up a rootless "hicolor" theme for the same hermetic
+            // purpose, so this reuses that rather than adding a second way to
+            // spell "no real icons".
+            icons: crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new()),
+            clock: Rc::new(crate::anim::ManualClock::new()),
+            env: crate::css::computed::ResolveEnv::default(),
+        }
+    }
+
+    /// Borrow it as a `BuildCx`.
+    pub fn cx(&mut self) -> BuildCx<'_> {
+        BuildCx {
+            sheet: &self.sheet,
+            fonts: &mut self.fonts,
+            icons: &mut self.icons,
+            clock: &self.clock,
+            env: &self.env,
+        }
+    }
+}
+
+impl Default for Headless {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A widget built outside an `App`, for tests and for `node_tree::matches_fixture`.
+pub struct BuiltWidget<Msg> {
+    /// The widget's root retained node.
+    pub node: Node,
+    /// Its controller, already `build`-ed.
+    pub controller: Box<dyn Controller<Msg>>,
+}
+
+/// Build one widget headlessly.
+#[must_use]
+pub fn build_widget<Msg: Clone + 'static>(kind: Kind, props: &Props) -> BuiltWidget<Msg> {
+    let mut hx = Headless::new();
+    let node = Node::with_classes(kind.css_name(), kind.base_classes());
+    let controller = {
+        let mut cx = hx.cx();
+        build_controller::<Msg>(kind, &node, props, &mut cx)
+    };
+    BuiltWidget { node, controller }
 }
 
 /// Build `kind` in isolation and render its retained subtree in GTK notation.
