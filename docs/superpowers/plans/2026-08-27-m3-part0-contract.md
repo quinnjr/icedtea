@@ -3043,6 +3043,12 @@ once (3) above gave the subnode real layout geometry. Not fixable inside P5's
 boundary (`view/app.rs` is D5 File Structure); unignore alongside the
 `DropDown` test once `aim` is fixed.
 
+**Superseded 2026-08-31 by §10 P5-D33:** `aim` is fixed inside P5 and both
+tests are un-ignored and green. The "not fixable inside P5's boundary"
+rationale is withdrawn — see P5-D32 for why the boundary claim did not hold.
+The description of `child_slot` in (3) above as a pre-existing walk is also
+corrected there: P5 added it to `reconcile.rs`.
+
 ---
 
 ### P5-D24 — `ui/Cargo.toml` gains `unicode-segmentation` and `unicode-linebreak`
@@ -3228,6 +3234,139 @@ framework bug outside every P5 file. The close-out's own gate run therefore
 sees four ignored tests in this file, not two; the discrepancy is P5-D23
 predating this entry, not a new gap.
 
+**Superseded 2026-08-31 by the P5 whole-part fix wave.** `aim` is fixed
+(P5-D33) and both of those tests are un-ignored. `ui/tests/widget_pixels.rs`
+now carries exactly the two `#[ignore]`s this entry owns, and P7 is the only
+part that may remove them.
+
+---
+
+### P5-D32 — P5 edits four files under `view/`, not one; E4's "no edit except `builders.rs`" is amended
+
+**Carried out by:** P5 (`ui/src/view/controller.rs`, `ui/src/view/reconcile.rs`,
+`ui/src/view/app.rs`, plus D5's `ui/src/view/builders.rs`). **Added:**
+2026-08-31, in the P5 whole-part fix wave, after a review found the drift
+undeclared.
+
+§11 E4 states verbatim that "P5 now makes **no** edit under `view/` except
+D5's `pub use` lines in `builders.rs`", and the part plan's File Structure
+lists `view/app.rs` as "Untouched". Both were true when written and are false
+as shipped. The four changes, none of them reverted:
+
+1. **`Controller<Msg>` gained `std::any::Any` as a supertrait**
+   (`controller.rs`). `widgets::child_slot` has to downcast a
+   `&dyn Controller<Msg>` to a concrete controller (`PopoverC`,
+   `MenuButtonC`, …) to find the node an application child attaches under.
+   `Any` as a supertrait, rather than a defaulted `as_any` method, means
+   trait-object upcasting does it at the call site with no per-implementor
+   boilerplate. This is a change to a P4 public trait: it adds a `'static`
+   bound that `Controller<Msg>: 'static` already implied, so every existing
+   implementor still compiles, but P6/P7 controllers must remain `'static`
+   concrete types (no borrowed fields) — which the trait already required.
+2. **`view::build_controller` now delegates to `widgets::build_controller`,
+   and `view::generic_controller` was split out of it** (`controller.rs`).
+   P5-D29 declared the widgets-side table but not this side of the seam.
+   `view::build_controller` keeps its P4 signature and stays the name
+   `reconcile`'s `Insert` arm calls; `generic_controller` is the new public
+   catch-all the widgets table falls back to, and it no longer runs the props
+   loop (its caller does). Contract §11 E1's "one definition, one fallback"
+   is preserved: a kind with no controller still lands on `GenericC`.
+3. **`reconcile.rs` routes application children through
+   `crate::widgets::child_slot(..).unwrap_or_else(|| node.clone())`** in both
+   `build_instance` and the update path. P5-D23 describes this walk as if it
+   pre-existed P5; it did not. Semantics: a widget whose chrome owns a child
+   slot (`Popover`'s `contents`, `MenuButton`'s popover) receives its `View`
+   children under that slot instead of directly under its root node.
+   `unwrap_or_else` preserves the P4 behaviour exactly for every kind that
+   declares no slot.
+4. **Four tests were rewritten** — three in `controller.rs`
+   (`Kind::Button` → `Kind::MenuButton` in the two tests that mean to
+   exercise `GenericC`'s own fallback behaviour, now that `Kind::Button` has
+   a real controller; and two class-order assertions flipped, because
+   `ButtonC`/`ToggleButtonC` apply `Universal` incrementally where `GenericC`
+   rewrites the whole class list) and one in `app.rs` (the same
+   `Kind::Button` → `Kind::MenuButton` substitution).
+
+**Ruling.** All four declared, not reverted. (1)–(3) are load-bearing: without
+them the shared-surface widgets (`Popover` and the four kinds embedding it)
+have no way to receive children and no way to find their own chrome, which is
+not an alternate valid implementation of §5.2 but a missing one. (4) is a
+consequence of P5 doing its job — the tests still test what they were written
+to test, on a kind that is still `GenericC`. **§11 E4 is amended accordingly**
+(see its own entry). P6 and P7 may edit `controller.rs`/`reconcile.rs` only to
+add arms to the same seams, and must record any further `view/**` change here
+rather than relying on E4's original wording.
+
+---
+
+### P5-D33 — `route`'s `aim` resolves to the innermost `Instance`, not the deepest hit node
+
+**Carried out by:** P5 (`ui/src/view/app.rs`, `ui/tests/widget_pixels.rs`).
+**Added:** 2026-08-31, in the P5 whole-part fix wave.
+
+**The bug.** `route`'s `aim` closure took `hit_chain(..).last()` — the
+geometrically deepest node under the pointer — with no regard for `Instance`
+identity. For a widget whose chrome lives on a controller-owned, non-zero-sized
+subnode (`DropDown`'s and `MenuButton`'s `button.toggle`,
+`ColorDialogButton`'s `button.color`), that node belongs to no `Instance`,
+`path_to` returns an empty path, and `deliver` silently drops the event: the
+widget never sees its own click. Flat widgets hid this for the whole of P1–P4,
+because their content nodes measure to (0, 0) and their deepest hit *is* their
+own `Instance` root.
+
+**As shipped:** `aim` now walks the chain innermost-outward and takes the
+first node `path_to` can reach:
+
+```rust
+chain.iter().rev()
+    .find(|hit| !path_to(&rt.instances, &hit.node).is_empty())
+    .map(|hit| (hit.node.clone(), hit.local))
+```
+
+`hit.local` is already that node's own local point, so a controller's
+`local_rect`/`shift_event` re-mapping is unchanged. For every case the old
+code delivered, this selects the identical node; it only adds delivery where
+there was none.
+
+**Ruling.** Fixed inside P5, not waived, and not deferred. P5-D23 and P5-D31
+both recorded this as "outside P5's boundary" — that rationale does not
+survive P5-D32, which shows P5 already editing three `view/**` files, and the
+alternative (waiving two acceptance criteria) would have let P6 build every
+further nested-chrome kind on a dead click path. Both blocked tests
+(`opening_a_drop_down_and_picking_an_item_updates_the_button`,
+`clicking_a_colour_button_opens_its_dialog_and_repaints_the_swatch`) are
+un-ignored and green, each with a re-verified `// mutation:` comment: the
+verified mutation is `return Vec::new()` at the top of the controller's
+`on_event`, since the narrower state mutations the original comments named do
+not move the asserted pixels. Whole-workspace gates re-run green (1418
+passing), so no compositor- or harness-side test depended on the old aim.
+
+---
+
+### P5-D34 — `Cmd::OpenPopup` discards its view payload; owned by P6, not P5
+
+**Carried out by:** P6 (`ui/src/view/app.rs`). **Added:** 2026-08-31, in the
+P5 whole-part fix wave, to give a previously-informal deferral a named owner.
+
+**The gap.** `Cmd::OpenPopup { positioner, .. }` drops its `view` field on the
+floor in `view/app.rs`. `PopoverC::open` therefore maps an autohide popover to
+a real, grabbed `Surface::Popup` that paints nothing at all. The P5 close-out
+expected Task 18 (`Popover`) to close this; it did not, and could not — the
+fix is in `view/app.rs`'s command loop, which has to build and render a second
+instance tree against the popup surface, not in any `widgets/**` file.
+`window_events.rs::a_popup_opened_from_a_menubutton_takes_the_grab_and_is_dismissed_outside_it`
+stays green because it only exercises grab and dismissal, never content.
+
+**Ruling.** Assigned to **P6**, which owns the menus and the popup-hosted
+widget kinds that make an empty popup visibly wrong, and which already edits
+`view/app.rs` under P5-D32's amended E4. P6 may not close its popup tasks
+while `Cmd::OpenPopup`'s `view` is still discarded, and must add a pixel test
+that a popup's *content* inks. Until then, `Popover` and the four P5 kinds
+embedding it (`MenuButton`, `DropDown`, `ColorDialogButton`,
+`FontDialogButton`) ship with correct grab, dismissal and chrome, and no
+rendered popup body — a known, recorded limitation of the P5 milestone, not a
+regression P6 introduces.
+
 ---
 
 ## 11. Execution notes — cross-part consistency check (E1–E16)
@@ -3329,8 +3468,20 @@ P5 D8 added `App::sheet(self, CompiledSheet) -> Self` as "the one edit to
 `App::{with_sheet, with_fonts, with_icons}` for the identical reason. P5's
 plan has been edited: D8 is marked WITHDRAWN, its file-structure row now reads
 "Untouched", its one call site is `.with_sheet(…)`, and its §10 record E8 is
-rewritten. P5 now makes **no** edit under `view/` except D5's `pub use` lines
-in `builders.rs`, which is what §9's P5 boundary wanted.
+rewritten. P5 adds **no stylesheet setter** to `view/app.rs`, which is what
+§9's P5 boundary wanted.
+
+**AMENDED 2026-08-31 (§10 P5-D32, P5-D33).** The sentence this entry
+originally ended on — "P5 now makes **no** edit under `view/` except D5's
+`pub use` lines in `builders.rs`" — is withdrawn as a false statement about
+what P5 shipped. E4's actual, still-binding ruling is the narrow one above:
+`App::sheet` is withdrawn and `App::with_sheet` is the setter. P5 does edit
+`view/controller.rs`, `view/reconcile.rs` and `view/app.rs`; every such edit
+is recorded in §10 under **P5-D32** (the `Any` supertrait, the
+`build_controller`/`generic_controller` split, `reconcile`'s `child_slot`
+routing, four rewritten tests) and **P5-D33** (`route`'s `aim`). P6 and P7
+must read those two entries, not this sentence, for the state of `view/**`,
+and must record any further `view/**` change in §10 the same way.
 
 ### E5 — one `ListItem`, in `view/mod.rs`, owned by P4
 

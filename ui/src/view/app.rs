@@ -817,7 +817,20 @@ fn route<Msg: Clone + 'static>(
             return Some((target, local));
         }
         let chain = hit_chain(&rt.root, &rt.layout, &rt.styles, (x, y));
-        chain.last().map(|hit| (hit.node.clone(), hit.local))
+        // The geometrically deepest hit is often a *controller-owned* subnode
+        // -- a `DropDown`'s `button.toggle`, a `ColorDialogButton`'s
+        // `button.color` -- which no `Instance` owns. `path_to` finds no path
+        // to such a node, so `deliver` below silently drops the event and the
+        // widget never sees its own click. Flat widgets hid this: their
+        // content nodes measure to (0, 0), so their deepest hit *was* their
+        // own `Instance` root. Aim instead at the innermost node the instance
+        // tree actually knows, which for a flat widget is the same node as
+        // before and for nested chrome is the controller that built it.
+        chain
+            .iter()
+            .rev()
+            .find(|hit| !path_to(&rt.instances, &hit.node).is_empty())
+            .map(|hit| (hit.node.clone(), hit.local))
     };
 
     let mut pending: Vec<(Node, Event)> = Vec::new();
