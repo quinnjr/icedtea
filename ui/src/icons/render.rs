@@ -17,7 +17,7 @@ use skia_rs_safe::canvas::Surface;
 use skia_rs_safe::codec::{Image, decode_image};
 use skia_rs_safe::core::{Color, Rect};
 use skia_rs_safe::paint::Paint;
-use skia_rs_safe::svg::{parse_svg, render_svg_in_container};
+use skia_rs_safe::svg::{SvgDom, render_svg_in_container};
 
 use super::theme::{IconFile, Palette};
 use super::{IconFormat, MAX_ICON_PX, symbolic};
@@ -55,6 +55,28 @@ pub fn pixel_size(size: u32, scale: u32) -> i32 {
     px.clamp(1, u64::from(MAX_ICON_PX)) as i32
 }
 
+/// Rasterise an already-parsed document.
+///
+/// The parse is the expensive half and is cached by
+/// [`super::theme::IconTheme::dom_for`]; the recolour clones it per palette.
+#[must_use]
+pub fn render_dom(dom: &SvgDom, px: i32, symbolic_file: bool, palette: &Palette) -> Option<Image> {
+    let recoloured;
+    let dom = if symbolic_file {
+        recoloured = symbolic::recolour(dom, palette);
+        &recoloured
+    } else {
+        dom
+    };
+    let mut surface = Surface::new_raster_n32_premul(px, px)?;
+    {
+        let mut canvas = surface.canvas();
+        canvas.clear(Color::TRANSPARENT);
+        render_svg_in_container(dom, &mut canvas, px as f32, px as f32);
+    }
+    surface.make_image_snapshot()
+}
+
 /// Render an SVG file into a `px × px` transparent surface.
 fn render_svg_file(path: &Path, px: i32, symbolic_file: bool, palette: &Palette) -> Option<Image> {
     let bytes = std::fs::read(path)
@@ -63,21 +85,8 @@ fn render_svg_file(path: &Path, px: i32, symbolic_file: bool, palette: &Palette)
     // `parse_svg` takes `&str`; an icon file need not be valid UTF-8, and a
     // lossy read keeps every ASCII tag and attribute intact.
     let text = String::from_utf8_lossy(&bytes);
-    let dom = parse_svg(&text)
-        .map_err(|_| log_once(path, "icon SVG could not be parsed"))
-        .ok()?;
-    let dom = if symbolic_file {
-        symbolic::recolour(&dom, palette)
-    } else {
-        dom
-    };
-    let mut surface = Surface::new_raster_n32_premul(px, px)?;
-    {
-        let mut canvas = surface.canvas();
-        canvas.clear(Color::TRANSPARENT);
-        render_svg_in_container(&dom, &mut canvas, px as f32, px as f32);
-    }
-    surface.make_image_snapshot()
+    let dom = super::svg_parse_logged(path, &text)?;
+    render_dom(&dom, px, symbolic_file, palette)
 }
 
 /// Decode a raster file and resample it to `px × px` if it is not already.

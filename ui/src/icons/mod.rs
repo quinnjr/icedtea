@@ -50,6 +50,20 @@ pub type Handle = Rc<skia_rs_safe::codec::Image>;
 /// multi-gigabyte allocation.
 pub const MAX_ICON_PX: u32 = 4096;
 
+/// `parse_svg`, with the failure logged once per path.
+pub(crate) fn svg_parse_logged(
+    path: &std::path::Path,
+    text: &str,
+) -> Option<skia_rs_safe::svg::SvgDom> {
+    match skia_rs_safe::svg::parse_svg(text) {
+        Ok(dom) => Some(dom),
+        Err(_) => {
+            render::log_once(path, "icon SVG could not be parsed");
+            None
+        }
+    }
+}
+
 /// GTK 4's `GtkIconSize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconSize {

@@ -4,6 +4,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
+
+use skia_rs_safe::codec::Image;
+use skia_rs_safe::svg::SvgDom;
 
 use super::IconFormat;
 
@@ -55,6 +59,44 @@ fn is_safe_theme_name(name: &str) -> bool {
         && !name.contains('\0')
 }
 
+/// The most rasterised icons remembered at once.
+///
+/// Each entry is at most `MAX_ICON_PX²` pixels, but in practice a UI's icons
+/// are 16–48 px; 256 of those is a few megabytes.
+pub(crate) const MAX_RENDER_CACHE: usize = 256;
+
+/// The most parsed `SvgDom`s remembered at once.
+pub(crate) const MAX_DOM_CACHE: usize = 128;
+
+/// A rasterisation's cache key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RenderKey {
+    path: PathBuf,
+    mtime: Option<u64>,
+    size: u32,
+    scale: u32,
+    palette: [u32; 4],
+}
+
+/// A parsed document's cache key: the file, and when it last changed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DomKey {
+    path: PathBuf,
+    mtime: Option<u64>,
+}
+
+/// The file's mtime in whole nanoseconds since the epoch, or `None` when it
+/// cannot be read.
+///
+/// `None` is not "never changed": it makes the key differ from a keyed entry
+/// only if the mtime later becomes readable, which is the conservative
+/// direction — a re-render, never a stale one.
+fn mtime_of(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    u64::try_from(since.as_nanos()).ok()
+}
+
 /// One icon theme, its inheritance chain, its search roots and its caches.
 ///
 /// Construct once per application and keep it: the caches are what make an
@@ -72,6 +114,8 @@ pub struct IconTheme {
     indexes: HashMap<Rc<str>, ThemeIndex>,
     scale: u32,
     lookups: HashMap<LookupKey, Option<IconFile>>,
+    renders: HashMap<RenderKey, Rc<Image>>,
+    doms: HashMap<DomKey, Rc<SvgDom>>,
 }
 
 impl IconTheme {
@@ -115,6 +159,8 @@ impl IconTheme {
             indexes: HashMap::new(),
             scale: 1,
             lookups: HashMap::new(),
+            renders: HashMap::new(),
+            doms: HashMap::new(),
         };
         theme.resolve_chain();
         theme
@@ -285,6 +331,8 @@ impl IconTheme {
     /// `IconTheme`.
     pub fn clear_caches(&mut self) {
         self.lookups.clear();
+        self.renders.clear();
+        self.doms.clear();
     }
 
     /// How many lookups are remembered. Test observability only; nothing
@@ -292,6 +340,108 @@ impl IconTheme {
     #[cfg(test)]
     pub(crate) fn lookup_cache_len(&self) -> usize {
         self.lookups.len()
+    }
+
+    /// The parsed document for an SVG icon file, parsed once per
+    /// `(path, mtime)`.
+    ///
+    /// Callers **clone** the result before recolouring it: one document is
+    /// shared by every node that draws the icon, whatever their palettes.
+    pub(crate) fn dom_for(&mut self, file: &IconFile) -> Option<Rc<SvgDom>> {
+        let key = DomKey {
+            path: file.path.clone(),
+            mtime: mtime_of(&file.path),
+        };
+        if let Some(dom) = self.doms.get(&key) {
+            return Some(Rc::clone(dom));
+        }
+        let bytes = std::fs::read(&file.path).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let dom = Rc::new(super::svg_parse_logged(&file.path, &text)?);
+        if self.doms.len() >= MAX_DOM_CACHE {
+            self.doms.clear();
+        }
+        self.doms.insert(key, Rc::clone(&dom));
+        Some(dom)
+    }
+
+    /// `lookup` + decode + recolour + rasterize, memoized. This is what paint
+    /// calls; `lookup` alone is for tests and diagnostics.
+    ///
+    /// Memoised on `(path, mtime, size, scale, palette)`, so a palette change
+    /// therefore costs a re-render and never a re-parse, while a repeated
+    /// frame costs a hash probe. A file that will not render falls through
+    /// to `image-missing`, exactly as a miss does — one corrupt PNG in a
+    /// theme must not paint a hole.
+    pub fn render(
+        &mut self,
+        name: &str,
+        size: u32,
+        scale: u32,
+        symbolic: bool,
+        palette: &Palette,
+    ) -> Option<Rc<Image>> {
+        let file = self.lookup(name, size, scale, symbolic)?;
+        if let Some(image) = self.render_file(&file, size, scale, palette) {
+            return Some(image);
+        }
+        if file.path.file_stem().and_then(|s| s.to_str()) == Some(super::lookup::MISSING_ICON) {
+            return None;
+        }
+        let fallback = self.lookup(super::lookup::MISSING_ICON, size, scale, false)?;
+        self.render_file(&fallback, size, scale, palette)
+    }
+
+    /// One located file, rasterised and memoised.
+    fn render_file(
+        &mut self,
+        file: &IconFile,
+        size: u32,
+        scale: u32,
+        palette: &Palette,
+    ) -> Option<Rc<Image>> {
+        let key = RenderKey {
+            path: file.path.clone(),
+            mtime: mtime_of(&file.path),
+            size,
+            scale,
+            palette: palette.key(),
+        };
+        if let Some(image) = self.renders.get(&key) {
+            return Some(Rc::clone(image));
+        }
+        let image = match file.format {
+            IconFormat::Svg => {
+                let dom = self.dom_for(file)?;
+                let symbolic_file = super::symbolic::is_symbolic(file);
+                Rc::new(super::render::render_dom(
+                    &dom,
+                    super::render::pixel_size(size, scale),
+                    symbolic_file,
+                    palette,
+                )?)
+            }
+            IconFormat::Png | IconFormat::Xpm => {
+                Rc::new(super::render::render(file, size, scale, palette)?)
+            }
+        };
+        if self.renders.len() >= MAX_RENDER_CACHE {
+            self.renders.clear();
+        }
+        self.renders.insert(key, Rc::clone(&image));
+        Some(image)
+    }
+
+    /// How many rasterisations are remembered. Test observability only.
+    #[cfg(test)]
+    pub(crate) fn render_cache_len(&self) -> usize {
+        self.renders.len()
+    }
+
+    /// How many parsed documents are remembered. Test observability only.
+    #[cfg(test)]
+    pub(crate) fn dom_cache_len(&self) -> usize {
+        self.doms.len()
     }
 
     /// `<root>/<theme>/<subdir>/<name>.<ext>` for every root, in order.
@@ -947,7 +1097,6 @@ impl Palette {
     /// form is exactly what a rasterisation depends on, since that is what
     /// reaches the SVG's `fill`.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn key(self) -> [u32; 4] {
         [
             self.foreground.to_color32().0,
@@ -1677,6 +1826,117 @@ Type=Fixed
         };
         assert_eq!(base.key(), base.key());
         assert_ne!(base.key(), other.key());
+    }
+
+    // The paint path: a name in, pixels out.
+    // Mutation check: pass `symbolic: false` through to `lookup` regardless
+    // and the second assertion's colour becomes the full-colour blue.
+    #[test]
+    fn render_resolves_a_name_all_the_way_to_pixels() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        let palette = Palette {
+            foreground: Rgba {
+                r: 0x35 as f32 / 255.0,
+                g: 0x84 as f32 / 255.0,
+                b: 0xe4 as f32 / 255.0,
+                a: 1.0,
+            },
+            ..Palette::for_color(Rgba::TRANSPARENT)
+        };
+        let image = theme
+            .render("document-open", 16, 1, false, &palette)
+            .expect("rendered");
+        assert_eq!(image.width(), 16);
+
+        let symbolic = theme
+            .render("document-open", 16, 1, true, &palette)
+            .expect("rendered");
+        assert_eq!(symbolic.width(), 16);
+        assert!(!Rc::ptr_eq(&image, &symbolic));
+    }
+
+    // The same request twice is the same allocation, not two.
+    // Mutation check: skip the render cache and `Rc::ptr_eq` fails.
+    #[test]
+    fn an_identical_render_request_is_served_from_the_cache() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        let palette = Palette::for_color(Rgba::TRANSPARENT);
+        let first = theme
+            .render("document-open", 16, 1, false, &palette)
+            .expect("rendered");
+        let second = theme
+            .render("document-open", 16, 1, false, &palette)
+            .expect("rendered");
+        assert!(Rc::ptr_eq(&first, &second));
+        assert_eq!(theme.render_cache_len(), 1);
+    }
+
+    // A palette change re-renders but must not re-parse: the SvgDom cache is
+    // keyed on the file, the image cache on the file *and* the palette.
+    // Mutation check: put the palette in the SvgDom key and dom_cache_len
+    // becomes 2.
+    #[test]
+    fn a_palette_change_re_renders_without_re_parsing() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        let blue = Palette::for_color(Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 1.0,
+            a: 1.0,
+        });
+        let red = Palette::for_color(Rgba {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        });
+        let a = theme
+            .render("document-open", 16, 1, true, &blue)
+            .expect("rendered");
+        let b = theme
+            .render("document-open", 16, 1, true, &red)
+            .expect("rendered");
+        assert!(!Rc::ptr_eq(&a, &b));
+        assert_eq!(theme.render_cache_len(), 2);
+        assert_eq!(theme.dom_cache_len(), 1);
+    }
+
+    // An unrenderable file falls through to image-missing rather than
+    // returning nothing -- otherwise one corrupt PNG in a theme paints a
+    // hole.
+    // Mutation check: return None on a render failure and the assertion
+    // fails.
+    #[test]
+    fn an_undecodable_icon_falls_back_to_image_missing() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        let palette = Palette::for_color(Rgba::TRANSPARENT);
+        let image = theme
+            .render("broken", 16, 1, false, &palette)
+            .expect("fell back to image-missing");
+        assert_eq!(image.width(), 16);
+    }
+
+    // Both caches are bounded and both are emptied together.
+    // Mutation check: leave the dom cache out of `clear_caches` and the last
+    // assertion fails.
+    #[test]
+    fn the_render_caches_are_bounded_and_cleared_together() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        for i in 0..super::MAX_RENDER_CACHE + 8 {
+            let palette = Palette::for_color(Rgba {
+                r: (i % 256) as f32 / 255.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            });
+            let _ = theme.render("document-open", 16, 1, true, &palette);
+        }
+        assert!(theme.render_cache_len() <= super::MAX_RENDER_CACHE);
+        assert!(theme.dom_cache_len() <= super::MAX_DOM_CACHE);
+        theme.clear_caches();
+        assert_eq!(theme.render_cache_len(), 0);
+        assert_eq!(theme.dom_cache_len(), 0);
+        assert_eq!(theme.lookup_cache_len(), 0);
     }
 }
 
