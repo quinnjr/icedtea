@@ -559,6 +559,17 @@ impl Selection {
         changed
     }
 
+    /// Insert `index`, never removing another -- `GtkFlowBox`'s rubberband,
+    /// which only ever grows the set the band covers. Returns whether it
+    /// inserted.
+    pub fn toggle_on(&mut self, index: usize) -> bool {
+        if self.mode == SelectionMode::None {
+            return false;
+        }
+        self.anchor = Some(index);
+        self.set.insert(index)
+    }
+
     /// Drop every index at or above `count`, after a model swap.
     pub fn retain_below(&mut self, count: usize) {
         self.set.retain(|i| *i < count);

@@ -110,6 +110,16 @@ impl Rect {
     pub fn to_skia(&self) -> skia_rs_safe::core::Rect {
         skia_rs_safe::core::Rect::from_xywh(self.x, self.y, self.width, self.height)
     }
+
+    /// Whether `self` and `other` share any area -- `GtkFlowBox`'s
+    /// rubberband selection test, an edge or corner touch does not count.
+    #[must_use]
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
 }
 
 /// One node's laid-out geometry, in absolute tree-origin coordinates.

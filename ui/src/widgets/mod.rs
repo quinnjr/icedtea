@@ -63,6 +63,7 @@ pub mod edit;
 pub mod editable_label;
 pub mod entry;
 pub mod expander;
+pub mod flow_box;
 pub mod font_dialog;
 pub mod frame;
 pub mod grid;
@@ -1232,6 +1233,9 @@ pub fn build_controller<Msg: Clone + 'static>(
             <editable_label::EditableLabelC as Controller<Msg>>::build(node, props, cx),
         ),
         Kind::ListBox => Box::new(<list_box::ListBoxC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::FlowBox => Box::new(<flow_box::FlowBoxC as Controller<Msg>>::build(
             node, props, cx,
         )),
         Kind::StackSwitcher => Box::new(

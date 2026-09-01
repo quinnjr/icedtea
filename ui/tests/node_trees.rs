@@ -749,6 +749,20 @@ fn list_box_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn flow_box_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::MinChildrenPerLine,
+        icedtea_ui::view::Prop::Int(2),
+    );
+    props.set(
+        icedtea_ui::view::PropName::MaxChildrenPerLine,
+        icedtea_ui::view::Prop::Int(4),
+    );
+    assert_fixture(icedtea_ui::view::Kind::FlowBox, &props, "flow_box");
+}
+
+#[test]
 fn stack_switcher_matches_its_gtk_fixture() {
     let mut props = icedtea_ui::view::Props::default();
     props.set(

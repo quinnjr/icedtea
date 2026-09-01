@@ -624,6 +624,36 @@ pub fn list_box_row<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
     View::new(Kind::ListBoxRow).child(child)
 }
 
+/// `GtkFlowBox` over `children`, each wrapped in its own `flowboxchild`.
+#[must_use]
+pub fn flow_box<Msg: Clone + 'static>(children: impl IntoIterator<Item = View<Msg>>) -> View<Msg> {
+    View::new(Kind::FlowBox).children(
+        children
+            .into_iter()
+            .map(|child| View::new(Kind::FlowBoxChild).child(child)),
+    )
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// `GtkFlowBox:min-children-per-line`.
+    #[must_use]
+    pub fn min_children_per_line(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MinChildrenPerLine, v)
+    }
+
+    /// `GtkFlowBox:max-children-per-line`.
+    #[must_use]
+    pub fn max_children_per_line(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::MaxChildrenPerLine, v)
+    }
+
+    /// `GtkFlowBox:enable-rubberband`.
+    #[must_use]
+    pub fn enable_rubberband(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::EnableRubberband, v)
+    }
+}
+
 /// `stack_switcher`/`stack_sidebar`'s shared prop pair: titles as
 /// `PropName::Pages`'s `Prop::Classes` (deviation 5's shape reused for a
 /// plain string list) and the flagged pages folded into `PropName::
