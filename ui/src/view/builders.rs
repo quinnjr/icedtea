@@ -1091,6 +1091,7 @@ pub use crate::widgets::statusbar::{StatusbarExt, statusbar};
 pub use crate::widgets::switch::{SwitchExt, switch};
 pub use crate::widgets::text_view::{TextViewExt, text_view};
 pub use crate::widgets::toggle_button::{ToggleButtonExt, toggle_button};
+pub use crate::widgets::window::{WindowExt, window};
 pub use crate::widgets::window_controls::{WindowControlsExt, window_controls};
 
 #[cfg(test)]

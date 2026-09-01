@@ -104,6 +104,7 @@ pub mod switch;
 pub mod text_view;
 pub mod toggle_button;
 pub mod types;
+pub mod window;
 pub mod window_controls;
 
 #[doc(inline)]
@@ -1345,6 +1346,7 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::StackSidebar => Box::new(<stack_sidebar::StackSidebarC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::Window => Box::new(<window::WindowC as Controller<Msg>>::build(node, props, cx)),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {
