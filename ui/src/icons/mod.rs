@@ -33,7 +33,8 @@ use std::rc::Rc;
 // idempotence note. `Builtin` was already re-exported here by P5.
 pub use builtin::Builtin;
 pub use theme::{
-    DirKind, IconEnv, IconFile, IconTheme, SubDir, ThemeIndex, theme_name_from_settings_ini,
+    DirKind, IconEnv, IconFile, IconTheme, Palette, SubDir, ThemeIndex,
+    theme_name_from_settings_ini,
 };
 
 /// A rasterised icon, shared by every node that asked for it.

@@ -844,6 +844,120 @@ pub struct IconFile {
     pub kind: DirKind,
 }
 
+use crate::css::computed::ComputedStyle;
+use crate::css::registry::Prop;
+use crate::css::value::{ColorCtx, ColorTable, ColorValue, Rgba, Value};
+
+/// The vendored Adwaita `@success_color` (`themes/adwaita-light.css:1920`).
+const DEFAULT_SUCCESS: Rgba = Rgba {
+    r: 0x33 as f32 / 255.0,
+    g: 0xd1 as f32 / 255.0,
+    b: 0x7a as f32 / 255.0,
+    a: 1.0,
+};
+/// The vendored Adwaita `@warning_color` (`themes/adwaita-light.css:1918`).
+const DEFAULT_WARNING: Rgba = Rgba {
+    r: 0xf5 as f32 / 255.0,
+    g: 0x79 as f32 / 255.0,
+    b: 0x00 as f32 / 255.0,
+    a: 1.0,
+};
+/// The vendored Adwaita `@error_color` (`themes/adwaita-light.css:1919`).
+const DEFAULT_ERROR: Rgba = Rgba {
+    r: 0xcc as f32 / 255.0,
+    g: 0x00 as f32 / 255.0,
+    b: 0x00 as f32 / 255.0,
+    a: 1.0,
+};
+
+/// The four logical slots GTK passes positionally as
+/// `[foreground, success, warning, error]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Palette {
+    /// `colors[0]`: the icon's foreground, i.e. the painting node's `color`.
+    pub foreground: Rgba,
+    /// `colors[1]`.
+    pub success: Rgba,
+    /// `colors[2]`.
+    pub warning: Rgba,
+    /// `colors[3]`.
+    pub error: Rgba,
+}
+
+impl Palette {
+    /// A palette with `foreground` and the theme's default status colours.
+    ///
+    /// The three defaults are the vendored Adwaita sheet's own
+    /// `@success_color`/`@warning_color`/`@error_color`, so an icon rendered
+    /// without a sheet in hand matches one rendered with it.
+    #[must_use]
+    pub const fn for_color(foreground: Rgba) -> Palette {
+        Palette {
+            foreground,
+            success: DEFAULT_SUCCESS,
+            warning: DEFAULT_WARNING,
+            error: DEFAULT_ERROR,
+        }
+    }
+
+    /// `foreground` = the painting node's computed `color`; the other three
+    /// come from `-gtk-icon-palette` on that node, falling back to the
+    /// theme's `@success_color`/`@warning_color`/`@error_color`.
+    ///
+    /// `-gtk-icon-palette`'s entries may still carry `@name`s and
+    /// `currentColor` here: `computed`'s resolution of the whole value fails
+    /// as a unit if *any* entry's `@name` is unknown (`computed.rs:901-907`),
+    /// so a sheet with two of the three colours defined leaves the property
+    /// unresolved. Resolving per entry here is what makes the two that *are*
+    /// defined still count.
+    ///
+    /// A slot name GTK does not know (anything but `success`, `warning`,
+    /// `error`) is ignored: the property is a list of overrides, not a
+    /// replacement.
+    #[must_use]
+    pub fn from_style(style: &ComputedStyle, colors: &ColorTable) -> Palette {
+        let foreground = style.color();
+        let mut palette = Palette::for_color(foreground);
+        let Value::IconPalette(entries) = style.raw(Prop::GtkIconPalette) else {
+            return palette;
+        };
+        let ctx = ColorCtx {
+            table: colors,
+            current: foreground,
+            depth: 0,
+        };
+        for (name, value) in entries.iter() {
+            let Some(resolved) = ColorValue::resolve(value, &ctx) else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("success") {
+                palette.success = resolved;
+            } else if name.eq_ignore_ascii_case("warning") {
+                palette.warning = resolved;
+            } else if name.eq_ignore_ascii_case("error") {
+                palette.error = resolved;
+            }
+        }
+        palette
+    }
+
+    /// The four slots packed as `0xAARRGGBB`, for use as a cache key.
+    ///
+    /// `Palette` holds `f32`s and so is neither `Eq` nor `Hash`; the packed
+    /// form is exactly what a rasterisation depends on, since that is what
+    /// reaches the SVG's `fill`.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn key(self) -> [u32; 4] {
+        [
+            self.foreground.to_color32().0,
+            self.success.to_color32().0,
+            self.warning.to_color32().0,
+            self.error.to_color32().0,
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1453,6 +1567,116 @@ Type=Fixed
         assert_eq!(theme.lookup_cache_len(), 1);
         theme.set_scale(2);
         assert_eq!(theme.lookup_cache_len(), 0);
+    }
+
+    use super::Palette;
+    use crate::css::cascade::CompiledSheet;
+    use crate::css::computed::{ComputedStyle, ResolveEnv};
+    use crate::css::node::Node;
+    use crate::css::select::MatchCx;
+    use crate::css::value::Rgba;
+
+    fn palette_for(css: &str) -> Palette {
+        let sheet = CompiledSheet::compile(css);
+        let node = Node::new("image");
+        let env = ResolveEnv::default();
+        let mut cx = MatchCx::new();
+        let style = ComputedStyle::resolve_chain(&sheet, &node, &env, &mut cx);
+        Palette::from_style(&style, &sheet.colors)
+    }
+
+    fn hex(color: Rgba) -> u32 {
+        color.to_color32().0
+    }
+
+    // The foreground slot is the node's own `color`, which is what GTK
+    // passes as `colors[0]` to `snapshot_symbolic`.
+    // Mutation check: read `Prop::BackgroundColor` instead of `color()` and
+    // the first assertion fails.
+    #[test]
+    fn the_foreground_slot_is_the_nodes_color() {
+        let palette = palette_for("image { color: #3584e4 }");
+        assert_eq!(hex(palette.foreground), 0xFF35_84E4);
+    }
+
+    // With no `@define-color`s in the sheet, the registry's initial
+    // `-gtk-icon-palette` (`success @success_color, ...`) cannot resolve, so
+    // the slots take the vendored Adwaita values.
+    // Mutation check: return `Rgba::TRANSPARENT` for an unresolvable slot and
+    // every symbolic status icon paints as nothing.
+    #[test]
+    fn unresolvable_slots_take_the_vendored_adwaita_defaults() {
+        let palette = palette_for("image { color: #000000 }");
+        assert_eq!(hex(palette.success), 0xFF33_D17A);
+        assert_eq!(hex(palette.warning), 0xFFF5_7900);
+        assert_eq!(hex(palette.error), 0xFFCC_0000);
+    }
+
+    // With them, the sheet's own colours win -- which is how a theme
+    // restyles every status icon at once.
+    // Mutation check: ignore the ColorTable and the assertions see the
+    // defaults instead.
+    #[test]
+    fn defined_colors_feed_the_three_status_slots() {
+        let palette = palette_for(
+            "@define-color success_color #26a269; \
+             @define-color warning_color #cd9309; \
+             @define-color error_color #e01b24; \
+             image { color: #000000 }",
+        );
+        assert_eq!(hex(palette.success), 0xFF26_A269);
+        assert_eq!(hex(palette.warning), 0xFFCD_9309);
+        assert_eq!(hex(palette.error), 0xFFE0_1B24);
+    }
+
+    // An explicit `-gtk-icon-palette` overrides slot by slot and leaves the
+    // rest alone; `currentColor` in it means the node's own colour.
+    // Mutation check: replace the whole palette from the declaration instead
+    // of overriding named slots and `success` comes back transparent.
+    #[test]
+    fn gtk_icon_palette_overrides_named_slots_only() {
+        let palette = palette_for(
+            "image { color: #3584e4; -gtk-icon-palette: warning #ff0000, error currentColor }",
+        );
+        assert_eq!(hex(palette.warning), 0xFFFF_0000);
+        assert_eq!(hex(palette.error), 0xFF35_84E4);
+        assert_eq!(hex(palette.success), 0xFF33_D17A);
+        assert_eq!(hex(palette.foreground), 0xFF35_84E4);
+    }
+
+    // A slot name GTK does not know is ignored, not fatal.
+    // Mutation check: panic or clear the palette on an unknown name and this
+    // fails.
+    #[test]
+    fn an_unknown_palette_slot_is_ignored() {
+        let palette = palette_for("image { color: #000000; -gtk-icon-palette: bogus #ff0000 }");
+        assert_eq!(hex(palette.success), 0xFF33_D17A);
+        assert_eq!(hex(palette.foreground), 0xFF00_0000);
+    }
+
+    // The cache key is the four slots, packed -- `Palette` holds `f32`s and
+    // so is not `Hash`/`Eq`.
+    // Mutation check: key on the foreground alone and the last assertion
+    // fails, so a palette change would serve a stale rasterisation.
+    #[test]
+    fn the_palette_key_separates_every_slot() {
+        let base = Palette::for_color(Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        });
+        let other = Palette {
+            success: Rgba {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+            ..base
+        };
+        assert_eq!(base.key(), base.key());
+        assert_ne!(base.key(), other.key());
     }
 }
 
