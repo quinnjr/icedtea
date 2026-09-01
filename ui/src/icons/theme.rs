@@ -392,6 +392,34 @@ impl IconTheme {
         self.render_file(&fallback, size, scale, palette)
     }
 
+    /// Rasterise the file at `path` directly, bypassing theme lookup.
+    ///
+    /// `-gtk-recolor(url(...))` names a file, not an icon: there is no theme
+    /// to search, but the same caches, the same recolouring and the same
+    /// bounds apply.
+    pub(crate) fn render_path(
+        &mut self,
+        path: PathBuf,
+        size: u32,
+        scale: u32,
+        symbolic: bool,
+        palette: &Palette,
+    ) -> Option<Rc<Image>> {
+        let format = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(IconFormat::from_extension)?;
+        let file = IconFile {
+            path,
+            format,
+            nominal_size: size,
+            scale: 1,
+            symbolic,
+            kind: DirKind::Fixed { size },
+        };
+        self.render_file(&file, size, scale, palette)
+    }
+
     /// One located file, rasterised and memoised.
     fn render_file(
         &mut self,
