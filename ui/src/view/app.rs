@@ -22,6 +22,7 @@ use crate::view::render::{
 use crate::view::{Kind, View};
 use crate::window::focus::{FocusCause, FocusRing};
 use crate::window::pointer::{ImplicitGrab, hit_chain};
+use crate::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
 use crate::window::selection::Clipboard;
 use crate::window::{InputEvent, SurfaceError};
 
@@ -380,6 +381,35 @@ struct Runtime<Msg> {
     images: ImageCache,
     env: ResolveEnv,
     quit: bool,
+    /// The popup surfaces this app has open, in the order they were opened.
+    ///
+    /// `Cmd::OpenPopup` carries the popup's own view function, and this is
+    /// where that payload is built and kept: without it the command opened a
+    /// surface and dropped the view (contract §10 P5-D34).
+    popups: Vec<PopupSurface<Msg>>,
+    /// The next offscreen [`PopupKey`] to mint. A windowed run takes its keys
+    /// from `Window::open_popup` instead.
+    next_popup_key: u64,
+}
+
+/// One open popup surface's own retained tree.
+///
+/// A popup is a second surface with its own root, styles, layout and
+/// instances -- the main window's tree knows nothing about it -- so it
+/// carries the same five fields `Runtime` does for the window, plus where it
+/// sits in the parent's frame space.
+struct PopupSurface<Msg> {
+    key: PopupKey,
+    root: Node,
+    instances: Vec<Instance<Msg>>,
+    styles: StyleMap,
+    anims: Animations,
+    containers: HashMap<NodeAddr, Container>,
+    layout: LayoutTree,
+    /// Top-left in the parent window's frame space, from the positioner's
+    /// anchor rectangle.
+    origin: (f32, f32),
+    size: (u32, u32),
 }
 
 /// Bridges `Controller::measure` into taffy.
@@ -543,6 +573,8 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             images: ImageCache::new(),
             env: ResolveEnv::default(),
             quit: false,
+            popups: Vec::new(),
+            next_popup_key: 0,
         };
 
         let mut surface = skia_rs_safe::canvas::Surface::new_raster_n32_premul(
@@ -625,10 +657,37 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 &dyn_clock,
                 clock.now(),
             ) {
-                // Offscreen there is no surface to title, minimise or open a
-                // popup on, so the window-bound commands are logged and
-                // dropped.
-                tracing::debug!(?other, "command has no effect offscreen");
+                match other {
+                    // Offscreen there is no compositor to ask for a popup
+                    // surface, but the command's *payload* is a view like any
+                    // other: it is built into its own retained tree here and
+                    // composited over the window in `render_popups`, so a
+                    // pixel test can see what a menu actually paints.
+                    Cmd::OpenPopup {
+                        anchor,
+                        positioner,
+                        view,
+                    } => {
+                        let key = PopupKey(rt.next_popup_key);
+                        rt.next_popup_key += 1;
+                        let root = Node::with_classes("popup", &["background"]);
+                        open_popup(
+                            &mut rt,
+                            key,
+                            root,
+                            &anchor,
+                            &positioner,
+                            &view,
+                            &sheet,
+                            &mut fonts,
+                            &mut icons,
+                            &dyn_clock,
+                        );
+                    }
+                    Cmd::ClosePopup(key) => close_popup(&mut rt, key),
+                    // There is still no surface to title or minimise.
+                    other => tracing::debug!(?other, "command has no effect offscreen"),
+                }
             }
             // `Cmd::Focus` moves the ring inside `drain`; announce it too.
             let moved = sync_focus(
@@ -647,6 +706,14 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 &mut icons,
                 &dyn_clock,
                 size,
+                &mut surface,
+            )?;
+            render_popups(
+                &mut rt,
+                &sheet,
+                &mut fonts,
+                &mut icons,
+                &dyn_clock,
                 &mut surface,
             )?;
 
@@ -746,6 +813,166 @@ fn render_once<Msg: Clone + 'static>(
         &mut cx,
         &mut painter,
     );
+    Ok(())
+}
+
+/// Build `view`'s tree into a new popup surface and push it onto `rt`.
+///
+/// Ten arguments because a popup build needs everything a window build does
+/// (`sheet`/`fonts`/`icons`/`clock` are `BuildCx`'s own fields, borrowed
+/// separately from `rt` at both call sites) plus the surface's identity and
+/// placement.
+///
+/// This is the payload half of `Cmd::OpenPopup`: the command carries the
+/// popup's own view function, and until the P6 fix wave the loop dropped it
+/// and opened an empty surface (contract §10 P5-D34). `key` comes from
+/// `Window::open_popup` in a windowed run and from `rt.next_popup_key`
+/// offscreen; `root` is the popup surface's own root node, the window's own
+/// when there is a window.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a popup build takes the window build's five borrows plus the surface's identity, placement and payload"
+)]
+fn open_popup<Msg: Clone + 'static>(
+    rt: &mut Runtime<Msg>,
+    key: PopupKey,
+    root: Node,
+    anchor: &PopupAnchorPoint,
+    positioner: &Positioner,
+    view: &Rc<dyn Fn() -> View<Msg>>,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clock: &Rc<dyn Clock>,
+) {
+    let anchor_rect = match anchor {
+        crate::window::popup::PopupAnchorPoint::Rect(rect) => *rect,
+        crate::window::popup::PopupAnchorPoint::Node(node) => rt
+            .layout
+            .allocation(node)
+            .map_or(positioner.anchor_rect, |a| a.border_box),
+    };
+    let mut surface = PopupSurface {
+        key,
+        root,
+        instances: Vec::new(),
+        styles: StyleMap::new(),
+        anims: Animations::new(),
+        containers: HashMap::new(),
+        layout: LayoutTree::new(),
+        // The compositor places the real surface from the positioner's
+        // gravity; offscreen there is no compositor, so this is the one
+        // placement a menu positioner always means -- under the anchor's
+        // bottom-left corner.
+        origin: (anchor_rect.x, anchor_rect.y + anchor_rect.height),
+        size: positioner.size,
+    };
+    let described = view();
+    let mut cx = BuildCx {
+        sheet,
+        fonts,
+        icons,
+        clock,
+        env: &rt.env,
+    };
+    reconcile(
+        &surface.root,
+        &mut surface.instances,
+        vec![described],
+        &mut cx,
+    );
+    surface.containers.insert(
+        crate::view::render::node_addr(&surface.root),
+        Container::Box {
+            direction: crate::layout::BoxDirection::Column,
+        },
+    );
+    containers_of(&surface.instances, &mut surface.containers);
+    rt.popups.push(surface);
+}
+
+/// Drop the popup `key` names, and every popup opened after it.
+///
+/// xdg-shell destroys popups topmost-first, and a menu chain dismissed at
+/// its root takes its submenus with it; the retained trees follow the same
+/// rule so a `ClosePopup` on the root never leaves an orphan.
+fn close_popup<Msg>(rt: &mut Runtime<Msg>, key: PopupKey) {
+    if let Some(index) = rt.popups.iter().position(|p| p.key == key) {
+        rt.popups.truncate(index);
+    }
+}
+
+/// Restyle, relayout and paint every open popup into `surface`, at its own
+/// origin in the parent's frame space.
+///
+/// Offscreen there is one raster surface, so a popup composites over the
+/// window the way the compositor stacks the real surfaces.
+fn render_popups<Msg: Clone + 'static>(
+    rt: &mut Runtime<Msg>,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clock: &Rc<dyn Clock>,
+    surface: &mut skia_rs_safe::canvas::Surface,
+) -> Result<(), AppError> {
+    let now = clock.now();
+    for index in 0..rt.popups.len() {
+        let (width, height) = rt.popups[index].size;
+        let origin = rt.popups[index].origin;
+        {
+            let popup = &mut rt.popups[index];
+            restyle_tree(
+                &popup.root,
+                sheet,
+                &rt.env,
+                &mut popup.styles,
+                &mut popup.anims,
+                now,
+            );
+            let mut measure = ControllerMeasure {
+                instances: &mut popup.instances,
+                sheet,
+                fonts,
+                icons,
+                clock,
+                env: &rt.env,
+            };
+            layout_tree(
+                &popup.root,
+                &popup.styles,
+                &popup.containers,
+                &mut popup.layout,
+                &rt.env,
+                (Some(width as f32), Some(height as f32)),
+                &mut measure,
+            )?;
+        }
+        let images = &mut rt.images;
+        let env = &rt.env;
+        let popup = &mut rt.popups[index];
+        let mut cx = PaintCx {
+            env,
+            colors: &sheet.colors,
+            fonts,
+            images,
+            text: None,
+        };
+        let mut painter = ControllerPainter {
+            instances: &mut popup.instances,
+        };
+        let mut canvas = surface.canvas();
+        paint_tree(
+            &mut canvas,
+            &popup.root,
+            &popup.styles,
+            &popup.layout,
+            &mut popup.anims,
+            now,
+            origin,
+            &mut cx,
+            &mut painter,
+        );
+    }
     Ok(())
 }
 
@@ -1105,6 +1332,8 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             images: ImageCache::new(),
             env: ResolveEnv::default(),
             quit: false,
+            popups: Vec::new(),
+            next_popup_key: 0,
         };
 
         rebuild(&mut self, &mut rt, &sheet, &mut fonts, &mut icons, &clock);
@@ -1178,13 +1407,35 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                     Cmd::Minimize => window.minimize(),
                     Cmd::ToggleMaximized => window.toggle_maximized(),
                     Cmd::OpenPopup {
-                        anchor, positioner, ..
-                    } => {
-                        if let Err(error) = window.open_popup(anchor, positioner) {
-                            tracing::warn!(?error, "opening a popup failed");
+                        anchor,
+                        positioner,
+                        view,
+                    } => match window.open_popup(anchor.clone(), positioner) {
+                        Ok(key) => {
+                            // The payload builds into the popup surface's own
+                            // root, which `Window` created and owns.
+                            if let Some(root) = window.popup_root(key) {
+                                open_popup(
+                                    &mut rt,
+                                    key,
+                                    root,
+                                    &anchor,
+                                    &positioner,
+                                    &view,
+                                    &sheet,
+                                    &mut fonts,
+                                    &mut icons,
+                                    &clock,
+                                );
+                                window.popup_mark_dirty(key);
+                            }
                         }
+                        Err(error) => tracing::warn!(?error, "opening a popup failed"),
+                    },
+                    Cmd::ClosePopup(key) => {
+                        close_popup(&mut rt, key);
+                        window.close_popup(key);
                     }
-                    Cmd::ClosePopup(key) => window.close_popup(key),
                     other => tracing::debug!(?other, "command not applicable to a window"),
                 }
             }
@@ -1480,6 +1731,8 @@ mod tests {
             images: ImageCache::new(),
             env: ResolveEnv::default(),
             quit: false,
+            popups: Vec::new(),
+            next_popup_key: 0,
         }
     }
 

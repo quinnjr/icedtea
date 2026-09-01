@@ -1179,10 +1179,13 @@ fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
     // chain (contract P5-D33) rather than the geometrically deepest node,
     // which for a `DropDown` is the controller-owned `button.toggle` subnode.
     //
-    // Scope, honestly stated: the offscreen app has no popup surface to paint
-    // the opened list into (`Cmd::OpenPopup` drops its view payload -- P5-D34,
-    // deferred to P6/P7), so the *row click* half of this criterion cannot be
-    // driven from here. It is covered over a really laid-out tree by
+    // Scope, honestly stated: `PopoverC::open` hands `Cmd::OpenPopup` a stub
+    // payload (`|| View::new(Kind::Popover)`, in P5's `popover.rs`, which P6
+    // may not edit), so the popup surface the offscreen app now really does
+    // build and composite (see
+    // `a_popup_paints_the_view_its_open_command_carried`) is empty for a
+    // `DropDown`, and the *row click* half of this criterion cannot be driven
+    // from here. It is covered over a really laid-out tree by
     // `widgets::drop_down::tests::opening_a_drop_down_and_clicking_a_row_selects_that_item`,
     // which drives open -> click-row -> `EventKind::Selected` end to end. What
     // this test now pins that nothing else did is that the button's own click
@@ -1714,4 +1717,69 @@ fn every_p5_kind_renders_at_rest_without_panicking() {
         let rendered = node_tree_of(*kind, &Props::default());
         assert!(!rendered.is_empty(), "{kind:?} rendered nothing");
     }
+}
+
+#[test]
+fn a_popup_paints_the_view_its_open_command_carried() {
+    // `Cmd::OpenPopup` carries the popup's own view function. Until the P6
+    // fix wave the loop matched `Cmd::OpenPopup { anchor, positioner, .. }`
+    // and dropped it: a surface opened and rendered nothing (contract §10
+    // P5-D34).
+    //
+    // Mutation: put the `..` back (drop the payload, or skip `render_popups`)
+    // and the second capture equals the first -- no popup ink anywhere.
+    use icedtea_ui::view::builders::{box_, label};
+    use icedtea_ui::view::cmd::Cmd as ViewCmd;
+    use icedtea_ui::widgets::Orientation;
+    use icedtea_ui::window::popup::{PopupAnchorPoint, Positioner};
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Open;
+
+    let frames = run(
+        false,
+        |model: &mut bool, Open: Open| {
+            *model = true;
+            ViewCmd::OpenPopup {
+                anchor: PopupAnchorPoint::Rect(icedtea_ui::layout::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                }),
+                positioner: Positioner::menu(
+                    icedtea_ui::layout::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                    (180, 60),
+                ),
+                view: std::rc::Rc::new(|| label("Menu item")),
+            }
+        },
+        |_model: &bool| box_(Orientation::Vertical, [label("window")]),
+        (200, 120),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Message(Open),
+            ScriptStep::Capture,
+        ],
+    );
+
+    // The window's own view does not depend on the model, so every pixel
+    // that changed between the two captures is popup ink.
+    let mut changed = 0;
+    for y in 0..120 {
+        for x in 0..200 {
+            if frames.pixel(0, x, y) != frames.pixel(1, x, y) {
+                changed += 1;
+            }
+        }
+    }
+    assert!(
+        changed > 20,
+        "the popup painted the label its command carried ({changed} px changed)"
+    );
 }
