@@ -1,0 +1,6 @@
+expander-widget
+╰── box
+    ├── title
+    │   ├── expander
+    │   ╰── <child>
+    ╰── <child>

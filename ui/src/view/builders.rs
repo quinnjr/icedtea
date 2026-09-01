@@ -254,6 +254,20 @@ impl<Msg: Clone + 'static> View<Msg> {
     }
 }
 
+/// `GtkExpander` titled `label`, wrapping `child`.
+#[must_use]
+pub fn expander<Msg: Clone + 'static>(label: &str, child: View<Msg>) -> View<Msg> {
+    View::new(Kind::Expander).label(label).child(child)
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// `GtkExpander:expanded`.
+    #[must_use]
+    pub fn expanded(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Expanded, v)
+    }
+}
+
 /// `GtkPaned`: `start` and `end` flank the draggable separator, in that
 /// order.
 #[must_use]

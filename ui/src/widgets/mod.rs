@@ -59,6 +59,7 @@ pub mod drop_down;
 pub mod edit;
 pub mod editable_label;
 pub mod entry;
+pub mod expander;
 pub mod font_dialog;
 pub mod frame;
 pub mod grid;
@@ -969,6 +970,9 @@ pub fn build_controller<Msg: Clone + 'static>(
         )),
         Kind::Grid => Box::new(<grid::GridC as Controller<Msg>>::build(node, props, cx)),
         Kind::Frame => Box::new(<frame::FrameC as Controller<Msg>>::build(node, props, cx)),
+        Kind::Expander => Box::new(<expander::ExpanderC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         Kind::Paned => Box::new(<paned::PanedC as Controller<Msg>>::build(node, props, cx)),
         Kind::Separator => Box::new(<separator::SeparatorC as Controller<Msg>>::build(
             node, props, cx,
@@ -1066,8 +1070,10 @@ pub fn build_controller<Msg: Clone + 'static>(
 ///
 /// Most kinds take children on their own node. A few nest them in a subnode
 /// GTK's own tree names — `popover > contents` is P5's only case; P6 adds
-/// `frame > box`, `expander-widget > box` and the scrolled window's viewport.
-/// P4's reconciler calls this before `Node::append_child`.
+/// the scrolled window's viewport and `expander-widget`'s own dedicated
+/// `content` node (`box`'s second child, always present so the child keeps
+/// its identity across a collapse/expand cycle -- `ExpanderC`'s own doc
+/// comment). P4's reconciler calls this before `Node::append_child`.
 ///
 /// It also has to answer for every kind whose controller appends its *own*
 /// subnodes straight onto its root, because the reconciler's "no application
@@ -1089,6 +1095,9 @@ pub fn child_slot(kind: Kind, controller: &dyn std::any::Any) -> Option<Node> {
         Kind::Popover => controller
             .downcast_ref::<popover::PopoverC>()
             .map(|c| c.contents.clone()),
+        Kind::Expander => controller
+            .downcast_ref::<expander::ExpanderC>()
+            .map(|c| c.content.clone()),
         Kind::MenuButton => controller
             .downcast_ref::<menu_button::MenuButtonC>()
             .map(|c| c.popover.contents.clone()),
@@ -1177,6 +1186,37 @@ impl Headless {
     ) -> crate::view::EventCx<'a, Msg> {
         let handlers: &crate::view::Handlers<Msg> =
             Box::leak(Box::new(crate::view::Handlers::default()));
+        let cmds: &mut Vec<crate::view::Cmd<Msg>> = Box::leak(Box::new(Vec::new()));
+        crate::view::EventCx {
+            node,
+            handlers,
+            tree: &self.tree,
+            styles: &self.styles,
+            focus: &mut self.focus,
+            clipboard: &mut self.clipboard,
+            icons: &mut self.icons,
+            fonts: &mut self.fonts,
+            clock: &self.clock,
+            env: &self.env,
+            cmds,
+            phase: crate::view::Phase::Target,
+            handled: false,
+        }
+    }
+
+    /// [`Headless::event_cx`], with `populate` given a chance to register
+    /// handlers first -- a controller's `on_event` only emits a `Msg` when
+    /// [`crate::view::Handlers`] actually holds a handler for the
+    /// [`crate::view::EventKind`] it fires, which the empty set `event_cx`
+    /// leaks never does.
+    pub fn event_cx_with_handlers<'a, Msg: Clone + 'static>(
+        &'a mut self,
+        node: &'a Node,
+        populate: impl FnOnce(&mut crate::view::Handlers<Msg>),
+    ) -> crate::view::EventCx<'a, Msg> {
+        let mut handlers = crate::view::Handlers::default();
+        populate(&mut handlers);
+        let handlers: &crate::view::Handlers<Msg> = Box::leak(Box::new(handlers));
         let cmds: &mut Vec<crate::view::Cmd<Msg>> = Box::leak(Box::new(Vec::new()));
         crate::view::EventCx {
             node,
