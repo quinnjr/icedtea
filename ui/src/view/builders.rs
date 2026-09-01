@@ -1052,7 +1052,9 @@ impl<Msg: Clone + 'static> View<Msg> {
 // The per-widget builders themselves live beside their controllers under
 // `crate::widgets` (contract §11 E5); this module re-exports them so every
 // builder is reachable as `view::builders::<name>`.
+pub use crate::widgets::about_dialog::{AboutDialogExt, about_dialog};
 pub use crate::widgets::action_bar::ActionBarExt;
+pub use crate::widgets::alert_dialog::{AlertDialogExt, alert_dialog};
 pub use crate::widgets::button::{ButtonExt, button, button_from};
 pub use crate::widgets::calendar::{CalendarExt, calendar};
 pub use crate::widgets::check_button::{CheckButtonExt, check_button};
@@ -1085,6 +1087,7 @@ pub use crate::widgets::scrollbar::{ScrollbarExt, scrollbar};
 pub use crate::widgets::search_bar::SearchBarExt;
 pub use crate::widgets::search_entry::{SearchEntryExt, search_entry};
 pub use crate::widgets::separator::separator;
+pub use crate::widgets::shortcuts_window::{ShortcutsSectionExt, shortcuts_window};
 pub use crate::widgets::spin_button::{SpinButtonExt, spin_button};
 pub use crate::widgets::spinner::{SpinnerExt, spinner};
 pub use crate::widgets::statusbar::{StatusbarExt, statusbar};

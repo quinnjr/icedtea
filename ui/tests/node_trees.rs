@@ -868,6 +868,50 @@ fn window_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn shortcuts_window_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::Title,
+        icedtea_ui::view::Prop::Str("Keyboard Shortcuts".into()),
+    );
+    assert_fixture(
+        icedtea_ui::view::Kind::ShortcutsWindow,
+        &props,
+        "shortcuts_window",
+    );
+}
+
+#[test]
+fn about_dialog_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::ProgramName,
+        icedtea_ui::view::Prop::Str("Files".into()),
+    );
+    assert_fixture(icedtea_ui::view::Kind::AboutDialog, &props, "about_dialog");
+}
+
+#[test]
+fn alert_dialog_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::Message,
+        icedtea_ui::view::Prop::Str("Discard changes?".into()),
+    );
+    props.set(
+        icedtea_ui::view::PropName::Detail,
+        icedtea_ui::view::Prop::Str("They cannot be recovered.".into()),
+    );
+    props.set(
+        icedtea_ui::view::PropName::Buttons,
+        icedtea_ui::view::Prop::Classes(
+            ["Cancel", "Discard"].iter().map(|s| (*s).into()).collect(),
+        ),
+    );
+    assert_fixture(icedtea_ui::view::Kind::AlertDialog, &props, "alert_dialog");
+}
+
+#[test]
 fn no_p5_kind_falls_through_to_the_unimplemented_controller() {
     // mutation: remove any dispatch arm from build_controller and that kind's
     // tree renders as a bare node, failing its fixture's required subnodes.

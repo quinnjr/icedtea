@@ -50,7 +50,9 @@ impl ListItem {
     }
 }
 
+pub mod about_dialog;
 pub mod action_bar;
+pub mod alert_dialog;
 pub mod box_;
 pub mod button;
 pub mod calendar;
@@ -94,6 +96,7 @@ pub mod scrolled_window;
 pub mod search_bar;
 pub mod search_entry;
 pub mod separator;
+pub mod shortcuts_window;
 pub mod spin_button;
 pub mod spinner;
 pub mod stack;
@@ -1347,6 +1350,15 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Window => Box::new(<window::WindowC as Controller<Msg>>::build(node, props, cx)),
+        Kind::ShortcutsWindow => Box::new(<shortcuts_window::ShortcutsWindowC as Controller<
+            Msg,
+        >>::build(node, props, cx)),
+        Kind::AboutDialog => Box::new(<about_dialog::AboutDialogC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::AlertDialog => Box::new(<alert_dialog::AlertDialogC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {
