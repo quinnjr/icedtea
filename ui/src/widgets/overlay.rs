@@ -190,7 +190,7 @@ mod tests {
     use crate::layout::Align;
     use crate::view::builders::{label, overlay};
     use crate::view::{Cmd, Kind, Props, ScriptStep, View};
-    use crate::widgets::offscreen::{frames, px};
+    use crate::widgets::offscreen::px;
     use crate::widgets::overlay::OverlayC;
     use crate::widgets::{build_widget, matches_fixture};
 
@@ -229,34 +229,67 @@ mod tests {
     }
 
     fn view(_: &()) -> View<Msg> {
-        // Reconciliation: the reconciler gives the app's own top-level view
-        // no `ChildLayout` (`view::app::rebuild`'s `Container::Box{Column}`
-        // for the window has no per-child override for it), so it lands
-        // centred at its own natural size rather than filling the surface
-        // -- `frame.rs`'s own pixel test hits the identical gap. A
-        // three-line main child gives the overlay real vertical room for
-        // `valign(Start)` to move within, where a single matched line pair
-        // would not.
-        overlay(label("under\nunder\nunder").class("under"))
-            .overlay(label("over").class("over").valign(Align::Start))
+        // Reconciliation (review round 1): the plan's original pair of
+        // same-colour text labels cannot prove paint order at all -- with
+        // the main child's own text already covering the sample point,
+        // the assertion `top != bottom` holds whether or not the overlay
+        // child paints, or in which order, as long as *something* inks the
+        // top strip. Giving `.under`/`.over` their own solid, mutually
+        // exclusive background colours (below) makes the sample point read
+        // one specific colour if the overlay child paints last (correct)
+        // and the other if paint order is reversed -- an actual z-order
+        // assertion, not a "something painted" one. `min-width`/
+        // `min-height` give each label a guaranteed rectangle regardless of
+        // its text's own natural size.
+        overlay(label("under").class("under")).overlay(
+            label("over")
+                .class("over")
+                .halign(Align::Start)
+                .valign(Align::Start),
+        )
     }
 
     #[test]
     fn the_overlay_child_paints_over_the_main_child_at_rest() {
         // Rest-state pixel test. Mutation check: painting children in
-        // reverse order leaves the top strip showing the main child.
-        let out = frames((), update, view, (200, 60), vec![ScriptStep::Capture]);
-        // Reconciliation: the top-level view lands centred at its own
-        // natural size (this file's `view` doc comment), so with a
-        // single-line main child the whole overlay is only one line tall
-        // and `valign(Start)` has no room to move within it -- hence the
-        // three-line main child, which makes the overlay's own natural
-        // height span nearly the full 60px surface. `(100, 8)` is inside
-        // its first rendered line's ink; `(100, 58)` is below the last of
-        // its three lines, back on the plain background.
-        let bottom = px(&out, 0, 100, 58);
-        let top = px(&out, 0, 100, 8);
-        assert_ne!(top, bottom, "the overlaid child owns the top strip");
+        // reverse order shows the main child's red at a point the overlay
+        // child's own blue rectangle covers.
+        use crate::anim::ManualClock;
+        use crate::css::cascade::CompiledSheet;
+        use crate::view::app::App;
+        use std::rc::Rc;
+
+        // `.under` fills the whole 200x60 surface red; `.over` is pinned to
+        // the top-left corner as a 40x20 blue rectangle -- disjoint colours
+        // at overlapping positions, so which one a sample point reads
+        // depends only on paint order, never on text content or shaping.
+        let sheet = CompiledSheet::compile(
+            "window { background-color: #ffffff; }
+             label.under { background-color: #ff0000; min-width: 200px; min-height: 60px; }
+             label.over { background-color: #0000ff; min-width: 40px; min-height: 20px; }",
+        );
+        let clock = Rc::new(ManualClock::new());
+        let out = App::new((), update, view)
+            .with_sheet(sheet)
+            .run_offscreen((200, 60), clock, vec![ScriptStep::Capture])
+            .expect("offscreen run");
+
+        // Inside the overlay child's own 40x20 rectangle: blue only if it
+        // painted on top of the main child, as `GtkOverlay` requires.
+        let overlaid = px(&out, 0, 10, 10);
+        // Outside that rectangle, but still inside the main child: red
+        // either way, confirming the main child did paint at all.
+        let main_only = px(&out, 0, 150, 50);
+        assert_eq!(
+            overlaid,
+            (0, 0, 255, 255),
+            "the overlay child's own rectangle must show its own colour, not the main child's"
+        );
+        assert_eq!(
+            main_only,
+            (255, 0, 0, 255),
+            "the main child must still show through everywhere the overlay child doesn't cover"
+        );
     }
 
     #[test]
