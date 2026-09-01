@@ -56,3 +56,7 @@ path = "src/bin/themed-button.rs"
 [[bin]]
 name = "window-probe"
 path = "src/bin/window-probe.rs"
+
+[[bin]]
+name = "gallery"
+path = "src/bin/gallery.rs"
