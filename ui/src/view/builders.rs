@@ -624,6 +624,71 @@ pub fn list_box_row<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
     View::new(Kind::ListBoxRow).child(child)
 }
 
+/// `stack_switcher`/`stack_sidebar`'s shared prop pair: titles as
+/// `PropName::Pages`'s `Prop::Classes` (deviation 5's shape reused for a
+/// plain string list) and the flagged pages folded into `PropName::
+/// NeedsAttention`'s `Prop::Int` bitmask. Page 0 is the mask's high bit —
+/// see `widgets::stack_switcher`'s module doc for why the mask reads that
+/// way instead of the more usual bit-0-is-page-0.
+fn stack_page_props(pages: &[crate::widgets::StackPageInfo]) -> (Prop, Prop) {
+    let titles: Rc<[Rc<str>]> = pages.iter().map(|p| Rc::clone(&p.title)).collect();
+    let total = pages.len();
+    let mut mask: i64 = 0;
+    for (i, page) in pages.iter().enumerate() {
+        if page.needs_attention {
+            let shift = total - 1 - i;
+            if shift < 64 {
+                mask |= 1i64 << shift;
+            }
+        }
+    }
+    (Prop::Classes(titles), Prop::Int(mask))
+}
+
+/// `GtkStackSwitcher` over `pages` -- one linked button per page, taken by
+/// value rather than a live `Stack` handle so the reactive layer can diff
+/// it (`widgets::stack_switcher`'s module doc).
+#[must_use]
+pub fn stack_switcher<Msg: Clone + 'static>(
+    pages: Rc<[crate::widgets::StackPageInfo]>,
+) -> View<Msg> {
+    let (titles, mask) = stack_page_props(&pages);
+    View::new(Kind::StackSwitcher)
+        .prop(PropName::Pages, titles)
+        .prop(PropName::NeedsAttention, mask)
+}
+
+/// `GtkStackSidebar` over `pages` -- a `scrolledwindow` over a
+/// `navigation-sidebar` list, one row per page.
+#[must_use]
+pub fn stack_sidebar<Msg: Clone + 'static>(
+    pages: Rc<[crate::widgets::StackPageInfo]>,
+) -> View<Msg> {
+    let (titles, mask) = stack_page_props(&pages);
+    View::new(Kind::StackSidebar)
+        .prop(PropName::Pages, titles)
+        .prop(PropName::NeedsAttention, mask)
+}
+
+/// [`stack_switcher`]/[`stack_sidebar`]'s own `.selected`, chained after
+/// either. Scoped to its own trait for the same reason [`HeaderBarExt`]'s
+/// doc comment gives -- `DropDownExt` already has a `.selected` of its own,
+/// over the same `PropName::Selected`, so this one only exists to let a
+/// caller write `stack_switcher(pages).selected(1)` without importing
+/// `DropDownExt` for an unrelated widget.
+pub trait StackPagesExt<Msg>: Sized {
+    /// `GtkStackSwitcher:selected`/no true `GtkStackSidebar` counterpart in
+    /// GTK (it tracks its `GtkStack` live); both of this crate's
+    /// controllers accept it as their initial checked/selected index.
+    fn selected(self, index: usize) -> Self;
+}
+
+impl<Msg: Clone + 'static> StackPagesExt<Msg> for View<Msg> {
+    fn selected(self, index: usize) -> Self {
+        self.prop(PropName::Selected, Prop::Int(index as i64))
+    }
+}
+
 impl<Msg: Clone + 'static> View<Msg> {
     /// `GtkBox:spacing`, `GtkGrid` row/column spacing's shorthand.
     #[must_use]

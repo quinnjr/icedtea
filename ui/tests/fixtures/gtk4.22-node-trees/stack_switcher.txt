@@ -1,0 +1,4 @@
+stackswitcher.stack-switcher
+├── button[.needs-attention]
+┊
+╰── button[.needs-attention]

@@ -91,6 +91,8 @@ pub mod separator;
 pub mod spin_button;
 pub mod spinner;
 pub mod stack;
+pub mod stack_sidebar;
+pub mod stack_switcher;
 pub mod statusbar;
 pub mod switch;
 pub mod text_view;
@@ -1230,6 +1232,12 @@ pub fn build_controller<Msg: Clone + 'static>(
             <editable_label::EditableLabelC as Controller<Msg>>::build(node, props, cx),
         ),
         Kind::ListBox => Box::new(<list_box::ListBoxC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::StackSwitcher => Box::new(
+            <stack_switcher::StackSwitcherC as Controller<Msg>>::build(node, props, cx),
+        ),
+        Kind::StackSidebar => Box::new(<stack_sidebar::StackSidebarC as Controller<Msg>>::build(
             node, props, cx,
         )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),

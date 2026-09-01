@@ -749,6 +749,34 @@ fn list_box_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn stack_switcher_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::Pages,
+        icedtea_ui::view::Prop::Classes(["One", "Two"].iter().map(|s| (*s).into()).collect()),
+    );
+    assert_fixture(
+        icedtea_ui::view::Kind::StackSwitcher,
+        &props,
+        "stack_switcher",
+    );
+}
+
+#[test]
+fn stack_sidebar_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::Pages,
+        icedtea_ui::view::Prop::Classes(["One", "Two"].iter().map(|s| (*s).into()).collect()),
+    );
+    assert_fixture(
+        icedtea_ui::view::Kind::StackSidebar,
+        &props,
+        "stack_sidebar",
+    );
+}
+
+#[test]
 fn no_p5_kind_falls_through_to_the_unimplemented_controller() {
     // mutation: remove any dispatch arm from build_controller and that kind's
     // tree renders as a bare node, failing its fixture's required subnodes.
