@@ -3086,7 +3086,9 @@ steppers have something to call.
 `SpinButton`, `MenuButton`'s arrow) need `Builtin` to exist before P7 lands;
 the file's own module doc says as much. P7 replaces the two placeholder
 bodies and un-ignores `a_check_button_paints_the_builtin_check_glyph` and
-`an_image_paints_its_resolved_icon` (P5-D28 below); it must not rename the
+`an_image_paints_its_resolved_icon` (P5-D31 below, which owns those two
+`#[ignore]`s; P5-D28 is the builders-file record and was cited here in
+error); it must not rename the
 enum or its two methods, since P5's `CheckButtonC`/`SpinButtonC` already call
 them by these exact names.
 
@@ -3105,7 +3107,7 @@ returns `Option<Rc<Image>>` (`Image` = `skia_rs_safe::codec::Image`).
 `ImageC.resolved: Option<Rc<skia_rs_safe::codec::Image>>` matches
 `IconTheme::render`'s return type exactly, so `ImageC::build` can store it
 without a conversion; it stays `None` until P7 wires icon resolution through
-(P5-D28).
+(P5-D31).
 
 ---
 
@@ -3367,6 +3369,179 @@ embedding it (`MenuButton`, `DropDown`, `ColorDialogButton`,
 rendered popup body — a known, recorded limitation of the P5 milestone, not a
 regression P6 introduces.
 
+**PARTLY CLOSED 2026-09-01 (§10 P6-D39).** P6's whole-part fix wave wires the
+payload: `Runtime` keeps a `PopupSurface` per open popup, `Cmd::OpenPopup`
+builds its `view` into it, and
+`widget_pixels.rs::a_popup_paints_the_view_its_open_command_carried` is the
+required content pixel test. What remains is in two files P6 may not edit —
+`PopoverC::open`'s own stub payload (`widgets/popover.rs`, P5) and a
+popup-paint seam on `Window` (`window/mod.rs`, P3) — and is assigned to P7 in
+P6-D39.
+
+---
+
+### P6-D35 — P6 edits four files under `view/` beyond `builders.rs`; recorded per E4's amendment
+
+**Carried out by:** P6 (`ui/src/view/controller.rs`, `ui/src/view/reconcile.rs`,
+`ui/src/view/app.rs`, `ui/src/view/render.rs`). **Added:** 2026-09-01, in the
+P6 whole-part fix wave, after a review found the drift undeclared.
+
+The part-6 plan's File Structure table lists only `view/builders.rs` as
+P6-editable under `view/`, and §11 E4 (as amended by P5-D32) instructs P6 to
+"record any further `view/**` change in §10 the same way". The changes, none
+of them reverted, all additive, no gate regressed:
+
+1. **`Controller::child_index` / `Controller::reserved_total`**
+   (`controller.rs`, defaulted trait methods). A controller whose chrome
+   shares its root node with the application children maps a *logical* child
+   index onto a real node index, and tells reconcile's trim step how many
+   node children to expect. The defaults (`view_index`, `view_count`) are
+   exactly the pre-P6 behaviour, so every P4/P5 controller is unchanged.
+2. **`reconcile_reserved`** (`reconcile.rs`), the `reserve`-aware body
+   `reconcile` now delegates to. Without it, the first real view child
+   reconciled into a widget whose controller had attached chrome to the same
+   node detached that chrome (`Frame`'s label, `Paned`'s separator).
+3. **`Frames::width` / `Frames::height`** (`app.rs`), so a pixel test can
+   derive a coordinate from the frame instead of hard-coding it.
+4. **`crate::widgets::flush_layout(tree)`** (`render.rs`), called from
+   `layout_tree` immediately after `write_styles`. A widget controller has no
+   `&mut LayoutTree`, so its container/gap/homogeneous/child-placement
+   decisions are recorded on node-keyed side tables and folded in here.
+
+Three further `view/**` changes were made in the P6 whole-part fix wave and
+are recorded in **P6-D36**, **P6-D37** and **P6-D38** below.
+
+**Ruling.** All four declared, not reverted. P7 and P8 may edit these same
+seams to add arms, and must record any further `view/**` change here.
+
+---
+
+### P6-D36 — `reconcile`'s `Remove` evicts the widget side tables; the tables are `Weak`-tagged
+
+**Carried out by:** P6 (`ui/src/widgets/mod.rs`, `ui/src/view/reconcile.rs`).
+**Added:** 2026-09-01, in the P6 whole-part fix wave.
+
+**The bug.** The six thread-local side tables in `widgets` (`PENDING`,
+`CONTAINERS`, `NODE_PROPS`, `NODE_CHILD`, `TRANSITIONS`, `ROW_BINDING`) are
+keyed on `node.opaque()` — the `NodeInner` allocation's address — and had no
+removal path. Five of them hold no reference to the node they describe, so a
+torn-down node's address was handed straight back to the next node built and
+that node inherited the dead one's grid cell, container variant,
+stack-transition state or pooled row binding (measured: 512 of 512 freshly
+built nodes landed on the dead node's address). `PENDING` holds a strong
+`Node`, so it leaked instead of aliasing. Reachable in ordinary use: destroy
+a `Grid`/`Stack`/`ListBox` child and build another.
+
+**Ruling.** Both halves are fixed together, and the fix crosses the `view/`
+boundary, hence this record. Every entry carries a `Weak<NodeInner>` tag: a
+stale entry reads as absent, and — because a live `Weak` keeps the allocation
+alive — the address cannot be reused while one is held. `reconcile`'s
+`Remove` arm calls the new `widgets::forget_subtree` on the instance's node,
+and `flush_layout` sweeps dead entries once per frame for whatever a
+controller dropped on its own.
+
+---
+
+### P6-D37 — E6 is honoured by converging on P6's fixture slack, not by discarding it
+
+**Carried out by:** P6 (`ui/src/widgets/node_tree.rs`, `ui/src/widgets/mod.rs`,
+`ui/tests/node_trees.rs`). **Added:** 2026-09-01, in the P6 whole-part fix
+wave.
+
+**The gap.** §11 E6 rules that P6's Task 3 relocates P5's `node_tree_of`,
+`render_node_tree` and `fixture_matches` into `widgets/node_tree.rs`
+unchanged, re-exports all three, and adds `matches_fixture` as a thin
+node-first wrapper — "there is exactly one matcher implementation". P6 left
+P5's three functions in `widgets/mod.rs` and wrote a second, independent
+backtracking matcher, so P5's 32 fixtures and P6's 27 were validated by two
+matchers with different slack semantics.
+
+**Ruling.** E6 is carried out as written: the three functions moved verbatim,
+`matches_fixture` renders and delegates, and the second implementation
+(`Pattern`, `parse_fixture`, `match_list`, `render_tree`) is deleted. Two
+generalisations were needed for P5's matcher to accept P6's vendored blocks,
+both of rules it already had, and both now apply to all 59 fixtures:
+
+* any line opening with a `<...>` token is an application-supplied subtree
+  (`<overlay child>[.left]`, `<column header>`, not just `<child>`);
+* a fixture line with no children of its own describes a subtree GTK's block
+  elides, so that node's rendered descendants are not checked.
+
+The surviving matcher is path-based and therefore does **not** check sibling
+order; the two order-sensitive facts P6 depends on carry their own
+assertions (`frame::tests::a_titled_frame_is_a_label_then_the_child`,
+`scrolled_window::tests::chrome_follows_the_application_child_in_gtks_declared_order`).
+`node_tree_of` also builds through `build_widget` now, so the fixture gate
+and the widget modules share one `Headless` environment (bundled Adwaita
+light) instead of diverging on an empty sheet. **This matcher is normative
+for P8's gallery gate.**
+
+---
+
+### P6-D38 — E8's extension-trait convention, applied to P6's containers; argument types stay `impl Into<Prop>`
+
+**Carried out by:** P6 (`ui/src/view/builders.rs`, `ui/src/widgets/expander.rs`,
+and the six widget modules whose tests import the new traits). **Added:**
+2026-09-01, in the P6 whole-part fix wave.
+
+**The gap.** §11 E8 withdraws part-6 plan deviation 13 and rules that P6
+ships per-widget extension traits, warning that "a trait method is shadowed
+by an inherent method of the same name". P6 shipped both conventions, and the
+predicted collision landed: the inherent `View::position` shadowed P5's
+`PopoverExt::position` and the inherent `View::label` shadowed
+`ButtonExt::label`, making both unreachable public API.
+
+**Ruling.** Ten inherent `impl<Msg> View<Msg>` blocks in `builders.rs` become
+thirteen traits — `BoxExt`, `GridExt`, `CenterBoxExt`, `FrameExt`,
+`OverlayExt`, `PanedExt`, `PackExt`, `ScrolledWindowExt`, `StackExt`,
+`ListBoxExt`, `ListViewExt`, `FlowBoxExt`, `GridViewExt` — plus `expanded`
+folded into the existing `ExpanderExt`. Three consequences are recorded
+rather than hidden:
+
+1. **Argument types stay `impl Into<Prop>`** except where E8's own worked
+   example demands otherwise (`PanedExt::position(i32)`, against
+   `PopoverExt::position(Position)`). Narrowing the rest would change which
+   `Prop` variant reaches a controller that already reads `Int` or `Float`
+   from the same setter, which is a behaviour change no review asked for.
+2. **There is no `FrameExt::label`.** Two traits in scope defining one method
+   name make every call site ambiguous (Rust resolves inherent-then-trait,
+   and among traits it is an error), so the universal `PropName::Label`
+   setter stays P5's `ButtonExt::label`, which has identical semantics.
+3. **P4's eighteen inherent `on_*` setters are untouched** — E8 names them as
+   the inherent namespace.
+
+---
+
+### P6-D39 — `Cmd::OpenPopup`'s payload is wired; `PopoverC`'s own payload is still a stub
+
+**Carried out by:** P6 (`ui/src/view/app.rs`, `ui/tests/widget_pixels.rs`).
+**Added:** 2026-09-01, in the P6 whole-part fix wave. **Closes P5-D34 in
+part.**
+
+`Runtime` now keeps a `PopupSurface` per open popup — its own root, styles,
+animations, container map, layout tree and instances — `open_popup`
+reconciles `Cmd::OpenPopup`'s `view` payload into it, and `Cmd::ClosePopup`
+drops that popup and every popup opened after it. Offscreen the popup is
+composited over the window at its anchor rectangle's bottom-left, which is
+what makes P5-D34's required pixel test possible:
+`widget_pixels.rs::a_popup_paints_the_view_its_open_command_carried`.
+
+Two limits remain, both outside P6's file list:
+
+1. **`PopoverC::open` still passes `|| View::new(Kind::Popover)`** — an empty
+   payload — so `Popover` and the four P5 kinds embedding it still open a
+   blank popup. `ui/src/widgets/popover.rs` is a P5 per-widget file, which §9
+   forbids P6 from editing. **P7 owns this**; the mechanism it needs now
+   exists.
+2. **The windowed loop builds the payload into `Window::popup_root(key)` and
+   marks it dirty, but `App::run` cannot paint a popup surface**: it drives
+   the main surface through `Window::paint_with`, and `Window` exposes no
+   popup equivalent (`render_popups` is private and runs only from
+   `Window::render`, which `App::run` must not call — it would repaint the
+   main surface from the window's own style map). A
+   `Window::paint_popup_with(key, f)` seam in `ui/src/window/mod.rs` — a
+   P6-forbidden file — closes it. **P7 owns this too.**
+
 ---
 
 ## 11. Execution notes — cross-part consistency check (E1–E16)
@@ -3534,6 +3709,12 @@ say so.
 
 Carried out by: P6 (Task 3).
 
+**AMENDED 2026-09-01 (§10 P6-D37).** P6 shipped a second matcher instead;
+the P6 whole-part fix wave carried E6 out as written and deleted it. The two
+pieces of fixture slack P6's blocks need were added to the surviving matcher
+rather than kept in a second one — see P6-D37, which also names this matcher
+normative for P8's gallery gate.
+
 ### E7 — `PaintCx` is re-exported from `view::controller` — FIXED IN PLACE
 
 `Controller::paint`'s `cx` is M2's `crate::paint::PaintCx` (`paint/mod.rs:44`),
@@ -3570,6 +3751,15 @@ where a widget's own setter must differ from P4's inherent `on_*`, §10 P6-D14's
 `.on_item_activated` renaming is the pattern to follow.
 
 Carried out by: P6 (Task 4 and every widget task).
+
+**AMENDED 2026-09-01 (§10 P6-D38).** P6 shipped ten inherent
+`impl<Msg> View<Msg>` blocks alongside its `*Ext` traits, and the predicted
+shadowing landed on `View::position` (over `PopoverExt::position`) and
+`View::label` (over `ButtonExt::label`). The P6 whole-part fix wave converted
+all ten; P6-D38 records the three consequences, notably that setter arguments
+stay `impl Into<Prop>` except `PanedExt::position(i32)`, and that there is no
+`FrameExt::label` because two traits cannot share a method name without making
+every call site ambiguous.
 
 ### E9 — `on_date_selected` carries `Handler::Text` (`YYYY-MM-DD`)
 

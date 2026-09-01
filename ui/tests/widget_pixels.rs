@@ -158,8 +158,11 @@ fn clicking_a_link_in_a_label_fires_activate_link_with_its_uri() {
 
 #[test]
 fn a_spinner_carries_checked_while_spinning_and_advances_its_phase() {
-    // mutation: drop the CHECKED state in SpinnerC::apply and the two frames
-    // become identical; drop the `phase` advance in `tick` and they do too.
+    // mutation: drop the `phase` advance in `SpinnerC::tick` (or its
+    // `next_deadline`, so no tick ever runs) and the two captured rows are
+    // identical -- the arc never rotates. The `:checked` state `SpinnerC`
+    // also carries while spinning is asserted in the widget's own module
+    // test, not here: this is the animation half.
     use icedtea_ui::view::builders::spinner;
     use icedtea_ui::widgets::spinner::SpinnerExt;
     let frames = run(
@@ -1781,5 +1784,60 @@ fn a_popup_paints_the_view_its_open_command_carried() {
     assert!(
         changed > 20,
         "the popup painted the label its command carried ({changed} px changed)"
+    );
+}
+
+#[test]
+fn a_password_entry_paints_its_caret_and_its_selection() {
+    // P5 leftover, swept in the P6 whole-part fix wave: `PasswordEntryC::paint`
+    // drew the masked text and nothing else, where `EntryC`/`SearchEntryC`
+    // draw selection rects behind the text and a caret in front of it.
+    //
+    // mutation: delete either the selection loop or the caret rect from
+    // `PasswordEntryC::paint` and the selected frame stops differing from the
+    // plain one -- a focused password entry becomes indistinguishable from an
+    // unfocused one.
+    use icedtea_ui::view::builders::password_entry;
+
+    let frames = run(
+        "hunter2".to_owned(),
+        |model: &mut String, text: String| {
+            *model = text;
+            Cmd::None
+        },
+        |model: &String| password_entry(model),
+        (200, 40),
+        vec![
+            ScriptStep::Capture,
+            // Click into the masked text (caret), then select to the end
+            // with Shift+End.
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 8,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+
+    let mut changed = 0;
+    for y in 0..40 {
+        for x in 0..200 {
+            if frames.pixel(0, x, y) != frames.pixel(1, x, y) {
+                changed += 1;
+            }
+        }
+    }
+    assert!(
+        changed > 0,
+        "clicking in paints a caret the resting frame does not have"
     );
 }

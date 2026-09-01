@@ -356,7 +356,14 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
-        if matches!(ev, Event::PointerDown { .. }) {
+        // Left button only, exactly as `GenericC` gates it
+        // (`view/controller.rs`): a right- or middle-click neither focuses a
+        // GTK text view nor moves its caret.
+        let left_press = matches!(
+            ev,
+            Event::PointerDown { button, .. } if *button == crate::window::layer::BTN_LEFT
+        );
+        if left_press {
             // GTK grabs focus to a clicked focusable widget itself; the
             // generic controller does this for every widget it owns
             // (`view/controller.rs`'s `GenericC`), but a dedicated
@@ -374,7 +381,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
                 &shifted,
                 Some(Rect::new(0.0, 0.0, rect.width, rect.height)),
             );
-            if let Event::PointerDown { local, .. } = shifted {
+            if let Event::PointerDown { local, .. } = shifted
+                && left_press
+            {
                 self.cursor = clamp_to_boundary(&self.buffer, self.layout.byte_at(local));
                 self.anchor = None;
                 self.sync_selection();
@@ -434,5 +443,55 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
             style.color(),
         );
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::view::{Kind, Prop, PropName, Props};
+    use crate::widgets::{Headless, build_widget};
+    use crate::window::layer::BTN_LEFT;
+
+    fn with_text() -> Props {
+        let mut p = Props::default();
+        p.set(PropName::Text, Prop::Str("hello world".into()));
+        p
+    }
+
+    /// Mutation: gate `on_event`'s focus grab and caret move on
+    /// `Event::PointerDown { .. }` again (any button, as this module
+    /// shipped) and the right-click below takes the focus and moves the
+    /// caret -- neither of which a GTK text view does.
+    #[test]
+    fn only_a_left_click_focuses_the_view_and_moves_the_caret() {
+        const BTN_RIGHT: u32 = 0x111;
+        let built = build_widget::<()>(Kind::TextView, &with_text());
+        let mut c = built.controller;
+        let mut hx = Headless::new();
+        let mut cx = hx.event_cx::<()>(&built.node);
+        c.on_event(
+            &crate::view::controller::Event::PointerDown {
+                local: (40.0, 4.0),
+                button: BTN_RIGHT,
+                serial: 1,
+            },
+            &mut cx,
+        );
+        assert!(
+            cx.focus.focus().is_none(),
+            "a right-click must not take the focus"
+        );
+        c.on_event(
+            &crate::view::controller::Event::PointerDown {
+                local: (40.0, 4.0),
+                button: BTN_LEFT,
+                serial: 2,
+            },
+            &mut cx,
+        );
+        assert!(
+            cx.focus.focus().is_some(),
+            "a left-click focuses the view, as GTK does"
+        );
     }
 }

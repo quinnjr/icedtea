@@ -256,9 +256,26 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
         _cx: &mut crate::view::controller::PaintCx<'_>,
     ) -> bool {
         let content = alloc.content_box;
+        // Selection behind the text, caret in front -- the same three steps,
+        // in the same order, as `EntryC::paint`. A password entry hides
+        // *which* characters were typed, not where the caret is: GTK draws
+        // both over the bullets, and without them a focused password entry is
+        // indistinguishable from an unfocused one.
+        for rect in self.edit.layout.selection_rects(self.edit.selection()) {
+            let placed = Rect::new(
+                content.x + rect.x,
+                content.y + rect.y,
+                rect.width,
+                rect.height,
+            );
+            canvas.draw_rect(&placed.to_skia(), &crate::paint::fill_paint(style.color()));
+        }
         self.edit
             .layout
             .draw(canvas, (content.x, content.y), style.color());
+        let caret = self.edit.layout.caret_rect(self.edit.cursor);
+        let placed = Rect::new(content.x + caret.x, content.y + caret.y, 1.0, caret.height);
+        canvas.draw_rect(&placed.to_skia(), &crate::paint::fill_paint(style.color()));
         true
     }
 }

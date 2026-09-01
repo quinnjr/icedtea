@@ -4,9 +4,14 @@
 //! button.toggle
 //! ```
 //!
-//! A grouped toggle behaves radio-like: activating one clears its siblings.
-//! Groups are keyed by the `Group` prop's name (contract §5.2's "Switch group
-//! note"), not by object identity — the reactive layer has no stable handles.
+//! Grouping is recorded, not enforced. `GtkToggleButton` in a group behaves
+//! radio-like — activating one clears its siblings — and the `Group` prop
+//! names the group (contract §5.2's "Switch group note"; groups are keyed by
+//! name, not by object identity, because the reactive layer has no stable
+//! handles). **Sibling clearing is not implemented here**: a controller sees
+//! only its own node and has no registry of the other members, so the model
+//! is what keeps a group exclusive today — the widget stores and reports the
+//! name, and every toggle in a group still toggles independently.
 
 use std::rc::Rc;
 
