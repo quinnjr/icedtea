@@ -266,6 +266,208 @@ impl DirKind {
     }
 }
 
+/// The most subdirectories one theme may declare.
+///
+/// Adwaita, the largest theme in common use, declares 33. The cap exists
+/// because `index.theme` is untrusted: a file that names a million
+/// directories must cost a bounded amount of work, not a bounded amount of
+/// patience.
+pub(crate) const MAX_SUBDIRS: usize = 512;
+
+/// The most parent themes one `Inherits=` line may name.
+pub(crate) const MAX_INHERITS: usize = 32;
+
+/// The spec's default `Threshold`.
+const DEFAULT_THRESHOLD: u32 = 2;
+
+/// One subdirectory of an icon theme, as `index.theme` declares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubDir {
+    /// The path relative to the theme's own directory, e.g. `16x16/actions`.
+    pub path: Rc<str>,
+    /// The declared `Size`.
+    pub size: u32,
+    /// The declared `Scale`, defaulting to 1.
+    pub scale: u32,
+    /// `Type` plus the keys that type reads.
+    pub kind: DirKind,
+}
+
+/// One theme's parsed `index.theme`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeIndex {
+    /// The theme's directory name — **not** its localised `Name=` unless the
+    /// file supplies one; lookup matches themes by directory name.
+    pub name: Rc<str>,
+    /// `Inherits=`, in order, with empty entries dropped.
+    pub inherits: Vec<Rc<str>>,
+    /// `Directories=` then `ScaledDirectories=`, in declaration order, with
+    /// entries that have no group of their own dropped.
+    pub dirs: Vec<SubDir>,
+}
+
+/// One `key=value` line, split on the *first* `=` and trimmed.
+///
+/// Localised keys (`Name[de]=`) keep their brackets here and are matched
+/// exactly by the caller, so `Name[de]` never overwrites `Name`.
+fn split_key_value(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once('=')?;
+    Some((key.trim(), value.trim()))
+}
+
+/// A `,`-separated list, trimmed, with empty entries dropped and at most
+/// `cap` entries kept.
+fn comma_list(value: &str, cap: usize) -> Vec<Rc<str>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .take(cap)
+        .map(Rc::from)
+        .collect()
+}
+
+/// A `u32` key, or `default` when the value is absent, empty, negative,
+/// non-numeric or larger than a `u32`.
+fn u32_key(groups: &[(String, Vec<(String, String)>)], group: &str, key: &str) -> Option<u32> {
+    let entries = &groups.iter().find(|(name, _)| name == group)?.1;
+    let value = entries
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())?;
+    value.parse::<u32>().ok()
+}
+
+impl ThemeIndex {
+    /// Parse an `index.theme`.
+    ///
+    /// Never fails and never panics: this is a file on disk that anything at
+    /// all may have written. A line that does not parse is skipped, a key
+    /// that does not parse takes the spec's default, and the result is
+    /// bounded by [`MAX_SUBDIRS`]/[`MAX_INHERITS`]. `name` is the theme's
+    /// directory name, used when the file declares no `Name=`.
+    #[must_use]
+    pub fn parse(name: &str, text: &str) -> ThemeIndex {
+        // Group name -> ordered key/value pairs. A duplicate key keeps the
+        // first, as the desktop-entry spec says.
+        let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        let mut current: Option<usize> = None;
+
+        for raw in text.lines() {
+            // `\r` survives `lines()` on a CRLF file read as bytes, and a
+            // lone `\r` (classic-Mac line endings, or a truncated write)
+            // never splits at all -- so trim it off both ends.
+            let line = raw.trim_matches(|c: char| c == '\r' || c == '\u{0}').trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix('[') {
+                let Some(group) = rest.strip_suffix(']') else {
+                    // An unterminated group header is not a group.
+                    continue;
+                };
+                let group = group.trim();
+                if group.is_empty() {
+                    continue;
+                }
+                current = Some(match groups.iter().position(|(n, _)| n == group) {
+                    Some(existing) => existing,
+                    None => {
+                        groups.push((group.to_owned(), Vec::new()));
+                        groups.len() - 1
+                    }
+                });
+                continue;
+            }
+            let Some(index) = current else {
+                // A key before any group header belongs to nothing.
+                continue;
+            };
+            let Some((key, value)) = split_key_value(line) else {
+                continue;
+            };
+            if key.is_empty() {
+                continue;
+            }
+            let entries = &mut groups[index].1;
+            if !entries.iter().any(|(k, _)| k == key) {
+                entries.push((key.to_owned(), value.to_owned()));
+            }
+        }
+
+        let header = groups
+            .iter()
+            .find(|(group, _)| group == "Icon Theme")
+            .map(|(_, entries)| entries.as_slice())
+            .unwrap_or(&[]);
+        let get = |key: &str| {
+            header
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+
+        let display_name: Rc<str> = get("Name")
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| Rc::from(name), Rc::from);
+        let inherits = get("Inherits").map_or_else(Vec::new, |v| comma_list(v, MAX_INHERITS));
+
+        let mut declared = get("Directories").map_or_else(Vec::new, |v| comma_list(v, MAX_SUBDIRS));
+        for scaled in get("ScaledDirectories").map_or_else(Vec::new, |v| comma_list(v, MAX_SUBDIRS))
+        {
+            if declared.len() >= MAX_SUBDIRS {
+                break;
+            }
+            if !declared.contains(&scaled) {
+                declared.push(scaled);
+            }
+        }
+
+        let mut dirs = Vec::with_capacity(declared.len());
+        for path in declared {
+            // A directory with no group of its own has no `Size`, and `Size`
+            // is required: the spec has nothing to match it against.
+            let Some(size) = u32_key(&groups, &path, "Size") else {
+                continue;
+            };
+            let scale = u32_key(&groups, &path, "Scale")
+                .filter(|scale| *scale > 0)
+                .unwrap_or(1);
+            let type_key = groups
+                .iter()
+                .find(|(group, _)| *group == *path)
+                .and_then(|(_, entries)| entries.iter().find(|(k, _)| k == "Type"))
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("Threshold");
+            let kind = if type_key.eq_ignore_ascii_case("Fixed") {
+                DirKind::Fixed { size }
+            } else if type_key.eq_ignore_ascii_case("Scalable") {
+                DirKind::Scalable {
+                    min: u32_key(&groups, &path, "MinSize").unwrap_or(size),
+                    max: u32_key(&groups, &path, "MaxSize").unwrap_or(size),
+                }
+            } else {
+                DirKind::Threshold {
+                    size,
+                    threshold: u32_key(&groups, &path, "Threshold").unwrap_or(DEFAULT_THRESHOLD),
+                }
+            };
+            dirs.push(SubDir {
+                path,
+                size,
+                scale,
+                kind,
+            });
+        }
+
+        ThemeIndex {
+            name: display_name,
+            inherits,
+            dirs,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +545,188 @@ mod tests {
         theme.clear_caches();
         assert_eq!(theme.name(), "Papirus");
         assert_eq!(theme.roots().len(), 1);
+    }
+
+    use super::{MAX_INHERITS, MAX_SUBDIRS, ThemeIndex};
+
+    const MINI: &str = "\
+[Icon Theme]
+Name=MiniTheme
+Comment=A hermetic fixture
+Inherits=MiniParent
+Directories=16x16/actions,scalable/actions
+ScaledDirectories=16x16@2/actions
+
+[16x16/actions]
+Size=16
+Type=Fixed
+Context=Actions
+
+[scalable/actions]
+Size=128
+MinSize=8
+MaxSize=512
+Type=Scalable
+
+[16x16@2/actions]
+Size=16
+Scale=2
+Type=Fixed
+";
+
+    // Mutation check: stop appending `ScaledDirectories` to `dirs` and the
+    // `16x16@2/actions` assertions fail -- which is the whole HiDPI path for
+    // a theme that ships pre-rendered 2x assets.
+    #[test]
+    fn an_index_theme_parses_its_directories_inherits_and_types() {
+        let index = ThemeIndex::parse("MiniTheme", MINI);
+        assert_eq!(&*index.name, "MiniTheme");
+        assert_eq!(index.inherits.len(), 1);
+        assert_eq!(&*index.inherits[0], "MiniParent");
+        assert_eq!(index.dirs.len(), 3);
+
+        assert_eq!(&*index.dirs[0].path, "16x16/actions");
+        assert_eq!(index.dirs[0].size, 16);
+        assert_eq!(index.dirs[0].scale, 1);
+        assert_eq!(index.dirs[0].kind, DirKind::Fixed { size: 16 });
+
+        assert_eq!(&*index.dirs[1].path, "scalable/actions");
+        assert_eq!(index.dirs[1].kind, DirKind::Scalable { min: 8, max: 512 });
+
+        assert_eq!(&*index.dirs[2].path, "16x16@2/actions");
+        assert_eq!(index.dirs[2].scale, 2);
+    }
+
+    // `Type` defaults to Threshold and `Threshold` to 2; `MinSize`/`MaxSize`
+    // default to `Size`; `Scale` defaults to 1. All four are spec defaults
+    // and all four are load-bearing for real themes.
+    // Mutation check: default `Threshold` to 0 and the `matches(1, 22, 1)`
+    // assertion fails.
+    #[test]
+    fn omitted_keys_take_the_specs_defaults() {
+        let text = "\
+[Icon Theme]
+Directories=a,b
+[a]
+Size=24
+[b]
+Size=48
+Type=Scalable
+";
+        let index = ThemeIndex::parse("T", text);
+        assert_eq!(
+            index.dirs[0].kind,
+            DirKind::Threshold {
+                size: 24,
+                threshold: 2
+            }
+        );
+        assert!(index.dirs[0].kind.matches(1, 22, 1));
+        assert_eq!(index.dirs[0].scale, 1);
+        assert_eq!(index.dirs[1].kind, DirKind::Scalable { min: 48, max: 48 });
+    }
+
+    // A directory named in `Directories=` with no group of its own is not a
+    // directory: the spec requires `Size`, and GTK skips such entries rather
+    // than inventing one.
+    // Mutation check: emit a `SubDir` for a group-less name and `dirs.len()`
+    // becomes 2.
+    #[test]
+    fn a_directory_without_a_group_is_dropped() {
+        let text = "\
+[Icon Theme]
+Directories=ghost,real
+[real]
+Size=16
+Type=Fixed
+";
+        let index = ThemeIndex::parse("T", text);
+        assert_eq!(index.dirs.len(), 1);
+        assert_eq!(&*index.dirs[0].path, "real");
+    }
+
+    // Comments, blank lines, CRLF line endings, whitespace around `=`, and
+    // the localised `Name[de]=` form all appear in shipped index.theme files.
+    // Mutation check: split on `'='` with `split('=')` and take the last
+    // field, and the `Comment` line's second `=` corrupts nothing here but
+    // the `Inherits` assertion fails once a value contains one.
+    #[test]
+    fn comments_crlf_and_localised_keys_are_tolerated() {
+        let text = "# a comment\r\n\
+                    [Icon Theme]\r\n\
+                    Name[de]=Mini\r\n\
+                    Name = MiniTheme \r\n\
+                    Inherits = a , b ,, c \r\n\
+                    Directories=d\r\n\
+                    \r\n\
+                    [d]\r\n\
+                    Size=16\r\n";
+        let index = ThemeIndex::parse("fallback", text);
+        assert_eq!(&*index.name, "MiniTheme");
+        let inherits: Vec<&str> = index.inherits.iter().map(|s| &**s).collect();
+        assert_eq!(inherits, vec!["a", "b", "c"]);
+        assert_eq!(index.dirs.len(), 1);
+    }
+
+    // Untrusted input: nothing below may panic, and every bound holds.
+    // Mutation check: remove the MAX_SUBDIRS truncation and the
+    // `dirs.len() <= MAX_SUBDIRS` assertion fails on the flood input.
+    #[test]
+    fn a_hostile_index_theme_never_panics_and_stays_bounded() {
+        let flood_dirs: String = (0..MAX_SUBDIRS * 3)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut flood = format!("[Icon Theme]\nDirectories={flood_dirs}\n");
+        for i in 0..MAX_SUBDIRS * 3 {
+            flood.push_str(&format!("[d{i}]\nSize=16\n"));
+        }
+        let index = ThemeIndex::parse("T", &flood);
+        assert!(index.dirs.len() <= MAX_SUBDIRS);
+
+        let many_inherits: String = (0..MAX_INHERITS * 4)
+            .map(|i| format!("p{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let index = ThemeIndex::parse("T", &format!("[Icon Theme]\nInherits={many_inherits}\n"));
+        assert!(index.inherits.len() <= MAX_INHERITS);
+
+        for hostile in [
+            "",
+            "\0\0\0",
+            "[",
+            "[]",
+            "[Icon Theme",
+            "=",
+            "Size=16",
+            "[a]\nSize=\n",
+            "[a]\nSize=-1\n",
+            "[a]\nSize=99999999999999999999\n",
+            "[Icon Theme]\nDirectories=,,,,\n",
+            "[Icon Theme]\nInherits=\n",
+            "[Icon Theme]\nDirectories=a\n[a]\nSize=4294967295\nType=Scalable\nMinSize=4294967295\nMaxSize=0\n",
+            "[Icon Theme]\r\rDirectories=a\r[a]\rSize=16",
+        ] {
+            let index = ThemeIndex::parse("T", hostile);
+            assert!(index.dirs.len() <= MAX_SUBDIRS, "input: {hostile:?}");
+            assert!(index.inherits.len() <= MAX_INHERITS, "input: {hostile:?}");
+        }
+
+        // Pseudo-random bytes, deterministically generated: an index.theme
+        // can be any file at all that happens to sit at that path.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..256 {
+            let mut bytes = Vec::with_capacity(512);
+            for _ in 0..512 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                bytes.push((state & 0xFF) as u8);
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let index = ThemeIndex::parse("T", &text);
+            assert!(index.dirs.len() <= MAX_SUBDIRS);
+        }
     }
 }
 
