@@ -21,19 +21,35 @@
 //! asks for them and `[<action widget>]` is optional notation, so their
 //! absence still matches every fixture.
 //!
-//! Reconciliation: this controller's page count is driven entirely by
-//! `PropName::Pages` (a test-only `Prop::Int` -- deviation 5's "the variant
-//! name is a payload shape, not a semantic claim" pattern, reused here for a
-//! *count* rather than a string list), because `Controller::build` in this
-//! crate takes `&Props` only, never the view's child list, and a single
-//! `Kind::NotebookTab` view's own content would in any case need to land on
-//! *two* disjoint nodes (a `tab` under `tabs` for its label, a bare page
-//! under `stack` for its child) -- something no single `child_slot` target
-//! can express. `builders::notebook`/`builders::notebook_tab` are still
-//! implemented exactly as the interface asks, for API-surface completeness,
-//! but nothing yet drains those child views into this split structure at
-//! build or reconcile time; production notebooks render their page count
-//! from `Pages` until a later task addresses that routing.
+//! Reconciliation: a `Kind::NotebookTab` view's own content belongs on two
+//! disjoint nodes -- a `tab` under `tabs` for its label, a bare page under
+//! `stack` for its child -- and `Controller::build` in this crate takes
+//! `&Props` only, never the view's child list, so nothing at `build` time
+//! can do that split. This controller uses exactly
+//! [`super::header_bar::HeaderBarC`]'s "attach flat, then sort by hand"
+//! pattern instead: `child_index`/`reserved_total` let every real
+//! `Kind::NotebookTab` child attach flat onto this controller's own root
+//! node (alongside `header`/`stack`, both reserved by `child_index`'s `+2`
+//! offset), and [`NotebookC::place`] -- run from `reserved_total`, once per
+//! reconcile, the same hook `HeaderBarC::place` uses -- pulls each one's
+//! own already-built child (its page content) out into `stack` and moves
+//! the tab node itself into `tabs_node`. `PropName::Pages` (a test-only
+//! `Prop::Int` -- deviation 5's "the variant name is a payload shape, not a
+//! semantic claim" pattern, reused here for a *count*) still drives a
+//! separate, synthetic tab/page pair per unit, entirely through `build`/
+//! `set_prop`, for the tests in this module that build a bare `NotebookC`
+//! with no view tree at all (`build_widget` never calls `reserved_total`);
+//! the two mechanisms simply append to the same `tabs`/`stack` lists and
+//! never both fire for one real widget.
+//!
+//! Because `reserved_total` takes `&self` (reconcile holds only a shared
+//! `&dyn Controller<Msg>` when it calls it, mid-recursion into a sibling's
+//! own children), `place` cannot take `&mut self` -- so `page` and `tabs`
+//! are `Cell`/`RefCell`, not the plain fields the interface sketch shows,
+//! the same deviation [`super::header_bar::HeaderBarC::title`]'s doc
+//! comment already establishes for exactly this constraint.
+use std::cell::{Cell, RefCell};
+
 use crate::css::node::{Node, PseudoStates};
 use crate::layout::{BoxDirection, Container};
 use crate::view::{BuildCx, Controller, Event, EventCx, EventKind, Kind, Prop, PropName, Props};
@@ -63,10 +79,11 @@ fn set_visible(node: &Node, visible: bool) {
 
 /// `GtkNotebook`.
 pub struct NotebookC {
-    /// The visible page.
-    pub page: usize,
-    /// One `tab` node per page.
-    pub tabs: Vec<Node>,
+    /// The visible page. A `Cell`, not a plain field -- see the module doc.
+    pub page: Cell<usize>,
+    /// One `tab` node per page. A `RefCell`, not a plain `Vec` -- see the
+    /// module doc.
+    pub tabs: RefCell<Vec<Node>>,
     /// Horizontal scroll of the strip, px, when `scrollable`.
     pub scroll: f32,
     /// `(index, grab offset)` while a tab is being dragged.
@@ -93,6 +110,7 @@ impl NotebookC {
         let any: &dyn std::any::Any = c;
         any.downcast_ref::<Self>().map_or_else(Vec::new, |me| {
             me.tabs
+                .borrow()
                 .iter()
                 .enumerate()
                 .filter(|(_, tab)| tab.states().contains(PseudoStates::CHECKED))
@@ -105,31 +123,33 @@ impl NotebookC {
     #[must_use]
     pub fn visible_page<Msg>(c: &dyn Controller<Msg>) -> usize {
         let any: &dyn std::any::Any = c;
-        any.downcast_ref::<Self>().map_or(usize::MAX, |me| me.page)
+        any.downcast_ref::<Self>()
+            .map_or(usize::MAX, |me| me.page.get())
     }
 
     /// Reflect `self.page` onto every tab's `:checked` state and every
     /// stack child's visibility.
     fn apply_selection(&self) {
-        for (i, tab) in self.tabs.iter().enumerate() {
-            tab.set_state(PseudoStates::CHECKED, i == self.page);
+        let page = self.page.get();
+        for (i, tab) in self.tabs.borrow().iter().enumerate() {
+            tab.set_state(PseudoStates::CHECKED, i == page);
         }
         for (i, child) in self.stack.children().iter().enumerate() {
-            set_visible(child, i == self.page);
+            set_visible(child, i == page);
         }
     }
 
     /// Move to `page`, clamped to the page count; `true` when it moved.
-    fn goto(&mut self, page: usize) -> bool {
-        let count = self.tabs.len();
+    fn goto(&self, page: usize) -> bool {
+        let count = self.tabs.borrow().len();
         if count == 0 {
             return false;
         }
         let page = page.min(count - 1);
-        if page == self.page {
+        if page == self.page.get() {
             return false;
         }
-        self.page = page;
+        self.page.set(page);
         self.apply_selection();
         true
     }
@@ -137,18 +157,84 @@ impl NotebookC {
     /// The tab index a strip-local x falls in. See [`TAB_WIDTH`]'s doc
     /// comment for why this is a fixed partition, not a hit-test.
     fn tab_at(&self, x: f32) -> Option<usize> {
-        if self.tabs.is_empty() {
+        let count = self.tabs.borrow().len();
+        if count == 0 {
             return None;
         }
         let raw = (x.max(0.0) / TAB_WIDTH).floor();
         let index = if raw.is_finite() { raw as usize } else { 0 };
-        Some(index.min(self.tabs.len() - 1))
+        Some(index.min(count - 1))
+    }
+
+    /// Move every `Kind::NotebookTab` instance the reconciler just attached
+    /// flat to this controller's own root node (alongside `header`/`stack`,
+    /// both skipped by identity) into `tabs_node` -- pulling its own real
+    /// child, the page content `notebook_tab` gave it, out into `stack` on
+    /// the way. See the module doc for why this mirrors
+    /// [`super::header_bar::HeaderBarC::place`].
+    ///
+    /// Idempotent, and safe to call every reconcile: a tab already sorted
+    /// has nothing of its own left to pull into `stack` (already moved),
+    /// and re-appending an already-placed node to `tabs_node`/`stack` just
+    /// re-affirms its position. That repeated work is necessary, not just
+    /// harmless -- reconcile's own attach step (`reconcile.rs`'s step 4)
+    /// re-inserts every reused child flat onto the root each frame, since
+    /// `child_index` has no memory of last frame's placement, so `place`
+    /// has to undo that every time it runs, not only the first.
+    fn place(&self) {
+        let Some(root) = self.header.parent().or_else(|| self.stack.parent()) else {
+            return;
+        };
+        let mut tabs = self.tabs.borrow_mut();
+        // Drop tabs whose `Kind::NotebookTab` view is gone from this frame:
+        // reconcile already detached the node (step 2, before `place` ever
+        // runs), so it has no parent at all any more. Its page is pruned
+        // from `stack` at the same index, keeping the two lists aligned --
+        // see the struct doc's "one `tab` node per page" ordering.
+        let mut i = 0;
+        while i < tabs.len() {
+            if tabs[i].parent().is_some() {
+                i += 1;
+                continue;
+            }
+            tabs.remove(i);
+            if let Some(page) = self.stack.children().get(i).cloned() {
+                page.detach();
+            }
+        }
+        for child in root.children() {
+            if child.ptr_eq(&self.header) || child.ptr_eq(&self.stack) {
+                continue;
+            }
+            if self.reorderable {
+                child.add_class("reorderable-page");
+            }
+            // The tab's own child -- `notebook_tab`'s `child`, already
+            // built and attached under it by its own recursive reconcile,
+            // since `Kind::NotebookTab` has no `child_slot` entry either --
+            // is the page; move it into `stack` and leave the tab carrying
+            // nothing but the label text its own `GenericC` already shaped.
+            if let Some(page) = child.children().first().cloned() {
+                page.detach();
+                self.stack.append_child(&page);
+            }
+            self.tabs_node.append_child(&child);
+            if !tabs.iter().any(|tab| tab.ptr_eq(&child)) {
+                tabs.push(child);
+            }
+        }
+        let count = tabs.len();
+        if count > 0 && self.page.get() >= count {
+            self.page.set(count - 1);
+        }
+        drop(tabs);
+        self.apply_selection();
     }
 
     /// Grow or shrink `self.tabs`/the stack's children to `n`, preserving
     /// every existing tab and page untouched.
     fn resize_pages(&mut self, n: usize) {
-        while self.tabs.len() < n {
+        while self.tabs.borrow().len() < n {
             let tab = Node::new("tab");
             if self.reorderable {
                 tab.add_class("reorderable-page");
@@ -160,19 +246,20 @@ impl NotebookC {
                 .len()
                 .saturating_sub(trailing_arrow);
             self.tabs_node.insert_child(insert_at, &tab);
-            self.tabs.push(tab);
+            self.tabs.borrow_mut().push(tab);
             self.stack.append_child(&Node::new("child"));
         }
-        while self.tabs.len() > n {
-            if let Some(tab) = self.tabs.pop() {
+        while self.tabs.borrow().len() > n {
+            if let Some(tab) = self.tabs.borrow_mut().pop() {
                 tab.detach();
             }
             if let Some(page) = self.stack.children().last() {
                 page.detach();
             }
         }
-        if self.page >= self.tabs.len() {
-            self.page = self.tabs.len().saturating_sub(1);
+        let count = self.tabs.borrow().len();
+        if self.page.get() >= count {
+            self.page.set(count.saturating_sub(1));
         }
         self.apply_selection();
     }
@@ -212,7 +299,7 @@ impl NotebookC {
 
     fn set_reorderable(&mut self, on: bool) {
         self.reorderable = on;
-        for tab in &self.tabs {
+        for tab in self.tabs.borrow().iter() {
             if on {
                 tab.add_class("reorderable-page");
             } else {
@@ -263,8 +350,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for NotebookC {
         );
 
         let mut me = NotebookC {
-            page: 0,
-            tabs: Vec::new(),
+            page: Cell::new(0),
+            tabs: RefCell::new(Vec::new()),
             scroll: 0.0,
             drag: None,
             header,
@@ -282,11 +369,12 @@ impl<Msg: Clone + 'static> Controller<Msg> for NotebookC {
         let n = props.int(PropName::Pages, 0).clamp(0, 100_000) as usize;
         me.resize_pages(n);
         let requested = props.int(PropName::Page, 0).clamp(0, i64::from(u32::MAX)) as usize;
-        me.page = if me.tabs.is_empty() {
+        let tab_count = me.tabs.borrow().len();
+        me.page.set(if tab_count == 0 {
             0
         } else {
-            requested.min(me.tabs.len() - 1)
-        };
+            requested.min(tab_count - 1)
+        });
         me.apply_selection();
         if !props.bool(PropName::ShowTabs, true) {
             me.set_show_tabs(node, false);
@@ -349,7 +437,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for NotebookC {
                     }
                     if self.reorderable {
                         self.drag = Some((index, local.0));
-                        self.tabs[index].add_class("dragging");
+                        self.tabs.borrow()[index].add_class("dragging");
                     }
                     cx.handled = true;
                 }
@@ -363,7 +451,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for NotebookC {
             }
             Event::PointerUp { button, local, .. } if *button == crate::window::layer::BTN_LEFT => {
                 if let Some((from, _)) = self.drag.take() {
-                    self.tabs[from].remove_class("dragging");
+                    self.tabs.borrow()[from].remove_class("dragging");
                     if let Some(to) = self.tab_at(local.0)
                         && to != from
                         && let Some(msg) = cx.handlers.fire_indices(EventKind::Reordered, from, to)
@@ -379,9 +467,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for NotebookC {
                 let ctrl = key.mods.contains(Mods::CTRL);
                 let alt = key.mods.contains(Mods::ALT);
                 let target = if ctrl && sym == keysyms::KEY_Next {
-                    Some(self.page.saturating_add(1))
+                    Some(self.page.get().saturating_add(1))
                 } else if ctrl && sym == keysyms::KEY_Prior {
-                    Some(self.page.saturating_sub(1))
+                    Some(self.page.get().saturating_sub(1))
                 } else if alt && (keysyms::KEY_1..=keysyms::KEY_9).contains(&sym) {
                     Some((sym - keysyms::KEY_1) as usize)
                 } else {
@@ -390,9 +478,11 @@ impl<Msg: Clone + 'static> Controller<Msg> for NotebookC {
                 // Alt+9 on a three-page notebook selects nothing at all --
                 // GTK clamps to the *last* page only for Ctrl+PageDown.
                 if let Some(target) = target
-                    && target < self.tabs.len()
+                    && target < self.tabs.borrow().len()
                     && self.goto(target)
-                    && let Some(msg) = cx.handlers.fire_index(EventKind::PageChanged, self.page)
+                    && let Some(msg) = cx
+                        .handlers
+                        .fire_index(EventKind::PageChanged, self.page.get())
                 {
                     out.push(msg);
                     cx.handled = true;
@@ -401,6 +491,20 @@ impl<Msg: Clone + 'static> Controller<Msg> for NotebookC {
             _ => {}
         }
         out
+    }
+
+    fn child_index(&self, view_index: usize) -> usize {
+        // `header` and `stack` are chrome at indices 0 and 1; every real
+        // `Kind::NotebookTab` child attaches flat after them until `place`
+        // (run from `reserved_total`) sorts it into `tabs_node`/`stack`.
+        view_index + 2
+    }
+
+    fn reserved_total(&self, view_count: usize) -> usize {
+        let _ = view_count;
+        self.place();
+        // `place` has just emptied the root back down to `header`/`stack`.
+        2
     }
 }
 
@@ -534,5 +638,61 @@ mod tests {
             &mut cx,
         );
         assert_eq!(msgs, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn real_notebook_tab_children_route_their_label_and_page() {
+        // Regression for the review finding on this task: `notebook`/
+        // `notebook_tab` build views to the right signatures but, without
+        // `child_index`/`reserved_total`/`place`, a real app's tab labels
+        // and page content never reached `tabs_node`/`stack` at all --
+        // they were built and immediately orphaned as flat children of the
+        // notebook's own root node, which is exactly what this test drives
+        // through the real reconciler (not `build_widget`, which never
+        // calls `reserved_total`) to catch.
+        use crate::css::node::Node;
+        use crate::view::builders::{notebook, notebook_tab};
+        use crate::view::reconcile::reconcile;
+        use crate::widgets::label::label;
+
+        let mut hx = Headless::new();
+        let view = notebook::<()>(vec![
+            notebook_tab("One", label("Page One")),
+            notebook_tab("Two", label("Page Two")),
+        ]);
+        let root = Node::new("window");
+        let mut prev = Vec::new();
+        reconcile(&root, &mut prev, vec![view], &mut hx.cx());
+
+        let nb = &prev[0];
+        assert_eq!(
+            nb.node.children().len(),
+            2,
+            "only header and stack remain on the notebook's own root once \
+             `place` has sorted every real child: {:?}",
+            nb.node
+                .children()
+                .iter()
+                .map(Node::name)
+                .collect::<Vec<_>>()
+        );
+        let header = nb.node.child(0).expect("header");
+        let tabs = header.child(0).expect("tabs");
+        assert_eq!(
+            tabs.children().len(),
+            2,
+            "both notebook_tab views became a tab"
+        );
+        let stack = nb.node.child(1).expect("stack");
+        let pages = stack.children();
+        assert_eq!(pages.len(), 2, "both notebook_tab children became a page");
+        // The page content -- a `label` view -- landed under `stack`, not
+        // left behind as the tab's own child.
+        assert_eq!(&*pages[0].name(), "label");
+        assert_eq!(&*pages[1].name(), "label");
+        assert!(
+            tabs.children()[0].children().is_empty(),
+            "the tab's label text is its own GenericC's shaped text, not a child node"
+        );
     }
 }

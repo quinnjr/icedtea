@@ -484,11 +484,11 @@ impl<Msg: Clone + 'static> View<Msg> {
 
 /// `GtkNotebook` over `pages`, each a [`notebook_tab`] view.
 ///
-/// Reconciliation: `notebook.rs`'s own module doc explains why nothing yet
-/// drains these child views into the header/stack split GTK's own fixture
-/// needs -- `Controller::build` in this crate never sees a view's children,
-/// and one `Kind::NotebookTab` view's content belongs on two disjoint nodes.
-/// The builder still takes and stores them, exactly as the interface asks.
+/// Reconciliation: `notebook.rs`'s own module doc explains how each page's
+/// label and content reach `header`/`stack` despite `Controller::build`
+/// never seeing a view's children -- `NotebookC::child_index`/
+/// `reserved_total`/`place`, the same "attach flat, then sort by hand"
+/// pattern `HeaderBarC` uses for its own packed children.
 #[must_use]
 pub fn notebook<Msg: Clone + 'static>(pages: impl IntoIterator<Item = View<Msg>>) -> View<Msg> {
     View::new(Kind::Notebook).children(pages)
