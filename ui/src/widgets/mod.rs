@@ -74,6 +74,7 @@ pub mod level_bar;
 pub mod link_button;
 pub mod menu_button;
 pub mod node_tree;
+pub mod notebook;
 pub mod paned;
 pub mod password_entry;
 pub mod picture;
@@ -1113,6 +1114,9 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::Calendar => Box::new(<calendar::CalendarC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::Notebook => Box::new(<notebook::NotebookC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         Kind::Popover => Box::new(<popover::PopoverC as Controller<Msg>>::build(
             node, props, cx,
         )),
@@ -1369,6 +1373,30 @@ impl Headless {
             serial: 0,
             time_ms: 0,
         }
+    }
+
+    /// [`Headless::key`], with `mods` (xkbcommon `Mods` variant names --
+    /// `"Control"`, `"Alt"`, `"Shift"`, `"Logo"`, `"Lock"`, `"NumLock"`) held.
+    ///
+    /// Reconciliation: introduced for Task 13's `NotebookC` key-nav test,
+    /// which needs `Ctrl+PageDown` and `Alt+<digit>`; [`Headless::key`] takes
+    /// no modifiers and the task text's `Keymap::key_with_mods` does not
+    /// exist for the same reason `key`'s own doc comment gives for itself.
+    #[must_use]
+    pub fn key_with_mods(name: &str, mods: &[&str]) -> crate::window::keyboard::KeyEvent {
+        let mut event = Self::key(name);
+        for m in mods {
+            event.mods |= match *m {
+                "Shift" => crate::window::keyboard::Mods::SHIFT,
+                "Control" => crate::window::keyboard::Mods::CTRL,
+                "Alt" => crate::window::keyboard::Mods::ALT,
+                "Logo" => crate::window::keyboard::Mods::LOGO,
+                "Lock" => crate::window::keyboard::Mods::CAPS,
+                "NumLock" => crate::window::keyboard::Mods::NUM,
+                _ => crate::window::keyboard::Mods::empty(),
+            };
+        }
+        event
     }
 }
 

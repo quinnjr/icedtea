@@ -482,6 +482,73 @@ impl<Msg: Clone + 'static> View<Msg> {
     }
 }
 
+/// `GtkNotebook` over `pages`, each a [`notebook_tab`] view.
+///
+/// Reconciliation: `notebook.rs`'s own module doc explains why nothing yet
+/// drains these child views into the header/stack split GTK's own fixture
+/// needs -- `Controller::build` in this crate never sees a view's children,
+/// and one `Kind::NotebookTab` view's content belongs on two disjoint nodes.
+/// The builder still takes and stores them, exactly as the interface asks.
+#[must_use]
+pub fn notebook<Msg: Clone + 'static>(pages: impl IntoIterator<Item = View<Msg>>) -> View<Msg> {
+    View::new(Kind::Notebook).children(pages)
+}
+
+/// One `notebook`'s page: `label` for the strip, `child` for its content.
+#[must_use]
+pub fn notebook_tab<Msg: Clone + 'static>(label: &str, child: View<Msg>) -> View<Msg> {
+    View::new(Kind::NotebookTab).label(label).child(child)
+}
+
+/// `GtkNotebook`'s own property setters, chained after [`notebook`], and
+/// `GtkNotebook:reorderable`/`GtkNotebook:detachable`, chained after
+/// [`notebook_tab`] since they are per-page GTK properties.
+///
+/// Scoped to its own trait for the same reason [`HeaderBarExt`]'s doc
+/// comment gives: `.page` would otherwise collide with any future widget
+/// that wants the same name over a different `PropName`.
+pub trait NotebookExt<Msg>: Sized {
+    /// `GtkNotebook:page`.
+    fn page(self, v: impl Into<Prop>) -> Self;
+    /// `GtkNotebook:tab-pos`.
+    fn tab_pos(self, v: impl Into<Prop>) -> Self;
+    /// `GtkNotebook:scrollable`.
+    fn scrollable(self, v: impl Into<Prop>) -> Self;
+    /// `GtkNotebook:show-tabs`.
+    fn show_tabs(self, v: impl Into<Prop>) -> Self;
+    /// `GtkNotebook:show-border`.
+    fn show_border(self, v: impl Into<Prop>) -> Self;
+    /// `GtkNotebook:reorderable` (a per-page property in real GTK; this
+    /// controller applies it strip-wide -- see contract deviation notes).
+    fn reorderable(self, v: impl Into<Prop>) -> Self;
+    /// `GtkNotebook:detachable` (per-page).
+    fn detachable(self, v: impl Into<Prop>) -> Self;
+}
+
+impl<Msg: Clone + 'static> NotebookExt<Msg> for View<Msg> {
+    fn page(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Page, v)
+    }
+    fn tab_pos(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::TabPos, v)
+    }
+    fn scrollable(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Scrollable, v)
+    }
+    fn show_tabs(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShowTabs, v)
+    }
+    fn show_border(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::ShowBorder, v)
+    }
+    fn reorderable(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Reorderable, v)
+    }
+    fn detachable(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::Detachable, v)
+    }
+}
+
 impl<Msg: Clone + 'static> View<Msg> {
     /// `GtkBox:spacing`, `GtkGrid` row/column spacing's shorthand.
     #[must_use]
@@ -597,13 +664,19 @@ impl<Msg: Clone + 'static> View<Msg> {
         self.on(EventKind::Response, Handler::Index(Rc::new(f)))
     }
 
-    /// A reorderable child was dropped.
+    /// A reorderable child was dropped, `(from, to)`.
     ///
-    /// Contract deviation D13: the payload is the **destination** index,
-    /// because §4.4's `Handler` has no `(usize, usize)` variant.
+    /// Contract §10 E10: P4's Task 5 shipped this as `impl Fn(usize) -> Msg`
+    /// over `Handler::Index` (deviation D13's other half); P6 deviation 4
+    /// adds `Handler::Indices` for exactly this two-argument shape and E10
+    /// re-types this setter onto it, in the same commit that adds
+    /// `Handler::Indices`/`Handlers::fire_indices` -- the one place P6
+    /// touches P4's own setter rather than adding beside it. The lone P4
+    /// call site is `every_event_kind_has_exactly_one_on_setter`, updated in
+    /// this same commit.
     #[must_use]
-    pub fn on_reordered(self, f: impl Fn(usize) -> Msg + 'static) -> Self {
-        self.on(EventKind::Reordered, Handler::Index(Rc::new(f)))
+    pub fn on_reordered(self, f: impl Fn(usize, usize) -> Msg + 'static) -> Self {
+        self.on(EventKind::Reordered, Handler::Indices(Rc::new(f)))
     }
 
     /// A scale, scrollbar or spin button's value changed.
@@ -707,7 +780,7 @@ mod tests {
             widget::<Msg>(Kind::DropDown).on_selected(Msg::Index),
             widget::<Msg>(Kind::Notebook).on_page_changed(Msg::Index),
             widget::<Msg>(Kind::AlertDialog).on_response(Msg::Index),
-            widget::<Msg>(Kind::Notebook).on_reordered(Msg::Index),
+            widget::<Msg>(Kind::Notebook).on_reordered(|_from, to| Msg::Index(to)),
             widget::<Msg>(Kind::Scale).on_value_changed(|v| Msg::Value(v as u64)),
             widget::<Msg>(Kind::ScrolledWindow).on_scrolled(|v| Msg::Value(v as u64)),
             widget::<Msg>(Kind::Entry).on_key(|_| Some(Msg::Clicked)),

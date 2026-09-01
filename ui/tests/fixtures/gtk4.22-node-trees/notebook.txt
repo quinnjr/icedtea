@@ -1,0 +1,15 @@
+notebook
+├── header.top
+│   ├── [<action widget>]
+│   ├── tabs
+│   │   ├── [arrow]
+│   │   ├── tab
+┊   ┊   ┊
+│   │   ├── tab[.reorderable-page]
+│   │   ╰── [arrow]
+│   ╰── [<action widget>]
+│
+╰── stack
+    ├── <child>
+    ┊
+    ╰── <child>
