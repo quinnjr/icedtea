@@ -1,0 +1,5 @@
+[Icon Theme]
+Name=MiniLoopB
+Comment=The other half of the deliberate inheritance cycle
+Inherits=MiniLoopA
+Directories=

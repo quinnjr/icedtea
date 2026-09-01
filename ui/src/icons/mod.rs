@@ -118,6 +118,34 @@ pub(crate) const SEARCH_EXTENSIONS: [IconFormat; 3] =
     [IconFormat::Png, IconFormat::Svg, IconFormat::Xpm];
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    //! Paths into `ui/tests/fixtures/mini-icon-theme/`.
+    //!
+    //! Every icon test in this crate is hermetic: it reads this fixture and
+    //! never `$XDG_DATA_DIRS`, `/usr/share/icons` or the user's home. The one
+    //! exception is the Adwaita probe in `ui/tests/icon_theme.rs`, which is
+    //! skipped when the theme is not installed.
+
+    use std::path::PathBuf;
+
+    /// The fixture root, resolved from the crate manifest rather than the
+    /// process's working directory (which `cargo test` does not pin).
+    pub(crate) fn fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini-icon-theme")
+    }
+
+    /// The two themed roots, in search order.
+    pub(crate) fn roots() -> Vec<PathBuf> {
+        vec![fixture_dir().join("root-a"), fixture_dir().join("root-b")]
+    }
+
+    /// The flat, non-themed last resort.
+    pub(crate) fn pixmaps() -> Vec<PathBuf> {
+        vec![fixture_dir().join("pixmaps")]
+    }
+}
+
+#[cfg(test)]
 mod mod_tests {
     use super::{IconFormat, IconSize};
 
@@ -144,5 +172,71 @@ mod mod_tests {
         assert_eq!(IconFormat::from_extension("jpeg"), None);
         assert_eq!(IconFormat::from_extension(""), None);
         assert_eq!(IconFormat::Png.extension(), "png");
+    }
+
+    // The fixture is checked in, not generated at test time: a test that
+    // builds its own PNGs proves the builder, not the lookup. This asserts
+    // the shape every later task's tests assume.
+    // Mutation check: delete `root-b/MiniTheme/16x16/actions/only-in-root-b.png`
+    // and this fails -- which is exactly the file that proves an icon is
+    // searched across every root, not only the one holding index.theme.
+    #[test]
+    fn the_mini_icon_theme_fixture_is_complete() {
+        use super::test_support::{fixture_dir, pixmaps, roots};
+
+        let root_a = &roots()[0];
+        for relative in [
+            "MiniTheme/index.theme",
+            "MiniTheme/16x16/actions/document-open.png",
+            "MiniTheme/16x16/actions/dual.png",
+            "MiniTheme/16x16/actions/broken.png",
+            "MiniTheme/scalable/actions/document-open.svg",
+            "MiniTheme/symbolic/actions/document-open-symbolic.svg",
+            "MiniParent/index.theme",
+            "MiniParent/24x24/actions/parent-only.png",
+            "MiniParent/24x24/actions/dual.png",
+            "MiniLoopA/index.theme",
+            "MiniLoopB/index.theme",
+            "hicolor/index.theme",
+            "hicolor/48x48/actions/image-missing.png",
+        ] {
+            let path = root_a.join(relative);
+            assert!(path.is_file(), "missing fixture file {}", path.display());
+        }
+        assert!(
+            roots()[1]
+                .join("MiniTheme/16x16/actions/only-in-root-b.png")
+                .is_file()
+        );
+        assert!(pixmaps()[0].join("flat-only.png").is_file());
+        assert!(!fixture_dir().join("root-a/MiniTheme/cursors").exists());
+    }
+
+    // The PNGs must really decode, and `broken.png` must really not: two
+    // later tasks hang their fallback behaviour off that file.
+    // Mutation check: replace `broken.png` with a valid PNG and the last
+    // assertion fails.
+    #[test]
+    fn the_fixture_pngs_decode_and_the_broken_one_does_not() {
+        use super::test_support::roots;
+
+        let root_a = &roots()[0];
+        let good = std::fs::read(root_a.join("MiniTheme/16x16/actions/document-open.png"))
+            .expect("fixture readable");
+        let image = skia_rs_safe::codec::decode_image(&good).expect("fixture PNG decodes");
+        assert_eq!(image.width(), 16);
+        assert_eq!(image.height(), 16);
+
+        let missing = std::fs::read(root_a.join("hicolor/48x48/actions/image-missing.png"))
+            .expect("fixture readable");
+        let image = skia_rs_safe::codec::decode_image(&missing).expect("fixture PNG decodes");
+        assert_eq!(image.width(), 48);
+
+        let broken =
+            std::fs::read(root_a.join("MiniTheme/16x16/actions/broken.png")).expect("readable");
+        assert!(
+            skia_rs_safe::codec::decode_image(&broken).is_err(),
+            "broken.png decoded, so the decode-failure fallback has nothing to prove"
+        );
     }
 }

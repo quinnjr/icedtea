@@ -1,0 +1,10 @@
+[Icon Theme]
+Name=MiniParent
+Comment=The inherited theme MiniTheme names
+Directories=24x24/actions
+
+[24x24/actions]
+Size=24
+Type=Threshold
+Threshold=2
+Context=Actions
