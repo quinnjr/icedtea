@@ -46,8 +46,10 @@ impl ListItem {
 pub mod button;
 pub mod calendar;
 pub mod check_button;
+pub mod color_dialog;
 pub mod drawing_area;
 pub mod drop_down;
+pub mod font_dialog;
 pub mod image;
 pub mod info_bar;
 pub mod label;
@@ -691,6 +693,18 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::DropDown => Box::new(<drop_down::DropDownC as Controller<Msg>>::build(
             node, props, cx,
         )),
+        Kind::ColorDialogButton => {
+            Box::new(<color_dialog::ColorDialogButtonC as Controller<Msg>>::build(node, props, cx))
+        }
+        Kind::ColorDialog => Box::new(<color_dialog::ColorDialogC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::FontDialogButton => Box::new(
+            <font_dialog::FontDialogButtonC as Controller<Msg>>::build(node, props, cx),
+        ),
+        Kind::FontDialog => Box::new(<font_dialog::FontDialogC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {
@@ -731,6 +745,18 @@ pub fn child_slot(kind: Kind, controller: &dyn std::any::Any) -> Option<Node> {
             .map(|c| c.popover.contents.clone()),
         Kind::DropDown => controller
             .downcast_ref::<drop_down::DropDownC>()
+            .map(|c| c.sink.clone()),
+        Kind::ColorDialogButton => controller
+            .downcast_ref::<color_dialog::ColorDialogButtonC>()
+            .map(|c| c.sink.clone()),
+        Kind::ColorDialog => controller
+            .downcast_ref::<color_dialog::ColorDialogC>()
+            .map(|c| c.sink.clone()),
+        Kind::FontDialogButton => controller
+            .downcast_ref::<font_dialog::FontDialogButtonC>()
+            .map(|c| c.sink.clone()),
+        Kind::FontDialog => controller
+            .downcast_ref::<font_dialog::FontDialogC>()
             .map(|c| c.sink.clone()),
         _ => None,
     }

@@ -158,8 +158,14 @@ impl<Msg: Clone + 'static> View<Msg> {
 pub use crate::widgets::button::{ButtonExt, button, button_from};
 pub use crate::widgets::calendar::{CalendarExt, calendar};
 pub use crate::widgets::check_button::{CheckButtonExt, check_button};
+pub use crate::widgets::color_dialog::{
+    ColorDialogButtonExt, ColorDialogExt, color_dialog, color_dialog_button,
+};
 pub use crate::widgets::drawing_area::{DrawingAreaExt, drawing_area};
 pub use crate::widgets::drop_down::{DropDownExt, drop_down, drop_down_from};
+pub use crate::widgets::font_dialog::{
+    FontDialogButtonExt, FontDialogExt, font_dialog, font_dialog_button,
+};
 pub use crate::widgets::image::{ImageExt, image, image_named};
 pub use crate::widgets::info_bar::{InfoBarExt, info_bar};
 pub use crate::widgets::label::{LabelExt, label};

@@ -414,3 +414,73 @@ fn a_drop_downs_search_filter_never_panics_and_honours_its_mode() {
     // needle and a needle longer than every haystack must both be fine.
     assert!(DropDownC::filter(&items, &"x".repeat(100_000), MatchMode::Substring).is_empty());
 }
+
+#[test]
+fn the_dialog_buttons_and_their_dialog_bodies_match_gtks_trees() {
+    // mutation: name the colour button's child `button` without `.color` and
+    // the matcher reports "required class 'color' missing".
+    use icedtea_ui::css::value::Rgba;
+    use icedtea_ui::widgets::color_dialog::ColorDialogC;
+
+    let mut colour = Props::default();
+    colour.set(
+        PropName::Value,
+        Prop::Float(ColorDialogC::pack(Rgba {
+            r: 0.2,
+            g: 0.5,
+            b: 0.9,
+            a: 1.0,
+        })),
+    );
+    check(Kind::ColorDialogButton, "color_dialog_button", &colour);
+    check(Kind::ColorDialog, "color_dialog", &colour);
+    let body = node_tree_of(Kind::ColorDialog, &colour);
+    assert!(body.starts_with("window.dialog"), "{body}");
+    assert!(body.matches("colorswatch").count() >= 2, "{body}");
+
+    let mut font = Props::default();
+    font.set(PropName::Text, Prop::Str("Cantarell 11".into()));
+    check(Kind::FontDialogButton, "font_dialog_button", &font);
+    check(Kind::FontDialog, "font_dialog", &font);
+}
+
+#[test]
+fn a_packed_colour_round_trips_exactly() {
+    // mutation: pack with `* 255.0` and no rounding and the round trip drifts.
+    use icedtea_ui::css::value::Rgba;
+    use icedtea_ui::widgets::color_dialog::ColorDialogC;
+    for rgba in [
+        Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        },
+        Rgba {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        },
+        Rgba {
+            r: 0.2,
+            g: 0.5,
+            b: 0.9,
+            a: 0.5,
+        },
+    ] {
+        let back = ColorDialogC::unpack(ColorDialogC::pack(rgba));
+        for (a, b) in [
+            (rgba.r, back.r),
+            (rgba.g, back.g),
+            (rgba.b, back.b),
+            (rgba.a, back.a),
+        ] {
+            assert!((a - b).abs() <= 1.0 / 255.0, "{a} vs {b}");
+        }
+    }
+    // Hostile input: NaN and out-of-range packs must clamp, not panic.
+    let _ = ColorDialogC::unpack(f64::NAN);
+    let _ = ColorDialogC::unpack(-1.0);
+    let _ = ColorDialogC::unpack(f64::MAX);
+}

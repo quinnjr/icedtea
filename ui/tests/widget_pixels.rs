@@ -1043,3 +1043,50 @@ fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
     };
     assert_ne!(row(0), row(1), "the button repaints when the list opens");
 }
+
+#[test]
+#[ignore = "blocked on the same framework bug as \
+            `opening_a_drop_down_and_picking_an_item_updates_the_button` above: \
+            `ColorDialogButton`'s chrome lives on the nested, non-zero-sized \
+            `button.color` subnode, so `route`'s `aim` (ui/src/view/app.rs) \
+            never lands on an `Instance` and `deliver` drops the event before \
+            `ColorDialogButtonC::on_event` ever runs. Confirmed with an inline \
+            eprintln! in on_event that never fires. Not fixable from P5's \
+            boundary (view/app.rs is D5 File Structure); unignore once `aim` \
+            resolves to the innermost `Instance` in the chain."]
+fn clicking_a_colour_button_opens_its_dialog_and_repaints_the_swatch() {
+    // mutation: never set `dialog_open` in ColorDialogButtonC::on_event and the
+    // two captures match.
+    use icedtea_ui::css::value::Rgba;
+    use icedtea_ui::view::builders::color_dialog_button;
+    use icedtea_ui::window::BTN_LEFT;
+
+    let frames = run(
+        Rgba {
+            r: 0.2,
+            g: 0.5,
+            b: 0.9,
+            a: 1.0,
+        },
+        |_m: &mut Rgba, _msg: ()| Cmd::None,
+        |model: &Rgba| color_dialog_button(*model),
+        (80, 40),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Event(InputEvent::pointer_enter(40.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..80)
+            .map(|x| frames.pixel(frame, x, 20))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), ":active must repaint the colour button");
+}
