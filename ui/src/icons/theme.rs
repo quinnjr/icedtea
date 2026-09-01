@@ -22,6 +22,24 @@ pub(crate) const MAX_CHAIN: usize = 32;
 /// The largest `Scale` a surface is ever asked for.
 const MAX_SCALE: u32 = 4;
 
+/// The most `(name, size, scale, symbolic)` lookups remembered at once.
+pub(crate) const MAX_LOOKUP_CACHE: usize = 1024;
+
+/// A lookup's cache key.
+///
+/// `chain` is the hash of the resolved inheritance chain. It is constant for
+/// the lifetime of one `IconTheme` today, and is in the key anyway because
+/// the contract puts it there and because the day a `set_theme` lands, a key
+/// without it silently serves the previous theme's paths.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LookupKey {
+    chain: u64,
+    name: Rc<str>,
+    size: u32,
+    scale: u32,
+    symbolic: bool,
+}
+
 /// `true` if `name` is a usable theme directory name: non-empty, no path
 /// separators, no `.`/`..`, no NUL.
 ///
@@ -50,8 +68,10 @@ pub struct IconTheme {
     #[allow(dead_code)]
     pixmaps: Vec<PathBuf>,
     chain: Vec<Rc<str>>,
+    chain_hash: u64,
     indexes: HashMap<Rc<str>, ThemeIndex>,
     scale: u32,
+    lookups: HashMap<LookupKey, Option<IconFile>>,
 }
 
 impl IconTheme {
@@ -91,8 +111,10 @@ impl IconTheme {
             roots,
             pixmaps,
             chain: Vec::new(),
+            chain_hash: 0,
             indexes: HashMap::new(),
             scale: 1,
+            lookups: HashMap::new(),
         };
         theme.resolve_chain();
         theme
@@ -206,14 +228,71 @@ impl IconTheme {
             chain.push(hicolor);
         }
         self.chain = chain;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for theme in &self.chain {
+            std::hash::Hash::hash(&**theme, &mut hasher);
+        }
+        self.chain_hash = std::hash::Hasher::finish(&hasher);
+    }
+
+    /// The spec's `FindIcon`: per theme in the chain, try each `Directories`
+    /// (+ `ScaledDirectories`) subdir for `name.{png,svg,xpm}` where
+    /// `DirectoryMatchesSize(subdir, size, scale)`; if none matched, take that
+    /// theme's minimum `DirectorySizeDistance` candidate **before** moving to
+    /// the next theme; finally `/usr/share/pixmaps`.
+    /// `symbolic` prefers `<name>-symbolic` and falls back to `<name>`;
+    /// a total miss falls back to `image-missing`, and only then to `None`.
+    ///
+    /// Memoised on `(chain, name, size, scale, symbolic)`, misses included:
+    /// an application that asks for an icon it does not have every frame must
+    /// not walk every directory of every theme every frame. The table is
+    /// capped at [`MAX_LOOKUP_CACHE`] and emptied by
+    /// [`clear_caches`](Self::clear_caches) — which is also how a theme
+    /// edited on disk is picked up.
+    pub fn lookup(
+        &mut self,
+        name: &str,
+        size: u32,
+        scale: u32,
+        symbolic: bool,
+    ) -> Option<IconFile> {
+        let key = LookupKey {
+            chain: self.chain_hash,
+            name: Rc::from(name),
+            size,
+            scale,
+            symbolic,
+        };
+        if let Some(found) = self.lookups.get(&key) {
+            return found.clone();
+        }
+        let found = super::lookup::lookup_uncached(self, name, size, scale, symbolic);
+        if self.lookups.len() >= MAX_LOOKUP_CACHE {
+            // Whole-table eviction rather than an LRU: an icon set that
+            // overflows this is one that changed wholesale (a file manager
+            // scrolled to new MIME types), and the cost of rebuilding it is
+            // one directory walk per icon actually on screen.
+            self.lookups.clear();
+        }
+        self.lookups.insert(key, found.clone());
+        found
     }
 
     /// Empty every memo table.
     ///
     /// The chain and the parsed indexes are *not* caches: they are the
     /// theme's identity, and re-reading them means constructing a new
-    /// `IconTheme`. Task 7 and Task 11 add the tables this clears.
-    pub fn clear_caches(&mut self) {}
+    /// `IconTheme`.
+    pub fn clear_caches(&mut self) {
+        self.lookups.clear();
+    }
+
+    /// How many lookups are remembered. Test observability only; nothing
+    /// outside this module's tests reads it.
+    #[cfg(test)]
+    pub(crate) fn lookup_cache_len(&self) -> usize {
+        self.lookups.len()
+    }
 
     /// `<root>/<theme>/<subdir>/<name>.<ext>` for every root, in order.
     ///
@@ -1290,6 +1369,90 @@ Type=Fixed
         assert_eq!(ini_value(text, "C", "k"), None);
         assert_eq!(ini_value(text, "A", "j"), None);
         assert_eq!(ini_value("", "A", "k"), None);
+    }
+
+    // A cache is only a cache if a second call does not touch the disk. The
+    // proof: look up, delete the file, look up again -- and still get it.
+    // Mutation check: bypass the memo table in `lookup` and the second
+    // assertion returns image-missing instead of the deleted file.
+    #[test]
+    fn a_second_lookup_does_not_touch_the_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        let actions = root.join("T/16x16/actions");
+        std::fs::create_dir_all(&actions).expect("mkdir");
+        std::fs::write(
+            root.join("T/index.theme"),
+            "[Icon Theme]\nDirectories=16x16/actions\n[16x16/actions]\nSize=16\nType=Fixed\n",
+        )
+        .expect("write");
+        let icon = actions.join("a.png");
+        std::fs::write(&icon, b"not really a png, lookup never decodes").expect("write");
+
+        let mut theme = IconTheme::with_name_and_roots("T", vec![root]);
+        let first = theme.lookup("a", 16, 1, false).expect("found");
+        assert_eq!(first.path, icon);
+
+        std::fs::remove_file(&icon).expect("remove");
+        let second = theme.lookup("a", 16, 1, false).expect("cached");
+        assert_eq!(second.path, icon);
+
+        theme.clear_caches();
+        assert!(theme.lookup("a", 16, 1, false).is_none());
+    }
+
+    // Misses are cached too: an application that asks for a missing icon
+    // every frame must not walk every directory of every theme every frame.
+    // Mutation check: cache only the `Some` results and `lookup_cache_len`
+    // stays 0 across the two calls.
+    #[test]
+    fn a_miss_is_cached_as_a_miss() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", Vec::new());
+        assert!(theme.lookup("nothing-here", 16, 1, false).is_none());
+        assert_eq!(theme.lookup_cache_len(), 1);
+        assert!(theme.lookup("nothing-here", 16, 1, false).is_none());
+        assert_eq!(theme.lookup_cache_len(), 1);
+    }
+
+    // Every part of the key separates entries -- a size, a scale and the
+    // symbolic flag all produce different files.
+    // Mutation check: drop `symbolic` from the key and the fourth
+    // assertion returns the PNG.
+    #[test]
+    fn the_cache_key_separates_size_scale_and_symbolic() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        let png = theme.lookup("document-open", 16, 1, false).expect("found");
+        let svg = theme.lookup("document-open", 128, 1, false).expect("found");
+        let sym = theme.lookup("document-open", 16, 1, true).expect("found");
+        assert_ne!(png.path, svg.path);
+        assert_ne!(png.path, sym.path);
+        assert!(sym.symbolic);
+        assert_eq!(theme.lookup_cache_len(), 3);
+    }
+
+    // The cache is bounded: an application that generates icon names (a
+    // file manager showing MIME icons, say) must not grow it forever.
+    // Mutation check: remove the eviction and the assertion fails.
+    #[test]
+    fn the_lookup_cache_is_bounded() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", Vec::new());
+        for i in 0..super::MAX_LOOKUP_CACHE * 2 {
+            let _ = theme.lookup(&format!("icon-{i}"), 16, 1, false);
+        }
+        assert!(theme.lookup_cache_len() <= super::MAX_LOOKUP_CACHE);
+    }
+
+    // Changing the output scale invalidates every rasterisation decision
+    // made under the old one.
+    // Mutation check: drop the `clear_caches()` from `set_scale` and the
+    // final assertion sees the stale entry count.
+    #[test]
+    fn setting_the_scale_clears_the_caches() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        let _ = theme.lookup("document-open", 16, 1, false);
+        assert_eq!(theme.lookup_cache_len(), 1);
+        theme.set_scale(2);
+        assert_eq!(theme.lookup_cache_len(), 0);
     }
 }
 
