@@ -182,9 +182,14 @@ pub struct ColorDialogC {
     pub custom: Option<Rgba>,
     /// One `colorswatch` node per palette entry.
     pub swatches: Vec<Node>,
+    /// One press-tracking [`PointerState`] per entry of `swatches`, parallel
+    /// to it. A swatch click is a press-then-release-inside gesture like any
+    /// other, so the press has to survive between the two events: a
+    /// per-event scratch `PointerState` always reports `pressed == false` on
+    /// the release and would never fire [`EventKind::ValueChanged`] at all.
+    swatch_pointers: Vec<PointerState>,
     /// A detached, never-attached sink: see `ColorDialogButtonC::sink`.
     pub sink: Node,
-    pointer: PointerState,
 }
 
 impl ColorDialogC {
@@ -259,7 +264,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
         let chooser = Node::new("colorchooser");
         node.append_child(&chooser);
         let palette = Self::default_palette();
-        let swatches = palette
+        let swatches: Vec<Node> = palette
             .iter()
             .map(|_| {
                 let swatch = Node::new("colorswatch");
@@ -267,13 +272,15 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
                 swatch
             })
             .collect();
+        let swatch_pointers: Vec<PointerState> =
+            swatches.iter().map(|_| PointerState::default()).collect();
         ColorDialogC {
             rgba: Self::unpack(props.float(PropName::Value, 0.0)),
             palette,
             custom: None,
             swatches,
+            swatch_pointers,
             sink: Node::new("sink"),
-            pointer: PointerState::default(),
         }
     }
 
@@ -284,28 +291,211 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
-        for (index, swatch) in self.swatches.iter().enumerate() {
-            let Some(rect) = local_rect(cx.tree, cx.node, swatch) else {
+        let mut picked = None;
+        for index in 0..self.swatches.len() {
+            let swatch = self.swatches[index].clone();
+            let Some(rect) = local_rect(cx.tree, cx.node, &swatch) else {
                 continue;
             };
             let shifted = shift_event(ev, rect);
-            let mut probe = PointerState::default();
-            let clicked = probe.observe(
-                swatch,
+            let Some(state) = self.swatch_pointers.get_mut(index) else {
+                continue;
+            };
+            if state.observe(
+                &swatch,
                 &shifted,
                 Some(Rect::new(0.0, 0.0, rect.width, rect.height)),
-            );
-            if let Some(rgba) = clicked.then(|| self.palette.get(index).copied()).flatten() {
-                self.rgba = rgba;
-                self.custom = Some(rgba);
-                cx.handled = true;
-                return cx
-                    .handlers
-                    .fire_float(EventKind::ValueChanged, Self::pack(rgba))
-                    .map_or_else(Vec::new, |m| vec![m]);
+            ) && picked.is_none()
+            {
+                picked = Some(index);
             }
         }
-        let _ = &mut self.pointer;
+        if let Some(rgba) = picked.and_then(|index| self.palette.get(index).copied()) {
+            self.rgba = rgba;
+            self.custom = Some(rgba);
+            cx.handled = true;
+            return cx
+                .handlers
+                .fire_float(EventKind::ValueChanged, Self::pack(rgba))
+                .map_or_else(Vec::new, |m| vec![m]);
+        }
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use super::ColorDialogC;
+    use crate::anim::{Clock, ManualClock};
+    use crate::css::cascade::CompiledSheet;
+    use crate::css::computed::ResolveEnv;
+    use crate::css::node::Node;
+    use crate::css::value::Rgba;
+    use crate::layout::{Container, FixedMeasure, LayoutTree};
+    use crate::view::controller::{Controller, Event, EventCx, Phase};
+    use crate::view::reconcile::BuildCx;
+    use crate::view::render::{Animations, StyleMap, layout_tree, node_addr, restyle_tree};
+    use crate::view::{Cmd, EventKind, Handler, Handlers, Props};
+    use crate::window::focus::FocusRing;
+    use crate::window::selection::Clipboard;
+
+    /// Drives `ColorDialogC::on_event` over a really laid-out tree — the
+    /// real allocations `local_rect` consults — so a press-then-release
+    /// gesture over a palette swatch actually selects that swatch's colour
+    /// and fires `EventKind::ValueChanged`.
+    #[test]
+    fn clicking_a_palette_swatch_selects_its_colour() {
+        // mutation: give the swatch hit-test a fresh `PointerState` per
+        // event (or never fire `EventKind::ValueChanged`) and the click
+        // produces no message and leaves `rgba`/`custom` unchanged.
+        let sheet = CompiledSheet::compile("colorswatch { color: #000000; }");
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", vec![]);
+        let clock: Rc<dyn Clock> = Rc::new(ManualClock::new());
+        let env = ResolveEnv::default();
+
+        let node = Node::new("window");
+        let props = Props::default();
+        let mut controller = {
+            let mut cx = BuildCx {
+                sheet: &sheet,
+                fonts: &mut fonts,
+                icons: &mut icons,
+                clock: &clock,
+                env: &env,
+            };
+            <ColorDialogC as Controller<usize>>::build(&node, &props, &mut cx)
+        };
+        assert!(controller.swatches.len() > 1, "a real palette");
+
+        // Lay the retained tree out for real: every leaf is 20x20, and each
+        // container stacks its children on the main axis, so the swatches
+        // land on disjoint rectangles.
+        let mut styles = StyleMap::new();
+        let mut anims = Animations::new();
+        restyle_tree(&node, &sheet, &env, &mut styles, &mut anims, Duration::ZERO);
+        let mut containers: HashMap<_, Container> = HashMap::new();
+        for addr in styles.keys() {
+            containers.insert(
+                *addr,
+                Container::Box {
+                    direction: crate::layout::BoxDirection::Column,
+                },
+            );
+        }
+        containers.insert(
+            node_addr(&node),
+            Container::Box {
+                direction: crate::layout::BoxDirection::Column,
+            },
+        );
+        let mut tree = LayoutTree::new();
+        let mut measure = FixedMeasure(taffy::Size {
+            width: 20.0,
+            height: 20.0,
+        });
+        layout_tree(
+            &node,
+            &styles,
+            &containers,
+            &mut tree,
+            &env,
+            (Some(400.0), Some(800.0)),
+            &mut measure,
+        )
+        .expect("the dialog lays out");
+
+        let root = tree.allocation(&node).expect("root allocation").border_box;
+        let centre = |sub: &Node| {
+            let b = tree.allocation(sub).expect("subnode allocation").border_box;
+            assert!(b.width > 0.0 && b.height > 0.0, "a clickable box");
+            (b.x - root.x + b.width / 2.0, b.y - root.y + b.height / 2.0)
+        };
+        let target_index = 2;
+        let swatch_at = centre(&controller.swatches[target_index]);
+
+        let mut handlers: Handlers<usize> = Handlers::default();
+        handlers.set(
+            EventKind::ValueChanged,
+            Handler::Float(Rc::new(|packed| packed as usize)),
+        );
+        let mut focus = <FocusRing as Default>::default();
+        let mut clipboard = Clipboard::offscreen();
+        let mut cmds: Vec<Cmd<usize>> = Vec::new();
+
+        let mut click = |controller: &mut ColorDialogC,
+                         at: (f32, f32),
+                         cmds: &mut Vec<Cmd<usize>>,
+                         fonts: &mut crate::text::FontDatabase,
+                         icons: &mut crate::icons::IconTheme|
+         -> Vec<usize> {
+            let mut out = Vec::new();
+            for ev in [
+                Event::PointerDown {
+                    button: 0x110,
+                    local: at,
+                    serial: 1,
+                },
+                Event::PointerUp {
+                    button: 0x110,
+                    local: at,
+                    serial: 2,
+                },
+            ] {
+                let mut ecx = EventCx {
+                    node: &node,
+                    handlers: &handlers,
+                    tree: &tree,
+                    styles: &styles,
+                    focus: &mut focus,
+                    clipboard: &mut clipboard,
+                    icons,
+                    fonts,
+                    clock: &clock,
+                    env: &env,
+                    cmds,
+                    phase: Phase::Target,
+                    handled: false,
+                };
+                out.extend(Controller::<usize>::on_event(controller, &ev, &mut ecx));
+            }
+            out
+        };
+
+        let expected_rgba = controller.palette[target_index];
+        let fired = click(
+            &mut controller,
+            swatch_at,
+            &mut cmds,
+            &mut fonts,
+            &mut icons,
+        );
+        assert_eq!(fired.len(), 1, "one ValueChanged message reaches the app");
+        assert_eq!(
+            fired[0],
+            ColorDialogC::pack(expected_rgba) as usize,
+            "the packed colour round-trips through the handler"
+        );
+        assert_eq!(controller.rgba, expected_rgba);
+        assert_eq!(controller.custom, Some(expected_rgba));
+    }
+
+    #[test]
+    fn pack_unpack_round_trips() {
+        let rgba = Rgba {
+            r: 0.2,
+            g: 0.4,
+            b: 0.6,
+            a: 0.8,
+        };
+        let back = ColorDialogC::unpack(ColorDialogC::pack(rgba));
+        assert!((back.r - rgba.r).abs() < 1.0 / 255.0);
+        assert!((back.g - rgba.g).abs() < 1.0 / 255.0);
+        assert!((back.b - rgba.b).abs() < 1.0 / 255.0);
+        assert!((back.a - rgba.a).abs() < 1.0 / 255.0);
     }
 }
