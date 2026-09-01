@@ -75,6 +75,13 @@ struct RenderKey {
     mtime: Option<u64>,
     size: u32,
     scale: u32,
+    /// Whether this rasterisation was recoloured.
+    ///
+    /// Part of the key, not derivable from the path: `-gtk-recolor(url(a.svg))`
+    /// and a `url(a.svg)` arm of `-gtk-scaled()` name the same file at the
+    /// same size and palette and want *different* pixels, so without this the
+    /// first of the two to render served the other one its own recolouring.
+    symbolic: bool,
     palette: [u32; 4],
 }
 
@@ -433,6 +440,7 @@ impl IconTheme {
             mtime: mtime_of(&file.path),
             size,
             scale,
+            symbolic: file.symbolic,
             palette: palette.key(),
         };
         if let Some(image) = self.renders.get(&key) {
@@ -1927,6 +1935,35 @@ Type=Fixed
         assert!(!Rc::ptr_eq(&a, &b));
         assert_eq!(theme.render_cache_len(), 2);
         assert_eq!(theme.dom_cache_len(), 1);
+    }
+
+    // The same file at the same size and palette, asked for once recoloured
+    // and once verbatim, is two rasterisations -- which is exactly the pair
+    // `-gtk-recolor(url(a.svg))` and a `url(a.svg)` arm of `-gtk-scaled()`
+    // produce (`paint/icon.rs`'s `render_path` call sites pass `true` and
+    // `false` for the same path).
+    // Mutation check: drop `symbolic` from `RenderKey` and the cache length
+    // is 1 and the two handles are the same allocation.
+    #[test]
+    fn a_recoloured_render_and_a_verbatim_one_are_not_the_same_cache_entry() {
+        let mut theme = IconTheme::with_name_and_roots("MiniTheme", roots());
+        let palette = Palette::for_color(Rgba {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        });
+        // A path that does *not* name itself symbolic, so the `symbolic`
+        // argument is the only thing that differs between the two renders.
+        let path = roots()[0].join("MiniTheme/scalable/actions/document-open.svg");
+        let recoloured = theme
+            .render_path(path.clone(), 16, 1, true, &palette)
+            .expect("rendered");
+        let verbatim = theme
+            .render_path(path, 16, 1, false, &palette)
+            .expect("rendered");
+        assert!(!Rc::ptr_eq(&recoloured, &verbatim));
+        assert_eq!(theme.render_cache_len(), 2);
     }
 
     // An unrenderable file falls through to image-missing rather than
