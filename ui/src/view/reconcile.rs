@@ -284,6 +284,14 @@ fn reconcile_reserved<Msg: Clone + 'static>(
         }
         if let Some(instance) = slot.take() {
             instance.node.detach();
+            // The instance's node (and the chrome subnodes its controller
+            // owns under it) may have recorded container/child-layout/props/
+            // transition/row-binding entries in `widgets`' node-keyed side
+            // tables. Those tables are keyed on an allocation address, so an
+            // entry left behind is both a leak and — once the allocator hands
+            // that address to a freshly built node — a wrong answer. Evict
+            // them here, while the subtree is still reachable.
+            crate::widgets::forget_subtree(&instance.node);
             ops.push(Op::Remove { index });
             drop(instance);
         }

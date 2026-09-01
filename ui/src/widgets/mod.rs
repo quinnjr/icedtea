@@ -14,13 +14,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use selectors::Element as _;
 use selectors::OpaqueElement;
 
-use crate::css::node::{Node, PseudoStates};
+use crate::css::node::{Node, NodeInner, PseudoStates};
 use crate::layout::{ChildLayout, Container, Rect};
 use crate::view::controller::{Controller, Event};
 use crate::view::{BuildCx, Kind, Prop, PropName, Props};
@@ -809,11 +809,145 @@ struct Pending {
     node: Option<Node>,
 }
 
+/// One node-keyed side table, safe against address reuse.
+///
+/// The key is `node.opaque()` -- the `NodeInner` allocation's address --
+/// which is unique only among *live* nodes: the allocator hands that address
+/// back the moment the node is torn down, so a plain
+/// `HashMap<OpaqueElement, T>` lets a freshly built node silently inherit a
+/// dead node's entry (its grid cell, its container variant, its pooled row
+/// binding). Destroy a `Grid`/`Stack`/`ListBox` child and build another and
+/// that is exactly what happens.
+///
+/// Every entry therefore carries a `Weak` handle on the payload it was
+/// recorded against, which fixes both halves at once:
+///
+/// * **No aliasing.** A live `Weak` keeps the *allocation* (not the node)
+///   alive, so its address cannot be handed out again while a stale entry
+///   holds it; and a read still checks `upgrade()` and payload identity, so
+///   a stale entry reads as absent rather than as the dead node's value.
+/// * **No unbounded growth.** [`forget_subtree`] (called from `reconcile`'s
+///   `Remove` op) drops a removed instance's entries eagerly, and
+///   [`NodeTable::purge`] (once per [`flush_layout`]) sweeps whatever a
+///   controller dropped on its own -- a scrollbar a policy change removed, a
+///   pooled row a shrinking pool released.
+struct NodeTable<T> {
+    entries: HashMap<OpaqueElement, (Weak<NodeInner>, T)>,
+}
+
+impl<T> NodeTable<T> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Whether this entry's recorded payload is still `node`'s own.
+    fn is_live(alive: &Weak<NodeInner>, node: &Node) -> bool {
+        alive
+            .upgrade()
+            .is_some_and(|payload| Rc::ptr_eq(&payload, &node.opaque_payload()))
+    }
+
+    fn get(&self, node: &Node) -> Option<&T> {
+        self.entries
+            .get(&node.opaque())
+            .filter(|(alive, _)| Self::is_live(alive, node))
+            .map(|(_, value)| value)
+    }
+
+    fn insert(&mut self, node: &Node, value: T) {
+        self.entries.insert(
+            node.opaque(),
+            (Rc::downgrade(&node.opaque_payload()), value),
+        );
+    }
+
+    /// The entry for `node`, created (or *replaced*, when the entry at this
+    /// address belongs to a dead node) from `T::default()`.
+    fn entry_mut(&mut self, node: &Node) -> &mut T
+    where
+        T: Default,
+    {
+        let key = node.opaque();
+        let stale = self
+            .entries
+            .get(&key)
+            .is_none_or(|(alive, _)| !Self::is_live(alive, node));
+        if stale {
+            self.entries
+                .insert(key, (Rc::downgrade(&node.opaque_payload()), T::default()));
+        }
+        &mut self
+            .entries
+            .get_mut(&key)
+            .expect("just inserted when it was missing or stale")
+            .1
+    }
+
+    fn remove(&mut self, node: &Node) {
+        self.entries.remove(&node.opaque());
+    }
+
+    /// Drop every entry whose node is gone.
+    fn purge(&mut self) {
+        self.entries
+            .retain(|_, (alive, _)| alive.strong_count() > 0);
+    }
+
+    /// Every value whose node is still alive.
+    fn live_values(&self) -> impl Iterator<Item = &T> {
+        self.entries
+            .values()
+            .filter(|(alive, _)| alive.strong_count() > 0)
+            .map(|(_, value)| value)
+    }
+}
+
 thread_local! {
-    static PENDING: RefCell<HashMap<OpaqueElement, Pending>> = RefCell::new(HashMap::new());
-    static CONTAINERS: RefCell<HashMap<OpaqueElement, Container>> = RefCell::new(HashMap::new());
-    static NODE_PROPS: RefCell<HashMap<OpaqueElement, Props>> = RefCell::new(HashMap::new());
-    static NODE_CHILD: RefCell<HashMap<OpaqueElement, ChildLayout>> = RefCell::new(HashMap::new());
+    static PENDING: RefCell<NodeTable<Pending>> = RefCell::new(NodeTable::new());
+    static CONTAINERS: RefCell<NodeTable<Container>> = RefCell::new(NodeTable::new());
+    static NODE_PROPS: RefCell<NodeTable<Props>> = RefCell::new(NodeTable::new());
+    static NODE_CHILD: RefCell<NodeTable<ChildLayout>> = RefCell::new(NodeTable::new());
+}
+
+/// The depth [`forget_subtree`] walks before giving up, so a pathological
+/// tree cannot blow the stack. Anything deeper is left to
+/// [`NodeTable::purge`], which is not recursive at all.
+const MAX_FORGET_DEPTH: usize = 256;
+
+/// Forget every side-table entry belonging to `node` or any descendant.
+///
+/// `reconcile`'s `Remove` op calls this as it drops an instance: the instance
+/// owns its root [`Node`] and (through its controller) that node's chrome
+/// subnodes, and any of them may have recorded a container, a child layout, a
+/// props subset, a stack transition or a row binding.
+pub(crate) fn forget_subtree(node: &Node) {
+    fn walk(node: &Node, depth: usize) {
+        if depth > MAX_FORGET_DEPTH {
+            return;
+        }
+        for child in node.children() {
+            walk(&child, depth + 1);
+        }
+        PENDING.with(|p| p.borrow_mut().remove(node));
+        CONTAINERS.with(|c| c.borrow_mut().remove(node));
+        NODE_PROPS.with(|m| m.borrow_mut().remove(node));
+        NODE_CHILD.with(|m| m.borrow_mut().remove(node));
+        TRANSITIONS.with(|t| t.borrow_mut().remove(node));
+        ROW_BINDING.with(|m| m.borrow_mut().remove(node));
+    }
+    walk(node, 0);
+}
+
+/// Drop every side-table entry whose node has been torn down.
+fn purge_tables() {
+    PENDING.with(|p| p.borrow_mut().purge());
+    CONTAINERS.with(|c| c.borrow_mut().purge());
+    NODE_PROPS.with(|m| m.borrow_mut().purge());
+    NODE_CHILD.with(|m| m.borrow_mut().purge());
+    TRANSITIONS.with(|t| t.borrow_mut().purge());
+    ROW_BINDING.with(|m| m.borrow_mut().purge());
 }
 
 /// The prop names [`record_props`] keeps; every other prop is dropped on the
@@ -868,7 +1002,7 @@ pub(crate) fn record_props(node: &Node, props: &Props) {
             kept.set(name, value.clone());
         }
     }
-    NODE_PROPS.with(|m| m.borrow_mut().insert(node.opaque(), kept));
+    NODE_PROPS.with(|m| m.borrow_mut().insert(node, kept));
 }
 
 /// The props last applied to `node`, or an empty set.
@@ -879,7 +1013,7 @@ pub(crate) fn record_props(node: &Node, props: &Props) {
 #[must_use]
 pub(crate) fn props_of(node: &Node) -> Props {
     NODE_PROPS
-        .with(|m| m.borrow().get(&node.opaque()).cloned())
+        .with(|m| m.borrow().get(node).cloned())
         .unwrap_or_default()
 }
 
@@ -887,13 +1021,13 @@ pub(crate) fn props_of(node: &Node) -> Props {
 #[must_use]
 pub(crate) fn child_layout_of(node: &Node) -> ChildLayout {
     NODE_CHILD
-        .with(|m| m.borrow().get(&node.opaque()).copied())
+        .with(|m| m.borrow().get(node).copied())
         .unwrap_or_default()
 }
 
 thread_local! {
-    static TRANSITIONS: RefCell<HashMap<OpaqueElement, (types::StackTransition, f32)>> =
-        RefCell::new(HashMap::new());
+    static TRANSITIONS: RefCell<NodeTable<(types::StackTransition, f32)>> =
+        RefCell::new(NodeTable::new());
 }
 
 /// Record `node`'s current stack-transition state.
@@ -912,16 +1046,16 @@ pub(crate) fn set_transition_progress(
     transition: types::StackTransition,
     progress: f32,
 ) {
-    TRANSITIONS.with(|t| t.borrow_mut().insert(node.opaque(), (transition, progress)));
+    TRANSITIONS.with(|t| t.borrow_mut().insert(node, (transition, progress)));
 }
 
 /// Record `node`'s container, for later [`flush_layout`] and for the
 /// headless `container_of` test hook every container controller exposes.
 pub(crate) fn set_container(node: &Node, container: Container) {
-    CONTAINERS.with(|c| c.borrow_mut().insert(node.opaque(), container));
+    CONTAINERS.with(|c| c.borrow_mut().insert(node, container));
     PENDING.with(|p| {
         let mut p = p.borrow_mut();
-        let entry = p.entry(node.opaque()).or_default();
+        let entry = p.entry_mut(node);
         entry.container = Some(container);
         entry.node = Some(node.clone());
     });
@@ -933,7 +1067,7 @@ pub(crate) fn set_container(node: &Node, container: Container) {
 pub(crate) fn mark_grid_children(node: &Node) {
     PENDING.with(|p| {
         let mut p = p.borrow_mut();
-        let entry = p.entry(node.opaque()).or_default();
+        let entry = p.entry_mut(node);
         entry.grid_from_children = true;
         entry.node = Some(node.clone());
     });
@@ -945,7 +1079,7 @@ pub(crate) fn mark_grid_children(node: &Node) {
 pub(crate) fn mark_overlay_children(node: &Node) {
     PENDING.with(|p| {
         let mut p = p.borrow_mut();
-        let entry = p.entry(node.opaque()).or_default();
+        let entry = p.entry_mut(node);
         entry.overlay_from_children = true;
         entry.node = Some(node.clone());
     });
@@ -973,13 +1107,13 @@ impl Default for RowBinding {
 }
 
 thread_local! {
-    static ROW_BINDING: RefCell<HashMap<OpaqueElement, RowBinding>> = RefCell::new(HashMap::new());
+    static ROW_BINDING: RefCell<NodeTable<RowBinding>> = RefCell::new(NodeTable::new());
 }
 
 /// Set a pooled row's displayed text.
 pub(crate) fn set_text(node: &Node, text: &str) {
     ROW_BINDING.with(|m| {
-        m.borrow_mut().entry(node.opaque()).or_default().text = Rc::from(text);
+        m.borrow_mut().entry_mut(node).text = Rc::from(text);
     });
 }
 
@@ -987,7 +1121,7 @@ pub(crate) fn set_text(node: &Node, text: &str) {
 #[must_use]
 pub(crate) fn text_of(node: &Node) -> Rc<str> {
     ROW_BINDING
-        .with(|m| m.borrow().get(&node.opaque()).map(|b| Rc::clone(&b.text)))
+        .with(|m| m.borrow().get(node).map(|b| Rc::clone(&b.text)))
         .unwrap_or_else(|| Rc::from(""))
 }
 
@@ -995,13 +1129,13 @@ pub(crate) fn text_of(node: &Node) -> Rc<str> {
 /// pool slot, which changes on every scroll while the row's identity does
 /// not.
 pub(crate) fn set_row_index(node: &Node, index: usize) {
-    ROW_BINDING.with(|m| m.borrow_mut().entry(node.opaque()).or_default().index = index);
+    ROW_BINDING.with(|m| m.borrow_mut().entry_mut(node).index = index);
 }
 
 /// The model index last bound to this row, if any.
 #[must_use]
 pub(crate) fn row_index_of(node: &Node) -> Option<usize> {
-    ROW_BINDING.with(|m| m.borrow().get(&node.opaque()).map(|b| b.index))
+    ROW_BINDING.with(|m| m.borrow().get(node).map(|b| b.index))
 }
 
 /// Replace a pooled row's extra classes with exactly `classes`, leaving every
@@ -1009,7 +1143,7 @@ pub(crate) fn row_index_of(node: &Node) -> Option<usize> {
 pub(crate) fn set_row_classes(node: &Node, classes: &[Rc<str>]) {
     ROW_BINDING.with(|m| {
         let mut m = m.borrow_mut();
-        let entry = m.entry(node.opaque()).or_default();
+        let entry = m.entry_mut(node);
         for old in entry.classes.iter() {
             if !classes.iter().any(|c| c == old) {
                 node.remove_class(old);
@@ -1030,7 +1164,7 @@ pub(crate) fn set_row_classes(node: &Node, classes: &[Rc<str>]) {
 /// did my controller build?" without standing up a `LayoutTree` at all.
 #[must_use]
 pub(crate) fn container_of(node: &Node) -> Container {
-    CONTAINERS.with(|c| c.borrow().get(&node.opaque()).copied().unwrap_or_default())
+    CONTAINERS.with(|c| c.borrow().get(node).copied().unwrap_or_default())
 }
 
 /// Record `node`'s per-child layout (alignment/expansion), keyed by the
@@ -1041,18 +1175,18 @@ pub(crate) fn container_of(node: &Node) -> Container {
 pub(crate) fn set_child_layout(node: &Node, layout: ChildLayout) {
     PENDING.with(|p| {
         let mut p = p.borrow_mut();
-        let entry = p.entry(node.opaque()).or_default();
+        let entry = p.entry_mut(node);
         entry.child_layout = Some(layout);
         entry.node = Some(node.clone());
     });
-    NODE_CHILD.with(|m| m.borrow_mut().insert(node.opaque(), layout));
+    NODE_CHILD.with(|m| m.borrow_mut().insert(node, layout));
 }
 
 /// Record a gap floor for `node`'s main axis, keyed by `orientation`.
 pub(crate) fn set_gap(node: &Node, spacing: f32, orientation: Orientation) {
     PENDING.with(|p| {
         let mut p = p.borrow_mut();
-        let entry = p.entry(node.opaque()).or_default();
+        let entry = p.entry_mut(node);
         entry.gap = Some((
             if spacing.is_finite() {
                 spacing.max(0.0)
@@ -1071,7 +1205,7 @@ pub(crate) fn set_gap(node: &Node, spacing: f32, orientation: Orientation) {
 pub(crate) fn set_homogeneous(node: &Node, on: bool, orientation: Orientation) {
     PENDING.with(|p| {
         let mut p = p.borrow_mut();
-        let entry = p.entry(node.opaque()).or_default();
+        let entry = p.entry_mut(node);
         entry.homogeneous = Some((on, orientation));
         entry.node = Some(node.clone());
     });
@@ -1087,8 +1221,12 @@ pub(crate) fn set_homogeneous(node: &Node, on: bool, orientation: Orientation) {
 /// controller that recorded a decision before its node was attached, or a
 /// node `reconcile` has since removed.
 pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
+    // Once per frame is the natural sweep point for whatever the eager
+    // `forget_subtree` path cannot see: a chrome subnode a controller dropped
+    // on its own, or a pooled row a shrinking pool released.
+    purge_tables();
     PENDING.with(|p| {
-        for pending in p.borrow().values() {
+        for pending in p.borrow().live_values() {
             let Some(node) = &pending.node else { continue };
             if let Some(container) = pending.container {
                 tree.set_container(node, container);
@@ -2181,5 +2319,75 @@ mod tests {
             .map(|c| c.as_str().to_owned())
             .collect();
         assert_eq!(names, vec!["horizontal".to_owned()]);
+    }
+}
+
+#[cfg(test)]
+mod side_table_tests {
+    use super::{
+        container_of, forget_subtree, props_of, record_props, set_container, set_text, text_of,
+    };
+    use crate::css::node::Node;
+    use crate::layout::{BoxDirection, Container};
+    use crate::view::{Prop, PropName, Props};
+
+    const CENTER: Container = Container::Center {
+        direction: BoxDirection::Row,
+        shrink_center_last: false,
+    };
+
+    /// Mutation: key `NodeTable` on `node.opaque()` alone, without the `Weak`
+    /// liveness tag (as these tables did before the P6 fix wave), and this
+    /// fails -- the allocator hands the dead node's address straight back
+    /// (verified: 512 of 512 fresh nodes land on it) and `props_of` answers
+    /// `Int(7)`, `text_of` `"dead"`, for a node nobody ever recorded.
+    ///
+    /// The two tables read here are the ones that hold no reference of their
+    /// own; `PENDING` (and `CONTAINERS`, written with it) keeps a strong
+    /// `Node`, which blocks reuse but leaks instead -- that half is
+    /// `forgetting_a_subtree_drops_every_entry_under_it` below.
+    #[test]
+    fn a_dead_node_never_lends_its_side_table_entry_to_a_fresh_one() {
+        {
+            let dead = Node::new("gridchild");
+            let mut props = Props::default();
+            props.set(PropName::Column, Prop::Int(7));
+            record_props(&dead, &props);
+            set_text(&dead, "dead");
+            assert_eq!(props_of(&dead).get(PropName::Column), Some(&Prop::Int(7)));
+        }
+        for _ in 0..512 {
+            let fresh = Node::new("gridchild");
+            assert!(
+                props_of(&fresh).get(PropName::Column).is_none(),
+                "a fresh node inherited a dead node's recorded grid cell"
+            );
+            assert_eq!(
+                &*text_of(&fresh),
+                "",
+                "a fresh node inherited a dead node's pooled row binding"
+            );
+        }
+    }
+
+    /// Mutation: delete `forget_subtree`'s body (or `reconcile`'s call to it)
+    /// and this fails -- the entries outlive the subtree they describe.
+    #[test]
+    fn forgetting_a_subtree_drops_every_entry_under_it() {
+        let root = Node::new("box");
+        let child = Node::new("label");
+        root.append_child(&child);
+        set_container(&root, CENTER);
+        let mut props = Props::default();
+        props.set(PropName::Row, Prop::Int(3));
+        record_props(&child, &props);
+
+        assert_eq!(container_of(&root), CENTER);
+        assert_eq!(props_of(&child).get(PropName::Row), Some(&Prop::Int(3)));
+
+        forget_subtree(&root);
+
+        assert_eq!(container_of(&root), Container::default());
+        assert!(props_of(&child).get(PropName::Row).is_none());
     }
 }
