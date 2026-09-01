@@ -58,11 +58,13 @@ pub mod label;
 pub mod level_bar;
 pub mod link_button;
 pub mod menu_button;
+pub mod password_entry;
 pub mod picture;
 pub mod popover;
 pub mod progress_bar;
 pub mod scale;
 pub mod scrollbar;
+pub mod search_entry;
 pub mod separator;
 pub mod spinner;
 pub mod statusbar;
@@ -708,6 +710,12 @@ pub fn build_controller<Msg: Clone + 'static>(
             node, props, cx,
         )),
         Kind::Entry => Box::new(<entry::EntryC as Controller<Msg>>::build(node, props, cx)),
+        Kind::SearchEntry => Box::new(<search_entry::SearchEntryC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::PasswordEntry => Box::new(
+            <password_entry::PasswordEntryC as Controller<Msg>>::build(node, props, cx),
+        ),
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {

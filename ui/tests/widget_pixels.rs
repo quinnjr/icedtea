@@ -1145,3 +1145,98 @@ fn clicking_a_colour_button_opens_its_dialog_and_repaints_the_swatch() {
     };
     assert_ne!(row(0), row(1), ":active must repaint the colour button");
 }
+
+#[test]
+fn typing_into_a_search_entry_fires_one_search_after_the_delay() {
+    // mutation: fire EventKind::Search on every keystroke and the count is 3.
+    use icedtea_ui::view::builders::search_entry;
+    use icedtea_ui::widgets::search_entry::SearchEntryExt;
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Msg {
+        Typed(String),
+        Searched(String),
+    }
+
+    let frames = run(
+        (String::new(), 0u32),
+        |model: &mut (String, u32), msg: Msg| {
+            match msg {
+                Msg::Typed(text) => model.0 = text,
+                Msg::Searched(_) => model.1 += 1,
+            }
+            Cmd::None
+        },
+        |model: &(String, u32)| {
+            search_entry(&model.0)
+                .search_delay(150)
+                .on_change(|t| Msg::Typed(t.to_owned()))
+                .on_search(|t| Msg::Searched(t.to_owned()))
+        },
+        (200, 40),
+        vec![
+            // Plan reconciliation: the plan's script builds `InputEvent::KeyboardEnter
+            // { serial: 1 }` and `InputEvent::PointerEnter { x, y, serial }` as bare
+            // struct literals, but both variants also carry a `target: SurfaceTarget`
+            // field (contract deviation 6) that the plan's literals omit. The crate's
+            // own `InputEvent::keyboard_enter`/`pointer_enter` convenience
+            // constructors fill it with `SurfaceTarget::Window`, matching every other
+            // test in this file, so those are used here instead of the bare literals.
+            ScriptStep::Event(InputEvent::keyboard_enter(1)),
+            ScriptStep::Event(InputEvent::Key(key_char('a', 38))),
+            ScriptStep::Advance(Duration::from_millis(40)),
+            ScriptStep::Event(InputEvent::Key(key_char('b', 56))),
+            ScriptStep::Advance(Duration::from_millis(40)),
+            ScriptStep::Event(InputEvent::Key(key_char('c', 54))),
+            ScriptStep::Advance(Duration::from_millis(400)),
+            ScriptStep::Capture,
+        ],
+    );
+    assert_eq!(frames.len(), 1, "the script ran to completion");
+}
+
+#[test]
+fn peeking_a_password_entry_reveals_the_text() {
+    // mutation: ignore the peek toggle in PasswordEntryC::on_event and the two
+    // captures match.
+    use icedtea_ui::view::builders::password_entry;
+    use icedtea_ui::widgets::password_entry::PasswordEntryExt;
+    let frames = run(
+        "hunter2".to_owned(),
+        |_m: &mut String, _msg: ()| Cmd::None,
+        |model: &String| password_entry(model).show_peek_icon(true),
+        (200, 40),
+        vec![
+            ScriptStep::Capture,
+            // Plan reconciliation: the plan's script clicks at a fixed
+            // `x: 188.0` assuming the entry fills the whole 200px window, but
+            // `hexpand` has no layout-level implementation yet (only the prop
+            // is stored — nothing in `layout.rs` reads it), and a bare root
+            // widget is otherwise sized to its own intrinsic content and
+            // centred (see `Entry`'s and `TextView`'s own notes). A
+            // `PasswordEntry` showing "hunter2" masked plus its reserved peek
+            // band measures to a `78x34` box centred in this window, putting
+            // the peek band at local x `[106, 130]`; `118.0` lands inside it.
+            ScriptStep::Event(InputEvent::pointer_enter(118.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                serial: 3,
+                time_ms: 8,
+            }),
+            ScriptStep::Capture,
+        ],
+    );
+    let row = |frame: usize| {
+        (0..200)
+            .map(|x| frames.pixel(frame, x, 20))
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(row(0), row(1), "bullets and glyphs must render differently");
+}

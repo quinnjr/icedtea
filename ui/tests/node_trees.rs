@@ -504,3 +504,18 @@ fn an_entry_renders_the_shared_text_subtree_and_its_optional_icons() {
     assert!(with_progress.contains("progress"), "{with_progress}");
     check(Kind::Entry, "entry", &props);
 }
+
+#[test]
+fn the_search_and_password_entries_carry_their_classes_and_indicators() {
+    // mutation: drop the `.search` class in SearchEntryC::build and the matcher
+    // reports "required class 'search' missing".
+    let mut props = Props::default();
+    props.set(PropName::Text, Prop::Str("q".into()));
+    check(Kind::SearchEntry, "search_entry", &props);
+    assert!(node_tree_of(Kind::SearchEntry, &props).starts_with("entry.search"));
+
+    check(Kind::PasswordEntry, "password_entry", &props);
+    let password = node_tree_of(Kind::PasswordEntry, &props);
+    assert!(password.starts_with("entry.password"), "{password}");
+    assert!(password.contains("image.caps-lock-indicator"), "{password}");
+}
