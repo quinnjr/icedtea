@@ -624,6 +624,25 @@ pub fn list_box_row<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {
     View::new(Kind::ListBoxRow).child(child)
 }
 
+/// `GtkListView` over an explicit model, rendering rows via `factory`.
+#[must_use]
+pub fn list_view<Msg: Clone + 'static>(
+    model: Rc<[crate::view::ListItem]>,
+    factory: crate::widgets::types::ItemFactory,
+) -> View<Msg> {
+    View::new(Kind::ListView)
+        .prop(PropName::Model, Prop::Items(model))
+        .prop(PropName::ItemFactory, Prop::Factory(factory))
+}
+
+impl<Msg: Clone + 'static> View<Msg> {
+    /// `GtkListView:single-click-activate`.
+    #[must_use]
+    pub fn single_click_activate(self, v: impl Into<Prop>) -> Self {
+        self.prop(PropName::SingleClickActivate, v)
+    }
+}
+
 /// `GtkFlowBox` over `children`, each wrapped in its own `flowboxchild`.
 #[must_use]
 pub fn flow_box<Msg: Clone + 'static>(children: impl IntoIterator<Item = View<Msg>>) -> View<Msg> {

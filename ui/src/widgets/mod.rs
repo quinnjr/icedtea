@@ -74,6 +74,7 @@ pub mod label;
 pub mod level_bar;
 pub mod link_button;
 pub mod list_box;
+pub mod list_view;
 pub mod menu_button;
 pub mod node_tree;
 pub mod notebook;
@@ -932,6 +933,77 @@ pub(crate) fn mark_overlay_children(node: &Node) {
     });
 }
 
+/// One pooled row's currently-bound content, for [`ListViewC`](list_view::ListViewC)
+/// (and any future recycling view) to keep beside a `Node` without a
+/// dedicated field on the `Node` type itself -- a `Node` carries CSS state,
+/// never arbitrary widget-owned data, and text/model-index are exactly that.
+#[derive(Clone)]
+struct RowBinding {
+    text: Rc<str>,
+    index: usize,
+    classes: Rc<[Rc<str>]>,
+}
+
+impl Default for RowBinding {
+    fn default() -> Self {
+        Self {
+            text: Rc::from(""),
+            index: 0,
+            classes: Rc::from(&[][..]),
+        }
+    }
+}
+
+thread_local! {
+    static ROW_BINDING: RefCell<HashMap<OpaqueElement, RowBinding>> = RefCell::new(HashMap::new());
+}
+
+/// Set a pooled row's displayed text.
+pub(crate) fn set_text(node: &Node, text: &str) {
+    ROW_BINDING.with(|m| {
+        m.borrow_mut().entry(node.opaque()).or_default().text = Rc::from(text);
+    });
+}
+
+/// A pooled row's currently-bound text, or empty if never bound.
+#[must_use]
+pub(crate) fn text_of(node: &Node) -> Rc<str> {
+    ROW_BINDING
+        .with(|m| m.borrow().get(&node.opaque()).map(|b| Rc::clone(&b.text)))
+        .unwrap_or_else(|| Rc::from(""))
+}
+
+/// Record which *model* index a pooled row currently displays -- never its
+/// pool slot, which changes on every scroll while the row's identity does
+/// not.
+pub(crate) fn set_row_index(node: &Node, index: usize) {
+    ROW_BINDING.with(|m| m.borrow_mut().entry(node.opaque()).or_default().index = index);
+}
+
+/// The model index last bound to this row, if any.
+#[must_use]
+pub(crate) fn row_index_of(node: &Node) -> Option<usize> {
+    ROW_BINDING.with(|m| m.borrow().get(&node.opaque()).map(|b| b.index))
+}
+
+/// Replace a pooled row's extra classes with exactly `classes`, leaving every
+/// other class (`row`'s own name, `.activatable`, `:selected`, ...) alone.
+pub(crate) fn set_row_classes(node: &Node, classes: &[Rc<str>]) {
+    ROW_BINDING.with(|m| {
+        let mut m = m.borrow_mut();
+        let entry = m.entry(node.opaque()).or_default();
+        for old in entry.classes.iter() {
+            if !classes.iter().any(|c| c == old) {
+                node.remove_class(old);
+            }
+        }
+        for new in classes {
+            node.add_class(new);
+        }
+        entry.classes = Rc::from(classes.to_vec());
+    });
+}
+
 /// This node's last recorded container, for a headless (`App`-less) test.
 ///
 /// A real `App` derives a node's container independently, from its `Kind`
@@ -1233,6 +1305,9 @@ pub fn build_controller<Msg: Clone + 'static>(
             <editable_label::EditableLabelC as Controller<Msg>>::build(node, props, cx),
         ),
         Kind::ListBox => Box::new(<list_box::ListBoxC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
+        Kind::ListView => Box::new(<list_view::ListViewC as Controller<Msg>>::build(
             node, props, cx,
         )),
         Kind::FlowBox => Box::new(<flow_box::FlowBoxC as Controller<Msg>>::build(

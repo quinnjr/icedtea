@@ -1,0 +1,4 @@
+listview[.separators][.rich-list][.navigation-sidebar][.data-table]
+├── row[.activatable]
+┊
+╰── [rubberband]

@@ -749,6 +749,18 @@ fn list_box_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn list_view_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::Model,
+        icedtea_ui::view::Prop::Items(std::rc::Rc::from(vec![icedtea_ui::view::ListItem::new(
+            0, "row 0",
+        )])),
+    );
+    assert_fixture(icedtea_ui::view::Kind::ListView, &props, "list_view");
+}
+
+#[test]
 fn flow_box_matches_its_gtk_fixture() {
     let mut props = icedtea_ui::view::Props::default();
     props.set(
