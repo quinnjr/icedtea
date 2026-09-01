@@ -155,6 +155,101 @@ pub enum PropName {
     Detail,
     Buttons,
     MessageType,
+    // P6 · containers (deviation P6-D3: additive names for §5.4–§5.7's
+    // builders, appended after the last P4/P5 variant so no existing
+    // discriminant, and therefore no `Props` ordering, changes).
+    BaselinePosition,
+    BaselineChild,
+    BaselineRow,
+    RowHomogeneous,
+    ColumnHomogeneous,
+    ShrinkCenterLast,
+    HscrollbarPolicy,
+    VscrollbarPolicy,
+    HasFrame,
+    MaxContentWidth,
+    MaxContentHeight,
+    PropagateNaturalWidth,
+    PropagateNaturalHeight,
+    PositionSet,
+    WideHandle,
+    ResizeStart,
+    ResizeEnd,
+    ShrinkStart,
+    ShrinkEnd,
+    LabelXalign,
+    LabelWidget,
+    UseUnderline,
+    ResizeToplevel,
+    SearchMode,
+    ShowCloseButton,
+    KeyCapture,
+    Revealed,
+    ShowTitleButtons,
+    TitleWidget,
+    TabPos,
+    Scrollable,
+    ShowTabs,
+    ShowBorder,
+    Reorderable,
+    Detachable,
+    MeasureOverlay,
+    ClipOverlay,
+    VisibleChild,
+    Hhomogeneous,
+    Vhomogeneous,
+    InterpolateSize,
+    PageName,
+    PageTitle,
+    NeedsAttention,
+    Pages,
+    // P6 · lists
+    ActivateOnSingleClick,
+    Activatable,
+    MinChildrenPerLine,
+    MaxChildrenPerLine,
+    SingleClickActivate,
+    EnableRubberband,
+    MinColumns,
+    MaxColumns,
+    ShowRowSeparators,
+    ShowColumnSeparators,
+    SortColumn,
+    SortOrder,
+    Expand,
+    // P6 · menus
+    Flags,
+    VisibleSubmenu,
+    Accel,
+    Submenu,
+    Section,
+    DisplayHint,
+    Menus,
+    // P6 · windows
+    DefaultWidget,
+    Deletable,
+    Decorated,
+    DefaultWidth,
+    DefaultHeight,
+    IconName,
+    SectionName,
+    ViewName,
+    ProgramName,
+    Version,
+    Comments,
+    Copyright,
+    License,
+    LicenseType,
+    Website,
+    WebsiteLabel,
+    Authors,
+    Artists,
+    Documenters,
+    TranslatorCredits,
+    LogoIconName,
+    WrapLicense,
+    DefaultButton,
+    CancelButton,
 }
 
 impl PropName {
@@ -259,6 +354,107 @@ impl PropName {
         PropName::Buttons,
         PropName::MessageType,
     ];
+
+    /// Every `PropName` Part 6 introduced, in declaration order.
+    ///
+    /// Exists so a rebase that drops one fails a test instead of failing a
+    /// widget at run time. `ALL` stays P4's ninety-seven: it is the contract's
+    /// own table, and the M2 property-reference gate reads it.
+    #[must_use]
+    pub fn all_p6() -> &'static [PropName] {
+        use PropName::*;
+        &[
+            BaselinePosition,
+            BaselineChild,
+            BaselineRow,
+            RowHomogeneous,
+            ColumnHomogeneous,
+            ShrinkCenterLast,
+            HscrollbarPolicy,
+            VscrollbarPolicy,
+            HasFrame,
+            MaxContentWidth,
+            MaxContentHeight,
+            PropagateNaturalWidth,
+            PropagateNaturalHeight,
+            PositionSet,
+            WideHandle,
+            ResizeStart,
+            ResizeEnd,
+            ShrinkStart,
+            ShrinkEnd,
+            LabelXalign,
+            LabelWidget,
+            UseUnderline,
+            ResizeToplevel,
+            SearchMode,
+            ShowCloseButton,
+            KeyCapture,
+            Revealed,
+            ShowTitleButtons,
+            TitleWidget,
+            TabPos,
+            Scrollable,
+            ShowTabs,
+            ShowBorder,
+            Reorderable,
+            Detachable,
+            MeasureOverlay,
+            ClipOverlay,
+            VisibleChild,
+            Hhomogeneous,
+            Vhomogeneous,
+            InterpolateSize,
+            PageName,
+            PageTitle,
+            NeedsAttention,
+            Pages,
+            ActivateOnSingleClick,
+            Activatable,
+            MinChildrenPerLine,
+            MaxChildrenPerLine,
+            SingleClickActivate,
+            EnableRubberband,
+            MinColumns,
+            MaxColumns,
+            ShowRowSeparators,
+            ShowColumnSeparators,
+            SortColumn,
+            SortOrder,
+            Expand,
+            Flags,
+            VisibleSubmenu,
+            Accel,
+            Submenu,
+            Section,
+            DisplayHint,
+            Menus,
+            DefaultWidget,
+            Deletable,
+            Decorated,
+            DefaultWidth,
+            DefaultHeight,
+            IconName,
+            SectionName,
+            ViewName,
+            ProgramName,
+            Version,
+            Comments,
+            Copyright,
+            License,
+            LicenseType,
+            Website,
+            WebsiteLabel,
+            Authors,
+            Artists,
+            Documenters,
+            TranslatorCredits,
+            LogoIconName,
+            WrapLicense,
+            DefaultButton,
+            CancelButton,
+        ]
+    }
 }
 
 /// One row of a list model.
@@ -312,6 +508,10 @@ pub enum Prop {
         reason = "the contract's own Prop::Draw signature; a type alias would only hide it"
     )]
     Draw(Rc<dyn Fn(&mut Canvas<'_>, Rect)>),
+    /// A row factory for the list family. `Msg`-free by construction so it
+    /// can live in the non-generic [`Props`], and compared by pointer exactly
+    /// as `Draw` is.
+    Factory(crate::widgets::types::ItemFactory),
     /// The property is absent — what [`Props::diff`] reports for a removal
     /// and what [`crate::view::controller::Controller::set_prop`] receives
     /// when a prop disappears.
@@ -334,6 +534,7 @@ impl std::fmt::Debug for Prop {
             // A closure has no useful representation; its identity is its
             // address, which is what `PartialEq` compares.
             Prop::Draw(rc) => write!(f, "Draw({:p})", Rc::as_ptr(rc)),
+            Prop::Factory(factory) => f.debug_tuple("Factory").field(factory).finish(),
             Prop::None => f.write_str("None"),
         }
     }
@@ -355,6 +556,7 @@ impl PartialEq for Prop {
             (Prop::Enum(a), Prop::Enum(b)) => a == b,
             (Prop::Items(a), Prop::Items(b)) => a == b,
             (Prop::Draw(a), Prop::Draw(b)) => Rc::ptr_eq(a, b),
+            (Prop::Factory(a), Prop::Factory(b)) => a.ptr_eq(b),
             (Prop::None, Prop::None) => true,
             _ => false,
         }
@@ -930,6 +1132,10 @@ pub enum Handler<Msg> {
     Float(Rc<dyn Fn(f64) -> Msg>),
     /// From a key event; `None` means "not mine, keep bubbling".
     Key(Rc<dyn Fn(&crate::window::keyboard::KeyEvent) -> Option<Msg>>),
+    /// Two floats, for `on_scrolled((x, y))` (deviation P6-D4).
+    Pair(Rc<dyn Fn(f64, f64) -> Msg>),
+    /// Two indices, for `on_reordered((from, to))` (deviation P6-D4).
+    Indices(Rc<dyn Fn(usize, usize) -> Msg>),
 }
 
 impl<Msg> Clone for Handler<Msg>
@@ -944,6 +1150,8 @@ where
             Handler::Index(f) => Handler::Index(Rc::clone(f)),
             Handler::Float(f) => Handler::Float(Rc::clone(f)),
             Handler::Key(f) => Handler::Key(Rc::clone(f)),
+            Handler::Pair(f) => Handler::Pair(Rc::clone(f)),
+            Handler::Indices(f) => Handler::Indices(Rc::clone(f)),
         }
     }
 }
@@ -957,6 +1165,8 @@ impl<Msg: std::fmt::Debug> std::fmt::Debug for Handler<Msg> {
             Handler::Index(_) => f.write_str("Index(..)"),
             Handler::Float(_) => f.write_str("Float(..)"),
             Handler::Key(_) => f.write_str("Key(..)"),
+            Handler::Pair(_) => f.write_str("Pair(..)"),
+            Handler::Indices(_) => f.write_str("Indices(..)"),
         }
     }
 }
@@ -1067,6 +1277,28 @@ impl<Msg: Clone + 'static> Handlers<Msg> {
         match self.get(kind)? {
             Handler::Float(f) => Some(f(value)),
             Handler::Unit(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+
+    /// Fire a two-float handler; `None` when nothing of that arity is bound.
+    ///
+    /// Unlike [`Handlers::fire_text`] and friends there is no `Unit`
+    /// fallthrough: a `Unit` binding on `Scrolled` is a builder that meant a
+    /// different arity, and firing it would emit the wrong message.
+    #[must_use]
+    pub fn fire_pair(&self, kind: EventKind, a: f64, b: f64) -> Option<Msg> {
+        match self.get(kind)? {
+            Handler::Pair(f) => Some(f(a, b)),
+            _ => None,
+        }
+    }
+
+    /// Fire a two-index handler; `None` when nothing of that arity is bound.
+    #[must_use]
+    pub fn fire_indices(&self, kind: EventKind, a: usize, b: usize) -> Option<Msg> {
+        match self.get(kind)? {
+            Handler::Indices(f) => Some(f(a, b)),
             _ => None,
         }
     }
@@ -1608,6 +1840,56 @@ mod tests {
         let v: View<TestMsg> = View::new(Kind::Label).tooltip("first").tooltip("second");
         assert_eq!(v.props.str(PropName::Tooltip), Some("second"));
         assert_eq!(v.props.len(), 1);
+    }
+
+    #[test]
+    fn the_two_new_handler_arities_fire_and_the_others_do_not() {
+        // Mutation check: making fire_pair fall through to fire_unit returns
+        // Some for the Indices handler too, and a scroll event would emit a
+        // reorder message.
+        let mut h: Handlers<(u32, u32)> = Handlers::default();
+        h.set(
+            EventKind::Scrolled,
+            Handler::Pair(Rc::new(|a, b| (a as u32, b as u32))),
+        );
+        h.set(
+            EventKind::Reordered,
+            Handler::Indices(Rc::new(|a, b| (a as u32, b as u32))),
+        );
+        assert_eq!(h.fire_pair(EventKind::Scrolled, 3.0, 4.0), Some((3, 4)));
+        assert_eq!(h.fire_indices(EventKind::Reordered, 1, 2), Some((1, 2)));
+        assert_eq!(h.fire_pair(EventKind::Reordered, 1.0, 2.0), None);
+        assert_eq!(h.fire_unit(EventKind::Scrolled), None);
+    }
+
+    #[test]
+    fn a_factory_prop_compares_by_pointer_like_draw() {
+        // Mutation check: comparing factories as always-equal makes
+        // Props::diff miss a model swap and the list keeps the old rows.
+        use crate::widgets::types::{ItemFactory, ListItem, RowContent};
+        let f = ItemFactory::new(|_, item: &ListItem| RowContent::from_label(&item.text));
+        let g = ItemFactory::new(|_, item: &ListItem| RowContent::from_label(&item.text));
+        assert_eq!(Prop::Factory(f.clone()), Prop::Factory(f));
+        assert_ne!(
+            Prop::Factory(ItemFactory::new(|_, i: &ListItem| RowContent::from_label(
+                &i.text
+            ))),
+            Prop::Factory(g)
+        );
+    }
+
+    #[test]
+    fn every_p6_prop_name_is_distinct_and_ordered() {
+        // Mutation check: a duplicated variant name would not compile, but a
+        // duplicated *use* (two builders writing PropName::Position for
+        // different meanings) shows up as a Props::set collision; this pins
+        // the count so an accidental deletion during a rebase is caught.
+        let names = PropName::all_p6();
+        let mut sorted = names.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "duplicate P6 PropName");
+        assert_eq!(names.len(), 89);
     }
 
     #[test]

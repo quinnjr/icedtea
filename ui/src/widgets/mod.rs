@@ -73,7 +73,14 @@ pub mod statusbar;
 pub mod switch;
 pub mod text_view;
 pub mod toggle_button;
+pub mod types;
 pub mod window_controls;
+
+#[doc(inline)]
+pub use types::{
+    BaselinePosition, Decoration, DisplayHint, ItemFactory, LicenseType, MenuFlags, Policy,
+    RowContent, Selection, SelectionMode, SortOrder, Sorter, StackPageInfo, StackTransition,
+};
 
 /// Re-express a pointer event given in the root node's space in `rect`'s space.
 ///
