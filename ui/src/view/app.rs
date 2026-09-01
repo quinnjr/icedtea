@@ -1313,7 +1313,12 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             .fonts
             .take()
             .unwrap_or_else(|| std::mem::take(window.fonts()));
-        let mut icons = self.icons.take().unwrap_or_else(IconTheme::from_env);
+        // The window already selected a theme from the environment; take it
+        // rather than building a second one, so the two never disagree.
+        let mut icons = self
+            .icons
+            .take()
+            .unwrap_or_else(|| window.take_icon_theme());
         let clock: Rc<dyn Clock> = Rc::clone(window.clock());
 
         let mut rt = Runtime {
@@ -1354,6 +1359,10 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             for event in &events {
                 if matches!(event, InputEvent::Close) {
                     rt.quit = true;
+                }
+                // HiDPI: the output scale is what icons rasterise at.
+                if let InputEvent::ScaleChanged(factor) = event {
+                    icons.set_scale(u32::try_from(*factor).unwrap_or(1));
                 }
                 let produced = {
                     let clipboard = window.clipboard();
@@ -1520,6 +1529,81 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                     &mut painter,
                 );
             })?;
+
+            // Every open popup is its own surface with its own tree; the
+            // window gives one buffer per popup through `paint_popup_with`
+            // (contract §10 P6-D39's second limit, closed by P7).
+            for index in 0..rt.popups.len() {
+                let key = rt.popups[index].key;
+                let Some((pw, ph)) = window.popup_size(key) else {
+                    continue;
+                };
+                {
+                    let popup = &mut rt.popups[index];
+                    popup.size = (pw, ph);
+                    restyle_tree(
+                        &popup.root,
+                        &sheet,
+                        &rt.env,
+                        &mut popup.styles,
+                        &mut popup.anims,
+                        now,
+                    );
+                    let mut measure = ControllerMeasure {
+                        instances: &mut popup.instances,
+                        sheet: &sheet,
+                        fonts: &mut fonts,
+                        icons: &mut icons,
+                        clock: &clock,
+                        env: &rt.env,
+                    };
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "a popup surface is never 2^24 px on a side"
+                    )]
+                    layout_tree(
+                        &popup.root,
+                        &popup.styles,
+                        &popup.containers,
+                        &mut popup.layout,
+                        &rt.env,
+                        (Some(pw as f32), Some(ph as f32)),
+                        &mut measure,
+                    )?;
+                }
+                let images = &mut rt.images;
+                let env = &rt.env;
+                let popup = &mut rt.popups[index];
+                let fonts_ref = &mut fonts;
+                let icons_ref = &mut icons;
+                window.paint_popup_with(key, |surface| {
+                    let mut cx = PaintCx {
+                        env,
+                        colors: &sheet.colors,
+                        fonts: fonts_ref,
+                        images,
+                        icons: icons_ref,
+                        text: None,
+                    };
+                    let mut painter = ControllerPainter {
+                        instances: &mut popup.instances,
+                    };
+                    let mut canvas = surface.canvas();
+                    paint_tree(
+                        &mut canvas,
+                        &popup.root,
+                        &popup.styles,
+                        &popup.layout,
+                        &mut popup.anims,
+                        now,
+                        // A popup surface's own origin: the compositor placed
+                        // the surface, so the tree starts at its top-left.
+                        (0.0, 0.0),
+                        &mut cx,
+                        &mut painter,
+                    );
+                })?;
+            }
         }
         Ok(())
     }

@@ -727,8 +727,13 @@ pub(crate) struct WindowState {
     /// floor produces from a `Some((0, 0))`.
     default_size: (u32, u32),
     states: SurfaceStates,
-    /// Task 11 updates this from `wl_surface.preferred_buffer_scale`.
-    #[allow(dead_code)]
+    /// The output scale the compositor last announced through
+    /// `wl_surface.preferred_buffer_scale`.
+    ///
+    /// Read by [`sync_surface_from_state`] (so every role's `scale()` agrees
+    /// with it) and by [`Window::open`], which seeds the icon theme's
+    /// rasterisation scale from it; later changes arrive as
+    /// [`InputEvent::ScaleChanged`] and go through [`Window::pump`].
     scale: i32,
     closed: bool,
     /// A pending scroll frame, accumulated until `wl_pointer.frame`
@@ -912,9 +917,10 @@ pub struct Window {
     fonts: FontDatabase,
     /// Icon-theme lookup and rasterisation for `-gtk-icontheme()` etc.
     ///
-    /// Hermetic (contract §8.1's `PaintCx` field): real theme selection is
-    /// wired by a later task, so this window paints against a fixed,
-    /// name-only theme the way every M3 paint fixture does.
+    /// Selected from the environment (`gtk-icon-theme-name` plus the XDG
+    /// roots) by [`crate::icons::IconTheme::from_env`], so a client driving a
+    /// `Window` directly gets the user's real icons; replaceable through
+    /// [`Window::set_icon_theme`] for a client that wants a hermetic one.
     icons: crate::icons::IconTheme,
     clock: Rc<dyn Clock>,
     /// `Window::render` gates its first attach on this.
@@ -1051,6 +1057,10 @@ impl Window {
         let skia = skia_rs_safe::canvas::Surface::new_raster_n32_premul(width, height)
             .ok_or(SurfaceError::Render("the raster surface to paint into"))?;
         let root = Node::with_classes("window", &["background"]);
+        // The user's real icon theme, at whatever output scale the first
+        // `wl_surface.preferred_buffer_scale` already reported.
+        let mut icons = crate::icons::IconTheme::from_env();
+        icons.set_scale(u32::try_from(state.scale).unwrap_or(1));
         Ok(Self {
             conn,
             queue,
@@ -1068,7 +1078,7 @@ impl Window {
             images: crate::paint::ImageCache::new(),
             sheet,
             fonts,
-            icons: crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new()),
+            icons,
             clock: Rc::new(MonotonicClock::new()),
             phase: MapPhase::Configured,
             dirty: true,
@@ -1125,8 +1135,14 @@ impl Window {
                     sync_surface_from_state(&mut self.surface, &self.state);
                     self.dirty = true;
                 }
-                InputEvent::ScaleChanged(_) => {
+                InputEvent::ScaleChanged(factor) => {
                     sync_surface_from_state(&mut self.surface, &self.state);
+                    // HiDPI icons: the rasterisation scale is the output
+                    // scale (contract §10 P7-D42 / deviation 3). Without
+                    // this the theme stays at 1 forever and a 2x display
+                    // gets 16 px icons stretched to 32.
+                    self.icons.set_scale(u32::try_from(*factor).unwrap_or(1));
+                    self.dirty = true;
                 }
                 _ => {}
             }
@@ -1148,6 +1164,41 @@ impl Window {
     #[must_use]
     pub fn root(&self) -> &Node {
         &self.root
+    }
+
+    /// The icon theme this window's own paints resolve through.
+    pub fn icons(&mut self) -> &mut crate::icons::IconTheme {
+        &mut self.icons
+    }
+
+    /// Take ownership of the window's icon theme, leaving a hermetic
+    /// placeholder behind.
+    ///
+    /// `App::run` drives every paint itself, through [`Window::paint_with`]
+    /// and [`Window::paint_popup_with`], and needs the theme as a `&mut` for
+    /// a whole frame — which it cannot hold across its own `&mut Window`
+    /// borrows. So it takes the theme the window selected from the
+    /// environment and owns it for the rest of the run. What is left behind
+    /// is only ever used by [`Window::render`], which the reactive loop never
+    /// calls.
+    pub fn take_icon_theme(&mut self) -> crate::icons::IconTheme {
+        std::mem::replace(
+            &mut self.icons,
+            crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new()),
+        )
+    }
+
+    /// Replace the icon theme, keeping the output scale the compositor
+    /// announced.
+    ///
+    /// [`Window::open`] builds one from the environment; a client that wants
+    /// a hermetic theme (a test, or a shell shipping its own icon set) hands
+    /// one in here. `App::run` does exactly this so the window and the
+    /// reactive loop resolve icons through the same theme.
+    pub fn set_icon_theme(&mut self, mut icons: crate::icons::IconTheme) {
+        icons.set_scale(u32::try_from(self.state.scale).unwrap_or(1));
+        self.icons = icons;
+        self.dirty = true;
     }
 
     pub fn layout(&mut self) -> &mut crate::layout::LayoutTree {
@@ -1669,6 +1720,84 @@ impl Window {
             .iter_mut()
             .find(|p| p.key == key)
             .map(|p| &mut p.anim)
+    }
+
+    /// Paint one popup surface with `f` and commit it.
+    ///
+    /// The popup equivalent of [`Window::paint_with`], and the seam contract
+    /// §10 P6-D39's second limit names: `App::run` drives the main surface
+    /// through `paint_with` and must not call [`Window::render`] (which would
+    /// repaint the main surface from the window's own style map), so without
+    /// this a popup opened by the reactive loop never got a buffer at all.
+    ///
+    /// `Ok(false)` means the popup is unknown, has never been configured (no
+    /// buffer may be attached before its first `xdg_surface.configure`, or
+    /// the compositor kills the client), or every buffer in its pool is still
+    /// held; the caller retries on the next frame.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Shm`] if the popup's pool cannot grow or the upload
+    /// fails, [`SurfaceError::Render`] if its raster surface cannot be
+    /// reallocated, [`SurfaceError::Socket`] if the flush fails.
+    pub fn paint_popup_with(
+        &mut self,
+        key: PopupKey,
+        f: impl FnOnce(&mut skia_rs_safe::canvas::Surface),
+    ) -> Result<bool, SurfaceError> {
+        // Fold any `xdg_popup.configure` that arrived since the last call, so
+        // the size painted into is the size the compositor last granted.
+        for (configured_key, position, size) in std::mem::take(&mut self.state.popup_configures) {
+            if let Some(popup) = self.popups.iter_mut().find(|p| p.key == configured_key)
+                && let Some(role) = popup.popup_mut()
+            {
+                role.position = position;
+                role.size = size;
+                popup.dirty = true;
+            }
+        }
+        let configured = self
+            .state
+            .pending_ack
+            .iter()
+            .any(|(t, _)| *t == SurfaceTarget::Popup(key));
+        if !configured {
+            return Ok(false);
+        }
+        let Some(popup) = self.popups.iter_mut().find(|p| p.key == key) else {
+            return Ok(false);
+        };
+        let (width, height) = popup.surface.size();
+        let (w, h) = (
+            i32::try_from(width).unwrap_or(1).max(1),
+            i32::try_from(height).unwrap_or(1).max(1),
+        );
+        if popup.buffers.size() != (w, h) {
+            popup.buffers =
+                BufferPool::new(&self.shm, &self.qh, w, h).map_err(SurfaceError::Shm)?;
+            popup.skia = skia_rs_safe::canvas::Surface::new_raster_n32_premul(w, h)
+                .ok_or(SurfaceError::Render("the popup's raster surface"))?;
+        }
+        popup
+            .skia
+            .canvas()
+            .clear(skia_rs_safe::core::Color::TRANSPARENT);
+        f(&mut popup.skia);
+        popup
+            .surface
+            .commit_buffer(&mut popup.skia, &mut popup.buffers, &self.shm, &self.qh)?;
+        popup.dirty = false;
+        self.conn.flush().map_err(socket_error)?;
+        Ok(true)
+    }
+
+    /// The size the compositor last granted popup `key`, if it has one.
+    #[must_use]
+    pub fn popup_size(&self, key: PopupKey) -> Option<(u32, u32)> {
+        self.popups
+            .iter()
+            .find(|p| p.key == key)
+            .map(|p| p.surface.size())
     }
 
     pub fn popup_mark_dirty(&mut self, key: PopupKey) {
