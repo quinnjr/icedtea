@@ -162,7 +162,13 @@ fn build_instance<Msg: Clone + 'static>(view: View<Msg>, cx: &mut BuildCx<'_>) -
         controller,
         children: Vec::new(),
     };
-    reconcile(&attach, &mut instance.children, view.children, cx);
+    reconcile_reserved(
+        &attach,
+        &mut instance.children,
+        view.children,
+        cx,
+        Some(instance.controller.as_ref()),
+    );
     instance
 }
 
@@ -224,6 +230,25 @@ pub fn reconcile<Msg: Clone + 'static>(
     prev: &mut Vec<Instance<Msg>>,
     next: Vec<View<Msg>>,
     cx: &mut BuildCx<'_>,
+) -> Vec<Op> {
+    reconcile_reserved(parent, prev, next, cx, None)
+}
+
+/// [`reconcile`]'s real body, plus `reserve`: the controller that owns
+/// `parent` directly (`None` at the tree root, where nothing does), so its
+/// [`Controller::child_index`]/[`Controller::reserved_total`] can be
+/// consulted when placing and trimming `parent`'s children. Kept private
+/// so every existing call to the public, four-argument `reconcile` --
+/// dozens, across `app.rs` and both crates' test suites -- needed no
+/// change; only the two sites that recurse into a specific instance's own
+/// node (here and in [`build_instance`]) call this directly, with
+/// `Some(&*instance.controller)`.
+fn reconcile_reserved<Msg: Clone + 'static>(
+    parent: &Node,
+    prev: &mut Vec<Instance<Msg>>,
+    next: Vec<View<Msg>>,
+    cx: &mut BuildCx<'_>,
+    reserve: Option<&dyn Controller<Msg>>,
 ) -> Vec<Op> {
     let mut ops: Vec<Op> = Vec::new();
     let mut taken: Vec<Option<Instance<Msg>>> =
@@ -296,7 +321,15 @@ pub fn reconcile<Msg: Clone + 'static>(
                 }
                 let attach = crate::widgets::child_slot(instance.kind, &*instance.controller)
                     .unwrap_or_else(|| instance.node.clone());
-                if !reconcile(&attach, &mut instance.children, view.children, cx).is_empty() {
+                if !reconcile_reserved(
+                    &attach,
+                    &mut instance.children,
+                    view.children,
+                    cx,
+                    Some(instance.controller.as_ref()),
+                )
+                .is_empty()
+                {
                     ops.push(Op::Recurse { index });
                 }
                 built.push(instance);
@@ -314,7 +347,17 @@ pub fn reconcile<Msg: Clone + 'static>(
     //    Every `insert_child` bumps the tree generation and dirties a
     //    restyle, so the comparison here is what keeps a steady frame from
     //    restyling the whole window.
-    let mut position = 0usize;
+    //
+    //    `logical` counts visible view children only, same as the old
+    //    unconditional `position`; `reserve` (when `parent` is a specific
+    //    instance's own node, not the tree root) maps that count onto
+    //    `parent`'s real child indices, leaving room for chrome subnodes
+    //    the owning controller attached directly to `parent` itself (a
+    //    `Frame`'s label, a `Paned`'s separator) that are not among
+    //    `built` at all. Skipping this mapping (as this function did
+    //    before `reserve` existed) silently detached that chrome the first
+    //    time a real child was reconciled in alongside it.
+    let mut logical = 0usize;
     for instance in &built {
         if !instance.is_visible() {
             if instance.node.parent().is_some() {
@@ -322,16 +365,18 @@ pub fn reconcile<Msg: Clone + 'static>(
             }
             continue;
         }
+        let target = reserve.map_or(logical, |c| c.child_index(logical));
         let in_place = parent
-            .child(position)
+            .child(target)
             .is_some_and(|current| current.ptr_eq(&instance.node));
         if !in_place {
-            parent.insert_child(position, &instance.node);
+            parent.insert_child(target, &instance.node);
         }
-        position += 1;
+        logical += 1;
     }
-    while parent.child_count() > position {
-        if let Some(extra) = parent.child(position) {
+    let trim_from = reserve.map_or(logical, |c| c.reserved_total(logical));
+    while parent.child_count() > trim_from {
+        if let Some(extra) = parent.child(trim_from) {
             extra.detach();
         } else {
             break;

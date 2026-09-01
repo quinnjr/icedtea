@@ -219,6 +219,36 @@ pub trait Controller<Msg>: std::any::Any {
         let _ = (canvas, alloc, style, cx);
         false
     }
+
+    /// Where the view's child at `view_index` (0-based, counting only this
+    /// level's visible reconciled children) belongs among this
+    /// controller's own node's actual children, for a controller that
+    /// attaches chrome subnodes of its own directly onto that same node
+    /// alongside the view's children -- a [`Frame`](crate::widgets::frame)'s
+    /// label, a [`Paned`](crate::widgets::paned)'s separator. Reconcile
+    /// (`view::reconcile::reconcile`) calls this to place and to keep
+    /// track of each reused or newly-built child, instead of assuming the
+    /// node's children are exactly the view's children in order.
+    ///
+    /// The default is the identity: a controller with no such interleaved
+    /// chrome.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index
+    }
+
+    /// The total number of node children expected once `view_count` view
+    /// children have been reconciled at this level, chrome subnodes
+    /// included. Reconcile's trim step -- the one that detaches whatever a
+    /// previous frame left past the current child count -- never detaches
+    /// a node before this bound, so a controller that reserves chrome the
+    /// last [`Controller::child_index`] call can't see (there being no
+    /// view child to index chrome placed *after*, e.g. with zero view
+    /// children) must say so here.
+    ///
+    /// The default is `view_count`: no reserved chrome.
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count
+    }
 }
 
 /// The controller every [`Kind`] gets until P5 or P6 writes a specific one.

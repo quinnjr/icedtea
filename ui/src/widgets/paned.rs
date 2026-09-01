@@ -105,10 +105,13 @@ impl<Msg: Clone + 'static> Controller<Msg> for PanedC {
         // `build` runs before the reconciler attaches this view's own
         // children (`view::reconcile::build_instance`'s own order: controller
         // first, `reconcile` over `view.children` after), so `node` has none
-        // yet here whatever the final child count will be. The separator
-        // therefore always lands at index 0 -- `insert_child` clamps to
-        // `child_count()`, which is zero -- and stays the widget's sole
-        // subnode until real children are attached.
+        // yet here whatever the final child count will be, and the
+        // separator always lands at index 0 -- `insert_child` clamps to
+        // `child_count()`, which is zero. It moves to its real position,
+        // between the two view children, once they attach: `child_index`/
+        // `reserved_total` below tell `reconcile` to place `start` at 0 and
+        // `end` at 2, leaving 1 for the separator, and never to trim it as
+        // an "extra" node past the view's own two children.
         let separator = Node::new("separator");
         node.insert_child(0, &separator);
         let mut me = Self {
@@ -222,6 +225,22 @@ impl<Msg: Clone + 'static> Controller<Msg> for PanedC {
             _ => {}
         }
         out
+    }
+
+    fn child_index(&self, view_index: usize) -> usize {
+        // `start` (view_index 0) keeps index 0; the separator occupies
+        // index 1 between the two panes, so `end` (view_index 1) lands at
+        // index 2. `Paned` always has exactly the two children `paned()`
+        // took, so `view_index` is never anything else in practice.
+        if view_index == 0 { 0 } else { view_index + 1 }
+    }
+
+    fn reserved_total(&self, view_count: usize) -> usize {
+        // The separator itself, plus every view child -- reconcile's trim
+        // step must never treat it as a leftover node past the view's own
+        // children, including on the frame the paned has zero of them
+        // (`child_index` alone has nothing to index chrome placed after).
+        view_count + 1
     }
 }
 
@@ -356,6 +375,153 @@ mod tests {
         for v in [i64::MIN, -1, 0, i64::MAX] {
             let built = build_widget::<()>(Kind::Paned, &props(v, false));
             assert!(crate::widgets::paned::PanedC::position_of(built.controller.as_ref()) >= 0.0);
+        }
+    }
+
+    // Contract deviation 10: "one rest-state and one interaction-state
+    // assertion through App::run_offscreen" per widget, in the widget's
+    // own module. Both go through a real `App`/reconcile pass -- unlike
+    // every test above, which uses `build_widget`'s bare `Controller::build`
+    // and never attaches real children -- so both exercise
+    // `reconcile::Controller::child_index`/`reserved_total` directly: the
+    // fix for the bug this round of review caught, where the separator
+    // (attached to `node` by `build`, not by the view's own children) was
+    // detached the instant a full reconcile pass attached Paned's two real
+    // children, per `reconcile`'s old "trim to the reconciled count" step.
+    // Before that fix, the rest-state test below found no 5px run at all.
+    mod pixels {
+        use crate::view::app::ScriptStep;
+        use crate::view::builders::{label, paned};
+        use crate::view::{Cmd, View};
+        use crate::widgets::offscreen::{frames, px};
+        use crate::widgets::types::Orientation;
+        use crate::window::InputEvent;
+
+        /// The x of the first run of `>= 5` identical, non-background
+        /// pixels along `y` -- Adwaita's `paned > separator.wide` (`min-
+        /// width: 5px`, a flat fill) is the only thing in this frame that
+        /// paints five px running the same colour; glyph antialiasing
+        /// never holds still that long.
+        fn separator_x(frames: &crate::view::app::Frames, y: u32) -> u32 {
+            let background = px(frames, 0, 0, y);
+            let mut run_start = 0;
+            let mut run_len = 0u32;
+            let mut previous = background;
+            for x in 0..frames.width() {
+                let p = px(frames, 0, x, y);
+                if p != background && p == previous {
+                    run_len += 1;
+                } else {
+                    run_start = x;
+                    run_len = u32::from(p != background);
+                }
+                if run_len >= 5 {
+                    return run_start;
+                }
+                previous = p;
+            }
+            panic!("no 5px flat-colour run on row {y}: the separator never painted");
+        }
+
+        #[derive(Clone)]
+        enum Msg {}
+
+        fn update(_: &mut (), msg: Msg) -> Cmd<Msg> {
+            match msg {}
+        }
+
+        fn view(_: &()) -> View<Msg> {
+            paned(Orientation::Horizontal, label("start"), label("end")).wide_handle(true)
+        }
+
+        #[test]
+        fn a_paned_paints_a_separator_between_its_two_real_children_at_rest() {
+            // Rest-state pixel test.
+            let out = frames((), update, view, (200, 40), vec![ScriptStep::Capture]);
+            let background = px(&out, 0, 0, 20);
+            let sep_x = separator_x(&out, 20);
+            assert!(
+                (0..sep_x).any(|x| px(&out, 0, x, 20) != background),
+                "the start child paints before the separator"
+            );
+            assert!(
+                (sep_x + 5..out.width()).any(|x| px(&out, 0, x, 20) != background),
+                "the end child paints after the separator"
+            );
+        }
+
+        fn view_labelled(moved: &bool) -> View<Msg2> {
+            paned(
+                Orientation::Horizontal,
+                label("start"),
+                label(if *moved { "end (moved)" } else { "end" }),
+            )
+            .wide_handle(true)
+            .on_value_changed(Msg2::Moved)
+        }
+
+        #[derive(Clone)]
+        enum Msg2 {
+            Moved(f64),
+        }
+
+        fn update_labelled(model: &mut bool, msg: Msg2) -> Cmd<Msg2> {
+            let Msg2::Moved(v) = msg;
+            *model = v > 20.0;
+            Cmd::None
+        }
+
+        #[test]
+        fn dragging_the_separator_through_a_real_app_repaints_the_frame() {
+            // Interaction-state pixel test. Mutation check: dropping the
+            // `fire_float(EventKind::ValueChanged, ..)` call from
+            // `PanedC::on_event`'s `PointerMotion` arm leaves the model (and
+            // so the second capture) identical to the first.
+            let baseline = frames(
+                false,
+                update_labelled,
+                view_labelled,
+                (200, 40),
+                vec![ScriptStep::Capture],
+            );
+            let sep_x = f64::from(separator_x(&baseline, 20));
+            let out = frames(
+                false,
+                update_labelled,
+                view_labelled,
+                (200, 40),
+                vec![
+                    ScriptStep::Capture,
+                    ScriptStep::Event(InputEvent::pointer_enter(sep_x, 20.0, 1)),
+                    ScriptStep::Event(InputEvent::PointerButton {
+                        button: 0x110,
+                        pressed: true,
+                        serial: 2,
+                        time_ms: 0,
+                    }),
+                    ScriptStep::Event(InputEvent::PointerMotion {
+                        x: sep_x + 40.0,
+                        y: 20.0,
+                        time_ms: 8,
+                    }),
+                    ScriptStep::Event(InputEvent::PointerButton {
+                        button: 0x110,
+                        pressed: false,
+                        serial: 3,
+                        time_ms: 16,
+                    }),
+                    ScriptStep::Capture,
+                ],
+            );
+            assert_eq!(out.len(), 2);
+            let row = |frame: usize| -> Vec<_> {
+                (0..out.width()).map(|x| px(&out, frame, x, 20)).collect()
+            };
+            assert_ne!(
+                row(0),
+                row(1),
+                "the drag reached the app, moved the divider past the threshold and repainted"
+            );
         }
     }
 }
