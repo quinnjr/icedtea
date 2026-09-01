@@ -1279,3 +1279,76 @@ fn peeking_a_password_entry_reveals_the_text() {
     };
     assert_ne!(row(0), row(1), "bullets and glyphs must render differently");
 }
+
+#[test]
+fn clicking_into_a_password_entry_places_the_caret_like_its_siblings() {
+    // mutation: drop the `self.edit.cursor = self.edit.buffer_offset_at(local)`
+    // arm from PasswordEntryC::on_event (the review-caught asymmetry with
+    // SearchEntryC/EntryC) and the typed glyph is appended, giving "hunter2X".
+    // mutation: use `self.edit.layout.byte_at(local)` instead of
+    // `buffer_offset_at` and the masked layout's three-byte bullet offsets
+    // land past the end of the seven-byte buffer, so the caret clamps to the
+    // end and the glyph is appended again.
+    use icedtea_ui::view::builders::password_entry;
+    use std::cell::RefCell;
+
+    // As in `typing_into_a_search_entry_...` above: `view` is a bare `fn`
+    // pointer, so the log of every reported edit rides in the model.
+    let edits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    run(
+        ("hunter2".to_owned(), edits.clone()),
+        |model: &mut (String, Rc<RefCell<Vec<String>>>), text: String| {
+            model.0 = text;
+            Cmd::None
+        },
+        |model: &(String, Rc<RefCell<Vec<String>>>)| {
+            let recorder = model.1.clone();
+            password_entry(&model.0).on_change(move |t| {
+                recorder.borrow_mut().push(t.to_owned());
+                t.to_owned()
+            })
+        },
+        (200, 40),
+        vec![
+            // The entry is sized to its own content and centred (see the
+            // peek test's note on `hexpand`), so the window's centre is the
+            // middle of the masked text, not its end.
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 8,
+            }),
+            ScriptStep::Event(InputEvent::Key(key_char('X', 53))),
+            ScriptStep::Capture,
+        ],
+    );
+    let edits = edits.borrow();
+    let [text] = edits.as_slice() else {
+        panic!("exactly one edit must be reported, got {edits:?}");
+    };
+    assert_eq!(text.len(), 8, "one glyph inserted into \"hunter2\"");
+    assert_ne!(
+        text.as_str(),
+        "hunter2X",
+        "the click must move the caret into the middle of the masked text, \
+         as it does for Entry and SearchEntry"
+    );
+    assert_eq!(
+        format!(
+            "{}{}",
+            &text[..text.find('X').unwrap()],
+            &text[text.find('X').unwrap() + 1..]
+        ),
+        "hunter2",
+        "the insertion must land on a character boundary of the buffer"
+    );
+}

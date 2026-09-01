@@ -17,7 +17,7 @@ use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{EditOutcome, TextEditState};
-use crate::widgets::{PointerState, local_rect, shift_event};
+use crate::widgets::{PointerState, content_rect_local, shift_event};
 use crate::window::focus::FocusCause;
 
 /// GTK's own default `search-delay`.
@@ -114,7 +114,15 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
             // never receive keyboard focus by any means.
             cx.focus.set_focus(Some(cx.node), FocusCause::Pointer);
         }
-        if let Some(rect) = local_rect(cx.tree, cx.node, &self.edit.text_node) {
+        // Plan reconciliation: the plan hit-tested the text with
+        // `local_rect(cx.tree, cx.node, &self.edit.text_node)`, as `Entry`
+        // does — but `text` is a subnode `TextEditState::build` appends
+        // itself, never a `View` child, so it has no taffy node and
+        // `tree.allocation` (hence `local_rect`) is `None` for it, always,
+        // leaving the whole block dead. `content_rect_local` derives the same
+        // region from this controller's own allocation instead, which
+        // `window/pointer.rs::descend` does stop at.
+        if let Some(rect) = content_rect_local(cx.tree, cx.node) {
             let shifted = shift_event(ev, rect);
             self.pointer.observe(
                 &self.edit.text_node,
@@ -122,7 +130,12 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
                 Some(Rect::new(0.0, 0.0, rect.width, rect.height)),
             );
             if let Event::PointerDown { local, .. } = shifted {
-                self.edit.cursor = self.edit.layout.byte_at(local);
+                // Plan reconciliation: the plan's `on_event` does not place
+                // the caret on click either; `Entry`'s own controller does,
+                // and both siblings built here now do the same, through the
+                // shared `buffer_offset_at` (identity here — a search entry is
+                // never masked — and mask-aware in `PasswordEntry`).
+                self.edit.cursor = self.edit.buffer_offset_at(local);
                 self.edit.anchor = None;
                 cx.handled = true;
             }

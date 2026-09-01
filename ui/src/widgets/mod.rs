@@ -121,6 +121,26 @@ pub(crate) fn local_rect(
     ))
 }
 
+/// A controller root's *content* box, in that same root's own event space.
+///
+/// [`local_rect`] only answers for subnodes the reconciler gave a taffy node,
+/// which the extra nodes a controller appends itself (`text`, `image.peek`,
+/// `trough`, …) never are — `tree.allocation` is `None` for every one of them.
+/// A controller that needs to hit-test its own content therefore has to derive
+/// the region from its root's allocation, offset by the padding+border inset
+/// its content box already carries, because `Event`'s `local` is relative to
+/// the *border* box's origin (`window/pointer.rs::aim`).
+pub(crate) fn content_rect_local(tree: &crate::layout::LayoutTree, root: &Node) -> Option<Rect> {
+    let alloc = tree.allocation(root)?;
+    let (content, border) = (alloc.content_box, alloc.border_box);
+    Some(Rect::new(
+        content.x - border.x,
+        content.y - border.y,
+        content.width,
+        content.height,
+    ))
+}
+
 /// A widget-local enum carried through `Prop::Enum(u16)`.
 ///
 /// [`Prop`] cannot hold an arbitrary type, and the contract's

@@ -18,7 +18,7 @@ use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{EditOutcome, TextEditState};
-use crate::widgets::{PointerState, shift_event};
+use crate::widgets::{PointerState, content_rect_local, shift_event};
 use crate::window::focus::FocusCause;
 use crate::window::keyboard::Mods;
 
@@ -130,20 +130,19 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
         // always, and the icon could never be clicked. `on_event`'s own
         // `local` is already relative to this controller's root box (P4's
         // `window/pointer.rs::descend` stops there for the same reason), so
-        // the peek band is computed straight from that, the reserved-width
-        // counterpart to `measure`'s own reservation below.
+        // the peek band — and, below, the text's own region — is computed
+        // straight from that through `content_rect_local`, the reserved-width
+        // counterpart to `measure`'s own reservation below. The same is true
+        // of `edit.text_node`, which `TextEditState::build` appends itself:
+        // `local_rect` is `None` for it too, so the caret placement below
+        // cannot use it either.
+        let content = content_rect_local(cx.tree, cx.node);
         if let Some(peek) = self.peek_node.clone()
-            && let Some(alloc) = cx.tree.allocation(cx.node)
+            && let Some(content) = content
         {
-            // `ev`'s own `local` is relative to the *border* box's origin
-            // (P4's `window/pointer.rs::aim`), so the band's origin needs
-            // the same padding+border inset the content box already
-            // carries.
-            let content = alloc.content_box;
-            let border = alloc.border_box;
             let band = Rect::new(
-                content.x - border.x + content.width - PEEK_WIDTH_PX,
-                content.y - border.y,
+                content.x + content.width - PEEK_WIDTH_PX,
+                content.y,
                 PEEK_WIDTH_PX,
                 content.height,
             );
@@ -167,6 +166,39 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
             // `PasswordEntry` could never receive keyboard focus by any
             // means.
             cx.focus.set_focus(Some(cx.node), FocusCause::Pointer);
+        }
+        if let Some(content) = content {
+            // The text occupies the content box less whatever the peek band
+            // reserves at its right (see `measure` below).
+            let reserve = if self.peek_node.is_some() {
+                PEEK_WIDTH_PX
+            } else {
+                0.0
+            };
+            let rect = Rect::new(
+                content.x,
+                content.y,
+                (content.width - reserve).max(0.0),
+                content.height,
+            );
+            let shifted = shift_event(ev, rect);
+            self.pointer.observe(
+                &self.edit.text_node,
+                &shifted,
+                Some(Rect::new(0.0, 0.0, rect.width, rect.height)),
+            );
+            if let Event::PointerDown { local, .. } = shifted {
+                // Plan reconciliation: neither controller in the plan places
+                // the caret on click; `Entry` and `SearchEntry` both do (their
+                // own notes), and a `PasswordEntry` behaving differently from
+                // its siblings for the same gesture is the asymmetry review
+                // caught. `buffer_offset_at`, not `layout.byte_at`, because
+                // the layout here is over the masked bullets, whose byte
+                // offsets are not the buffer's.
+                self.edit.cursor = self.edit.buffer_offset_at(local);
+                self.edit.anchor = None;
+                cx.handled = true;
+            }
         }
         let Event::Key(key) = ev else {
             return Vec::new();

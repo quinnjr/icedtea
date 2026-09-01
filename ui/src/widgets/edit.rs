@@ -251,6 +251,30 @@ impl TextEditState {
         }
     }
 
+    /// The buffer byte offset a point inside the shaped line names.
+    ///
+    /// [`TextLayout::byte_at`] answers in offsets into
+    /// [`TextEditState::display`], which is the buffer itself only while
+    /// `visibility` is on; with it off the layout is one three-byte bullet per
+    /// *character*, so a display offset has to come back through the character
+    /// index to be a valid `buffer` offset (and `cursor` is documented as a
+    /// `buffer` offset).
+    #[must_use]
+    pub fn buffer_offset_at(&self, local: (f32, f32)) -> usize {
+        let display_offset = self.layout.byte_at(local);
+        if self.visibility {
+            return display_offset.min(self.buffer.len());
+        }
+        let display = self.display();
+        let chars = display
+            .get(..display_offset)
+            .map_or_else(|| display.chars().count(), |head| head.chars().count());
+        self.buffer
+            .char_indices()
+            .nth(chars)
+            .map_or(self.buffer.len(), |(byte, _)| byte)
+    }
+
     /// The ordered, clamped selection range.
     #[must_use]
     pub fn selection(&self) -> std::ops::Range<usize> {
