@@ -697,6 +697,20 @@ fn scrolled_window_matches_its_gtk_fixture() {
 }
 
 #[test]
+fn header_bar_matches_its_gtk_fixture() {
+    let mut props = icedtea_ui::view::Props::default();
+    props.set(
+        icedtea_ui::view::PropName::Decoration,
+        icedtea_ui::view::Prop::Str("icon:minimize,close".into()),
+    );
+    props.set(
+        icedtea_ui::view::PropName::ShowTitleButtons,
+        icedtea_ui::view::Prop::Bool(true),
+    );
+    assert_fixture(icedtea_ui::view::Kind::HeaderBar, &props, "header_bar");
+}
+
+#[test]
 fn no_p5_kind_falls_through_to_the_unimplemented_controller() {
     // mutation: remove any dispatch arm from build_controller and that kind's
     // tree renders as a bare node, failing its fixture's required subnodes.

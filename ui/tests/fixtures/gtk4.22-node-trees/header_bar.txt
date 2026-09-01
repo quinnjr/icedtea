@@ -1,0 +1,10 @@
+headerbar
+╰── windowhandle
+    ╰── box
+        ├── box.start
+        │   ├── windowcontrols.start
+        │   ╰── [other children]
+        ├── [label]
+        ╰── box.end
+            ├── [other children]
+            ╰── windowcontrols.end

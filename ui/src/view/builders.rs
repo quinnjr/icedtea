@@ -362,6 +362,52 @@ impl<Msg: Clone + 'static> View<Msg> {
     }
 }
 
+/// `GtkHeaderBar`, empty until [`View::pack_start`]/[`View::pack_end`]/
+/// [`HeaderBarExt::title_widget`] fill it.
+#[must_use]
+pub fn header_bar<Msg: Clone + 'static>() -> View<Msg> {
+    View::new(Kind::HeaderBar)
+}
+
+/// `GtkHeaderBar`'s own property setters, chained after [`header_bar`].
+///
+/// Scoped to its own trait, rather than plain inherent `View<Msg>` methods,
+/// for the same reason [`crate::widgets::action_bar::ActionBarExt`]'s own
+/// doc comment gives: `.title` already exists over the same
+/// [`PropName::Title`] for `ColorDialogButton` and `FontDialog`, and an
+/// inherent method would silently win over both at every call site.
+pub trait HeaderBarExt<Msg>: Sized {
+    /// `GtkHeaderBar:title`.
+    fn title(self, text: &str) -> Self;
+    /// `GtkHeaderBar:subtitle` (GTK 3; kept for the CSS-node shape only).
+    fn subtitle(self, text: &str) -> Self;
+    /// `GtkHeaderBar:title-widget`.
+    fn title_widget(self, view: View<Msg>) -> Self;
+    /// `GtkHeaderBar:show-title-buttons`.
+    fn show_title_buttons(self, on: bool) -> Self;
+    /// `GtkHeaderBar:decoration-layout`.
+    fn decoration_layout(self, layout: &str) -> Self;
+}
+
+impl<Msg: Clone + 'static> HeaderBarExt<Msg> for View<Msg> {
+    fn title(self, text: &str) -> Self {
+        self.prop(PropName::Title, Prop::Str(Rc::from(text)))
+    }
+    fn subtitle(self, text: &str) -> Self {
+        self.prop(PropName::Subtitle, Prop::Str(Rc::from(text)))
+    }
+    fn title_widget(mut self, view: View<Msg>) -> Self {
+        self.children.push(slot(view, "title"));
+        self
+    }
+    fn show_title_buttons(self, on: bool) -> Self {
+        self.prop(PropName::ShowTitleButtons, Prop::Bool(on))
+    }
+    fn decoration_layout(self, layout: &str) -> Self {
+        self.prop(PropName::Decoration, Prop::Str(Rc::from(layout)))
+    }
+}
+
 /// `GtkScrolledWindow` wrapping `child`.
 #[must_use]
 pub fn scrolled_window<Msg: Clone + 'static>(child: View<Msg>) -> View<Msg> {

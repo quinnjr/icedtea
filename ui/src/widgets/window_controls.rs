@@ -61,6 +61,17 @@ pub struct WindowControlsC {
 }
 
 impl WindowControlsC {
+    /// Test hook: the button names this instance actually rendered, in
+    /// layout order -- `HeaderBar`'s own tests use it to check that each
+    /// side got only its own half of `gtk-decoration-layout`.
+    #[must_use]
+    pub fn button_names(&self) -> Vec<String> {
+        self.buttons
+            .iter()
+            .map(|(button, _)| button.css_class().to_string())
+            .collect()
+    }
+
     /// The tokens `side` contributes, in order.
     ///
     /// `menu` is recognised by the setting's documentation but

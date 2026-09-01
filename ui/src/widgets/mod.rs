@@ -28,6 +28,8 @@ use crate::window::focus::FOCUSABLE_CLASS;
 
 #[doc(inline)]
 pub use crate::view::ListItem;
+#[doc(inline)]
+pub use window_controls::WindowControlsC;
 
 /// `ListItem`'s widget-facing constructor.
 ///
@@ -64,6 +66,7 @@ pub mod expander;
 pub mod font_dialog;
 pub mod frame;
 pub mod grid;
+pub mod header_bar;
 pub mod image;
 pub mod info_bar;
 pub mod label;
@@ -1104,6 +1107,9 @@ pub fn build_controller<Msg: Clone + 'static>(
         Kind::WindowControls => {
             Box::new(<window_controls::WindowControlsC as Controller<Msg>>::build(node, props, cx))
         }
+        Kind::HeaderBar => Box::new(<header_bar::HeaderBarC as Controller<Msg>>::build(
+            node, props, cx,
+        )),
         Kind::Calendar => Box::new(<calendar::CalendarC as Controller<Msg>>::build(
             node, props, cx,
         )),
