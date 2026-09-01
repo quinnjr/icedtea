@@ -337,6 +337,39 @@ impl From<LayoutError> for AppError {
     }
 }
 
+/// A built, styled and laid-out view tree with no Wayland connection.
+///
+/// This is what `gallery --probe-points` reads: the same pipeline
+/// [`App::run`] drives, stopped after the first layout so a tool can ask the
+/// tree where its nodes ended up. Without it the only way to learn a
+/// coordinate would be to hard-code it, which the M3 gate forbids.
+pub struct Probe<Msg> {
+    root: Node,
+    instances: Vec<Instance<Msg>>,
+    tree: LayoutTree,
+}
+
+impl<Msg> Probe<Msg> {
+    /// The synthetic root every instance hangs from.
+    #[must_use]
+    pub fn root(&self) -> &Node {
+        &self.root
+    }
+
+    /// The top-level instances, in view order.
+    #[must_use]
+    pub fn instances(&self) -> &[Instance<Msg>] {
+        &self.instances
+    }
+
+    /// `node`'s allocation in tree-origin coordinates, or `None` for a node
+    /// that is not in this tree.
+    #[must_use]
+    pub fn allocation(&self, node: &Node) -> Option<crate::layout::Allocation> {
+        self.tree.allocation(node)
+    }
+}
+
 /// The Elm loop over a retained tree.
 pub struct App<M, Msg> {
     model: M,
@@ -529,6 +562,74 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     #[must_use]
     pub fn model(&self) -> &M {
         &self.model
+    }
+
+    /// Run view → reconcile → restyle → layout **once**, against `size`, with
+    /// no surface, and hand back the result.
+    ///
+    /// `sheet`, `fonts` and `icons` are parameters rather than fields because
+    /// [`App::run`] takes them from the `Window` it is handed; a probe has no
+    /// window, so its caller supplies them.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Layout`] if the tree cannot be laid out.
+    pub fn probe(
+        self,
+        size: (u32, u32),
+        sheet: CompiledSheet,
+        mut fonts: FontDatabase,
+        mut icons: IconTheme,
+        clock: Rc<dyn Clock>,
+    ) -> Result<Probe<Msg>, AppError> {
+        // Same body as `run`'s per-frame pass, minus the surface: build the
+        // view from the model, reconcile it into instances, restyle the
+        // whole tree, then lay out against `size` as the available space.
+        let App { model, view, .. } = self;
+        let env = ResolveEnv::default();
+        let root = Node::with_classes(Kind::Window.css_name(), Kind::Window.base_classes());
+        let mut instances: Vec<Instance<Msg>> = Vec::new();
+        let mut containers = HashMap::new();
+        let mut styles = StyleMap::new();
+        let mut anims = Animations::new();
+        let mut tree = LayoutTree::new();
+        {
+            let mut cx = BuildCx {
+                sheet: &sheet,
+                fonts: &mut fonts,
+                icons: &mut icons,
+                clock: &clock,
+                env: &env,
+            };
+            reconcile(&root, &mut instances, vec![view(&model)], &mut cx);
+        }
+        containers.insert(
+            crate::view::render::node_addr(&root),
+            Container::Box {
+                direction: crate::layout::BoxDirection::Column,
+            },
+        );
+        containers_of(&instances, &mut containers);
+        restyle_and_layout(
+            &root,
+            &mut instances,
+            &sheet,
+            &env,
+            &mut fonts,
+            &mut icons,
+            &clock,
+            &containers,
+            &mut styles,
+            &mut anims,
+            &mut tree,
+            size,
+        )
+        .map_err(AppError::Layout)?;
+        Ok(Probe {
+            root,
+            instances,
+            tree,
+        })
     }
 
     /// Run the whole loop against an offscreen raster surface with no
@@ -757,6 +858,51 @@ fn rebuild<M: 'static, Msg: Clone + 'static>(
     containers_of(&rt.instances, &mut rt.containers);
 }
 
+/// Restyle the tree under `root`, then lay it out against `size`.
+///
+/// Shared by [`render_once`] (called every frame `run`/`run_offscreen` draw)
+/// and [`App::probe`] (called once, with no surface to paint into), so the
+/// two never drift into computing two different trees.
+#[allow(clippy::too_many_arguments, reason = "one call site plus probe's")]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a surface is never 2^24 px on a side"
+)]
+fn restyle_and_layout<Msg: Clone + 'static>(
+    root: &Node,
+    instances: &mut Vec<Instance<Msg>>,
+    sheet: &CompiledSheet,
+    env: &ResolveEnv,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clock: &Rc<dyn Clock>,
+    containers: &HashMap<NodeAddr, Container>,
+    styles: &mut StyleMap,
+    anims: &mut Animations,
+    tree: &mut LayoutTree,
+    size: (u32, u32),
+) -> Result<(), LayoutError> {
+    let now = clock.now();
+    restyle_tree(root, sheet, env, styles, anims, now);
+    let mut measure = ControllerMeasure {
+        instances,
+        sheet,
+        fonts,
+        icons,
+        clock,
+        env,
+    };
+    layout_tree(
+        root,
+        styles,
+        containers,
+        tree,
+        env,
+        (Some(size.0 as f32), Some(size.1 as f32)),
+        &mut measure,
+    )
+}
+
 /// Restyle, relayout and repaint into `surface`.
 fn render_once<Msg: Clone + 'static>(
     rt: &mut Runtime<Msg>,
@@ -768,26 +914,20 @@ fn render_once<Msg: Clone + 'static>(
     surface: &mut skia_rs_safe::canvas::Surface,
 ) -> Result<(), AppError> {
     let now = clock.now();
-    restyle_tree(&rt.root, sheet, &rt.env, &mut rt.styles, &mut rt.anims, now);
-    {
-        let mut measure = ControllerMeasure {
-            instances: &mut rt.instances,
-            sheet,
-            fonts,
-            icons,
-            clock,
-            env: &rt.env,
-        };
-        layout_tree(
-            &rt.root,
-            &rt.styles,
-            &rt.containers,
-            &mut rt.layout,
-            &rt.env,
-            (Some(size.0 as f32), Some(size.1 as f32)),
-            &mut measure,
-        )?;
-    }
+    restyle_and_layout(
+        &rt.root,
+        &mut rt.instances,
+        sheet,
+        &rt.env,
+        fonts,
+        icons,
+        clock,
+        &rt.containers,
+        &mut rt.styles,
+        &mut rt.anims,
+        &mut rt.layout,
+        size,
+    )?;
     surface
         .canvas()
         .clear(skia_rs_safe::core::Color::TRANSPARENT);
@@ -922,30 +1062,19 @@ fn render_popups<Msg: Clone + 'static>(
         let origin = rt.popups[index].origin;
         {
             let popup = &mut rt.popups[index];
-            restyle_tree(
+            restyle_and_layout(
                 &popup.root,
+                &mut popup.instances,
                 sheet,
                 &rt.env,
-                &mut popup.styles,
-                &mut popup.anims,
-                now,
-            );
-            let mut measure = ControllerMeasure {
-                instances: &mut popup.instances,
-                sheet,
                 fonts,
                 icons,
                 clock,
-                env: &rt.env,
-            };
-            layout_tree(
-                &popup.root,
-                &popup.styles,
                 &popup.containers,
+                &mut popup.styles,
+                &mut popup.anims,
                 &mut popup.layout,
-                &rt.env,
-                (Some(width as f32), Some(height as f32)),
-                &mut measure,
+                (width, height),
             )?;
         }
         let images = &mut rt.images;
@@ -1465,37 +1594,20 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             }
 
             let (w, h) = window.size();
-            restyle_tree(
+            restyle_and_layout(
                 &rt.root,
+                &mut rt.instances,
                 &sheet,
                 &rt.env,
+                &mut fonts,
+                &mut icons,
+                &clock,
+                &rt.containers,
                 &mut rt.styles,
                 &mut rt.anims,
-                now,
-            );
-            {
-                let mut measure = ControllerMeasure {
-                    instances: &mut rt.instances,
-                    sheet: &sheet,
-                    fonts: &mut fonts,
-                    icons: &mut icons,
-                    clock: &clock,
-                    env: &rt.env,
-                };
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "a surface is never 2^24 px on a side"
-                )]
-                layout_tree(
-                    &rt.root,
-                    &rt.styles,
-                    &rt.containers,
-                    &mut rt.layout,
-                    &rt.env,
-                    (Some(w as f32), Some(h as f32)),
-                    &mut measure,
-                )?;
-            }
+                &mut rt.layout,
+                (w, h),
+            )?;
 
             let styles = &rt.styles;
             let layout = &rt.layout;
@@ -1541,34 +1653,19 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 {
                     let popup = &mut rt.popups[index];
                     popup.size = (pw, ph);
-                    restyle_tree(
+                    restyle_and_layout(
                         &popup.root,
+                        &mut popup.instances,
                         &sheet,
                         &rt.env,
+                        &mut fonts,
+                        &mut icons,
+                        &clock,
+                        &popup.containers,
                         &mut popup.styles,
                         &mut popup.anims,
-                        now,
-                    );
-                    let mut measure = ControllerMeasure {
-                        instances: &mut popup.instances,
-                        sheet: &sheet,
-                        fonts: &mut fonts,
-                        icons: &mut icons,
-                        clock: &clock,
-                        env: &rt.env,
-                    };
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        reason = "a popup surface is never 2^24 px on a side"
-                    )]
-                    layout_tree(
-                        &popup.root,
-                        &popup.styles,
-                        &popup.containers,
                         &mut popup.layout,
-                        &rt.env,
-                        (Some(pw as f32), Some(ph as f32)),
-                        &mut measure,
+                        (pw, ph),
                     )?;
                 }
                 let images = &mut rt.images;
@@ -1631,6 +1728,7 @@ fn read_rgba(surface: &skia_rs_safe::canvas::Surface, size: (u32, u32)) -> Vec<u
 mod tests {
     use super::*;
     use crate::css::cascade::CompiledSheet;
+    use crate::css::parse::parse_stylesheet_with_base;
     use crate::view::builders::widget;
     use crate::view::reconcile::reconcile;
     use crate::view::{BuildCx, Handler, Kind, PropName};
@@ -2200,6 +2298,44 @@ mod tests {
             whole(0),
             whole(1),
             "the click never incremented the counter"
+        );
+    }
+
+    /// `probe` must run the *same* pipeline `run` does — view, reconcile,
+    /// restyle, layout — or the gate's coordinates would describe a tree
+    /// nobody renders.
+    ///
+    /// Mutation check: make `probe` skip its `compute` call; every allocation
+    /// comes back 0x0 and this test fails. Restore.
+    #[test]
+    fn probe_lays_the_tree_out_and_reports_allocations() {
+        let clock: Rc<dyn Clock> = Rc::new(ManualClock::new());
+        let app = App::new(
+            0u32,
+            |_m: &mut u32, _msg: ()| Cmd::None,
+            |_m: &u32| crate::view::builders::label("probe me"),
+        );
+        let sheet = CompiledSheet::from_stylesheet(parse_stylesheet_with_base(
+            crate::BUNDLED_ADWAITA_LIGHT,
+            None,
+        ));
+        let probe = app
+            .probe(
+                (200, 100),
+                sheet,
+                FontDatabase::new(),
+                IconTheme::with_name_and_roots("hicolor", Vec::new()),
+                clock,
+            )
+            .expect("probe lays out");
+        assert_eq!(probe.instances().len(), 1);
+        let alloc = probe
+            .allocation(&probe.instances()[0].node)
+            .expect("the root has an allocation");
+        assert!(
+            alloc.border_box.width > 0.0 && alloc.border_box.height > 0.0,
+            "a label with text must have a non-empty allocation, got {:?}",
+            alloc.border_box
         );
     }
 }

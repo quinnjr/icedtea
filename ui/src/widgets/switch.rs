@@ -109,6 +109,21 @@ impl<Msg: Clone + 'static> Controller<Msg> for SwitchC {
         }
     }
 
+    /// `build` attaches `on_image`/`off_image`/`slider` directly to `node`,
+    /// ahead of any real view child, so they occupy indices 0..3.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + 3
+    }
+
+    /// ... and reconcile's trim step must know all three are there, or it
+    /// detaches them as soon as it runs (`reconcile_reserved`'s `trim_from`)
+    /// — the same chrome-eviction bug `reserve` exists to fix, which this
+    /// controller was missing until a headless probe walked `node`'s real
+    /// children and found none.
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + 3
+    }
+
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         let bounds = cx
             .tree

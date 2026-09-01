@@ -39,7 +39,17 @@ fn main() {
         return;
     }
 
-    // Tasks 5 and 6 replace this with the probe/allocation/run dispatch.
-    eprintln!("gallery: nothing to do yet");
-    std::process::exit(2);
+    let result = if opts.probe_points {
+        icedtea_ui::gallery::print_probe_points(&opts)
+    } else if opts.print_allocation {
+        icedtea_ui::gallery::print_allocations(&opts)
+    } else {
+        // Task 6 fills this in.
+        eprintln!("gallery: nothing to do yet");
+        std::process::exit(2);
+    };
+    if let Err(err) = result {
+        eprintln!("gallery: {err:?}");
+        std::process::exit(1);
+    }
 }

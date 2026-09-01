@@ -13,16 +13,24 @@ use std::rc::Rc;
 use skia_rs_safe::core::Color;
 use skia_rs_safe::paint::Paint;
 
+use crate::anim::clock::{Clock, MonotonicClock};
+use crate::css::cascade::CompiledSheet;
+use crate::css::node::Node;
+use crate::css::parse::parse_stylesheet_with_base;
 use crate::css::parse::{ColorScheme, Contrast, MediaEnv};
 use crate::css::value::{IconRef, Rgba};
+use crate::icons::IconTheme;
+use crate::layout::Allocation;
 use crate::layout::Rect;
+use crate::text::FontDatabase;
+use crate::view::app::{App, AppError, Probe};
 use crate::view::builders::{
     self as w, CheckButtonExt, ColorDialogButtonExt, DropDownExt, ImageExt, InfoBarExt, LabelExt,
     LevelBarExt, MenuButtonExt, PopoverExt, ProgressBarExt, ScaleExt, ScrollbarExt, SpinnerExt,
     StatusbarExt, TextViewExt, ToggleButtonExt,
 };
 use crate::view::cmd::Cmd;
-use crate::view::{Kind, View};
+use crate::view::{Instance, Kind, View};
 use crate::widgets::types::{
     ItemFactory, ListItem, MessageType, Orientation, RowContent, SelectionMode, Side,
 };
@@ -1163,6 +1171,220 @@ pub fn sample_shape(kind: Kind) -> SampleShape {
     }
 }
 
+/// One derived probe point, in page coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbePoint {
+    /// The widget's [`kind_name`].
+    pub widget: &'static str,
+    /// The CSS node name this point sits on, indexed when repeated.
+    pub label: String,
+    /// Centre of that node's border box.
+    pub x: i32,
+    /// Centre of that node's border box.
+    pub y: i32,
+}
+
+/// The compiled sheet `opts` asks for: a file used *whole*, or the bundled
+/// sheet compiled under the theme's own `@media` environment.
+#[must_use]
+pub fn compile_sheet(opts: &Options) -> CompiledSheet {
+    let env = opts.theme.media_env();
+    // `--scroll`'s one caller-visible rule: `scrolled_page` shifts the page
+    // by adding this class, never by `View::margin` (a prop no controller
+    // in this tree reads back into layout — see `scrolled_page`'s doc).
+    // CSS `margin`, unlike that prop, is the real, taffy-consumed box model,
+    // so a one-off class carries the offset the rest of the sheet cannot
+    // know ahead of time. Relative to the flat page's own margin (`page`'s
+    // `View::margin(12, ..)` call is that same inert prop, so the flat
+    // page's real top margin is 0) rather than to GTK's nominal 12px, so the
+    // shift is exactly `--scroll`, not `--scroll` plus whatever the prop
+    // would have contributed had it worked.
+    let scroll_rule = format!(".gallery-scroll {{ margin-top: {}px; }}", -opts.scroll);
+    match &opts.theme_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(css) => CompiledSheet::compile_with_env(
+                &parse_stylesheet_with_base(&format!("{css}\n{scroll_rule}"), path.parent()),
+                &env,
+            ),
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "cannot read --theme-file; using the bundled sheet");
+                CompiledSheet::compile_with_env(
+                    &parse_stylesheet_with_base(
+                        &format!("{}\n{scroll_rule}", opts.theme.sheet()),
+                        None,
+                    ),
+                    &env,
+                )
+            }
+        },
+        None => CompiledSheet::compile_with_env(
+            &parse_stylesheet_with_base(&format!("{}\n{scroll_rule}", opts.theme.sheet()), None),
+            &env,
+        ),
+    }
+}
+
+/// Build, style and lay the page out with no compositor.
+///
+/// # Errors
+///
+/// Whatever [`App::probe`] returns.
+pub fn build(opts: &Options) -> Result<Probe<GalleryMsg>, AppError> {
+    let mut model = GalleryModel::new(opts.theme, opts.widget);
+    model.scroll = opts.scroll;
+    let app = App::new(model, update, scrolled_page);
+    app.probe(
+        opts.size,
+        compile_sheet(opts),
+        FontDatabase::new(),
+        IconTheme::from_env(),
+        Rc::new(MonotonicClock::new()) as Rc<dyn Clock>,
+    )
+}
+
+/// [`page`] with `model.scroll` applied as a negative top margin.
+///
+/// Shifting the page node itself, rather than tracking an offset beside it,
+/// is what lets the probe points be read straight off the laid-out tree: the
+/// scrolled tree *is* the tree. A plain `fn`, because `App::new` takes a
+/// function pointer, not a closure.
+///
+/// Reconciliation: the plan reached for `View::margin`, but that prop has no
+/// reader anywhere in the tree this part's controllers form — `GenericC`
+/// (what `Kind::Box` reconciles to) forwards every prop `apply_universal`
+/// does not claim (`Classes`/`Focusable`/`Id`/`Sensitive`/`Checked`/
+/// `Indeterminate`/`Selected`) straight to its `Label`/`Text` check and drops
+/// it there, so it never reaches a taffy box. CSS `margin`, resolved and
+/// consumed by `write_styles`/`layout_tree` on every kind including `Box`,
+/// is; `--scroll`'s effect rides that path instead, through the
+/// `gallery-scroll` class [`compile_sheet`] gives a rule to.
+pub fn scrolled_page(model: &GalleryModel) -> View<GalleryMsg> {
+    let built = page(model);
+    if model.scroll == 0 || model.only.is_some() {
+        built
+    } else {
+        built.class("gallery-scroll")
+    }
+}
+
+/// The `(widget name, instance)` pairs the printing modes and the gates walk.
+///
+/// In `--widget` mode the root instance *is* the widget. Otherwise the root is
+/// the page box and its children are the frames, each holding exactly one
+/// sample, in `own_kinds()` order.
+#[must_use]
+pub fn entry_instances<'a>(
+    opts: &Options,
+    probe: &'a Probe<GalleryMsg>,
+) -> Vec<(&'static str, &'a Instance<GalleryMsg>)> {
+    let Some(root) = probe.instances().first() else {
+        return Vec::new();
+    };
+    if let Some(kind) = opts.widget {
+        return vec![(kind_name(kind), root)];
+    }
+    own_kinds()
+        .into_iter()
+        .zip(root.children.iter())
+        .filter_map(|(kind, frame)| Some((kind_name(kind), frame.children.first()?)))
+        .collect()
+}
+
+/// Derive `instance`'s probe points: `"root"`, then every descendant node,
+/// labelled by its CSS node name and indexed when that name repeats.
+///
+/// Every descendant with an allocation gets a point, even a collapsed one —
+/// `Switch`'s two `image` subnodes are legitimate zero-size chrome in every
+/// bundled Adwaita variant (upstream GTK never paints them either) and are
+/// still real nodes a caller may need to name and locate. Only a node with
+/// no allocation at all (not laid out, or not in this tree) is skipped.
+#[must_use]
+pub fn probe_points_of(
+    instance: &Instance<GalleryMsg>,
+    widget: &'static str,
+    probe: &Probe<GalleryMsg>,
+) -> Vec<ProbePoint> {
+    let mut points = Vec::new();
+    if let Some(alloc) = probe.allocation(&instance.node) {
+        points.push(centre(widget, "root".to_string(), &alloc));
+    }
+    let descendants: Vec<Node> = instance.node.descendants().collect();
+    let mut counts: BTreeMap<Rc<str>, usize> = BTreeMap::new();
+    for node in &descendants {
+        *counts.entry(node.name()).or_default() += 1;
+    }
+    let mut seen: BTreeMap<Rc<str>, usize> = BTreeMap::new();
+    for node in &descendants {
+        let name = node.name();
+        let index = seen.entry(name.clone()).or_default();
+        let label = if counts.get(&name).copied().unwrap_or(0) > 1 {
+            format!("{name}{index}")
+        } else {
+            name.to_string()
+        };
+        *index += 1;
+        if let Some(alloc) = probe.allocation(node) {
+            points.push(centre(widget, label, &alloc));
+        }
+    }
+    points
+}
+
+/// The centre of a border box, floored to the pixel below.
+///
+/// `f32::floor` before the cast, not a bare `as i32` (which truncates toward
+/// zero) or `f32::round` (ties away from zero): both move a positive and a
+/// negative half-pixel centre in opposite directions, so shifting a box by
+/// an integer number of pixels would not always shift its rounded centre by
+/// that same integer. `floor(v - k) == floor(v) - k` for every real `v` and
+/// integer `k`, so a scrolled copy of a box centres exactly `--scroll`
+/// pixels from its unscrolled original, which is what
+/// `scroll_shifts_every_probe_point_by_exactly_that_many_pixels` checks.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a gallery surface is never within rounding distance of i32::MAX"
+)]
+fn centre(widget: &'static str, label: String, alloc: &Allocation) -> ProbePoint {
+    let r = alloc.border_box;
+    ProbePoint {
+        widget,
+        label,
+        x: (r.x + r.width / 2.0).floor() as i32,
+        y: (r.y + r.height / 2.0).floor() as i32,
+    }
+}
+
+/// `<widget> <label> <x> <y>`, one per line.
+///
+/// # Errors
+///
+/// Whatever [`build`] returns.
+pub fn print_probe_points(opts: &Options) -> Result<(), AppError> {
+    let probe = build(opts)?;
+    for (widget, instance) in entry_instances(opts, &probe) {
+        for point in probe_points_of(instance, widget, &probe) {
+            println!("{} {} {} {}", point.widget, point.label, point.x, point.y);
+        }
+    }
+    Ok(())
+}
+
+/// `<widget> <x> <y> <width> <height>`, one per line: each entry's border box.
+///
+/// # Errors
+///
+/// Whatever [`build`] returns.
+pub fn print_allocations(opts: &Options) -> Result<(), AppError> {
+    let probe = build(opts)?;
+    for (widget, instance) in entry_instances(opts, &probe) {
+        if let Some(alloc) = probe.allocation(&instance.node) {
+            let r = alloc.border_box;
+            println!("{widget} {} {} {} {}", r.x, r.y, r.width, r.height);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1528,5 +1750,72 @@ mod tests {
         let model = GalleryModel::new(Theme::Light, None);
         let page = page(&model);
         assert_eq!(page.kind, Kind::Box, "the page is one vertical box");
+    }
+
+    #[test]
+    fn every_widget_exposes_a_root_probe_point_inside_its_own_allocation() {
+        let opts = Options::parse(vec![]).unwrap();
+        let probe = build(&opts).expect("the page lays out headlessly");
+        let entries = entry_instances(&opts, &probe);
+        assert_eq!(entries.len(), own_kinds().len());
+        for (widget, instance) in entries {
+            let points = probe_points_of(instance, widget, &probe);
+            assert!(!points.is_empty(), "{widget} has no probe points");
+            assert_eq!(
+                points[0].label, "root",
+                "{widget}'s first point is its root"
+            );
+            let mut labels: Vec<&str> = points.iter().map(|p| p.label.as_str()).collect();
+            labels.sort_unstable();
+            let before = labels.len();
+            labels.dedup();
+            assert_eq!(before, labels.len(), "{widget} has duplicate probe labels");
+            for point in &points {
+                assert!(
+                    point.x >= 0 && point.y >= 0,
+                    "{widget}/{} is off the surface at ({}, {})",
+                    point.label,
+                    point.x,
+                    point.y
+                );
+            }
+        }
+    }
+
+    /// Repetition gets indices, uniqueness does not — GTK's own `tab0`/`row0`
+    /// convention, derived rather than hard-coded.
+    ///
+    /// Mutation check: always append the index; `check_button`'s point becomes
+    /// `check0` and this test fails. Restore.
+    #[test]
+    fn repeated_node_names_are_indexed_and_unique_ones_are_not() {
+        let opts = Options::parse(vec!["--widget".into(), "switch".into()]).unwrap();
+        let probe = build(&opts).expect("the switch lays out");
+        let entries = entry_instances(&opts, &probe);
+        let points = probe_points_of(entries[0].1, entries[0].0, &probe);
+        let labels: Vec<&str> = points.iter().map(|p| p.label.as_str()).collect();
+        assert!(labels.contains(&"root"));
+        assert!(
+            labels.contains(&"slider"),
+            "switch > slider is unique and keeps its bare name: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"image0") && labels.contains(&"image1"),
+            "switch has two image subnodes, so both are indexed: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn scroll_shifts_every_probe_point_by_exactly_that_many_pixels() {
+        let flat = Options::parse(vec![]).unwrap();
+        let scrolled = Options::parse(vec!["--scroll".into(), "100".into()]).unwrap();
+        let a = build(&flat).unwrap();
+        let b = build(&scrolled).unwrap();
+        let (wa, ia) = entry_instances(&flat, &a)[0];
+        let (_wb, ib) = entry_instances(&scrolled, &b)[0];
+        let pa = probe_points_of(ia, wa, &a);
+        let pb = probe_points_of(ib, wa, &b);
+        assert_eq!(pa[0].x, pb[0].x, "scrolling never moves x");
+        assert_eq!(pa[0].y - 100, pb[0].y, "scrolling moves y by --scroll");
     }
 }
