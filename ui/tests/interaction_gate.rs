@@ -165,3 +165,45 @@ fn a_pointer_click_focuses_without_showing_the_focus_ring() {
         gallery.messages()
     );
 }
+
+/// Dragging the slider must move it *and* report the value: a scale that
+/// paints without reporting is as broken as one that reports without painting.
+///
+/// Reconciliation: `trough`/`slider` are subnodes `ScaleC` positions
+/// directly rather than `View` children with their own taffy box
+/// (`ScaleC::on_event`'s own doc: "they never get a taffy box of their own
+/// ... there is no `local_rect(cx.tree, cx.node, &self.trough)` to read");
+/// `--probe-points` therefore prints only `root` for this widget, not
+/// `trough`/`slider`. `root`'s content box is exactly the trough's own box
+/// per that same doc, and a `PointerDown` anywhere inside it snaps the value
+/// to that point immediately (`commit` in `ScaleC::on_event`), so `root`
+/// stands in for both the task's `slider` and `trough` probe points.
+///
+/// Mutation check: make `ScaleC` clamp its drag to the press position; the
+/// value message never arrives and this test fails. Restore.
+#[test]
+fn dragging_a_scale_moves_the_slider_and_reports_the_value() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "scale");
+    let (sx, sy) = driver.point("scale", "root");
+    let (tx, ty) = (sx, sy);
+    // Drag right, staying inside the trough: its centre plus most of the
+    // remaining half-width.
+    let target = (tx + (tx - sx).abs().max(40), ty);
+    let at_rest = driver.pixel(sx, sy);
+
+    driver.drag((sx, sy), target);
+    assert!(
+        gallery
+            .messages()
+            .iter()
+            .any(|line| line.starts_with("value scale ")),
+        "the drag reported no value; got {:?}",
+        gallery.messages()
+    );
+    let vacated = driver.wait_pixel_change(sx, sy, at_rest);
+    assert!(
+        !support::matches(vacated, at_rest),
+        "the slider never left its starting position"
+    );
+}
