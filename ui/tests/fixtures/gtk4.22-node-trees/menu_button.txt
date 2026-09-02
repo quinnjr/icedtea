@@ -1,5 +1,6 @@
 menubutton
-╰── button.toggle
-    ├── [label]
-    ├── [image]
-    ╰── [arrow]
+├── button.toggle
+│   ├── [label]
+│   ├── [image]
+│   ╰── [arrow]
+╰── [popover.background.menu]

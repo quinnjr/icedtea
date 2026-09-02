@@ -419,7 +419,7 @@ outside the process.
 
 ```bash
 cargo test -p icedtea-ui --test gallery_gate       # rest state, 3 themes
-cargo test -p icedtea-ui --test interaction_gate   # 6 driven interactions
+cargo test -p icedtea-ui --test interaction_gate   # 15 driven interactions
 cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
 ```
 
@@ -436,14 +436,17 @@ cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
   node tree matches its vendored GTK 4.22 fixture; and that this README's
   table lists every `Kind`.
 - `tests/interaction_gate.rs` drives interactions with a virtual pointer and
-  keyboard. **Six of the contract's sixteen ship**: click, toggle, check,
-  switch, scale drag, and the pointer-click-without-focus-ring rule. The other
-  ten — type, debounced search, password peek, held spin repeat, drop-down
-  pick, list scroll with recycling, expander, stack page, popover grab and
-  dismissal, and Tab in geometric order — were written, driven RED and
-  root-caused, but each fails on a pre-existing production defect that M3's
-  final part is not allowed to fix; they are not in the file. Contract
-  amendments P8-D71 and P8-D72 carry the ten names and their diagnoses.
+  keyboard. **Fifteen of the contract's sixteen ship**: click, toggle, check,
+  switch, the pointer-click-without-focus-ring rule, typing with a placed
+  caret, debounced search, password peek, held spin repeat, scale drag,
+  drop-down pick, expander disclosure, stack-page switch, menu-button popover,
+  and Tab in geometric order. Each of the last ten landed with the
+  pre-existing production defect it was RED on — none is asserted around.
+  The one that does not ship is `scrolling_a_list_view_recycles_rows_without_
+  losing_selection`: a pooled `ListView` row measures and paints nothing, so
+  ten rows cannot overflow a viewport and a recycling test would assert
+  nothing. Contract amendments P8-D71 and P8-D72 carry the whole trail, and
+  `.superpowers/sdd/m3-close/` the RED/GREEN evidence.
 - Colours are pinned in exactly one place — `tests/themed_button_offscreen.rs`,
   the M1 gate. The gallery gates assert *change*, not constants: 64 pinned
   colours would be a fixture to maintain, not a gate.

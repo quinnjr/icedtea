@@ -462,6 +462,43 @@ pub fn allocation_sized(theme: &str, widget: &str, size: (u32, u32)) -> EntryAll
         .unwrap_or_else(|| panic!("gallery --widget {widget} printed no allocation"))
 }
 
+/// `allocation_sized`, but with the gallery's `--open` flag set: the border
+/// box a disclosure widget has once it is showing its body.
+///
+/// The counterpart to [`probe_points_open`] for a band that has to span a
+/// *box* rather than sit on a subnode's centre. A collapsed `Expander` gives
+/// its `content` no space and a closed `MenuButton` hides its popover, so the
+/// closed box says nothing about where the disclosed body lands; the test
+/// still drives the real disclosure by clicking.
+///
+/// # Panics
+///
+/// As [`allocation_sized`].
+#[must_use]
+pub fn allocation_open(theme: &str, widget: &str, size: (u32, u32)) -> EntryAllocation {
+    let output = gallery(theme)
+        .arg("--widget")
+        .arg(widget)
+        .arg("--size")
+        .arg(format!("{}x{}", size.0, size.1))
+        .arg("--open")
+        .arg("--print-allocation")
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to run gallery --print-allocation --open");
+    assert!(
+        output.status.success(),
+        "gallery --print-allocation --open exited with {}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).expect("allocations are not UTF-8");
+    stdout
+        .lines()
+        .filter_map(parse_allocation_line)
+        .find(|alloc| alloc.widget == widget)
+        .unwrap_or_else(|| panic!("gallery --open --widget {widget} printed no allocation"))
+}
+
 /// A running `gallery`, killed on drop, with its stdout captured.
 ///
 /// The captured stdout is what makes §7's "screencopy **or model** assertions"
@@ -873,6 +910,14 @@ impl Driver {
     #[must_use]
     pub fn allocation(&self, widget: &str) -> EntryAllocation {
         allocation_sized(&self.theme, widget, self.output)
+    }
+
+    /// `widget`'s border box as it will be once its body is disclosed — see
+    /// [`allocation_open`]. The counterpart to [`Driver::point_open`] for a
+    /// band that has to span a box.
+    #[must_use]
+    pub fn allocation_open(&self, widget: &str) -> EntryAllocation {
+        allocation_open(&self.theme, widget, self.output)
     }
 
     /// Move the pointer, in output coordinates.

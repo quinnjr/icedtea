@@ -112,8 +112,17 @@ pub struct PopoverC {
 
 impl PopoverC {
     /// Build the two subnodes under a fresh detached root — the constructor
-    /// the positioner unit test uses, and the one every embedding widget calls
-    /// when it owns its popover rather than receiving it from the reconciler.
+    /// the positioner unit test uses.
+    ///
+    /// **Detached is the whole of it: this root is a local, and a caller that
+    /// keeps only the `PopoverC` drops the `popover` node on the floor.** It
+    /// therefore has no production caller and must not gain one; an embedding
+    /// widget appends a `popover` node to its own and calls
+    /// `<PopoverC as Controller<Msg>>::build` on that (`DropDownC::build`,
+    /// `MenuButtonC::build`). This doc used to say the opposite, and
+    /// `MenuButtonC` believed it: its menu body was reconciled into a subtree
+    /// nothing was attached to, so it had no allocation in any state and could
+    /// not be laid out, painted or hit (contract §10 P8-D72).
     #[must_use]
     pub fn for_test(position: Position, autohide: bool, has_arrow: bool) -> Self {
         let root = Node::with_classes("popover", &["background"]);

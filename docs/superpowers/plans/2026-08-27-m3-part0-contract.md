@@ -4488,6 +4488,121 @@ significant one: with no pixel-level proof of the focus ring anywhere in the
 crate, §10's "geometric focus order" interaction is currently unverifiable
 end-to-end against *any* widget.
 
+**Amended/Closed: 2026-09-02, M3 close-out.** All four of Task 12's tests are
+landed and green; `interaction_gate.rs` now carries **fifteen** tests, not
+eleven. Four production defects were driven RED first and fixed. Two of Task
+12's four diagnoses were exact, one was backwards and one named the wrong
+part.
+
+1. **`ExpanderC` — confirmed, but stated backwards; fixed.** Nothing outside
+   the module read `expanded` or `progress`, as recorded — but what that
+   cost was the *collapsed* state, not the expanded one: a collapsed gallery
+   expander was already painting its child, and the RED run says so
+   (`the band from (611, 368) to (668, 368) stayed [(188,188,188),
+   (48,54,56), …]`, glyph pixels at rest). `ExpanderC::sync_disclosure` now
+   writes `GtkWidget:visible` onto `content` through `widgets::set_displayed`
+   from `build`, `set_expanded` and every `tick`, tracking `expanded ||
+   progress > 0.0` so the content stays up for the whole of a collapse.
+   Hidden and not detached, for P8-D71's drop-down half's reason. **Not a
+   partial-height reveal**: nothing in the paint walker reads a per-node
+   transform or clip (`widgets::Revealer`'s own doc records the same limit),
+   and GTK4's own `GtkExpander` has no size transition either —
+   `gtk_expander_set_expanded` moves the child's visibility. `progress` stays
+   the arrow's rotation, and the animation half of the test's name is
+   `ExpanderC`'s own
+   `expanding_animates_progress_to_one_and_then_stops_asking_for_frames`.
+2. **`StackSwitcherC` — half right; both halves fixed.** The missing `label`
+   child is real, but it is not what made the box 0x0. A `StackSwitcher`
+   takes no view children (its pages arrive as `PropName::Pages`), so every
+   one of its node children is past reconcile's default trim bound of
+   `view_count` and the trim step detached all of them on the first
+   reconcile — `ListViewC`'s defect, in the same shape.
+   `child_index`/`reserved_total` now reserve the buttons (and `rebuild`
+   detaches only its own), and each button gains a `label` child and the
+   `.text-button` class GTK gives it, which is what Adwaita's
+   `stackswitcher > button.text-button { min-width: 100px }` is written
+   against. The switcher goes from `0 0` to `268 34`, `button0` at (573,
+   360) and `button1` at (707, 360) — clickable in the live app for the first
+   time. The label paints no text, like `MenuButton`'s and `Expander`'s: a
+   subnode with no controller has no `Measure` and no `paint`.
+3. **`MenuButtonC` — half (a) exact and fixed; half (b) was already closed.**
+   The orphaned `PopoverC::for_test` root was the whole of it: a real
+   `popover.background.menu` node is now appended to the menu button's own
+   node, `<PopoverC as Controller<Msg>>::build` runs on it and
+   `hide_when_closed()` follows — `DropDownC::build`'s shape exactly.
+   `PopoverC::open`'s `content: None` early return, half (b), had already
+   been fixed by this close-out's drop-down commit (`642f612`), which reveals
+   the retained body before consulting `content`; nothing further was needed.
+   `PopoverC::for_test` now has no production caller. A new
+   `MenuButtonC::set_expanded` is the single place the pointer path and the
+   property path meet, and `PropName::Expanded` reaches it, so `gallery
+   --open` builds the tree a click produces.
+
+   **One vendored §5.2 fixture was amended**, the only contract-signature
+   change in this entry: `menu_button.txt` gains
+   `╰── [popover.background.menu]`. GTK's own doc block for `GtkMenuButton`
+   stops at the button, but it is eliding, not contradicting —
+   `gtkmenubutton.c` calls `gtk_widget_set_parent (popover, GTK_WIDGET
+   (menu_button))`, so the popover's CSS node *is* a child of `menubutton`,
+   which is how GTK's `GtkDropDown` block spells the same relationship and
+   how `drop_down.txt` already carries it. Optional, because a `MenuButton`
+   with no menu has none. The reasoning is in `menu_button.rs`'s module doc.
+4. **The focus ring was routed to the wrong part, and the defect is much
+   larger than "the ring does not paint".** `grep` for `navigate` and
+   `note_key` across `ui/src` finds `src/bin/window-probe.rs` and nothing
+   else. P3 shipped `window::focus::navigate`, `focus_sort`,
+   `window_binding` and `FocusRing::note_key`, all unit-tested, and
+   **`App::run` never called any of them**: `route`'s `InputEvent::Key` arm
+   delivered every key to the focused controller, no controller in the crate
+   reads Tab, so Tab did nothing at all in the live app — no focus moved and
+   the ring had nothing to paint. This was not a dirty-marking bug and not a
+   P3 paint bug; it was missing wiring in P7's `App`. `route` now feeds
+   `rt.focus.note_key(key)` for every key both ways before acting on it
+   (GTK's `_gtk_window_update_focus_visible` rule) and takes
+   `window_binding`'s two Tab directions at the window, navigating with the
+   wrap `window-probe` uses. **Only the Tab directions**: the arrows, Space,
+   Return and Escape `window_binding` also names belong to widgets that
+   already read them for themselves (a `ListView`'s row cursor, a
+   `SpinButton`'s step), and stealing them at the window would break those.
+
+**Reconciliations in the landed tests.** The expander samples `gallery
+--open`'s coordinates rather than the task's `title + 30px`, which lands
+below a collapsed expander's own border box. The menu-button test's
+"dismisses outside" is not reachable: P7-D54 retains an embedded popover's
+body in the parent window's tree and `App::run` routes input only over
+`rt.instances`, so there is no grab to take and a click outside the widget
+never reaches `MenuButtonC`; the toggle is the dismissal this crate has, and
+the test asserts that round trip over the strip of the open box that lies
+outside the closed one (a band containing the button could not come back
+exactly, since the button keeps the `:hover` the click left on it). The
+Tab test bands whole buttons rather than each centre, because Adwaita's ring
+is `outline-offset: -2px`.
+
+**Test support.** `support::allocation_open`/`Driver::allocation_open` is
+`--print-allocation` with `--open`, the counterpart to `probe_points_open`;
+`gallery --open` now also seeds `model.expanded`, so a disclosure widget and
+not only a popover is built disclosed.
+
+**One adjacent defect was found and deliberately not fixed.**
+`StackSidebar` has `StackSwitcher`'s eviction defect too and still has it:
+`gallery --print-allocation --widget stack_sidebar` gives `580 320 121 80`
+— its `width_request`/`height_request` alone — and `--probe-points` emits
+only `root`, so not one of its rows is in the layout tree. It builds its rows
+from `PropName::Pages` the same way, takes no view children, and carries no
+`child_index`/`reserved_total`. No §10 interaction covers it and it is not
+one of this entry's four, so it is recorded rather than folded into a
+defect-closure commit; the fix is `StackSwitcherC`'s, verbatim.
+
+**Still open, and the only interaction of §10's sixteen that is:**
+`scrolling_a_list_view_recycles_rows_without_losing_selection`, for the
+reason P8-D71's list-view half gives (a pooled row measures and paints
+nothing, so ten rows cannot overflow a viewport and nothing recycles). All
+four of this entry's own interactions are closed; what it still carries is
+the `StackSidebar` note above.
+
+**Commit:** see `.superpowers/sdd/m3-close/closure-chrome-focus.md` for the
+full RED/GREEN trail.
+
 ### P8-D73 — `CheckButtonC` and `SwitchC` did receive the chrome-eviction fix P8-D71 reverts elsewhere
 
 **Carried out by:** Task 5 (`e41bdbf`, `SwitchC`) and Task 9 (`ff43ffd`,

@@ -150,15 +150,18 @@ pub struct Options {
     pub scroll: i32,
     /// Output scale, for HiDPI probes.
     pub scale: i32,
-    /// Render every popover-bearing sample with its popover already open.
+    /// Render every sample whose body can be disclosed with it already
+    /// disclosed — a popover shown, an expander expanded.
     ///
     /// A geometry affordance for the interaction gate, not a new interaction:
     /// a `DropDown`'s popover is hidden while closed (`PopoverC`'s own
-    /// `reveal`, which lays it out at zero size), so a closed-state
-    /// `--probe-points` can never say where a row *will* be once a click
-    /// opens it. `--open` builds the same tree the click produces, so the
-    /// gate reads the open coordinates from the binary instead of hard-coding
-    /// them, and still drives the real open by clicking.
+    /// `reveal`, which lays it out at zero size), a `MenuButton`'s the same,
+    /// and a collapsed `Expander`'s `content` takes no space at all, so a
+    /// closed-state `--probe-points` can never say where a row — or a
+    /// disclosed child — *will* be once a click opens it. `--open` builds the
+    /// same tree the click produces, so the gate reads the open coordinates
+    /// from the binary instead of hard-coding them, and still drives the real
+    /// open by clicking.
     pub open: bool,
 }
 
@@ -665,6 +668,9 @@ pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
         Kind::MenuButton => Sample::Own(
             w::menu_button("Menu")
                 .always_show_arrow(true)
+                // `--open`: the menu's own geometry, for a gate that has to
+                // know where the body lands before it clicks the button.
+                .prop(PropName::Expanded, Prop::Bool(model.open))
                 .child(w::label("Menu content")),
         ),
         Kind::Switch => Sample::Own(
@@ -1253,6 +1259,10 @@ pub fn build(opts: &Options) -> Result<Probe<GalleryMsg>, AppError> {
     let mut model = GalleryModel::new(opts.theme, opts.widget);
     model.scroll = opts.scroll;
     model.open = opts.open;
+    // `--open` discloses every retained body, not only a popover: a collapsed
+    // `Expander` gives its `content` no space, so the gate needs the expanded
+    // tree to know where the disclosed child lands.
+    model.expanded = opts.open;
     let app = App::new(model, update, scrolled_page);
     app.probe(
         opts.size,
@@ -1429,6 +1439,10 @@ pub fn run(opts: &Options) -> Result<(), AppError> {
     let mut model = GalleryModel::new(opts.theme, opts.widget);
     model.scroll = opts.scroll;
     model.open = opts.open;
+    // `--open` discloses every retained body, not only a popover: a collapsed
+    // `Expander` gives its `content` no space, so the gate needs the expanded
+    // tree to know where the disclosed child lands.
+    model.expanded = opts.open;
     let spec = SurfaceSpec {
         role: Role::Layer(LayerSpec {
             layer: zwlr_layer_shell_v1::Layer::Overlay,

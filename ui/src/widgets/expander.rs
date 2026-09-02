@@ -110,6 +110,30 @@ impl ExpanderC {
         self.started = Some(now);
         node.set_state(PseudoStates::CHECKED, on);
         self.arrow.set_state(PseudoStates::CHECKED, on);
+        self.sync_disclosure();
+    }
+
+    /// Show the `content` node exactly while the child is disclosed —
+    /// `GtkWidget:visible`, which is what `gtk_expander_set_expanded` moves
+    /// (`gtk_widget_set_child_visible` on the child bin).
+    ///
+    /// Until P8-D72's close-out nothing outside this module read `expanded`
+    /// or `progress` at all: `content` was laid out and painted whether the
+    /// expander was open or shut, so a *collapsed* gallery expander already
+    /// showed "Revealed" and expanding it changed no pixel. Hidden rather
+    /// than detached, for [`crate::widgets::set_displayed`]'s reason — the
+    /// node keeps its place in the CSS tree, so §5.2's vendored fixture
+    /// still matches and the child keeps its identity across a cycle.
+    ///
+    /// Tied to the animation, not to the target: the content stays shown for
+    /// the whole of a collapse and goes away when `progress` reaches zero, so
+    /// a controller that paints a partial reveal has something to paint.
+    /// `progress` itself is still only the arrow's rotation — nothing in the
+    /// paint walker reads a per-node transform or clip, the same limit
+    /// [`crate::widgets::Revealer`]'s own doc records — so the disclosure is
+    /// a show/hide, which is also all GTK4's own expander does.
+    fn sync_disclosure(&self) {
+        crate::widgets::set_displayed(&self.content, self.expanded || self.progress > 0.0);
     }
 
     /// Whether `local` (in `cx.node`'s own frame) falls inside `self.title`'s
@@ -176,7 +200,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for ExpanderC {
         node.set_state(PseudoStates::CHECKED, expanded);
         arrow.set_state(PseudoStates::CHECKED, expanded);
 
-        Self {
+        let this = Self {
             expanded,
             progress: if expanded { 1.0 } else { 0.0 },
             title,
@@ -184,7 +208,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for ExpanderC {
             content,
             started: None,
             universal: Universal::new(node, Kind::Expander),
-        }
+        };
+        this.sync_disclosure();
+        this
     }
 
     fn set_prop(&mut self, node: &Node, name: PropName, value: &Prop, cx: &mut BuildCx<'_>) {
@@ -232,6 +258,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for ExpanderC {
             (elapsed.as_secs_f32() / DURATION.as_secs_f32()).clamp(0.0, 1.0)
         };
         self.progress = if self.expanded { t } else { 1.0 - t };
+        self.sync_disclosure();
         if t >= 1.0 {
             self.started = None;
         }

@@ -95,17 +95,29 @@ impl StackSwitcherC {
     /// touches one of those three -- there is no incremental path over a
     /// controller-owned list this small.
     fn rebuild(&mut self) {
-        for old in self.node.children() {
+        for old in self.buttons.drain(..) {
             old.detach();
         }
-        self.buttons.clear();
         let total = self.titles.len();
         for i in 0..total {
             let button = Node::new("button");
             if needs_attention_bit(self.needs_attention, i, total) {
                 button.add_class("needs-attention");
             }
+            // A page button shows its page's title, so it is a text button
+            // and carries GTK's own `.text-button` class for it. Both halves
+            // matter to the box the switcher ends up with: `stackswitcher >
+            // button.text-button { min-width: 100px }` is Adwaita's rule for
+            // exactly this widget, and the `label` child is the node that
+            // rule (and `stackswitcher > button > label`'s padding) is
+            // written against — every other button-shaped node in this crate
+            // carries one. Like `MenuButton`'s and `Frame`'s, it is chrome:
+            // the title text itself is not painted, because a subnode with no
+            // controller has no `Measure` and no `paint` (contract §11's
+            // standing note, and `ExpanderC`'s own `label`).
+            button.add_class("text-button");
             button.set_state(PseudoStates::CHECKED, i == self.selected);
+            button.append_child(&Node::new("label"));
             self.node.append_child(&button);
             self.buttons.push(button);
         }
@@ -162,6 +174,28 @@ impl<Msg: Clone + 'static> Controller<Msg> for StackSwitcherC {
                 self.universal.apply(node, Kind::StackSwitcher, name, value);
             }
         }
+    }
+
+    /// The page buttons are this controller's own node children, built from
+    /// `PropName::Pages` before any view child could arrive, so a view child
+    /// of a `StackSwitcher` starts after them.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + self.buttons.len()
+    }
+
+    /// ... and reconcile's trim step has to know they are there, or it
+    /// detaches every one of them the moment it runs — a `StackSwitcher`
+    /// takes no view children at all (its pages arrive as props, see the
+    /// module doc), so *every* one of its node children is past the default
+    /// bound of `view_count`. Until P8-D72's close-out that is exactly what
+    /// happened: `gallery --print-allocation --widget stack_switcher`
+    /// reported a 0x0 box and `--probe-points` emitted only `root`, because
+    /// no button survived the first reconcile — so a live `StackSwitcher`
+    /// could not be clicked at all, `on_event`'s own hit-test reading the
+    /// same missing allocations. This is `ListViewC`'s pair, for the same
+    /// reason and in the same shape.
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + self.buttons.len()
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {

@@ -512,3 +512,274 @@ fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
          open:   {opened:?}\nafter:  {closed_again:?}"
     );
 }
+
+/// The band across `alloc`'s interior at row `y`: one pixel in from each
+/// vertical border edge, which is where a disclosed body's own background
+/// and border show up.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a gallery surface is never within rounding distance of i32::MAX"
+)]
+fn band(alloc: &support::EntryAllocation, y: i32) -> (i32, i32, i32) {
+    (alloc.x as i32 + 1, (alloc.x + alloc.width) as i32 - 2, y)
+}
+
+/// Clicking the title discloses the child: the message reaches the model and
+/// the child's own pixels reach the screen.
+///
+/// Reconciliation: the task text samples `(title.x, title.y + 30)`, which
+/// lands *below* a collapsed expander's own border box, and the disclosed
+/// child has no geometry at all until it is disclosed. Both coordinates come
+/// from `gallery --open` instead — the same binary asked for the tree the
+/// click produces — and the click itself is real.
+///
+/// Reconciliation 2: "animates" is asserted by `ExpanderC`'s own
+/// `expanding_animates_progress_to_one_and_then_stops_asking_for_frames`, not
+/// here. GTK4's `GtkExpander` has no size transition of its own
+/// (`gtk_expander_set_expanded` sets the child's visibility); `progress`
+/// drives the arrow. What this test can see on screen is the disclosure, and
+/// that is what it asserts.
+///
+/// A band rather than one pixel, for [`support::Driver::row`]'s reason: the
+/// disclosed child is a label, and a glyph row is mostly background between
+/// the stems.
+///
+/// Mutation check: drop the `set_displayed` call from
+/// `ExpanderC::sync_disclosure`; the content is laid out and painted whether
+/// the expander is open or shut, the band never changes, and this test fails.
+/// Restore.
+#[test]
+fn expanding_an_expander_animates_and_reveals_the_child() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "expander");
+    let (tx, ty) = driver.point("expander", "title");
+    // Where the child lands once it is disclosed — not where anything is now.
+    let (_, cy) = driver.point_open("expander", "content");
+    let (x0, x1, y) = band(&driver.allocation_open("expander"), cy);
+    let collapsed = driver.row(x0, x1, y);
+
+    driver.click(tx, ty);
+    assert!(
+        gallery.wait_msg("expanded true", REACT),
+        "the title click never reached the model; got {:?}",
+        gallery.messages()
+    );
+    let revealed = driver.wait_row_change(x0, x1, y, &collapsed);
+    assert!(
+        !support::row_matches(&revealed, &collapsed),
+        "expanding revealed nothing: the band from ({x0}, {y}) to ({x1}, {y}) \
+         stayed {collapsed:?}"
+    );
+}
+
+/// Clicking the second page button selects it, and paints it: a switcher that
+/// reports without painting is as broken as one that paints without
+/// reporting.
+///
+/// The two buttons are read from `--probe-points`, and the test requires
+/// `button0` to be left of `button1` — the geometric order the switcher packs
+/// them in — so a switcher that laid its pages out in reverse would fail here
+/// rather than silently pass on whichever button the click happened to hit.
+///
+/// Mutation check: drop `StackSwitcherC::reserved_total`; reconcile's trim
+/// step detaches every page button, no `button0` probe point exists at all
+/// and this test fails on `Driver::point`. Mutation check 2: stop clearing
+/// `:checked` on the previously selected button; the *first* assertion below
+/// still passes, so delete the `fire_index` call instead and the message
+/// never arrives. Restore.
+#[test]
+fn switching_a_stack_page_runs_the_transition() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "stack_switcher");
+    let (x0, y0) = driver.point("stack_switcher", "button0");
+    let (x1, y1) = driver.point("stack_switcher", "button1");
+    assert!(
+        x0 < x1,
+        "the switcher packs page 0 left of page 1; got ({x0}, {y0}) and ({x1}, {y1})"
+    );
+    let rest = driver.pixel(x1, y1);
+
+    driver.click(x1, y1);
+    assert!(
+        gallery.wait_msg("page 1", REACT),
+        "clicking the second page reported nothing; got {:?}",
+        gallery.messages()
+    );
+    let checked = driver.wait_pixel_change(x1, y1, rest);
+    assert!(
+        !support::matches(checked, rest),
+        "the newly selected page button never painted `:checked`; it stayed {rest:?}"
+    );
+}
+
+/// The horizontal strip `shown` covers and `shut` does not, on the side
+/// `inside` falls: where a disclosed body lands, with nothing that was
+/// already on screen in it.
+///
+/// # Panics
+///
+/// If `inside` is not outside `shut` on one side or the other, which would
+/// mean the body opens over the closed box rather than beyond it.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a gallery surface is never within rounding distance of i32::MAX"
+)]
+fn strip_beyond(
+    shut: &support::EntryAllocation,
+    shown: &support::EntryAllocation,
+    inside: i32,
+) -> (i32, i32) {
+    let (shut_left, shut_right) = (shut.x as i32, (shut.x + shut.width) as i32);
+    let (shown_left, shown_right) = (shown.x as i32, (shown.x + shown.width) as i32);
+    let strip = if inside >= shut_right {
+        (shut_right + 1, shown_right - 2)
+    } else {
+        (shown_left + 1, shut_left - 2)
+    };
+    assert!(
+        strip.0 < strip.1 && (strip.0..=strip.1).contains(&inside),
+        "{inside} is not in the strip {strip:?} beyond {shut_left}..{shut_right}"
+    );
+    strip
+}
+
+/// Clicking a menu button shows its popover, and clicking it again puts the
+/// popover away.
+///
+/// Reconciliation: the task text's "dismisses outside" is not reachable in
+/// this crate. P7-D54 rules that an embedded popover's body is retained in
+/// the parent window's own tree rather than opened as a second surface, and
+/// `App::run` routes input only over `rt.instances` — so there is no
+/// `xdg_popup` to take a grab, and no compositor-side dismissal to drive: a
+/// click outside the menu button never reaches `MenuButtonC` at all. The
+/// dismissal this crate *does* have is the toggle, and that is what the
+/// second half asserts. The round trip is the point either way: a popover
+/// that opens and never closes passes "it appeared" on its own.
+///
+/// A band, for the same reason the drop-down test uses one — the popover's
+/// own `contents` background and border are what a closed menu button does
+/// not paint — but over the strip of the *open* box that lies outside the
+/// *closed* one, on whichever side the menu opens. Not across the whole open
+/// box: showing the menu also moves the button along the row, and the button
+/// keeps the `:hover` the click left on it (nothing re-runs enter/leave for a
+/// relayout under a stationary pointer), so a band containing the button can
+/// never come back to exactly what it was. The strip the menu occupies
+/// contains no button in either state.
+///
+/// Mutation check: put `MenuButtonC::build`'s popover back on
+/// `PopoverC::for_test`; the popover root is a local that is never appended
+/// to the menu button's node, no `contents` probe point exists in any state
+/// and this test fails on `Driver::point_open`. Mutation check 2: drop
+/// `self.popover.hide_when_closed()`; the contents are painted whether the
+/// menu is open or shut and the *first* assertion fails. Restore both.
+#[test]
+fn opening_a_menu_button_popover_takes_the_grab_and_dismisses_outside() {
+    let mut driver = Driver::new();
+    let _gallery = driver.open("light", "menu_button");
+    let (bx, by) = driver.point("menu_button", "button");
+    // Where the menu lands once it is open — not where anything is now.
+    let (px, y) = driver.point_open("menu_button", "contents");
+    let shut = driver.allocation("menu_button");
+    let shown = driver.allocation_open("menu_button");
+    let (x0, x1) = strip_beyond(&shut, &shown, px);
+    let closed = driver.row(x0, x1, y);
+
+    driver.click(bx, by);
+    let opened = driver.wait_row_change(x0, x1, y, &closed);
+    assert!(
+        !support::row_matches(&opened, &closed),
+        "the menu button's popover never appeared: the band from ({x0}, {y}) \
+         to ({x1}, {y}) stayed {closed:?}"
+    );
+
+    // The button where it is *now*: the menu is a sibling of the button in the
+    // parent window's own tree (P7-D54), so showing it moves the button along
+    // the row. Clicking the closed centre again would land on the menu, not on
+    // the toggle.
+    let (ox, oy) = driver.point_open("menu_button", "button");
+    driver.click(ox, oy);
+    let closed_again = driver.wait_row_change(x0, x1, y, &opened);
+    assert!(
+        support::row_matches(&closed_again, &closed),
+        "clicking the menu button again must put the popover away.\n\
+         closed: {closed:?}\nopen:   {opened:?}\nafter:  {closed_again:?}"
+    );
+}
+
+/// Tab moves the focus ring from the first widget in geometric order to the
+/// second, and takes it off the first on the way.
+///
+/// The `ActionBar` is the form: `pack_start`'s button is left of
+/// `pack_end`'s, so "geometric order" is a real claim about this page and not
+/// about whichever node happened to be built first. Both halves are asserted
+/// — the ring arriving on `button1` *and* leaving `button0` — because a focus
+/// ring that is painted once and never moved passes either one alone.
+///
+/// This is the first assertion anywhere in this crate that the focus ring
+/// reaches the screen at all: the file's own
+/// `a_pointer_click_focuses_without_showing_the_focus_ring` asserts on
+/// messages and on the ring's *absence*, never on its pixels.
+///
+/// Mutation check: drop the Tab arm from `route`'s `InputEvent::Key` so the
+/// key is delivered to the focused controller instead — which is what the app
+/// did until P8-D72's close-out. No controller in the crate reads Tab, the
+/// focus never moves, no ring is ever painted, and this test fails on the
+/// first band. Mutation check 2: drop the `rt.focus.note_key(key)` call; the
+/// focus still moves, but GTK's focus-visible rule never runs, so the ring
+/// shows only because `FocusCause::Keyboard` set the flag — flip
+/// `set_focus`'s `Keyboard` arm to leave `focus_visible` alone and both
+/// mutations together leave the ring dark. Restore.
+#[test]
+fn tabbing_through_a_form_moves_the_focus_ring_in_geometric_order() {
+    let mut driver = Driver::new();
+    let _gallery = driver.open("light", "action_bar");
+    let (bx0, by0) = driver.point("action_bar", "button0");
+    let (bx1, by1) = driver.point("action_bar", "button1");
+    assert!(
+        bx0 < bx1,
+        "pack_start's button must be left of pack_end's; got ({bx0}, {by0}) \
+         and ({bx1}, {by1})"
+    );
+    // A band per button, not one across the whole bar: both buttons sit on
+    // the same row, so a band spanning the bar cannot say which of them the
+    // ring is on. Each band runs from the bar's own interior edge to the
+    // midpoint between the two centres, which holds all of one button and
+    // none of the other whatever the buttons measure. Whole buttons and not a
+    // margin around each centre, because Adwaita draws the ring as
+    // `outline-offset: -2px` -- two pixels inside the *border* edge, which a
+    // band clustered on the centre would miss entirely.
+    let alloc = driver.allocation("action_bar");
+    let (left, right, _) = band(&alloc, by0);
+    let mid = (bx0 + bx1) / 2;
+    assert!(
+        left < mid && mid < right,
+        "the two buttons must straddle the bar's interior; got {bx0} and {bx1} \
+         inside {left}..{right}"
+    );
+    let (a0, a1) = (left, mid);
+    let (c0, c1) = (mid, right);
+    let before0 = driver.row(a0, a1, by0);
+    let before1 = driver.row(c0, c1, by1);
+
+    driver.key(KEY_TAB);
+    let ringed0 = driver.wait_row_change(a0, a1, by0, &before0);
+    assert!(
+        !support::row_matches(&ringed0, &before0),
+        "the first Tab painted no focus ring on the first button: the band at \
+         y={by0} stayed {before0:?}"
+    );
+
+    driver.key(KEY_TAB);
+    let ringed1 = driver.wait_row_change(c0, c1, by1, &before1);
+    assert!(
+        !support::row_matches(&ringed1, &before1),
+        "the second Tab painted no focus ring on the second button: the band \
+         at y={by1} stayed {before1:?}"
+    );
+    let left0 = driver.wait_row_change(a0, a1, by0, &ringed0);
+    assert!(
+        support::row_matches(&left0, &before0),
+        "the ring must leave the first button when Tab moves on.\nbefore: \
+         {before0:?}\nringed: {ringed0:?}\nafter:  {left0:?}"
+    );
+}

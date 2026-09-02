@@ -20,7 +20,9 @@ use crate::view::render::{
     Animations, NodeAddr, NodePainter, StyleMap, layout_tree, paint_tree, restyle_tree,
 };
 use crate::view::{Kind, View};
-use crate::window::focus::{FocusCause, FocusRing};
+use crate::window::focus::{
+    Binding, FocusCause, FocusDirection, FocusRing, navigate, window_binding,
+};
 use crate::window::pointer::{ImplicitGrab, hit_chain};
 use crate::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
 use crate::window::selection::Clipboard;
@@ -1276,7 +1278,37 @@ fn route<Msg: Clone + 'static>(
             }
         }
         InputEvent::Key(key) => {
-            if let Some(node) = rt.focus.focus() {
+            // GTK's focus-visible rule (`_gtk_window_update_focus_visible`),
+            // fed every key both ways *before* the key is acted on, so the
+            // press records the focus this key found and the release can ask
+            // whether it moved: a Tab that moves the focus shows the ring,
+            // typing a letter hides it again.
+            rt.focus.note_key(key);
+            // Tab is the window's, not the focused widget's. P3 shipped
+            // `window_binding`/`navigate` and P8-D72's close-out is where
+            // `App::run` finally calls them: until then nothing in the app
+            // ever moved the focus by keyboard at all -- Tab was delivered to
+            // the focused controller, no controller in the crate reads it, and
+            // it did nothing. Only the two Tab directions are taken here; the
+            // arrows, Space, Return and Escape `window_binding` also names
+            // belong to widgets that already read them for themselves (a
+            // `ListView`'s row cursor, a `SpinButton`'s step), and stealing
+            // them at the window would break those.
+            let tab = match window_binding(key) {
+                Some(Binding::Move(
+                    dir @ (FocusDirection::TabForward | FocusDirection::TabBackward),
+                )) => Some(dir),
+                _ => None,
+            };
+            if let Some(dir) = tab {
+                // Wrapping at the end of the ring, as `window-probe` does:
+                // the second `navigate` starts over from no focus at all.
+                let next = navigate(&rt.root, &rt.layout, rt.focus.focus().as_ref(), dir)
+                    .or_else(|| navigate(&rt.root, &rt.layout, None, dir));
+                if next.is_some() {
+                    rt.focus.set_focus(next.as_ref(), FocusCause::Keyboard);
+                }
+            } else if let Some(node) = rt.focus.focus() {
                 pending.push((node, Event::Key(key.clone())));
             }
         }

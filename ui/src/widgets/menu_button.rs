@@ -11,6 +11,16 @@
 //! from its content, and the `arrow` node carries one of `.none`, `.up`,
 //! `.down`, `.left`, `.right` for the direction the menu will appear in.
 //!
+//! Reconciliation 2 (P8-D72's close-out): GTK's own doc block for this widget
+//! stops at the button and does not list the popover, so §5.2's vendored
+//! fixture gained `╰── [popover.background.menu]` when the popover stopped
+//! being an orphan. The block is eliding, not contradicting: `gtkmenubutton.c`
+//! parents the popover to the menu button (`gtk_widget_set_parent (popover,
+//! GTK_WIDGET (menu_button))`), so its CSS node *is* a child of `menubutton` —
+//! which is exactly how GTK's own `GtkDropDown` block spells the same
+//! relationship, and how `drop_down.txt` already carries it. Optional, because
+//! a `MenuButton` with no menu has none.
+//!
 //! Reconciliation: GTK nests the button's content (and the arrow within it)
 //! under an anonymous box the plan's doc comment calls `<content>`; the
 //! fixture matcher only recognises the literal token `<child>` as a wildcard
@@ -26,7 +36,7 @@ use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Kind, Prop, PropName, Props, View};
 use crate::widgets::popover::PopoverC;
-use crate::widgets::{ArrowDirection, PointerState, Position, WidgetEnum, local_rect, shift_event};
+use crate::widgets::{ArrowDirection, PointerState, WidgetEnum, local_rect, shift_event};
 use crate::window::popup::PopupAnchorPoint;
 
 /// A `GtkMenuButton` labelled `label`. Children become the popover content.
@@ -80,12 +90,26 @@ pub struct MenuButtonC {
     pointer: PointerState,
 }
 
+impl MenuButtonC {
+    /// Show or hide the menu, and paint the toggle to match.
+    ///
+    /// The pointer path and the property path have to agree about what "open"
+    /// means down to the node's own visibility, so both go through here —
+    /// `DropDownC::set_expanded`'s shape, for the same reason.
+    fn set_expanded(&mut self, on: bool) {
+        self.open = on;
+        self.popover.open = on;
+        self.popover.reveal(on);
+        self.button.set_state(PseudoStates::CHECKED, on);
+    }
+}
+
 impl<Msg: Clone + 'static> Controller<Msg> for MenuButtonC {
     fn kind(&self) -> Kind {
         Kind::MenuButton
     }
 
-    fn build(node: &Node, props: &Props, _cx: &mut BuildCx<'_>) -> Self {
+    fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {
         let button = Node::with_classes("button", &["toggle"]);
         node.append_child(&button);
         let has_label = props.str(PropName::Label).is_some();
@@ -107,28 +131,59 @@ impl<Msg: Clone + 'static> Controller<Msg> for MenuButtonC {
                 button.add_class("arrow-button");
                 arrow
             });
-        MenuButtonC {
+        // A real, tree-attached popover node — `DropDownC::build`'s shape.
+        // Until P8-D72's close-out this was `PopoverC::for_test`, whose root
+        // is a local `Node` dropped at the end of the call: the `arrow` and
+        // `contents` it built were never appended to anything, so the menu's
+        // own body (routed under `contents` by `widgets::child_slot`) was
+        // reconciled into a detached subtree, had no allocation in any state,
+        // and could not be laid out, painted or hit. `for_test`'s own doc
+        // named this the case it served; nothing in production uses it now.
+        let popover_node = Node::with_classes("popover", &["background", "menu"]);
+        node.append_child(&popover_node);
+        let mut popover_props = Props::default();
+        popover_props.set(PropName::ShowArrow, Prop::Bool(true));
+        let mut popover = <PopoverC as Controller<Msg>>::build(&popover_node, &popover_props, cx);
+        // A closed menu shows no menu. Without this the body would simply be
+        // painted beside the button for the widget's whole life, which is the
+        // defect P8-D71 measured on `DropDown` and fixed the same way.
+        popover.hide_when_closed();
+        let mut this = MenuButtonC {
             open: false,
             button,
             arrow,
-            popover: PopoverC::for_test(Position::Bottom, true, true),
+            popover,
             pointer: PointerState::default(),
-        }
+        };
+        // `GtkMenuButton` has no "popover shown" property of its own; this
+        // reuses `Expanded`, the name every other disclosure widget in the
+        // crate already carries (`DropDownC` included), so a caller — and
+        // `gallery --open`, which the interaction gate reads the open
+        // coordinates from — can build the tree a click produces without one.
+        this.set_expanded(props.bool(PropName::Expanded, false));
+        this
     }
 
     fn set_prop(&mut self, _node: &Node, name: PropName, value: &Prop, _cx: &mut BuildCx<'_>) {
-        if let (PropName::Gravity, Prop::Enum(_)) = (name, value) {
-            let direction = ArrowDirection::from_prop(Some(value), ArrowDirection::Down);
-            if let Some(arrow) = self.arrow.as_ref() {
-                arrow.set_classes(&[direction.css_class()]);
+        match (name, value) {
+            (PropName::Gravity, Prop::Enum(_)) => {
+                let direction = ArrowDirection::from_prop(Some(value), ArrowDirection::Down);
+                if let Some(arrow) = self.arrow.as_ref() {
+                    arrow.set_classes(&[direction.css_class()]);
+                }
             }
+            (PropName::Expanded, Prop::Bool(on)) => self.set_expanded(*on),
+            _ => {}
         }
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         if matches!(ev, Event::PopupDone) {
-            self.open = false;
-            self.button.set_state(PseudoStates::CHECKED, false);
+            // Through `set_expanded`, not by hand: the popover's own
+            // `on_event` never runs for an embedded popover (`deliver` routes
+            // to `Instance`s, and this node belongs to no instance), so this is
+            // the only place a dismissal can put the body away.
+            self.set_expanded(false);
             return Vec::new();
         }
         // Focus in/out is a widget-level signal, not a `MenuButton` one:
@@ -164,7 +219,6 @@ impl<Msg: Clone + 'static> Controller<Msg> for MenuButtonC {
             cx.handled = true;
             if self.open {
                 self.popover.close(cx);
-                self.open = false;
             } else {
                 self.popover.open(
                     PopupAnchorPoint::Node(self.button.clone()),
@@ -174,9 +228,11 @@ impl<Msg: Clone + 'static> Controller<Msg> for MenuButtonC {
                     None,
                     cx,
                 );
-                self.open = true;
             }
-            self.button.set_state(PseudoStates::CHECKED, self.open);
+            // `open`/`close` have already moved the popover's own state and
+            // visibility; this keeps this controller's copy and the toggle's
+            // `:checked` in step with them.
+            self.set_expanded(self.popover.open);
         }
         Vec::new()
     }
