@@ -832,6 +832,83 @@ fn a_model_swap_that_lands_the_caret_mid_codepoint_never_panics() {
 }
 
 #[test]
+fn clicking_into_a_masked_entry_places_the_caret_in_the_buffer_not_the_mask() {
+    // mutation: put `EntryC::on_event`'s caret placement back on
+    // `self.edit.layout.byte_at(local)` (its shape before this fix) and the
+    // model reads "\u{e9}\u{e9}\u{e9}z" instead -- the caret lands two
+    // characters further along than the click.
+    //
+    // With `GtkEntry:visibility` off the layout is over three *3-byte*
+    // bullets while the buffer holds three *2-byte* characters, so a display
+    // offset is not a buffer offset: `byte_at`'s 6 (after the second bullet)
+    // is the end of a 6-byte buffer, and only `buffer_offset_at` maps it back
+    // to the 4 the click actually pointed at. The same arithmetic on a longer
+    // buffer runs off its end, or lands inside one of its codepoints, which
+    // `TextEditState::insert`'s `String::replace_range` then panics on.
+    // `SearchEntryC` and `PasswordEntryC` already went through
+    // `buffer_offset_at` for exactly this reason; `EntryC`, which has its own
+    // `visibility` setter, did not.
+    use icedtea_ui::view::builders::entry;
+    use icedtea_ui::widgets::entry::EntryExt;
+    use icedtea_ui::window::BTN_LEFT;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Typed(String);
+
+    // The model itself carries the log, because `view` must be a bare `fn`
+    // pointer and cannot capture from this scope (see the search-entry test's
+    // own note): what the caret placement did is only visible in *where* the
+    // typed character landed.
+    let typed: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let frames = run(
+        ("\u{e9}\u{e9}\u{e9}".to_owned(), typed.clone()),
+        |model: &mut (String, Rc<RefCell<Vec<String>>>), Typed(text): Typed| {
+            model.0 = text;
+            Cmd::None
+        },
+        |model: &(String, Rc<RefCell<Vec<String>>>)| {
+            let recorder = model.1.clone();
+            entry(&model.0).visibility(false).on_change(move |t| {
+                recorder.borrow_mut().push(t.to_owned());
+                Typed(t.to_owned())
+            })
+        },
+        (200, 40),
+        vec![
+            // The centre of a bare, intrinsically-sized entry centred in this
+            // window: between bullets, so the caret lands mid-mask.
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 20.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 1,
+            }),
+            ScriptStep::Event(InputEvent::Key(key_char('z', 52))),
+            ScriptStep::Capture,
+        ],
+    );
+    assert!(
+        has_ink(&frames, 0, (200, 40)),
+        "the masked entry must still paint after the click and the keystroke"
+    );
+    assert_eq!(
+        typed.borrow().as_slice(),
+        ["\u{e9}\u{e9}z\u{e9}"],
+        "the keystroke must land after the second buffer character -- the one \
+         under the click -- not at a byte offset borrowed from the mask"
+    );
+}
+
+#[test]
 fn dragging_a_scale_moves_the_slider_and_reports_the_value() {
     // mutation: return early from ScaleC::on_event's PointerMotion arm and the
     // model stays at 0.0.

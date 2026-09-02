@@ -419,6 +419,49 @@ pub fn entry_allocations(theme: &str) -> Vec<EntryAllocation> {
         .collect()
 }
 
+/// Two captured spans, compared pixel for pixel with [`matches`]'s tolerance.
+#[must_use]
+pub fn row_matches(a: &[(u8, u8, u8)], b: &[(u8, u8, u8)]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| matches(*x, *y))
+}
+
+/// `entry_allocations`, but for one widget and with `--size` pinned to `size`.
+///
+/// The interaction gate needs a widget's real border box, not only its probe
+/// centres: a click that must land *past* the end of an entry's text (where
+/// GTK puts the caret at the end of the buffer) is a fraction of a box, not
+/// the centre of a subnode, and deriving it from the box the binary reports
+/// keeps it correct when an intrinsic size moves. See
+/// [`spawn_gallery_widget_sized`] for why `--size` must be pinned on every
+/// query.
+///
+/// # Panics
+///
+/// As [`probe_points`], plus if `widget` prints no allocation at all.
+#[must_use]
+pub fn allocation_sized(theme: &str, widget: &str, size: (u32, u32)) -> EntryAllocation {
+    let output = gallery(theme)
+        .arg("--widget")
+        .arg(widget)
+        .arg("--size")
+        .arg(format!("{}x{}", size.0, size.1))
+        .arg("--print-allocation")
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to run gallery --print-allocation");
+    assert!(
+        output.status.success(),
+        "gallery --print-allocation exited with {}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).expect("allocations are not UTF-8");
+    stdout
+        .lines()
+        .filter_map(parse_allocation_line)
+        .find(|alloc| alloc.widget == widget)
+        .unwrap_or_else(|| panic!("gallery --widget {widget} printed no allocation"))
+}
+
 /// A running `gallery`, killed on drop, with its stdout captured.
 ///
 /// The captured stdout is what makes §7's "screencopy **or model** assertions"
@@ -766,6 +809,15 @@ impl Driver {
             })
     }
 
+    /// `widget`'s own border box, in output coordinates.
+    ///
+    /// The counterpart to [`Driver::point`] for a click that has to be placed
+    /// *relative to* a box rather than at a subnode's centre.
+    #[must_use]
+    pub fn allocation(&self, widget: &str) -> EntryAllocation {
+        allocation_sized(&self.theme, widget, self.output)
+    }
+
     /// Move the pointer, in output coordinates.
     ///
     /// Reconciliation: the compositor's own assignment of pointer focus to
@@ -855,6 +907,51 @@ impl Driver {
         let frame = self.screencopy.capture();
         pixel_at(&frame, x as u32, y as u32)
             .unwrap_or_else(|| panic!("({x}, {y}) is outside the {:?} output", self.output))
+    }
+
+    /// Every colour along row `y` from `x0` to `x1` inclusive, from one
+    /// capture.
+    ///
+    /// A single pixel is the wrong probe for "did this text repaint": a glyph
+    /// row is mostly background between the stems, so which exact pixel a
+    /// probe centre lands on is an accident of the current metrics. A whole
+    /// band across the widget changes if *anything* in it did, and stays
+    /// meaningful when a glyph moves by a pixel.
+    ///
+    /// # Panics
+    ///
+    /// If any point in the span is outside the output.
+    pub fn row(&mut self, x0: i32, x1: i32, y: i32) -> Vec<(u8, u8, u8)> {
+        let frame = self.screencopy.capture();
+        (x0..=x1)
+            .map(|x| {
+                pixel_at(&frame, x as u32, y as u32)
+                    .unwrap_or_else(|| panic!("({x}, {y}) is outside the {:?} output", self.output))
+            })
+            .collect()
+    }
+
+    /// Capture until row `y` over `x0..=x1` stops matching `before`, or
+    /// [`REACT_TIMEOUT`] passes; returns whatever it ended on, so the caller
+    /// writes the assertion.
+    pub fn wait_row_change(
+        &mut self,
+        x0: i32,
+        x1: i32,
+        y: i32,
+        before: &[(u8, u8, u8)],
+    ) -> Vec<(u8, u8, u8)> {
+        let started = Instant::now();
+        loop {
+            let row = self.row(x0, x1, y);
+            let same = row.len() == before.len()
+                && row.iter().zip(before).all(|(now, was)| matches(*now, *was));
+            if !same || started.elapsed() >= REACT_TIMEOUT {
+                return row;
+            }
+            self.pointer.pump();
+            std::thread::sleep(CAPTURE_POLL);
+        }
     }
 
     /// Capture until `(x, y)` stops being `before`, or [`REACT_TIMEOUT`]

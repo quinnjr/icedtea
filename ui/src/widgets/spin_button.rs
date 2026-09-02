@@ -124,7 +124,14 @@ pub struct SpinButtonC {
 /// fell back to a zero-content-box default. Both `measure` and `on_event`
 /// below derive the steppers' geometry from this constant against the root's
 /// own allocation instead, matching `ScaleC`'s and `EntryC`'s precedent.
-const STEPPER_SIZE: f32 = 20.0;
+///
+/// Public because it is the only way a caller outside this module can say
+/// *where* a stepper is: the `button.up`/`button.down` subnodes carry no
+/// allocation of their own (that is what this constant exists to work
+/// around), so `interaction_gate.rs` derives its click point from the root's
+/// border box and this width rather than from a magic number that silently
+/// stops pointing at a stepper the day the control is measured differently.
+pub const STEPPER_SIZE: f32 = 20.0;
 
 impl SpinButtonC {
     /// Format `value` at `digits`. A non-finite value renders as zero rather
@@ -370,12 +377,13 @@ impl<Msg: Clone + 'static> Controller<Msg> for SpinButtonC {
         let Some(timer) = self.repeat.as_mut() else {
             return Vec::new();
         };
-        let fired = timer.fire(now);
-        if fired == 0 {
+        if !timer.fire(now) {
             return Vec::new();
         }
-        let steps = self.direction * i32::try_from(fired).unwrap_or(1);
-        let value = self.step_by(steps, false);
+        // Exactly one increment per repeat, however late this tick is: see
+        // [`RepeatTimer::fire`] for why the missed intervals are dropped
+        // rather than settled in one jump to the adjustment's bound.
+        let value = self.step_by(self.direction, false);
         cx.handlers
             .fire_float(EventKind::ValueChanged, value)
             .map_or_else(Vec::new, |m| vec![m])

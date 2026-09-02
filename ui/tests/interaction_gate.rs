@@ -3,13 +3,17 @@
 //!
 //! Every test opens **one** widget (`gallery --widget NAME`), so its
 //! coordinates are the widget's own and no other widget can move them. Points
-//! are read from `--probe-points`; nothing here hard-codes a coordinate.
+//! are read from `--probe-points`, or derived from `--print-allocation` and
+//! the hit geometry the controller itself publishes; nothing here hard-codes
+//! a coordinate.
 
 mod support;
 
 use std::time::Duration;
 
-use support::{Driver, KEY_SPACE, KEY_TAB};
+use icedtea_ui::widgets::password_entry::PEEK_WIDTH_PX;
+use icedtea_ui::widgets::spin_button::STEPPER_SIZE;
+use support::{Driver, KEY_H, KEY_I, KEY_SPACE, KEY_TAB};
 
 /// How long an interaction gets to reach the model and the screen.
 ///
@@ -163,6 +167,250 @@ fn a_pointer_click_focuses_without_showing_the_focus_ring() {
         gallery.wait_msg("clicked button", REACT),
         "Space did not activate the focused button; got {:?}",
         gallery.messages()
+    );
+}
+
+// The entry family's four subnodes (`text`, `image.left`/`image.right`,
+// `image.peek`, `button.up`/`button.down`) are appended by their controller
+// rather than returned as `View` children, so `reconcile`'s trim step
+// detaches every one of them and none has an allocation — `--probe-points`
+// reports only `root` for all four widgets, and there is no subnode centre
+// to click.
+//
+// Landing them in the layout tree (a `child_index`/`reserved_total`
+// override, the shape `SwitchC` carries) is *not* the fix it looks like: an
+// entry's own `Container` is `Container::Leaf`, which
+// `LayoutTree::set_style` writes as `Display::Flex`, and taffy calls a
+// node's measure closure only when that node has no taffy children
+// (`compute_layout_with_measure` dispatches on `has_children`). Attaching
+// the chrome therefore silences `EntryC::measure`/`PasswordEntryC::measure`/
+// `SpinButtonC::measure` and each control collapses to whatever its chrome
+// happens to size to — measured, a `PasswordEntry` showing "hunter2" went
+// from a 78px box to a 43px one, and `widget_pixels.rs`'s own
+// `peeking_a_password_entry_reveals_the_text` stopped finding the peek band
+// at all. Sizing these four from their subnodes is a real piece of work
+// (each subnode needs its own `Measure`), not a two-line override.
+//
+// So the four tests below take their click points from the one box that is
+// always right — the widget's own border box, from
+// `gallery --print-allocation` — plus the hit geometry the controller
+// itself publishes ([`PEEK_WIDTH_PX`], [`STEPPER_SIZE`]). Nothing here is a
+// magic number either way; both spellings are derived, and this one does not
+// need a production regression to work.
+
+/// Just inside `alloc`'s *left* border edge, vertically centred: before the
+/// first glyph, which is where GTK puts the caret for a click there.
+///
+/// The left edge and not the right: `TextEditState::build` starts the cursor
+/// at `text.len()`, so a click past the end of the text lands the caret
+/// exactly where it already was and a test written against it passes whether
+/// the click placed the caret or not.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a gallery surface is never within rounding distance of i32::MAX"
+)]
+fn before_the_text(alloc: &support::EntryAllocation) -> (i32, i32) {
+    (alloc.x as i32 + 3, (alloc.y + alloc.height / 2.0) as i32)
+}
+
+/// `alloc`'s interior, one pixel in from each border edge: the band a repaint
+/// of the widget's *content* shows up in, with the focus ring the border
+/// paints excluded so a state change cannot be mistaken for a content change.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a gallery surface is never within rounding distance of i32::MAX"
+)]
+fn interior(alloc: &support::EntryAllocation) -> (i32, i32, i32) {
+    (
+        alloc.x as i32 + 1,
+        (alloc.x + alloc.width) as i32 - 2,
+        (alloc.y + alloc.height / 2.0) as i32,
+    )
+}
+
+/// Typing must reach the model *and* the glyphs must reach the screen: either
+/// half alone would pass with the other broken.
+///
+/// The click lands before the first glyph of "Entry", so the caret must move
+/// from where the model left it (the end of the buffer) to 0, and the two
+/// keys must land *there*: the model reads exactly `hiEntry`, never `Entryhi`
+/// (the click never moved the caret) or `Ehintry` (it moved somewhere else).
+///
+/// Mutation check: make `EntryC` swallow `Event::Key` without emitting
+/// `EventKind::Change`; the message never arrives and this test fails.
+/// Restore. Mutation check 2: put `EntryC::on_event`'s caret placement back on
+/// `local_rect(cx.tree, cx.node, &self.edit.text_node)`; `text` has no
+/// allocation, the block goes dead, the caret stays at the end and the model
+/// reads `Entryhi`.
+#[test]
+fn typing_into_an_entry_shows_the_glyphs_and_moves_the_caret() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "entry");
+    let alloc = driver.allocation("entry");
+    let (cx, cy) = before_the_text(&alloc);
+    let (x0, x1, y) = interior(&alloc);
+    let before = driver.row(x0, x1, y);
+
+    driver.click(cx, cy);
+    driver.keys(&[KEY_H, KEY_I]);
+
+    assert!(
+        gallery.wait_msg("changed entry hiEntry", REACT),
+        "typing did not reach the model at the clicked caret; got {:?}",
+        gallery.messages()
+    );
+    let after = driver.wait_row_change(x0, x1, y, &before);
+    assert!(
+        !support::row_matches(&after, &before),
+        "the typed glyphs never reached the screen"
+    );
+}
+
+/// One search, after the delay — not one per keystroke. That debounce is the
+/// whole behaviour `SearchEntry` adds over `Entry`.
+///
+/// Mutation check: make `SearchEntryC` fire `EventKind::Search` on every key;
+/// the count assertion below fails with 2. Restore.
+#[test]
+fn typing_into_a_search_entry_fires_one_search_after_the_delay() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "search_entry");
+    let (tx, ty) = driver.point("search_entry", "root");
+
+    driver.click(tx, ty);
+    driver.keys(&[KEY_H, KEY_I]);
+    assert!(
+        gallery.wait_msg("search hi", REACT),
+        "the search never fired; got {:?}",
+        gallery.messages()
+    );
+    // Let any further debounced fire land before counting.
+    std::thread::sleep(Duration::from_millis(500));
+    let searches = gallery
+        .messages()
+        .iter()
+        .filter(|line| line.starts_with("search "))
+        .count();
+    assert_eq!(
+        searches,
+        1,
+        "two keystrokes must debounce into one search; got {:?}",
+        gallery.messages()
+    );
+}
+
+/// Peeking reveals the real text, and peeking again hides it: the widget's
+/// content must change when the peek icon is clicked, with no keystroke in
+/// between, and come back to what it was on the second click.
+///
+/// Three clicks, not one, and the interior band rather than a single pixel,
+/// because a single click also focuses the entry: comparing two *focused*
+/// renderings of the same buffer is what makes this a test of the peek toggle
+/// rather than of the focus ring, and the third click proves the change is a
+/// toggle and not a one-way state change that any first click would produce.
+///
+/// The peek icon's hit band is the last [`PEEK_WIDTH_PX`] of the content box
+/// (`PasswordEntryC::on_event`), and the content box is the border box less
+/// Adwaita's `entry` padding, which is well under half that width — so a
+/// point `PEEK_WIDTH_PX / 2` in from the right border edge is inside the band
+/// whatever that padding is.
+///
+/// Mutation check: drop `self.edit.visibility = self.peek;` from
+/// `PasswordEntryC::on_event`'s peek arm; the *second* assertion below fails
+/// ("a second peek must hide the text again"). Note that the first one still
+/// passes under that mutation -- the click does change the rendering, through
+/// focus and the caret -- which is exactly why the round trip is here.
+/// Restore.
+#[test]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a gallery surface is never within rounding distance of i32::MAX"
+)]
+fn peeking_a_password_entry_reveals_the_text() {
+    let mut driver = Driver::new();
+    let _gallery = driver.open("light", "password_entry");
+    let alloc = driver.allocation("password_entry");
+    let (x0, x1, y) = interior(&alloc);
+    let (px, py) = (
+        (alloc.x + alloc.width - PEEK_WIDTH_PX / 2.0) as i32,
+        (alloc.y + alloc.height / 2.0) as i32,
+    );
+
+    let masked = driver.row(x0, x1, y);
+    driver.click(px, py);
+    let revealed = driver.wait_row_change(x0, x1, y, &masked);
+    assert!(
+        !support::row_matches(&revealed, &masked),
+        "the peek icon revealed nothing: the text stayed {masked:?}"
+    );
+
+    driver.click(px, py);
+    let remasked = driver.wait_row_change(x0, x1, y, &revealed);
+    assert!(
+        !support::row_matches(&remasked, &revealed),
+        "a second peek must hide the text again; it stayed {revealed:?}"
+    );
+
+    driver.click(px, py);
+    let revealed_again = driver.wait_row_change(x0, x1, y, &remasked);
+    assert!(
+        support::row_matches(&revealed_again, &revealed),
+        "peek is a toggle: the third click must render exactly what the first \
+         did.\nfirst:  {revealed:?}\nthird:  {revealed_again:?}"
+    );
+}
+
+/// Holding the up button must step more than once, one increment at a time:
+/// that repeat timer is the clock-driven behaviour `SpinButtonC::tick` owns.
+///
+/// The gallery's spin button is horizontal, whose `button.up` is the last
+/// [`STEPPER_SIZE`] of the root's border box (`SpinButtonC::stepper_rects`),
+/// so the press lands `STEPPER_SIZE / 2` in from the right edge.
+///
+/// Mutation check: make `SpinButtonC::next_deadline` return `None`; only the
+/// first step happens and this test fails on the second value. Restore.
+/// Mutation check 2: put `RepeatTimer::fire`'s catch-up loop back and run the
+/// whole file at once; one late tick settles every missed interval, the value
+/// jumps 4 -> 10 and the `value spin_button 5` assertion fails. It has to be
+/// the whole file: run alone on an idle machine the app loop ticks on time
+/// and the catch-up loop passes this too, which is why
+/// `RepeatTimer`'s own `a_late_repeat_fires_once_and_re_anchors_on_the_clock_it_was_given`
+/// is the deterministic guard for that half.
+#[test]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a gallery surface is never within rounding distance of i32::MAX"
+)]
+fn stepping_a_spin_button_repeats_while_the_button_is_held() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "spin_button");
+    let alloc = driver.allocation("spin_button");
+    let (ux, uy) = (
+        (alloc.x + alloc.width - STEPPER_SIZE / 2.0) as i32,
+        (alloc.y + alloc.height / 2.0) as i32,
+    );
+
+    driver.press(ux, uy);
+    assert!(
+        gallery.wait_msg("value spin_button 4", REACT),
+        "the first step never happened; got {:?}",
+        gallery.messages()
+    );
+    assert!(
+        gallery.wait_msg("value spin_button 5", REACT),
+        "the held button did not repeat one step at a time; got {:?}",
+        gallery.messages()
+    );
+    driver.release(ux, uy);
+
+    let steps = gallery
+        .messages()
+        .iter()
+        .filter(|line| line.starts_with("value spin_button "))
+        .count();
+    assert!(
+        steps >= 2,
+        "a held spin button must step at least twice, got {steps}"
     );
 }
 

@@ -19,7 +19,7 @@ use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{EditOutcome, TextEditState, UndoStack};
-use crate::widgets::{PointerState, local_rect, shift_event};
+use crate::widgets::{PointerState, content_rect_local, local_rect, shift_event};
 use crate::window::focus::FocusCause;
 use crate::window::keyboard::Mods;
 use crate::window::popup::PopupKey;
@@ -241,7 +241,30 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
             // receive keyboard focus by any means.
             cx.focus.set_focus(Some(cx.node), FocusCause::Pointer);
         }
-        if let Some(rect) = local_rect(cx.tree, cx.node, &self.edit.text_node) {
+        // The caret follows the click.
+        //
+        // This hit-tested `local_rect(cx.tree, cx.node, &self.edit.text_node)`,
+        // which is `None` for `text` in every frame: `TextEditState::build`
+        // appends that subnode itself rather than returning it as a `View`
+        // child, so `reconcile`'s trim step detaches it (this controller
+        // reserves nothing) and `tree.allocation` never answers for it. The
+        // whole block was therefore dead and an `Entry`'s caret could not be
+        // placed by clicking at all -- it stayed where `TextEditState::build`
+        // put it (`cursor: text.len()`), so a click anywhere in the entry,
+        // followed by typing, appended at the end of the buffer.
+        // `SearchEntryC` and `PasswordEntryC` both already carry the fix and
+        // say so in their own notes; `content_rect_local` derives the same
+        // region from this controller's own allocation, which
+        // `window/pointer.rs::descend` does stop at.
+        //
+        // `buffer_offset_at`, not `layout.byte_at`, for the same reason
+        // `PasswordEntryC` gives: with `GtkEntry:visibility` off the layout is
+        // over the invisible character, whose byte offsets are not the
+        // buffer's -- a bare `byte_at` can land the cursor past the end of a
+        // shorter buffer, or inside one of its codepoints, which
+        // `TextEditState::insert`'s own `String::replace_range` then panics
+        // on.
+        if let Some(rect) = content_rect_local(cx.tree, cx.node) {
             let shifted = shift_event(ev, rect);
             self.pointer.observe(
                 &self.edit.text_node,
@@ -249,7 +272,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
                 Some(Rect::new(0.0, 0.0, rect.width, rect.height)),
             );
             if let Event::PointerDown { local, .. } = shifted {
-                self.edit.cursor = self.edit.layout.byte_at(local);
+                self.edit.cursor = self.edit.buffer_offset_at(local);
                 self.edit.anchor = None;
                 cx.handled = true;
             }

@@ -4234,6 +4234,87 @@ gate's 4, the M2 gate's 9/10 + 4, the transition test's 1, the M3 gates'
 8 + 6-of-16, `compositor/tests/popups.rs` green three times running,
 `widget_pixels.rs` at 39/39) is verified green.
 
+**Amended/Closed (entry half): 2026-09-02, M3 close-out.** Task 10's four
+tests are landed and green; `interaction_gate.rs` now carries **ten** tests,
+not six, and `widget_pixels.rs` **40**, not 39. Task 11's two drop-down and
+list-view tests remain the only ones this amendment still leaves open (they
+are the other half of this entry, closed separately).
+
+**The chrome-eviction fix was *not* landed, and must not be.** Recovering
+`1f64d71` and re-deriving `widget_pixels.rs`'s coordinates — the path this
+amendment's Ruling anticipated — was tried and rejected on evidence. The
+`child_index`/`reserved_total` overrides do not merely *shift* those two
+widgets' intrinsic sizes; they **disable the controllers' own `measure`
+entirely**. An entry-family widget takes no `View` children, so
+`view::render::container_for` classifies it `Container::Leaf`, which
+`LayoutTree::set_style` writes into taffy as `Display::Flex`; taffy calls a
+node's measure closure only for a node with no taffy children
+(`compute_layout_with_measure` dispatches on `has_children`), and
+`LayoutTree::sync_node` gives every CSS child a taffy node. Attaching the
+chrome therefore silences `EntryC::measure`, `PasswordEntryC::measure` and
+`SpinButtonC::measure`, and each control collapses to whatever its chrome
+happens to size to: measured on this branch, a `PasswordEntry` showing
+"hunter2" went from a 78x34 box to a 43x34 one, and the peek band it reserves
+moved out from under `widget_pixels.rs`'s click. The 39/39 → 37/39 regression
+was that sizing collapse showing through, not coordinate drift — re-deriving
+the two coordinates would have shipped four mis-sized widgets and called it
+a coordinate fix. Sizing these four from their own subnodes (each subnode
+needs its own `Measure`) is real work, out of scope for a close-out, and
+tracked by this amendment rather than half-done by it.
+
+**What landed instead.** The four tests take their click points from the one
+box that is always correct — the widget's own border box, from
+`gallery --print-allocation`, via the new `support::allocation_sized` and
+`Driver::allocation` — plus the hit geometry the controller itself publishes
+(`password_entry::PEEK_WIDTH_PX` and `spin_button::STEPPER_SIZE`, both made
+`pub` for this). Nothing is hard-coded either way, and no production sizing
+changes.
+
+**Two of Task 10's three diagnoses were confirmed; the third was wrong.**
+
+1. **`EntryC`'s caret-click `local_rect` path — confirmed, fixed.** The block
+   hit-tested `local_rect(cx.tree, cx.node, &self.edit.text_node)`, which is
+   `None` for `text` in every frame, so the whole block was dead and an
+   `Entry`'s caret could not be placed by clicking *at all*: it stayed at
+   `TextEditState::build`'s initial `text.len()`. Now `content_rect_local`,
+   the fix `SearchEntryC` and `PasswordEntryC` already carried. Driven RED
+   first: with the old spelling, clicking before the first glyph of "Entry"
+   and typing "hi" gives `changed entry Entryhi` (the caret never moved);
+   with the fix, `changed entry hiEntry`. Note that Task 10's test clicked
+   *past* the text, where the initial caret already is — an assertion no
+   caret placement, working or broken, can fail.
+2. **`SpinButtonC`'s repeat overshoot — confirmed, fixed in
+   `RepeatTimer::fire`.** `fire` counted every interval that had elapsed
+   since the deadline it missed and `tick` stepped once per count, so one
+   late tick — routine, since a gallery repaint takes seconds — took a held
+   stepper straight from its first step to the adjustment's clamped bound
+   (the observed `3 -> 4 -> 10`), and re-applied `climb` once per missed
+   interval on the way. `fire` now returns `bool`, fires at most once per
+   call and re-anchors the next deadline on `now`, which is what a repeat
+   means (GTK's stepper is a `g_timeout` callback: once per invocation, never
+   replayed). Covered by the new
+   `a_late_repeat_fires_once_and_re_anchors_on_the_clock_it_was_given`.
+3. **The password-peek failure was *not* a production defect.** Task 10 read
+   it as the same degenerate-geometry problem. It was the probe point: the
+   `text` centre it sampled is background in both the masked and the revealed
+   rendering, so a single pixel there cannot see the toggle at all. The test
+   now samples the widget's whole interior band and clicks the peek icon
+   three times, asserting reveal, re-mask, and that the third click renders
+   exactly what the first did — which no focus-ring or caret change can
+   satisfy, and which the "peek without re-shaping" mutation fails.
+
+**One further defect was found and fixed on the way**, latent rather than
+observed: `EntryC` placed the caret with `layout.byte_at`, a *display* offset,
+where both siblings use `buffer_offset_at`. With `GtkEntry:visibility` off the
+layout is over 3-byte bullets while the buffer is not, so the caret lands at
+the wrong character, and on a longer or non-ASCII buffer past its end or
+inside a codepoint, which `String::replace_range` panics on. Covered by
+`widget_pixels.rs`'s new
+`clicking_into_a_masked_entry_places_the_caret_in_the_buffer_not_the_mask`.
+
+**Commit:** see `.superpowers/sdd/m3-close/closure-entries.md` for the full
+RED/GREEN trail.
+
 ### P8-D72 — Task 12's four interactions are absent too, each blocked by a distinct pre-existing production defect
 
 **Carried out by:** Task 12 (written, driven RED, root-caused, left

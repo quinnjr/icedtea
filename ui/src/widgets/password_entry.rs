@@ -63,7 +63,12 @@ impl<Msg: Clone + 'static> PasswordEntryExt<Msg> for View<Msg> {
 /// Plan reconciliation: see [`PasswordEntryC::on_event`]'s own note — the
 /// space this controller reserves, at the right of its content box, for the
 /// peek icon's hit region.
-const PEEK_WIDTH_PX: f32 = 24.0;
+///
+/// Public for the same reason [`crate::widgets::spin_button::STEPPER_SIZE`]
+/// is: `image.peek` carries no allocation of its own, so a test that has to
+/// click the peek icon derives its point from the root's border box and this
+/// width instead of from a magic number.
+pub const PEEK_WIDTH_PX: f32 = 24.0;
 
 /// Plan reconciliation: see [`crate::widgets::entry`]'s own `CARET_WIDTH_PX`
 /// — an empty buffer measures to zero width, and a zero-area node is one

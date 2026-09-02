@@ -499,19 +499,31 @@ impl RepeatTimer {
         self.next
     }
 
-    /// How many repeats are due at `now`, rearming for the next one.
+    /// Whether a repeat is due at `now`, rearming for the next one.
     ///
-    /// Returns 0 before the deadline. Bounded at 16 per call so a clock that
-    /// jumped forward cannot emit thousands of steps in one tick.
-    pub fn fire(&mut self, now: Duration) -> u32 {
-        let mut fired = 0u32;
-        while now >= self.next && fired < 16 {
-            fired += 1;
-            let scaled = self.interval.as_secs_f64() / self.climb;
-            self.interval = Duration::from_secs_f64(scaled).max(Self::MIN_INTERVAL);
-            self.next += self.interval;
+    /// `false` before the deadline. **At most one repeat per call, and the
+    /// next deadline is measured from `now`, not from the deadline that was
+    /// missed.** A held button repeats on a wall clock the caller does not
+    /// control: `tick` runs from the app loop, and one gallery repaint takes
+    /// seconds (`support::GALLERY_MAP_TIMEOUT` measures why), so several
+    /// intervals routinely elapse between two ticks. Counting them and
+    /// stepping once per missed interval made a held `SpinButton` jump
+    /// straight from its first step to its clamped bound -- the observed
+    /// `3 -> 4 -> 10` -- instead of stepping visibly, one increment at a
+    /// time, for as long as the button is held; and each counted interval
+    /// also applied `climb` again, so a slow frame accelerated the repeat as
+    /// if the user had held the button through every one of them. Dropping
+    /// the arrears is what a repeat *means*: GTK's own stepper is a
+    /// `g_timeout` callback, which fires once per invocation however late the
+    /// main loop is, and never replays the ones it missed.
+    pub fn fire(&mut self, now: Duration) -> bool {
+        if now < self.next {
+            return false;
         }
-        fired
+        let scaled = self.interval.as_secs_f64() / self.climb;
+        self.interval = Duration::from_secs_f64(scaled).max(Self::MIN_INTERVAL);
+        self.next = now + self.interval;
+        true
     }
 }
 
@@ -2010,15 +2022,16 @@ mod tests {
     #[test]
     fn a_repeat_timer_accelerates_but_never_below_its_floor() {
         // mutation: remove the `.max(MIN_INTERVAL)` and the interval collapses
-        // to zero, so `fire` returns the 16-step cap on every call.
+        // to zero, so the deadline stops advancing and the floor assertion
+        // below fails.
         let mut timer = RepeatTimer::armed(
             Duration::ZERO,
             Duration::from_millis(400),
             Duration::from_millis(100),
             2.0,
         );
-        assert_eq!(timer.fire(Duration::from_millis(399)), 0, "not yet due");
-        assert_eq!(timer.fire(Duration::from_millis(400)), 1);
+        assert!(!timer.fire(Duration::from_millis(399)), "not yet due");
+        assert!(timer.fire(Duration::from_millis(400)));
         let first = timer.deadline();
         assert!(first > Duration::from_millis(400));
         for step in 1..40u64 {
@@ -2029,6 +2042,43 @@ mod tests {
         assert!(
             timer.deadline() - before >= RepeatTimer::MIN_INTERVAL,
             "the interval floors at 20ms"
+        );
+    }
+
+    #[test]
+    fn a_late_repeat_fires_once_and_re_anchors_on_the_clock_it_was_given() {
+        // mutation: restore `fire`'s catch-up loop (`while now >= self.next`,
+        // `self.next += self.interval`) and the deadline assertion below fails
+        // (`5.1s` against `5.103s`): the re-armed deadline is measured from
+        // the last missed deadline, so it stays on the old grid instead of one
+        // interval past the clock the caller actually gave. The `bool` return
+        // makes the *other* half of the same bug -- several repeats settled in
+        // one call -- unrepresentable rather than merely untested.
+        //
+        // This is the `SpinButton` repeat overshoot: the app loop cannot tick
+        // on time while a repaint is in flight, and a repeat that settles its
+        // arrears in one call steps a held stepper straight to its bound.
+        let mut timer = RepeatTimer::armed(
+            Duration::ZERO,
+            Duration::from_millis(400),
+            Duration::from_millis(100),
+            1.0,
+        );
+        // Deliberately not a whole number of intervals past the arming
+        // delay: a catch-up loop lands the deadline on `400 + n * 100`, which
+        // for a round `late` would coincide with the re-anchored answer.
+        let late = Duration::from_millis(5_003);
+        assert!(timer.fire(late), "a missed deadline still fires");
+        assert!(
+            !timer.fire(late),
+            "and only once: the arrears of the 46 intervals it slept through \
+             are dropped, not replayed"
+        );
+        assert_eq!(
+            timer.deadline(),
+            late + Duration::from_millis(100),
+            "the next deadline is one interval after the clock it was given, \
+             not after the deadline that was missed"
         );
     }
 
