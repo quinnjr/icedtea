@@ -154,6 +154,24 @@ impl<Msg: Clone + 'static> Controller<Msg> for CheckButtonC {
         self.apply(node);
     }
 
+    /// `build` attaches `check` (always) and `label` (when there is one)
+    /// directly to `node`, ahead of any real view child.
+    ///
+    /// Without this override, [`Controller::reserved_total`]'s default of
+    /// `view_count` (zero, since a `CheckButton` takes no view children at
+    /// all) makes `reconcile`'s trim step detach both on the very first
+    /// reconcile -- the same chrome-eviction bug documented on
+    /// [`crate::widgets::switch::SwitchC::child_index`], found here by a
+    /// headless probe walking `node`'s real children and finding neither.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + 1 + usize::from(self.label.is_some())
+    }
+
+    /// See [`Self::child_index`].
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + 1 + usize::from(self.label.is_some())
+    }
+
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         let bounds = cx
             .tree

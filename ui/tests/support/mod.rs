@@ -8,7 +8,9 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use icedtea_harness::{CapturedFrame, ScreencopyClient, VirtualPointerClient};
+use icedtea_harness::{
+    CapturedFrame, Compositor, ScreencopyClient, VirtualKeyboardClient, VirtualPointerClient,
+};
 
 /// The theme every test pins its expected colours against. Never the
 /// developer's own `gtk.css`.
@@ -500,6 +502,68 @@ pub fn spawn_gallery_widget(socket: &str, theme: &str, widget: &str) -> GalleryP
     spawn_gallery_command(command, socket)
 }
 
+/// `spawn_gallery_widget`, but with `--size` pinned to `size` instead of
+/// [`Options::DEFAULT_SIZE`].
+///
+/// Reconciliation: [`Driver`] needs this and [`probe_points_sized`] below,
+/// which [`spawn_gallery_widget`]/[`probe_points`] cannot be repurposed into
+/// without changing a signature every other test file in this crate already
+/// calls positionally. A layer surface requesting the default 1280x800 is
+/// silently clamped by the compositor to fit its real output when that
+/// output is shorter -- the harness's own is 1280x720 -- so the *live*
+/// gallery relayouts to the clamped size while a headless `--probe-points`
+/// run with no `--size` still measures the unclamped 1280x800 layout. A
+/// widget centred on the window's full height then lands at a different
+/// point in each (e.g. y=400 in the assumed 800px height versus y=360 in the
+/// real 720px one, well outside a 34px-tall button), so every click coded
+/// against the mismatched probe coordinate silently misses the widget.
+/// Pinning `--size` to the compositor's own `output_size()` on both the live
+/// process and every probe query keeps them laying out identically.
+#[must_use]
+pub fn spawn_gallery_widget_sized(
+    socket: &str,
+    theme: &str,
+    widget: &str,
+    size: (u32, u32),
+) -> GalleryProc {
+    let mut command = gallery(theme);
+    command
+        .arg("--widget")
+        .arg(widget)
+        .arg("--size")
+        .arg(format!("{}x{}", size.0, size.1));
+    spawn_gallery_command(command, socket)
+}
+
+/// `probe_points`, but with `--size` pinned to `size`. See
+/// [`spawn_gallery_widget_sized`] for why.
+///
+/// # Panics
+///
+/// As [`probe_points`].
+#[must_use]
+pub fn probe_points_sized(theme: &str, widget: &str, size: (u32, u32)) -> Vec<ProbePoint> {
+    let output = gallery(theme)
+        .arg("--widget")
+        .arg(widget)
+        .arg("--size")
+        .arg(format!("{}x{}", size.0, size.1))
+        .arg("--probe-points")
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to run gallery --probe-points");
+    assert!(
+        output.status.success(),
+        "gallery --probe-points exited with {}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).expect("probe points are not UTF-8");
+    stdout
+        .lines()
+        .map(|line| parse_probe_line(line).unwrap_or_else(|| panic!("bad probe line {line:?}")))
+        .collect()
+}
+
 /// How long a gallery gets to map and paint its first frame.
 ///
 /// A generous complexity bound, not a wall-clock pin: it covers compiling a
@@ -595,3 +659,239 @@ pub fn paints_something(
         })
     })
 }
+
+// ---------------------------------------------------------------------------
+// M3: the interaction driver
+// ---------------------------------------------------------------------------
+
+/// Linux input-event keycodes the interaction gate sends.
+pub const KEY_ESC: u32 = 1;
+pub const KEY_A: u32 = 30;
+pub const KEY_H: u32 = 35;
+pub const KEY_I: u32 = 23;
+pub const KEY_TAB: u32 = 15;
+pub const KEY_ENTER: u32 = 28;
+pub const KEY_SPACE: u32 = 57;
+pub const KEY_UP: u32 = 103;
+pub const KEY_DOWN: u32 = 108;
+
+/// One compositor, one gallery, one pointer and one keyboard: everything an
+/// interaction test needs, with the coordinates read from the binary.
+pub struct Driver {
+    compositor: Compositor,
+    socket: String,
+    screencopy: ScreencopyClient,
+    pointer: VirtualPointerClient,
+    keyboard: VirtualKeyboardClient,
+    output: (u32, u32),
+    theme: String,
+    widget: String,
+    background: (u8, u8, u8),
+    background_probe: (u32, u32),
+}
+
+impl Driver {
+    /// Boot a compositor and its injectors.
+    ///
+    /// # Panics
+    ///
+    /// If the compositor advertises no output, screencopy or injector.
+    #[must_use]
+    pub fn new() -> Driver {
+        let compositor = Compositor::spawn();
+        let socket = compositor
+            .socket_path()
+            .file_name()
+            .expect("socket name")
+            .to_string_lossy()
+            .to_string();
+        let (w, h) = compositor.output_size();
+        let mut screencopy = ScreencopyClient::spawn(&socket);
+        let background_probe = (w as u32 - 3, h as u32 / 2);
+        let empty = screencopy.capture();
+        let background = pixel_at(&empty, background_probe.0, background_probe.1)
+            .expect("the background probe is inside the frame");
+        let pointer = VirtualPointerClient::spawn(&socket);
+        let keyboard = VirtualKeyboardClient::spawn(&socket);
+        Driver {
+            compositor,
+            socket,
+            screencopy,
+            pointer,
+            keyboard,
+            output: (w as u32, h as u32),
+            theme: String::new(),
+            widget: String::new(),
+            background,
+            background_probe,
+        }
+    }
+
+    /// The compositor's socket name.
+    #[must_use]
+    pub fn socket(&self) -> String {
+        self.socket.clone()
+    }
+
+    /// Open one widget, alone, and wait for its first frame.
+    ///
+    /// # Panics
+    ///
+    /// If the gallery never paints.
+    pub fn open(&mut self, theme: &str, widget: &str) -> GalleryProc {
+        self.theme = theme.to_string();
+        self.widget = widget.to_string();
+        let gallery = spawn_gallery_widget_sized(&self.socket, theme, widget, self.output);
+        let _ = wait_for_gallery(&mut self.screencopy, self.background_probe, self.background);
+        gallery
+    }
+
+    /// The output-space centre of `widget`'s `label` subnode.
+    ///
+    /// # Panics
+    ///
+    /// If the widget exposes no such probe point — the message lists the ones
+    /// it does expose, which is what makes a renamed subnode a readable
+    /// failure rather than a mystery.
+    #[must_use]
+    pub fn point(&self, widget: &str, label: &str) -> (i32, i32) {
+        let points = probe_points_sized(&self.theme, widget, self.output);
+        points
+            .iter()
+            .find(|p| p.label == label)
+            .map(|p| (p.x, p.y))
+            .unwrap_or_else(|| {
+                let have: Vec<&str> = points.iter().map(|p| p.label.as_str()).collect();
+                panic!("{widget} has no {label:?} probe point; it has {have:?}")
+            })
+    }
+
+    /// Move the pointer, in output coordinates.
+    ///
+    /// Reconciliation: the compositor's own assignment of pointer focus to
+    /// the surface under the cursor is not synchronous with the
+    /// `motion_absolute` request that triggers it -- `window_events.rs`
+    /// documents the analogous "spawn the pointer before the client connects"
+    /// race for `wl_pointer` object capability, and this is the same race one
+    /// level up, for *surface* focus: a `button()` sent immediately after a
+    /// `motion_absolute` that has just moved the pointer onto a surface for
+    /// the first time can reach the seat before it has finished assigning
+    /// focus, and `wlr_seat_pointer_notify_button` drops a button with no
+    /// focused surface silently rather than erroring. A short settle with a
+    /// few extra roundtrips closes that window; confirmed against a debug
+    /// build of the gallery binary that a `button()` sent back-to-back with
+    /// `motion_absolute` (no settle) is dropped, while the same click after
+    /// this settle reaches `ButtonC::on_event`.
+    pub fn move_to(&mut self, x: i32, y: i32) {
+        self.pointer
+            .motion_absolute(f64::from(x), f64::from(y), self.output.0, self.output.1);
+        self.pointer.frame();
+        self.pointer.pump();
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(25));
+            self.pointer.pump();
+        }
+    }
+
+    /// Press the left button at `(x, y)`.
+    pub fn press(&mut self, x: i32, y: i32) {
+        self.move_to(x, y);
+        self.pointer.button(icedtea_ui::wayland::BTN_LEFT, true);
+        self.pointer.frame();
+        self.pointer.pump();
+    }
+
+    /// Release the left button at `(x, y)`.
+    pub fn release(&mut self, x: i32, y: i32) {
+        self.move_to(x, y);
+        self.pointer.button(icedtea_ui::wayland::BTN_LEFT, false);
+        self.pointer.frame();
+        self.pointer.pump();
+    }
+
+    /// Press and release at `(x, y)`.
+    pub fn click(&mut self, x: i32, y: i32) {
+        self.press(x, y);
+        self.release(x, y);
+    }
+
+    /// Press at `from`, move through the midpoint, release at `to` — the
+    /// motion in the middle is what a drag needs; a teleport looks like a
+    /// click somewhere else.
+    pub fn drag(&mut self, from: (i32, i32), to: (i32, i32)) {
+        self.press(from.0, from.1);
+        self.move_to((from.0 + to.0) / 2, (from.1 + to.1) / 2);
+        self.move_to(to.0, to.1);
+        self.release(to.0, to.1);
+    }
+
+    /// Scroll at `(x, y)`; positive `vertical` scrolls down.
+    pub fn scroll(&mut self, x: i32, y: i32, vertical: f64) {
+        self.move_to(x, y);
+        self.pointer.axis(0.0, vertical);
+        self.pointer.frame();
+        self.pointer.pump();
+    }
+
+    /// Press and release one key.
+    pub fn key(&mut self, keycode: u32) {
+        self.keyboard.key_press(keycode);
+        self.keyboard.pump();
+    }
+
+    /// Press and release each key in order.
+    pub fn keys(&mut self, keycodes: &[u32]) {
+        for &code in keycodes {
+            self.key(code);
+        }
+    }
+
+    /// The current colour at `(x, y)`.
+    ///
+    /// # Panics
+    ///
+    /// If the point is outside the output.
+    pub fn pixel(&mut self, x: i32, y: i32) -> (u8, u8, u8) {
+        let frame = self.screencopy.capture();
+        pixel_at(&frame, x as u32, y as u32)
+            .unwrap_or_else(|| panic!("({x}, {y}) is outside the {:?} output", self.output))
+    }
+
+    /// Capture until `(x, y)` stops being `before`, or [`REACT_TIMEOUT`]
+    /// passes; returns whatever it ended on so the caller writes the
+    /// assertion.
+    pub fn wait_pixel_change(&mut self, x: i32, y: i32, before: (u8, u8, u8)) -> (u8, u8, u8) {
+        let started = Instant::now();
+        loop {
+            let px = self.pixel(x, y);
+            if !matches(px, before) || started.elapsed() >= REACT_TIMEOUT {
+                return px;
+            }
+            self.pointer.pump();
+            std::thread::sleep(CAPTURE_POLL);
+        }
+    }
+
+    /// Capture until `(x, y)` holds the same colour for two consecutive polls
+    /// — "the animation is over", without pinning how long it took.
+    pub fn wait_pixel_settled(&mut self, x: i32, y: i32) -> (u8, u8, u8) {
+        let started = Instant::now();
+        let mut last = self.pixel(x, y);
+        loop {
+            std::thread::sleep(CAPTURE_POLL);
+            let now = self.pixel(x, y);
+            if matches(now, last) || started.elapsed() >= REACT_TIMEOUT {
+                return now;
+            }
+            last = now;
+        }
+    }
+}
+
+/// The ceiling every `wait_*` here shares: a generous complexity bound on one
+/// round trip through the compositor, the app loop, a restyle and a repaint.
+///
+/// Reconciliation: see `interaction_gate.rs`'s `REACT` for why the task
+/// text's 5s is not enough -- the same `clip_path` cost `GALLERY_MAP_TIMEOUT`
+/// documents applies to every repaint, not only the first.
+pub const REACT_TIMEOUT: Duration = Duration::from_secs(60);

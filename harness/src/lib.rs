@@ -3981,6 +3981,46 @@ impl VirtualPointerClient {
         self.conn.flush().expect("flush frame");
     }
 
+    /// Scroll by a continuous amount, in surface-local units + flush.
+    ///
+    /// `wl_pointer`'s own sign convention: positive is down/right. Callers
+    /// send `frame()` themselves, as with every other request here.
+    pub fn axis(&mut self, horizontal: f64, vertical: f64) {
+        let time = self.next_time();
+        if horizontal != 0.0 {
+            self.vp
+                .axis(time, wl_pointer::Axis::HorizontalScroll, horizontal);
+        }
+        if vertical != 0.0 {
+            self.vp
+                .axis(time, wl_pointer::Axis::VerticalScroll, vertical);
+        }
+        self.conn.flush().expect("flush axis");
+    }
+
+    /// Scroll by whole wheel clicks + flush: one click is 10 units, which is
+    /// what a real wheel sends alongside its discrete value.
+    pub fn axis_discrete(&mut self, horizontal: i32, vertical: i32) {
+        let time = self.next_time();
+        if horizontal != 0 {
+            self.vp.axis_discrete(
+                time,
+                wl_pointer::Axis::HorizontalScroll,
+                f64::from(horizontal) * 10.0,
+                horizontal,
+            );
+        }
+        if vertical != 0 {
+            self.vp.axis_discrete(
+                time,
+                wl_pointer::Axis::VerticalScroll,
+                f64::from(vertical) * 10.0,
+                vertical,
+            );
+        }
+        self.conn.flush().expect("flush axis_discrete");
+    }
+
     /// One roundtrip, to keep the injector responsive during a test.
     pub fn pump(&mut self) {
         let _ = self.queue.roundtrip(&mut self.state);
@@ -4837,5 +4877,33 @@ impl GammaControlClient {
         self.control.set_gamma(file.as_fd());
         self.conn.flush().expect("flush set_gamma");
         let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Compositor, VirtualPointerClient};
+
+    /// The axis request the interaction gate's scroll test needs; the harness
+    /// injector had motion and buttons but no axis at all.
+    #[test]
+    fn a_virtual_pointer_can_send_an_axis_event() {
+        let compositor = Compositor::spawn();
+        let socket = compositor
+            .socket_path()
+            .file_name()
+            .expect("socket name")
+            .to_string_lossy()
+            .to_string();
+        let mut pointer = VirtualPointerClient::spawn(&socket);
+        pointer.motion_absolute(10.0, 10.0, 100, 100);
+        pointer.frame();
+        pointer.axis(0.0, 10.0);
+        pointer.frame();
+        pointer.pump();
+        // No protocol error killed the client: the connection is still usable.
+        pointer.motion_absolute(11.0, 11.0, 100, 100);
+        pointer.frame();
+        pointer.pump();
     }
 }
