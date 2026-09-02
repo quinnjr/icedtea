@@ -30,7 +30,7 @@ use crate::view::builders::{
     StatusbarExt, TextViewExt, ToggleButtonExt,
 };
 use crate::view::cmd::Cmd;
-use crate::view::{Instance, Kind, View};
+use crate::view::{Instance, Kind, Prop, PropName, View};
 use crate::widgets::types::{
     ItemFactory, ListItem, MessageType, Orientation, RowContent, SelectionMode, Side,
 };
@@ -150,6 +150,16 @@ pub struct Options {
     pub scroll: i32,
     /// Output scale, for HiDPI probes.
     pub scale: i32,
+    /// Render every popover-bearing sample with its popover already open.
+    ///
+    /// A geometry affordance for the interaction gate, not a new interaction:
+    /// a `DropDown`'s popover is hidden while closed (`PopoverC`'s own
+    /// `reveal`, which lays it out at zero size), so a closed-state
+    /// `--probe-points` can never say where a row *will* be once a click
+    /// opens it. `--open` builds the same tree the click produces, so the
+    /// gate reads the open coordinates from the binary instead of hard-coding
+    /// them, and still drives the real open by clicking.
+    pub open: bool,
 }
 
 impl Options {
@@ -174,6 +184,7 @@ impl Options {
             size: Options::DEFAULT_SIZE,
             scroll: 0,
             scale: 1,
+            open: false,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -181,6 +192,7 @@ impl Options {
                 "--list" => opts.list = true,
                 "--probe-points" => opts.probe_points = true,
                 "--print-allocation" => opts.print_allocation = true,
+                "--open" => opts.open = true,
                 "--theme" => {
                     let value = args.next().ok_or(OptionsError::MissingValue("--theme"))?;
                     opts.theme = Theme::parse(&value)
@@ -414,6 +426,8 @@ pub struct GalleryModel {
     pub page: usize,
     /// The `Expander`'s state.
     pub expanded: bool,
+    /// `--open`: every popover-bearing sample starts with its popover shown.
+    pub open: bool,
     /// `--scroll`, in px. Lives on the model because `App::new` takes a
     /// `fn(&M) -> View<Msg>` pointer (§4.7), which cannot capture it.
     pub scroll: i32,
@@ -434,6 +448,7 @@ impl GalleryModel {
             selected: BTreeMap::new(),
             page: 0,
             expanded: false,
+            open: false,
             scroll: 0,
             log: Vec::new(),
         };
@@ -659,6 +674,9 @@ pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
         Kind::DropDown => Sample::Own(
             w::drop_down(&["One", "Two", "Three"])
                 .selected(model.selection(Kind::DropDown))
+                // `--open`: the popover's own geometry, for a gate that has
+                // to know where a row lands before it clicks the button.
+                .prop(PropName::Expanded, Prop::Bool(model.open))
                 .on_selected(|i| GalleryMsg::Selected(Kind::DropDown, i)),
         ),
         Kind::ColorDialogButton => Sample::Own(ColorDialogButtonExt::on_change(
@@ -1234,6 +1252,7 @@ pub fn compile_sheet(opts: &Options) -> CompiledSheet {
 pub fn build(opts: &Options) -> Result<Probe<GalleryMsg>, AppError> {
     let mut model = GalleryModel::new(opts.theme, opts.widget);
     model.scroll = opts.scroll;
+    model.open = opts.open;
     let app = App::new(model, update, scrolled_page);
     app.probe(
         opts.size,
@@ -1409,6 +1428,7 @@ pub fn print_allocations(opts: &Options) -> Result<(), AppError> {
 pub fn run(opts: &Options) -> Result<(), AppError> {
     let mut model = GalleryModel::new(opts.theme, opts.widget);
     model.scroll = opts.scroll;
+    model.open = opts.open;
     let spec = SurfaceSpec {
         role: Role::Layer(LayerSpec {
             layer: zwlr_layer_shell_v1::Layer::Overlay,

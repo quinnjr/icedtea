@@ -4315,6 +4315,102 @@ inside a codepoint, which `String::replace_range` panics on. Covered by
 **Commit:** see `.superpowers/sdd/m3-close/closure-entries.md` for the full
 RED/GREEN trail.
 
+**Amended/Closed (drop-down half): 2026-09-02, M3 close-out.** Task 11's
+drop-down interaction is landed and green:
+`interaction_gate.rs::opening_a_drop_down_and_picking_an_item_updates_the_button`
+opens the popover with a real click, picks row 1, and requires the list to be
+absent before the first click and absent again after the pick. The file now
+carries **eleven** tests, not ten.
+
+**The defect was bigger than Task 11 reported.** `PopoverC::open`'s
+`content: None` branch did not merely fail to open a surface: it did nothing
+at all, and nothing else ever flipped the popover node's visibility, so a
+`DropDown`'s list was **always laid out and painted**. Measured before the
+fix, a *closed* `dropdown`'s border box was 102x40 — its 36x34 button plus
+three live `row`s beside it — and a click at those rows' coordinates selected
+an item. `open` was a bool no pixel could see.
+
+**Fixed by revealing the retained body, not by opening a surface.** `PopoverC`
+keeps its own `root` node and gains `hide_when_closed()`/`reveal(bool)`;
+`open` reveals, `close` and `PopupDone` hide, and `DropDownC` opts in and
+guards its row hit-test with `self.open`. The payload stays `None`: P7-D54
+rules that a `DropDown`'s list is retained in the parent window's tree and a
+second surface would double-draw it, and `App::run` routes input only over
+`rt.instances`, never `rt.popups` — a real `xdg_popup` here would be a
+picture of a list that could not be clicked. Only `DropDown` opts in;
+`PopoverMenuBar` sizes its `item`s from their menu child and its own
+hover-to-switch test reads those boxes, so hiding a menu bar's menus is its
+own change.
+
+**`GtkWidget:visible` is now modelled, because detaching broke a vendored
+fixture.** Hiding the popover by detaching its node failed `node_trees.rs`
+("fixture requires a node at `dropdown/popover`"): GTK's node trees list
+hidden nodes, and §5.2's vendored fixtures with them. `LayoutTree::
+set_displayed`/`is_displayed` now write taffy `Display::None` — applied
+*after* `container_style`, which otherwise overwrites `display` — and
+`view::render`'s paint walk skips a hidden node and its subtree, so a hidden
+node keeps its CSS-tree place while taking no space, receiving no events and
+painting nothing. `widgets::set_displayed` is the controller-side entry, on
+the same side table `set_gap`/`set_container` use.
+
+**`gallery --open` is a geometry affordance, not a new interaction.** A closed
+drop-down's rows have no geometry, so no closed-state probe can say where row
+1 lands once a click opens it. `--open` builds every popover-bearing sample
+with its popover shown (`DropDownC` honours `PropName::Expanded`, the name
+every other disclosure widget already carries), and
+`support::probe_points_open`/`Driver::point_open` read it. The test still
+drives the real open by clicking.
+
+**One coordinate was re-derived.** `widget_pixels.rs::opening_a_drop_down_and_picking_an_item_updates_the_button`
+clicked (67, 100) — a point derived from the old 102x40 box. A closed
+drop-down is now 36x34 and centred in that test's 200x200 window, so the click
+moved to (100, 100); the captured row shows the button's own border at x 82
+and x 117. This is a sizing *correction*, not the sizing *collapse* the entry
+half of this amendment refuses: no controller's `measure` is silenced, and
+`widget_pixels.rs` is 40/40.
+
+**Amended (list-view half): 2026-09-02, M3 close-out. Three production
+defects fixed; the interaction test is still not landed.** Task 11's diagnosis
+("no `measure()` override") named the wrong cause — a `ListView`'s container
+is `Container::Box`, so taffy never calls a measure closure for it at all.
+What was actually wrong:
+
+1. **`WidthRequest`/`HeightRequest` were read by three widgets in the whole
+   crate** (`label`, `entry`, `drawing_area`). GTK's size request is
+   universal, and fourteen gallery entries laid out at the wrong size because
+   of it, twelve of them collapsed or near it (`list_view` and `grid_view` at
+   0x0, `stack_sidebar` at 1x0, …). `Universal::apply` now honours both
+   through `widgets::set_size_request`, folded into taffy by `flush_layout`
+   as `LayoutTree::set_size_floor` — a floor, as GTK's pair are, so CSS
+   `min-width`/`min-height` still win where they are larger.
+2. **Reconcile evicted the pool.** A `ListView` takes no view children, so
+   every node child of a `listview` is past `reserved_total`'s default bound
+   and the trim step detached every pooled row on the first reconcile — no
+   row ever had an allocation. `ListViewC::child_index`/`reserved_total` now
+   reserve the pool and the rubberband.
+3. **`set_metrics` had no production caller**, which Task 11 got right.
+   `ListViewC::tick` now calls `adopt_metrics`: the viewport from the node's
+   own allocation, the row height from the *sheet* rather than from the
+   allocation (reading it back off a stretched pool makes the pool size and
+   the row height chase each other frame after frame).
+
+**Still open: `scrolling_a_list_view_recycles_rows_without_losing_selection`.**
+A pooled row renders and measures nothing — its bound text lives in the
+`ROW_BINDING` side table (`widgets::set_text`/`text_of`) and nothing paints or
+measures it — so a row's whole height is Adwaita's `listview > row
+{ padding: 2px }`, 4px. The gallery's ten rows occupy 40px of a 120px
+viewport: `max_offset` is 0, nothing scrolls, nothing is recycled, and a test
+named for recycling would assert nothing; driven anyway, a click at every
+offset into the sample's content box produces `messages: []`. Giving
+`ListView` rows a `label` subnode with a real text `Measure` and a paint pass
+— which is what makes ten rows overflow the viewport and a selection visible
+enough to assert on — is P6 widget work with its own design, shared with
+`GridViewC`/`ColumnViewC`, not a close-out edit. Recorded here rather than
+half-done.
+
+**Commit:** see `.superpowers/sdd/m3-close/closure-popup-lists.md` for the
+full RED/GREEN trail.
+
 ### P8-D72 — Task 12's four interactions are absent too, each blocked by a distinct pre-existing production defect
 
 **Carried out by:** Task 12 (written, driven RED, root-caused, left

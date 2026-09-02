@@ -607,6 +607,42 @@ pub fn probe_points_sized(theme: &str, widget: &str, size: (u32, u32)) -> Vec<Pr
         .collect()
 }
 
+/// `probe_points_sized`, but with the gallery's `--open` flag set: every
+/// popover-bearing sample is built with its popover already shown.
+///
+/// A `DropDown`'s popover is hidden while closed — laid out at zero size — so
+/// a closed-state probe reports its rows collapsed onto one point and cannot
+/// say where any of them lands once a click opens it. This asks the same
+/// binary for the *open* tree's coordinates; the test still drives the real
+/// open by clicking the button.
+///
+/// # Panics
+///
+/// As [`probe_points`].
+#[must_use]
+pub fn probe_points_open(theme: &str, widget: &str, size: (u32, u32)) -> Vec<ProbePoint> {
+    let output = gallery(theme)
+        .arg("--widget")
+        .arg(widget)
+        .arg("--size")
+        .arg(format!("{}x{}", size.0, size.1))
+        .arg("--open")
+        .arg("--probe-points")
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to run gallery --probe-points --open");
+    assert!(
+        output.status.success(),
+        "gallery --probe-points --open exited with {}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).expect("probe points are not UTF-8");
+    stdout
+        .lines()
+        .map(|line| parse_probe_line(line).unwrap_or_else(|| panic!("bad probe line {line:?}")))
+        .collect()
+}
+
 /// How long a gallery gets to map and paint its first frame.
 ///
 /// A generous complexity bound, not a wall-clock pin: it covers compiling a
@@ -806,6 +842,27 @@ impl Driver {
             .unwrap_or_else(|| {
                 let have: Vec<&str> = points.iter().map(|p| p.label.as_str()).collect();
                 panic!("{widget} has no {label:?} probe point; it has {have:?}")
+            })
+    }
+
+    /// The output-space centre of `widget`'s `label` subnode, as it will be
+    /// once every popover in `widget` is open — see [`probe_points_open`].
+    /// The counterpart to [`Driver::point`] for a target that only has real
+    /// geometry while something is open.
+    ///
+    /// # Panics
+    ///
+    /// As [`Driver::point`].
+    #[must_use]
+    pub fn point_open(&self, widget: &str, label: &str) -> (i32, i32) {
+        let points = probe_points_open(&self.theme, widget, self.output);
+        points
+            .iter()
+            .find(|p| p.label == label)
+            .map(|p| (p.x, p.y))
+            .unwrap_or_else(|| {
+                let have: Vec<&str> = points.iter().map(|p| p.label.as_str()).collect();
+                panic!("open {widget} has no {label:?} probe point; it has {have:?}")
             })
     }
 

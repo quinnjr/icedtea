@@ -455,3 +455,60 @@ fn dragging_a_scale_moves_the_slider_and_reports_the_value() {
         "the slider never left its starting position"
     );
 }
+
+/// Opening a drop-down must *show* its list, picking a row must report that
+/// row's index, and picking must put the list away again.
+///
+/// All three halves, because each alone passes with the others broken: a
+/// popover that opens and never closes passes "it appeared" and passes
+/// "picking reported the index", and a drop-down whose list is simply always
+/// on screen — P8-D71's actual defect, measured — passes the pick half while
+/// failing both of the others.
+///
+/// The coordinates come from `gallery --open --probe-points`, the same binary
+/// asked for the tree a click produces; the click itself is real. A *band*
+/// spanning all three rows rather than one pixel, for the reason
+/// [`support::Driver::row`] gives: a `dropdown`'s `row` paints no text and
+/// the popover's own background is the same white as the surface behind it,
+/// so a single pixel inside a row cannot tell an open list from no list —
+/// the band picks up the `contents` border that only exists while it is open.
+///
+/// Mutation check: drop `self.popover.reveal(true)` from `PopoverC::open`;
+/// the first assertion fails ("the popover never appeared"). Mutation check
+/// 2: drop `self.reveal(false)` from `PopoverC::close`; the *third*
+/// assertion fails, because picking a row leaves the list on screen. Restore
+/// both.
+#[test]
+fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "drop_down");
+    let (bx, by) = driver.point("drop_down", "button");
+    // Where the list lands once the popover is open — not where anything is
+    // now. The outer two rows bound the band; the middle one is the target.
+    let (x0, _) = driver.point_open("drop_down", "row0");
+    let (rx, ry) = driver.point_open("drop_down", "row1");
+    let (x1, _) = driver.point_open("drop_down", "row2");
+    let closed = driver.row(x0, x1, ry);
+
+    driver.click(bx, by);
+    let opened = driver.wait_row_change(x0, x1, ry, &closed);
+    assert!(
+        !support::row_matches(&opened, &closed),
+        "the drop-down's popover never appeared below the button: the band \
+         from ({x0}, {ry}) to ({x1}, {ry}) stayed {closed:?}"
+    );
+
+    driver.click(rx, ry);
+    assert!(
+        gallery.wait_msg("selected drop_down 1", REACT),
+        "picking the second row reported nothing; got {:?}",
+        gallery.messages()
+    );
+
+    let closed_again = driver.wait_row_change(x0, x1, ry, &opened);
+    assert!(
+        support::row_matches(&closed_again, &closed),
+        "picking a row must put the popover away again.\nclosed: {closed:?}\n\
+         open:   {opened:?}\nafter:  {closed_again:?}"
+    );
+}

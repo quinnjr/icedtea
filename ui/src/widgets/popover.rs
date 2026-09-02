@@ -95,6 +95,18 @@ pub struct PopoverC {
     pub arrow: Node,
     /// The `contents` subnode; every child goes under it.
     pub contents: Node,
+    /// The `popover` node itself, so opening and closing can show and hide
+    /// it. `PopoverC` is embedded by four other widgets that hand it a node
+    /// they built; without keeping it, nothing in this crate could ever flip
+    /// a popover's own visibility, which is P8-D71's drop-down half.
+    pub root: Node,
+    /// Whether closing this popover hides its node.
+    ///
+    /// Opt-in, through [`PopoverC::hide_when_closed`], and not the default:
+    /// `PopoverMenuBar` sizes its `item`s from their menu child and its own
+    /// hover-to-switch test reads those boxes, so hiding a menu bar's menus
+    /// is its own change. `DropDown` — P8-D71's half — opts in.
+    hides: bool,
     offset: (i32, i32),
 }
 
@@ -117,7 +129,29 @@ impl PopoverC {
             popup: None,
             arrow,
             contents,
+            root,
+            hides: false,
             offset: (0, 0),
+        }
+    }
+
+    /// Make closing this popover hide its node, and close it now.
+    ///
+    /// GTK's `visible`: an invisible widget keeps its state but takes no
+    /// space, receives no events and paints nothing. Hidden rather than
+    /// detached, because GTK's own node trees — and this crate's vendored
+    /// §5.2 fixtures with them — list a `dropdown`'s `popover` whether it is
+    /// showing or not.
+    pub fn hide_when_closed(&mut self) {
+        self.hides = true;
+        self.reveal(false);
+    }
+
+    /// Show or hide the popover's own node — see
+    /// [`PopoverC::hide_when_closed`], which is the only thing that arms it.
+    pub fn reveal(&self, on: bool) {
+        if self.hides {
+            crate::widgets::set_displayed(&self.root, on);
         }
     }
 
@@ -175,9 +209,16 @@ impl PopoverC {
             return;
         }
         self.open = true;
+        // Whichever way the body is carried, opening has to make it visible.
+        // Before P8-D71's close-out the `None` branch below returned here
+        // having done nothing at all — neither a surface nor a reveal — so a
+        // `DropDown`'s list was laid out and painted whether the popover was
+        // open or shut, and "open" was a bool no pixel could see.
+        self.reveal(true);
         let Some(content) = content else {
             // Nothing to build a surface from: the body is in the parent
-            // window's tree and is painted there.
+            // window's tree and is painted there (P7-D54), and the reveal
+            // above is the whole of opening it.
             return;
         };
         if !self.autohide {
@@ -202,6 +243,7 @@ impl PopoverC {
     /// Close, dropping the popup if one was taken.
     pub fn close<Msg: Clone + 'static>(&mut self, cx: &mut EventCx<'_, Msg>) {
         self.open = false;
+        self.reveal(false);
         if let Some(key) = self.popup.take() {
             cx.cmds.push(Cmd::ClosePopup(key));
         }
@@ -241,6 +283,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for PopoverC {
             popup: None,
             arrow,
             contents,
+            root: node.clone(),
+            hides: false,
             offset,
         };
         this.apply(node);
@@ -266,6 +310,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for PopoverC {
             Event::PopupDone => {
                 self.open = false;
                 self.popup = None;
+                self.reveal(false);
                 cx.handlers
                     .fire_unit(EventKind::Close)
                     .map_or_else(Vec::new, |msg| vec![msg])

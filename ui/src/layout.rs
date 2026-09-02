@@ -331,6 +331,19 @@ struct NodeCtx {
     /// own gap property (`GtkBox:spacing`, …). CSS `border-spacing` still
     /// applies; the larger of the two wins on each axis, matching GtkBox.
     gap_floor: (f32, f32),
+    /// A floor on the node's own `(width, height)` in px, from
+    /// `GtkWidget:width-request`/`height-request`. CSS `min-width`/
+    /// `min-height` still apply; the larger of the two wins on each axis,
+    /// which is what GTK does when a theme sets both. Like the CSS
+    /// minimums this floors the *content* box (see this module's own header),
+    /// so a widget with padding ends up at least this big inside its chrome.
+    size_floor: (f32, f32),
+    /// `GtkWidget:visible`. A hidden node keeps its place in the CSS tree —
+    /// GTK's own node trees list hidden nodes, and this crate's vendored
+    /// §5.2 fixtures with them — but takes no space, receives no events and
+    /// paints nothing, which is taffy's `Display::None` plus the skip in
+    /// `view::render`'s paint walk.
+    displayed: bool,
 }
 
 /// A `taffy` tree that mirrors one `css::node::Node` subtree.
@@ -441,6 +454,8 @@ impl LayoutTree {
                     measure: None,
                     env: ResolveEnv::default(),
                     gap_floor: (0.0, 0.0),
+                    size_floor: (0.0, 0.0),
+                    displayed: true,
                 };
                 let id = self.tree.new_leaf_with_context(Style::default(), ctx)?;
                 self.ids.insert(key, id);
@@ -552,6 +567,50 @@ impl LayoutTree {
             }
         }
         self.write_taffy_style(id);
+    }
+
+    /// Raise the floor on `node`'s own width and height to `(w, h)` px.
+    ///
+    /// `GtkWidget:width-request`/`height-request`, which are minimums, not
+    /// fixed sizes. Non-finite or negative input floors at zero, so a hostile
+    /// `Props` value can never poison the taffy style with NaN.
+    pub fn set_size_floor(&mut self, node: &Node, w: f32, h: f32) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_size_floor on an unsynced node");
+            return;
+        };
+        let clamp = |px: f32| if px.is_finite() { px.max(0.0) } else { 0.0 };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            ctx.size_floor = (clamp(w), clamp(h));
+        }
+        self.write_taffy_style(id);
+    }
+
+    /// Show or hide `node` and its subtree — `GtkWidget:visible`.
+    ///
+    /// A hidden node stays in the CSS tree (so a fixture that names it still
+    /// matches, and so its controller keeps its state) but is laid out as
+    /// `display: none`: zero size, no hit, and `view::render` skips painting
+    /// it.
+    pub fn set_displayed(&mut self, node: &Node, on: bool) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_displayed on an unsynced node");
+            return;
+        };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            ctx.displayed = on;
+        }
+        self.write_taffy_style(id);
+    }
+
+    /// Whether `node` is shown. An unknown node counts as shown, so a caller
+    /// that has never hidden anything behaves exactly as it did.
+    #[must_use]
+    pub fn is_displayed(&self, node: &Node) -> bool {
+        self.ids
+            .get(&node.opaque())
+            .and_then(|&id| self.tree.get_node_context(id))
+            .is_none_or(|ctx| ctx.displayed)
     }
 
     /// Give one node its own [`Measure`], overriding the one passed to
@@ -757,15 +816,17 @@ impl LayoutTree {
         let Some(ctx) = self.tree.get_node_context(id) else {
             return;
         };
-        let (node, style, container, child, env, gap_floor) = (
+        let (node, style, container, child, env, gap_floor, size_floor, displayed) = (
             ctx.node.clone(),
             Rc::clone(&ctx.style),
             ctx.container,
             ctx.child,
             ctx.env,
             ctx.gap_floor,
+            ctx.size_floor,
+            ctx.displayed,
         );
-        let mut taffy_style = Self::box_model_style(&style, &env, gap_floor);
+        let mut taffy_style = Self::box_model_style(&style, &env, gap_floor, size_floor);
         Self::container_style(container, node.direction(), &mut taffy_style);
         if let Some(child) = child {
             let parent_container = node.parent().map(|p| self.container(&p));
@@ -783,6 +844,11 @@ impl LayoutTree {
             let parent_is_grid = matches!(parent_container, Some(Container::Grid { .. }));
             Self::child_style(child, parent_is_row, parent_is_grid, &mut taffy_style);
         }
+        // Last, so it survives `container_style`'s own `display` write: a
+        // hidden node is `display: none` whatever kind of container it is.
+        if !displayed {
+            taffy_style.display = taffy::style::Display::None;
+        }
         if let Err(err) = self.tree.set_style(id, taffy_style) {
             tracing::debug!(node = %node.name(), %err, "taffy rejected a style");
         }
@@ -792,7 +858,12 @@ impl LayoutTree {
     /// padding, border and the container gap. M2's `set_style` body, verbatim,
     /// plus `gap_floor` (a widget's own gap property) raising the CSS
     /// `border-spacing` gap on either axis when it is larger.
-    fn box_model_style(style: &ComputedStyle, env: &ResolveEnv, gap_floor: (f32, f32)) -> Style {
+    fn box_model_style(
+        style: &ComputedStyle,
+        env: &ResolveEnv,
+        gap_floor: (f32, f32),
+        size_floor: (f32, f32),
+    ) -> Style {
         // CSS resolves *every* percentage in the box model against the
         // containing block's inline size, and taffy is the only thing here
         // that knows what that is -- so a percentage must reach taffy *as* a
@@ -806,6 +877,10 @@ impl LayoutTree {
         let [bt, br, bb, bl] = style.border_widths();
         let margin = style.margin(basis);
         let (min_w, min_h) = style.min_size((basis, basis));
+        // `GtkWidget:width-request`/`height-request` raise the CSS minimum;
+        // a declared *percentage* minimum still wins outright, since only
+        // taffy knows what it resolves against (see `min` below).
+        let (min_w, min_h) = (min_w.max(size_floor.0), min_h.max(size_floor.1));
 
         /// The declared value's own percentage, when it has one.
         fn declared_percent(style: &ComputedStyle, prop: Prop) -> Option<f32> {
@@ -1388,6 +1463,63 @@ mod tests {
             a.border_box.height, 34.0,
             "max(6, 24) + 4 + 4 + 1 + 1 == 34"
         );
+    }
+
+    /// `GtkWidget:width-request`/`height-request` raise a widget's own
+    /// floor. Until P8-D71's close-out nothing but `Label`/`Entry`/
+    /// `DrawingArea` read either prop, so a `list_view` that asked for
+    /// 200x120 laid out 0x0.
+    ///
+    /// Mutation check: drop `size_floor` from `box_model_style`'s `min_w`/
+    /// `min_h` and both assertions fall back to the CSS 36x34.
+    #[test]
+    fn a_size_request_floors_the_box_and_the_larger_of_it_and_min_size_wins() {
+        let (mut tree, button, _label) = button_layout(ADWAITA_LIKE, (0.0, 6.0));
+        // Wider than the CSS minimum on one axis, narrower on the other: the
+        // request wins where it is bigger and loses where it is not.
+        tree.set_size_floor(&button, 200.0, 4.0);
+        let window = button.parent().expect("the button has a parent");
+        tree.compute(
+            &window,
+            Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+            &mut LabelSize(0.0, 6.0),
+        )
+        .expect("compute");
+        let a = tree.allocation(&button).expect("button allocation");
+        assert_eq!(a.border_box.width, 220.0, "200 + 9 + 9 + 1 + 1");
+        assert_eq!(a.border_box.height, 34.0, "the CSS min-height still wins");
+    }
+
+    /// A hidden node keeps its place in the CSS tree — GTK's own node trees
+    /// list hidden nodes, and this crate's vendored §5.2 fixtures with them —
+    /// but takes no space at all, itself or below.
+    ///
+    /// Mutation check: write the `Display::None` before `container_style`
+    /// instead of after and the container's own `display` overwrites it; the
+    /// button lays out at its full 36x34.
+    #[test]
+    fn a_hidden_node_takes_no_space_and_neither_do_its_children() {
+        let (mut tree, button, label) = button_layout(ADWAITA_LIKE, (0.0, 6.0));
+        assert!(tree.is_displayed(&button), "shown until something hides it");
+        tree.set_displayed(&button, false);
+        assert!(!tree.is_displayed(&button));
+        let window = button.parent().expect("the button has a parent");
+        tree.compute(
+            &window,
+            Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+            &mut LabelSize(0.0, 6.0),
+        )
+        .expect("compute");
+        let a = tree.allocation(&button).expect("button allocation");
+        assert_eq!((a.border_box.width, a.border_box.height), (0.0, 0.0));
+        let l = tree.allocation(&label).expect("label allocation");
+        assert_eq!((l.border_box.width, l.border_box.height), (0.0, 0.0));
     }
 
     #[test]

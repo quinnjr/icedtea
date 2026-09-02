@@ -1288,17 +1288,16 @@ fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
     // chain (contract P5-D33) rather than the geometrically deepest node,
     // which for a `DropDown` is the controller-owned `button.toggle` subnode.
     //
-    // Scope, honestly stated: `PopoverC::open` hands `Cmd::OpenPopup` a stub
-    // payload (`|| View::new(Kind::Popover)`, in P5's `popover.rs`, which P6
-    // may not edit), so the popup surface the offscreen app now really does
-    // build and composite (see
-    // `a_popup_paints_the_view_its_open_command_carried`) is empty for a
-    // `DropDown`, and the *row click* half of this criterion cannot be driven
-    // from here. It is covered over a really laid-out tree by
+    // Scope, honestly stated: a `DropDown`'s list lives under its own
+    // `popover > contents > listview` node in the parent window's tree and is
+    // painted there, so no popup surface is asked for (contract §10 P7-D54)
+    // and the *row click* half of this criterion is not driven from here. It
+    // is covered over a really laid-out tree by
     // `widgets::drop_down::tests::opening_a_drop_down_and_clicking_a_row_selects_that_item`,
-    // which drives open -> click-row -> `EventKind::Selected` end to end. What
-    // this test now pins that nothing else did is that the button's own click
-    // reaches `DropDownC` at all.
+    // and against the real compositor by `interaction_gate.rs`'s
+    // `opening_a_drop_down_and_picking_an_item_updates_the_button`. What this
+    // test pins is that the button's own click reaches `DropDownC` at all,
+    // and that the list it reveals repaints the row it opens over.
     use icedtea_ui::view::builders::drop_down;
     use icedtea_ui::widgets::drop_down::DropDownExt;
 
@@ -1319,11 +1318,16 @@ fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
         (200, 200),
         vec![
             ScriptStep::Capture,
-            // The window is 200x200; the dropdown's `button.toggle` (with no
-            // arrow shown) sits near the top-left of the dropdown's own box,
-            // around (67, 100), not centred in the full 200x200 window.
+            // Re-derived for P8-D71's close-out: a *closed* drop-down's
+            // popover is now hidden (`display: none`), so `dropdown`'s own
+            // border box is the button's 36x34 rather than the 102x40 that
+            // counted three always-laid-out `row`s beside it, and the button
+            // is centred in the 200x200 window instead of sitting at its
+            // left edge. `gallery --widget drop_down --print-allocation`
+            // reports the same shrink (102x40 -> 36x34); the captured row
+            // below shows the button's own border at x 82 and x 117.
             ScriptStep::Event(InputEvent::PointerEnter {
-                x: 67.0,
+                x: 100.0,
                 y: 100.0,
                 serial: 1,
                 target: icedtea_ui::window::SurfaceTarget::Window,

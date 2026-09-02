@@ -649,6 +649,10 @@ impl Revealer {
 pub struct Universal {
     /// The classes the last `Classes` prop put on the node.
     extra: Vec<Rc<str>>,
+    /// `GtkWidget:width-request`/`height-request`, in px, kept together
+    /// because the side table [`set_size_request`] writes carries the pair
+    /// and each prop arrives on its own.
+    size_request: (f32, f32),
 }
 
 impl Universal {
@@ -662,7 +666,10 @@ impl Universal {
         if kind.is_focusable_by_default() {
             node.add_class(FOCUSABLE_CLASS);
         }
-        Universal { extra: Vec::new() }
+        Universal {
+            extra: Vec::new(),
+            size_request: (0.0, 0.0),
+        }
     }
 
     /// Write one universal prop onto `node`. `true` when `name` was one of
@@ -720,6 +727,32 @@ impl Universal {
             }
             PropName::Selected => {
                 node.set_state(PseudoStates::SELECTED, matches!(value, Prop::Bool(true)));
+                true
+            }
+            PropName::WidthRequest | PropName::HeightRequest => {
+                // GTK's size request is universal, and until P8-D71's
+                // close-out nothing but `Label`/`Entry`/`DrawingArea` read
+                // either name: `gallery`'s `list_view` sample asked for
+                // 200x120 and laid out 0x0, which is why no interaction
+                // could be driven against it at all. Both axes are re-read
+                // together, because the side table carries the pair.
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a size request beyond 2^24 px is not a size"
+                )]
+                if let Prop::Int(px) = value {
+                    let px = *px as f32;
+                    if name == PropName::WidthRequest {
+                        self.size_request.0 = px;
+                    } else {
+                        self.size_request.1 = px;
+                    }
+                } else if name == PropName::WidthRequest {
+                    self.size_request.0 = 0.0;
+                } else {
+                    self.size_request.1 = 0.0;
+                }
+                set_size_request(node, self.size_request.0, self.size_request.1);
                 true
             }
             _ => false,
@@ -818,6 +851,12 @@ struct Pending {
     /// from its own recorded props on every flush, for the same
     /// build-order reason as `grid_from_children`.
     overlay_from_children: bool,
+    /// `GtkWidget:width-request`/`height-request`, in px: a floor on this
+    /// node's own size, folded into taffy by [`flush_layout`].
+    size_request: Option<(f32, f32)>,
+    /// `GtkWidget:visible` for a controller-owned node, folded into taffy by
+    /// [`flush_layout`] as `display: none`.
+    displayed: Option<bool>,
     node: Option<Node>,
 }
 
@@ -1211,6 +1250,38 @@ pub(crate) fn set_gap(node: &Node, spacing: f32, orientation: Orientation) {
     });
 }
 
+/// Record `GtkWidget:width-request`/`height-request` for `node`, in px.
+///
+/// A floor, never a fixed size, exactly as GTK's own pair are: CSS
+/// `min-width`/`min-height` still apply and the larger wins on each axis.
+/// Recorded on the side table rather than written to the tree because a
+/// controller has no `&mut LayoutTree`; [`flush_layout`] folds it in.
+pub(crate) fn set_size_request(node: &Node, width: f32, height: f32) {
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let entry = p.entry_mut(node);
+        let clamp = |px: f32| if px.is_finite() { px.max(0.0) } else { 0.0 };
+        entry.size_request = Some((clamp(width), clamp(height)));
+        entry.node = Some(node.clone());
+    });
+}
+
+/// Record whether a controller-owned `node` is shown — `GtkWidget:visible`.
+///
+/// Hidden means `display: none`: the node keeps its place in the CSS tree, so
+/// a vendored §5.2 fixture naming it still matches and its controller keeps
+/// its state, but it takes no space, receives no events and paints nothing.
+/// Recorded on the side table because a controller has no `&mut LayoutTree`;
+/// [`flush_layout`] folds it in.
+pub(crate) fn set_displayed(node: &Node, on: bool) {
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let entry = p.entry_mut(node);
+        entry.displayed = Some(on);
+        entry.node = Some(node.clone());
+    });
+}
+
 /// Record that every child of `node` should expand on `orientation`'s axis
 /// while `on` holds, applied to whatever children `node` has when
 /// [`flush_layout`] next runs.
@@ -1245,6 +1316,12 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
             }
             if let Some(child_layout) = pending.child_layout {
                 tree.set_child_layout(node, child_layout);
+            }
+            if let Some(on) = pending.displayed {
+                tree.set_displayed(node, on);
+            }
+            if let Some((w, h)) = pending.size_request {
+                tree.set_size_floor(node, w, h);
             }
             if let Some((gap, orientation)) = pending.gap {
                 // GTK's own gap property and CSS `border-spacing` both

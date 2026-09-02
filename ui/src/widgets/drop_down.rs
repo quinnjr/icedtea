@@ -148,6 +148,17 @@ impl DropDownC {
             .collect()
     }
 
+    /// Show or hide the popover, and paint the toggle to match.
+    ///
+    /// The pointer path and the property path have to agree about what "open"
+    /// means down to the node's own attachment, so both go through here.
+    fn set_expanded(&mut self, on: bool) {
+        self.open = on;
+        self.popover.open = on;
+        self.popover.reveal(on);
+        self.button.set_state(PseudoStates::CHECKED, on);
+    }
+
     /// Rebuild the row nodes from `filtered`.
     fn rebuild_rows(&mut self) {
         for row in self.rows.drain(..) {
@@ -216,6 +227,17 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
             pointer: PointerState::default(),
         };
         this.rebuild_rows();
+        // A closed drop-down shows no list: the popover node leaves the tree
+        // until a click opens it. Before this, `dropdown`'s own border box
+        // was 102x40 with three `row`s painted beside the button whether it
+        // was open or shut (measured); it is now the button's own 36x34.
+        this.popover.hide_when_closed();
+        // `GtkDropDown` has no "popover shown" property of its own; this
+        // reuses `Expanded`, the name every other disclosure widget in the
+        // crate already carries, so a caller (and `gallery --open`, which the
+        // interaction gate reads the open row coordinates from) can build the
+        // tree a click produces without one.
+        this.set_expanded(props.bool(PropName::Expanded, false));
         this
     }
 
@@ -231,6 +253,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
                     .unwrap_or(0)
                     .min(self.items.len().saturating_sub(1));
             }
+            (PropName::Expanded, Prop::Bool(on)) => {
+                self.set_expanded(*on);
+                return;
+            }
             _ => return,
         }
         self.rebuild_rows();
@@ -238,8 +264,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         if matches!(ev, Event::PopupDone) {
-            self.open = false;
-            self.button.set_state(PseudoStates::CHECKED, false);
+            self.set_expanded(false);
             return Vec::new();
         }
         // Same widget-level focus forwarding `MenuButtonC` does: taking a
@@ -266,8 +291,12 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
         // own retained `PointerState` (hover and `:active` track the pointer
         // even for the rows the gesture does not complete on), and the first
         // row whose press-release gesture completes wins.
+        // Only while the popover is showing. Belt and braces: a closed
+        // popover lays its rows out at zero size, so `local_rect` already
+        // gives them nothing to be hit in — but a row's clickability should
+        // not rest on a geometry coincidence.
         let mut picked = None;
-        for position in 0..self.rows.len() {
+        for position in 0..(if self.open { self.rows.len() } else { 0 }) {
             let row = self.rows[position].clone();
             let Some(rect) = local_rect(cx.tree, cx.node, &row) else {
                 continue;
@@ -321,7 +350,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
                     (rect.width.max(1.0) as u32, 240),
                     // The list lives under this widget's own `popover`
                     // node in the parent tree; a popup surface would
-                    // duplicate it.
+                    // duplicate it (P7-D54). `PopoverC::open` reveals that
+                    // retained body instead.
                     None,
                     cx,
                 );
@@ -391,52 +421,65 @@ mod tests {
         // Lay the retained tree out for real: every leaf is 40x20, and each
         // container stacks its children on the main axis, so the button and
         // the three rows all land on disjoint rectangles.
-        let mut styles = StyleMap::new();
-        let mut anims = Animations::new();
-        restyle_tree(&node, &sheet, &env, &mut styles, &mut anims, Duration::ZERO);
-        let mut containers: HashMap<_, Container> = HashMap::new();
-        for addr in styles.keys() {
+        //
+        // Twice, not once: a closed drop-down's popover is hidden
+        // (`PopoverC::hide_when_closed`), so its rows lay out at zero size
+        // until the button has been clicked. That is the behaviour P8-D71's
+        // drop-down half added, and re-laying out between the two clicks is
+        // how this test drives it rather than assuming it away.
+        let lay_out = |anims: &mut Animations| {
+            let mut styles = StyleMap::new();
+            restyle_tree(&node, &sheet, &env, &mut styles, anims, Duration::ZERO);
+            let mut containers: HashMap<_, Container> = HashMap::new();
+            for addr in styles.keys() {
+                containers.insert(
+                    *addr,
+                    Container::Box {
+                        direction: crate::layout::BoxDirection::Column,
+                    },
+                );
+            }
             containers.insert(
-                *addr,
+                node_addr(&node),
                 Container::Box {
                     direction: crate::layout::BoxDirection::Column,
                 },
             );
-        }
-        containers.insert(
-            node_addr(&node),
-            Container::Box {
-                direction: crate::layout::BoxDirection::Column,
-            },
-        );
-        let mut tree = LayoutTree::new();
-        let mut measure = FixedMeasure(taffy::Size {
-            width: 40.0,
-            height: 20.0,
-        });
-        layout_tree(
-            &node,
-            &styles,
-            &containers,
-            &mut tree,
-            &env,
-            (Some(400.0), Some(400.0)),
-            &mut measure,
-        )
-        .expect("the dropdown lays out");
-
-        let root = tree.allocation(&node).expect("root allocation").border_box;
-        let centre = |sub: &Node| {
+            let mut tree = LayoutTree::new();
+            let mut measure = FixedMeasure(taffy::Size {
+                width: 40.0,
+                height: 20.0,
+            });
+            layout_tree(
+                &node,
+                &styles,
+                &containers,
+                &mut tree,
+                &env,
+                (Some(400.0), Some(400.0)),
+                &mut measure,
+            )
+            .expect("the dropdown lays out");
+            (styles, tree)
+        };
+        let centre = |tree: &LayoutTree, sub: &Node| {
+            let root = tree.allocation(&node).expect("root allocation").border_box;
             let b = tree.allocation(sub).expect("subnode allocation").border_box;
             assert!(b.width > 0.0 && b.height > 0.0, "a clickable box");
             (b.x - root.x + b.width / 2.0, b.y - root.y + b.height / 2.0)
         };
-        let button_at = centre(&controller.button);
-        let row_at = centre(&controller.rows[1]);
+
+        let mut anims = Animations::new();
+        let (styles, tree) = lay_out(&mut anims);
+        let closed_row = tree
+            .allocation(&controller.rows[1])
+            .expect("a hidden row is still in the tree")
+            .border_box;
         assert!(
-            (button_at.1 - row_at.1).abs() > f32::EPSILON,
-            "the button and the row are separate targets"
+            closed_row.width == 0.0 && closed_row.height == 0.0,
+            "a closed drop-down's rows take no space; got {closed_row:?}"
         );
+        let button_at = centre(&tree, &controller.button);
 
         let mut handlers: Handlers<usize> = Handlers::default();
         handlers.set(EventKind::Selected, Handler::Index(Rc::new(|index| index)));
@@ -446,6 +489,8 @@ mod tests {
 
         let mut click = |controller: &mut DropDownC,
                          at: (f32, f32),
+                         tree: &LayoutTree,
+                         styles: &StyleMap,
                          cmds: &mut Vec<Cmd<usize>>,
                          fonts: &mut crate::text::FontDatabase,
                          icons: &mut crate::icons::IconTheme|
@@ -466,8 +511,8 @@ mod tests {
                 let mut ecx = EventCx {
                     node: &node,
                     handlers: &handlers,
-                    tree: &tree,
-                    styles: &styles,
+                    tree,
+                    styles,
                     focus: &mut focus,
                     clipboard: &mut clipboard,
                     icons,
@@ -487,6 +532,8 @@ mod tests {
         let opened = click(
             &mut controller,
             button_at,
+            &tree,
+            &styles,
             &mut cmds,
             &mut fonts,
             &mut icons,
@@ -495,9 +542,24 @@ mod tests {
         assert!(controller.open, "the popover is open");
         assert!(controller.button.states().contains(PseudoStates::CHECKED));
 
-        // 2. Clicking a row selects it, closes the popover and repaints the
-        //    button's own state.
-        let picked = click(&mut controller, row_at, &mut cmds, &mut fonts, &mut icons);
+        // 2. Opening put the popover into the tree, so the rows have real
+        //    boxes now; clicking one selects it, closes the popover and
+        //    repaints the button's own state.
+        let (styles, tree) = lay_out(&mut anims);
+        let row_at = centre(&tree, &controller.rows[1]);
+        assert!(
+            (button_at.1 - row_at.1).abs() > f32::EPSILON,
+            "the button and the row are separate targets"
+        );
+        let picked = click(
+            &mut controller,
+            row_at,
+            &tree,
+            &styles,
+            &mut cmds,
+            &mut fonts,
+            &mut icons,
+        );
         assert_eq!(picked, vec![1], "the row's index reaches the application");
         assert_eq!(controller.selected, 1);
         assert!(!controller.open, "picking a row closes the popover");

@@ -222,6 +222,65 @@ impl ListViewC {
         }
     }
 
+    /// A pooled row's own height, from the sheet rather than from the last
+    /// layout pass: `min-height` plus the vertical padding and border a
+    /// `listview > row` declares.
+    ///
+    /// Not the row's *allocated* height, deliberately. The pool's size is a
+    /// function of the row height and the rows share the viewport between
+    /// them, so reading the height back off the allocation makes the two
+    /// chase each other frame after frame (a one-row pool measures the whole
+    /// viewport, which halves the pool, which doubles the height, ...). The
+    /// sheet's own number is a fixed point.
+    fn css_row_height(&self, styles: &crate::view::StyleMap) -> Option<f32> {
+        let row = self.pool.first()?;
+        let style = styles.get(&crate::view::node_addr(row))?;
+        let (_, min_h) = style.min_size((0.0, 0.0));
+        let [pad_top, _, pad_bottom, _] = style.padding(0.0);
+        let [top, _, bottom, _] = style.border_widths();
+        let height = min_h + pad_top + pad_bottom + top + bottom;
+        (height.is_finite() && height > 0.0).then_some(height)
+    }
+
+    /// Take this frame's real geometry — the viewport from the node's own
+    /// allocation, the row height from the sheet — and rebind if either
+    /// moved.
+    ///
+    /// Until P8-D71's close-out `row_height`/`viewport` were written *only*
+    /// by [`ListViewC::set_metrics`], which no production path ever called:
+    /// `rebind` is a documented no-op while `row_height <= 0.0`, so a real
+    /// `ListView` never grew past `build`'s single placeholder row and no
+    /// interaction could be driven against one. This is the missing feedback
+    /// path, and `tick` (which `next_deadline` already asks for every frame)
+    /// is where a controller can see a completed layout pass.
+    fn adopt_metrics<Msg: Clone + 'static>(&mut self, cx: &EventCx<'_, Msg>) {
+        let Some(alloc) = cx.tree.allocation(&self.node) else {
+            return;
+        };
+        let viewport = alloc.content_box.height;
+        let Some(row_height) = self.css_row_height(cx.styles) else {
+            return;
+        };
+        if !viewport.is_finite() || viewport <= 0.0 {
+            return;
+        }
+        if (viewport - self.viewport).abs() < f32::EPSILON
+            && (row_height - self.row_height).abs() < f32::EPSILON
+        {
+            return;
+        }
+        self.viewport = viewport;
+        self.row_height = row_height;
+        self.offset = self.offset.clamp(0.0, self.max_offset(viewport));
+        self.rebind(viewport);
+    }
+
+    /// How many of this node's children are the controller's own: every
+    /// pooled row, plus the rubberband while a drag is running.
+    fn reserved(&self) -> usize {
+        self.pool.len() + usize::from(self.rubberband.is_some())
+    }
+
     /// The maximum scroll offset, never negative.
     fn max_offset(&self, viewport: f32) -> f32 {
         if self.row_height.is_finite() && self.row_height > 0.0 && viewport.is_finite() {
@@ -417,6 +476,23 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListViewC {
         }
     }
 
+    /// The pooled rows (and the rubberband, while one exists) are this
+    /// controller's own node children, built before any view child; a view
+    /// child of a `ListView` therefore starts after them.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + self.reserved()
+    }
+
+    /// ... and reconcile's trim step has to know they are there, or it
+    /// detaches every pooled row the moment it runs — a `ListView` takes no
+    /// view children at all, so *every* one of its node children is past the
+    /// default bound of `view_count`. Until P8-D71's close-out that is
+    /// exactly what happened: the pool was evicted on the first reconcile,
+    /// no row ever had an allocation, and no click could land on one.
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + self.reserved()
+    }
+
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         use crate::window::keyboard::Mods;
         use xkbcommon::xkb::keysyms;
@@ -533,7 +609,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListViewC {
         out
     }
 
-    fn tick(&mut self, now: Duration, _cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
+    fn tick(&mut self, now: Duration, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
+        self.adopt_metrics(cx);
         if let Some(delta) = self.kinetic.sample(now) {
             let viewport = self.viewport;
             self.offset = (self.offset + delta.1).clamp(0.0, self.max_offset(viewport));
@@ -632,6 +709,137 @@ pub(crate) mod tests {
             "selection survived"
         );
         assert_eq!(ListViewC::bound_label(c.as_ref(), 0), "row 500");
+    }
+
+    /// The metrics-feedback path P8-D71's close-out added: a `ListView` in a
+    /// real layout learns its own viewport and row height from the frame it
+    /// was just laid out in, and grows its pool, with nobody calling
+    /// `set_metrics`.
+    ///
+    /// Mutation check: drop the `self.adopt_metrics(cx)` line from
+    /// `ListViewC::tick` and the pool stays at `build`'s single placeholder
+    /// row, which is what every real `ListView` did before this.
+    #[test]
+    fn a_laid_out_list_view_learns_its_own_metrics_and_grows_its_pool() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use crate::anim::{Clock, ManualClock};
+        use crate::css::cascade::CompiledSheet;
+        use crate::css::computed::ResolveEnv;
+        use crate::css::node::Node;
+        use crate::layout::{BoxDirection, Container, FixedMeasure, LayoutTree};
+        use crate::view::controller::{Controller, EventCx, Phase};
+        use crate::view::reconcile::BuildCx;
+        use crate::view::render::{Animations, StyleMap, layout_tree, node_addr, restyle_tree};
+        use crate::view::{Cmd, Handlers};
+        use crate::window::focus::FocusRing;
+        use crate::window::selection::Clipboard;
+
+        // 30px rows in a 120px viewport: four fit, so the pool is well short
+        // of the model's thousand and well past `build`'s one placeholder.
+        let sheet = CompiledSheet::compile(
+            "listview { min-height: 120px; min-width: 200px } \
+             listview > row { min-height: 30px }",
+        );
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", vec![]);
+        let clock: Rc<dyn Clock> = Rc::new(ManualClock::new());
+        let env = ResolveEnv::default();
+        // Under a parent: `layout_tree` floors its *root* at the available
+        // space, and this test is about the widget's own box.
+        let window = Node::new("window");
+        let node = Node::new("listview");
+        window.append_child(&node);
+        let mut controller = {
+            let mut cx = BuildCx {
+                sheet: &sheet,
+                fonts: &mut fonts,
+                icons: &mut icons,
+                clock: &clock,
+                env: &env,
+            };
+            <ListViewC as Controller<()>>::build(&node, &props(1_000), &mut cx)
+        };
+        assert_eq!(controller.pool.len(), 1, "build seeds one placeholder row");
+
+        let mut anims = Animations::new();
+        let mut styles = StyleMap::new();
+        restyle_tree(
+            &window,
+            &sheet,
+            &env,
+            &mut styles,
+            &mut anims,
+            Duration::ZERO,
+        );
+        let mut containers: HashMap<_, Container> = HashMap::new();
+        for addr in [node_addr(&window), node_addr(&node)] {
+            containers.insert(
+                addr,
+                Container::Box {
+                    direction: BoxDirection::Column,
+                },
+            );
+        }
+        let mut tree = LayoutTree::new();
+        let mut measure = FixedMeasure(taffy::Size {
+            width: 0.0,
+            height: 0.0,
+        });
+        layout_tree(
+            &window,
+            &styles,
+            &containers,
+            &mut tree,
+            &env,
+            (Some(400.0), Some(400.0)),
+            &mut measure,
+        )
+        .expect("the list view lays out");
+
+        let handlers: Handlers<()> = Handlers::default();
+        let mut focus = <FocusRing as Default>::default();
+        let mut clipboard = Clipboard::offscreen();
+        let mut cmds: Vec<Cmd<()>> = Vec::new();
+        let mut ecx = EventCx {
+            node: &node,
+            handlers: &handlers,
+            tree: &tree,
+            styles: &styles,
+            focus: &mut focus,
+            clipboard: &mut clipboard,
+            icons: &mut icons,
+            fonts: &mut fonts,
+            clock: &clock,
+            env: &env,
+            cmds: &mut cmds,
+            phase: Phase::Target,
+            handled: false,
+        };
+        Controller::<()>::tick(&mut controller, Duration::ZERO, &mut ecx);
+
+        assert!(
+            (controller.row_height - 30.0).abs() < f32::EPSILON,
+            "the row height came from the sheet; got {}",
+            controller.row_height
+        );
+        assert!(
+            (controller.viewport - 120.0).abs() < f32::EPSILON,
+            "the viewport came from the allocation; got {}",
+            controller.viewport
+        );
+        assert_eq!(
+            controller.pool.len(),
+            controller.visible_range(120.0).len(),
+            "the pool is the visible range, not the model"
+        );
+        assert!(
+            controller.pool.len() > 1 && controller.pool.len() < 20,
+            "a 120px viewport of 30px rows pools a handful, not 1 and not \
+             1000; got {}",
+            controller.pool.len()
+        );
     }
 
     #[test]

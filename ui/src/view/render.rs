@@ -482,6 +482,12 @@ fn paint_one(
     let Some(alloc) = tree.allocation(node) else {
         return;
     };
+    // `GtkWidget:visible` is false: the node is still here (GTK's node trees
+    // list hidden nodes, and so do this crate's vendored fixtures) but paints
+    // nothing, itself or below.
+    if !tree.is_displayed(node) {
+        return;
+    }
     let alloc = Allocation {
         border_box: crate::layout::Rect::new(
             alloc.border_box.x + origin.0,
