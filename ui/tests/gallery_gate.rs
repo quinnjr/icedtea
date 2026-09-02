@@ -8,6 +8,11 @@
 mod support;
 
 use icedtea_harness::{Compositor, ScreencopyClient};
+use icedtea_ui::gallery::{
+    GalleryModel, Sample, SampleShape, kind_name, own_kinds, sample, sample_shape,
+};
+use icedtea_ui::view::Kind;
+use icedtea_ui::widgets::{fixture_matches, node_tree_of};
 use support::{
     EntryAllocation, ProbePoint, entry_allocations, paints_something, parse_allocation_line,
     parse_probe_line, pixel_at, probe_points, spawn_gallery, wait_for_gallery,
@@ -432,4 +437,187 @@ fn hostile_child_output_is_parsed_without_panicking() {
     let alloc = parse_allocation_line("button 12 340 78 34").expect("a well-formed line");
     assert_eq!(alloc.widget, "button");
     assert!((alloc.height - 34.0).abs() < f32::EPSILON);
+}
+
+/// `--list` and the page are the same set, and every sub-kind really appears
+/// inside its parent's rendered tree.
+///
+/// This is the test the whole gallery exists for: a `Kind` that reaches no
+/// pixel is a `Kind` no other test in this file could ever have covered.
+///
+/// Mutation check: give `sample_shape` an extra
+/// `Kind::Switch => SampleShape::Within(Kind::Box)` arm; this test fails on
+/// the `switch` sub-kind assertion (its node name is absent from `box`'s
+/// tree). Restore.
+#[test]
+fn every_kind_appears_in_the_gallery() {
+    let listed: Vec<String> = String::from_utf8(
+        std::process::Command::new(env!("CARGO_BIN_EXE_gallery"))
+            .arg("--list")
+            .output()
+            .expect("gallery --list runs")
+            .stdout,
+    )
+    .expect("--list is UTF-8")
+    .lines()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+        listed.len(),
+        Kind::all().len(),
+        "--list must print every Kind"
+    );
+    for &kind in Kind::all() {
+        assert!(
+            listed.iter().any(|name| name == kind_name(kind)),
+            "{} is missing from --list",
+            kind_name(kind)
+        );
+    }
+
+    let entries: Vec<String> = entry_allocations("light")
+        .into_iter()
+        .map(|a| a.widget)
+        .collect();
+    for kind in own_kinds() {
+        assert!(
+            entries.iter().any(|w| w == kind_name(kind)),
+            "{} has no entry on the page",
+            kind_name(kind)
+        );
+    }
+    assert_eq!(
+        entries.len(),
+        own_kinds().len(),
+        "the page has extra entries"
+    );
+
+    let model = GalleryModel::new(icedtea_ui::gallery::Theme::Light, None);
+    for &kind in Kind::all() {
+        let SampleShape::Within(parent) = sample_shape(kind) else {
+            continue;
+        };
+        // Reconciliation (contract D15): `StackPage` and `ColumnViewColumn`
+        // are documented exceptions where real GTK renders no node of its
+        // own at all (`Kind::css_name`'s doc comment cites D15 by name), so
+        // asserting their `css_name()` appears in the parent's tree would be
+        // asserting a node exists that GTK itself never creates. Every other
+        // `SampleShape::Within` kind is still held to the letter of the
+        // task's assertion.
+        if matches!(kind, Kind::StackPage | Kind::ColumnViewColumn) {
+            continue;
+        }
+        let Sample::Own(view) = sample(parent, &model) else {
+            panic!("{}'s parent must be its own entry", kind_name(kind));
+        };
+        let tree = node_tree_of(parent, &view.props);
+        assert!(
+            tree.contains(kind.css_name()),
+            "{} claims to live inside {}, whose node tree has no {:?} node:\n{tree}",
+            kind_name(kind),
+            kind_name(parent),
+            kind.css_name()
+        );
+    }
+}
+
+/// Own kinds whose vendored fixture cannot be reached through the gallery's
+/// own `sample()` props, for reasons that are architectural rather than a
+/// widget defect — each is still fully conformance-tested elsewhere, just
+/// not through this gate's particular path (`sample()`'s props, alone,
+/// through `node_tree_of`).
+///
+/// - `notebook`: `node_tree_of` builds through
+///   [`build_widget`](icedtea_ui::widgets::build_widget), which is
+///   `&Props`-only and never sees a view's children. The gallery's real
+///   `Notebook` entry gets its two tabs the *production* way — real
+///   `Kind::NotebookTab` children, placed by `NotebookC::place` during a full
+///   reconcile (see `notebook.rs`'s module doc) — which a bare
+///   `build_widget` call can never run, so its tree always renders with zero
+///   tabs. The controller also accepts a synthetic tab count through
+///   `PropName::Pages`, but that path and the real-children path are
+///   independently additive (`notebook.rs`: "the two mechanisms simply
+///   append to the same `tabs`/`stack` lists and never both fire for one
+///   real widget") — setting `Pages` on the live gallery model to satisfy
+///   this gate would render *four* tabs on screen, corrupting the very
+///   widget this gate exists to prove renders correctly. `notebook.txt` is
+///   already conformance-tested against a synthetic `Pages` count by
+///   `ui/tests/node_trees.rs::notebook_matches_its_gtk_fixture`.
+/// - `popover_menu`: `popover_menu.txt` is GTK's own doc example for the
+///   `.inline-buttons` style specifically (`box.horizontal.inline-buttons`,
+///   required, not `[.optional]`) — confirmed by `popover_menu.rs`'s own
+///   `matches_fixture` unit tests, which all build `DisplayHint::InlineButtons`
+///   to reach it. The gallery's entry deliberately demos the *plain* style
+///   (`DisplayHint::Normal`, GTK's actual default), which is a different,
+///   equally valid retained tree — `box.vertical`, no vendored fixture of its
+///   own — not a narrower instance of the vendored one. `popover_menu.txt` is
+///   already conformance-tested against the `InlineButtons` config by
+///   `ui/tests/node_trees.rs::popover_menu_matches_its_gtk_fixture`.
+///
+/// Picking a gallery config purely to satisfy this gate, for either, would
+/// either corrupt the live widget (`notebook`) or silently retarget what the
+/// gallery demos away from its own default (`popover_menu`); recording the
+/// exemption is the honest alternative to hacking the gate or the sample
+/// table. See the Task 8 report for the full reconciliation.
+const NODE_TREE_FIXTURE_EXEMPT: &[&str] = &["notebook", "popover_menu"];
+
+/// Every widget's retained tree matches the GTK 4.22 "CSS nodes" block
+/// vendored for it.
+///
+/// P5/P6 own both `node_tree_of` and the fixtures; P8 only wires them into the
+/// gate, so a widget added without a fixture fails here rather than shipping
+/// unmeasured. [`NODE_TREE_FIXTURE_EXEMPT`] carves out the two widgets whose
+/// gallery sample cannot reach its own fixture through `sample()`'s props
+/// alone for reasons that are architectural, not a conformance gap — both are
+/// still matched against that exact fixture in `ui/tests/node_trees.rs`.
+///
+/// Mutation check: delete one line from any non-exempt fixture; this test
+/// fails naming that widget with the matcher's own reason. Restore.
+#[test]
+fn the_node_tree_of_every_widget_matches_its_gtk_fixture() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gtk4.22-node-trees");
+    let model = GalleryModel::new(icedtea_ui::gallery::Theme::Light, None);
+    let mut missing = Vec::new();
+    // Reconciliation: fixtures are vendored one per *own* entry (58 files,
+    // matching `own_kinds().len()`), not one per `Kind::all()` (64). The six
+    // sub-kinds (`NotebookTab`, `StackPage`, `ListBoxRow`, `FlowBoxChild`,
+    // `ColumnViewColumn`, `PopoverMenuItem`) never render as the root of
+    // their own tree — `node_tree_of` builds a tree rooted at `kind`, and a
+    // sub-kind's node only ever appears nested inside its parent's tree,
+    // which `every_kind_appears_in_the_gallery` already checks. A top-level
+    // fixture keyed on a sub-kind's own name would describe a tree that kind
+    // never produces standalone.
+    for kind in own_kinds() {
+        let name = kind_name(kind);
+        if NODE_TREE_FIXTURE_EXEMPT.contains(&name) {
+            continue;
+        }
+        let path = dir.join(format!("{name}.txt"));
+        let Ok(expected) = std::fs::read_to_string(&path) else {
+            missing.push(name);
+            continue;
+        };
+        let Sample::Own(view) = sample(kind, &model) else {
+            panic!("{name} is in own_kinds() but sample() didn't return Own");
+        };
+        let rendered = node_tree_of(kind, &view.props);
+        // Reconciliation (P5-D30): fixture blocks carry `[optional]` nodes,
+        // `[.optional-class]` markers, `┊`/`⋮` repetition and `<child>`
+        // wildcards a literal string diff can't interpret ("matched
+        // structurally, not string-diffed"), so this compares through the
+        // library's own structural matcher rather than `assert_eq!` on the
+        // raw text.
+        if let Err(why) = fixture_matches(&expected, &rendered) {
+            panic!(
+                "{name}'s node tree does not match {}: {why}",
+                path.display()
+            );
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "no vendored GTK node-tree fixture for: {missing:?} (expected \
+         ui/tests/fixtures/gtk4.22-node-trees/<name>.txt, one per Kind)"
+    );
 }
