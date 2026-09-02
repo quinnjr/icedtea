@@ -477,19 +477,21 @@ impl<Msg: Clone + 'static> Measure for ControllerMeasure<'_, Msg> {
             clock: self.clock,
             env: self.env,
         };
-        let measured = self
+        let room = (
+            cap(known.width, available.width),
+            cap(known.height, available.height),
+        );
+        let measured = match self
             .instances
             .iter_mut()
             .find_map(|root| root.find_mut(node))
-            .and_then(|instance| {
-                instance.controller.measure(
-                    (
-                        cap(known.width, available.width),
-                        cap(known.height, available.height),
-                    ),
-                    &mut cx,
-                )
-            });
+        {
+            Some(instance) => instance.controller.measure(room, &mut cx),
+            // No instance owns this node: a recycling view's pooled row, which
+            // is a bare `Node` by design. Its text lives on the row-binding
+            // side table instead (`widgets::measure_row`).
+            None => crate::widgets::measure_row(node, room, &mut cx),
+        };
         match measured {
             Some((w, h)) => taffy::Size {
                 width: known.width.unwrap_or(w),
@@ -517,10 +519,15 @@ impl<Msg: Clone + 'static> NodePainter for ControllerPainter<'_, Msg> {
         style: &crate::css::computed::ComputedStyle,
         cx: &mut PaintCx<'_>,
     ) -> bool {
-        self.instances
+        match self
+            .instances
             .iter_mut()
             .find_map(|root| root.find_mut(node))
-            .is_some_and(|instance| instance.controller.paint(canvas, alloc, style, cx))
+        {
+            Some(instance) => instance.controller.paint(canvas, alloc, style, cx),
+            // A pooled row, for `ControllerMeasure::measure`'s reason.
+            None => crate::widgets::paint_row(node, canvas, alloc, style, cx),
+        }
     }
 }
 
@@ -566,8 +573,18 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
         &self.model
     }
 
-    /// Run view → reconcile → restyle → layout **once**, against `size`, with
-    /// no surface, and hand back the result.
+    /// Run view → reconcile → restyle → layout → **one settling tick** →
+    /// restyle → layout, against `size`, with no surface, and hand back the
+    /// result.
+    ///
+    /// The tick is not decoration. A controller that learns its own geometry
+    /// from the frame it was just laid out in does so in
+    /// [`Controller::tick`](crate::view::Controller::tick) —
+    /// `ListViewC::adopt_metrics` grows its pool from one placeholder row to
+    /// the viewport's worth there — and this is what the gallery's
+    /// `--print-allocation`/`--probe-points` publish and what both §8 gates
+    /// locate every widget by. Without the tick a probe describes a tree a
+    /// running app never shows.
     ///
     /// `sheet`, `fonts` and `icons` are parameters rather than fields because
     /// [`App::run`] takes them from the `Window` it is handed; a probe has no
@@ -612,6 +629,47 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             },
         );
         containers_of(&instances, &mut containers);
+        restyle_and_layout(
+            &root,
+            &mut instances,
+            &sheet,
+            &env,
+            &mut fonts,
+            &mut icons,
+            &clock,
+            &containers,
+            &mut styles,
+            &mut anims,
+            &mut tree,
+            size,
+        )
+        .map_err(AppError::Layout)?;
+        // One settling tick, then lay out again. A `Probe` is what the
+        // gallery's `--print-allocation`/`--probe-points` publish and what
+        // the gates locate every widget by, so it has to agree with what a
+        // *running* app shows — and a controller that learns its own
+        // geometry from the frame it was just laid out in only does so in
+        // `tick` (`ListViewC::adopt_metrics`, whose pool goes from one
+        // placeholder row to the viewport's worth). Without this the printed
+        // allocation of every widget below a `ListView` on the page was the
+        // one-row tree's, and the live frame's was the settled tree's.
+        {
+            let mut clipboard = Clipboard::offscreen();
+            let mut focus = <FocusRing as Default>::default();
+            let mut cmds: Vec<Cmd<Msg>> = Vec::new();
+            let mut cx = Dispatch {
+                styles: &styles,
+                tree: &tree,
+                focus: &mut focus,
+                clipboard: &mut clipboard,
+                icons: &mut icons,
+                fonts: &mut fonts,
+                clock: &clock,
+                env: &env,
+                cmds: &mut cmds,
+            };
+            tick_all(&mut instances, clock.now(), &mut cx);
+        }
         restyle_and_layout(
             &root,
             &mut instances,

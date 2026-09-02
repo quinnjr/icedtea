@@ -419,34 +419,43 @@ outside the process.
 
 ```bash
 cargo test -p icedtea-ui --test gallery_gate       # rest state, 3 themes
-cargo test -p icedtea-ui --test interaction_gate   # 15 driven interactions
+cargo test -p icedtea-ui --test interaction_gate   # 16 interactions, 15 driven
 cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
 ```
 
 - `tests/gallery_gate.rs` walks the page in surface-height slices under the
   harness compositor and asserts every widget paints something in light, dark
-  and high-contrast Adwaita — except the fifteen entries listed in that file's
+  and high-contrast Adwaita — except the nine entries listed in that file's
   `KNOWN_BLANK_AT_REST`, which are measured, not asserted on, because they
-  render nothing today (thirteen collapse to a zero-area allocation, and
+  render nothing today (seven collapse to a zero-area allocation, and
   `link_button`/`check_button` draw nothing into a real one; see contract
-  amendment P8-D69). Every entry, exempt or not, must still appear whole in
-  some slice. It further asserts that every `Kind` appears in `--list`, on the
+  amendment P8-D69). The list was fifteen until the M3 close-out's first fix
+  wave, which made the universal size request reach every kind (P8-D75) and
+  gave a recycling view's pooled rows a measure and a paint, so
+  `progress_bar`, `stack_switcher`, `stack_sidebar`, `list_view`, `grid_view`
+  and `about_dialog` are now asserted on like everything else. Every entry,
+  exempt or not, must still appear whole in some slice. It further asserts that every `Kind` appears in `--list`, on the
   page and (for sub-kinds) inside its parent's node tree; that at least one
   probe point per widget differs between light and dark; that every widget's
   node tree matches its vendored GTK 4.22 fixture; and that this README's
   table lists every `Kind`.
 - `tests/interaction_gate.rs` drives interactions with a virtual pointer and
-  keyboard. **Fifteen of the contract's sixteen ship**: click, toggle, check,
+  keyboard. **All sixteen of the contract's interactions ship; fifteen run**:
+  click, toggle, check,
   switch, the pointer-click-without-focus-ring rule, typing with a placed
   caret, debounced search, password peek, held spin repeat, scale drag,
   drop-down pick, expander disclosure, stack-page switch, menu-button popover,
   and Tab in geometric order. Each of the last ten landed with the
   pre-existing production defect it was RED on — none is asserted around.
-  The one that does not ship is `scrolling_a_list_view_recycles_rows_without_
-  losing_selection`: a pooled `ListView` row measures and paints nothing, so
-  ten rows cannot overflow a viewport and a recycling test would assert
-  nothing. Contract amendments P8-D71 and P8-D72 carry the whole trail, and
-  `.superpowers/sdd/m3-close/` the RED/GREEN evidence.
+  The sixteenth, `scrolling_a_list_view_recycles_rows_without_losing_
+  selection`, is written and `#[ignore]`d: its widget defects are fixed (rows
+  measure and paint, and the viewport no longer feeds itself), and what
+  blocks it is transport — `wlr` 0.20.28 forwards no `wl_pointer.axis` to any
+  client, so a scroll cannot be injected through the harness compositor at
+  all. The interaction itself is proven offscreen by
+  `widgets::list_view::tests::pixels::scrolling_recycles_the_pooled_rows_and_
+  keeps_the_selection`. Contract amendments P8-D71, P8-D72 and P8-D74 carry
+  the whole trail, and `.superpowers/sdd/m3-close/` the RED/GREEN evidence.
 - Colours are pinned in exactly one place — `tests/themed_button_offscreen.rs`,
   the M1 gate. The gallery gates assert *change*, not constants: 64 pinned
   colours would be a fixture to maintain, not a gate.

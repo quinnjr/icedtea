@@ -110,6 +110,15 @@ pub struct ListViewC {
     /// The pool slot, if any, the press landed on -- the click-select
     /// fallback `PointerUp` uses when no rubberband was ever created.
     press_hit: Option<usize>,
+    /// Something changed this frame that the screen has not caught up with
+    /// yet -- the pool grew, the metrics moved, the offset moved -- so one
+    /// more frame is owed. See [`Controller::next_deadline`]'s impl below.
+    dirty: bool,
+    /// Whether a flick is still coasting, mirrored out of `kinetic` (which
+    /// keeps that flag private) exactly as `ScrolledWindowC::kinetic_active`
+    /// does, so `next_deadline` can ask for frames while it decelerates and
+    /// stop when it is done.
+    kinetic_active: bool,
     universal: Universal,
 }
 
@@ -222,29 +231,63 @@ impl ListViewC {
         }
     }
 
-    /// A pooled row's own height, from the sheet rather than from the last
-    /// layout pass: `min-height` plus the vertical padding and border a
+    /// A pooled row's own height, from the sheet and the font rather than
+    /// from the last layout pass: the taller of `min-height` and the row
+    /// text's own line box, plus the vertical padding and border a
     /// `listview > row` declares.
     ///
     /// Not the row's *allocated* height, deliberately. The pool's size is a
     /// function of the row height and the rows share the viewport between
     /// them, so reading the height back off the allocation makes the two
     /// chase each other frame after frame (a one-row pool measures the whole
-    /// viewport, which halves the pool, which doubles the height, ...). The
-    /// sheet's own number is a fixed point.
-    fn css_row_height(&self, styles: &crate::view::StyleMap) -> Option<f32> {
+    /// viewport, which halves the pool, which doubles the height, ...). Both
+    /// terms here are pure functions of the sheet and the font database, so
+    /// this is still a fixed point.
+    ///
+    /// The line box is not optional. Adwaita gives `row` no `min-height` at
+    /// all — `min_size` is `(0, 0)` and the padding is 2px a side — so
+    /// before P8-D72's close-out every row was 4px tall, the gallery's ten
+    /// rows totalled 40px inside a 120px viewport, [`Self::max_offset`] was
+    /// 0, and a `ListView` could not be scrolled or recycled at all. GTK
+    /// sizes the row from the label inside it; so does this.
+    fn css_row_height(
+        &self,
+        styles: &crate::view::StyleMap,
+        fonts: &mut crate::text::FontDatabase,
+    ) -> Option<f32> {
         let row = self.pool.first()?;
         let style = styles.get(&crate::view::node_addr(row))?;
         let (_, min_h) = style.min_size((0.0, 0.0));
+        let text = crate::widgets::row_text_height(row, style, fonts).unwrap_or(0.0);
         let [pad_top, _, pad_bottom, _] = style.padding(0.0);
         let [top, _, bottom, _] = style.border_widths();
-        let height = min_h + pad_top + pad_bottom + top + bottom;
+        let height = min_h.max(text) + pad_top + pad_bottom + top + bottom;
         (height.is_finite() && height > 0.0).then_some(height)
     }
 
-    /// Take this frame's real geometry — the viewport from the node's own
-    /// allocation, the row height from the sheet — and rebind if either
-    /// moved.
+    /// **The viewport is the extent this view was *asked* to be, never what
+    /// its own rows made it.**
+    ///
+    /// `GtkListView` is a `GtkScrollable`: its viewport is imposed from
+    /// outside, and the rows it pools are a function of that viewport. The
+    /// two numbers a widget here can be given from outside are its
+    /// `height-request` (P8-D71's close-out made that universal) and the
+    /// sheet's `min-height`; the allocation is the fallback for a view given
+    /// neither.
+    ///
+    /// **Not the allocation when a request exists.** A recycling view whose
+    /// viewport is its own allocation feeds itself: the pool is
+    /// `ceil(viewport / row_height) + 1 + OVERSCAN` rows, those rows are its
+    /// children, so the box grows to hold them, so the viewport grows, so the
+    /// pool grows — until the pool is the whole model, `max_offset` is 0 and
+    /// nothing can scroll. Measured on the gallery's own sample the moment
+    /// rows started measuring their text: a 120 px request settled at a
+    /// 231 px "viewport", ten rows of 23 px, `max_offset` 0. Both terms here
+    /// are instead pure functions of the props and the sheet.
+    ///
+    /// Take this frame's real geometry — the viewport from what the view was
+    /// asked to be, the row height from the sheet and the font — and rebind
+    /// if either moved.
     ///
     /// Until P8-D71's close-out `row_height`/`viewport` were written *only*
     /// by [`ListViewC::set_metrics`], which no production path ever called:
@@ -253,12 +296,25 @@ impl ListViewC {
     /// interaction could be driven against one. This is the missing feedback
     /// path, and `tick` (which `next_deadline` already asks for every frame)
     /// is where a controller can see a completed layout pass.
-    fn adopt_metrics<Msg: Clone + 'static>(&mut self, cx: &EventCx<'_, Msg>) {
+    fn adopt_metrics<Msg: Clone + 'static>(&mut self, cx: &mut EventCx<'_, Msg>) {
         let Some(alloc) = cx.tree.allocation(&self.node) else {
             return;
         };
-        let viewport = alloc.content_box.height;
-        let Some(row_height) = self.css_row_height(cx.styles) else {
+        // See this function's own doc for why the viewport is not the
+        // allocation whenever the view was given an extent of its own.
+        let requested = crate::widgets::size_request_of(&self.node).1;
+        let css_min = cx
+            .styles
+            .get(&crate::view::node_addr(&self.node))
+            .map_or(0.0, |style| style.min_size((0.0, 0.0)).1);
+        let viewport = if requested > 0.0 {
+            requested
+        } else if css_min > 0.0 {
+            css_min
+        } else {
+            alloc.content_box.height
+        };
+        let Some(row_height) = self.css_row_height(cx.styles, cx.fonts) else {
             return;
         };
         if !viewport.is_finite() || viewport <= 0.0 {
@@ -273,6 +329,7 @@ impl ListViewC {
         self.row_height = row_height;
         self.offset = self.offset.clamp(0.0, self.max_offset(viewport));
         self.rebind(viewport);
+        self.dirty = true;
     }
 
     /// How many of this node's children are the controller's own: every
@@ -417,6 +474,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListViewC {
             rubberband_enabled: props.bool(PropName::EnableRubberband, false),
             press_origin: None,
             press_hit: None,
+            dirty: true,
+            kinetic_active: false,
             universal: Universal::new(node, Kind::ListView),
         };
         // `rebind` is a no-op before real metrics exist (module doc), so the
@@ -550,6 +609,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListViewC {
                 self.feed_kinetic(scroll, cx.clock.now());
                 if self.offset != before {
                     self.rebind(self.viewport);
+                    self.dirty = true;
                 }
                 cx.handled = true;
             }
@@ -610,23 +670,42 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListViewC {
     }
 
     fn tick(&mut self, now: Duration, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
+        // Cleared *before* the work: `adopt_metrics` and a coasting flick
+        // both set it again when they actually change something, and this
+        // frame is the one that pays off whatever the last one owed.
+        self.dirty = false;
         self.adopt_metrics(cx);
         if let Some(delta) = self.kinetic.sample(now) {
             let viewport = self.viewport;
             self.offset = (self.offset + delta.1).clamp(0.0, self.max_offset(viewport));
             self.rebind(viewport);
+            self.kinetic_active = true;
+            self.dirty = true;
+        } else {
+            self.kinetic_active = false;
         }
         Vec::new()
     }
 
     fn next_deadline(&self, now: Duration) -> Option<Duration> {
         let _ = now;
-        // `Kinetic` keeps its own "still coasting" flag private (unlike
-        // `ScrolledWindowC`, which mirrors it into `kinetic_active` for
-        // exactly this reason); no task test in this file drives the tick
-        // loop off this return value, so this stays the always-poll default
-        // rather than inventing a mirror flag nothing exercises.
-        Some(Duration::ZERO)
+        // Frames are asked for only while something is actually owed: the
+        // pool has just grown or rebound (`dirty`), or a flick is still
+        // coasting (`kinetic_active`, mirrored out of `Kinetic`'s private
+        // flag the way `ScrolledWindowC` mirrors it).
+        //
+        // This used to be an unconditional `Some(Duration::ZERO)` — "the
+        // always-poll default", on the grounds that no unit test drove the
+        // loop off it. A unit test is not the only reader: `App::run` treats
+        // a zero deadline as "render again immediately", so a `ListView`
+        // anywhere in the tree pinned the loop at a full repaint per
+        // iteration forever. With M3's own accepted `clip_path` cost (see
+        // `interaction_gate.rs`'s `REACT`) that is on the order of ten
+        // seconds a frame, and the gallery's `--widget list_view` run
+        // dispatched **no** pointer event at all in 25 s of a driver
+        // clicking and scrolling at it: the input it was starving was the
+        // interaction gate's.
+        (self.dirty || self.kinetic_active).then_some(Duration::ZERO)
     }
 }
 
@@ -864,5 +943,238 @@ pub(crate) mod tests {
             &mut hx.cx(),
         );
         assert!(ListViewC::selected(c.as_ref()).is_empty());
+    }
+
+    /// The §8 interaction gate's "scroll a list" interaction, driven through
+    /// a real `App` instead of through the compositor.
+    ///
+    /// `interaction_gate.rs`'s own
+    /// `scrolling_a_list_view_recycles_rows_without_losing_selection` is the
+    /// contract's home for this and is `#[ignore]`d: `wlr` 0.20.28 forwards
+    /// no `wl_pointer.axis` to any client, so a scroll cannot be *injected*
+    /// through the harness compositor at all (contract §10 P8-D74). Nothing
+    /// about the widget stops it being proven here, where the event goes
+    /// straight into the loop: this is the same ten rows in the same 120 px
+    /// viewport the gallery's sample builds, laid out, painted, scrolled and
+    /// read back off the raster surface.
+    mod pixels {
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        use crate::view::app::ScriptStep;
+        use crate::view::builders::{self as w, ListBoxExt, StackPagesExt};
+        use crate::view::{Cmd, Frames, View};
+        use crate::widgets::offscreen::{frames, px};
+        use crate::widgets::types::{ItemFactory, ListItem, RowContent, SelectionMode};
+        use crate::window::InputEvent;
+        use crate::window::pointer::{Scroll, ScrollSource};
+
+        /// The gallery's own `LIST_ROWS`, so this test and the gallery sample
+        /// stay the same fixture.
+        const ROWS: [&str; 10] = [
+            "Row 0", "Row 1", "Row 2", "Row 3", "Row 4", "Row 5", "Row 6", "Row 7", "Row 8",
+            "Row 9",
+        ];
+
+        #[derive(Clone, Debug)]
+        enum Msg {
+            Selected(usize),
+        }
+
+        fn update(model: &mut usize, msg: Msg) -> Cmd<Msg> {
+            match msg {
+                Msg::Selected(index) => *model = index,
+            }
+            Cmd::None
+        }
+
+        /// The gallery's `Kind::ListView` sample, verbatim in shape: ten
+        /// rows, single selection, a 200x120 request.
+        fn view(model: &usize) -> View<Msg> {
+            let items: Rc<[ListItem]> = ROWS
+                .iter()
+                .enumerate()
+                .map(|(i, text)| ListItem::new(i as u64, text))
+                .collect();
+            let factory =
+                ItemFactory::new(|_index, item: &ListItem| RowContent::from_label(&item.text));
+            w::list_view(items, factory)
+                .selection_mode(SelectionMode::Single)
+                .selected(*model)
+                .on_selected(Msg::Selected)
+                .width_request(200)
+                .height_request(120)
+        }
+
+        /// Inside the second pooled row, in surface coordinates: the view is
+        /// 208 px of nine ~23 px rows centred in a 260 px surface, so the
+        /// rows start at y=26 and the second spans 49..72. Derived, not
+        /// guessed -- `a_laid_out_list_view_learns_its_own_metrics_and_grows_its_pool`
+        /// pins the geometry this follows from, and the click assertion
+        /// below fails loudly if it ever stops landing on a row.
+        const ROW1_Y: f64 = 60.0;
+
+        /// A left press or release at the pointer's current position.
+        fn button(pressed: bool) -> ScriptStep<Msg> {
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: crate::window::layer::BTN_LEFT,
+                pressed,
+                serial: 0,
+                time_ms: 0,
+            })
+        }
+
+        /// A wheel scroll of `dy` px at the pointer's current position.
+        fn wheel(dy: f32) -> ScriptStep<Msg> {
+            ScriptStep::Event(InputEvent::Scroll(Scroll {
+                dx: 0.0,
+                dy,
+                source: ScrollSource::Wheel,
+                stop: false,
+                time_ms: 0,
+            }))
+        }
+
+        /// The frame's background: its most common pixel value.
+        ///
+        /// Not `px(.., 0, 0)`. This surface is not the window's own paint at
+        /// every corner, and taking a corner as the reference made a frame of
+        /// plain background read as entirely ink.
+        fn background(out: &Frames, frame: usize) -> (u8, u8, u8, u8) {
+            let mut counts: std::collections::HashMap<(u8, u8, u8, u8), usize> =
+                std::collections::HashMap::new();
+            for y in 0..out.height() {
+                for x in 0..out.width() {
+                    *counts.entry(px(out, frame, x, y)).or_default() += 1;
+                }
+            }
+            counts
+                .into_iter()
+                .max_by_key(|&(_, n)| n)
+                .map(|(colour, _)| colour)
+                .expect("a frame has pixels")
+        }
+
+        /// Every pixel of one frame, for comparing two of them.
+        fn whole(out: &Frames, frame: usize) -> Vec<(u8, u8, u8, u8)> {
+            (0..out.height())
+                .flat_map(|y| (0..out.width()).map(move |x| (x, y)))
+                .map(|(x, y)| px(out, frame, x, y))
+                .collect()
+        }
+
+        /// Rows paint their bound text at all.
+        ///
+        /// Mutation check: make `ControllerPainter::paint_content`'s `None`
+        /// arm return `false` again instead of calling
+        /// `widgets::paint_row`; a pooled row is a bare `Node` with no
+        /// instance, nothing draws its label, and the whole frame is
+        /// background. Restore.
+        #[test]
+        fn a_pooled_row_paints_its_bound_label() {
+            let out = frames(
+                0usize,
+                update,
+                view,
+                (200, 260),
+                vec![
+                    ScriptStep::Advance(Duration::from_millis(16)),
+                    ScriptStep::Advance(Duration::from_millis(16)),
+                    ScriptStep::Capture,
+                ],
+            );
+            let background = background(&out, 0);
+            let ink = whole(&out, 0)
+                .into_iter()
+                .filter(|p| *p != background)
+                .count();
+            assert!(ink > 0, "no pooled row painted anything");
+        }
+
+        /// A scroll rebinds the pool, and the selection made before the
+        /// scroll is back — same rows, same `:selected` band — after
+        /// scrolling home again.
+        ///
+        /// Four frames: at rest (row 0 selected, the model's default), after
+        /// selecting row 1, at the far end of the scroll, and home again.
+        /// `rest != selected` proves the band is really the selection and
+        /// not some constant; `selected != scrolled` proves the pool rebound
+        /// to other rows; `selected == home` proves the recycled rows came
+        /// back carrying the same selection.
+        ///
+        /// Mutation check 1 (verified): make `ListViewC::adopt_metrics` take
+        /// its viewport from `alloc.content_box.height`; the view sizes
+        /// itself to all ten rows, `max_offset` is 0, the scrolled frame is
+        /// identical to the selected one and the second assertion fails.
+        /// Mutation check 2 (verified): drop the
+        /// `row.set_state(PseudoStates::SELECTED, ..)` line from
+        /// [`ListViewC::rebind`]; the rows come home but the `:selected`
+        /// band does not, and the third assertion fails. Restore both.
+        #[test]
+        fn scrolling_recycles_the_pooled_rows_and_keeps_the_selection() {
+            // 260px tall so every pooled row is on the surface; the view's
+            // own viewport is its 120px request either way.
+            let out = frames(
+                0usize,
+                update,
+                view,
+                (200, 260),
+                vec![
+                    ScriptStep::Advance(Duration::from_millis(16)),
+                    ScriptStep::Advance(Duration::from_millis(16)),
+                    ScriptStep::Capture,
+                    // Click the *second* row. Not the first: `ListViewC`
+                    // selects index 0 on its own, so clicking row 0 selects
+                    // what is already selected and paints nothing. And a
+                    // click, not a `Msg::Selected(1)` fed back through
+                    // `.selected(..)`: `ListViewC::set_prop` reads no
+                    // `PropName::Selected`, so the prop the gallery sets is
+                    // inert and only a real click moves the selection.
+                    //
+                    // The pointer stays here for the scrolls below, which is
+                    // what a real one would do -- `view::app`'s
+                    // `InputEvent::Scroll` arm delivers to `hovered`.
+                    ScriptStep::Event(InputEvent::PointerMotion {
+                        x: 100.0,
+                        y: ROW1_Y,
+                        time_ms: 0,
+                    }),
+                    button(true),
+                    button(false),
+                    ScriptStep::Advance(Duration::from_millis(16)),
+                    ScriptStep::Capture,
+                    // Further than `max_offset`, which the controller clamps.
+                    wheel(10_000.0),
+                    ScriptStep::Advance(Duration::from_millis(16)),
+                    ScriptStep::Capture,
+                    wheel(-10_000.0),
+                    ScriptStep::Advance(Duration::from_millis(16)),
+                    ScriptStep::Capture,
+                ],
+            );
+            assert_eq!(out.len(), 4, "four frames were captured");
+
+            let rest = whole(&out, 0);
+            let selected = whole(&out, 1);
+            let scrolled = whole(&out, 2);
+            let home = whole(&out, 3);
+            assert!(
+                rest != selected,
+                "clicking the second row painted nothing, so the frames \
+                 below prove nothing about a selection"
+            );
+            assert!(
+                selected != scrolled,
+                "scrolling to the end left every pixel exactly as it was, so \
+                 nothing recycled"
+            );
+            assert!(
+                selected == home,
+                "scrolling home again must rebind the same rows, with the \
+                 same selection: {} of {} pixels differ",
+                selected.iter().zip(&home).filter(|(a, b)| a != b).count(),
+                selected.len()
+            );
+        }
     }
 }

@@ -315,6 +315,11 @@ fn reconcile_reserved<Msg: Clone + 'static>(
                 let changed = view.props.diff(&instance.props);
                 for name in changed {
                     let value = view.props.get(name).cloned().unwrap_or(Prop::None);
+                    // The universal half first, for every kind alike: a
+                    // controller that owns no `Universal` of its own would
+                    // otherwise drop `Classes`/`Id`/`Sensitive`/`Focusable`
+                    // and both size requests on the floor.
+                    crate::widgets::apply_universal(&instance.node, instance.kind, name, &value);
                     instance
                         .controller
                         .set_prop(&instance.node, name, &value, cx);

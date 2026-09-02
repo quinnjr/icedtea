@@ -960,6 +960,59 @@ thread_local! {
     static CONTAINERS: RefCell<NodeTable<Container>> = RefCell::new(NodeTable::new());
     static NODE_PROPS: RefCell<NodeTable<Props>> = RefCell::new(NodeTable::new());
     static NODE_CHILD: RefCell<NodeTable<ChildLayout>> = RefCell::new(NodeTable::new());
+    static NODE_UNIVERSAL: RefCell<NodeTable<Universal>> = RefCell::new(NodeTable::new());
+}
+
+/// The universal props [`apply_universal`] writes centrally, for *every*
+/// kind, whether or not that kind's controller owns a [`Universal`].
+///
+/// Deliberately a subset of the fifteen [`Universal::apply`] knows. These six
+/// have exactly one meaning on every `GtkWidget` — a class list, an id, a
+/// focus default, a sensitivity, a size floor — so applying them centrally
+/// can only ever agree with a controller that also applies them.
+/// `Checked`/`Indeterminate`/`Selected` are **not** here: a widget is free to
+/// give those names its own meaning (`ListView`'s `.selected(index)` is a
+/// model index, not a `:selected` flag on the view's own node), so writing a
+/// pseudo-state for them centrally would be wrong.
+const CENTRAL_UNIVERSAL: &[PropName] = &[
+    PropName::Classes,
+    PropName::Focusable,
+    PropName::Id,
+    PropName::Sensitive,
+    PropName::WidthRequest,
+    PropName::HeightRequest,
+];
+
+/// Write one universal prop onto `node`, from the reconciler, before the
+/// kind's own controller sees it.
+///
+/// [`Universal`] is opt-in per controller and only half the toolkit opted in:
+/// 30 of the widget modules mention it nowhere, so their `set_prop` fell
+/// through to `_ => return` for every universal name. `width-request` is the
+/// visible half of that — `gallery`'s `progress_bar` sample asked for 160 px
+/// and laid out `progress_bar 640 140 0 19`, a zero-width widget, and the
+/// `scrollbar` sample did the same — but `Classes`, `Id`, `Sensitive` and
+/// `Focusable` were dropped just as silently.
+///
+/// Applying centrally rather than in each of those 30 modules is what makes
+/// "universal" true by construction instead of by 60 files agreeing. It is
+/// idempotent against a controller that *does* own a `Universal`: both write
+/// the same class/id/state/size-request, and each tracks the classes it
+/// itself contributed, so a later change removes the stale class once from
+/// each and adds the new one twice — the node's class list is a set.
+///
+/// `true` when `name` was one of [`CENTRAL_UNIVERSAL`]; the caller passes it
+/// to the controller either way, because a controller may have work of its
+/// own to do on the same name.
+pub(crate) fn apply_universal(node: &Node, kind: Kind, name: PropName, value: &Prop) -> bool {
+    if !CENTRAL_UNIVERSAL.contains(&name) {
+        return false;
+    }
+    NODE_UNIVERSAL.with(|m| {
+        m.borrow_mut()
+            .entry_mut(node)
+            .apply(node, kind, name, value)
+    })
 }
 
 /// The depth [`forget_subtree`] walks before giving up, so a pathological
@@ -987,6 +1040,7 @@ pub(crate) fn forget_subtree(node: &Node) {
         NODE_CHILD.with(|m| m.borrow_mut().remove(node));
         TRANSITIONS.with(|t| t.borrow_mut().remove(node));
         ROW_BINDING.with(|m| m.borrow_mut().remove(node));
+        NODE_UNIVERSAL.with(|m| m.borrow_mut().remove(node));
     }
     walk(node, 0);
 }
@@ -999,6 +1053,7 @@ fn purge_tables() {
     NODE_CHILD.with(|m| m.borrow_mut().purge());
     TRANSITIONS.with(|t| t.borrow_mut().purge());
     ROW_BINDING.with(|m| m.borrow_mut().purge());
+    NODE_UNIVERSAL.with(|m| m.borrow_mut().purge());
 }
 
 /// The prop names [`record_props`] keeps; every other prop is dropped on the
@@ -1176,6 +1231,107 @@ pub(crate) fn text_of(node: &Node) -> Rc<str> {
         .unwrap_or_else(|| Rc::from(""))
 }
 
+/// A pooled row's text, shaped in `node`'s own resolved style.
+///
+/// The shaping half of [`measure_row`]/[`paint_row`]. `FontDatabase::shape`
+/// is itself cached on the same key, so calling this once per measure and
+/// once per paint costs one map lookup after the first frame.
+fn shaped_row(
+    node: &Node,
+    computed: &crate::css::computed::ComputedStyle,
+    fonts: &mut crate::text::FontDatabase,
+) -> Option<(crate::text::TextStyle, Rc<crate::text::ShapedText>)> {
+    let text = text_of(node);
+    if text.is_empty() {
+        return None;
+    }
+    let style = crate::text::TextStyle::from_computed(computed);
+    let face = fonts.match_face(&style.query())?;
+    let shaped = fonts.shape(&style.shape_key(&text, &face));
+    Some((style, shaped))
+}
+
+/// The line box a pooled row's bound text occupies, in `node`'s own resolved
+/// style. `None` when the row is unbound or the sheet's family resolves to no
+/// usable face.
+///
+/// This is a *content* height, a pure function of the sheet and the font — it
+/// never reads an allocation — so a caller sizing rows by it (see
+/// `ListViewC::css_row_height`) still has a fixed point rather than a
+/// pool-size feedback loop.
+pub(crate) fn row_text_height(
+    node: &Node,
+    computed: &crate::css::computed::ComputedStyle,
+    fonts: &mut crate::text::FontDatabase,
+) -> Option<f32> {
+    let (style, shaped) = shaped_row(node, computed, fonts)?;
+    let height = style.line_height_px(&shaped.metrics);
+    (height.is_finite() && height > 0.0).then_some(height)
+}
+
+/// Measure a pooled row's bound text, or `None` when `node` is not a bound
+/// row at all.
+///
+/// A pooled row is a bare [`Node`], never a reconciled `Instance`: it is
+/// created by `ListViewC`/`GridViewC`/`ColumnViewC` and rebound in place, so
+/// that a scroll keeps a row's identity, its `:selected` state and its
+/// running animations (§4.3's recycling contract). The price is that no
+/// controller owns it, so `view::app`'s `ControllerMeasure`/`ControllerPainter`
+/// — which both resolve a node through the instance tree — found nothing and
+/// every row measured 0 px high and drew no glyphs. Ten rows could not
+/// overflow a 120 px viewport, `max_offset` was 0, and nothing scrolled or
+/// recycled.
+///
+/// This is the second source those two consult when the instance lookup
+/// misses: the row's own [`RowBinding`], measured and painted exactly the way
+/// [`crate::view::controller::GenericC`] does its label.
+pub(crate) fn measure_row(
+    node: &Node,
+    available: (Option<f32>, Option<f32>),
+    cx: &mut BuildCx<'_>,
+) -> Option<(f32, f32)> {
+    // The emptiness check comes before the cascade, not inside `shaped_row`'s
+    // own: this runs for *every* leaf taffy measures that no instance owns —
+    // a scrollbar's trough, a switch's slider, every controller-built subnode
+    // in the tree — and a full `resolve_chain` per leaf per layout pass is
+    // not a price a row-binding lookup should make them pay.
+    if text_of(node).is_empty() {
+        return None;
+    }
+    let mut match_cx = crate::css::select::MatchCx::new();
+    let computed =
+        crate::css::computed::ComputedStyle::resolve_chain(cx.sheet, node, cx.env, &mut match_cx);
+    let (style, shaped) = shaped_row(node, &computed, cx.fonts)?;
+    let width = shaped.metrics.width;
+    let height = style.line_height_px(&shaped.metrics);
+    Some((
+        available.0.map_or(width, |cap| width.min(cap)),
+        available.1.map_or(height, |cap| height.min(cap)),
+    ))
+}
+
+/// Paint a pooled row's bound text into its own content box. `true` when
+/// anything was drawn. See [`measure_row`].
+pub(crate) fn paint_row(
+    node: &Node,
+    canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+    alloc: &crate::layout::Allocation,
+    style: &crate::css::computed::ComputedStyle,
+    cx: &mut crate::paint::PaintCx<'_>,
+) -> bool {
+    let Some((_, shaped)) = shaped_row(node, style, cx.fonts) else {
+        return false;
+    };
+    crate::paint::text::paint_text(
+        canvas,
+        &shaped,
+        alloc.content_box,
+        style,
+        &cx.base_length_ctx(),
+    );
+    true
+}
+
 /// Record which *model* index a pooled row currently displays -- never its
 /// pool slot, which changes on every scroll while the row's identity does
 /// not.
@@ -1264,6 +1420,21 @@ pub(crate) fn set_size_request(node: &Node, width: f32, height: f32) {
         entry.size_request = Some((clamp(width), clamp(height)));
         entry.node = Some(node.clone());
     });
+}
+
+/// The `width-request`/`height-request` last recorded for `node`, or `(0, 0)`.
+///
+/// The read side of [`set_size_request`], for the one caller that needs the
+/// *requested* extent rather than the allocated one: a recycling view's
+/// viewport (`ListViewC::adopt_metrics`).
+#[must_use]
+pub(crate) fn size_request_of(node: &Node) -> (f32, f32) {
+    PENDING.with(|p| {
+        p.borrow()
+            .get(node)
+            .and_then(|entry| entry.size_request)
+            .unwrap_or((0.0, 0.0))
+    })
 }
 
 /// Record whether a controller-owned `node` is shown — `GtkWidget:visible`.
@@ -1589,6 +1760,7 @@ pub fn build_controller<Msg: Clone + 'static>(
         _ => crate::view::controller::generic_controller(kind, node, props, cx),
     };
     for (name, value) in props.iter() {
+        apply_universal(node, kind, name, value);
         boxed.set_prop(node, name, value, cx);
     }
     boxed

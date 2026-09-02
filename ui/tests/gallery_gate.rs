@@ -80,23 +80,33 @@ fn visible_in_slice(
 /// Widgets whose entry is entirely the page background at rest, tracked as
 /// Part 8 deviation #12
 /// (`docs/superpowers/plans/2026-08-27-m3-part8-gallery-gate-docs.md`) pending
-/// a scheduled fix in each widget's own controller — no file this part owns
-/// can affect any of them.
+/// a scheduled fix in each widget's own controller.
 ///
-/// Two distinct defects, both measured rather than inferred, by walking the
-/// whole page once and recording every entry's non-background pixel count
-/// instead of asserting on it:
+/// Re-derived in the M3 close-out's first fix wave, against
+/// `gallery --print-allocation` and a full light-theme pass of this gate. The
+/// list it replaces was written when thirteen entries measured to nothing;
+/// six of those now have a real allocation and paint, and the three fixes
+/// that got them there are:
 ///
-/// **Thirteen collapse to a zero-area allocation** (`gallery
+/// * `widgets::apply_universal` — `width-request`/`height-request` (and
+///   `Classes`/`Id`/`Sensitive`/`Focusable`) now reach every kind, not only
+///   the controllers that happened to own a `Universal` — thirty widget
+///   modules mentioned it nowhere. That is what
+///   `progress_bar` (was `0x19`, now `160x19`) was missing.
+/// * `widgets::measure_row`/`paint_row` — a recycling view's pooled rows are
+///   bare `Node`s with no instance, so nothing measured or painted them;
+///   `list_view` and `grid_view` were 4px-tall rows of empty padding.
+/// * `00ddd7f`'s `StackSwitcherC` child-slot fix, which this list was never
+///   updated for.
+///
+/// **Seven still collapse to a zero-area allocation** (`gallery
 /// --print-allocation` prints `w` and/or `h` as `0`, headless, so this is a
-/// layout result and not a rendering artifact), and every one of them lands
-/// at `x = 640`, exactly half the 1280px page — the signature of a box taffy
-/// centred after it measured to nothing. Root-caused for `progress_bar` in
-/// `ui/src/widgets/progress_bar.rs`'s `measure`: `show_text(true)` delegates
-/// the whole measurement to an unshaped label instead of ever reporting the
-/// trough's own intrinsic `(150.0, 2.0)`, and the label measures to zero
-/// before shaping runs. The other twelve are the same shape of bug in a
-/// different controller, not individually traced.
+/// layout result and not a rendering artifact): `scrollbar` (`160x0` — the
+/// width request lands now, the height does not), `window_controls`,
+/// `color_dialog`, `font_dialog`, `popover_menu`, `popover_menu_bar` and
+/// `alert_dialog`. Each is a controller that reports no intrinsic size of its
+/// own, the same shape of bug `progress_bar` had; none is individually
+/// traced.
 ///
 /// **Two have a real allocation and still paint nothing**: `link_button`
 /// (36x34, 0 of 1224 pixels differ from the background) and `check_button`
@@ -110,6 +120,11 @@ fn visible_in_slice(
 /// gap and only pass this gate because `.link` is flat and they are not, so
 /// their 1px border is the only thing either of them draws.
 ///
+/// **`stack_sidebar` is no longer exempt either.** It has a real allocation
+/// (121x80) and paints; what it still gets wrong is which pages it shows
+/// (`StackSidebarC`'s eviction defect, contract §10 P8-D72), and that is a
+/// content bug this gate does not and should not test for.
+///
 /// This gate exists precisely to catch "does not paint at rest" — excluding
 /// these widgets from the paint assertion does not un-report the defect, it
 /// only keeps the gate from blocking on widgets a later, dedicated task must
@@ -121,23 +136,16 @@ fn visible_in_slice(
 /// 2x2) but both do paint, and now that [`paints_something`] scans the whole
 /// border box instead of an inset 5x5 grid, the gate can see it.
 ///
-/// Mutation check: remove `"progress_bar"` from this list; the light-theme
-/// test fails with "progress_bar painted nothing in the light theme".
-/// Restore.
+/// Mutation check: remove `"scrollbar"` from this list; the light-theme test
+/// fails with "scrollbar painted nothing in the light theme". Restore.
 const KNOWN_BLANK_AT_REST: &[&str] = &[
     // Zero-area allocation.
-    "progress_bar",
     "scrollbar",
     "window_controls",
     "color_dialog",
     "font_dialog",
-    "stack_switcher",
-    "stack_sidebar",
-    "list_view",
-    "grid_view",
     "popover_menu",
     "popover_menu_bar",
-    "about_dialog",
     "alert_dialog",
     // Real allocation, nothing drawn into it.
     "link_button",

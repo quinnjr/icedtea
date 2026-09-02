@@ -524,6 +524,137 @@ fn band(alloc: &support::EntryAllocation, y: i32) -> (i32, i32, i32) {
     (alloc.x as i32 + 1, (alloc.x + alloc.width) as i32 - 2, y)
 }
 
+/// Further than any `ListView` in the gallery can scroll, so the offset lands
+/// on `max_offset` exactly and the test never has to know a row height. The
+/// controller clamps (`ListViewC::on_event`'s `Scroll` arm), so overshooting
+/// is the point.
+const PAST_THE_END: f64 = 10_000.0;
+
+/// How long the band has to hold still before [`settled_row`] believes the
+/// repaint is over. Three seconds of quiet, which is well past the round trip
+/// a click or a scroll takes here (measured: the band moves within five
+/// seconds of the event) and well short of [`REACT`].
+const QUIET: Duration = Duration::from_secs(3);
+
+/// The band at `y`, once it has stopped changing.
+///
+/// `Driver::wait_row_change` answers "did it move"; this answers "where did it
+/// come to rest", which is what a *comparison between two states* needs. A
+/// selection repaints in two visible steps here — the glyphs of the row that
+/// was rebound, then the `:selected` background behind them — so a band read
+/// the instant it first differs can be the intermediate one, and comparing it
+/// with a later, fully painted band then fails on a difference that is only
+/// timing.
+fn settled_row(driver: &mut Driver, x0: i32, x1: i32, y: i32) -> Vec<(u8, u8, u8)> {
+    let started = std::time::Instant::now();
+    let mut last = driver.row(x0, x1, y);
+    let mut quiet_since = std::time::Instant::now();
+    loop {
+        std::thread::sleep(support::CAPTURE_POLL);
+        let now = driver.row(x0, x1, y);
+        if support::row_matches(&now, &last) {
+            if quiet_since.elapsed() >= QUIET || started.elapsed() >= REACT {
+                return now;
+            }
+        } else {
+            quiet_since = std::time::Instant::now();
+        }
+        last = now;
+    }
+}
+
+/// A `ListView` scrolls by rebinding its pooled rows, and the row that was
+/// selected before the scroll is still selected when it comes back.
+///
+/// The gallery's sample is ten rows in a 120 px viewport, so `max_offset` is
+/// four rows' worth: scrolling to the end puts a different model row in slot
+/// 1, and scrolling back to the top puts row 1 there again — *the same
+/// `Node`*, still `:selected`, which is what recycling means. The band is
+/// read from `--probe-points`' own `row1`, never from a hard-coded row
+/// height.
+///
+/// The *second* row, not the first: the gallery model's default selection is
+/// index 0 for every selectable widget (`GalleryModel::selection`), so
+/// clicking row 0 selects what is already selected and `ListViewC` — like
+/// GTK — reports no change.
+///
+/// A band rather than one pixel, for [`support::Driver::row`]'s reason: a row
+/// is a glyph run, and a glyph row is mostly background between the stems.
+///
+/// **Ignored: nothing in this compositor stack can deliver a scroll.**
+/// Everything above the two `driver.scroll` calls passes today — the row is
+/// clicked, `selected list_view 1` reaches the model, and the `:selected`
+/// band paints — and then the axis event goes nowhere. Traced end to end
+/// with a print at the top of `view::app`'s `dispatch_input`: injecting
+/// `zwlr_virtual_pointer_v1.axis` + `frame` delivers `PointerEnter` and
+/// nothing else, ever. The gap is below this crate and below the compositor
+/// in this repo: `wlr` 0.20.28 (`compositor/Cargo.toml`) never subscribes to
+/// a pointer's `events.axis` and never calls `wlr_seat_pointer_notify_axis`
+/// — `grep -c axis` over its whole `src/` finds only comments about layout
+/// axes — so no Wayland client under this compositor has ever received a
+/// `wl_pointer.axis`, and `Driver::scroll` (which no other test in the crate
+/// calls) has never worked. Closing it means a `wlr` release, which this
+/// branch cannot make; it is recorded as contract §10 **P8-D74**.
+///
+/// The interaction itself is *not* untested. `widgets::list_view::tests::
+/// pixels::scrolling_recycles_the_pooled_rows_and_keeps_the_selection`
+/// proves exactly this behaviour — a click that paints a selection, a scroll
+/// that repaints the view with other rows, and a scroll home that brings the
+/// selected one back pixel for pixel — through a real `App`, a real layout
+/// pass and a real paint, on the offscreen surface, where the scroll can be
+/// delivered. Un-`ignore` this the day the transport exists.
+///
+/// Mutation check 1 (recycling): make `ListViewC::adopt_metrics` take its
+/// viewport from `alloc.content_box.height` again; the view sizes itself to
+/// all ten rows, `max_offset` is 0, the scroll moves nothing and the second
+/// assertion fails. Mutation check 2 (selection): drop the
+/// `row.set_state(PseudoStates::SELECTED, ..)` line from `ListViewC::rebind`;
+/// the scroll back to the top restores the glyphs but not the selection
+/// background, and the last assertion fails. Restore both. (Both are checked
+/// today by the offscreen test named above.)
+#[test]
+#[ignore = "no wl_pointer.axis transport: wlr 0.20.28 never forwards one (P8-D74)"]
+fn scrolling_a_list_view_recycles_rows_without_losing_selection() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "list_view");
+    let alloc = driver.allocation("list_view");
+    let (rx, ry) = driver.point("list_view", "row1");
+    let (x0, x1, _) = band(&alloc, ry);
+    let unselected = settled_row(&mut driver, x0, x1, ry);
+
+    driver.click(rx, ry);
+    assert!(
+        gallery.wait_msg("selected list_view 1", REACT),
+        "clicking the second row reported nothing; got {:?}",
+        gallery.messages()
+    );
+    driver.wait_row_change(x0, x1, ry, &unselected);
+    let selected = settled_row(&mut driver, x0, x1, ry);
+    assert!(
+        !support::row_matches(&selected, &unselected),
+        "selecting the second row painted nothing: the band from ({x0}, {ry}) \
+         to ({x1}, {ry}) stayed {unselected:?}"
+    );
+
+    driver.scroll(rx, ry, PAST_THE_END);
+    driver.wait_row_change(x0, x1, ry, &selected);
+    let scrolled = settled_row(&mut driver, x0, x1, ry);
+    assert!(
+        !support::row_matches(&scrolled, &selected),
+        "scrolling to the end left the second row exactly as it was, so \
+         nothing recycled.\nselected: {selected:?}\nscrolled: {scrolled:?}"
+    );
+
+    driver.scroll(rx, ry, -PAST_THE_END);
+    driver.wait_row_change(x0, x1, ry, &scrolled);
+    let back = settled_row(&mut driver, x0, x1, ry);
+    assert!(
+        support::row_matches(&back, &selected),
+        "scrolling back to the top must rebind the same selected row.\n\
+         selected: {selected:?}\nafter:    {back:?}"
+    );
+}
+
 /// Clicking the title discloses the child: the message reaches the model and
 /// the child's own pixels reach the screen.
 ///

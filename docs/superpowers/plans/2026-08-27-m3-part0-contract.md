@@ -4600,6 +4600,16 @@ nothing, so ten rows cannot overflow a viewport and nothing recycles). All
 four of this entry's own interactions are closed; what it still carries is
 the `StackSidebar` note above.
 
+**Amended 2026-09-02** (M3 close-out, fix wave 1). The pooled-row half is
+fixed — rows measure and paint their bound text (`widgets::measure_row`/
+`paint_row`), a row's height comes from the sheet *and* the font
+(`ListViewC::css_row_height`), and the viewport is what the view was asked to
+be rather than what its own rows made it (`ListViewC::adopt_metrics`), so ten
+rows do overflow a 120px viewport and a scroll does recycle. The test is
+written and ships, `#[ignore]`d: no `wl_pointer.axis` reaches any client
+under this compositor, which is **P8-D74**. The behaviour itself is proven
+offscreen; see that entry.
+
 **Commit:** see `.superpowers/sdd/m3-close/closure-chrome-focus.md` for the
 full RED/GREEN trail.
 
@@ -4638,6 +4648,87 @@ class specifically, as barring changes that regress an existing gate; a
 two-line reservation count that regresses nothing and is proven by a gate
 test is permitted, provided it is recorded here. No other widget
 implementation was modified by P8.
+
+### P8-D74 — the "scroll a list" interaction cannot be driven: `wlr` 0.20.28 forwards no `wl_pointer.axis`
+
+**Carried out by:** the M3 close-out, fix wave 1. **Added:** 2026-09-02.
+
+**§7's gate says** `interaction_gate.rs` ships sixteen tests, one of them
+`scrolling_a_list_view_recycles_rows_without_losing_selection`. P8-D72
+recorded it as the last one still open, blocked on pooled rows measuring and
+painting nothing.
+
+**As shipped:** the rows defect is fixed (`widgets::measure_row`/`paint_row`,
+`ListViewC::css_row_height`, `ListViewC::adopt_metrics`' request-derived
+viewport) and the interaction still cannot be driven through the harness
+compositor, for a reason below this crate entirely.
+
+**The blocker, traced end to end.** With a print at the top of
+`view::app::dispatch_input`, a `--widget list_view` gallery run under the
+harness receives `Configure`, `KeyboardEnter`, `PointerEnter` and a stream of
+`Frame`s — and never one `Scroll`, however many
+`zwlr_virtual_pointer_v1.axis` + `frame` pairs `Driver::scroll` injects. The
+gap is in the compositor stack: `wlr` 0.20.28 (`compositor/Cargo.toml`) never
+subscribes to a pointer's `events.axis` and never calls
+`wlr_seat_pointer_notify_axis` — `grep -rn axis` over its whole `src/`
+returns only comments about layout axes. No Wayland client under this
+compositor has ever received a `wl_pointer.axis`; `Driver::scroll` has no
+caller anywhere in the tree older than this test, so nothing had noticed.
+Closing it means a `wlr` release, which this branch cannot make.
+
+**Ruling.** The test ships, named exactly as §7 names it, written exactly as
+it would run, and `#[ignore]`d with that reason in the attribute and the full
+trace in its doc comment. `interaction_gate.rs` therefore carries all sixteen
+of §7's names; fifteen run, one is ignored, and the ignore is a transport
+gap, not a widget defect.
+
+**The interaction is covered, not dropped.** `widgets::list_view::tests::
+pixels::scrolling_recycles_the_pooled_rows_and_keeps_the_selection` drives the
+same ten rows in the same 120px viewport through a real `App`, a real layout
+pass and a real paint on the offscreen surface, where the scroll *can* be
+delivered: it clicks the second row, scrolls to the end, scrolls home, and
+asserts on the frames — the selection paints, the pool rebinds to other rows,
+and the recycled rows come home carrying the same selection. Both of its
+mutation checks were verified to fail.
+
+**Un-ignore it** the day `wlr` forwards an axis event; nothing else in the
+test needs to change.
+
+
+### P8-D75 — §4.3's universal props are applied centrally, not per controller
+
+**Carried out by:** the M3 close-out, fix wave 1. **Added:** 2026-09-02.
+
+**§4.3 says** fifteen `GtkWidget` props are universal. §5's widget catalogue
+assumes every kind honours them.
+
+**As shipped (before this wave):** `widgets::Universal` was opt-in per
+controller, and 30 of the widget modules mentioned it nowhere — their
+`set_prop` fell through to `_ => return` for every universal name. The
+visible half was the size request: `gallery`'s `progress_bar` sample asked
+for `width_request(160)` and `--print-allocation` reported
+`progress_bar 640 140 0 19`, a zero-width widget; the `scrollbar` sample did
+the same. `Classes`, `Id`, `Sensitive` and `Focusable` were dropped just as
+silently on those same kinds. `642f612` had called the size request
+"universal" while fixing only the controllers that already owned a
+`Universal`.
+
+**Ruling.** `widgets::apply_universal(node, kind, name, value)` is called
+from both prop seams — `widgets::build_controller`'s initial loop and
+`view::reconcile`'s diff loop — *before* the controller's own `set_prop`, for
+every kind alike, keyed on a node-keyed side table like every other piece of
+per-node widget bookkeeping. It is idempotent against a controller that also
+owns a `Universal`.
+
+It applies six of the fifteen, not all of them:
+`Classes`/`Focusable`/`Id`/`Sensitive`/`WidthRequest`/`HeightRequest`. Those
+six have exactly one meaning on every `GtkWidget`.
+`Checked`/`Indeterminate`/`Selected` are deliberately excluded: a widget is
+free to give those names its own meaning — `ListView`'s `.selected(index)` is
+a model index, not a `:selected` flag on the view's own node — so writing a
+pseudo-state for them centrally would be wrong. The remaining §4.3 names
+have no universal writer and stay where they are.
+
 
 ---
 
