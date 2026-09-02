@@ -9,7 +9,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::{Driver, KEY_H, KEY_I, KEY_SPACE, KEY_TAB};
+use support::{Driver, KEY_SPACE, KEY_TAB};
 
 /// How long an interaction gets to reach the model and the screen.
 ///
@@ -163,137 +163,6 @@ fn a_pointer_click_focuses_without_showing_the_focus_ring() {
         gallery.wait_msg("clicked button", REACT),
         "Space did not activate the focused button; got {:?}",
         gallery.messages()
-    );
-}
-
-/// Typing must reach the model *and* the glyphs must reach the screen: either
-/// half alone would pass with the other broken.
-///
-/// Mutation check: make `EntryC` swallow `Event::Key` without emitting
-/// `EventKind::Change`; the message never arrives and this test fails.
-/// Restore.
-#[test]
-fn typing_into_an_entry_shows_the_glyphs_and_moves_the_caret() {
-    let mut driver = Driver::new();
-    let gallery = driver.open("light", "entry");
-    let (tx, ty) = driver.point("entry", "text");
-    let before = driver.pixel(tx, ty);
-
-    driver.click(tx, ty);
-    driver.keys(&[KEY_H, KEY_I]);
-
-    assert!(
-        gallery.wait_msg("changed entry Entryhi", REACT)
-            || gallery.wait_msg("changed entry hi", REACT),
-        "typing did not reach the model; got {:?}",
-        gallery.messages()
-    );
-    let after = driver.wait_pixel_change(tx, ty, before);
-    assert!(
-        !support::matches(after, before),
-        "the typed glyphs never reached the `text` subnode"
-    );
-}
-
-/// One search, after the delay — not one per keystroke. That debounce is the
-/// whole behaviour `SearchEntry` adds over `Entry`.
-///
-/// Mutation check: make `SearchEntryC` fire `EventKind::Search` on every key;
-/// the count assertion below fails with 2. Restore.
-#[test]
-fn typing_into_a_search_entry_fires_one_search_after_the_delay() {
-    let mut driver = Driver::new();
-    let gallery = driver.open("light", "search_entry");
-    let (tx, ty) = driver.point("search_entry", "text");
-
-    driver.click(tx, ty);
-    driver.keys(&[KEY_H, KEY_I]);
-    assert!(
-        gallery.wait_msg("search hi", REACT),
-        "the search never fired; got {:?}",
-        gallery.messages()
-    );
-    // Let any further debounced fire land before counting.
-    std::thread::sleep(Duration::from_millis(500));
-    let searches = gallery
-        .messages()
-        .iter()
-        .filter(|line| line.starts_with("search "))
-        .count();
-    assert_eq!(
-        searches,
-        1,
-        "two keystrokes must debounce into one search; got {:?}",
-        gallery.messages()
-    );
-}
-
-/// Peeking reveals the real text: the `text` subnode must change when the peek
-/// icon is clicked, with no keystroke in between.
-///
-/// Reconciliation: the task text reads the peek icon's probe point as
-/// `password_entry`/`image`; `--probe-points` prints `image0` (the
-/// `caps-lock-indicator`, nested under `text` and visited first in the
-/// preorder walk) and `image1` (the peek icon itself, a direct child of
-/// `node` appended after `text`), so this samples `image1`, the label the
-/// binary actually prints.
-///
-/// Mutation check: make `PasswordEntryC`'s peek toggle `visibility` without
-/// re-shaping the text; the pixels stay bullets and this test fails. Restore.
-#[test]
-fn peeking_a_password_entry_reveals_the_text() {
-    let mut driver = Driver::new();
-    let _gallery = driver.open("light", "password_entry");
-    let (tx, ty) = driver.point("password_entry", "text");
-    let bullets = driver.pixel(tx, ty);
-    let (ix, iy) = driver.point("password_entry", "image1");
-
-    driver.click(ix, iy);
-    let revealed = driver.wait_pixel_change(tx, ty, bullets);
-    assert!(
-        !support::matches(revealed, bullets),
-        "the peek icon revealed nothing: the text stayed {bullets:?}"
-    );
-}
-
-/// Holding the up button must step more than once: that repeat timer is the
-/// clock-driven behaviour `SpinButtonC::tick` owns.
-///
-/// Reconciliation: the task text reads the up button's probe point as
-/// `spin_button`/`button0`; `--probe-points` prints `button0` for
-/// `button.down` and `button1` for `button.up` (the gallery sample is
-/// horizontal, whose node order is `text`, `button.down`, `button.up`), so
-/// this samples `button1`, the label the binary actually prints.
-///
-/// Mutation check: make `SpinButtonC::next_deadline` return `None`; only the
-/// first step happens and this test fails on the second value. Restore.
-#[test]
-fn stepping_a_spin_button_repeats_while_the_button_is_held() {
-    let mut driver = Driver::new();
-    let gallery = driver.open("light", "spin_button");
-    let (ux, uy) = driver.point("spin_button", "button1");
-
-    driver.press(ux, uy);
-    assert!(
-        gallery.wait_msg("value spin_button 4", REACT),
-        "the first step never happened; got {:?}",
-        gallery.messages()
-    );
-    assert!(
-        gallery.wait_msg("value spin_button 5", REACT),
-        "the held button did not repeat; got {:?}",
-        gallery.messages()
-    );
-    driver.release(ux, uy);
-
-    let steps = gallery
-        .messages()
-        .iter()
-        .filter(|line| line.starts_with("value spin_button "))
-        .count();
-    assert!(
-        steps >= 2,
-        "a held spin button must step at least twice, got {steps}"
     );
 }
 

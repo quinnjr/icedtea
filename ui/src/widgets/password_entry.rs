@@ -119,28 +119,6 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
         }
     }
 
-    /// `build` attaches `text` (always) and `image.peek` (when
-    /// `show-peek-icon`) directly to `node`, ahead of any real view child;
-    /// `image.caps-lock-indicator` nests under `text` itself, so it needs no
-    /// entry here.
-    ///
-    /// Without this override, [`Controller::reserved_total`]'s default of
-    /// `view_count` (zero, since a `PasswordEntry` takes no view children at
-    /// all) makes `reconcile`'s trim step detach both on the very first
-    /// reconcile -- the same chrome-eviction bug documented on
-    /// [`crate::widgets::switch::SwitchC::child_index`], found here by a
-    /// headless probe walking `node`'s real children and finding none. This
-    /// controller's own `on_event` doc below ("never gets a taffy node...
-    /// always") was describing that eviction, not a deliberate design.
-    fn child_index(&self, view_index: usize) -> usize {
-        view_index + 1 + usize::from(self.peek_node.is_some())
-    }
-
-    /// See [`Self::child_index`].
-    fn reserved_total(&self, view_count: usize) -> usize {
-        view_count + 1 + usize::from(self.peek_node.is_some())
-    }
-
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         // Plan reconciliation: the plan hit-tested the peek icon with
         // `local_rect(cx.tree, cx.node, &peek)`, the same helper `Entry`'s

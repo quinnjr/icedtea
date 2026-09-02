@@ -269,24 +269,6 @@ impl<Msg: Clone + 'static> Controller<Msg> for SpinButtonC {
         self.sync_text(cx);
     }
 
-    /// `build` attaches `text`, `button.up` and `button.down` directly to
-    /// `node`, ahead of any real view child.
-    ///
-    /// Without this override, [`Controller::reserved_total`]'s default of
-    /// `view_count` (zero, since a `SpinButton` takes no view children at
-    /// all) makes `reconcile`'s trim step detach all three on the very
-    /// first reconcile -- the same chrome-eviction bug documented on
-    /// [`crate::widgets::switch::SwitchC::child_index`], found here by a
-    /// headless probe walking `node`'s real children and finding none.
-    fn child_index(&self, view_index: usize) -> usize {
-        view_index + 3
-    }
-
-    /// See [`Self::child_index`].
-    fn reserved_total(&self, view_count: usize) -> usize {
-        view_count + 3
-    }
-
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         // Plan reconciliation: the plan's `on_event` never granted keyboard
         // focus on click, the same gap `Entry`/`TextView` had — without this

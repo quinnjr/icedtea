@@ -211,29 +211,6 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
         self.apply(node);
     }
 
-    /// `build` attaches `text`, `image.left` and `image.right` (always) and
-    /// `progress` (when a fraction is set) directly to `node`, ahead of any
-    /// real view child.
-    ///
-    /// Without this override, [`Controller::reserved_total`]'s default of
-    /// `view_count` (zero, since an `Entry` takes no view children at all)
-    /// makes `reconcile`'s trim step detach every one of them on the very
-    /// first reconcile -- the same chrome-eviction bug documented on
-    /// [`crate::widgets::switch::SwitchC::child_index`], found here by a
-    /// headless probe walking `node`'s real children and finding none: with
-    /// `text` gone, `local_rect`/`content_rect_local`'s own doc trail
-    /// ("never gets a taffy node") was describing this eviction, not a
-    /// deliberate design, and `icon_left`/`icon_right`'s `local_rect`-based
-    /// press handling below was dead code as a direct consequence.
-    fn child_index(&self, view_index: usize) -> usize {
-        view_index + 3 + usize::from(self.progress.is_some())
-    }
-
-    /// See [`Self::child_index`].
-    fn reserved_total(&self, view_count: usize) -> usize {
-        view_count + 3 + usize::from(self.progress.is_some())
-    }
-
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         // An icon press reports its index and consumes the event.
         for (index, icon) in self.icons.iter().enumerate() {

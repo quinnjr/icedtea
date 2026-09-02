@@ -106,26 +106,6 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
         }
     }
 
-    /// `build` attaches `text` directly to `node`, ahead of any real view
-    /// child.
-    ///
-    /// Without this override, [`Controller::reserved_total`]'s default of
-    /// `view_count` (zero, since a `SearchEntry` takes no view children at
-    /// all) makes `reconcile`'s trim step detach it on the very first
-    /// reconcile -- the same chrome-eviction bug documented on
-    /// [`crate::widgets::switch::SwitchC::child_index`], found here by a
-    /// headless probe walking `node`'s real children and finding none. This
-    /// module's own doc comment above (`local_rect`... "has no taffy node...
-    /// always") was describing that eviction, not a deliberate design.
-    fn child_index(&self, view_index: usize) -> usize {
-        view_index + 1
-    }
-
-    /// See [`Self::child_index`].
-    fn reserved_total(&self, view_count: usize) -> usize {
-        view_count + 1
-    }
-
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         if matches!(ev, Event::PointerDown { .. }) {
             // Plan reconciliation: the plan's `on_event` never granted focus
