@@ -247,6 +247,153 @@ fn every_widget_renders_at_rest_in_the_light_theme() {
     every_widget_renders_at_rest("light");
 }
 
+#[test]
+fn every_widget_renders_at_rest_in_the_dark_theme() {
+    every_widget_renders_at_rest("dark");
+}
+
+#[test]
+fn every_widget_renders_at_rest_in_the_high_contrast_theme() {
+    every_widget_renders_at_rest("hc");
+}
+
+/// Capture every slice of `theme` and index the probe pixels by
+/// `(widget, label)`.
+///
+/// Reconciliation: the task text walks slices with a literal `SLICE_STEP` and
+/// bounds each point's visibility against a literal `SURFACE_HEIGHT`. Neither
+/// constant exists in this file — Task 6 reconciled the same walk to
+/// `slice_step(capturable_height, tallest_entry)` against the compositor's own
+/// `output_size()`, for the reasons documented on `visible_in_slice` above.
+/// This function reuses that same derivation rather than reintroducing the
+/// literals it replaced.
+fn probe_pixels(theme: &str) -> std::collections::BTreeMap<(String, String), (u8, u8, u8)> {
+    let compositor = Compositor::spawn();
+    let socket = compositor
+        .socket_path()
+        .file_name()
+        .expect("socket name")
+        .to_string_lossy()
+        .to_string();
+    let (out_w, out_h) = compositor.output_size();
+    let mut screencopy = ScreencopyClient::spawn(&socket);
+    let empty = screencopy.capture();
+    let background_probe = (out_w as u32 - 3, out_h as u32 / 2);
+    let wallpaper = pixel_at(&empty, background_probe.0, background_probe.1).expect("inside");
+
+    let allocations = entry_allocations(theme);
+    let page_height = allocations
+        .iter()
+        .map(|a| (a.y + a.height) as i32)
+        .max()
+        .expect("a non-empty page");
+    let tallest = allocations
+        .iter()
+        .map(|a| a.height as i32)
+        .max()
+        .expect("a non-empty page");
+    let step = slice_step(out_h, tallest);
+    let points = probe_points(theme, None);
+
+    let mut sampled = std::collections::BTreeMap::new();
+    let mut scroll = 0;
+    while scroll < page_height {
+        let gallery = spawn_gallery(&socket, theme, scroll);
+        let frame = wait_for_gallery(&mut screencopy, background_probe, wallpaper);
+        for point in &points {
+            let y = point.y - scroll;
+            if y < 2 || y >= out_h - 2 {
+                continue;
+            }
+            let key = (point.widget.clone(), point.label.clone());
+            if let std::collections::btree_map::Entry::Vacant(slot) = sampled.entry(key)
+                && let Some(px) = pixel_at(&frame, point.x as u32, y as u32)
+            {
+                slot.insert(px);
+            }
+        }
+        drop(gallery);
+        scroll += step;
+    }
+    sampled
+}
+
+/// Widgets whose gallery sample is theme-blind by construction, not by
+/// defect.
+///
+/// Found by running this test with per-slice diagnostics: both full walks
+/// (light then dark, one compositor each, ~29 minutes total on this
+/// machine) complete and paint every slice, and these three are the *only*
+/// entries with zero differing probe points. Root-caused against
+/// `ui/src/gallery.rs`'s own `sample`, not guessed:
+///
+/// - `Kind::Picture` draws a fixed PNG loaded from `sample_png_path()`. A
+///   photo does not repaint for a light/dark switch in real Adwaita GTK
+///   either.
+/// - `Kind::DrawingArea`'s callback fills a hardcoded `#33D17A` rectangle
+///   with no reference to the active sheet — the same is true of a real
+///   `GtkDrawingArea`'s cairo callback, which is entirely the caller's paint
+///   code.
+/// - `Kind::Image` samples `IconRef::Theme { name: "folder" }` — a
+///   non-symbolic icon. Only a `-symbolic` name would be recoloured to
+///   `currentColor` (and even then would hit the M2-inherited
+///   background-image-layer `currentColor` gap this part's controller notes
+///   name as a deferred minor), so a full-colour `folder` bitmap is
+///   correctly identical in both sheets, exactly as it is in a real desktop.
+///
+/// None of the three reads `Theme` at all, so failing them here would not be
+/// deviation 6's "the theme never reached them" (a controller wiring gap) —
+/// it would be asserting that a photo, a caller's own drawing and a
+/// full-colour icon must repaint for a stylesheet that was never supposed to
+/// touch them.
+///
+/// Mutation check: remove `"picture"` from this list; the test fails with
+/// `picture` back in the `unchanged` list (it never differs). Restore.
+const THEME_BLIND_BY_DESIGN: &[&str] = &["drawing_area", "image", "picture"];
+
+/// Per widget, at least one probe point must look different in dark Adwaita.
+///
+/// Per widget, not per point: a transparent subnode, or one Adwaita styles
+/// identically in both sheets, legitimately matches across themes — the
+/// contract's test name is kept, its assertion is the honest one (deviation
+/// 6). A widget where *nothing* changes is a widget the theme never reached,
+/// with [`THEME_BLIND_BY_DESIGN`] carved out for the three that are exempt
+/// from that claim on purpose.
+///
+/// Mutation check: make `Theme::sheet` return the light sheet for
+/// `Theme::Dark`; every widget then matches and this test fails on the first
+/// one not in [`THEME_BLIND_BY_DESIGN`]. Restore.
+#[test]
+fn every_probe_point_differs_between_light_and_dark() {
+    let light = probe_pixels("light");
+    let dark = probe_pixels("dark");
+    let widgets: std::collections::BTreeSet<&String> = light
+        .keys()
+        .map(|(widget, _)| widget)
+        .filter(|w| !THEME_BLIND_BY_DESIGN.contains(&w.as_str()))
+        .collect();
+    assert!(!widgets.is_empty(), "no probe pixels were sampled at all");
+    let mut unchanged = Vec::new();
+    for widget in widgets {
+        let differs =
+            light
+                .iter()
+                .filter(|((w, _), _)| w == widget)
+                .any(|((w, label), light_px)| {
+                    dark.get(&(w.clone(), label.clone()))
+                        .is_some_and(|dark_px| !support::matches(*light_px, *dark_px))
+                });
+        if !differs {
+            unchanged.push(widget.clone());
+        }
+    }
+    assert!(
+        unchanged.is_empty(),
+        "these widgets look identical in light and dark Adwaita, so the theme \
+         never reached them: {unchanged:?}"
+    );
+}
+
 /// Never-panic gate for the two stdout parsers: the gate reads a child
 /// process's output, and a crashed or half-written child must fail the
 /// assertion, not the harness.
