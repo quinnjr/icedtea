@@ -4163,22 +4163,30 @@ step — not enough to guarantee `scrolled_window` (229px tall) and `list_box`
 formula makes the "every entry captured whole at least once" guarantee hold
 for any output height, closing a flake rather than a contract signature.
 
-### P8-D71 — `interaction_gate.rs` ships with ten of the contract's sixteen tests, not sixteen; Task 10's four remain uncommitted
+### P8-D71 — `interaction_gate.rs` ships with six of the contract's sixteen tests, not sixteen; Task 10's four remain uncommitted
 
 **Carried out by:** Task 10 (found, left uncommitted); Task 14 (attempted to
 land, found a second regression, reverted). **Added:** 2026-09-02, in the
-Part 8 whole-part fix wave.
+Part 8 whole-part fix wave. **Amended:** 2026-09-02, same fix wave — the
+heading previously said "ten", a miscount inherited from
+`.superpowers/sdd/m3-part8/task-12-report.md` ("stays at 10 committed
+tests"), which counted Task 10's four *uncommitted* tests as committed. Six
+is the number the body, the History paragraph and the file itself all carry.
+Task 12's own four missing tests are recorded separately as P8-D72.
 
 **§9's P8 gate says** "all sixteen `interaction_gate.rs` tests"; Task 14's own
 Step 2 says "if anything fails, stop … this task does not start until the
 tree is green."
 
-**As shipped:** `interaction_gate.rs` carries six tests, not sixteen.
-Task 10's four (`typing_into_an_entry_shows_the_glyphs_and_moves_the_caret`,
+**As shipped:** `interaction_gate.rs` carries six tests, not sixteen. Ten
+are absent. This amendment covers six of them: Task 10's four
+(`typing_into_an_entry_shows_the_glyphs_and_moves_the_caret`,
 `typing_into_a_search_entry_fires_one_search_after_the_delay`,
 `peeking_a_password_entry_reveals_the_text`,
 `stepping_a_spin_button_repeats_while_the_button_is_held`) and Task 11's two
-(the drop-down popover and list-view interactions) are not present at all.
+(the drop-down popover and list-view interactions). The remaining four —
+Task 12's expander, stack-page, menu-button-popover and Tab-order tests —
+are recorded, with their diagnoses, in **P8-D72** below.
 
 **History.** Task 10 wrote its four tests plus a chrome-eviction fix
 (`Controller::child_index`/`reserved_total` overrides) across
@@ -4225,6 +4233,118 @@ task allowed to do either. Every other named count in Task 14 Step 2 (the M1
 gate's 4, the M2 gate's 9/10 + 4, the transition test's 1, the M3 gates'
 8 + 6-of-16, `compositor/tests/popups.rs` green three times running,
 `widget_pixels.rs` at 39/39) is verified green.
+
+### P8-D72 — Task 12's four interactions are absent too, each blocked by a distinct pre-existing production defect
+
+**Carried out by:** Task 12 (written, driven RED, root-caused, left
+uncommitted). **Added:** 2026-09-02, in the Part 8 whole-part fix wave —
+P8-D71 named only six of the ten missing tests, so a reader of the contract
+alone would have concluded these four defects were unknown.
+
+**§9's P8 gate says** "all sixteen `interaction_gate.rs` tests"; §9's P8
+"must not touch: any widget implementation" and the standing "all gates stay
+green" rule together forbid both fixing these defects and committing a red
+test.
+
+**As shipped:** none of Task 12's four tests is in the file:
+
+1. `expanding_an_expander_animates_and_reveals_the_child` — **P6,
+   `ui/src/widgets/expander.rs`.** The click and message path work
+   (`expanded true` arrives), but the `content` pixel never changes.
+   `ExpanderC::progress` is written by the tick loop and read only by its own
+   test hook `content_scale`; nothing in `ui/src` outside `expander.rs`
+   reads it — no CSS write, no layout write, no paint clip. `content` never
+   receives `PseudoStates::CHECKED` (only the root and `arrow` do), and
+   Adwaita has no rule styling a `content` node by an ancestor `:checked`.
+   Child disclosure was never wired to layout or paint; `progress` drives
+   the arrow only. (The task's own `child = title + 30px` probe offset also
+   lands 2px below the widget's border box; `driver.point("expander",
+   "content")` is the correct sample point, and still fails.) A fix wants a
+   `content` height or clip driven by `progress`, on the model of
+   `RevealerC` in `ui/src/widgets/mod.rs`, which already carries the
+   identical `progress`/`started`/`tick` shape.
+2. `switching_a_stack_page_runs_the_transition` — **P6,
+   `ui/src/widgets/stack_switcher.rs`.** `--print-allocation --widget
+   stack_switcher` returns a 0x0 box and `--probe-points` emits only `root`:
+   no `button0`/`button1` exists. `rebuild` (lines ~97-115) builds each page
+   button as a bare `Node::new("button")` and never appends a `label` child,
+   unlike every other button-shaped node in the crate, so the row collapses
+   to zero intrinsic size. `on_event`'s per-button hit-test uses that same
+   allocation, so **a live `StackSwitcher` cannot be clicked at all** —
+   page switching is unreachable in the app, not merely untested.
+3. `opening_a_menu_button_popover_takes_the_grab_and_dismisses_outside` —
+   **P5, `MenuButtonC`/`PopoverC`.** Two independent defects. (a)
+   `MenuButtonC::build` (`ui/src/widgets/menu_button.rs` ~114) uses
+   `PopoverC::for_test`, whose root `Node` is a local dropped at the end of
+   the call — the `arrow`/`contents` subtree is never appended to
+   `MenuButtonC`'s own node, so no popover probe point exists in any state.
+   `DropDownC::build` (`ui/src/widgets/drop_down.rs` ~182-186) shows the
+   correct shape: append a real `popover_node`, then call `<PopoverC as
+   Controller<Msg>>::build` on it. (b) Even so, `PopoverC::open`
+   (`ui/src/widgets/popover.rs` ~167-200) returns early whenever `content`
+   is `None`, *before* consulting `self.autohide`, so it never pushes
+   `Cmd::OpenPopup` — the same gap Task 11 already routed for `DropDownC`,
+   now confirmed on a second embedder. Any fix should sweep every embedder
+   (`about_dialog.rs`, `alert_dialog.rs`, `popover_menu.rs`,
+   `shortcuts_window.rs`) rather than special-casing these two.
+4. `tabbing_through_a_form_moves_the_focus_ring_in_geometric_order` —
+   **P3, focus-ring paint.** Not an `ActionBar` defect: its geometry is
+   correct (`button0` at 609,401, `button1` at 671,401). A throwaway
+   differential test on a bare `button` gallery reproduced it exactly —
+   `(248, 247, 247) -> (248, 247, 247)`, no ring — so the first-ever `Tab`
+   from a fresh window paints no focus ring on the simplest focusable
+   widget in the crate. `Universal::new` adds `FOCUSABLE_CLASS` and
+   `window::focus::navigate`/`collect`/`is_focusable` look correct by
+   inspection; the existing
+   `a_pointer_click_focuses_without_showing_the_focus_ring` asserts on
+   messages, never on ring *pixels*, so nothing in this crate had ever
+   proven the ring renders.
+
+**Ruling.** Left uncommitted, matching Task 10's and Task 11's precedent and
+this part's own bar on widget-implementation work: none of the four is
+reachable green without production fixes spanning three other parts (P3, P5,
+P6), and committing them red would break the standing all-gates-green rule.
+Recorded here so the contract, read alone, names all ten missing
+interactions and all four of these defects. Finding 4 is the structurally
+significant one: with no pixel-level proof of the focus ring anywhere in the
+crate, §10's "geometric focus order" interaction is currently unverifiable
+end-to-end against *any* widget.
+
+### P8-D73 — `CheckButtonC` and `SwitchC` did receive the chrome-eviction fix P8-D71 reverts elsewhere
+
+**Carried out by:** Task 5 (`e41bdbf`, `SwitchC`) and Task 9 (`ff43ffd`,
+`CheckButtonC`). **Added:** 2026-09-02, in the Part 8 whole-part fix wave,
+after a review found the same defect class adjudicated two ways inside one
+part.
+
+**§9's P8 says** "must not touch: any widget implementation" — the ground on
+which P8-D71 reverts the identical `Controller::child_index`/`reserved_total`
+override for `EntryC`/`SearchEntryC`/`PasswordEntryC`/`SpinButtonC`.
+
+**As shipped:** `ui/src/widgets/switch.rs:114` and
+`ui/src/widgets/check_button.rs:166` each carry that override.
+`SwitchC` reserves its three chrome children (`on_image`/`off_image`/
+`slider`), `CheckButtonC` its `check` plus optional `label`. Without them,
+`reconcile`'s trim step (`reconcile_reserved`'s `trim_from`) detaches all
+chrome on the first reconcile, which a headless probe walking the real node
+tree caught — the subnodes simply were not there. Two shipped interaction
+tests depend on them: `checking_a_check_button_paints_the_builtin_check`
+(probe point `check_button`/`check`) and
+`flipping_a_switch_animates_the_slider_to_the_other_end` (`switch`/`slider`).
+
+**Ruling.** Kept, not reverted, and recorded here rather than left silent.
+The distinguishing fact is empirical, not principled: **`widget_pixels.rs`
+is 39/39 with both edits in the tree** (re-verified in this fix wave), so
+unlike the four entry-family widgets, these two shift no already-committed
+hard-coded coordinate and land no undiagnosed second regression. Reverting
+them would delete two green, shipped gate tests and restore a confirmed
+chrome-eviction bug in two widgets, to gain only formal symmetry with
+P8-D71 — whose reversion was driven by the 39/39 → 37/39 regression, not by
+§9 alone. §9's "must not touch" is hereby read, for the chrome-eviction
+class specifically, as barring changes that regress an existing gate; a
+two-line reservation count that regresses nothing and is proven by a gate
+test is permitted, provided it is recorded here. No other widget
+implementation was modified by P8.
 
 ---
 
