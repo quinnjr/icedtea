@@ -4163,44 +4163,68 @@ step — not enough to guarantee `scrolled_window` (229px tall) and `list_box`
 formula makes the "every entry captured whole at least once" guarantee hold
 for any output height, closing a flake rather than a contract signature.
 
-### P8-D71 — three of `interaction_gate.rs`'s sixteen tests are known-red pre-existing P5 defects, not a Task 14 gap
+### P8-D71 — `interaction_gate.rs` ships with ten of the contract's sixteen tests, not sixteen; Task 10's four remain uncommitted
 
-**Carried out by:** Task 10 (`ui/tests/interaction_gate.rs`); recorded by P8's
-Task 14. **Added:** 2026-09-02, in the Part 8 whole-part fix wave.
+**Carried out by:** Task 10 (found, left uncommitted); Task 14 (attempted to
+land, found a second regression, reverted). **Added:** 2026-09-02, in the
+Part 8 whole-part fix wave.
 
 **§9's P8 gate says** "all sixteen `interaction_gate.rs` tests"; Task 14's own
 Step 2 says "if anything fails, stop … this task does not start until the
 tree is green."
 
-**As shipped:** three of the sixteen fail on real, pre-existing `EntryC`/
-`SpinButtonC` defects (P5-owned files), each independently root-caused by
-Task 10's own report (`.superpowers/sdd/m3-part8/task-10-report.md`) and
-reproduced identically, deterministically, by Task 14:
+**As shipped:** `interaction_gate.rs` carries six tests, not sixteen.
+Task 10's four (`typing_into_an_entry_shows_the_glyphs_and_moves_the_caret`,
+`typing_into_a_search_entry_fires_one_search_after_the_delay`,
+`peeking_a_password_entry_reveals_the_text`,
+`stepping_a_spin_button_repeats_while_the_button_is_held`) and Task 11's two
+(the drop-down popover and list-view interactions) are not present at all.
 
-- `typing_into_an_entry_shows_the_glyphs_and_moves_the_caret` and
-  `peeking_a_password_entry_reveals_the_text` — `EntryC::on_event`'s
-  caret-click path still calls `local_rect` against `text_node`, a subnode
-  with no `Measure` and no CSS flex wiring, instead of the
-  `content_rect_local` fix `SearchEntryC`/`PasswordEntryC` already carry; the
-  sampled point lands on a near-zero-area box.
-- `stepping_a_spin_button_repeats_while_the_button_is_held` —
-  `SpinButtonC`'s repeat timer jumps straight to the clamped bound on the
-  first repeat tick instead of stepping once per interval.
+**History.** Task 10 wrote its four tests plus a chrome-eviction fix
+(`Controller::child_index`/`reserved_total` overrides) across
+`EntryC`/`SearchEntryC`/`PasswordEntryC`/`SpinButtonC`, found three of the
+four fail on real pre-existing behavioural defects (`EntryC`'s caret-click
+`local_rect` path; `SpinButtonC`'s repeat timer overshoot), and — per §9's
+"Must not touch: any widget implementation" and the CONTROLLER NOTE requiring
+all gates green — left everything uncommitted in the working tree rather
+than either weaken an assertion or check in a red test file
+(`.superpowers/sdd/m3-part8/task-10-report.md`). That state survived,
+unrecorded, through Tasks 11–13's own commits. Task 14 found it, verified
+Task 10's own diagnosis (the same three tests fail, identically), and
+initially committed it (`1f64d71`) intending to record the three as a
+known-red list the way P8-D69 records `KNOWN_BLANK_AT_REST`. Running the
+rest of the whole-milestone gate immediately after found a **second, larger
+problem** Task 10's report did not check for: `cargo test -p icedtea-ui
+--test widget_pixels` regressed from 39/39 to 37/39 — the same
+`child_index`/`reserved_total` fix that lets a probe point exist at all also
+changes each of the four widgets' measured intrinsic size (subnodes that were
+previously evicted before layout now count toward it), which shifts the
+hard-coded click coordinates two pre-existing, already-committed
+`widget_pixels.rs` tests depend on
+(`typing_into_an_entry_shows_the_glyphs_and_moves_the_caret` and
+`peeking_a_password_entry_reveals_the_text` — same names, a different file,
+pixel-exact rather than harness-driven), so both clicks silently miss and
+both tests fail. Task 10's report claim ("does not regress any existing
+test") checked only `cargo test -p icedtea-ui --lib` (1053/1053), not this
+integration file.
 
-**Ruling.** Task 10 landed these three deliberately red, per its own text
-("A failure here is a P5 defect and belongs in P5's fix wave — do not weaken
-the assertion") and per §9's "Must not touch: any widget implementation — a
-gate failure is fixed in the owning part's fix wave, not in the gate." No
-further P5 fix wave is scheduled after P8 (this is M3's final part), and
-Task 14 itself "Produces: no code," so fixing `EntryC`/`SpinButtonC` here
-would violate both P8's file-ownership boundary and Task 14's own interface.
-Declared rather than silently passed over — the same treatment P8-D69 gives
-the fifteen `KNOWN_BLANK_AT_REST` widgets. `cargo test -p icedtea-ui` and
-`cargo test --workspace` therefore exit non-zero on this branch until a
-post-M3 fix wave closes these three; every other named count in Task 14 Step
-2 (the M1 gate's 4, the M2 gate's 9 + 4, the transition test's 1, the M3
-gates' 8 + 13-of-16, `compositor/tests/popups.rs` green three times running)
-is verified green.
+**Ruling.** Reverted (`183e8ad`) rather than shipped with a second,
+undiagnosed regression: fixing the chrome-eviction bug is squarely
+`EntryC`/`SearchEntryC`/`PasswordEntryC`/`SpinButtonC` widget-implementation
+work, which both Task 10 and Task 14 are contractually barred from doing
+(§9's P8 "must not touch"), and the coordinate fix `widget_pixels.rs` would
+now need is not obviously safe to make without re-deriving four widgets'
+new intrinsic sizes by hand under the same restriction. No further P5 fix
+wave is scheduled after this, M3's final part. The tree is left exactly as
+Task 10 left it — six `interaction_gate.rs` tests, `widget_pixels.rs` at
+39/39, both green — and this amendment is the record a fix-wave task needs:
+the chrome-eviction bug is real and confirmed (Task 10's diagnosis), landing
+its fix requires also re-deriving `widget_pixels.rs`'s four affected pixel
+coordinates in the same change, and neither Task 10 nor Task 14 is the
+task allowed to do either. Every other named count in Task 14 Step 2 (the M1
+gate's 4, the M2 gate's 9/10 + 4, the transition test's 1, the M3 gates'
+8 + 6-of-16, `compositor/tests/popups.rs` green three times running,
+`widget_pixels.rs` at 39/39) is verified green.
 
 ---
 
