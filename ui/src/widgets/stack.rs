@@ -8,7 +8,7 @@
 //! text's `build` reads pages from there anyway, which would leave `pages`
 //! permanently empty for every real `stack(pages)` view. This controller
 //! therefore borrows `NotebookC`'s/`HeaderBarC`'s own fix for exactly this
-//! timing gap -- [`StackC::place`], run from [`Controller::reserved_total`]
+//! timing gap -- `StackC::place`, run from [`Controller::reserved_total`]
 //! (the one `&self` hook the reconciler calls once real children are
 //! attached, on every reconcile of this level) -- which re-derives `pages`
 //! from `node.children()` for real. That forces `pages`/`visible` into

@@ -30,7 +30,7 @@
 //! pattern instead: `child_index`/`reserved_total` let every real
 //! `Kind::NotebookTab` child attach flat onto this controller's own root
 //! node (alongside `header`/`stack`, both reserved by `child_index`'s `+2`
-//! offset), and [`NotebookC::place`] -- run from `reserved_total`, once per
+//! offset), and `NotebookC::place` -- run from `reserved_total`, once per
 //! reconcile, the same hook `HeaderBarC::place` uses -- pulls each one's
 //! own already-built child (its page content) out into `stack` and moves
 //! the tab node itself into `tabs_node`. `PropName::Pages` (a test-only

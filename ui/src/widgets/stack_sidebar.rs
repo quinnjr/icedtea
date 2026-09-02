@@ -30,7 +30,7 @@
 //! row_at` hit-tests rows against its own `node` (the `list`). Every other
 //! controller with a nested subnode -- `DropDownC`'s popover list,
 //! `MenuButtonC`'s popover, `EntryC`'s icons -- re-expresses the event with
-//! [`crate::widgets::shift_event`] over [`crate::widgets::local_rect`]
+//! `crate::widgets::shift_event` over `crate::widgets::local_rect`
 //! first; this one does the same before delegating.
 
 use std::rc::Rc;

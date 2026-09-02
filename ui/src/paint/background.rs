@@ -253,7 +253,7 @@ pub(crate) fn intersect(a: Rect, b: Rect) -> Option<Rect> {
 /// # Bounded work
 ///
 /// Every loop below is driven by the *painted* rectangle, which is `clip`
-/// intersected with [`drawable_bounds`] -- never by `clip` alone.
+/// intersected with `drawable_bounds` -- never by `clip` alone.
 /// `Rect::is_empty` accepts `+inf` and huge finite extents, so a CSS-reachable
 /// clip of `1e9` px (or an infinite one) would otherwise spin up to
 /// `i32::MAX` iterations, each issuing a `draw_rect`: a hang, not a panic.
@@ -491,7 +491,7 @@ const MAX_TILES_TOTAL: usize = 1 << 16;
 
 /// Every copy of `tile` that intersects `clip`, per `repeat`.
 ///
-/// The returned vector is bounded by [`MAX_TILES_TOTAL`] for every input,
+/// The returned vector is bounded by `MAX_TILES_TOTAL` for every input,
 /// including a sub-device-pixel step or an infinite clip.
 #[must_use]
 pub fn tile_positions(tile: &Tile, clip: Rect, repeat: RepeatStyle) -> Vec<Rect> {

@@ -49,7 +49,7 @@ pub fn alert_dialog<Msg: Clone + 'static>(message: &str) -> View<Msg> {
 }
 
 /// [`alert_dialog`]'s own setters. `.on_response` is
-/// [`crate::view::builders::View::on_response`] (universal, shared with
+/// [`crate::view::View::on_response`] (universal, shared with
 /// `ColorDialog`/`FontDialog`/`InfoBar`) and `.modal` is
 /// [`crate::widgets::window::WindowExt::modal`] (shared with every other
 /// `Window` preset) — neither is repeated here.

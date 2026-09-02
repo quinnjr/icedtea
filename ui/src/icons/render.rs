@@ -58,7 +58,7 @@ pub fn pixel_size(size: u32, scale: u32) -> i32 {
 /// Rasterise an already-parsed document.
 ///
 /// The parse is the expensive half and is cached by
-/// [`super::theme::IconTheme::dom_for`]; the recolour clones it per palette.
+/// `IconTheme::dom_for`; the recolour clones it per palette.
 #[must_use]
 pub fn render_dom(dom: &SvgDom, px: i32, symbolic_file: bool, palette: &Palette) -> Option<Image> {
     let recoloured;

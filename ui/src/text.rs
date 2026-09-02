@@ -317,7 +317,7 @@ impl FontDatabase {
     /// available (a later task wires that in) and the [`FONT_CANDIDATES`]
     /// probe otherwise.
     ///
-    /// Cached per query, up to [`FACE_CACHE_CAPACITY`] entries; a query that
+    /// Cached per query, up to `FACE_CACHE_CAPACITY` entries; a query that
     /// resolves to nothing is cached as nothing, so a missing font costs one
     /// lookup, not one per restyle.
     pub fn match_face(&mut self, query: &FontQuery<'_>) -> Option<FontFace> {
@@ -339,7 +339,7 @@ impl FontDatabase {
     }
 
     /// The loaded typeface for `face`, cached by `(path, index)` up to
-    /// [`FACE_CACHE_CAPACITY`] entries.
+    /// `FACE_CACHE_CAPACITY` entries.
     ///
     /// `index` is kept even though `skia-rs-text` 0.4.0's `Typeface::from_data`
     /// cannot select a face inside a collection: it is part of the cache
@@ -512,7 +512,7 @@ impl FontDatabase {
     /// Nothing in M2 calls this: the sheet is compiled once when the window
     /// opens and never swapped, so there is no reload edge to invalidate on.
     /// What bounds the caches instead is their capacity
-    /// ([`SHAPE_CACHE_CAPACITY`], [`FACE_CACHE_CAPACITY`]), which holds
+    /// (`SHAPE_CACHE_CAPACITY`, `FACE_CACHE_CAPACITY`), which holds
     /// whether or not anything ever signals a reload. This stays as the hook
     /// a live theme-reload path would call, and as the way a test proves an
     /// entry really was cached rather than recomputed.

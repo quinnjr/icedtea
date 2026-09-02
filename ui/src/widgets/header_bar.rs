@@ -18,11 +18,11 @@
 //! [`HeaderBarC::build`]; the view's own children -- routed here flat, as
 //! direct siblings of `windowhandle` on the widget's own root node, the same
 //! "chrome alongside the view's children" arrangement [`super::action_bar`]
-//! uses -- are sorted into their slot by [`HeaderBarC::place`], which reads
-//! each child's own [`PropName::Section`] back with [`super::props_of`]
+//! uses -- are sorted into their slot by `HeaderBarC::place`, which reads
+//! each child's own [`PropName::Section`] back with `super::props_of`
 //! rather than through an `Instance` this controller does not own.
 //!
-//! [`HeaderBarC::place`] runs from [`Controller::reserved_total`]: the
+//! `HeaderBarC::place` runs from [`Controller::reserved_total`]: the
 //! reconciler calls that once per reconcile, after every new or moved child
 //! is already attached flat to the root, and before it trims anything past
 //! the returned bound. Because a `.title_widget()` child can arrive *after*

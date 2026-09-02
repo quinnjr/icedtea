@@ -1427,7 +1427,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     /// `open_popup`, `clipboard` and the root node the loop needs, and there
     /// is no public way to get one from the other.
     ///
-    /// Each iteration: wait up to [`frame_deadline`] for events, route them
+    /// Each iteration: wait up to `frame_deadline` for events, route them
     /// to controllers, fold the messages one at a time, run their commands,
     /// rebuild the view once, then restyle, relayout and repaint the dirty
     /// tree into the window's next buffer.

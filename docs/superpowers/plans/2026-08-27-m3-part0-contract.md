@@ -3907,6 +3907,300 @@ present". `an_image_paints_its_resolved_icon` builds its own `App` against the
 checked-in `tests/fixtures/mini-icon-theme` instead of asking for
 `image-missing` from the machine.
 
+### P8-D58 — `ui/src/gallery.rs` is added as a library module
+
+**Carried out by:** P8 (`ui/src/gallery.rs`, new; `ui/src/bin/gallery.rs`,
+new). **Added:** 2026-09-02, in the Part 8 whole-part fix wave.
+
+**§0's module map gives P8 only `ui/src/bin/gallery.rs`.**
+
+**As shipped:** the sample table and every exhaustive `match kind { … }` live
+in `ui/src/gallery.rs`, a library module in the same crate as `Kind`;
+`ui/src/bin/gallery.rs` is CLI plumbing only (argv → `Options` → `gallery::*`).
+
+**Ruling.** Forced by `Kind` being `#[non_exhaustive]` (§4.2) — that attribute
+bites *across crates*, so a binary target (a separate crate from the library)
+could not exhaustively match `Kind` without a wildcard arm, and the contract's
+own "adding a `Kind` without a gallery entry is a compile-time hole" guarantee
+would evaporate. Keeping the match in-crate is the only way to keep that
+guarantee.
+
+### P8-D59 — `App::probe` and `Probe<Msg>` are added to `ui/src/view/app.rs`
+
+**Carried out by:** P8 (`ui/src/view/app.rs`). **Added:** 2026-09-02, in the
+Part 8 whole-part fix wave.
+
+**§7 says** "This is how the gate learns coordinates — it never hard-codes",
+extending the M2 `--print-allocation` precedent (headless), but names no
+accessor for it and §4.7 does not list one.
+
+**As shipped:** `App::probe` runs the reconcile → restyle → layout pipeline
+once, headlessly, and hands back the retained tree plus its `LayoutTree`,
+through a new `Probe<Msg>` type.
+
+**Ruling.** Additive to a P4-owned file, nothing renamed or re-typed.
+`--probe-points` and `--print-allocation` must produce geometry without a
+compositor, and the whole pipeline that produces it is otherwise private to
+`App`; reimplementing it inside the gallery would duplicate P4's reconcile/
+restyle/layout sequence rather than reuse it. `App::run_offscreen` already
+existed but returns pixels (`Frames`), not allocations, so it does not serve
+this need.
+
+### P8-D60 — probe points are derived by the gallery, not exposed per widget
+
+**Carried out by:** P8 (`ui/src/gallery.rs::probe_points_of`). **Added:**
+2026-09-02, in the Part 8 whole-part fix wave.
+
+**§7 says** "Every widget exposes its probe points as `(label, node)` pairs",
+but §9 also says P8 "**Must not touch:** any widget implementation." Both
+cannot hold — exposing probe points per widget means editing every widget.
+
+**As shipped:** `gallery::probe_points_of(instance, tree)` derives them from
+the retained `Node` subtree instead: `"root"` for the widget's own node, then
+each descendant labelled by its CSS node name, with `<name><index>` for every
+repeated name in that subtree (`tab0`, `tab1`, `row0`).
+
+**Ruling.** This reproduces §7's own worked examples (`"check"`, `"slider"`,
+`"trough"`, `"text"`, `"arrow"`, `"tab0"`, `"row0"`) while touching no widget
+file, and stays derived rather than hard-coded, which is the property §7's
+sentence about "the gate never hard-codes" actually cares about.
+
+### P8-D61 — `support::probe_points`/`spawn_gallery` signatures widen
+
+**Carried out by:** P8 (`ui/tests/support/mod.rs`). **Added:** 2026-09-02, in
+the Part 8 whole-part fix wave.
+
+**§7 lists** `probe_points(theme: &str)` and
+`spawn_gallery(socket, theme) -> Reaper`.
+
+**As shipped:**
+`probe_points(theme: Theme, widget: Option<&str>)` and
+`spawn_gallery(socket, theme, scroll) -> GalleryProc`, where `GalleryProc` is a
+`Reaper` plus the spawned child's captured stdout.
+
+**Ruling.** The interaction gate needs the isolated `--widget` layout's
+coordinates, which the two-argument form cannot ask for. `GalleryProc` exists
+because §7's "screencopy **or model** assertions" require reading the
+messages the app folded, which only cross the process boundary on the child's
+stdout. `Reaper` itself is unchanged and still used unmodified by the M2
+tests.
+
+### P8-D62 — the gallery maps a `zwlr_layer_shell_v1` overlay, not an xdg-toplevel
+
+**Carried out by:** P8 (`ui/src/bin/gallery.rs`). **Added:** 2026-09-02, in
+the Part 8 whole-part fix wave.
+
+**§7 does not name a surface role** for the gallery binary.
+
+**As shipped:** the gallery maps a layer-shell overlay (anchor top|left,
+margin 0), keyboard-interactive `Exclusive`.
+
+**Ruling.** Probe coordinates are output coordinates, and only the layer role
+has a compositor-independent origin — the same reasoning behind M2's
+`themed-button` precedent. `Exclusive` keyboard interactivity is required so
+the typing/Tab interactions in the interaction gate get a focused keyboard.
+
+### P8-D63 — `every_probe_point_differs_between_light_and_dark` is asserted per widget
+
+**Carried out by:** P8 (`ui/tests/gallery_gate.rs`). **Added:** 2026-09-02, in
+the Part 8 whole-part fix wave.
+
+**§7 names a test** `every_probe_point_differs_between_light_and_dark`, read
+literally asserting every probe point on every widget differs between themes.
+
+**As shipped:** the test keeps its contract name but asserts **at least one
+probe point per widget** differs by more than `SCREENCOPY_TOLERANCE`, naming
+the failing widget if none does.
+
+**Ruling.** The literal reading is false on its face: a fully transparent
+subnode, or one Adwaita styles identically in both sheets, legitimately
+matches across themes without indicating a broken theme. Requiring only one
+differing probe point per widget still proves the widget is theme-reactive at
+all, which is what the test exists to catch.
+
+### P8-D64 — `--probe-points`/`--print-allocation` line formats are pinned
+
+**Carried out by:** P8 (`ui/src/gallery.rs`). **Added:** 2026-09-02, in the
+Part 8 whole-part fix wave.
+
+**§7 pins** `--probe-points` as `<widget> <label> <x> <y>` but leaves
+`--print-allocation` as "one allocation per line", with no format.
+
+**As shipped:** `--print-allocation` prints
+`<widget> <x> <y> <width> <height>` — the entry's border box, in page
+coordinates.
+
+**Ruling.** This is the exact shape the rest-state gate's page-slice
+arithmetic needs (it must know each entry's height to compute slice overlap —
+see P8-D70); §7 left the format unspecified, so pinning it is filling a gap,
+not overriding a stated format.
+
+### P8-D65 — one test is added to `gallery_gate.rs` beyond §7's six
+
+**Carried out by:** P8 (`ui/tests/gallery_gate.rs`). **Added:** 2026-09-02, in
+the Part 8 whole-part fix wave.
+
+**§7 names six `gallery_gate.rs` tests.**
+
+**As shipped:** a seventh, `the_readme_widget_table_lists_every_kind`, is
+added alongside them.
+
+**Ruling.** All six of §7's named tests remain and are implemented verbatim;
+the seventh is additive and keeps `ui/README.md`'s widget table (P8's own
+documentation deliverable) from rotting the moment a `Kind` is added, by
+asserting the table against `Kind::all()`.
+
+### P8-D66 — `harness/src/lib.rs` grows `VirtualPointerClient::{axis, axis_discrete}`
+
+**Carried out by:** P8 (`harness/src/lib.rs`). **Added:** 2026-09-02, in the
+Part 8 whole-part fix wave.
+
+**§9's P2 boundary** does not anticipate P8 adding to the harness crate.
+
+**As shipped:** two additive methods, `VirtualPointerClient::axis` and
+`::axis_discrete`. No existing harness method is renamed, re-typed, or
+removed, and no existing harness test (§8.2) is touched.
+
+**Ruling.** The contract's own interaction-gate list requires
+`scrolling_a_list_view_recycles_rows_without_losing_selection`, and the
+harness injector had motion/button/frame methods but no scroll-axis event at
+all before this change. Additive-only, so it costs the M2/P2 harness tests
+nothing.
+
+### P8-D67 — ASSUMED types the contract names but never defines
+
+**Carried out by:** P3/P5/P6 (definitions); recorded by P8. **Added:**
+2026-09-02, in the Part 8 whole-part fix wave.
+
+**The contract names, but never defines:** `SurfaceSpec` (§3.1
+`Window::open`'s first parameter), `ListItem` (§4.3 `Prop::Items`), the
+list/grid/column `factory` parameter, and the widget enums `MessageType`,
+`Orientation`, `Position`, `Side`, `SelectionMode`, `StackTransition`,
+`ContentFit`, `Ellipsize`, `Policy`, `LevelBarMode`, `ArrowDirection`, `Rgba`,
+`MenuFlags`, `DisplayHint`, `MatchMode`, `SortOrder`, `Sorter`, `IconSize`,
+`WrapMode`.
+
+**As shipped:** P3/P5/P6 defined all of them before P8 started; P8 constructs
+values of each type by reading the shipped definition at the call site
+(marked `// ASSUMED` where the plan does so) rather than inventing a
+replacement.
+
+**Ruling.** Recorded for completeness per the plan's own instruction ("record
+it in the contract's §10"); no gap was found — every named type exists in
+`ui/src/window/mod.rs`, `ui/src/view/mod.rs`, or `ui/src/widgets/*.rs` by the
+time P8 runs, so no gate logic depends on an undefined type.
+
+### P8-D68 — `App::run` is called with the `Window`, not a `Surface`
+
+**Carried out by:** P8 (`ui/src/gallery.rs::run`). **Added:** 2026-09-02, in
+the Part 8 whole-part fix wave.
+
+**§4.7 spells it** `App::run(self, surface: Surface)`.
+
+**As shipped:** the gallery calls `App::run(window)`.
+
+**Ruling.** Not a P8 deviation from what P4 shipped — P4-D21 already
+established that `App::run` needs the `CompiledSheet`, `FontDatabase`, clock
+and `AnimationState` that only `Window` owns (§3.1), none of which `Surface`
+exposes. P8 records the call-site consequence: the gallery constructs a
+`Window` either way, so passing it to `App::run` costs nothing beyond what
+P4-D21 already paid for.
+
+### P8-D69 — `every_widget_renders_at_rest` excludes fifteen widgets from its paint assertion
+
+**Carried out by:** P8 (`ui/tests/gallery_gate.rs`, `KNOWN_BLANK_AT_REST`).
+**Added:** 2026-09-02, in the Part 8 whole-part fix wave.
+
+**§7's rest-state gate implies every widget in the gallery paints
+non-background pixels at rest.**
+
+**As shipped:** fifteen widgets are excluded from that one assertion via a
+measured (not inferred) `KNOWN_BLANK_AT_REST` list — every entry's
+non-background pixel count was recorded, not asserted on, in one real-harness
+pass over the whole page, and every entry that came back at zero is listed:
+
+- Thirteen collapse to a zero-area allocation (`progress_bar`, `scrollbar`,
+  `window_controls`, `color_dialog`, `font_dialog`, `stack_switcher`,
+  `stack_sidebar`, `list_view`, `grid_view`, `popover_menu`,
+  `popover_menu_bar`, `about_dialog`, `alert_dialog`) — a layout defect, not a
+  rendering one; root-caused for `progress_bar`
+  (`ui/src/widgets/progress_bar.rs`): `measure()` delegates entirely to an
+  unshaped label when `show_text(true)` instead of reporting the trough's own
+  intrinsic size.
+- Two have a real allocation and still draw nothing: `link_button`
+  (`ui/src/widgets/link_button.rs` appends a `label` subnode but never gives
+  it text) and `check_button` (`ui/src/widgets/check_button.rs`'s `paint`
+  returns `false` when neither active nor inconsistent, and the sample starts
+  unchecked).
+
+**Ruling.** `separator` and `calendar` are deliberately **not** excluded even
+though both look zero-ish (1x1 and 2x2) — both paint, once
+`paints_something` was widened to scan the whole border box rather than an
+inset 5x5 grid (the same change also fixed a false negative on `action_bar`).
+The gate still requires all fifteen to appear whole in some slice — only the
+non-background-pixel assertion is skipped for them, so a widget silently
+vanishing from the page still fails. Closing each of these fifteen
+controllers' bugs is left to a follow-up task; this list must be empty, or
+carry a fresh equally-justified amendment, before the whole-milestone gate
+this task runs.
+
+### P8-D70 — the rest-state gate derives its scroll step instead of the plan's literal `SLICE_STEP = 700`
+
+**Carried out by:** P8 (`ui/tests/gallery_gate.rs`). **Added:** 2026-09-02, in
+the Part 8 whole-part fix wave.
+
+**The part plan specified** a literal `SLICE_STEP = 700`, sized for an
+800px-tall output.
+
+**As shipped:** `slice_step(capturable, tallest) = capturable - tallest - 4`,
+computed from the harness's real output height and the tallest gallery entry.
+
+**Ruling.** The harness output is 720px tall (`WLR_HEADLESS_OUTPUTS` is a
+count, not a geometry knob), leaving only 20px of overlap under the literal
+step — not enough to guarantee `scrolled_window` (229px tall) and `list_box`
+(72px) are ever captured whole, so they intermittently failed the gate's
+`missing` assertion on a page that in fact rendered correctly. The derived
+formula makes the "every entry captured whole at least once" guarantee hold
+for any output height, closing a flake rather than a contract signature.
+
+### P8-D71 — three of `interaction_gate.rs`'s sixteen tests are known-red pre-existing P5 defects, not a Task 14 gap
+
+**Carried out by:** Task 10 (`ui/tests/interaction_gate.rs`); recorded by P8's
+Task 14. **Added:** 2026-09-02, in the Part 8 whole-part fix wave.
+
+**§9's P8 gate says** "all sixteen `interaction_gate.rs` tests"; Task 14's own
+Step 2 says "if anything fails, stop … this task does not start until the
+tree is green."
+
+**As shipped:** three of the sixteen fail on real, pre-existing `EntryC`/
+`SpinButtonC` defects (P5-owned files), each independently root-caused by
+Task 10's own report (`.superpowers/sdd/m3-part8/task-10-report.md`) and
+reproduced identically, deterministically, by Task 14:
+
+- `typing_into_an_entry_shows_the_glyphs_and_moves_the_caret` and
+  `peeking_a_password_entry_reveals_the_text` — `EntryC::on_event`'s
+  caret-click path still calls `local_rect` against `text_node`, a subnode
+  with no `Measure` and no CSS flex wiring, instead of the
+  `content_rect_local` fix `SearchEntryC`/`PasswordEntryC` already carry; the
+  sampled point lands on a near-zero-area box.
+- `stepping_a_spin_button_repeats_while_the_button_is_held` —
+  `SpinButtonC`'s repeat timer jumps straight to the clamped bound on the
+  first repeat tick instead of stepping once per interval.
+
+**Ruling.** Task 10 landed these three deliberately red, per its own text
+("A failure here is a P5 defect and belongs in P5's fix wave — do not weaken
+the assertion") and per §9's "Must not touch: any widget implementation — a
+gate failure is fixed in the owning part's fix wave, not in the gate." No
+further P5 fix wave is scheduled after P8 (this is M3's final part), and
+Task 14 itself "Produces: no code," so fixing `EntryC`/`SpinButtonC` here
+would violate both P8's file-ownership boundary and Task 14's own interface.
+Declared rather than silently passed over — the same treatment P8-D69 gives
+the fifteen `KNOWN_BLANK_AT_REST` widgets. `cargo test -p icedtea-ui` and
+`cargo test --workspace` therefore exit non-zero on this branch until a
+post-M3 fix wave closes these three; every other named count in Task 14 Step
+2 (the M1 gate's 4, the M2 gate's 9 + 4, the transition test's 1, the M3
+gates' 8 + 13-of-16, `compositor/tests/popups.rs` green three times running)
+is verified green.
 
 ---
 

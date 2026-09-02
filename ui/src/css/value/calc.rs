@@ -53,7 +53,7 @@ pub enum CalcNode {
 /// parse is refused.
 ///
 /// The AST is left-deep, so a chain of *n* terms is *n* frames deep in
-/// [`CalcNode::eval`], in the derived `PartialEq`, and in `Rc`'s drop glue;
+/// `CalcNode::eval`, in the derived `PartialEq`, and in `Rc`'s drop glue;
 /// it also costs O(n^2) to parse, because every `*` re-evaluates its left
 /// operand to test whether it is a scalar. Nothing a human authors or a GTK
 /// theme ships comes near 64 terms, and past the cap the value is refused as
@@ -257,7 +257,7 @@ fn fold(
 /// `max` or `clamp`.
 ///
 /// This is the single choke point every `calc()`/`min()`/`max()`/`clamp()`
-/// body passes through, whether reached through [`parse_unary`]'s own
+/// body passes through, whether reached through `parse_unary`'s own
 /// `Function` arm or directly from another value type's parser (`Length`,
 /// `Time`, colour channels, ...); guarding it here bounds recursion for both
 /// without needing a guard at every call site.

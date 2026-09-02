@@ -269,7 +269,7 @@ pub fn parse_selector_list(text: &str) -> Option<SelectorList<GtkSelectorImpl>> 
 /// - the tree generation and filter position both were built for, so a stale
 ///   cache can never answer for a mutated tree.
 ///
-/// [`matches`] and [`matches_with_specificity`] call [`MatchCx::seed_for`]
+/// [`matches()`] and [`matches_with_specificity`] call [`MatchCx::seed_for`]
 /// themselves; a caller walking a tree depth-first can instead drive the filter
 /// with [`MatchCx::push_ancestor`]/[`MatchCx::pop_ancestor`] and pay for each
 /// ancestor once.
@@ -709,7 +709,7 @@ pub fn matches(list: &SelectorList<GtkSelectorImpl>, node: &Node, cx: &mut Match
     matches_with_specificity(list, node, cx).is_some()
 }
 
-/// [`matches`] with the ancestor filter switched off.
+/// [`matches()`] with the ancestor filter switched off.
 ///
 /// The bloom filter may only ever *reject* selectors that could not match;
 /// this is the reference implementation that claim is tested against, and the

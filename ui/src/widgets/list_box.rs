@@ -12,7 +12,7 @@
 //! `NotebookC`, ...), is the incremental [`Universal`] type applied as
 //! `self.universal.apply(node, Kind::ListBox, name, value)`, so `set_prop`
 //! uses that instead. `row_at` takes the real `&LayoutTree` from
-//! [`EventCx::tree`] and hit-tests through [`crate::widgets::local_rect`]
+//! [`EventCx::tree`] and hit-tests through `crate::widgets::local_rect`
 //! (the same subnode-rect helper every other controller with owned
 //! subnodes uses) rather than a standalone `hit` free function, because a
 //! `Node` alone carries no geometry in this crate -- only a `LayoutTree`

@@ -10,7 +10,7 @@
 //!
 //! Reconciliation: `Props` (contract §4) is one flat scalar map per widget --
 //! there is no `Prop` variant that carries a *list of item lists* (one per
-//! menu), and [`crate::widgets::props_of`]'s `RECORDED_PROP_NAMES` whitelist
+//! menu), and `crate::widgets::props_of`'s `RECORDED_PROP_NAMES` whitelist
 //! (the only channel a container controller has for reading a real child's
 //! own props back) does not carry `PropName::Menus`/`Section`/`DisplayHint`
 //! either -- only slot-identifying props like `PageName` are recorded there.
@@ -42,7 +42,7 @@
 //!
 //! `PopoverMenuBarC::build` creates one `item` node per menu name, each
 //! wrapping a fresh `popover` node built by [`PopoverMenuC`]. Only one
-//! `item` ever carries `:active` -- [`PopoverMenuBarC::open`] moves it.
+//! `item` ever carries `:active` -- `PopoverMenuBarC::open` moves it.
 //! Hovering a sibling `item` while a menu is already open switches to it
 //! without a second click (the whole point of a menu bar, contract §5.6);
 //! `Left`/`Right` move the same way; `Escape` closes.
@@ -63,7 +63,7 @@
 //! `FixedMeasure` leaf, so nothing already-green pins the right number down
 //! this deep in taffy's flex pass; the hover-switch test below simply asks
 //! for double what it wants (`40.0` for 80px items) rather than changing
-//! [`PopoverMenuBarC::item_at`], which reads real allocations and is
+//! `PopoverMenuBarC::item_at`, which reads real allocations and is
 //! correct regardless of what produced them.
 
 use std::rc::Rc;
@@ -122,7 +122,7 @@ pub struct PopoverMenuBarC {
 }
 
 impl PopoverMenuBarC {
-    /// Test hook: [`PopoverMenuBarC::open`]'s current value through a `&dyn
+    /// Test hook: `PopoverMenuBarC::open`'s current value through a `&dyn
     /// Controller<Msg>`, the shape this crate's other test hooks use.
     #[must_use]
     pub fn open_of<Msg: Clone + 'static>(c: &dyn Controller<Msg>) -> Option<usize> {

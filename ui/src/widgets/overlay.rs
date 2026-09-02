@@ -16,7 +16,7 @@
 //! children (`grid::GridC`'s own doc comment), so `OverlayC::classify`
 //! calling `node.children()` at build time sees none yet. The real
 //! classification -- the positional class, and each child's
-//! [`ChildLayout`] -- happens in [`classify_overlay_child`], called from
+//! [`ChildLayout`] -- happens in `classify_overlay_child`, called from
 //! `widgets::flush_layout` every frame via `mark_overlay_children`'s
 //! pending flag, the same deferral `grid_from_children` uses.
 

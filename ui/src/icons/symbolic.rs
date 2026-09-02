@@ -148,7 +148,7 @@ fn strip_inline_fill(root: &mut SvgNode) {
 ///
 /// Returns a clone: the caller's `SvgDom` is a cached parse shared by every
 /// palette, and mutating it would recolour every other node that shares it.
-/// A document that exceeds [`MAX_SVG_DEPTH`]/[`MAX_SVG_NODES`] comes back
+/// A document that exceeds `MAX_SVG_DEPTH`/`MAX_SVG_NODES` comes back
 /// cloned and unrecoloured — a bounded wrong colour, never an unbounded
 /// stack.
 #[must_use]

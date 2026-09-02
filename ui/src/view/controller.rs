@@ -555,7 +555,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for GenericC {
 ///
 /// One definition, one fallback (contract §11 E1): the dispatch table lives
 /// beside the widgets in [`crate::widgets::build_controller`], and this is the
-/// name [`crate::view::reconcile`]'s `Insert` arm calls. A kind no part has
+/// name [`crate::view::reconcile::reconcile`]'s `Insert` arm calls. A kind no part has
 /// written a controller for still lands on [`GenericC`], never on an inert
 /// stub.
 #[must_use]

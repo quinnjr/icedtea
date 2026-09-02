@@ -299,7 +299,7 @@ impl IconTheme {
     /// Memoised on `(chain, name, size, scale, symbolic)`, misses included:
     /// an application that asks for an icon it does not have every frame must
     /// not walk every directory of every theme every frame. The table is
-    /// capped at [`MAX_LOOKUP_CACHE`] and emptied by
+    /// capped at `MAX_LOOKUP_CACHE` and emptied by
     /// [`clear_caches`](Self::clear_caches) — which is also how a theme
     /// edited on disk is picked up.
     pub fn lookup(
@@ -721,7 +721,7 @@ impl ThemeIndex {
     /// Never fails and never panics: this is a file on disk that anything at
     /// all may have written. A line that does not parse is skipped, a key
     /// that does not parse takes the spec's default, and the result is
-    /// bounded by [`MAX_SUBDIRS`]/[`MAX_INHERITS`]. `name` is the theme's
+    /// bounded by `MAX_SUBDIRS`/`MAX_INHERITS`. `name` is the theme's
     /// directory name, used when the file declares no `Name=`.
     #[must_use]
     pub fn parse(name: &str, text: &str) -> ThemeIndex {

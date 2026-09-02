@@ -31,7 +31,7 @@
 //!
 //! The task text's `on_event` hit-tests buttons with a free `crate::widgets
 //! ::hit(b, *local)` function that does not exist in this crate -- there is
-//! no node-only hit-test, only [`crate::widgets::local_rect`] against a real
+//! no node-only hit-test, only `crate::widgets::local_rect` against a real
 //! `LayoutTree` (`ListBoxC::row_at`'s own reconciliation note explains why:
 //! a bare `Node` carries no geometry). `on_event` uses that instead, and
 //! also gates on `BTN_LEFT` the way `ListBoxC::on_event` does -- the task

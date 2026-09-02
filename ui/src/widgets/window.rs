@@ -9,7 +9,7 @@
 //! The window is its own root node -- there is no chrome subnode the way
 //! `HeaderBar`'s `windowhandle` or `ActionBar`'s `revealer` are -- so the
 //! view's own children land flat on it in declaration order, and
-//! [`WindowC::place`] only needs to tag whichever one carries
+//! `WindowC::place` only needs to tag whichever one carries
 //! [`PropName::Section`] `"titlebar"` (`crate::view::builders::slot`, via
 //! `.titlebar()`) with the `.titlebar` class; `window()`/`.titlebar()`
 //! already put it last, so no reparenting is needed the way `ActionBar`'s
@@ -36,12 +36,12 @@ use crate::window::keyboard::Mods;
 pub struct WindowC {
     /// The `xdg_toplevel` states the compositor last reported.
     pub states: SurfaceStates,
-    /// The child tagged `slot("titlebar")`, once [`WindowC::place`] has
+    /// The child tagged `slot("titlebar")`, once `WindowC::place` has
     /// found it. `RefCell` -- see the module doc.
     pub titlebar: RefCell<Option<Node>>,
     /// The window's focus ring.
     pub focus: FocusRing,
-    /// The descendant Enter activates, once [`WindowC::place`] has found
+    /// The descendant Enter activates, once `WindowC::place` has found
     /// it. `RefCell` -- see the module doc.
     pub default_widget: RefCell<Option<Node>>,
     /// Who draws this window's decorations.
@@ -181,10 +181,10 @@ impl<Msg: Clone + 'static> WindowExt<Msg> for crate::view::View<Msg> {
 /// deep under the window's child), not on the window itself, so there is
 /// nothing for it to collide with the way `.modal`/`.icon_name` do.
 ///
-/// [`WindowC::place`] finds it back by the `.default` class this adds,
+/// `WindowC::place` finds it back by the `.default` class this adds,
 /// walking every descendant after the reconciler has attached the whole
 /// subtree -- there is no `Prop::Node` a builder could hand the window
-/// directly, the same gap [`crate::view::builders::View::label_widget`]'s
+/// directly, the same gap [`crate::view::builders::FrameExt::label_widget`]'s
 /// unread [`PropName::LabelWidget`] marker leaves for `Frame`.
 impl<Msg: Clone + 'static> crate::view::View<Msg> {
     /// See the trait-level doc above.

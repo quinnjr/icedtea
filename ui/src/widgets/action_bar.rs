@@ -14,7 +14,7 @@
 //!
 //! `box.start`/`box.center`/`box.end` are built once, in [`ActionBarC::build`],
 //! and never removed: they are what `ActionBarC::apply` centres the middle
-//! one against. [`crate::view::builders::pack_start`]/`pack_end`/`center`
+//! one against. [`crate::view::builders::PackExt::pack_start`]/`pack_end`/`center`
 //! tag a child with [`PropName::Section`] rather than routing it to a
 //! different [`crate::widgets::child_slot`] (there is only one attach point
 //! a reconciled batch of children can land on), so this controller does not

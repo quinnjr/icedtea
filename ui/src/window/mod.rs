@@ -400,7 +400,7 @@ pub(crate) fn apply_configure_states(root: &Node, states: SurfaceStates) {
 /// `states`, `resize`, `set_cursor_shape`, `commit_buffer`); a window's own
 /// surface is a `Toplevel` or a `Layer`, and each of its open popups is a
 /// `Popup` held by a
-/// [`PopupWindow`](crate::window::popup::PopupWindow).
+/// `PopupWindow` (`crate::window::popup::PopupWindow`).
 pub enum Surface {
     Toplevel(toplevel::Toplevel),
     Layer(layer::Layer),
@@ -1413,8 +1413,8 @@ impl Window {
     ///
     /// Reconciliation: the contract's sketch names a pre-existing
     /// `acquire_slot`/`upload_and_commit` pair on `Window`; P3 instead factored
-    /// that sequence as the free functions [`commit_buffer_to`] and
-    /// [`Surface::commit_buffer`], which paint a *known* tree rather than
+    /// that sequence as the free functions `commit_buffer_to` and
+    /// `Surface::commit_buffer`, which paint a *known* tree rather than
     /// accepting an arbitrary closure and give no way to learn whether a
     /// buffer was actually acquired. `paint_with` inlines the same
     /// acquire/upload/attach/damage/commit sequence those helpers already use,
@@ -1565,7 +1565,7 @@ impl Window {
 
     /// Open a popup anchored to a node or a rect of this window.
     ///
-    /// Sequencing, per xdg-shell: positioner -> `get_popup` -> [`grab`] ->
+    /// Sequencing, per xdg-shell: positioner -> `get_popup` -> `grab` ->
     /// commit with no buffer -> configure -> ack -> attach. The grab, if any,
     /// uses the window's most recent input serial.
     ///

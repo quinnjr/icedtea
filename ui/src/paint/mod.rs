@@ -118,7 +118,7 @@ enum CacheEntry {
 /// A URL that fails to decode is *recorded unresolved*: it is remembered as
 /// a miss so the file is not re-read every frame, logged once, and paints
 /// nothing. That is not an error -- the computed value keeps the URL. The
-/// miss expires after [`IMAGE_MISS_COOLDOWN`] rather than lasting forever.
+/// miss expires after `IMAGE_MISS_COOLDOWN` rather than lasting forever.
 pub struct ImageCache {
     /// What a relative `url()` resolves against: the stylesheet's own
     /// directory. Empty means "the process's working directory", which is

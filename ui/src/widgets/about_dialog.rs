@@ -10,7 +10,7 @@
 //! [`crate::widgets::popover_menu::PopoverMenuC`] uses for its embedded
 //! `PopoverC`. [`about_dialog`] takes no child views (contract §5.7: its
 //! credits are flat name lists, not real per-page content the way
-//! [`crate::widgets::stack::stack`]'s own pages are), so — the identical
+//! [`crate::view::builders::stack`]'s own pages are), so — the identical
 //! fact [`crate::widgets::stack::StackC`]'s own module doc explains for
 //! `StackC::place` reading an empty `node.children()` at `build` time —
 //! `pages` is always empty here: there is no per-page `View` for the

@@ -20,7 +20,7 @@
 //! * The plan's `select_band` sketch calls a free `crate::widgets::
 //!   intersects(child, band)` on a bare `&Node`. A `Node` alone carries no
 //!   absolute geometry in this crate -- only a [`crate::layout::LayoutTree`]
-//!   does (see [`crate::widgets::local_rect`]'s own doc comment) -- so this
+//!   does (see `crate::widgets::local_rect`'s own doc comment) -- so this
 //!   controller resolves each child's rect through the real `&LayoutTree`
 //!   `EventCx::tree` hands `on_event`, via a `Rect::intersects` method this
 //!   task adds, mirroring `ListBoxC::row_at`'s use of `local_rect`.

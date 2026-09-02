@@ -1,5 +1,5 @@
 //! Keyed reconciliation of a `View` description tree into retained
-//! [`Node`](crate::css::node::Node)s.
+//! [`Node`]s.
 
 use std::rc::Rc;
 

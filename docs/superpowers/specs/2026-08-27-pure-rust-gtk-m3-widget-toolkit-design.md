@@ -1,7 +1,9 @@
 # Pure-Rust GTK-themed UI — M3: Widget Toolkit, Popups, Windows, Icons — Design
 
 **Date:** 2026-08-27
-**Status:** approved (2026-08-27); P1, P2 and P3 landed on `rebuild/pure-rust-gtk-m3`
+**Status:** implemented on `rebuild/pure-rust-gtk-m3` (parts 1–8 of
+`docs/superpowers/plans/2026-08-27-m3-part0-contract.md`); `wlr` 0.20.28
+published; awaiting owner review before merge
 **Branch:** `rebuild/pure-rust-gtk-m3` (off `develop` @ 8df998e)
 **Parent spec:** `docs/superpowers/specs/2026-08-20-pure-rust-gtk-ui-design.md` (§Decomposition M3 + M4)
 **Previous milestone:** M2 — `docs/superpowers/specs/2026-08-26-pure-rust-gtk-m2-css-engine-design.md`
