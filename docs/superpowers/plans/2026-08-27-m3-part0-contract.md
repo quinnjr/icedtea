@@ -4408,8 +4408,9 @@ enough to assert on — is P6 widget work with its own design, shared with
 `GridViewC`/`ColumnViewC`, not a close-out edit. Recorded here rather than
 half-done.
 
-**Commit:** see `.superpowers/sdd/m3-close/closure-popup-lists.md` for the
-full RED/GREEN trail.
+**Commit:** `642f612`; see
+`.superpowers/sdd/m3-close/closure-popup-lists.md` for the full RED/GREEN
+trail.
 
 ### P8-D72 — Task 12's four interactions are absent too, each blocked by a distinct pre-existing production defect
 
