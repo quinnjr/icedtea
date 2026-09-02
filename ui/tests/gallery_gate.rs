@@ -621,3 +621,43 @@ fn the_node_tree_of_every_widget_matches_its_gtk_fixture() {
          ui/tests/fixtures/gtk4.22-node-trees/<name>.txt, one per Kind)"
     );
 }
+
+/// The README's widget table is generated from `Kind::all()` and must stay
+/// that way: a widget added to the toolkit and not to the table is a widget
+/// the next reader will not know exists.
+///
+/// Mutation check: delete one row from the table between the markers; this
+/// test fails naming that widget. Restore.
+#[test]
+fn the_readme_widget_table_lists_every_kind() {
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("ui/README.md is readable");
+    let table = readme
+        .split_once("<!-- widgets:begin -->")
+        .expect("the README has a `<!-- widgets:begin -->` marker")
+        .1
+        .split_once("<!-- widgets:end -->")
+        .expect("the README has a `<!-- widgets:end -->` marker")
+        .0;
+    let listed: Vec<&str> = table
+        .lines()
+        .filter_map(|line| {
+            let cell = line.strip_prefix("| `")?;
+            cell.split_once('`')
+        })
+        .map(|(name, _)| name)
+        .collect();
+    for &kind in Kind::all() {
+        assert!(
+            listed.contains(&kind_name(kind)),
+            "`{}` is missing from the README's widget table",
+            kind_name(kind)
+        );
+    }
+    assert_eq!(
+        listed.len(),
+        Kind::all().len(),
+        "the README table has rows for widgets that do not exist: {listed:?}"
+    );
+}

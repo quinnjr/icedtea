@@ -7,24 +7,116 @@ A pure-Rust, GTK4-theme-compatible widget layer: no `gtk4`, `gio`, `glib`,
 ## What this crate covers
 
 M1 proved one themed `button` end to end. M2 widened the CSS layer to the whole
-GTK 4.22 property table: every property in GTK's CSS reference parses, cascades,
-inherits, computes, paints and animates on a widget-independent styled-node
-tree.
+GTK 4.22 property table. **M3 turns that engine into a widget toolkit:** real
+windows and popups, a keyboard/pointer/focus model, a reactive view layer, the
+GTK 4.22 core widget set with GTK-exact CSS node trees, and icon theming.
 
 | Layer | Crate |
 |---|---|
-| Wayland + layer shell | `wayland-client`, `wayland-protocols-wlr` (hand-rolled, no sctk/calloop) |
+| Wayland: toplevel, layer shell, popups | `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr` (hand-rolled, no sctk/calloop) |
+| Keyboard | `xkbcommon` (keymaps, compose, repeat) |
 | 2D paint | `skia-rs-safe` (pure Rust) |
-| Text shaping | `skia-rs-text` — `Typeface::from_data` + `rustybuzz` (**not** `cosmic-text`) |
-| Font discovery | `fontconfig` — real `fc-match` parity (default feature; see below) |
+| Text shaping | `skia-rs-text` — `Typeface::from_data` + `rustybuzz` |
+| Font discovery | `fontconfig` — real `fc-match` parity (default feature) |
 | Layout | `taffy` |
 | CSS parse / match | Servo's `cssparser` + `selectors` |
-| Widget | bespoke — a `css::node::Node` tree wearing GTK's node identity |
+| Widgets | bespoke — `css::node::Node` trees wearing GTK's node identity |
+
+### The module map
+
+| Module | What it owns |
+|---|---|
+| `css/` | The property registry, parsing, selectors, cascade, computed values (M2) |
+| `anim/` | Transitions, `@keyframes`, the animation clock (M2) |
+| `layout.rs` | The `taffy` bridge: box, grid and centre containers, per-child alignment |
+| `paint/` | Backgrounds, borders, shadows, outlines, blur, text, icons |
+| `text.rs` | Font matching, shaping caches, wrap/ellipsize/caret/selection |
+| `window/` | `Surface::{Toplevel, Layer, Popup}`, keyboard, pointer, focus, selection |
+| `view/` | `View`, builders, the keyed reconciler, controllers, `App`, `Cmd` |
+| `widgets/` | One file per widget: node tree, controller, behaviour |
+| `icons/` | freedesktop icon themes, symbolic recolouring, builtins |
+| `gallery.rs` | Every widget on one page — the binary the M3 gate measures |
 
 The property registry (`css/registry.rs`) is the spine: one static table of
 114 rows — 95 longhands, 19 shorthands — drives parsing, shorthand expansion,
 inheritance, computed values and interpolation. Nothing outside that module
 names a property string.
+
+## The widget set
+
+Every widget below is a `Kind`, a builder in `view::builders`, a controller, a
+GTK-exact CSS node tree with a vendored fixture, a rest-state pixel probe and —
+per widget class — one driven interaction. The name is what
+`gallery --widget <NAME>` takes.
+
+<!-- widgets:begin -->
+| Widget | CSS node | Notes |
+|---|---|---|
+| `label` | `label` | wrap, ellipsize, `<b><i><span>` markup, links |
+| `spinner` | `spinner` | `:checked` while spinning, as GTK does |
+| `statusbar` | `statusbar` | one-line message area |
+| `level_bar` | `levelbar` | discrete/continuous fill, offset colour bands |
+| `progress_bar` | `progressbar` | determinate fill, optional inline text |
+| `info_bar` | `infobar` | message type styling (`.info`/`.warning`/…), close button |
+| `scrollbar` | `scrollbar` | orientation, slider drag |
+| `image` | `image` | icon-name or file source, painted through `paint_icon_source` |
+| `picture` | `picture` | raster content, `content-fit` scaling |
+| `separator` | `separator` | horizontal/vertical rule |
+| `text_view` | `textview` | multi-line editable text, caret and selection |
+| `scale` | `scale` | continuous drag with a live value, keyboard step |
+| `drawing_area` | `widget` | GTK sets no CSS name on it; caller-supplied paint callback |
+| `window_controls` | `windowcontrols` | minimise/maximise/close glyphs |
+| `calendar` | `calendar.view` | month grid, day selection |
+| `popover` | `popover.background` | arrow, grab-and-dismiss surface (shared with `MenuButton`/`DropDown`) |
+| `button` | `button` | click, `:hover`/`:active`, Space/Enter activation |
+| `toggle_button` | `button.toggle` | persists `:checked` across clicks |
+| `link_button` | `button.link` | opens a URI, `:visited` styling |
+| `check_button` | `checkbutton` | tri-state check, optional radio grouping |
+| `menu_button` | `menubutton` | opens a `PopoverC` on click |
+| `switch` | `switch` | on/off drag or click, animated thumb |
+| `drop_down` | `dropdown` | popover list, type-ahead filter, keyboard pick |
+| `color_dialog_button` | `colorbutton` | swatch button, opens `ColorDialog` |
+| `color_dialog` | `window.dialog` | HSV picker, hex entry |
+| `font_dialog_button` | `fontbutton` | opens `FontDialog` |
+| `font_dialog` | `window.dialog` | family/style/size list |
+| `entry` | `entry` | caret, selection, undo stack (`widgets::edit`) |
+| `search_entry` | `entry.search` | debounced search-changed signal |
+| `password_entry` | `entry.password` | peek-to-reveal toggle |
+| `spin_button` | `spinbutton` | steppers repeat while held |
+| `editable_label` | `editablelabel` | click-to-edit label/entry swap |
+| `box` | `box` | linear layout, per-child alignment |
+| `grid` | `grid` | row/column layout with spans |
+| `center_box` | `box` | three-slot start/center/end layout |
+| `scrolled_window` | `scrolledwindow` | kinetic scroll, overlay scrollbars |
+| `paned` | `paned` | draggable divider between two panes |
+| `frame` | `frame` | optional labelled border around one child |
+| `expander` | `expander-widget` | disclosure triangle, animated reveal |
+| `search_bar` | `searchbar` | reveals a `search_entry` on `/`-style trigger |
+| `action_bar` | `actionbar` | start/center/end action row, focus-order gate |
+| `header_bar` | `headerbar` | title, start/end widget packing |
+| `notebook` | `notebook` | tabbed pages, keyboard tab switching |
+| `notebook_tab` | `tab` | one `notebook` page's tab label (sub-kind) |
+| `overlay` | `overlay` | stacked children, one main plus floating overlays |
+| `stack` | `stack` | one visible page at a time, transition-driven swap |
+| `stack_page` | `stackpage` | one `stack` page's metadata (sub-kind) |
+| `stack_switcher` | `stackswitcher.stack-switcher` | button row bound to a `stack` |
+| `stack_sidebar` | `stacksidebar.sidebar` | list-style page picker bound to a `stack` |
+| `list_box` | `list` | selectable rows, keyboard navigation |
+| `list_box_row` | `row` | one `list_box` row (sub-kind) |
+| `flow_box` | `flowbox` | wrapping selectable grid of children |
+| `flow_box_child` | `flowboxchild` | one `flow_box` cell (sub-kind) |
+| `list_view` | `listview` | recycled rows, scroll with reuse |
+| `grid_view` | `gridview` | recycled grid cells, scroll with reuse |
+| `column_view` | `columnview` | multi-column recycled list |
+| `column_view_column` | `button` | one `column_view` header (sub-kind) |
+| `popover_menu` | `popover.background.menu` | menu-model-backed popover |
+| `popover_menu_bar` | `menubar` | horizontal menu bar opening `popover_menu`s |
+| `popover_menu_item` | `button.model` | one `popover_menu` row (sub-kind) |
+| `window` | `window.background` | toplevel surface, title, decoration |
+| `shortcuts_window` | `window.shortcuts` | grouped accelerator reference (kept, ruling R1) |
+| `about_dialog` | `window.aboutdialog` | app name/version/credits dialog |
+| `alert_dialog` | `window.dialog.message` | message, detail, buttons |
+<!-- widgets:end -->
 
 ## Running it
 
@@ -284,6 +376,69 @@ Widget builders (`button("Ok")`, `label("Hi")`, …) arrive with P5 and P6;
   as the seat's whole current set: losing the pointer releases it and clears
   hover and active, regaining it binds a new one.
 
+## The gallery
+
+```bash
+cargo run -p icedtea-ui --bin gallery                 # every widget, light Adwaita
+cargo run -p icedtea-ui --bin gallery -- --theme dark
+cargo run -p icedtea-ui --bin gallery -- --widget check_button
+```
+
+One scrollable page, one `frame` per widget, in `Kind::all()` order. The page is
+built by *iterating* `Kind::all()`, so a widget added without a gallery entry
+does not compile — the gallery is the toolkit's completeness measure, not a
+demo.
+
+| Option | Meaning |
+|---|---|
+| `--theme <light\|dark\|hc>` | Which bundled sheet to compile. Default: light. |
+| `--theme-file <PATH>` | A sheet on disk, used *whole*, instead of a bundled one. |
+| `--widget <NAME>` | Render exactly one widget, alone, at the origin. |
+| `--list` | Print every widget name, one per line, and exit. |
+| `--probe-points` | Print `<widget> <label> <x> <y>` for every probe point and exit. |
+| `--print-allocation` | Print `<widget> <x> <y> <width> <height>` per entry and exit. |
+| `--size <WxH>` | Surface size. Default: 1280x800. |
+| `--scroll <PX>` | Scroll the page before the first frame. |
+| `--scale <N>` | Output scale, for HiDPI probes. Default: 1. |
+
+`--list`, `--probe-points` and `--print-allocation` never touch Wayland: they
+run the same view → reconcile → restyle → layout pipeline the app loop runs and
+print what it produced. Everything else maps a `zwlr_layer_shell_v1` overlay
+anchored top-left, so on-screen coordinates are page coordinates.
+
+**Probe points** are derived, never declared: `"root"` is the widget's own node,
+every descendant is labelled by its CSS node name, and a name that occurs more
+than once is indexed (`tab0`, `image1`). That is how the gates learn where to
+sample — no test in this crate hard-codes a coordinate.
+
+Every folded message is printed as `msg <line>` on stdout and flushed
+immediately, which is how the interaction gate asserts on the model from
+outside the process.
+
+## The M3 gates
+
+```bash
+cargo test -p icedtea-ui --test gallery_gate       # rest state, 3 themes
+cargo test -p icedtea-ui --test interaction_gate   # 16 driven interactions
+cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
+```
+
+- `tests/gallery_gate.rs` walks the page in surface-height slices under the
+  harness compositor and asserts every widget paints something in light, dark
+  and high-contrast Adwaita; that every `Kind` appears in `--list`, on the page
+  and (for sub-kinds) inside its parent's node tree; that at least one probe
+  point per widget differs between light and dark; that every widget's node tree
+  matches its vendored GTK 4.22 fixture; and that this README's table lists
+  every `Kind`.
+- `tests/interaction_gate.rs` drives one interaction per widget class with a
+  virtual pointer and keyboard: click, toggle, check, switch, type, debounced
+  search, password peek, held spin repeat, drop-down pick, scale drag, list
+  scroll with recycling, expander, stack page, popover grab and dismissal, Tab
+  in geometric order, and the pointer-click-without-focus-ring rule.
+- Colours are pinned in exactly one place — `tests/themed_button_offscreen.rs`,
+  the M1 gate. The gallery gates assert *change*, not constants: 64 pinned
+  colours would be a fixture to maintain, not a gate.
+
 ## Tests
 
 ```bash
@@ -313,18 +468,17 @@ cargo test -p icedtea-ui
   kind and inherited flag, asserted both ways — nothing missing, nothing
   invented — in registry order.
 
-## Deliberately not covered by M2
+## Deliberately not covered by M3
 
-Icon *drawing* — every `-gtk-icon-*` value parses, computes and is stored, but
-nothing rasterizes an icon yet (M4). Widgets beyond the button behaviour that
-carries the M1 gate, the focus/event model, grid and centre layouts, and text
-editing (M3). Accessibility, input methods, drag and drop (M6). `url()` images
-beyond PNG, and SVG only where `skia-rs-svg` decodes it — anything else is
-recorded unresolved and paints nothing rather than erroring. `@media` features
-beyond `prefers-color-scheme` and `prefers-contrast`. Fractional scale and
-surface resize. `font-feature-settings`/`font-variation-settings` reaching the
-shaper, and font-collection face indices (see **Fonts and text** above). See the
-spec's M3–M6.
+Input methods and `text-input-v3`, the emoji chooser, drag and drop, and
+`accesskit` accessibility (M6). Markup beyond `<b><i><span>`. GL and video
+widgets (`GLArea`, `Video`, `MediaControls`), the portal-backed choosers
+(file, print, app) and `LockButton`, and the deprecated widgets GTK 4.22 itself
+retired — except `Statusbar`, `InfoBar` and `ShortcutsWindow`, which Adwaita
+still styles and which the M3 contract keeps (ruling R1). Client-side cursor
+themes: the toolkit maps the `cursor` property to `wp_cursor_shape_v1` names
+instead. XWayland clients. Fractional scale. The app migrations onto this
+toolkit — settings, then shell, then clipboard — are M5.
 
 ## Vendored files
 
@@ -335,7 +489,7 @@ themes, redistributed under the LGPL-2.1-or-later. See
 is a transcription of GTK 4.22's CSS property reference, with the doc URL in its
 header.
 
-## M3 Part 3 — the window and event layer
+## The window and event layer
 
 `icedtea_ui::window` is one Wayland client per window: a `Surface` in one of
 three roles (`xdg_toplevel`, `zwlr_layer_surface_v1`, `xdg_popup`), a retained
@@ -360,10 +514,10 @@ M1's `LayerWindow` is unchanged, at `window::layer` and still reachable as
 `wayland::LayerWindow`; the `themed-button` demo and its pixel gate run on it
 exactly as before.
 
-Not here: widgets beyond P5's 32 kinds (P6), the reactive loop (P4), icons
-(P7), IME, drag and drop, client-side cursor themes.
+Not covered here: input methods (`text-input-v3`), drag and drop, client-side
+cursor themes (M6/see below).
 
-## M3 Part 5 — the widget catalogue
+## The P5 half of the widget catalogue, in detail
 
 `icedtea_ui::widgets` builds one `Controller` per `Kind`, dispatched by
 `widgets::build_controller`; `view::builders` re-exports each widget's free
@@ -424,7 +578,7 @@ files with its own 32 kinds; P8's gallery gate wires the whole set together.
 | `SpinButton` | `spinbutton` | `spin_button(lower, upper)` | `spin_button.txt` |
 | `EditableLabel` | `editablelabel` | `editable_label(text)` | `editable_label.txt` |
 
-Not here: P6's 32 remaining kinds (containers, lists, and the rest), icon
-rasterization for `Image`/`CheckButton` (P7 — see contract §10 P5-D25/D26),
-`ListView` (P6 — `DropDown` and `FontDialog` build their row lists directly
-until then, contract §10 P5-D22/D23).
+This table only carries the constructor signature and fixture path for P5's
+original 32 kinds; P6's remaining 32 (containers, lists, menus, dialogs) are
+listed with their CSS node and one-line behaviour in **The widget set** above,
+without a per-kind builder-signature row here.
