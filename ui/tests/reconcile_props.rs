@@ -240,5 +240,9 @@ fn a_removed_key_s_controller_is_dropped_exactly_once() {
 
     // A second empty frame must not drop it again.
     reconcile(&parent, &mut prev, Vec::new(), &mut h.cx());
-    assert_eq!(drops.get(), 1, "the drop ran twice");
+    assert_eq!(
+        drops.get(),
+        1,
+        "a second empty reconcile must not drop the instance again"
+    );
 }

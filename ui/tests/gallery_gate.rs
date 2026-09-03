@@ -99,16 +99,19 @@ fn visible_in_slice(
 /// * `00ddd7f`'s `StackSwitcherC` child-slot fix, which this list was never
 ///   updated for.
 ///
-/// **Seven still collapse to a zero-area allocation** (`gallery
+/// **Six still collapse to a zero-area allocation** (`gallery
 /// --print-allocation` prints `w` and/or `h` as `0`, headless, so this is a
-/// layout result and not a rendering artifact): `scrollbar` (`160x0` — the
-/// width request lands now, the height does not), `window_controls`,
+/// layout result and not a rendering artifact): `window_controls`,
 /// `color_dialog`, `font_dialog`, `popover_menu`, `popover_menu_bar` and
 /// `alert_dialog`. Each is a controller that reports no intrinsic size of its
 /// own, the same shape of bug `progress_bar` had; none is individually
 /// traced.
 ///
-/// **Two have a real allocation and still paint nothing**: `link_button`
+/// **Three have a real allocation and still paint nothing**: `scrollbar`
+/// (40x14 since `ScrollbarC::measure` landed in the review-fix wave, and its
+/// drag interaction is real — but the trough and slider are unallocated
+/// chrome nodes and the controller has no `paint`, so nothing draws at
+/// rest), `link_button`
 /// (36x34, 0 of 1224 pixels differ from the background) and `check_button`
 /// (22x22, 0 of 484). Both are traced. `CheckButtonC::paint`
 /// (`ui/src/widgets/check_button.rs`) returns `false` outright when the button
@@ -132,15 +135,16 @@ fn visible_in_slice(
 /// whole in some slice (the `missing` check below is not exempted), so a
 /// widget that regresses to never being laid out at all still fails the gate.
 ///
-/// Neither `separator` nor `calendar` is here: both look zero-ish (1x1 and
-/// 2x2) but both do paint, and now that [`paints_something`] scans the whole
-/// border box instead of an inset 5x5 grid, the gate can see it.
+/// Neither `separator` nor `calendar` is here: `separator` looks zero-ish
+/// (1x1) but paints, and `calendar` sizes itself for real now
+/// (`CalendarC::measure`, 168 wide) and paints its own background; now that
+/// [`paints_something`] scans the whole border box instead of an inset 5x5
+/// grid, the gate can see both.
 ///
 /// Mutation check: remove `"scrollbar"` from this list; the light-theme test
 /// fails with "scrollbar painted nothing in the light theme". Restore.
 const KNOWN_BLANK_AT_REST: &[&str] = &[
     // Zero-area allocation.
-    "scrollbar",
     "window_controls",
     "color_dialog",
     "font_dialog",
@@ -148,6 +152,7 @@ const KNOWN_BLANK_AT_REST: &[&str] = &[
     "popover_menu_bar",
     "alert_dialog",
     // Real allocation, nothing drawn into it.
+    "scrollbar",
     "link_button",
     "check_button",
 ];

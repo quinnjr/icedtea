@@ -1114,8 +1114,12 @@ pub struct Clipboard { /* wl_data_device_manager, wl_data_device,
 
 impl Clipboard {
     /// Offers `text/plain;charset=utf-8`. `serial` must come from a real input
-    /// event. Panics with the missing global's name if the compositor never
-    /// advertised `wl_data_device_manager` — fail-fast, matching the harness.
+    /// event. AMENDED (M3 review-fix wave, 2026-09-03): a compositor that never
+    /// advertised `wl_data_device_manager` no longer panics — the clipboard
+    /// degrades to the in-process offscreen transport with a warning, matching
+    /// what the primary-selection half always did for its own missing manager.
+    /// The original fail-fast ruling cost a legal minimal compositor the whole
+    /// app; the review judged the asymmetry a defect.
     pub fn copy(&mut self, text: &str, serial: u32);
     /// Reads the current selection with a deadline; `None` on no offer, no
     /// matching mime type, or timeout.

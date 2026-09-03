@@ -757,8 +757,9 @@ pub fn wait_for_gallery(
 ///
 /// The `w <= 2 || h <= 2` early return of the task text goes with it, for the
 /// same reason: it was there only because a 5x5 inset grid has nothing to
-/// sample in a 2px box. A full scan does, and both `separator` (1x1, one
-/// `#d8d4d0` pixel) and `calendar` (2x2, four `#cdc7c2` pixels) do paint.
+/// sample in a 2px box. A full scan does, and `separator` (1x1, one
+/// `#d8d4d0` pixel) does paint (`calendar` used to be the other 2px case,
+/// before `CalendarC::measure` gave it a real month-grid allocation).
 #[must_use]
 pub fn paints_something(
     frame: &CapturedFrame,
@@ -1071,18 +1072,29 @@ impl Driver {
         }
     }
 
-    /// Capture until `(x, y)` holds the same colour for two consecutive polls
-    /// — "the animation is over", without pinning how long it took.
+    /// Capture until `(x, y)` holds the same colour across several
+    /// consecutive polls — "the animation is over", without pinning how long
+    /// it took.
+    ///
+    /// Two agreeing polls are not enough: both can land before the repaint
+    /// they are waiting on has even started, so "unchanged" would just be the
+    /// pre-animation colour reported twice. Settlement therefore needs
+    /// [`SETTLED_SAMPLES`] agreeing reads *and* [`SETTLED_MIN`] of wall clock
+    /// to have passed, which puts the window past the compositor round trip
+    /// that starts the repaint.
     pub fn wait_pixel_settled(&mut self, x: i32, y: i32) -> (u8, u8, u8) {
         let started = Instant::now();
         let mut last = self.pixel(x, y);
+        let mut agreeing = 1usize;
         loop {
             std::thread::sleep(CAPTURE_POLL);
             let now = self.pixel(x, y);
-            if matches(now, last) || started.elapsed() >= REACT_TIMEOUT {
+            agreeing = if matches(now, last) { agreeing + 1 } else { 1 };
+            last = now;
+            let settled = agreeing >= SETTLED_SAMPLES && started.elapsed() >= SETTLED_MIN;
+            if settled || started.elapsed() >= REACT_TIMEOUT {
                 return now;
             }
-            last = now;
         }
     }
 }
@@ -1094,3 +1106,11 @@ impl Driver {
 /// text's 5s is not enough -- the same `clip_path` cost `GALLERY_MAP_TIMEOUT`
 /// documents applies to every repaint, not only the first.
 pub const REACT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Consecutive agreeing captures [`Driver::wait_pixel_settled`] needs before
+/// it calls a pixel settled.
+pub const SETTLED_SAMPLES: usize = 3;
+
+/// Floor on how long [`Driver::wait_pixel_settled`] polls before it will
+/// accept settlement at all, so it cannot report the pre-animation colour.
+pub const SETTLED_MIN: Duration = Duration::from_millis(100);

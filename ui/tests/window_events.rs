@@ -407,8 +407,14 @@ fn a_held_key_repeats_through_pump_and_types_more_than_one_glyph() {
     // Hold `H` well past the initial delay plus a few repeat intervals, so
     // the probe's `Window::pump` has every chance to arm and then re-fire
     // the repeat timer.
+    //
+    // The deadline is the shared `REACT_TIMEOUT` rather than a snug multiple
+    // of 600ms + 1/25s: the loop breaks the moment a second glyph shows up,
+    // so a generous ceiling costs a passing run nothing and only stops a
+    // loaded machine — where the delay, the pumps and the report write can
+    // all slip — from failing a working repeat.
     keyboard.key_down(KEY_H);
-    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    let deadline = std::time::Instant::now() + support::REACT_TIMEOUT;
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
         keyboard.pump();

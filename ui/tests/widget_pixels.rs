@@ -3,6 +3,28 @@
 //! Everything here runs through `App::run_offscreen` on a `ManualClock` — no
 //! compositor, no Wayland connection. P8's `gallery_gate.rs` and
 //! `interaction_gate.rs` are the compositor-backed versions of the same idea.
+//!
+//! # Chrome a controller appends itself is not in the layout tree
+//!
+//! `widgets/mod.rs::local_rect` says so itself: it "only answers for subnodes
+//! the reconciler gave a taffy node, which the extra nodes a controller
+//! appends itself (`text`, `image.peek`, `trough`, …) never are —
+//! `tree.allocation` is `None` for every one of them". A controller that
+//! hit-tests such a node through `local_rect` therefore bails on every event
+//! and its whole `on_event` body is dead code; worse, a widget whose *only*
+//! content is that chrome also measures to 0x0, so it is not even hit-tested
+//! in the first place.
+//!
+//! `ScaleC` has always got this right — an intrinsic `measure`, plus a trough
+//! derived from `content_rect_local` — and `ScrollbarC`, `InfoBarC` and
+//! `CalendarC` now do too (`ScrollbarC::measure`, `InfoBarC::close_rect`,
+//! `CalendarC::day_cell`). The three interaction tests below
+//! (`dragging_a_scrollbar_slider_reports_the_new_value`,
+//! `clicking_an_info_bars_close_button_fires_close`,
+//! `clicking_a_calendar_day_selects_it`) were `#[ignore]`d on that defect and
+//! are green assertions again; each carries the geometry its coordinates come
+//! from, because those widgets sit at their intrinsic size, centred, and not
+//! wherever `hexpand` suggests.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -123,29 +145,44 @@ fn a_label_inks_its_glyphs_at_rest_in_adwaita_light() {
 #[test]
 fn clicking_a_link_in_a_label_fires_activate_link_with_its_uri() {
     // mutation: drop the hit-test against `links` in LabelC::on_event and no
-    // message arrives.
+    // message arrives, so `opened` stays empty and the URI assertion fails.
     use icedtea_ui::view::builders::label;
     use icedtea_ui::widgets::label::LabelExt;
+    use std::cell::RefCell;
 
     #[derive(Clone, Debug, PartialEq)]
     struct Opened(String);
 
+    // `run`'s `view` must be a bare `fn` pointer, so the log is threaded
+    // through the model rather than captured from the test's scope; that is
+    // what lets the assertion below name the exact URI instead of settling
+    // for `frames.len()`.
+    let opened: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
     let frames = run(
-        Vec::<String>::new(),
-        |model: &mut Vec<String>, Opened(uri): Opened| {
-            model.push(uri);
+        opened.clone(),
+        |model: &mut Rc<RefCell<Vec<String>>>, Opened(uri): Opened| {
+            model.borrow_mut().push(uri);
             Cmd::None
         },
-        |_m: &Vec<String>| {
+        |_m: &Rc<RefCell<Vec<String>>>| {
             label("go to <a href=\"https://gtk.org\">GTK</a> now")
                 .markup(true)
                 .on_activate_link(|uri| Opened(uri.to_owned()))
         },
         (240, 40),
         vec![
+            // `LabelC` reports its own intrinsic text size and is centred in
+            // the window, so the anchor is nowhere near the window's own
+            // left edge: sweeping every pixel of this 240x40 window puts the
+            // "GTK" run at x 109..132, y 10..29 (the plain "go to " and
+            // " now" spans around it fire nothing, which is what makes the
+            // URI assertion below a real hit-test check and not just
+            // "something was clicked"). x=40, the coordinate this test used
+            // before, lands on empty window and could never fire.
             ScriptStep::Event(InputEvent::PointerEnter {
-                x: 40.0,
-                y: 14.0,
+                x: 120.0,
+                y: 20.0,
                 serial: 1,
                 target: icedtea_ui::window::SurfaceTarget::Window,
             }),
@@ -165,6 +202,11 @@ fn clicking_a_link_in_a_label_fires_activate_link_with_its_uri() {
         ],
     );
     assert_eq!(frames.len(), 1, "the script captured once");
+    assert_eq!(
+        opened.borrow().as_slice(),
+        ["https://gtk.org"],
+        "clicking the anchor must fire activate-link once with the href"
+    );
 }
 
 #[test]
@@ -338,20 +380,26 @@ fn a_discrete_level_bars_fill_widens_with_its_value() {
 #[test]
 fn clicking_an_info_bars_close_button_fires_close() {
     // mutation: never set `handled` / never fire EventKind::Close in
-    // InfoBarC::on_event and the model stays at 0.
+    // InfoBarC::on_event and `closes` stays at 0, failing the count assertion.
     use icedtea_ui::view::builders::info_bar;
     use icedtea_ui::widgets::info_bar::InfoBarExt;
+    use std::cell::Cell;
 
     #[derive(Clone, Debug, PartialEq)]
     struct Closed;
 
+    // Threaded through the model because `run`'s `view` is a bare `fn`
+    // pointer: `run` returns only the frames, so the fired-message count has
+    // to leave the app by a shared cell for the test to assert on it.
+    let closes: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+
     let frames = run(
-        0u32,
-        |model: &mut u32, _msg: Closed| {
-            *model += 1;
+        closes.clone(),
+        |model: &mut Rc<Cell<u32>>, _msg: Closed| {
+            model.set(model.get() + 1);
             Cmd::None
         },
-        |_m: &u32| {
+        |_m: &Rc<Cell<u32>>| {
             info_bar()
                 .show_close_button(true)
                 .revealed(true)
@@ -360,7 +408,14 @@ fn clicking_an_info_bars_close_button_fires_close() {
         },
         (300, 48),
         vec![
-            ScriptStep::Event(InputEvent::pointer_enter(285.0, 24.0, 1)),
+            // `InfoBarC` reports the close button's own 24x24 as its
+            // intrinsic size (see `InfoBarC::measure`) because that button is
+            // a subnode with no taffy box; with no other children the bar is
+            // that square, centred in this 300x48 window at x 138..162,
+            // y 12..36, and the button fills it (`InfoBarC::close_rect`
+            // packs it at the trailing edge). x=285, this test's previous
+            // coordinate, is bare window and could never reach the widget.
+            ScriptStep::Event(InputEvent::pointer_enter(150.0, 24.0, 1)),
             ScriptStep::Event(InputEvent::PointerButton {
                 button: 0x110,
                 pressed: true,
@@ -377,6 +432,11 @@ fn clicking_an_info_bars_close_button_fires_close() {
         ],
     );
     assert_eq!(frames.len(), 1);
+    assert_eq!(
+        closes.get(),
+        1,
+        "clicking the close button must fire close exactly once"
+    );
 }
 
 /// Bundled Adwaita layered under a rule that paints the bare `infobar` node
@@ -448,24 +508,31 @@ fn a_revealed_info_bar_inks_the_bar() {
 
 #[test]
 fn dragging_a_scrollbar_slider_reports_the_new_value() {
-    // mutation: ignore the drag delta in ScrollbarC::on_event and the model
-    // stays at 0.0.
+    // mutation: ignore the drag delta in ScrollbarC::on_event and the value
+    // stays at 0.0, failing the "moved right" assertion below.
     use icedtea_ui::view::builders::scrollbar;
     use icedtea_ui::widgets::Orientation;
     use icedtea_ui::widgets::scrollbar::ScrollbarExt;
+    use std::cell::Cell;
 
     #[derive(Clone, Debug, PartialEq)]
     struct Moved(f64);
 
+    // The model's own value drives the view, and the shared cell mirrors it
+    // out of the app so the test can assert on it — `run` hands back only the
+    // frames and its `view` must be a bare `fn` pointer.
+    let value: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+
     let frames = run(
-        0.0f64,
-        |model: &mut f64, Moved(v): Moved| {
-            *model = v;
+        (0.0f64, value.clone()),
+        |model: &mut (f64, Rc<Cell<f64>>), Moved(v): Moved| {
+            model.0 = v;
+            model.1.set(v);
             Cmd::None
         },
-        |model: &f64| {
+        |model: &(f64, Rc<Cell<f64>>)| {
             scrollbar(Orientation::Horizontal)
-                .value(*model)
+                .value(model.0)
                 .upper(100.0)
                 .page_size(10.0)
                 .hexpand(true)
@@ -473,8 +540,14 @@ fn dragging_a_scrollbar_slider_reports_the_new_value() {
         },
         (200, 20),
         vec![
+            // `ScrollbarC` reports its own intrinsic size (40x14, see
+            // `ScrollbarC::measure`) because its `range`/`trough`/`slider`
+            // have no taffy box to size against; centred in this 200x20
+            // window that content box runs x 80..120, y 3..17, so every point
+            // below has to land inside it. x=8, the coordinate this test used
+            // before, is bare window and could never reach the widget.
             ScriptStep::Event(InputEvent::PointerEnter {
-                x: 8.0,
+                x: 84.0,
                 y: 10.0,
                 serial: 1,
                 target: icedtea_ui::window::SurfaceTarget::Window,
@@ -486,7 +559,7 @@ fn dragging_a_scrollbar_slider_reports_the_new_value() {
                 time_ms: 0,
             }),
             ScriptStep::Event(InputEvent::PointerMotion {
-                x: 150.0,
+                x: 116.0,
                 y: 10.0,
                 time_ms: 16,
             }),
@@ -503,6 +576,11 @@ fn dragging_a_scrollbar_slider_reports_the_new_value() {
         frames.len(),
         1,
         "the drag ran to completion without panicking"
+    );
+    assert!(
+        value.get() > 0.0,
+        "dragging the slider right must report a larger value, got {}",
+        value.get()
     );
 }
 
@@ -1043,8 +1121,9 @@ fn a_drawing_area_runs_its_callback_against_the_allocated_rect() {
 #[test]
 fn clicking_a_calendar_day_selects_it() {
     // mutation: never fire EventKind::DateSelected in CalendarC::on_event and
-    // the model stays at 15.
+    // the selected day stays at 15, failing the assertion below.
     use icedtea_ui::view::builders::calendar;
+    use std::cell::Cell;
 
     // Reconciliation (contract D13): `on_date_selected` already exists as
     // the generic `View::on_date_selected`, firing `Handler::Text` with an
@@ -1055,16 +1134,22 @@ fn clicking_a_calendar_day_selects_it() {
     #[derive(Clone, Debug, PartialEq)]
     struct Picked(String);
 
+    // The shared cell mirrors the model's day out of the app: `run` returns
+    // only the frames, and its `view` must be a bare `fn` pointer, so the
+    // recorder is threaded through the model itself.
+    let day: Rc<Cell<u32>> = Rc::new(Cell::new(15));
+
     let frames = run(
-        15u32,
-        |model: &mut u32, Picked(date): Picked| {
-            if let Some(day) = date.rsplit('-').next().and_then(|d| d.parse().ok()) {
-                *model = day;
+        (15u32, day.clone()),
+        |model: &mut (u32, Rc<Cell<u32>>), Picked(date): Picked| {
+            if let Some(d) = date.rsplit('-').next().and_then(|d| d.parse().ok()) {
+                model.0 = d;
+                model.1.set(d);
             }
             Cmd::None
         },
-        |model: &u32| {
-            calendar(2026, 3, *model)
+        |model: &(u32, Rc<Cell<u32>>)| {
+            calendar(2026, 3, model.0)
                 .hexpand(true)
                 .vexpand(true)
                 .on_date_selected(|s| Picked(s.to_owned()))
@@ -1072,9 +1157,18 @@ fn clicking_a_calendar_day_selects_it() {
         (280, 240),
         vec![
             ScriptStep::Capture,
+            // `CalendarC` reports its own intrinsic size (7 columns of 24px
+            // over a 32px header plus one 24px row per week, see
+            // `CalendarC::measure`) because its `header`/`grid`/day labels
+            // have no taffy box; centred in this 280x240 window March 2026's
+            // six rows put the content box at x 56..224, y 32..208, so the
+            // 24x24 day cells start at y 64. March 1st 2026 is a Sunday
+            // (column 6), which puts the 10th in column 1, row 2 --
+            // x 80..104, y 112..136. (60, 120), this test's previous
+            // coordinate, is bare window left of the calendar.
             ScriptStep::Event(InputEvent::PointerEnter {
-                x: 60.0,
-                y: 120.0,
+                x: 92.0,
+                y: 124.0,
                 serial: 1,
                 target: icedtea_ui::window::SurfaceTarget::Window,
             }),
@@ -1094,6 +1188,11 @@ fn clicking_a_calendar_day_selects_it() {
         ],
     );
     assert_eq!(frames.len(), 2, "both captures ran without a panic");
+    assert_eq!(
+        day.get(),
+        10,
+        "clicking the cell of March 10th must select exactly that day"
+    );
 }
 
 #[test]
