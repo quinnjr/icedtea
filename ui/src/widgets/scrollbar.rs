@@ -18,7 +18,9 @@ use crate::css::node::Node;
 use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
-use crate::widgets::{Adjustment, Orientation, PointerState, WidgetEnum, local_rect, shift_event};
+use crate::widgets::{
+    Adjustment, Orientation, PointerState, WidgetEnum, content_rect_local, shift_event,
+};
 use crate::window::keyboard::Mods;
 
 /// A `GtkScrollbar` in `orientation`.
@@ -282,8 +284,38 @@ impl<Msg: Clone + 'static> Controller<Msg> for ScrollbarC {
         self.apply(node);
     }
 
+    fn measure(
+        &mut self,
+        _available: (Option<f32>, Option<f32>),
+        _cx: &mut BuildCx<'_>,
+    ) -> Option<(f32, f32)> {
+        // `range`/`trough`/`slider` are subnodes this controller owns rather
+        // than `View` children, so they never get a taffy box of their own
+        // (`widgets::content_rect_local`'s note) and none of Adwaita's
+        // `scrollbar > range > trough > slider` sizing reaches layout: without
+        // an intrinsic size of its own the whole scrollbar collapses to 0x0,
+        // which is not even hit-testable. The numbers are those same Adwaita
+        // rules resolved by hand: `min-width/min-height: 8px` on the slider
+        // plus its `border: 4px solid transparent` and `margin: -1px` gives
+        // the 14px cross axis, and `scrollbar.horizontal > range > trough >
+        // slider { min-width: 40px }` (`.vertical`'s `min-height`) the main
+        // one.
+        match self.orientation {
+            Orientation::Horizontal => Some((40.0, 14.0)),
+            Orientation::Vertical => Some((14.0, 40.0)),
+        }
+    }
+
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
-        let Some(trough) = local_rect(cx.tree, cx.node, &self.trough) else {
+        // The trough is a subnode this controller appends itself, so
+        // `local_rect(cx.tree, cx.node, &self.trough)` is `None` on every
+        // event and the whole body below used to be dead code. `ScaleC` has
+        // the same shape and the same fix: this leaf's own content box — the
+        // only allocation the node actually has — stands in for the trough's,
+        // and `Event`'s `local` is already relative to the border box, so
+        // `content_rect_local`'s padding offset is what re-expresses it in
+        // content space.
+        let Some(trough) = content_rect_local(cx.tree, cx.node) else {
             return Vec::new();
         };
         let local_ev = shift_event(ev, trough);

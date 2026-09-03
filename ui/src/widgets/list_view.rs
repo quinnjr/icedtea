@@ -217,17 +217,10 @@ impl ListViewC {
     /// Feed a `Scroll` frame into `self.kinetic` -- `ScrolledWindowC::
     /// feed_kinetic`'s own logic, verbatim.
     fn feed_kinetic(&mut self, scroll: &Scroll, now: Duration) {
-        match scroll.source {
-            ScrollSource::Finger if scroll.stop => {
-                let seed = Scroll {
-                    stop: false,
-                    ..*scroll
-                };
-                self.kinetic.feed(&seed, now);
-                self.kinetic.feed(scroll, now + Duration::from_millis(16));
-            }
-            ScrollSource::Finger => self.kinetic.feed(scroll, now),
-            _ => self.kinetic.cancel(),
+        if scroll.source == ScrollSource::Finger {
+            self.kinetic.feed(scroll, now);
+        } else {
+            self.kinetic.cancel();
         }
     }
 
@@ -528,6 +521,18 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListViewC {
             PropName::SingleClickActivate => {
                 self.single_click_activate = prop_bool(value, false);
             }
+            PropName::Selected => {
+                // The builder's `.selected(index)` writes this prop; until
+                // the review-fix wave nothing read it and only a real click
+                // could move the selection.
+                if let Prop::Int(index) = value
+                    && let Ok(index) = usize::try_from(*index)
+                    && index < self.model.len()
+                {
+                    self.selection.select(index);
+                    self.apply_selection();
+                }
+            }
             PropName::EnableRubberband => self.rubberband_enabled = prop_bool(value, false),
             other => {
                 self.universal.apply(node, Kind::ListView, other, value);
@@ -752,6 +757,31 @@ pub(crate) mod tests {
              ├── row[.activatable]\n┊\n╰── [rubberband]\n",
         )
         .expect("list_view fixture");
+    }
+
+    #[test]
+    fn the_selected_prop_moves_the_selection() {
+        // Mutation check: remove `PropName::Selected` from
+        // `ListViewC::set_prop` and the builder's `.selected(..)` is inert
+        // again -- the selection stays at the default index 0 and the first
+        // assertion fails.
+        let mut p = props(5);
+        p.set(PropName::Selected, Prop::Int(3));
+        let built = build_widget::<()>(Kind::ListView, &p);
+        assert_eq!(
+            ListViewC::selected::<()>(built.controller.as_ref()),
+            vec![3],
+            "the Selected prop must select its index"
+        );
+        // Out-of-range writes are dropped, matching the DropDown arm's clamp
+        // philosophy without inventing a selection.
+        let mut p = props(5);
+        p.set(PropName::Selected, Prop::Int(99));
+        let built = build_widget::<()>(Kind::ListView, &p);
+        assert!(
+            !ListViewC::selected::<()>(built.controller.as_ref()).contains(&99),
+            "an out-of-range Selected index must not select anything"
+        );
     }
 
     #[test]
@@ -1126,10 +1156,9 @@ pub(crate) mod tests {
                     // Click the *second* row. Not the first: `ListViewC`
                     // selects index 0 on its own, so clicking row 0 selects
                     // what is already selected and paints nothing. And a
-                    // click, not a `Msg::Selected(1)` fed back through
-                    // `.selected(..)`: `ListViewC::set_prop` reads no
-                    // `PropName::Selected`, so the prop the gallery sets is
-                    // inert and only a real click moves the selection.
+                    // click, exercising the pointer path end to end
+                    // (`set_prop` also honours `PropName::Selected` since
+                    // the review-fix wave, but this test is about clicks).
                     //
                     // The pointer stays here for the scrolls below, which is
                     // what a real one would do -- `view::app`'s

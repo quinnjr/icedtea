@@ -132,20 +132,34 @@ pub use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_
 #[derive(Debug, Default)]
 pub struct ImplicitGrab {
     target: Option<Node>,
-    /// Which buttons are down, as a bitmask over `button - BTN_LEFT`.
+    /// Which of the first 31 buttons are down, as a bitmask over
+    /// `button - BTN_LEFT`.
     ///
     /// A mask, not a count: the compositor can send a release for a button
     /// pressed before this surface had focus, and a count would go negative
     /// (or, unsigned, end a grab that is still live).
     held: u32,
+    /// Buttons at or past [`HIGH_BUTTON`], tracked by code.
+    ///
+    /// The mask has 32 bits and evdev's button codes do not stop at 32: a
+    /// tablet or a gaming mouse reports codes far above `BTN_LEFT + 31`, and
+    /// folding all of them onto one saturated bit means releasing any one of
+    /// them ends a drag another is still holding.
+    held_high: std::collections::BTreeSet<u32>,
 }
+
+/// The first button code too large for [`ImplicitGrab`]'s bitmask.
+const HIGH_BUTTON: u32 = 0x110 + 31;
 
 impl ImplicitGrab {
     /// Record a press. `true` if this press began the grab.
     pub fn press(&mut self, button: u32, target: &Node) -> bool {
-        let bit = button_bit(button);
-        let began = self.held == 0;
-        self.held |= bit;
+        let began = !self.is_held();
+        if button >= HIGH_BUTTON {
+            self.held_high.insert(button);
+        } else {
+            self.held |= button_bit(button);
+        }
         if began {
             self.target = Some(target.clone());
         }
@@ -154,12 +168,18 @@ impl ImplicitGrab {
 
     /// Record a release. `true` if this release ended the grab.
     pub fn release(&mut self, button: u32) -> bool {
-        let bit = button_bit(button);
-        if self.held & bit == 0 {
+        let was_held = if button >= HIGH_BUTTON {
+            self.held_high.remove(&button)
+        } else {
+            let bit = button_bit(button);
+            let held = self.held & bit != 0;
+            self.held &= !bit;
+            held
+        };
+        if !was_held {
             return false;
         }
-        self.held &= !bit;
-        if self.held == 0 {
+        if !self.is_held() {
             self.target = None;
             return true;
         }
@@ -174,22 +194,24 @@ impl ImplicitGrab {
 
     #[must_use]
     pub fn is_held(&self) -> bool {
-        self.held != 0
+        self.held != 0 || !self.held_high.is_empty()
     }
 
     /// Drop the grab outright: the pointer left, or the seat lost it.
     pub fn clear(&mut self) {
         self.target = None;
         self.held = 0;
+        self.held_high.clear();
     }
 }
 
-/// One bit per pointer button, saturating at the 32 the mask can hold.
+/// One bit per pointer button, for the codes the mask can hold.
 ///
-/// `BTN_LEFT` is 0x110 and the codes run upward; a tablet or gaming mouse can
-/// report codes far above that, and shifting by more than 31 is undefined.
+/// `BTN_LEFT` is 0x110 and the codes run upward; anything from
+/// [`HIGH_BUTTON`] on is the caller's job (`held_high`), so the shift here is
+/// always in range.
 fn button_bit(button: u32) -> u32 {
-    1u32 << button.saturating_sub(0x110).min(31)
+    1u32 << button.saturating_sub(0x110).min(30)
 }
 
 /// One `wl_pointer.axis` frame.
@@ -221,6 +243,15 @@ const DECAY_PER_SECOND: f32 = 0.05;
 
 /// Below this many pixels per second a coast is over.
 pub const MIN_VELOCITY: f32 = 20.0;
+
+/// The shortest interval a motion delta is ever rated over, in seconds.
+///
+/// `wl_pointer.axis_stop` is the one frame with no *following* frame to time
+/// the previous motion against, and compositors routinely send it in the same
+/// millisecond as the last motion. Rating that motion over a zero interval
+/// would either discard it or blow up to infinity; rating it over one 60 Hz
+/// frame is the honest lower bound on how long it took.
+const MIN_RATE_DT: f32 = 0.016;
 
 /// Kinetic deceleration for finger scrolls.
 #[derive(Debug, Default)]
@@ -256,23 +287,27 @@ impl Kinetic {
         // Rate the previous event now that we know how long it took to reach
         // this one.
         if let Some((pdx, pdy, pending_at)) = self.pending.take() {
-            let dt = now.saturating_sub(pending_at).as_secs_f32();
+            let mut dt = now.saturating_sub(pending_at).as_secs_f32();
+            // On lift-off there is no *later* frame to time this one against,
+            // so a stop frame that shares its predecessor's timestamp gets the
+            // frame-time floor rather than being thrown away: the last motion
+            // before the finger left is the one that defines the flick.
+            if scroll.stop {
+                dt = dt.max(MIN_RATE_DT);
+            }
             // A zero or backwards step tells us nothing about velocity;
             // keeping the previous estimate is the only finite answer.
             if dt > f32::EPSILON {
-                let instant = (pdx / dt, pdy / dt);
-                if instant.0.is_finite() && instant.1.is_finite() {
-                    // Half old, half new: one jittery frame must not define
-                    // the flick, and the last frames before lift-off must
-                    // dominate.
-                    self.velocity = (
-                        self.velocity.0.mul_add(0.5, instant.0 * 0.5),
-                        self.velocity.1.mul_add(0.5, instant.1 * 0.5),
-                    );
-                }
+                self.blend((pdx / dt, pdy / dt));
             }
         }
         if scroll.stop {
+            // A stop frame normally carries no distance of its own, but one
+            // that does (a synthesised single-frame flick) is the same last
+            // motion, rated at the same floor.
+            if scroll.dx != 0.0 || scroll.dy != 0.0 {
+                self.blend((scroll.dx / MIN_RATE_DT, scroll.dy / MIN_RATE_DT));
+            }
             self.coasting = self.speed() >= MIN_VELOCITY;
             self.last = Some(now);
             return;
@@ -313,6 +348,21 @@ impl Kinetic {
         self.last = None;
         self.last_delta = (0.0, 0.0);
         self.coasting = false;
+    }
+
+    /// Fold one instantaneous velocity estimate into the running one.
+    ///
+    /// Half old, half new: one jittery frame must not define the flick, and
+    /// the last frames before lift-off must dominate. A non-finite estimate
+    /// (a clock that went backwards, a zero interval) is dropped rather than
+    /// poisoning every scroll offset downstream.
+    fn blend(&mut self, instant: (f32, f32)) {
+        if instant.0.is_finite() && instant.1.is_finite() {
+            self.velocity = (
+                self.velocity.0.mul_add(0.5, instant.0 * 0.5),
+                self.velocity.1.mul_add(0.5, instant.1 * 0.5),
+            );
+        }
     }
 
     fn speed(&self) -> f32 {
@@ -687,6 +737,36 @@ mod tests {
     }
 
     #[test]
+    fn buttons_past_the_masks_width_are_tracked_one_by_one() {
+        // Every code from BTN_LEFT + 31 up used to saturate onto the same
+        // bit, so a tablet's stylus buttons (0x130 and up) shared one: the
+        // release of either ended a drag the other still held.
+        let pressed = Node::new("button");
+        let mut grab = ImplicitGrab::default();
+        assert!(grab.press(0x130, &pressed), "the first press begins it");
+        assert!(!grab.press(0x131, &pressed));
+        assert!(
+            !grab.release(0x130),
+            "0x131 is still down: the grab must survive"
+        );
+        assert!(grab.is_held());
+        assert!(grab.target().is_some());
+        assert!(grab.release(0x131), "the last one ends it");
+        assert!(!grab.is_held());
+        assert!(grab.target().is_none());
+
+        // A low and a high code together, and a release of one never
+        // released before.
+        grab.press(BTN_LEFT, &pressed);
+        grab.press(0x140, &pressed);
+        assert!(!grab.release(0x141), "never pressed: a no-op");
+        assert!(grab.is_held());
+        assert!(!grab.release(BTN_LEFT));
+        assert!(grab.release(0x140));
+        assert!(!grab.is_held());
+    }
+
+    #[test]
     fn only_a_finger_scroll_coasts() {
         let mut kinetic = Kinetic::default();
         for source in [
@@ -756,6 +836,33 @@ mod tests {
         assert!(
             kinetic.sample(Duration::from_millis(now + 16)).is_none(),
             "once stopped it stays stopped"
+        );
+    }
+
+    #[test]
+    fn the_lift_off_frame_does_not_halve_the_flicks_velocity() {
+        // `wl_pointer.axis_stop` carries no distance. Rating that zero as a
+        // motion frame blended a 0 px/s instant into the estimate at 50%, so
+        // every finger lift-off halved the coast before it began.
+        //
+        // Two 50 px frames 50 ms apart are 1000 px/s each; the blend leaves
+        // 750 px/s (0 -> 500 -> 750), and the stop frame must not touch it.
+        let mut kinetic = Kinetic::default();
+        kinetic.feed(&finger(0.0, -50.0, false), Duration::from_millis(0));
+        kinetic.feed(&finger(0.0, -50.0, false), Duration::from_millis(50));
+        kinetic.feed(&finger(0.0, -50.0, false), Duration::from_millis(100));
+        kinetic.feed(&finger(0.0, 0.0, true), Duration::from_millis(150));
+
+        // The first sampled frame is velocity * dt, before any decay is
+        // applied to that frame's own delta.
+        let dt = 0.016_f32;
+        let first = kinetic
+            .sample(Duration::from_millis(166))
+            .expect("it coasts");
+        let speed = -first.1 / dt;
+        assert!(
+            (speed - 875.0).abs() < 25.0,
+            "the lift-off halved the flick: {speed} px/s, expected ~875"
         );
     }
 

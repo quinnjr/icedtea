@@ -159,6 +159,9 @@ impl ModIndices {
 /// The key currently repeating, and when its next repeat is due.
 #[derive(Debug, Clone)]
 struct Repeat {
+    /// The evdev code of the key being repeated, so only *its* own release
+    /// disarms: a `Shift` tapped while `a` is held must not stop the `a`s.
+    keycode: u32,
     /// The event to re-emit, already marked `repeat: true`.
     event: KeyEvent,
     /// The clock reading the next repeat fires at.
@@ -370,18 +373,32 @@ impl Keymap {
 
     /// Arm the repeat timer for a held key, or disarm it.
     ///
-    /// A release, a key the keymap says never repeats, and a disabled rate all
-    /// disarm: `arm_repeat` is called for every key event so there is exactly
-    /// one place that decides.
+    /// `arm_repeat` is called for every key event so there is exactly one place
+    /// that decides, and it decides *per key*: only the repeating key's own
+    /// release disarms. A `Shift` press or release mid-repeat -- a key the
+    /// keymap says never repeats -- leaves the live repeat alone, because the
+    /// held key is still held. Focus loss is [`Self::clear_repeat`]'s job.
     pub fn arm_repeat(&mut self, ev: &KeyEvent, now: Duration) {
-        if !ev.pressed || self.repeat_rate <= 0 || !self.repeats(ev.keycode) {
-            self.repeat = None;
+        if !ev.pressed {
+            if self
+                .repeat
+                .as_ref()
+                .is_some_and(|r| r.keycode == ev.keycode)
+            {
+                self.repeat = None;
+            }
+            return;
+        }
+        if self.repeat_rate <= 0 || !self.repeats(ev.keycode) {
+            // A non-repeating press (a modifier, a lock) is not a new repeat
+            // and does not cancel the one already running.
             return;
         }
         let interval = Duration::from_secs_f64(1.0 / f64::from(self.repeat_rate));
         let mut event = ev.clone();
         event.repeat = true;
         self.repeat = Some(Repeat {
+            keycode: ev.keycode,
             event,
             next: now + Duration::from_millis(u64::from(self.repeat_delay.unsigned_abs())),
             interval,
@@ -914,6 +931,43 @@ mod tests {
         assert!(
             keymap.repeat_deadline(ms(20)).is_none(),
             "wl_keyboard.leave disarms"
+        );
+    }
+
+    #[test]
+    fn another_keys_event_does_not_cancel_a_live_repeat() {
+        // Holding `a` and tapping Shift (to type an `A`, or just resting a
+        // hand) used to kill the repeat: every key event went through
+        // `arm_repeat`, and a non-repeating key disarmed unconditionally.
+        let mut keymap = repeating();
+        let press = keymap.translate(KEY_A, true, 1, 0);
+        keymap.arm_repeat(&press, ms(0));
+
+        let shift_down = keymap.translate(KEY_LEFTSHIFT, true, 2, 10);
+        keymap.arm_repeat(&shift_down, ms(10));
+        assert!(
+            keymap.repeat_deadline(ms(10)).is_some(),
+            "a modifier press must not disarm the held key's repeat"
+        );
+        let shift_up = keymap.translate(KEY_LEFTSHIFT, false, 3, 20);
+        keymap.arm_repeat(&shift_up, ms(20));
+        assert!(
+            keymap.repeat_deadline(ms(20)).is_some(),
+            "nor must its release"
+        );
+        // Another repeating key's release is just as unrelated.
+        let b_up = keymap.translate(KEY_B, false, 4, 30);
+        keymap.arm_repeat(&b_up, ms(30));
+        assert!(keymap.repeat_deadline(ms(30)).is_some());
+
+        let due = keymap.repeat_due(ms(600)).expect("the `a` still repeats");
+        assert_eq!(due.keycode, KEY_A);
+
+        let release = keymap.translate(KEY_A, false, 5, 40);
+        keymap.arm_repeat(&release, ms(640));
+        assert!(
+            keymap.repeat_deadline(ms(640)).is_none(),
+            "the repeating key's own release disarms"
         );
     }
 

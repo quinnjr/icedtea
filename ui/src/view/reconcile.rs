@@ -361,26 +361,45 @@ fn reconcile_reserved<Msg: Clone + 'static>(
     //    restyle, so the comparison here is what keeps a steady frame from
     //    restyling the whole window.
     //
-    //    `logical` counts visible view children only, same as the old
-    //    unconditional `position`; `reserve` (when `parent` is a specific
-    //    instance's own node, not the tree root) maps that count onto
-    //    `parent`'s real child indices, leaving room for chrome subnodes
-    //    the owning controller attached directly to `parent` itself (a
-    //    `Frame`'s label, a `Paned`'s separator) that are not among
-    //    `built` at all. Skipping this mapping (as this function did
-    //    before `reserve` existed) silently detached that chrome the first
-    //    time a real child was reconciled in alongside it.
+    //    Two counters, deliberately. `Controller::child_index` maps a *view*
+    //    index -- the child's slot in the view's own child list -- onto
+    //    `parent`'s real child indices, leaving room for chrome subnodes the
+    //    owning controller attached directly to `parent` itself (a `Frame`'s
+    //    label, a `Paned`'s separator) that are not among `built` at all.
+    //    Skipping this mapping (as this function did before `reserve`
+    //    existed) silently detached that chrome the first time a real child
+    //    was reconciled in alongside it. Feeding it the *visible* count
+    //    instead was just as wrong for chrome that sits between two slots:
+    //    `PanedC` puts its separator at index 1, so a `Paned` whose start
+    //    pane is `.visible(false)` handed the end pane view index 0 and
+    //    inserted it *before* the separator.
+    //
+    //    `logical`, the visible count, stays for `reserved_total`: the trim
+    //    below must not count a hidden child that was just detached.
     let mut logical = 0usize;
-    for instance in &built {
+    for (view_index, instance) in built.iter().enumerate() {
         if !instance.is_visible() {
             if instance.node.parent().is_some() {
                 instance.node.detach();
             }
             continue;
         }
-        let target = reserve.map_or(logical, |c| c.child_index(logical));
+        // Without a `reserve` there is no chrome and the node index simply is
+        // the visible ordinal, which is what `logical` counts.
+        let target = reserve.map_or(logical, |c| c.child_index(view_index));
+        // Where the node would actually land: `insert_child` clamps a
+        // past-the-end index to an append, and detaches the child first, so
+        // a target past the end is already satisfied by a node sitting last.
+        // Without this, a reserved parent with a hidden child would reinsert
+        // -- and so re-dirty the restyle of -- every visible sibling on every
+        // single frame.
+        let mine = instance
+            .node
+            .parent()
+            .is_some_and(|current| current.ptr_eq(parent));
+        let landing = target.min(parent.child_count().saturating_sub(usize::from(mine)));
         let in_place = parent
-            .child(target)
+            .child(landing)
             .is_some_and(|current| current.ptr_eq(&instance.node));
         if !in_place {
             parent.insert_child(target, &instance.node);
@@ -650,6 +669,51 @@ mod tests {
         assert!(ops.contains(&Op::Remove { index: 1 }));
         assert!(prev[0].node.ptr_eq(&first_label));
         assert!(prev[1].node.ptr_eq(&second_label));
+    }
+
+    #[test]
+    fn a_paned_with_a_hidden_start_pane_keeps_its_end_pane_after_the_separator() {
+        // `PanedC`'s chrome sits *between* its two slots, so the mapping
+        // `child_index` performs is by view slot, not by visible ordinal.
+        // Handed the visible count, the end pane became "view index 0" and
+        // landed at node index 0 -- before the separator, which then read as
+        // the *start* pane's divider and put the handle on the wrong side.
+        let mut f = Fixture::new();
+        let root = Node::new("window");
+        let mut prev: Vec<Instance<Msg>> = Vec::new();
+        let paned = |start_visible: bool| {
+            vec![widget::<Msg>(Kind::Paned).key("p").children(vec![
+                labelled(Kind::Button, "start", "S").visible(start_visible),
+                labelled(Kind::Label, "end", "E"),
+            ])]
+        };
+        reconcile(&root, &mut prev, paned(true), &mut f.cx());
+        assert_eq!(
+            names(&prev[0].node),
+            vec![
+                "button".to_owned(),
+                "separator".to_owned(),
+                "label".to_owned()
+            ],
+        );
+
+        reconcile(&root, &mut prev, paned(false), &mut f.cx());
+        assert_eq!(
+            names(&prev[0].node),
+            vec!["separator".to_owned(), "label".to_owned()],
+            "the end pane must stay on the far side of the separator"
+        );
+
+        // And it goes back when the start pane returns.
+        reconcile(&root, &mut prev, paned(true), &mut f.cx());
+        assert_eq!(
+            names(&prev[0].node),
+            vec![
+                "button".to_owned(),
+                "separator".to_owned(),
+                "label".to_owned()
+            ],
+        );
     }
 
     #[test]

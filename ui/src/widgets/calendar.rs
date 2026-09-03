@@ -36,7 +36,7 @@ use crate::css::node::{Node, PseudoStates};
 use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Kind, Prop, PropName, Props, View};
-use crate::widgets::{PointerState, local_rect, shift_event};
+use crate::widgets::{PointerState, content_rect_local, shift_event};
 
 /// A `GtkCalendar` showing `year`/`month` with `day` selected.
 #[must_use]
@@ -83,6 +83,18 @@ impl<Msg: Clone + 'static> CalendarExt<Msg> for View<Msg> {
     }
 }
 
+/// The `header` row's height, in px.
+///
+/// GTK's calendar header is a row of `button`s around the month `stack` and
+/// the year `label`; Adwaita sizes those through `button { min-height: 24px }`
+/// plus its 4px vertical padding. A constant rather than a layout answer
+/// because `header` is a subnode this controller appends itself and so never
+/// gets a taffy box of its own (`widgets::content_rect_local`'s note).
+pub const HEADER_HEIGHT: f32 = 32.0;
+
+/// One day cell's side, in px — GTK's own `GtkCalendar` day-cell minimum.
+pub const DAY_CELL: f32 = 24.0;
+
 /// `Kind::Calendar`'s controller.
 pub struct CalendarC {
     /// The `(year, month)` currently displayed.
@@ -97,7 +109,15 @@ pub struct CalendarC {
     pub grid: Node,
     /// One `label` per day cell, ascending.
     pub day_nodes: Vec<Node>,
-    pointer: PointerState,
+    /// One press/hover latch per day cell, parallel to `day_nodes`.
+    ///
+    /// One shared [`PointerState`] cannot work here: `on_event` walks every
+    /// cell in turn, and a single latch is cleared by the first cell the
+    /// release misses (`PointerState::observe`'s `PointerUp` arm clears
+    /// `pressed` whether or not the point is inside), so the cell that was
+    /// actually pressed would never see `was == true`. A latch per cell is
+    /// also what GTK has, one gesture per day widget.
+    pointers: Vec<PointerState>,
 }
 
 impl CalendarC {
@@ -133,11 +153,58 @@ impl CalendarC {
         u32::try_from((h + 5).rem_euclid(7)).unwrap_or(0)
     }
 
+    /// Rows of day cells `shown`'s month needs, 4..=6.
+    #[must_use]
+    pub fn week_rows(&self) -> u32 {
+        let days = Self::days_in_month(self.shown.0, self.shown.1);
+        let first = Self::first_weekday(self.shown.0, self.shown.1);
+        (first + days).div_ceil(7)
+    }
+
+    /// `day`'s cell inside `content`, in that same space, or `None` for a day
+    /// `shown`'s month does not have.
+    ///
+    /// `header` and `grid` are subnodes this controller appends itself, so
+    /// neither they nor the day labels under them ever get a taffy box
+    /// (`widgets::content_rect_local`'s note): the grid's geometry is this
+    /// arithmetic and nothing else. The header takes [`HEADER_HEIGHT`] off the
+    /// top and the rest is a 7-column grid, one column per weekday with day 1
+    /// starting at its own weekday column, exactly as GTK lays it out.
+    #[must_use]
+    pub fn day_cell(&self, content: Rect, day: u32) -> Option<Rect> {
+        let days = Self::days_in_month(self.shown.0, self.shown.1);
+        if day == 0 || day > days {
+            return None;
+        }
+        let first = Self::first_weekday(self.shown.0, self.shown.1);
+        let rows = self.week_rows();
+        let header = HEADER_HEIGHT.min(content.height.max(0.0));
+        let cell_w = content.width / 7.0;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a month is at most six rows of seven"
+        )]
+        let cell_h = (content.height - header) / rows as f32;
+        let index = first + day - 1;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a month is at most six rows of seven"
+        )]
+        let (column, row) = ((index % 7) as f32, (index / 7) as f32);
+        Some(Rect::new(
+            content.x + column * cell_w,
+            content.y + header + row * cell_h,
+            cell_w,
+            cell_h,
+        ))
+    }
+
     /// Rebuild the day grid for `shown`.
     fn rebuild(&mut self) {
         for node in self.day_nodes.drain(..) {
             node.detach();
         }
+        self.pointers.clear();
         let days = Self::days_in_month(self.shown.0, self.shown.1);
         for day in 1..=days {
             let mut classes: Vec<&str> = vec!["day-number"];
@@ -151,6 +218,7 @@ impl CalendarC {
             );
             self.grid.append_child(&node);
             self.day_nodes.push(node);
+            self.pointers.push(PointerState::default());
         }
     }
 }
@@ -187,7 +255,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for CalendarC {
             header,
             grid,
             day_nodes: Vec::new(),
-            pointer: PointerState::default(),
+            pointers: Vec::new(),
         };
         this.rebuild();
         this
@@ -214,13 +282,53 @@ impl<Msg: Clone + 'static> Controller<Msg> for CalendarC {
         self.rebuild();
     }
 
+    fn measure(
+        &mut self,
+        _available: (Option<f32>, Option<f32>),
+        _cx: &mut BuildCx<'_>,
+    ) -> Option<(f32, f32)> {
+        // `header`, `grid` and the day labels are subnodes this controller
+        // appends itself, so none of them gets a taffy box and none of their
+        // CSS sizing reaches layout: without an intrinsic size of its own the
+        // whole calendar collapses to `min-width`/`min-height`, which is not
+        // even hit-testable. Seven columns of `DAY_CELL` wide, `HEADER_HEIGHT`
+        // plus one `DAY_CELL` per week tall — the same geometry
+        // [`CalendarC::day_cell`] hit-tests against.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a month is at most six rows of seven"
+        )]
+        let height = HEADER_HEIGHT + self.week_rows() as f32 * DAY_CELL;
+        Some((7.0 * DAY_CELL, height))
+    }
+
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
-        for (index, day_node) in self.day_nodes.iter().enumerate() {
-            let Some(rect) = local_rect(cx.tree, cx.node, day_node) else {
+        // `local_rect(cx.tree, cx.node, day_node)` is `None` on every event --
+        // the day labels are subnodes this controller appends itself, which
+        // the reconciler never gives a taffy node -- so this whole body used
+        // to be dead code. `ScaleC`'s fix applies here too: derive each cell
+        // from the calendar's own content box and its own grid arithmetic.
+        let Some(content) = content_rect_local(cx.tree, cx.node) else {
+            return Vec::new();
+        };
+        for index in 0..self.day_nodes.len() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "a month has at most 31 day nodes"
+            )]
+            let Some(rect) = self.day_cell(content, index as u32 + 1) else {
                 continue;
             };
             let shifted = shift_event(ev, rect);
-            if self.pointer.observe(
+            // `rebuild` is the only writer of either vector and always pushes
+            // in lockstep, so this never skips; indexing both would panic if
+            // that ever stopped being true.
+            let (Some(day_node), Some(pointer)) =
+                (self.day_nodes.get(index), self.pointers.get_mut(index))
+            else {
+                continue;
+            };
+            if pointer.observe(
                 day_node,
                 &shifted,
                 Some(Rect::new(0.0, 0.0, rect.width, rect.height)),

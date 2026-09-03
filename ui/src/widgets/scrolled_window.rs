@@ -30,10 +30,6 @@ use crate::window::pointer::{Kinetic, Scroll, ScrollSource};
 const MAX_OVERSHOOT: f32 = 64.0;
 /// Spring-back time from a full overshoot.
 const SPRING: Duration = Duration::from_millis(200);
-/// The synthetic gap used to seed a velocity estimate from a single
-/// "flick" event (a lift-off `Scroll` whose `dx`/`dy` carry the last
-/// motion's distance) -- see [`ScrolledWindowC::feed_kinetic`].
-const FLICK_SEED_DT: Duration = Duration::from_millis(16);
 
 /// Content-size hints GTK derives layout from (`GtkScrolledWindow`'s
 /// `min/max-content-{width,height}` and `propagate-natural-{width,height}`).
@@ -391,39 +387,18 @@ impl ScrolledWindowC {
 
     /// Feed a `Scroll` frame into `self.kinetic`.
     ///
-    /// `Kinetic::feed` rates a motion frame only once the *following* frame
-    /// tells it how long the first took, so a genuine touch drag is a
-    /// sequence of non-stop frames ending in one `stop` frame with no
-    /// distance of its own. This crate's headless tests instead send one
-    /// "flick" frame whose `dx`/`dy` carry the whole gesture's last motion
-    /// with `stop` already set; to rate that single frame, the same delta
-    /// is fed once more first, non-stop, at `now`, with the real stop frame
-    /// then landing `FLICK_SEED_DT` later -- the two-frame shape
-    /// `Kinetic::feed` expects, without ever feeding an event stamped
-    /// before this controller's own notion of `now` (a `ManualClock` a test
-    /// never advances stays at zero, and `Duration` cannot go negative, so
-    /// seeding *before* `now` would collapse both frames onto one instant
-    /// and rate no velocity at all).
+    /// Every finger frame goes straight through, stop frames included:
+    /// `Kinetic::feed` owns the rating, including the frame-time floor a
+    /// lift-off needs (there is no *later* frame to time the last motion
+    /// against). Anything else cancels the coast.
     fn feed_kinetic(&mut self, scroll: &Scroll, now: Duration) {
-        if !self.kinetic_enabled {
+        if !self.kinetic_enabled || scroll.source != ScrollSource::Finger {
             self.kinetic.cancel();
             return;
         }
-        match scroll.source {
-            ScrollSource::Finger if scroll.stop => {
-                let seed = Scroll {
-                    stop: false,
-                    ..*scroll
-                };
-                self.kinetic.feed(&seed, now);
-                let stop_at = now + FLICK_SEED_DT;
-                self.kinetic.feed(scroll, stop_at);
-                self.kinetic_active = self.kinetic.sample(stop_at).is_some();
-            }
-            ScrollSource::Finger => {
-                self.kinetic.feed(scroll, now);
-            }
-            _ => self.kinetic.cancel(),
+        self.kinetic.feed(scroll, now);
+        if scroll.stop {
+            self.kinetic_active = self.kinetic.sample(now).is_some();
         }
     }
 }
@@ -721,6 +696,43 @@ mod tests {
             "sprung back"
         );
         assert_eq!(c.next_deadline(Duration::from_millis(500)), None);
+    }
+
+    #[test]
+    fn a_real_lift_off_frame_keeps_the_flicks_velocity() {
+        // The shape a compositor actually sends: motion frames carrying the
+        // distance, then one `axis_stop` with no distance of its own.
+        //
+        // Mutation check: this controller used to synthesise a non-stop
+        // "seed" frame from the stop frame and feed the stop one tick later,
+        // which rated the seed's zero delta into the estimate -- halving a
+        // real gesture's coast, and (as here, with both frames on one clock
+        // reading) cancelling it outright.
+        let built = build_widget::<()>(Kind::ScrolledWindow, &props(false));
+        let mut c = built.controller;
+        let mut hx = Headless::new();
+        let mut cx = hx.event_cx(&built.node);
+        ScrolledWindowC::set_extent(c.as_mut(), (100.0, 10_000.0), (100.0, 100.0));
+        let motion = Scroll {
+            dx: 0.0,
+            dy: 40.0,
+            source: ScrollSource::Finger,
+            stop: false,
+            time_ms: 0,
+        };
+        c.on_event(&Event::Scroll(motion), &mut cx);
+        c.on_event(&Event::Scroll(Headless::flick(0.0, 0.0)), &mut cx);
+        assert_eq!(
+            c.next_deadline(Duration::ZERO),
+            Some(Duration::ZERO),
+            "the lift-off must leave a coast running, not cancel it"
+        );
+        let before = ScrolledWindowC::offset_of(c.as_ref()).1;
+        c.tick(Duration::from_millis(16), &mut cx);
+        assert!(
+            ScrolledWindowC::offset_of(c.as_ref()).1 > before,
+            "the coast must actually move the viewport"
+        );
     }
 
     #[test]
