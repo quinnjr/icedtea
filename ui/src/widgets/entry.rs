@@ -64,8 +64,8 @@ pub trait EntryExt<Msg>: Sized {
     fn xalign(self, a: f32) -> Self;
     /// `GtkEditable:width-chars`.
     fn width_chars(self, n: i32) -> Self;
-    /// `GtkEditable::changed`.
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self;
+    // `GtkEditable::changed` is the inherent `View::on_change`, which shadows
+    // any same-named trait method at every call site anyway.
     /// `GtkEntry::activate`.
     fn on_activate(self, msg: Msg) -> Self;
     /// `GtkEntry::icon-press`, carrying 0 for the left icon and 1 for the right.
@@ -108,9 +108,6 @@ impl<Msg: Clone + 'static> EntryExt<Msg> for View<Msg> {
     }
     fn width_chars(self, n: i32) -> Self {
         self.prop(PropName::WidthRequest, Prop::Int(i64::from(n)))
-    }
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self {
-        self.on(EventKind::Change, Handler::Text(Rc::new(f)))
     }
     fn on_activate(self, msg: Msg) -> Self {
         self.on(EventKind::Activate, Handler::Unit(msg))

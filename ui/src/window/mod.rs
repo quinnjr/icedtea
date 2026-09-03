@@ -674,21 +674,15 @@ pub(crate) struct WindowState {
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
-    /// Read by Task 13's layer role.
-    #[allow(dead_code)]
+    /// The layer role's shell global.
     layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
-    /// Read by Task 12's `move`/`resize`/`show_window_menu` plumbing.
-    #[allow(dead_code)]
+    /// The seat `move`/`resize`/`show_window_menu` and the clipboard use.
     seat: Option<wl_seat::WlSeat>,
-    /// Task 11's seat-capability handler creates these three.
-    #[allow(dead_code)]
+    /// The three input objects the seat-capability handler creates.
     pointer: Option<wl_pointer::WlPointer>,
-    #[allow(dead_code)]
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    #[allow(dead_code)]
     touch: Option<wl_touch::WlTouch>,
-    /// Read by Task 12's `Surface::set_cursor_shape`.
-    #[allow(dead_code)]
+    /// Read by `Surface::set_cursor_shape`.
     cursor_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
     /// Read by `Window::clipboard`.
     data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
@@ -707,15 +701,13 @@ pub(crate) struct WindowState {
     /// The events `pump` will hand up, in arrival order.
     events: Vec<InputEvent>,
     /// Buffers the compositor released, by `wl_buffer` id: one window has
-    /// several pools and `BufferSlot` alone cannot say which. Drained by
-    /// Task 12's repaint.
-    #[allow(dead_code)]
+    /// several pools and `BufferSlot` alone cannot say which. Drained by the
+    /// repaint.
     released: Vec<(wayland_client::backend::ObjectId, BufferSlot)>,
     /// The most recent serial from any input event, for `grab`, `move`,
     /// `resize` and the clipboard.
     seat_serial: Option<u32>,
     /// The last `xdg_surface.configure` serial per surface, to ack on commit.
-    #[allow(dead_code)]
     pending_ack: Vec<(SurfaceTarget, u32)>,
     configured: Option<(u32, u32)>,
     /// The size the client asked for, from `SurfaceSpec::size`.
@@ -736,9 +728,7 @@ pub(crate) struct WindowState {
     /// [`InputEvent::ScaleChanged`] and go through [`Window::pump`].
     scale: i32,
     closed: bool,
-    /// A pending scroll frame, accumulated until `wl_pointer.frame`
-    /// (Task 11).
-    #[allow(dead_code)]
+    /// A pending scroll frame, accumulated until `wl_pointer.frame`.
     axis: Option<Scroll>,
     /// Set by Task 14's popup dispatch.
     #[allow(dead_code)]
@@ -1148,15 +1138,20 @@ impl Window {
             }
         }
         // The repeat clock is ours (see `wl_keyboard::Event::Key`'s dispatch
-        // comment): arm it here, from the last Key event in the batch, so a
-        // held key actually starts repeating. A synthetic repeat event pushed
-        // above by `repeat_due` must not re-arm from itself.
-        if let Some(event) = batch.iter().rev().find_map(|event| match event {
-            InputEvent::Key(key) if !key.repeat => Some(key),
-            _ => None,
-        }) && let Some(keymap) = self.state.keymap.as_mut()
-        {
-            keymap.arm_repeat(event, now);
+        // comment): arm it here, from the batch's Key events, so a held key
+        // actually starts repeating. Every one of them in order, not just the
+        // last: `arm_repeat` decides per key, and a batch holding
+        // `a down, Shift down` must arm on the `a` and then leave it alone.
+        // A synthetic repeat event pushed above by `repeat_due` must not
+        // re-arm from itself.
+        if let Some(keymap) = self.state.keymap.as_mut() {
+            for event in &batch {
+                if let InputEvent::Key(key) = event
+                    && !key.repeat
+                {
+                    keymap.arm_repeat(key, now);
+                }
+            }
         }
         Ok(batch)
     }
@@ -1247,11 +1242,14 @@ impl Window {
     /// (and, if advertised, the primary-selection device) the first time this
     /// is called.
     ///
+    /// A compositor that never advertised `wl_data_device_manager` gets an
+    /// in-process clipboard (with a warning) rather than a panic, matching
+    /// the primary-selection path (§3.8 as amended by the M3 review-fix
+    /// wave).
+    ///
     /// # Panics
     ///
-    /// If the compositor never advertised `wl_data_device_manager` (contract
-    /// §3.8's and `harness/src/lib.rs`'s own fail-fast contract for it) or
-    /// never advertised a `wl_seat`.
+    /// If the compositor never advertised a `wl_seat`.
     pub fn clipboard(&mut self) -> &mut Clipboard {
         if self.clipboard.is_none() {
             let seat = self

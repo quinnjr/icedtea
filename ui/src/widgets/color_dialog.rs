@@ -47,8 +47,12 @@ pub trait ColorDialogButtonExt<Msg>: Sized {
     fn with_alpha(self, on: bool) -> Self;
     /// The dialog the button launches.
     fn dialog(self, spec: ColorDialogSpec) -> Self;
-    /// `GtkColorDialogButton:rgba`'s change notification, as a packed colour.
-    fn on_change(self, f: impl Fn(f64) -> Msg + 'static) -> Self;
+    // `GtkColorDialogButton:rgba`'s change notification is
+    // `View::on_value_changed`, not a method here: an `on_change` taking
+    // `Fn(f64)` is shadowed by the inherent `View::on_change(&str)` at every
+    // call site, so it could only ever be reached fully qualified — and it
+    // wired up the identical `EventKind::ValueChanged`/`Handler::Float` pair
+    // `on_value_changed` already does.
 }
 
 impl<Msg: Clone + 'static> ColorDialogButtonExt<Msg> for View<Msg> {
@@ -58,9 +62,6 @@ impl<Msg: Clone + 'static> ColorDialogButtonExt<Msg> for View<Msg> {
     fn dialog(self, spec: ColorDialogSpec) -> Self {
         self.prop(PropName::Ratio, Prop::Bool(spec.with_alpha))
             .prop(PropName::Modal, Prop::Bool(spec.modal))
-    }
-    fn on_change(self, f: impl Fn(f64) -> Msg + 'static) -> Self {
-        self.on(EventKind::ValueChanged, Handler::Float(Rc::new(f)))
     }
 }
 
@@ -74,8 +75,8 @@ pub trait ColorDialogExt<Msg>: Sized {
     fn with_alpha(self, on: bool) -> Self;
     /// The dialog's response index.
     fn on_response(self, f: impl Fn(usize) -> Msg + 'static) -> Self;
-    /// The chosen colour, packed.
-    fn on_change(self, f: impl Fn(f64) -> Msg + 'static) -> Self;
+    // The chosen colour, packed, is `View::on_value_changed` — see
+    // [`ColorDialogButtonExt`] for why it is not an `on_change` here.
 }
 
 impl<Msg: Clone + 'static> ColorDialogExt<Msg> for View<Msg> {
@@ -90,9 +91,6 @@ impl<Msg: Clone + 'static> ColorDialogExt<Msg> for View<Msg> {
     }
     fn on_response(self, f: impl Fn(usize) -> Msg + 'static) -> Self {
         self.on(EventKind::Response, Handler::Index(Rc::new(f)))
-    }
-    fn on_change(self, f: impl Fn(f64) -> Msg + 'static) -> Self {
-        self.on(EventKind::ValueChanged, Handler::Float(Rc::new(f)))
     }
 }
 

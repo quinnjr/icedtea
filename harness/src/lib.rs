@@ -25,10 +25,6 @@
 //! name the right compositor. The client connects to an explicit path
 //! instead, via `Connection::from_socket`.
 
-// The harness is written against the API contract later tasks compile
-// against, so any single test binary uses only part of it.
-#![allow(dead_code)]
-
 use std::io::Write as _;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;

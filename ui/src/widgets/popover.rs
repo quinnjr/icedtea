@@ -123,6 +123,13 @@ impl PopoverC {
     /// `MenuButtonC` believed it: its menu body was reconciled into a subtree
     /// nothing was attached to, so it had no allocation in any state and could
     /// not be laid out, painted or hit (contract §10 P8-D72).
+    ///
+    /// **Test scaffolding only, and `pub` under protest.** It stays public
+    /// (rather than `pub(crate)` or `#[cfg(test)]`) purely because the
+    /// integration tests under `ui/tests/` are separate crates and cannot see
+    /// a crate-private constructor; it is `#[doc(hidden)]` so it never shows
+    /// up as part of the widget API, and any production use is a bug.
+    #[doc(hidden)]
     #[must_use]
     pub fn for_test(position: Position, autohide: bool, has_arrow: bool) -> Self {
         let root = Node::with_classes("popover", &["background"]);

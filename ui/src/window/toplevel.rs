@@ -89,13 +89,6 @@ impl Toplevel {
         self.xdg_surface
             .set_window_geometry(x, y, width.max(1), height.max(1));
     }
-
-    /// Ack a configure by hand. Task 10's dispatch acks inline; Task 12's
-    /// commit path acks the serial it deferred.
-    #[allow(dead_code)]
-    pub(crate) fn ack(&self, serial: u32) {
-        self.xdg_surface.ack_configure(serial);
-    }
 }
 
 impl Drop for Toplevel {

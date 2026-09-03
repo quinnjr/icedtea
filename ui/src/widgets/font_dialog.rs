@@ -44,8 +44,9 @@ pub trait FontDialogButtonExt<Msg>: Sized {
     fn use_size(self, on: bool) -> Self;
     /// `GtkFontDialogButton:level`.
     fn level(self, level: FontLevel) -> Self;
-    /// `GtkFontDialogButton:font-desc`'s change notification.
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self;
+    // `GtkFontDialogButton:font-desc`'s change notification is the inherent
+    // `View::on_change`, which shadows any same-named trait method at every
+    // call site anyway.
 }
 
 impl<Msg: Clone + 'static> FontDialogButtonExt<Msg> for View<Msg> {
@@ -57,9 +58,6 @@ impl<Msg: Clone + 'static> FontDialogButtonExt<Msg> for View<Msg> {
     }
     fn level(self, level: FontLevel) -> Self {
         self.prop(PropName::SelectionMode, level.to_prop())
-    }
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self {
-        self.on(EventKind::Change, Handler::Text(Rc::new(f)))
     }
 }
 
@@ -73,8 +71,8 @@ pub trait FontDialogExt<Msg>: Sized {
     fn language(self, lang: &str) -> Self;
     /// The dialog's response index.
     fn on_response(self, f: impl Fn(usize) -> Msg + 'static) -> Self;
-    /// The chosen font description.
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self;
+    // The chosen font description arrives through the inherent
+    // `View::on_change` -- see [`FontDialogButtonExt`].
 }
 
 impl<Msg: Clone + 'static> FontDialogExt<Msg> for View<Msg> {
@@ -89,9 +87,6 @@ impl<Msg: Clone + 'static> FontDialogExt<Msg> for View<Msg> {
     }
     fn on_response(self, f: impl Fn(usize) -> Msg + 'static) -> Self {
         self.on(EventKind::Response, Handler::Index(Rc::new(f)))
-    }
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self {
-        self.on(EventKind::Change, Handler::Text(Rc::new(f)))
     }
 }
 

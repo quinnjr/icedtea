@@ -25,9 +25,9 @@ use crate::layout::Rect;
 use crate::text::FontDatabase;
 use crate::view::app::{App, AppError, Probe};
 use crate::view::builders::{
-    self as w, CheckButtonExt, ColorDialogButtonExt, DropDownExt, ImageExt, InfoBarExt, LabelExt,
-    LevelBarExt, MenuButtonExt, PopoverExt, ProgressBarExt, ScaleExt, ScrollbarExt, SpinnerExt,
-    StatusbarExt, TextViewExt, ToggleButtonExt,
+    self as w, CheckButtonExt, DropDownExt, ImageExt, InfoBarExt, LabelExt, LevelBarExt,
+    MenuButtonExt, PopoverExt, ProgressBarExt, ScaleExt, ScrollbarExt, SpinnerExt, StatusbarExt,
+    TextViewExt, ToggleButtonExt,
 };
 use crate::view::cmd::Cmd;
 use crate::view::{Instance, Kind, Prop, PropName, View};
@@ -685,15 +685,15 @@ pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
                 .prop(PropName::Expanded, Prop::Bool(model.open))
                 .on_selected(|i| GalleryMsg::Selected(Kind::DropDown, i)),
         ),
-        Kind::ColorDialogButton => Sample::Own(ColorDialogButtonExt::on_change(
+        Kind::ColorDialogButton => Sample::Own(
             w::color_dialog_button(Rgba {
                 r: 0.21,
                 g: 0.52,
                 b: 0.89,
                 a: 1.0,
-            }),
-            |v: f64| GalleryMsg::ValueChanged(Kind::ColorDialogButton, v),
-        )),
+            })
+            .on_value_changed(|v| GalleryMsg::ValueChanged(Kind::ColorDialogButton, v)),
+        ),
         Kind::ColorDialog => Sample::Own(w::color_dialog(Rgba {
             r: 0.21,
             g: 0.52,

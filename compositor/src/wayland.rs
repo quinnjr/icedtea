@@ -44,6 +44,11 @@ impl ToplevelKey {
     /// that, and a key built this way never resolves to a live toplevel, so
     /// every outbound push through it is a no-op — which is exactly the
     /// property that makes it safe to hand to `State`.
+    ///
+    /// `pub` (not `#[cfg(test)]`, unlike [`PopupKey::for_test`]) only because
+    /// `compositor/tests/headless_boot.rs` is a separate crate and needs it;
+    /// production code must never call it.
+    #[doc(hidden)]
     pub fn for_test(n: u64) -> Self {
         ToplevelKey(wlr::ToplevelId::dangling_nth_for_test(n))
     }
@@ -70,6 +75,12 @@ impl PopupKey {
     /// Same contract as [`ToplevelKey::for_test`]: `n` only distinguishes one
     /// test key from another, and a key built this way never resolves to a
     /// live popup, so every outbound push through it is a no-op.
+    ///
+    /// `#[cfg(test)]` because -- unlike [`ToplevelKey::for_test`], which
+    /// `tests/headless_boot.rs` builds keys with from outside the crate --
+    /// every caller of this one is a unit test in `state.rs` or in this
+    /// file's own `tests` module, so it need not be part of the public API.
+    #[cfg(test)]
     pub fn for_test(n: u64) -> Self {
         PopupKey(wlr::PopupId::dangling_nth_for_test(n))
     }
@@ -552,10 +563,6 @@ impl Wayland {
     /// `initialized` yet, in which case the library skips the configure rather
     /// than tripping wlroots' own assert -- see contract §1.2's
     /// `Popup::send_configure`).
-    /// `#[allow(dead_code)]`: no `state.rs` caller exists yet -- Task 3
-    /// wires `State::popup_constraint_box` and friends onto these six
-    /// methods. Unused only in this commit's isolation.
-    #[allow(dead_code)]
     pub(crate) fn configure_popup(&self, popup: PopupKey, constraint: Rectangle) -> bool {
         let Some(runtime) = self.runtime.as_ref() else {
             return false;
@@ -578,7 +585,6 @@ impl Wayland {
     /// Committed state, not scheduled: between a configure and the client's
     /// ack this still names the old position, which is exactly right for
     /// hit-testing -- a popup keeps taking clicks where it is drawn.
-    #[allow(dead_code)]
     pub(crate) fn popup_geometry(&self, popup: PopupKey) -> Option<Rectangle> {
         let runtime = self.runtime.as_ref()?;
         let handle = runtime.popup(popup.0)?;
@@ -594,7 +600,6 @@ impl Wayland {
 
     /// Whether the client asked for its popup to be re-unconstrained whenever
     /// the parent moves (`xdg_positioner.set_reactive`).
-    #[allow(dead_code)]
     pub(crate) fn popup_is_reactive(&self, popup: PopupKey) -> bool {
         self.runtime
             .as_ref()
@@ -603,6 +608,13 @@ impl Wayland {
     }
 
     /// Whether the client sent `xdg_popup.grab` for this popup.
+    ///
+    /// `#[allow(dead_code)]`: unlike its five neighbours this one has no
+    /// `state.rs` caller. wlroots owns the popup grab's whole lifetime
+    /// (contract §1.6), so the compositor's policy code asks
+    /// [`Self::has_explicit_grab`] -- "is *some* grab up?" -- rather than
+    /// per-popup. It is kept as the per-popup read the seam owes the model
+    /// for popup-level grab decisions (e.g. which chain to dismiss first).
     #[allow(dead_code)]
     pub(crate) fn popup_is_grabbing(&self, popup: PopupKey) -> bool {
         self.runtime
@@ -628,7 +640,6 @@ impl Wayland {
     /// popup grab's whole lifetime (contract §1.6). This is the read that
     /// tells `sync_seat_focus` to keep its hands off the seat's keyboard
     /// while one is up.
-    #[allow(dead_code)]
     pub(crate) fn has_explicit_grab(&self) -> bool {
         self.runtime
             .as_ref()

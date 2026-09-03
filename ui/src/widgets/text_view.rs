@@ -22,7 +22,7 @@ use crate::css::node::Node;
 use crate::layout::Rect;
 use crate::text::{Ellipsize, TextLayout, TextStyle, WrapMode};
 use crate::view::controller::{Controller, Event, EventCx};
-use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
+use crate::view::{BuildCx, EventKind, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{UndoStack, clamp_to_boundary};
 use crate::widgets::{PointerState, local_rect, shift_event};
 use crate::window::keyboard::Mods;
@@ -59,8 +59,8 @@ pub trait TextViewExt<Msg>: Sized {
     fn bottom_margin(self, px: i32) -> Self;
     /// `GtkTextView:enable-undo`.
     fn enable_undo(self, on: bool) -> Self;
-    /// `GtkTextBuffer::changed`.
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self;
+    // `GtkTextBuffer::changed` is the inherent `View::on_change`, which
+    // shadows any same-named trait method at every call site anyway.
 }
 
 impl<Msg: Clone + 'static> TextViewExt<Msg> for View<Msg> {
@@ -98,9 +98,6 @@ impl<Msg: Clone + 'static> TextViewExt<Msg> for View<Msg> {
     }
     fn enable_undo(self, on: bool) -> Self {
         self.prop(PropName::EnableUndo, Prop::Bool(on))
-    }
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self {
-        self.on(EventKind::Change, Handler::Text(Rc::new(f)))
     }
 }
 

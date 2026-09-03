@@ -260,13 +260,19 @@ impl<Msg: Clone + 'static> Controller<Msg> for PopoverMenuBarC {
             Event::Key(key) if key.pressed => {
                 let count = self.items.len();
                 match u32::from(key.keysym) {
-                    keysyms::KEY_Right if self.open.is_some() && count > 0 => {
-                        let next = (self.open.unwrap() + 1) % count;
+                    keysyms::KEY_Right
+                        if let Some(open) = self.open
+                            && count > 0 =>
+                    {
+                        let next = (open + 1) % count;
                         cx.handled = true;
                         self.open(next, cx.tree, cx.node, cx);
                     }
-                    keysyms::KEY_Left if self.open.is_some() && count > 0 => {
-                        let prev = (self.open.unwrap() + count - 1) % count;
+                    keysyms::KEY_Left
+                        if let Some(open) = self.open
+                            && count > 0 =>
+                    {
+                        let prev = (open + count - 1) % count;
                         cx.handled = true;
                         self.open(prev, cx.tree, cx.node, cx);
                     }

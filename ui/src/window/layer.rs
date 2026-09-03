@@ -1722,12 +1722,6 @@ pub struct Layer {
     layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     pub(crate) size: (u32, u32),
     pub(crate) scale: i32,
-    /// Reserved for a per-surface pool the way [`popup::Popup`](crate::window::popup::Popup)
-    /// owns one: `Window::open` still commits through the one `BufferPool`
-    /// it owns for its primary surface (`Toplevel` or `Layer` alike), so
-    /// this stays `None` until a later task gives a `Layer` its own.
-    #[allow(dead_code)]
-    pub(crate) buffers: Option<BufferPool>,
     pub(crate) cursor: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
 }
 
@@ -1772,7 +1766,6 @@ impl Layer {
             layer_surface,
             size: (size.0.max(1) as u32, size.1.max(1) as u32),
             scale: 1,
-            buffers: None,
             cursor: None,
         })
     }

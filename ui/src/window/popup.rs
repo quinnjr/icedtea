@@ -172,14 +172,6 @@ impl Popup {
     pub(crate) fn grab(&self, seat: &wayland_client::protocol::wl_seat::WlSeat, serial: u32) {
         self.xdg_popup.grab(seat, serial);
     }
-
-    /// Re-run the positioner. The compositor echoes `token` back.
-    #[allow(dead_code)]
-    pub(crate) fn reposition(&self, positioner: &xdg_positioner::XdgPositioner, token: u32) {
-        if self.xdg_popup.version() >= 3 {
-            self.xdg_popup.reposition(positioner, token);
-        }
-    }
 }
 
 impl Drop for Popup {

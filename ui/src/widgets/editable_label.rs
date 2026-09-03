@@ -15,7 +15,7 @@ use std::rc::Rc;
 use crate::css::node::Node;
 use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
-use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
+use crate::view::{BuildCx, EventKind, Kind, Prop, PropName, Props, View};
 use crate::widgets::PointerState;
 use crate::widgets::edit::{EditOutcome, TextEditState};
 use crate::window::focus::FocusCause;
@@ -34,16 +34,14 @@ pub fn editable_label<Msg: Clone + 'static>(text: &str) -> View<Msg> {
 pub trait EditableLabelExt<Msg>: Sized {
     /// `GtkEditableLabel:editing`.
     fn editing(self, on: bool) -> Self;
-    /// `GtkEditable::changed`, fired on commit.
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self;
+    // `GtkEditable::changed`, fired on commit, is the inherent
+    // `View::on_change`, which shadows any same-named trait method at every
+    // call site anyway.
 }
 
 impl<Msg: Clone + 'static> EditableLabelExt<Msg> for View<Msg> {
     fn editing(self, on: bool) -> Self {
         self.prop(PropName::Editable, Prop::Bool(on))
-    }
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self {
-        self.on(EventKind::Change, Handler::Text(Rc::new(f)))
     }
 }
 

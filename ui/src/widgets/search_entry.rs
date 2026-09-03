@@ -43,8 +43,9 @@ pub trait SearchEntryExt<Msg>: Sized {
     fn search_delay(self, ms: u32) -> Self;
     /// `GtkSearchEntry::search-changed`, debounced.
     fn on_search(self, f: impl Fn(&str) -> Msg + 'static) -> Self;
-    /// `GtkEditable::changed`, on every keystroke.
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self;
+    // `GtkEditable::changed`, on every keystroke, is the inherent
+    // `View::on_change`, which shadows any same-named trait method at every
+    // call site anyway.
     /// `GtkSearchEntry::activate`.
     fn on_activate(self, msg: Msg) -> Self;
 }
@@ -58,9 +59,6 @@ impl<Msg: Clone + 'static> SearchEntryExt<Msg> for View<Msg> {
     }
     fn on_search(self, f: impl Fn(&str) -> Msg + 'static) -> Self {
         self.on(EventKind::Search, Handler::Text(Rc::new(f)))
-    }
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self {
-        self.on(EventKind::Change, Handler::Text(Rc::new(f)))
     }
     fn on_activate(self, msg: Msg) -> Self {
         self.on(EventKind::Activate, Handler::Unit(msg))

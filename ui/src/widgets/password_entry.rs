@@ -36,8 +36,8 @@ pub trait PasswordEntryExt<Msg>: Sized {
     fn show_peek_icon(self, on: bool) -> Self;
     /// `GtkPasswordEntry:activates-default`.
     fn activates_default(self, on: bool) -> Self;
-    /// `GtkEditable::changed`.
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self;
+    // `GtkEditable::changed` is the inherent `View::on_change`, which shadows
+    // any same-named trait method at every call site anyway.
     /// `GtkPasswordEntry::activate`.
     fn on_activate(self, msg: Msg) -> Self;
 }
@@ -51,9 +51,6 @@ impl<Msg: Clone + 'static> PasswordEntryExt<Msg> for View<Msg> {
     }
     fn activates_default(self, on: bool) -> Self {
         self.prop(PropName::Modal, Prop::Bool(on))
-    }
-    fn on_change(self, f: impl Fn(&str) -> Msg + 'static) -> Self {
-        self.on(EventKind::Change, Handler::Text(Rc::new(f)))
     }
     fn on_activate(self, msg: Msg) -> Self {
         self.on(EventKind::Activate, Handler::Unit(msg))
