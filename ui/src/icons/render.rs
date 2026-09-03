@@ -44,6 +44,41 @@ pub(crate) fn log_once(path: &Path, message: &'static str) {
     });
 }
 
+/// The largest icon file this crate will read into memory.
+///
+/// An icon file is untrusted input sitting at a path a theme names: a 4 GiB
+/// file (or a named pipe that never ends) must cost a `metadata` call, not
+/// the address space. Adwaita's largest shipped icon is under 200 KiB, so
+/// 8 MiB is three orders of magnitude of headroom.
+pub(crate) const MAX_ICON_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Read one icon file, refusing anything over [`MAX_ICON_BYTES`] and logging
+/// every refusal once per path.
+///
+/// The size is checked with `metadata` *before* the read, so an oversized
+/// file never reaches the allocator. A path whose metadata cannot be read at
+/// all is left to the read itself to reject: the file may still be a
+/// perfectly good icon on a filesystem that answers `stat` badly.
+pub(crate) fn read_icon_bytes(path: &Path) -> Option<Vec<u8>> {
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_ICON_BYTES) {
+        log_once(path, "icon file is larger than the icon size cap");
+        return None;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() as u64 > MAX_ICON_BYTES => {
+            // The `stat` above can be stale, or lie (procfs, a FUSE mount);
+            // the length actually read is the one that matters.
+            log_once(path, "icon file is larger than the icon size cap");
+            None
+        }
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            log_once(path, "icon file could not be read");
+            None
+        }
+    }
+}
+
 /// The device pixel size an icon is rasterised at: `size * scale`, clamped
 /// into `1..=MAX_ICON_PX`.
 ///
@@ -79,9 +114,7 @@ pub fn render_dom(dom: &SvgDom, px: i32, symbolic_file: bool, palette: &Palette)
 
 /// Render an SVG file into a `px × px` transparent surface.
 fn render_svg_file(path: &Path, px: i32, symbolic_file: bool, palette: &Palette) -> Option<Image> {
-    let bytes = std::fs::read(path)
-        .map_err(|_| log_once(path, "icon file could not be read"))
-        .ok()?;
+    let bytes = read_icon_bytes(path)?;
     // `parse_svg` takes `&str`; an icon file need not be valid UTF-8, and a
     // lossy read keeps every ASCII tag and attribute intact.
     let text = String::from_utf8_lossy(&bytes);
@@ -91,12 +124,17 @@ fn render_svg_file(path: &Path, px: i32, symbolic_file: bool, palette: &Palette)
 
 /// Decode a raster file and resample it to `px × px` if it is not already.
 fn render_raster_file(path: &Path, px: i32) -> Option<Image> {
-    let bytes = std::fs::read(path)
-        .map_err(|_| log_once(path, "icon file could not be read"))
-        .ok()?;
+    let bytes = read_icon_bytes(path)?;
     let image = decode_image(&bytes)
         .map_err(|_| log_once(path, "icon image could not be decoded"))
         .ok()?;
+    // A small file may still declare enormous dimensions; the decoder that
+    // honoured them has already allocated, but nothing downstream needs to
+    // resample a gigapixel surface on top of it.
+    if image.width() > MAX_ICON_PX as i32 || image.height() > MAX_ICON_PX as i32 {
+        log_once(path, "icon image is larger than the icon pixel cap");
+        return None;
+    }
     if image.width() == px && image.height() == px {
         return Some(image);
     }
@@ -394,6 +432,43 @@ mod tests {
             };
             let _ = render(&icon, 16, 1, &palette);
         }
+    }
+
+    // An icon file is untrusted input at a path a theme names: an enormous
+    // one must be refused by its size, before it is read into memory.
+    // Mutation check: drop the `MAX_ICON_BYTES` check and this either
+    // allocates the whole file or, with `read_icon_bytes` gone entirely,
+    // fails to compile.
+    #[test]
+    fn a_file_over_the_byte_cap_is_refused_without_being_read() {
+        use super::{MAX_ICON_BYTES, read_icon_bytes};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = dir.path().join("huge.png");
+        // Sparse where the filesystem allows it: the point is the declared
+        // length, not the bytes.
+        let file = std::fs::File::create(&big).expect("create");
+        file.set_len(MAX_ICON_BYTES + 1).expect("set_len");
+        drop(file);
+        assert!(read_icon_bytes(&big).is_none());
+
+        let small = dir.path().join("small.svg");
+        std::fs::write(&small, b"<svg/>").expect("write");
+        assert_eq!(
+            read_icon_bytes(&small).as_deref(),
+            Some(b"<svg/>".as_slice())
+        );
+
+        // And the whole render path refuses it rather than panicking.
+        let icon = IconFile {
+            path: big,
+            format: IconFormat::Png,
+            nominal_size: 16,
+            scale: 1,
+            symbolic: false,
+            kind: DirKind::Fixed { size: 16 },
+        };
+        assert!(render(&icon, 16, 1, &test_palette()).is_none());
     }
 
     // The pixel size is `size * scale`, clamped into `1..=MAX_ICON_PX`.

@@ -102,7 +102,11 @@ fn strip_fill_from_stylesheet(sheet: &mut Stylesheet) {
 /// The tree's depth and node count, walked iteratively.
 ///
 /// `None` when either bound is exceeded.
-fn measure(root: &SvgNode) -> Option<()> {
+///
+/// Visible to the module because *every* parsed document is measured at
+/// parse time (`super::svg_parse_logged`), not only the symbolic ones: the
+/// renderer recurses over the tree whether or not it was recoloured.
+pub(crate) fn measure(root: &SvgNode) -> Option<()> {
     let mut stack: Vec<(&SvgNode, usize)> = vec![(root, 1)];
     let mut nodes = 0usize;
     while let Some((node, depth)) = stack.pop() {

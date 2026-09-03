@@ -111,10 +111,7 @@ fn mtime_of(path: &Path) -> Option<u64> {
 pub struct IconTheme {
     name: Rc<str>,
     roots: Vec<PathBuf>,
-    // Read only by `pixmap_dirs` below, which is itself unused until Task 6's
-    // lookup consumes the flat fallback — allowed here rather than deferred,
-    // since the plan places the field in this task.
-    #[allow(dead_code)]
+    // Read through `pixmap_dirs` below, which `lookup::find_pixmap` consumes.
     pixmaps: Vec<PathBuf>,
     chain: Vec<Rc<str>>,
     chain_hash: u64,
@@ -212,21 +209,20 @@ impl IconTheme {
 
     /// The themed roots, in search order.
     ///
-    /// Unused outside tests until Task 6's lookup consumes it — allowed here
-    /// rather than deferred, since the plan places the accessor in this task.
+    /// The search itself reads `self.roots` through
+    /// [`candidate_paths`](Self::candidate_paths); this accessor exists for
+    /// tests and diagnostics.
     #[allow(dead_code)]
     pub(crate) fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
 
     /// The flat, non-themed last-resort directories.
-    #[allow(dead_code)]
     pub(crate) fn pixmap_dirs(&self) -> &[PathBuf] {
         &self.pixmaps
     }
 
     /// The parsed `index.theme` for one theme in the chain, if it has one.
-    #[allow(dead_code)]
     pub(crate) fn index(&self, theme: &str) -> Option<&ThemeIndex> {
         self.indexes.get(theme)
     }
@@ -362,7 +358,7 @@ impl IconTheme {
         if let Some(dom) = self.doms.get(&key) {
             return Some(Rc::clone(dom));
         }
-        let bytes = std::fs::read(&file.path).ok()?;
+        let bytes = super::render::read_icon_bytes(&file.path)?;
         let text = String::from_utf8_lossy(&bytes);
         let dom = Rc::new(super::svg_parse_logged(&file.path, &text)?);
         if self.doms.len() >= MAX_DOM_CACHE {
@@ -482,9 +478,9 @@ impl IconTheme {
 
     /// `<root>/<theme>/<subdir>/<name>.<ext>` for every root, in order.
     ///
-    /// Unused until Task 6's lookup consumes it — allowed here rather than
-    /// deferred, since the plan places the accessor in this task.
-    #[allow(dead_code)]
+    /// `subdir` comes from a parsed [`ThemeIndex`], whose `Directories=`
+    /// entries are already restricted to plain relative components, so the
+    /// join cannot leave the root.
     pub(crate) fn candidate_paths(&self, theme: &str, subdir: &str, file: &str) -> Vec<PathBuf> {
         self.roots
             .iter()
@@ -704,6 +700,21 @@ fn comma_list(value: &str, cap: usize) -> Vec<Rc<str>> {
         .collect()
 }
 
+/// `true` if `path` is a usable subdirectory of a theme: relative, with
+/// every component an ordinary name.
+///
+/// `Directories=` comes out of an `index.theme`, which is a file anything
+/// running as the user may have written, and every entry is joined onto each
+/// search root. `Directories=../../..` or `Directories=/etc` would otherwise
+/// walk straight out of the roots the theme name is so carefully kept inside.
+fn is_safe_subdir(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\0')
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
 /// A `u32` key, or `default` when the value is absent, empty, negative,
 /// non-numeric or larger than a `u32`.
 fn u32_key(groups: &[(String, Vec<(String, String)>)], group: &str, key: &str) -> Option<u32> {
@@ -802,6 +813,11 @@ impl ThemeIndex {
 
         let mut dirs = Vec::with_capacity(declared.len());
         for path in declared {
+            // A traversing or absolute entry is not a subdirectory of this
+            // theme, whatever the file says.
+            if !is_safe_subdir(&path) {
+                continue;
+            }
             // A directory with no group of its own has no `Size`, and `Size`
             // is required: the spec has nothing to match it against.
             let Some(size) = u32_key(&groups, &path, "Size") else {
@@ -867,39 +883,6 @@ pub struct IconEnv {
 /// `XDG_DATA_DIRS=""` means.
 fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-/// One `key=value` from one group of an INI file.
-///
-/// Never fails and never panics: `settings.ini` is a file on disk that
-/// anything may have written. Values keep their quotes, as GTK's own
-/// key-file reader does for an unquoted-string key.
-#[must_use]
-pub(crate) fn ini_value(text: &str, group: &str, key: &str) -> Option<String> {
-    let mut in_group = false;
-    for raw in text.lines() {
-        let line = raw.trim_matches(|c: char| c == '\r' || c == '\u{0}').trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('[') {
-            let Some(name) = rest.strip_suffix(']') else {
-                continue;
-            };
-            in_group = name.trim() == group;
-            continue;
-        }
-        if !in_group {
-            continue;
-        }
-        let Some((found, value)) = line.split_once('=') else {
-            continue;
-        };
-        if found.trim() == key {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
 }
 
 impl IconEnv {
@@ -975,7 +958,7 @@ impl IconEnv {
             return DEFAULT_THEME.to_string();
         };
         let text = String::from_utf8_lossy(&bytes);
-        match ini_value(&text, "Settings", "gtk-icon-theme-name") {
+        match theme_name_from_settings_ini(&text) {
             Some(name) if is_safe_theme_name(&name) => name,
             Some(name) => {
                 tracing::debug!(
@@ -1330,6 +1313,44 @@ Type=Fixed
         assert_eq!(&*index.dirs[0].path, "real");
     }
 
+    // `Directories=` is untrusted, and every entry is joined onto each search
+    // root: an entry that is absolute or that climbs out of the theme is not
+    // a subdirectory of it and is dropped.
+    // Mutation check: drop `is_safe_subdir` and `dirs.len()` becomes 4, with
+    // `candidate_paths` then producing `/etc/passwd.png` and
+    // `<root>/../../evil/x.png`.
+    #[test]
+    fn a_traversing_or_absolute_directory_entry_is_dropped() {
+        let text = "\
+[Icon Theme]
+Directories=../../evil,/etc,./here,ok/actions
+[../../evil]
+Size=16
+[/etc]
+Size=16
+[./here]
+Size=16
+[ok/actions]
+Size=16
+";
+        let index = ThemeIndex::parse("T", text);
+        let paths: Vec<&str> = index.dirs.iter().map(|d| &*d.path).collect();
+        assert_eq!(paths, vec!["ok/actions"]);
+
+        let theme = IconTheme::with_name_and_roots("T", vec![PathBuf::from("/roots")]);
+        for hostile in ["../../evil", "/etc", ".", "..", "a/../../b"] {
+            assert!(
+                !is_safe_subdir(hostile),
+                "{hostile:?} was accepted as a subdirectory"
+            );
+        }
+        assert!(is_safe_subdir("16x16/actions"));
+        assert_eq!(
+            theme.candidate_paths("T", "16x16/actions", "a.png"),
+            vec![PathBuf::from("/roots/T/16x16/actions/a.png")]
+        );
+    }
+
     // Comments, blank lines, CRLF line endings, whitespace around `=`, and
     // the localised `Name[de]=` form all appear in shipped index.theme files.
     // Mutation check: split on `'='` with `split('=')` and take the last
@@ -1534,7 +1555,7 @@ Type=Fixed
         let _: &[PathBuf] = hermetic.roots();
     }
 
-    use super::{IconEnv, ini_value};
+    use super::IconEnv;
 
     // The spec's root order: $XDG_DATA_HOME/icons, $HOME/.icons, then each
     // $XDG_DATA_DIRS entry + /icons. `/usr/share/pixmaps` is not a root: it
@@ -1656,18 +1677,27 @@ Type=Fixed
         }
     }
 
-    // The INI reader is shared with nothing and does one job.
-    // Mutation check: return the value trimmed of quotes as well and the
-    // quoted case comes back without them, which GTK does not do.
+    // The one settings.ini reader is the one `IconEnv::theme_name` calls,
+    // and it keeps a value's quotes, as GTK's own key-file reader does for an
+    // unquoted-string key.
+    // Mutation check: trim quotes as well and the quoted case comes back
+    // without them, which GTK does not do; read the key from any group and
+    // the `[Other]` case returns Wrong.
     #[test]
-    fn the_ini_reader_finds_a_key_in_its_own_group_only() {
-        let text = "[A]\nk=1\n[B]\nk = 2 \nj=\"q\"\n";
-        assert_eq!(ini_value(text, "A", "k").as_deref(), Some("1"));
-        assert_eq!(ini_value(text, "B", "k").as_deref(), Some("2"));
-        assert_eq!(ini_value(text, "B", "j").as_deref(), Some("\"q\""));
-        assert_eq!(ini_value(text, "C", "k"), None);
-        assert_eq!(ini_value(text, "A", "j"), None);
-        assert_eq!(ini_value("", "A", "k"), None);
+    fn the_ini_reader_finds_the_key_in_its_own_group_only() {
+        assert_eq!(
+            theme_name_from_settings_ini("[Other]\ngtk-icon-theme-name=Wrong\n"),
+            None
+        );
+        assert_eq!(
+            theme_name_from_settings_ini("[Settings]\ngtk-icon-theme-name=\"q\"\n").as_deref(),
+            Some("\"q\"")
+        );
+        assert_eq!(
+            theme_name_from_settings_ini("[Settings]\ngtk-theme-name=Adwaita\n"),
+            None
+        );
+        assert_eq!(theme_name_from_settings_ini(""), None);
     }
 
     // A cache is only a cache if a second call does not touch the disk. The

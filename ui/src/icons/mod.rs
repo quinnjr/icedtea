@@ -50,13 +50,75 @@ pub type Handle = Rc<skia_rs_safe::codec::Image>;
 /// multi-gigabyte allocation.
 pub const MAX_ICON_PX: u32 = 4096;
 
+/// A conservative bound on an SVG *text*'s element nesting and count,
+/// computed without parsing it.
+///
+/// `parse_svg` recurses over the document, so a deeply nested file overflows
+/// the stack *inside the parser* — a tree-walking budget applied to the
+/// result never gets to run. This scan is therefore the guard that matters,
+/// and it is deliberately crude: `<` may not appear unescaped in element
+/// content or in an attribute value, so counting angle brackets is a sound
+/// over-approximation of the nesting the parser is about to recurse into.
+/// Over-approximating costs at worst an `image-missing`, which is what an
+/// unrenderable icon draws anyway.
+fn text_within_budget(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut elements = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'<' {
+            continue;
+        }
+        match bytes.get(index + 1) {
+            Some(b'/') => depth = depth.saturating_sub(1),
+            // Comments, CDATA sections, doctypes and processing instructions
+            // open no element and nest nothing.
+            Some(b'!' | b'?') | None => {}
+            Some(_) => {
+                elements += 1;
+                if elements > symbolic::MAX_SVG_NODES {
+                    return false;
+                }
+                // `<g/>` opens and closes in one go; `<g>` does not.
+                let end = bytes[index..].iter().position(|b| *b == b'>');
+                let self_closing = end.is_some_and(|offset| bytes[index + offset - 1] == b'/');
+                if !self_closing {
+                    depth += 1;
+                    if depth > symbolic::MAX_SVG_DEPTH {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 /// `parse_svg`, with the failure logged once per path.
+///
+/// A document that exceeds [`symbolic::MAX_SVG_DEPTH`]/[`symbolic::MAX_SVG_NODES`]
+/// is refused here rather than downstream, because both the *parser* and the
+/// *renderer* recurse over the tree — recoloured or not, symbolic or not.
+/// Refusing at the parse makes it a miss, so the caller falls through to
+/// `image-missing` exactly as it does for a corrupt PNG.
 pub(crate) fn svg_parse_logged(
     path: &std::path::Path,
     text: &str,
 ) -> Option<skia_rs_safe::svg::SvgDom> {
+    if !text_within_budget(text) {
+        render::log_once(path, "icon SVG exceeds the depth or node budget");
+        return None;
+    }
     match skia_rs_safe::svg::parse_svg(text) {
-        Ok(dom) => Some(dom),
+        Ok(dom) => {
+            // The text scan bounds what the parser recursed into; this bounds
+            // what it actually produced, which is what the renderer walks.
+            if symbolic::measure(&dom.root).is_none() {
+                render::log_once(path, "icon SVG exceeds the depth or node budget");
+                return None;
+            }
+            Some(dom)
+        }
         Err(_) => {
             render::log_once(path, "icon SVG could not be parsed");
             None
@@ -127,10 +189,6 @@ impl IconFormat {
 }
 
 /// The extensions the spec searches, in its own order.
-///
-/// Unused until `lookup::` consumes it in Task 6 — allowed here rather than
-/// deferred, since the plan places the constant in this task.
-#[allow(dead_code)]
 pub(crate) const SEARCH_EXTENSIONS: [IconFormat; 3] =
     [IconFormat::Png, IconFormat::Svg, IconFormat::Xpm];
 
@@ -227,6 +285,42 @@ mod mod_tests {
         );
         assert!(pixmaps()[0].join("flat-only.png").is_file());
         assert!(!fixture_dir().join("root-a/MiniTheme/cursors").exists());
+    }
+
+    // Every parsed document is measured, not only the symbolic ones: the
+    // renderer recurses over the tree whichever kind it is, so an
+    // over-budget document must never leave the parse at all.
+    // Mutation check: drop the `measure` call from `svg_parse_logged` and the
+    // deep document parses -- and is then handed to a recursive renderer.
+    #[test]
+    fn an_over_budget_svg_is_refused_at_the_parse() {
+        use super::symbolic::MAX_SVG_DEPTH;
+
+        let depth = MAX_SVG_DEPTH * 4;
+        let mut text = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\">");
+        for _ in 0..depth {
+            text.push_str("<g>");
+        }
+        text.push_str("<rect width=\"1\" height=\"1\"/>");
+        for _ in 0..depth {
+            text.push_str("</g>");
+        }
+        text.push_str("</svg>");
+
+        let path = std::path::Path::new("/t/deep.svg");
+        assert!(
+            super::svg_parse_logged(path, &text).is_none(),
+            "a {depth}-deep document survived the budget"
+        );
+        // A shallow one still parses, so the budget is not simply refusing
+        // everything.
+        assert!(
+            super::svg_parse_logged(
+                path,
+                "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"1\" height=\"1\"/></svg>"
+            )
+            .is_some()
+        );
     }
 
     // The PNGs must really decode, and `broken.png` must really not: two

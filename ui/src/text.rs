@@ -1570,7 +1570,10 @@ impl TextLayout {
         }
         let budget = limit - ellipsis_w;
 
-        let display = match ellipsize {
+        // Each arm knows exactly where it inserted the ellipsis; searching the
+        // display string for it would find a literal '…' the source already
+        // carried and skew every remapped offset past that point.
+        let (display, ellipsis_at) = match ellipsize {
             Ellipsize::None => unreachable!("guarded above"),
             Ellipsize::End => {
                 let mut keep = 0usize;
@@ -1581,7 +1584,7 @@ impl TextLayout {
                         break;
                     }
                 }
-                format!("{}{}", &source[..keep], Self::ELLIPSIS)
+                (format!("{}{}", &source[..keep], Self::ELLIPSIS), keep)
             }
             Ellipsize::Start => {
                 let mut keep = source.len();
@@ -1592,7 +1595,7 @@ impl TextLayout {
                         break;
                     }
                 }
-                format!("{}{}", Self::ELLIPSIS, &source[keep..])
+                (format!("{}{}", Self::ELLIPSIS, &source[keep..]), 0)
             }
             Ellipsize::Middle => {
                 let (mut head, mut tail) = (0usize, source.len());
@@ -1618,7 +1621,10 @@ impl TextLayout {
                         }
                     }
                 }
-                format!("{}{}{}", &source[..head], Self::ELLIPSIS, &source[tail..])
+                (
+                    format!("{}{}{}", &source[..head], Self::ELLIPSIS, &source[tail..]),
+                    head,
+                )
             }
         };
 
@@ -1626,7 +1632,6 @@ impl TextLayout {
         // offset that fell inside the ellipsis onto the source byte the
         // ellipsis stands for.
         let mut table = Self::caret_table(&display, 0, &display, style, fonts);
-        let ellipsis_at = display.find(Self::ELLIPSIS).unwrap_or(0);
         for entry in &mut table {
             let byte = entry.0;
             entry.0 = base
@@ -1843,11 +1848,18 @@ pub fn parse_markup(text: &str) -> (String, Vec<MarkupSpan>) {
                     Some(rest) => (true, rest),
                     None => (false, tag),
                 };
-                let name = name_and_attrs
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
+                // Split once and keep the remainder: recomputing the attribute
+                // slice as `name_and_attrs[name.len()..]` measures a length
+                // taken *after* leading whitespace was skipped against the raw
+                // string, which slices through a char boundary when that
+                // whitespace is multi-byte (U+3000, U+2028, …) and mis-parses
+                // the attributes even when it is ASCII.
+                let name_and_attrs = name_and_attrs.trim_start();
+                let (name, attrs) = match name_and_attrs.split_once(char::is_whitespace) {
+                    Some((name, rest)) => (name, rest.trim_start()),
+                    None => (name_and_attrs, ""),
+                };
+                let name = name.to_ascii_lowercase();
 
                 match (closing, name.as_str()) {
                     (false, "b" | "i" | "span") => {
@@ -1858,7 +1870,7 @@ pub fn parse_markup(text: &str) -> (String, Vec<MarkupSpan>) {
                                 "b" => next.bold = true,
                                 "i" => next.italic = true,
                                 _ => apply_span_attrs(
-                                    name_and_attrs[name.len()..].trim_start(),
+                                    attrs,
                                     &mut next.color,
                                     &mut next.weight,
                                     &mut next.size_px,
@@ -3291,6 +3303,52 @@ mod tests {
     }
 
     #[test]
+    fn ellipsized_carets_ignore_a_literal_ellipsis_in_the_source() {
+        // A source that already contains '…' inside the retained head used to
+        // fool the caret remapping, which located the *inserted* ellipsis with
+        // `find` and so picked the literal one at byte 1.
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let source = "a\u{2026}bcdefghijklmnopqrstuvwx";
+        let full = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        let limit = full.size().0 * 0.5;
+        let cut = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            Some(limit),
+            super::WrapMode::None,
+            super::Ellipsize::End,
+        );
+
+        let display = cut.display_line(0);
+        assert!(
+            display.ends_with('\u{2026}'),
+            "End appends one: {display:?}"
+        );
+        let keep = display.len() - '\u{2026}'.len_utf8();
+        assert!(
+            keep > "a\u{2026}".len(),
+            "the kept head must span the literal ellipsis: {display:?}"
+        );
+
+        // Past the end of the visible line the caret is the end of the source;
+        // the `find`-based remap returned `source.len() - keep + 1` instead.
+        assert_eq!(
+            cut.byte_at((limit * 4.0, 0.0)),
+            source.len(),
+            "the last caret maps to the end of the source"
+        );
+    }
+
+    #[test]
     fn a_limit_narrower_than_the_ellipsis_yields_the_ellipsis_alone() {
         let style = ui_style("label { font-size: 14px; }");
         let mut db = FontDatabase::new();
@@ -3480,6 +3538,31 @@ mod tests {
     }
 
     #[test]
+    fn markup_tolerates_whitespace_before_the_tag_name() {
+        // Both ASCII and multi-byte leading whitespace: the name is recognised
+        // and the attributes still parse (the old raw-offset slice either
+        // panicked on a char boundary or fed garbage to the attribute parser).
+        for input in [
+            "<  span foreground=\"#ff0000\">x</span>",
+            "<\u{3000}\u{3000}span foreground=\"#ff0000\">x</span>",
+            "<\u{2028}span foreground=\"#ff0000\">x</span>",
+        ] {
+            let (plain, spans) = super::parse_markup(input);
+            assert_eq!(plain, "x", "tags removed for {input:?}");
+            let coloured = spans
+                .iter()
+                .find(|s| s.color.is_some())
+                .unwrap_or_else(|| panic!("a coloured span for {input:?}"));
+            assert_eq!(coloured.range, 0..1);
+            assert_eq!(
+                coloured.color.map(|c| (c.r, c.g, c.b)),
+                Some((1.0, 0.0, 0.0)),
+                "attributes parse for {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn markup_entities_are_decoded_and_unknown_tags_are_dropped() {
         let (plain, spans) = super::parse_markup("5 &lt; 6 &amp; <u>x</u>&gt;");
         assert_eq!(plain, "5 < 6 & x>", "entities decode, unknown tags vanish");
@@ -3522,6 +3605,13 @@ mod tests {
             "&\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9}",
             &"<b>".repeat(5_000),
             &format!("<b>{}</b>", "\u{00e9}".repeat(10_000)),
+            // Multi-byte whitespace between '<' and the tag name: the attribute
+            // slice must not be recomputed from a whitespace-skipped length.
+            "<\u{3000}\u{3000}span foreground='red'>x</span>",
+            "<\u{2028}span foreground='red'>x</span>",
+            "<\u{3000}>x",
+            "<\u{3000}\u{3000}>x",
+            "</\u{3000}span>",
         ];
         for input in hostile {
             let (plain, spans) = super::parse_markup(input);

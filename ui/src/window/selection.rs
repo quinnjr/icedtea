@@ -6,7 +6,7 @@
 //! Drag and drop is M6 and is deliberately not wired here.
 
 use std::cell::RefCell;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -30,6 +30,72 @@ pub const TEXT_MIME: &str = "text/plain;charset=utf-8";
 /// The writer is another client; without a cap, one that streams forever turns
 /// a paste into an OOM.
 pub(crate) const MAX_OFFER_BYTES: usize = 16 * 1024 * 1024;
+
+/// The most a [`wl_data_source::Event::Send`]/primary-selection `Send`
+/// handler will block trying to hand our payload to a requesting peer.
+///
+/// That fd is a pipe the *peer* created and controls the read end of; a
+/// malicious or stalled peer can shrink it and never drain it. This bounds
+/// how long we keep trying before giving up on that one transfer.
+const SEND_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Write `payload` to a `Send` event's pipe fd, with a deadline.
+///
+/// Mirrors [`read_offer_fd`]'s shape but for the write side: the fd is
+/// switched to non-blocking and polled for `POLLOUT` so a peer that shrinks
+/// its pipe and never reads cannot hang the caller (typically the UI event
+/// loop) forever.
+fn write_offer_fd(fd: OwnedFd, payload: &[u8], deadline: Duration) {
+    use rustix::event::{PollFlags, Timespec};
+    use rustix::fs::OFlags;
+
+    if let Err(err) = rustix::fs::fcntl_setfl(&fd, OFlags::NONBLOCK) {
+        tracing::warn!(%err, "could not set O_NONBLOCK on a selection send pipe; not sending");
+        return;
+    }
+    let until = Instant::now() + deadline;
+    let mut file = std::fs::File::from(fd);
+    let mut written = 0usize;
+    while written < payload.len() {
+        let now = Instant::now();
+        if now >= until {
+            tracing::warn!("a selection send did not finish within its deadline; abandoning it");
+            return;
+        }
+        let remaining = until - now;
+        let borrowed = file.as_fd();
+        let mut fds = [rustix::event::PollFd::new(&borrowed, PollFlags::OUT)];
+        let timespec = Timespec {
+            tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
+            tv_nsec: i64::from(remaining.subsec_nanos()),
+        };
+        match rustix::event::poll(&mut fds, Some(&timespec)) {
+            Ok(0) => {
+                tracing::warn!("a selection send timed out waiting for POLLOUT; abandoning it");
+                return;
+            }
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(err) => {
+                tracing::warn!(%err, "poll failed on a selection send pipe; abandoning it");
+                return;
+            }
+        }
+        match file.write(&payload[written..]) {
+            Ok(0) => {
+                tracing::warn!("a selection send pipe accepted 0 bytes; abandoning it");
+                return;
+            }
+            Ok(n) => written += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => {
+                tracing::warn!(%err, "write failed on a selection send pipe; abandoning it");
+                return;
+            }
+        }
+    }
+}
 
 /// Read a data offer's pipe to EOF, with a deadline.
 ///
@@ -75,6 +141,16 @@ pub fn read_offer_fd(fd: OwnedFd, deadline: Duration) -> Option<String> {
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
+    }
+    // A truncation cut may have landed mid-codepoint; back up to the last
+    // char boundary so a merely-too-long paste doesn't also fail UTF-8
+    // decoding outright and become `None`.
+    if out.len() == MAX_OFFER_BYTES {
+        let mut boundary = out.len();
+        while boundary > 0 && out[boundary - 1] & 0xC0 == 0x80 {
+            boundary -= 1;
+        }
+        out.truncate(boundary);
     }
     // The mime type promises UTF-8; anything else is another client's bug and
     // is dropped rather than lossily mangled into the user's document.
@@ -142,11 +218,12 @@ struct Offscreen {
 }
 
 impl Clipboard {
-    /// # Panics
-    ///
-    /// If `manager` is `None` -- the compositor never advertised
-    /// `wl_data_device_manager`, which is this fail-fast contract's own
-    /// (`harness/src/lib.rs`'s `set_selection_text`) and contract §3.8's.
+    /// Degrades to the in-process [`Clipboard::offscreen`] transport (with a
+    /// warning) when `manager` is `None` -- the compositor never advertised
+    /// `wl_data_device_manager` -- exactly as the primary-selection half
+    /// already does for its own missing manager. Contract §3.8's original
+    /// fail-fast ruling was amended by the M3 review-fix wave: a legal
+    /// minimal compositor costs the app its clipboard, not its life.
     pub(crate) fn new(
         conn: Connection,
         qh: QueueHandle<WindowState>,
@@ -157,7 +234,13 @@ impl Clipboard {
         >,
         shared: Rc<RefCell<ClipboardShared>>,
     ) -> Self {
-        let manager = manager.expect("compositor did not advertise wl_data_device_manager");
+        let Some(manager) = manager else {
+            tracing::warn!(
+                "compositor did not advertise wl_data_device_manager; \
+                 the clipboard degrades to an in-process buffer"
+            );
+            return Self::offscreen();
+        };
         let device = manager.get_data_device(seat, &qh, ());
         let primary_device = primary_manager
             .as_ref()
@@ -207,7 +290,9 @@ impl Clipboard {
             shared.payload = text.to_string();
             shared.source = Some(source);
         }
-        let _ = wl.conn.flush();
+        if let Err(err) = wl.conn.flush() {
+            tracing::warn!(%err, "flush after copy failed; the connection may be dead");
+        }
     }
 
     /// Read the current clipboard offer, if any, blocking on its pipe until
@@ -219,9 +304,13 @@ impl Clipboard {
             Transport::Offscreen(slots) => return slots.selection.clone(),
         };
         let offer = wl.shared.borrow().offer.clone()?;
-        let (read, write) = std::io::pipe().ok()?;
+        let (read, write) = std::io::pipe()
+            .inspect_err(|err| tracing::warn!(%err, "could not create a pipe for a paste"))
+            .ok()?;
         offer.receive(TEXT_MIME.to_string(), write.as_fd());
-        let _ = wl.conn.flush();
+        if let Err(err) = wl.conn.flush() {
+            tracing::warn!(%err, "flush after paste's receive() failed; the connection may be dead");
+        }
         drop(write);
         read_offer_fd(read.into(), deadline)
     }
@@ -250,7 +339,9 @@ impl Clipboard {
             shared.primary_payload = text.to_string();
             shared.primary_source = Some(source);
         }
-        let _ = wl.conn.flush();
+        if let Err(err) = wl.conn.flush() {
+            tracing::warn!(%err, "flush after set_primary failed; the connection may be dead");
+        }
     }
 
     /// As [`Clipboard::paste`], but for the primary selection.
@@ -261,9 +352,13 @@ impl Clipboard {
             Transport::Offscreen(slots) => return slots.primary.clone(),
         };
         let offer = wl.shared.borrow().primary_offer.clone()?;
-        let (read, write) = std::io::pipe().ok()?;
+        let (read, write) = std::io::pipe()
+            .inspect_err(|err| tracing::warn!(%err, "could not create a pipe for a primary paste"))
+            .ok()?;
         offer.receive(TEXT_MIME.to_string(), write.as_fd());
-        let _ = wl.conn.flush();
+        if let Err(err) = wl.conn.flush() {
+            tracing::warn!(%err, "flush after primary's receive() failed; the connection may be dead");
+        }
         drop(write);
         read_offer_fd(read.into(), deadline)
     }
@@ -350,8 +445,7 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WindowState {
             && shared.borrow().source.as_ref() == Some(source)
         {
             let payload = shared.borrow().payload.clone();
-            let mut f = std::fs::File::from(fd);
-            let _ = std::io::Write::write_all(&mut f, payload.as_bytes());
+            write_offer_fd(fd, payload.as_bytes(), SEND_DEADLINE);
         }
     }
 }
@@ -445,15 +539,14 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()> 
             && shared.borrow().primary_source.as_ref() == Some(source)
         {
             let payload = shared.borrow().primary_payload.clone();
-            let mut f = std::fs::File::from(fd);
-            let _ = std::io::Write::write_all(&mut f, payload.as_bytes());
+            write_offer_fd(fd, payload.as_bytes(), SEND_DEADLINE);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TEXT_MIME, read_offer_fd};
+    use super::{TEXT_MIME, read_offer_fd, write_offer_fd};
     use std::io::Write;
     use std::time::Duration;
 
@@ -486,6 +579,38 @@ mod tests {
         assert!(text.is_none() || text.as_deref() == Some(""), "{text:?}");
         assert!(started.elapsed() < Duration::from_secs(2), "it hung");
         drop(write);
+    }
+
+    #[test]
+    fn a_send_to_a_peer_that_never_drains_times_out_instead_of_hanging() {
+        // The read end of a `Send` pipe belongs to the requesting peer. A
+        // malicious or stalled peer can shrink the pipe and never read it;
+        // a blocking write would hang the UI thread forever.
+        let (read, write) = std::io::pipe().expect("pipe");
+        // Bigger than any reasonable pipe buffer, so the write can't just
+        // complete into kernel buffering before the deadline is checked.
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        write_offer_fd(write.into(), &payload, Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(2), "it hung");
+        drop(read);
+    }
+
+    #[test]
+    fn a_send_that_fits_the_pipe_buffer_completes() {
+        let (mut read, write) = std::io::pipe().expect("pipe");
+        let handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut read, &mut buf).expect("read");
+            buf
+        });
+        write_offer_fd(
+            write.into(),
+            "hello wörld".as_bytes(),
+            Duration::from_secs(2),
+        );
+        let received = handle.join().expect("reader thread");
+        assert_eq!(received, "hello wörld".as_bytes());
     }
 
     #[test]

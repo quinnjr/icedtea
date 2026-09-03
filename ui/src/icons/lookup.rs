@@ -13,15 +13,9 @@ use super::theme::{IconFile, IconTheme, SubDir, ThemeIndex};
 use super::{IconFormat, MAX_ICON_PX, SEARCH_EXTENSIONS};
 
 /// The icon every miss falls back to.
-///
-/// Unused outside this module's own tests until a later task's cache wires
-/// `lookup_uncached` in — allowed here rather than deferred, since the plan
-/// places these items in this task.
-#[allow(dead_code)]
 pub(crate) const MISSING_ICON: &str = "image-missing";
 
 /// The longest icon name this will look for.
-#[allow(dead_code)]
 const MAX_ICON_NAME: usize = 255;
 
 /// `true` if `name` can be a file stem: non-empty, no separators, no `.`
@@ -30,7 +24,6 @@ const MAX_ICON_NAME: usize = 255;
 /// Icon names arrive from CSS (`-gtk-icontheme(name)`) and from application
 /// code; joining `../../etc/passwd` onto a theme directory would walk out of
 /// the search roots.
-#[allow(dead_code)]
 pub(crate) fn is_safe_icon_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_ICON_NAME
@@ -43,7 +36,6 @@ pub(crate) fn is_safe_icon_name(name: &str) -> bool {
 
 /// `true` for a `-symbolic` file stem, or any path with a `symbolic`
 /// directory component.
-#[allow(dead_code)]
 pub(crate) fn path_is_symbolic(path: &Path) -> bool {
     let stem_symbolic = path
         .file_stem()
@@ -57,7 +49,6 @@ pub(crate) fn path_is_symbolic(path: &Path) -> bool {
 
 /// The first existing `<root>/<theme>/<subdir>/<name>.<ext>`, in the spec's
 /// extension order and the roots' own order.
-#[allow(dead_code)]
 fn first_existing(
     theme: &IconTheme,
     theme_name: &str,
@@ -76,7 +67,6 @@ fn first_existing(
 }
 
 /// Build the `IconFile` for a hit in `subdir`.
-#[allow(dead_code)]
 fn icon_file(subdir: &SubDir, path: PathBuf, format: IconFormat) -> IconFile {
     IconFile {
         symbolic: path_is_symbolic(&path),
@@ -90,7 +80,6 @@ fn icon_file(subdir: &SubDir, path: PathBuf, format: IconFormat) -> IconFile {
 
 /// The spec's `FindIconHelper` for one theme: the exact-match pass, then that
 /// same theme's minimum-distance candidate.
-#[allow(dead_code)]
 fn find_in_theme(
     theme: &IconTheme,
     index: &ThemeIndex,
@@ -124,7 +113,6 @@ fn find_in_theme(
 }
 
 /// `<pixmaps>/<name>.<ext>`, the flat non-themed last resort.
-#[allow(dead_code)]
 fn find_pixmap(theme: &IconTheme, name: &str, size: u32) -> Option<IconFile> {
     for format in SEARCH_EXTENSIONS {
         let file = format!("{name}.{}", format.extension());
@@ -146,7 +134,6 @@ fn find_pixmap(theme: &IconTheme, name: &str, size: u32) -> Option<IconFile> {
 }
 
 /// One name, searched through the whole chain and then the pixmaps.
-#[allow(dead_code)]
 fn find_one(theme: &IconTheme, name: &str, size: u32, scale: u32) -> Option<IconFile> {
     if !is_safe_icon_name(name) {
         return None;
@@ -171,7 +158,6 @@ fn find_one(theme: &IconTheme, name: &str, size: u32, scale: u32) -> Option<Icon
 ///
 /// `None` means the icon, *and* `image-missing`, are absent everywhere — the
 /// caller draws nothing rather than a made-up path.
-#[allow(dead_code)]
 pub(crate) fn lookup_uncached(
     theme: &IconTheme,
     name: &str,
