@@ -391,6 +391,11 @@ pub struct App<M, Msg> {
     sheet: Option<CompiledSheet>,
     fonts: Option<FontDatabase>,
     icons: Option<IconTheme>,
+    /// External messages (M5-D2). At most one per app.
+    inbox: Option<crate::view::inbox::Inbox<Msg>>,
+    /// `FdReady(id)` → messages (M5-D2's `on_fd`).
+    #[allow(clippy::type_complexity, reason = "one boxed closure per watched fd")]
+    fd_handlers: Vec<(crate::window::WatchId, Box<dyn Fn() -> Vec<Msg>>)>,
 }
 
 impl<M: std::fmt::Debug, Msg> std::fmt::Debug for App<M, Msg> {
@@ -557,6 +562,8 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             sheet: None,
             fonts: None,
             icons: None,
+            inbox: None,
+            fd_handlers: Vec::new(),
         }
     }
 
@@ -579,6 +586,20 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     #[must_use]
     pub fn with_icons(mut self, icons: IconTheme) -> Self {
         self.icons = Some(icons);
+        self
+    }
+
+    /// Feed `inbox`'s messages into this app's loop.
+    ///
+    /// At most one inbox per app; a second call replaces the first. `Msg: Send`
+    /// is what makes a worker thread able to hold the sender, and is why an M5
+    /// message carries `Arc<T>` and never `Rc<T>`.
+    #[must_use]
+    pub fn with_inbox(mut self, inbox: crate::view::inbox::Inbox<Msg>) -> Self
+    where
+        Msg: Send,
+    {
+        self.inbox = Some(inbox);
         self
     }
 
@@ -777,6 +798,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
         )?;
 
         for step in script {
+            // The same drain, at the same point: an ingress test needs no
+            // compositor (M5-D2 §5).
+            drain_inbox(&self, &mut rt);
             let mut capture = false;
             match step {
                 ScriptStep::Capture => capture = true,
@@ -1436,6 +1460,19 @@ fn route<Msg: Clone + 'static>(
     out
 }
 
+/// M5-D2 §3 steps (a) and (b): read the wake pipe empty, then move every
+/// queued message onto the fold queue **in send order**.
+///
+/// Called once per loop iteration, before any input is routed, so a message a
+/// worker produced is folded against the same model the frame's clicks are.
+fn drain_inbox<M, Msg>(app: &App<M, Msg>, rt: &mut Runtime<Msg>) {
+    let Some(inbox) = app.inbox.as_ref() else {
+        return;
+    };
+    inbox.drain_pipe();
+    inbox.drain_into(&mut rt.queue);
+}
+
 /// Fold every queued message, run the commands they produced, and rebuild
 /// the view **once** per drained batch (contract §4.7).
 ///
@@ -1579,6 +1616,18 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
 
         rebuild(&mut self, &mut rt, &sheet, &mut fonts, &mut icons, &clock);
 
+        // M5-D2 §2: the inbox's wake pipe joins the window's poll set, and
+        // leaves it on the way out.
+        let inbox_watch = match self.inbox.as_ref().map(crate::view::inbox::Inbox::watch_fd) {
+            Some(Ok(fd)) => Some(window.watch_fd(fd, crate::window::Interest::Read)),
+            Some(Err(err)) => {
+                tracing::warn!(%err, "the inbox pipe could not be registered; \
+                                      its messages will only be seen on other wakeups");
+                None
+            }
+            None => None,
+        };
+
         // Bug fix (found while wiring `gallery::run`, the first real caller
         // of this loop against a live compositor): a page with no running
         // animation or key-repeat has `frame_deadline` return `None` on the
@@ -1606,6 +1655,18 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 wait = Some(wait.unwrap_or(Duration::ZERO));
             }
             let events = window.pump(wait)?;
+
+            // M5-D2 §3: inbox first, then `on_fd`, then the input batch.
+            drain_inbox(&self, &mut rt);
+            for event in &events {
+                if let InputEvent::FdReady(id) = event {
+                    for (watch, handler) in &self.fd_handlers {
+                        if watch == id {
+                            rt.queue.extend(handler());
+                        }
+                    }
+                }
+            }
 
             for event in &events {
                 if matches!(event, InputEvent::Close) {
@@ -1823,6 +1884,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                     );
                 })?;
             }
+        }
+        if let Some(id) = inbox_watch {
+            window.unwatch(id);
         }
         Ok(())
     }

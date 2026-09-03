@@ -5195,3 +5195,13 @@ whose rest are `Window::watch_fd` registrations, reported as
 `new(model, update: fn(..), view: fn(..))` (this file, l. 1516-1521) becomes
 `impl FnMut`/`impl Fn`, a strict widening: every `fn`-item call site compiles
 unchanged. Full text: M5 contract §1 M5-D4.
+
+### M5-D2 — `App` grows an external-message hook (§4.7 had none)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §4.7's loop had no way for a
+worker thread to reach `update`; `App::with_inbox` and `App::on_fd` add one, on
+a normative per-frame drain order — the inbox's wake pipe, then its channel in
+send order, then `on_fd` messages, then the frame's own input batch, folded
+once. `run` registers the pipe with `Window::watch_fd` and unwatches it on
+exit; `run_offscreen` drains at the same point so an ingress test needs no
+compositor. Full text: M5 contract §1 M5-D2.

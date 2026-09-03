@@ -315,6 +315,12 @@ the loop and the channel is the queue. A `send` after the app exits returns the
 message rather than panicking. `Msg` must be `Send`, which means a message
 carries `Arc<T>`, never `Rc<T>`.
 
+Delivery order inside one frame is normative: the inbox's messages are folded
+first, in send order, then any `on_fd` messages, then the frame's input batch —
+so a click never runs against a model that has not yet seen the worker update
+that arrived on the same wake. `run_offscreen` drains at the same point, which
+is what makes an ingress test compositor-free.
+
 ## Fonts and text
 
 - **Font discovery is real fontconfig.** `text::FontDatabase` builds one
