@@ -1686,6 +1686,7 @@ name = "icedtea-ui"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
+ "crossbeam-channel",
  "cssparser",
  "fontconfig",
  "icedtea-compositor",

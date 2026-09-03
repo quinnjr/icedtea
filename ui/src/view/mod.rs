@@ -36,6 +36,7 @@ pub mod app;
 pub mod builders;
 pub mod cmd;
 pub mod controller;
+pub mod inbox;
 pub mod reconcile;
 pub mod render;
 
@@ -43,6 +44,7 @@ pub use app::{App, AppError, Frames, ScriptStep};
 pub use builders::widget;
 pub use cmd::Cmd;
 pub use controller::{Controller, Event, EventCx, Phase};
+pub use inbox::{Inbox, InboxSender, SendError};
 pub use reconcile::{BuildCx, Instance, Op, containers_of, reconcile};
 pub use render::{Animations, NodeAddr, StyleMap, node_addr};
 

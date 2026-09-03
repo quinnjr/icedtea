@@ -2034,6 +2034,21 @@ P0's eleven items above are the pre-declared set and are already numbered
 `M5-D1 … M5-D11`; a part's own discoveries start at `P1-D1`, `P4-D1`, and so on,
 so the two sets never collide.)*
 
+### P0-D5 — no `unsafe impl Send for InboxSender`
+
+M5-D2's sketch includes `unsafe impl<Msg: Send> Send for InboxSender<Msg> {}`.
+`crossbeam_channel::Sender<T>` is `Send` for `T: Send` and `Arc<OwnedFd>` is
+`Send + Sync`, so the auto impl already holds; an unnecessary `unsafe` block
+is not written. Carried out by P0 (Task 3).
+
+### P0-D6 — `Inbox` keeps its own dup of the pipe's read end
+
+M5-D2 has `App::run` register "the inbox's read end" with `watch_fd`, which
+takes ownership — after which nothing could drain the pipe. Shipped: `Inbox`
+holds the read end and hands `watch_fd` a `try_clone()` of it (CLOEXEC, same
+open file description), so the poll set and the drain both see the same
+pipe. Carried out by P0 (Task 3).
+
 ---
 
 ## 7. Execution notes

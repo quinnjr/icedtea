@@ -294,6 +294,22 @@ what `ui/tests/counter_app.rs` and every controller unit test use.
 Widget builders (`button("Ok")`, `label("Hi")`, …) arrive with P5 and P6;
 `view::builders`' module docs carry the naming rule they follow.
 
+### External events
+
+A worker thread reaches the loop through an inbox:
+
+```rust
+let (inbox, tx) = Inbox::new()?;                  // tx: Send + Clone
+std::thread::spawn(move || { tx.send(Msg::Reloaded)?; Ok::<_, SendError<Msg>>(()) });
+App::new(model, update, view).with_inbox(inbox).run(window)?;
+```
+
+`send` pushes onto an unbounded channel and writes one byte to a wake pipe the
+window polls; a full pipe is not an error, because the byte already in it wakes
+the loop and the channel is the queue. A `send` after the app exits returns the
+message rather than panicking. `Msg` must be `Send`, which means a message
+carries `Arc<T>`, never `Rc<T>`.
+
 ## Fonts and text
 
 - **Font discovery is real fontconfig.** `text::FontDatabase` builds one
