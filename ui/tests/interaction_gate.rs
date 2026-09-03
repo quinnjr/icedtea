@@ -581,28 +581,21 @@ fn settled_row(driver: &mut Driver, x0: i32, x1: i32, y: i32) -> Vec<(u8, u8, u8
 /// A band rather than one pixel, for [`support::Driver::row`]'s reason: a row
 /// is a glyph run, and a glyph row is mostly background between the stems.
 ///
-/// **Ignored: nothing in this compositor stack can deliver a scroll.**
-/// Everything above the two `driver.scroll` calls passes today — the row is
-/// clicked, `selected list_view 1` reaches the model, and the `:selected`
-/// band paints — and then the axis event goes nowhere. Traced end to end
-/// with a print at the top of `view::app`'s `dispatch_input`: injecting
-/// `zwlr_virtual_pointer_v1.axis` + `frame` delivers `PointerEnter` and
-/// nothing else, ever. The gap is below this crate and below the compositor
-/// in this repo: `wlr` 0.20.28 (`compositor/Cargo.toml`) never subscribes to
-/// a pointer's `events.axis` and never calls `wlr_seat_pointer_notify_axis`
-/// — `grep -c axis` over its whole `src/` finds only comments about layout
-/// axes — so no Wayland client under this compositor has ever received a
-/// `wl_pointer.axis`, and `Driver::scroll` (which no other test in the crate
-/// calls) has never worked. Closing it means a `wlr` release, which this
-/// branch cannot make; it is recorded as contract §10 **P8-D74**.
+/// **History: this test shipped `#[ignore]`d in M3.** Everything above the
+/// two `driver.scroll` calls passed, and then the axis event went nowhere:
+/// `wlr` 0.20.28 never subscribed to a pointer's `events.axis` and never
+/// called `wlr_seat_pointer_notify_axis`, so no Wayland client under this
+/// compositor had ever received a `wl_pointer.axis`, and `Driver::scroll`
+/// (which no other test in the crate calls) had never worked. Contract §10
+/// **P8-D74** carries the full trace. `wlr` 0.20.29 forwards the axis (and
+/// its frame) through `SeatHandler::pointer_axis`, and this test runs.
 ///
-/// The interaction itself is *not* untested. `widgets::list_view::tests::
-/// pixels::scrolling_recycles_the_pooled_rows_and_keeps_the_selection`
-/// proves exactly this behaviour — a click that paints a selection, a scroll
-/// that repaints the view with other rows, and a scroll home that brings the
-/// selected one back pixel for pixel — through a real `App`, a real layout
-/// pass and a real paint, on the offscreen surface, where the scroll can be
-/// delivered. Un-`ignore` this the day the transport exists.
+/// The same behaviour is also proven offscreen by `widgets::list_view::
+/// tests::pixels::scrolling_recycles_the_pooled_rows_and_keeps_the_selection`
+/// — a click that paints a selection, a scroll that repaints the view with
+/// other rows, and a scroll home that brings the selected one back pixel for
+/// pixel — through a real `App`, layout and paint with no compositor at all.
+/// This test is the same story through the real transport.
 ///
 /// Mutation check 1 (recycling): make `ListViewC::adopt_metrics` take its
 /// viewport from `alloc.content_box.height` again; the view sizes itself to
@@ -613,7 +606,6 @@ fn settled_row(driver: &mut Driver, x0: i32, x1: i32, y: i32) -> Vec<(u8, u8, u8
 /// background, and the last assertion fails. Restore both. (Both are checked
 /// today by the offscreen test named above.)
 #[test]
-#[ignore = "no wl_pointer.axis transport: wlr 0.20.28 never forwards one (P8-D74)"]
 fn scrolling_a_list_view_recycles_rows_without_losing_selection() {
     let mut driver = Driver::new();
     let gallery = driver.open("light", "list_view");

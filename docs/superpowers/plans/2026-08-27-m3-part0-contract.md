@@ -4698,6 +4698,15 @@ mutation checks were verified to fail.
 **Un-ignore it** the day `wlr` forwards an axis event; nothing else in the
 test needs to change.
 
+**Closed (2026-09-03).** `wlr` 0.20.29 links every pointer's `events.axis`
+(physical and virtual alike), emits it to the new defaulted
+`SeatHandler::pointer_axis`, and forwards it with
+`wlr_seat_pointer_notify_axis` + `wlr_seat_pointer_notify_frame` —
+additive, so `compositor/src/state.rs`'s `impl SeatHandler` needed no
+change. The pins moved 0.20.28 → 0.20.29, the `#[ignore]` came off, and
+`interaction_gate.rs` runs all sixteen of §7's tests. Exactly as predicted,
+nothing else in the test changed.
+
 
 ### P8-D75 — §4.3's universal props are applied centrally, not per controller
 
