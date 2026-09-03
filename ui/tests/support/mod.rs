@@ -220,6 +220,32 @@ pub fn spawn_window_probe(
     )
 }
 
+/// `spawn_window_probe`, plus extra argv flags.
+///
+/// The probe's modes are environment-driven and its *variants within a mode*
+/// are argv-driven, so a test can ask for two watches or a silent one without
+/// a new mode name.
+#[must_use]
+pub fn spawn_window_probe_with(
+    socket: &str,
+    mode: &str,
+    theme: &std::path::Path,
+    report: &std::path::Path,
+    args: &[&str],
+) -> Reaper {
+    Reaper(
+        Command::new(env!("CARGO_BIN_EXE_window-probe"))
+            .args(args)
+            .env("WAYLAND_DISPLAY", socket)
+            .env("ICEDTEA_UI_THEME", theme)
+            .env("ICEDTEA_PROBE_MODE", mode)
+            .env("ICEDTEA_PROBE_REPORT", report)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn window-probe"),
+    )
+}
+
 /// Every line the probe has reported so far.
 #[must_use]
 pub fn probe_report(path: &std::path::Path) -> Vec<String> {

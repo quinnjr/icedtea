@@ -20,7 +20,7 @@ use icedtea_ui::window::focus::{
     Binding, FOCUSABLE_CLASS, FocusCause, FocusRing, navigate, window_binding,
 };
 use icedtea_ui::window::popup::{PopupAnchorPoint, Positioner};
-use icedtea_ui::window::{InputEvent, Role, SurfaceSpec, Window};
+use icedtea_ui::window::{InputEvent, Interest, Role, SurfaceSpec, Window};
 
 fn report(line: &str) {
     let Ok(path) = std::env::var("ICEDTEA_PROBE_REPORT") else {
@@ -45,7 +45,7 @@ fn main() {
     let sheet = compile_theme(&theme);
     let fonts = FontDatabase::new();
 
-    let mut window = Window::open(
+    let window = Window::open(
         SurfaceSpec {
             role: Role::Toplevel,
             size: (400, 200),
@@ -57,6 +57,14 @@ fn main() {
     )
     .expect("the probe could not open its window");
 
+    let two_watches = std::env::args().any(|a| a == "--two-watches");
+    let silent_watch = std::env::args().any(|a| a == "--silent-watch");
+    if mode == "ingress" {
+        run_ingress(window, two_watches, silent_watch);
+        return;
+    }
+
+    let mut window = window;
     // window > box > (entry > text), (menubutton > label)
     let root = window.root().clone();
     let container = Node::new("box");
@@ -170,4 +178,142 @@ fn main() {
             return;
         }
     }
+}
+
+/// `ICEDTEA_PROBE_MODE=ingress`: exercise `Window::watch_fd`/`unwatch` against
+/// a real compositor and report what the loop saw.
+///
+/// The pipes are written from a helper thread rather than from the loop, which
+/// is the shape a real worker has: the loop must learn about them only through
+/// `poll`.
+fn run_ingress(mut window: Window, two_watches: bool, silent_watch: bool) {
+    use rustix::pipe::{PipeFlags, pipe_with};
+    use std::time::{Duration, Instant};
+
+    // An id the window cannot have live: registered, then immediately
+    // retired. `WatchId` is opaque and ids are never reused, so it stays dead
+    // and `unwatch`ing it twice is the "unknown id" case M5-D1 §4 names.
+    let (scratch_read, _scratch_write) =
+        pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("scratch pipe");
+    let stale = window.watch_fd(scratch_read, Interest::Read);
+    window.unwatch(stale);
+    let before = window.watches().len();
+    window.unwatch(stale);
+    if window.watches().len() == before {
+        report("unwatch-unknown-ok");
+    }
+
+    let (read_a, write_a) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("pipe a");
+    let id_a = window.watch_fd(read_a, Interest::Read);
+    report(&format!("watch-registered {}", id_index(id_a)));
+    let mut id_b = None;
+    let mut write_b = None;
+    if two_watches {
+        let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("pipe b");
+        let id = window.watch_fd(read, Interest::Read);
+        report(&format!("watch-registered {}", id_index(id)));
+        id_b = Some(id);
+        write_b = Some(write);
+    }
+
+    // The writer: one byte on each pipe, a little after the loop starts, so
+    // the wake is a real poll wake and not a leftover from before it.
+    if !silent_watch {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            let _ = rustix::io::write(&write_a, b"x");
+            if let Some(write_b) = write_b {
+                let _ = rustix::io::write(&write_b, b"x");
+            }
+        });
+    }
+
+    let started = Instant::now();
+    let mut wakes: u64 = 0;
+    let mut seen_ready = false;
+    let mut unwatched = false;
+    let mut quiet_from: Option<Instant> = None;
+    let mut frames = 0_u32;
+    loop {
+        if window.render().is_err() {
+            return;
+        }
+        // A bounded wait even when nothing is scheduled, so the idle-wake
+        // count below is a count of *this* loop's polls, not of a block.
+        let timeout = Some(
+            window
+                .next_deadline()
+                .unwrap_or(Duration::from_millis(50))
+                .min(Duration::from_millis(50)),
+        );
+        let Ok(events) = window.pump(timeout) else {
+            return;
+        };
+        wakes += 1;
+        let mut batch_ready: Vec<u64> = Vec::new();
+        for event in events {
+            match event {
+                InputEvent::Configure { size, states } => {
+                    report(&format!("configure {} {} {states:?}", size.0, size.1));
+                }
+                InputEvent::Frame { now } => {
+                    if frames < 3 {
+                        frames += 1;
+                        report(&format!("frame {}", now.as_micros()));
+                    }
+                }
+                InputEvent::FdReady(id) => {
+                    batch_ready.push(id_index(id));
+                    report(&format!("fd-ready {}", id_index(id)));
+                }
+                InputEvent::Close => return,
+                _ => {}
+            }
+        }
+        if batch_ready.len() == 2 {
+            report(&format!("fd-pair {} {}", batch_ready[0], batch_ready[1]));
+        }
+        if !batch_ready.is_empty() {
+            seen_ready = true;
+        }
+        // Once the readiness has been observed, unwatch *without* draining the
+        // pipe: a still-readable fd that no longer wakes the loop is the whole
+        // point of the assertion.
+        if seen_ready && !unwatched {
+            window.unwatch(id_a);
+            if let Some(id) = id_b {
+                window.unwatch(id);
+            }
+            unwatched = true;
+            report(&format!("unwatched {}", id_index(id_a)));
+            quiet_from = Some(Instant::now());
+        }
+        if let Some(from) = quiet_from
+            && from.elapsed() > Duration::from_millis(500)
+        {
+            report("fd-quiet");
+            quiet_from = None;
+        }
+        if silent_watch && started.elapsed() > Duration::from_secs(1) {
+            report(&format!("wakes {wakes}"));
+            return;
+        }
+        if unwatched && quiet_from.is_none() && !silent_watch {
+            report(&format!("wakes {wakes}"));
+            return;
+        }
+        if window.is_closed() {
+            return;
+        }
+    }
+}
+
+/// A `WatchId`'s report form. `WatchId` is opaque, so the probe prints its
+/// `Debug` payload — the only stable, orderable thing a consumer can quote.
+fn id_index(id: icedtea_ui::window::WatchId) -> u64 {
+    format!("{id:?}")
+        .trim_start_matches("WatchId(")
+        .trim_end_matches(')')
+        .parse()
+        .unwrap_or(u64::MAX)
 }
