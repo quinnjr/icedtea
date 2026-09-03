@@ -269,6 +269,11 @@ fn update(model: &mut Model, msg: Msg) -> Cmd<Msg> {
 App::new(Model { n: 0 }, update, view).run(window)?;
 ```
 
+`App::new` takes `impl FnMut(&mut M, Msg) -> Cmd<Msg>` and `impl Fn(&M) ->
+View<Msg>`, so an `update` can capture worker senders or a swappable command
+trait object. Plain `fn` items still coerce, which is what the gallery and the
+counter test use.
+
 Messages are queued and folded one at a time — an `update` that produces a
 `Cmd` producing a `Msg` enqueues it; the fold never re-enters. Commands run
 where they can: the clipboard, timer and focus ones inside the fold, the

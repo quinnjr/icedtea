@@ -372,11 +372,22 @@ impl<Msg> Probe<Msg> {
     }
 }
 
+/// `App::update`'s field type (M5-D4). Named so `clippy::type_complexity`
+/// does not fire on the inline `Box<dyn FnMut(..)>` in the struct.
+type UpdateFn<M, Msg> = Box<dyn FnMut(&mut M, Msg) -> Cmd<Msg>>;
+/// `App::view`'s field type (M5-D4); see [`UpdateFn`].
+type ViewFn<M, Msg> = Box<dyn Fn(&M) -> View<Msg>>;
+
 /// The Elm loop over a retained tree.
 pub struct App<M, Msg> {
     model: M,
-    update: fn(&mut M, Msg) -> Cmd<Msg>,
-    view: fn(&M) -> View<Msg>,
+    /// Boxed, not a `fn` pointer (M5-D4): both M5 apps capture — settings a
+    /// `WorkerHandles`, shell an `Rc<dyn CompositorCommands>` its tests swap.
+    /// `FnMut`, because an `update` may own counters and senders.
+    update: UpdateFn<M, Msg>,
+    /// `Fn`, not `FnMut`: `view` runs during reconcile while the model is
+    /// borrowed, and must not mutate.
+    view: ViewFn<M, Msg>,
     sheet: Option<CompiledSheet>,
     fonts: Option<FontDatabase>,
     icons: Option<IconTheme>,
@@ -534,11 +545,15 @@ impl<Msg: Clone + 'static> NodePainter for ControllerPainter<'_, Msg> {
 impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     /// A new app over `model`, folded by `update`, described by `view`.
     #[must_use]
-    pub fn new(model: M, update: fn(&mut M, Msg) -> Cmd<Msg>, view: fn(&M) -> View<Msg>) -> Self {
+    pub fn new(
+        model: M,
+        update: impl FnMut(&mut M, Msg) -> Cmd<Msg> + 'static,
+        view: impl Fn(&M) -> View<Msg> + 'static,
+    ) -> Self {
         App {
             model,
-            update,
-            view,
+            update: Box::new(update),
+            view: Box::new(view),
             sheet: None,
             fonts: None,
             icons: None,

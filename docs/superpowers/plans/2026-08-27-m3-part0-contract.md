@@ -5188,3 +5188,10 @@ wlr 0.20.28 (commit 02b1c90 on feature/wlr-xdg-popup). P2's
 whose rest are `Window::watch_fd` registrations, reported as
 `InputEvent::FdReady(WatchId)`. Full text:
 `docs/superpowers/plans/2026-09-03-m5-part0-contract.md` §1 M5-D1.
+
+### M5-D4 — `App::new` takes closures, not `fn` pointers (amends §4.7)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §4.7's
+`new(model, update: fn(..), view: fn(..))` (this file, l. 1516-1521) becomes
+`impl FnMut`/`impl Fn`, a strict widening: every `fn`-item call site compiles
+unchanged. Full text: M5 contract §1 M5-D4.

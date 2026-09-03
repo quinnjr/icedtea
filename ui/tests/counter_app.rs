@@ -186,3 +186,62 @@ fn a_click_outside_every_child_changes_nothing() {
         }
     }
 }
+
+/// M5-D4: an `update` may capture. Both M5 apps need it — settings holds
+/// worker senders, shell holds `Rc<dyn CompositorCommands>` so a test can
+/// swap the mock in.
+///
+/// mutation: change `App::new`'s `update` parameter back to
+/// `fn(&mut M, Msg) -> Cmd<Msg>`; this stops compiling ("expected fn
+/// pointer, found closure").
+#[test]
+fn a_closure_capturing_state_drives_the_loop() {
+    use std::cell::RefCell;
+
+    use icedtea_ui::BUNDLED_ADWAITA_LIGHT;
+    use icedtea_ui::widgets::label::label;
+
+    let seen: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
+    let recorder = Rc::clone(&seen);
+    let clock = Rc::new(ManualClock::new());
+    let frames = App::new(
+        0_u32,
+        move |model: &mut u32, msg: u32| {
+            *model += msg;
+            recorder.borrow_mut().push(*model);
+            Cmd::None
+        },
+        |model: &u32| label(&model.to_string()),
+    )
+    .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+    .run_offscreen(
+        (120, 40),
+        clock,
+        vec![
+            ScriptStep::Message(2),
+            ScriptStep::Message(3),
+            ScriptStep::Capture,
+        ],
+    )
+    .expect("the offscreen app runs");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(*seen.borrow(), vec![2, 5], "the closure kept its capture");
+}
+
+/// The widening must not break the `fn`-item call sites: the gallery, this
+/// file's own counter and every widget test pass plain `fn`s.
+///
+/// mutation: make `App::new` take `Box<dyn FnMut…>` directly instead of
+/// `impl FnMut…`; every existing call site stops compiling.
+#[test]
+fn an_fn_item_still_coerces_into_app_new() {
+    fn update(model: &mut u32, msg: u32) -> Cmd<u32> {
+        *model += msg;
+        Cmd::None
+    }
+    fn view(model: &u32) -> View<u32> {
+        icedtea_ui::widgets::label::label(&model.to_string())
+    }
+    let app = App::new(7_u32, update, view);
+    assert_eq!(*app.model(), 7);
+}
