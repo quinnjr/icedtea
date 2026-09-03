@@ -533,6 +533,23 @@ M1's `LayerWindow` is unchanged, at `window::layer` and still reachable as
 `wayland::LayerWindow`; the `themed-button` demo and its pixel gate run on it
 exactly as before.
 
+### Watching a foreign fd
+
+A window polls its own Wayland connection *and* any fd its owner registers:
+
+```rust
+let id = window.watch_fd(fd, Interest::Read);   // the window owns `fd` now
+// … `window.pump(..)` now yields `InputEvent::FdReady(id)` when it is ready …
+window.unwatch(id);                              // drops the watch, closes the fd
+```
+
+Element 0 of the poll set is always the connection, so a Wayland wake is never
+starved by a chatty watch; `FdReady`s come after the Wayland events of the same
+wake, one per ready watch, in registration order. `HUP` and `ERR` are reported
+as readiness whatever the `Interest`: the toolkit never decides a foreign fd is
+dead, it tells the owner, who calls `unwatch`. Nothing here adds a timer, so a
+registered-but-silent fd costs zero wakeups.
+
 Not covered here: input methods (`text-input-v3`), drag and drop, client-side
 cursor themes (M6/see below).
 

@@ -641,6 +641,14 @@ pub enum InputEvent {
     },
     SelectionChanged,
     PrimaryChanged,
+    /// A watched fd is ready.
+    ///
+    /// Carries no readiness flags on purpose: the owner of the fd is the only
+    /// thing that knows what to do with it, and re-encoding `revents` here
+    /// would invite the toolkit to interpret a foreign protocol. One event per
+    /// ready watch per [`Window::pump`] batch, in registration order, after
+    /// whatever Wayland events the same wake dispatched.
+    FdReady(WatchId),
 }
 
 impl InputEvent {
@@ -806,6 +814,82 @@ impl WindowState {
     }
 }
 
+/// Opaque handle for one fd registered with [`Window::watch_fd`].
+///
+/// Ids are minted per window and never reused, so a stale id from a dropped
+/// watch can never name a later one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WatchId(u64);
+
+/// What a watch waits for.
+///
+/// `Read` is readability, `Write` writability, `ReadWrite` either. `HUP` and
+/// `ERR` are always reported whatever the interest, and always arrive as an
+/// [`InputEvent::FdReady`] — the toolkit never decides on its own that a
+/// foreign fd is dead. It reports, and the owner calls [`Window::unwatch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Interest {
+    /// Readable, or hung up.
+    Read,
+    /// Writable.
+    Write,
+    /// Either.
+    ReadWrite,
+}
+
+impl Interest {
+    fn flags(self) -> rustix::event::PollFlags {
+        use rustix::event::PollFlags;
+        match self {
+            Interest::Read => PollFlags::IN,
+            Interest::Write => PollFlags::OUT,
+            Interest::ReadWrite => PollFlags::IN | PollFlags::OUT,
+        }
+    }
+}
+
+/// One registered fd: the window owns it until [`Window::unwatch`] drops it.
+struct Watch {
+    id: WatchId,
+    fd: std::os::fd::OwnedFd,
+    flags: rustix::event::PollFlags,
+}
+
+/// Every live watch, in registration order.
+#[derive(Default)]
+struct Watches {
+    entries: Vec<Watch>,
+    next: u64,
+}
+
+impl Watches {
+    fn add(&mut self, fd: std::os::fd::OwnedFd, interest: Interest) -> WatchId {
+        let id = WatchId(self.next);
+        self.next += 1;
+        self.entries.push(Watch {
+            id,
+            fd,
+            flags: interest.flags(),
+        });
+        id
+    }
+
+    /// Drop the watch and close its fd. An unknown id is a no-op, not a panic:
+    /// an owner that unwatches twice is not a protocol error (M5-D1 §4).
+    fn remove(&mut self, id: WatchId) {
+        self.entries.retain(|w| w.id != id);
+    }
+
+    fn ids(&self) -> Vec<WatchId> {
+        self.entries.iter().map(|w| w.id).collect()
+    }
+
+    fn entries(&self) -> impl Iterator<Item = &Watch> {
+        self.entries.iter()
+    }
+}
+
 /// Block until `ready`, the surface closes, or `timeout` expires.
 ///
 /// wayland-client 0.31's bounded-wait shape: dispatch what is queued,
@@ -817,6 +901,9 @@ fn wait_bounded(
     queue: &mut EventQueue<WindowState>,
     state: &mut WindowState,
     timeout: Duration,
+    // M5-D1: the extra fds this window's owner registered. Empty for
+    // `Window::open`, which has no owner yet.
+    watches: &Watches,
     ready: impl Fn(&WindowState) -> bool,
 ) -> Result<(), SurfaceError> {
     use rustix::event::{PollFlags, Timespec};
@@ -826,10 +913,17 @@ fn wait_bounded(
     // `Instant + Duration::MAX` panics: an unrepresentable deadline is `None`,
     // which polls without a timespec rather than overflowing.
     let deadline = Instant::now().checked_add(timeout);
+    // M5-D1: watches that fired on the *previous* poll, published after the
+    // dispatch below so a batch reads "Wayland events first, then FdReady",
+    // which is the order M5-D1 §3 fixes.
+    let mut fired: Vec<WatchId> = Vec::new();
     loop {
         queue
             .dispatch_pending(state)
             .map_err(SurfaceError::Dispatch)?;
+        state
+            .events
+            .extend(fired.drain(..).map(InputEvent::FdReady));
         if state.closed {
             return Err(SurfaceError::Closed);
         }
@@ -852,22 +946,45 @@ fn wait_bounded(
         };
 
         let fd = queue.as_fd();
-        let mut fds = [rustix::event::PollFd::new(&fd, PollFlags::IN)];
+        // M5-D1: element 0 is always the Wayland queue's fd; elements 1..
+        // are the watches in registration order, which is what makes
+        // `fds[index + 1]` name `watches.entries().nth(index)`.
+        let mut fds = Vec::with_capacity(1 + watches.entries().count());
+        fds.push(rustix::event::PollFd::new(&fd, PollFlags::IN));
+        for watch in watches.entries() {
+            fds.push(rustix::event::PollFd::new(&watch.fd, watch.flags));
+        }
         let timespec = remaining.map(|remaining| Timespec {
             tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
             tv_nsec: i64::from(remaining.subsec_nanos()),
         });
         match rustix::event::poll(&mut fds, timespec.as_ref()) {
-            // Only reachable with a timespec: a `None` deadline means poll
-            // blocks until the fd speaks.
             Ok(0) => return Err(SurfaceError::Timeout(timeout)),
-            Ok(_) => match guard.read() {
-                Ok(_) => {}
-                // A racing reader on another queue drained the socket.
-                Err(wayland_client::backend::WaylandError::Io(err))
-                    if err.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(err) => return Err(socket_error(err)),
-            },
+            Ok(_) => {
+                // M5-D1: a wake caused only by a watch must not read the
+                // Wayland socket — `guard.read()` on a socket with nothing to
+                // say is at best a wasted syscall and at worst a block.
+                // Dropping the guard cancels the read intent.
+                if fds[0].revents().is_empty() {
+                    drop(guard);
+                } else {
+                    match guard.read() {
+                        Ok(_) => {}
+                        // A racing reader on another queue drained the socket.
+                        Err(wayland_client::backend::WaylandError::Io(err))
+                            if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(err) => return Err(socket_error(err)),
+                    }
+                }
+                // M5-D1 §2/§3: one `FdReady` per ready watch, whatever bits
+                // are set (`HUP`/`ERR` included, which poll reports without
+                // being asked). Published at the top of the next iteration.
+                for (index, watch) in watches.entries().enumerate() {
+                    if !fds[index + 1].revents().is_empty() {
+                        fired.push(watch.id);
+                    }
+                }
+            }
             Err(rustix::io::Errno::INTR) => {}
             Err(err) => return Err(SurfaceError::Socket(err.into())),
         }
@@ -933,6 +1050,8 @@ pub struct Window {
     /// glyphs on a real surface: one shaped run per node. P5 deletes this
     /// field in the commit that lands `TextLayout`.
     texts: std::collections::HashMap<NodeAddr, String>,
+    /// Foreign fds this window polls alongside its own connection (M5-D1).
+    watches: Watches,
 }
 
 /// How long [`Window::open`] waits for the first `configure`.
@@ -1032,9 +1151,14 @@ impl Window {
         wl_surface.commit();
         conn.flush().map_err(socket_error)?;
 
-        wait_bounded(&conn, &mut queue, &mut state, CONFIGURE_TIMEOUT, |state| {
-            state.configured.is_some()
-        })?;
+        wait_bounded(
+            &conn,
+            &mut queue,
+            &mut state,
+            CONFIGURE_TIMEOUT,
+            &Watches::default(),
+            |state| state.configured.is_some(),
+        )?;
         let (width, height) = state.configured.map_or((width, height), |(w, h)| {
             (
                 i32::try_from(w.max(1)).unwrap_or(width),
@@ -1076,6 +1200,7 @@ impl Window {
             next_popup_key: 1,
             clipboard: None,
             texts: std::collections::HashMap::new(),
+            watches: Watches::default(),
         })
     }
 
@@ -1096,6 +1221,7 @@ impl Window {
             &mut self.queue,
             &mut self.state,
             wait,
+            &self.watches,
             |state| !state.events.is_empty(),
         ) {
             Ok(()) | Err(SurfaceError::Timeout(_)) | Err(SurfaceError::Closed) => {}
@@ -1159,6 +1285,27 @@ impl Window {
     #[must_use]
     pub fn root(&self) -> &Node {
         &self.root
+    }
+
+    /// Register `fd` in this window's poll set.
+    ///
+    /// The window takes ownership so the caller cannot close the fd out from
+    /// under the loop; [`Window::unwatch`] is what closes it. Readiness is
+    /// reported as [`InputEvent::FdReady`] from [`Window::pump`], and nothing
+    /// is read from the fd by the toolkit — that is the owner's job.
+    pub fn watch_fd(&mut self, fd: std::os::fd::OwnedFd, interest: Interest) -> WatchId {
+        self.watches.add(fd, interest)
+    }
+
+    /// Drop a watch and close its fd. An unknown id is a no-op.
+    pub fn unwatch(&mut self, id: WatchId) {
+        self.watches.remove(id);
+    }
+
+    /// Every live watch, in registration order.
+    #[must_use]
+    pub fn watches(&self) -> Vec<WatchId> {
+        self.watches.ids()
     }
 
     /// The icon theme this window's own paints resolve through.
@@ -2904,6 +3051,48 @@ mod tests {
     }
 
     #[test]
+    fn interest_maps_onto_poll_flags() {
+        use rustix::event::PollFlags;
+        assert_eq!(super::Interest::Read.flags(), PollFlags::IN);
+        assert_eq!(super::Interest::Write.flags(), PollFlags::OUT);
+        assert_eq!(
+            super::Interest::ReadWrite.flags(),
+            PollFlags::IN | PollFlags::OUT
+        );
+    }
+
+    #[test]
+    fn a_watch_set_polls_the_wayland_fd_first_and_the_watches_in_registration_order() {
+        // The poll set's shape is the whole of M5-D1's semantics §1: element 0
+        // is always the connection, elements 1.. are the watches as registered.
+        // Building it is a pure function of the registry, so it is tested
+        // without a compositor; `ui/tests/ingress.rs` proves the live wake.
+        use rustix::event::PollFlags;
+        let (a_read, _a_write) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .expect("a pipe");
+        let (b_read, _b_write) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .expect("a pipe");
+        let mut watches = super::Watches::default();
+        let first = watches.add(a_read, super::Interest::Read);
+        let second = watches.add(b_read, super::Interest::ReadWrite);
+        assert_eq!(watches.ids(), vec![first, second]);
+        assert_ne!(first, second, "ids are never reused inside one window");
+        let flags: Vec<PollFlags> = watches.entries().map(|w| w.flags).collect();
+        assert_eq!(flags, vec![PollFlags::IN, PollFlags::IN | PollFlags::OUT]);
+
+        watches.remove(first);
+        assert_eq!(watches.ids(), vec![second]);
+        // Removing an id twice, or one that was never issued, is a no-op.
+        watches.remove(first);
+        watches.remove(super::WatchId(4242));
+        assert_eq!(watches.ids(), vec![second]);
+    }
+
+    #[test]
     fn a_pump_on_a_silent_compositor_times_out_rather_than_hanging() {
         // M1's `the_configure_wait_is_bounded`, generalised: a compositor that
         // accepts the connection and then says nothing must not hang the pump.
@@ -2915,6 +3104,7 @@ mod tests {
             &mut queue,
             &mut state,
             Duration::from_millis(120),
+            &super::Watches::default(),
             |state| !state.events.is_empty(),
         );
         assert!(
@@ -2939,6 +3129,7 @@ mod tests {
             &mut queue,
             &mut state,
             Duration::from_secs(5),
+            &super::Watches::default(),
             |_| false,
         );
         assert!(matches!(result, Err(SurfaceError::Closed)), "{result:?}");
@@ -2971,7 +3162,14 @@ mod tests {
         let (conn, mut queue, _peer) = silent_connection();
         let mut state = super::WindowState::new_for_test();
         state.close();
-        let result = super::wait_bounded(&conn, &mut queue, &mut state, Duration::MAX, |_| false);
+        let result = super::wait_bounded(
+            &conn,
+            &mut queue,
+            &mut state,
+            Duration::MAX,
+            &super::Watches::default(),
+            |_| false,
+        );
         assert!(matches!(result, Err(SurfaceError::Closed)), "{result:?}");
     }
 

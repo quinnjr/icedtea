@@ -31,7 +31,7 @@ wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 xkbcommon = "0.9"
-rustix = { version = "1", features = ["fs", "event"] }
+rustix = { version = "1", features = ["fs", "event", "pipe"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

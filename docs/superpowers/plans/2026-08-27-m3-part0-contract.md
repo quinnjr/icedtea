@@ -5180,3 +5180,11 @@ rules (`wlr_xdg_positioner_rules_get_geometry`) before unconstraining — wlroot
 path — so repeat calls with a different constraint box yield the correct configure. Fixed in
 wlr 0.20.28 (commit 02b1c90 on feature/wlr-xdg-popup). P2's
 `a_reactive_popup_is_reconfigured_when_its_parent_moves` is the end-to-end proof.
+
+### M5-D1 — `wait_bounded` polls N fds, not one (superseded §3.1)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §3.1's single-`PollFd`
+`wait_bounded` is replaced by a set whose element 0 is the Wayland queue and
+whose rest are `Window::watch_fd` registrations, reported as
+`InputEvent::FdReady(WatchId)`. Full text:
+`docs/superpowers/plans/2026-09-03-m5-part0-contract.md` §1 M5-D1.
