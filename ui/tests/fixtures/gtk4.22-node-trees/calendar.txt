@@ -1,0 +1,10 @@
+calendar.view
+├── header
+│   ├── button
+│   ├── stack.month
+│   ├── button
+│   ├── button
+│   ├── label.year
+│   ╰── button
+╰── grid
+    ╰── label[.day-name][.week-number][.day-number][.other-month][.today]

@@ -1,0 +1,4 @@
+paned
+├── <child>
+├── separator[.wide]
+╰── <child>

@@ -8,12 +8,17 @@
 pub mod anim;
 pub mod app;
 pub mod css;
+pub mod gallery;
+pub mod icons;
 pub mod layout;
 pub mod paint;
 pub mod shm;
 pub mod text;
+pub mod view;
 pub mod wayland;
 pub mod widget;
+pub mod widgets;
+pub mod window;
 
 /// GTK 4's default light theme, vendored so tests are hermetic.
 ///

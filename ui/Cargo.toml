@@ -20,9 +20,17 @@ cssparser = "0.37"
 selectors = "0.40"
 precomputed-hash = "0.1"
 taffy = "0.14"
+# Grapheme-cluster and word boundaries for TextLayout's caret movement, and
+# UAX #14 line-break opportunities for its word wrapping. Both already resolve
+# in the workspace lockfile (cosmic-text pulls them under skia-rs-text), so
+# neither adds a crate to the tree.
+unicode-segmentation = "1.13"
+unicode-linebreak = "0.1"
 fontconfig = { version = "0.11", optional = true }
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+xkbcommon = "0.9"
 rustix = { version = "1", features = ["fs", "event"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -38,8 +46,17 @@ fontconfig = ["dep:fontconfig"]
 
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }
+icedtea-compositor = { path = "../compositor" }
 tempfile = "3"
 
 [[bin]]
 name = "themed-button"
 path = "src/bin/themed-button.rs"
+
+[[bin]]
+name = "window-probe"
+path = "src/bin/window-probe.rs"
+
+[[bin]]
+name = "gallery"
+path = "src/bin/gallery.rs"

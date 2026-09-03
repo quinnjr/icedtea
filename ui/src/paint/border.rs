@@ -455,11 +455,13 @@ mod tests {
         let colors = HashMap::new();
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = PaintCx {
             env: &env,
             colors: &colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(40, 20).expect("raster surface");
@@ -493,11 +495,13 @@ mod tests {
         let colors = HashMap::new();
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = PaintCx {
             env: &env,
             colors: &colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(40, 20).expect("raster surface");
@@ -575,11 +579,13 @@ mod tests {
         let colors = HashMap::new();
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = PaintCx {
             env: &env,
             colors: &colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(40, 40).expect("raster surface");
@@ -768,11 +774,13 @@ mod tests {
         let colors = crate::css::value::ColorTable::default();
         let mut fonts = crate::text::FontDatabase::probe_only();
         let mut images = crate::paint::ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = crate::paint::PaintCx {
             env: &env,
             colors: &colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let slice = crate::css::value::BorderImageSlice {
@@ -814,11 +822,13 @@ mod tests {
         let colors = crate::css::value::ColorTable::default();
         let mut fonts = crate::text::FontDatabase::probe_only();
         let mut images = crate::paint::ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = crate::paint::PaintCx {
             env: &env,
             colors: &colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let slice = crate::css::value::BorderImageSlice {

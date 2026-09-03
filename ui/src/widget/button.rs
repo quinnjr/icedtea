@@ -39,6 +39,14 @@ pub struct Button {
     line_height: f32,
     layout: LayoutTree,
     images: ImageCache,
+    /// The icon theme `render`'s `PaintCx` carries.
+    ///
+    /// Owned rather than passed in: contract §8.1 keeps `Button` exactly as
+    /// M2 left it, and §8.2 keeps `ui/tests/themed_button_offscreen.rs`
+    /// byte-identical, so `render` may not grow a fifth parameter. The
+    /// M1 gate's button draws no icon, so a hermetic, name-only theme with
+    /// no roots is the honest theme for it (§10 P7-D53).
+    icons: crate::icons::IconTheme,
     env: ResolveEnv,
     /// The clock this widget's transitions and animations run on. Shared with
     /// the `LayerWindow` that drives its frame callbacks, and swapped for a
@@ -123,6 +131,7 @@ impl Button {
             line_height: 0.0,
             layout: LayoutTree::new(),
             images: ImageCache::new(),
+            icons: crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new()),
             env,
             clock: Rc::new(MonotonicClock::new()),
             anim: AnimationState::new(),
@@ -394,6 +403,7 @@ impl Button {
             colors: &sheet.colors,
             fonts,
             images: &mut self.images,
+            icons: &mut self.icons,
             text: None,
         };
         let mut canvas = surface.canvas();

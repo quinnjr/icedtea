@@ -1,0 +1,3 @@
+window.background[.csd / .solid-csd / .ssd][.maximized / .fullscreen / .tiled]
+├── <child>
+╰── <titlebar child>.titlebar[.default-decoration]

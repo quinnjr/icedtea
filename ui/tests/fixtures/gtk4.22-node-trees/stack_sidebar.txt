@@ -1,0 +1,5 @@
+stacksidebar.sidebar
+╰── scrolledwindow
+    ╰── list.navigation-sidebar
+        ╰── row[.needs-attention]
+        ┊

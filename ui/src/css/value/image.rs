@@ -225,8 +225,10 @@ pub struct Gradient {
 /// A `-gtk-recolor()` / `-gtk-icon-palette` palette: `name <color>` pairs.
 pub type IconPalette = Rc<[(Rc<str>, ColorValue)]>;
 
-/// A GTK image function. Parsed and stored, but not rasterised: drawing
-/// icons is M4's, so a paint that reaches one draws nothing.
+/// A GTK image function. Parsed and stored here; drawn by
+/// [`crate::paint::icon::paint_icon`], which resolves a `Theme` name through
+/// the icon theme, a `Recolor` URL through the symbolic recolourer, and a
+/// `Scaled` pair through the output scale.
 #[derive(Clone, Debug, PartialEq)]
 pub enum IconRef {
     /// `-gtk-icontheme(name)`.

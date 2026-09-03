@@ -120,7 +120,7 @@ pub fn sigma_within_pad(sigma: f32, pad: f32) -> f32 {
 
 /// Blur a premultiplied RGBA buffer in place.
 ///
-/// Three box passes per axis, sized by [`box_radii_for_gauss`] rather than
+/// Three box passes per axis, sized by `box_radii_for_gauss` rather than
 /// one radius repeated three times: three passes of the *same full* radius
 /// would sum their reach to `3 * radius` (each pass's reach adds, since
 /// they run in sequence), tripling the intended spread.

@@ -1,0 +1,24 @@
+[Icon Theme]
+Name=MiniTheme
+Comment=Hermetic fixture for icedtea-ui's icon tests
+Inherits=MiniParent
+Directories=16x16/actions,scalable/actions,symbolic/actions
+
+[16x16/actions]
+Size=16
+Type=Fixed
+Context=Actions
+
+[scalable/actions]
+Size=128
+MinSize=8
+MaxSize=512
+Type=Scalable
+Context=Actions
+
+[symbolic/actions]
+Size=16
+MinSize=8
+MaxSize=512
+Type=Scalable
+Context=Actions

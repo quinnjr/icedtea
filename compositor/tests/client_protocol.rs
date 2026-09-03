@@ -9,8 +9,6 @@
 //! here because a client actually mapped a surface, and the compositor
 //! actually ran the `mapped` path against a live toplevel.
 
-use std::time::Duration;
-
 use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
@@ -2670,13 +2668,12 @@ fn an_implicit_grab_on_a_layer_surface_survives_the_drag_off() {
 /// notifying the button. The implicit grab deliberately steps aside whenever
 /// `wlr_seat_pointer_has_grab` is true; this is the test that says so.
 ///
-/// The popup is created and grabbed but never mapped -- see
-/// `TestClient::popup_configured` for why that costs this test nothing, and
-/// for the assertion that says so and fails the day it stops being true.
+/// The popup is created, grabbed and driven all the way to mapped --
+/// `open_grabbing_popup` is `open_popup` with a grab serial -- so
+/// `popup_configured()` is asserted positively here.
 ///
-/// Green on the current code by design — it guards behaviour rather than
-/// driving it. Verified non-vacuous by mutation: skipping `notify_button`
-/// under an explicit grab makes `popup_done` never arrive.
+/// Verified non-vacuous by mutation: skipping `notify_button` under an
+/// explicit grab makes `popup_done` never arrive.
 #[test]
 fn a_popup_grab_still_dismisses_on_a_click_outside_it() {
     let comp = Compositor::spawn();
@@ -2739,10 +2736,9 @@ fn a_popup_grab_still_dismisses_on_a_click_outside_it() {
 
     a.open_grabbing_popup(serial, 64, 48);
     assert!(
-        !a.wait_until_timeout(Duration::from_millis(300), |c| c.popup_configured()),
-        "a popup was configured: the `wlr` crate has grown xdg-popup support, \
-         so this test should now map the popup properly rather than relying on \
-         the grab alone"
+        a.wait_until(|c| c.popup_configured().is_some()),
+        "the popup was never configured: the compositor must answer a popup's \
+         first commit or it can never legally attach a buffer and map"
     );
 
     // A point on bare desktop: outside the parent's frame, and so outside
@@ -2763,7 +2759,7 @@ fn a_popup_grab_still_dismisses_on_a_click_outside_it() {
     vp.frame();
 
     assert!(
-        a.wait_until(|c| c.popup_dismissed()),
+        a.wait_until(|c| c.popup_done()),
         "the popup was never dismissed by a click outside it: the explicit \
          xdg-popup grab is not reaching the seat"
     );

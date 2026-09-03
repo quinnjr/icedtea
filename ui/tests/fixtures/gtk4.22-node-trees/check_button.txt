@@ -1,0 +1,3 @@
+checkbutton[.text-button][.grouped]
+├── check
+╰── [label]

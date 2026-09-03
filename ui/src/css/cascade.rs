@@ -52,7 +52,7 @@ use super::value::color::{ColorTable, build_color_table};
 use super::value::{Keyframes, Value};
 
 /// A rule whose prelude has been compiled to a selector list.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledRule {
     /// The rule's selectors.
     pub selectors: SelectorList<GtkSelectorImpl>,
@@ -71,7 +71,7 @@ pub struct CompiledRule {
 /// `@media` blocks are kept *unevaluated* in [`Stylesheet`] so one parse can be
 /// compiled under several environments -- the coverage gate compiles Adwaita's
 /// light, dark and high-contrast sheets from the same parse.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledSheet {
     /// Rules whose preludes parsed, in source order.
     pub rules: Vec<CompiledRule>,

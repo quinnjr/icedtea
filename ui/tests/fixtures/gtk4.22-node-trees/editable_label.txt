@@ -1,0 +1,10 @@
+editablelabel[.editing]
+╰── stack
+    ├── label
+    ╰── text
+        ├── placeholder
+        ├── undershoot.left
+        ├── undershoot.right
+        ├── [selection]
+        ├── [block-cursor]
+        ╰── [window.popup]

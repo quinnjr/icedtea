@@ -1,0 +1,4 @@
+gridview
+├── child[.activatable]
+┊
+╰── [rubberband]

@@ -1,0 +1,5 @@
+menubar
+├── item[.active]
+┊   ╰── popover
+╰── item
+    ╰── popover

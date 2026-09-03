@@ -21,6 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Once;
 
+use skia_rs_safe::canvas::Canvas;
 use skia_rs_safe::core::Point;
 use skia_rs_safe::text::{Font, Shaper, TextBlob, TextBlobBuilder, Typeface};
 
@@ -28,8 +29,9 @@ use crate::css::computed::ComputedStyle;
 use crate::css::registry::Prop;
 use crate::css::value::{
     FeatureSetting, FontFamily, FontStyle, FontWeight, GenericFamily, Keyword, Length, LengthUnit,
-    LineHeight, Value, VariationSetting,
+    LineHeight, Rgba, Value, VariationSetting,
 };
+use crate::layout::Rect;
 
 /// Well-known UI sans-serif faces, in preference order.
 pub const FONT_CANDIDATES: &[&str] = &[
@@ -315,7 +317,7 @@ impl FontDatabase {
     /// available (a later task wires that in) and the [`FONT_CANDIDATES`]
     /// probe otherwise.
     ///
-    /// Cached per query, up to [`FACE_CACHE_CAPACITY`] entries; a query that
+    /// Cached per query, up to `FACE_CACHE_CAPACITY` entries; a query that
     /// resolves to nothing is cached as nothing, so a missing font costs one
     /// lookup, not one per restyle.
     pub fn match_face(&mut self, query: &FontQuery<'_>) -> Option<FontFace> {
@@ -337,7 +339,7 @@ impl FontDatabase {
     }
 
     /// The loaded typeface for `face`, cached by `(path, index)` up to
-    /// [`FACE_CACHE_CAPACITY`] entries.
+    /// `FACE_CACHE_CAPACITY` entries.
     ///
     /// `index` is kept even though `skia-rs-text` 0.4.0's `Typeface::from_data`
     /// cannot select a face inside a collection: it is part of the cache
@@ -510,7 +512,7 @@ impl FontDatabase {
     /// Nothing in M2 calls this: the sheet is compiled once when the window
     /// opens and never swapped, so there is no reload edge to invalidate on.
     /// What bounds the caches instead is their capacity
-    /// ([`SHAPE_CACHE_CAPACITY`], [`FACE_CACHE_CAPACITY`]), which holds
+    /// (`SHAPE_CACHE_CAPACITY`, `FACE_CACHE_CAPACITY`), which holds
     /// whether or not anything ever signals a reload. This stays as the hook
     /// a live theme-reload path would call, and as the way a test proves an
     /// entry really was cached rather than recomputed.
@@ -1039,6 +1041,1038 @@ fn stretch_percent(value: &Value) -> f32 {
             _ => 100.0,
         },
         _ => 100.0,
+    }
+}
+
+/// How a paragraph that does not fit its width is shortened.
+///
+/// GTK's `PangoEllipsizeMode`. `None` lets the text overflow; the other three
+/// replace a run of clusters with `…` at that end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ellipsize {
+    /// Never shorten; overflow instead.
+    None,
+    /// Drop leading clusters.
+    Start,
+    /// Drop clusters from the middle.
+    Middle,
+    /// Drop trailing clusters.
+    End,
+}
+
+/// How a paragraph that does not fit its width is broken.
+///
+/// GTK's `PangoWrapMode`: `Word` breaks only at UAX #14 opportunities,
+/// `Char` breaks between any two grapheme clusters, `WordChar` prefers a word
+/// break and falls back to a character break for a word wider than the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapMode {
+    /// Never break; overflow instead.
+    None,
+    /// Break at word boundaries only.
+    Word,
+    /// Break between grapheme clusters.
+    Char,
+    /// Word boundaries, falling back to clusters.
+    WordChar,
+}
+
+/// One laid-out line of a [`TextLayout`].
+struct ShapedLine {
+    /// Byte range of this line within the layout's own `text`.
+    range: std::ops::Range<usize>,
+    /// The shaped run for `text[range]` (already ellipsized, if it was).
+    shaped: Rc<ShapedText>,
+    /// One entry per grapheme boundary in `range`, as
+    /// `(byte offset in the layout's text, x advance from the line's left edge)`.
+    /// The first entry is `(range.start, 0.0)` and the last
+    /// `(range.end, line width)`, so a caret query is a lookup, never a reshape.
+    carets: Vec<(usize, f32)>,
+    /// Top of the line box, relative to the layout's origin.
+    top: f32,
+    /// Line box height.
+    height: f32,
+    /// Baseline offset from `top`.
+    baseline: f32,
+    /// Inked width.
+    width: f32,
+}
+
+/// A wrapped, ellipsized, cursor-aware paragraph over [`FontDatabase::shape`].
+///
+/// M2's [`ShapedText`] is one run of one line. `TextLayout` is the multi-line,
+/// editable-text layer every M3 widget that shows more than a fixed label needs:
+/// `Label`'s wrapping and ellipsizing, `TextView`'s cursor and selection, and
+/// the whole entry family's caret arithmetic. Caret positions are precomputed
+/// at build time so [`TextLayout::caret_rect`] and [`TextLayout::byte_at`] can
+/// take `&self` and never reach the font database again.
+pub struct TextLayout {
+    text: String,
+    lines: Vec<ShapedLine>,
+    width: f32,
+    height: f32,
+    /// The face every line was shaped with; `None` when no face loaded.
+    face: Option<FontFace>,
+    /// The string each line actually shaped — the source text for a line that
+    /// was not ellipsized, and the shortened form for one that was. Diagnostics
+    /// and tests only; painting goes through the shaped blob.
+    line_display: Vec<String>,
+}
+
+impl TextLayout {
+    /// Lay `text` out.
+    ///
+    /// `width` is the available inline size; `None` means unbounded, which is
+    /// also what a non-finite or negative width is treated as. A face that will
+    /// not load yields empty runs rather than a panic — a missing font must not
+    /// take the widget tree down.
+    pub fn build(
+        text: &str,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        width: Option<f32>,
+        wrap: WrapMode,
+        ellipsize: Ellipsize,
+    ) -> Self {
+        let limit = width.filter(|w| w.is_finite() && *w > 0.0);
+        let face = fonts.match_face(&style.query());
+        let mut layout = TextLayout {
+            text: text.to_owned(),
+            lines: Vec::new(),
+            width: 0.0,
+            height: 0.0,
+            face: face.clone(),
+            line_display: Vec::new(),
+        };
+
+        // Paragraphs first: a hard newline always breaks, whatever `wrap` says.
+        let mut para_start = 0usize;
+        let mut pieces: Vec<std::ops::Range<usize>> = Vec::new();
+        for (idx, ch) in text.char_indices() {
+            if ch == '\n' {
+                pieces.push(para_start..idx);
+                para_start = idx + ch.len_utf8();
+            }
+        }
+        pieces.push(para_start..text.len());
+
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for para in pieces {
+            layout.break_paragraph(para, style, fonts, limit, wrap, &mut ranges);
+        }
+
+        let mut top = 0.0f32;
+        for range in ranges {
+            let (display, line) =
+                layout.shape_line_with_display(range, style, fonts, limit, ellipsize, top);
+            top += line.height;
+            layout.width = layout.width.max(line.width);
+            layout.line_display.push(display);
+            layout.lines.push(line);
+        }
+        layout.height = top;
+        layout
+    }
+
+    /// Shape one already-broken line and precompute its caret table, also
+    /// returning the display string it was actually shaped from.
+    fn shape_line_with_display(
+        &self,
+        range: std::ops::Range<usize>,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        limit: Option<f32>,
+        ellipsize: Ellipsize,
+        top: f32,
+    ) -> (String, ShapedLine) {
+        let source = &self.text[range.clone()];
+        let (display, carets) =
+            Self::ellipsize_line(source, range.start, style, fonts, limit, ellipsize);
+        let shaped = self.shape_str(&display, style, fonts);
+        let line_height = style.line_height_px(&shaped.metrics);
+        let leading =
+            ((line_height - shaped.metrics.ascent.max(0.0) - shaped.metrics.descent.max(0.0))
+                / 2.0)
+                .max(0.0);
+        let line = ShapedLine {
+            range,
+            width: shaped.metrics.width.max(0.0),
+            baseline: leading + shaped.metrics.ascent.max(0.0),
+            height: line_height.max(0.0),
+            top,
+            carets,
+            shaped,
+        };
+        (display, line)
+    }
+
+    /// Shape one string with this layout's face, or an empty run if none loaded.
+    fn shape_str(&self, s: &str, style: &TextStyle, fonts: &mut FontDatabase) -> Rc<ShapedText> {
+        match self.face.as_ref() {
+            Some(face) => fonts.shape(&style.shape_key(s, face)),
+            None => Rc::new(ShapedText {
+                blob: None,
+                metrics: TextMetrics {
+                    width: 0.0,
+                    ascent: style.size_px * 0.8,
+                    descent: style.size_px * 0.2,
+                    line_height: style.size_px * 1.2,
+                },
+                face: FontFace {
+                    path: PathBuf::new(),
+                    index: 0,
+                    family: String::new(),
+                },
+                size_px: style.size_px,
+            }),
+        }
+    }
+
+    /// Total inked width and total height, in px.
+    #[must_use]
+    pub fn size(&self) -> (f32, f32) {
+        (self.width, self.height)
+    }
+
+    /// Number of laid-out lines. Always at least 1.
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// The source text this layout was built from.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The string line `index` actually shapes — the source text for a line
+    /// that was not ellipsized, and the shortened form for one that was.
+    /// Diagnostics and tests only; painting goes through the shaped blob.
+    #[must_use]
+    pub fn display_line(&self, index: usize) -> String {
+        self.line_display.get(index).cloned().unwrap_or_default()
+    }
+
+    /// Draw every line, `origin` being the top-left of the layout's box.
+    pub fn draw(&self, canvas: &mut Canvas<'_>, origin: (f32, f32), color: Rgba) {
+        let (ox, oy) = (
+            if origin.0.is_finite() { origin.0 } else { 0.0 },
+            if origin.1.is_finite() { origin.1 } else { 0.0 },
+        );
+        let paint = crate::paint::fill_paint(color);
+        for line in &self.lines {
+            if let Some(blob) = line.shaped.blob.as_ref() {
+                canvas.draw_text_blob(blob, ox, oy + line.top + line.baseline, &paint);
+            }
+        }
+    }
+
+    /// Which line `byte` sits on. Clamped to the last line.
+    #[must_use]
+    pub fn line_of(&self, byte: usize) -> usize {
+        for (index, line) in self.lines.iter().enumerate() {
+            if byte < line.range.end {
+                return index;
+            }
+        }
+        self.lines.len().saturating_sub(1)
+    }
+
+    /// The caret rectangle for `byte`: a zero-width, line-box-tall sliver at
+    /// the cluster boundary at or before `byte`.
+    ///
+    /// A `byte` inside a cluster snaps to that cluster's start, which is what
+    /// every caret consumer wants — a caret never sits inside a grapheme.
+    #[must_use]
+    pub fn caret_rect(&self, byte: usize) -> Rect {
+        let index = self.line_of(byte);
+        let Some(line) = self.lines.get(index) else {
+            return Rect::zero();
+        };
+        let mut x = 0.0f32;
+        for &(at, advance) in &line.carets {
+            if at <= byte {
+                x = advance;
+            } else {
+                break;
+            }
+        }
+        Rect::new(x, line.top, 0.0, line.height)
+    }
+
+    /// The byte offset nearest `point`, in the layout's own coordinate space.
+    ///
+    /// A point above the first line lands on byte 0, below the last on the end
+    /// of the text; horizontally it snaps to the nearer of the two cluster
+    /// boundaries it falls between, which is what a click in the right half of
+    /// a glyph means.
+    #[must_use]
+    pub fn byte_at(&self, point: (f32, f32)) -> usize {
+        let (x, y) = (
+            if point.0.is_finite() { point.0 } else { 0.0 },
+            if point.1.is_finite() { point.1 } else { 0.0 },
+        );
+        let Some(line) = self
+            .lines
+            .iter()
+            .find(|line| y < line.top + line.height)
+            .or_else(|| self.lines.last())
+        else {
+            return 0;
+        };
+        let mut best = line.carets.first().map_or(0, |entry| entry.0);
+        let mut best_delta = f32::INFINITY;
+        for &(at, advance) in &line.carets {
+            let delta = (advance - x).abs();
+            if delta < best_delta {
+                best_delta = delta;
+                best = at;
+            }
+        }
+        best
+    }
+
+    /// One rectangle per line covered by `range`, top-first.
+    ///
+    /// An inverted or out-of-range `range` is clamped rather than rejected —
+    /// selection ranges come from pointer drags and key repeats and must never
+    /// panic.
+    #[must_use]
+    pub fn selection_rects(&self, range: std::ops::Range<usize>) -> Vec<Rect> {
+        let start = range.start.min(range.end).min(self.text.len());
+        let end = range.end.max(range.start).min(self.text.len());
+        if start == end {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for line in &self.lines {
+            let from = start.max(line.range.start);
+            let to = end.min(line.range.end);
+            if from >= to {
+                continue;
+            }
+            let x0 = self.advance_in(line, from);
+            let x1 = self.advance_in(line, to);
+            out.push(Rect::new(x0, line.top, (x1 - x0).max(0.0), line.height));
+        }
+        out
+    }
+
+    /// x advance of `byte` within `line`, snapped to a cluster boundary.
+    fn advance_in(&self, line: &ShapedLine, byte: usize) -> f32 {
+        let mut x = 0.0f32;
+        for &(at, advance) in &line.carets {
+            if at <= byte {
+                x = advance;
+            } else {
+                break;
+            }
+        }
+        x
+    }
+}
+
+impl TextLayout {
+    /// Break one paragraph into line ranges that respect `limit`.
+    ///
+    /// `Word` breaks only at UAX #14 opportunities (`unicode_linebreak`), which
+    /// is what Pango does; `Char` breaks between grapheme clusters; `WordChar`
+    /// prefers a word break and falls back to clusters for a word that cannot
+    /// fit a whole line on its own. Trailing whitespace at a break is dropped
+    /// from the line's inked range, as Pango does, so a wrapped line's width is
+    /// measured without it.
+    fn break_paragraph(
+        &self,
+        para: std::ops::Range<usize>,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        limit: Option<f32>,
+        wrap: WrapMode,
+        out: &mut Vec<std::ops::Range<usize>>,
+    ) {
+        let Some(limit) = limit.filter(|_| wrap != WrapMode::None) else {
+            out.push(para);
+            return;
+        };
+        let source = &self.text[para.clone()];
+        if source.is_empty() {
+            out.push(para);
+            return;
+        }
+
+        // Candidate break offsets, relative to `source`, ascending, always
+        // ending at `source.len()`.
+        let candidates: Vec<usize> = match wrap {
+            WrapMode::None => unreachable!("guarded above"),
+            WrapMode::Char => Self::cluster_breaks(source),
+            WrapMode::Word | WrapMode::WordChar => unicode_linebreak::linebreaks(source)
+                .map(|(offset, _)| offset)
+                .collect(),
+        };
+
+        let mut start = 0usize;
+        let mut last_fit: Option<usize> = None;
+        for &candidate in &candidates {
+            if candidate <= start {
+                continue;
+            }
+            let piece = source[start..candidate].trim_end();
+            let width = self.shape_str(piece, style, fonts).metrics.width.max(0.0);
+            if width <= limit {
+                last_fit = Some(candidate);
+                continue;
+            }
+            match last_fit.take() {
+                // A break that fits: take it and retry this candidate.
+                Some(fit) => {
+                    out.push(para.start + start..para.start + source[..fit].trim_end().len());
+                    start = fit;
+                    // Re-measure this candidate against the new line.
+                    let piece = source[start..candidate].trim_end();
+                    let width = self.shape_str(piece, style, fonts).metrics.width.max(0.0);
+                    if width <= limit {
+                        last_fit = Some(candidate);
+                    } else if wrap == WrapMode::WordChar {
+                        start = self.break_overlong(
+                            source, start, candidate, para.start, style, fonts, limit, out,
+                        );
+                    } else {
+                        out.push(para.start + start..para.start + candidate);
+                        start = candidate;
+                    }
+                }
+                // No break fits: the run from `start` is wider than a whole line.
+                None if wrap == WrapMode::WordChar => {
+                    start = self.break_overlong(
+                        source, start, candidate, para.start, style, fonts, limit, out,
+                    );
+                }
+                None => {
+                    out.push(para.start + start..para.start + candidate);
+                    start = candidate;
+                }
+            }
+        }
+        if start < source.len() || out.is_empty() {
+            out.push(para.start + start..para.end);
+        }
+    }
+
+    /// Emit cluster-broken lines for `source[start..end]`, which does not fit
+    /// `limit` at any word boundary. Returns the new `start`.
+    #[allow(clippy::too_many_arguments)]
+    fn break_overlong(
+        &self,
+        source: &str,
+        start: usize,
+        end: usize,
+        base: usize,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        limit: f32,
+        out: &mut Vec<std::ops::Range<usize>>,
+    ) -> usize {
+        let mut cursor = start;
+        let clusters = Self::cluster_breaks(&source[start..end]);
+        let mut last_fit = cursor;
+        for offset in clusters {
+            let candidate = start + offset;
+            let width = self
+                .shape_str(&source[cursor..candidate], style, fonts)
+                .metrics
+                .width
+                .max(0.0);
+            if width <= limit {
+                last_fit = candidate;
+                continue;
+            }
+            // Always consume at least one cluster, or this loops forever.
+            let take = if last_fit > cursor {
+                last_fit
+            } else {
+                candidate
+            };
+            out.push(base + cursor..base + take);
+            cursor = take;
+            last_fit = cursor;
+        }
+        cursor
+    }
+
+    /// Grapheme-cluster boundaries of `s`, ascending, ending at `s.len()`.
+    fn cluster_breaks(s: &str) -> Vec<usize> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let mut out = Vec::new();
+        let mut byte = 0usize;
+        for cluster in s.graphemes(true) {
+            byte += cluster.len();
+            out.push(byte);
+        }
+        if out.last() != Some(&s.len()) {
+            out.push(s.len());
+        }
+        out
+    }
+
+    /// The character Pango and GTK use for every ellipsis.
+    const ELLIPSIS: &'static str = "\u{2026}";
+
+    /// Shorten `source` to `limit` at the end named by `ellipsize`.
+    ///
+    /// Returns the string that is actually shaped plus the caret table, whose
+    /// byte offsets always point back into the *source* text: a caret query on
+    /// an ellipsized label must land on a real byte offset, never inside the
+    /// ellipsis. Clusters swallowed by the ellipsis collapse onto the offset of
+    /// the first cluster the ellipsis replaced.
+    fn ellipsize_line(
+        source: &str,
+        base: usize,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+        limit: Option<f32>,
+        ellipsize: Ellipsize,
+    ) -> (String, Vec<(usize, f32)>) {
+        let plain = |fonts: &mut FontDatabase| {
+            (
+                source.to_owned(),
+                Self::caret_table(source, base, source, style, fonts),
+            )
+        };
+        let Some(limit) = limit.filter(|_| ellipsize != Ellipsize::None) else {
+            return plain(fonts);
+        };
+        let face = fonts.match_face(&style.query());
+        let Some(face) = face else {
+            return plain(fonts);
+        };
+        let measure = |fonts: &mut FontDatabase, s: &str| {
+            fonts
+                .shape(&style.shape_key(s, &face))
+                .metrics
+                .width
+                .max(0.0)
+        };
+        if measure(fonts, source) <= limit {
+            return plain(fonts);
+        }
+
+        let clusters = Self::cluster_breaks(source);
+        let ellipsis_w = measure(fonts, Self::ELLIPSIS);
+        if ellipsis_w > limit {
+            // Even the ellipsis does not fit; show it anyway rather than
+            // nothing, which is what GTK renders.
+            let display = Self::ELLIPSIS.to_owned();
+            return (
+                display,
+                vec![(base, 0.0), (base + source.len(), ellipsis_w)],
+            );
+        }
+        let budget = limit - ellipsis_w;
+
+        // Each arm knows exactly where it inserted the ellipsis; searching the
+        // display string for it would find a literal '…' the source already
+        // carried and skew every remapped offset past that point.
+        let (display, ellipsis_at) = match ellipsize {
+            Ellipsize::None => unreachable!("guarded above"),
+            Ellipsize::End => {
+                let mut keep = 0usize;
+                for &offset in &clusters {
+                    if measure(fonts, &source[..offset]) <= budget {
+                        keep = offset;
+                    } else {
+                        break;
+                    }
+                }
+                (format!("{}{}", &source[..keep], Self::ELLIPSIS), keep)
+            }
+            Ellipsize::Start => {
+                let mut keep = source.len();
+                for &offset in clusters.iter().rev() {
+                    if measure(fonts, &source[offset..]) <= budget {
+                        keep = offset;
+                    } else {
+                        break;
+                    }
+                }
+                (format!("{}{}", Self::ELLIPSIS, &source[keep..]), 0)
+            }
+            Ellipsize::Middle => {
+                let (mut head, mut tail) = (0usize, source.len());
+                loop {
+                    let next_head = clusters.iter().copied().find(|&o| o > head);
+                    let next_tail = clusters.iter().rev().copied().find(|&o| o < tail);
+                    let grown = match (next_head, next_tail) {
+                        (Some(h), Some(t)) if h <= t => (h, t),
+                        _ => break,
+                    };
+                    let candidate = format!("{}{}", &source[..grown.0], &source[grown.1..]);
+                    if measure(fonts, &candidate) > budget {
+                        break;
+                    }
+                    head = grown.0;
+                    tail = grown.1;
+                    // Shrink the tail on the next pass, not the head, so both
+                    // ends grow evenly.
+                    if let Some(t) = clusters.iter().rev().copied().find(|&o| o < tail) {
+                        let candidate = format!("{}{}", &source[..head], &source[t..]);
+                        if measure(fonts, &candidate) <= budget {
+                            tail = t;
+                        }
+                    }
+                }
+                (
+                    format!("{}{}{}", &source[..head], Self::ELLIPSIS, &source[tail..]),
+                    head,
+                )
+            }
+        };
+
+        // Rebuild the caret table over the *display* string, then remap every
+        // offset that fell inside the ellipsis onto the source byte the
+        // ellipsis stands for.
+        let mut table = Self::caret_table(&display, 0, &display, style, fonts);
+        for entry in &mut table {
+            let byte = entry.0;
+            entry.0 = base
+                + if byte <= ellipsis_at {
+                    match ellipsize {
+                        Ellipsize::Start => 0,
+                        _ => byte,
+                    }
+                } else if byte >= ellipsis_at + Self::ELLIPSIS.len() {
+                    let after = byte - (ellipsis_at + Self::ELLIPSIS.len());
+                    source.len() - (display.len() - ellipsis_at - Self::ELLIPSIS.len()) + after
+                } else {
+                    ellipsis_at
+                };
+        }
+        (display, table)
+    }
+
+    /// One `(byte, x)` pair per grapheme boundary of `display`, with byte
+    /// offsets taken from `source` (they differ once an ellipsis is inserted).
+    ///
+    /// Prefix widths come from re-shaping each prefix; `FontDatabase::shape`
+    /// memoizes, so a caret table costs one cache miss per cluster once.
+    fn caret_table(
+        source: &str,
+        base: usize,
+        display: &str,
+        style: &TextStyle,
+        fonts: &mut FontDatabase,
+    ) -> Vec<(usize, f32)> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let face = fonts.match_face(&style.query());
+        let mut out = vec![(base, 0.0f32)];
+        let mut byte = 0usize;
+        for cluster in display.graphemes(true) {
+            byte += cluster.len();
+            let width = match face.as_ref() {
+                Some(face) => fonts
+                    .shape(&style.shape_key(&display[..byte], face))
+                    .metrics
+                    .width
+                    .max(0.0),
+                None => 0.0,
+            };
+            out.push((base + byte.min(source.len()), width));
+        }
+        out
+    }
+}
+
+impl TextLayout {
+    /// The cluster boundary after `byte`. Clamped to the end of the text; a
+    /// `byte` inside a cluster moves to the end of that cluster.
+    #[must_use]
+    pub fn next_grapheme(&self, byte: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = byte.min(self.text.len());
+        for (offset, cluster) in self.text.grapheme_indices(true) {
+            if offset + cluster.len() > byte {
+                return offset + cluster.len();
+            }
+        }
+        self.text.len()
+    }
+
+    /// The cluster boundary before `byte`. Clamped to 0; a `byte` inside a
+    /// cluster moves to the start of that cluster.
+    #[must_use]
+    pub fn prev_grapheme(&self, byte: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = byte.min(self.text.len());
+        let mut previous = 0usize;
+        for (offset, cluster) in self.text.grapheme_indices(true) {
+            if offset >= byte {
+                break;
+            }
+            if offset + cluster.len() >= byte {
+                return offset;
+            }
+            previous = offset;
+        }
+        previous
+    }
+
+    /// The start of the next word after `byte` — where `Ctrl+Right` lands.
+    ///
+    /// GTK moves to the *start* of the following word, not the end of the
+    /// current one, so trailing whitespace is consumed with the move.
+    #[must_use]
+    pub fn next_word(&self, byte: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = byte.min(self.text.len());
+        let mut seen_current = false;
+        for (offset, word) in self.text.split_word_bound_indices() {
+            if offset < byte {
+                continue;
+            }
+            let is_word = word.chars().any(|c| !c.is_whitespace());
+            if !is_word {
+                continue;
+            }
+            if offset > byte || seen_current {
+                return offset;
+            }
+            seen_current = true;
+        }
+        self.text.len()
+    }
+
+    /// The start of the word at or before `byte` — where `Ctrl+Left` lands.
+    #[must_use]
+    pub fn prev_word(&self, byte: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = byte.min(self.text.len());
+        let mut best = 0usize;
+        for (offset, word) in self.text.split_word_bound_indices() {
+            if offset >= byte {
+                break;
+            }
+            if word.chars().any(|c| !c.is_whitespace()) {
+                best = offset;
+            }
+        }
+        best
+    }
+}
+
+/// One attributed run produced by [`parse_markup`], indexed into the plain text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkupSpan {
+    /// Byte range in the returned plain string.
+    pub range: std::ops::Range<usize>,
+    /// `<b>` was open over this run.
+    pub bold: bool,
+    /// `<i>` was open over this run.
+    pub italic: bool,
+    /// `<span foreground="…">`.
+    pub color: Option<Rgba>,
+    /// `<span weight="…">`, 1..=1000.
+    pub weight: Option<f32>,
+    /// `<span size="…">`, in px.
+    pub size_px: Option<f32>,
+}
+
+/// How deep `parse_markup` will nest before it stops opening spans.
+///
+/// Hostile markup is a string a theme or an app model can supply; an
+/// unbounded stack here is a stack overflow waiting for `"<b>".repeat(n)`.
+const MARKUP_MAX_DEPTH: usize = 64;
+
+static MARKUP_WARNED: Once = Once::new();
+
+/// Parse the `<b>`, `<i>` and `<span foreground|weight|size>` subset.
+///
+/// Everything else — any other tag, any other attribute, a malformed entity, a
+/// stray angle bracket — is dropped and logged once. This never panics and
+/// never returns a span that is not on a char boundary of the returned string:
+/// markup reaches here from application models and stylesheets, which are
+/// untrusted input (contract §9, cross-cutting rules).
+#[must_use]
+pub fn parse_markup(text: &str) -> (String, Vec<MarkupSpan>) {
+    #[derive(Clone, Copy, Default)]
+    struct Frame {
+        bold: bool,
+        italic: bool,
+        color: Option<Rgba>,
+        weight: Option<f32>,
+        size_px: Option<f32>,
+    }
+
+    let mut plain = String::with_capacity(text.len());
+    let mut spans: Vec<MarkupSpan> = Vec::new();
+    let mut stack: Vec<(Frame, usize)> = Vec::new();
+    let mut current = Frame::default();
+    let mut run_start = 0usize;
+    let mut warned = false;
+
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'<' => {
+                let Some(close) = text[i..].find('>').map(|o| i + o) else {
+                    // A lone '<' with no '>': copy it through as text.
+                    plain.push('<');
+                    i += 1;
+                    continue;
+                };
+                let tag = &text[i + 1..close];
+                // Flush the run that ends here.
+                if plain.len() > run_start
+                    && (current.bold
+                        || current.italic
+                        || current.color.is_some()
+                        || current.weight.is_some()
+                        || current.size_px.is_some())
+                {
+                    spans.push(MarkupSpan {
+                        range: run_start..plain.len(),
+                        bold: current.bold,
+                        italic: current.italic,
+                        color: current.color,
+                        weight: current.weight,
+                        size_px: current.size_px,
+                    });
+                }
+                run_start = plain.len();
+
+                let (closing, name_and_attrs) = match tag.strip_prefix('/') {
+                    Some(rest) => (true, rest),
+                    None => (false, tag),
+                };
+                // Split once and keep the remainder: recomputing the attribute
+                // slice as `name_and_attrs[name.len()..]` measures a length
+                // taken *after* leading whitespace was skipped against the raw
+                // string, which slices through a char boundary when that
+                // whitespace is multi-byte (U+3000, U+2028, …) and mis-parses
+                // the attributes even when it is ASCII.
+                let name_and_attrs = name_and_attrs.trim_start();
+                let (name, attrs) = match name_and_attrs.split_once(char::is_whitespace) {
+                    Some((name, rest)) => (name, rest.trim_start()),
+                    None => (name_and_attrs, ""),
+                };
+                let name = name.to_ascii_lowercase();
+
+                match (closing, name.as_str()) {
+                    (false, "b" | "i" | "span") => {
+                        if stack.len() < MARKUP_MAX_DEPTH {
+                            stack.push((current, plain.len()));
+                            let mut next = current;
+                            match name.as_str() {
+                                "b" => next.bold = true,
+                                "i" => next.italic = true,
+                                _ => apply_span_attrs(
+                                    attrs,
+                                    &mut next.color,
+                                    &mut next.weight,
+                                    &mut next.size_px,
+                                ),
+                            }
+                            current = next;
+                        } else {
+                            warned = true;
+                        }
+                    }
+                    (true, "b" | "i" | "span") => match stack.pop() {
+                        Some((frame, _)) => current = frame,
+                        None => warned = true,
+                    },
+                    _ => warned = true,
+                }
+                i = close + 1;
+            }
+            b'&' => {
+                let (decoded, consumed) = decode_entity(&text[i..]);
+                match decoded {
+                    Some(ch) => plain.push(ch),
+                    None => {
+                        warned = true;
+                        plain.push('&');
+                    }
+                }
+                i += consumed;
+            }
+            _ => {
+                let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+                plain.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+
+    if plain.len() > run_start
+        && (current.bold
+            || current.italic
+            || current.color.is_some()
+            || current.weight.is_some()
+            || current.size_px.is_some())
+    {
+        spans.push(MarkupSpan {
+            range: run_start..plain.len(),
+            bold: current.bold,
+            italic: current.italic,
+            color: current.color,
+            weight: current.weight,
+            size_px: current.size_px,
+        });
+    }
+    if warned {
+        MARKUP_WARNED.call_once(|| {
+            tracing::warn!(
+                "markup outside the <b>/<i>/<span foreground|weight|size> subset was dropped"
+            );
+        });
+    }
+    (plain, spans)
+}
+
+/// Read `foreground`, `weight` and `size` off a `<span …>` attribute list.
+/// An attribute that does not parse is dropped, never defaulted to nonsense.
+fn apply_span_attrs(
+    attrs: &str,
+    color: &mut Option<Rgba>,
+    weight: &mut Option<f32>,
+    size_px: &mut Option<f32>,
+) {
+    let mut rest = attrs;
+    while let Some(eq) = rest.find('=') {
+        let name = rest[..eq].trim().to_ascii_lowercase();
+        let after = &rest[eq + 1..];
+        let trimmed = after.trim_start();
+        let (value, consumed) = match trimmed.chars().next() {
+            Some(quote @ ('"' | '\'')) => match trimmed[1..].find(quote) {
+                Some(end) => (&trimmed[1..1 + end], 1 + end + 1),
+                None => return,
+            },
+            Some(_) => {
+                let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+                (&trimmed[..end], end)
+            }
+            None => return,
+        };
+        match name.as_str() {
+            "foreground" | "color" => {
+                if let Some(rgba) = parse_markup_color(value) {
+                    *color = Some(rgba);
+                }
+            }
+            "weight" => {
+                if let Ok(w) = value.parse::<f32>() {
+                    if w.is_finite() && (1.0..=1000.0).contains(&w) {
+                        *weight = Some(w);
+                    }
+                } else {
+                    *weight = match value.to_ascii_lowercase().as_str() {
+                        "bold" => Some(700.0),
+                        "normal" => Some(400.0),
+                        _ => *weight,
+                    };
+                }
+            }
+            "size" => {
+                if let Ok(s) = value.parse::<f32>()
+                    && s.is_finite()
+                    && s > 0.0
+                {
+                    *size_px = Some(s);
+                }
+            }
+            _ => {}
+        }
+        let offset = eq + 1 + (after.len() - trimmed.len()) + consumed;
+        rest = &rest[offset.min(rest.len())..];
+    }
+}
+
+/// `#rgb`, `#rrggbb` and the sixteen HTML colour names Pango markup uses.
+fn parse_markup_color(value: &str) -> Option<Rgba> {
+    let value = value.trim();
+    if let Some(hex) = value.strip_prefix('#') {
+        let expand = |c: u8| -> f32 { f32::from(c) / 255.0 };
+        let byte = |s: &str| u8::from_str_radix(s, 16).ok();
+        return match hex.len() {
+            3 => {
+                let mut it = hex.chars();
+                let mut nibble = || {
+                    let c = it.next()?;
+                    let v = c.to_digit(16)? as u8;
+                    Some(expand(v * 17))
+                };
+                Some(Rgba {
+                    r: nibble()?,
+                    g: nibble()?,
+                    b: nibble()?,
+                    a: 1.0,
+                })
+            }
+            6 => Some(Rgba {
+                r: expand(byte(&hex[0..2])?),
+                g: expand(byte(&hex[2..4])?),
+                b: expand(byte(&hex[4..6])?),
+                a: 1.0,
+            }),
+            _ => None,
+        };
+    }
+    let named = |r: f32, g: f32, b: f32| Some(Rgba { r, g, b, a: 1.0 });
+    match value.to_ascii_lowercase().as_str() {
+        "black" => named(0.0, 0.0, 0.0),
+        "white" => named(1.0, 1.0, 1.0),
+        "red" => named(1.0, 0.0, 0.0),
+        "green" => named(0.0, 0.5019608, 0.0),
+        "blue" => named(0.0, 0.0, 1.0),
+        "yellow" => named(1.0, 1.0, 0.0),
+        "cyan" | "aqua" => named(0.0, 1.0, 1.0),
+        "magenta" | "fuchsia" => named(1.0, 0.0, 1.0),
+        "gray" | "grey" => named(0.5019608, 0.5019608, 0.5019608),
+        "silver" => named(0.7529412, 0.7529412, 0.7529412),
+        "maroon" => named(0.5019608, 0.0, 0.0),
+        "olive" => named(0.5019608, 0.5019608, 0.0),
+        "lime" => named(0.0, 1.0, 0.0),
+        "teal" => named(0.0, 0.5019608, 0.5019608),
+        "navy" => named(0.0, 0.0, 0.5019608),
+        "purple" => named(0.5019608, 0.0, 0.5019608),
+        _ => None,
+    }
+}
+
+/// Decode one XML entity at the head of `s`, returning `(char, bytes consumed)`.
+/// A malformed entity consumes exactly one byte and decodes to `None`, so the
+/// caller copies the `&` through and continues.
+fn decode_entity(s: &str) -> (Option<char>, usize) {
+    let mut cap = s.len().min(12);
+    while !s.is_char_boundary(cap) {
+        cap -= 1;
+    }
+    let Some(semi) = s[..cap].find(';') else {
+        return (None, 1);
+    };
+    let body = &s[1..semi];
+    let decoded = match body {
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "amp" => Some('&'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => body.strip_prefix('#').and_then(|num| {
+            let code = match num.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => num.parse::<u32>().ok()?,
+            };
+            char::from_u32(code)
+        }),
+    };
+    match decoded {
+        Some(ch) => (Some(ch), semi + 1),
+        None => (None, 1),
     }
 }
 
@@ -2041,6 +3075,557 @@ mod tests {
             }
             let long = "aあ ".repeat(5_000);
             let _ = apply_text_transform(&long, transform);
+        }
+    }
+
+    fn ui_style(css: &str) -> TextStyle {
+        TextStyle::from_computed(&style_for(css))
+    }
+
+    #[test]
+    fn a_paragraph_lays_out_one_line_per_newline_and_sizes_to_the_widest() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "Hello\nHello world",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+
+        assert_eq!(layout.line_count(), 2, "one line per newline");
+        assert_eq!(layout.text(), "Hello\nHello world");
+
+        let (w, h) = layout.size();
+        assert!(w > 0.0 && h > 0.0, "a non-empty paragraph has extents");
+
+        let short = super::TextLayout::build(
+            "Hello",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        assert!(
+            w > short.size().0,
+            "the paragraph is as wide as its widest line ({w} vs {})",
+            short.size().0
+        );
+        assert!(
+            (h - short.size().1 * 2.0).abs() < 0.51,
+            "two lines are two line boxes tall: {h} vs {}",
+            short.size().1 * 2.0
+        );
+    }
+
+    #[test]
+    fn an_empty_string_lays_out_as_one_zero_width_line() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        assert_eq!(
+            layout.line_count(),
+            1,
+            "an empty label still has a line box"
+        );
+        assert_eq!(layout.size().0, 0.0);
+        assert!(layout.size().1 > 0.0, "the line box keeps its height");
+    }
+
+    #[test]
+    fn word_wrapping_breaks_at_spaces_and_never_exceeds_the_limit() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let one = super::TextLayout::build(
+            "wrap",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        // Four short words, at a limit that fits about two of them.
+        let limit = one.size().0 * 2.6;
+        let wrapped = super::TextLayout::build(
+            "wrap wrap wrap wrap",
+            &style,
+            &mut db,
+            Some(limit),
+            super::WrapMode::Word,
+            super::Ellipsize::None,
+        );
+        assert!(
+            wrapped.line_count() >= 2,
+            "four words must not fit on one line at {limit}px"
+        );
+        assert!(
+            wrapped.size().0 <= limit + 0.01,
+            "no line may exceed the limit: {} > {limit}",
+            wrapped.size().0
+        );
+        assert_eq!(
+            wrapped.text(),
+            "wrap wrap wrap wrap",
+            "the source is intact"
+        );
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_stays_whole_under_word_and_breaks_under_word_char() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let long = "abcdefghijklmnopqrstuvwxyz";
+        let narrow = super::TextLayout::build(
+            "abcd",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        )
+        .size()
+        .0;
+
+        let word = super::TextLayout::build(
+            long,
+            &style,
+            &mut db,
+            Some(narrow),
+            super::WrapMode::Word,
+            super::Ellipsize::None,
+        );
+        assert_eq!(word.line_count(), 1, "Word never breaks inside a word");
+        assert!(word.size().0 > narrow, "so it overflows instead");
+
+        let word_char = super::TextLayout::build(
+            long,
+            &style,
+            &mut db,
+            Some(narrow),
+            super::WrapMode::WordChar,
+            super::Ellipsize::None,
+        );
+        assert!(
+            word_char.line_count() > 1,
+            "WordChar falls back to a cluster break"
+        );
+        assert!(word_char.size().0 <= narrow + 0.01);
+
+        let ch = super::TextLayout::build(
+            long,
+            &style,
+            &mut db,
+            Some(narrow),
+            super::WrapMode::Char,
+            super::Ellipsize::None,
+        );
+        assert!(ch.line_count() > 1, "Char always breaks between clusters");
+    }
+
+    #[test]
+    fn ellipsizing_fits_the_limit_and_keeps_the_named_end() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let source = "alpha bravo charlie delta";
+        let full = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        let limit = full.size().0 * 0.5;
+
+        for mode in [
+            super::Ellipsize::Start,
+            super::Ellipsize::Middle,
+            super::Ellipsize::End,
+        ] {
+            let cut = super::TextLayout::build(
+                source,
+                &style,
+                &mut db,
+                Some(limit),
+                super::WrapMode::None,
+                mode,
+            );
+            assert_eq!(cut.line_count(), 1, "{mode:?} does not add lines");
+            assert!(
+                cut.size().0 <= limit + 0.01,
+                "{mode:?} must fit {limit}px, got {}",
+                cut.size().0
+            );
+            assert_eq!(cut.text(), source, "{mode:?} leaves the source intact");
+            assert!(
+                cut.display_line(0).contains('\u{2026}'),
+                "{mode:?} inserts an ellipsis: {:?}",
+                cut.display_line(0)
+            );
+        }
+
+        let end = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            Some(limit),
+            super::WrapMode::None,
+            super::Ellipsize::End,
+        );
+        assert!(
+            end.display_line(0).starts_with("alpha"),
+            "End keeps the head: {:?}",
+            end.display_line(0)
+        );
+        let start = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            Some(limit),
+            super::WrapMode::None,
+            super::Ellipsize::Start,
+        );
+        assert!(
+            start.display_line(0).ends_with("delta"),
+            "Start keeps the tail: {:?}",
+            start.display_line(0)
+        );
+    }
+
+    #[test]
+    fn ellipsized_carets_ignore_a_literal_ellipsis_in_the_source() {
+        // A source that already contains '…' inside the retained head used to
+        // fool the caret remapping, which located the *inserted* ellipsis with
+        // `find` and so picked the literal one at byte 1.
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let source = "a\u{2026}bcdefghijklmnopqrstuvwx";
+        let full = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        let limit = full.size().0 * 0.5;
+        let cut = super::TextLayout::build(
+            source,
+            &style,
+            &mut db,
+            Some(limit),
+            super::WrapMode::None,
+            super::Ellipsize::End,
+        );
+
+        let display = cut.display_line(0);
+        assert!(
+            display.ends_with('\u{2026}'),
+            "End appends one: {display:?}"
+        );
+        let keep = display.len() - '\u{2026}'.len_utf8();
+        assert!(
+            keep > "a\u{2026}".len(),
+            "the kept head must span the literal ellipsis: {display:?}"
+        );
+
+        // Past the end of the visible line the caret is the end of the source;
+        // the `find`-based remap returned `source.len() - keep + 1` instead.
+        assert_eq!(
+            cut.byte_at((limit * 4.0, 0.0)),
+            source.len(),
+            "the last caret maps to the end of the source"
+        );
+    }
+
+    #[test]
+    fn a_limit_narrower_than_the_ellipsis_yields_the_ellipsis_alone() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let cut = super::TextLayout::build(
+            "alpha bravo",
+            &style,
+            &mut db,
+            Some(0.5),
+            super::WrapMode::None,
+            super::Ellipsize::End,
+        );
+        assert_eq!(cut.display_line(0), "\u{2026}", "never an empty display");
+        assert_eq!(cut.line_count(), 1);
+    }
+
+    #[test]
+    fn a_caret_round_trips_through_its_own_rect() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "Hello world",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+
+        let zero = layout.caret_rect(0);
+        assert_eq!(zero.x, 0.0, "the caret before the first byte sits at x=0");
+        assert!(zero.height > 0.0, "a caret is a line-height-tall sliver");
+
+        let end = layout.caret_rect("Hello world".len());
+        assert!(
+            (end.x - layout.size().0).abs() < 0.51,
+            "the caret past the last byte sits at the line's width: {} vs {}",
+            end.x,
+            layout.size().0
+        );
+
+        for byte in [0usize, 1, 5, 6, 11] {
+            let rect = layout.caret_rect(byte);
+            let back = layout.byte_at((rect.x + 0.01, rect.y + rect.height / 2.0));
+            assert_eq!(back, byte, "byte_at must invert caret_rect at {byte}");
+        }
+    }
+
+    #[test]
+    fn a_point_past_the_end_of_a_line_lands_on_that_lines_last_byte() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "ab\ncd",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        let first = layout.caret_rect(0);
+        assert_eq!(
+            layout.byte_at((10_000.0, first.y + 1.0)),
+            2,
+            "end of line 1"
+        );
+        assert_eq!(layout.byte_at((-5.0, first.y + 1.0)), 0, "before line 1");
+        assert_eq!(
+            layout.byte_at((10_000.0, 10_000.0)),
+            5,
+            "below everything is the last byte"
+        );
+        assert_eq!(layout.line_of(4), 1, "byte 4 is on the second line");
+    }
+
+    #[test]
+    fn a_selection_yields_one_rect_per_covered_line() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let layout = super::TextLayout::build(
+            "abc\ndef",
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+        assert_eq!(
+            layout.selection_rects(0..0).len(),
+            0,
+            "an empty range is empty"
+        );
+        assert_eq!(layout.selection_rects(1..2).len(), 1, "within one line");
+        let across = layout.selection_rects(1..6);
+        assert_eq!(across.len(), 2, "one rect per covered line");
+        assert!(across[0].y < across[1].y, "top-first");
+        assert!(across[0].width > 0.0 && across[1].width > 0.0);
+        // An out-of-range end must be clamped, not panic.
+        assert_eq!(layout.selection_rects(0..99_999).len(), 2);
+    }
+
+    #[test]
+    fn grapheme_movement_steps_over_combining_marks_and_clamps_at_the_ends() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        // "e" + combining acute, then a flag (two regional indicators).
+        let text = "e\u{0301}x\u{1F1EF}\u{1F1F5}";
+        let layout = super::TextLayout::build(
+            text,
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+
+        assert_eq!(layout.next_grapheme(0), 3, "e + U+0301 is one cluster");
+        assert_eq!(layout.next_grapheme(3), 4, "then the ASCII x");
+        assert_eq!(
+            layout.next_grapheme(4),
+            text.len(),
+            "the flag is one cluster"
+        );
+        assert_eq!(layout.next_grapheme(text.len()), text.len(), "clamped");
+
+        assert_eq!(layout.prev_grapheme(text.len()), 4);
+        assert_eq!(layout.prev_grapheme(4), 3);
+        assert_eq!(layout.prev_grapheme(3), 0);
+        assert_eq!(layout.prev_grapheme(0), 0, "clamped");
+
+        // A byte in the middle of a cluster must not panic and must not slice
+        // through a char boundary.
+        assert_eq!(layout.next_grapheme(1), 3);
+        assert_eq!(layout.prev_grapheme(2), 0);
+    }
+
+    #[test]
+    fn word_movement_lands_on_word_starts_the_way_ctrl_arrow_does() {
+        let style = ui_style("label { font-size: 14px; }");
+        let mut db = FontDatabase::new();
+        let text = "alpha  bravo charlie";
+        let layout = super::TextLayout::build(
+            text,
+            &style,
+            &mut db,
+            None,
+            super::WrapMode::None,
+            super::Ellipsize::None,
+        );
+
+        assert_eq!(layout.next_word(0), 7, "past 'alpha' and both spaces");
+        assert_eq!(layout.next_word(7), 13, "to 'charlie'");
+        assert_eq!(layout.next_word(13), text.len(), "to the end");
+        assert_eq!(layout.next_word(text.len()), text.len(), "clamped");
+
+        assert_eq!(layout.prev_word(text.len()), 13);
+        assert_eq!(layout.prev_word(13), 7);
+        assert_eq!(layout.prev_word(7), 0);
+        assert_eq!(layout.prev_word(0), 0, "clamped");
+    }
+
+    #[test]
+    fn markup_extracts_bold_italic_and_span_attributes() {
+        let (plain, spans) = super::parse_markup(
+            "a<b>bold</b>c<i>it</i><span foreground=\"#ff0000\" weight=\"700\" \
+             size=\"20\">red</span>",
+        );
+        assert_eq!(plain, "aboldcitred", "tags are removed from the text");
+
+        let bold = spans.iter().find(|s| s.bold).expect("a bold span");
+        assert_eq!(bold.range, 1..5, "'bold' at bytes 1..5");
+        assert!(!bold.italic);
+
+        let italic = spans.iter().find(|s| s.italic).expect("an italic span");
+        assert_eq!(italic.range, 6..8);
+
+        let coloured = spans
+            .iter()
+            .find(|s| s.color.is_some())
+            .expect("a coloured span");
+        assert_eq!(coloured.range, 8..11);
+        assert_eq!(
+            coloured.color.map(|c| (c.r, c.g, c.b)),
+            Some((1.0, 0.0, 0.0))
+        );
+        assert_eq!(coloured.weight, Some(700.0));
+        assert_eq!(coloured.size_px, Some(20.0));
+    }
+
+    #[test]
+    fn markup_tolerates_whitespace_before_the_tag_name() {
+        // Both ASCII and multi-byte leading whitespace: the name is recognised
+        // and the attributes still parse (the old raw-offset slice either
+        // panicked on a char boundary or fed garbage to the attribute parser).
+        for input in [
+            "<  span foreground=\"#ff0000\">x</span>",
+            "<\u{3000}\u{3000}span foreground=\"#ff0000\">x</span>",
+            "<\u{2028}span foreground=\"#ff0000\">x</span>",
+        ] {
+            let (plain, spans) = super::parse_markup(input);
+            assert_eq!(plain, "x", "tags removed for {input:?}");
+            let coloured = spans
+                .iter()
+                .find(|s| s.color.is_some())
+                .unwrap_or_else(|| panic!("a coloured span for {input:?}"));
+            assert_eq!(coloured.range, 0..1);
+            assert_eq!(
+                coloured.color.map(|c| (c.r, c.g, c.b)),
+                Some((1.0, 0.0, 0.0)),
+                "attributes parse for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn markup_entities_are_decoded_and_unknown_tags_are_dropped() {
+        let (plain, spans) = super::parse_markup("5 &lt; 6 &amp; <u>x</u>&gt;");
+        assert_eq!(plain, "5 < 6 & x>", "entities decode, unknown tags vanish");
+        assert!(
+            spans
+                .iter()
+                .all(|s| !s.bold && !s.italic && s.color.is_none()),
+            "an unknown tag contributes no span"
+        );
+    }
+
+    #[test]
+    fn decode_entity_truncation_stays_on_a_char_boundary() {
+        // 13 bytes: '&' followed by six 2-byte 'é' characters, no ';' present.
+        // Byte offset 12 (the old fixed truncation length) lands mid-'é'; the
+        // truncation must snap back to a char boundary instead of panicking.
+        let hostile = format!("&{}", "\u{00e9}".repeat(6));
+        let (plain, spans) = super::parse_markup(&hostile);
+        assert_eq!(
+            plain, hostile,
+            "stray '&' with no entity is copied through verbatim"
+        );
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn markup_never_panics_on_hostile_input() {
+        // Unclosed, mismatched, nested past any sane depth, invalid attribute
+        // values, lone angle brackets, and a non-ASCII payload — none of these
+        // may panic or slice through a char boundary.
+        let hostile = [
+            "<b>",
+            "</b>",
+            "<b><i></b></i>",
+            "<span foreground=\"not-a-colour\" size=\"NaN\" weight=\"-3\">x</span>",
+            "<span foreground=>x",
+            "a < b > c",
+            "&notanentity; &#; &#xZZ;",
+            "<b>\u{00e9}\u{0301}\u{1F1EF}\u{1F1F5}</b>",
+            "&\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9}",
+            &"<b>".repeat(5_000),
+            &format!("<b>{}</b>", "\u{00e9}".repeat(10_000)),
+            // Multi-byte whitespace between '<' and the tag name: the attribute
+            // slice must not be recomputed from a whitespace-skipped length.
+            "<\u{3000}\u{3000}span foreground='red'>x</span>",
+            "<\u{2028}span foreground='red'>x</span>",
+            "<\u{3000}>x",
+            "<\u{3000}\u{3000}>x",
+            "</\u{3000}span>",
+        ];
+        for input in hostile {
+            let (plain, spans) = super::parse_markup(input);
+            assert!(plain.is_char_boundary(plain.len()));
+            for span in &spans {
+                assert!(
+                    span.range.start <= span.range.end && span.range.end <= plain.len(),
+                    "span {:?} out of range for {:?}",
+                    span.range,
+                    plain
+                );
+                assert!(plain.is_char_boundary(span.range.start));
+                assert!(plain.is_char_boundary(span.range.end));
+            }
         }
     }
 }

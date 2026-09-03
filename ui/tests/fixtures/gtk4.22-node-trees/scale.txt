@@ -1,0 +1,18 @@
+scale[.fine-tune][.marks-before][.marks-after]
+├── [value][.top][.right][.bottom][.left]
+├── [marks.top]
+│   ├── mark
+│   ┊    ├── [label]
+│   ┊    ╰── indicator
+┊   ┊
+│   ╰── mark
+├── [marks.bottom]
+│   ├── mark
+│   ┊    ├── indicator
+│   ┊    ╰── [label]
+┊   ┊
+│   ╰── mark
+╰── trough
+    ├── [fill]
+    ├── [highlight]
+    ╰── slider

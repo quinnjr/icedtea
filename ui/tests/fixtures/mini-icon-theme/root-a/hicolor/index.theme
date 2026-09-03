@@ -1,0 +1,9 @@
+[Icon Theme]
+Name=Hicolor
+Comment=The spec-mandated backstop theme
+Directories=48x48/actions
+
+[48x48/actions]
+Size=48
+Type=Fixed
+Context=Actions

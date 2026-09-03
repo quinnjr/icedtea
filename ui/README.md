@@ -7,24 +7,116 @@ A pure-Rust, GTK4-theme-compatible widget layer: no `gtk4`, `gio`, `glib`,
 ## What this crate covers
 
 M1 proved one themed `button` end to end. M2 widened the CSS layer to the whole
-GTK 4.22 property table: every property in GTK's CSS reference parses, cascades,
-inherits, computes, paints and animates on a widget-independent styled-node
-tree.
+GTK 4.22 property table. **M3 turns that engine into a widget toolkit:** real
+windows and popups, a keyboard/pointer/focus model, a reactive view layer, the
+GTK 4.22 core widget set with GTK-exact CSS node trees, and icon theming.
 
 | Layer | Crate |
 |---|---|
-| Wayland + layer shell | `wayland-client`, `wayland-protocols-wlr` (hand-rolled, no sctk/calloop) |
+| Wayland: toplevel, layer shell, popups | `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr` (hand-rolled, no sctk/calloop) |
+| Keyboard | `xkbcommon` (keymaps, compose, repeat) |
 | 2D paint | `skia-rs-safe` (pure Rust) |
-| Text shaping | `skia-rs-text` — `Typeface::from_data` + `rustybuzz` (**not** `cosmic-text`) |
-| Font discovery | `fontconfig` — real `fc-match` parity (default feature; see below) |
+| Text shaping | `skia-rs-text` — `Typeface::from_data` + `rustybuzz` |
+| Font discovery | `fontconfig` — real `fc-match` parity (default feature) |
 | Layout | `taffy` |
 | CSS parse / match | Servo's `cssparser` + `selectors` |
-| Widget | bespoke — a `css::node::Node` tree wearing GTK's node identity |
+| Widgets | bespoke — `css::node::Node` trees wearing GTK's node identity |
+
+### The module map
+
+| Module | What it owns |
+|---|---|
+| `css/` | The property registry, parsing, selectors, cascade, computed values (M2) |
+| `anim/` | Transitions, `@keyframes`, the animation clock (M2) |
+| `layout.rs` | The `taffy` bridge: box, grid and centre containers, per-child alignment |
+| `paint/` | Backgrounds, borders, shadows, outlines, blur, text, icons |
+| `text.rs` | Font matching, shaping caches, wrap/ellipsize/caret/selection |
+| `window/` | `Surface::{Toplevel, Layer, Popup}`, keyboard, pointer, focus, selection |
+| `view/` | `View`, builders, the keyed reconciler, controllers, `App`, `Cmd` |
+| `widgets/` | One file per widget: node tree, controller, behaviour |
+| `icons/` | freedesktop icon themes, symbolic recolouring, builtins |
+| `gallery.rs` | Every widget on one page — the binary the M3 gate measures |
 
 The property registry (`css/registry.rs`) is the spine: one static table of
 114 rows — 95 longhands, 19 shorthands — drives parsing, shorthand expansion,
 inheritance, computed values and interpolation. Nothing outside that module
 names a property string.
+
+## The widget set
+
+Every widget below is a `Kind`, a builder in `view::builders`, a controller, a
+GTK-exact CSS node tree with a vendored fixture, a rest-state pixel probe and —
+per widget class — one driven interaction. The name is what
+`gallery --widget <NAME>` takes.
+
+<!-- widgets:begin -->
+| Widget | CSS node | Notes |
+|---|---|---|
+| `label` | `label` | wrap, ellipsize, `<b><i><span>` markup, links |
+| `spinner` | `spinner` | `:checked` while spinning, as GTK does |
+| `statusbar` | `statusbar` | one-line message area |
+| `level_bar` | `levelbar` | discrete/continuous fill, offset colour bands |
+| `progress_bar` | `progressbar` | determinate fill, optional inline text |
+| `info_bar` | `infobar` | message type styling (`.info`/`.warning`/…), close button |
+| `scrollbar` | `scrollbar` | orientation, slider drag |
+| `image` | `image` | icon-name or file source, painted through `paint_icon_source` |
+| `picture` | `picture` | raster content, `content-fit` scaling |
+| `separator` | `separator` | horizontal/vertical rule |
+| `text_view` | `textview` | multi-line editable text, caret and selection |
+| `scale` | `scale` | continuous drag with a live value, keyboard step |
+| `drawing_area` | `widget` | GTK sets no CSS name on it; caller-supplied paint callback |
+| `window_controls` | `windowcontrols` | minimise/maximise/close glyphs |
+| `calendar` | `calendar.view` | month grid, day selection |
+| `popover` | `popover.background` | arrow, grab-and-dismiss surface (shared with `MenuButton`/`DropDown`) |
+| `button` | `button` | click, `:hover`/`:active`, Space/Enter activation |
+| `toggle_button` | `button.toggle` | persists `:checked` across clicks |
+| `link_button` | `button.link` | opens a URI, `:visited` styling |
+| `check_button` | `checkbutton` | tri-state check, optional radio grouping |
+| `menu_button` | `menubutton` | opens a `PopoverC` on click |
+| `switch` | `switch` | on/off drag or click, animated thumb |
+| `drop_down` | `dropdown` | popover list, type-ahead filter, keyboard pick |
+| `color_dialog_button` | `colorbutton` | swatch button, opens `ColorDialog` |
+| `color_dialog` | `window.dialog` | HSV picker, hex entry |
+| `font_dialog_button` | `fontbutton` | opens `FontDialog` |
+| `font_dialog` | `window.dialog` | family/style/size list |
+| `entry` | `entry` | caret, selection, undo stack (`widgets::edit`) |
+| `search_entry` | `entry.search` | debounced search-changed signal |
+| `password_entry` | `entry.password` | peek-to-reveal toggle |
+| `spin_button` | `spinbutton` | steppers repeat while held |
+| `editable_label` | `editablelabel` | click-to-edit label/entry swap |
+| `box` | `box` | linear layout, per-child alignment |
+| `grid` | `grid` | row/column layout with spans |
+| `center_box` | `box` | three-slot start/center/end layout |
+| `scrolled_window` | `scrolledwindow` | kinetic scroll, overlay scrollbars |
+| `paned` | `paned` | draggable divider between two panes |
+| `frame` | `frame` | optional labelled border around one child |
+| `expander` | `expander-widget` | disclosure triangle, animated reveal |
+| `search_bar` | `searchbar` | reveals a `search_entry` on `/`-style trigger |
+| `action_bar` | `actionbar` | start/center/end action row, focus-order gate |
+| `header_bar` | `headerbar` | title, start/end widget packing |
+| `notebook` | `notebook` | tabbed pages, keyboard tab switching |
+| `notebook_tab` | `tab` | one `notebook` page's tab label (sub-kind) |
+| `overlay` | `overlay` | stacked children, one main plus floating overlays |
+| `stack` | `stack` | one visible page at a time, transition-driven swap |
+| `stack_page` | `stackpage` | one `stack` page's metadata (sub-kind) |
+| `stack_switcher` | `stackswitcher.stack-switcher` | button row bound to a `stack` |
+| `stack_sidebar` | `stacksidebar.sidebar` | list-style page picker bound to a `stack` |
+| `list_box` | `list` | selectable rows, keyboard navigation |
+| `list_box_row` | `row` | one `list_box` row (sub-kind) |
+| `flow_box` | `flowbox` | wrapping selectable grid of children |
+| `flow_box_child` | `flowboxchild` | one `flow_box` cell (sub-kind) |
+| `list_view` | `listview` | recycled rows, scroll with reuse |
+| `grid_view` | `gridview` | recycled grid cells, scroll with reuse |
+| `column_view` | `columnview` | multi-column recycled list |
+| `column_view_column` | `button` | one `column_view` header (sub-kind) |
+| `popover_menu` | `popover.background.menu` | menu-model-backed popover |
+| `popover_menu_bar` | `menubar` | horizontal menu bar opening `popover_menu`s |
+| `popover_menu_item` | `button.model` | one `popover_menu` row (sub-kind) |
+| `window` | `window.background` | toplevel surface, title, decoration |
+| `shortcuts_window` | `window.shortcuts` | grouped accelerator reference (kept, ruling R1) |
+| `about_dialog` | `window.aboutdialog` | app name/version/credits dialog |
+| `alert_dialog` | `window.dialog.message` | message, detail, buttons |
+<!-- widgets:end -->
 
 ## Running it
 
@@ -155,6 +247,53 @@ Notes that are load-bearing for anyone reading computed values:
 - **Negative lengths clamp to 0** for padding, border widths, radii and
   minimums.
 
+## Reactive framework (`view/`)
+
+`view(&Model) -> View<Msg>` describes the UI; the reconciler diffs it into
+the retained node tree from `css::node`, keeping identity — animations,
+focus, shaping caches — for every child whose key and kind survive.
+Behaviour lives in a `Controller` per widget kind, not in the model:
+
+```rust
+fn view(model: &Model) -> View<Msg> {
+    widget::<Msg>(Kind::Box)
+        .child(widget(Kind::Button).prop(PropName::Label, "+").on_click(Msg::Inc))
+        .child(widget(Kind::Label).prop(PropName::Label, model.n.to_string()))
+}
+
+fn update(model: &mut Model, msg: Msg) -> Cmd<Msg> {
+    match msg { Msg::Inc => model.n += 1 }
+    Cmd::None
+}
+
+App::new(Model { n: 0 }, update, view).run(window)?;
+```
+
+Messages are queued and folded one at a time — an `update` that produces a
+`Cmd` producing a `Msg` enqueues it; the fold never re-enters. Commands run
+where they can: the clipboard, timer and focus ones inside the fold, the
+window-bound ones (`SetTitle`, `Minimize`, `ToggleMaximized`, `OpenPopup`,
+`ClosePopup`) on the way back out of it, so a `Cmd` an `update` returns reaches
+the toplevel just as a controller's does.
+
+Events dispatch in GTK's three phases, capture → target → bubble, and a
+controller that sets `cx.handled` consumes the event: it is the last node the
+event reaches, whichever phase it was in. Focus moves — from a click, from
+`Cmd::Focus`, from a keyboard binding — are announced once as `FocusOut` on the
+old node then `FocusIn` on the new one, which is what `on_focus_in`/
+`on_focus_out` fire on. Whether a node can take focus at all comes from
+`Kind::is_focusable_by_default`, overridable per view with `.focusable(bool)`;
+it reaches `window::focus` as the `focusable` class, which is what the Tab ring
+walks.
+
+
+`App::run_offscreen` runs the identical loop against a raster surface with no
+compositor, driven by a `Vec<ScriptStep<Msg>>` on a `ManualClock`; that is
+what `ui/tests/counter_app.rs` and every controller unit test use.
+
+Widget builders (`button("Ok")`, `label("Hi")`, …) arrive with P5 and P6;
+`view::builders`' module docs carry the naming rule they follow.
+
 ## Fonts and text
 
 - **Font discovery is real fontconfig.** `text::FontDatabase` builds one
@@ -237,6 +376,90 @@ Notes that are load-bearing for anyone reading computed values:
   as the seat's whole current set: losing the pointer releases it and clears
   hover and active, regaining it binds a new one.
 
+## The gallery
+
+```bash
+cargo run -p icedtea-ui --bin gallery                 # every widget, light Adwaita
+cargo run -p icedtea-ui --bin gallery -- --theme dark
+cargo run -p icedtea-ui --bin gallery -- --widget check_button
+```
+
+One scrollable page, one `frame` per widget, in `Kind::all()` order. The page is
+built by *iterating* `Kind::all()`, so a widget added without a gallery entry
+does not compile — the gallery is the toolkit's completeness measure, not a
+demo.
+
+| Option | Meaning |
+|---|---|
+| `--theme <light\|dark\|hc>` | Which bundled sheet to compile. Default: light. |
+| `--theme-file <PATH>` | A sheet on disk, used *whole*, instead of a bundled one. |
+| `--widget <NAME>` | Render exactly one widget, alone, at the origin. |
+| `--list` | Print every widget name, one per line, and exit. |
+| `--probe-points` | Print `<widget> <label> <x> <y>` for every probe point and exit. |
+| `--print-allocation` | Print `<widget> <x> <y> <width> <height>` per entry and exit. |
+| `--size <WxH>` | Surface size. Default: 1280x800. |
+| `--scroll <PX>` | Scroll the page before the first frame. |
+| `--scale <N>` | Output scale, for HiDPI probes. Default: 1. |
+
+`--list`, `--probe-points` and `--print-allocation` never touch Wayland: they
+run the same view → reconcile → restyle → layout pipeline the app loop runs and
+print what it produced. Everything else maps a `zwlr_layer_shell_v1` overlay
+anchored top-left, so on-screen coordinates are page coordinates.
+
+**Probe points** are derived, never declared: `"root"` is the widget's own node,
+every descendant is labelled by its CSS node name, and a name that occurs more
+than once is indexed (`tab0`, `image1`). That is how the gates learn where to
+sample — no test in this crate hard-codes a coordinate.
+
+Every folded message is printed as `msg <line>` on stdout and flushed
+immediately, which is how the interaction gate asserts on the model from
+outside the process.
+
+## The M3 gates
+
+```bash
+cargo test -p icedtea-ui --test gallery_gate       # rest state, 3 themes
+cargo test -p icedtea-ui --test interaction_gate   # 16 interactions, 15 driven
+cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
+```
+
+- `tests/gallery_gate.rs` walks the page in surface-height slices under the
+  harness compositor and asserts every widget paints something in light, dark
+  and high-contrast Adwaita — except the nine entries listed in that file's
+  `KNOWN_BLANK_AT_REST`, which are measured, not asserted on, because they
+  render nothing today (seven collapse to a zero-area allocation, and
+  `link_button`/`check_button` draw nothing into a real one; see contract
+  amendment P8-D69). The list was fifteen until the M3 close-out's first fix
+  wave, which made the universal size request reach every kind (P8-D75) and
+  gave a recycling view's pooled rows a measure and a paint, so
+  `progress_bar`, `stack_switcher`, `stack_sidebar`, `list_view`, `grid_view`
+  and `about_dialog` are now asserted on like everything else. Every entry,
+  exempt or not, must still appear whole in some slice. It further asserts that every `Kind` appears in `--list`, on the
+  page and (for sub-kinds) inside its parent's node tree; that at least one
+  probe point per widget differs between light and dark; that every widget's
+  node tree matches its vendored GTK 4.22 fixture; and that this README's
+  table lists every `Kind`.
+- `tests/interaction_gate.rs` drives interactions with a virtual pointer and
+  keyboard. **All sixteen of the contract's interactions ship; fifteen run**:
+  click, toggle, check,
+  switch, the pointer-click-without-focus-ring rule, typing with a placed
+  caret, debounced search, password peek, held spin repeat, scale drag,
+  drop-down pick, expander disclosure, stack-page switch, menu-button popover,
+  and Tab in geometric order. Each of the last ten landed with the
+  pre-existing production defect it was RED on — none is asserted around.
+  The sixteenth, `scrolling_a_list_view_recycles_rows_without_losing_
+  selection`, is written and `#[ignore]`d: its widget defects are fixed (rows
+  measure and paint, and the viewport no longer feeds itself), and what
+  blocks it is transport — `wlr` 0.20.28 forwards no `wl_pointer.axis` to any
+  client, so a scroll cannot be injected through the harness compositor at
+  all. The interaction itself is proven offscreen by
+  `widgets::list_view::tests::pixels::scrolling_recycles_the_pooled_rows_and_
+  keeps_the_selection`. Contract amendments P8-D71, P8-D72 and P8-D74 carry
+  the whole trail, and `.superpowers/sdd/m3-close/` the RED/GREEN evidence.
+- Colours are pinned in exactly one place — `tests/themed_button_offscreen.rs`,
+  the M1 gate. The gallery gates assert *change*, not constants: 64 pinned
+  colours would be a fixture to maintain, not a gate.
+
 ## Tests
 
 ```bash
@@ -266,18 +489,17 @@ cargo test -p icedtea-ui
   kind and inherited flag, asserted both ways — nothing missing, nothing
   invented — in registry order.
 
-## Deliberately not covered by M2
+## Deliberately not covered by M3
 
-Icon *drawing* — every `-gtk-icon-*` value parses, computes and is stored, but
-nothing rasterizes an icon yet (M4). Widgets beyond the button behaviour that
-carries the M1 gate, the focus/event model, grid and centre layouts, and text
-editing (M3). Accessibility, input methods, drag and drop (M6). `url()` images
-beyond PNG, and SVG only where `skia-rs-svg` decodes it — anything else is
-recorded unresolved and paints nothing rather than erroring. `@media` features
-beyond `prefers-color-scheme` and `prefers-contrast`. Fractional scale and
-surface resize. `font-feature-settings`/`font-variation-settings` reaching the
-shaper, and font-collection face indices (see **Fonts and text** above). See the
-spec's M3–M6.
+Input methods and `text-input-v3`, the emoji chooser, drag and drop, and
+`accesskit` accessibility (M6). Markup beyond `<b><i><span>`. GL and video
+widgets (`GLArea`, `Video`, `MediaControls`), the portal-backed choosers
+(file, print, app) and `LockButton`, and the deprecated widgets GTK 4.22 itself
+retired — except `Statusbar`, `InfoBar` and `ShortcutsWindow`, which Adwaita
+still styles and which the M3 contract keeps (ruling R1). Client-side cursor
+themes: the toolkit maps the `cursor` property to `wp_cursor_shape_v1` names
+instead. XWayland clients. Fractional scale. The app migrations onto this
+toolkit — settings, then shell, then clipboard — are M5.
 
 ## Vendored files
 
@@ -287,3 +509,97 @@ themes, redistributed under the LGPL-2.1-or-later. See
 [`themes/README.md`](themes/README.md). `tests/fixtures/gtk4.22-css-properties.txt`
 is a transcription of GTK 4.22's CSS property reference, with the doc URL in its
 header.
+
+## The window and event layer
+
+`icedtea_ui::window` is one Wayland client per window: a `Surface` in one of
+three roles (`xdg_toplevel`, `zwlr_layer_surface_v1`, `xdg_popup`), a retained
+`Node` tree with its `LayoutTree`, `AnimationState` and `StyleMap`, and a
+bounded pump that hands up a flat `InputEvent` stream.
+
+- **Keyboard** — `window::keyboard` compiles the compositor's keymap with
+  `libxkbcommon`, runs the compose table, reports the modifiers a keysym
+  consumed (so `!` matches a plain-`!` accelerator), and owns the repeat timer
+  xkbcommon does not have.
+- **Pointer** — `window::pointer` hit-tests the retained tree in reverse paint
+  order, mirrors the compositor's implicit grab client-side, and coasts finger
+  scrolls kinetically.
+- **Focus** — `window::focus` sorts candidates *geometrically*, as GTK's
+  `gtk_widget_focus_sort` does, and implements GTK's `:focus-visible` rule:
+  visible by default, hidden by a pointer click, shown again by a key that
+  moved the focus.
+- **Selection** — `window::selection` offers and reads
+  `text/plain;charset=utf-8` on `wl_data_device` and the primary selection.
+
+M1's `LayerWindow` is unchanged, at `window::layer` and still reachable as
+`wayland::LayerWindow`; the `themed-button` demo and its pixel gate run on it
+exactly as before.
+
+Not covered here: input methods (`text-input-v3`), drag and drop, client-side
+cursor themes (M6/see below).
+
+## The P5 half of the widget catalogue, in detail
+
+`icedtea_ui::widgets` builds one `Controller` per `Kind`, dispatched by
+`widgets::build_controller`; `view::builders` re-exports each widget's free
+constructor and `*Ext` setter trait under the name §4.4 requires. Behaviour
+(steppers repeating while held, a search entry's debounce, an entry's caret
+and selection, a drop-down's type-ahead filter) lives on the controller, not
+duplicated per widget: `Entry`, `SearchEntry`, `PasswordEntry` and
+`SpinButton` all share one `TextEditState`/`UndoStack` engine
+(`widgets::edit`); `MenuButton`, `DropDown` and the two dialog buttons all
+embed the same `PopoverC` surface.
+
+Every kind below is checked two ways: `tests/node_trees.rs` renders its
+retained `Node` subtree in GTK's own notation and matches it, node by node
+and class by class, against the fixture vendored verbatim from GTK 4.22.4's
+sources (`tests/fixtures/gtk4.22-node-trees/<fixture>.txt`); `tests/
+widget_pixels.rs` runs it through `App::run_offscreen` against Adwaita light
+and asserts on the rasterized pixels for both its rest state and its
+interactions. `every_p5_kind_has_a_fixture_and_matches_it_with_default_props`
+and `no_p5_kind_falls_through_to_the_unimplemented_controller` in
+`node_trees.rs`, and `every_p5_kind_renders_at_rest_without_panicking` in
+`widget_pixels.rs`, are exhaustive gates over `Kind::all()`'s P5 half: adding
+a kind without a fixture, without a dispatch arm, or whose default-props tree
+panics fails a named test rather than passing silently. P6 extends both
+files with its own 32 kinds; P8's gallery gate wires the whole set together.
+
+| Kind | CSS node | Builder | Fixture |
+| --- | --- | --- | --- |
+| `Label` | `label` | `label(text)` | `label.txt` |
+| `Spinner` | `spinner` | `spinner()` | `spinner.txt` |
+| `Statusbar` | `statusbar` | `statusbar()` | `statusbar.txt` |
+| `LevelBar` | `levelbar` | `level_bar()` | `level_bar.txt` |
+| `ProgressBar` | `progressbar` | `progress_bar()` | `progress_bar.txt` |
+| `InfoBar` | `infobar` | `info_bar()` | `info_bar.txt` |
+| `Scrollbar` | `scrollbar` | `scrollbar()` | `scrollbar.txt` |
+| `Image` | `image` | `image`/`image_named` | `image.txt` |
+| `Picture` | `picture` | `picture`/`picture_from_bytes` | `picture.txt` |
+| `Separator` | `separator` | `separator()` | `separator.txt` |
+| `TextView` | `textview` | `text_view()` | `text_view.txt` |
+| `Scale` | `scale` | `scale(lower, upper)` | `scale.txt` |
+| `DrawingArea` | `widget` | `drawing_area()` | `drawing_area.txt` |
+| `WindowControls` | `windowcontrols` | `window_controls()` | `window_controls.txt` |
+| `Calendar` | `calendar` | `calendar()` | `calendar.txt` |
+| `Popover` | `popover` | `popover(..)` | `popover.txt` |
+| `Button` | `button` | `button`/`button_from` | `button.txt` |
+| `ToggleButton` | `button.toggle` | `toggle_button()` | `toggle_button.txt` |
+| `LinkButton` | `button.link` | `link_button()` | `link_button.txt` |
+| `CheckButton` | `checkbutton` | `check_button()` | `check_button.txt` |
+| `MenuButton` | `menubutton` | `menu_button(..)` | `menu_button.txt` |
+| `Switch` | `switch` | `switch()` | `switch.txt` |
+| `DropDown` | `dropdown` | `drop_down`/`drop_down_from` | `drop_down.txt` |
+| `ColorDialogButton` | `colorbutton` | `color_dialog_button()` | `color_dialog_button.txt` |
+| `ColorDialog` | `window.dialog` | `color_dialog()` | `color_dialog.txt` |
+| `FontDialogButton` | `fontbutton` | `font_dialog_button()` | `font_dialog_button.txt` |
+| `FontDialog` | `window.dialog` | `font_dialog()` | `font_dialog.txt` |
+| `Entry` | `entry` | `entry()` | `entry.txt` |
+| `SearchEntry` | `entry.search` | `search_entry()` | `search_entry.txt` |
+| `PasswordEntry` | `entry.password` | `password_entry()` | `password_entry.txt` |
+| `SpinButton` | `spinbutton` | `spin_button(lower, upper)` | `spin_button.txt` |
+| `EditableLabel` | `editablelabel` | `editable_label(text)` | `editable_label.txt` |
+
+This table only carries the constructor signature and fixture path for P5's
+original 32 kinds; P6's remaining 32 (containers, lists, menus, dialogs) are
+listed with their CSS node and one-line behaviour in **The widget set** above,
+without a per-kind builder-signature row here.

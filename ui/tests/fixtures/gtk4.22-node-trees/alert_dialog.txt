@@ -1,0 +1,7 @@
+window.dialog.message
+├── label.title
+├── [label]
+╰── box
+    ├── button
+    ┊
+    ╰── button

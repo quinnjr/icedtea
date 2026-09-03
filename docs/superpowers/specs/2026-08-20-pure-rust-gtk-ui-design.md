@@ -1,9 +1,9 @@
 # Pure-Rust, GTK-themed Desktop UI — Design
 
 **Date:** 2026-08-20
-**Status:** M1 implemented and hardened by two review waves (see
-`docs/superpowers/plans/2026-08-25-pure-rust-gtk-m1-proving-slice.md` and
-`.superpowers/sdd/2026-08-25-pure-rust-gtk-m1-proving-slice/`); M2–M6 proposed
+**Status:** M1 and M2 implemented and merged; M3 implemented on
+`rebuild/pure-rust-gtk-m3` (widget toolkit, popups, windows, icons — the parent
+plan's M4 folded in); M5–M6 proposed
 **Branch:** `rebuild/pure-rust-gtk`
 
 ## Goal
@@ -152,12 +152,16 @@ get their own spec** when reached; this document details M1 and sketches the res
    rect rather than its border box, so shadows and outlines are not clipped.
    `ui/README.md` is the reference for all of these.
 
-3. **M3 — Widget toolkit breadth**: the retained widget tree + event/focus model
-   + a core widget set (window, headerbar, button, label, box, grid, entry,
-   switch, checkbutton, dropdown, scrolledwindow, listview/row, stack,
-   stackswitcher, spinbutton, colorbutton), each with GTK-matching nodes.
-4. **M4 — Icon & asset theming**: freedesktop icon themes, symbolic recolor,
-   cursor themes, HiDPI/fractional scale assets.
+3. **M3 — Widget toolkit breadth** *(implemented)*: xdg-popup end to end (`wlr`
+   0.20.28 → compositor → harness → toolkit), the window/event/focus layer over
+   `xkbcommon`, a keyed reactive view layer, the GTK 4.22 core widget set with
+   GTK-exact CSS node trees, and icon theming. Measured by the `gallery` binary
+   and its two gates; `ui/README.md` is the reference.
+4. **M4 — Icon & asset theming** *(folded into M3, done)*: freedesktop icon
+   themes, symbolic recolouring, builtin shapes and HiDPI assets shipped as M3's
+   P7. Client-side cursor themes were dropped: icedtea supports
+   `wp_cursor_shape_v1`, so the toolkit maps the `cursor` property to shape
+   names instead.
 5. **M5 — App migrations**: rebuild `settings`, then `shell`/bar, then the
    clipboard shell on the toolkit, each reusing its pure core and dropping
    `gtk4`. Ordered settings → shell → clipboard (settings is the richest widget

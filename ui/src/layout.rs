@@ -15,14 +15,16 @@
 //! Adwaita's "Click me" came out 27 px high against GTK 4.22's 34, and an
 //! empty button 20x27 against 36x34.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use selectors::Element as _;
 use selectors::OpaqueElement;
 use taffy::prelude::{
-    AlignItems, BoxSizing, Dimension, Display, FlexDirection, JustifyContent, LengthPercentage,
-    LengthPercentageAuto, Size, Style, TaffyAuto as _, TaffyTree, auto, length, percent,
+    AlignItems, AlignSelf, BoxSizing, Dimension, Display, FlexDirection, JustifyContent,
+    JustifyItems, LengthPercentage, LengthPercentageAuto, Position, Size, Style, TaffyAuto as _,
+    TaffyTree, auto, fr, length, line, percent, span,
 };
 
 use crate::css::computed::{ComputedStyle, ResolveEnv};
@@ -108,6 +110,16 @@ impl Rect {
     pub fn to_skia(&self) -> skia_rs_safe::core::Rect {
         skia_rs_safe::core::Rect::from_xywh(self.x, self.y, self.width, self.height)
     }
+
+    /// Whether `self` and `other` share any area -- `GtkFlowBox`'s
+    /// rubberband selection test, an edge or corner touch does not count.
+    #[must_use]
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
 }
 
 /// One node's laid-out geometry, in absolute tree-origin coordinates.
@@ -157,17 +169,64 @@ pub enum BoxDirection {
     Column,
 }
 
+/// GTK's per-child alignment (`halign`/`valign`).
+///
+/// P6 (contract §3.6) makes `LayoutTree::set_style` read this through a
+/// `ChildLayout`; P4 needs only the enum, because `view::Prop::Align` and
+/// `View::halign`/`View::valign` carry it (contract deviation D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Align {
+    /// Fill the whole allocation — GTK's default.
+    #[default]
+    Fill,
+    /// Pack at the start edge (left under LTR).
+    Start,
+    /// Pack at the end edge.
+    End,
+    /// Centre in the allocation.
+    Center,
+    /// Align on the first baseline; falls back to `Start` where there is none.
+    Baseline,
+}
+
 /// How a node lays its children out.
 ///
-/// M2 has exactly two: GTK's box, and a leaf whose size comes from a
-/// [`Measure`]. Grid and centre layouts are M3.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// M2 had two variants; M3 adds GTK's grid and centre-box layouts, which
+/// the M2 doc comment on this enum deferred to this milestone.
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Container {
-    /// A flex container on `direction`, centring its children on both axes
-    /// -- GTK's box default, and what M1's button relied on.
+    /// A flex container on `direction`. With no per-child [`ChildLayout`]
+    /// it centres its children on both axes -- GTK's box default, and what
+    /// M1's button relied on.
     Box {
         /// The main axis.
         direction: BoxDirection,
+    },
+    /// `GtkGrid`: a fixed track grid. `columns`/`rows` are template bounds
+    /// (clamped to `1..=1024`); children with a [`GridPlacement`] are pinned
+    /// and the rest are auto-placed.
+    Grid {
+        /// Column tracks.
+        columns: u16,
+        /// Row tracks.
+        rows: u16,
+        /// Gap between columns, px.
+        column_spacing: f32,
+        /// Gap between rows, px.
+        row_spacing: f32,
+        /// Every column track the same width.
+        column_homogeneous: bool,
+        /// Every row track the same height.
+        row_homogeneous: bool,
+    },
+    /// `GtkCenterBox`: exactly three children, the middle one centred in the
+    /// whole allocation. The *first* child is allocated per text direction
+    /// (`gtk/gtkcenterbox.c:45`).
+    Center {
+        /// The main axis.
+        direction: BoxDirection,
+        /// The centre child shrinks after the outer two, not before.
+        shrink_center_last: bool,
     },
     /// A childless node sized by its [`Measure`].
     Leaf,
@@ -179,6 +238,51 @@ impl Default for Container {
             direction: BoxDirection::Column,
         }
     }
+}
+
+/// Per-child placement, as GTK's `GtkWidget` expresses it.
+///
+/// A node this tree has never been given a `ChildLayout` for is not
+/// `Align::Fill`, it is *unaligned*, and keeps the container's own centring.
+/// See [`LayoutTree::set_child_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChildLayout {
+    /// Horizontal alignment.
+    pub halign: Align,
+    /// Vertical alignment.
+    pub valign: Align,
+    /// Absorb extra horizontal space.
+    pub hexpand: bool,
+    /// Absorb extra vertical space.
+    pub vexpand: bool,
+    /// Outer margin, top/right/bottom/left, px.
+    pub margin: [f32; 4],
+    /// Explicit grid cell, when the parent is a [`Container::Grid`].
+    pub grid: Option<GridPlacement>,
+    /// Out of flow, positioned by `halign`/`valign` alone over the whole
+    /// containing block instead of sharing a track's sizing with its
+    /// siblings -- `GtkOverlay`'s overlay children, which must not widen a
+    /// grid row/column the way an ordinary same-cell sibling would.
+    pub absolute: bool,
+}
+
+/// One child's cell in a [`Container::Grid`], zero-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridPlacement {
+    /// Zero-based column.
+    pub column: u16,
+    /// Zero-based row.
+    pub row: u16,
+    /// Columns covered; `0` is read as `1`.
+    pub column_span: u16,
+    /// Rows covered; `0` is read as `1`.
+    pub row_span: u16,
+}
+
+/// `v` if it is finite, else `0.0`. Every geometry number that reaches taffy
+/// from a `Props` value passes through here.
+fn finite(v: f32) -> f32 {
+    if v.is_finite() { v } else { 0.0 }
 }
 
 /// Why a layout call could not produce an answer.
@@ -212,6 +316,34 @@ impl From<taffy::TaffyError> for LayoutError {
 struct NodeCtx {
     node: Node,
     style: Rc<ComputedStyle>,
+    /// The container this node *is*.
+    container: Container,
+    /// How this node is placed inside its parent. `None` -- the M2 state --
+    /// means "unaligned": the parent's own centring decides, which is what
+    /// keeps every M1/M2 number bit-identical.
+    child: Option<ChildLayout>,
+    /// A measure that overrides the tree-wide one for this node only.
+    measure: Option<Rc<RefCell<dyn Measure>>>,
+    /// The `ResolveEnv` the last `set_style` used, so `set_container` and
+    /// `set_child_layout` can rewrite the taffy style without one.
+    env: ResolveEnv,
+    /// A floor on the container's `(column, row)` gap in px, from a widget's
+    /// own gap property (`GtkBox:spacing`, …). CSS `border-spacing` still
+    /// applies; the larger of the two wins on each axis, matching GtkBox.
+    gap_floor: (f32, f32),
+    /// A floor on the node's own `(width, height)` in px, from
+    /// `GtkWidget:width-request`/`height-request`. CSS `min-width`/
+    /// `min-height` still apply; the larger of the two wins on each axis,
+    /// which is what GTK does when a theme sets both. Like the CSS
+    /// minimums this floors the *content* box (see this module's own header),
+    /// so a widget with padding ends up at least this big inside its chrome.
+    size_floor: (f32, f32),
+    /// `GtkWidget:visible`. A hidden node keeps its place in the CSS tree —
+    /// GTK's own node trees list hidden nodes, and this crate's vendored
+    /// §5.2 fixtures with them — but takes no space, receives no events and
+    /// paints nothing, which is taffy's `Display::None` plus the skip in
+    /// `view::render`'s paint walk.
+    displayed: bool,
 }
 
 /// A `taffy` tree that mirrors one `css::node::Node` subtree.
@@ -317,6 +449,13 @@ impl LayoutTree {
                 let ctx = NodeCtx {
                     node: node.clone(),
                     style: ComputedStyle::initial(&self.env),
+                    container: Container::default(),
+                    child: None,
+                    measure: None,
+                    env: ResolveEnv::default(),
+                    gap_floor: (0.0, 0.0),
+                    size_floor: (0.0, 0.0),
+                    displayed: true,
                 };
                 let id = self.tree.new_leaf_with_context(Style::default(), ctx)?;
                 self.ids.insert(key, id);
@@ -364,7 +503,367 @@ impl LayoutTree {
             tracing::debug!(node = %node.name(), "set_style on an unsynced node");
             return;
         };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            ctx.style = Rc::new(style.clone());
+            ctx.container = container;
+            ctx.env = *env;
+        }
+        self.write_taffy_style(id);
+    }
 
+    /// Set the container without re-running the cascade.
+    ///
+    /// A widget controller knows what it *is* (`GtkGrid` is a grid) long
+    /// before a restyle happens, so it can say so without a
+    /// [`ComputedStyle`] in hand; the container is remembered on the node
+    /// and re-applied by every later [`set_child_layout`](Self::set_child_layout).
+    /// [`set_style`](Self::set_style) carries a container of its own and
+    /// remains authoritative: a restyle that passes a different one wins,
+    /// so a controller that restyles calls this again afterwards.
+    pub fn set_container(&mut self, node: &Node, container: Container) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_container on an unsynced node");
+            return;
+        };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            ctx.container = container;
+        }
+        self.write_taffy_style(id);
+    }
+
+    /// Place `node` inside its parent.
+    ///
+    /// Calling this at all opts the node out of the container's blanket
+    /// centring: from here on its alignment is exactly what `child` says.
+    pub fn set_child_layout(&mut self, node: &Node, child: ChildLayout) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_child_layout on an unsynced node");
+            return;
+        };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            ctx.child = Some(child);
+        }
+        self.write_taffy_style(id);
+    }
+
+    /// Raise the floor on `node`'s container gap, on one axis, to `px`.
+    ///
+    /// A widget's own gap property (`GtkBox:spacing`, `GtkGrid`'s row/column
+    /// spacing) and CSS `border-spacing` both apply; the larger wins, which
+    /// is what GTK does when a theme sets both. `px` is clamped to
+    /// non-negative and non-finite input floors at zero, so a hostile
+    /// `Props` value can never poison the taffy style with NaN.
+    pub fn set_gap_floor(&mut self, node: &Node, px: f32, horizontal: bool) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_gap_floor on an unsynced node");
+            return;
+        };
+        let px = if px.is_finite() { px.max(0.0) } else { 0.0 };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            if horizontal {
+                ctx.gap_floor.0 = px;
+            } else {
+                ctx.gap_floor.1 = px;
+            }
+        }
+        self.write_taffy_style(id);
+    }
+
+    /// Raise the floor on `node`'s own width and height to `(w, h)` px.
+    ///
+    /// `GtkWidget:width-request`/`height-request`, which are minimums, not
+    /// fixed sizes. Non-finite or negative input floors at zero, so a hostile
+    /// `Props` value can never poison the taffy style with NaN.
+    pub fn set_size_floor(&mut self, node: &Node, w: f32, h: f32) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_size_floor on an unsynced node");
+            return;
+        };
+        let clamp = |px: f32| if px.is_finite() { px.max(0.0) } else { 0.0 };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            ctx.size_floor = (clamp(w), clamp(h));
+        }
+        self.write_taffy_style(id);
+    }
+
+    /// Show or hide `node` and its subtree — `GtkWidget:visible`.
+    ///
+    /// A hidden node stays in the CSS tree (so a fixture that names it still
+    /// matches, and so its controller keeps its state) but is laid out as
+    /// `display: none`: zero size, no hit, and `view::render` skips painting
+    /// it.
+    pub fn set_displayed(&mut self, node: &Node, on: bool) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_displayed on an unsynced node");
+            return;
+        };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            ctx.displayed = on;
+        }
+        self.write_taffy_style(id);
+    }
+
+    /// Whether `node` is shown. An unknown node counts as shown, so a caller
+    /// that has never hidden anything behaves exactly as it did.
+    #[must_use]
+    pub fn is_displayed(&self, node: &Node) -> bool {
+        self.ids
+            .get(&node.opaque())
+            .and_then(|&id| self.tree.get_node_context(id))
+            .is_none_or(|ctx| ctx.displayed)
+    }
+
+    /// Give one node its own [`Measure`], overriding the one passed to
+    /// [`compute`](Self::compute) for that node alone.
+    ///
+    /// `RefCell` and not a bare `Rc` because `Measure::measure` takes
+    /// `&mut self` and a controller keeps its own handle to the same
+    /// measurer (contract deviation 1).
+    pub fn set_measure(&mut self, node: &Node, measure: Rc<RefCell<dyn Measure>>) {
+        let Some(&id) = self.ids.get(&node.opaque()) else {
+            tracing::debug!(node = %node.name(), "set_measure on an unsynced node");
+            return;
+        };
+        if let Some(ctx) = self.tree.get_node_context_mut(id) {
+            ctx.measure = Some(measure);
+        }
+        if let Err(err) = self.tree.mark_dirty(id) {
+            tracing::debug!(%err, "taffy rejected a mark_dirty after set_measure");
+        }
+    }
+
+    /// This node's placement inside its parent, or `None` if it was never
+    /// given one.
+    #[must_use]
+    pub fn child_layout(&self, node: &Node) -> Option<ChildLayout> {
+        let id = *self.ids.get(&node.opaque())?;
+        self.tree.get_node_context(id).and_then(|ctx| ctx.child)
+    }
+
+    /// This node's container.
+    #[must_use]
+    pub fn container(&self, node: &Node) -> Container {
+        self.ids
+            .get(&node.opaque())
+            .and_then(|id| self.tree.get_node_context(*id))
+            .map_or(Container::default(), |ctx| ctx.container)
+    }
+
+    /// The display, axis, alignment and track half of one node's taffy style.
+    fn container_style(
+        container: Container,
+        direction: crate::css::node::Direction,
+        out: &mut Style,
+    ) {
+        /// GTK's grids are small; a `Props`-driven count is not trusted.
+        fn tracks<S: taffy::style::CheapCloneStr>(
+            n: u16,
+            homogeneous: bool,
+        ) -> Vec<taffy::style::GridTemplateComponent<S>> {
+            let n = usize::from(n.clamp(1, 1024));
+            let track = if homogeneous { fr(1.0) } else { auto() };
+            vec![track; n]
+        }
+        let rtl = direction == crate::css::node::Direction::Rtl;
+        match container {
+            Container::Box { direction: axis } => {
+                out.display = Display::Flex;
+                out.flex_direction = match (axis, rtl) {
+                    (BoxDirection::Row, false) => FlexDirection::Row,
+                    (BoxDirection::Row, true) => FlexDirection::RowReverse,
+                    (BoxDirection::Column, _) => FlexDirection::Column,
+                };
+                // GTK's box centres a child that asked for nothing; a child
+                // that called `set_child_layout` overrides this per child.
+                out.align_items = Some(AlignItems::CENTER);
+                out.justify_content = Some(JustifyContent::CENTER);
+            }
+            Container::Center {
+                direction: axis,
+                shrink_center_last: _,
+            } => {
+                out.display = Display::Flex;
+                out.flex_direction = match (axis, rtl) {
+                    (BoxDirection::Row, false) => FlexDirection::Row,
+                    (BoxDirection::Row, true) => FlexDirection::RowReverse,
+                    (BoxDirection::Column, _) => FlexDirection::Column,
+                };
+                out.align_items = Some(AlignItems::CENTER);
+                out.justify_content = Some(JustifyContent::SPACE_BETWEEN);
+            }
+            Container::Grid {
+                columns,
+                rows,
+                column_spacing,
+                row_spacing,
+                column_homogeneous,
+                row_homogeneous,
+            } => {
+                out.display = Display::Grid;
+                out.grid_template_columns = tracks(columns, column_homogeneous);
+                out.grid_template_rows = tracks(rows, row_homogeneous);
+                out.gap = Size {
+                    width: length(finite(column_spacing).max(0.0)),
+                    height: length(finite(row_spacing).max(0.0)),
+                };
+                out.align_items = Some(AlignItems::CENTER);
+                out.justify_items = Some(JustifyItems::CENTER);
+            }
+            Container::Leaf => {
+                out.display = Display::Flex;
+                out.flex_direction = FlexDirection::Row;
+                out.align_items = Some(AlignItems::CENTER);
+                out.justify_content = Some(JustifyContent::CENTER);
+            }
+        }
+    }
+
+    /// The per-child half: alignment, expansion, margin and grid cell.
+    ///
+    /// The parent's main axis has no per-child alignment in flexbox, so a
+    /// main-axis [`Align`] becomes an auto margin on the free side -- the
+    /// standard idiom, and exactly what GTK's own allocation does when a
+    /// child is smaller than its cell. A grid parent has no "main axis" at
+    /// all -- CSS Grid's `align-self`/`justify-self` are the block/inline
+    /// axes directly, independent of any row/column concept -- so a grid
+    /// child (Task 14's `Overlay`, stacking every child in one cell) skips
+    /// the flex cross/main split and auto-margin idiom entirely.
+    fn child_style(child: ChildLayout, parent_is_row: bool, parent_is_grid: bool, out: &mut Style) {
+        fn to_self(a: Align) -> Option<AlignSelf> {
+            Some(match a {
+                Align::Fill => AlignSelf::STRETCH,
+                Align::Start => AlignSelf::START,
+                Align::End => AlignSelf::END,
+                Align::Center => AlignSelf::CENTER,
+                Align::Baseline => AlignSelf::BASELINE,
+            })
+        }
+        if child.absolute {
+            // Out of flow: every inset stays auto, so the item keeps its
+            // own (measured) size and `align_self`/`justify_self` place it
+            // within the whole containing block -- setting any inset to a
+            // definite `0` would instead *stretch* it edge to edge on that
+            // axis regardless of alignment, which is the one CSS pitfall
+            // this idiom exists to avoid. Never shares track/flex-line
+            // sizing with an in-flow sibling.
+            out.position = Position::Absolute;
+            out.align_self = to_self(child.valign);
+            out.justify_self = to_self(child.halign);
+        } else if parent_is_grid {
+            out.align_self = to_self(child.valign);
+            out.justify_self = to_self(child.halign);
+            let [mt, mr, mb, ml] = child.margin.map(finite);
+            out.margin = taffy::geometry::Rect {
+                top: length(mt),
+                right: length(mr),
+                bottom: length(mb),
+                left: length(ml),
+            };
+        } else {
+            let (cross, main) = if parent_is_row {
+                (child.valign, child.halign)
+            } else {
+                (child.halign, child.valign)
+            };
+            out.align_self = to_self(cross);
+            let [mt, mr, mb, ml] = child.margin.map(finite);
+            let (mut lead, mut trail) = (
+                length(if parent_is_row { ml } else { mt }),
+                length(if parent_is_row { mr } else { mb }),
+            );
+            match main {
+                Align::Fill | Align::Baseline | Align::Start => {}
+                Align::End => lead = auto(),
+                Align::Center => {
+                    lead = auto();
+                    trail = auto();
+                }
+            }
+            out.margin = taffy::geometry::Rect {
+                top: if parent_is_row { length(mt) } else { lead },
+                right: if parent_is_row { trail } else { length(mr) },
+                bottom: if parent_is_row { length(mb) } else { trail },
+                left: if parent_is_row { lead } else { length(ml) },
+            };
+            let expand = if parent_is_row {
+                child.hexpand
+            } else {
+                child.vexpand
+            };
+            if expand {
+                out.flex_grow = 1.0;
+                out.flex_basis = Dimension::length(0.0);
+            }
+        }
+        if let Some(g) = child.grid {
+            let col = i16::try_from(g.column.min(1023)).unwrap_or(0) + 1;
+            let row = i16::try_from(g.row.min(1023)).unwrap_or(0) + 1;
+            out.grid_column = taffy::geometry::Line {
+                start: line(col),
+                end: span(g.column_span.max(1)),
+            };
+            out.grid_row = taffy::geometry::Line {
+                start: line(row),
+                end: span(g.row_span.max(1)),
+            };
+        }
+    }
+
+    /// Rebuild one node's taffy style from its stored style, container and
+    /// child layout. The single writer; `set_style`, `set_container` and
+    /// `set_child_layout` all funnel through it.
+    fn write_taffy_style(&mut self, id: taffy::NodeId) {
+        let Some(ctx) = self.tree.get_node_context(id) else {
+            return;
+        };
+        let (node, style, container, child, env, gap_floor, size_floor, displayed) = (
+            ctx.node.clone(),
+            Rc::clone(&ctx.style),
+            ctx.container,
+            ctx.child,
+            ctx.env,
+            ctx.gap_floor,
+            ctx.size_floor,
+            ctx.displayed,
+        );
+        let mut taffy_style = Self::box_model_style(&style, &env, gap_floor, size_floor);
+        Self::container_style(container, node.direction(), &mut taffy_style);
+        if let Some(child) = child {
+            let parent_container = node.parent().map(|p| self.container(&p));
+            let parent_is_row = matches!(
+                parent_container,
+                Some(
+                    Container::Box {
+                        direction: BoxDirection::Row
+                    } | Container::Center {
+                        direction: BoxDirection::Row,
+                        ..
+                    }
+                )
+            );
+            let parent_is_grid = matches!(parent_container, Some(Container::Grid { .. }));
+            Self::child_style(child, parent_is_row, parent_is_grid, &mut taffy_style);
+        }
+        // Last, so it survives `container_style`'s own `display` write: a
+        // hidden node is `display: none` whatever kind of container it is.
+        if !displayed {
+            taffy_style.display = taffy::style::Display::None;
+        }
+        if let Err(err) = self.tree.set_style(id, taffy_style) {
+            tracing::debug!(node = %node.name(), %err, "taffy rejected a style");
+        }
+    }
+
+    /// The CSS box model half of one node's taffy style: sizes, margins,
+    /// padding, border and the container gap. M2's `set_style` body, verbatim,
+    /// plus `gap_floor` (a widget's own gap property) raising the CSS
+    /// `border-spacing` gap on either axis when it is larger.
+    fn box_model_style(
+        style: &ComputedStyle,
+        env: &ResolveEnv,
+        gap_floor: (f32, f32),
+        size_floor: (f32, f32),
+    ) -> Style {
         // CSS resolves *every* percentage in the box model against the
         // containing block's inline size, and taffy is the only thing here
         // that knows what that is -- so a percentage must reach taffy *as* a
@@ -378,6 +877,10 @@ impl LayoutTree {
         let [bt, br, bb, bl] = style.border_widths();
         let margin = style.margin(basis);
         let (min_w, min_h) = style.min_size((basis, basis));
+        // `GtkWidget:width-request`/`height-request` raise the CSS minimum;
+        // a declared *percentage* minimum still wins outright, since only
+        // taffy knows what it resolves against (see `min` below).
+        let (min_w, min_h) = (min_w.max(size_floor.0), min_h.max(size_floor.1));
 
         /// The declared value's own percentage, when it has one.
         fn declared_percent(style: &ComputedStyle, prop: Prop) -> Option<f32> {
@@ -404,25 +907,10 @@ impl LayoutTree {
             declared_percent(style, prop).map_or_else(|| length(px), percent)
         };
         let (gap_x, gap_y) = Self::border_spacing_px(style, env);
+        let gap_x = gap_x.max(gap_floor.0);
+        let gap_y = gap_y.max(gap_floor.1);
 
-        let (display, flex_direction) = match container {
-            Container::Box { direction } => (
-                Display::Flex,
-                match direction {
-                    BoxDirection::Row => FlexDirection::Row,
-                    BoxDirection::Column => FlexDirection::Column,
-                },
-            ),
-            Container::Leaf => (Display::Flex, FlexDirection::Row),
-        };
-
-        let taffy_style = Style {
-            display,
-            flex_direction,
-            // GTK's box centres its children on both axes; per-child
-            // alignment arrives with the widget layer in M3.
-            align_items: Some(AlignItems::CENTER),
-            justify_content: Some(JustifyContent::CENTER),
+        Style {
             // GTK's min-width/min-height floor the CONTENT box.
             box_sizing: BoxSizing::ContentBox,
             size: Size {
@@ -456,13 +944,6 @@ impl LayoutTree {
                 height: length(gap_y),
             },
             ..Style::default()
-        };
-
-        if let Some(ctx) = self.tree.get_node_context_mut(id) {
-            ctx.style = Rc::new(style.clone());
-        }
-        if let Err(err) = self.tree.set_style(id, taffy_style) {
-            tracing::debug!(node = %node.name(), %err, "taffy rejected a style");
         }
     }
 
@@ -558,7 +1039,12 @@ impl LayoutTree {
                     style,
                     |_, _| 0.0,
                     |known, avail| match ctx {
-                        Some(ctx) => measure.measure(&ctx.node, &ctx.style, known, avail),
+                        Some(ctx) => match &ctx.measure {
+                            Some(own) => own
+                                .borrow_mut()
+                                .measure(&ctx.node, &ctx.style, known, avail),
+                            None => measure.measure(&ctx.node, &ctx.style, known, avail),
+                        },
                         None => taffy::Size::ZERO,
                     },
                 )
@@ -979,6 +1465,63 @@ mod tests {
         );
     }
 
+    /// `GtkWidget:width-request`/`height-request` raise a widget's own
+    /// floor. Until P8-D71's close-out nothing but `Label`/`Entry`/
+    /// `DrawingArea` read either prop, so a `list_view` that asked for
+    /// 200x120 laid out 0x0.
+    ///
+    /// Mutation check: drop `size_floor` from `box_model_style`'s `min_w`/
+    /// `min_h` and both assertions fall back to the CSS 36x34.
+    #[test]
+    fn a_size_request_floors_the_box_and_the_larger_of_it_and_min_size_wins() {
+        let (mut tree, button, _label) = button_layout(ADWAITA_LIKE, (0.0, 6.0));
+        // Wider than the CSS minimum on one axis, narrower on the other: the
+        // request wins where it is bigger and loses where it is not.
+        tree.set_size_floor(&button, 200.0, 4.0);
+        let window = button.parent().expect("the button has a parent");
+        tree.compute(
+            &window,
+            Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+            &mut LabelSize(0.0, 6.0),
+        )
+        .expect("compute");
+        let a = tree.allocation(&button).expect("button allocation");
+        assert_eq!(a.border_box.width, 220.0, "200 + 9 + 9 + 1 + 1");
+        assert_eq!(a.border_box.height, 34.0, "the CSS min-height still wins");
+    }
+
+    /// A hidden node keeps its place in the CSS tree — GTK's own node trees
+    /// list hidden nodes, and this crate's vendored §5.2 fixtures with them —
+    /// but takes no space at all, itself or below.
+    ///
+    /// Mutation check: write the `Display::None` before `container_style`
+    /// instead of after and the container's own `display` overwrites it; the
+    /// button lays out at its full 36x34.
+    #[test]
+    fn a_hidden_node_takes_no_space_and_neither_do_its_children() {
+        let (mut tree, button, label) = button_layout(ADWAITA_LIKE, (0.0, 6.0));
+        assert!(tree.is_displayed(&button), "shown until something hides it");
+        tree.set_displayed(&button, false);
+        assert!(!tree.is_displayed(&button));
+        let window = button.parent().expect("the button has a parent");
+        tree.compute(
+            &window,
+            Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+            &mut LabelSize(0.0, 6.0),
+        )
+        .expect("compute");
+        let a = tree.allocation(&button).expect("button allocation");
+        assert_eq!((a.border_box.width, a.border_box.height), (0.0, 0.0));
+        let l = tree.allocation(&label).expect("label allocation");
+        assert_eq!((l.border_box.width, l.border_box.height), (0.0, 0.0));
+    }
+
     #[test]
     fn an_intrinsic_size_above_the_minimum_still_wins() {
         // The clamp is `max`, not "always the minimum".
@@ -1182,5 +1725,431 @@ mod tests {
             },
             "min-width: 50% survives as a percentage"
         );
+    }
+
+    use super::{Align, ChildLayout, GridPlacement};
+    use crate::css::node::Direction;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A tree of `root > a, b, c` with a stylesheet-free computed style.
+    fn three_children() -> (Node, Node, Node, Node) {
+        let root = Node::new("box");
+        let a = Node::new("widget");
+        let b = Node::new("widget");
+        let c = Node::new("widget");
+        root.append_child(&a);
+        root.append_child(&b);
+        root.append_child(&c);
+        (root, a, b, c)
+    }
+
+    /// Lay `root` out at a fixed 300x100 with every leaf measuring 20x10.
+    ///
+    /// taffy sizes a non-block root to its *content*, never to the available
+    /// space (`taffy-0.14.0/src/compute/mod.rs:64`), so the 300x100 viewport
+    /// is pinned through the root's own CSS minimums as well: a content-box
+    /// floor on a root with neither padding nor border is exactly its size.
+    /// The container the test set is read back and re-applied, because
+    /// `set_style` takes one.
+    fn lay_out(tree: &mut LayoutTree, root: &Node) {
+        tree.sync(root).expect("sync");
+        let sheet = CompiledSheet::compile("box { min-width: 300px; min-height: 100px }");
+        let env = ResolveEnv::default();
+        let root_style = ComputedStyle::resolve_chain(&sheet, root, &env, &mut MatchCx::new());
+        let container = tree.container(root);
+        tree.set_style(root, &root_style, container, &env);
+        tree.compute(
+            root,
+            taffy::Size {
+                width: taffy::AvailableSpace::Definite(300.0),
+                height: taffy::AvailableSpace::Definite(100.0),
+            },
+            &mut FixedMeasure(taffy::Size {
+                width: 20.0,
+                height: 10.0,
+            }),
+        )
+        .expect("compute");
+    }
+
+    #[test]
+    fn a_node_with_no_child_layout_keeps_m2s_centre_centre() {
+        // Mutation check: making `write_taffy_style` treat an absent
+        // ChildLayout as `ChildLayout::default()` (halign/valign = Fill =>
+        // AlignSelf::STRETCH) makes `a`'s height 100, not 10, and breaks
+        // every M1 button number that depends on CENTER/CENTER.
+        let (root, a, _b, _c) = three_children();
+        let mut tree = LayoutTree::new();
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        tree.sync(&root).expect("sync");
+        for n in [&root, &a] {
+            tree.set_style(
+                n,
+                &style,
+                Container::Box {
+                    direction: BoxDirection::Row,
+                },
+                &ResolveEnv::default(),
+            );
+        }
+        assert_eq!(tree.child_layout(&a), None, "no ChildLayout was set");
+        lay_out(&mut tree, &root);
+        let alloc = tree.allocation(&a).expect("allocation");
+        assert_eq!(alloc.border_box.height, 10.0, "centred, not stretched");
+        assert_eq!(
+            alloc.border_box.y, 45.0,
+            "centred on the cross axis: (100 - 10) / 2"
+        );
+    }
+
+    #[test]
+    fn an_explicit_fill_stretches_and_start_pins_to_the_leading_edge() {
+        // Mutation check: mapping Align::Fill to AlignSelf::CENTER (the
+        // "keep M2 behaviour everywhere" mistake) makes the first height 10;
+        // mapping Align::Start to STRETCH makes the second 100.
+        let (root, a, b, _c) = three_children();
+        let mut tree = LayoutTree::new();
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        tree.sync(&root).expect("sync");
+        for n in [&root, &a, &b] {
+            tree.set_style(
+                n,
+                &style,
+                Container::Box {
+                    direction: BoxDirection::Row,
+                },
+                &ResolveEnv::default(),
+            );
+        }
+        tree.set_child_layout(
+            &a,
+            ChildLayout {
+                valign: Align::Fill,
+                ..ChildLayout::default()
+            },
+        );
+        tree.set_child_layout(
+            &b,
+            ChildLayout {
+                valign: Align::Start,
+                ..ChildLayout::default()
+            },
+        );
+        lay_out(&mut tree, &root);
+        assert_eq!(tree.allocation(&a).unwrap().border_box.height, 100.0);
+        assert_eq!(tree.allocation(&b).unwrap().border_box.height, 10.0);
+        assert_eq!(tree.allocation(&b).unwrap().border_box.y, 0.0);
+    }
+
+    #[test]
+    fn grid_places_children_at_their_column_and_row() {
+        // Mutation check: dropping the `+ 1` in the taffy line conversion
+        // (taffy grid lines are 1-based) puts `c` in column 0's track and
+        // both x values become equal.
+        let (root, a, b, c) = three_children();
+        let mut tree = LayoutTree::new();
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        tree.sync(&root).expect("sync");
+        for n in [&root, &a, &b, &c] {
+            tree.set_style(n, &style, Container::Leaf, &ResolveEnv::default());
+        }
+        tree.set_container(
+            &root,
+            Container::Grid {
+                columns: 2,
+                rows: 2,
+                column_spacing: 4.0,
+                row_spacing: 6.0,
+                column_homogeneous: true,
+                row_homogeneous: true,
+            },
+        );
+        for (n, place) in [
+            (
+                &a,
+                GridPlacement {
+                    column: 0,
+                    row: 0,
+                    column_span: 1,
+                    row_span: 1,
+                },
+            ),
+            (
+                &b,
+                GridPlacement {
+                    column: 0,
+                    row: 1,
+                    column_span: 1,
+                    row_span: 1,
+                },
+            ),
+            (
+                &c,
+                GridPlacement {
+                    column: 1,
+                    row: 0,
+                    column_span: 1,
+                    row_span: 2,
+                },
+            ),
+        ] {
+            tree.set_child_layout(
+                n,
+                ChildLayout {
+                    grid: Some(place),
+                    ..ChildLayout::default()
+                },
+            );
+        }
+        lay_out(&mut tree, &root);
+        let (aa, ab, ac) = (
+            tree.allocation(&a).unwrap(),
+            tree.allocation(&b).unwrap(),
+            tree.allocation(&c).unwrap(),
+        );
+        assert_eq!(aa.border_box.x, ab.border_box.x, "same column");
+        assert!(
+            ac.border_box.x > aa.border_box.x,
+            "second column is to the right"
+        );
+        assert!(ab.border_box.y > aa.border_box.y, "second row is below");
+        assert_eq!(
+            ab.border_box.y - aa.border_box.y,
+            (100.0 - 6.0) / 2.0 + 6.0,
+            "homogeneous rows plus the 6px row-spacing"
+        );
+    }
+
+    #[test]
+    fn an_absolute_grid_child_keeps_its_own_size_and_ignores_track_sizing() {
+        // Mutation check (Task 14's `Overlay`): setting an absolute child's
+        // `inset` to a definite `0` instead of leaving it auto stretches it
+        // edge to edge, hiding `Align::Start`'s natural-sized 10px result
+        // behind a wrongly-stretched 100px one; forgetting `absolute`
+        // entirely lets the second same-cell child fight the first for the
+        // single track's size, shrinking `a` from 100 to 90.
+        let (root, a, b, c) = three_children();
+        root.remove_child(&c);
+        let mut tree = LayoutTree::new();
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        tree.sync(&root).expect("sync");
+        for n in [&root, &a, &b] {
+            tree.set_style(n, &style, Container::Leaf, &ResolveEnv::default());
+        }
+        tree.set_container(
+            &root,
+            Container::Grid {
+                columns: 1,
+                rows: 1,
+                column_spacing: 0.0,
+                row_spacing: 0.0,
+                column_homogeneous: true,
+                row_homogeneous: true,
+            },
+        );
+        let pin = Some(GridPlacement {
+            column: 0,
+            row: 0,
+            column_span: 1,
+            row_span: 1,
+        });
+        tree.set_child_layout(
+            &a,
+            ChildLayout {
+                halign: Align::Fill,
+                valign: Align::Fill,
+                hexpand: true,
+                vexpand: true,
+                grid: pin,
+                ..ChildLayout::default()
+            },
+        );
+        tree.set_child_layout(
+            &b,
+            ChildLayout {
+                halign: Align::Fill,
+                valign: Align::Start,
+                grid: pin,
+                absolute: true,
+                ..ChildLayout::default()
+            },
+        );
+        lay_out(&mut tree, &root);
+        assert_eq!(
+            tree.allocation(&a).unwrap().border_box.height,
+            100.0,
+            "the in-flow main child fills the whole track, undiminished by its absolute sibling"
+        );
+        let ab = tree.allocation(&b).unwrap().border_box;
+        assert_eq!(
+            ab.height, 10.0,
+            "kept its own measured height, not stretched"
+        );
+        assert_eq!(
+            ab.y, 0.0,
+            "start-aligned to the top of the containing block"
+        );
+    }
+
+    #[test]
+    fn centre_box_centres_the_middle_child_whatever_the_ends_measure() {
+        // Mutation check: implementing Center as plain SPACE_BETWEEN without
+        // the grow-from-zero on the outer children moves the centre child
+        // off centre as soon as the two ends differ in width.
+        let (root, start, centre, end) = three_children();
+        let mut tree = LayoutTree::new();
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        tree.sync(&root).expect("sync");
+        for n in [&root, &start, &centre, &end] {
+            tree.set_style(n, &style, Container::Leaf, &ResolveEnv::default());
+        }
+        tree.set_container(
+            &root,
+            Container::Center {
+                direction: BoxDirection::Row,
+                shrink_center_last: true,
+            },
+        );
+        tree.set_style(&start, &style, Container::Leaf, &ResolveEnv::default());
+        tree.set_child_layout(&start, ChildLayout::default());
+        lay_out(&mut tree, &root);
+        let mid = tree.allocation(&centre).unwrap().border_box;
+        assert_eq!(
+            mid.x + mid.width / 2.0,
+            150.0,
+            "the centre child's centre is the container's centre"
+        );
+    }
+
+    #[test]
+    fn centre_box_puts_the_first_child_on_the_right_under_rtl() {
+        // Mutation check: ignoring Direction::Rtl (using Row for both) puts
+        // `start` at x == 0 under RTL, which is GTK's documented opposite
+        // (gtk/gtkcenterbox.c:45).
+        let (root, start, _centre, _end) = three_children();
+        root.set_direction(Some(Direction::Rtl));
+        let mut tree = LayoutTree::new();
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        tree.sync(&root).expect("sync");
+        tree.set_style(&root, &style, Container::Leaf, &ResolveEnv::default());
+        tree.set_container(
+            &root,
+            Container::Center {
+                direction: BoxDirection::Row,
+                shrink_center_last: false,
+            },
+        );
+        lay_out(&mut tree, &root);
+        assert!(
+            tree.allocation(&start).unwrap().border_box.x > 150.0,
+            "the first child is allocated on the right under RTL"
+        );
+    }
+
+    #[test]
+    fn a_per_node_measure_overrides_the_tree_measure_for_that_node_only() {
+        // Mutation check: applying the per-node measure to every leaf (the
+        // "last one wins" bug) makes `b` 40x30 too.
+        let (root, a, b, _c) = three_children();
+        let mut tree = LayoutTree::new();
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        tree.sync(&root).expect("sync");
+        for n in [&root, &a, &b] {
+            tree.set_style(n, &style, Container::Leaf, &ResolveEnv::default());
+        }
+        tree.set_measure(
+            &a,
+            Rc::new(RefCell::new(FixedMeasure(taffy::Size {
+                width: 40.0,
+                height: 30.0,
+            }))),
+        );
+        lay_out(&mut tree, &root);
+        assert_eq!(tree.allocation(&a).unwrap().border_box.width, 40.0);
+        assert_eq!(tree.allocation(&b).unwrap().border_box.width, 20.0);
+    }
+
+    #[test]
+    fn hostile_container_and_child_layout_values_never_panic() {
+        // A Props-driven container count and spacing arrive from an
+        // application model, so every one of them is clamped on the way to
+        // taffy. Mutation checks: `n.clamp(1, 1024)` -> `n.min(1024)` gives
+        // the first case 0 tracks; -> `n.max(1)` gives the second 65535;
+        // dropping `finite(..).max(0.0)` on the spacing puts NaN, +inf and
+        // -1e30 into the gap; dropping `finite` on the margins puts NaN into
+        // the allocation; dropping `column_span.max(1)` leaves a zero span;
+        // dropping `row.min(1023)` leaves a line index of 65536.
+        let (root, a, _b, _c) = three_children();
+        let mut tree = LayoutTree::new();
+        let style = ComputedStyle::initial(&ResolveEnv::default());
+        tree.sync(&root).expect("sync");
+        tree.set_style(&root, &style, Container::Leaf, &ResolveEnv::default());
+        for (columns, rows, spacing, tracks) in [
+            (0_u16, 0_u16, f32::NAN, (1_usize, 1_usize)),
+            (u16::MAX, u16::MAX, f32::INFINITY, (1024, 1024)),
+            (1, 1, -1.0e30, (1, 1)),
+        ] {
+            tree.set_container(
+                &root,
+                Container::Grid {
+                    columns,
+                    rows,
+                    column_spacing: spacing,
+                    row_spacing: spacing,
+                    column_homogeneous: true,
+                    row_homogeneous: false,
+                },
+            );
+            tree.set_child_layout(
+                &a,
+                ChildLayout {
+                    margin: [spacing; 4],
+                    grid: Some(GridPlacement {
+                        column: u16::MAX,
+                        row: u16::MAX,
+                        column_span: 0,
+                        row_span: u16::MAX,
+                    }),
+                    ..ChildLayout::default()
+                },
+            );
+            let taffy = tree.taffy_style(&root).expect("styled");
+            assert_eq!(
+                (
+                    taffy.grid_template_columns.len(),
+                    taffy.grid_template_rows.len()
+                ),
+                tracks,
+                "a hostile track count is clamped to 1..=1024"
+            );
+            assert_eq!(
+                taffy.gap.width,
+                taffy::prelude::length(0.0),
+                "NaN, infinite and hugely negative spacings all become 0"
+            );
+            assert_eq!(taffy.gap.height, taffy::prelude::length(0.0));
+            let child = tree.taffy_style(&a).expect("styled child");
+            assert_eq!(
+                child.grid_column.end,
+                taffy::prelude::span(1),
+                "a zero span is read as one"
+            );
+            assert_eq!(
+                child.grid_row.start,
+                taffy::prelude::line(1024),
+                "a hostile row index is clamped to the last track taffy is given"
+            );
+            lay_out(&mut tree, &root);
+            let alloc = tree.allocation(&a).expect("allocation");
+            assert!(
+                alloc.border_box.x.is_finite()
+                    && alloc.border_box.y.is_finite()
+                    && alloc.border_box.width.is_finite()
+                    && alloc.border_box.height.is_finite(),
+                "a hostile margin must not put NaN into an allocation: {:?}",
+                alloc.border_box
+            );
+        }
     }
 }

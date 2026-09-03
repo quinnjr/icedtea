@@ -1,0 +1,13 @@
+scrolledwindow[.frame]
+├── <child>
+├── [overshoot.top]
+├── [overshoot.bottom]
+├── [overshoot.left]
+├── [overshoot.right]
+├── [undershoot.top]
+├── [undershoot.bottom]
+├── [undershoot.left]
+├── [undershoot.right]
+├── [scrollbar.horizontal[.overlay-indicator][.dragging][.hovering]]
+├── [scrollbar.vertical[.overlay-indicator][.dragging][.hovering]]
+╰── [junction]

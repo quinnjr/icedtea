@@ -124,9 +124,19 @@ fn paint_layer(
                 }
             }
         }
-        // `cross-fade()` and `-gtk-*` icon images are stored by the registry
-        // and drawn in M4; they paint nothing here (spec, Out of scope).
-        Image::None | Image::CrossFade(_) | Image::Icon(_) => {}
+        Image::Icon(icon) => {
+            // `-gtk-icontheme()`, `-gtk-recolor()` and `-gtk-scaled()` as a
+            // background layer: each tile is one icon box, and the palette's
+            // foreground is the node's `currentColor` -- the only colour a
+            // background layer has (contract §6; `paint_layer` keeps its
+            // M2 signature).
+            let palette = crate::icons::Palette::for_color(current);
+            for rect in &rects {
+                crate::paint::icon::paint_icon_image(canvas, icon, *rect, &palette, cx);
+            }
+        }
+        // `cross-fade()` is stored by the registry and still paints nothing.
+        Image::None | Image::CrossFade(_) => {}
     }
 
     canvas.restore_to_count(save);
@@ -243,7 +253,7 @@ pub(crate) fn intersect(a: Rect, b: Rect) -> Option<Rect> {
 /// # Bounded work
 ///
 /// Every loop below is driven by the *painted* rectangle, which is `clip`
-/// intersected with [`drawable_bounds`] -- never by `clip` alone.
+/// intersected with `drawable_bounds` -- never by `clip` alone.
 /// `Rect::is_empty` accepts `+inf` and huge finite extents, so a CSS-reachable
 /// clip of `1e9` px (or an infinite one) would otherwise spin up to
 /// `i32::MAX` iterations, each issuing a `draw_rect`: a hang, not a panic.
@@ -481,7 +491,7 @@ const MAX_TILES_TOTAL: usize = 1 << 16;
 
 /// Every copy of `tile` that intersects `clip`, per `repeat`.
 ///
-/// The returned vector is bounded by [`MAX_TILES_TOTAL`] for every input,
+/// The returned vector is bounded by `MAX_TILES_TOTAL` for every input,
 /// including a sub-device-pixel step or an infinite clip.
 #[must_use]
 pub fn tile_positions(tile: &Tile, clip: Rect, repeat: RepeatStyle) -> Vec<Rect> {
@@ -642,11 +652,13 @@ mod tests {
         let layers = style.background_layers();
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut paint_cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(40, 20).expect("raster surface");
@@ -902,11 +914,13 @@ mod tests {
         let sheet = CompiledSheet::compile("button { color: #000 }");
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let len_ctx = cx.base_length_ctx();
@@ -947,11 +961,13 @@ mod tests {
         let sheet = CompiledSheet::compile("button { color: #000 }");
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(8, 8).expect("raster surface");
@@ -1004,11 +1020,13 @@ mod tests {
         let sheet = CompiledSheet::compile("button { color: #000 }");
         let mut fonts = FontDatabase::probe_only();
         let mut images = ImageCache::new();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", Vec::new());
         let mut cx = PaintCx {
             env: &env,
             colors: &sheet.colors,
             fonts: &mut fonts,
             images: &mut images,
+            icons: &mut icons,
             text: None,
         };
         let mut surface = Surface::new_raster_n32_premul(100, 100).expect("raster surface");
