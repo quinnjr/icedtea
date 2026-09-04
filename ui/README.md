@@ -325,6 +325,21 @@ is what makes an ingress test compositor-free.
 that produced it — a channel push to a worker, never a blocking call. It has no
 return value on purpose: an answer comes back through the inbox as a message.
 
+### Pointer events at the view layer
+
+`on_pointer_down` / `on_pointer_motion` / `on_pointer_up` turn raw pointer
+phases into messages on **any** widget kind, with `(x, y)` in the node's own
+border box. The `_with_button` variants add the Linux button code
+(`window::pointer::{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}`); a motion reports `0`,
+because it carries no button. M3's implicit grab already routes motion and the
+matching release to the node that took the press, so
+`PointerDown → PointerMotion* → PointerUp` is one node's whole gesture even
+when the pointer leaves it; a release outside still arrives, a `PointerLeave`
+mid-drag does not end the sequence, and a grab broken by a closed surface
+fabricates no synthetic release — an app treats a fresh `PointerDown` as
+re-anchoring. `EventKind::Click` is unaffected: a left press-release on a node
+carrying both `on_click` and `on_pointer_up_with_button` produces both messages.
+
 ## Fonts and text
 
 - **Font discovery is real fontconfig.** `text::FontDatabase` builds one

@@ -1126,6 +1126,45 @@ impl<Msg: Clone + 'static> View<Msg> {
     pub fn on_key(self, f: impl Fn(&KeyEvent) -> Option<Msg> + 'static) -> Self {
         self.on(EventKind::KeyPressed, Handler::Key(Rc::new(f)))
     }
+
+    /// A raw pointer press, with the point in this node's border box.
+    #[must_use]
+    pub fn on_pointer_down(self, f: impl Fn(f64, f64) -> Msg + 'static) -> Self {
+        self.on(EventKind::PointerDown, Handler::Pair(Rc::new(f)))
+    }
+
+    /// A raw pointer motion. While a press is held this arrives here even when
+    /// the pointer has left the node (M3's implicit grab).
+    #[must_use]
+    pub fn on_pointer_motion(self, f: impl Fn(f64, f64) -> Msg + 'static) -> Self {
+        self.on(EventKind::PointerMotion, Handler::Pair(Rc::new(f)))
+    }
+
+    /// A raw pointer release, delivered even when it lands outside the node.
+    #[must_use]
+    pub fn on_pointer_up(self, f: impl Fn(f64, f64) -> Msg + 'static) -> Self {
+        self.on(EventKind::PointerUp, Handler::Pair(Rc::new(f)))
+    }
+
+    /// [`View::on_pointer_down`], plus the Linux button code.
+    #[must_use]
+    pub fn on_pointer_down_with_button(self, f: impl Fn(f64, f64, u32) -> Msg + 'static) -> Self {
+        self.on(EventKind::PointerDown, Handler::PairButton(Rc::new(f)))
+    }
+
+    /// [`View::on_pointer_motion`], plus the button code (`0` — a motion
+    /// carries none).
+    #[must_use]
+    pub fn on_pointer_motion_with_button(self, f: impl Fn(f64, f64, u32) -> Msg + 'static) -> Self {
+        self.on(EventKind::PointerMotion, Handler::PairButton(Rc::new(f)))
+    }
+
+    /// [`View::on_pointer_up`], plus the Linux button code — how
+    /// middle-click-to-close is expressed.
+    #[must_use]
+    pub fn on_pointer_up_with_button(self, f: impl Fn(f64, f64, u32) -> Msg + 'static) -> Self {
+        self.on(EventKind::PointerUp, Handler::PairButton(Rc::new(f)))
+    }
 }
 
 // The per-widget builders themselves live beside their controllers under
@@ -1227,8 +1266,11 @@ mod tests {
 
     #[test]
     fn every_event_kind_has_exactly_one_on_setter() {
-        // The eighteen setters, each binding its own EventKind and nothing
-        // else. A new EventKind without a setter fails this test.
+        // The eighteen M3 setters, each binding its own EventKind and nothing
+        // else, plus M5-D5's three pointer kinds -- each of which has two
+        // setters (a `Pair` and a `PairButton` builder), so those three are
+        // asserted separately below rather than folded into the "exactly
+        // one" list. A new EventKind without any setter fails this test.
         let bound: Vec<EventKind> = vec![
             widget::<Msg>(Kind::Button).on_click(Msg::Clicked),
             widget::<Msg>(Kind::Button).on_activate(Msg::Clicked),
@@ -1267,7 +1309,34 @@ mod tests {
             18,
             "two setters bound the same EventKind: {bound:?}"
         );
-        assert_eq!(sorted, EventKind::ALL.to_vec());
+        let eighteen: Vec<EventKind> = EventKind::ALL[..18].to_vec();
+        assert_eq!(sorted, eighteen);
+
+        // M5-D5: each pointer kind has two setters -- a `Pair` builder and a
+        // `_with_button` `PairButton` builder -- and both bind that kind
+        // alone.
+        for (plain, with_button, kind) in [
+            (
+                widget::<Msg>(Kind::Box).on_pointer_down(|_x, _y| Msg::Clicked),
+                widget::<Msg>(Kind::Box).on_pointer_down_with_button(|_x, _y, _b| Msg::Clicked),
+                EventKind::PointerDown,
+            ),
+            (
+                widget::<Msg>(Kind::Box).on_pointer_motion(|_x, _y| Msg::Clicked),
+                widget::<Msg>(Kind::Box).on_pointer_motion_with_button(|_x, _y, _b| Msg::Clicked),
+                EventKind::PointerMotion,
+            ),
+            (
+                widget::<Msg>(Kind::Box).on_pointer_up(|_x, _y| Msg::Clicked),
+                widget::<Msg>(Kind::Box).on_pointer_up_with_button(|_x, _y, _b| Msg::Clicked),
+                EventKind::PointerUp,
+            ),
+        ] {
+            assert_eq!(plain.handlers.len(), 1);
+            assert_eq!(with_button.handlers.len(), 1);
+            assert!(plain.handlers.has(kind));
+            assert!(with_button.handlers.has(kind));
+        }
     }
 
     #[test]

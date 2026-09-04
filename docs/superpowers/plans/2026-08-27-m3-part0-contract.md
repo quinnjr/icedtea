@@ -5214,3 +5214,16 @@ fold that produced it — a `flatten` leaf, printed opaquely as `Task(..)`,
 executed identically by `drain` whether reached through `run` or
 `run_offscreen`. It has no return value: an answer comes back through the
 inbox (M5-D2) as a message. Full text: M5 contract §1 M5-D3.
+
+### M5-D5 — three pointer `EventKind`s and a button-carrying `Handler` (extends §4.4)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §4.4's `EventKind` gains
+`PointerDown`/`PointerMotion`/`PointerUp` (appended to `ALL`, now 21 entries)
+so raw pointer phases reach any widget kind, not only the ones with a typed
+gesture already. `Handler` gains `PairButton(Rc<dyn Fn(f64, f64, u32) ->
+Msg>)`; `Handlers::fire_pair_button` fires either a `PairButton` or a `Pair`
+binding on the same kind (button dropped for the latter), with no `Unit`
+fallthrough. Six builders (`on_pointer_down`/`_motion`/`_up`, each with a
+`_with_button` variant) and `BTN_RIGHT`/`BTN_MIDDLE` beside a re-exported
+`BTN_LEFT` in `window::pointer` (P0-D3). Nothing in M5 P0 fires these yet.
+Full text: M5 contract §6 P0-D2, P0-D3.

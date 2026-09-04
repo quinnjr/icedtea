@@ -2050,3 +2050,76 @@ fn a_password_entry_paints_its_caret_and_its_selection() {
         "clicking in paints a caret the resting frame does not have"
     );
 }
+
+#[test]
+fn event_kind_all_lists_twenty_one_kinds() {
+    // mutation: forget to add one of the three pointer kinds to
+    // `EventKind::ALL`; the count fails and so does any dispatcher that
+    // iterates ALL.
+    use icedtea_ui::view::EventKind;
+    assert_eq!(EventKind::ALL.len(), 21);
+    for kind in [
+        EventKind::PointerDown,
+        EventKind::PointerMotion,
+        EventKind::PointerUp,
+    ] {
+        assert!(
+            EventKind::ALL.contains(&kind),
+            "{kind:?} is missing from ALL"
+        );
+    }
+    // Declaration order: the three are appended, so nothing before them moved.
+    assert_eq!(EventKind::ALL[0], EventKind::Click);
+    assert_eq!(EventKind::ALL[18], EventKind::PointerDown);
+    assert_eq!(EventKind::ALL[19], EventKind::PointerMotion);
+    assert_eq!(EventKind::ALL[20], EventKind::PointerUp);
+}
+
+#[test]
+fn a_pair_button_handler_falls_back_to_a_pair_handler() {
+    // Why `fire_pair_button` accepts both arities: a caller that fires does
+    // not know which builder the view used, so `on_pointer_down` and
+    // `on_pointer_down_with_button` coexist without a second fire method.
+    // mutation: delete the `Handler::Pair` arm of `fire_pair_button`; the
+    // first assertion returns None.
+    use icedtea_ui::view::{EventKind, Handler, Handlers};
+    use std::rc::Rc;
+
+    let mut pair: Handlers<String> = Handlers::default();
+    pair.set(
+        EventKind::PointerDown,
+        Handler::Pair(Rc::new(|x, y| format!("{x},{y}"))),
+    );
+    assert_eq!(
+        pair.fire_pair_button(EventKind::PointerDown, 3.0, 4.0, 0x112),
+        Some("3,4".to_owned()),
+        "a Pair handler on a pointer kind receives (x, y) and drops the button"
+    );
+
+    let mut with_button: Handlers<String> = Handlers::default();
+    with_button.set(
+        EventKind::PointerUp,
+        Handler::PairButton(Rc::new(|x, y, b| format!("{x},{y},{b:#x}"))),
+    );
+    assert_eq!(
+        with_button.fire_pair_button(EventKind::PointerUp, 1.0, 2.0, 0x112),
+        Some("1,2,0x112".to_owned())
+    );
+    // A different kind, or an arity the binding cannot supply, fires nothing.
+    assert_eq!(
+        with_button.fire_pair_button(EventKind::PointerDown, 1.0, 2.0, 0x110),
+        None
+    );
+    assert_eq!(with_button.fire_unit(EventKind::PointerUp), None);
+}
+
+#[test]
+fn the_linux_button_codes_are_reachable_from_one_module() {
+    // P0-D3: `BTN_LEFT` keeps its M1 home and is re-exported beside the two
+    // new ones, so `window::BTN_LEFT` stays unambiguous and
+    // `layer_shell_screencopy.rs`'s import is untouched.
+    use icedtea_ui::window::pointer::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+    assert_eq!((BTN_LEFT, BTN_RIGHT, BTN_MIDDLE), (0x110, 0x111, 0x112));
+    assert_eq!(icedtea_ui::window::BTN_LEFT, BTN_LEFT);
+    assert_eq!(icedtea_ui::wayland::BTN_LEFT, BTN_LEFT);
+}

@@ -1168,6 +1168,13 @@ pub enum EventKind {
     Reordered,
     Search,
     DateSelected,
+    /// A raw pointer press on this node (M5-D5). Generic: any kind may carry it.
+    PointerDown,
+    /// A raw pointer motion, delivered to the node that took the press for as
+    /// long as the implicit grab holds.
+    PointerMotion,
+    /// A raw pointer release, delivered even when it lands outside the node.
+    PointerUp,
 }
 
 impl EventKind {
@@ -1191,6 +1198,9 @@ impl EventKind {
         EventKind::Reordered,
         EventKind::Search,
         EventKind::DateSelected,
+        EventKind::PointerDown,
+        EventKind::PointerMotion,
+        EventKind::PointerUp,
     ];
 }
 
@@ -1224,6 +1234,9 @@ pub enum Handler<Msg> {
     Pair(Rc<dyn Fn(f64, f64) -> Msg>),
     /// Two indices, for `on_reordered((from, to))` (deviation P6-D4).
     Indices(Rc<dyn Fn(usize, usize) -> Msg>),
+    /// Local `(x, y)` plus the Linux input-event button code — the shape
+    /// middle-click-to-close and a canvas drag need (M5-D5).
+    PairButton(Rc<dyn Fn(f64, f64, u32) -> Msg>),
 }
 
 impl<Msg> Clone for Handler<Msg>
@@ -1240,6 +1253,7 @@ where
             Handler::Key(f) => Handler::Key(Rc::clone(f)),
             Handler::Pair(f) => Handler::Pair(Rc::clone(f)),
             Handler::Indices(f) => Handler::Indices(Rc::clone(f)),
+            Handler::PairButton(f) => Handler::PairButton(Rc::clone(f)),
         }
     }
 }
@@ -1255,6 +1269,7 @@ impl<Msg: std::fmt::Debug> std::fmt::Debug for Handler<Msg> {
             Handler::Key(_) => f.write_str("Key(..)"),
             Handler::Pair(_) => f.write_str("Pair(..)"),
             Handler::Indices(_) => f.write_str("Indices(..)"),
+            Handler::PairButton(_) => f.write_str("PairButton(..)"),
         }
     }
 }
@@ -1378,6 +1393,25 @@ impl<Msg: Clone + 'static> Handlers<Msg> {
     pub fn fire_pair(&self, kind: EventKind, a: f64, b: f64) -> Option<Msg> {
         match self.get(kind)? {
             Handler::Pair(f) => Some(f(a, b)),
+            _ => None,
+        }
+    }
+
+    /// Fire a `PairButton` **or** a `Pair` handler registered for `kind`.
+    ///
+    /// A `Pair` receives `(x, y)` and the button is dropped, so
+    /// `on_pointer_down` and `on_pointer_down_with_button` can sit on
+    /// different nodes without the caller choosing a fire method. As with
+    /// [`Handlers::fire_pair`] there is no `Unit` fallthrough: a `Unit`
+    /// binding on a pointer kind is a builder that meant a different arity.
+    ///
+    /// `button` is `0` for a motion, which carries none (P0-D2); no real
+    /// `BTN_*` code is zero.
+    #[must_use]
+    pub fn fire_pair_button(&self, kind: EventKind, x: f64, y: f64, button: u32) -> Option<Msg> {
+        match self.get(kind)? {
+            Handler::PairButton(f) => Some(f(x, y, button)),
+            Handler::Pair(f) => Some(f(x, y)),
             _ => None,
         }
     }
@@ -1685,14 +1719,15 @@ mod tests {
     }
 
     #[test]
-    fn the_event_kind_table_is_the_contract_s_eighteen() {
-        assert_eq!(EventKind::ALL.len(), 18);
+    fn the_event_kind_table_is_the_contract_s_eighteen_plus_m5_d5s_three() {
+        assert_eq!(EventKind::ALL.len(), 21);
         assert_eq!(EventKind::ALL[0], EventKind::Click);
         assert_eq!(EventKind::ALL[17], EventKind::DateSelected);
+        assert_eq!(EventKind::ALL[20], EventKind::PointerUp);
         let mut sorted = EventKind::ALL.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 18);
+        assert_eq!(sorted.len(), 21);
     }
 
     #[test]

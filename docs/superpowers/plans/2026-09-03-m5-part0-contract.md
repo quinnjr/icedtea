@@ -2034,6 +2034,29 @@ P0's eleven items above are the pre-declared set and are already numbered
 `M5-D1 … M5-D11`; a part's own discoveries start at `P1-D1`, `P4-D1`, and so on,
 so the two sets never collide.)*
 
+### P0-D2 — a pointer motion's button code is `0`, not an `Option<u32>`
+
+M5-D5 leaves `fire_pair_button`'s and the `_with_button` builders' third
+argument a bare `u32`, not `Option<u32>`, even though `PointerMotion` carries
+no button on the wire. Shipped: motion is reported with button `0`; no real
+`BTN_*` code from Linux's `input-event-codes.h` is zero, so the sentinel is
+unambiguous and callers avoid an `Option` unwrap for the common case (a raw
+drag) at the cost of the two press/release kinds tolerating a value that can
+never actually arrive there. Carried out by P0 (Task 8).
+
+### P0-D3 — `BTN_LEFT` stays defined in `window::layer`, re-exported from `window::pointer`
+
+M5-D5's sketch shows `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE` as three sibling
+`pub const`s in `ui/src/window/pointer.rs`. `BTN_LEFT` already has an M1 home
+in `crate::window::layer` (both `wayland::BTN_LEFT` and `window::BTN_LEFT` name
+that one, and `ui/tests/layer_shell_screencopy.rs` is a byte-identical gate
+that imports it from there); redefining it in `pointer.rs` would either
+duplicate the constant or force an unrelated edit onto that gate. Shipped:
+`pointer.rs` re-exports `BTN_LEFT` (`pub use crate::window::layer::BTN_LEFT;`)
+beside the two new consts it does define, so `window::pointer::{BTN_LEFT,
+BTN_RIGHT, BTN_MIDDLE}` is one importable set without moving or duplicating
+the original. Carried out by P0 (Task 8).
+
 ### P0-D5 — no `unsafe impl Send for InboxSender`
 
 M5-D2's sketch includes `unsafe impl<Msg: Send> Send for InboxSender<Msg> {}`.

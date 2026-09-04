@@ -15,6 +15,7 @@ pub mod selection;
 pub mod toplevel;
 
 pub use layer::BTN_LEFT;
+pub use pointer::{BTN_MIDDLE, BTN_RIGHT};
 
 use std::cell::RefCell;
 use std::rc::Rc;
