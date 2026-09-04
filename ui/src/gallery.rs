@@ -636,7 +636,20 @@ pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
                 },
             )
             .width_request(64)
-            .height_request(48),
+            .height_request(48)
+            // The interaction gate reads these back off stdout. `Changed`
+            // rather than a new `GalleryMsg` variant: the payload is already a
+            // flat string and `log_line` folds control characters, so the
+            // gate's substring matching needs nothing new.
+            .on_pointer_down_with_button(|x, y, b| {
+                GalleryMsg::Changed(Kind::DrawingArea, format!("down {x} {y} {b}"))
+            })
+            .on_pointer_motion(|x, y| {
+                GalleryMsg::Changed(Kind::DrawingArea, format!("motion {x} {y} 0"))
+            })
+            .on_pointer_up_with_button(|x, y, b| {
+                GalleryMsg::Changed(Kind::DrawingArea, format!("up {x} {y} {b}"))
+            }),
         ),
         Kind::WindowControls => Sample::Own(w::window_controls(Side::End)),
         Kind::Calendar => Sample::Own(

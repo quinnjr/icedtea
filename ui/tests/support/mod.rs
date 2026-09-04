@@ -547,12 +547,16 @@ impl GalleryProc {
         self.messages.lock().expect("message log").clone()
     }
 
-    /// Wait until some message line equals `needle`, or `timeout` passes.
+    /// Wait until some message line starts with `needle`, or `timeout`
+    /// passes. A prefix rather than an exact match: `drawing_area`'s
+    /// per-phase lines carry coordinates and a button code after the phase
+    /// name, which a caller asserting only on the phase cannot spell out in
+    /// full.
     #[must_use]
     pub fn wait_msg(&self, needle: &str, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
-            if self.messages().iter().any(|line| line == needle) {
+            if self.messages().iter().any(|line| line.starts_with(needle)) {
                 return true;
             }
             if started.elapsed() >= timeout {
@@ -974,20 +978,44 @@ impl Driver {
         }
     }
 
-    /// Press the left button at `(x, y)`.
-    pub fn press(&mut self, x: i32, y: i32) {
+    /// Press `button` (a Linux `BTN_*` code) at `(x, y)`.
+    pub fn press_button(&mut self, x: i32, y: i32, button: u32) {
         self.move_to(x, y);
-        self.pointer.button(icedtea_ui::wayland::BTN_LEFT, true);
+        self.pointer.button(button, true);
         self.pointer.frame();
         self.pointer.pump();
     }
 
-    /// Release the left button at `(x, y)`.
-    pub fn release(&mut self, x: i32, y: i32) {
+    /// Release `button` at `(x, y)`.
+    pub fn release_button(&mut self, x: i32, y: i32, button: u32) {
         self.move_to(x, y);
-        self.pointer.button(icedtea_ui::wayland::BTN_LEFT, false);
+        self.pointer.button(button, false);
         self.pointer.frame();
         self.pointer.pump();
+    }
+
+    /// Press and release `button` at `(x, y)`.
+    pub fn click_button(&mut self, x: i32, y: i32, button: u32) {
+        self.press_button(x, y, button);
+        self.release_button(x, y, button);
+    }
+
+    /// [`Driver::drag`] with a button other than the left one.
+    pub fn drag_with_button(&mut self, from: (i32, i32), to: (i32, i32), button: u32) {
+        self.press_button(from.0, from.1, button);
+        self.move_to((from.0 + to.0) / 2, (from.1 + to.1) / 2);
+        self.move_to(to.0, to.1);
+        self.release_button(to.0, to.1, button);
+    }
+
+    /// Press the left button at `(x, y)`.
+    pub fn press(&mut self, x: i32, y: i32) {
+        self.press_button(x, y, icedtea_ui::wayland::BTN_LEFT);
+    }
+
+    /// Release the left button at `(x, y)`.
+    pub fn release(&mut self, x: i32, y: i32) {
+        self.release_button(x, y, icedtea_ui::wayland::BTN_LEFT);
     }
 
     /// Press and release at `(x, y)`.
