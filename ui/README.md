@@ -570,6 +570,23 @@ bounded pump that hands up a flat `InputEvent` stream.
   `libxkbcommon`, runs the compose table, reports the modifiers a keysym
   consumed (so `!` matches a plain-`!` accelerator), and owns the repeat timer
   xkbcommon does not have.
+
+### Base-level keysyms
+
+`Keymap::base_keysym(keycode)` is the sym a key produces at group 0, level 0 —
+GDK's `translate_key(keycode, 0, 0)` — and every `KeyEvent` carries it as
+`base`. An accelerator capture normalises with it, exactly as the compositor
+matches:
+
+```rust
+let sym = if ev.base != xkb::keysyms::KEY_NoSymbol { ev.base } else { ev.keysym };
+```
+
+The raw/latin sym, falling back to the modified one only when the keycode
+produces no base sym at all; modifiers come from `KeyEvent::mods`, the
+effective state, not from `consumed`. This is what makes a binding captured
+from `SUPER+SHIFT+q` match the `KEY_q` the config file encodes.
+
 - **Pointer** — `window::pointer` hit-tests the retained tree in reverse paint
   order, mirrors the compositor's implicit grab client-side, and coasts finger
   scrolls kinetically.

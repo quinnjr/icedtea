@@ -604,3 +604,78 @@ fn a_release_outside_the_node_still_reaches_it_through_the_grab() {
         "the release outside the box still reached the pressed node: {seen:?}"
     );
 }
+
+/// The vendored US keymap every keyboard test in the crate uses.
+fn us_keymap() -> icedtea_ui::window::keyboard::Keymap {
+    icedtea_ui::window::keyboard::Keymap::from_string(include_str!("fixtures/keymaps/us.xkb"))
+        .expect("the vendored us keymap compiles")
+}
+
+/// evdev keycodes (xkb's are these + 8, applied inside the keymap).
+const KEY_A_CODE: u32 = 30;
+const KEY_LEFTSHIFT: u32 = 42;
+
+#[test]
+fn base_keysym_reports_the_level_zero_sym_for_a_shifted_key() {
+    // Settings' keybinding capture stores the *unshifted* sym, because
+    // `icedtea_config::keys::key_name_to_keysym` always encodes that one;
+    // storing XK_A from SUPER+SHIFT+a would produce a binding the compositor
+    // can never match (M5-D7's normalisation rule).
+    // mutation: change the level argument from 0 to 1 in `base_keysym`; the
+    // base becomes `A` and this fails.
+    use xkbcommon::xkb::keysyms;
+
+    let mut keymap = us_keymap();
+    keymap.update_key(KEY_LEFTSHIFT, true);
+    keymap.update_mask(1, 0, 0, 0); // Shift depressed
+    let ev = keymap.translate(KEY_A_CODE, true, 1, 0);
+    assert_eq!(ev.keysym.raw(), keysyms::KEY_A, "the modified sym is `A`");
+    assert_eq!(ev.base.raw(), keysyms::KEY_a, "the base sym is `a`");
+    assert_eq!(
+        keymap.base_keysym(KEY_A_CODE).raw(),
+        keysyms::KEY_a,
+        "and asking the keymap directly gives the same answer"
+    );
+}
+
+#[test]
+fn base_keysym_is_group_and_caps_agnostic() {
+    // mutation: read the sym from `state.key_get_one_sym` instead of the
+    // keymap's level-0 lookup; Caps Lock flips it and this fails.
+    use xkbcommon::xkb::keysyms;
+
+    let mut keymap = us_keymap();
+    keymap.update_mask(2, 0, 2, 1); // caps latched+locked, group 1
+    assert_eq!(keymap.base_keysym(KEY_A_CODE).raw(), keysyms::KEY_a);
+}
+
+#[test]
+fn base_keysym_of_an_unmapped_keycode_is_no_symbol() {
+    // Untrusted keymaps never panic (contract cross-cutting rule).
+    // mutation: `expect` the first sym in `base_keysym`; this panics.
+    use xkbcommon::xkb::keysyms;
+
+    let keymap = us_keymap();
+    for keycode in [0_u32, 9_999, u32::MAX] {
+        assert_eq!(
+            keymap.base_keysym(keycode).raw(),
+            keysyms::KEY_NoSymbol,
+            "keycode {keycode} is not in the us keymap"
+        );
+    }
+}
+
+#[test]
+fn translate_stamps_base_on_every_key_event() {
+    // mutation: leave `base` set to `keysym` in `translate`; the shifted case
+    // in the first test fails, and this one still passes — which is why both
+    // exist.
+    let mut keymap = us_keymap();
+    let press = keymap.translate(KEY_A_CODE, true, 1, 0);
+    let release = keymap.translate(KEY_A_CODE, false, 2, 1);
+    assert_eq!(
+        press.base, press.keysym,
+        "an unmodified press: base == keysym"
+    );
+    assert_eq!(release.base, release.keysym);
+}

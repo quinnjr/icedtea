@@ -5237,3 +5237,16 @@ text, resolve an icon or read the theme's colours — the same paint context
 every controller's `paint` receives — instead of being limited to fills and
 strokes. `Props::diff` still compares by `Rc` pointer, so no diff behaviour
 changes. Full text: M5 contract §1 M5-D6.
+
+### M5-D7 — `Keymap` exposes a level-0 lookup and `KeyEvent` carries it (extends §3.3)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §3.3's `Keymap` gains
+`base_keysym(keycode) -> xkb::Keysym`, the sym at group 0, level 0 —
+GDK's `translate_key(keycode, 0, 0)` — never panicking on an unmapped
+keycode (`Keysym::NoSymbol` instead). Every `KeyEvent` gains a `base` field,
+stamped by `Keymap::translate` with `base_keysym(keycode)`, so a view-layer
+`on_key` closure can normalise an accelerator capture without reaching into
+the window. Settings' keybinding capture needs exactly this: `icedtea_config`'s
+`key_name_to_keysym` always encodes the unshifted keysym, so a capture that
+stored the modified sym would produce a binding the compositor's
+`match_action` can never fire. Full text: M5 contract §1 M5-D7.

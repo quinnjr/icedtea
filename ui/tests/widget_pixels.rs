@@ -632,6 +632,7 @@ pub fn key_char(ch: char, keycode: u32) -> icedtea_ui::window::keyboard::KeyEven
     icedtea_ui::window::keyboard::KeyEvent {
         keycode,
         keysym: xkbcommon::xkb::Keysym::from(u32::from(ch)),
+        base: xkbcommon::xkb::Keysym::from(u32::from(ch)),
         utf8: Some(ch.to_string()),
         mods: icedtea_ui::window::keyboard::Mods::empty(),
         consumed: icedtea_ui::window::keyboard::Mods::empty(),
@@ -649,6 +650,7 @@ pub fn key_named(keysym: u32, keycode: u32) -> icedtea_ui::window::keyboard::Key
     icedtea_ui::window::keyboard::KeyEvent {
         keycode,
         keysym: xkbcommon::xkb::Keysym::from(keysym),
+        base: xkbcommon::xkb::Keysym::from(keysym),
         utf8: None,
         mods: icedtea_ui::window::keyboard::Mods::empty(),
         consumed: icedtea_ui::window::keyboard::Mods::empty(),

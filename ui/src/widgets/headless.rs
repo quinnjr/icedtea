@@ -149,6 +149,7 @@ impl Headless {
         crate::window::keyboard::KeyEvent {
             keycode: 0,
             keysym,
+            base: keysym,
             utf8: None,
             mods: crate::window::keyboard::Mods::empty(),
             consumed: crate::window::keyboard::Mods::empty(),

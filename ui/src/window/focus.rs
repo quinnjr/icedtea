@@ -623,6 +623,7 @@ mod tests {
         KeyEvent {
             keycode: 0,
             keysym,
+            base: keysym,
             utf8: None,
             mods,
             consumed,
