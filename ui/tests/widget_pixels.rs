@@ -1464,6 +1464,62 @@ fn a_check_button_paints_the_builtin_check_glyph() {
 }
 
 #[test]
+fn an_unchecked_check_button_paints_its_box() {
+    // GTK draws the empty indicator: a background and a 1px border. Without
+    // it a settings page full of unchecked boxes shows nothing at all, which
+    // is why `check_button` was on KNOWN_BLANK_AT_REST.
+    // mutation: restore the early `if !self.active && !self.inconsistent {
+    // return false }`; this fails with a flat frame.
+    use icedtea_ui::view::builders::check_button;
+    use icedtea_ui::widgets::check_button::CheckButtonExt;
+
+    let frames = run(
+        false,
+        |model: &mut bool, on: bool| {
+            *model = on;
+            Cmd::None
+        },
+        // An empty label on purpose: `GenericC` shapes no glyphs for it, so
+        // any ink in the frame is the indicator this task draws.
+        |model: &bool| check_button("").active(*model),
+        (120, 40),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        has_ink(&frames, 0, (120, 40)),
+        "an unchecked check button painted nothing"
+    );
+}
+
+#[test]
+fn a_checked_check_button_still_paints_the_builtin() {
+    // The regression guard for the branch above: the checked path must still
+    // go through `paint::icon::paint_builtin`, and must differ from unchecked.
+    // mutation: return early for the *checked* state instead; the two frames
+    // become identical and this fails.
+    use icedtea_ui::view::builders::check_button;
+    use icedtea_ui::widgets::check_button::CheckButtonExt;
+
+    let unchecked = run(
+        false,
+        |_m: &mut bool, _on: bool| Cmd::None,
+        |model: &bool| check_button("Check").active(*model),
+        (120, 40),
+        vec![ScriptStep::Capture],
+    );
+    let checked = run(
+        true,
+        |_m: &mut bool, _on: bool| Cmd::None,
+        |model: &bool| check_button("Check").active(*model),
+        (120, 40),
+        vec![ScriptStep::Capture],
+    );
+    let differs =
+        (0..120).any(|x| (0..40).any(|y| unchecked.pixel(0, x, y) != checked.pixel(0, x, y)));
+    assert!(differs, "checked and unchecked paint the same pixels");
+}
+
+#[test]
 fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
     // mutation: `return Vec::new()` at the top of `DropDownC::on_event` and
     // the two captures match -- the click reaches the controller only because

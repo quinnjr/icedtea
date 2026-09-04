@@ -212,14 +212,34 @@ impl<Msg: Clone + 'static> Controller<Msg> for CheckButtonC {
         style: &crate::css::computed::ComputedStyle,
         cx: &mut crate::view::controller::PaintCx<'_>,
     ) -> bool {
-        if !self.active && !self.inconsistent {
+        let indicator = alloc.content_box;
+        if indicator.is_empty() {
             return false;
+        }
+        if !self.active && !self.inconsistent {
+            // GTK paints the empty indicator too: `check` has a background and
+            // a 1px border in every theme. Reading both off `style` is what
+            // keeps light/dark/high-contrast right without a second palette
+            // here — the same "read the colour off `style`, not off the
+            // subnode" convention `ProgressBarC::paint` and `LevelBarC::paint`
+            // follow.
+            let colour = style.color();
+            let fill = crate::css::value::Rgba {
+                a: colour.a * 0.15,
+                ..colour
+            };
+            canvas.draw_rect(&indicator.to_skia(), &crate::paint::fill_paint(fill));
+            let mut border = crate::paint::fill_paint(style.border_colors()[0]);
+            border.set_style(skia_rs_safe::paint::Style::Stroke);
+            border.set_stroke_width(1.0);
+            canvas.draw_rect(&indicator.to_skia(), &border);
+            return true;
         }
         // The indicator's own allocation is the `check` node's, and the glyph
         // goes through `paint_builtin` rather than `Builtin::draw` so it
         // honours the same `-gtk-icon-transform`/`-gtk-icon-filter`/
         // `-gtk-icon-shadow` stack an icon file does (contract §6).
-        crate::paint::icon::paint_builtin(canvas, self.builtin(), alloc.content_box, style, cx);
+        crate::paint::icon::paint_builtin(canvas, self.builtin(), indicator, style, cx);
         true
     }
 }
