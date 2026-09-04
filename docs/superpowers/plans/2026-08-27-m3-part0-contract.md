@@ -5250,3 +5250,15 @@ the window. Settings' keybinding capture needs exactly this: `icedtea_config`'s
 `key_name_to_keysym` always encodes the unshifted keysym, so a capture that
 stored the modified sym would produce a binding the compositor's
 `match_action` can never fire. Full text: M5 contract §1 M5-D7.
+
+### M5-D9 — probing works on a live `Window`, not only offscreen (extends P8-D59/P8-D60)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. P8-D59/P8-D60 put probing on
+`App::probe`, which is offscreen-only — a harness test against a *running*
+process has no other way to ask where a widget ended up, and the gate rules
+forbid hard-coded coordinates. `window::probe_points_of`/`allocation_of` label
+and centre a laid-out tree with the gallery's own rule (id-or-node-name with a
+repeat index, floored centres), and `Window::probe_points`/`Window::allocation`
+expose them. `window-probe --emit-probe` writes the report lines
+`ui/tests/support` already parses (`probe <label> <x> <y>`,
+`alloc <id> <x> <y> <w> <h>`). Full text: M5 contract §1 M5-D9.

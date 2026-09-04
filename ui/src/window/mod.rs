@@ -999,6 +999,88 @@ fn socket_error(err: wayland_client::backend::WaylandError) -> SurfaceError {
     }
 }
 
+/// One probe point on a live window, in window-surface coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbePoint {
+    /// The node's `id` if it has one, else its CSS node name, indexed when the
+    /// name repeats — `gallery::probe_points_of`'s labelling rule.
+    pub label: String,
+    /// Centre of the border box, floored.
+    pub x: i32,
+    /// Centre of the border box, floored.
+    pub y: i32,
+}
+
+/// Label and centre every laid-out node under `root`.
+///
+/// Same derivation as `gallery::probe_points_of`: walk `root.descendants()`,
+/// label by id-or-node-name with a repeat index, take the centre of the border
+/// box **floored** (`f32::floor` before the cast, not `as i32`, which
+/// truncates toward zero, and not `round`, which ties away from it: only
+/// flooring makes an integer shift of a box shift its centre by that same
+/// integer). A node with no allocation is skipped. Cheap: it reads the layout
+/// tree the last frame already computed and lays nothing out.
+#[must_use]
+pub fn probe_points_of(root: &Node, layout: &crate::layout::LayoutTree) -> Vec<ProbePoint> {
+    use std::collections::BTreeMap;
+
+    let centre = |label: String, alloc: &crate::layout::Allocation| {
+        let r = alloc.border_box;
+        ProbePoint {
+            label,
+            x: (r.x + r.width / 2.0).floor() as i32,
+            y: (r.y + r.height / 2.0).floor() as i32,
+        }
+    };
+    let label_of = |node: &Node, index: usize, repeats: bool| -> String {
+        node.id().map_or_else(
+            || {
+                let name = node.name();
+                if repeats {
+                    format!("{name}{index}")
+                } else {
+                    name.to_string()
+                }
+            },
+            |id| id.as_str().to_string(),
+        )
+    };
+
+    let mut points = Vec::new();
+    if let Some(alloc) = layout.allocation(root) {
+        points.push(centre("root".to_string(), &alloc));
+    }
+    let descendants: Vec<Node> = root.descendants().collect();
+    let mut counts: BTreeMap<Rc<str>, usize> = BTreeMap::new();
+    for node in &descendants {
+        *counts.entry(node.name()).or_default() += 1;
+    }
+    let mut seen: BTreeMap<Rc<str>, usize> = BTreeMap::new();
+    for node in &descendants {
+        let name = node.name();
+        let index = seen.entry(name.clone()).or_default();
+        let repeats = counts.get(&name).copied().unwrap_or(0) > 1;
+        let label = label_of(node, *index, repeats);
+        *index += 1;
+        if let Some(alloc) = layout.allocation(node) {
+            points.push(centre(label, &alloc));
+        }
+    }
+    points
+}
+
+/// The allocation of the node under `root` whose [`Node::id`] is `id`.
+#[must_use]
+pub fn allocation_of(
+    root: &Node,
+    layout: &crate::layout::LayoutTree,
+    id: &str,
+) -> Option<crate::layout::Allocation> {
+    root.descendants()
+        .find(|node| node.id().is_some_and(|found| found.as_str() == id))
+        .and_then(|node| layout.allocation(&node))
+}
+
 /// One window: a surface, its retained tree, and the pump that drives them.
 pub struct Window {
     conn: Connection,
@@ -1286,6 +1368,25 @@ impl Window {
     #[must_use]
     pub fn root(&self) -> &Node {
         &self.root
+    }
+
+    /// Every laid-out node of this window's tree, labelled and centred.
+    ///
+    /// The live counterpart of `App::probe`, which is offscreen-only: a
+    /// harness test against a running client has no other way to ask where a
+    /// widget ended up, and the gate rules forbid hard-coded coordinates.
+    /// Reads the tree the last [`Window::render`] laid out.
+    #[must_use]
+    pub fn probe_points(&self) -> Vec<ProbePoint> {
+        probe_points_of(&self.root, &self.layout)
+    }
+
+    /// The border box of the node whose [`Node::id`] is `id`, in
+    /// window-surface coordinates. `None` for an unknown id or a node that has
+    /// not been laid out.
+    #[must_use]
+    pub fn allocation(&self, id: &str) -> Option<crate::layout::Allocation> {
+        allocation_of(&self.root, &self.layout, id)
     }
 
     /// Register `fd` in this window's poll set.

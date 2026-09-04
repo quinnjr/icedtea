@@ -535,3 +535,96 @@ fn a_popup_opened_from_a_menubutton_takes_the_grab_and_is_dismissed_outside_it()
         probe_report(report.path())
     );
 }
+
+#[test]
+fn probe_points_locate_a_live_windows_widgets() {
+    // Every M5 gate addresses widgets by id rather than by hard-coded
+    // coordinates; on a live window `App::probe` (offscreen-only) cannot
+    // answer, so `Window::probe_points` must.
+    // mutation: return `Vec::new()` from `probe_points_of`; no `probe ` line
+    // is ever written and this fails.
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let _probe = support::spawn_window_probe_with(
+        &compositor.socket_path().to_string_lossy(),
+        "entry",
+        theme.path(),
+        report.path(),
+        &["--emit-probe"],
+    );
+    assert!(
+        wait_for_report_line(report.path(), "probe ", Duration::from_secs(20)).is_some(),
+        "the probe emitted no probe points: {:?}",
+        probe_report(report.path())
+    );
+    let points: Vec<support::ProbePoint> = probe_report(report.path())
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("probe ").map(str::to_owned))
+        // `parse_probe_line` wants `<widget> <label> <x> <y>`; a window's
+        // lines have no widget column, so the label stands in for both.
+        .filter_map(|rest| support::parse_probe_line(&format!("window {rest}")))
+        .collect();
+    assert!(
+        points.iter().any(|p| p.label == "entry"),
+        "the entry is not among the probe points: {points:?}"
+    );
+    assert!(
+        points.iter().any(|p| p.label == "menubutton"),
+        "the menubutton is not among the probe points: {points:?}"
+    );
+    for point in &points {
+        assert!(
+            point.x >= 0 && point.y >= 0,
+            "a probe point must be inside the surface: {point:?}"
+        );
+    }
+}
+
+#[test]
+fn allocation_by_id_matches_the_probe_point_centre() {
+    // mutation: return the border box un-floored (`as i32` on the raw centre)
+    // in `probe_points_of`; a half-pixel centre rounds the other way and the
+    // equality below fails.
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let _probe = support::spawn_window_probe_with(
+        &compositor.socket_path().to_string_lossy(),
+        "entry",
+        theme.path(),
+        report.path(),
+        &["--emit-probe"],
+    );
+    assert!(
+        wait_for_report_line(report.path(), "alloc entry ", Duration::from_secs(20)).is_some(),
+        "no allocation line for the entry: {:?}",
+        probe_report(report.path())
+    );
+    let lines = probe_report(report.path());
+    let alloc = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("alloc "))
+        .and_then(support::parse_allocation_line)
+        .expect("an allocation line parses");
+    // `probe_points_of` emits the window's own root point first (labelled
+    // "root", per its shared derivation with `gallery::probe_points_of`),
+    // then every descendant in tree order -- not "entry" first. Find the
+    // entry's own probe point by label rather than assuming it leads.
+    let point = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("probe "))
+        .map(|rest| format!("window {rest}"))
+        .filter_map(|line| support::parse_probe_line(&line))
+        .find(|p| p.label == "entry")
+        .expect("an entry probe line parses");
+    assert_eq!(alloc.widget, "entry", "the first alloc line is the entry's");
+    assert_eq!(
+        (point.x, point.y),
+        (
+            (alloc.x + alloc.width / 2.0).floor() as i32,
+            (alloc.y + alloc.height / 2.0).floor() as i32
+        ),
+        "the probe point is the floored centre of the allocation"
+    );
+}

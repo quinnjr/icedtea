@@ -623,6 +623,16 @@ registered-but-silent fd costs zero wakeups.
 Not covered here: input methods (`text-input-v3`), drag and drop, client-side
 cursor themes (M6/see below).
 
+### Probing a live window
+
+`Window::probe_points()` labels and centres every laid-out node — id, else CSS
+node name with a repeat index — and `Window::allocation(id)` returns one node's
+border box, both in window-surface coordinates and both read off the tree the
+last frame laid out. A client that sets `$ICEDTEA_PROBE_REPORT` writes them as
+`probe <label> <x> <y>` and `alloc <id> <x> <y> <w> <h>` lines, which
+`ui/tests/support/mod.rs` parses back. This is how a harness test addresses a
+widget on a *running* app: `App::probe` is offscreen-only.
+
 ## The P5 half of the widget catalogue, in detail
 
 `icedtea_ui::widgets` builds one `Controller` per `Kind`, dispatched by

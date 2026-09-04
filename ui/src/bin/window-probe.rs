@@ -59,6 +59,7 @@ fn main() {
 
     let two_watches = std::env::args().any(|a| a == "--two-watches");
     let silent_watch = std::env::args().any(|a| a == "--silent-watch");
+    let emit_probe = std::env::args().any(|a| a == "--emit-probe");
     if mode == "ingress" {
         run_ingress(window, two_watches, silent_watch);
         return;
@@ -97,9 +98,30 @@ fn main() {
     // callback and the probe only commits when it is dirty, so the stream is
     // bounded anyway; the cap keeps the report file bounded regardless.
     let mut frames = 0_u32;
+    let mut emitted_probe = false;
     loop {
         if window.render().is_err() {
             break;
+        }
+        if emit_probe && !emitted_probe {
+            let points = window.probe_points();
+            if points.len() > 1 {
+                // Only once the tree has really been laid out: before the
+                // first configure every node is at the origin with no size.
+                for point in &points {
+                    report(&format!("probe {} {} {}", point.label, point.x, point.y));
+                }
+                for id in ["entry", "menubutton"] {
+                    if let Some(alloc) = window.allocation(id) {
+                        let r = alloc.border_box;
+                        report(&format!(
+                            "alloc {id} {} {} {} {}",
+                            r.x, r.y, r.width, r.height
+                        ));
+                    }
+                }
+                emitted_probe = true;
+            }
         }
         let timeout = window.next_deadline();
         let Ok(events) = window.pump(timeout) else {
