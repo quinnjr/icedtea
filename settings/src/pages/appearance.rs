@@ -72,6 +72,20 @@ pub fn packed_to_hex(packed: f64) -> String {
     rgba_to_hex(ColorDialogC::unpack(packed))
 }
 
+/// The Appearance page.
+///
+/// P1 ships the page's frame only; P2 fills it in (contract §2.6).
+#[must_use]
+pub fn view(m: &crate::app::SettingsModel) -> icedtea_ui::view::View<crate::app::Msg> {
+    let _ = m;
+    icedtea_ui::view::builders::box_(
+        icedtea_ui::widgets::types::Orientation::Vertical,
+        [icedtea_ui::view::builders::label("Appearance")],
+    )
+    .id("appearance_page")
+    .margin(16, 16, 16, 16)
+}
+
 fn labeled_row(grid: &Grid, row: i32, text: &str, widget: &impl IsA<gtk4::Widget>) {
     let label = Label::new(Some(text));
     label.set_halign(Align::Start);

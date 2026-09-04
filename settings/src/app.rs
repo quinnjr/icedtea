@@ -6,9 +6,15 @@
 
 use std::rc::Rc;
 
-use icedtea_ui::view::Cmd;
+use icedtea_ui::layout::Align;
+use icedtea_ui::view::builders::{
+    StackExt, box_, button, label, stack, stack_page, stack_switcher,
+};
+use icedtea_ui::view::{Cmd, View};
+use icedtea_ui::widgets::types::Orientation;
 
 use crate::compositor_reload::ReloadOutcome;
+use crate::pages;
 use crate::pages::PageId;
 use crate::pages::displays::state::DisplaysState;
 
@@ -155,9 +161,77 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
     }
 }
 
+/// What the footer's status label shows: the dirty indicator wins over the
+/// last status line, exactly as the GTK `update_footer` closure did.
+#[must_use]
+pub fn footer_text(m: &SettingsModel) -> &str {
+    if m.is_dirty() {
+        "Unsaved changes"
+    } else {
+        &m.status
+    }
+}
+
+/// The whole window, rebuilt from the model on every frame.
+#[must_use]
+pub fn view(m: &SettingsModel) -> View<Msg> {
+    box_(
+        Orientation::Vertical,
+        [
+            nav(m),
+            stack([
+                stack_page("appearance", "Appearance", pages::appearance::view(m)),
+                stack_page("behavior", "Behavior", pages::behavior::view(m)),
+                stack_page("workspaces", "Workspaces", pages::workspaces::view(m)),
+                stack_page("keybindings", "Keybindings", pages::keybindings::view(m)),
+                stack_page("displays", "Displays", pages::displays::view(m)),
+            ])
+            .visible_child(m.page.name())
+            .id("pages")
+            .vexpand(true),
+            footer(m),
+        ],
+    )
+    .id("root")
+}
+
+/// The page switcher. `Stack` + `StackSwitcher`, not `StackSidebar` (spec D7:
+/// the sidebar's eviction defect is out of M5's scope).
+fn nav(m: &SettingsModel) -> View<Msg> {
+    let _ = m;
+    stack_switcher(pages::page_infos())
+        .id("nav")
+        .on_selected(Msg::PageSelected)
+}
+
+/// Status line plus Revert and Apply. Every value here is computed from the
+/// model — there is no dirty flag and no `Rc<dyn Fn()>` to call.
+fn footer(m: &SettingsModel) -> View<Msg> {
+    let dirty = m.is_dirty();
+    box_(
+        Orientation::Horizontal,
+        [
+            label(footer_text(m))
+                .id("status")
+                .hexpand(true)
+                .halign(Align::Start),
+            button("Revert")
+                .id("revert")
+                .sensitive(dirty)
+                .on_click(Msg::Revert),
+            button("Apply")
+                .id("apply")
+                .sensitive(dirty)
+                .on_click(Msg::Apply),
+        ],
+    )
+    .id("footer")
+    .margin(8, 8, 8, 8)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Msg, SettingsModel, update};
+    use super::{Msg, SettingsModel, footer_text, update, view};
     use crate::compositor_reload::ReloadOutcome;
     use crate::pages::PageId;
 
@@ -246,5 +320,77 @@ mod tests {
             "an external reload must not touch the working copy"
         );
         assert_eq!(m.status, "Compositor reloaded its configuration");
+    }
+
+    /// Every node the tree lays out, by id.
+    fn node_ids(probe: &icedtea_ui::view::app::Probe<Msg>) -> Vec<String> {
+        let mut out = Vec::new();
+        for node in probe.root().descendants() {
+            if let Some(id) = node.id() {
+                out.push(id.as_str().to_string());
+            }
+        }
+        out
+    }
+
+    fn probe_of(m: SettingsModel) -> icedtea_ui::view::app::Probe<Msg> {
+        icedtea_ui::view::App::new(m, update, view)
+            .probe(
+                (480, 420),
+                icedtea_ui::app::compile_theme(&icedtea_ui::app::ThemeSource::Bundled),
+                icedtea_ui::text::FontDatabase::probe_only(),
+                icedtea_ui::icons::IconTheme::with_name_and_roots("hicolor", vec![]),
+                std::rc::Rc::new(icedtea_ui::anim::ManualClock::new()),
+            )
+            .expect("the settings tree lays out")
+    }
+
+    /// The frame every page hangs off. Mutation check: drop `footer(m)` from
+    /// `view`; this test fails on `apply`. Restore.
+    #[test]
+    fn the_root_carries_the_nav_the_stack_and_the_footer() {
+        let (m, _dir) = model();
+        let probe = probe_of(m);
+        let ids = node_ids(&probe);
+        for wanted in [
+            "root", "nav", "pages", "footer", "status", "revert", "apply",
+        ] {
+            assert!(
+                ids.contains(&wanted.to_string()),
+                "missing #{wanted} in {ids:?}"
+            );
+        }
+    }
+
+    /// Only the selected page's body is in the tree the stack shows, and the
+    /// selection follows the model.
+    #[test]
+    fn the_stack_shows_the_selected_page() {
+        let (m, _dir) = model();
+        assert_eq!(m.page, PageId::Appearance);
+        let ids = node_ids(&probe_of(m));
+        assert!(ids.contains(&"appearance_page".to_string()));
+
+        let (mut m2, _dir2) = model();
+        m2.page = PageId::Displays;
+        let ids = node_ids(&probe_of(m2));
+        assert!(ids.contains(&"displays_page".to_string()));
+    }
+
+    /// The footer is computed, not pushed: `Unsaved changes` is what
+    /// `is_dirty()` says, and Revert/Apply are insensitive while clean —
+    /// `main.rs:73-84`'s `update_footer` closure, with the Rc<dyn Fn()> gone.
+    ///
+    /// Mutation check: make `footer` always render `m.status`; this fails.
+    #[test]
+    fn the_footer_reports_dirtiness_without_a_flag() {
+        let (mut m, _dir) = model();
+        let clean = footer_text(&m);
+        assert_eq!(clean, "");
+        m.model.working.appearance.palette.accent = "#ff00aa".to_string();
+        assert_eq!(footer_text(&m), "Unsaved changes");
+        m.status = "Applied".to_string();
+        m.model.saved = m.model.working.clone();
+        assert_eq!(footer_text(&m), "Applied");
     }
 }

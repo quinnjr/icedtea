@@ -29,6 +29,20 @@ use state::{
     reconcile, refreshes_for,
 };
 
+/// The Displays page.
+///
+/// P1 ships the page's frame only; P4 fills it in (contract §2.6).
+#[must_use]
+pub fn view(m: &crate::app::SettingsModel) -> icedtea_ui::view::View<crate::app::Msg> {
+    let _ = m;
+    icedtea_ui::view::builders::box_(
+        icedtea_ui::widgets::types::Orientation::Vertical,
+        [icedtea_ui::view::builders::label("Displays")],
+    )
+    .id("displays_page")
+    .margin(16, 16, 16, 16)
+}
+
 /// Replace a dropdown's contents and select `selected`.
 fn set_dropdown(dd: &DropDown, labels: &[String], selected: usize) {
     let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();

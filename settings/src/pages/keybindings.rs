@@ -23,6 +23,20 @@ use icedtea_config::KeyCombo;
 use crate::model::{CaptureMods, combo_from_keysym, duplicate_bindings};
 use crate::pages::{Ctx, Page};
 
+/// The Keybindings page.
+///
+/// P1 ships the page's frame only; P3 fills it in (contract §2.6).
+#[must_use]
+pub fn view(m: &crate::app::SettingsModel) -> icedtea_ui::view::View<crate::app::Msg> {
+    let _ = m;
+    icedtea_ui::view::builders::box_(
+        icedtea_ui::widgets::types::Orientation::Vertical,
+        [icedtea_ui::view::builders::label("Keybindings")],
+    )
+    .id("keybindings_page")
+    .margin(16, 16, 16, 16)
+}
+
 /// The fixed part of the action set -- always present regardless of
 /// workspace count. Kept in the same order the compositor's own defaults
 /// insert them (`icedtea_config::defaults::default_config`) purely so the
