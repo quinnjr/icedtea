@@ -440,3 +440,167 @@ fn a_task_command_runs_once_after_the_fold_offscreen_too() {
         "each message's fold is immediately followed by its own batch's tasks, in order"
     );
 }
+
+/// The whole pointer gesture, on a plain `box_` — proof it is generic and not
+/// a `DrawingArea` special case.
+///
+/// mutation: delete the `Event::PointerMotion` arm of
+/// `fire_pointer_handlers`; the motion tag disappears and this fails (this is
+/// M5-D5's mutation check, relocated by P0-D1).
+#[test]
+fn pointer_handlers_fire_down_motion_up_in_order_with_local_coordinates() {
+    use icedtea_ui::view::builders::{box_, label};
+    use icedtea_ui::widgets::Orientation;
+    use std::cell::RefCell;
+
+    let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let recorder = Rc::clone(&log);
+    let clock = Rc::new(ManualClock::new());
+    let frames = App::new(
+        (),
+        move |_m: &mut (), msg: String| {
+            recorder.borrow_mut().push(msg);
+            Cmd::None
+        },
+        |_m: &()| -> View<String> {
+            // `width_request`/`height_request`, not `hexpand`/`vexpand`:
+            // reconciliation — `hexpand`/`vexpand` round-trip through `Props`
+            // (`ui/src/view/mod.rs`) but nothing in the generic layout path
+            // reads either name (only `action_bar`/`center_box`/`header_bar`/
+            // `paned`/`overlay`/`state` set a `ChildLayout` for their own
+            // children, and this canvas is the window's sole top-level
+            // child); an explicit floor sized to the surface centers to the
+            // same (0, 0) origin `hexpand`/`vexpand` would fill to, without
+            // depending on the missing wiring.
+            box_(Orientation::Vertical, [label("canvas")])
+                .width_request(200)
+                .height_request(100)
+                .id("canvas")
+                .on_pointer_down(|x, y| format!("down {x} {y}"))
+                .on_pointer_motion(|x, y| format!("motion {x} {y}"))
+                .on_pointer_up_with_button(|x, y, b| format!("up {x} {y} {b:#x}"))
+        },
+    )
+    .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+    .run_offscreen(
+        (200, 100),
+        clock,
+        vec![
+            ScriptStep::Event(InputEvent::pointer_enter(20.0, 30.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerMotion {
+                x: 40.0,
+                y: 50.0,
+                time_ms: 1,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::pointer::BTN_MIDDLE,
+                pressed: false,
+                serial: 3,
+                time_ms: 2,
+            }),
+            ScriptStep::Capture,
+        ],
+    )
+    .expect("the offscreen app runs");
+    assert_eq!(frames.len(), 1);
+    let seen = log.borrow().clone();
+    assert_eq!(
+        seen,
+        vec![
+            "motion 20 30".to_owned(),
+            "down 20 30".to_owned(),
+            "motion 40 50".to_owned(),
+            "up 40 50 0x112".to_owned(),
+        ],
+        "phases arrive in order, in the node's own coordinates, with the button"
+    );
+}
+
+/// The property the Displays drag depends on: once a node has the press, the
+/// motion and the release are its, even outside its box.
+///
+/// mutation: fire the handlers at `Phase::Bubble` instead of `Phase::Target`;
+/// the grabbed node is the target, so the release outside it never fires.
+#[test]
+fn a_release_outside_the_node_still_reaches_it_through_the_grab() {
+    use icedtea_ui::view::builders::{box_, label};
+    use icedtea_ui::widgets::Orientation;
+    use std::cell::RefCell;
+
+    let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let recorder = Rc::clone(&log);
+    let clock = Rc::new(ManualClock::new());
+    let _ = App::new(
+        (),
+        move |_m: &mut (), msg: String| {
+            recorder.borrow_mut().push(msg);
+            Cmd::None
+        },
+        |_m: &()| -> View<String> {
+            // A small, centred canvas: (190, 90) is outside it.
+            //
+            // reconciliation: `width_request`/`height_request` are a floor
+            // GTK's own way, so a box exactly the label's own content size
+            // (40x20, the plan's literal figure) leaves the label's border
+            // box identical to the box's — `aim` (`ui/src/view/app.rs`)
+            // always resolves to the innermost `Instance` a point falls in
+            // (P5-D33's note on `aim`), so no point inside such a box is
+            // ever *outside* the label and `on_pointer_down`, set on the
+            // box, could never become the target. Sizing the box bigger
+            // than its content leaves a margin the label does not cover,
+            // and the press below lands there.
+            box_(Orientation::Vertical, [label("canvas")])
+                .width_request(80)
+                .height_request(60)
+                .id("canvas")
+                .on_pointer_down(|_, _| "down".to_owned())
+                .on_pointer_up(|_, _| "up".to_owned())
+        },
+    )
+    .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+    .run_offscreen(
+        (200, 100),
+        clock,
+        vec![
+            // Inside the 80x60 box, outside the label it centres (roughly
+            // 44x20, at the box's own centre).
+            ScriptStep::Event(InputEvent::pointer_enter(65.0, 25.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerMotion {
+                x: 190.0,
+                y: 90.0,
+                time_ms: 1,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 2,
+            }),
+            ScriptStep::Capture,
+        ],
+    )
+    .expect("the offscreen app runs");
+    let seen = log.borrow().clone();
+    assert_eq!(
+        seen.iter().filter(|m| *m == "down").count(),
+        1,
+        "one press: {seen:?}"
+    );
+    assert_eq!(
+        seen.iter().filter(|m| *m == "up").count(),
+        1,
+        "the release outside the box still reached the pressed node: {seen:?}"
+    );
+}

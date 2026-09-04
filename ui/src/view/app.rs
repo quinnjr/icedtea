@@ -19,7 +19,7 @@ use crate::view::reconcile::{BuildCx, Instance, containers_of, reconcile};
 use crate::view::render::{
     Animations, NodeAddr, NodePainter, StyleMap, layout_tree, paint_tree, restyle_tree,
 };
-use crate::view::{Kind, View};
+use crate::view::{EventKind, Handlers, Kind, View};
 use crate::window::focus::{
     Binding, FocusCause, FocusDirection, FocusRing, navigate, window_binding,
 };
@@ -101,6 +101,32 @@ pub fn path_to<Msg: Clone + 'static>(roots: &[Instance<Msg>], target: &Node) -> 
 /// would hand the event to the very node it just intercepted. `cx.phase` (D5)
 /// still tells a controller which phase it is in; what changed is the reach of
 /// `handled`.
+/// M5-D5's three pointer kinds, fired from one place (P0-D1).
+///
+/// The contract's text puts this in `GenericC::on_event` plus a forwarding arm
+/// per widget. `GenericC` is not on the dispatch path of a widget that has its
+/// own controller — `ButtonC`, `DrawingAreaC` and thirty others replace it —
+/// and P5 puts `on_pointer_up_with_button` on `button(..)` nodes while being
+/// forbidden from touching `ui/`. So the firing lives in `deliver`, once, for
+/// every kind alike, and no widget file is edited to opt in.
+///
+/// `button` is `0` for a motion, which carries none (P0-D2).
+fn fire_pointer_handlers<Msg: Clone + 'static>(
+    event: &Event,
+    handlers: &Handlers<Msg>,
+) -> Vec<Msg> {
+    let (kind, local, button) = match event {
+        Event::PointerDown { local, button, .. } => (EventKind::PointerDown, *local, *button),
+        Event::PointerMotion { local } => (EventKind::PointerMotion, *local, 0),
+        Event::PointerUp { local, button, .. } => (EventKind::PointerUp, *local, *button),
+        _ => return Vec::new(),
+    };
+    handlers
+        .fire_pair_button(kind, f64::from(local.0), f64::from(local.1), button)
+        .into_iter()
+        .collect()
+}
+
 pub fn deliver<Msg: Clone + 'static>(
     roots: &mut [Instance<Msg>],
     path: &[Node],
@@ -147,6 +173,13 @@ pub fn deliver<Msg: Clone + 'static>(
                 phase,
                 handled: false,
             };
+            // M5-D5/P0-D1: the node the event is aimed at — the innermost
+            // `Instance` (P5-D33) — gets its pointer handlers fired before its
+            // controller runs, so a controller that sets `cx.handled` (as
+            // `GenericC` does on every left press) cannot swallow them.
+            if phase == Phase::Target {
+                out.extend(fire_pointer_handlers(event, &*handlers));
+            }
             out.extend(controller.on_event(event, &mut ecx));
             // `cx.handled` ends the whole dispatch (deviation D19, recorded in
             // §10 as P4-D19): the node that set it is the last one this event

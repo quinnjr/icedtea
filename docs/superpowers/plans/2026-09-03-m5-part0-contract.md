@@ -2034,6 +2034,21 @@ P0's eleven items above are the pre-declared set and are already numbered
 `M5-D1 … M5-D11`; a part's own discoveries start at `P1-D1`, `P4-D1`, and so on,
 so the two sets never collide.)*
 
+### P0-D1 — pointer handlers fire centrally in `view::app::deliver`, not from `GenericC::on_event` plus per-widget forwarding
+
+M5-D5 §1/§4 say the three pointer `EventKind`s are fired from
+`GenericC::on_event` and that `DrawingAreaC::on_event` gains its own
+forwarding arm. `GenericC` is not on the dispatch path of a widget that has
+its own controller — `ButtonC`, `DrawingAreaC`, `ListBoxC` and thirty others
+replace it, so the contract's own consumers would not work — and P5 puts
+`on_pointer_up_with_button` on `button(...)` nodes (`Kind::Button` ⇒
+`ButtonC`) while being forbidden from touching `ui/`. Shipped: one call to
+`fire_pointer_handlers(event, handlers)` in `deliver`, at `Phase::Target`,
+before the target node's `controller.on_event`. Every kind is covered by one
+code path, `button.rs` is not edited, and the M5-D5 mutation check moves from
+"delete `DrawingAreaC`'s `PointerMotion` arm" to "delete the `PointerMotion`
+arm of `fire_pointer_handlers`". Carried out by P0 (Task 9).
+
 ### P0-D2 — a pointer motion's button code is `0`, not an `Option<u32>`
 
 M5-D5 leaves `fire_pair_button`'s and the `_with_button` builders' third
