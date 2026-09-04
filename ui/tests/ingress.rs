@@ -203,6 +203,51 @@ fn an_idle_watch_costs_no_extra_wakeups() {
     );
 }
 
+#[test]
+fn on_fd_maps_a_foreign_fd_to_messages() {
+    // mutation: drop the `for (watch, handler) in &self.fd_handlers` loop from
+    // `App::run`; the probe never reports `folded fd`.
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let _probe = spawn_window_probe_with(
+        &compositor.socket_path().to_string_lossy(),
+        "app-inbox",
+        theme.path(),
+        report.path(),
+        &[],
+    );
+    assert!(
+        wait_for_report_line(report.path(), "folded fd", REPORT).is_some(),
+        "an `on_fd` closure never produced a message: {:?}",
+        probe_report(report.path())
+    );
+}
+
+#[test]
+fn an_inbox_message_wakes_a_live_app() {
+    // The end-to-end claim P1 and P5 rest on: a worker thread's `send` reaches
+    // `update` on a running app with no polling and no timer.
+    // mutation: never call `window.watch_fd` for the inbox in `App::run`; the
+    // app only notices on some *other* wakeup, and with nothing else moving
+    // the report line never appears inside the timeout.
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let _probe = spawn_window_probe_with(
+        &compositor.socket_path().to_string_lossy(),
+        "app-inbox",
+        theme.path(),
+        report.path(),
+        &[],
+    );
+    assert!(
+        wait_for_report_line(report.path(), "folded inbox", REPORT).is_some(),
+        "a worker's message never reached update: {:?}",
+        probe_report(report.path())
+    );
+}
+
 use icedtea_ui::BUNDLED_ADWAITA_LIGHT;
 use icedtea_ui::anim::ManualClock;
 use icedtea_ui::css::cascade::CompiledSheet;

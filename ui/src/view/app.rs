@@ -603,6 +603,18 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
         self
     }
 
+    /// Map a foreign fd's readiness to messages.
+    ///
+    /// `f` runs on the loop thread whenever [`InputEvent::FdReady`] names `id`,
+    /// and its messages are enqueued in order — after the inbox's, before the
+    /// frame's input batch. A handler for an id that has since been
+    /// `unwatch`ed is simply never called again (M5-D1 §4).
+    #[must_use]
+    pub fn on_fd(mut self, id: crate::window::WatchId, f: impl Fn() -> Vec<Msg> + 'static) -> Self {
+        self.fd_handlers.push((id, Box::new(f)));
+        self
+    }
+
     /// The current model — what an offscreen test asserts on besides pixels.
     #[must_use]
     pub fn model(&self) -> &M {

@@ -63,6 +63,10 @@ fn main() {
         run_ingress(window, two_watches, silent_watch);
         return;
     }
+    if mode == "app-inbox" {
+        run_app_inbox(window);
+        return;
+    }
 
     let mut window = window;
     // window > box > (entry > text), (menubutton > label)
@@ -316,4 +320,72 @@ fn id_index(id: icedtea_ui::window::WatchId) -> u64 {
         .trim_end_matches(')')
         .parse()
         .unwrap_or(u64::MAX)
+}
+
+/// `ICEDTEA_PROBE_MODE=app-inbox`: a real `App` on this live toplevel, fed by
+/// a worker thread through an inbox and by a foreign fd through `on_fd`.
+///
+/// This is the shape both M5 apps have, reduced to what can be asserted from
+/// outside: every folded message is reported, and the app quits once it has
+/// seen both.
+fn run_app_inbox(mut window: Window) {
+    use icedtea_ui::view::builders::label;
+    use icedtea_ui::view::{App, Cmd, Inbox, View};
+    use icedtea_ui::window::Interest;
+    use rustix::pipe::{PipeFlags, pipe_with};
+    use std::time::Duration;
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Msg {
+        FromInbox,
+        FromFd,
+    }
+
+    let (inbox, tx) = Inbox::<Msg>::new().expect("an inbox");
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        let _ = tx.send(Msg::FromInbox);
+    });
+
+    let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("a pipe");
+    let watch = window.watch_fd(read, Interest::Read);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = rustix::io::write(&write, b"x");
+    });
+
+    let app = App::new(
+        (false, false),
+        |model: &mut (bool, bool), msg: Msg| {
+            match msg {
+                Msg::FromInbox => {
+                    model.0 = true;
+                    report("folded inbox");
+                }
+                Msg::FromFd => {
+                    model.1 = true;
+                    report("folded fd");
+                }
+            }
+            if model.0 && model.1 {
+                report("folded both");
+                Cmd::Quit
+            } else {
+                Cmd::None
+            }
+        },
+        |model: &(bool, bool)| -> View<Msg> {
+            label(if model.0 { "inbox" } else { "waiting" }).id("status")
+        },
+    )
+    .with_inbox(inbox)
+    // One message per readiness: the closure does not read the pipe, so the
+    // fd stays readable and the app unwatches nothing — which is exactly the
+    // "a handler decides, the toolkit does not" rule. `Cmd::Quit` above ends
+    // the run before that can loop more than a few times.
+    .on_fd(watch, || vec![Msg::FromFd]);
+
+    if let Err(err) = app.run(window) {
+        report(&format!("app-error {err}"));
+    }
 }
