@@ -2397,3 +2397,85 @@ fn a_color_dialogs_measured_box_is_the_grid_it_paints() {
         );
     }
 }
+
+#[test]
+fn a_scrollbar_paints_its_trough_and_slider() {
+    // `range`/`trough`/`slider` are controller-owned subnodes with no taffy
+    // box, so M2's box painting never reaches them: this controller is the
+    // only thing that can draw a scrollbar at all.
+    // mutation: return `false` from `ScrollbarC::paint`; the frame is flat.
+    use icedtea_ui::view::builders::scrollbar;
+    use icedtea_ui::widgets::Orientation;
+    use icedtea_ui::widgets::scrollbar::ScrollbarExt;
+
+    let frames = run(
+        0.0_f64,
+        |model: &mut f64, v: f64| {
+            *model = v;
+            Cmd::None
+        },
+        |model: &f64| {
+            scrollbar(Orientation::Horizontal)
+                .lower(0.0)
+                .upper(100.0)
+                .page_size(20.0)
+                .value(*model)
+                .hexpand(true)
+        },
+        (200, 40),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        has_ink(&frames, 0, (200, 40)),
+        "the scrollbar painted nothing"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for x in 0..200 {
+        for y in 0..40 {
+            if let Some(px) = frames.pixel(0, x, y) {
+                seen.insert(px);
+            }
+        }
+    }
+    assert!(
+        seen.len() >= 3,
+        "trough and slider must differ from the background, saw {} colours",
+        seen.len()
+    );
+}
+
+#[test]
+fn a_scrollbars_slider_moves_with_its_value() {
+    // The paint reads the same `slider_rect` the hit test does, so a value
+    // change moves what is drawn.
+    // mutation: paint the slider at a fixed x; the two frames match and this
+    // fails.
+    use icedtea_ui::view::builders::scrollbar;
+    use icedtea_ui::widgets::Orientation;
+    use icedtea_ui::widgets::scrollbar::ScrollbarExt;
+
+    fn bar(model: &f64) -> View<f64> {
+        scrollbar(Orientation::Horizontal)
+            .lower(0.0)
+            .upper(100.0)
+            .page_size(20.0)
+            .value(*model)
+            .hexpand(true)
+    }
+    let left = run(
+        0.0_f64,
+        |_m: &mut f64, _v: f64| Cmd::None,
+        bar,
+        (200, 40),
+        vec![ScriptStep::Capture],
+    );
+    let right = run(
+        80.0_f64,
+        |_m: &mut f64, _v: f64| Cmd::None,
+        bar,
+        (200, 40),
+        vec![ScriptStep::Capture],
+    );
+    let differs = (0..200).any(|x| (0..40).any(|y| left.pixel(0, x, y) != right.pixel(0, x, y)));
+    assert!(differs, "the slider did not move with the value");
+}

@@ -991,3 +991,36 @@ fn a_middle_click_on_a_drawing_area_reports_the_middle_button_code() {
         "the release must carry BTN_MIDDLE (274 decimal): {up}"
     );
 }
+
+/// Ties the new paint to the hit geometry: dragging the slider must move the
+/// pixels the widget draws, not just the value it reports.
+///
+/// Mutation check: paint the slider from `self.value` while hit-testing from
+/// `self.adj.value` (they can disagree once `sanitized` clamps); the drag
+/// reports a value but the pixels do not follow, and this fails. Restore.
+#[test]
+fn dragging_a_scrollbar_slider_moves_what_it_paints() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "scrollbar");
+    let alloc = driver.allocation("scrollbar");
+    let (x, y) = driver.point("scrollbar", "root");
+    let left_edge = alloc.x as i32 + 2;
+    let target = (alloc.x as i32 + alloc.width as i32 - 3, y);
+    let before = driver.row(left_edge, target.0, y);
+
+    driver.drag((x, y), target);
+
+    assert!(
+        gallery
+            .messages()
+            .iter()
+            .any(|line| line.starts_with("value scrollbar ")),
+        "the drag reported no value; got {:?}",
+        gallery.messages()
+    );
+    let after = driver.wait_row_change(left_edge, target.0, y, &before);
+    assert!(
+        !support::row_matches(&after, &before),
+        "the slider's pixels did not move with the drag"
+    );
+}
