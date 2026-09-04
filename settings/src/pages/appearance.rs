@@ -9,37 +9,67 @@ use gtk4::prelude::*;
 use gtk4::{
     Align, Button, ColorDialog, ColorDialogButton, DropDown, FileDialog, Grid, Label, SpinButton,
 };
+use icedtea_ui::css::value::Rgba;
+use icedtea_ui::widgets::color_dialog::ColorDialogC;
 
 use crate::model::{BAR_POSITIONS, valid_hex};
 use crate::pages::{Ctx, Page};
 
-/// Parse a `#RRGGBB` string into an opaque `RGBA`; falls back to black for
-/// anything `valid_hex` rejects (should not happen for values this page
-/// itself wrote, but keeps `refresh()` panic-free against a hand-edited db).
-fn hex_to_rgba(s: &str) -> RGBA {
+/// Parse a `#RRGGBB` string into an opaque toolkit colour; falls back to
+/// opaque black for anything `valid_hex` rejects (should not happen for
+/// values this page itself wrote, but keeps `view` panic-free against a
+/// hand-edited db).
+///
+/// Same parse as the GDK version it replaces — `model::valid_hex` then
+/// `u8::from_str_radix` per channel — with `icedtea_ui`'s colour type in
+/// place of `gdk::RGBA`.
+#[must_use]
+pub fn hex_to_rgba(s: &str) -> Rgba {
     if !valid_hex(s) {
-        return RGBA::BLACK;
+        return Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
     }
     let digits = &s[1..];
     let byte = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).unwrap_or(0);
-    RGBA::new(
-        byte(0) as f32 / 255.0,
-        byte(2) as f32 / 255.0,
-        byte(4) as f32 / 255.0,
-        1.0,
-    )
+    Rgba {
+        r: f32::from(byte(0)) / 255.0,
+        g: f32::from(byte(2)) / 255.0,
+        b: f32::from(byte(4)) / 255.0,
+        a: 1.0,
+    }
 }
 
-/// Format an `RGBA`'s color channels (alpha is ignored -- the palette has no
+/// Format a colour's channels (alpha ignored — the palette has no
 /// transparency concept) as `#RRGGBB`.
-fn rgba_to_hex(c: &RGBA) -> String {
-    let chan = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    format!(
-        "#{:02x}{:02x}{:02x}",
-        chan(c.red()),
-        chan(c.green()),
-        chan(c.blue())
-    )
+#[must_use]
+pub fn rgba_to_hex(c: Rgba) -> String {
+    let chan = |v: f32| {
+        if v.is_nan() {
+            0
+        } else {
+            (v.clamp(0.0, 1.0) * 255.0).round() as u8
+        }
+    };
+    format!("#{:02x}{:02x}{:02x}", chan(c.r), chan(c.g), chan(c.b))
+}
+
+/// The value a `color_dialog_button` carries for `s` (M3 P5-D23: the colour
+/// rides `PropName::Value` as a packed `f64`).
+#[must_use]
+pub fn hex_to_packed(s: &str) -> f64 {
+    ColorDialogC::pack(hex_to_rgba(s))
+}
+
+/// The hex a `color_dialog_button`'s `on_value_changed` payload means.
+/// `ColorDialogC::unpack` already yields opaque black for a non-finite or
+/// out-of-range value, so this never panics on a hostile model.
+#[must_use]
+pub fn packed_to_hex(packed: f64) -> String {
+    rgba_to_hex(ColorDialogC::unpack(packed))
 }
 
 fn labeled_row(grid: &Grid, row: i32, text: &str, widget: &impl IsA<gtk4::Widget>) {
@@ -127,7 +157,13 @@ pub fn build(ctx: Ctx) -> Page {
             if ctx.populating.get() {
                 return;
             }
-            ctx.model.borrow_mut().working.appearance.palette.background = rgba_to_hex(&btn.rgba());
+            let g = btn.rgba();
+            ctx.model.borrow_mut().working.appearance.palette.background = rgba_to_hex(Rgba {
+                r: g.red(),
+                g: g.green(),
+                b: g.blue(),
+                a: g.alpha(),
+            });
             ctx.mark_dirty();
         });
     }
@@ -141,7 +177,13 @@ pub fn build(ctx: Ctx) -> Page {
             if ctx.populating.get() {
                 return;
             }
-            ctx.model.borrow_mut().working.appearance.palette.foreground = rgba_to_hex(&btn.rgba());
+            let g = btn.rgba();
+            ctx.model.borrow_mut().working.appearance.palette.foreground = rgba_to_hex(Rgba {
+                r: g.red(),
+                g: g.green(),
+                b: g.blue(),
+                a: g.alpha(),
+            });
             ctx.mark_dirty();
         });
     }
@@ -155,7 +197,13 @@ pub fn build(ctx: Ctx) -> Page {
             if ctx.populating.get() {
                 return;
             }
-            ctx.model.borrow_mut().working.appearance.palette.accent = rgba_to_hex(&btn.rgba());
+            let g = btn.rgba();
+            ctx.model.borrow_mut().working.appearance.palette.accent = rgba_to_hex(Rgba {
+                r: g.red(),
+                g: g.green(),
+                b: g.blue(),
+                a: g.alpha(),
+            });
             ctx.mark_dirty();
         });
     }
@@ -229,9 +277,12 @@ pub fn build(ctx: Ctx) -> Page {
             bar_height.set_value(appearance.bar_height as f64);
             corner_radius.set_value(appearance.corner_radius as f64);
             snap_gap.set_value(appearance.snap_gap as f64);
-            background.set_rgba(&hex_to_rgba(&appearance.palette.background));
-            foreground.set_rgba(&hex_to_rgba(&appearance.palette.foreground));
-            accent.set_rgba(&hex_to_rgba(&appearance.palette.accent));
+            let c = hex_to_rgba(&appearance.palette.background);
+            background.set_rgba(&RGBA::new(c.r, c.g, c.b, c.a));
+            let c = hex_to_rgba(&appearance.palette.foreground);
+            foreground.set_rgba(&RGBA::new(c.r, c.g, c.b, c.a));
+            let c = hex_to_rgba(&appearance.palette.accent);
+            accent.set_rgba(&RGBA::new(c.r, c.g, c.b, c.a));
             wallpaper_path.set_label(appearance.wallpaper.as_deref().unwrap_or("None"));
             ctx.populating.set(false);
         })
@@ -246,18 +297,42 @@ pub fn build(ctx: Ctx) -> Page {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{hex_to_packed, hex_to_rgba, packed_to_hex, rgba_to_hex};
 
+    /// Mutation check: make `hex_to_rgba` divide by 256.0 instead of 255.0;
+    /// this round trip fails on `#ffffff`. Restore.
     #[test]
     fn hex_rgba_round_trips() {
         for hex in ["#1e1e2e", "#cdd6f4", "#89b4fa", "#000000", "#ffffff"] {
             let rgba = hex_to_rgba(hex);
-            assert_eq!(rgba_to_hex(&rgba), hex);
+            assert_eq!(rgba_to_hex(rgba), hex);
         }
     }
 
     #[test]
     fn invalid_hex_falls_back_to_black_without_panicking() {
-        assert_eq!(hex_to_rgba("not-a-color"), RGBA::BLACK);
+        let black = hex_to_rgba("not-a-color");
+        assert_eq!(rgba_to_hex(black), "#000000");
+        assert_eq!(
+            black.a, 1.0,
+            "the fallback is opaque black, not transparent"
+        );
+    }
+
+    /// A `ColorDialogButton` carries its colour as a packed f64 (M3 P5-D23),
+    /// so the page's hex strings have to survive that packing exactly.
+    ///
+    /// Mutation check: swap `pack`/`unpack` in `packed_to_hex`; this fails.
+    #[test]
+    fn packed_round_trips_through_the_color_dialog_packing() {
+        for hex in ["#1e1e2e", "#cdd6f4", "#89b4fa", "#000000", "#ffffff"] {
+            assert_eq!(packed_to_hex(hex_to_packed(hex)), hex);
+        }
+    }
+
+    #[test]
+    fn a_nonsense_packed_value_is_black_not_a_panic() {
+        assert_eq!(packed_to_hex(f64::NAN), "#000000");
+        assert_eq!(packed_to_hex(-1.0), "#000000");
     }
 }

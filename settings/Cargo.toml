@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 icedtea-config = { path = "../config" }
 icedtea-contract = { path = "../contract" }
+icedtea-ui = { path = "../ui" }
+crossbeam-channel.workspace = true
 gtk4 = { version = "0.11", features = ["v4_10"] }
 # The Displays page talks to the compositor over a *second* Wayland connection
 # (`zwlr_output_management_v1`), dispatched on a `gio::Socket` glib source —

@@ -1647,12 +1647,14 @@ name = "icedtea-settings"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "crossbeam-channel",
  "gio",
  "glib",
  "gtk4",
  "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
+ "icedtea-ui",
  "redb",
  "rustix 1.1.4",
  "tempfile",
