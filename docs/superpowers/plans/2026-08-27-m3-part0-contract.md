@@ -5225,8 +5225,11 @@ Msg>)`; `Handlers::fire_pair_button` fires either a `PairButton` or a `Pair`
 binding on the same kind (button dropped for the latter), with no `Unit`
 fallthrough. Six builders (`on_pointer_down`/`_motion`/`_up`, each with a
 `_with_button` variant) and `BTN_RIGHT`/`BTN_MIDDLE` beside a re-exported
-`BTN_LEFT` in `window::pointer` (P0-D3). Nothing in M5 P0 fires these yet.
-Full text: M5 contract §6 P0-D2, P0-D3.
+`BTN_LEFT` in `window::pointer` (P0-D3). They are fired centrally, by
+`view::app::fire_pointer_handlers` from `view::app::deliver` (P0-D1) rather
+than from `GenericC::on_event`, at `Phase::Target` and again on the ancestor
+chain at `Phase::Bubble` (P0-D8); the gallery's `drawing_area` sample binds all
+three. Full text: M5 contract §6 P0-D1, P0-D2, P0-D3, P0-D8.
 
 ### M5-D6 — `Prop::Draw` carries the paint context (widens §4.3)
 
@@ -5262,3 +5265,30 @@ repeat index, floored centres), and `Window::probe_points`/`Window::allocation`
 expose them. `window-probe --emit-probe` writes the report lines
 `ui/tests/support` already parses (`probe <label> <x> <y>`,
 `alloc <id> <x> <y> <w> <h>`). Full text: M5 contract §1 M5-D9.
+
+### M5-D8 — four widgets paint at rest; `KNOWN_BLANK_AT_REST` drops to six (supersedes P8-D69)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. P8-D69's fifteen-entry
+`KNOWN_BLANK_AT_REST` list is superseded: `ColorDialogButtonC`,
+`ColorDialogC`, `CheckButtonC` and `ScrollbarC` now paint at rest —
+respectively the swatch on a real intrinsic floor (P0-D10), the palette grid
+`measure` and `paint` both read from one `grid()`, the unchecked indicator box
+from `style.color()`/`style.border_colors()`, and the trough plus slider — so
+`ui/tests/gallery_gate.rs`'s list is exactly six entries
+(`window_controls`, `font_dialog`, `popover_menu`, `popover_menu_bar`,
+`alert_dialog` — all zero-area allocations — and `link_button`), pinned by `the_readme_names_every_known_blank_widget` against
+`ui/README.md`. P8-D69's own text is retained above as the record of what
+fifteen used to mean; the live number is this one. The gate's separate
+`THEME_BLIND_BY_DESIGN` carve-out grows to four with `color_dialog`, recorded
+as M5 contract §6 P0-D9. Full text: M5 contract §1 M5-D8, §6 P0-D9, P0-D10.
+
+### M5-P0-fix — `Cmd::Unwatch`, and pointer handlers that bubble
+
+**Carried out by:** M5 P0 (whole-part fix wave). **Added:** 2026-09-04.
+`Cmd` gains `Unwatch(WatchId)`, handled in `App::run`'s window-bound command
+match: without it an app that has handed its window to `App::run` cannot retire
+a watch at all, and a level-triggered `POLLHUP`/`POLLERR` on a foreign fd spins
+the loop with no exit (M5 contract §6 P0-D7). `fire_pointer_handlers` also runs
+at `Phase::Bubble`, so a container with a pointer handler sees a gesture that
+landed on a child instance, subject to P4-D19's `cx.handled` rule (§6 P0-D8).
+Full text: M5 contract §6 P0-D7, P0-D8.

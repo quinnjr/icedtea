@@ -331,11 +331,31 @@ point, which is what makes an ingress test compositor-free.
 that produced it — a channel push to a worker, never a blocking call. It has no
 return value on purpose: an answer comes back through the inbox as a message.
 
+`Cmd::Unwatch(WatchId)` retires a watch and closes its fd from inside `update`.
+It is the *only* way an app driven by `App::run` can do so — `run` takes the
+window by value, so `Window::unwatch` is out of reach once the loop owns it —
+and it is not optional bookkeeping: `poll(2)` is level-triggered and reports
+`HUP`/`ERR` as readiness whatever the `Interest`, so a hung-up or never-drained
+fd is ready on *every* poll and an `on_fd` handler that yields a message each
+time spins the loop with no exit. A connection whose dispatch failed therefore
+ends its story with `Cmd::Unwatch(id)`. Unwatching an id this window does not
+hold is a no-op, so unwatching twice is safe.
+
 ### Pointer events at the view layer
 
 `on_pointer_down` / `on_pointer_motion` / `on_pointer_up` turn raw pointer
 phases into messages on **any** widget kind, with `(x, y)` in the node's own
-border box; each registers a `Handler::Pair(Rc<dyn Fn(f64, f64) -> Msg>)`. The
+border box; each registers a `Handler::Pair(Rc<dyn Fn(f64, f64) -> Msg>)`.
+They fire from one place — `view::app::deliver`, at `Phase::Target`, and again
+on the ancestor chain at `Phase::Bubble` — so a container's handler still sees
+a gesture that landed on a child, hit-testing having resolved to the innermost
+instance. Bubbling obeys the same rule as every other dispatch: a controller
+that sets `cx.handled` ends it. `GenericC` — the controller behind a plain
+`box_`, `label` and every kind without one of its own — marks a **left** press
+and a completed left release handled, so a container above such a child sees
+bubbled motions and non-left buttons but not that left press. A handler that
+must see every left press goes on the leaf itself, or on a node whose children
+are a controller's own chrome rather than `Instance`s. The
 three `_with_button` variants (`on_pointer_down_with_button`,
 `on_pointer_motion_with_button`, `on_pointer_up_with_button`) are the other
 half of that pair of builders: they register a
@@ -499,7 +519,10 @@ cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
   `check_button` and `scrollbar` a rest paint. Every entry, exempt or not, must
   still appear whole in some slice. It further asserts that every `Kind` appears in `--list`, on the
   page and (for sub-kinds) inside its parent's node tree; that at least one
-  probe point per widget differs between light and dark; that every widget's
+  probe point per widget differs between light and dark, except the four in
+  that file's `THEME_BLIND_BY_DESIGN` (`drawing_area`, `image`, `picture` and,
+  per M5 contract §6 P0-D9, `color_dialog`, whose sampled points all land on
+  fixed palette fill); that every widget's
   node tree matches its vendored GTK 4.22 fixture; and that this README's
   table lists every `Kind`.
 - `tests/interaction_gate.rs` drives interactions with a virtual pointer and
@@ -632,7 +655,9 @@ starved by a chatty watch; `FdReady`s come after the Wayland events of the same
 wake, one per ready watch, in registration order. `HUP` and `ERR` are reported
 as readiness whatever the `Interest`: the toolkit never decides a foreign fd is
 dead, it tells the owner, who calls `unwatch`. Nothing here adds a timer, so a
-registered-but-silent fd costs zero wakeups.
+registered-but-silent fd costs zero wakeups. An owner that has handed its window
+to `App::run` calls `unwatch` by returning `Cmd::Unwatch(id)` from `update`;
+see "External events" above.
 
 Not covered here: input methods (`text-input-v3`), drag and drop, client-side
 cursor themes (M6/see below).
@@ -712,6 +737,14 @@ files with its own 32 kinds; P8's gallery gate wires the whole set together.
 | `PasswordEntry` | `entry.password` | `password_entry()` | `password_entry.txt` |
 | `SpinButton` | `spinbutton` | `spin_button(lower, upper)` | `spin_button.txt` |
 | `EditableLabel` | `editablelabel` | `editable_label(text)` | `editable_label.txt` |
+
+`ColorDialogButton` carries a **64x32** minimum size, not Adwaita's bare
+`button.color` minimum of 48x32: the controller fills the node's box with the
+colour and the `button` subnode's own gradient chrome paints over the centre of
+that fill afterwards, so the extra 16px of width is the margin that stays
+visible. One constant (`SWATCH_BUTTON_MIN`) is read by both the layout floor
+`build` sets and `Controller::measure`, so a caller measuring a detached
+instance is told the number layout actually honours (M5 contract §6 P0-D10).
 
 This table only carries the constructor signature and fixture path for P5's
 original 32 kinds; P6's remaining 32 (containers, lists, menus, dialogs) are

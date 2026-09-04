@@ -2105,6 +2105,108 @@ holds the read end and hands `watch_fd` a `try_clone()` of it (CLOEXEC, same
 open file description), so the poll set and the drain both see the same
 pipe. Carried out by P0 (Task 3).
 
+### P0-D7 — `Cmd::Unwatch(WatchId)`: an app driven by `App::run` can retire a watch
+
+M5-D1 §4 gives `Window::watch_fd`/`Window::unwatch` as the pair, and says
+"`App::on_fd` skips callbacks for ids it no longer holds" — presuming an
+unwatch path exists for an `App`. There was none: `App::run(window)` takes the
+window by value, so `Window::unwatch` is unreachable from that point on, and
+`Cmd` had no unwatch variant. That is not a missing convenience. `poll(2)` is
+level-triggered and `wait_bounded` reports `POLLHUP`/`POLLERR` as readiness
+whatever the `Interest` (M5-D1 §3's own rule: the toolkit never decides a
+foreign fd is dead), so a hung-up or never-drained fd yields one
+`InputEvent::FdReady` per poll forever — `pump` returns immediately, `on_fd`
+runs, its message is folded, the tree is rebuilt and repainted, and the loop
+spins with no exit. §2.5 routes settings' second wayland connection straight
+into that path ("A dispatch error calls `notify_disconnected()` and yields the
+resulting `Disconnected` message; the watch is left registered so the app can
+decide") and P1/P4 may not touch `ui/` (§7 E6), so they could not decide.
+
+Shipped: `Cmd::Unwatch(WatchId)`, handled in `App::run`'s window-bound command
+match (`Cmd::Unwatch(id) => window.unwatch(id)`) beside `SetTitle`, `Minimize`
+and the popup commands, since only `run` holds the window. `drain` treats it as
+window-bound and hands it back rather than dropping it; an offscreen run logs it
+as inapplicable, as it does every other window-bound command. An id the window
+does not hold is a no-op (`Watches::remove`), so unwatching twice is safe, and
+the id `run` mints for its own inbox pipe is never handed to the app, so it
+cannot be retired by accident. Recorded in `ui/README.md` under "External
+events" and "Watching a foreign fd"; covered by
+`ui/tests/ingress.rs::cmd_unwatch_retires_a_watch_on_a_running_app`, against a
+`window-probe` `app-inbox` mode whose pipe is deliberately never drained.
+Carried out by P0 (whole-part fix wave).
+
+### P0-D8 — pointer handlers fire at `Phase::Target` *and* while bubbling
+
+P0-D1 shipped `fire_pointer_handlers` at `Phase::Target` only. M5-D5 §1
+promises the three builders work on "a `box_`, a `button` and a
+`drawing_area`", and `ui/README.md` said "on **any** widget kind"; both
+overstate a target-only rule, because hit-testing resolves to the innermost
+`Instance` (P5-D33), so a press on a populated container lands on the *child*
+and the container's own `on_pointer_down` never fires. The part's own test had
+to size its `box_` larger than the label it contains so the press could land on
+the container's uncovered margin.
+
+Shipped: `fire_pointer_handlers` is also called at `Phase::Bubble`, for the
+ancestors on the dispatch path, before each ancestor's `controller.on_event` —
+so a container with a pointer handler sees the gesture that started in a child.
+`Phase::Bubble`'s node order excludes the target, so no node fires twice.
+P4-D19 is unchanged and governs: a controller that sets `cx.handled` ends the
+whole dispatch, so a bubble that never happens fires nothing. That has one
+consequence worth stating rather than discovering: `GenericC` marks a **left**
+press and a completed left release handled, so a container above a
+`GenericC`-backed child sees bubbled `PointerMotion` and non-left buttons, but
+not the left press that the child consumed. A handler that must see every left
+press belongs on the leaf, or on a node whose children are chrome rather than
+`Instance`s. Both facts are in `ui/README.md`'s "Pointer events at the view
+layer". The M5-D5 mutation check is unchanged (delete the `PointerMotion` arm
+of `fire_pointer_handlers`); a second one covers the phase: change
+`Phase::Bubble` back to firing nothing and
+`ui/tests/ingress.rs::a_container_sees_a_press_that_landed_on_its_child` fails.
+Carried out by P0 (whole-part fix wave).
+
+### P0-D9 — `color_dialog` is `THEME_BLIND_BY_DESIGN` in the gallery gate
+
+`ui/tests/gallery_gate.rs`'s `every_probe_point_differs_between_light_and_dark`
+requires at least one probe point per widget to change between the light and
+dark Adwaita sheets, with `THEME_BLIND_BY_DESIGN` carved out for widgets whose
+pixels are legitimately not chrome. M5-D8 gave `ColorDialogC` a rest paint; the
+task that landed it added `"color_dialog"` to that list without a record, which
+loosened a pinned M2/M3 gate silently.
+
+Ruling: the exemption stands and is recorded here. `ColorDialogC::paint` draws
+`self.grid(content)` — 45 fixed `Rgba` palette swatches, `GtkColorChooser`'s own
+`default_palette()` — over the whole content box, and every probe point the gate
+samples for this widget is a *centre* (`window::probe_points_of`): the node's own
+centre falls inside the middle palette cell, and the `colorchooser`/`colorswatch`
+subnodes are zero-sized and centre on the first cell. Painting the chooser's
+background or a swatch border from `style` first, which is what the reviewer's
+preferred fix asked for, therefore changes no sampled pixel — the centres are
+palette fill either way. A colour picker's swatches are the colours themselves:
+red is red in both sheets, exactly as in a real `GtkColorChooserWidget`, and
+asserting otherwise would assert that a palette must repaint for a stylesheet
+that was never supposed to touch it. `color_dialog` joins `drawing_area`,
+`image` and `picture` on the same grounds and for the same reason those three
+are there. The list is closed at four; a fifth needs its own amendment.
+Carried out by P0 (whole-part fix wave).
+
+### P0-D10 — `ColorDialogButton`'s floor is 64x32 in `build` *and* in `measure`
+
+`ColorDialogButtonC::build` calls `set_size_request(node, 64.0, 32.0)` — wider
+than Adwaita's own `button.color` minimum, because the button's real Adwaita
+gradient chrome paints over the centre of the swatch fill afterwards and the
+extra width is the margin that stays legible. `measure` returned
+`Some((48.0, 32.0))`, Adwaita's bare minimum, so the two disagreed by 16px with
+neither number written down anywhere; a later page sizing a row from
+`measure()` would have been wrong by that much.
+
+Shipped: one `const SWATCH_BUTTON_MIN: (f32, f32) = (64.0, 32.0)` read by both
+`build`'s `set_size_request` and `measure`, so there is one floor and it cannot
+drift. `measure` stays unreachable from the real render loop (`button` is a
+synced taffy child, so `node` is never a taffy leaf) and is kept for
+`Controller<Msg>`'s contract and for a caller measuring a detached instance —
+which now gets the same answer layout gets. Named in `ui/README.md`'s widget
+catalogue. Carried out by P0 (whole-part fix wave).
+
 ---
 
 ## 7. Execution notes
