@@ -50,7 +50,7 @@ fn set_remove_sensitivity(rows: &[Row]) {
 /// to collide) that formula can duplicate an existing name or land on one a
 /// rename left free further down the list, instead of the actual next
 /// unused slot.
-fn next_workspace_name(existing: &[String]) -> String {
+pub fn next_workspace_name(existing: &[String]) -> String {
     let mut n: u32 = 1;
     loop {
         let candidate = n.to_string();
@@ -68,7 +68,7 @@ fn next_workspace_name(existing: &[String]) -> String {
 /// count, any binding beyond the new length is unreachable from the UI --
 /// left in place it would sit in the saved config forever, a keybinding for
 /// a workspace slot that no longer exists.
-fn prune_orphaned_workspace_bindings(cfg: &mut icedtea_config::Config) {
+pub fn prune_orphaned_workspace_bindings(cfg: &mut icedtea_config::Config) {
     let workspace_count = cfg.workspace_names.len();
     cfg.keybindings.retain(|action, _| {
         for prefix in ["workspace:", "move_to_workspace:"] {
@@ -317,5 +317,21 @@ mod tests {
                     .contains_key(&format!("move_to_workspace:{n}"))
             );
         }
+    }
+
+    /// The two GTK-free helpers are the module's public surface — `app.rs`'s
+    /// `WorkspaceAdded`/`WorkspaceRemoved` arms call them directly.
+    ///
+    /// Mutation check: drop `pub` from `next_workspace_name`; this test stops
+    /// compiling. Restore.
+    #[test]
+    fn the_pure_surface_is_public() {
+        let next: fn(&[String]) -> String = crate::pages::workspaces::next_workspace_name;
+        assert_eq!(next(&[]), "1");
+        let prune: fn(&mut icedtea_config::Config) =
+            crate::pages::workspaces::prune_orphaned_workspace_bindings;
+        let mut cfg = icedtea_config::default_config();
+        prune(&mut cfg);
+        assert!(!cfg.workspace_names.is_empty());
     }
 }
