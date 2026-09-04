@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::css::node::Node;
 use crate::view::View;
+use crate::window::WatchId;
 use crate::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
 
 /// A side effect the [`App`](crate::view::app::App) performs on the model's
@@ -51,6 +52,20 @@ pub enum Cmd<Msg> {
     CloseWindow,
     /// Leave the loop.
     Quit,
+    /// Retire a watch this app registered with
+    /// [`Window::watch_fd`](crate::window::Window::watch_fd), closing its fd.
+    ///
+    /// This is the only way an app driven by [`App::run`](crate::view::App::run)
+    /// can retire a foreign fd: `run` takes the window by value, so
+    /// [`Window::unwatch`](crate::window::Window::unwatch) is out of reach
+    /// once the loop owns it. `poll(2)` is level-triggered and reports `HUP`
+    /// and `ERR` as readiness whatever the [`Interest`](crate::window::Interest),
+    /// so a hung-up or never-drained fd is ready on *every* poll — an
+    /// [`App::on_fd`](crate::view::App::on_fd) handler that yields a message
+    /// each time would spin the loop forever. The handler that decides the fd
+    /// is done returns `Cmd::Unwatch(id)`; an id this window does not hold is
+    /// a no-op, so unwatching twice is safe (P0-D7).
+    Unwatch(WatchId),
     /// Run `f` once, on the loop thread, after the fold that produced it.
     ///
     /// `f` **must not block**: the intended body is a channel push to a worker
@@ -91,6 +106,7 @@ impl<Msg> std::fmt::Debug for Cmd<Msg> {
             Cmd::ToggleMaximized => f.write_str("ToggleMaximized"),
             Cmd::CloseWindow => f.write_str("CloseWindow"),
             Cmd::Quit => f.write_str("Quit"),
+            Cmd::Unwatch(id) => f.debug_tuple("Unwatch").field(id).finish(),
             Cmd::Task(_) => f.write_str("Task(..)"),
         }
     }

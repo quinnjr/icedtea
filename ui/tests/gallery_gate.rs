@@ -362,6 +362,15 @@ fn probe_pixels(theme: &str) -> std::collections::BTreeMap<(String, String), (u8
 ///   the colours themselves, not chrome; red is red in both sheets, exactly
 ///   like a real `GtkColorChooserWidget`'s palette.
 ///
+/// `color_dialog`'s exemption is recorded as **P0-D9** in the M5 contract §6:
+/// every probe point this gate samples for a widget is a laid-out node's
+/// *centre* (`window::probe_points_of`), and for this widget every one of them
+/// lands on palette fill — the node's own centre inside the middle cell, the
+/// zero-sized `colorchooser`/`colorswatch` subnodes on the first. Painting the
+/// chooser's background or a swatch border from `style` first changes no
+/// sampled pixel, so the exemption is the honest record rather than a
+/// workaround for a missing paint.
+///
 /// None of the four reads `Theme` at all, so failing them here would not be
 /// deviation 6's "the theme never reached them" (a controller wiring gap) —
 /// it would be asserting that a photo, a caller's own drawing, a full-colour
@@ -378,8 +387,9 @@ const THEME_BLIND_BY_DESIGN: &[&str] = &["drawing_area", "image", "picture", "co
 /// identically in both sheets, legitimately matches across themes — the
 /// contract's test name is kept, its assertion is the honest one (deviation
 /// 6). A widget where *nothing* changes is a widget the theme never reached,
-/// with [`THEME_BLIND_BY_DESIGN`] carved out for the three that are exempt
-/// from that claim on purpose.
+/// with [`THEME_BLIND_BY_DESIGN`] carved out for the four that are exempt
+/// from that claim on purpose (M5 contract §6 P0-D9). The list is closed at
+/// four; a fifth needs its own §6 amendment.
 ///
 /// Mutation check: make `Theme::sheet` return the light sheet for
 /// `Theme::Dark`; every widget then matches and this test fails on the first

@@ -224,6 +224,47 @@ fn on_fd_maps_a_foreign_fd_to_messages() {
     );
 }
 
+/// P0-D7: an app driven by `App::run` can retire a watch, and must be able
+/// to — `poll(2)` is level-triggered, so a never-drained (or hung-up) fd is
+/// ready on every single poll and an `on_fd` handler that yields a message
+/// each time turns the loop into a 100% CPU spin with no exit.
+///
+/// `app-inbox`'s pipe is deliberately never read, so the only thing that can
+/// stop `FdReady(watch)` arriving is `Cmd::Unwatch`.
+///
+/// mutation: drop the `Cmd::Unwatch(id) => window.unwatch(id)` arm from
+/// `App::run`'s window-bound match (or replace the probe's `Cmd::Unwatch`
+/// with `Cmd::None`); `folded fd` is then reported once per poll and this
+/// fails on the count.
+#[test]
+fn cmd_unwatch_retires_a_watch_on_a_running_app() {
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let _probe = spawn_window_probe_with(
+        &compositor.socket_path().to_string_lossy(),
+        "app-inbox",
+        theme.path(),
+        report.path(),
+        &[],
+    );
+    assert!(
+        wait_for_report_line(report.path(), "folded both", REPORT).is_some(),
+        "the app never folded both sources: {:?}",
+        probe_report(report.path())
+    );
+    // Give a still-spinning loop time to prove it is spinning.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let folded = probe_report(report.path())
+        .iter()
+        .filter(|line| line.as_str() == "folded fd")
+        .count();
+    assert_eq!(
+        folded, 1,
+        "the watch was not retired: `folded fd` was reported {folded} times"
+    );
+}
+
 #[test]
 fn an_inbox_message_wakes_a_live_app() {
     // The end-to-end claim P1 and P5 rest on: a worker thread's `send` reaches
@@ -564,6 +605,77 @@ fn pointer_handlers_fire_down_motion_up_in_order_with_local_coordinates() {
     );
 }
 
+/// P0-D8: hit-testing resolves to the innermost `Instance` (P5-D33), so a
+/// press on a populated container lands on the *child*. The container's own
+/// pointer handlers still fire, on the bubble.
+///
+/// The press is a middle button rather than a left one on purpose: the label
+/// child's `GenericC` marks a left press handled, and P4-D19 says a handled
+/// event ends the whole dispatch — so a left press legitimately never bubbles.
+/// The motion afterwards is the other half of the claim: `GenericC` does not
+/// handle motions, so one bubbles even after a left press would not have.
+///
+/// mutation: restore `if phase == Phase::Target` in `deliver`; neither the
+/// press nor the motion reaches the box and this fails on the empty log.
+#[test]
+fn a_container_sees_a_press_that_landed_on_its_child() {
+    use icedtea_ui::view::builders::{box_, label};
+    use icedtea_ui::widgets::Orientation;
+    use std::cell::RefCell;
+
+    let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let recorder = Rc::clone(&log);
+    let clock = Rc::new(ManualClock::new());
+    let _ = App::new(
+        (),
+        move |_m: &mut (), msg: String| {
+            recorder.borrow_mut().push(msg);
+            Cmd::None
+        },
+        |_m: &()| -> View<String> {
+            // The press below is aimed at the centre, where the label is:
+            // the label is the innermost `Instance` there, so the box can
+            // only be reached on the bubble.
+            box_(Orientation::Vertical, [label("canvas")])
+                .width_request(80)
+                .height_request(60)
+                .id("canvas")
+                .on_pointer_down_with_button(|_, _, b| format!("down 0x{b:x}"))
+                .on_pointer_motion(|_, _| "motion".to_owned())
+        },
+    )
+    .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+    .run_offscreen(
+        (200, 100),
+        clock,
+        vec![
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 50.0, 1)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: icedtea_ui::window::pointer::BTN_MIDDLE,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerMotion {
+                x: 101.0,
+                y: 51.0,
+                time_ms: 1,
+            }),
+            ScriptStep::Capture,
+        ],
+    )
+    .expect("the offscreen app runs");
+    let seen = log.borrow().clone();
+    assert!(
+        seen.contains(&"down 0x112".to_owned()),
+        "the container never saw the press its child was the target of: {seen:?}"
+    );
+    assert!(
+        seen.contains(&"motion".to_owned()),
+        "the container never saw the bubbled motion: {seen:?}"
+    );
+}
+
 /// The property the Displays drag depends on: once a node has the press, the
 /// motion and the release are its, even outside its box.
 ///
@@ -596,7 +708,10 @@ fn a_release_outside_the_node_still_reaches_it_through_the_grab() {
             // ever *outside* the label and `on_pointer_down`, set on the
             // box, could never become the target. Sizing the box bigger
             // than its content leaves a margin the label does not cover,
-            // and the press below lands there.
+            // and the press below lands there. P0-D8 later made the box
+            // reachable on the bubble too, but this test wants it to be the
+            // *target* — that is what a grab anchors to — so the margin
+            // stays deliberate rather than incidental.
             box_(Orientation::Vertical, [label("canvas")])
                 .width_request(80)
                 .height_request(60)

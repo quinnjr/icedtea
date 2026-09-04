@@ -36,6 +36,16 @@ const SWATCH_GAP_PX: f32 = 4.0;
 /// Cells per row — GTK's own palette is nine hues by five steps.
 const SWATCH_COLUMNS: usize = 9;
 
+/// A `ColorDialogButton`'s minimum size, in px (P0-D10).
+///
+/// Wider than Adwaita's own `button.color` minimum of 48x32: `ColorDialogButtonC`
+/// fills `node`'s box with the colour and the `button` subnode's real Adwaita
+/// gradient chrome paints over the centre of that fill afterwards, so the extra
+/// 16px is the margin that stays visible. `build`'s `set_size_request` and
+/// `measure` both read this one pair, so what layout honours and what a caller
+/// measuring a detached instance is told can never drift apart.
+const SWATCH_BUTTON_MIN: (f32, f32) = (64.0, 32.0);
+
 /// A `GtkColorDialogButton` showing `rgba`.
 #[must_use]
 pub fn color_dialog_button<Msg: Clone + 'static>(rgba: Rgba) -> View<Msg> {
@@ -152,9 +162,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogButtonC {
         // reaching that here would mean giving `content` a controller of
         // its own, well past this task's two-controller scope. Padding the
         // width out to a margin `button` cannot cover keeps the swatch
-        // legible without one — recorded as a contract amendment, not
-        // hidden in a constant.
-        crate::widgets::set_size_request(node, 64.0, 32.0);
+        // legible without one — recorded as a contract amendment (P0-D10),
+        // not hidden in a constant, and read by `measure` too so the two
+        // cannot disagree.
+        crate::widgets::set_size_request(node, SWATCH_BUTTON_MIN.0, SWATCH_BUTTON_MIN.1);
         ColorDialogButtonC {
             rgba: ColorDialogC::unpack(props.float(PropName::Value, 0.0)),
             dialog_open: false,
@@ -187,20 +198,23 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogButtonC {
         Vec::new()
     }
 
-    /// Adwaita's `button.color` minimum.
+    /// The same floor `build` puts on the node: [`SWATCH_BUTTON_MIN`].
     ///
     /// Unlike `ScrollbarC`/`ScaleC`'s chrome, `button` is a *synced* subnode
     /// here (`build`'s comment) — hit-testing needs it laid out — so `node`
     /// always has a taffy child and this is never actually the leaf-measure
     /// taffy calls; `build`'s `set_size_request` is the floor that reaches
     /// layout. Kept for `Controller<Msg>`'s contract and any caller that
-    /// measures a detached instance directly.
+    /// measures a detached instance directly — which is exactly why it
+    /// returns the *same* pair rather than Adwaita's bare `button.color`
+    /// minimum (48x32): a caller sizing a row from `measure` would otherwise
+    /// be 16px narrower than what layout actually honours (P0-D10).
     fn measure(
         &mut self,
         _available: (Option<f32>, Option<f32>),
         _cx: &mut BuildCx<'_>,
     ) -> Option<(f32, f32)> {
-        Some((48.0, 32.0))
+        Some(SWATCH_BUTTON_MIN)
     }
 
     fn paint(

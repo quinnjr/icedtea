@@ -177,7 +177,13 @@ pub fn deliver<Msg: Clone + 'static>(
             // `Instance` (P5-D33) — gets its pointer handlers fired before its
             // controller runs, so a controller that sets `cx.handled` (as
             // `GenericC` does on every left press) cannot swallow them.
-            if phase == Phase::Target {
+            //
+            // P0-D8: and again while bubbling, so a container whose press
+            // landed on a child instance still sees the gesture. `Bubble`'s
+            // node order excludes the target, so nothing fires twice, and
+            // P4-D19 still governs — a child that marked the event handled
+            // ends the dispatch and there is no bubble to fire on.
+            if phase == Phase::Target || phase == Phase::Bubble {
                 out.extend(fire_pointer_handlers(event, &*handlers));
             }
             out.extend(controller.on_event(event, &mut ecx));
@@ -1877,6 +1883,11 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                         close_popup(&mut rt, key);
                         window.close_popup(key);
                     }
+                    // P0-D7: the only way out of a watch once `run` owns the
+                    // window. An id `run` minted for the inbox is not one an
+                    // app can name, and an unknown id is a no-op, so this can
+                    // only retire a watch the app registered itself.
+                    Cmd::Unwatch(id) => window.unwatch(id),
                     other => tracing::debug!(?other, "command not applicable to a window"),
                 }
             }

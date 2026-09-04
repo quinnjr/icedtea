@@ -364,21 +364,27 @@ fn run_app_inbox(mut window: Window) {
     }
 
     let (inbox, tx) = Inbox::<Msg>::new().expect("an inbox");
+    // The fd fires *first* and the inbox second, on purpose: the run has to
+    // stay alive for a while after `Msg::FromFd`, with the pipe still
+    // readable, for `Cmd::Unwatch` to be observable at all (P0-D7). If both
+    // sources landed at once the `Cmd::Quit` below would end the loop before
+    // a missing unwatch could spin it.
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(450));
         let _ = tx.send(Msg::FromInbox);
     });
 
     let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("a pipe");
     let watch = window.watch_fd(read, Interest::Read);
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(200));
         let _ = rustix::io::write(&write, b"x");
     });
 
     let app = App::new(
         (false, false),
-        |model: &mut (bool, bool), msg: Msg| {
+        move |model: &mut (bool, bool), msg: Msg| {
+            let mut out = Vec::new();
             match msg {
                 Msg::FromInbox => {
                     model.0 = true;
@@ -387,14 +393,19 @@ fn run_app_inbox(mut window: Window) {
                 Msg::FromFd => {
                     model.1 = true;
                     report("folded fd");
+                    // P0-D7. Nothing ever reads this pipe, so the byte in it
+                    // keeps the fd readable and `poll` reports it on every
+                    // wakeup: without retiring the watch the loop would spin
+                    // at 100% CPU for as long as it ran. `Cmd::Unwatch` is
+                    // how a handler says "this fd is done".
+                    out.push(Cmd::Unwatch(watch));
                 }
             }
             if model.0 && model.1 {
                 report("folded both");
-                Cmd::Quit
-            } else {
-                Cmd::None
+                out.push(Cmd::Quit);
             }
+            Cmd::Batch(out)
         },
         |model: &(bool, bool)| -> View<Msg> {
             label(if model.0 { "inbox" } else { "waiting" }).id("status")
@@ -402,9 +413,9 @@ fn run_app_inbox(mut window: Window) {
     )
     .with_inbox(inbox)
     // One message per readiness: the closure does not read the pipe, so the
-    // fd stays readable and the app unwatches nothing — which is exactly the
-    // "a handler decides, the toolkit does not" rule. `Cmd::Quit` above ends
-    // the run before that can loop more than a few times.
+    // fd stays readable and `poll` keeps reporting it — "a handler decides,
+    // the toolkit does not". The decision is `update`'s `Cmd::Unwatch`
+    // above, which is why `folded fd` appears exactly once.
     .on_fd(watch, || vec![Msg::FromFd]);
 
     if let Err(err) = app.run(window) {
