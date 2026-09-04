@@ -99,29 +99,23 @@ fn visible_in_slice(
 /// * `00ddd7f`'s `StackSwitcherC` child-slot fix, which this list was never
 ///   updated for.
 ///
-/// **Six still collapse to a zero-area allocation** (`gallery
+/// **Five still collapse to a zero-area allocation** (`gallery
 /// --print-allocation` prints `w` and/or `h` as `0`, headless, so this is a
 /// layout result and not a rendering artifact): `window_controls`,
-/// `color_dialog`, `font_dialog`, `popover_menu`, `popover_menu_bar` and
+/// `font_dialog`, `popover_menu`, `popover_menu_bar` and
 /// `alert_dialog`. Each is a controller that reports no intrinsic size of its
 /// own, the same shape of bug `progress_bar` had; none is individually
 /// traced.
 ///
-/// **Three have a real allocation and still paint nothing**: `scrollbar`
-/// (40x14 since `ScrollbarC::measure` landed in the review-fix wave, and its
-/// drag interaction is real — but the trough and slider are unallocated
-/// chrome nodes and the controller has no `paint`, so nothing draws at
-/// rest), `link_button`
-/// (36x34, 0 of 1224 pixels differ from the background) and `check_button`
-/// (22x22, 0 of 484). Both are traced. `CheckButtonC::paint`
-/// (`ui/src/widgets/check_button.rs`) returns `false` outright when the button
-/// is neither active nor inconsistent — the gallery's sample starts unchecked
-/// — and the `check` subnode Adwaita gives a border and background of its own
-/// never gets an allocation to paint into. `LinkButtonC`
-/// (`ui/src/widgets/link_button.rs`) appends a `label` subnode but never gives
-/// it text, so it paints no glyphs; `button` and `toggle_button` share that
-/// gap and only pass this gate because `.link` is flat and they are not, so
-/// their 1px border is the only thing either of them draws.
+/// **One has a real allocation and still paints nothing**: `link_button`
+/// (36x34, 0 of 1224 pixels differ from the background). It is traced.
+/// `LinkButtonC` (`ui/src/widgets/link_button.rs`) appends a `label` subnode
+/// but never gives it text, so it paints no glyphs; `button` and
+/// `toggle_button` share that gap and only pass this gate because `.link` is
+/// flat and they are not, so their 1px border is the only thing either of
+/// them draws. `scrollbar` (`ScrollbarC::paint`) and `check_button`
+/// (`CheckButtonC::paint`'s empty-box branch) used to be here too; M5-D8 gave
+/// both a rest paint.
 ///
 /// **`stack_sidebar` is no longer exempt either.** It has a real allocation
 /// (121x80) and paints; what it still gets wrong is which pages it shows
@@ -141,20 +135,24 @@ fn visible_in_slice(
 /// [`paints_something`] scans the whole border box instead of an inset 5x5
 /// grid, the gate can see both.
 ///
-/// Mutation check: remove `"scrollbar"` from this list; the light-theme test
-/// fails with "scrollbar painted nothing in the light theme". Restore.
+/// M5-D8 removed `color_dialog`, `check_button` and `scrollbar`: all three now
+/// paint at rest (`ColorDialogC::paint`, `CheckButtonC::paint`'s empty-box
+/// branch, `ScrollbarC::paint`). `color_dialog_button` was never on the list.
+/// The six that remain are the ones M5 does not touch.
+///
+/// Mutation check: re-add `"scrollbar"`; nothing fails, which shows the entry
+/// would now be hiding a widget that paints — that is why it is gone. The
+/// opposite check is the real one: delete `ScrollbarC::paint` and the
+/// light-theme test fails with "scrollbar painted nothing in the light theme".
 const KNOWN_BLANK_AT_REST: &[&str] = &[
     // Zero-area allocation.
     "window_controls",
-    "color_dialog",
     "font_dialog",
     "popover_menu",
     "popover_menu_bar",
     "alert_dialog",
     // Real allocation, nothing drawn into it.
-    "scrollbar",
     "link_button",
-    "check_button",
 ];
 
 /// Every own-kind entry paints something, in `theme`.
@@ -340,10 +338,10 @@ fn probe_pixels(theme: &str) -> std::collections::BTreeMap<(String, String), (u8
 /// defect.
 ///
 /// Found by running this test with per-slice diagnostics: both full walks
-/// (light then dark, one compositor each, ~29 minutes total on this
-/// machine) complete and paint every slice, and these three are the *only*
-/// entries with zero differing probe points. Root-caused against
-/// `ui/src/gallery.rs`'s own `sample`, not guessed:
+/// (light then dark, one compositor each) complete and paint every slice,
+/// and these four are the *only* entries with zero differing probe points.
+/// Root-caused against `ui/src/gallery.rs`'s own `sample` or the widget's
+/// own paint, not guessed:
 ///
 /// - `Kind::Picture` draws a fixed PNG loaded from `sample_png_path()`. A
 ///   photo does not repaint for a light/dark switch in real Adwaita GTK
@@ -358,16 +356,21 @@ fn probe_pixels(theme: &str) -> std::collections::BTreeMap<(String, String), (u8
 ///   background-image-layer `currentColor` gap this part's controller notes
 ///   name as a deferred minor), so a full-colour `folder` bitmap is
 ///   correctly identical in both sheets, exactly as it is in a real desktop.
+/// - `Kind::ColorDialog` (`ColorDialogC::paint`, `ui/src/widgets/color_dialog.rs`)
+///   fills its box with `self.grid(content)` — a palette of fixed `Rgba`
+///   swatch values from `default_palette()`. A colour picker's swatches are
+///   the colours themselves, not chrome; red is red in both sheets, exactly
+///   like a real `GtkColorChooserWidget`'s palette.
 ///
-/// None of the three reads `Theme` at all, so failing them here would not be
+/// None of the four reads `Theme` at all, so failing them here would not be
 /// deviation 6's "the theme never reached them" (a controller wiring gap) —
-/// it would be asserting that a photo, a caller's own drawing and a
-/// full-colour icon must repaint for a stylesheet that was never supposed to
-/// touch them.
+/// it would be asserting that a photo, a caller's own drawing, a full-colour
+/// icon and a colour swatch grid must repaint for a stylesheet that was
+/// never supposed to touch them.
 ///
 /// Mutation check: remove `"picture"` from this list; the test fails with
 /// `picture` back in the `unchanged` list (it never differs). Restore.
-const THEME_BLIND_BY_DESIGN: &[&str] = &["drawing_area", "image", "picture"];
+const THEME_BLIND_BY_DESIGN: &[&str] = &["drawing_area", "image", "picture", "color_dialog"];
 
 /// Per widget, at least one probe point must look different in dark Adwaita.
 ///
@@ -672,5 +675,35 @@ fn the_readme_widget_table_lists_every_kind() {
         listed.len(),
         Kind::all().len(),
         "the README table has rows for widgets that do not exist: {listed:?}"
+    );
+}
+
+/// The README's blank-widget prose and the const cannot drift.
+///
+/// mutation: drop one name from the README paragraph; this fails and names it.
+#[test]
+fn the_readme_names_every_known_blank_widget() {
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("ui/README.md is readable");
+    let section = readme
+        .split_once("<!-- known-blank:begin -->")
+        .expect("the README has a `<!-- known-blank:begin -->` marker")
+        .1
+        .split_once("<!-- known-blank:end -->")
+        .expect("the README has a `<!-- known-blank:end -->` marker")
+        .0;
+    for widget in KNOWN_BLANK_AT_REST {
+        assert!(
+            section.contains(&format!("`{widget}`")),
+            "the README's blank-widget list does not name `{widget}`"
+        );
+    }
+    let named = section.matches('`').count() / 2;
+    assert_eq!(
+        named,
+        KNOWN_BLANK_AT_REST.len(),
+        "the README names {named} blank widgets, the const has {}",
+        KNOWN_BLANK_AT_REST.len()
     );
 }

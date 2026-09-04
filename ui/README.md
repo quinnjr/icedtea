@@ -476,16 +476,18 @@ cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
 
 - `tests/gallery_gate.rs` walks the page in surface-height slices under the
   harness compositor and asserts every widget paints something in light, dark
-  and high-contrast Adwaita — except the nine entries listed in that file's
+  and high-contrast Adwaita — except the six entries listed in that file's
   `KNOWN_BLANK_AT_REST`, which are measured, not asserted on, because they
-  render nothing today (seven collapse to a zero-area allocation, and
-  `link_button`/`check_button` draw nothing into a real one; see contract
-  amendment P8-D69). The list was fifteen until the M3 close-out's first fix
-  wave, which made the universal size request reach every kind (P8-D75) and
-  gave a recycling view's pooled rows a measure and a paint, so
-  `progress_bar`, `stack_switcher`, `stack_sidebar`, `list_view`, `grid_view`
-  and `about_dialog` are now asserted on like everything else. Every entry,
-  exempt or not, must still appear whole in some slice. It further asserts that every `Kind` appears in `--list`, on the
+  render nothing today:
+<!-- known-blank:begin -->
+  five collapse to a zero-area allocation (`window_controls`, `font_dialog`,
+  `popover_menu`, `popover_menu_bar`, `alert_dialog`), and one has a real
+  allocation it draws nothing into (`link_button`).
+<!-- known-blank:end -->
+  The list was fifteen until the M3 close-out's first fix wave (P8-D75 and the
+  pooled-row measure), and nine until M5-D8 gave `color_dialog`,
+  `check_button` and `scrollbar` a rest paint. Every entry, exempt or not, must
+  still appear whole in some slice. It further asserts that every `Kind` appears in `--list`, on the
   page and (for sub-kinds) inside its parent's node tree; that at least one
   probe point per widget differs between light and dark; that every widget's
   node tree matches its vendored GTK 4.22 fixture; and that this README's
