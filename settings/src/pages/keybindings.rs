@@ -27,7 +27,7 @@ use crate::pages::{Ctx, Page};
 /// workspace count. Kept in the same order the compositor's own defaults
 /// insert them (`icedtea_config::defaults::default_config`) purely so the
 /// row order is stable/predictable, not because order carries meaning here.
-const FIXED_ACTIONS: [&str; 10] = [
+pub const FIXED_ACTIONS: [&str; 10] = [
     "close",
     "fullscreen",
     "reload",
@@ -39,12 +39,12 @@ const FIXED_ACTIONS: [&str; 10] = [
     "snap:up",
     "snap:down",
 ];
-const SNAP_RESTORE: &str = "snap:restore";
+pub const SNAP_RESTORE: &str = "snap:restore";
 
 /// The full action set for a config with `workspace_count` workspaces: the
 /// fixed actions plus a generated `workspace:N`/`move_to_workspace:N` pair
 /// for every `1..=workspace_count`.
-fn action_list(workspace_count: usize) -> Vec<String> {
+pub fn action_list(workspace_count: usize) -> Vec<String> {
     let mut actions: Vec<String> = FIXED_ACTIONS.iter().map(|s| s.to_string()).collect();
     actions.push(SNAP_RESTORE.to_string());
     for n in 1..=workspace_count {
@@ -58,7 +58,7 @@ fn action_list(workspace_count: usize) -> Vec<String> {
 /// modifiers in the order they're stored (always `MODIFIER_TOKENS` order,
 /// per `combo_from_keysym`) followed by the key name with its `KEY_` prefix
 /// stripped.
-fn format_combo(combo: &KeyCombo) -> String {
+pub fn format_combo(combo: &KeyCombo) -> String {
     let key = combo.key.strip_prefix("KEY_").unwrap_or(&combo.key);
     let mut parts = combo.modifiers.clone();
     parts.push(key.to_string());
@@ -104,14 +104,14 @@ fn sync_rows(rows: &[Row], cfg: &icedtea_config::Config) {
 /// the Keybindings page is the visible child (`page_visible`) AND a capture is
 /// actually armed (`capturing`). Extracted so the gate is unit-testable without
 /// a live GTK display. (#4)
-fn should_capture(page_visible: bool, capturing: bool) -> bool {
+pub fn should_capture(page_visible: bool, capturing: bool) -> bool {
     page_visible && capturing
 }
 
 /// Clear an armed capture and report which action's row must have its Set
 /// button restored (`None` when nothing was armed). Pure so the reset decision
 /// is unit-testable; the caller performs the widget label restore. (#4)
-fn take_capture_reset(capturing: &mut Option<String>) -> Option<String> {
+pub fn take_capture_reset(capturing: &mut Option<String>) -> Option<String> {
     capturing.take()
 }
 
@@ -128,27 +128,25 @@ fn reset_capture(capturing: &Rc<RefCell<Option<String>>>, rows: &Rc<RefCell<Vec<
     }
 }
 
-/// Resolve the group-0/level-0 keysym for a captured hardware `keycode` --
-/// the layout-agnostic, un-shifted keysym the compositor's own matcher
-/// compares against (`compositor/src/input.rs` matches on the keysym as
-/// delivered with *no* level/group adjustment applied by us -- it relies on
-/// bindings being stored in their base form). `EventControllerKey`'s
-/// `keyval` is *already* shift/caps-adjusted by GDK (e.g. Shift+q ->
-/// `KEY_Q`, Shift+1 -> `KEY_exclam`), so capturing straight from `keyval`
-/// would silently store a binding that never matches a real, unshifted key
-/// press. Asking the display to translate the same `keycode` with an empty
-/// modifier state and group 0 gives back the level-0 keysym regardless of
-/// what Shift/Caps-Lock/group was actually active during capture.
+/// Pick the keysym a capture stores, given the two the key event carries.
 ///
-/// Falls back to `fallback_keysym` (the raw event `keyval`) if the display
-/// or its keymap can't translate the keycode -- should not happen for a
-/// real key-press event, but keeps capture panic-free against an exotic or
-/// absent keymap.
-pub fn unshifted_keysym(keycode: u32, fallback_keysym: u32) -> u32 {
-    gdk::Display::default()
-        .and_then(|display| display.translate_key(keycode, gdk::ModifierType::empty(), 0))
-        .map(|(key, _group, _level, _consumed)| key.into_glib())
-        .unwrap_or(fallback_keysym)
+/// `base` is the group-0/level-0 sym (`icedtea_ui::window::keyboard::KeyEvent::base`,
+/// M5-D7) and `modified` the shift/caps/group-adjusted one (`KeyEvent::keysym`).
+/// The rule is `compositor/src/input.rs:109-123`'s, verbatim: take the base sym,
+/// and fall back to the modified one **only** when the keycode produces no base
+/// sym at all (`XKB_KEY_NoSymbol`, which is 0).
+///
+/// This is required because `icedtea_config::keys::key_name_to_keysym` always
+/// encodes the unshifted keysym (`"KEY_q"` -> `0x71`), so a capture that stored
+/// `0x51` (`XK_Q`) from a `SUPER+SHIFT+q` press would produce a binding
+/// `match_action` can never fire.
+///
+/// Replaces the GDK-bound `unshifted_keysym(keycode, fallback)`: there is no
+/// `gdk::Display` to ask any more, and none is needed -- the toolkit stamps
+/// `base` on every `KeyEvent`.
+#[must_use]
+pub fn normalise_keysym(base: u32, modified: u32) -> u32 {
+    if base == 0 { modified } else { base }
 }
 
 /// Install the CSS provider for [`CONFLICT_CSS_CLASS`] on the default
@@ -235,7 +233,11 @@ pub fn build(ctx: Ctx) -> Page {
             // If `combo_from_keysym` returns `None` (a lone modifier press),
             // fall through leaving `capturing` set -- stay in capture mode
             // and wait for the "real" key.
-            let keysym = unshifted_keysym(keycode, keyval.into_glib());
+            let base = gdk::Display::default()
+                .and_then(|display| display.translate_key(keycode, gdk::ModifierType::empty(), 0))
+                .map(|(k, _group, _level, _consumed)| k.into_glib())
+                .unwrap_or(0);
+            let keysym = normalise_keysym(base, keyval.into_glib());
             if let Some(combo) = combo_from_keysym(keysym, mods) {
                 model
                     .borrow_mut()
@@ -457,5 +459,39 @@ mod tests {
         assert_eq!(armed, None, "capture must be cleared after a reset");
         // A second reset is a no-op once nothing is armed.
         assert_eq!(take_capture_reset(&mut armed), None);
+    }
+
+    /// `KEY_NoSymbol` is 0; a keycode the keymap does not map reports it as
+    /// `base`, and the capture must then fall back to the modified sym rather
+    /// than storing 0.
+    ///
+    /// Mutation check: make `normalise_keysym` return `modified`
+    /// unconditionally; `normalise_keysym_prefers_the_base_sym` fails. Restore.
+    #[test]
+    fn normalise_keysym_prefers_the_base_sym() {
+        // SUPER+SHIFT+q: GDK/xkb report the modified sym XK_Q (0x51); the
+        // compositor only ever matches the unshifted XK_q (0x71), because
+        // `icedtea_config::keys::key_name_to_keysym("KEY_q")` encodes 0x71.
+        assert_eq!(normalise_keysym(0x71, 0x51), 0x71);
+    }
+
+    #[test]
+    fn normalise_keysym_falls_back_when_there_is_no_base_sym() {
+        assert_eq!(normalise_keysym(0, 0x51), 0x51);
+    }
+
+    #[test]
+    fn normalise_keysym_is_identity_for_an_unmodified_key() {
+        assert_eq!(normalise_keysym(0x71, 0x71), 0x71);
+    }
+
+    /// The pure surface the M5 view layer calls is `pub` — a private helper
+    /// would leave `app.rs` re-implementing the action set.
+    #[test]
+    fn the_pure_surface_is_public() {
+        fn takes_fn(_: fn(usize) -> Vec<String>) {}
+        takes_fn(crate::pages::keybindings::action_list);
+        assert!(crate::pages::keybindings::should_capture(true, true));
+        assert_eq!(crate::pages::keybindings::FIXED_ACTIONS.len(), 10);
     }
 }

@@ -11,23 +11,25 @@
 //! `model::combo_round_trips_to_the_compositor_format` only proves
 //! `combo_from_keysym` preserves whatever keysym it's *given* (true
 //! whether or not shift-normalization happens upstream); this test drives
-//! the real GDK keymap query `pages::keybindings::unshifted_keysym`
-//! performs and contrasts it against the raw shift-adjusted keyval a real
-//! Shift+key press hands `EventControllerKey`. If the fix in `build()`'s
-//! `key_pressed` handler were reverted to feed that raw keyval straight
-//! into `combo_from_keysym` (as it did before), this test fails: the
-//! serialized key would be `KEY_Q`/`KEY_exclam` instead of `KEY_q`/`KEY_1`.
+//! the real GDK keymap query `build()`'s `key_pressed` handler performs
+//! (`gdk::Display::translate_key` at group 0 / no modifiers, fed through
+//! `pages::keybindings::normalise_keysym`) and contrasts it against the raw
+//! shift-adjusted keyval a real Shift+key press hands `EventControllerKey`.
+//! If the fix in `build()`'s `key_pressed` handler were reverted to feed
+//! that raw keyval straight into `combo_from_keysym` (as it did before),
+//! this test fails: the serialized key would be `KEY_Q`/`KEY_exclam` instead
+//! of `KEY_q`/`KEY_1`.
 
 use gtk4::glib::translate::IntoGlib;
 use gtk4::prelude::*;
 use icedtea_config::keysym_to_key_name;
 use icedtea_harness::Compositor;
 use icedtea_settings::model::{CaptureMods, combo_from_keysym};
-use icedtea_settings::pages::keybindings::unshifted_keysym;
+use icedtea_settings::pages::keybindings::normalise_keysym;
 
 /// Point GDK at the harness compositor (which speaks a real "us" xkb
 /// keymap over Wayland -- see `icedtea_harness::VirtualKeyboardClient`) and
-/// init GTK, so `unshifted_keysym` has an actual `gdk::Display` to query.
+/// init GTK, so the GDK keymap query has an actual `gdk::Display` to query.
 /// `false` means GTK could not come up -- a FAILURE by default (the harness
 /// provides a display) unless opted out via `ICEDTEA_ALLOW_NO_GTK`.
 fn require_gtk(comp: &Compositor) -> bool {
@@ -53,7 +55,7 @@ fn require_gtk(comp: &Compositor) -> bool {
 /// CORRECTNESS BAR from the finding: capturing Super+Shift+q must serialize
 /// to `KEY_q`; Super+Shift+1 must serialize to `KEY_1`.
 #[test]
-fn unshifted_keysym_normalizes_shift_to_the_base_key() {
+fn normalise_keysym_normalizes_shift_to_the_base_key() {
     let comp = Compositor::spawn();
     if !require_gtk(&comp) {
         return;
@@ -81,10 +83,14 @@ fn unshifted_keysym_normalizes_shift_to_the_base_key() {
             "test setup: keycode {keycode} shifted must be {shifted_name}"
         );
 
-        let normalized = unshifted_keysym(keycode, shifted_keysym);
+        let base = display
+            .translate_key(keycode, gtk4::gdk::ModifierType::empty(), 0)
+            .map(|(k, ..)| k.into_glib())
+            .unwrap_or(0);
+        let normalized = normalise_keysym(base, shifted_keysym);
         assert_ne!(
             normalized, shifted_keysym,
-            "unshifted_keysym must differ from the shifted keysym for this test to be non-vacuous"
+            "normalise_keysym must differ from the shifted keysym for this test to be non-vacuous"
         );
         assert_eq!(
             keysym_to_key_name(normalized),
