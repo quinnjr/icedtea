@@ -40,6 +40,9 @@ pub struct SettingsModel {
     pub displays_status: String,
     pub displays_in_flight: bool,
     pub outputs_available: bool,
+    /// The second Wayland connection, when there is one. `Cmd::Task` reaches
+    /// Test/Apply through it (P4); `None` means output management is absent.
+    pub outputs: Option<crate::outputs::pump::OutputsPump>,
     /// Worker senders, so `update` can `Cmd::Task` onto them.
     pub workers: crate::ipc::WorkerHandles,
 }
@@ -70,6 +73,7 @@ impl SettingsModel {
             displays_status: String::new(),
             displays_in_flight: false,
             outputs_available: false,
+            outputs: None,
             workers,
         }
     }
@@ -78,6 +82,14 @@ impl SettingsModel {
     #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.model.is_dirty()
+    }
+
+    /// Attach the outputs connection, if the window got one.
+    #[must_use]
+    pub fn with_outputs(mut self, pump: Option<crate::outputs::pump::OutputsPump>) -> Self {
+        self.outputs_available = pump.is_some();
+        self.outputs = pump;
+        self
     }
 }
 
@@ -96,6 +108,9 @@ pub enum Msg {
     Applied(Result<ReloadOutcome, String>),
     /// The compositor emitted `ConfigReloaded`.
     ConfigReloaded,
+    /// One protocol message from the outputs connection, via `App::on_fd`.
+    /// `Arc`, not `Rc`: `Msg` is `Send` (M5-D2).
+    Outputs(std::sync::Arc<crate::outputs::OutputsMsg>),
 }
 
 const _: fn() = || {
@@ -156,6 +171,74 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
         }
         Msg::ConfigReloaded => {
             m.status = "Compositor reloaded its configuration".to_string();
+            Cmd::None
+        }
+        Msg::Outputs(update) => {
+            match &*update {
+                crate::outputs::OutputsMsg::HeadsChanged(heads) => {
+                    let r = crate::pages::displays::state::reconcile(
+                        &m.displays.heads,
+                        &m.displays.edits,
+                        m.displays.selected,
+                        m.displays.dirty,
+                        heads,
+                    );
+                    m.displays.heads = heads.clone();
+                    m.displays.edits = r.edits;
+                    m.displays.selected = r.selected;
+                    // A drag was indexed against the *old* head list; the new
+                    // one may be shorter or reordered (finding #2).
+                    m.displays.drag = None;
+                    if !r.compatible {
+                        // A genuine set change re-baselines, so nothing is
+                        // unsaved any more.
+                        m.displays.dirty = false;
+                    }
+                    m.outputs_available = true;
+                    m.displays_status = if r.dropped {
+                        "Displays changed \u{2014} pending edits discarded".to_string()
+                    } else {
+                        String::new()
+                    };
+                }
+                crate::outputs::OutputsMsg::ApplySucceeded { is_test } => {
+                    m.displays_in_flight = false;
+                    if *is_test {
+                        // A preview succeeded: keep the edits so the user can
+                        // commit them.
+                        m.displays_status = "Test succeeded".to_string();
+                    } else {
+                        m.displays.dirty = false;
+                        m.displays_status = "Applied".to_string();
+                    }
+                }
+                crate::outputs::OutputsMsg::ApplyFailed { is_test } => {
+                    m.displays_in_flight = false;
+                    if *is_test {
+                        m.displays_status = "Test rejected by the compositor".to_string();
+                    } else {
+                        // Re-baseline: the compositor kept its own layout.
+                        m.displays.edits = m
+                            .displays
+                            .heads
+                            .iter()
+                            .map(crate::pages::displays::state::baseline_edit)
+                            .collect();
+                        m.displays.dirty = false;
+                        m.displays_status = "Configuration rejected by the compositor".to_string();
+                    }
+                }
+                crate::outputs::OutputsMsg::ApplyCancelled => {
+                    m.displays_in_flight = false;
+                    m.displays_status = "Configuration superseded \u{2014} re-reading".to_string();
+                }
+                crate::outputs::OutputsMsg::ManagerUnavailable
+                | crate::outputs::OutputsMsg::Disconnected => {
+                    m.displays_in_flight = false;
+                    m.outputs_available = false;
+                    m.displays_status = String::new();
+                }
+            }
             Cmd::None
         }
     }
@@ -392,5 +475,90 @@ mod tests {
         m.status = "Applied".to_string();
         m.model.saved = m.model.working.clone();
         assert_eq!(footer_text(&m), "Applied");
+    }
+
+    use crate::outputs::{Head, Mode, OutputsMsg};
+    use std::sync::Arc;
+
+    fn head(name: &str) -> Head {
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60_000,
+            preferred: true,
+        };
+        Head {
+            name: name.to_string(),
+            description: format!("{name} test head"),
+            enabled: true,
+            modes: vec![mode],
+            current_mode: Some(mode),
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            transform: 0,
+        }
+    }
+
+    /// The glib source's `match` on OutputsMsg becomes six `update` arms
+    /// (contract §2.5). Mutation check: drop the `outputs_available = true`
+    /// in the `HeadsChanged` arm; this test fails. Restore.
+    #[test]
+    fn heads_changed_reconciles_and_marks_output_management_available() {
+        let (mut m, _dir) = model();
+        update(
+            &mut m,
+            Msg::Outputs(Arc::new(OutputsMsg::HeadsChanged(vec![head("DP-1")]))),
+        );
+        assert!(m.outputs_available);
+        assert_eq!(m.displays.heads.len(), 1);
+        assert_eq!(m.displays.edits.len(), 1);
+        assert_eq!(m.displays.selected, Some(0));
+    }
+
+    #[test]
+    fn losing_the_manager_or_the_connection_takes_the_page_out_of_service() {
+        for msg in [OutputsMsg::ManagerUnavailable, OutputsMsg::Disconnected] {
+            let (mut m, _dir) = model();
+            m.outputs_available = true;
+            m.displays_in_flight = true;
+            update(&mut m, Msg::Outputs(Arc::new(msg)));
+            assert!(!m.outputs_available);
+            assert!(
+                !m.displays_in_flight,
+                "an in-flight request can never complete now"
+            );
+        }
+    }
+
+    /// A reply's own `is_test` tag decides what it means — never a shared
+    /// in-flight flag, which an overlapped Test/Apply pair would misread.
+    #[test]
+    fn an_apply_reply_clears_in_flight_by_its_own_is_test_tag() {
+        let (mut m, _dir) = model();
+        m.displays.dirty = true;
+        m.displays_in_flight = true;
+        update(
+            &mut m,
+            Msg::Outputs(Arc::new(OutputsMsg::ApplySucceeded { is_test: true })),
+        );
+        assert!(!m.displays_in_flight);
+        assert!(
+            m.displays.dirty,
+            "a successful *test* keeps the pending edits"
+        );
+        assert_eq!(m.displays_status, "Test succeeded");
+
+        m.displays_in_flight = true;
+        update(
+            &mut m,
+            Msg::Outputs(Arc::new(OutputsMsg::ApplySucceeded { is_test: false })),
+        );
+        assert!(!m.displays_in_flight);
+        assert!(
+            !m.displays.dirty,
+            "a successful apply is no longer pending work"
+        );
+        assert_eq!(m.displays_status, "Applied");
     }
 }

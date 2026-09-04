@@ -14,6 +14,7 @@
 
 pub mod client;
 pub mod protocol;
+pub mod pump;
 
 pub use client::OutputsClient;
 pub use protocol::{
