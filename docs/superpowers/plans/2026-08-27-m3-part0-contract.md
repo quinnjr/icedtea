@@ -5205,3 +5205,12 @@ send order, then `on_fd` messages, then the frame's own input batch, folded
 once. `run` registers the pipe with `Window::watch_fd` and unwatches it on
 exit; `run_offscreen` drains at the same point so an ingress test needs no
 compositor. Full text: M5 contract §1 M5-D2.
+
+### M5-D3 — `Cmd` grows a side-effect leaf (§4.7 had none)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. `Cmd::Task(Rc<dyn Fn()>)`
+runs a non-blocking side effect on the loop thread, outside `update`, after the
+fold that produced it — a `flatten` leaf, printed opaquely as `Task(..)`,
+executed identically by `drain` whether reached through `run` or
+`run_offscreen`. It has no return value: an answer comes back through the
+inbox (M5-D2) as a message. Full text: M5 contract §1 M5-D3.

@@ -1543,6 +1543,9 @@ fn drain<M: 'static, Msg: Clone + 'static>(
                 .focus
                 .set_focus(Some(&node), crate::window::focus::FocusCause::Programmatic),
             Cmd::Quit | Cmd::CloseWindow => rt.quit = true,
+            // Outside `update`, after every queued message has been folded
+            // (M5-D3). Not window-bound, so it is never returned to `run`.
+            Cmd::Task(f) => f(),
             // The window-bound commands are `run`'s (Task 17): only it has a
             // surface to title, minimise or open a popup on. They are handed
             // back to the caller rather than dropped here.

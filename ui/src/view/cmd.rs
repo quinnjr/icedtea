@@ -51,6 +51,13 @@ pub enum Cmd<Msg> {
     CloseWindow,
     /// Leave the loop.
     Quit,
+    /// Run `f` once, on the loop thread, after the fold that produced it.
+    ///
+    /// `f` **must not block**: the intended body is a channel push to a worker
+    /// thread, or a call the app has already proven non-blocking. Anything
+    /// whose answer matters comes back through the inbox as a `Msg`, never as
+    /// a return value — `Cmd::Task` has none.
+    Task(Rc<dyn Fn()>),
 }
 
 #[allow(
@@ -84,6 +91,7 @@ impl<Msg> std::fmt::Debug for Cmd<Msg> {
             Cmd::ToggleMaximized => f.write_str("ToggleMaximized"),
             Cmd::CloseWindow => f.write_str("CloseWindow"),
             Cmd::Quit => f.write_str("Quit"),
+            Cmd::Task(_) => f.write_str("Task(..)"),
         }
     }
 }
@@ -169,5 +177,22 @@ mod tests {
         assert_eq!(f(), Msg::A);
         // The other two variants exist and are distinct.
         assert_ne!(Msg::B, Msg::C);
+    }
+
+    #[test]
+    fn a_task_is_a_flatten_leaf_and_prints_opaquely() {
+        // mutation: give `Cmd::Task` a `Batch`-like arm in `flatten`; it
+        // disappears from the flat list and this fails.
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = std::rc::Rc::clone(&ran);
+        let cmd: Cmd<Msg> = Cmd::Batch(vec![
+            Cmd::Task(std::rc::Rc::new(move || flag.set(true))),
+            Cmd::Quit,
+        ]);
+        assert!(!cmd.is_none());
+        let flat = cmd.flatten();
+        assert_eq!(flat.len(), 2);
+        assert_eq!(format!("{:?}", flat[0]), "Task(..)");
+        assert!(!ran.get(), "flatten must not run the task");
     }
 }

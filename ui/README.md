@@ -321,6 +321,10 @@ so a click never runs against a model that has not yet seen the worker update
 that arrived on the same wake. `run_offscreen` drains at the same point, which
 is what makes an ingress test compositor-free.
 
+`Cmd::Task(Rc<dyn Fn()>)` runs a side effect on the loop thread after the fold
+that produced it — a channel push to a worker, never a blocking call. It has no
+return value on purpose: an answer comes back through the inbox as a message.
+
 ## Fonts and text
 
 - **Font discovery is real fontconfig.** `text::FontDatabase` builds one

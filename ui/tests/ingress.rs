@@ -389,3 +389,54 @@ fn run_tagged(
     let order = seen.borrow().clone();
     (frames, order)
 }
+
+#[test]
+fn a_task_command_runs_once_after_the_fold_offscreen_too() {
+    // The seam spec D8 requires: an outbound D-Bus call leaves `update` and
+    // runs on the loop *after* the fold, never inside it.
+    // mutation: execute `Cmd::Task` inside `update`'s match arm instead of in
+    // `drain`; `during` is observed non-empty and this fails.
+    use icedtea_ui::view::builders::label;
+    use std::cell::RefCell;
+
+    let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let in_update = Rc::clone(&log);
+    let clock = Rc::new(ManualClock::new());
+    let frames = App::new(
+        0_u32,
+        move |model: &mut u32, msg: u32| {
+            *model += msg;
+            in_update.borrow_mut().push(format!("fold{}", *model));
+            let after = Rc::clone(&in_update);
+            Cmd::Batch(vec![
+                Cmd::Task(Rc::new(move || after.borrow_mut().push("task-a".into()))),
+                Cmd::Task({
+                    let after = Rc::clone(&in_update);
+                    Rc::new(move || after.borrow_mut().push("task-b".into()))
+                }),
+            ])
+        },
+        |model: &u32| label(&model.to_string()),
+    )
+    .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+    .run_offscreen(
+        (120, 40),
+        clock,
+        vec![
+            ScriptStep::Message(1),
+            ScriptStep::Message(1),
+            ScriptStep::Capture,
+        ],
+    )
+    .expect("the offscreen app runs");
+    assert_eq!(frames.len(), 1);
+    // Reconciliation: `run_offscreen` drains after *each* `ScriptStep`, not
+    // once after the whole script, so a `Cmd::Task` runs after the fold that
+    // produced it (as documented on the variant) rather than after every
+    // queued message in the script has folded.
+    assert_eq!(
+        *log.borrow(),
+        vec!["fold1", "task-a", "task-b", "fold2", "task-a", "task-b"],
+        "each message's fold is immediately followed by its own batch's tasks, in order"
+    );
+}
