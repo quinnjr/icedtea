@@ -32,7 +32,7 @@ GTK 4.22 core widget set with GTK-exact CSS node trees, and icon theming.
 | `paint/` | Backgrounds, borders, shadows, outlines, blur, text, icons |
 | `text.rs` | Font matching, shaping caches, wrap/ellipsize/caret/selection |
 | `window/` | `Surface::{Toplevel, Layer, Popup}`, keyboard, pointer, focus, selection |
-| `view/` | `View`, builders, the keyed reconciler, controllers, `App`, `Cmd` |
+| `view/` | `View`, builders, the keyed reconciler, controllers, `App`, `Cmd`, `inbox.rs` (`Inbox`/`InboxSender`) |
 | `widgets/` | One file per widget: node tree, controller, behaviour |
 | `icons/` | freedesktop icon themes, symbolic recolouring, builtins |
 | `gallery.rs` | Every widget on one page — the binary the M3 gate measures |
@@ -301,25 +301,31 @@ Widget builders (`button("Ok")`, `label("Hi")`, …) arrive with P5 and P6;
 
 ### External events
 
-A worker thread reaches the loop through an inbox:
+A worker thread reaches the loop through an inbox: it holds the
+[`InboxSender`], the loop holds the [`Inbox`] via `App::with_inbox`.
 
 ```rust
-let (inbox, tx) = Inbox::new()?;                  // tx: Send + Clone
+let (inbox, tx) = Inbox::new()?;                  // tx: InboxSender, Send + Clone
 std::thread::spawn(move || { tx.send(Msg::Reloaded)?; Ok::<_, SendError<Msg>>(()) });
 App::new(model, update, view).with_inbox(inbox).run(window)?;
 ```
 
-`send` pushes onto an unbounded channel and writes one byte to a wake pipe the
-window polls; a full pipe is not an error, because the byte already in it wakes
-the loop and the channel is the queue. A `send` after the app exits returns the
-message rather than panicking. `Msg` must be `Send`, which means a message
-carries `Arc<T>`, never `Rc<T>`.
+`InboxSender::send` pushes onto an unbounded channel and writes one byte to a
+wake pipe the window polls; a full pipe is not an error, because the byte
+already in it wakes the loop and the channel is the queue. A `send` after the
+app exits returns the message rather than panicking. `Msg` must be `Send`,
+which means a message carries `Arc<T>`, never `Rc<T>`.
+
+A second, independent source is `App::on_fd(id, f)`: `f` runs on the loop
+thread whenever `InputEvent::FdReady` names `id`, and its returned messages are
+enqueued in order. A handler for an id that has since been `unwatch`ed is
+simply never called again.
 
 Delivery order inside one frame is normative: the inbox's messages are folded
-first, in send order, then any `on_fd` messages, then the frame's input batch —
-so a click never runs against a model that has not yet seen the worker update
-that arrived on the same wake. `run_offscreen` drains at the same point, which
-is what makes an ingress test compositor-free.
+first, in send order, then any `App::on_fd` messages, then the frame's input
+batch — so a click never runs against a model that has not yet seen the worker
+update that arrived on the same wake. `run_offscreen` drains at the same
+point, which is what makes an ingress test compositor-free.
 
 `Cmd::Task(Rc<dyn Fn()>)` runs a side effect on the loop thread after the fold
 that produced it — a channel push to a worker, never a blocking call. It has no
@@ -329,10 +335,14 @@ return value on purpose: an answer comes back through the inbox as a message.
 
 `on_pointer_down` / `on_pointer_motion` / `on_pointer_up` turn raw pointer
 phases into messages on **any** widget kind, with `(x, y)` in the node's own
-border box. The `_with_button` variants add the Linux button code
-(`window::pointer::{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}`); a motion reports `0`,
-because it carries no button. M3's implicit grab already routes motion and the
-matching release to the node that took the press, so
+border box; each registers a `Handler::Pair(Rc<dyn Fn(f64, f64) -> Msg>)`. The
+three `_with_button` variants (`on_pointer_down_with_button`,
+`on_pointer_motion_with_button`, `on_pointer_up_with_button`) are the other
+half of that pair of builders: they register a
+`Handler::PairButton(Rc<dyn Fn(f64, f64, u32) -> Msg>)` and add the Linux
+button code (`window::pointer::{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}`); a motion
+reports `0`, because it carries no button. M3's implicit grab already routes
+motion and the matching release to the node that took the press, so
 `PointerDown → PointerMotion* → PointerUp` is one node's whole gesture even
 when the pointer leaves it; a release outside still arrives, a `PointerLeave`
 mid-drag does not end the sequence, and a grab broken by a closed surface
@@ -470,7 +480,7 @@ outside the process.
 
 ```bash
 cargo test -p icedtea-ui --test gallery_gate       # rest state, 3 themes
-cargo test -p icedtea-ui --test interaction_gate   # 16 interactions, 15 driven
+cargo test -p icedtea-ui --test interaction_gate   # 19 interactions, all driven
 cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
 ```
 
@@ -493,20 +503,23 @@ cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
   node tree matches its vendored GTK 4.22 fixture; and that this README's
   table lists every `Kind`.
 - `tests/interaction_gate.rs` drives interactions with a virtual pointer and
-  keyboard. **All sixteen of the contract's interactions ship; fifteen run**:
+  keyboard. **All nineteen ship and run**: the M3 contract's sixteen —
   click, toggle, check,
   switch, the pointer-click-without-focus-ring rule, typing with a placed
   caret, debounced search, password peek, held spin repeat, scale drag,
   drop-down pick, expander disclosure, stack-page switch, menu-button popover,
-  and Tab in geometric order. Each of the last ten landed with the
-  pre-existing production defect it was RED on — none is asserted around.
-  The sixteenth, `scrolling_a_list_view_recycles_rows_without_losing_
-  selection`, shipped `#[ignore]`d in M3 for a transport gap below this crate
-  — `wlr` 0.20.28 forwarded no `wl_pointer.axis` to any client — and runs
-  since the 0.20.29 bump; the same interaction is also proven offscreen by
+  scrolling a list view without losing selection, and Tab in geometric
+  order — plus M5's three: dragging across a `drawing_area` reports every
+  pointer phase, a middle click on a `drawing_area` reports `BTN_MIDDLE`, and
+  dragging a `scrollbar` slider moves what it paints. Ten of the sixteen
+  landed with the pre-existing production defect they were RED on — none is
+  asserted around. The list-view scroll shipped `#[ignore]`d in M3 for a
+  transport gap below this crate — `wlr` 0.20.28 forwarded no
+  `wl_pointer.axis` to any client — and has run since the 0.20.29 bump; the
+  same interaction is also proven offscreen by
   `widgets::list_view::tests::pixels::scrolling_recycles_the_pooled_rows_and_
   keeps_the_selection`. Contract amendments P8-D71, P8-D72 and P8-D74 carry
-  the whole trail.
+  that trail.
 - Colours are pinned in exactly one place — `tests/themed_button_offscreen.rs`,
   the M1 gate. The gallery gates assert *change*, not constants: 64 pinned
   colours would be a fixture to maintain, not a gate.
@@ -605,7 +618,8 @@ exactly as before.
 
 ### Watching a foreign fd
 
-A window polls its own Wayland connection *and* any fd its owner registers:
+A window polls its own Wayland connection *and* any fd its owner registers,
+via `Window::watch_fd`:
 
 ```rust
 let id = window.watch_fd(fd, Interest::Read);   // the window owns `fd` now

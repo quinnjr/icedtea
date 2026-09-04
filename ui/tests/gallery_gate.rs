@@ -707,3 +707,45 @@ fn the_readme_names_every_known_blank_widget() {
         KNOWN_BLANK_AT_REST.len()
     );
 }
+
+/// M5-D11: the README documents every M5 P0 addition. A cheap, exact check —
+/// the names are the API, so a rename that skips the docs fails here.
+///
+/// mutation: delete the "External events" heading from the README; this fails
+/// and names it.
+#[test]
+fn the_readme_documents_the_m5_toolkit_additions() {
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("ui/README.md is readable");
+    for needle in [
+        "### External events",
+        "### Pointer events at the view layer",
+        "### Base-level keysyms",
+        "### Probing a live window",
+        "### Watching a foreign fd",
+        "Inbox",
+        "InboxSender",
+        "App::with_inbox",
+        "App::on_fd",
+        "Window::watch_fd",
+        "InputEvent::FdReady",
+        "Cmd::Task",
+        "impl FnMut",
+        "Handler::PairButton",
+        "on_pointer_up_with_button",
+        "BTN_MIDDLE",
+        "Keymap::base_keysym",
+        "Window::probe_points",
+        "$ICEDTEA_PROBE_REPORT",
+    ] {
+        assert!(
+            readme.contains(needle),
+            "ui/README.md does not document `{needle}`"
+        );
+    }
+    assert!(
+        !readme.contains("seven collapse to a zero-area allocation"),
+        "the stale blank-widget sentence is still in the README"
+    );
+}
