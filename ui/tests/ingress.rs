@@ -836,3 +836,15 @@ fn translate_stamps_base_on_every_key_event() {
     );
     assert_eq!(release.base, release.keysym);
 }
+
+/// Mutation check: make `try_recv` return `None` unconditionally; this test
+/// fails. Restore.
+#[test]
+fn try_recv_takes_messages_in_send_order_and_then_reports_empty() {
+    let (inbox, tx) = icedtea_ui::view::Inbox::<u32>::new().expect("inbox");
+    tx.send(1).expect("send 1");
+    tx.send(2).expect("send 2");
+    assert_eq!(inbox.try_recv(), Some(1));
+    assert_eq!(inbox.try_recv(), Some(2));
+    assert_eq!(inbox.try_recv(), None);
+}

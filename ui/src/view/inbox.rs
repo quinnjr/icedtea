@@ -122,6 +122,23 @@ impl<Msg> Inbox<Msg> {
             out.push_back(msg);
         }
     }
+
+    /// Take one queued message, if any, without waiting.
+    ///
+    /// The counterpart of the drain [`App::run`](crate::view::App::run) does
+    /// once per frame, exposed so a worker thread's round trip can be tested
+    /// without a compositor. Consumes one wake byte per message taken, so a
+    /// caller that drains the inbox to empty leaves the pipe empty too and
+    /// the loop does not wake for messages that are already gone.
+    #[must_use]
+    pub fn try_recv(&self) -> Option<Msg> {
+        let msg = self.rx.try_recv().ok()?;
+        let mut byte = [0u8; 1];
+        // A short read or `WouldBlock` is fine: the channel is the queue, the
+        // pipe is only the wakeup, and one spurious wake costs one empty frame.
+        let _ = rustix::io::read(&self.read, &mut byte[..]);
+        Some(msg)
+    }
 }
 
 impl<Msg> InboxSender<Msg> {

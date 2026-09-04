@@ -25,6 +25,7 @@ glib = "0.22"
 rustix = "1"
 async-channel = "2"
 zbus.workspace = true
+futures-util = "0.3"
 redb.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

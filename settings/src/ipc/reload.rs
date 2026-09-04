@@ -6,6 +6,11 @@
 //! arrives here as a [`ReloadRequest`] and every answer leaves as a
 //! `Msg::Applied` on the inbox.
 
+use icedtea_ui::view::InboxSender;
+
+use crate::app::Msg;
+use crate::compositor_reload::{ReloadClient, apply_and_reload};
+
 /// What the loop thread asks the worker for.
 pub enum ReloadRequest {
     /// Write `cfg` to `db_path`, then best-effort `ReloadConfig`.
@@ -13,4 +18,80 @@ pub enum ReloadRequest {
         cfg: icedtea_config::Config,
         db_path: std::path::PathBuf,
     },
+}
+
+const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
+/// The signal member name is **not** PascalCase — zbus exposes `#[interface]`
+/// *methods* in PascalCase (`ReloadConfig`) but leaves signal names alone
+/// (contract §0, and `shell/src/clip_client.rs:37,41` proves both halves).
+const CONFIG_RELOADED: &str = "ConfigReloaded";
+
+/// Start the worker. It returns when every `Inbox` is dropped (the app exited)
+/// or the request channel closes.
+///
+/// Unlike shell's worker it does **not** `process::exit` on a D-Bus failure:
+/// settings is a foreground app with no `Restart=always` unit, and a dead
+/// reload worker must leave the window usable.
+pub fn spawn(
+    rx: crossbeam_channel::Receiver<ReloadRequest>,
+    tx: InboxSender<Msg>,
+) -> std::thread::JoinHandle<()> {
+    let signal_tx = tx.clone();
+    // The signal subscription is its own thread so a long blocking
+    // `ReloadConfig` cannot delay a `ConfigReloaded` and vice versa.
+    std::thread::Builder::new()
+        .name("settings-config-reloaded".to_string())
+        .spawn(move || watch_config_reloaded(&signal_tx))
+        .map_or_else(
+            |err| tracing::warn!(%err, "no ConfigReloaded watcher thread"),
+            drop,
+        );
+
+    std::thread::Builder::new()
+        .name("settings-reload".to_string())
+        .spawn(move || {
+            let client = ReloadClient::new();
+            while let Ok(request) = rx.recv() {
+                let ReloadRequest::Apply { cfg, db_path } = request;
+                let answer =
+                    apply_and_reload(&cfg, &db_path, &client).map_err(|err| err.to_string());
+                if tx.send(Msg::Applied(answer)).is_err() {
+                    // Every Inbox is gone: the app exited.
+                    return;
+                }
+            }
+        })
+        .expect("spawning the settings reload worker")
+}
+
+/// Subscribe to `org.icedtea.Compositor`'s `ConfigReloaded` and post one
+/// `Msg::ConfigReloaded` per signal.
+///
+/// Every failure — no session bus, no compositor, a stream error — ends the
+/// watcher quietly: the app stays usable without it. Nothing here panics on a
+/// malformed signal body, because the body is never deserialised.
+fn watch_config_reloaded(tx: &InboxSender<Msg>) {
+    let outcome = zbus::block_on(async {
+        let conn = zbus::Connection::session().await?;
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface(COMPOSITOR_IFACE)?
+            .path(icedtea_contract::COMPOSITOR_PATH)?
+            .build();
+        let mut stream = zbus::MessageStream::for_match_rule(rule, &conn, None).await?;
+        use futures_util::StreamExt as _;
+        while let Some(Ok(msg)) = stream.next().await {
+            let is_reloaded = msg
+                .header()
+                .member()
+                .is_some_and(|member| member.as_str() == CONFIG_RELOADED);
+            if is_reloaded && tx.send(Msg::ConfigReloaded).is_err() {
+                break;
+            }
+        }
+        Ok::<(), zbus::Error>(())
+    });
+    if let Err(err) = outcome {
+        tracing::info!(%err, "no ConfigReloaded subscription; settings runs without it");
+    }
 }
