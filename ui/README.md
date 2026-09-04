@@ -340,6 +340,11 @@ fabricates no synthetic release — an app treats a fresh `PointerDown` as
 re-anchoring. `EventKind::Click` is unaffected: a left press-release on a node
 carrying both `on_click` and `on_pointer_up_with_button` produces both messages.
 
+A `drawing_area`'s callback is `Fn(&mut Canvas, Rect, &mut PaintCx)`: the third
+argument is the same paint context every controller's `paint` receives, so a
+canvas can shape text, resolve an icon and read the theme's colours instead of
+being limited to fills and strokes.
+
 ## Fonts and text
 
 - **Font discovery is real fontconfig.** `text::FontDatabase` builds one

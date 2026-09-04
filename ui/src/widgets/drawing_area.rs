@@ -20,7 +20,7 @@ use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View
 /// A `GtkDrawingArea` whose `draw_func` is `draw`.
 #[must_use]
 pub fn drawing_area<Msg: Clone + 'static>(
-    draw: impl Fn(&mut Canvas<'_>, Rect) + 'static,
+    draw: impl Fn(&mut Canvas<'_>, Rect, &mut PaintCx<'_>) + 'static,
 ) -> View<Msg> {
     View::new(Kind::DrawingArea).prop(PropName::DrawFn, Prop::Draw(Rc::new(draw)))
 }
@@ -54,7 +54,7 @@ pub struct DrawingAreaC {
         clippy::type_complexity,
         reason = "the contract's own Prop::Draw signature; a type alias would only hide it"
     )]
-    pub draw: Rc<dyn Fn(&mut Canvas<'_>, Rect)>,
+    pub draw: Rc<dyn Fn(&mut Canvas<'_>, Rect, &mut PaintCx<'_>)>,
     /// `(content-width, content-height)`, the intrinsic size.
     pub content: (i32, i32),
     /// The last allocation the callback saw, for the resize signal.
@@ -70,7 +70,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for DrawingAreaC {
         DrawingAreaC {
             draw: match props.get(PropName::DrawFn) {
                 Some(Prop::Draw(f)) => Rc::clone(f),
-                _ => Rc::new(|_, _| {}),
+                _ => Rc::new(|_, _, _| {}),
             },
             content: (
                 i32::try_from(props.int(PropName::WidthRequest, 0)).unwrap_or(0),
@@ -119,14 +119,18 @@ impl<Msg: Clone + 'static> Controller<Msg> for DrawingAreaC {
         canvas: &mut Canvas<'_>,
         alloc: &Allocation,
         _style: &ComputedStyle,
-        _cx: &mut PaintCx<'_>,
+        cx: &mut PaintCx<'_>,
     ) -> bool {
         let content = alloc.content_box;
         if content.is_empty() {
             return false;
         }
         self.last_size = (content.width, content.height);
-        (self.draw)(canvas, content);
+        // Cloned out of `self` first: the callback borrows nothing of the
+        // controller, and holding `&self.draw` across the call would conflict
+        // with the `&mut self` this method holds.
+        let draw = Rc::clone(&self.draw);
+        draw(canvas, content, cx);
         true
     }
 }

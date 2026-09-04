@@ -1093,7 +1093,7 @@ fn a_drawing_area_runs_its_callback_against_the_allocated_rect() {
         (),
         |_m: &mut (), _msg: ()| Cmd::None,
         |_m: &()| {
-            drawing_area(|canvas, rect| {
+            drawing_area(|canvas, rect, _cx: &mut icedtea_ui::paint::PaintCx<'_>| {
                 canvas.draw_rect(
                     &rect.to_skia(),
                     &icedtea_ui::paint::fill_paint(Rgba {
@@ -1116,6 +1116,88 @@ fn a_drawing_area_runs_its_callback_against_the_allocated_rect() {
         frames.pixel(0, 32, 32).map(|p| (p.0, p.1, p.2)),
         Some((255, 0, 0))
     );
+}
+
+#[test]
+fn a_drawing_area_can_shape_text_through_its_paint_cx() {
+    // P4's Displays canvas draws a connector name and a resolution per head;
+    // without `&mut PaintCx` the callback cannot reach a FontDatabase and
+    // cannot shape a glyph at all.
+    // mutation: pass a fresh, empty `PaintCx` instead of the one `paint`
+    // received; the shaping finds no font and the row stays flat.
+    use icedtea_ui::css::value::{FontFamily, FontStyle, GenericFamily, Keyword, Rgba};
+    use icedtea_ui::text::{FontQuery, ShapeKey};
+    use icedtea_ui::view::builders::drawing_area;
+    use icedtea_ui::widgets::drawing_area::DrawingAreaExt;
+
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| {
+            drawing_area(|canvas, rect, cx| {
+                // A white ground, so a glyph is the only dark ink.
+                canvas.draw_rect(
+                    &rect.to_skia(),
+                    &icedtea_ui::paint::fill_paint(Rgba {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    }),
+                );
+                let families = [FontFamily::Generic(GenericFamily::SansSerif)];
+                let query = FontQuery {
+                    families: &families,
+                    weight: 400.0,
+                    style: FontStyle::Normal,
+                    stretch: 100.0,
+                    size_px: 24.0,
+                };
+                let Some(face) = cx.fonts.match_face(&query) else {
+                    return;
+                };
+                let shaped = cx.fonts.shape(&ShapeKey {
+                    text: "HH",
+                    face: &face,
+                    size_px: 24.0,
+                    letter_spacing_px: 0.0,
+                    features: &[],
+                    variations: &[],
+                    transform: Keyword::None,
+                });
+                if let Some(blob) = shaped.blob.as_ref() {
+                    canvas.draw_text_blob(
+                        blob,
+                        rect.x + 4.0,
+                        rect.y + 32.0,
+                        &icedtea_ui::paint::fill_paint(Rgba {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                    );
+                }
+            })
+            .content_width(120)
+            .content_height(48)
+            .hexpand(true)
+            .vexpand(true)
+        },
+        (120, 48),
+        vec![ScriptStep::Capture],
+    );
+    let mut dark = 0;
+    for x in 0..120 {
+        for y in 0..48 {
+            if let Some(px) = frames.pixel(0, x, y)
+                && (u32::from(px.0) + u32::from(px.1) + u32::from(px.2)) < 300
+            {
+                dark += 1;
+            }
+        }
+    }
+    assert!(dark > 20, "no glyph ink on the canvas: {dark} dark pixels");
 }
 
 #[test]

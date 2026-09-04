@@ -627,7 +627,9 @@ pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
         ),
         Kind::DrawingArea => Sample::Own(
             w::drawing_area(
-                |canvas: &mut skia_rs_safe::canvas::Canvas<'_>, rect: Rect| {
+                |canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+                 rect: Rect,
+                 _cx: &mut crate::paint::PaintCx<'_>| {
                     let mut paint = Paint::new();
                     paint.set_color32(Color(0xFF33_D17A));
                     canvas.draw_rect(&rect.to_skia(), &paint);

@@ -5227,3 +5227,13 @@ fallthrough. Six builders (`on_pointer_down`/`_motion`/`_up`, each with a
 `_with_button` variant) and `BTN_RIGHT`/`BTN_MIDDLE` beside a re-exported
 `BTN_LEFT` in `window::pointer` (P0-D3). Nothing in M5 P0 fires these yet.
 Full text: M5 contract §6 P0-D2, P0-D3.
+
+### M5-D6 — `Prop::Draw` carries the paint context (widens §4.3)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §4.3's
+`Prop::Draw(Rc<dyn Fn(&mut Canvas<'_>, Rect)>)` widens to `Fn(&mut Canvas<'_>,
+Rect, &mut crate::paint::PaintCx<'_>)` so a `drawing_area` callback can shape
+text, resolve an icon or read the theme's colours — the same paint context
+every controller's `paint` receives — instead of being limited to fills and
+strokes. `Props::diff` still compares by `Rc` pointer, so no diff behaviour
+changes. Full text: M5 contract §1 M5-D6.

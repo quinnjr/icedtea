@@ -512,12 +512,14 @@ pub enum Prop {
     Enum(u16),
     /// A list model.
     Items(Rc<[ListItem]>),
-    /// A `DrawingArea` paint callback.
+    /// `GtkDrawingArea`'s paint callback: the canvas, the rect to fill, and
+    /// the paint context — the last so a callback can shape text, resolve an
+    /// icon or read the theme's colours (M5-D6).
     #[allow(
         clippy::type_complexity,
         reason = "the contract's own Prop::Draw signature; a type alias would only hide it"
     )]
-    Draw(Rc<dyn Fn(&mut Canvas<'_>, Rect)>),
+    Draw(Rc<dyn Fn(&mut Canvas<'_>, Rect, &mut crate::paint::PaintCx<'_>)>),
     /// A row factory for the list family. `Msg`-free by construction so it
     /// can live in the non-generic [`Props`], and compared by pointer exactly
     /// as `Draw` is.
@@ -1792,10 +1794,20 @@ mod tests {
         reason = "matches Prop::Draw's own signature; a type alias would only hide it"
     )]
     fn draw_props_compare_by_pointer_not_by_call() {
-        let f: Rc<dyn Fn(&mut skia_rs_safe::canvas::Canvas<'_>, crate::layout::Rect)> =
-            Rc::new(|_, _| {});
-        let g: Rc<dyn Fn(&mut skia_rs_safe::canvas::Canvas<'_>, crate::layout::Rect)> =
-            Rc::new(|_, _| {});
+        let f: Rc<
+            dyn Fn(
+                &mut skia_rs_safe::canvas::Canvas<'_>,
+                crate::layout::Rect,
+                &mut crate::paint::PaintCx<'_>,
+            ),
+        > = Rc::new(|_, _, _| {});
+        let g: Rc<
+            dyn Fn(
+                &mut skia_rs_safe::canvas::Canvas<'_>,
+                crate::layout::Rect,
+                &mut crate::paint::PaintCx<'_>,
+            ),
+        > = Rc::new(|_, _, _| {});
         assert_eq!(Prop::Draw(Rc::clone(&f)), Prop::Draw(Rc::clone(&f)));
         assert_ne!(Prop::Draw(f), Prop::Draw(g));
     }
