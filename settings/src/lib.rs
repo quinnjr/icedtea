@@ -4,7 +4,9 @@
 //! translation, and validation -- consumed by the (GTK) view in [`pages`]
 //! and `main.rs`.
 
+pub mod app;
 pub mod compositor_reload;
+pub mod ipc;
 pub mod model;
 pub mod outputs;
 pub mod pages;
