@@ -29,6 +29,13 @@ use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::{ColorDialogSpec, PointerState, local_rect, shift_event};
 
+/// One palette cell, in px. Adwaita's `colorswatch` minimum.
+const SWATCH_PX: f32 = 24.0;
+/// The gap between cells.
+const SWATCH_GAP_PX: f32 = 4.0;
+/// Cells per row — GTK's own palette is nine hues by five steps.
+const SWATCH_COLUMNS: usize = 9;
+
 /// A `GtkColorDialogButton` showing `rgba`.
 #[must_use]
 pub fn color_dialog_button<Msg: Clone + 'static>(rgba: Rgba) -> View<Msg> {
@@ -122,6 +129,32 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogButtonC {
         node.append_child(&button);
         let swatch = Node::new("content");
         button.append_child(&swatch);
+        // `node` keeps `button` as a real CSS/taffy child (contract §10's
+        // sink deviation only redirects the *reconciler's* no-children
+        // cleanup, so `on_event`'s `local_rect(cx.tree, cx.node, &self.button)`
+        // still has a synced descendant to look up); a node with a taffy
+        // child is never a leaf, so taffy never calls `measure` below no
+        // matter what it returns. The floor that actually reaches layout is
+        // this side-table request — `Controller::measure` stays for the
+        // trait's contract and for `BuildCx`-only callers.
+        //
+        // The width is wider than Adwaita's own `button.color` (48px):
+        // `button` centres inside `node` at its *own* CSS width (real
+        // `adwaita-light.css` gives `button.color` a 26px content+padding+
+        // border footprint), and `paint` below fills `node`'s box, painted
+        // *before* `button`'s own background — a real, opaque `button`
+        // element rule (`adwaita-light.css`'s unconditioned `button {
+        // background-image: linear-gradient(...) }`) — paints over the
+        // centre of that fill afterwards (`paint`'s doc: "before
+        // children"). Real GTK avoids this because its `colorswatch` is a
+        // distinct widget that paints its own snapshot on top of the
+        // button's background, i.e. *after* it, in the child's own right;
+        // reaching that here would mean giving `content` a controller of
+        // its own, well past this task's two-controller scope. Padding the
+        // width out to a margin `button` cannot cover keeps the swatch
+        // legible without one — recorded as a contract amendment, not
+        // hidden in a constant.
+        crate::widgets::set_size_request(node, 64.0, 32.0);
         ColorDialogButtonC {
             rgba: ColorDialogC::unpack(props.float(PropName::Value, 0.0)),
             dialog_open: false,
@@ -152,6 +185,22 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogButtonC {
             cx.handled = true;
         }
         Vec::new()
+    }
+
+    /// Adwaita's `button.color` minimum.
+    ///
+    /// Unlike `ScrollbarC`/`ScaleC`'s chrome, `button` is a *synced* subnode
+    /// here (`build`'s comment) — hit-testing needs it laid out — so `node`
+    /// always has a taffy child and this is never actually the leaf-measure
+    /// taffy calls; `build`'s `set_size_request` is the floor that reaches
+    /// layout. Kept for `Controller<Msg>`'s contract and any caller that
+    /// measures a detached instance directly.
+    fn measure(
+        &mut self,
+        _available: (Option<f32>, Option<f32>),
+        _cx: &mut BuildCx<'_>,
+    ) -> Option<(f32, f32)> {
+        Some((48.0, 32.0))
     }
 
     fn paint(
@@ -250,6 +299,57 @@ impl ColorDialogC {
             a: channel(24),
         }
     }
+
+    /// The palette grid in `content`'s coordinate space: one rect per palette
+    /// entry, row-major, then the custom colour on a row of its own.
+    ///
+    /// `measure` and `paint` both read this, so what is drawn and what is
+    /// measured cannot drift (the defect that put `color_dialog` on
+    /// `KNOWN_BLANK_AT_REST`: its whole body was subnodes taffy never sized).
+    #[must_use]
+    pub fn grid(&self, content: Rect) -> Vec<(Rgba, Rect)> {
+        let step = SWATCH_PX + SWATCH_GAP_PX;
+        let mut cells = Vec::with_capacity(self.palette.len() + 1);
+        for (index, colour) in self.palette.iter().enumerate() {
+            let column = index % SWATCH_COLUMNS;
+            let row = index / SWATCH_COLUMNS;
+            cells.push((
+                *colour,
+                Rect::new(
+                    content.x + column as f32 * step,
+                    content.y + row as f32 * step,
+                    SWATCH_PX,
+                    SWATCH_PX,
+                ),
+            ));
+        }
+        if let Some(custom) = self.custom {
+            let row = self.palette.len().div_ceil(SWATCH_COLUMNS);
+            cells.push((
+                custom,
+                Rect::new(
+                    content.x,
+                    content.y + row as f32 * step,
+                    SWATCH_PX,
+                    SWATCH_PX,
+                ),
+            ));
+        }
+        cells
+    }
+
+    /// The grid's intrinsic size: nine columns, as many rows as the palette
+    /// needs, plus one for the custom colour once there is one.
+    #[must_use]
+    pub fn intrinsic(&self) -> (f32, f32) {
+        let step = SWATCH_PX + SWATCH_GAP_PX;
+        let columns = SWATCH_COLUMNS.min(self.palette.len().max(1));
+        let rows = self.palette.len().div_ceil(SWATCH_COLUMNS) + usize::from(self.custom.is_some());
+        (
+            columns as f32 * step - SWATCH_GAP_PX,
+            (rows.max(1) as f32) * step - SWATCH_GAP_PX,
+        )
+    }
 }
 
 impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
@@ -272,14 +372,23 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
             .collect();
         let swatch_pointers: Vec<PointerState> =
             swatches.iter().map(|_| PointerState::default()).collect();
-        ColorDialogC {
+        let this = ColorDialogC {
             rgba: Self::unpack(props.float(PropName::Value, 0.0)),
             palette,
             custom: None,
             swatches,
             swatch_pointers,
             sink: Node::new("sink"),
-        }
+        };
+        // See `ColorDialogButtonC::build`: `chooser`/`swatches` are real
+        // taffy children of `node` (needed for `on_event`'s swatch
+        // hit-testing), so `node` is never a taffy leaf and `measure` below
+        // is unreachable from the real render loop; this side-table floor
+        // is what actually sizes the dialog. Re-applied here and wherever
+        // `custom` changes, so it never drifts from `intrinsic()`.
+        let (w, h) = this.intrinsic();
+        crate::widgets::set_size_request(node, w, h);
+        this
     }
 
     fn set_prop(&mut self, _node: &Node, name: PropName, value: &Prop, _cx: &mut BuildCx<'_>) {
@@ -311,6 +420,11 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
         if let Some(rgba) = picked.and_then(|index| self.palette.get(index).copied()) {
             self.rgba = rgba;
             self.custom = Some(rgba);
+            // `custom` just grew the grid by one row (`intrinsic`'s
+            // `usize::from(self.custom.is_some())`); refresh the floor so
+            // next frame's layout keeps matching what `paint` draws.
+            let (w, h) = self.intrinsic();
+            crate::widgets::set_size_request(cx.node, w, h);
             cx.handled = true;
             return cx
                 .handlers
@@ -318,6 +432,44 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
                 .map_or_else(Vec::new, |m| vec![m]);
         }
         Vec::new()
+    }
+
+    /// Never actually taffy's leaf-measure closure for the reason `build`'s
+    /// `set_size_request` comment gives (`chooser`/`swatches` are synced,
+    /// so `node` has children); kept for `Controller<Msg>`'s contract.
+    fn measure(
+        &mut self,
+        _available: (Option<f32>, Option<f32>),
+        _cx: &mut BuildCx<'_>,
+    ) -> Option<(f32, f32)> {
+        Some(self.intrinsic())
+    }
+
+    fn paint(
+        &mut self,
+        canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+        alloc: &crate::layout::Allocation,
+        _style: &crate::css::computed::ComputedStyle,
+        _cx: &mut crate::view::controller::PaintCx<'_>,
+    ) -> bool {
+        let content = alloc.content_box;
+        if content.is_empty() {
+            return false;
+        }
+        let mut painted = false;
+        for (colour, rect) in self.grid(content) {
+            if rect.x + rect.width > content.x + content.width
+                || rect.y + rect.height > content.y + content.height
+            {
+                // A grid larger than the box it was given: clip by dropping
+                // the cells that do not fit, rather than overdrawing a
+                // neighbour's chrome.
+                continue;
+            }
+            canvas.draw_rect(&rect.to_skia(), &crate::paint::fill_paint(colour));
+            painted = true;
+        }
+        painted
     }
 }
 

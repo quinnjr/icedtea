@@ -2207,3 +2207,137 @@ fn the_linux_button_codes_are_reachable_from_one_module() {
     assert_eq!(icedtea_ui::window::BTN_LEFT, BTN_LEFT);
     assert_eq!(icedtea_ui::wayland::BTN_LEFT, BTN_LEFT);
 }
+
+/// Build a controller with a real `BuildCx` — the six-line pattern
+/// `ColorDialogC`'s own unit test uses (`ui/src/widgets/color_dialog.rs`).
+fn build_controller_for_test<C: icedtea_ui::view::controller::Controller<usize>>(
+    node: &icedtea_ui::css::node::Node,
+    props: &icedtea_ui::view::Props,
+) -> C {
+    let sheet = CompiledSheet::compile("");
+    let mut fonts = icedtea_ui::text::FontDatabase::probe_only();
+    let mut icons = icedtea_ui::icons::IconTheme::with_name_and_roots("hicolor", vec![]);
+    let clock: Rc<dyn icedtea_ui::anim::Clock> = Rc::new(ManualClock::new());
+    let env = icedtea_ui::css::computed::ResolveEnv::default();
+    let mut cx = icedtea_ui::view::reconcile::BuildCx {
+        sheet: &sheet,
+        fonts: &mut fonts,
+        icons: &mut icons,
+        clock: &clock,
+        env: &env,
+    };
+    C::build(node, props, &mut cx)
+}
+
+#[test]
+fn a_color_dialog_button_paints_its_swatch_at_rest() {
+    // `ColorDialogButtonC::paint` has always filled `alloc.content_box` with
+    // its colour; what it lacked was an intrinsic size, so the whole button
+    // collapsed to 0x0 (unlaid-out, not even hit-testable) — the
+    // `ScrollbarC::measure` / `ScaleC::measure` case in shape, though here
+    // `button` stays a real synced taffy child (`on_event`'s hit-testing
+    // needs it), so `node` is never a taffy leaf and `Controller::measure`
+    // is unreachable from this render loop; `build`'s `set_size_request`
+    // side-table floor is the mechanism that actually reaches layout. Its
+    // width also has to clear the margin `button`'s own real Adwaita
+    // gradient chrome paints over the fill afterwards — see `build`'s
+    // comment. mutation: delete the `set_size_request` call in `build`; the
+    // box collapses again and no red pixel appears.
+    use icedtea_ui::css::value::Rgba;
+    use icedtea_ui::view::builders::color_dialog_button;
+
+    let red = Rgba {
+        r: 1.0,
+        g: 0.0,
+        b: 0.0,
+        a: 1.0,
+    };
+    let frames = run(
+        red,
+        |_m: &mut Rgba, _msg: ()| Cmd::None,
+        |model: &Rgba| color_dialog_button(*model),
+        (80, 60),
+        vec![ScriptStep::Capture],
+    );
+    let mut reds = 0;
+    for x in 0..80 {
+        for y in 0..60 {
+            if frames.pixel(0, x, y).map(|p| (p.0, p.1, p.2)) == Some((255, 0, 0)) {
+                reds += 1;
+            }
+        }
+    }
+    assert!(
+        reds >= 48 * 32 / 2,
+        "the swatch did not fill its button: {reds} red pixels"
+    );
+}
+
+#[test]
+fn a_color_dialog_paints_its_palette_at_rest() {
+    // mutation: return `false` from `ColorDialogC::paint`; the frame is one
+    // flat colour and `has_ink` fails.
+    use icedtea_ui::css::value::Rgba;
+    use icedtea_ui::view::builders::color_dialog;
+
+    let start = Rgba {
+        r: 0.2,
+        g: 0.5,
+        b: 0.9,
+        a: 1.0,
+    };
+    let frames = run(
+        start,
+        |_m: &mut Rgba, _msg: ()| Cmd::None,
+        |model: &Rgba| color_dialog(*model),
+        (320, 240),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        has_ink(&frames, 0, (320, 240)),
+        "the palette painted nothing"
+    );
+    // More than one palette colour, not just a wash: count distinct pixels.
+    let mut seen = std::collections::HashSet::new();
+    for x in 0..320 {
+        for y in 0..240 {
+            if let Some(px) = frames.pixel(0, x, y) {
+                seen.insert(px);
+            }
+        }
+    }
+    assert!(
+        seen.len() > 8,
+        "a palette grid must show many colours, saw {}",
+        seen.len()
+    );
+}
+
+#[test]
+fn a_color_dialogs_measured_box_is_the_grid_it_paints() {
+    // The drift guard: `measure` and `paint` read one geometry function.
+    // mutation: hard-code a different column count in `intrinsic`; this fails.
+    use icedtea_ui::css::node::Node;
+    use icedtea_ui::layout::Rect;
+    use icedtea_ui::view::Props;
+    use icedtea_ui::widgets::color_dialog::ColorDialogC;
+
+    let node = Node::new("window");
+    let controller: ColorDialogC = build_controller_for_test(&node, &Props::default());
+    let (w, h) = controller.intrinsic();
+    let cells = controller.grid(Rect::new(0.0, 0.0, w, h));
+    assert_eq!(
+        cells.len(),
+        controller.palette.len() + usize::from(controller.custom.is_some()),
+        "every palette entry gets a cell"
+    );
+    for (_, rect) in &cells {
+        assert!(
+            rect.x >= 0.0
+                && rect.y >= 0.0
+                && rect.x + rect.width <= w + 0.01
+                && rect.y + rect.height <= h + 0.01,
+            "cell {rect:?} escapes the measured {w}x{h} box"
+        );
+    }
+}
