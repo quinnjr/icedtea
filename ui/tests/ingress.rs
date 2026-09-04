@@ -248,6 +248,48 @@ fn an_inbox_message_wakes_a_live_app() {
     );
 }
 
+#[test]
+fn a_running_app_writes_its_probe_report() {
+    // Why the toolkit does this and not the app (P0-D4): `App::run` owns the
+    // loop and lays the tree out into its own Runtime, so an app that has
+    // handed over its window has no frame hook and no laid-out tree. Every M5
+    // gate addresses widgets by id, so without this P1..P5 have no gates.
+    // mutation: never call the report writer in `App::run`; no `probe ` line
+    // appears and this fails.
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let _probe = spawn_window_probe_with(
+        &compositor.socket_path().to_string_lossy(),
+        "app-inbox",
+        theme.path(),
+        report.path(),
+        &[],
+    );
+    assert!(
+        wait_for_report_line(report.path(), "alloc status ", REPORT).is_some(),
+        "the running app never reported its `status` allocation: {:?}",
+        probe_report(report.path())
+    );
+    let lines = probe_report(report.path());
+    let probes: Vec<&String> = lines.iter().filter(|l| l.starts_with("probe ")).collect();
+    assert!(
+        probes.iter().any(|l| l.starts_with("probe status ")),
+        "the id-labelled probe point is missing: {probes:?}"
+    );
+    // Written when they change, not once per frame: a settled app must not
+    // grow the file without bound.
+    let settled = lines
+        .iter()
+        .filter(|l| l.starts_with("probe status "))
+        .count();
+    assert!(
+        settled <= 4,
+        "the report repeats unchanged lines ({settled} copies); it must only \
+         write when the tree changed"
+    );
+}
+
 use icedtea_ui::BUNDLED_ADWAITA_LIGHT;
 use icedtea_ui::anim::ManualClock;
 use icedtea_ui::css::cascade::CompiledSheet;

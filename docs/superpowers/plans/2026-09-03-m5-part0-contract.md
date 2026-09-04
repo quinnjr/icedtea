@@ -2072,6 +2072,24 @@ beside the two new consts it does define, so `window::pointer::{BTN_LEFT,
 BTN_RIGHT, BTN_MIDDLE}` is one importable set without moving or duplicating
 the original. Carried out by P0 (Task 8).
 
+### P0-D4 — `App::run` writes the `$ICEDTEA_PROBE_REPORT` lines itself (M5-D9)
+
+M5-D9 says "P1 adds the writer to settings; P5 to shell". §7's E1 supersedes
+that: an app that has handed its window to `App::run` has no per-frame hook
+and no laid-out tree of its own to derive `probe`/`alloc` lines from, so every
+app part reaching for the same writer would either duplicate it or reach into
+the toolkit's private `Runtime`. Shipped: a third `App` field,
+`probe_report: Option<PathBuf>`, that `App::new` initialises from
+`$ICEDTEA_PROBE_REPORT` and `App::with_probe_report(path)` sets explicitly;
+`App::run` calls a free `write_probe_report` after each frame's
+`restyle_and_layout`, built from `crate::window::probe_points_of(&rt.root,
+&rt.layout)` (the `probe` lines) plus one `alloc` line per id'd node's
+`rt.layout.allocation`, deduplicated against the previous frame's lines so a
+settled app writes nothing. `App::run_offscreen` and `App::probe` do not
+write: an offscreen test reads `Probe`/`Frames` directly. Carried out by P0
+(Task 18); P1 and P5's own "add the writer" steps are satisfied by this and
+reduce to setting widget ids (§7 E1).
+
 ### P0-D5 — no `unsafe impl Send for InboxSender`
 
 M5-D2's sketch includes `unsafe impl<Msg: Send> Send for InboxSender<Msg> {}`.

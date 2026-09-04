@@ -633,6 +633,11 @@ last frame laid out. A client that sets `$ICEDTEA_PROBE_REPORT` writes them as
 `ui/tests/support/mod.rs` parses back. This is how a harness test addresses a
 widget on a *running* app: `App::probe` is offscreen-only.
 
+An app driven by `App::run` gets this for free: with `$ICEDTEA_PROBE_REPORT`
+set (or `App::with_probe_report(path)`), the loop writes those lines once per
+frame in which they change — deduplicated, so a settled app writes nothing.
+That is what M5's settings and shell gates read.
+
 ## The P5 half of the widget catalogue, in detail
 
 `icedtea_ui::widgets` builds one `Controller` per `Kind`, dispatched by

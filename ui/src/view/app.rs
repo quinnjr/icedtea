@@ -429,6 +429,8 @@ pub struct App<M, Msg> {
     /// `FdReady(id)` → messages (M5-D2's `on_fd`).
     #[allow(clippy::type_complexity, reason = "one boxed closure per watched fd")]
     fd_handlers: Vec<(crate::window::WatchId, Box<dyn Fn() -> Vec<Msg>>)>,
+    /// Where `run` writes `probe`/`alloc` lines, when asked (M5-D9, P0-D4).
+    probe_report: Option<std::path::PathBuf>,
 }
 
 impl<M: std::fmt::Debug, Msg> std::fmt::Debug for App<M, Msg> {
@@ -597,6 +599,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             icons: None,
             inbox: None,
             fd_handlers: Vec::new(),
+            probe_report: std::env::var_os("ICEDTEA_PROBE_REPORT").map(std::path::PathBuf::from),
         }
     }
 
@@ -645,6 +648,18 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     #[must_use]
     pub fn on_fd(mut self, id: crate::window::WatchId, f: impl Fn() -> Vec<Msg> + 'static) -> Self {
         self.fd_handlers.push((id, Box::new(f)));
+        self
+    }
+
+    /// Write `probe <label> <x> <y>` and `alloc <id> <x> <y> <w> <h>` lines to
+    /// `path`, once per frame in which they change.
+    ///
+    /// `App::new` already picks `$ICEDTEA_PROBE_REPORT` up; this is the
+    /// explicit form. The lines are exactly what `ui/tests/support/mod.rs`
+    /// parses, and the labels are `Window::probe_points`'.
+    #[must_use]
+    pub fn with_probe_report(mut self, path: std::path::PathBuf) -> Self {
+        self.probe_report = Some(path);
         self
     }
 
@@ -1609,6 +1624,57 @@ fn frame_deadline<T>(
         .min()
 }
 
+/// Append `lines` to `path` when they differ from `last`.
+///
+/// Deduplicated by content: a settled app writes nothing, so the file stays
+/// bounded no matter how long the app runs, and a test that greps for a line
+/// still finds it.
+fn write_probe_report(path: &std::path::Path, lines: &[String], last: &mut Vec<String>) {
+    use std::io::Write;
+
+    if lines == last.as_slice() {
+        return;
+    }
+    last.clear();
+    last.extend_from_slice(lines);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    for line in lines {
+        let _ = writeln!(file, "{line}");
+    }
+    let _ = file.flush();
+}
+
+/// The report lines for one laid-out tree: every probe point, then one
+/// `alloc` line per node that has an id.
+fn probe_report_lines<Msg>(rt: &Runtime<Msg>) -> Vec<String> {
+    let mut lines: Vec<String> = crate::window::probe_points_of(&rt.root, &rt.layout)
+        .into_iter()
+        .map(|p| format!("probe {} {} {}", p.label, p.x, p.y))
+        .collect();
+    for node in rt.root.descendants() {
+        let Some(id) = node.id() else { continue };
+        let Some(alloc) = rt.layout.allocation(&node) else {
+            continue;
+        };
+        let r = alloc.border_box;
+        lines.push(format!(
+            "alloc {} {} {} {} {}",
+            id.as_str(),
+            r.x,
+            r.y,
+            r.width,
+            r.height
+        ));
+    }
+    lines
+}
+
 impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     /// Run the loop against a live `Window`.
     ///
@@ -1663,6 +1729,10 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
         };
 
         rebuild(&mut self, &mut rt, &sheet, &mut fonts, &mut icons, &clock);
+
+        // M5-D9, P0-D4: lines written by `write_probe_report` only when they
+        // differ from what is already here.
+        let mut reported: Vec<String> = Vec::new();
 
         // M5-D2 §2: the inbox's wake pipe joins the window's poll set, and
         // leaves it on the way out.
@@ -1839,6 +1909,11 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 &mut rt.layout,
                 (w, h),
             )?;
+
+            if let Some(path) = self.probe_report.as_deref() {
+                let lines = probe_report_lines(&rt);
+                write_probe_report(path, &lines, &mut reported);
+            }
 
             let styles = &rt.styles;
             let layout = &rt.layout;
