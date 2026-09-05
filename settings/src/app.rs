@@ -182,6 +182,20 @@ pub enum Msg {
     WorkspaceAdded,
     /// A row's Remove button, by row index.
     WorkspaceRemoved(usize),
+
+    // --- Keybindings (P3) --------------------------------------------------
+    /// The window-root capture handler resolved the pressed key and decided
+    /// it wasn't Escape (contract §2.7, Task 4). The full arm that stores it
+    /// into `m.model.working.keybindings` lands in Task 7; for now `update`
+    /// only needs an arm to stay exhaustive.
+    KeyCaptured {
+        keysym: u32,
+        mods: crate::model::CaptureMods,
+    },
+    /// The window-root capture handler saw Escape while a row was armed.
+    /// Task 7 clears `m.capturing`; for now `update` only needs an arm to
+    /// stay exhaustive.
+    CaptureCancelled,
 }
 
 const _: fn() = || {
@@ -472,6 +486,11 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             pages::workspaces::remove_workspace(&mut m.model.working, index);
             Cmd::None
         }
+        // Task 4 (`capture_key`) only needs `Msg` to carry these two
+        // variants so its return type compiles; the arms that actually
+        // store a binding / clear `m.capturing` are Task 7's (contract
+        // §2.7, deviation P3-D1).
+        Msg::KeyCaptured { .. } | Msg::CaptureCancelled => Cmd::None,
     };
     crate::probe::report(&format!("page {}", m.page.name()));
     crate::probe::report(&format!("status {}", footer_text(m)));

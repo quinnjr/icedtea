@@ -8,6 +8,10 @@
 //! tracks the Workspaces page's row count.
 
 use icedtea_config::KeyCombo;
+use icedtea_ui::window::keyboard::{KeyEvent, Mods};
+
+use crate::app::Msg;
+use crate::model::CaptureMods;
 
 /// The Keybindings page.
 ///
@@ -96,6 +100,45 @@ pub fn take_capture_reset(capturing: &mut Option<String>) -> Option<String> {
 #[must_use]
 pub fn normalise_keysym(base: u32, modified: u32) -> u32 {
     if base == 0 { modified } else { base }
+}
+
+/// The window-root `on_key` handler.
+///
+/// `armed` is `m.capturing.is_some()`, read off the model by `app::view`
+/// each frame. It is a parameter and not a `capturing.is_none()` check
+/// inside `update` (which is what contract §2.7 rule 4 originally said)
+/// because `GenericC::on_event`'s `Event::Key` arm sets `cx.handled = true`
+/// for *any* message a `KeyPressed` handler returns, and M3 deviation
+/// P4-D19 makes a handled event end the whole dispatch -- so a handler that
+/// answers every key press swallows every keystroke in the window,
+/// including the ones a focused `Entry` needs. Deviation P3-D1.
+///
+/// `None` means "not ours, let it through".
+///
+/// The keysym is resolved exactly the way `compositor/src/input.rs:109-123`
+/// matches: the raw, level-0 sym, falling back to the modified one only
+/// when the keycode produces no base sym at all. `icedtea_config::keys::
+/// key_name_to_keysym` always encodes the unshifted keysym (`"KEY_q"` ->
+/// `0x71`), so a capture that stored `0x51` (`XK_Q`) from a `SUPER+SHIFT+q`
+/// press would produce a binding the compositor can never fire.
+#[must_use]
+pub fn capture_key(armed: bool, ev: &KeyEvent) -> Option<Msg> {
+    if !armed || !ev.pressed || ev.repeat {
+        return None;
+    }
+    let keysym = normalise_keysym(ev.base.raw(), ev.keysym.raw());
+    if keysym == xkbcommon::xkb::keysyms::KEY_Escape {
+        return Some(Msg::CaptureCancelled);
+    }
+    Some(Msg::KeyCaptured {
+        keysym,
+        mods: CaptureMods {
+            ctrl: ev.mods.contains(Mods::CTRL),
+            alt: ev.mods.contains(Mods::ALT),
+            shift: ev.mods.contains(Mods::SHIFT),
+            logo: ev.mods.contains(Mods::LOGO),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -228,5 +271,156 @@ mod tests {
         takes_fn(crate::pages::keybindings::action_list);
         assert!(crate::pages::keybindings::should_capture(true, true));
         assert_eq!(crate::pages::keybindings::FIXED_ACTIONS.len(), 10);
+    }
+
+    use icedtea_ui::window::keyboard::{KeyEvent, Mods};
+    use xkbcommon::xkb::{Keysym, keysyms};
+
+    /// A synthesised press. `base` is what `Keymap::translate` stamps from
+    /// `Keymap::base_keysym` (M5-D7); `keysym` is the level-adjusted sym the
+    /// same translate produced.
+    fn press(keycode: u32, keysym: u32, base: u32, mods: Mods) -> KeyEvent {
+        KeyEvent {
+            keycode,
+            keysym: Keysym::from(keysym),
+            base: Keysym::from(base),
+            utf8: None,
+            mods,
+            consumed: Mods::empty(),
+            pressed: true,
+            repeat: false,
+            serial: 1,
+            time_ms: 1,
+        }
+    }
+
+    /// The SHIP-BLOCKER the GTK test guarded (findings #1/#2), re-expressed
+    /// on the toolkit: capturing with Shift held stores the *unshifted*
+    /// keysym, because that is the only form `key_name_to_keysym` -- and so
+    /// the compositor's `match_action` -- can ever match.
+    ///
+    /// Mutation check: make `capture_key` pass `ev.keysym.raw()` where it
+    /// passes `ev.base.raw()`; this test fails with `KEY_A` (0x41). Restore.
+    #[test]
+    fn a_shifted_press_captures_the_base_keysym() {
+        // evdev KEY_A = 30. xkb's is 38; the KeyEvent carries the evdev code.
+        let ev = press(30, keysyms::KEY_A, keysyms::KEY_a, Mods::SHIFT);
+        let msg = capture_key(true, &ev).expect("an armed press captures");
+        match msg {
+            Msg::KeyCaptured { keysym, mods } => {
+                assert_eq!(keysym, keysyms::KEY_a, "the base, unshifted sym is stored");
+                assert_eq!(
+                    mods,
+                    crate::model::CaptureMods {
+                        shift: true,
+                        ..Default::default()
+                    }
+                );
+            }
+            other => panic!("expected KeyCaptured, got {other:?}"),
+        }
+    }
+
+    /// A keycode whose base sym is `NoSymbol` falls back to the modified sym
+    /// rather than storing 0 -- `normalise_keysym`'s second clause, reached
+    /// through `capture_key`.
+    ///
+    /// Mutation check: make `capture_key` return `ev.base.raw()`
+    /// unconditionally; this fails with 0. Restore.
+    #[test]
+    fn a_keycode_with_no_base_sym_falls_back_to_the_modified_one() {
+        let ev = press(999, keysyms::KEY_F5, keysyms::KEY_NoSymbol, Mods::empty());
+        match capture_key(true, &ev).expect("still captures") {
+            Msg::KeyCaptured { keysym, .. } => assert_eq!(keysym, keysyms::KEY_F5),
+            other => panic!("expected KeyCaptured, got {other:?}"),
+        }
+    }
+
+    /// Escape cancels rather than binding -- checked against the *normalised*
+    /// sym, so an exotic layout that reaches Escape only at a shifted level
+    /// still cancels.
+    ///
+    /// Mutation check: drop the Escape arm; this fails with `KeyCaptured`.
+    /// Restore.
+    #[test]
+    fn escape_cancels_the_capture() {
+        let ev = press(1, keysyms::KEY_Escape, keysyms::KEY_Escape, Mods::empty());
+        assert!(matches!(
+            capture_key(true, &ev),
+            Some(Msg::CaptureCancelled)
+        ));
+    }
+
+    /// Nothing armed: the handler must decline, or `GenericC`'s
+    /// `Event::Key` arm sets `cx.handled` (M3 P4-D19: that ends the whole
+    /// dispatch) and every keystroke in the window is swallowed -- typing
+    /// into a workspace-name Entry included. This is deviation P3-D1's whole
+    /// reason for existing.
+    ///
+    /// Mutation check: drop the `!armed` early return; this fails. Restore.
+    #[test]
+    fn an_unarmed_press_is_declined_so_the_focused_widget_still_sees_it() {
+        let ev = press(30, keysyms::KEY_a, keysyms::KEY_a, Mods::empty());
+        assert!(capture_key(false, &ev).is_none());
+    }
+
+    /// A release and an auto-repeat are both declined: a capture binds on
+    /// the press, and a held key must not rebind the row again and again.
+    ///
+    /// Mutation check: drop the `!ev.repeat` clause; the repeat assertion
+    /// fails. Restore.
+    #[test]
+    fn releases_and_repeats_are_declined() {
+        let mut release = press(30, keysyms::KEY_a, keysyms::KEY_a, Mods::empty());
+        release.pressed = false;
+        assert!(capture_key(true, &release).is_none());
+
+        let mut repeat = press(30, keysyms::KEY_a, keysyms::KEY_a, Mods::empty());
+        repeat.repeat = true;
+        assert!(capture_key(true, &repeat).is_none());
+    }
+
+    /// Modifiers come from `mods` (every effectively-active modifier), not
+    /// from `consumed` (the ones this sym spent reaching its level). A
+    /// Super+Shift+q press consumes Shift to reach `Q`, and a capture that
+    /// read `consumed` would drop Super entirely.
+    ///
+    /// Mutation check: read `ev.consumed` instead of `ev.mods`; this fails
+    /// with `logo: false`. Restore.
+    #[test]
+    fn modifiers_are_read_from_the_effective_state() {
+        let mut ev = press(16, keysyms::KEY_Q, keysyms::KEY_q, Mods::SHIFT | Mods::LOGO);
+        ev.consumed = Mods::SHIFT;
+        match capture_key(true, &ev).expect("captures") {
+            Msg::KeyCaptured { keysym, mods } => {
+                assert_eq!(keysym, keysyms::KEY_q);
+                assert_eq!(
+                    mods,
+                    crate::model::CaptureMods {
+                        shift: true,
+                        logo: true,
+                        ..Default::default()
+                    }
+                );
+            }
+            other => panic!("expected KeyCaptured, got {other:?}"),
+        }
+    }
+
+    /// Caps Lock and Num Lock are not binding modifiers -- `CaptureMods` has
+    /// four fields and `MODIFIER_TOKENS` four tokens, so a lock state must
+    /// not leak into a stored combo.
+    ///
+    /// Mutation check: add `Mods::CAPS` to the `shift` expression; this
+    /// fails. Restore.
+    #[test]
+    fn lock_states_are_not_binding_modifiers() {
+        let ev = press(30, keysyms::KEY_A, keysyms::KEY_a, Mods::CAPS | Mods::NUM);
+        match capture_key(true, &ev).expect("captures") {
+            Msg::KeyCaptured { mods, .. } => {
+                assert_eq!(mods, crate::model::CaptureMods::default());
+            }
+            other => panic!("expected KeyCaptured, got {other:?}"),
+        }
     }
 }
