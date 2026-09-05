@@ -437,100 +437,32 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             m.model.working.behavior.snap_enabled = on;
             Cmd::None
         }
-        Msg::Outputs(update) => match &*update {
-            crate::outputs::OutputsMsg::HeadsChanged(heads) => {
-                let r = crate::pages::displays::state::reconcile(
-                    &m.displays.heads,
-                    &m.displays.edits,
-                    m.displays.selected,
-                    m.displays.dirty,
-                    heads,
-                );
-                m.displays.heads = heads.clone();
-                m.displays.edits = r.edits;
-                m.displays.selected = r.selected;
-                // A drag was indexed against the *old* head list; the new
-                // one may be shorter or reordered (finding #2).
-                m.displays.drag = None;
-                if !r.compatible {
-                    // A genuine set change re-baselines, so nothing is
-                    // unsaved any more.
-                    m.displays.dirty = false;
-                }
-                m.outputs_available = true;
-                m.displays_status = if r.dropped {
-                    "Displays changed \u{2014} pending edits discarded".to_string()
-                } else {
-                    String::new()
-                };
-                Cmd::None
+        Msg::Outputs(update) => {
+            // The socket going dead needs one thing `on_outputs` (which only
+            // ever touches the model) cannot express: a dead fd is
+            // *permanently* readable, so the toolkit reports readiness and
+            // never retires a foreign fd itself (`ui/src/window/mod.rs` —
+            // "the toolkit never decides on its own that a foreign fd is
+            // dead. It reports, and the owner calls `Window::unwatch`"). Left
+            // watched, every poll wake would dispatch-error, warn, re-emit
+            // `Disconnected` and re-render, forever. `Cmd::Unwatch` (P0-D7)
+            // is the way out; the pump also latches shut so the interval
+            // before this lands stays quiet. `tests/outputs_pump.rs` gates
+            // on this Cmd, so it stays here rather than folding into the
+            // pure model fold.
+            let unwatch = matches!(&*update, crate::outputs::OutputsMsg::Disconnected)
+                .then(|| {
+                    m.outputs
+                        .as_ref()
+                        .map(crate::outputs::pump::OutputsPump::watch)
+                })
+                .flatten();
+            crate::pages::displays::on_outputs(m, update.as_ref());
+            match unwatch {
+                Some(watch) => Cmd::Unwatch(watch),
+                None => Cmd::None,
             }
-            crate::outputs::OutputsMsg::ApplySucceeded { is_test } => {
-                m.displays_in_flight = false;
-                if *is_test {
-                    // A preview succeeded: keep the edits so the user can
-                    // commit them.
-                    m.displays_status = "Test succeeded".to_string();
-                } else {
-                    m.displays.dirty = false;
-                    m.displays_status = "Applied".to_string();
-                }
-                Cmd::None
-            }
-            crate::outputs::OutputsMsg::ApplyFailed { is_test } => {
-                m.displays_in_flight = false;
-                if *is_test {
-                    m.displays_status = "Test rejected by the compositor".to_string();
-                } else {
-                    // Re-baseline: the compositor kept its own layout.
-                    m.displays.edits = m
-                        .displays
-                        .heads
-                        .iter()
-                        .map(crate::pages::displays::state::baseline_edit)
-                        .collect();
-                    m.displays.dirty = false;
-                    m.displays_status = "Configuration rejected by the compositor".to_string();
-                }
-                Cmd::None
-            }
-            crate::outputs::OutputsMsg::ApplyCancelled => {
-                m.displays_in_flight = false;
-                m.displays_status = "Configuration superseded \u{2014} re-reading".to_string();
-                Cmd::None
-            }
-            crate::outputs::OutputsMsg::ManagerUnavailable => {
-                // The connection is alive; only the global is missing.
-                // Keep watching the fd — nothing is spinning.
-                m.displays_in_flight = false;
-                m.outputs_available = false;
-                m.displays_status = String::new();
-                Cmd::None
-            }
-            crate::outputs::OutputsMsg::Disconnected => {
-                m.displays_in_flight = false;
-                m.outputs_available = false;
-                m.displays_status = String::new();
-                // The socket is dead, and a dead fd is *permanently*
-                // readable: the toolkit reports readiness and never
-                // retires a foreign fd itself (`ui/src/window/mod.rs` —
-                // "the toolkit never decides on its own that a foreign fd
-                // is dead. It reports, and the owner calls
-                // `Window::unwatch`"). Left watched, every poll wake would
-                // dispatch-error, warn, re-emit `Disconnected` and
-                // re-render, forever. `Cmd::Unwatch` (P0-D7) is the way
-                // out; the pump also latches shut so the interval before
-                // this lands stays quiet.
-                match m
-                    .outputs
-                    .as_ref()
-                    .map(crate::outputs::pump::OutputsPump::watch)
-                {
-                    Some(watch) => Cmd::Unwatch(watch),
-                    None => Cmd::None,
-                }
-            }
-        },
+        }
         Msg::WallpaperEdited(text) => set_wallpaper(m, text),
         Msg::WallpaperChosen(path) => {
             m.browse_in_flight = false;
