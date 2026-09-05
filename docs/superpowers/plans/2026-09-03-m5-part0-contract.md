@@ -2319,7 +2319,8 @@ edit may be made without a new §6 amendment:
 
 | Part | `ui/` files | Why P0 cannot |
 |---|---|---|
-| P1 | `view/inbox.rs` (`Inbox::try_recv`), `tests/ingress.rs` | P1-D4a: only a consumer with a worker round trip needs to observe the inbox without a running `App` |
+| P1 | `view/inbox.rs` (`Inbox::try_recv`), `view/app.rs`, `tests/ingress.rs` | P1-D4a: only a consumer with a worker round trip needs to observe the inbox without a running `App`. `view/app.rs` is added here in P2's fix wave: P1 edited it and this table omitted it (doc-only correction, no behaviour) |
+| P2 | `widgets/stack.rs` | P2-D17: `StackC` never told the layout side table about an inactive page, so no control inside *any* stack page was reachable by a pointer. It is a `ui/` defect with no fix inside a settings page, and P0 could not have specified it blind — no test in M1–M5 had clicked inside a stack page before P2's own gates |
 | P4 | `widgets/drop_down.rs` | §7's pre-discharged exception (P4-D5); the right list height is knowable only from a real page in a 420 px window |
 | P5 | `view/app.rs`, `window/popup.rs`, `window/mod.rs`, new `tests/popup_input.rs`, `tests/app_frame_hook.rs` | P5-D1/D2/D4/D5/D8: §3.4's real-`xdg_popup` clipboard popover cannot work without surface-scoped input routing, a re-reconciled popup view, `App::on_popup`, a per-frame `&Window` hook and popup-scoped probe accessors — none of which M5-D1…D11 provides and none of which P0 could specify blind |
 | P0 | everything else | — |
@@ -2463,3 +2464,463 @@ consumes P0's toolkit and adds its own `ui/` items before it uses them (Tasks
 backward-looking claims in the freeze — P2-D1's "P1 stub", P4-D7's "where P1 has
 not", P4-D9's and P3-D6's env knobs, P5-D5's "if P1 landed it" — are the ones
 E1–E5 close.
+
+### P2-D1 — P2 creates `settings/src/ipc/portal.rs` and completes `WorkerHandles`
+
+**Carried out by:** P2 (Task 3). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Contract §5 says** `ipc/portal.rs` is P2's file, but §2.4 is headed `(P1)`
+and shows a `WorkerHandles { reload, portal }` with `choose_wallpaper`.
+
+**As shipped:** P1-D7 governs (§6 E5) — P1 shipped `WorkerHandles { reload }`
+only. P2 creates `ipc/portal.rs`, adds the `portal` field and
+`WorkerHandles::choose_wallpaper`, extends `ipc::spawn` to start the portal
+worker beside the reload worker, and extends `handles_for_test`'s tuple with
+the portal receiver. `PortalRequest`, `pub fn spawn(rx, tx) -> JoinHandle<()>`
+and `choose_wallpaper` use contract §2.4's signatures exactly.
+
+**Ruling.** Reconciled with P1-D7 (binding): §2.4 is the union across P1+P2;
+nothing P1 shipped changed.
+
+---
+
+### P2-D2 — `settings/tests/support/mod.rs` is shared with P1, extended not replaced
+
+**Carried out by:** P2 (Task 9). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Contract** names no settings test-support module, yet P1's gate and every
+P2–P4 gate need one.
+
+**As shipped:** Task 9 added to the module P1 already created: `Reaper`,
+`EntryAllocation`, `wait_for_prefix`, `latest_allocations`,
+`latest_probe_points`, `pixel_at`, `matches`, `click`, `wait_pixel_change`,
+`dominant_colour`, `paints_something`, `client_origin`, `wait_for_window`,
+`seeded_config_dir`, `spawn_settings`, `TITLE_BAR_HEIGHT`,
+`SETTINGS_APP_ID`. Four names P1 had already taken this shape for
+(`spawn_settings`, `click`, `paints_something`, `pixel_at`'s argument type)
+collided outright with Task 9's normative signatures, so the three that could
+not simply be widened were renamed in place (`spawn_settings_process`,
+`click_fixed`, `paints_something_anywhere`), and their two P1 call sites
+(`skeleton.rs`, `outputs_pump.rs`) updated to match; `pixel_at` itself was
+widened to Task 9's `i32` signature.
+
+**Ruling.** Task 9's signatures stand as normative for P3/P4, as the plan
+requires.
+
+---
+
+### P2-D3 — three additive helpers in `pages/appearance.rs`
+
+**Carried out by:** P2 (Task 4). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Contract §2.1's extraction table** does not list `WALLPAPER_EXTENSIONS`,
+`validate_wallpaper` or `spin_px`.
+
+**As shipped:** all three are additive `pub` items in `pages/appearance.rs`,
+named here so P3/P4 can rely on them.
+
+**Ruling.** Additive, non-conflicting; no contract text changes.
+
+---
+
+### P2-D4 — `a_colour_pick_changes_the_swatch` moves from P4 to P2
+
+**Carried out by:** P2 (Task 11). **Added:** 2026-09-05.
+
+**Contract §2.8** lists this gate in P4's gate list; §5 forbids P4 from
+touching another page.
+
+**As shipped:** the gate lives in `settings/tests/appearance.rs` (Task 11);
+P4's list loses it, per §6 E4 (already recorded during the plans'
+consistency check, restated here as the amendment the plan promised).
+
+**Ruling.** P2 owns `a_colour_pick_changes_the_swatch`; P4 owns
+`apply_reaches_reload_config_on_the_mock` instead.
+
+---
+
+### P2-D5 — new integration binary `settings/tests/portal_worker.rs`
+
+**Carried out by:** P2 (Task 3). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Contract §5's P2 "Owns" list** does not name this file.
+
+**As shipped:** `settings/tests/portal_worker.rs` exists because its
+degradation proof mutates process-global environment
+(`DBUS_SESSION_BUS_ADDRESS`) and must own its process, the same reasoning
+`appearance_gtk.rs` gave for GTK's one-init-per-process rule.
+
+**Ruling.** Additive test binary; no contract text changes.
+
+---
+
+### P2-D6 — `color_dialog_button(rgba)`, not `color_dialog_button(hex_to_packed(&hex))`
+
+**Carried out by:** P2 (Task 4). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Contract §2.6's table** passes a packed `f64` into `color_dialog_button`.
+
+**As shipped:** the M3 builder is `color_dialog_button(rgba: Rgba)`
+(`ui/src/widgets/color_dialog.rs:34`), which packs internally.
+
+**Ruling.** Superseded in practice by P2-D11 below, which drops the widget
+from the page entirely; `hex_to_packed`/`packed_to_hex` remain the
+model↔handler currency.
+
+---
+
+### P2-D7 — the settings binary honours `$ICEDTEA_UI_THEME`
+
+**Carried out by:** P2 (Task 9). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Contract** does not name this knob.
+
+**As shipped:** `settings/src/main.rs`'s `sheet()` reads
+`$ICEDTEA_UI_THEME` as a path to a complete base theme file
+(`ui/src/bin/window-probe.rs:41`'s convention), with `settings/style.css`
+layered over it as the app origin; falls back to real desktop theme
+resolution when unset.
+
+**Ruling.** Per §6 E3, P2 owns and lands this knob (it runs before P3), in
+P3-D6's spelling. P3/P4 verify and consume; neither re-lands it.
+
+---
+
+### P2-D8 — the settings binary honours `ICEDTEA_SETTINGS_PAGE`
+
+**Carried out by:** P2 (Task 9). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Contract** does not name this knob.
+
+**As shipped:** `settings/src/main.rs`'s `initial_page()` reads
+`$ICEDTEA_SETTINGS_PAGE`, matching against `PageId::ALL` by name and falling
+back to `PageId::Appearance` for an empty or unknown value — the same role
+`gallery --widget` plays for the gallery binary.
+
+**Ruling.** Per §6 E3, P2 owns and lands this knob; P4 verifies and consumes,
+does not re-land it.
+
+---
+
+### P2-D9 — one contract gate name becomes three per-theme test functions
+
+**Carried out by:** P2 (Task 9). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Contract §2.8** names `appearance_page_paints_every_probe_point_at_rest` and
+`behavior_page_paints_every_probe_point_at_rest` as single gates.
+
+**As shipped:** each ships as three functions —
+`…_in_the_light_theme`/`…_in_the_dark_theme`/`…_in_the_high_contrast_theme` —
+matching `ui/tests/gallery_gate.rs`'s convention.
+
+**Ruling.** Same coverage, finer-grained failure reporting; no behaviour
+change.
+
+---
+
+### P2-D10 — `snap_gap` is a Behavior-page control writing `working.appearance.snap_gap`
+
+**Carried out by:** P2 (Task 8). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Spec §5.4 and contract §2.3's id list** put `snap_gap` on the Behavior page;
+the GTK page had it on Appearance.
+
+**As shipped:** `behavior_snap_gap` is a Behavior-page `spin_button` writing
+`icedtea_contract::Appearance::snap_gap` (the config field's on-disk location
+is unchanged).
+
+**Ruling.** UI placement moves; the config schema does not.
+
+---
+
+### P2-D11 — colour swatches are `button_from(drawing_area(..))`, not `color_dialog_button`/`color_dialog`
+
+**Carried out by:** P2 (Task 7). **Added:** 2026-09-05, in Task 11's close-out.
+
+**Contract §2.6** sketches `color_dialog_button`/`color_dialog` for the three
+palette slots and the picker.
+
+**As shipped:** both of those controllers hit-test through
+`local_rect(cx.tree, cx.node, &subnode)` against nodes the controller appends
+itself, and such nodes get **no taffy allocation** in a live tree
+(`ui/src/widgets/scrollbar.rs:309-317` and `ui/src/widgets/mod.rs:174-180`
+both state it) — neither the button's toggle nor a palette swatch's pick is
+reachable from a real pointer. `pages/appearance.rs` paints each swatch with
+`drawing_area` (M5-D6's three-argument `Prop::Draw`) inside a `button_from`,
+an ordinary clickable `View` child with a real id, a real allocation and a
+real probe point. `SettingsModel::color_picker: Option<ColorSlot>` and
+`Msg::{ColorPickerOpened(ColorSlot), ColorPickerClosed}` are added;
+`Msg::{BackgroundPicked, ForegroundPicked, AccentPicked}(f64)` keep the
+contract's shape and are emitted by the palette buttons.
+
+**Ruling.** Load-bearing: without this the colour-pick interaction gate could
+not exist at all. Verified end to end in Task 11 —
+`a_colour_pick_changes_the_swatch` clicks a real swatch through a real
+compositor and reads the repainted pixel back.
+
+---
+
+### P2-D12 — P2 edits `settings/src/app.rs` and `settings/src/main.rs`
+
+**Carried out by:** P2 (Tasks 6, 9). **Added:** 2026-09-05, in Task 11's
+close-out.
+
+**Contract §5** lists P2's "Owns" as the two page modules, `ipc/portal.rs`
+and the tests, and forbids only "other pages" and `ui/`.
+
+**As shipped:** the Appearance/Behavior `Msg` arm groups of `update`, the
+`color_picker` field on `SettingsModel`, and the two env knobs (P2-D7, P2-D8)
+are edits to `app.rs`/`main.rs`, since §2.2 puts `update` and §2.3 puts the
+root `view` there.
+
+**Ruling.** P2 touches no other arm group in either file; Behavior's own
+`Msg` arms and `RaiseOnFocusToggled` etc. are the only other page-specific
+edits, made in Task 8.
+
+---
+
+### P2-D13 — a stack page occupied layout space while inactive (fixed in P2-D17)
+
+**Carried out by:** P2 (Task 11, diagnosis; fix wave, `ui/src/widgets/stack.rs`).
+**Added:** 2026-09-05, in Task 11's close-out. **Revised:** 2026-09-05, in the
+whole-part fix wave.
+
+**Contract/spec** assume `nav`'s `Stack` + `StackSwitcher` (contract §2.3,
+`app.rs`'s `view`) hides every page but the one `visible_child` names, the
+ordinary meaning of a page switcher.
+
+**The defect.** `ui/src/widgets/stack.rs`'s own module doc said so directly —
+`StackC::set_visible`'s `hidden` class went onto every inactive page, but
+"nothing in this crate's layout or paint walkers reads the class back yet".
+`StackC::build` puts every page into one `Container::Grid { columns: 1,
+rows: 1 }`, so the pages past the first landed in taffy's *implicit* rows and
+the stack laid its five pages out **sequentially, one below the next**. A
+probe dump of the real root view showed exactly that: appearance y=34..405,
+behavior y=405..547, workspaces y=547, keybindings y=566, displays y=585,
+against a window whose negotiated client area is far shorter.
+
+**Correction to this record's original wording.** As first written, this
+deviation claimed two supporting measurements, and the second — a screencopy
+read at `behavior_raise_on_focus`'s own reported box, with Behavior active,
+showing plain window background — does not hold: the three
+`behavior_page_paints_every_probe_point_at_rest_in_the_*_theme` gates pass at
+the part's own HEAD *without* any work-around, and they cannot pass
+vacuously (`support::paints_something` returns false when every pixel of the
+rect falls outside the frame). The underlying Stack gap was real; that
+particular reading of it was not, and the P2-D14 work-around it justified has
+been withdrawn accordingly.
+
+**As shipped.** Fixed at the source in P2-D17 below, not worked around:
+`set_visible` now records `crate::widgets::set_displayed(node, visible)`
+beside the class, which is `display: none` — no space, no paint, no hit. With
+that in place a report from the running app shows every inactive page at
+`0 34 0 0` and the active one laid out normally.
+
+---
+
+### P2-D14 — WITHDRAWN: `pages::appearance::view` no longer collapses when inactive
+
+**Carried out by:** nobody. **Added:** 2026-09-05. **Withdrawn:** 2026-09-05,
+in the whole-part fix wave.
+
+**As first written** this deviation had `pages::appearance::view` return an
+empty `#appearance` box whenever `m.page != PageId::Appearance`, to keep the
+page from contributing height to P2-D13's sequential layout.
+
+**Withdrawn** for two reasons, both established by measurement: the second
+measurement P2-D13 rested on does not hold (see the correction there), and
+P2-D17 fixes the real gap in `ui/`, so no page needs to hide itself by hand.
+`pages/appearance.rs` is back to building its rows unconditionally.
+
+**What survives.** The *other* half of the same edit stays, on its own
+evidence and under its own name (P2-D18 below): while a colour slot is open,
+the page shows the 45-swatch palette panel **instead of** its nine rows
+rather than appending it as a tenth. That is about the window's height, not
+the stack's, and P2-D17 does not change it.
+
+---
+
+### P2-D15 — RESOLVED: a stack page's own content never received pointer events
+
+**Carried out by:** the fix wave (`ui/src/widgets/stack.rs`), per P2-D17.
+**Added:** 2026-09-05 as BLOCKING/unresolved. **Resolved:** 2026-09-05.
+
+**The symptom, as diagnosed in Task 11:** neither interaction gate's click
+ever reached its target — after a click computed from the target's own fresh
+`alloc` line, `update` logged no further `msg` line at all.
+
+**The cause,** found in the fix wave and more specific than Task 11's
+"`Kind::Stack` does not route pointer events": `window::pointer::descend`
+visits children in reverse tree order and `break`s on the first child whose
+border box contains the point, returning `true` for *containing* it whether
+or not a deeper target was found. Combined with P2-D13 — pages laid out
+sequentially, boxes overlapping the window and each other — the walk
+terminated inside the wrong page and the active page's control never entered
+the hit chain. Nothing about `deliver`'s `aim` closure or `StackC::on_event`
+was at fault; both were downstream of a hit chain that never reached the
+control. With P2-D17 in place, a live trace of the running app shows the
+chain resolving as `["box", "stack", "stackpage", "grid", "switch"]` and the
+fold happening.
+
+**Ruling.** Closed. Both of Task 11's interaction gates are committed and
+green.
+
+---
+
+### P2-D16 — a cancelled file chooser does not latch Browse off
+
+**Carried out by:** the fix wave (`settings/src/ipc/portal.rs`,
+`settings/src/app.rs`). **Added:** 2026-09-05.
+
+**Contract §2.6** describes one failure path: `Msg::WallpaperPickerFailed`
+sets `portal_available = false`, which greys Browse for the session.
+
+**The defect.** `response_to_outcome` mapped portal response `1` — "the user
+cancelled" — to the same `Err` as "no portal at all", the worker turned every
+`Err` into `WallpaperPickerFailed`, and that arm latched. Pressing Escape in
+a file chooser that works perfectly therefore disabled Browse permanently.
+§2.6's latch was written for "the portal is unavailable"; a cancel is not
+that.
+
+**As shipped.** `response_to_outcome` returns a three-state
+`PortalOutcome { Chosen(PathBuf), Cancelled, Failed(String) }`. The worker
+maps them to `Msg::WallpaperChosen`, a new `Msg::WallpaperPickerCancelled`
+and `Msg::WallpaperPickerFailed`. The new arm sets the status line only;
+`portal_available` still latches on `Failed`, exactly as §2.6 says, and the
+`Entry` beside the button remains authoritative in every case.
+
+**Ruling.** Accepted as an amendment to §2.6: the latch text now governs the
+*unavailable* state, and cancellation is a third state §2.6 did not name.
+
+---
+
+### P2-D17 — `StackC` honours its own `hidden` class (a `ui/` fix, §6 E6 exception)
+
+**Carried out by:** the fix wave (`ui/src/widgets/stack.rs`). **Added:**
+2026-09-05.
+
+**Contract §5 and §7 E6** give `ui/` to P0 and enumerate the app parts allowed
+to touch it. P2 was not among them, and the Global Constraints forbid it.
+
+**Why the exception.** P2-D13 and P2-D15 are one defect in `StackC`, and it
+has no fix inside a settings page: a page cannot make the *other* pages stop
+taking space or stop swallowing the hit test, and restructuring `app.rs`'s
+shared `nav`/`stack`/`footer` wiring is outside the arm groups P2-D12 grants.
+Nothing before P2 could have caught it either — `ui/tests/gallery_gate.rs` and
+`interaction_gate.rs` do not use `Kind::Stack`, and `settings/tests/skeleton.rs`
+only clicks `nav` and the footer, both *siblings* of the stack. P2's own two
+interaction gates are the first tests anywhere in M1–M5 to click a control
+living inside an active stack page.
+
+**As shipped.** `set_visible` records `crate::widgets::set_displayed(node,
+visible)` alongside the `hidden` class, so an inactive page is `display:
+none`: taffy gives it `Display::None`, `view::render` skips painting it, and
+`window::pointer::descend` skips it because its border box is empty. One new
+unit test, `widgets::stack::tests::an_inactive_page_takes_no_space`, pins it
+(mutation-checked: drop the `set_displayed` call and the inactive page lays
+out at full size below the active one). No public API changes; no other
+widget, gate or fixture changes.
+
+**Ruling.** Accepted, and recorded in §6 E6's table as P2's single `ui/`
+exception. `notebook.rs` carries the same class-only bookkeeping for its own
+pages and is deliberately left alone: no part of M5 clicks inside a notebook
+page, and changing it is a `ui/` part's call.
+
+---
+
+### P2-D18 — the palette panel replaces the page's rows while a slot is open
+
+**Carried out by:** P2 (Task 11). **Added:** 2026-09-05 (as the surviving half
+of the original P2-D14).
+
+**Contract §2.6** shows the picker as an extra row on the Appearance page.
+
+**As shipped.** A picker is 45 swatches over 9 rows, and the window never
+grows past its negotiated surface size (`render_once` sizes the paint surface
+to the window's own `size`, not the tree's natural size, so content beyond it
+is allocated but never painted). Appended below the page's other rows, the
+panel starts at roughly the y those rows already reach, and its lower rows
+are invisible and unclickable. `view` therefore returns the panel *instead of*
+the rows while `m.color_picker` names a slot. No id changes:
+`opening_a_slot_reveals_the_palette_panel` and
+`the_page_carries_every_id_its_gates_address` pass unmodified, and the
+rest-state gates never open a picker.
+
+**Ruling.** Accepted; independent of P2-D17, which is about the stack's
+height, not the window's.
+
+---
+
+### P2-D19 — the two interaction gates run untheméd, on a 180s pixel budget
+
+**Carried out by:** the fix wave (`settings/tests/support/mod.rs`,
+`settings/tests/appearance.rs`). **Added:** 2026-09-05.
+
+**The plan** spells both interaction gates with the same `spawn_settings(...,
+"light", ...)` the rest-state gates use, and a two-second pixel budget.
+
+**The measurement.** Instrumenting `ui/src/view/app.rs`'s loop with a
+timestamp either side of `window.paint_with` shows this window takes **~17.9s
+to paint one frame** in the debug profile the harness builds (17.87s ± 0.02
+across consecutive frames), and that every pointer event arriving during a
+paint is delivered in one batch afterwards. The cost is the surface's, not
+the theme's: it is the same with a complete bundled Adwaita sheet and with
+none. A click-then-repaint round trip therefore costs up to two of those.
+
+**As shipped.** `spawn_settings` treats an empty `theme` as "leave
+`$ICEDTEA_UI_THEME` unset" and the two interaction gates pass `""` — neither
+asserts on a themed colour (one reads a `drawing_area`'s raw rgba, the other
+only that the switch's pixel changed at all), and `skeleton.rs`'s own
+clicking gate already runs that way. `PIXEL_CHANGE_BUDGET` is 180s and the
+gates' own `wait_for_prefix` budgets are 180s, four frames' headroom rather
+than one. Both gates additionally wait for `update`'s own `msg <variant>`
+line before reading a pixel, so the pixel read never races a half-finished
+transition; that strengthens the gates rather than weakening them, since
+every assertion is still the pixel read the plan asked for.
+
+**One assertion changed shape.** `toggling_raise_on_focus_repaints_the_switch_and_the_footer`
+read Apply's own pixel for the footer half. Apply's only visible change here
+is sensitive-versus-insensitive, whose two fills are 4 bytes apart — inside
+`SCREENCOPY_TOLERANCE` (12), which exists because the output goes through a
+format conversion — so that read could not fail in either direction and was
+not a test. The gate now pixel-asserts the *switch's* repaint (its trough
+changes colour outright) and asserts the footer through `footer_text`'s own
+published `status Unsaved changes` line, which the tolerance cannot swallow.
+
+---
+
+### M5-D2 note — `Inbox<Msg>::try_recv`
+
+Task 11 checked whether Task 3's portal worker needed a public `try_recv`
+added to `Inbox<Msg>` beyond what P0 shipped. It did not:
+`ui/src/view/inbox.rs:134`'s `pub fn try_recv(&self) -> Option<Msg>` already
+exists from P0, and `settings/tests/portal_worker.rs`'s degradation proof
+(Task 3) uses it as shipped.
+
+---
+
+### P2-D20 — the fix wave's four carried-over minors
+
+**Carried out by:** the fix wave. **Added:** 2026-09-05.
+
+Four items earlier parts' reviews flagged as deferred, closed here because
+this wave touches their files:
+
+* **`settings/src/main.rs`'s dead `with_probe_report` wiring** (P1) — `App::new`
+  already reads `$ICEDTEA_PROBE_REPORT` (P0-D4), so the explicit
+  `if let Some(path) = probe::report_path() { app = app.with_probe_report(path) }`
+  set the same field twice. Deleted, with the now-unused `probe` import.
+* **`settings/src/ipc/reload.rs`'s `.expect` on the worker thread spawn** —
+  panicked the app at boot under thread exhaustion while §2.4 asks the worker
+  to degrade. `reload::spawn` now returns `Option<JoinHandle<()>>`, logging
+  and returning `None`; `ipc::spawn` drops it either way, and the caller's
+  `Sender` simply never answers. `portal::spawn` is the same shape and is
+  handled identically, as the review asked.
+* **`futures-util` in `settings/Cargo.toml`** — added by P1's Task 6b, which
+  §2.1's dependency list does not name. Recorded, not removed: it is what
+  P1's `ConfigReloaded` watcher consumes the signal stream with.
+* **`settings/tests/no_gtk.rs`'s vacuous pass** — left as P1 shipped it. This
+  wave does not touch that file, and rewriting a gate P2 does not own would
+  be a scope breach; it stays on the ledger for whoever owns it next.
+
+---
