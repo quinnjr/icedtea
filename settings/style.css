@@ -6,3 +6,12 @@
 #footer {
   border-top: 1px solid alpha(currentColor, 0.15);
 }
+
+/* A keybinding bound to more than one action. Advisory only: conflicts
+   never block Apply (M5 spec §5.4). Replaces the GTK
+   `install_conflict_css` provider, which loaded the same declaration at
+   STYLE_PROVIDER_PRIORITY_APPLICATION. */
+.conflict {
+    color: #f38ba8;
+    font-weight: bold;
+}

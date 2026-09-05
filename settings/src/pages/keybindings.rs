@@ -8,23 +8,75 @@
 //! tracks the Workspaces page's row count.
 
 use icedtea_config::KeyCombo;
+use icedtea_ui::view::View;
+use icedtea_ui::view::builders::{BoxExt, box_, scrolled_window};
+use icedtea_ui::widgets::Orientation;
+use icedtea_ui::widgets::button::button;
+use icedtea_ui::widgets::label::{LabelExt, label};
 use icedtea_ui::window::keyboard::{KeyEvent, Mods};
 
-use crate::app::Msg;
+use crate::app::{Msg, SettingsModel};
 use crate::model::CaptureMods;
 
-/// The Keybindings page.
+/// The Keybindings page body.
 ///
-/// P1 ships the page's frame only; P3 fills it in (contract §2.6).
+/// Pure: it reads `m.model.working.keybindings`, `m.capturing` and
+/// `m.conflicts`, and never writes. The action set is recomputed from
+/// `working.workspace_names.len()` on every call, which is why the GTK
+/// `RebuildSlot` forward-reference between this page and the Workspaces
+/// page disappears -- this page cannot go stale.
+///
+/// Rows are keyed by action, so adding a workspace inserts two rows without
+/// rebuilding (and re-arming) any of the others.
 #[must_use]
-pub fn view(m: &crate::app::SettingsModel) -> icedtea_ui::view::View<crate::app::Msg> {
-    let _ = m;
-    icedtea_ui::view::builders::box_(
-        icedtea_ui::widgets::types::Orientation::Vertical,
-        [icedtea_ui::view::builders::label("Keybindings")],
+pub fn view(m: &SettingsModel) -> View<Msg> {
+    let cfg = &m.model.working;
+    let rows: Vec<View<Msg>> = action_list(cfg.workspace_names.len())
+        .into_iter()
+        .map(|action| {
+            let text = cfg
+                .keybindings
+                .get(&action)
+                .map_or_else(|| "(unbound)".to_string(), format_combo);
+            let colliding = m
+                .conflicts
+                .iter()
+                .any(|(_, actions)| actions.contains(&action));
+            let mut combo = label(&text)
+                .id(&format!("kb_combo_{action}"))
+                .width_chars(20)
+                .xalign(0.0)
+                .hexpand(true);
+            if colliding {
+                combo = combo.classes(&["conflict"]);
+            }
+            let armed = m.capturing.as_deref() == Some(action.as_str());
+            let set_label = if armed { "Press a key…" } else { "Set" };
+            let armed_action = action.clone();
+            box_(
+                Orientation::Horizontal,
+                [
+                    label(&action).width_chars(24).xalign(0.0),
+                    combo,
+                    button(set_label)
+                        .id(&format!("kb_set_{action}"))
+                        .on_click(Msg::CaptureArmed(armed_action)),
+                ],
+            )
+            .spacing(12)
+            .key(action.clone())
+            .id(&format!("kb_row_{action}"))
+        })
+        .collect();
+
+    scrolled_window(
+        box_(Orientation::Vertical, rows)
+            .spacing(4)
+            .margin(16, 16, 16, 16),
     )
-    .id("keybindings_page")
-    .margin(16, 16, 16, 16)
+    .id("keybindings_list")
+    .vexpand(true)
+    .hexpand(true)
 }
 
 /// The fixed part of the action set -- always present regardless of
@@ -626,5 +678,203 @@ mod tests {
         .expect("write");
         let text = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(text, "probe root 10 20\nbinding close - KEY_a\n");
+    }
+
+    use icedtea_ui::css::cascade::{CompiledSheet, cascade};
+    use icedtea_ui::css::node::Node;
+    use icedtea_ui::css::registry::Prop as CssProp;
+    use icedtea_ui::css::select::MatchCx;
+    use icedtea_ui::view::{EventKind, Kind, Prop, PropName};
+
+    /// A `SettingsModel` on a throwaway db, with `workspace_names` set so
+    /// `action_list`'s generated rows are predictable.
+    fn model_with_workspaces(count: usize) -> crate::app::SettingsModel {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.redb");
+        let (inbox, tx) = icedtea_ui::view::Inbox::new().expect("inbox");
+        let workers = crate::ipc::spawn(tx);
+        let mut m = crate::app::SettingsModel::new(db_path, workers);
+        m.model.working.workspace_names = (1..=count).map(|n| n.to_string()).collect();
+        drop(inbox);
+        m
+    }
+
+    /// One keyed row per `action_list` entry, with the three ids the gates
+    /// address and the `CaptureArmed` message the Set button emits.
+    ///
+    /// Mutation check: key the rows by index instead of by action; the key
+    /// assertion fails. Restore.
+    #[test]
+    fn one_keyed_row_per_action_with_its_own_ids() {
+        let m = model_with_workspaces(2);
+        let page = view(&m);
+        assert_eq!(page.kind, Kind::ScrolledWindow);
+        assert_eq!(page.props.str(PropName::Id), Some("keybindings_list"));
+
+        let rows = &page.children[0].children;
+        let actions = action_list(2);
+        assert_eq!(rows.len(), actions.len(), "one row per action");
+
+        for (row, action) in rows.iter().zip(actions.iter()) {
+            assert_eq!(
+                row.props.str(PropName::Id),
+                Some(format!("kb_row_{action}").as_str())
+            );
+            assert_eq!(
+                row.key,
+                Some(icedtea_ui::view::Key::Name(action.as_str().into()))
+            );
+            assert_eq!(
+                row.children[0].props.str(PropName::Label),
+                Some(action.as_str())
+            );
+            assert_eq!(
+                row.children[1].props.str(PropName::Id),
+                Some(format!("kb_combo_{action}").as_str())
+            );
+
+            let set = &row.children[2];
+            assert_eq!(
+                set.props.str(PropName::Id),
+                Some(format!("kb_set_{action}").as_str())
+            );
+            let armed = set
+                .handlers
+                .fire_unit(EventKind::Click)
+                .expect("Set emits a Click");
+            assert!(
+                matches!(&armed, Msg::CaptureArmed(a) if a == action),
+                "row {action} emitted {armed:?}"
+            );
+        }
+    }
+
+    /// The combo label shows `format_combo` when bound and `(unbound)` when
+    /// not -- `sync_rows`' two branches, now computed.
+    ///
+    /// Mutation check: drop the `(unbound)` branch and render an empty
+    /// string; this fails. Restore.
+    #[test]
+    fn the_combo_label_shows_the_binding_or_unbound() {
+        let mut m = model_with_workspaces(1);
+        m.model.working.keybindings.insert(
+            "close".to_string(),
+            icedtea_config::KeyCombo {
+                modifiers: vec!["SUPER".to_string()],
+                key: "KEY_q".to_string(),
+            },
+        );
+        m.model.working.keybindings.remove("quit");
+
+        let page = view(&m);
+        let rows = &page.children[0].children;
+        let combo_of = |action: &str| -> String {
+            rows.iter()
+                .find(|r| r.props.str(PropName::Id) == Some(format!("kb_row_{action}").as_str()))
+                .and_then(|r| r.children[1].props.str(PropName::Label))
+                .expect("a combo label")
+                .to_string()
+        };
+        assert_eq!(combo_of("close"), "SUPER+q");
+        assert_eq!(combo_of("quit"), "(unbound)");
+    }
+
+    /// The armed row's Set button says so; every other row still says "Set".
+    ///
+    /// Mutation check: always render "Set"; this fails. Restore.
+    #[test]
+    fn the_armed_rows_button_prompts_for_a_key() {
+        let mut m = model_with_workspaces(1);
+        m.capturing = Some("fullscreen".to_string());
+        let page = view(&m);
+        let rows = &page.children[0].children;
+        let label_of = |action: &str| -> String {
+            rows.iter()
+                .find(|r| r.props.str(PropName::Id) == Some(format!("kb_row_{action}").as_str()))
+                .and_then(|r| r.children[2].props.str(PropName::Label))
+                .expect("a Set button label")
+                .to_string()
+        };
+        assert_eq!(label_of("fullscreen"), "Press a key…");
+        assert_eq!(label_of("close"), "Set");
+    }
+
+    /// A conflicting binding's combo label carries the `conflict` class; a
+    /// clean one does not. This is what replaces `install_conflict_css`.
+    ///
+    /// Mutation check: add the class unconditionally; the `close` assertion
+    /// fails. Restore.
+    #[test]
+    fn a_conflicting_row_carries_the_conflict_class() {
+        let mut m = model_with_workspaces(1);
+        let combo = icedtea_config::KeyCombo {
+            modifiers: vec![],
+            key: "KEY_a".to_string(),
+        };
+        m.model
+            .working
+            .keybindings
+            .insert("close".to_string(), combo.clone());
+        m.model
+            .working
+            .keybindings
+            .insert("quit".to_string(), combo.clone());
+        m.conflicts = crate::model::duplicate_bindings(&m.model.working);
+
+        let page = view(&m);
+        let rows = &page.children[0].children;
+        let classes_of = |action: &str| -> Vec<String> {
+            rows.iter()
+                .find(|r| r.props.str(PropName::Id) == Some(format!("kb_row_{action}").as_str()))
+                .and_then(|r| match r.children[1].props.get(PropName::Classes) {
+                    Some(Prop::Classes(list)) => Some(list.iter().map(|c| c.to_string()).collect()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        assert!(classes_of("close").contains(&"conflict".to_string()));
+        assert!(classes_of("quit").contains(&"conflict".to_string()));
+        assert!(
+            !classes_of("reload").contains(&"conflict".to_string()),
+            "an unconflicted row is not flagged"
+        );
+    }
+
+    /// The settings sheet actually styles that class: a `label.conflict`
+    /// wins a `color` declaration a plain `label` does not, once
+    /// `settings/style.css` is layered over the Adwaita stack the way
+    /// `main.rs` layers it.
+    ///
+    /// Mutation check: delete the `.conflict` rule from `settings/style.css`;
+    /// this fails with equal winners. Restore.
+    #[test]
+    fn the_settings_sheet_colours_a_conflicting_binding() {
+        let css = format!(
+            "{}\n{}",
+            icedtea_ui::BUNDLED_ADWAITA_LIGHT,
+            include_str!("../../style.css")
+        );
+        let sheet = CompiledSheet::compile(&css);
+        let mut cx = MatchCx::new();
+        let window = Node::with_classes("window", &["background"]);
+        let plain = Node::new("label");
+        let flagged = Node::with_classes("label", &["conflict"]);
+        window.append_child(&plain);
+        window.append_child(&flagged);
+
+        let plain_color = cascade(&sheet, &plain, &mut cx)
+            .winner(CssProp::Color)
+            .cloned();
+        let flagged_color = cascade(&sheet, &flagged, &mut cx)
+            .winner(CssProp::Color)
+            .cloned();
+        assert!(
+            flagged_color.is_some(),
+            "the .conflict rule declares a colour"
+        );
+        assert_ne!(
+            plain_color, flagged_color,
+            "a conflicting label must not resolve to the ordinary label colour"
+        );
     }
 }

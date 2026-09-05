@@ -184,6 +184,11 @@ pub enum Msg {
     WorkspaceRemoved(usize),
 
     // --- Keybindings (P3) --------------------------------------------------
+    /// The Keybindings page's per-row Set button, by action string. Task 6
+    /// only needs the variant to exist so `pages::keybindings::view` can
+    /// emit it from the Set button; the arm that arms `m.capturing` is
+    /// Task 7's (contract §2.7).
+    CaptureArmed(String),
     /// The window-root capture handler resolved the pressed key and decided
     /// it wasn't Escape (contract §2.7, Task 4). The full arm that stores it
     /// into `m.model.working.keybindings` lands in Task 7; for now `update`
@@ -486,11 +491,11 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             pages::workspaces::remove_workspace(&mut m.model.working, index);
             Cmd::None
         }
-        // Task 4 (`capture_key`) only needs `Msg` to carry these two
-        // variants so its return type compiles; the arms that actually
-        // store a binding / clear `m.capturing` are Task 7's (contract
-        // §2.7, deviation P3-D1).
-        Msg::KeyCaptured { .. } | Msg::CaptureCancelled => Cmd::None,
+        // Task 4 (`capture_key`) and Task 6 (the Set button) only need
+        // `Msg` to carry these three variants so their return types
+        // compile; the arms that actually arm/store/cancel a capture are
+        // Task 7's (contract §2.7, deviation P3-D1).
+        Msg::CaptureArmed(_) | Msg::KeyCaptured { .. } | Msg::CaptureCancelled => Cmd::None,
     };
     crate::probe::report(&format!("page {}", m.page.name()));
     crate::probe::report(&format!("status {}", footer_text(m)));
