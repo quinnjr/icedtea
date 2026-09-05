@@ -6,7 +6,7 @@
 //! here blocks: `drain` dispatches what is already buffered and reads only if
 //! that dispatched nothing, exactly as `protocol.rs:367-379` does.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use icedtea_ui::window::{Interest, WatchId, Window};
@@ -20,6 +20,14 @@ pub struct OutputsPump {
     conn: Rc<RefCell<OutputsConnection>>,
     rx: async_channel::Receiver<OutputsMsg>,
     watch: WatchId,
+    /// Latched the first time a dispatch or read errors. A dead socket stays
+    /// POLLIN-ready forever — the toolkit reports HUP/ERR and never retires a
+    /// foreign fd on its own (`ui/src/window/mod.rs`) — so without this a
+    /// second wake would dispatch-error, warn and re-emit `Disconnected`
+    /// again, and again. `update`'s `Disconnected` arm answers with
+    /// `Cmd::Unwatch`; this latch is the belt to that pair of braces, and
+    /// covers the window between the error and the unwatch landing.
+    dead: Rc<Cell<bool>>,
 }
 
 impl OutputsPump {
@@ -59,6 +67,7 @@ impl OutputsPump {
             conn: Rc::new(RefCell::new(conn)),
             rx,
             watch,
+            dead: Rc::new(Cell::new(false)),
         }))
     }
 
@@ -68,10 +77,36 @@ impl OutputsPump {
         self.watch
     }
 
+    /// True once the output-management global was bound.
+    ///
+    /// `attach` roundtrips twice, so this is final by the time the pump
+    /// exists: a compositor with no `zwlr_output_manager_v1` yields `false`
+    /// and the model must start with the Displays page out of service rather
+    /// than optimistically available, because the corrective
+    /// `ManagerUnavailable` is queued *before* the loop starts and no further
+    /// event will ever arrive to carry it.
+    #[must_use]
+    pub fn manager_present(&self) -> bool {
+        self.conn.borrow().manager_present()
+    }
+
+    /// True once a dispatch or read has errored and the pump latched shut.
+    #[must_use]
+    pub fn is_dead(&self) -> bool {
+        self.dead.get()
+    }
+
     /// The `App::on_fd` body: dispatch, then fold every queued protocol
     /// message into a `Msg`. Never blocks, never `blocking_dispatch`.
+    ///
+    /// Once the connection has errored the pump is latched and every later
+    /// call is a no-op returning no messages — the dead fd never warn-spams
+    /// and never re-emits `Disconnected`.
     #[must_use]
     pub fn drain(&self) -> Vec<Msg> {
+        if self.dead.get() {
+            return Vec::new();
+        }
         {
             let mut conn = self.conn.borrow_mut();
             let dispatched = conn.dispatch_pending();
@@ -81,6 +116,7 @@ impl OutputsPump {
             };
             if let Err(err) = outcome {
                 tracing::warn!(%err, "the outputs connection died");
+                self.dead.set(true);
                 conn.notify_disconnected();
             }
         }
@@ -95,6 +131,9 @@ impl OutputsPump {
     /// arrives as `OutputsMsg::ApplySucceeded { is_test: true }` or its
     /// failure/cancel siblings.
     pub fn test_configuration(&self, edits: &[HeadEdit]) {
+        if self.dead.get() {
+            return;
+        }
         if let Err(err) = self.conn.borrow_mut().test_configuration(edits) {
             tracing::warn!(?err, "test configuration could not be sent");
         }
@@ -104,6 +143,9 @@ impl OutputsPump {
     /// Apply a configuration. Same fire-and-forget shape as
     /// [`OutputsPump::test_configuration`].
     pub fn build_and_send_configuration(&self, edits: &[HeadEdit]) {
+        if self.dead.get() {
+            return;
+        }
         if let Err(err) = self.conn.borrow_mut().build_and_send_configuration(edits) {
             tracing::warn!(?err, "configuration could not be sent");
         }
@@ -113,6 +155,9 @@ impl OutputsPump {
     /// Push queued requests out. The toolkit's loop flushes its own
     /// connection, never this one.
     pub fn flush(&self) {
+        if self.dead.get() {
+            return;
+        }
         if let Err(err) = self.conn.borrow().flush() {
             tracing::warn!(%err, "flushing the outputs connection failed");
         }

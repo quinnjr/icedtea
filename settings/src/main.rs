@@ -60,6 +60,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let seed_tx = tx.clone();
     let workers = ipc::spawn(tx);
 
     // A missing output-management global is not fatal: the Displays page
@@ -69,6 +70,22 @@ fn main() {
         None
     });
     let watch = pump.as_ref().map(OutputsPump::watch);
+
+    // `OutputsConnection::from_connection` roundtrips twice inside `attach`,
+    // so the initial enumeration — a `HeadsChanged`, or `ManagerUnavailable` —
+    // is already queued before the loop exists. `App::on_fd` only ever fires on
+    // an `InputEvent::FdReady`, and after those roundtrips the socket is quiet,
+    // so nothing would wake it: seed the inbox with that first drain instead of
+    // stranding it. The inbox is an fd of its own, so the messages are folded
+    // on the loop's first pass.
+    if let Some(pump) = pump.as_ref() {
+        for msg in pump.drain() {
+            if seed_tx.send(msg).is_err() {
+                tracing::warn!("the inbox is gone; the initial outputs enumeration was dropped");
+                break;
+            }
+        }
+    }
 
     let model = SettingsModel::new(default_db_path(), workers).with_outputs(pump.clone());
     let mut app = App::new(model, update, view).with_inbox(inbox);

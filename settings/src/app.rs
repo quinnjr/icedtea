@@ -87,7 +87,15 @@ impl SettingsModel {
     /// Attach the outputs connection, if the window got one.
     #[must_use]
     pub fn with_outputs(mut self, pump: Option<crate::outputs::pump::OutputsPump>) -> Self {
-        self.outputs_available = pump.is_some();
+        // `manager_present()`, not `is_some()`: a connection with no
+        // `zwlr_output_manager_v1` queues its `ManagerUnavailable` during
+        // `attach`, before the loop exists, and nothing on a quiet socket will
+        // ever wake the fd to deliver it. Starting optimistically available
+        // would leave the page permanently lying. (`main` also seeds the loop
+        // with `pump.drain()` so the initial enumeration itself is not lost.)
+        self.outputs_available = pump
+            .as_ref()
+            .is_some_and(crate::outputs::pump::OutputsPump::manager_present);
         self.outputs = pump;
         self
     }
@@ -176,74 +184,100 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             m.status = "Compositor reloaded its configuration".to_string();
             Cmd::None
         }
-        Msg::Outputs(update) => {
-            match &*update {
-                crate::outputs::OutputsMsg::HeadsChanged(heads) => {
-                    let r = crate::pages::displays::state::reconcile(
-                        &m.displays.heads,
-                        &m.displays.edits,
-                        m.displays.selected,
-                        m.displays.dirty,
-                        heads,
-                    );
-                    m.displays.heads = heads.clone();
-                    m.displays.edits = r.edits;
-                    m.displays.selected = r.selected;
-                    // A drag was indexed against the *old* head list; the new
-                    // one may be shorter or reordered (finding #2).
-                    m.displays.drag = None;
-                    if !r.compatible {
-                        // A genuine set change re-baselines, so nothing is
-                        // unsaved any more.
-                        m.displays.dirty = false;
-                    }
-                    m.outputs_available = true;
-                    m.displays_status = if r.dropped {
-                        "Displays changed \u{2014} pending edits discarded".to_string()
-                    } else {
-                        String::new()
-                    };
+        Msg::Outputs(update) => match &*update {
+            crate::outputs::OutputsMsg::HeadsChanged(heads) => {
+                let r = crate::pages::displays::state::reconcile(
+                    &m.displays.heads,
+                    &m.displays.edits,
+                    m.displays.selected,
+                    m.displays.dirty,
+                    heads,
+                );
+                m.displays.heads = heads.clone();
+                m.displays.edits = r.edits;
+                m.displays.selected = r.selected;
+                // A drag was indexed against the *old* head list; the new
+                // one may be shorter or reordered (finding #2).
+                m.displays.drag = None;
+                if !r.compatible {
+                    // A genuine set change re-baselines, so nothing is
+                    // unsaved any more.
+                    m.displays.dirty = false;
                 }
-                crate::outputs::OutputsMsg::ApplySucceeded { is_test } => {
-                    m.displays_in_flight = false;
-                    if *is_test {
-                        // A preview succeeded: keep the edits so the user can
-                        // commit them.
-                        m.displays_status = "Test succeeded".to_string();
-                    } else {
-                        m.displays.dirty = false;
-                        m.displays_status = "Applied".to_string();
-                    }
+                m.outputs_available = true;
+                m.displays_status = if r.dropped {
+                    "Displays changed \u{2014} pending edits discarded".to_string()
+                } else {
+                    String::new()
+                };
+                Cmd::None
+            }
+            crate::outputs::OutputsMsg::ApplySucceeded { is_test } => {
+                m.displays_in_flight = false;
+                if *is_test {
+                    // A preview succeeded: keep the edits so the user can
+                    // commit them.
+                    m.displays_status = "Test succeeded".to_string();
+                } else {
+                    m.displays.dirty = false;
+                    m.displays_status = "Applied".to_string();
                 }
-                crate::outputs::OutputsMsg::ApplyFailed { is_test } => {
-                    m.displays_in_flight = false;
-                    if *is_test {
-                        m.displays_status = "Test rejected by the compositor".to_string();
-                    } else {
-                        // Re-baseline: the compositor kept its own layout.
-                        m.displays.edits = m
-                            .displays
-                            .heads
-                            .iter()
-                            .map(crate::pages::displays::state::baseline_edit)
-                            .collect();
-                        m.displays.dirty = false;
-                        m.displays_status = "Configuration rejected by the compositor".to_string();
-                    }
+                Cmd::None
+            }
+            crate::outputs::OutputsMsg::ApplyFailed { is_test } => {
+                m.displays_in_flight = false;
+                if *is_test {
+                    m.displays_status = "Test rejected by the compositor".to_string();
+                } else {
+                    // Re-baseline: the compositor kept its own layout.
+                    m.displays.edits = m
+                        .displays
+                        .heads
+                        .iter()
+                        .map(crate::pages::displays::state::baseline_edit)
+                        .collect();
+                    m.displays.dirty = false;
+                    m.displays_status = "Configuration rejected by the compositor".to_string();
                 }
-                crate::outputs::OutputsMsg::ApplyCancelled => {
-                    m.displays_in_flight = false;
-                    m.displays_status = "Configuration superseded \u{2014} re-reading".to_string();
-                }
-                crate::outputs::OutputsMsg::ManagerUnavailable
-                | crate::outputs::OutputsMsg::Disconnected => {
-                    m.displays_in_flight = false;
-                    m.outputs_available = false;
-                    m.displays_status = String::new();
+                Cmd::None
+            }
+            crate::outputs::OutputsMsg::ApplyCancelled => {
+                m.displays_in_flight = false;
+                m.displays_status = "Configuration superseded \u{2014} re-reading".to_string();
+                Cmd::None
+            }
+            crate::outputs::OutputsMsg::ManagerUnavailable => {
+                // The connection is alive; only the global is missing.
+                // Keep watching the fd — nothing is spinning.
+                m.displays_in_flight = false;
+                m.outputs_available = false;
+                m.displays_status = String::new();
+                Cmd::None
+            }
+            crate::outputs::OutputsMsg::Disconnected => {
+                m.displays_in_flight = false;
+                m.outputs_available = false;
+                m.displays_status = String::new();
+                // The socket is dead, and a dead fd is *permanently*
+                // readable: the toolkit reports readiness and never
+                // retires a foreign fd itself (`ui/src/window/mod.rs` —
+                // "the toolkit never decides on its own that a foreign fd
+                // is dead. It reports, and the owner calls
+                // `Window::unwatch`"). Left watched, every poll wake would
+                // dispatch-error, warn, re-emit `Disconnected` and
+                // re-render, forever. `Cmd::Unwatch` (P0-D7) is the way
+                // out; the pump also latches shut so the interval before
+                // this lands stays quiet.
+                match m
+                    .outputs
+                    .as_ref()
+                    .map(crate::outputs::pump::OutputsPump::watch)
+                {
+                    Some(watch) => Cmd::Unwatch(watch),
+                    None => Cmd::None,
                 }
             }
-            Cmd::None
-        }
+        },
     };
     crate::probe::report(&format!("page {}", m.page.name()));
     crate::probe::report(&format!("status {}", footer_text(m)));
@@ -522,18 +556,22 @@ mod tests {
         assert_eq!(m.displays.selected, Some(0));
     }
 
+    /// Neither arm can unwatch anything with no pump attached — the id lives
+    /// on the pump. `Disconnected`'s `Cmd::Unwatch` is gated on a real pump in
+    /// `tests/outputs_pump.rs`.
     #[test]
     fn losing_the_manager_or_the_connection_takes_the_page_out_of_service() {
         for msg in [OutputsMsg::ManagerUnavailable, OutputsMsg::Disconnected] {
             let (mut m, _dir) = model();
             m.outputs_available = true;
             m.displays_in_flight = true;
-            update(&mut m, Msg::Outputs(Arc::new(msg)));
+            let cmd = update(&mut m, Msg::Outputs(Arc::new(msg)));
             assert!(!m.outputs_available);
             assert!(
                 !m.displays_in_flight,
                 "an in-flight request can never complete now"
             );
+            assert!(matches!(cmd, icedtea_ui::view::Cmd::None));
         }
     }
 
