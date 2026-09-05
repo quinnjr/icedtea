@@ -315,6 +315,14 @@ fn typing_into_a_search_entry_fires_one_search_after_the_delay() {
 /// point `PEEK_WIDTH_PX / 2` in from the right border edge is inside the band
 /// whatever that padding is.
 ///
+/// The bands are read with [`settled_row`], not with the first capture that
+/// differs: the first click also focuses the entry, and the focus ring fades
+/// in over its own frames, so a band read the instant it moves can carry a
+/// half-drawn ring in its two border pixels. The first and third bands are
+/// compared for *equality*, which is exactly the comparison an intermediate
+/// band breaks — observed once the dev profile's optimised `skia-rs` made the
+/// repaint fast enough for the poll to land inside the fade.
+///
 /// Mutation check: drop `self.edit.visibility = self.peek;` from
 /// `PasswordEntryC::on_event`'s peek arm; the *second* assertion below fails
 /// ("a second peek must hide the text again"). Note that the first one still
@@ -336,23 +344,26 @@ fn peeking_a_password_entry_reveals_the_text() {
         (alloc.y + alloc.height / 2.0) as i32,
     );
 
-    let masked = driver.row(x0, x1, y);
+    let masked = settled_row(&mut driver, x0, x1, y);
     driver.click(px, py);
-    let revealed = driver.wait_row_change(x0, x1, y, &masked);
+    driver.wait_row_change(x0, x1, y, &masked);
+    let revealed = settled_row(&mut driver, x0, x1, y);
     assert!(
         !support::row_matches(&revealed, &masked),
         "the peek icon revealed nothing: the text stayed {masked:?}"
     );
 
     driver.click(px, py);
-    let remasked = driver.wait_row_change(x0, x1, y, &revealed);
+    driver.wait_row_change(x0, x1, y, &revealed);
+    let remasked = settled_row(&mut driver, x0, x1, y);
     assert!(
         !support::row_matches(&remasked, &revealed),
         "a second peek must hide the text again; it stayed {revealed:?}"
     );
 
     driver.click(px, py);
-    let revealed_again = driver.wait_row_change(x0, x1, y, &remasked);
+    driver.wait_row_change(x0, x1, y, &remasked);
+    let revealed_again = settled_row(&mut driver, x0, x1, y);
     assert!(
         support::row_matches(&revealed_again, &revealed),
         "peek is a toggle: the third click must render exactly what the first \
@@ -473,6 +484,18 @@ fn dragging_a_scale_moves_the_slider_and_reports_the_value() {
 /// so a single pixel inside a row cannot tell an open list from no list —
 /// the band picks up the `contents` border that only exists while it is open.
 ///
+/// Both bands that are *compared with each other* — the one before the
+/// popover opens and the one after it closes — are read with [`settled_row`],
+/// never with the first capture that differs. Closing paints in two visible
+/// steps (the popover's own background, then the surface behind it once the
+/// popover surface is gone), so the first differing capture is the
+/// intermediate one: measured, it holds for ~500 ms and then the band comes
+/// to rest on exactly the pre-open colours. Reading the intermediate band was
+/// invisible while a debug-profile `skia-rs` painted a frame slowly enough
+/// that the poll only ever caught the resting state; with dependencies
+/// optimised in the dev profile the whole open/pick/close round trip takes
+/// ~2 s instead of ~31 s and the poll lands inside the transition instead.
+///
 /// Mutation check: drop `self.popover.reveal(true)` from `PopoverC::open`;
 /// the first assertion fails ("the popover never appeared"). Mutation check
 /// 2: drop `self.reveal(false)` from `PopoverC::close`; the *third*
@@ -488,7 +511,7 @@ fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
     let (x0, _) = driver.point_open("drop_down", "row0");
     let (rx, ry) = driver.point_open("drop_down", "row1");
     let (x1, _) = driver.point_open("drop_down", "row2");
-    let closed = driver.row(x0, x1, ry);
+    let closed = settled_row(&mut driver, x0, x1, ry);
 
     driver.click(bx, by);
     let opened = driver.wait_row_change(x0, x1, ry, &closed);
@@ -505,7 +528,8 @@ fn opening_a_drop_down_and_picking_an_item_updates_the_button() {
         gallery.messages()
     );
 
-    let closed_again = driver.wait_row_change(x0, x1, ry, &opened);
+    driver.wait_row_change(x0, x1, ry, &opened);
+    let closed_again = settled_row(&mut driver, x0, x1, ry);
     assert!(
         support::row_matches(&closed_again, &closed),
         "picking a row must put the popover away again.\nclosed: {closed:?}\n\
