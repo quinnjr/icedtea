@@ -13,8 +13,9 @@ use icedtea_ui::view::builders::{
 use icedtea_ui::widgets::types::Orientation;
 
 use crate::app::{Msg, SettingsModel};
+use crate::outputs::ModeRequest;
 use crate::pages::displays::state::{
-    DisplaysState, TRANSFORM_LABELS, TRANSFORM_VALUES, distinct_resolutions, format_refresh,
+    self, DisplaysState, TRANSFORM_LABELS, TRANSFORM_VALUES, distinct_resolutions, format_refresh,
     refreshes_for,
 };
 
@@ -204,6 +205,98 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
     .id("displays_controls")
 }
 
+/// Select head `index`, if it exists. Selecting is not an edit: `dirty` is
+/// untouched.
+pub fn select_head(st: &mut DisplaysState, index: usize) {
+    if index >= st.heads.len() || index >= st.edits.len() {
+        return;
+    }
+    st.selected = Some(index);
+    repopulate(st);
+}
+
+/// Toggle the selected head's `enabled` flag.
+///
+/// Enabling a head whose edit names no mode would leave it unplaceable on the
+/// canvas and applied at a mode the user never saw, so it adopts the head's
+/// default mode (state.rs finding #9).
+pub fn set_enabled(st: &mut DisplaysState, on: bool) {
+    let Some(idx) = selection(st) else { return };
+    st.edits[idx].enabled = on;
+    if on && st.edits[idx].mode.is_none() {
+        let default_mode = st.heads.get(idx).and_then(state::default_mode_for);
+        if default_mode.is_some() {
+            st.edits[idx].mode = default_mode;
+        }
+    }
+    st.dirty = true;
+    repopulate(st);
+}
+
+/// Pick `index` from the resolution list.
+///
+/// The current refresh survives when the new resolution offers it; otherwise
+/// the resolution's highest is taken.
+pub fn pick_resolution(st: &mut DisplaysState, index: usize) {
+    let Some(idx) = selection(st) else { return };
+    let Some(&(w, h)) = st.res_options.get(index) else {
+        return;
+    };
+    let modes = st.heads[idx].modes.clone();
+    let refreshes = refreshes_for(&modes, w, h);
+    let cur = st.edits[idx].mode.map(|m| m.refresh_mhz);
+    let refresh = cur
+        .filter(|r| refreshes.contains(r))
+        .or_else(|| refreshes.first().copied())
+        .unwrap_or(0);
+    st.edits[idx].mode = Some(ModeRequest {
+        width: w,
+        height: h,
+        refresh_mhz: refresh,
+    });
+    st.dirty = true;
+    repopulate(st);
+}
+
+/// Pick `index` from the refresh list.
+///
+/// On a head whose edit names no mode the refresh list was built for the first
+/// resolution, so a whole mode is synthesized from it — otherwise the pick
+/// would be dropped for want of an existing mode (state.rs finding #14).
+pub fn pick_refresh(st: &mut DisplaysState, index: usize) {
+    let Some(idx) = selection(st) else { return };
+    let Some(&r) = st.refresh_options.get(index) else {
+        return;
+    };
+    if let Some(mode) = st.edits[idx].mode.as_mut() {
+        mode.refresh_mhz = r;
+        st.dirty = true;
+    } else if let Some(&(w, h)) = st.res_options.first() {
+        st.edits[idx].mode = Some(ModeRequest {
+            width: w,
+            height: h,
+            refresh_mhz: r,
+        });
+        st.dirty = true;
+    }
+    repopulate(st);
+}
+
+/// Pick `index` from the transform list, writing the raw `wl_output.transform`
+/// value it names. An index past the end falls back to `Normal`.
+pub fn pick_transform(st: &mut DisplaysState, index: usize) {
+    let Some(idx) = selection(st) else { return };
+    st.edits[idx].transform = Some(TRANSFORM_VALUES.get(index).copied().unwrap_or(0));
+    st.dirty = true;
+}
+
+/// Set the selected head's scale.
+pub fn set_scale(st: &mut DisplaysState, value: f64) {
+    let Some(idx) = selection(st) else { return };
+    st.edits[idx].scale = Some(value);
+    st.dirty = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +458,163 @@ mod tests {
                 "missing id {id}; got {ids:?}"
             );
         }
+    }
+
+    /// A head that advertises modes but whose edit names none — the state a
+    /// disabled head arrives in.
+    fn mode_less_head() -> Head {
+        let mut head = multi_mode_head();
+        head.enabled = false;
+        head.current_mode = None;
+        head
+    }
+
+    /// Contract §2.8 / state.rs finding #9.
+    ///
+    /// Mutation check: delete the `default_mode_for` call from `set_enabled`;
+    /// the mode stays `None` and this fails. Restore.
+    #[test]
+    fn enabling_a_mode_less_head_gives_it_a_default_mode() {
+        let mut st = state_with(mode_less_head());
+        st.edits[0].mode = None;
+        st.edits[0].enabled = false;
+        repopulate(&mut st);
+
+        set_enabled(&mut st, true);
+        assert!(st.edits[0].enabled);
+        assert_eq!(
+            st.edits[0].mode,
+            Some(ModeRequest {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60_000,
+            }),
+            "the preferred advertised mode is adopted so the head is placeable"
+        );
+        assert!(st.dirty);
+        assert!(!st.res_options.is_empty(), "the option lists repopulate");
+    }
+
+    /// Mutation check: have `pick_resolution` always take `refreshes.first()`;
+    /// the retained-144 assertion fails. Restore.
+    #[test]
+    fn picking_a_resolution_keeps_the_refresh_when_it_is_offered() {
+        let mut st = state_with(multi_mode_head());
+        st.edits[0].mode = Some(ModeRequest {
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 144_000,
+        });
+        repopulate(&mut st);
+        // Re-pick 1920x1080: 144 Hz is still offered, so it survives.
+        pick_resolution(&mut st, 0);
+        assert_eq!(st.edits[0].mode.map(|m| m.refresh_mhz), Some(144_000));
+        // Pick 1280x720, which offers only 60 Hz: the highest is taken.
+        pick_resolution(&mut st, 1);
+        assert_eq!(
+            st.edits[0].mode,
+            Some(ModeRequest {
+                width: 1280,
+                height: 720,
+                refresh_mhz: 60_000,
+            })
+        );
+        assert!(st.dirty);
+    }
+
+    /// state.rs finding #14: a refresh pick on a mode-less head synthesizes a
+    /// whole mode from the first resolution rather than being dropped.
+    ///
+    /// Mutation check: delete the `else if` branch of `pick_refresh`; the mode
+    /// stays `None` and this fails. Restore.
+    #[test]
+    fn picking_a_refresh_on_a_mode_less_head_synthesizes_a_mode() {
+        let mut st = state_with(mode_less_head());
+        st.edits[0].mode = None;
+        repopulate(&mut st);
+        // With no mode the refresh list is built for the first resolution.
+        pick_refresh(&mut st, 0);
+        assert_eq!(
+            st.edits[0].mode,
+            Some(ModeRequest {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 144_000,
+            })
+        );
+        assert!(st.dirty);
+    }
+
+    /// Mutation check: have `pick_transform` write the *index* instead of
+    /// `TRANSFORM_VALUES[index]`; index 6 happens to equal value 6, so use
+    /// the out-of-range case below to catch it — an index past the end must
+    /// fall back to 0, not write 9. Restore.
+    #[test]
+    fn picking_a_transform_writes_a_raw_wl_output_value() {
+        let mut st = state_with(multi_mode_head());
+        pick_transform(&mut st, 5);
+        assert_eq!(st.edits[0].transform, Some(TRANSFORM_VALUES[5]));
+        pick_transform(&mut st, 9);
+        assert_eq!(st.edits[0].transform, Some(0), "out of range falls back");
+    }
+
+    /// Mutation check: drop the `dirty = true` from `set_scale`; this fails.
+    /// Restore.
+    #[test]
+    fn setting_a_scale_writes_it_and_dirties_the_page() {
+        let mut st = state_with(multi_mode_head());
+        set_scale(&mut st, 1.75);
+        assert_eq!(st.edits[0].scale, Some(1.75));
+        assert!(st.dirty);
+    }
+
+    /// Selecting a head repopulates the option lists for *that* head.
+    ///
+    /// Mutation check: drop the `repopulate` call from `select_head`; the
+    /// 720p-only head's option list keeps the first head's entries and this
+    /// fails. Restore.
+    #[test]
+    fn selecting_a_head_repopulates_for_it() {
+        let mut st = state_with(multi_mode_head());
+        let mut second = multi_mode_head();
+        second.name = "HDMI-A-1".to_string();
+        second.modes = vec![mode(1280, 720, 60_000, true)];
+        second.current_mode = Some(mode(1280, 720, 60_000, true));
+        st.edits.push(baseline_edit(&second));
+        st.heads.push(second);
+
+        select_head(&mut st, 1);
+        assert_eq!(st.selected, Some(1));
+        assert_eq!(st.res_options, vec![(1280, 720)]);
+        assert!(!st.dirty, "selecting is not an edit");
+    }
+
+    /// An out-of-range selection is ignored rather than stored.
+    ///
+    /// Mutation check: drop the bounds check from `select_head`; the later
+    /// `position_text` reads an em dash but `st.selected` is `Some(7)`, and
+    /// this fails. Restore.
+    #[test]
+    fn selecting_a_head_that_does_not_exist_is_ignored() {
+        let mut st = state_with(multi_mode_head());
+        select_head(&mut st, 7);
+        assert_eq!(st.selected, Some(0));
+    }
+
+    /// Every mutator with nothing selected is a no-op, never a panic.
+    ///
+    /// Mutation check: drop any `let Some(idx) = selection(st) else` guard;
+    /// this panics. Restore.
+    #[test]
+    fn every_control_mutator_is_a_no_op_with_no_selection() {
+        let mut st = state_with(multi_mode_head());
+        st.selected = None;
+        repopulate(&mut st);
+        set_enabled(&mut st, true);
+        pick_resolution(&mut st, 0);
+        pick_refresh(&mut st, 0);
+        pick_transform(&mut st, 3);
+        set_scale(&mut st, 2.0);
+        assert!(!st.dirty, "nothing selected means nothing edited");
     }
 }

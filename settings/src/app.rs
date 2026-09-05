@@ -627,15 +627,26 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             crate::pages::displays::canvas::drag_ended(&mut m.displays, x, y);
             Cmd::None
         }
-        // The arms that actually write into `m.displays.edits` are a later
-        // task's (contract §2.6); Task 4 only needs the variants to exist so
-        // `controls::view` can emit them (the same forward-reference pattern
-        // as the drag trio above, P4 Task 2).
-        Msg::HeadEnabledToggled(_) => Cmd::None,
-        Msg::ResolutionSelected(_) => Cmd::None,
-        Msg::RefreshSelected(_) => Cmd::None,
-        Msg::HeadScaleChanged(_) => Cmd::None,
-        Msg::TransformSelected(_) => Cmd::None,
+        Msg::HeadEnabledToggled(on) => {
+            crate::pages::displays::controls::set_enabled(&mut m.displays, on);
+            Cmd::None
+        }
+        Msg::ResolutionSelected(i) => {
+            crate::pages::displays::controls::pick_resolution(&mut m.displays, i);
+            Cmd::None
+        }
+        Msg::RefreshSelected(i) => {
+            crate::pages::displays::controls::pick_refresh(&mut m.displays, i);
+            Cmd::None
+        }
+        Msg::HeadScaleChanged(v) => {
+            crate::pages::displays::controls::set_scale(&mut m.displays, v);
+            Cmd::None
+        }
+        Msg::TransformSelected(i) => {
+            crate::pages::displays::controls::pick_transform(&mut m.displays, i);
+            Cmd::None
+        }
         Msg::KeyCaptured { keysym, mods } => {
             // `false` means `combo_from_keysym` declined -- a lone modifier
             // press. Stay armed and wait for the real key (contract §2.7
