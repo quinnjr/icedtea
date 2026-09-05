@@ -16,3 +16,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
 image = "0.25"
+
+# Dependencies are optimised even in the dev profile: skia-rs (pure-Rust
+# rasteriser) at opt-level 0 paints a settings-window frame in ~18 s, which
+# turned the harness-driven gates into minutes-long waits (M5 P2-D19). Workspace
+# crates keep opt-level 0 for fast rebuilds and debuggability; only the
+# dependency graph is optimised, and only once per target dir.
+[profile.dev.package."*"]
+opt-level = 2
