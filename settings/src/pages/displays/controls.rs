@@ -472,13 +472,20 @@ mod tests {
     /// Contract §2.8 / state.rs finding #9.
     ///
     /// Mutation check: delete the `default_mode_for` call from `set_enabled`;
-    /// the mode stays `None` and this fails. Restore.
+    /// the mode stays `None` and this fails. Also covers the trailing
+    /// `repopulate` call: the lists are cleared beforehand, so deleting that
+    /// call leaves `res_options`/`refresh_options` empty and this fails.
+    /// Restore.
     #[test]
     fn enabling_a_mode_less_head_gives_it_a_default_mode() {
         let mut st = state_with(mode_less_head());
         st.edits[0].mode = None;
         st.edits[0].enabled = false;
         repopulate(&mut st);
+        // Wipe the option lists so only `set_enabled`'s own `repopulate` call
+        // can refill them.
+        st.res_options.clear();
+        st.refresh_options.clear();
 
         set_enabled(&mut st, true);
         assert!(st.edits[0].enabled);
@@ -492,11 +499,19 @@ mod tests {
             "the preferred advertised mode is adopted so the head is placeable"
         );
         assert!(st.dirty);
-        assert!(!st.res_options.is_empty(), "the option lists repopulate");
+        assert_eq!(
+            st.res_options,
+            vec![(1920, 1080), (1280, 720)],
+            "the option lists repopulate"
+        );
+        assert_eq!(st.refresh_options, vec![144_000, 60_000]);
     }
 
     /// Mutation check: have `pick_resolution` always take `refreshes.first()`;
-    /// the retained-144 assertion fails. Restore.
+    /// the retained-144 assertion fails. Also covers the trailing
+    /// `repopulate` call: deleting it leaves `refresh_options` at the stale
+    /// 1920x1080 list instead of the re-derived 1280x720 one, and the final
+    /// assertion fails. Restore.
     #[test]
     fn picking_a_resolution_keeps_the_refresh_when_it_is_offered() {
         let mut st = state_with(multi_mode_head());
@@ -520,29 +535,75 @@ mod tests {
             })
         );
         assert!(st.dirty);
+        assert_eq!(
+            st.refresh_options,
+            vec![60_000],
+            "the refresh list re-derives for the newly picked resolution"
+        );
     }
 
     /// state.rs finding #14: a refresh pick on a mode-less head synthesizes a
     /// whole mode from the first resolution rather than being dropped.
     ///
     /// Mutation check: delete the `else if` branch of `pick_refresh`; the mode
-    /// stays `None` and this fails. Restore.
+    /// stays `None` and this fails. Also covers the trailing `repopulate`
+    /// call: the option lists are forced to look like only 1280x720 was ever
+    /// offered before the pick, so only `pick_refresh`'s own `repopulate` call
+    /// can restore the full, correct list afterward — deleting that call
+    /// leaves the forced, incomplete list in place and the final assertion
+    /// fails. Restore.
     #[test]
     fn picking_a_refresh_on_a_mode_less_head_synthesizes_a_mode() {
         let mut st = state_with(mode_less_head());
         st.edits[0].mode = None;
         repopulate(&mut st);
-        // With no mode the refresh list is built for the first resolution.
+        // With no mode the refresh list is built for the first resolution;
+        // force that resolution to 1280x720 so the eventual synthesized mode
+        // (and the repopulated lists) are distinguishable from what was
+        // already sitting in `st` before this call.
+        st.res_options = vec![(1280, 720)];
+        st.refresh_options = vec![60_000];
+
         pick_refresh(&mut st, 0);
         assert_eq!(
             st.edits[0].mode,
             Some(ModeRequest {
-                width: 1920,
-                height: 1080,
-                refresh_mhz: 144_000,
+                width: 1280,
+                height: 720,
+                refresh_mhz: 60_000,
             })
         );
         assert!(st.dirty);
+        assert_eq!(
+            st.res_options,
+            vec![(1920, 1080), (1280, 720)],
+            "the option lists repopulate for the synthesized mode, replacing \
+             the forced, incomplete list"
+        );
+        assert_eq!(st.refresh_options, vec![60_000]);
+    }
+
+    /// An out-of-range pick, with a valid head selected, is a safe no-op —
+    /// never a panic, and nothing in the state moves.
+    ///
+    /// Mutation check: drop the `st.res_options.get(index)`/
+    /// `st.refresh_options.get(index)` bounds guard from `pick_resolution`/
+    /// `pick_refresh`; this panics on the out-of-bounds index. Restore.
+    #[test]
+    fn picking_an_out_of_range_resolution_or_refresh_is_a_no_op() {
+        let mut st = state_with(multi_mode_head());
+        let before_edit = st.edits[0].clone();
+        let before_dirty = st.dirty;
+        let before_res = st.res_options.clone();
+        let before_refresh = st.refresh_options.clone();
+
+        pick_resolution(&mut st, 99);
+        pick_refresh(&mut st, 99);
+
+        assert_eq!(st.edits[0], before_edit, "the edit is untouched");
+        assert_eq!(st.dirty, before_dirty, "an ignored pick is not an edit");
+        assert_eq!(st.res_options, before_res);
+        assert_eq!(st.refresh_options, before_refresh);
     }
 
     /// Mutation check: have `pick_transform` write the *index* instead of
