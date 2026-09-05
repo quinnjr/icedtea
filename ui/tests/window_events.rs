@@ -14,7 +14,7 @@ use icedtea_compositor::dbus::DbCommand;
 use icedtea_harness::{Compositor, ScreencopyClient, VirtualKeyboardClient, VirtualPointerClient};
 use support::{
     PROBE_BG, PROBE_ENTRY_BG, matches, pixel_at, probe_report, probe_theme, spawn_window_probe,
-    wait_for_report_line,
+    wait_for_probe_window, wait_for_report_line,
 };
 
 /// The compositor's server-side title bar, from `compositor/src/decoration.rs`.
@@ -40,12 +40,8 @@ fn a_toplevel_maps_under_server_side_decorations() {
         .collect();
     let (configured_w, configured_h) = (fields[0], fields[1]);
 
-    let snapshot = compositor.snapshot();
-    let window = snapshot
-        .windows
-        .iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window is in the model");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
+    let window = &window;
     assert_eq!(
         configured_w, window.geometry.width,
         "an SSD window is configured at the full frame width"
@@ -121,13 +117,7 @@ fn a_configure_resize_relayouts_and_repaints() {
     );
     let first = wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let id = compositor
-        .snapshot()
-        .windows
-        .iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window")
-        .id;
+    let id = wait_for_probe_window(&compositor, Duration::from_secs(10)).id;
 
     compositor.send(DbCommand::Maximize(id, true));
     // `wait_for_report_line` matches on prefix alone, and the report is
@@ -166,12 +156,7 @@ fn a_configure_resize_relayouts_and_repaints() {
     );
 
     let mut screencopy = ScreencopyClient::spawn(&compositor.socket_path().to_string_lossy());
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
     // The far corner of the *new* geometry is painted, which it would not be
     // if the buffer had stayed at its original size. The probe's own render
     // loop repaints asynchronously after the configure it just reported, so
@@ -207,12 +192,7 @@ fn a_virtual_keyboard_types_into_the_entry_and_the_glyphs_appear() {
     let _probe = spawn_window_probe(&socket, "entry", theme.path(), report.path());
     wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
     // The headless backend advertises `wl_seat`'s Keyboard capability only
     // once a device exists on the seat -- a virtual keyboard, here -- so the
     // probe cannot bind `wl_keyboard` (and therefore cannot receive `enter`)
@@ -313,12 +293,7 @@ fn tab_moves_the_focus_ring_and_it_is_only_visible_after_a_key() {
     let _probe = spawn_window_probe(&socket, "entry", theme.path(), report.path());
     wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
     // See the ordering note in the sibling test: the seat only advertises
     // Keyboard once a device exists on it.
     let mut keyboard = VirtualKeyboardClient::spawn(&socket);
@@ -388,12 +363,7 @@ fn a_held_key_repeats_through_pump_and_types_more_than_one_glyph() {
     let _probe = spawn_window_probe(&socket, "entry", theme.path(), report.path());
     wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
 
     // Keyboard capability must exist on the seat before Focus can deliver
     // `keyboard-enter` (see reconciliation 1 above) -- spawn first.
@@ -473,12 +443,7 @@ fn a_popup_opened_from_a_menubutton_takes_the_grab_and_is_dismissed_outside_it()
     let _probe = spawn_window_probe(&socket, "menu", theme.path(), report.path());
     wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
     compositor.send(DbCommand::Focus(window.id));
 
     // Click on the menubutton: the probe opens its popup with the serial that

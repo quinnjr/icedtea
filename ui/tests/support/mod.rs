@@ -202,6 +202,41 @@ pub fn probe_theme() -> tempfile::NamedTempFile {
     file
 }
 
+/// The `window-probe`'s window in the compositor's model, once it is there.
+///
+/// The probe's own `configure` report is written by the client the moment it
+/// is configured, which is *before* it has attached a buffer and before
+/// wlroots' `map` signal has put it in the compositor's model: reading the
+/// snapshot straight after that line found no window at all roughly one
+/// parallel run in three. This polls instead of trusting a single read.
+///
+/// # Panics
+///
+/// If the window never appears -- every caller needs it, and skipping over a
+/// missing one would make the assertions that follow vacuous.
+#[must_use]
+pub fn wait_for_probe_window(
+    compositor: &icedtea_harness::Compositor,
+    timeout: Duration,
+) -> icedtea_contract::WindowInfo {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(window) = compositor
+            .snapshot()
+            .windows
+            .into_iter()
+            .find(|w| w.app_id == "org.icedtea.WindowProbe")
+        {
+            return window;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the probe's window never entered the compositor's model"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Spawn `window-probe` against `socket`, reaped when the guard drops.
 #[must_use]
 pub fn spawn_window_probe(

@@ -1691,6 +1691,7 @@ dependencies = [
  "cssparser",
  "fontconfig",
  "icedtea-compositor",
+ "icedtea-contract",
  "icedtea-harness",
  "precomputed-hash",
  "rustix 1.1.4",

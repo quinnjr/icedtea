@@ -47,6 +47,10 @@ fontconfig = ["dep:fontconfig"]
 
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }
+# `support::wait_for_probe_window` hands back the compositor's own
+# `WindowInfo`; a test's poll loop over `Compositor::snapshot` has nowhere
+# else to name that type.
+icedtea-contract = { path = "../contract" }
 icedtea-compositor = { path = "../compositor" }
 tempfile = "3"
 
