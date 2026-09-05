@@ -9,6 +9,7 @@
 //! **Apply** ship that set down the protocol, and results (or a lost
 //! connection) come back on the toolkit's `App::on_fd` pump.
 
+pub mod canvas;
 pub mod state;
 
 /// The Displays page.
