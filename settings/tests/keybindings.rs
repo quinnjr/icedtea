@@ -122,6 +122,15 @@ impl Settings {
         let reaper = Reaper(
             Command::new(env!("CARGO_BIN_EXE_icedtea-settings"))
                 .env("WAYLAND_DISPLAY", &socket)
+                // The harness compositor's socket lives under its own
+                // private runtime dir (fix wave, `harness/src/lib.rs`'s
+                // `runtime_dir`); a child that inherited the session's
+                // instead would look for `socket` in the wrong directory.
+                // The process env is rewritten too, so this is not the only
+                // thing making that true, but `settings/tests/support/
+                // mod.rs`'s own `spawn_settings`/`spawn_settings_process`
+                // now pass it explicitly, and this matches.
+                .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
                 .env("XDG_CONFIG_HOME", config.path())
                 .env("ICEDTEA_UI_THEME", theme.path())
                 .env("ICEDTEA_PROBE_REPORT", report.path())
@@ -206,6 +215,40 @@ impl Settings {
         while started.elapsed() < REPORT_TIMEOUT {
             if let Some(line) = self.lines().into_iter().find(|l| l.starts_with(prefix)) {
                 return Some(line);
+            }
+            std::thread::sleep(POLL);
+        }
+        None
+    }
+
+    /// How many lines so far start with `prefix`.
+    ///
+    /// Paired with [`Settings::wait_for_line_after`] so a caller can wait
+    /// for the *next* occurrence of a repeatable line (e.g. a second
+    /// `msg CaptureArmed("close")` from a re-arm) rather than
+    /// [`Settings::wait_for_line`]'s first-ever match, which would return
+    /// immediately on a stale line already in the report.
+    fn count_lines(&self, prefix: &str) -> usize {
+        self.lines()
+            .iter()
+            .filter(|l| l.starts_with(prefix))
+            .count()
+    }
+
+    /// Poll until more than `after` lines starting with `prefix` exist,
+    /// then return the `after`-th one (0-indexed among matches) -- i.e.
+    /// the first occurrence *after* the `after` already seen by a prior
+    /// [`Settings::count_lines`] call.
+    fn wait_for_line_after(&self, prefix: &str, after: usize) -> Option<String> {
+        let started = Instant::now();
+        while started.elapsed() < REPORT_TIMEOUT {
+            let matches: Vec<String> = self
+                .lines()
+                .into_iter()
+                .filter(|l| l.starts_with(prefix))
+                .collect();
+            if matches.len() > after {
+                return Some(matches[after].clone());
             }
             std::thread::sleep(POLL);
         }
@@ -445,5 +488,229 @@ fn shift_a_while_capturing_records_base_a_with_shift() {
     assert_eq!(
         line, "binding close SHIFT KEY_a",
         "a Shift-held capture must store the unshifted key name"
+    );
+}
+
+/// Escape while armed cancels: nothing is bound, and the row is disarmed --
+/// proven by the positive control, a subsequent `b` that binds only after
+/// the row is armed again.
+///
+/// Mutation check: drop `capture_key`'s Escape arm; the first assertion
+/// fails, because Escape itself gets stored as the binding. Restore.
+///
+/// Reconciliation: each Set click is followed by a wait for its own
+/// `msg CaptureArmed("close")` rather than firing the next key blind.
+/// `shift_a_while_capturing_records_base_a_with_shift`'s own doc comment
+/// names the underlying race (the root `.on_key` handler is armed from a
+/// bool baked into the closure at `view()` time, re-baked only on the next
+/// render reconcile): a key sent before a click's own arm has landed
+/// reaches a still-unarmed handler and is silently dropped, which would
+/// make both this test's absence assertions pass vacuously instead of
+/// exercising Escape's own cancel path. The second wait uses
+/// [`Settings::wait_for_line_after`] rather than [`Settings::wait_for_line`]
+/// because by then a first `CaptureArmed` already sits in the report; the
+/// plain, first-match wait would return on that stale line instead of
+/// waiting for the re-arm.
+#[test]
+fn escape_cancels_a_capture() {
+    let mut s = Settings::spawn(icedtea_ui::BUNDLED_ADWAITA_LIGHT);
+    s.select_page(PAGE_KEYBINDINGS);
+    s.wait_for_alloc("keybindings_list");
+
+    s.click_id("kb_set_close");
+    s.wait_for_line("msg CaptureArmed(\"close\")")
+        .unwrap_or_else(|| {
+            panic!(
+                "the first Set click never armed the capture; report:\n{}",
+                s.lines().join("\n")
+            )
+        });
+    s.keyboard.key_press(KEY_ESC);
+    s.keyboard.pump();
+
+    // The capture was cancelled, so the next key must not bind anything.
+    s.keyboard.key_press(KEY_A);
+    s.keyboard.pump();
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !s.lines().iter().any(|l| l.starts_with("binding ")),
+        "Escape must cancel; report:\n{}",
+        s.lines().join("\n")
+    );
+
+    // Positive control: re-arm and the very next key does bind.
+    let armed_before = s.count_lines("msg CaptureArmed(\"close\")");
+    s.click_id("kb_set_close");
+    s.wait_for_line_after("msg CaptureArmed(\"close\")", armed_before)
+        .unwrap_or_else(|| {
+            panic!(
+                "re-arming after Escape never armed the capture; report:\n{}",
+                s.lines().join("\n")
+            )
+        });
+    s.keyboard.key_press(KEY_B);
+    s.keyboard.pump();
+    let line = s
+        .wait_for_line("binding close ")
+        .unwrap_or_else(|| panic!("re-arming did not work; report:\n{}", s.lines().join("\n")));
+    assert_eq!(line, "binding close - KEY_b");
+}
+
+/// A lone Shift press mid-capture leaves the row armed and binds nothing --
+/// the GTK behaviour verbatim -- and the real key that follows binds
+/// normally, without a second click on Set.
+///
+/// Mutation check: make `apply_capture` return `true` when
+/// `combo_from_keysym` returned `None`; the second assertion fails, because
+/// the row disarms and the following `a` binds nothing. Restore.
+///
+/// Reconciliation: waits for its own `msg CaptureArmed("close")` before
+/// sending Shift, for the same reason `escape_cancels_a_capture` does --
+/// without it, a Shift sent before the click's own arm has reached the
+/// root `.on_key` closure is silently dropped by `capture_key`'s `!armed`
+/// gate, and the following `a` would never have been armed to begin with.
+#[test]
+fn a_lone_modifier_press_leaves_the_capture_armed_end_to_end() {
+    let mut s = Settings::spawn(icedtea_ui::BUNDLED_ADWAITA_LIGHT);
+    s.select_page(PAGE_KEYBINDINGS);
+    s.wait_for_alloc("keybindings_list");
+
+    s.click_id("kb_set_close");
+    s.wait_for_line("msg CaptureArmed(\"close\")")
+        .unwrap_or_else(|| {
+            panic!(
+                "the Set click never armed the capture; report:\n{}",
+                s.lines().join("\n")
+            )
+        });
+    s.keyboard.key_press(KEY_LEFTSHIFT);
+    s.keyboard.pump();
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !s.lines().iter().any(|l| l.starts_with("binding ")),
+        "a bare Shift must not become a binding; report:\n{}",
+        s.lines().join("\n")
+    );
+
+    // Still armed: no second click on Set.
+    s.keyboard.key_press(KEY_A);
+    s.keyboard.pump();
+    let line = s.wait_for_line("binding close ").unwrap_or_else(|| {
+        panic!(
+            "the capture did not stay armed; report:\n{}",
+            s.lines().join("\n")
+        )
+    });
+    assert_eq!(line, "binding close - KEY_a");
+}
+
+/// Leaving the page disarms, so a keystroke typed after the switch cannot
+/// silently rebind the row a user left armed -- the GTK `connect_unmap` /
+/// `EventControllerFocus` reset.
+///
+/// Mutation check: drop `m.capturing = None` from `Msg::PageSelected`; the
+/// first assertion fails with `binding close - KEY_a`. Restore.
+///
+/// Reconciliation: both the first click and the re-arm wait for their own
+/// `msg CaptureArmed("close")`, for the same race `escape_cancels_a_capture`
+/// documents. The first click's wait is likely redundant in practice --
+/// `select_page`/`wait_for_alloc("workspaces_add")` right after it already
+/// forces a render past the switch -- but it costs nothing and keeps the
+/// precondition for the mutation check (`capturing` genuinely `Some` when
+/// `PageSelected` lands) explicit rather than incidental. The re-arm's wait
+/// uses [`Settings::wait_for_line_after`], not the plain, first-match
+/// [`Settings::wait_for_line`], because a first `CaptureArmed` is already in
+/// the report by then.
+#[test]
+fn switching_pages_cancels_a_capture_end_to_end() {
+    let mut s = Settings::spawn(icedtea_ui::BUNDLED_ADWAITA_LIGHT);
+    s.select_page(PAGE_KEYBINDINGS);
+    s.wait_for_alloc("keybindings_list");
+
+    s.click_id("kb_set_close");
+    s.wait_for_line("msg CaptureArmed(\"close\")")
+        .unwrap_or_else(|| {
+            panic!(
+                "the first Set click never armed the capture; report:\n{}",
+                s.lines().join("\n")
+            )
+        });
+    s.select_page(PAGE_WORKSPACES);
+    s.wait_for_alloc("workspaces_add");
+
+    s.keyboard.key_press(KEY_A);
+    s.keyboard.pump();
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !s.lines().iter().any(|l| l.starts_with("binding ")),
+        "a page switch must disarm the capture; report:\n{}",
+        s.lines().join("\n")
+    );
+
+    // Positive control: back on the page, arming still works.
+    s.select_page(PAGE_KEYBINDINGS);
+    s.wait_for_alloc("keybindings_list");
+    let armed_before = s.count_lines("msg CaptureArmed(\"close\")");
+    s.click_id("kb_set_close");
+    s.wait_for_line_after("msg CaptureArmed(\"close\")", armed_before)
+        .unwrap_or_else(|| {
+            panic!(
+                "re-arming after the switch never armed the capture; report:\n{}",
+                s.lines().join("\n")
+            )
+        });
+    s.keyboard.key_press(KEY_B);
+    s.keyboard.pump();
+    let line = s.wait_for_line("binding close ").unwrap_or_else(|| {
+        panic!(
+            "re-arming after the switch failed; report:\n{}",
+            s.lines().join("\n")
+        )
+    });
+    assert_eq!(line, "binding close - KEY_b");
+}
+
+/// The Workspaces page's Add and Remove reach the model: Add grows the row
+/// set by one (a new `ws_row_<n>` appears in the probe batch) and Remove
+/// shrinks it back. Read through the probe report's `alloc` lines, which is
+/// the only thing about a running app this test can see.
+///
+/// Mutation check: make `remove_workspace` return before removing; the
+/// second assertion fails. Restore.
+#[test]
+fn adding_and_removing_a_workspace_reaches_the_model() {
+    let mut s = Settings::spawn(icedtea_ui::BUNDLED_ADWAITA_LIGHT);
+    s.select_page(PAGE_WORKSPACES);
+    s.wait_for_alloc("workspaces_add");
+
+    let rows_at_rest = s
+        .batch()
+        .iter()
+        .filter(|l| l.starts_with("alloc ws_row_"))
+        .count();
+    assert!(
+        rows_at_rest >= 1,
+        "the default config has at least one workspace"
+    );
+
+    s.click_id("workspaces_add");
+    s.wait_for_alloc(&format!("ws_row_{rows_at_rest}"));
+
+    s.click_id(&format!("ws_remove_{rows_at_rest}"));
+    let started = Instant::now();
+    while started.elapsed() < REPORT_TIMEOUT {
+        let rows = s
+            .batch()
+            .iter()
+            .filter(|l| l.starts_with("alloc ws_row_"))
+            .count();
+        if rows == rows_at_rest {
+            return;
+        }
+        std::thread::sleep(POLL);
+    }
+    panic!(
+        "the row count never returned to {rows_at_rest}; last batch:\n{}",
+        s.batch().join("\n")
     );
 }
