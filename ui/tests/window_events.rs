@@ -182,6 +182,65 @@ fn a_configure_resize_relayouts_and_repaints() {
 const KEY_H: u32 = 35;
 const KEY_I: u32 = 23;
 const KEY_TAB: u32 = 15;
+const KEY_LEFTSHIFT: u32 = 42;
+
+/// A modifier held over a key must reach the client: the `KeyEvent` carries
+/// `Mods::SHIFT`, its `base` stays the unshifted sym, and the text it
+/// produces is the capital.
+///
+/// This is the toolkit-level proof of what `settings/tests/keybindings.rs`'s
+/// `shift_a_while_capturing_records_base_a_with_shift` needs end to end, and
+/// it lives here because the behaviour is not the settings page's: it is
+/// `icedtea_harness::VirtualKeyboardClient::send_key`'s derived `modifiers`
+/// request (`zwp_virtual_keyboard_v1.key` does *not* update the compositor's
+/// xkb state, so a virtual keyboard that only ever sends `key` holds Shift
+/// down without any client ever being told a modifier is active) plus
+/// `Keymap::translate`'s `mods`/`base` stamping. Nothing in the harness or
+/// the ui crate pinned it before; the only cover was one settings gate.
+///
+/// Mutation check: drop the `self.vk.modifiers(..)` call from
+/// `VirtualKeyboardClient::send_key`; the reported line becomes
+/// `key 0x68 base 0x68 shift false` and both assertions fail. Restore.
+#[test]
+fn a_held_modifier_reaches_the_client_with_the_key_it_modifies() {
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let socket = compositor.socket_path().to_string_lossy().to_string();
+    let _probe = spawn_window_probe(&socket, "entry", theme.path(), report.path());
+    wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
+        .expect("a first configure");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
+    // Same ordering as `a_virtual_keyboard_types_into_the_entry_and_the_
+    // glyphs_appear`: the headless seat advertises its keyboard capability
+    // only once a device exists on it, so the probe cannot bind
+    // `wl_keyboard` until the virtual keyboard has been created.
+    let mut keyboard = VirtualKeyboardClient::spawn(&socket);
+    compositor.send(DbCommand::Focus(window.id));
+    wait_for_report_line(report.path(), "keyboard-enter", Duration::from_secs(10))
+        .expect("the probe never got keyboard focus");
+
+    keyboard.key_down(KEY_LEFTSHIFT);
+    keyboard.key_press(KEY_H);
+    keyboard.key_up(KEY_LEFTSHIFT);
+    keyboard.pump();
+
+    // `0x48` is `XK_H`, `0x68` is `XK_h`: the level-1 sym for the press and
+    // the level-0 sym a capture would store, in one line.
+    let line = wait_for_report_line(report.path(), "key 0x48 ", Duration::from_secs(10));
+    assert_eq!(
+        line.as_deref(),
+        Some("key 0x48 base 0x68 shift true ctrl false alt false logo false"),
+        "Shift+h must arrive as `H` with the modifier held and `h` as its \
+         base: {:?}",
+        probe_report(report.path())
+    );
+    assert!(
+        wait_for_report_line(report.path(), "typed H", Duration::from_secs(10)).is_some(),
+        "and it must insert the capital: {:?}",
+        probe_report(report.path())
+    );
+}
 
 #[test]
 fn a_virtual_keyboard_types_into_the_entry_and_the_glyphs_appear() {

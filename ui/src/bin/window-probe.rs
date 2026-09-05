@@ -19,6 +19,7 @@ use icedtea_ui::text::FontDatabase;
 use icedtea_ui::window::focus::{
     Binding, FOCUSABLE_CLASS, FocusCause, FocusRing, navigate, window_binding,
 };
+use icedtea_ui::window::keyboard::Mods;
 use icedtea_ui::window::popup::{PopupAnchorPoint, Positioner};
 use icedtea_ui::window::{InputEvent, Interest, Role, SurfaceSpec, Window};
 
@@ -141,6 +142,24 @@ fn main() {
                 }
                 InputEvent::Key(key) => {
                     focus.note_key(&key);
+                    // The translated event itself, not just the text it
+                    // produced: `typed` only ever shows the composed glyph,
+                    // and a modifier that never reached this client's xkb
+                    // state is invisible in it for every key whose shifted
+                    // and unshifted forms print the same. A capture (the
+                    // settings Keybindings page) reads `base` and `mods`
+                    // directly, so the probe publishes exactly those.
+                    if key.pressed {
+                        report(&format!(
+                            "key {:#x} base {:#x} shift {} ctrl {} alt {} logo {}",
+                            key.keysym.raw(),
+                            key.base.raw(),
+                            key.mods.contains(Mods::SHIFT),
+                            key.mods.contains(Mods::CTRL),
+                            key.mods.contains(Mods::ALT),
+                            key.mods.contains(Mods::LOGO),
+                        ));
+                    }
                     match window_binding(&key) {
                         Some(Binding::Move(dir)) => {
                             let next =
