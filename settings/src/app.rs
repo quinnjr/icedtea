@@ -148,17 +148,45 @@ pub enum Msg {
     /// One protocol message from the outputs connection, via `App::on_fd`.
     /// `Arc`, not `Rc`: `Msg` is `Send` (M5-D2).
     Outputs(std::sync::Arc<crate::outputs::OutputsMsg>),
+    /// The wallpaper `Entry` changed, by the user typing or by `Revert`
+    /// resetting it. Always authoritative (contract §2.6): validated the
+    /// same way as [`Msg::WallpaperChosen`].
+    WallpaperEdited(String),
+    /// The Browse button was clicked.
+    WallpaperBrowse,
     /// The portal worker's file chooser returned a path (contract §2.2).
     WallpaperChosen(std::path::PathBuf),
     /// The portal worker could not produce a path; the status line shows why
     /// (contract §2.2).
     WallpaperPickerFailed(String),
+    /// The field's clear control.
+    WallpaperCleared,
 }
 
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Msg>();
 };
+
+/// Fold a candidate wallpaper path into the model.
+///
+/// One code path for the `Entry` and for the portal's answer: the portal is
+/// another process and its reply is no more trusted than a typed string.
+fn set_wallpaper(m: &mut SettingsModel, text: String) {
+    m.wallpaper_text = text;
+    if m.wallpaper_text.trim().is_empty() {
+        m.wallpaper_error = None;
+        m.model.working.appearance.wallpaper = None;
+        return;
+    }
+    match crate::pages::appearance::validate_wallpaper(&m.wallpaper_text) {
+        Ok(path) => {
+            m.wallpaper_error = None;
+            m.model.working.appearance.wallpaper = Some(path.display().to_string());
+        }
+        Err(reason) => m.wallpaper_error = Some(reason),
+    }
+}
 
 /// Fold one message into the model.
 ///
@@ -352,13 +380,39 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
                 }
             }
         },
-        Msg::WallpaperChosen(path) => {
-            m.wallpaper_text = path.display().to_string();
-            m.wallpaper_error = None;
+        Msg::WallpaperEdited(text) => {
+            set_wallpaper(m, text);
             Cmd::None
+        }
+        Msg::WallpaperChosen(path) => {
+            set_wallpaper(m, path.display().to_string());
+            Cmd::None
+        }
+        Msg::WallpaperCleared => {
+            set_wallpaper(m, String::new());
+            Cmd::None
+        }
+        Msg::WallpaperBrowse => {
+            if !m.portal_available {
+                m.status = "No file portal available; type a path instead".to_string();
+                Cmd::None
+            } else {
+                let handles = m.workers.clone();
+                let current = m
+                    .model
+                    .working
+                    .appearance
+                    .wallpaper
+                    .as_ref()
+                    .map(std::path::PathBuf::from);
+                Cmd::Task(Rc::new(move || {
+                    handles.choose_wallpaper(current.clone());
+                }))
+            }
         }
         Msg::WallpaperPickerFailed(reason) => {
             m.status = reason;
+            m.portal_available = false;
             Cmd::None
         }
     };
@@ -440,6 +494,7 @@ mod tests {
     use super::{ColorSlot, Msg, SettingsModel, footer_text, update, view};
     use crate::compositor_reload::ReloadOutcome;
     use crate::pages::PageId;
+    use icedtea_ui::view::Cmd;
 
     /// `Msg` crosses a thread boundary on the inbox (M5-D2), so it must be
     /// `Send` — which is what forbids `Rc` in a payload.
@@ -452,7 +507,7 @@ mod tests {
     fn model() -> (SettingsModel, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("config.redb");
-        let (workers, _rx) = crate::ipc::handles_for_test();
+        let (workers, _rx, _portal_rx) = crate::ipc::handles_for_test();
         (SettingsModel::new(db, workers), dir)
     }
 
@@ -790,5 +845,116 @@ mod tests {
             "a successful apply is no longer pending work"
         );
         assert_eq!(m.displays_status, "Applied");
+    }
+
+    fn a_real_image(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"pixels").expect("write the image");
+        path
+    }
+
+    #[test]
+    fn a_valid_typed_path_reaches_the_model_and_clears_the_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image = a_real_image(dir.path(), "wall.png");
+        let (mut m, _inbox) = test_model();
+        m.wallpaper_error = Some("stale".to_string());
+
+        update(&mut m, Msg::WallpaperEdited(image.display().to_string()));
+
+        assert_eq!(m.wallpaper_text, image.display().to_string());
+        assert_eq!(m.wallpaper_error, None);
+        assert_eq!(
+            m.model.working.appearance.wallpaper,
+            Some(image.display().to_string())
+        );
+    }
+
+    #[test]
+    fn an_invalid_typed_path_shows_an_error_and_never_touches_the_model() {
+        let (mut m, _inbox) = test_model();
+        let before = m.model.working.appearance.wallpaper.clone();
+
+        update(
+            &mut m,
+            Msg::WallpaperEdited("/nonexistent/icedtea/wall.png".to_string()),
+        );
+
+        assert_eq!(m.wallpaper_text, "/nonexistent/icedtea/wall.png");
+        assert!(m.wallpaper_error.is_some(), "the field shows why");
+        assert_eq!(
+            m.model.working.appearance.wallpaper, before,
+            "an invalid path is never written to the working copy"
+        );
+    }
+
+    #[test]
+    fn clearing_the_field_clears_the_wallpaper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image = a_real_image(dir.path(), "wall.png");
+        let (mut m, _inbox) = test_model();
+        update(&mut m, Msg::WallpaperEdited(image.display().to_string()));
+
+        update(&mut m, Msg::WallpaperEdited("   ".to_string()));
+        assert_eq!(m.model.working.appearance.wallpaper, None);
+        assert_eq!(m.wallpaper_error, None, "empty is not an error");
+
+        update(&mut m, Msg::WallpaperEdited(image.display().to_string()));
+        update(&mut m, Msg::WallpaperCleared);
+        assert!(m.wallpaper_text.is_empty());
+        assert_eq!(m.model.working.appearance.wallpaper, None);
+        assert_eq!(m.wallpaper_error, None);
+    }
+
+    #[test]
+    fn a_portal_answer_goes_through_the_same_validation() {
+        let (mut m, _inbox) = test_model();
+        update(
+            &mut m,
+            Msg::WallpaperChosen(std::path::PathBuf::from("/nonexistent/portal/wall.png")),
+        );
+        assert!(
+            m.wallpaper_error.is_some(),
+            "the portal is not trusted more than the keyboard"
+        );
+        assert_eq!(m.model.working.appearance.wallpaper, None);
+    }
+
+    #[test]
+    fn a_failed_picker_disables_browse_without_touching_the_model() {
+        let (mut m, _inbox) = test_model();
+        let before = m.model.working.clone();
+
+        update(
+            &mut m,
+            Msg::WallpaperPickerFailed("No file portal available".to_string()),
+        );
+
+        assert!(!m.portal_available, "Browse is greyed for the session");
+        assert_eq!(m.status, "No file portal available");
+        assert_eq!(m.model.working, before, "the working copy is untouched");
+        assert!(!m.model.is_dirty());
+    }
+
+    #[test]
+    fn browsing_without_a_portal_is_a_status_line_not_a_task() {
+        let (mut m, _inbox) = test_model();
+        m.portal_available = false;
+        let cmd = update(&mut m, Msg::WallpaperBrowse);
+        assert!(
+            matches!(cmd, Cmd::None),
+            "no Cmd::Task is issued once the portal is known missing"
+        );
+        assert!(!m.status.is_empty());
+    }
+
+    #[test]
+    fn browsing_with_a_portal_issues_a_task() {
+        let (mut m, _inbox) = test_model();
+        let cmd = update(&mut m, Msg::WallpaperBrowse);
+        assert!(
+            matches!(cmd, Cmd::Task(_)),
+            "the outbound call runs on the worker, never inside update"
+        );
     }
 }

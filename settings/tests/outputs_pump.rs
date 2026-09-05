@@ -56,7 +56,7 @@ fn the_initial_enumeration_reaches_the_model_when_the_loop_is_seeded() {
         .expect("the harness advertises zwlr_output_manager_v1");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let (workers, _rx) = icedtea_settings::ipc::handles_for_test();
+    let (workers, _rx, _portal_rx) = icedtea_settings::ipc::handles_for_test();
     let mut model =
         icedtea_settings::app::SettingsModel::new(dir.path().join("config.redb"), workers)
             .with_outputs(Some(pump.clone()));
@@ -116,7 +116,7 @@ fn a_dead_connection_latches_the_pump_and_unwatches_the_fd() {
     );
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let (workers, _rx) = icedtea_settings::ipc::handles_for_test();
+    let (workers, _rx, _portal_rx) = icedtea_settings::ipc::handles_for_test();
     let mut model =
         icedtea_settings::app::SettingsModel::new(dir.path().join("config.redb"), workers)
             .with_outputs(Some(pump.clone()));

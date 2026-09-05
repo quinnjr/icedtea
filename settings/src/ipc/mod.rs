@@ -13,12 +13,11 @@ pub mod reload;
 /// `portal: crossbeam_channel::Sender<PortalRequest>` and
 /// `choose_wallpaper(&self, current: Option<PathBuf>)`; those land with the
 /// portal worker in P2 (§2.6, and §5's table assigns "§2.6 portal worker | P2"),
-/// recorded as deviation P1-D7. The field is private and `spawn`'s signature is
-/// already final, so adding it is a P2-local edit.
+/// recorded as deviation P1-D7 and completed per P2-D1.
 #[derive(Clone)]
 pub struct WorkerHandles {
     reload: crossbeam_channel::Sender<reload::ReloadRequest>,
-    // P2: portal: crossbeam_channel::Sender<portal::PortalRequest>,
+    portal: crossbeam_channel::Sender<portal::PortalRequest>,
 }
 
 impl WorkerHandles {
@@ -34,35 +33,64 @@ impl WorkerHandles {
             tracing::warn!("the reload worker is gone; Apply was dropped");
         }
     }
+
+    /// Queue a file-portal wallpaper pick. Never blocks: the answer arrives
+    /// as `Msg::WallpaperChosen` or `Msg::WallpaperPickerFailed` on the
+    /// inbox. A closed channel (the worker died) is logged once and dropped.
+    pub fn choose_wallpaper(&self, current: Option<std::path::PathBuf>) {
+        if self
+            .portal
+            .send(portal::PortalRequest::OpenFile { current })
+            .is_err()
+        {
+            tracing::warn!("the portal worker is gone; Browse was dropped");
+        }
+    }
 }
 
 /// Handles wired to a receiver the caller keeps, with no worker thread behind
 /// them — what a `SettingsModel` unit test constructs (deviation P1-D8).
 ///
-/// P2 extends the returned tuple with the portal receiver, in this same shape.
+/// P2 extends the returned tuple with the portal receiver, in this same shape
+/// (P2-D1).
 #[must_use]
 pub fn handles_for_test() -> (
     WorkerHandles,
     crossbeam_channel::Receiver<reload::ReloadRequest>,
+    crossbeam_channel::Receiver<portal::PortalRequest>,
 ) {
     let (reload_tx, reload_rx) = crossbeam_channel::unbounded();
-    (WorkerHandles { reload: reload_tx }, reload_rx)
+    let (portal_tx, portal_rx) = crossbeam_channel::unbounded();
+    (
+        WorkerHandles {
+            reload: reload_tx,
+            portal: portal_tx,
+        },
+        reload_rx,
+        portal_rx,
+    )
 }
 
 use icedtea_ui::view::InboxSender;
 
 /// Start every worker against `tx` and return their handles.
 ///
-/// P1 starts one: the reload worker. P2 starts the portal worker here too, from
-/// the same `tx` (deviation P1-D7); this signature is contract §2.4's final one
-/// and does not change when it does.
+/// P1 starts the reload worker; P2 starts the portal worker here too, from
+/// the same `tx` (deviation P1-D7, completed per P2-D1); this signature is
+/// contract §2.4's final one and does not change when it does.
 #[must_use]
 pub fn spawn(tx: InboxSender<crate::app::Msg>) -> WorkerHandles {
     let (reload_tx, reload_rx) = crossbeam_channel::unbounded();
-    // The join handle is deliberately dropped: the worker's lifetime is the
-    // process's, and it stops itself when the channel or the inbox closes.
-    drop(reload::spawn(reload_rx, tx));
-    WorkerHandles { reload: reload_tx }
+    let (portal_tx, portal_rx) = crossbeam_channel::unbounded();
+    // The join handles are deliberately dropped: each worker's lifetime is
+    // the process's, and it stops itself when its channel or the inbox
+    // closes.
+    drop(reload::spawn(reload_rx, tx.clone()));
+    drop(portal::spawn(portal_rx, tx));
+    WorkerHandles {
+        reload: reload_tx,
+        portal: portal_tx,
+    }
 }
 
 #[cfg(test)]
