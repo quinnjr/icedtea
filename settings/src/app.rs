@@ -165,8 +165,13 @@ pub enum Msg {
     /// The portal worker's file chooser returned a path (contract §2.2).
     WallpaperChosen(std::path::PathBuf),
     /// The portal worker could not produce a path; the status line shows why
-    /// (contract §2.2).
+    /// (contract §2.2). This is the *unavailable* case, and it latches
+    /// `portal_available` off.
     WallpaperPickerFailed(String),
+    /// The user dismissed the file chooser. A working portal, a normal
+    /// action: the status line says so and Browse stays live (amendment
+    /// P2-D16).
+    WallpaperPickerCancelled,
     /// The field's clear control.
     WallpaperCleared,
 }
@@ -437,6 +442,14 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
         Msg::WallpaperPickerFailed(reason) => {
             m.status = reason;
             m.portal_available = false;
+            Cmd::None
+        }
+        // No latch: the portal answered, and answered normally. Greying
+        // Browse for the session because someone pressed Escape once is the
+        // bug amendment P2-D16 records; contract §2.6's latch text is about
+        // a portal that is not there.
+        Msg::WallpaperPickerCancelled => {
+            m.status = "Wallpaper selection cancelled".to_string();
             Cmd::None
         }
     };
@@ -956,6 +969,28 @@ pub(crate) mod tests {
 
         assert!(!m.portal_available, "Browse is greyed for the session");
         assert_eq!(m.status, "No file portal available");
+        assert_eq!(m.model.working, before, "the working copy is untouched");
+        assert!(!m.model.is_dirty());
+    }
+
+    /// Amendment P2-D16: Escape in a working chooser is not a portal failure.
+    ///
+    /// Mutation check: give `Msg::WallpaperPickerCancelled` the same body as
+    /// `WallpaperPickerFailed` (what the code did before the amendment, via
+    /// `response_to_outcome`'s `Err`) and the `portal_available` assertion
+    /// fails. Restore.
+    #[test]
+    fn a_cancelled_picker_says_so_and_leaves_browse_live() {
+        let (mut m, _inbox) = test_model();
+        let before = m.model.working.clone();
+
+        update(&mut m, Msg::WallpaperPickerCancelled);
+
+        assert!(
+            m.portal_available,
+            "cancelling once must not grey Browse for the session"
+        );
+        assert_eq!(m.status, "Wallpaper selection cancelled");
         assert_eq!(m.model.working, before, "the working copy is untouched");
         assert!(!m.model.is_dirty());
     }
