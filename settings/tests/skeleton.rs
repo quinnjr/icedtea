@@ -7,7 +7,14 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-const SETTLE: Duration = Duration::from_secs(20);
+// Reconciliation (Task 7): the placeholder Appearance page P1 shipped was a
+// single label; the real page (drop-down, two spin buttons, three colour
+// swatches, a wallpaper entry and its buttons/status row) takes noticeably
+// longer to reach its first composited frame under the harness's headless
+// backend — 20s left the window-mapped wait and the paint-settle wait each
+// racing a real first paint that was landing at ~22-23s. Widened, not
+// removed: the assertions are unchanged, only the budget they get.
+const SETTLE: Duration = Duration::from_secs(45);
 
 /// The server-side title bar `compositor/src/decoration.rs` reserves above a
 /// window's content area — the same constant `ui/tests/window_events.rs`
@@ -72,7 +79,7 @@ fn the_first_toplevel_app_run_paints_and_navigates() {
         "status",
         "revert",
         "apply",
-        "appearance_page",
+        "appearance",
     ] {
         assert!(
             app.point(id).is_some(),

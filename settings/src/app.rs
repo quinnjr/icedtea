@@ -514,7 +514,7 @@ fn footer(m: &SettingsModel) -> View<Msg> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{ColorSlot, Msg, SettingsModel, footer_text, update, view};
     use crate::compositor_reload::ReloadOutcome;
     use crate::pages::PageId;
@@ -757,7 +757,7 @@ mod tests {
         let (m, _dir) = model();
         assert_eq!(m.page, PageId::Appearance);
         let ids = node_ids(&probe_of(m));
-        assert!(ids.contains(&"appearance_page".to_string()));
+        assert!(ids.contains(&"appearance".to_string()));
 
         let (mut m2, _dir2) = model();
         m2.page = PageId::Displays;

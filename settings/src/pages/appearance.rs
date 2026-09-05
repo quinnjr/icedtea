@@ -2,9 +2,16 @@
 //! palette colors, and wallpaper.
 
 use icedtea_ui::css::value::Rgba;
+use icedtea_ui::layout::Align;
+use icedtea_ui::view::View;
+use icedtea_ui::view::builders::{
+    self as w, DrawingAreaExt, DropDownExt, EntryExt, GridExt, SpinButtonExt,
+};
 use icedtea_ui::widgets::color_dialog::ColorDialogC;
+use icedtea_ui::widgets::types::Orientation;
 
-use crate::model::valid_hex;
+use crate::app::{ColorSlot, Msg, SettingsModel};
+use crate::model::{BAR_POSITIONS, valid_hex};
 
 /// Parse a `#RRGGBB` string into an opaque toolkit colour; falls back to
 /// opaque black for anything `valid_hex` rejects (should not happen for
@@ -126,23 +133,269 @@ pub fn spin_px(v: f64) -> i32 {
 /// GTK `SpinButton::with_range(0.0, 256.0, 1.0)` adjustments.
 pub const SPIN_MAX_PX: i32 = 256;
 
-/// The Appearance page.
+/// How wide and tall a colour swatch draws.
+const SWATCH_W: i32 = 40;
+const SWATCH_H: i32 = 22;
+
+/// A flat rectangle of `rgba`.
 ///
-/// P1 ships the page's frame only; P2 fills it in (contract §2.6).
+/// Deviation P2-D11: `color_dialog_button`'s own chrome lives on a subnode
+/// that never gets a taffy allocation, so `ColorDialogButtonC::on_event`'s
+/// `local_rect` is always `None` and the widget cannot be clicked in a live
+/// window (`ui/src/widgets/scrollbar.rs:309-317` documents the same shape).
+/// A `drawing_area` is an ordinary leaf with a real allocation, a real probe
+/// point, and P0's three-argument `Prop::Draw`.
 #[must_use]
-pub fn view(m: &crate::app::SettingsModel) -> icedtea_ui::view::View<crate::app::Msg> {
-    let _ = m;
-    icedtea_ui::view::builders::box_(
-        icedtea_ui::widgets::types::Orientation::Vertical,
-        [icedtea_ui::view::builders::label("Appearance")],
+pub fn swatch(rgba: Rgba) -> View<Msg> {
+    w::drawing_area(move |canvas, rect, _cx| {
+        canvas.draw_rect(&rect.to_skia(), &icedtea_ui::paint::fill_paint(rgba));
+    })
+    .content_width(SWATCH_W)
+    .content_height(SWATCH_H)
+}
+
+/// One labelled grid row: the label in column 0, the control in column 1.
+fn row(index: u16, text: &str, control: View<Msg>) -> [View<Msg>; 2] {
+    [
+        w::label(text).halign(Align::Start).at(0, index),
+        control.at(1, index),
+    ]
+}
+
+/// One row whose control spans both columns (the wallpaper buttons and the
+/// palette panel, which have no label of their own).
+fn wide(index: u16, control: View<Msg>) -> [View<Msg>; 1] {
+    [control.at(0, index).span(2, 1)]
+}
+
+/// The palette panel, shown while `m.color_picker` names a slot.
+fn picker(slot: ColorSlot) -> View<Msg> {
+    let palette = ColorDialogC::default_palette();
+    let columns = 5u16;
+    let buttons = palette.iter().enumerate().map(|(index, rgba)| {
+        let packed = ColorDialogC::pack(*rgba);
+        let msg = match slot {
+            ColorSlot::Background => Msg::BackgroundPicked(packed),
+            ColorSlot::Foreground => Msg::ForegroundPicked(packed),
+            ColorSlot::Accent => Msg::AccentPicked(packed),
+        };
+        w::button_from(swatch(*rgba))
+            .id(&format!("appearance_swatch_{index}"))
+            .key(index)
+            .at(index as u16 % columns, index as u16 / columns)
+            .on_click(msg)
+    });
+    w::box_(
+        Orientation::Vertical,
+        [
+            w::grid(buttons).row_spacing(4).column_spacing(4),
+            w::button("Close")
+                .id("appearance_picker_close")
+                .halign(Align::Start)
+                .on_click(Msg::ColorPickerClosed),
+        ],
     )
-    .id("appearance_page")
-    .margin(16, 16, 16, 16)
+    .id("appearance_picker")
+}
+
+/// The Appearance page.
+#[must_use]
+pub fn view(m: &SettingsModel) -> View<Msg> {
+    let a = &m.model.working.appearance;
+    let position = BAR_POSITIONS
+        .iter()
+        .position(|p| *p == a.bar_position)
+        .unwrap_or(0);
+
+    let mut children: Vec<View<Msg>> = Vec::new();
+    children.extend(row(
+        0,
+        "Bar position",
+        w::drop_down(&BAR_POSITIONS)
+            .selected(position)
+            .id("appearance_bar_position")
+            .on_selected(Msg::BarPositionSelected),
+    ));
+    children.extend(row(
+        1,
+        "Bar height",
+        w::spin_button(f64::from(a.bar_height), 0.0, f64::from(SPIN_MAX_PX))
+            .step(1.0)
+            .id("appearance_bar_height")
+            .on_value_changed(Msg::BarHeightChanged),
+    ));
+    children.extend(row(
+        2,
+        "Corner radius",
+        w::spin_button(f64::from(a.corner_radius), 0.0, f64::from(SPIN_MAX_PX))
+            .step(1.0)
+            .id("appearance_corner_radius")
+            .on_value_changed(Msg::CornerRadiusChanged),
+    ));
+    for (index, (text, hex, slot, id)) in [
+        (
+            "Background",
+            a.palette.background.as_str(),
+            ColorSlot::Background,
+            "appearance_background",
+        ),
+        (
+            "Foreground",
+            a.palette.foreground.as_str(),
+            ColorSlot::Foreground,
+            "appearance_foreground",
+        ),
+        (
+            "Accent",
+            a.palette.accent.as_str(),
+            ColorSlot::Accent,
+            "appearance_accent",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        children.extend(row(
+            3 + index as u16,
+            text,
+            w::button_from(swatch(hex_to_rgba(hex)))
+                .id(id)
+                .halign(Align::Start)
+                .on_click(Msg::ColorPickerOpened(slot)),
+        ));
+    }
+    children.extend(row(
+        6,
+        "Wallpaper",
+        w::entry(&m.wallpaper_text)
+            .placeholder("/path/to/image.png")
+            .id("appearance_wallpaper_entry")
+            .hexpand(true)
+            .on_change(|s| Msg::WallpaperEdited(s.to_string())),
+    ));
+    children.extend(wide(
+        7,
+        w::box_(
+            Orientation::Horizontal,
+            [
+                w::button("Choose\u{2026}")
+                    .id("appearance_wallpaper_browse")
+                    .sensitive(m.portal_available)
+                    .on_click(Msg::WallpaperBrowse),
+                w::button("Clear")
+                    .id("appearance_wallpaper_clear")
+                    .on_click(Msg::WallpaperCleared),
+            ],
+        )
+        .halign(Align::Start),
+    ));
+    children.extend(wide(8, wallpaper_status(m)));
+    if let Some(slot) = m.color_picker {
+        children.extend(wide(9, picker(slot)));
+    }
+
+    w::grid(children)
+        .row_spacing(10)
+        .column_spacing(16)
+        .margin(16, 16, 16, 16)
+        .id("appearance")
+}
+
+/// The row under the wallpaper buttons: the error, or a preview of the image
+/// the model currently holds, or nothing to say.
+fn wallpaper_status(m: &SettingsModel) -> View<Msg> {
+    if let Some(error) = &m.wallpaper_error {
+        return w::label(error)
+            .halign(Align::Start)
+            .classes(&["error"])
+            .id("appearance_wallpaper_status");
+    }
+    match &m.model.working.appearance.wallpaper {
+        Some(path) => w::picture(std::path::Path::new(path))
+            .height_request(72)
+            .halign(Align::Start)
+            .id("appearance_wallpaper_status"),
+        None => w::label("No wallpaper")
+            .halign(Align::Start)
+            .id("appearance_wallpaper_status"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{hex_to_packed, hex_to_rgba, packed_to_hex, rgba_to_hex};
+    use super::{hex_to_packed, hex_to_rgba, packed_to_hex, rgba_to_hex, view};
+    use icedtea_ui::anim::{Clock, ManualClock};
+    use icedtea_ui::css::cascade::CompiledSheet;
+    use icedtea_ui::icons::IconTheme;
+    use icedtea_ui::text::FontDatabase;
+    use icedtea_ui::view::App;
+
+    /// Lay the page out with no compositor and collect every node id.
+    fn ids_of(m: crate::app::SettingsModel) -> Vec<String> {
+        let sheet = CompiledSheet::compile(icedtea_ui::BUNDLED_ADWAITA_LIGHT);
+        let clock: std::rc::Rc<dyn Clock> = std::rc::Rc::new(ManualClock::new());
+        let probe = App::new(m, crate::app::update, view)
+            .probe(
+                (480, 420),
+                sheet,
+                FontDatabase::new(),
+                IconTheme::from_env(),
+                clock,
+            )
+            .expect("the appearance page lays out");
+        probe
+            .root()
+            .descendants()
+            .filter_map(|n| n.id().map(|id| id.as_str().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_page_carries_every_id_its_gates_address() {
+        let (m, _inbox) = crate::app::tests::test_model();
+        let ids = ids_of(m);
+        for id in [
+            "appearance_bar_position",
+            "appearance_bar_height",
+            "appearance_corner_radius",
+            "appearance_background",
+            "appearance_foreground",
+            "appearance_accent",
+            "appearance_wallpaper_entry",
+            "appearance_wallpaper_browse",
+            "appearance_wallpaper_clear",
+        ] {
+            assert!(
+                ids.contains(&id.to_string()),
+                "{id} is missing from {ids:?}"
+            );
+        }
+        assert!(
+            !ids.iter().any(|id| id.starts_with("appearance_swatch_")),
+            "the palette panel is closed until a slot is opened"
+        );
+    }
+
+    #[test]
+    fn opening_a_slot_reveals_the_palette_panel() {
+        let (mut m, _inbox) = crate::app::tests::test_model();
+        m.color_picker = Some(crate::app::ColorSlot::Foreground);
+        let ids = ids_of(m);
+        assert!(ids.contains(&"appearance_picker".to_string()));
+        assert!(ids.contains(&"appearance_picker_close".to_string()));
+        assert!(
+            ids.contains(&"appearance_swatch_0".to_string()),
+            "one button per palette entry"
+        );
+    }
+
+    #[test]
+    fn the_wallpaper_status_row_shows_the_error_when_there_is_one() {
+        let (mut m, _inbox) = crate::app::tests::test_model();
+        m.wallpaper_error = Some("No such file: /nope.png".to_string());
+        let ids = ids_of(m);
+        assert!(ids.contains(&"appearance_wallpaper_status".to_string()));
+    }
 
     /// Mutation check: make `hex_to_rgba` divide by 256.0 instead of 255.0;
     /// this round trip fails on `#ffffff`. Restore.
