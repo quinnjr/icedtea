@@ -298,6 +298,91 @@ pub fn view(m: &SettingsModel) -> UiView<Msg> {
     )
 }
 
+/// Begin a drag at canvas point `(x, y)`.
+///
+/// Recomputes the view the paint used (plan P4-D3) and publishes it into
+/// `st.view` so [`dragged`]'s delta maths reads the same mapping. Hit-tests
+/// against **every** head, disabled ones included, so a disabled monitor can be
+/// re-selected and switched back on (state.rs finding #10). A miss clears the
+/// drag and leaves the selection alone (contract §2.8).
+pub fn drag_began(st: &mut DisplaysState, x: f64, y: f64) {
+    let (idxs, rects, _enabled) = state::all_rects(st);
+    let view = displays_canvas::compute_view(&rects, CANVAS_W, CANVAS_H, state::CANVAS_MARGIN);
+    st.view = view;
+    match displays_canvas::hit_test(&rects, &view, x, y) {
+        Some(slot) => {
+            let Some(&head) = idxs.get(slot) else {
+                st.drag = None;
+                return;
+            };
+            let start = st
+                .edits
+                .get(head)
+                .and_then(|e| e.position)
+                .unwrap_or((0, 0));
+            st.selected = Some(head);
+            st.drag = Some(state::Drag {
+                head,
+                origin: (x, y),
+                start,
+            });
+        }
+        None => st.drag = None,
+    }
+}
+
+/// Continue a drag at canvas point `(x, y)`.
+///
+/// The canvas delta from the press point becomes a layout delta through the
+/// published view; the dragged head's own rectangle (which may be a disabled
+/// head's placeholder) gives the width and height `snap` needs; the snap targets
+/// are the *other* enabled heads plus the origin.
+pub fn dragged(st: &mut DisplaysState, x: f64, y: f64) {
+    let Some(drag) = st.drag else {
+        return;
+    };
+    // A `HeadsChanged` mid-drag replaces `heads`/`edits` and clears `drag`, but
+    // guard the cached index anyway: a stale drag bails rather than indexing
+    // out of bounds (state.rs finding #2).
+    if drag.head >= st.edits.len() {
+        st.drag = None;
+        return;
+    }
+    let (dx, dy) = st
+        .view
+        .canvas_delta_to_layout(x - drag.origin.0, y - drag.origin.1);
+    let (aidxs, arects, _enabled) = state::all_rects(st);
+    let size = aidxs
+        .iter()
+        .position(|&i| i == drag.head)
+        .map_or((0.0, 0.0), |slot| (arects[slot].w, arects[slot].h));
+    let candidate = Rect::new(
+        f64::from(drag.start.0) + dx,
+        f64::from(drag.start.1) + dy,
+        size.0,
+        size.1,
+    );
+    let (eidxs, erects) = state::enabled_rects(st);
+    let others: Vec<Rect> = eidxs
+        .iter()
+        .zip(erects.iter())
+        .filter(|&(&i, _)| i != drag.head)
+        .map(|(_, r)| *r)
+        .collect();
+    let (nx, ny) = displays_canvas::snap(candidate, &others, state::SNAP_THRESHOLD);
+    st.edits[drag.head].position = Some((nx, ny));
+    st.dirty = true;
+}
+
+/// End a drag at canvas point `(x, y)`: one last fold, then the drag is gone.
+///
+/// The release is delivered even when it lands outside the canvas (M5-D5 §3's
+/// grab semantics), which is what stops a drag wedging.
+pub fn drag_ended(st: &mut DisplaysState, x: f64, y: f64) {
+    dragged(st, x, y);
+    st.drag = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +581,101 @@ mod tests {
         assert!(area.handlers.has(EventKind::PointerMotion));
         assert!(area.handlers.has(EventKind::PointerUp));
         assert_eq!(area.props.str(PropName::Id), Some("displays_canvas"));
+    }
+
+    /// The canvas-space centre of `slot`'s tile at the fixed canvas size.
+    fn tile_centre(st: &DisplaysState, slot: usize) -> (f64, f64) {
+        let sc = scene(&DisplaysSnapshot::of(st), CANVAS_W, CANVAS_H);
+        let r = sc.tiles[slot].rect;
+        (r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
+    /// Contract §2.8: "on a miss clear `drag` (selection is left alone)".
+    ///
+    /// Mutation check: make the miss branch `st.selected = None`; this fails.
+    /// Restore.
+    #[test]
+    fn a_drag_that_hits_nothing_leaves_the_selection_alone() {
+        let mut st = state_of(vec![head("DP-1", 1920, 1080, 0, 0, true)], Some(0));
+        // The canvas margin corner is guaranteed to be outside every tile.
+        drag_began(&mut st, 0.0, 0.0);
+        assert_eq!(st.selected, Some(0), "a miss must not clear the selection");
+        assert!(st.drag.is_none(), "a miss must not start a drag");
+        assert!(!st.dirty, "a miss must not dirty the page");
+    }
+
+    /// Mutation check: pass an empty `others` slice to `snap`; the head lands
+    /// at its raw dragged position and this fails. Restore.
+    #[test]
+    fn a_drag_snaps_the_dragged_head_against_its_neighbour() {
+        let mut st = state_of(
+            vec![
+                head("DP-1", 1920, 1080, 0, 0, true),
+                head("HDMI-A-1", 1920, 1080, 4000, 0, true),
+            ],
+            Some(1),
+        );
+        let (cx, cy) = tile_centre(&st, 1);
+        drag_began(&mut st, cx, cy);
+        assert_eq!(st.drag.map(|d| d.head), Some(1));
+        assert_eq!(st.drag.map(|d| d.start), Some((4000, 0)));
+
+        // Drag left by exactly the canvas distance that is 2080 layout px,
+        // putting the head's left edge at 1920 — the neighbour's right edge.
+        let view = st.view;
+        let dx_canvas = -2080.0 * view.scale;
+        dragged(&mut st, cx + dx_canvas, cy);
+        assert_eq!(
+            st.edits[1].position,
+            Some((1920, 0)),
+            "the head must snap flush against DP-1's right edge"
+        );
+        assert!(st.dirty, "a move dirties the page");
+    }
+
+    /// Contract §2.8 / M5-D5 §3: a `PointerUp` outside the node still arrives
+    /// through the implicit grab, so a drag can never wedge.
+    ///
+    /// Mutation check: make `drag_ended` return early without clearing
+    /// `st.drag`; this fails. Restore.
+    #[test]
+    fn a_release_outside_the_canvas_ends_the_drag() {
+        let mut st = state_of(vec![head("DP-1", 1920, 1080, 0, 0, true)], Some(0));
+        let (cx, cy) = tile_centre(&st, 0);
+        drag_began(&mut st, cx, cy);
+        assert!(st.drag.is_some());
+        // Far outside the 360x240 canvas, in both axes.
+        drag_ended(&mut st, -400.0, 900.0);
+        assert!(st.drag.is_none(), "the release must end the drag");
+    }
+
+    /// A drag whose head vanished mid-gesture (a hotplug clears `heads` and
+    /// `edits`) must bail, not index out of bounds.
+    ///
+    /// Mutation check: drop the `drag.head >= st.edits.len()` guard in
+    /// `dragged`; this panics instead of failing. Restore.
+    #[test]
+    fn a_drag_whose_head_disappeared_is_dropped_not_indexed() {
+        let mut st = state_of(vec![head("DP-1", 1920, 1080, 0, 0, true)], Some(0));
+        let (cx, cy) = tile_centre(&st, 0);
+        drag_began(&mut st, cx, cy);
+        st.heads.clear();
+        st.edits.clear();
+        dragged(&mut st, cx + 40.0, cy);
+        assert!(st.drag.is_none(), "a stale drag must be dropped");
+    }
+
+    /// `drag_began` must publish the view the paint used, so the delta maths
+    /// and the hit test agree.
+    ///
+    /// Mutation check: have `drag_began` compute the view with a margin of
+    /// `0.0`; the scales differ and this fails. Restore.
+    #[test]
+    fn a_drag_publishes_the_same_view_the_paint_computed() {
+        let mut st = state_of(vec![head("DP-1", 1920, 1080, 0, 0, true)], Some(0));
+        let painted = scene(&DisplaysSnapshot::of(&st), CANVAS_W, CANVAS_H).view;
+        let (cx, cy) = tile_centre(&st, 0);
+        drag_began(&mut st, cx, cy);
+        assert_eq!(st.view, painted);
     }
 }

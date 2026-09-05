@@ -599,8 +599,19 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             Cmd::None
         }
         // --- Displays (P4) -----------------------------------------------
-        // Stub arms (contract §2.1): the drag maths land in a later task.
-        Msg::HeadDragBegan(..) | Msg::HeadDragged(..) | Msg::HeadDragEnded(..) => Cmd::None,
+        Msg::HeadDragBegan(x, y) => {
+            crate::pages::displays::canvas::drag_began(&mut m.displays, x, y);
+            // crate::pages::displays::controls::repopulate(&mut m.displays); // Task 4
+            Cmd::None
+        }
+        Msg::HeadDragged(x, y) => {
+            crate::pages::displays::canvas::dragged(&mut m.displays, x, y);
+            Cmd::None
+        }
+        Msg::HeadDragEnded(x, y) => {
+            crate::pages::displays::canvas::drag_ended(&mut m.displays, x, y);
+            Cmd::None
+        }
         Msg::KeyCaptured { keysym, mods } => {
             // `false` means `combo_from_keysym` declined -- a lone modifier
             // press. Stay armed and wait for the real key (contract §2.7
