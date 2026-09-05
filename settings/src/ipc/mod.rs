@@ -3,6 +3,7 @@
 //! Everything outbound is fire-and-forget: `update` pushes onto a channel and
 //! returns, and the answer arrives as a `Msg` on the app's inbox.
 
+pub mod portal;
 pub mod reload;
 
 /// Everything `update` needs to reach a worker. Cloneable; it lives on the
