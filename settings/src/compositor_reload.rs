@@ -36,9 +36,27 @@ impl ReloadClient {
     /// absence of a bus (e.g. in a headless test) just leaves `conn: None`,
     /// so every subsequent `reload()` reports `CompositorAbsent`.
     pub fn new() -> Self {
-        ReloadClient {
-            conn: zbus::blocking::Connection::session().ok(),
-        }
+        Self::on_bus(None)
+    }
+
+    /// [`ReloadClient::new`], against one named bus address.
+    ///
+    /// `None` is `$DBUS_SESSION_BUS_ADDRESS`, as before. A test passes an
+    /// address instead: the environment is process-global, and a unit test
+    /// that reached the *developer's* live bus would blocking-call
+    /// `ReloadConfig` on whatever owns `org.icedtea.Compositor` there —
+    /// forcing a real compositor to reload mid-`cargo test`. An address
+    /// nothing is listening on fails here, immediately, and every later
+    /// `reload()` reports `CompositorAbsent`.
+    #[must_use]
+    pub fn on_bus(address: Option<&str>) -> Self {
+        let conn = match address {
+            Some(address) => zbus::blocking::connection::Builder::address(address)
+                .and_then(zbus::blocking::connection::Builder::build)
+                .ok(),
+            None => zbus::blocking::Connection::session().ok(),
+        };
+        ReloadClient { conn }
     }
 
     /// Ask the running compositor to re-read config. Best-effort: if the bus

@@ -40,6 +40,14 @@ pub struct SettingsModel {
     pub db_path: std::path::PathBuf,
     pub page: PageId,
     pub status: String,
+    /// What is permanently unavailable because a worker thread could not be
+    /// started, or empty when they all did.
+    ///
+    /// A *standing* fact, not a status line: worker availability is decided
+    /// once, at spawn, and never changes. Seeding `status` with it (which is
+    /// what this replaced) put it behind the first user edit — the very fold
+    /// that makes Apply sensitive and so the moment it matters most.
+    pub worker_warning: String,
     /// The action whose binding is being captured, if any (P3 arms it).
     pub capturing: Option<String>,
     /// Conflicting bindings, recomputed from `working` after every edit.
@@ -76,18 +84,12 @@ impl SettingsModel {
             .clone()
             .unwrap_or_default();
         let conflicts = crate::model::duplicate_bindings(&model.working);
-        // A worker that could not be started is said so up front, rather than
-        // leaving a live-looking button whose click nothing ever answers.
-        let status = if workers.reload_available() && workers.fs_available() {
-            String::new()
-        } else {
-            "Some background work could not start; saving is unavailable".to_string()
-        };
         SettingsModel {
             model,
             db_path,
             page: PageId::Appearance,
-            status,
+            worker_warning: worker_warning(&workers),
+            status: String::new(),
             capturing: None,
             conflicts,
             wallpaper_text,
@@ -234,6 +236,28 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Msg>();
 };
+
+/// The standing warning for whatever could not start, naming the feature
+/// rather than the thread.
+fn worker_warning(workers: &crate::ipc::WorkerHandles) -> String {
+    let mut missing: Vec<&str> = Vec::new();
+    if !workers.reload_available() {
+        missing.push("applying changes");
+    }
+    if !workers.fs_available() {
+        missing.push("reverting and wallpaper checks");
+    }
+    if !workers.portal_available() {
+        missing.push("the file chooser");
+    }
+    if missing.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Some background work could not start; {} unavailable",
+        missing.join(", ")
+    )
+}
 
 /// Fold a candidate wallpaper path into the model.
 ///
@@ -629,15 +653,21 @@ fn clears_status(msg: &Msg) -> bool {
     }
 }
 
-/// What the footer's status label shows: the last thing the app said, and
-/// the dirty hint only when it has nothing to say.
+/// What the footer's status label shows, in priority order: whatever the app
+/// last said, then the standing degraded-worker warning, then the dirty hint.
+///
+/// The warning outranks "Unsaved changes" because it is the reason the
+/// unsaved changes cannot be saved, and no fold clears it — it is not a
+/// status line but a fact about this process.
 #[must_use]
 pub fn footer_text(m: &SettingsModel) -> &str {
-    if m.status.is_empty() && m.is_dirty() {
-        "Unsaved changes"
-    } else {
-        &m.status
+    if !m.status.is_empty() {
+        return &m.status;
     }
+    if !m.worker_warning.is_empty() {
+        return &m.worker_warning;
+    }
+    if m.is_dirty() { "Unsaved changes" } else { "" }
 }
 
 /// The whole window, rebuilt from the model on every frame.
@@ -695,13 +725,18 @@ fn footer(m: &SettingsModel) -> View<Msg> {
                 .id("status")
                 .hexpand(true)
                 .halign(Align::Start),
+            // Dirty is not enough: a worker that never started accepts the
+            // request and never answers, so the button would stay live and
+            // the footer would park on "Applying…" for the session. Revert
+            // reads the store on the filesystem worker; Apply writes it on
+            // the reload worker.
             button("Revert")
                 .id("revert")
-                .sensitive(dirty)
+                .sensitive(dirty && m.workers.fs_available())
                 .on_click(Msg::Revert),
             button("Apply")
                 .id("apply")
-                .sensitive(dirty)
+                .sensitive(dirty && m.workers.reload_available())
                 .on_click(Msg::Apply),
         ],
     )
@@ -792,6 +827,7 @@ pub(crate) mod tests {
             db_path: std::path::PathBuf::from("/nonexistent/icedtea-test.redb"),
             page: crate::pages::PageId::Appearance,
             status: String::new(),
+            worker_warning: String::new(),
             capturing: None,
             conflicts: Vec::new(),
             wallpaper_text: String::new(),
@@ -1063,7 +1099,7 @@ pub(crate) mod tests {
     #[test]
     fn a_worker_that_never_started_is_reported_in_the_footer() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let m = SettingsModel::new(
+        let mut m = SettingsModel::new(
             dir.path().join("config.redb"),
             crate::ipc::dead_handles_for_test(),
         );
@@ -1075,6 +1111,58 @@ pub(crate) mod tests {
         assert!(
             !m.portal_available,
             "and Browse is insensitive rather than inert"
+        );
+
+        // The warning must survive the fold that makes Apply *matter*.
+        // Seeding `status` with it (what this replaced) meant the first edit
+        // — which is exactly what makes the model dirty — cleared it.
+        //
+        // Mutation check: seed `m.status` from `worker_warning` in
+        // `SettingsModel::new` again and leave `footer_text` reading only
+        // `status`; this assertion fails with "Unsaved changes".
+        update(&mut m, Msg::CornerRadiusChanged(4.0));
+        assert!(m.is_dirty());
+        assert!(
+            footer_text(&m).contains("could not start"),
+            "the warning outlives the edit that makes it matter, got {:?}",
+            footer_text(&m)
+        );
+    }
+
+    /// Apply and Revert are insensitive when the worker that would serve them
+    /// never started, however dirty the model is: a click on either accepts a
+    /// request nothing will ever answer and parks the footer on "Applying…"
+    /// for the session.
+    ///
+    /// Mutation check: put `.sensitive(dirty)` back on either button and its
+    /// assertion here fails.
+    #[test]
+    fn a_dead_worker_leaves_its_button_insensitive_however_dirty_the_model_is() {
+        use icedtea_ui::css::node::PseudoStates;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut m = SettingsModel::new(
+            dir.path().join("config.redb"),
+            crate::ipc::dead_handles_for_test(),
+        );
+        m.model.working.appearance.palette.accent = "#ff00aa".to_string();
+        assert!(m.is_dirty(), "the precondition the buttons key off");
+
+        let probe = probe_of(m);
+        let disabled = |id: &str| {
+            probe
+                .root()
+                .descendants()
+                .find(|node| node.id().is_some_and(|found| found.as_str() == id))
+                .unwrap_or_else(|| panic!("#{id} is in the tree"))
+                .states()
+                .contains(PseudoStates::DISABLED)
+        };
+        assert!(disabled("apply"), "Apply needs the reload worker");
+        assert!(disabled("revert"), "Revert needs the filesystem worker");
+        assert!(
+            disabled("appearance_wallpaper_browse"),
+            "Browse needs the portal worker"
         );
     }
 

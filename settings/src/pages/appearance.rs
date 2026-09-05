@@ -344,7 +344,10 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
             [
                 w::button("Choose\u{2026}")
                     .id("appearance_wallpaper_browse")
-                    .sensitive(m.portal_available)
+                    // Insensitive while a chooser is already up, not merely
+                    // ignored in `update`: a live button that does nothing is
+                    // what makes a user click it twice.
+                    .sensitive(m.portal_available && !m.browse_in_flight)
                     .on_click(Msg::WallpaperBrowse),
                 w::button("Clear")
                     .id("appearance_wallpaper_clear")

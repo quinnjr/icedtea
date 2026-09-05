@@ -13,9 +13,16 @@ use icedtea_settings::app::Msg;
 use icedtea_settings::ipc::portal::{self, PortalRequest};
 use icedtea_ui::view::Inbox;
 
-/// Generous: this asserts "the worker answers rather than hanging", not how
-/// fast a failed bus connection is refused.
+/// The hard ceiling: `PORTAL_CONNECT_TIMEOUT` (10s) plus room for a loaded
+/// machine. It is only the *ceiling* — [`BUDGET`] is what these tests really
+/// assert against, so "answers rather than hangs" stays a claim about speed
+/// and not merely about eventually returning.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// What a refused connection to a socket that does not exist may take. The
+/// address never resolves to a listener, so this is dominated by process
+/// scheduling, not by any timeout in the worker.
+const BUDGET: Duration = Duration::from_secs(15);
 
 /// A bus address nothing is listening on.
 const NO_SUCH_BUS: &str = "unix:path=/nonexistent/icedtea-no-such-bus";
@@ -24,6 +31,11 @@ fn wait_for_answer(inbox: &Inbox<Msg>) -> Msg {
     let started = Instant::now();
     while started.elapsed() < ANSWER_TIMEOUT {
         if let Some(msg) = inbox.try_recv() {
+            let took = started.elapsed();
+            assert!(
+                took < BUDGET,
+                "the worker answered, but only after {took:?} — a wedged                  portal must fail fast, not merely before the ceiling"
+            );
             return msg;
         }
         std::thread::sleep(Duration::from_millis(20));

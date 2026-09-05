@@ -66,10 +66,28 @@ pub fn spawn_worker(
     rx: crossbeam_channel::Receiver<ReloadRequest>,
     tx: InboxSender<Msg>,
 ) -> Option<std::thread::JoinHandle<()>> {
+    spawn_worker_on_bus(rx, tx, None)
+}
+
+/// [`spawn_worker`], against one named bus address — `portal::spawn_on_bus`'s
+/// shape, for the same reason.
+///
+/// Splitting the watcher off was not enough on its own: the worker's *own*
+/// `ReloadClient` still connected to `$DBUS_SESSION_BUS_ADDRESS` and
+/// blocking-called `ReloadConfig` on whatever owned `org.icedtea.Compositor`
+/// there, so `cargo test -p icedtea-settings` forced the developer's running
+/// compositor to reload its configuration. The address travels per client
+/// instead; a unit test names one nothing is listening on, which exercises
+/// the whole write path and answers `CompositorAbsent`.
+pub fn spawn_worker_on_bus(
+    rx: crossbeam_channel::Receiver<ReloadRequest>,
+    tx: InboxSender<Msg>,
+    address: Option<String>,
+) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("settings-reload".to_string())
         .spawn(move || {
-            let client = ReloadClient::new();
+            let client = ReloadClient::on_bus(address.as_deref());
             while let Ok(request) = rx.recv() {
                 let (cfg, db_path) = match request {
                     ReloadRequest::Shutdown => return,

@@ -180,13 +180,21 @@ impl Workers {
     /// `Shutdown` request is queued *behind* whatever is already in the
     /// channel, so waiting for the worker to reach it is waiting for that
     /// write to land.
+    ///
+    /// The **portal** worker is told to stop but never waited for. Its
+    /// blocking unit of work is a file chooser a human is looking at, bounded
+    /// only by `PORTAL_TIMEOUT` (five minutes), so joining it would make
+    /// quitting with a chooser open stall for the whole `SHUTDOWN_TIMEOUT`
+    /// every time. It holds nothing that has to reach disk — the reason this
+    /// function exists at all — and the process is exiting.
     pub fn shutdown(self) {
         let _ = self.handles.reload.send(reload::ReloadRequest::Shutdown);
         let _ = self.handles.portal.send(portal::PortalRequest::Shutdown);
         let _ = self.handles.fs.send(fs::FsRequest::Shutdown);
         drop(self.handles);
+        drop(self.portal);
         let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
-        for worker in [self.reload, self.portal, self.fs] {
+        for worker in [self.reload, self.fs] {
             let Some(worker) = worker else { continue };
             while !worker.is_finished() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -267,18 +275,28 @@ mod tests {
     }
 
     /// The reload worker really does write the config and answer on the
-    /// inbox — over its own channel, with no `ipc::spawn`, and so no
-    /// `ConfigReloaded` watcher on anybody's live bus.
+    /// inbox — over its own channel, with no `ipc::spawn` (so no
+    /// `ConfigReloaded` watcher) and against a bus address nothing is
+    /// listening on (so no `ReloadConfig` on the developer's live bus, which
+    /// would make their running compositor re-read its configuration in the
+    /// middle of `cargo test`). The write path is exercised in full; the
+    /// D-Bus half fails fast and is asserted as `CompositorAbsent`.
     ///
-    /// Mutation check: drop the `tx.send(...)` in `reload::spawn_worker`'s
-    /// request arm; this test times out and fails. Restore.
+    /// Mutation check: drop the `tx.send(...)` in
+    /// `reload::spawn_worker_on_bus`'s request arm; this test times out and
+    /// fails. Restore.
     #[test]
     fn the_reload_worker_writes_the_config_and_answers_on_the_inbox() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("config.redb");
         let (inbox, tx) = icedtea_ui::view::Inbox::<crate::app::Msg>::new().expect("inbox");
         let (req_tx, req_rx) = crossbeam_channel::unbounded();
-        let worker = super::reload::spawn_worker(req_rx, tx).expect("the reload worker starts");
+        let worker = super::reload::spawn_worker_on_bus(
+            req_rx,
+            tx,
+            Some("unix:path=/nonexistent/icedtea-no-such-bus".to_string()),
+        )
+        .expect("the reload worker starts");
 
         let mut cfg = icedtea_config::default_config();
         cfg.appearance.palette.accent = "#ff00aa".to_string();
@@ -296,8 +314,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         match applied {
-            Some(crate::app::Msg::Applied { result: Ok(_), .. }) => {}
-            other => panic!("expected Msg::Applied(Ok(..)), got {other:?}"),
+            Some(crate::app::Msg::Applied {
+                result: Ok(crate::compositor_reload::ReloadOutcome::CompositorAbsent),
+                ..
+            }) => {}
+            other => panic!("expected Msg::Applied(Ok(CompositorAbsent)), got {other:?}"),
         }
         let on_disk = icedtea_config::load_or_default(&db);
         assert_eq!(on_disk.appearance.palette.accent, "#ff00aa");
