@@ -24,6 +24,17 @@ use crate::pages::displays::state::DisplaysState;
 /// `working != saved`, computed on every `view`, never a flag. The GTK
 /// `Ctx`/`Page`/`populating` machinery has no equivalent here — a programmatic
 /// widget write cannot happen on an Elm loop, so there is nothing to guard.
+/// Which palette entry the colour picker is editing.
+///
+/// The picker is a panel the Appearance page renders under the palette rows
+/// (contract deviation P2-D11); this is the only state it needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorSlot {
+    Background,
+    Foreground,
+    Accent,
+}
+
 pub struct SettingsModel {
     pub model: crate::model::Model,
     pub db_path: std::path::PathBuf,
@@ -36,6 +47,8 @@ pub struct SettingsModel {
     pub wallpaper_text: String,
     pub wallpaper_error: Option<String>,
     pub portal_available: bool,
+    /// The palette entry whose picker panel is open, if any.
+    pub color_picker: Option<ColorSlot>,
     pub displays: DisplaysState,
     pub displays_status: String,
     pub displays_in_flight: bool,
@@ -69,6 +82,7 @@ impl SettingsModel {
             wallpaper_text,
             wallpaper_error: None,
             portal_available: true,
+            color_picker: None,
             displays: DisplaysState::new(),
             displays_status: String::new(),
             displays_in_flight: false,
@@ -116,6 +130,21 @@ pub enum Msg {
     Applied(Result<ReloadOutcome, String>),
     /// The compositor emitted `ConfigReloaded`.
     ConfigReloaded,
+
+    // --- Appearance (P2) --------------------------------------------------
+    /// A `drop_down` selection, by index into `model::BAR_POSITIONS`.
+    BarPositionSelected(usize),
+    BarHeightChanged(f64),
+    CornerRadiusChanged(f64),
+    /// A palette swatch's picker panel opened or closed (contract P2-D11).
+    ColorPickerOpened(ColorSlot),
+    ColorPickerClosed,
+    /// A colour picked in a swatch's panel, packed as `ColorDialogC::pack`
+    /// (M3 P5-D23).
+    BackgroundPicked(f64),
+    ForegroundPicked(f64),
+    AccentPicked(f64),
+
     /// One protocol message from the outputs connection, via `App::on_fd`.
     /// `Arc`, not `Rc`: `Msg` is `Send` (M5-D2).
     Outputs(std::sync::Arc<crate::outputs::OutputsMsg>),
@@ -187,6 +216,46 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
         }
         Msg::ConfigReloaded => {
             m.status = "Compositor reloaded its configuration".to_string();
+            Cmd::None
+        }
+        Msg::BarPositionSelected(index) => {
+            if let Some(position) = crate::model::BAR_POSITIONS.get(index) {
+                m.model.working.appearance.bar_position = (*position).to_string();
+            }
+            Cmd::None
+        }
+        Msg::BarHeightChanged(v) => {
+            m.model.working.appearance.bar_height = crate::pages::appearance::spin_px(v);
+            Cmd::None
+        }
+        Msg::CornerRadiusChanged(v) => {
+            m.model.working.appearance.corner_radius = crate::pages::appearance::spin_px(v);
+            Cmd::None
+        }
+        Msg::ColorPickerOpened(slot) => {
+            m.color_picker = Some(slot);
+            Cmd::None
+        }
+        Msg::ColorPickerClosed => {
+            m.color_picker = None;
+            Cmd::None
+        }
+        Msg::BackgroundPicked(packed) => {
+            m.model.working.appearance.palette.background =
+                crate::pages::appearance::packed_to_hex(packed);
+            m.color_picker = None;
+            Cmd::None
+        }
+        Msg::ForegroundPicked(packed) => {
+            m.model.working.appearance.palette.foreground =
+                crate::pages::appearance::packed_to_hex(packed);
+            m.color_picker = None;
+            Cmd::None
+        }
+        Msg::AccentPicked(packed) => {
+            m.model.working.appearance.palette.accent =
+                crate::pages::appearance::packed_to_hex(packed);
+            m.color_picker = None;
             Cmd::None
         }
         Msg::Outputs(update) => match &*update {
@@ -368,7 +437,7 @@ fn footer(m: &SettingsModel) -> View<Msg> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Msg, SettingsModel, footer_text, update, view};
+    use super::{ColorSlot, Msg, SettingsModel, footer_text, update, view};
     use crate::compositor_reload::ReloadOutcome;
     use crate::pages::PageId;
 
@@ -385,6 +454,109 @@ mod tests {
         let db = dir.path().join("config.redb");
         let (workers, _rx) = crate::ipc::handles_for_test();
         (SettingsModel::new(db, workers), dir)
+    }
+
+    /// A model with live workers and no window. The returned `Inbox` must be
+    /// held: dropping it makes every worker's next `send` fail and the
+    /// worker threads exit, which is correct behaviour but confusing
+    /// mid-test.
+    pub(crate) fn test_model() -> (SettingsModel, icedtea_ui::view::Inbox<Msg>) {
+        let (inbox, tx) = icedtea_ui::view::Inbox::<Msg>::new().expect("inbox");
+        let workers = crate::ipc::spawn(tx);
+        let cfg = icedtea_config::default_config();
+        let model = SettingsModel {
+            model: crate::model::Model {
+                working: cfg.clone(),
+                saved: cfg,
+            },
+            db_path: std::path::PathBuf::from("/nonexistent/icedtea-test.redb"),
+            page: crate::pages::PageId::Appearance,
+            status: String::new(),
+            capturing: None,
+            conflicts: Vec::new(),
+            wallpaper_text: String::new(),
+            wallpaper_error: None,
+            portal_available: true,
+            color_picker: None,
+            displays: crate::pages::displays::state::DisplaysState::new(),
+            displays_status: String::new(),
+            displays_in_flight: false,
+            outputs_available: false,
+            outputs: None,
+            workers,
+        };
+        (model, inbox)
+    }
+
+    #[test]
+    fn a_bar_position_pick_writes_the_domain_value_not_the_index() {
+        let (mut m, _inbox) = test_model();
+        update(&mut m, Msg::BarPositionSelected(1));
+        assert_eq!(m.model.working.appearance.bar_position, "bottom");
+        update(&mut m, Msg::BarPositionSelected(0));
+        assert_eq!(m.model.working.appearance.bar_position, "top");
+    }
+
+    #[test]
+    fn an_out_of_domain_bar_position_index_is_ignored() {
+        let (mut m, _inbox) = test_model();
+        let before = m.model.working.appearance.bar_position.clone();
+        update(&mut m, Msg::BarPositionSelected(99));
+        assert_eq!(
+            m.model.working.appearance.bar_position, before,
+            "an index BAR_POSITIONS does not have leaves the model alone"
+        );
+    }
+
+    #[test]
+    fn the_pixel_spin_buttons_write_clamped_integers() {
+        let (mut m, _inbox) = test_model();
+        update(&mut m, Msg::BarHeightChanged(31.6));
+        update(&mut m, Msg::CornerRadiusChanged(-4.0));
+        assert_eq!(m.model.working.appearance.bar_height, 32);
+        assert_eq!(m.model.working.appearance.corner_radius, 0);
+        assert!(m.model.is_dirty(), "an edit makes the model dirty");
+    }
+
+    #[test]
+    fn a_colour_pick_writes_hex_and_closes_the_picker() {
+        let (mut m, _inbox) = test_model();
+        update(&mut m, Msg::ColorPickerOpened(ColorSlot::Accent));
+        assert_eq!(m.color_picker, Some(ColorSlot::Accent));
+        let packed = crate::pages::appearance::hex_to_packed("#89b4fa");
+        update(&mut m, Msg::AccentPicked(packed));
+        assert_eq!(m.model.working.appearance.palette.accent, "#89b4fa");
+        assert_eq!(m.color_picker, None, "picking closes the picker");
+    }
+
+    #[test]
+    fn the_three_colour_slots_are_independent() {
+        let (mut m, _inbox) = test_model();
+        update(
+            &mut m,
+            Msg::BackgroundPicked(crate::pages::appearance::hex_to_packed("#1e1e2e")),
+        );
+        update(
+            &mut m,
+            Msg::ForegroundPicked(crate::pages::appearance::hex_to_packed("#cdd6f4")),
+        );
+        let palette = &m.model.working.appearance.palette;
+        assert_eq!(palette.background, "#1e1e2e");
+        assert_eq!(palette.foreground, "#cdd6f4");
+        assert_eq!(
+            palette.accent,
+            icedtea_config::default_config().appearance.palette.accent,
+            "the untouched slot is untouched"
+        );
+    }
+
+    #[test]
+    fn closing_the_picker_leaves_the_model_alone() {
+        let (mut m, _inbox) = test_model();
+        update(&mut m, Msg::ColorPickerOpened(ColorSlot::Background));
+        update(&mut m, Msg::ColorPickerClosed);
+        assert_eq!(m.color_picker, None);
+        assert!(!m.model.is_dirty(), "opening and closing edits nothing");
     }
 
     /// Mutation check: make `Msg::PageSelected` ignore its index; this fails
