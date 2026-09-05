@@ -52,6 +52,42 @@ impl OutputsPump {
                 return Ok(None);
             }
         };
+        Self::attach_connection(window, conn, rx)
+    }
+
+    /// [`OutputsPump::attach`], against one named compositor socket.
+    ///
+    /// `$WAYLAND_DISPLAY` is process-global, and libtest runs a binary's tests
+    /// in parallel threads of one process: a test that rewrote it to reach its
+    /// own harness compositor rewrote it for every test beside it.
+    /// `OutputsConnection::connect_to_path` is the way out, and this is the
+    /// pump-shaped door to it.
+    ///
+    /// # Errors
+    ///
+    /// The same shape as [`OutputsPump::attach`]: a connect failure is
+    /// `Ok(None)`, not an error.
+    pub fn attach_at_path(
+        window: &mut Window,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Option<OutputsPump>> {
+        let (tx, rx) = async_channel::unbounded::<OutputsMsg>();
+        let conn = match OutputsConnection::connect_to_path(path, tx) {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!(%err, "no outputs connection; the Displays page is unavailable");
+                return Ok(None);
+            }
+        };
+        Self::attach_connection(window, conn, rx)
+    }
+
+    /// The half both constructors share, over a connection already made.
+    fn attach_connection(
+        window: &mut Window,
+        conn: OutputsConnection,
+        rx: async_channel::Receiver<OutputsMsg>,
+    ) -> std::io::Result<Option<OutputsPump>> {
         // Dup so the window owns its own fd and the original stays with the
         // EventQueue.
         let fd = match rustix::io::dup(std::os::fd::AsFd::as_fd(conn.queue())) {

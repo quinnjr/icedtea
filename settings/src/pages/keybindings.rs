@@ -691,11 +691,12 @@ mod tests {
     fn model_with_workspaces(count: usize) -> crate::app::SettingsModel {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("config.redb");
-        let (inbox, tx) = icedtea_ui::view::Inbox::new().expect("inbox");
-        let workers = crate::ipc::spawn(tx);
+        // `handles_for_test`, never the real `ipc::spawn`: that one opens a
+        // `ConfigReloaded` subscription on the developer's live session bus
+        // (finding 15). Nothing here issues a `Cmd::Task`.
+        let (workers, _rx, _portal_rx, _fs_rx) = crate::ipc::handles_for_test();
         let mut m = crate::app::SettingsModel::new(db_path, workers);
         m.model.working.workspace_names = (1..=count).map(|n| n.to_string()).collect();
-        drop(inbox);
         m
     }
 

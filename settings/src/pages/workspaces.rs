@@ -413,7 +413,7 @@ mod tests {
     fn model_with(names: &[&str]) -> crate::app::SettingsModel {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("config.redb");
-        let (workers, _rx, _portal_rx) = crate::ipc::handles_for_test();
+        let (workers, _rx, _portal_rx, _fs_rx) = crate::ipc::handles_for_test();
         let mut m = crate::app::SettingsModel::new(db_path, workers);
         m.model.working.workspace_names = names.iter().map(|s| (*s).to_string()).collect();
         m

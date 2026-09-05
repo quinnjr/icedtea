@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use icedtea_ui::layout::Align;
 use icedtea_ui::view::builders::{
-    StackExt, box_, button, label, stack, stack_page, stack_switcher,
+    StackExt, StackPagesExt, box_, button, label, stack, stack_page, stack_switcher,
 };
 use icedtea_ui::view::{Cmd, View};
 use icedtea_ui::widgets::types::Orientation;
@@ -47,6 +47,10 @@ pub struct SettingsModel {
     pub wallpaper_text: String,
     pub wallpaper_error: Option<String>,
     pub portal_available: bool,
+    /// A file chooser is open. A second Browse click while one is up served
+    /// a second, unprompted dialog once the first closed — the same latch
+    /// `displays_in_flight` is for the Displays page.
+    pub browse_in_flight: bool,
     /// The palette entry whose picker panel is open, if any.
     pub color_picker: Option<ColorSlot>,
     pub displays: DisplaysState,
@@ -72,16 +76,24 @@ impl SettingsModel {
             .clone()
             .unwrap_or_default();
         let conflicts = crate::model::duplicate_bindings(&model.working);
+        // A worker that could not be started is said so up front, rather than
+        // leaving a live-looking button whose click nothing ever answers.
+        let status = if workers.reload_available() && workers.fs_available() {
+            String::new()
+        } else {
+            "Some background work could not start; saving is unavailable".to_string()
+        };
         SettingsModel {
             model,
             db_path,
             page: PageId::Appearance,
-            status: String::new(),
+            status,
             capturing: None,
             conflicts,
             wallpaper_text,
             wallpaper_error: None,
-            portal_available: true,
+            portal_available: workers.portal_available(),
+            browse_in_flight: false,
             color_picker: None,
             displays: DisplaysState::new(),
             displays_status: String::new(),
@@ -127,7 +139,16 @@ pub enum Msg {
     Apply,
     Revert,
     /// From the reload worker, through the inbox.
-    Applied(Result<ReloadOutcome, String>),
+    ///
+    /// `shipped` is the snapshot the worker actually wrote — never the
+    /// current working copy. An edit folded while the write was in flight
+    /// used to be marked saved without ever reaching disk.
+    Applied {
+        shipped: std::sync::Arc<icedtea_config::Config>,
+        result: Result<ReloadOutcome, String>,
+    },
+    /// The filesystem worker read the config store back, for Revert.
+    ConfigLoaded(std::sync::Arc<icedtea_config::Config>),
     /// The compositor emitted `ConfigReloaded`.
     ConfigReloaded,
 
@@ -174,6 +195,12 @@ pub enum Msg {
     WallpaperPickerCancelled,
     /// The field's clear control.
     WallpaperCleared,
+    /// The filesystem worker's verdict on `text`, which is applied only
+    /// while `text` is still what the field holds (a later keystroke wins).
+    WallpaperValidated {
+        text: String,
+        result: Result<String, String>,
+    },
 
     // --- Workspaces (P3) --------------------------------------------------
     /// A workspace `Entry` changed, by row index.
@@ -212,20 +239,22 @@ const _: fn() = || {
 ///
 /// One code path for the `Entry` and for the portal's answer: the portal is
 /// another process and its reply is no more trusted than a typed string.
-fn set_wallpaper(m: &mut SettingsModel, text: String) {
+fn set_wallpaper(m: &mut SettingsModel, text: String) -> Cmd<Msg> {
     m.wallpaper_text = text;
     if m.wallpaper_text.trim().is_empty() {
         m.wallpaper_error = None;
         m.model.working.appearance.wallpaper = None;
-        return;
+        return Cmd::None;
     }
-    match crate::pages::appearance::validate_wallpaper(&m.wallpaper_text) {
-        Ok(path) => {
-            m.wallpaper_error = None;
-            m.model.working.appearance.wallpaper = Some(path.display().to_string());
-        }
-        Err(reason) => m.wallpaper_error = Some(reason),
-    }
+    // The verdict needs a `stat(2)`, and `update` does not block (spec D8):
+    // a wallpaper on a network mount stalled the whole window inside the
+    // fold, once per keystroke. The check leaves on the filesystem worker
+    // and comes back as `Msg::WallpaperValidated`; until it does the field
+    // keeps whatever it last said, which is what an `Entry` mid-edit shows
+    // anyway.
+    let handles = m.workers.clone();
+    let text = m.wallpaper_text.clone();
+    Cmd::Task(Rc::new(move || handles.validate_wallpaper(text.clone())))
 }
 
 /// Fold one message into the model.
@@ -236,6 +265,9 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
     // One line per fold, for the harness gates. A no-op without
     // $ICEDTEA_PROBE_REPORT.
     crate::probe::report(&format!("msg {msg:?}"));
+    if clears_status(&msg) {
+        m.status.clear();
+    }
     let cmd = match msg {
         Msg::PageSelected(index) => {
             m.page = PageId::from_index(index);
@@ -252,7 +284,16 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             Cmd::Task(Rc::new(move || workers.apply(cfg.clone(), db_path.clone())))
         }
         Msg::Revert => {
-            m.model.revert(&m.db_path);
+            // Reading the store means opening `redb`, which `update` must not
+            // do on the loop thread (spec D8): the read leaves on the
+            // filesystem worker and comes back as `Msg::ConfigLoaded`.
+            let handles = m.workers.clone();
+            let db_path = m.db_path.clone();
+            Cmd::Task(Rc::new(move || handles.load_config(db_path.clone())))
+        }
+        Msg::ConfigLoaded(cfg) => {
+            m.model.working = (*cfg).clone();
+            m.model.saved = (*cfg).clone();
             m.wallpaper_text = m
                 .model
                 .working
@@ -267,19 +308,22 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             // and never routes through this working copy (main.rs:165-174).
             Cmd::None
         }
-        Msg::Applied(Ok(ReloadOutcome::Reloaded)) => {
-            m.model.saved = m.model.working.clone();
-            m.status = "Applied".to_string();
-            Cmd::None
-        }
-        Msg::Applied(Ok(ReloadOutcome::CompositorAbsent)) => {
-            m.model.saved = m.model.working.clone();
-            m.status = "Saved; will apply when the compositor starts".to_string();
-            Cmd::None
-        }
-        Msg::Applied(Err(err)) => {
-            // The write failed: the working copy stays dirty on purpose.
-            m.status = format!("Failed to save: {err}");
+        Msg::Applied { shipped, result } => {
+            match result {
+                // `saved` is re-baselined from the snapshot the worker really
+                // wrote, not from the current working copy: an edit folded
+                // while the write was in flight stays dirty, because it is.
+                Ok(ReloadOutcome::Reloaded) => {
+                    m.model.saved = (*shipped).clone();
+                    m.status = "Applied".to_string();
+                }
+                Ok(ReloadOutcome::CompositorAbsent) => {
+                    m.model.saved = (*shipped).clone();
+                    m.status = "Saved; will apply when the compositor starts".to_string();
+                }
+                // The write failed: the working copy stays dirty on purpose.
+                Err(err) => m.status = format!("Failed to save: {err}"),
+            }
             Cmd::None
         }
         Msg::ConfigReloaded => {
@@ -436,23 +480,36 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
                 }
             }
         },
-        Msg::WallpaperEdited(text) => {
-            set_wallpaper(m, text);
-            Cmd::None
-        }
+        Msg::WallpaperEdited(text) => set_wallpaper(m, text),
         Msg::WallpaperChosen(path) => {
-            set_wallpaper(m, path.display().to_string());
-            Cmd::None
+            m.browse_in_flight = false;
+            set_wallpaper(m, path.display().to_string())
         }
-        Msg::WallpaperCleared => {
-            set_wallpaper(m, String::new());
+        Msg::WallpaperCleared => set_wallpaper(m, String::new()),
+        Msg::WallpaperValidated { text, result } => {
+            // A later keystroke has already superseded this answer.
+            if text == m.wallpaper_text {
+                match result {
+                    Ok(path) => {
+                        m.wallpaper_error = None;
+                        m.model.working.appearance.wallpaper = Some(path);
+                    }
+                    Err(reason) => m.wallpaper_error = Some(reason),
+                }
+            }
             Cmd::None
         }
         Msg::WallpaperBrowse => {
             if !m.portal_available {
                 m.status = "No file portal available; type a path instead".to_string();
                 Cmd::None
+            } else if m.browse_in_flight {
+                // The chooser is already up. Serving this click after it
+                // closes is a second, unprompted dialog nobody asked for --
+                // and `parent_window` is "", so neither is modal.
+                Cmd::None
             } else {
+                m.browse_in_flight = true;
                 let handles = m.workers.clone();
                 let current = m
                     .model
@@ -469,6 +526,7 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
         Msg::WallpaperPickerFailed(reason) => {
             m.status = reason;
             m.portal_available = false;
+            m.browse_in_flight = false;
             Cmd::None
         }
         // No latch: the portal answered, and answered normally. Greying
@@ -477,6 +535,7 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
         // a portal that is not there.
         Msg::WallpaperPickerCancelled => {
             m.status = "Wallpaper selection cancelled".to_string();
+            m.browse_in_flight = false;
             Cmd::None
         }
         Msg::WorkspaceRenamed(index, text) => {
@@ -524,11 +583,57 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
     cmd
 }
 
-/// What the footer's status label shows: the dirty indicator wins over the
-/// last status line, exactly as the GTK `update_footer` closure did.
+/// Whether folding `msg` is a user edit, and so clears the status line.
+///
+/// The status is what the app has to *say*; the dirty hint is a standing
+/// state. Letting dirty win outright (what the GTK `update_footer` closure
+/// did, and what this used to copy) meant "Failed to save: …" — which
+/// deliberately leaves the model dirty — could never be displayed at all,
+/// nor "Applying…", nor the picker's cancelled/unavailable lines. So the
+/// status wins while it is fresh, and the user's next edit is what makes it
+/// stale. Exhaustive on purpose: a new `Msg` has to decide.
+fn clears_status(msg: &Msg) -> bool {
+    match msg {
+        Msg::BarPositionSelected(_)
+        | Msg::BarHeightChanged(_)
+        | Msg::CornerRadiusChanged(_)
+        | Msg::BackgroundPicked(_)
+        | Msg::ForegroundPicked(_)
+        | Msg::AccentPicked(_)
+        | Msg::SnapGapChanged(_)
+        | Msg::RaiseOnFocusToggled(_)
+        | Msg::HideBarOnFullscreenToggled(_)
+        | Msg::SnapEnabledToggled(_)
+        | Msg::WallpaperEdited(_)
+        | Msg::WallpaperCleared
+        | Msg::WorkspaceRenamed(..)
+        | Msg::WorkspaceAdded
+        | Msg::WorkspaceRemoved(_)
+        | Msg::KeyCaptured { .. } => true,
+        Msg::PageSelected(_)
+        | Msg::Apply
+        | Msg::Revert
+        | Msg::Applied { .. }
+        | Msg::ConfigLoaded(_)
+        | Msg::ConfigReloaded
+        | Msg::ColorPickerOpened(_)
+        | Msg::ColorPickerClosed
+        | Msg::Outputs(_)
+        | Msg::WallpaperBrowse
+        | Msg::WallpaperChosen(_)
+        | Msg::WallpaperValidated { .. }
+        | Msg::WallpaperPickerFailed(_)
+        | Msg::WallpaperPickerCancelled
+        | Msg::CaptureArmed(_)
+        | Msg::CaptureCancelled => false,
+    }
+}
+
+/// What the footer's status label shows: the last thing the app said, and
+/// the dirty hint only when it has nothing to say.
 #[must_use]
 pub fn footer_text(m: &SettingsModel) -> &str {
-    if m.is_dirty() {
+    if m.status.is_empty() && m.is_dirty() {
         "Unsaved changes"
     } else {
         &m.status
@@ -569,8 +674,12 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
 /// The page switcher. `Stack` + `StackSwitcher`, not `StackSidebar` (spec D7:
 /// the sidebar's eviction defect is out of M5's scope).
 fn nav(m: &SettingsModel) -> View<Msg> {
-    let _ = m;
+    // Without this the switcher builds with `selected = 0` whatever page the
+    // stack is showing: `$ICEDTEA_SETTINGS_PAGE=behavior` opened on Behavior
+    // with "Appearance" checked, and clicking the lit button was swallowed by
+    // `StackSwitcherC::on_event`'s `index == self.selected` early return.
     stack_switcher(pages::page_infos())
+        .selected(m.page.index())
         .id("nav")
         .on_selected(Msg::PageSelected)
 }
@@ -615,20 +724,65 @@ pub(crate) mod tests {
         assert_send::<Msg>();
     }
 
-    fn model() -> (SettingsModel, tempfile::TempDir) {
+    /// A model over a real (empty) config store, plus the worker queues its
+    /// `Cmd::Task`s land on. The `TempDir` must be held for the db path to
+    /// stay valid.
+    fn model() -> (SettingsModel, tempfile::TempDir, TestWorkers) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("config.redb");
-        let (workers, _rx, _portal_rx) = crate::ipc::handles_for_test();
-        (SettingsModel::new(db, workers), dir)
+        let (workers, reload, portal, fs) = crate::ipc::handles_for_test();
+        (
+            SettingsModel::new(db, workers),
+            dir,
+            TestWorkers { reload, portal, fs },
+        )
     }
 
-    /// A model with live workers and no window. The returned `Inbox` must be
-    /// held: dropping it makes every worker's next `send` fail and the
-    /// worker threads exit, which is correct behaviour but confusing
-    /// mid-test.
-    pub(crate) fn test_model() -> (SettingsModel, icedtea_ui::view::Inbox<Msg>) {
-        let (inbox, tx) = icedtea_ui::view::Inbox::<Msg>::new().expect("inbox");
-        let workers = crate::ipc::spawn(tx);
+    /// The worker queues a [`test_model`] hands its `Cmd::Task`s to.
+    ///
+    /// No thread and no D-Bus: `ipc::spawn` (which this used to call) opens a
+    /// `ConfigReloaded` subscription on the developer's *live* session bus
+    /// and blocking-calls `ReloadConfig` on whatever owns
+    /// `org.icedtea.Compositor` there — a unit test that forced a real
+    /// compositor to reload (finding 15). `handles_for_test` (P1-D8) is the
+    /// sanctioned shape; [`TestWorkers::settle`] plays the queued filesystem
+    /// work back by hand, synchronously, so a test can still assert on what
+    /// the answer does to the model.
+    pub(crate) struct TestWorkers {
+        pub reload: crossbeam_channel::Receiver<crate::ipc::reload::ReloadRequest>,
+        pub portal: crossbeam_channel::Receiver<crate::ipc::portal::PortalRequest>,
+        pub fs: crossbeam_channel::Receiver<crate::ipc::fs::FsRequest>,
+    }
+
+    impl TestWorkers {
+        /// Run every queued filesystem request the way the worker would, and
+        /// fold its answer — the loop's `Cmd::Task` plus inbox round trip,
+        /// collapsed into one synchronous call.
+        pub fn settle(&self, m: &mut SettingsModel) {
+            while let Ok(request) = self.fs.try_recv() {
+                let msg = match request {
+                    crate::ipc::fs::FsRequest::Shutdown => continue,
+                    crate::ipc::fs::FsRequest::ValidateWallpaper { text } => {
+                        Msg::WallpaperValidated {
+                            text: text.clone(),
+                            result: crate::pages::appearance::validate_wallpaper(&text)
+                                .map(|path| path.display().to_string()),
+                        }
+                    }
+                    crate::ipc::fs::FsRequest::LoadConfig { db_path } => Msg::ConfigLoaded(
+                        std::sync::Arc::new(icedtea_config::load_or_default(&db_path)),
+                    ),
+                };
+                update(m, msg);
+            }
+        }
+    }
+
+    /// A model with worker *queues* and no window, and the receivers behind
+    /// them. The queues must be held: dropping them makes every `Cmd::Task`'s
+    /// send fail.
+    pub(crate) fn test_model() -> (SettingsModel, TestWorkers) {
+        let (workers, reload, portal, fs) = crate::ipc::handles_for_test();
         let cfg = icedtea_config::default_config();
         let model = SettingsModel {
             model: crate::model::Model {
@@ -643,6 +797,7 @@ pub(crate) mod tests {
             wallpaper_text: String::new(),
             wallpaper_error: None,
             portal_available: true,
+            browse_in_flight: false,
             color_picker: None,
             displays: crate::pages::displays::state::DisplaysState::new(),
             displays_status: String::new(),
@@ -651,12 +806,12 @@ pub(crate) mod tests {
             outputs: None,
             workers,
         };
-        (model, inbox)
+        (model, TestWorkers { reload, portal, fs })
     }
 
     #[test]
     fn a_bar_position_pick_writes_the_domain_value_not_the_index() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         update(&mut m, Msg::BarPositionSelected(1));
         assert_eq!(m.model.working.appearance.bar_position, "bottom");
         update(&mut m, Msg::BarPositionSelected(0));
@@ -665,7 +820,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_out_of_domain_bar_position_index_is_ignored() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         let before = m.model.working.appearance.bar_position.clone();
         update(&mut m, Msg::BarPositionSelected(99));
         assert_eq!(
@@ -676,7 +831,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_pixel_spin_buttons_write_clamped_integers() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         update(&mut m, Msg::BarHeightChanged(31.6));
         update(&mut m, Msg::CornerRadiusChanged(-4.0));
         assert_eq!(m.model.working.appearance.bar_height, 32);
@@ -686,7 +841,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_colour_pick_writes_hex_and_closes_the_picker() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         update(&mut m, Msg::ColorPickerOpened(ColorSlot::Accent));
         assert_eq!(m.color_picker, Some(ColorSlot::Accent));
         let packed = crate::pages::appearance::hex_to_packed("#89b4fa");
@@ -697,7 +852,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_three_colour_slots_are_independent() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         update(
             &mut m,
             Msg::BackgroundPicked(crate::pages::appearance::hex_to_packed("#1e1e2e")),
@@ -718,7 +873,7 @@ pub(crate) mod tests {
 
     #[test]
     fn closing_the_picker_leaves_the_model_alone() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         update(&mut m, Msg::ColorPickerOpened(ColorSlot::Background));
         update(&mut m, Msg::ColorPickerClosed);
         assert_eq!(m.color_picker, None);
@@ -729,7 +884,7 @@ pub(crate) mod tests {
     /// on the `Workspaces` assertion. Restore.
     #[test]
     fn selecting_a_page_moves_the_model_and_cancels_a_capture() {
-        let (mut m, _dir) = model();
+        let (mut m, _dir, _workers) = model();
         m.capturing = Some("close".to_string());
         update(&mut m, Msg::PageSelected(2));
         assert_eq!(m.page, PageId::Workspaces);
@@ -739,11 +894,20 @@ pub(crate) mod tests {
     /// Dirty is computed from working != saved, never a flag (spec §5.1).
     #[test]
     fn dirty_is_computed_and_revert_clears_it() {
-        let (mut m, _dir) = model();
+        let (mut m, _dir, workers) = model();
         assert!(!m.is_dirty(), "a freshly loaded model is clean");
         m.model.working.appearance.palette.accent = "#ff00aa".to_string();
         assert!(m.is_dirty());
-        update(&mut m, Msg::Revert);
+        // Revert reads `redb`, which `update` must not do on the loop thread
+        // (spec D8): it leaves through `Cmd::Task` and comes back as
+        // `Msg::ConfigLoaded`, which `settle` plays back here.
+        let cmd = update(&mut m, Msg::Revert);
+        assert!(
+            matches!(cmd, Cmd::Task(_)),
+            "the store is read on the worker, never inside update"
+        );
+        run_task(&cmd);
+        workers.settle(&mut m);
         assert!(!m.is_dirty(), "Revert reloads both halves from disk");
         assert_eq!(m.status, "");
     }
@@ -751,22 +915,199 @@ pub(crate) mod tests {
     /// The three Apply outcomes are the three `main.rs:136-158` shipped.
     #[test]
     fn the_three_apply_outcomes_set_status_and_the_saved_snapshot() {
-        let (mut m, _dir) = model();
+        let (mut m, _dir, _workers) = model();
         m.model.working.appearance.palette.accent = "#ff00aa".to_string();
 
-        update(&mut m, Msg::Applied(Ok(ReloadOutcome::Reloaded)));
-        assert!(!m.is_dirty(), "a reload snapshots working into saved");
+        let shipped = |m: &SettingsModel| std::sync::Arc::new(m.model.working.clone());
+
+        let snapshot = shipped(&m);
+        update(
+            &mut m,
+            Msg::Applied {
+                shipped: snapshot,
+                result: Ok(ReloadOutcome::Reloaded),
+            },
+        );
+        assert!(
+            !m.is_dirty(),
+            "a reload snapshots what was written into saved"
+        );
         assert_eq!(m.status, "Applied");
 
         m.model.working.appearance.palette.accent = "#00ff00".to_string();
-        update(&mut m, Msg::Applied(Ok(ReloadOutcome::CompositorAbsent)));
+        let snapshot = shipped(&m);
+        update(
+            &mut m,
+            Msg::Applied {
+                shipped: snapshot,
+                result: Ok(ReloadOutcome::CompositorAbsent),
+            },
+        );
         assert!(!m.is_dirty());
         assert_eq!(m.status, "Saved; will apply when the compositor starts");
 
         m.model.working.appearance.palette.accent = "#0000ff".to_string();
-        update(&mut m, Msg::Applied(Err("disk on fire".to_string())));
+        let snapshot = shipped(&m);
+        update(
+            &mut m,
+            Msg::Applied {
+                shipped: snapshot,
+                result: Err("disk on fire".to_string()),
+            },
+        );
         assert!(m.is_dirty(), "a failed write leaves the edit unsaved");
         assert_eq!(m.status, "Failed to save: disk on fire");
+        assert_eq!(
+            footer_text(&m),
+            "Failed to save: disk on fire",
+            "a failure the model stays dirty for must still be readable"
+        );
+    }
+
+    /// An edit made while an Apply is in flight is still unsaved when the
+    /// answer lands: `saved` is re-baselined from the snapshot the worker
+    /// really wrote, never from the working copy as it is by then.
+    ///
+    /// Mutation check: `m.model.saved = m.model.working.clone()` in the
+    /// `Applied` arm again (what it did) and both assertions fail — the app
+    /// reports "Applied" over an edit that never reached disk.
+    #[test]
+    fn an_edit_folded_during_an_apply_is_not_marked_saved() {
+        let (mut m, _dir, workers) = model();
+        m.model.working.appearance.palette.accent = "#ff00aa".to_string();
+
+        let cmd = update(&mut m, Msg::Apply);
+        run_task(&cmd);
+        let shipped = match workers.reload.try_recv() {
+            Ok(crate::ipc::reload::ReloadRequest::Apply { cfg, .. }) => std::sync::Arc::from(cfg),
+            other => panic!("expected a queued Apply, got one: {}", other.is_ok()),
+        };
+
+        // The user toggles something while the worker is inside its write.
+        let before = m.model.working.behavior.raise_on_focus;
+        update(&mut m, Msg::RaiseOnFocusToggled(!before));
+
+        update(
+            &mut m,
+            Msg::Applied {
+                shipped,
+                result: Ok(ReloadOutcome::Reloaded),
+            },
+        );
+        assert_eq!(
+            m.model.saved.appearance.palette.accent, "#ff00aa",
+            "what was written is what is baselined"
+        );
+        assert!(
+            m.is_dirty(),
+            "the toggle folded during the write never reached disk, so it is unsaved"
+        );
+    }
+
+    /// The status line is what the app has to say, and it outranks the
+    /// standing dirty hint until the user's next edit makes it stale.
+    ///
+    /// Mutation check: give `footer_text` its old "dirty wins outright" body
+    /// and the first assertion fails — which is how "Failed to save: …" (an
+    /// outcome that deliberately keeps the model dirty), "Applying…" and
+    /// every picker message were unreadable, in the window *and* in the probe
+    /// report the gates read.
+    #[test]
+    fn a_status_outranks_the_dirty_hint_until_the_next_edit() {
+        let (mut m, _dir, _workers) = model();
+        m.model.working.appearance.palette.accent = "#ff00aa".to_string();
+        update(&mut m, Msg::Apply);
+        assert!(m.is_dirty());
+        assert_eq!(footer_text(&m), "Applying\u{2026}");
+
+        update(&mut m, Msg::CornerRadiusChanged(4.0));
+        assert_eq!(
+            footer_text(&m),
+            "Unsaved changes",
+            "the next edit is what makes a status stale"
+        );
+    }
+
+    /// A second Browse click while a chooser is already open is dropped, not
+    /// queued: served afterwards it is a second dialog nobody asked for.
+    ///
+    /// Mutation check: drop the `browse_in_flight` guard and the second click
+    /// returns a `Cmd::Task` too. Restore.
+    #[test]
+    fn a_browse_while_the_chooser_is_open_is_not_a_second_dialog() {
+        let (mut m, _dir, workers) = model();
+        let first = update(&mut m, Msg::WallpaperBrowse);
+        assert!(matches!(first, Cmd::Task(_)));
+        run_task(&first);
+        assert!(m.browse_in_flight);
+        assert!(
+            matches!(update(&mut m, Msg::WallpaperBrowse), Cmd::None),
+            "the latch holds while a chooser is up"
+        );
+        assert!(workers.portal.try_recv().is_ok(), "one request went out");
+        assert!(
+            workers.portal.try_recv().is_err(),
+            "and only one: a second dialog is never queued behind the first"
+        );
+
+        update(&mut m, Msg::WallpaperPickerCancelled);
+        assert!(!m.browse_in_flight, "an answer releases the latch");
+        assert!(matches!(update(&mut m, Msg::WallpaperBrowse), Cmd::Task(_)));
+    }
+
+    /// A worker that could not start is said so, rather than leaving live
+    /// controls whose clicks nothing will ever answer.
+    ///
+    /// Mutation check: seed `status` with `String::new()` unconditionally
+    /// again and this fails.
+    #[test]
+    fn a_worker_that_never_started_is_reported_in_the_footer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = SettingsModel::new(
+            dir.path().join("config.redb"),
+            crate::ipc::dead_handles_for_test(),
+        );
+        assert!(
+            footer_text(&m).contains("could not start"),
+            "got {:?}",
+            footer_text(&m)
+        );
+        assert!(
+            !m.portal_available,
+            "and Browse is insensitive rather than inert"
+        );
+    }
+
+    /// The page switcher is told which page the stack is showing.
+    ///
+    /// Mutation check: drop `nav`'s `.selected(m.page.index())` and the
+    /// switcher checks "Appearance" while Behavior is on screen — and
+    /// clicking the lit button is then swallowed by `StackSwitcherC::
+    /// on_event`'s `index == self.selected` early return.
+    #[test]
+    fn the_switcher_checks_the_page_the_stack_is_showing() {
+        let (mut m, _dir, _workers) = model();
+        m.page = PageId::Behavior;
+        let index = m.page.index();
+        let probe = probe_of(m);
+
+        let nav = probe
+            .root()
+            .descendants()
+            .find(|node| node.id().is_some_and(|id| id.as_str() == "nav"))
+            .expect("the switcher is in the tree");
+        let checked: Vec<usize> = nav
+            .children()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, button)| {
+                button
+                    .states()
+                    .contains(icedtea_ui::css::node::PseudoStates::CHECKED)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(checked, vec![index], "exactly the shown page is checked");
     }
 
     /// `update` never blocks and never calls D-Bus: Apply hands the work to
@@ -775,7 +1116,7 @@ pub(crate) mod tests {
     /// Mutation check: make the `Apply` arm return `Cmd::None`; this fails.
     #[test]
     fn apply_queues_a_task_and_says_so() {
-        let (mut m, _dir) = model();
+        let (mut m, _dir, _workers) = model();
         m.model.working.appearance.palette.accent = "#ff00aa".to_string();
         let cmd = update(&mut m, Msg::Apply);
         assert!(
@@ -787,7 +1128,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_config_reloaded_signal_only_notes_itself() {
-        let (mut m, _dir) = model();
+        let (mut m, _dir, _workers) = model();
         m.model.working.appearance.palette.accent = "#ff00aa".to_string();
         update(&mut m, Msg::ConfigReloaded);
         assert!(
@@ -795,6 +1136,14 @@ pub(crate) mod tests {
             "an external reload must not touch the working copy"
         );
         assert_eq!(m.status, "Compositor reloaded its configuration");
+    }
+
+    /// Run a `Cmd::Task`'s closure, the way `App::drain` does after the fold.
+    fn run_task(cmd: &Cmd<Msg>) {
+        match cmd {
+            Cmd::Task(task) => task(),
+            other => panic!("expected a Cmd::Task, got {other:?}"),
+        }
     }
 
     /// Every node the tree lays out, by id.
@@ -824,7 +1173,7 @@ pub(crate) mod tests {
     /// `view`; this test fails on `apply`. Restore.
     #[test]
     fn the_root_carries_the_nav_the_stack_and_the_footer() {
-        let (m, _dir) = model();
+        let (m, _dir, _workers) = model();
         let probe = probe_of(m);
         let ids = node_ids(&probe);
         for wanted in [
@@ -841,12 +1190,12 @@ pub(crate) mod tests {
     /// selection follows the model.
     #[test]
     fn the_stack_shows_the_selected_page() {
-        let (m, _dir) = model();
+        let (m, _dir, _workers) = model();
         assert_eq!(m.page, PageId::Appearance);
         let ids = node_ids(&probe_of(m));
         assert!(ids.contains(&"appearance".to_string()));
 
-        let (mut m2, _dir2) = model();
+        let (mut m2, _dir2, _workers2) = model();
         m2.page = PageId::Displays;
         let ids = node_ids(&probe_of(m2));
         assert!(ids.contains(&"displays_page".to_string()));
@@ -859,7 +1208,7 @@ pub(crate) mod tests {
     /// Mutation check: make `footer` always render `m.status`; this fails.
     #[test]
     fn the_footer_reports_dirtiness_without_a_flag() {
-        let (mut m, _dir) = model();
+        let (mut m, _dir, _workers) = model();
         let clean = footer_text(&m);
         assert_eq!(clean, "");
         m.model.working.appearance.palette.accent = "#ff00aa".to_string();
@@ -897,7 +1246,7 @@ pub(crate) mod tests {
     /// in the `HeadsChanged` arm; this test fails. Restore.
     #[test]
     fn heads_changed_reconciles_and_marks_output_management_available() {
-        let (mut m, _dir) = model();
+        let (mut m, _dir, _workers) = model();
         update(
             &mut m,
             Msg::Outputs(Arc::new(OutputsMsg::HeadsChanged(vec![head("DP-1")]))),
@@ -914,7 +1263,7 @@ pub(crate) mod tests {
     #[test]
     fn losing_the_manager_or_the_connection_takes_the_page_out_of_service() {
         for msg in [OutputsMsg::ManagerUnavailable, OutputsMsg::Disconnected] {
-            let (mut m, _dir) = model();
+            let (mut m, _dir, _workers) = model();
             m.outputs_available = true;
             m.displays_in_flight = true;
             let cmd = update(&mut m, Msg::Outputs(Arc::new(msg)));
@@ -931,7 +1280,7 @@ pub(crate) mod tests {
     /// in-flight flag, which an overlapped Test/Apply pair would misread.
     #[test]
     fn an_apply_reply_clears_in_flight_by_its_own_is_test_tag() {
-        let (mut m, _dir) = model();
+        let (mut m, _dir, _workers) = model();
         m.displays.dirty = true;
         m.displays_in_flight = true;
         update(
@@ -968,10 +1317,14 @@ pub(crate) mod tests {
     fn a_valid_typed_path_reaches_the_model_and_clears_the_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let image = a_real_image(dir.path(), "wall.png");
-        let (mut m, _inbox) = test_model();
+        let (mut m, workers) = test_model();
         m.wallpaper_error = Some("stale".to_string());
 
-        update(&mut m, Msg::WallpaperEdited(image.display().to_string()));
+        // The `stat(2)` runs on the filesystem worker (spec D8), so the
+        // verdict lands as a second message; `settle` is that round trip.
+        let cmd = update(&mut m, Msg::WallpaperEdited(image.display().to_string()));
+        run_task(&cmd);
+        workers.settle(&mut m);
 
         assert_eq!(m.wallpaper_text, image.display().to_string());
         assert_eq!(m.wallpaper_error, None);
@@ -983,13 +1336,15 @@ pub(crate) mod tests {
 
     #[test]
     fn an_invalid_typed_path_shows_an_error_and_never_touches_the_model() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, workers) = test_model();
         let before = m.model.working.appearance.wallpaper.clone();
 
-        update(
+        let cmd = update(
             &mut m,
             Msg::WallpaperEdited("/nonexistent/icedtea/wall.png".to_string()),
         );
+        run_task(&cmd);
+        workers.settle(&mut m);
 
         assert_eq!(m.wallpaper_text, "/nonexistent/icedtea/wall.png");
         assert!(m.wallpaper_error.is_some(), "the field shows why");
@@ -1003,15 +1358,21 @@ pub(crate) mod tests {
     fn clearing_the_field_clears_the_wallpaper() {
         let dir = tempfile::tempdir().expect("tempdir");
         let image = a_real_image(dir.path(), "wall.png");
-        let (mut m, _inbox) = test_model();
-        update(&mut m, Msg::WallpaperEdited(image.display().to_string()));
+        let (mut m, workers) = test_model();
+        let cmd = update(&mut m, Msg::WallpaperEdited(image.display().to_string()));
+        run_task(&cmd);
+        workers.settle(&mut m);
 
         update(&mut m, Msg::WallpaperEdited("   ".to_string()));
+        workers.settle(&mut m);
         assert_eq!(m.model.working.appearance.wallpaper, None);
         assert_eq!(m.wallpaper_error, None, "empty is not an error");
 
-        update(&mut m, Msg::WallpaperEdited(image.display().to_string()));
+        let cmd = update(&mut m, Msg::WallpaperEdited(image.display().to_string()));
+        run_task(&cmd);
+        workers.settle(&mut m);
         update(&mut m, Msg::WallpaperCleared);
+        workers.settle(&mut m);
         assert!(m.wallpaper_text.is_empty());
         assert_eq!(m.model.working.appearance.wallpaper, None);
         assert_eq!(m.wallpaper_error, None);
@@ -1019,11 +1380,13 @@ pub(crate) mod tests {
 
     #[test]
     fn a_portal_answer_goes_through_the_same_validation() {
-        let (mut m, _inbox) = test_model();
-        update(
+        let (mut m, workers) = test_model();
+        let cmd = update(
             &mut m,
             Msg::WallpaperChosen(std::path::PathBuf::from("/nonexistent/portal/wall.png")),
         );
+        run_task(&cmd);
+        workers.settle(&mut m);
         assert!(
             m.wallpaper_error.is_some(),
             "the portal is not trusted more than the keyboard"
@@ -1033,7 +1396,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_failed_picker_disables_browse_without_touching_the_model() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         let before = m.model.working.clone();
 
         update(
@@ -1055,7 +1418,7 @@ pub(crate) mod tests {
     /// fails. Restore.
     #[test]
     fn a_cancelled_picker_says_so_and_leaves_browse_live() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         let before = m.model.working.clone();
 
         update(&mut m, Msg::WallpaperPickerCancelled);
@@ -1071,7 +1434,7 @@ pub(crate) mod tests {
 
     #[test]
     fn browsing_without_a_portal_is_a_status_line_not_a_task() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         m.portal_available = false;
         let cmd = update(&mut m, Msg::WallpaperBrowse);
         assert!(
@@ -1083,7 +1446,7 @@ pub(crate) mod tests {
 
     #[test]
     fn browsing_with_a_portal_issues_a_task() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         let cmd = update(&mut m, Msg::WallpaperBrowse);
         assert!(
             matches!(cmd, Cmd::Task(_)),
@@ -1093,7 +1456,7 @@ pub(crate) mod tests {
 
     #[test]
     fn each_behavior_switch_writes_its_own_field() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         let defaults = icedtea_config::default_config().behavior;
 
         update(&mut m, Msg::RaiseOnFocusToggled(!defaults.raise_on_focus));
@@ -1124,7 +1487,7 @@ pub(crate) mod tests {
 
     #[test]
     fn toggling_a_switch_makes_the_model_dirty_and_toggling_back_makes_it_clean() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         let before = m.model.working.behavior.raise_on_focus;
         update(&mut m, Msg::RaiseOnFocusToggled(!before));
         assert!(m.model.is_dirty());
@@ -1137,7 +1500,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_snap_gap_spin_writes_appearance_snap_gap_clamped() {
-        let (mut m, _inbox) = test_model();
+        let (mut m, _workers) = test_model();
         update(&mut m, Msg::SnapGapChanged(11.5));
         assert_eq!(
             m.model.working.appearance.snap_gap, 12,

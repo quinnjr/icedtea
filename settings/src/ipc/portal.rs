@@ -156,6 +156,10 @@ pub fn response_to_outcome(
 pub enum PortalRequest {
     /// Open the file chooser, starting at `current`'s directory if it has one.
     OpenFile { current: Option<PathBuf> },
+    /// Stop after the requests already queued. Sent by `WorkerHandles::
+    /// shutdown` so the app can wait for an exchange in flight instead of
+    /// exiting under it.
+    Shutdown,
 }
 
 /// How long the worker waits for a `Response` before closing the request.
@@ -165,6 +169,24 @@ pub enum PortalRequest {
 /// portal answer with a non-zero response, and the user sees a status line
 /// instead of a Browse button that never comes back.
 pub const PORTAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long the worker waits for a session bus to hand it a connection.
+///
+/// `Connection::session()` is blocking with no deadline of its own: a bus
+/// socket that accepts and then never authenticates parked the sole worker
+/// thread forever, and every later Browse click vanished with no `Msg` at
+/// all — exactly the hang [`await_response`]'s own doc claims was fixed.
+/// The connect runs on a helper thread and this is how long its answer is
+/// waited for.
+pub const PORTAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The deadline zbus itself puts on every method call this worker makes —
+/// `OpenFile` and the post-timeout `Request.Close`, both of which were
+/// unbounded (zbus 5's `method_timeout` is `None` unless asked for).
+pub const PORTAL_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a `Request.Close` is given to make a merely slow portal answer.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 /// One worker thread serving `rx` until every sender is dropped.
 ///
@@ -180,6 +202,22 @@ pub fn spawn(
     rx: crossbeam_channel::Receiver<PortalRequest>,
     tx: InboxSender<Msg>,
 ) -> Option<std::thread::JoinHandle<()>> {
+    spawn_on_bus(rx, tx, None)
+}
+
+/// [`spawn`], against one named bus address rather than `$DBUS_SESSION_BUS_
+/// ADDRESS`.
+///
+/// The environment is process-global: a test that pointed the worker at a
+/// dead bus by `unsafe set_var` doctored it for every other test in the same
+/// binary, and on edition 2024 does so through a call that is undefined
+/// behaviour the moment another thread reads the environment. The address
+/// travels per connection instead.
+pub fn spawn_on_bus(
+    rx: crossbeam_channel::Receiver<PortalRequest>,
+    tx: InboxSender<Msg>,
+    address: Option<String>,
+) -> Option<std::thread::JoinHandle<()>> {
     // Named, and `Builder::spawn` rather than `std::thread::spawn`: under
     // thread exhaustion the latter panics, and §2.4 wants this to degrade.
     // The caller keeps a live `Sender` either way; with no worker behind it a
@@ -193,8 +231,11 @@ pub fn spawn(
                 while let Ok(newer) = rx.try_recv() {
                     request = newer;
                 }
-                let PortalRequest::OpenFile { current } = request;
-                let msg = match open_file(current.as_deref()) {
+                let current = match request {
+                    PortalRequest::Shutdown => return,
+                    PortalRequest::OpenFile { current } => current,
+                };
+                let msg = match open_file(current.as_deref(), address.as_deref()) {
                     PortalOutcome::Chosen(path) => Msg::WallpaperChosen(path),
                     PortalOutcome::Cancelled => Msg::WallpaperPickerCancelled,
                     PortalOutcome::Failed(reason) => Msg::WallpaperPickerFailed(reason),
@@ -208,22 +249,51 @@ pub fn spawn(
         .ok()
 }
 
+/// A bus connection with a deadline on the connect *and* on every method call
+/// made through it.
+///
+/// The connect runs on its own short-lived thread because zbus offers no
+/// deadline for it; on expiry this returns and the helper is abandoned to
+/// finish or fail on its own, holding nothing the worker loop needs.
+fn connect(address: Option<&str>) -> Result<Connection, String> {
+    let address = address.map(str::to_owned);
+    let (tx, rx) = crossbeam_channel::bounded::<Result<Connection, String>>(1);
+    let spawned = std::thread::Builder::new()
+        .name("settings-portal-connect".to_string())
+        .spawn(move || {
+            let built = match address {
+                Some(address) => zbus::blocking::connection::Builder::address(address.as_str()),
+                None => zbus::blocking::connection::Builder::session(),
+            }
+            .and_then(|builder| builder.method_timeout(PORTAL_CALL_TIMEOUT).build())
+            .map_err(|err| format!("No session bus for the file portal: {err}"));
+            let _ = tx.send(built);
+        });
+    if let Err(err) = spawned {
+        return Err(format!("Cannot reach the file portal: {err}"));
+    }
+    rx.recv_timeout(PORTAL_CONNECT_TIMEOUT)
+        .unwrap_or_else(|_| Err("The session bus did not answer".to_string()))
+}
+
 /// The whole exchange, blocking, on the worker thread.
 ///
 /// Subscribe first (the request path is derived, not read off the reply, so a
 /// fast answer cannot be missed), then call `OpenFile`, then wait for the
 /// `Response` signal on that path.
-fn open_file(current: Option<&std::path::Path>) -> PortalOutcome {
-    match open_file_inner(current) {
+fn open_file(current: Option<&std::path::Path>, address: Option<&str>) -> PortalOutcome {
+    match open_file_inner(current, address) {
         Ok(outcome) => outcome,
         Err(reason) => PortalOutcome::Failed(reason),
     }
 }
 
 /// The body of [`open_file`], written with `?` over the failure strings.
-fn open_file_inner(current: Option<&std::path::Path>) -> Result<PortalOutcome, String> {
-    let conn = Connection::session()
-        .map_err(|err| format!("No session bus for the file portal: {err}"))?;
+fn open_file_inner(
+    current: Option<&std::path::Path>,
+    address: Option<&str>,
+) -> Result<PortalOutcome, String> {
+    let conn = connect(address)?;
     let unique = conn
         .unique_name()
         .map(|n| n.as_str().to_string())
@@ -231,16 +301,20 @@ fn open_file_inner(current: Option<&std::path::Path>) -> Result<PortalOutcome, S
     let token = format!("icedtea_{}", std::process::id());
     let path = request_object_path(&unique, &token);
 
+    // Deliberately *not* filtered on the request path: a portal that ignores
+    // `handle_token` answers on a path of its own choosing, and re-subscribing
+    // after reading that path back off the reply is a race the portal can win
+    // (the `Response` can arrive between the two). One subscription, opened
+    // before `OpenFile` is even called, covers both paths; which one is ours
+    // is decided when the reply names it, and `await_response` filters.
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface(REQUEST_IFACE)
         .map_err(|err| format!("Bad portal match rule: {err}"))?
         .member("Response")
         .map_err(|err| format!("Bad portal match rule: {err}"))?
-        .path(path.as_str())
-        .map_err(|err| format!("Bad portal request path: {err}"))?
         .build();
-    let signals = MessageIterator::for_match_rule(rule, &conn, Some(4))
+    let signals = MessageIterator::for_match_rule(rule, &conn, Some(16))
         .map_err(|err| format!("Cannot listen for the portal's answer: {err}"))?;
 
     let mut options: HashMap<&str, Value<'_>> = HashMap::new();
@@ -278,10 +352,9 @@ fn open_file_inner(current: Option<&std::path::Path>) -> Result<PortalOutcome, S
             got = %handle.as_str(),
             "the portal ignored handle_token; watching its own path instead"
         );
-        return await_response_on(&conn, handle.as_str());
     }
 
-    Ok(await_response(signals, &conn, &path))
+    Ok(await_response(signals, &conn, handle.as_str()))
 }
 
 /// Wait on an already-open subscription.
@@ -306,12 +379,23 @@ fn open_file_inner(current: Option<&std::path::Path>) -> Result<PortalOutcome, S
 /// `signals` is taken by value because that is what detaching requires.
 fn await_response(signals: MessageIterator, conn: &Connection, path: &str) -> PortalOutcome {
     let (done_tx, done_rx) = crossbeam_channel::bounded::<PortalOutcome>(1);
+    let wanted = path.to_string();
     let reader = std::thread::Builder::new()
         .name("settings-portal-reply".to_string())
         .spawn(move || {
             let mut signals = signals;
             for message in signals.by_ref() {
                 let Ok(message) = message else { continue };
+                // The subscription is by interface and member, not by path
+                // (see `open_file_inner`), so somebody else's `Response` is
+                // skipped here rather than answered.
+                let ours = message
+                    .header()
+                    .path()
+                    .is_some_and(|p| p.as_str() == wanted);
+                if !ours {
+                    continue;
+                }
                 let body = message.body();
                 let outcome = match body.deserialize::<(u32, HashMap<String, OwnedValue>)>() {
                     Ok((response, results)) => response_to_outcome(response, &results),
@@ -332,32 +416,22 @@ fn await_response(signals: MessageIterator, conn: &Connection, path: &str) -> Po
     match done_rx.recv_timeout(PORTAL_TIMEOUT) {
         Ok(outcome) => outcome,
         Err(_) => {
-            // Close the request so a merely slow portal still answers.
+            // Close the request so a merely slow portal still answers. Bounded
+            // by the connection's own `method_timeout`, not by hope.
             let _ = conn.call_method(Some(PORTAL_BUS), path, Some(REQUEST_IFACE), "Close", &());
-            done_rx
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap_or(PortalOutcome::Failed(
-                    "The file portal did not answer".to_string(),
-                ))
+            let answer = done_rx.recv_timeout(CLOSE_GRACE);
+            // Whatever happened, this exchange is over: closing the
+            // connection is what releases the reader thread (parked in
+            // `MessageIterator::next`), the connection itself and the match
+            // rule on the bus. Left open, every timed-out pick leaked all
+            // three for the life of the process. Each request builds its own
+            // connection, so nothing else is closed with it.
+            let _ = conn.clone().close();
+            answer.unwrap_or(PortalOutcome::Failed(
+                "The file portal did not answer".to_string(),
+            ))
         }
     }
-}
-
-/// The same wait, but subscribing after the fact — only reached when a portal
-/// ignores `handle_token` and hands back a path of its own choosing.
-fn await_response_on(conn: &Connection, path: &str) -> Result<PortalOutcome, String> {
-    let rule = zbus::MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .interface(REQUEST_IFACE)
-        .map_err(|err| format!("Bad portal match rule: {err}"))?
-        .member("Response")
-        .map_err(|err| format!("Bad portal match rule: {err}"))?
-        .path(path)
-        .map_err(|err| format!("Bad portal request path: {err}"))?
-        .build();
-    let signals = MessageIterator::for_match_rule(rule, conn, Some(4))
-        .map_err(|err| format!("Cannot listen for the portal's answer: {err}"))?;
-    Ok(await_response(signals, conn, path))
 }
 
 #[cfg(test)]

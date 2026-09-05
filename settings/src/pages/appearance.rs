@@ -87,7 +87,20 @@ pub fn validate_wallpaper(text: &str) -> Result<std::path::PathBuf, String> {
     if trimmed.is_empty() {
         return Err("Enter a path to an image".to_string());
     }
-    let path = std::path::PathBuf::from(trimmed);
+    // A relative path is stored *verbatim* nowhere: the compositor resolves
+    // what it reads against its own working directory, which is not this
+    // app's, so `wall.png` validated here and then silently never loaded
+    // there. Resolved against the directory the user typed it in, and
+    // canonicalised when the filesystem allows, so what reaches the config is
+    // a path anybody can open.
+    let typed = std::path::PathBuf::from(trimmed);
+    let path = if typed.is_absolute() {
+        typed
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&typed))
+            .map_err(|_| format!("Cannot resolve a relative path: {trimmed}"))?
+    };
     let meta = std::fs::metadata(&path).map_err(|_| format!("No such file: {trimmed}"))?;
     if !meta.is_file() {
         return Err(format!("Not a file: {trimmed}"));
@@ -106,7 +119,10 @@ pub fn validate_wallpaper(text: &str) -> Result<std::path::PathBuf, String> {
             }
         ));
     }
-    Ok(path)
+    // `canonicalize` also flattens `..` and follows symlinks; when the
+    // filesystem refuses (a path that stops resolving between the two calls),
+    // the absolutised path is already correct enough to store.
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 /// The pixel value a `SpinButton` on this page reports, as the config stores
@@ -168,9 +184,35 @@ fn wide(index: u16, control: View<Msg>) -> [View<Msg>; 1] {
     [control.at(0, index).span(2, 1)]
 }
 
+/// icedtea's own shipped colours: the config's default background,
+/// foreground and accent.
+///
+/// GTK's 45-swatch palette has none of them, so once a user changed a colour
+/// and applied it there was no way back to the shipped value from inside the
+/// app at all — the page offers no hex entry either. They lead the palette,
+/// on a row of their own.
+pub const ICEDTEA_DEFAULTS: [&str; 3] = ["#1e1e2e", "#cdd6f4", "#89b4fa"];
+
+/// The palette the picker panel offers: [`ICEDTEA_DEFAULTS`] first, then
+/// GTK's own, with any duplicate of a default dropped so no colour appears
+/// twice.
+#[must_use]
+pub fn picker_palette() -> Vec<Rgba> {
+    let mut palette: Vec<Rgba> = ICEDTEA_DEFAULTS
+        .iter()
+        .map(|hex| hex_to_rgba(hex))
+        .collect();
+    for colour in ColorDialogC::default_palette() {
+        if !palette.contains(&colour) {
+            palette.push(colour);
+        }
+    }
+    palette
+}
+
 /// The palette panel, shown while `m.color_picker` names a slot.
 fn picker(slot: ColorSlot) -> View<Msg> {
-    let palette = ColorDialogC::default_palette();
+    let palette = picker_palette();
     let columns = 5u16;
     let buttons = palette.iter().enumerate().map(|(index, rgba)| {
         let packed = ColorDialogC::pack(*rgba);
@@ -371,7 +413,7 @@ mod tests {
 
     #[test]
     fn the_page_carries_every_id_its_gates_address() {
-        let (m, _inbox) = crate::app::tests::test_model();
+        let (m, _workers) = crate::app::tests::test_model();
         let ids = ids_of(m);
         for id in [
             "appearance_bar_position",
@@ -397,7 +439,7 @@ mod tests {
 
     #[test]
     fn opening_a_slot_reveals_the_palette_panel() {
-        let (mut m, _inbox) = crate::app::tests::test_model();
+        let (mut m, _workers) = crate::app::tests::test_model();
         m.color_picker = Some(crate::app::ColorSlot::Foreground);
         let ids = ids_of(m);
         assert!(ids.contains(&"appearance_picker".to_string()));
@@ -408,9 +450,81 @@ mod tests {
         );
     }
 
+    /// The colours icedtea itself ships are in the picker, so a user who
+    /// changed one has a way back to the default from inside the app.
+    ///
+    /// Mutation check: offer `ColorDialogC::default_palette()` alone again
+    /// (what the page did) and every assertion here fails — none of the three
+    /// is in GTK's palette, and this page has no hex entry either.
+    #[test]
+    fn the_picker_offers_icedteas_own_defaults_first_and_only_once() {
+        use super::{ICEDTEA_DEFAULTS, picker_palette, rgba_to_hex};
+
+        let palette = picker_palette();
+        let hexes: Vec<String> = palette.iter().map(|c| rgba_to_hex(*c)).collect();
+        for (index, wanted) in ICEDTEA_DEFAULTS.iter().enumerate() {
+            assert_eq!(&hexes[index], wanted, "the shipped defaults lead");
+        }
+        let defaults = icedtea_config::default_config().appearance.palette;
+        for wanted in [defaults.background, defaults.foreground, defaults.accent] {
+            assert_eq!(
+                hexes.iter().filter(|hex| **hex == wanted).count(),
+                1,
+                "{wanted} is offered exactly once"
+            );
+        }
+        assert!(
+            palette.len() >= ICEDTEA_DEFAULTS.len(),
+            "GTK's own palette is still there"
+        );
+    }
+
+    /// A relative path is resolved against the directory it was typed in, not
+    /// stored verbatim for the compositor to resolve against *its* own
+    /// working directory (where it silently never loads).
+    ///
+    /// Mutation check: drop the absolutising branch in `validate_wallpaper`
+    /// and the stored path is `wall.png`, which fails `is_absolute`.
+    #[test]
+    fn a_relative_wallpaper_path_is_stored_absolute() {
+        use super::validate_wallpaper;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("wall.png"), b"pixels").expect("write the image");
+        // `set_current_dir` is process-global, so this test names the file
+        // relative to a directory it makes *under* the current one rather
+        // than changing where the process stands.
+        let cwd = std::env::current_dir().expect("a working directory");
+        let relative = pathdiff(&cwd, dir.path());
+
+        let stored = validate_wallpaper(&relative).expect("the image validates");
+        assert!(
+            stored.is_absolute(),
+            "a relative path is absolutised before it reaches the config: {}",
+            stored.display()
+        );
+        assert_eq!(
+            std::fs::canonicalize(dir.path().join("wall.png")).expect("canonical"),
+            stored
+        );
+    }
+
+    /// `to`'s `wall.png` expressed relative to `from`, the `../..` way.
+    fn pathdiff(from: &std::path::Path, to: &std::path::Path) -> String {
+        let mut up = String::new();
+        let mut base = from;
+        loop {
+            if let Ok(rest) = to.strip_prefix(base) {
+                return format!("{up}{}/wall.png", rest.display());
+            }
+            base = base.parent().expect("a common ancestor exists");
+            up.push_str("../");
+        }
+    }
+
     #[test]
     fn the_wallpaper_status_row_shows_the_error_when_there_is_one() {
-        let (mut m, _inbox) = crate::app::tests::test_model();
+        let (mut m, _workers) = crate::app::tests::test_model();
         m.wallpaper_error = Some("No such file: /nope.png".to_string());
         let ids = ids_of(m);
         assert!(ids.contains(&"appearance_wallpaper_status".to_string()));

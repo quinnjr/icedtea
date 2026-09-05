@@ -14,10 +14,17 @@ use crate::compositor_reload::{ReloadClient, apply_and_reload};
 /// What the loop thread asks the worker for.
 pub enum ReloadRequest {
     /// Write `cfg` to `db_path`, then best-effort `ReloadConfig`.
+    ///
+    /// `Box`ed: a `Config` is a few hundred bytes and `Shutdown` carries
+    /// none, so an unboxed variant would make every queued request that size.
     Apply {
-        cfg: icedtea_config::Config,
+        cfg: Box<icedtea_config::Config>,
         db_path: std::path::PathBuf,
     },
+    /// Stop, once everything already queued has been served. `ipc::Workers::
+    /// shutdown` sends this and waits: an Apply in flight is a `redb` write
+    /// the app must not exit out from under.
+    Shutdown,
 }
 
 const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
@@ -47,15 +54,34 @@ pub fn spawn(
             drop,
         );
 
+    spawn_worker(rx, tx)
+}
+
+/// The request-serving half of [`spawn`], without the `ConfigReloaded`
+/// watcher.
+///
+/// Split out so a unit test can exercise the real worker without opening a
+/// signal subscription on the developer's live session bus (finding 15).
+pub fn spawn_worker(
+    rx: crossbeam_channel::Receiver<ReloadRequest>,
+    tx: InboxSender<Msg>,
+) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("settings-reload".to_string())
         .spawn(move || {
             let client = ReloadClient::new();
             while let Ok(request) = rx.recv() {
-                let ReloadRequest::Apply { cfg, db_path } = request;
-                let answer =
+                let (cfg, db_path) = match request {
+                    ReloadRequest::Shutdown => return,
+                    ReloadRequest::Apply { cfg, db_path } => (*cfg, db_path),
+                };
+                let result =
                     apply_and_reload(&cfg, &db_path, &client).map_err(|err| err.to_string());
-                if tx.send(Msg::Applied(answer)).is_err() {
+                // The snapshot travels back with the answer: `update`
+                // re-baselines `saved` from *this* config, not from whatever
+                // the working copy has become while the write was in flight.
+                let shipped = std::sync::Arc::new(cfg);
+                if tx.send(Msg::Applied { shipped, result }).is_err() {
                     // Every Inbox is gone: the app exited.
                     return;
                 }

@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn the_page_carries_every_id_its_gates_address() {
-        let (m, _inbox) = crate::app::tests::test_model();
+        let (m, _workers) = crate::app::tests::test_model();
         let ids = ids_of(m);
         for id in [
             "behavior_raise_on_focus",
@@ -118,7 +118,7 @@ mod tests {
     fn the_page_lays_out_whatever_the_model_says() {
         // Both extremes of every control: a page that only lays out for the
         // default config is a page that will crash on a real one.
-        let (mut m, _inbox) = crate::app::tests::test_model();
+        let (mut m, _workers) = crate::app::tests::test_model();
         m.model.working.behavior.raise_on_focus = true;
         m.model.working.behavior.hide_bar_on_fullscreen = true;
         m.model.working.behavior.snap_enabled = true;

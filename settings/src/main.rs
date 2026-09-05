@@ -133,13 +133,20 @@ fn main() {
         }
     }
 
-    let mut model = SettingsModel::new(default_db_path(), workers).with_outputs(pump.clone());
+    let mut model =
+        SettingsModel::new(default_db_path(), workers.handles()).with_outputs(pump.clone());
     model.page = initial_page();
     let mut app = App::new(model, update, view).with_inbox(inbox);
     if let (Some(id), Some(pump)) = (watch, pump) {
         app = app.on_fd(id, move || pump.drain());
     }
-    if let Err(err) = app.run(window) {
+    let outcome = app.run(window);
+    // Apply is asynchronous: closing the window immediately after clicking it
+    // used to exit while the reload worker was still inside its `redb` write,
+    // and the edit was lost with no message at all. This waits, bounded, for
+    // whatever is in flight.
+    workers.shutdown();
+    if let Err(err) = outcome {
         tracing::error!(?err, "the settings loop stopped");
         std::process::exit(1);
     }
