@@ -20,6 +20,7 @@ use crate::css::value::image::IconRef;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::{PointerState, Universal};
+use crate::window::focus::FocusCause;
 
 /// How long `.keyboard-activating` stays on after Space or Enter.
 const ACTIVATE_FLASH: Duration = Duration::from_millis(120);
@@ -175,6 +176,17 @@ impl<Msg: Clone + 'static> Controller<Msg> for ButtonC {
             .tree
             .allocation(cx.node)
             .map(|a| crate::layout::Rect::new(0.0, 0.0, a.border_box.width, a.border_box.height));
+        if matches!(ev, Event::PointerDown { .. }) {
+            // Reconciliation (Task 8 fix-round): a click on a `GtkButton`
+            // must also grant it keyboard focus, matching `Entry`/
+            // `SearchEntry`/`PasswordEntry`/`SpinButton`/`EditableLabel`'s
+            // own `PointerDown` handling in this same crate — without this
+            // no button (including a settings page's "Set" binding-capture
+            // button) can ever become the node a subsequent key event is
+            // routed to, since `deliver`'s D19 rule stops all bubbling once
+            // this controller marks a target-phase event handled below.
+            cx.focus.set_focus(Some(cx.node), FocusCause::Pointer);
+        }
         if self.pointer.observe(cx.node, ev, bounds) {
             cx.handled = true;
             return cx

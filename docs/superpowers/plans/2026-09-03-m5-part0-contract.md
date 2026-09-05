@@ -2321,6 +2321,7 @@ edit may be made without a new §6 amendment:
 |---|---|---|
 | P1 | `view/inbox.rs` (`Inbox::try_recv`), `view/app.rs`, `tests/ingress.rs` | P1-D4a: only a consumer with a worker round trip needs to observe the inbox without a running `App`. `view/app.rs` is added here in P2's fix wave: P1 edited it and this table omitted it (doc-only correction, no behaviour) |
 | P2 | `widgets/stack.rs` | P2-D17: `StackC` never told the layout side table about an inactive page, so no control inside *any* stack page was reachable by a pointer. It is a `ui/` defect with no fix inside a settings page, and P0 could not have specified it blind — no test in M1–M5 had clicked inside a stack page before P2's own gates |
+| P3 | `widgets/button.rs`, `widgets/box_.rs` | P3-D8/P3-D9: `ButtonC` never granted keyboard focus on `PointerDown`, and separately `BoxC` never fired its `Event::Key` handler at all, so a `.on_key` on a `box_(...)` root (as `settings/src/app.rs` wires) was unreachable regardless of focus. Both are `ui/` defects with no fix inside a settings page, and P0 could not have specified either blind — Task 8 is the first test anywhere in M1–M5 to send a real key press after a real button click, and the first to attach `.on_key` to a `Kind::Box` node |
 | P4 | `widgets/drop_down.rs` | §7's pre-discharged exception (P4-D5); the right list height is knowable only from a real page in a 420 px window |
 | P5 | `view/app.rs`, `window/popup.rs`, `window/mod.rs`, new `tests/popup_input.rs`, `tests/app_frame_hook.rs` | P5-D1/D2/D4/D5/D8: §3.4's real-`xdg_popup` clipboard popover cannot work without surface-scoped input routing, a re-reconciled popup view, `App::on_popup`, a per-frame `&Window` hook and popup-scoped probe accessors — none of which M5-D1…D11 provides and none of which P0 could specify blind |
 | P0 | everything else | — |
@@ -2922,5 +2923,83 @@ this wave touches their files:
 * **`settings/tests/no_gtk.rs`'s vacuous pass** — left as P1 shipped it. This
   wave does not touch that file, and rewriting a gate P2 does not own would
   be a scope breach; it stays on the ledger for whoever owns it next.
+
+### P3-D8 — `ButtonC` grants keyboard focus on `PointerDown` (a `ui/` fix, §6 E6 exception)
+
+**Carried out by:** Task 8's fix round (`ui/src/widgets/button.rs`). **Added:**
+2026-09-05.
+
+**Contract §5 and §7 E6** give `ui/` to P0 and enumerate the app parts allowed
+to touch it. P3 was not among them, and the Global Constraints forbid it
+("P3 changes no file under `ui/`").
+
+**Why the exception.** Task 8's own capture proof
+(`settings/tests/keybindings.rs`,
+`shift_a_while_capturing_records_base_a_with_shift`) clicks a `Set` button
+and then sends a key press expecting the window-root `.on_key` handler
+(P3-D1) to see it. `ui/src/window/focus.rs`'s `FocusRing` starts with no
+focus and nothing in `icedtea-ui` ever moved it there: `ButtonC::on_event`
+(`ui/src/widgets/button.rs`) set `cx.handled` on `PointerDown`/`PointerUp`
+without ever calling `cx.focus.set_focus`, so no click on any `Kind::Button`
+node anywhere in M1–M5 could leave a focused node behind, and `deliver`'s
+D19 rule (a handled target suppresses bubble) meant a key sent afterward had
+nothing in the tree to route to. Five other widgets in the same crate
+(`Entry`, `SearchEntry`, `PasswordEntry`, `SpinButton`, `EditableLabel`)
+already call `cx.focus.set_focus(Some(cx.node), FocusCause::Pointer)` from
+their own `PointerDown` handling; `ButtonC` was the one controller missing
+it, and it is the actual dispatch target for a button click regardless of
+which `Kind` the row around it uses, so an ancestor-side fix could not have
+worked instead. Nothing before Task 8 could have caught it: no gate in
+M1–M5 sends a real key press after a real button click in the same test.
+
+**As shipped.** `ButtonC::on_event` calls
+`cx.focus.set_focus(Some(cx.node), FocusCause::Pointer)` on every
+`PointerDown`, unconditionally, before its existing click/activate handling.
+No public API changes; no prop, class or other widget's behaviour changes.
+Verified against the full M1–M3 gate set (`gallery_gate` 10/10,
+`interaction_gate` 19/19, and the other nine byte-identical gates) plus
+`icedtea-ui --lib` (1081/0), all unchanged.
+
+**Ruling.** Accepted, and recorded in §6 E6's table as P3's `ui/` exception
+(alongside P3-D9, below — one Task, two `ui/` files, both defects the same
+capture proof surfaced).
+
+### P3-D9 — `BoxC` fires its `Event::Key` handler (a `ui/` fix, §6 E6 exception)
+
+**Carried out by:** Task 8's fix round (`ui/src/widgets/box_.rs`). **Added:**
+2026-09-05.
+
+**Contract §5 and §7 E6**, as P3-D8 above.
+
+**Why the exception.** P3-D1's own ruling assumed the window-root `.on_key`
+handler (`settings/src/app.rs`'s `view()`, wired on the root `box_(...)`)
+would fire the way `GenericC::on_event`'s `Event::Key` arm does — that arm is
+the *only* place `Handlers::fire_key` was ever called anywhere in
+`icedtea-ui`. But `settings/src/app.rs`'s root is `box_(...)`, i.e.
+`Kind::Box`, and `build_controller` gives every `Kind::Box` node the
+dedicated `BoxC`, never `GenericC` — `GenericC` is the catch-all for kinds
+with no dedicated controller (contract §11 E1), and `Kind::Box` has one.
+`BoxC::on_event` ignored every event unconditionally, so the root's
+`.on_key` handler had no path to ever fire, independent of P3-D8's focus
+fix or of anything in `settings/`: a `.on_key` on any `box_(...)` node,
+anywhere in M1–M5, was dead on arrival. Nothing before Task 8 could have
+caught it: no other part attaches `.on_key` to a `Kind::Box` node.
+
+**As shipped.** `BoxC::on_event` gains one `Event::Key` arm, identical in
+shape to `GenericC`'s: on a pressed key it calls
+`cx.handlers.fire_key(EventKind::KeyPressed, key)` and sets `cx.handled` when
+a handler answers; every other event is still ignored, unchanged. No public
+API changes; no prop, class or other widget's behaviour changes. Verified
+against the full M1–M3 gate set (`gallery_gate` 10/10, `interaction_gate`
+19/19, and the other nine byte-identical gates) plus `icedtea-ui --lib`
+(1081/0), all unchanged.
+
+**Ruling.** Accepted, and recorded in §6 E6's table together with P3-D8.
+Centralising Key-handler firing in `deliver` itself, the way P0-D1
+centralised pointer-handler firing, would close the same gap for every
+`Kind`, not just `Box` — left for a future part to decide, since only
+`Kind::Box` is exercised by any `.on_key` call in M1–M5 today and widening
+the fix further than Task 8's own proof needs is not this round's call to
+make.
 
 ---
