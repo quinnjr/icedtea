@@ -1,9 +1,10 @@
 //! The portal worker's degradation proof.
 //!
-//! Owns its own test binary because it edits `DBUS_SESSION_BUS_ADDRESS`,
-//! which is process-global: a second test running concurrently in the same
-//! binary would see the doctored value. Same reasoning the deleted
-//! `appearance_gtk.rs` gave for GTK's one-init-per-process rule.
+//! The bus address travels *per connection* (`portal::spawn_on_bus`), never
+//! through `DBUS_SESSION_BUS_ADDRESS`: the environment is process-global, so
+//! an `unsafe set_var` here doctored the value for every other test running
+//! beside it in this binary — and on edition 2024 is undefined behaviour the
+//! moment another thread reads the environment.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,7 +15,10 @@ use icedtea_ui::view::Inbox;
 
 /// Generous: this asserts "the worker answers rather than hanging", not how
 /// fast a failed bus connection is refused.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A bus address nothing is listening on.
+const NO_SUCH_BUS: &str = "unix:path=/nonexistent/icedtea-no-such-bus";
 
 fn wait_for_answer(inbox: &Inbox<Msg>) -> Msg {
     let started = Instant::now();
@@ -29,18 +33,10 @@ fn wait_for_answer(inbox: &Inbox<Msg>) -> Msg {
 
 #[test]
 fn a_missing_session_bus_answers_with_a_picker_failure() {
-    // SAFETY: one test per binary, set before the worker thread starts, and
-    // never read by anything else in this process.
-    unsafe {
-        std::env::set_var(
-            "DBUS_SESSION_BUS_ADDRESS",
-            "unix:path=/nonexistent/icedtea-no-such-bus",
-        );
-    }
-
     let (inbox, tx) = Inbox::<Msg>::new().expect("inbox");
     let (req_tx, req_rx) = crossbeam_channel::unbounded();
-    let worker = portal::spawn(req_rx, tx).expect("the portal worker thread starts");
+    let worker = portal::spawn_on_bus(req_rx, tx, Some(NO_SUCH_BUS.to_string()))
+        .expect("the portal worker thread starts");
 
     req_tx
         .send(PortalRequest::OpenFile { current: None })
@@ -66,12 +62,6 @@ fn a_missing_session_bus_answers_with_a_picker_failure() {
 fn a_request_queued_behind_another_supersedes_it() {
     // Two requests queued before the worker can pick either up: the worker
     // must answer once, for the *last* one, not twice.
-    unsafe {
-        std::env::set_var(
-            "DBUS_SESSION_BUS_ADDRESS",
-            "unix:path=/nonexistent/icedtea-no-such-bus",
-        );
-    }
     let (inbox, tx) = Inbox::<Msg>::new().expect("inbox");
     let (req_tx, req_rx) = crossbeam_channel::unbounded();
     req_tx
@@ -82,7 +72,8 @@ fn a_request_queued_behind_another_supersedes_it() {
             current: Some(PathBuf::from("/tmp")),
         })
         .expect("second");
-    let worker = portal::spawn(req_rx, tx).expect("the portal worker thread starts");
+    let worker = portal::spawn_on_bus(req_rx, tx, Some(NO_SUCH_BUS.to_string()))
+        .expect("the portal worker thread starts");
 
     let first = wait_for_answer(&inbox);
     assert!(matches!(first, Msg::WallpaperPickerFailed(_)));

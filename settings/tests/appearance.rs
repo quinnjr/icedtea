@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use icedtea_harness::{Compositor, ScreencopyClient, VirtualPointerClient};
-use icedtea_ui::widgets::color_dialog::ColorDialogC;
 use support::{
     EntryAllocation, click, client_origin, dominant_colour, latest_allocations,
     latest_probe_points, matches as colour_matches, paints_something, pixel_at, seeded_config_dir,
@@ -268,7 +267,7 @@ fn a_colour_pick_changes_the_swatch() {
 
     // Pick the third palette entry: a mid-blue no theme uses for a control.
     let index = 2usize;
-    let expected = ColorDialogC::default_palette()[index];
+    let expected = icedtea_settings::pages::appearance::picker_palette()[index];
     let expected_rgb = (
         (expected.r * 255.0).round() as u8,
         (expected.g * 255.0).round() as u8,

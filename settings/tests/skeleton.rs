@@ -131,9 +131,17 @@ fn the_first_toplevel_app_run_paints_and_navigates() {
         "the switcher did not select the Displays page\n{:?}",
         app.lines()
     );
+    // Waited for, not read once: `page displays` is written by the *fold*,
+    // and the page's own probe points only exist after the render that
+    // follows it. (Before the fix wave this assertion passed the moment the
+    // app started, because the report published every stack page's
+    // widgets — the hidden ones included — from the first frame. Now that
+    // it publishes only what is displayed, this really does assert that the
+    // Displays page came on screen.)
     assert!(
-        app.point("displays_page").is_some(),
-        "the Displays page body never entered the tree"
+        app.wait_line("probe displays_page ", SETTLE).is_some(),
+        "the Displays page body never entered the tree\n{:?}",
+        app.lines()
     );
 
     // 3. The footer responds: Apply is insensitive while clean, and clicking

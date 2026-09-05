@@ -28,11 +28,13 @@ use icedtea_harness::{CapturedFrame, Compositor, ScreencopyClient, VirtualPointe
 /// A 480x420 toplevel window on `comp`'s socket, with the bundled Adwaita
 /// sheet — the same surface `icedtea-settings` opens.
 pub fn open_test_window(comp: &icedtea_harness::Compositor) -> icedtea_ui::window::Window {
-    // SAFETY-free: the harness owns the socket for the life of `comp`, and
-    // `Window::open` reads `$WAYLAND_DISPLAY` once, here, before any thread
-    // that could race it exists.
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &comp.socket) };
-    icedtea_ui::window::Window::open(
+    // `Window::open_at_path`, never an `unsafe set_var("WAYLAND_DISPLAY")`:
+    // the environment is process-global, libtest runs these tests in parallel
+    // threads of one process, and a test that rewrote it could hand another
+    // test's window to *its* compositor. (On edition 2024 the write is also
+    // undefined behaviour the moment another thread reads the environment.)
+    icedtea_ui::window::Window::open_at_path(
+        comp.socket_path(),
         icedtea_ui::window::SurfaceSpec {
             role: icedtea_ui::window::Role::Toplevel,
             size: (480, 420),
@@ -83,6 +85,10 @@ pub fn spawn_settings_process(comp: &icedtea_harness::Compositor) -> SettingsPro
     let report = dir.path().join("report");
     let child = Command::new(target_profile_dir().join("icedtea-settings"))
         .env("WAYLAND_DISPLAY", &comp.socket)
+        // The harness compositor's socket lives under its own private
+        // runtime dir; a child that inherited the session's would look for
+        // `comp.socket` in the wrong directory entirely.
+        .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
         .env("XDG_CONFIG_HOME", dir.path())
         .env("XDG_DATA_HOME", dir.path())
         .env("ICEDTEA_PROBE_REPORT", &report)
@@ -320,6 +326,7 @@ pub fn spawn_settings(
     Reaper(
         command
             .env("WAYLAND_DISPLAY", socket)
+            .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
             .env("XDG_CONFIG_HOME", config_home)
             .env("ICEDTEA_SETTINGS_PAGE", page)
             .env("ICEDTEA_PROBE_REPORT", report)
