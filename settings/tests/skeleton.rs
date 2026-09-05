@@ -64,7 +64,7 @@ fn the_first_toplevel_app_run_paints_and_navigates() {
     // up against that client's empty pointer list and silently dropped. The
     // pointer has to exist before `spawn_settings` connects.
     let mut pointer = icedtea_harness::VirtualPointerClient::spawn(&comp.socket);
-    let app = support::spawn_settings(&comp);
+    let app = support::spawn_settings_process(&comp);
 
     // 1. It painted: the first geometry block names the ids `view` builds.
     assert!(
@@ -108,7 +108,7 @@ fn the_first_toplevel_app_run_paints_and_navigates() {
     let mut painted = false;
     while Instant::now() < paint_deadline {
         let frame = shot.capture();
-        if support::paints_something(&frame, background) {
+        if support::paints_something_anywhere(&frame, background) {
             painted = true;
             break;
         }
@@ -125,7 +125,7 @@ fn the_first_toplevel_app_run_paints_and_navigates() {
     // Five equal-width linked buttons; the fifth's centre is at 90% of the width.
     let displays_local = (nav.0 - (nav_w as i32) / 2 + (nav_w as i32 * 9) / 10, nav.1);
     let (displays_x, displays_y) = to_screen(displays_local);
-    support::click(&mut pointer, displays_x, displays_y);
+    support::click_fixed(&mut pointer, displays_x, displays_y);
     assert!(
         app.wait_line("page displays", SETTLE).is_some(),
         "the switcher did not select the Displays page\n{:?}",
@@ -140,7 +140,7 @@ fn the_first_toplevel_app_run_paints_and_navigates() {
     //    it changes nothing — the model is not dirty.
     let apply_local = app.point("apply").expect("#apply is laid out");
     let (ax, ay) = to_screen(apply_local);
-    support::click(&mut pointer, ax, ay);
+    support::click_fixed(&mut pointer, ax, ay);
     assert!(
         app.wait_line("status Applying", Duration::from_secs(2))
             .is_none(),

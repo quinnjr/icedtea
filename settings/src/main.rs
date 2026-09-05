@@ -6,13 +6,15 @@
 //! connection is registered with `Window::watch_fd` and mapped to messages by
 //! `App::on_fd`.
 
+use std::path::Path;
+
 use icedtea_config::default_db_path;
 use icedtea_settings::app::{SettingsModel, update, view};
 use icedtea_settings::outputs::pump::OutputsPump;
 use icedtea_settings::{ipc, probe};
 use icedtea_ui::app::{ThemeEnv, load_layered_stylesheet};
 use icedtea_ui::css::cascade::CompiledSheet;
-use icedtea_ui::css::parse::parse_stylesheet_with_base;
+use icedtea_ui::css::parse::{Stylesheet, parse_stylesheet_with_base};
 use icedtea_ui::text::FontDatabase;
 use icedtea_ui::view::{App, Inbox};
 use icedtea_ui::window::{Role, SurfaceSpec, Window};
@@ -22,13 +24,57 @@ const TITLE: &str = "icedtea Settings";
 const SIZE: (u32, u32) = (480, 420);
 const STYLE: &str = include_str!("../style.css");
 
-/// The GTK theme stack with this app's own sheet layered on top, compiled
-/// under the media environment the theme implies.
+/// Parse `path` as a complete base theme, falling back to the bundled light
+/// Adwaita sheet (with a warning) when it cannot be read — the exact
+/// convention `ui/src/bin/window-probe.rs:41` uses for the same variable.
+fn read_theme_file(path: &Path) -> Stylesheet {
+    match std::fs::read_to_string(path) {
+        Ok(css) => parse_stylesheet_with_base(&css, path.parent()),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "cannot read $ICEDTEA_UI_THEME; using bundled Adwaita");
+            parse_stylesheet_with_base(icedtea_ui::BUNDLED_ADWAITA_LIGHT, None)
+        }
+    }
+}
+
+/// The theme stack this run composes, with this app's own sheet layered on
+/// top.
+///
+/// `$ICEDTEA_UI_THEME` (P2-D7, spelled per the M5 contract's E3 ruling —
+/// binding on both P2-D7 and P3-D6) names a path to a *complete* base theme
+/// file, used whole and compiled under the default (light, no contrast
+/// preference) media environment — again `window-probe.rs`'s convention, not
+/// `gallery --theme`'s media-aware one, since the three bundled sheets a gate
+/// writes to that path already bake in their own colours unconditionally.
+/// Unset, this falls back to the real desktop theme resolution
+/// (`$GTK_THEME` plus the user's own `gtk-4.0/gtk.css` override) production
+/// runs use.
 fn sheet() -> CompiledSheet {
+    if let Ok(path) = std::env::var("ICEDTEA_UI_THEME") {
+        let mut stylesheet = read_theme_file(Path::new(&path));
+        stylesheet.append_layer(parse_stylesheet_with_base(STYLE, None));
+        return CompiledSheet::from_stylesheet(stylesheet);
+    }
     let env = ThemeEnv::from_env();
     let mut stylesheet = load_layered_stylesheet(&env);
     stylesheet.append_layer(parse_stylesheet_with_base(STYLE, None));
     CompiledSheet::compile_with_env(&stylesheet, &env.media_env())
+}
+
+/// The page the window opens on (P2-D8).
+///
+/// A debug/test affordance with the same role as `gallery --widget`: it lets
+/// a rest-state gate photograph one page without synthesising a switcher
+/// click. An unknown name falls back to the first page rather than failing
+/// to start.
+fn initial_page() -> icedtea_settings::pages::PageId {
+    let Ok(name) = std::env::var("ICEDTEA_SETTINGS_PAGE") else {
+        return icedtea_settings::pages::PageId::Appearance;
+    };
+    icedtea_settings::pages::PageId::ALL
+        .into_iter()
+        .find(|page| page.name() == name)
+        .unwrap_or(icedtea_settings::pages::PageId::Appearance)
 }
 
 fn main() {
@@ -87,7 +133,8 @@ fn main() {
         }
     }
 
-    let model = SettingsModel::new(default_db_path(), workers).with_outputs(pump.clone());
+    let mut model = SettingsModel::new(default_db_path(), workers).with_outputs(pump.clone());
+    model.page = initial_page();
     let mut app = App::new(model, update, view).with_inbox(inbox);
     if let (Some(id), Some(pump)) = (watch, pump) {
         app = app.on_fd(id, move || pump.drain());

@@ -137,7 +137,7 @@ fn a_dead_connection_latches_the_pump_and_unwatches_the_fd() {
 #[test]
 fn the_real_binary_seeds_its_loop_with_the_initial_enumeration() {
     let comp = icedtea_harness::Compositor::spawn();
-    let settings = support::spawn_settings(&comp);
+    let settings = support::spawn_settings_process(&comp);
     let line = settings.wait_line("msg Outputs", std::time::Duration::from_secs(20));
     assert!(
         line.is_some_and(|l| l.contains("HeadsChanged")),
