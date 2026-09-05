@@ -144,6 +144,14 @@ pub enum Msg {
     BackgroundPicked(f64),
     ForegroundPicked(f64),
     AccentPicked(f64),
+    /// The Behavior page's snap-gap `spin_button` (contract deviation
+    /// P2-D10: the control is on Behavior, the field stays on Appearance).
+    SnapGapChanged(f64),
+
+    // --- Behavior (P2) --------------------------------------------------
+    RaiseOnFocusToggled(bool),
+    HideBarOnFullscreenToggled(bool),
+    SnapEnabledToggled(bool),
 
     /// One protocol message from the outputs connection, via `App::on_fd`.
     /// `Arc`, not `Rc`: `Msg` is `Send` (M5-D2).
@@ -284,6 +292,22 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             m.model.working.appearance.palette.accent =
                 crate::pages::appearance::packed_to_hex(packed);
             m.color_picker = None;
+            Cmd::None
+        }
+        Msg::SnapGapChanged(v) => {
+            m.model.working.appearance.snap_gap = crate::pages::appearance::spin_px(v);
+            Cmd::None
+        }
+        Msg::RaiseOnFocusToggled(on) => {
+            m.model.working.behavior.raise_on_focus = on;
+            Cmd::None
+        }
+        Msg::HideBarOnFullscreenToggled(on) => {
+            m.model.working.behavior.hide_bar_on_fullscreen = on;
+            Cmd::None
+        }
+        Msg::SnapEnabledToggled(on) => {
+            m.model.working.behavior.snap_enabled = on;
             Cmd::None
         }
         Msg::Outputs(update) => match &*update {
@@ -956,5 +980,61 @@ mod tests {
             matches!(cmd, Cmd::Task(_)),
             "the outbound call runs on the worker, never inside update"
         );
+    }
+
+    #[test]
+    fn each_behavior_switch_writes_its_own_field() {
+        let (mut m, _inbox) = test_model();
+        let defaults = icedtea_config::default_config().behavior;
+
+        update(&mut m, Msg::RaiseOnFocusToggled(!defaults.raise_on_focus));
+        assert_eq!(
+            m.model.working.behavior.raise_on_focus,
+            !defaults.raise_on_focus
+        );
+        assert_eq!(
+            m.model.working.behavior.hide_bar_on_fullscreen, defaults.hide_bar_on_fullscreen,
+            "the other two switches are untouched"
+        );
+        assert_eq!(m.model.working.behavior.snap_enabled, defaults.snap_enabled);
+
+        update(
+            &mut m,
+            Msg::HideBarOnFullscreenToggled(!defaults.hide_bar_on_fullscreen),
+        );
+        update(&mut m, Msg::SnapEnabledToggled(!defaults.snap_enabled));
+        assert_eq!(
+            m.model.working.behavior.hide_bar_on_fullscreen,
+            !defaults.hide_bar_on_fullscreen
+        );
+        assert_eq!(
+            m.model.working.behavior.snap_enabled,
+            !defaults.snap_enabled
+        );
+    }
+
+    #[test]
+    fn toggling_a_switch_makes_the_model_dirty_and_toggling_back_makes_it_clean() {
+        let (mut m, _inbox) = test_model();
+        let before = m.model.working.behavior.raise_on_focus;
+        update(&mut m, Msg::RaiseOnFocusToggled(!before));
+        assert!(m.model.is_dirty());
+        update(&mut m, Msg::RaiseOnFocusToggled(before));
+        assert!(
+            !m.model.is_dirty(),
+            "dirty is computed from working != saved, never a latched flag"
+        );
+    }
+
+    #[test]
+    fn the_snap_gap_spin_writes_appearance_snap_gap_clamped() {
+        let (mut m, _inbox) = test_model();
+        update(&mut m, Msg::SnapGapChanged(11.5));
+        assert_eq!(
+            m.model.working.appearance.snap_gap, 12,
+            "snap_gap lives on Appearance in the config even though the control is on Behavior"
+        );
+        update(&mut m, Msg::SnapGapChanged(-1.0));
+        assert_eq!(m.model.working.appearance.snap_gap, 0);
     }
 }
