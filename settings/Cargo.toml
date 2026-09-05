@@ -12,6 +12,9 @@ path = "src/main.rs"
 icedtea-config = { path = "../config" }
 icedtea-contract = { path = "../contract" }
 icedtea-ui = { path = "../ui" }
+skia-rs-safe = { version = "0.4.0", default-features = false, features = [
+    "std",
+] }
 crossbeam-channel.workspace = true
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }

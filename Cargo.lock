@@ -1655,6 +1655,7 @@ dependencies = [
  "icedtea-ui",
  "redb",
  "rustix 1.1.4",
+ "skia-rs-safe",
  "tempfile",
  "tracing",
  "tracing-subscriber",

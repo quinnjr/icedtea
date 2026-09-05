@@ -230,6 +230,18 @@ pub enum Msg {
     /// Task 7 clears `m.capturing`; for now `update` only needs an arm to
     /// stay exhaustive.
     CaptureCancelled,
+
+    // --- Displays (P4) -----------------------------------------------------
+    /// A press on the Displays canvas, at canvas-space `(x, y)`. Task 2
+    /// (`pages::displays::canvas::view`) only needs the variant to exist so
+    /// the drawing area's pointer handlers can be registered; the arm that
+    /// starts a [`crate::pages::displays::state::Drag`] is a later task's
+    /// (contract §2.1's `HeadDragBegan`/`HeadDragged`/`HeadDragEnded` trio).
+    HeadDragBegan(f64, f64),
+    /// A pointer motion over the canvas, at canvas-space `(x, y)`.
+    HeadDragged(f64, f64),
+    /// The pointer released over the canvas, at canvas-space `(x, y)`.
+    HeadDragEnded(f64, f64),
 }
 
 const _: fn() = || {
@@ -586,6 +598,9 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             m.capturing = None;
             Cmd::None
         }
+        // --- Displays (P4) -----------------------------------------------
+        // Stub arms (contract §2.1): the drag maths land in a later task.
+        Msg::HeadDragBegan(..) | Msg::HeadDragged(..) | Msg::HeadDragEnded(..) => Cmd::None,
         Msg::KeyCaptured { keysym, mods } => {
             // `false` means `combo_from_keysym` declined -- a lone modifier
             // press. Stay armed and wait for the real key (contract §2.7
@@ -649,7 +664,10 @@ fn clears_status(msg: &Msg) -> bool {
         | Msg::WallpaperPickerFailed(_)
         | Msg::WallpaperPickerCancelled
         | Msg::CaptureArmed(_)
-        | Msg::CaptureCancelled => false,
+        | Msg::CaptureCancelled
+        | Msg::HeadDragBegan(..)
+        | Msg::HeadDragged(..)
+        | Msg::HeadDragEnded(..) => false,
     }
 }
 

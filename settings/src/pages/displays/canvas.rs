@@ -11,6 +11,18 @@
 //! two constants are the shared source of truth instead and `update` recomputes
 //! the identical `View` for the drag maths.
 
+use std::rc::Rc;
+
+use icedtea_ui::css::value::{FontFamily, FontStyle, GenericFamily, Keyword, LineHeight, Rgba};
+use icedtea_ui::layout::Rect as UiRect;
+use icedtea_ui::paint::{PaintCx, fill_paint};
+use icedtea_ui::text::{Ellipsize, TextLayout, TextStyle, WrapMode};
+use icedtea_ui::view::View as UiView;
+use icedtea_ui::view::builders::{DrawingAreaExt, drawing_area, frame};
+use skia_rs_safe::canvas::Canvas;
+use skia_rs_safe::paint::Style;
+
+use crate::app::{Msg, SettingsModel};
 use crate::pages::displays::state::{self, DisplaysState};
 use crate::pages::displays_canvas::{self, Rect, View};
 
@@ -124,6 +136,166 @@ pub fn scene(snap: &DisplaysSnapshot, width: f64, height: f64) -> CanvasScene {
         })
         .collect();
     CanvasScene { view, tiles }
+}
+
+/// One opaque colour from three channels in 0..=1.
+const fn rgb(r: f32, g: f32, b: f32) -> Rgba {
+    Rgba { r, g, b, a: 1.0 }
+}
+
+/// The canvas backdrop.
+pub const CANVAS_BG: Rgba = rgb(0.12, 0.12, 0.16);
+/// An enabled monitor's body.
+pub const TILE_ON: Rgba = rgb(0.26, 0.28, 0.36);
+/// A disabled monitor's body, dimmed.
+pub const TILE_OFF: Rgba = rgb(0.17, 0.18, 0.22);
+/// The selected monitor's accent border.
+pub const BORDER_SELECTED: Rgba = rgb(0.54, 0.71, 0.98);
+/// An enabled monitor's border.
+pub const BORDER_ON: Rgba = rgb(0.45, 0.47, 0.55);
+/// A disabled monitor's border.
+pub const BORDER_OFF: Rgba = rgb(0.34, 0.35, 0.42);
+/// An enabled monitor's label.
+pub const TEXT_ON: Rgba = rgb(0.90, 0.91, 0.95);
+/// A disabled monitor's label.
+pub const TEXT_OFF: Rgba = rgb(0.60, 0.61, 0.66);
+
+/// The selected monitor's border width, in canvas pixels.
+const BORDER_SELECTED_PX: f32 = 2.5;
+/// Every other monitor's border width.
+const BORDER_PLAIN_PX: f32 = 1.0;
+/// Label inset from the tile's left edge.
+const LABEL_X: f64 = 6.0;
+/// The name's *baseline* offset from the tile's top edge (cairo semantics).
+const NAME_BASELINE: f64 = 16.0;
+/// The detail line's baseline offset.
+const DETAIL_BASELINE: f64 = 30.0;
+
+/// The face the canvas labels are shaped with.
+///
+/// The GTK page used cairo's toy text API with `set_font_size(11.0)` and no
+/// family at all, so there is no computed style to read here; this is the
+/// registry's initial font at the same size.
+#[must_use]
+pub fn canvas_text_style() -> TextStyle {
+    TextStyle {
+        families: Rc::from(vec![FontFamily::Generic(GenericFamily::SansSerif)]),
+        weight: 400.0,
+        style: FontStyle::Normal,
+        stretch: 100.0,
+        size_px: CANVAS_FONT_PX,
+        letter_spacing_px: 0.0,
+        features: Rc::from(Vec::new()),
+        variations: Rc::from(Vec::new()),
+        transform: Keyword::None,
+        line_height: LineHeight::Normal,
+    }
+}
+
+/// Draw one string with its cairo *baseline* at `baseline_y` (plan P4-D11:
+/// `TextLayout::draw`'s origin is the layout box's top-left, cairo's
+/// `move_to` is a baseline, and the conversion is one font size).
+fn draw_label(
+    canvas: &mut Canvas<'_>,
+    cx: &mut PaintCx<'_>,
+    text: &str,
+    x: f64,
+    baseline_y: f64,
+    colour: Rgba,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let style = canvas_text_style();
+    let layout = TextLayout::build(text, &style, cx.fonts, None, WrapMode::None, Ellipsize::End);
+    layout.draw(
+        canvas,
+        (x as f32, baseline_y as f32 - CANVAS_FONT_PX),
+        colour,
+    );
+}
+
+/// The `Prop::Draw` callback for `snap`.
+///
+/// The cairo calls of the GTK page map one for one: `set_source_rgb`,
+/// `rectangle` and `fill` become `draw_rect` with [`fill_paint`];
+/// `set_line_width` and `stroke` become a `Style::Stroke` paint; `set_font_size`,
+/// `move_to` and `show_text` become a [`TextLayout`] through `cx.fonts`, which
+/// is why M5-D6 widened the callback to carry `&mut PaintCx`.
+///
+/// The closure captures `snap` by value and never the model (contract §2.8).
+pub fn draw(
+    snap: DisplaysSnapshot,
+) -> impl Fn(&mut Canvas<'_>, UiRect, &mut PaintCx<'_>) + 'static {
+    move |canvas, rect, cx| {
+        // Neutral background across the whole content box.
+        canvas.draw_rect(&rect.to_skia().clone(), &fill_paint(CANVAS_BG));
+
+        let sc = scene(&snap, f64::from(rect.width), f64::from(rect.height));
+        for tile in &sc.tiles {
+            let r = UiRect::new(
+                rect.x + tile.rect.x as f32,
+                rect.y + tile.rect.y as f32,
+                tile.rect.w as f32,
+                tile.rect.h as f32,
+            );
+            // Body.
+            let body = if tile.enabled { TILE_ON } else { TILE_OFF };
+            canvas.draw_rect(&r.to_skia(), &fill_paint(body));
+            // Border.
+            let (edge, width) = if tile.selected {
+                (BORDER_SELECTED, BORDER_SELECTED_PX)
+            } else if tile.enabled {
+                (BORDER_ON, BORDER_PLAIN_PX)
+            } else {
+                (BORDER_OFF, BORDER_PLAIN_PX)
+            };
+            let mut stroke = fill_paint(edge);
+            stroke.set_style(Style::Stroke);
+            stroke.set_stroke_width(width);
+            canvas.draw_rect(&r.to_skia(), &stroke);
+            // Labels.
+            let ink = if tile.enabled { TEXT_ON } else { TEXT_OFF };
+            let x = f64::from(rect.x) + tile.rect.x + LABEL_X;
+            draw_label(
+                canvas,
+                cx,
+                &tile.name,
+                x,
+                f64::from(rect.y) + tile.rect.y + NAME_BASELINE,
+                ink,
+            );
+            draw_label(
+                canvas,
+                cx,
+                &tile.detail,
+                x,
+                f64::from(rect.y) + tile.rect.y + DETAIL_BASELINE,
+                ink,
+            );
+        }
+    }
+}
+
+/// The canvas, framed, with its three pointer handlers.
+///
+/// Fixed size (plan P4-D3): `hexpand`/`vexpand` are off and the content size is
+/// `CANVAS_W` x `CANVAS_H`, so `Prop::Draw`'s rectangle and the coordinates the
+/// pointer handlers receive are the same box, and `update` can recompute the
+/// identical `View` from the two constants.
+#[must_use]
+pub fn view(m: &SettingsModel) -> UiView<Msg> {
+    frame(
+        drawing_area(draw(DisplaysSnapshot::of(&m.displays)))
+            .content_width(CANVAS_W as i32)
+            .content_height(CANVAS_H as i32)
+            .id("displays_canvas")
+            .hexpand(false)
+            .vexpand(false)
+            .on_pointer_down(Msg::HeadDragBegan)
+            .on_pointer_motion(Msg::HeadDragged)
+            .on_pointer_up(Msg::HeadDragEnded),
+    )
 }
 
 #[cfg(test)]
@@ -256,5 +428,73 @@ mod tests {
         );
         assert!(sc.tiles.is_empty());
         assert_eq!(sc.view.scale, 1.0);
+    }
+
+    /// Mutation check: give `canvas_text_style` a `size_px` of `0.0`; the
+    /// assertion on the font size fails. Restore.
+    #[test]
+    fn the_canvas_text_style_is_an_11px_sans_face() {
+        let style = canvas_text_style();
+        assert_eq!(style.size_px, CANVAS_FONT_PX);
+        assert_eq!(style.weight, 400.0);
+        assert_eq!(style.letter_spacing_px, 0.0);
+        assert!(!style.families.is_empty(), "a face must be named");
+    }
+
+    /// The eight literal colours of the GTK draw func, unchanged.
+    ///
+    /// Mutation check: change any one channel; this fails. Restore.
+    #[test]
+    fn the_canvas_palette_is_the_gtk_palette() {
+        assert_eq!((CANVAS_BG.r, CANVAS_BG.g, CANVAS_BG.b), (0.12, 0.12, 0.16));
+        assert_eq!((TILE_ON.r, TILE_ON.g, TILE_ON.b), (0.26, 0.28, 0.36));
+        assert_eq!((TILE_OFF.r, TILE_OFF.g, TILE_OFF.b), (0.17, 0.18, 0.22));
+        assert_eq!(
+            (BORDER_SELECTED.r, BORDER_SELECTED.g, BORDER_SELECTED.b),
+            (0.54, 0.71, 0.98)
+        );
+        assert_eq!((BORDER_ON.r, BORDER_ON.g, BORDER_ON.b), (0.45, 0.47, 0.55));
+        assert_eq!(
+            (BORDER_OFF.r, BORDER_OFF.g, BORDER_OFF.b),
+            (0.34, 0.35, 0.42)
+        );
+        assert_eq!((TEXT_ON.r, TEXT_ON.g, TEXT_ON.b), (0.90, 0.91, 0.95));
+        assert_eq!((TEXT_OFF.r, TEXT_OFF.g, TEXT_OFF.b), (0.60, 0.61, 0.66));
+        for c in [
+            CANVAS_BG,
+            TILE_ON,
+            TILE_OFF,
+            BORDER_SELECTED,
+            BORDER_ON,
+            BORDER_OFF,
+            TEXT_ON,
+            TEXT_OFF,
+        ] {
+            assert_eq!(c.a, 1.0, "every canvas colour is opaque");
+        }
+    }
+
+    /// Mutation check: drop the `Msg::HeadDragged` registration from
+    /// `view`; the kind count falls to two and this fails. Restore.
+    ///
+    /// Reconciliation (Task 2): `View::children`, `View::handler_kinds` and
+    /// `View::id_of` are not names `icedtea-ui` exposes. `children` is a
+    /// public field (not an accessor method), there is no `handler_kinds`
+    /// enumerator so each kind is checked with `Handlers::has`, and `id_of`
+    /// is `Props::str(PropName::Id)`. `SettingsModel::for_test()` does not
+    /// exist either; `crate::app::tests::test_model()` (P1-D8's `pub(crate)`
+    /// constructor) is the equivalent the crate does expose.
+    #[test]
+    fn the_canvas_view_registers_all_three_pointer_kinds() {
+        use icedtea_ui::view::{EventKind, PropName};
+
+        let (m, _workers) = crate::app::tests::test_model();
+        let v = view(&m);
+        // `frame(drawing_area(..))` — the handlers sit on the child.
+        let area = v.children.first().expect("the frame wraps the canvas");
+        assert!(area.handlers.has(EventKind::PointerDown));
+        assert!(area.handlers.has(EventKind::PointerMotion));
+        assert!(area.handlers.has(EventKind::PointerUp));
+        assert_eq!(area.props.str(PropName::Id), Some("displays_canvas"));
     }
 }

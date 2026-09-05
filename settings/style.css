@@ -15,3 +15,13 @@
     color: #f38ba8;
     font-weight: bold;
 }
+
+/* The Displays canvas: `Event::PointerDown`'s `local` is border-box relative
+   while `Prop::Draw`'s rect is the content box. With no padding, border or
+   margin the two coincide, which is what makes the canvas hit test correct
+   (plan P4-D4). */
+#displays_canvas {
+    padding: 0;
+    border: 0 none;
+    margin: 0;
+}
