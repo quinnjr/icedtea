@@ -80,7 +80,6 @@ impl<Msg: Send + 'static> Inbox<Msg> {
     }
 }
 
-#[allow(dead_code)]
 impl<Msg> Inbox<Msg> {
     /// The fd to register with [`Window::watch_fd`](crate::window::Window::watch_fd).
     ///

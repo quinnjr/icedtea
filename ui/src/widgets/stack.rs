@@ -81,6 +81,11 @@ const ONE_CELL: GridPlacement = GridPlacement {
 };
 
 /// Pin `node` into the stack's one grid cell, filling it.
+///
+/// This *replaces* whatever `ChildLayout` the page itself would have had:
+/// a `GtkStack` page fills its stack, and an unpinned one auto-flows out of
+/// the single cell altogether (see [`ONE_CELL`]). A caller that wants a
+/// page's contents aligned puts the alignment on a child of the page.
 fn pin(node: &Node) {
     crate::widgets::set_child_layout(
         node,

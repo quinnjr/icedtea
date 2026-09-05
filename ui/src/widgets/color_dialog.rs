@@ -352,6 +352,18 @@ impl ColorDialogC {
         cells
     }
 
+    /// Whether `cell` fits inside `content` and is therefore drawn.
+    ///
+    /// `paint` drops a cell a too-small content box cannot hold rather than
+    /// overdrawing a neighbour's chrome, and `on_event` has to make the same
+    /// call: a click in a cell that was never painted would otherwise pick a
+    /// colour nothing on screen showed.
+    #[must_use]
+    pub fn cell_is_painted(content: Rect, cell: Rect) -> bool {
+        cell.x + cell.width <= content.x + content.width
+            && cell.y + cell.height <= content.y + content.height
+    }
+
     /// The grid's intrinsic size: nine columns, as many rows as the palette
     /// needs, plus one for the custom colour once there is one.
     #[must_use]
@@ -424,6 +436,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
         let cells = self.grid(content);
         let mut picked = None;
         for (index, (_, rect)) in cells.iter().enumerate().take(self.swatches.len()) {
+            if !Self::cell_is_painted(content, *rect) {
+                continue;
+            }
             let swatch = self.swatches[index].clone();
             let shifted = shift_event(ev, *rect);
             let Some(state) = self.swatch_pointers.get_mut(index) else {
@@ -479,12 +494,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
         }
         let mut painted = false;
         for (colour, rect) in self.grid(content) {
-            if rect.x + rect.width > content.x + content.width
-                || rect.y + rect.height > content.y + content.height
-            {
-                // A grid larger than the box it was given: clip by dropping
-                // the cells that do not fit, rather than overdrawing a
-                // neighbour's chrome.
+            // A grid larger than the box it was given: clip by dropping the
+            // cells that do not fit, rather than overdrawing a neighbour's
+            // chrome. `on_event` drops the same ones.
+            if !Self::cell_is_painted(content, rect) {
                 continue;
             }
             canvas.draw_rect(&rect.to_skia(), &crate::paint::fill_paint(colour));
@@ -668,6 +681,41 @@ mod tests {
         );
         assert_eq!(controller.rgba, expected_rgba);
         assert_eq!(controller.custom, Some(expected_rgba));
+    }
+
+    /// A cell the content box is too small to hold is not painted, so it is
+    /// not clickable either — picking a colour nothing on screen shows is
+    /// exactly the mismatch `grid()` exists to prevent.
+    ///
+    /// Mutation check: drop `on_event`'s `cell_is_painted` guard and this
+    /// fires a `ValueChanged` for a swatch the widget never drew.
+    #[test]
+    fn a_swatch_that_does_not_fit_is_not_painted_and_not_clickable() {
+        use crate::layout::Rect;
+
+        // One row of swatches' worth of height, a couple of columns wide.
+        let content = Rect::new(0.0, 0.0, 60.0, 24.0);
+        let controller = ColorDialogC {
+            rgba: ColorDialogC::unpack(0.0),
+            palette: ColorDialogC::default_palette(),
+            custom: None,
+            swatches: Vec::new(),
+            swatch_pointers: Vec::new(),
+            sink: Node::new("sink"),
+        };
+        let cells = controller.grid(content);
+        assert!(
+            ColorDialogC::cell_is_painted(content, cells[0].1),
+            "the first column fits"
+        );
+        assert!(
+            !ColorDialogC::cell_is_painted(content, cells[2].1),
+            "the third column runs off the 60px content box"
+        );
+        assert!(
+            !ColorDialogC::cell_is_painted(content, cells[9].1),
+            "and so does every row past the first"
+        );
     }
 
     #[test]
