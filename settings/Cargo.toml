@@ -13,15 +13,8 @@ icedtea-config = { path = "../config" }
 icedtea-contract = { path = "../contract" }
 icedtea-ui = { path = "../ui" }
 crossbeam-channel.workspace = true
-gtk4 = { version = "0.11", features = ["v4_10"] }
-# The Displays page talks to the compositor over a *second* Wayland connection
-# (`zwlr_output_management_v1`), dispatched on a `gio::Socket` glib source —
-# see `outputs/`. gtk4 re-exports gio/glib, but the outputs module is GTK-free
-# and testable without GTK, so it declares them directly.
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-gio = "0.22"
-glib = "0.22"
 rustix = "1"
 async-channel = "2"
 zbus.workspace = true

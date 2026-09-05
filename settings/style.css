@@ -1,0 +1,8 @@
+/* icedtea-settings' own sheet, layered over the GTK theme as a user-origin
+ * overlay — the mechanism the user's ~/.config/gtk-4.0/gtk.css uses.
+ *
+ * P3 adds the `.conflict` rule for duplicate keybindings. */
+
+#footer {
+  border-top: 1px solid alpha(currentColor, 0.15);
+}

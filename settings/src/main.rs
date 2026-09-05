@@ -1,22 +1,35 @@
-//! `icedtea-settings` — a GTK4 config editor for icedtea-wm: an Appearance
-//! page and a Behavior page over a shared working-copy [`Model`], with
-//! Apply/Revert wired to the on-disk redb store and (best-effort) a running
-//! compositor via `org.icedtea.Compositor`'s `ReloadConfig`.
-
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
-
-use gtk4::prelude::*;
-use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, Label, Orientation, Stack, StackSwitcher,
-};
+//! `icedtea-settings` — a config editor for icedtea, built on `icedtea-ui`.
+//!
+//! One `App<SettingsModel, Msg>` on one `Role::Toplevel` window. Two external
+//! event sources reach the loop through the toolkit's ingress: the reload
+//! worker posts on the inbox, and the Displays page's second Wayland
+//! connection is registered with `Window::watch_fd` and mapped to messages by
+//! `App::on_fd`.
 
 use icedtea_config::default_db_path;
-use icedtea_settings::compositor_reload::{ReloadClient, ReloadOutcome, apply_and_reload};
-use icedtea_settings::model::Model;
-use icedtea_settings::pages::{Ctx, Page, appearance, behavior, displays, keybindings, workspaces};
+use icedtea_settings::app::{SettingsModel, update, view};
+use icedtea_settings::outputs::pump::OutputsPump;
+use icedtea_settings::{ipc, probe};
+use icedtea_ui::app::{ThemeEnv, load_layered_stylesheet};
+use icedtea_ui::css::cascade::CompiledSheet;
+use icedtea_ui::css::parse::parse_stylesheet_with_base;
+use icedtea_ui::text::FontDatabase;
+use icedtea_ui::view::{App, Inbox};
+use icedtea_ui::window::{Role, SurfaceSpec, Window};
 
 const APP_ID: &str = "org.icedtea.Settings";
+const TITLE: &str = "icedtea Settings";
+const SIZE: (u32, u32) = (480, 420);
+const STYLE: &str = include_str!("../style.css");
+
+/// The GTK theme stack with this app's own sheet layered on top, compiled
+/// under the media environment the theme implies.
+fn sheet() -> CompiledSheet {
+    let env = ThemeEnv::from_env();
+    let mut stylesheet = load_layered_stylesheet(&env);
+    stylesheet.append_layer(parse_stylesheet_with_base(STYLE, None));
+    CompiledSheet::compile_with_env(&stylesheet, &env.media_env())
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -25,154 +38,48 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_window);
-    app.run();
-}
 
-fn build_window(app: &Application) {
-    let db_path = default_db_path();
-    let model = Rc::new(RefCell::new(Model::load(&db_path)));
-    let client = Rc::new(ReloadClient::new());
-
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("icedtea Settings")
-        .default_width(480)
-        .default_height(420)
-        .build();
-
-    let root = GtkBox::new(Orientation::Vertical, 0);
-    window.set_child(Some(&root));
-
-    let stack = Stack::new();
-    let switcher = StackSwitcher::builder().stack(&stack).build();
-    root.append(&switcher);
-    root.append(&stack);
-    stack.set_vexpand(true);
-
-    let footer = GtkBox::new(Orientation::Horizontal, 8);
-    footer.set_margin_top(8);
-    footer.set_margin_bottom(8);
-    footer.set_margin_start(8);
-    footer.set_margin_end(8);
-    let status = Label::new(None);
-    status.set_hexpand(true);
-    status.set_halign(gtk4::Align::Start);
-    let revert_button = Button::with_label("Revert");
-    let apply_button = Button::with_label("Apply");
-    footer.append(&status);
-    footer.append(&revert_button);
-    footer.append(&apply_button);
-    root.append(&footer);
-
-    // Recomputes the footer from `model.is_dirty()` -- called after every
-    // widget write-back (via `Ctx::mark_dirty`) and after Apply/Revert, so
-    // it's the single source of truth for the dirty indicator rather than a
-    // flag that only ever moves one direction.
-    let update_footer: Rc<dyn Fn()> = {
-        let model = model.clone();
-        let status = status.clone();
-        let revert_button = revert_button.clone();
-        let apply_button = apply_button.clone();
-        Rc::new(move || {
-            let dirty = model.borrow().is_dirty();
-            status.set_label(if dirty { "Unsaved changes" } else { "" });
-            revert_button.set_sensitive(dirty);
-            apply_button.set_sensitive(dirty);
-        })
+    let spec = SurfaceSpec {
+        role: Role::Toplevel,
+        size: SIZE,
+        title: TITLE.to_string(),
+        app_id: APP_ID.to_string(),
+    };
+    let mut window = match Window::open(spec, sheet(), FontDatabase::new()) {
+        Ok(window) => window,
+        Err(err) => {
+            tracing::error!(?err, "cannot open the settings window");
+            std::process::exit(1);
+        }
     };
 
-    let ctx = Ctx {
-        model: model.clone(),
-        window: window.clone(),
-        on_dirty: update_footer.clone(),
-        populating: Rc::new(Cell::new(false)),
+    let (inbox, tx) = match Inbox::new() {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::error!(%err, "cannot create the inbox");
+            std::process::exit(1);
+        }
     };
+    let workers = ipc::spawn(tx);
 
-    let appearance_page: Page = appearance::build(ctx.clone());
-    let behavior_page: Page = behavior::build(ctx.clone());
+    // A missing output-management global is not fatal: the Displays page
+    // shows its unavailable state and everything else works.
+    let pump = OutputsPump::attach(&mut window).unwrap_or_else(|err| {
+        tracing::warn!(%err, "no outputs pump");
+        None
+    });
+    let watch = pump.as_ref().map(OutputsPump::watch);
 
-    // Adding/removing a workspace on the Workspaces page changes the set of
-    // generated `workspace:N`/`move_to_workspace:N` rows the Keybindings
-    // page shows, so the Workspaces page needs to be able to trigger a
-    // refresh there. The Keybindings page doesn't exist yet at the point
-    // `workspaces::build` needs the callback, so it's routed through this
-    // slot and filled in right after `keybindings::build` runs.
-    let keybindings_page_slot: Rc<RefCell<Option<Page>>> = Rc::new(RefCell::new(None));
-    let on_workspaces_changed: Rc<dyn Fn()> = {
-        let slot = keybindings_page_slot.clone();
-        Rc::new(move || {
-            if let Some(page) = slot.borrow().as_ref() {
-                page.refresh();
-            }
-        })
-    };
-
-    let workspaces_page: Page = workspaces::build(ctx.clone(), on_workspaces_changed);
-    let keybindings_page: Page = keybindings::build(ctx.clone());
-    let keybindings_root = keybindings_page.root.clone();
-    *keybindings_page_slot.borrow_mut() = Some(keybindings_page);
-
-    // The Displays page is protocol-driven (talks to the compositor over
-    // `zwlr_output_management_v1` and has its own Test/Apply/Revert), so it is
-    // not part of the shared model footer / revert wiring below.
-    let displays_root = displays::build();
-
-    stack.add_titled(&appearance_page.root, Some("appearance"), "Appearance");
-    stack.add_titled(&behavior_page.root, Some("behavior"), "Behavior");
-    stack.add_titled(&workspaces_page.root, Some("workspaces"), "Workspaces");
-    stack.add_titled(&keybindings_root, Some("keybindings"), "Keybindings");
-    stack.add_titled(&displays_root, Some("displays"), "Displays");
-
-    update_footer();
-
-    {
-        let model = model.clone();
-        let client = client.clone();
-        let db_path = db_path.clone();
-        let status = status.clone();
-        let update_footer = update_footer.clone();
-        apply_button.connect_clicked(move |_| {
-            let cfg = model.borrow().working.clone();
-            match apply_and_reload(&cfg, &db_path, &client) {
-                Ok(ReloadOutcome::Reloaded) => {
-                    let mut model = model.borrow_mut();
-                    model.saved = model.working.clone();
-                    drop(model);
-                    update_footer();
-                    status.set_label("Applied");
-                }
-                Ok(ReloadOutcome::CompositorAbsent) => {
-                    let mut model = model.borrow_mut();
-                    model.saved = model.working.clone();
-                    drop(model);
-                    update_footer();
-                    status.set_label("Saved; will apply when the compositor starts");
-                }
-                Err(err) => {
-                    status.set_label(&format!("Failed to save: {err}"));
-                }
-            }
-        });
+    let model = SettingsModel::new(default_db_path(), workers).with_outputs(pump.clone());
+    let mut app = App::new(model, update, view).with_inbox(inbox);
+    if let (Some(id), Some(pump)) = (watch, pump) {
+        app = app.on_fd(id, move || pump.drain());
     }
-
-    {
-        let model = model.clone();
-        let db_path = db_path.clone();
-        let update_footer = update_footer.clone();
-        let keybindings_page_slot = keybindings_page_slot.clone();
-        revert_button.connect_clicked(move |_| {
-            model.borrow_mut().revert(&db_path);
-            appearance_page.refresh();
-            behavior_page.refresh();
-            workspaces_page.refresh();
-            if let Some(page) = keybindings_page_slot.borrow().as_ref() {
-                page.refresh();
-            }
-            update_footer();
-        });
+    if let Some(path) = probe::report_path() {
+        app = app.with_probe_report(path);
     }
-
-    window.present();
+    if let Err(err) = app.run(window) {
+        tracing::error!(?err, "the settings loop stopped");
+        std::process::exit(1);
+    }
 }

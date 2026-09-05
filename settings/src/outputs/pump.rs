@@ -45,7 +45,7 @@ impl OutputsPump {
             }
         };
         // Dup so the window owns its own fd and the original stays with the
-        // EventQueue — the same dup `outputs/client.rs:61` did for gio::Socket.
+        // EventQueue.
         let fd = match rustix::io::dup(std::os::fd::AsFd::as_fd(conn.queue())) {
             Ok(fd) => fd,
             Err(err) => {

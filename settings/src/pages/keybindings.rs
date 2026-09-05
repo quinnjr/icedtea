@@ -5,23 +5,9 @@
 //! The action set is the fixed set the compositor always recognizes
 //! (`close`, `fullscreen`, ...) plus `workspace:N`/`move_to_workspace:N`
 //! generated for `1..=workspace_names.len()` -- so this page's row set
-//! tracks the Workspaces page's row count (`main.rs` refreshes this page
-//! whenever that one adds/removes a workspace).
-
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use gtk4::glib::translate::IntoGlib;
-use gtk4::prelude::*;
-use gtk4::{
-    Box as GtkBox, Button, EventControllerFocus, EventControllerKey, Label, Orientation,
-    PropagationPhase, ScrolledWindow, gdk, glib,
-};
+//! tracks the Workspaces page's row count.
 
 use icedtea_config::KeyCombo;
-
-use crate::model::{CaptureMods, combo_from_keysym, duplicate_bindings};
-use crate::pages::{Ctx, Page};
 
 /// The Keybindings page.
 ///
@@ -79,45 +65,11 @@ pub fn format_combo(combo: &KeyCombo) -> String {
     parts.join("+")
 }
 
-const CONFLICT_CSS_CLASS: &str = "keybinding-conflict";
-
-/// One built row: the action name (the model key), the combo label to keep
-/// in sync, and the Set button (whose label flips to "Press a key..." while
-/// this row is capturing).
-struct Row {
-    action: String,
-    combo_label: Label,
-    set_button: Button,
-}
-
-/// Refresh every row's combo label from `cfg` and re-run
-/// `duplicate_bindings` to add/remove the conflict CSS class -- called after
-/// any binding change (a capture completing) and by `refresh()`.
-fn sync_rows(rows: &[Row], cfg: &icedtea_config::Config) {
-    let conflicts = duplicate_bindings(cfg);
-    for row in rows {
-        if let Some(combo) = cfg.keybindings.get(&row.action) {
-            row.combo_label.set_label(&format_combo(combo));
-        } else {
-            row.combo_label.set_label("(unbound)");
-        }
-        let colliding = conflicts
-            .iter()
-            .any(|(_, actions)| actions.contains(&row.action));
-        if colliding {
-            row.combo_label.add_css_class(CONFLICT_CSS_CLASS);
-        } else {
-            row.combo_label.remove_css_class(CONFLICT_CSS_CLASS);
-        }
-    }
-}
-
 /// Whether the shared window key controller should consume a key press as a
-/// binding capture. The controller lives on the *window* in the capture phase,
-/// so it fires for keystrokes typed on *any* Stack page; it must only act when
-/// the Keybindings page is the visible child (`page_visible`) AND a capture is
-/// actually armed (`capturing`). Extracted so the gate is unit-testable without
-/// a live GTK display. (#4)
+/// binding capture. It must only act when the Keybindings page is the
+/// visible child (`page_visible`) AND a capture is actually armed
+/// (`capturing`). Extracted so the gate is unit-testable without a live
+/// window. (#4)
 pub fn should_capture(page_visible: bool, capturing: bool) -> bool {
     page_visible && capturing
 }
@@ -127,19 +79,6 @@ pub fn should_capture(page_visible: bool, capturing: bool) -> bool {
 /// is unit-testable; the caller performs the widget label restore. (#4)
 pub fn take_capture_reset(capturing: &mut Option<String>) -> Option<String> {
     capturing.take()
-}
-
-/// Cancel any armed capture and restore the mid-capture row's Set button label.
-/// Wired to leaving the Keybindings page (root `unmap`, i.e. the Stack switching
-/// to another child) and to focus leaving the page, so an armed capture can
-/// never survive a page switch and hijack keystrokes typed elsewhere. (#4)
-fn reset_capture(capturing: &Rc<RefCell<Option<String>>>, rows: &Rc<RefCell<Vec<Row>>>) {
-    let reset = take_capture_reset(&mut capturing.borrow_mut());
-    if let Some(action) = reset
-        && let Some(row) = rows.borrow().iter().find(|r| r.action == action)
-    {
-        row.set_button.set_label("Set");
-    }
 }
 
 /// Pick the keysym a capture stores, given the two the key event carries.
@@ -154,227 +93,9 @@ fn reset_capture(capturing: &Rc<RefCell<Option<String>>>, rows: &Rc<RefCell<Vec<
 /// encodes the unshifted keysym (`"KEY_q"` -> `0x71`), so a capture that stored
 /// `0x51` (`XK_Q`) from a `SUPER+SHIFT+q` press would produce a binding
 /// `match_action` can never fire.
-///
-/// Replaces the GDK-bound `unshifted_keysym(keycode, fallback)`: there is no
-/// `gdk::Display` to ask any more, and none is needed -- the toolkit stamps
-/// `base` on every `KeyEvent`.
 #[must_use]
 pub fn normalise_keysym(base: u32, modified: u32) -> u32 {
     if base == 0 { modified } else { base }
-}
-
-/// Install the CSS provider for [`CONFLICT_CSS_CLASS`] on the default
-/// display, once. Purely advisory styling (a red label) -- see the brief's
-/// Step 4: conflicts never block Apply.
-fn install_conflict_css() {
-    let Some(display) = gdk::Display::default() else {
-        return;
-    };
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_data(&format!(
-        ".{CONFLICT_CSS_CLASS} {{ color: #f38ba8; font-weight: bold; }}"
-    ));
-    gtk4::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-}
-
-pub fn build(ctx: Ctx) -> Page {
-    install_conflict_css();
-
-    let scroller = ScrolledWindow::new();
-    scroller.set_vexpand(true);
-    scroller.set_hexpand(true);
-
-    let list = GtkBox::new(Orientation::Vertical, 4);
-    list.set_margin_top(16);
-    list.set_margin_bottom(16);
-    list.set_margin_start(16);
-    list.set_margin_end(16);
-    scroller.set_child(Some(&list));
-
-    let rows: Rc<RefCell<Vec<Row>>> = Rc::new(RefCell::new(Vec::new()));
-
-    // The action currently in capture mode (set by a row's Set button,
-    // cleared on a successful capture or Esc). `None` means the shared key
-    // controller below ignores key presses entirely, so normal window
-    // interaction (Tab-focus, etc.) is unaffected outside capture mode.
-    let capturing: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-
-    let key_controller = EventControllerKey::new();
-    key_controller.set_propagation_phase(PropagationPhase::Capture);
-    {
-        // Capture only the pieces of `Ctx` the handler actually needs (the
-        // shared model + the dirty plumbing) rather than the whole `Ctx`, whose
-        // `window` field is the very window this controller is attached to.
-        // Cloning `Ctx` here would form a window -> controller -> Ctx -> window
-        // strong reference cycle that leaks the window; these `Rc`s never point
-        // back at the window, so the cycle is broken. (#4)
-        let model = ctx.model.clone();
-        let on_dirty = ctx.on_dirty.clone();
-        let populating = ctx.populating.clone();
-        let rows = rows.clone();
-        let capturing = capturing.clone();
-        let scroller = scroller.clone();
-        key_controller.connect_key_pressed(move |_controller, keyval, keycode, state| {
-            // The controller is window-scoped in the capture phase, so gate on
-            // the page being visible: never touch keystrokes typed on another
-            // Stack page even if a capture was somehow left armed. (#4)
-            if !should_capture(scroller.is_mapped(), capturing.borrow().is_some()) {
-                return glib::Propagation::Proceed;
-            }
-            let Some(action) = capturing.borrow().clone() else {
-                return glib::Propagation::Proceed;
-            };
-
-            if keyval == gdk::Key::Escape {
-                *capturing.borrow_mut() = None;
-                if let Some(row) = rows.borrow().iter().find(|r| r.action == action) {
-                    row.set_button.set_label("Set");
-                }
-                return glib::Propagation::Stop;
-            }
-
-            let mods = CaptureMods {
-                ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
-                alt: state.contains(gdk::ModifierType::ALT_MASK),
-                shift: state.contains(gdk::ModifierType::SHIFT_MASK),
-                logo: state.contains(gdk::ModifierType::SUPER_MASK),
-            };
-
-            // If `combo_from_keysym` returns `None` (a lone modifier press),
-            // fall through leaving `capturing` set -- stay in capture mode
-            // and wait for the "real" key.
-            let base = gdk::Display::default()
-                .and_then(|display| display.translate_key(keycode, gdk::ModifierType::empty(), 0))
-                .map(|(k, _group, _level, _consumed)| k.into_glib())
-                .unwrap_or(0);
-            let keysym = normalise_keysym(base, keyval.into_glib());
-            if let Some(combo) = combo_from_keysym(keysym, mods) {
-                model
-                    .borrow_mut()
-                    .working
-                    .keybindings
-                    .insert(action.clone(), combo);
-                if !populating.get() {
-                    (on_dirty)();
-                }
-                *capturing.borrow_mut() = None;
-                let rows_ref = rows.borrow();
-                if let Some(row) = rows_ref.iter().find(|r| r.action == action) {
-                    row.set_button.set_label("Set");
-                }
-                sync_rows(&rows_ref, &model.borrow().working);
-            }
-            glib::Propagation::Stop
-        });
-    }
-    ctx.window.add_controller(key_controller);
-
-    // Cancel an armed capture whenever the page stops being the visible Stack
-    // child (GtkStack unmaps the non-visible child, so the root's `unmap` fires
-    // on a page switch away) or when focus leaves the page entirely. Without
-    // this, a capture armed here would stay armed across a page switch and the
-    // window-scoped controller would silently rebind + swallow keys typed on
-    // another page. (#4)
-    {
-        let capturing = capturing.clone();
-        let rows = rows.clone();
-        scroller.connect_unmap(move |_| reset_capture(&capturing, &rows));
-    }
-    {
-        let focus = EventControllerFocus::new();
-        let capturing = capturing.clone();
-        let rows = rows.clone();
-        focus.connect_leave(move |_| reset_capture(&capturing, &rows));
-        scroller.add_controller(focus);
-    }
-
-    // `rebuild` tears down and recreates every row from
-    // `ctx.model.working` -- used both for the initial populate and for
-    // `refresh()` (Revert, and workspace-count changes forwarded from the
-    // Workspaces page).
-    let rebuild: Rc<dyn Fn()> = {
-        let ctx = ctx.clone();
-        let list = list.clone();
-        let rows = rows.clone();
-        let capturing = capturing.clone();
-        Rc::new(move || {
-            *capturing.borrow_mut() = None;
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
-            }
-            rows.borrow_mut().clear();
-
-            let cfg = ctx.model.borrow().working.clone();
-            let actions = action_list(cfg.workspace_names.len());
-
-            for action in actions {
-                let row_box = GtkBox::new(Orientation::Horizontal, 12);
-                let action_label = Label::new(Some(&action));
-                action_label.set_width_chars(24);
-                action_label.set_xalign(0.0);
-
-                let combo_label = Label::new(None);
-                combo_label.set_width_chars(20);
-                combo_label.set_xalign(0.0);
-                combo_label.set_hexpand(true);
-
-                let set_button = Button::with_label("Set");
-
-                row_box.append(&action_label);
-                row_box.append(&combo_label);
-                row_box.append(&set_button);
-                list.append(&row_box);
-
-                {
-                    let capturing = capturing.clone();
-                    let rows = rows.clone();
-                    let action = action.clone();
-                    set_button.connect_clicked(move |button| {
-                        // Starting a new capture supersedes any row already
-                        // pending -- reset its Set button back to "Set" so
-                        // it doesn't stay stuck on "Press a key..." forever
-                        // once this row steals capture focus.
-                        if let Some(previous) = capturing.borrow_mut().replace(action.clone())
-                            && previous != action
-                            && let Some(row) = rows.borrow().iter().find(|r| r.action == previous)
-                        {
-                            row.set_button.set_label("Set");
-                        }
-                        button.set_label("Press a key…");
-                        button.grab_focus();
-                    });
-                }
-
-                rows.borrow_mut().push(Row {
-                    action,
-                    combo_label,
-                    set_button,
-                });
-            }
-
-            sync_rows(&rows.borrow(), &cfg);
-        })
-    };
-
-    let refresh: Rc<dyn Fn()> = {
-        let ctx = ctx.clone();
-        let rebuild = rebuild.clone();
-        Rc::new(move || {
-            ctx.populating.set(true);
-            rebuild();
-            ctx.populating.set(false);
-        })
-    };
-    refresh();
-
-    Page {
-        root: scroller.upcast(),
-        refresh,
-    }
 }
 
 #[cfg(test)]
