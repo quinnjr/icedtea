@@ -297,13 +297,30 @@ pub fn spawn_settings(
     page: &str,
     report: &Path,
 ) -> Reaper {
-    let theme_path = config_home.join("theme.css");
-    std::fs::write(&theme_path, bundled_theme_content(theme)).expect("write the theme file");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_icedtea-settings"));
+    // An empty `theme` means "leave `$ICEDTEA_UI_THEME` unset", which runs
+    // the app on the crate's own default sheet.
+    //
+    // Fix wave (deviation P2-D19): this is not a convenience. Painting one
+    // frame of this window takes ~17.9s in the debug profile this harness
+    // builds — see [`PIXEL_CHANGE_BUDGET`]'s comment for the measurement — and
+    // a gate that clicks and then waits for the repaint pays that twice. The
+    // two interaction gates therefore run untheméd, exactly as `skeleton.rs`'s
+    // own clicking gate already does: neither asserts on a themed colour (one
+    // reads a `drawing_area`'s raw rgba, the other only that a switch's pixel
+    // changed at all), so dropping the sheet costs them nothing and removes
+    // its share of the per-frame cost.
+    if theme.is_empty() {
+        command.env_remove("ICEDTEA_UI_THEME");
+    } else {
+        let theme_path = config_home.join("theme.css");
+        std::fs::write(&theme_path, bundled_theme_content(theme)).expect("write the theme file");
+        command.env("ICEDTEA_UI_THEME", &theme_path);
+    }
     Reaper(
-        Command::new(env!("CARGO_BIN_EXE_icedtea-settings"))
+        command
             .env("WAYLAND_DISPLAY", socket)
             .env("XDG_CONFIG_HOME", config_home)
-            .env("ICEDTEA_UI_THEME", &theme_path)
             .env("ICEDTEA_SETTINGS_PAGE", page)
             .env("ICEDTEA_PROBE_REPORT", report)
             .stdout(Stdio::null())
@@ -513,12 +530,18 @@ pub fn click(
     y: i32,
 ) {
     let (w, h) = (screencopy.capture().width, screencopy.capture().height);
-    pointer.motion_absolute(f64::from(x), f64::from(y), w, h);
-    pointer.frame();
-    pointer.pump();
+    // The motion is *re-sent* on every settle iteration, not sent once and
+    // then merely pumped. This is `click_fixed`'s loop verbatim, adopted in
+    // the fix wave so the two spellings of "click" in this module behave the
+    // same: surface focus is assigned asynchronously, and `click_fixed`'s own
+    // comment already records that a press sent in the same breath as a single
+    // motion races it. Nothing here depends on the difference — it is the
+    // cheaper of two shapes to keep identical.
     for _ in 0..8 {
-        std::thread::sleep(POLL);
+        pointer.motion_absolute(f64::from(x), f64::from(y), w, h);
+        pointer.frame();
         pointer.pump();
+        std::thread::sleep(POLL);
     }
     pointer.button(icedtea_ui::wayland::BTN_LEFT, true);
     pointer.frame();
@@ -529,8 +552,58 @@ pub fn click(
     pointer.pump();
 }
 
-/// Capture until the pixel at `(x, y)` differs from `before`, or two seconds
-/// pass. A generous complexity bound, not a timing pin.
+/// Capture until the pixel at `(x, y)` differs from `before`, or the budget
+/// below passes. A generous complexity bound, not a timing pin.
+///
+/// Reconciliation (Task 11, re-measured in the fix wave): widened from the
+/// plan's original two seconds, and then again from 45s.
+///
+/// The number is set by one measurement, not by feel. Instrumenting
+/// `ui/src/view/app.rs`'s own loop (a timestamp either side of
+/// `window.paint_with`) shows this window takes **~17.9s to paint one frame**
+/// in the debug profile the harness builds — `skia-rs` is a pure-Rust
+/// software rasteriser compiled at `opt-level = 0`, and the cost is a
+/// constant of the surface, not of the theme (measured at 17.87s ± 0.02
+/// across consecutive frames, both with a full bundled Adwaita sheet and with
+/// none at all). Every pointer event that arrives while a paint runs is
+/// delivered in one batch afterwards.
+///
+/// So a click-then-repaint round trip costs up to two of those: as much as
+/// ~17.9s before the app pumps the click at all, plus ~17.9s to paint the
+/// frame the assertion reads. 45s sat right on that edge, which is why both
+/// interaction gates failed on the pixel read while their `msg` fold had
+/// demonstrably already happened. This is four frames' worth of headroom.
+///
+/// Only P2's own two interaction gates call this (grep confirms it), so
+/// widening changes no other test's behaviour.
+const PIXEL_CHANGE_BUDGET: Duration = Duration::from_secs(180);
+
+/// Capture until the pixel at `(x, y)` *is* `wanted`, or the same budget
+/// passes; the last pixel seen either way.
+///
+/// The settled form of [`wait_pixel_change`], for a gate that knows the
+/// colour it is waiting for: "the first frame in which this differs" can land
+/// mid-transition — on a panel still closing, say — and read a pixel that is
+/// neither the old value nor the new one.
+pub fn wait_pixel_matching(
+    screencopy: &mut ScreencopyClient,
+    x: i32,
+    y: i32,
+    wanted: (u8, u8, u8),
+) -> (u8, u8, u8) {
+    let started = Instant::now();
+    let mut px = (0, 0, 0);
+    while started.elapsed() < PIXEL_CHANGE_BUDGET {
+        let frame = screencopy.capture();
+        px = pixel_at(&frame, x, y).unwrap_or(px);
+        if matches(px, wanted) {
+            return px;
+        }
+        std::thread::sleep(POLL);
+    }
+    px
+}
+
 pub fn wait_pixel_change(
     screencopy: &mut ScreencopyClient,
     x: i32,
@@ -539,7 +612,7 @@ pub fn wait_pixel_change(
 ) -> (u8, u8, u8) {
     let started = Instant::now();
     let mut px = before;
-    while started.elapsed() < Duration::from_secs(2) {
+    while started.elapsed() < PIXEL_CHANGE_BUDGET {
         let frame = screencopy.capture();
         px = pixel_at(&frame, x, y).unwrap_or(before);
         if !matches(px, before) {

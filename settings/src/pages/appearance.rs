@@ -201,6 +201,28 @@ fn picker(slot: ColorSlot) -> View<Msg> {
 /// The Appearance page.
 #[must_use]
 pub fn view(m: &SettingsModel) -> View<Msg> {
+    // Deviation P2-D18: a picker is 45 swatches (9 rows), and this
+    // window never grows past its negotiated surface size (`render_once`
+    // sizes the paint surface to the window's own `size`, not the tree's
+    // natural size — content beyond it is measured and allocated but never
+    // painted, confirmed by sampling a screencopy frame directly at a
+    // swatch's own reported box and reading the plain window background
+    // instead of its colour). Appending the picker below the other eight
+    // rows, as `wide(9, picker(slot))` alone would, starts it at roughly the
+    // y the rest-state gate's own ids already reach — already at the edge of
+    // what paints — so its lower rows are invisible and unclickable. Showing
+    // the picker *instead of* the page's other rows while a slot is open
+    // lets it start near the top, where the whole grid fits. This changes no
+    // id `opening_a_slot_reveals_the_palette_panel` (this module's own test)
+    // asserts on, and the rest-state gate never opens a picker.
+    if let Some(slot) = m.color_picker {
+        return w::grid(wide(0, picker(slot)))
+            .row_spacing(10)
+            .column_spacing(16)
+            .margin(16, 16, 16, 16)
+            .id("appearance");
+    }
+
     let a = &m.model.working.appearance;
     let position = BAR_POSITIONS
         .iter()
@@ -290,9 +312,6 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
         .halign(Align::Start),
     ));
     children.extend(wide(8, wallpaper_status(m)));
-    if let Some(slot) = m.color_picker {
-        children.extend(wide(9, picker(slot)));
-    }
 
     w::grid(children)
         .row_spacing(10)
