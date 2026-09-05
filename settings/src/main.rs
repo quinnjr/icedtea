@@ -10,8 +10,8 @@ use std::path::Path;
 
 use icedtea_config::default_db_path;
 use icedtea_settings::app::{SettingsModel, update, view};
+use icedtea_settings::ipc;
 use icedtea_settings::outputs::pump::OutputsPump;
-use icedtea_settings::{ipc, probe};
 use icedtea_ui::app::{ThemeEnv, load_layered_stylesheet};
 use icedtea_ui::css::cascade::CompiledSheet;
 use icedtea_ui::css::parse::{Stylesheet, parse_stylesheet_with_base};
@@ -138,9 +138,6 @@ fn main() {
     let mut app = App::new(model, update, view).with_inbox(inbox);
     if let (Some(id), Some(pump)) = (watch, pump) {
         app = app.on_fd(id, move || pump.drain());
-    }
-    if let Some(path) = probe::report_path() {
-        app = app.with_probe_report(path);
     }
     if let Err(err) = app.run(window) {
         tracing::error!(?err, "the settings loop stopped");

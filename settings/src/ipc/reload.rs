@@ -35,7 +35,7 @@ const CONFIG_RELOADED: &str = "ConfigReloaded";
 pub fn spawn(
     rx: crossbeam_channel::Receiver<ReloadRequest>,
     tx: InboxSender<Msg>,
-) -> std::thread::JoinHandle<()> {
+) -> Option<std::thread::JoinHandle<()>> {
     let signal_tx = tx.clone();
     // The signal subscription is its own thread so a long blocking
     // `ReloadConfig` cannot delay a `ConfigReloaded` and vice versa.
@@ -61,7 +61,13 @@ pub fn spawn(
                 }
             }
         })
-        .expect("spawning the settings reload worker")
+        // Fix wave: `.expect` here panicked the whole app at boot under
+        // thread exhaustion, while §2.4 asks this worker to degrade — the
+        // same shape, and the same handling, as the portal worker's own
+        // spawn. Without a worker the `Sender` the caller keeps simply never
+        // answers, and the window stays usable.
+        .map_err(|err| tracing::warn!(%err, "no settings reload worker thread"))
+        .ok()
 }
 
 /// Subscribe to `org.icedtea.Compositor`'s `ConfigReloaded` and post one
