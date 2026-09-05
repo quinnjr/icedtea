@@ -257,6 +257,12 @@ pub enum Msg {
     /// The control panel's Transform dropdown, by index into
     /// `TRANSFORM_VALUES`.
     TransformSelected(usize),
+    /// The Displays footer's Test button.
+    DisplaysTest,
+    /// The Displays footer's Revert button.
+    DisplaysRevert,
+    /// The Displays footer's Apply button.
+    DisplaysApply,
 }
 
 const _: fn() = || {
@@ -579,6 +585,18 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             crate::pages::displays::controls::pick_transform(&mut m.displays, i);
             Cmd::None
         }
+        Msg::DisplaysTest => {
+            crate::pages::displays::submit(m, true);
+            Cmd::None
+        }
+        Msg::DisplaysApply => {
+            crate::pages::displays::submit(m, false);
+            Cmd::None
+        }
+        Msg::DisplaysRevert => {
+            crate::pages::displays::revert(m);
+            Cmd::None
+        }
         Msg::KeyCaptured { keysym, mods } => {
             // `false` means `combo_from_keysym` declined -- a lone modifier
             // press. Stay armed and wait for the real key (contract §2.7
@@ -650,7 +668,10 @@ fn clears_status(msg: &Msg) -> bool {
         | Msg::ResolutionSelected(_)
         | Msg::RefreshSelected(_)
         | Msg::HeadScaleChanged(_)
-        | Msg::TransformSelected(_) => false,
+        | Msg::TransformSelected(_)
+        | Msg::DisplaysTest
+        | Msg::DisplaysRevert
+        | Msg::DisplaysApply => false,
     }
 }
 

@@ -163,29 +163,44 @@ impl OutputsPump {
         msgs
     }
 
-    /// Preview a configuration. Fire-and-forget, from `Cmd::Task`; the reply
-    /// arrives as `OutputsMsg::ApplySucceeded { is_test: true }` or its
-    /// failure/cancel siblings.
-    pub fn test_configuration(&self, edits: &[HeadEdit]) {
-        if self.dead.get() {
-            return;
+    /// Ship `edits` as a **preview** configuration.
+    ///
+    /// Non-blocking: it builds the configuration objects and flushes. The
+    /// answer arrives later as `Msg::Outputs(ApplySucceeded/ApplyFailed)`.
+    ///
+    /// Returns the error when the request could not even be attempted — no
+    /// manager global, an edit naming a head that is not present, or a flush
+    /// failure. `update` needs that synchronously to keep the in-flight latch
+    /// honest, which `Cmd::Task` (no return value) cannot deliver (plan
+    /// P4-D8).
+    ///
+    /// # Errors
+    /// [`crate::outputs::OutputsError`] from `OutputsConnection`.
+    pub fn test_configuration(
+        &self,
+        edits: &[HeadEdit],
+    ) -> Result<(), crate::outputs::OutputsError> {
+        let result = self.conn.borrow_mut().test_configuration(edits);
+        if result.is_ok() {
+            self.flush();
         }
-        if let Err(err) = self.conn.borrow_mut().test_configuration(edits) {
-            tracing::warn!(?err, "test configuration could not be sent");
-        }
-        self.flush();
+        result
     }
 
-    /// Apply a configuration. Same fire-and-forget shape as
-    /// [`OutputsPump::test_configuration`].
-    pub fn build_and_send_configuration(&self, edits: &[HeadEdit]) {
-        if self.dead.get() {
-            return;
+    /// Ship `edits` as a **real** configuration. See
+    /// [`OutputsPump::test_configuration`] for the return contract.
+    ///
+    /// # Errors
+    /// [`crate::outputs::OutputsError`] from `OutputsConnection`.
+    pub fn build_and_send_configuration(
+        &self,
+        edits: &[HeadEdit],
+    ) -> Result<(), crate::outputs::OutputsError> {
+        let result = self.conn.borrow_mut().build_and_send_configuration(edits);
+        if result.is_ok() {
+            self.flush();
         }
-        if let Err(err) = self.conn.borrow_mut().build_and_send_configuration(edits) {
-            tracing::warn!(?err, "configuration could not be sent");
-        }
-        self.flush();
+        result
     }
 
     /// Push queued requests out. The toolkit's loop flushes its own

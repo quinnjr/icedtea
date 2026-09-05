@@ -13,7 +13,12 @@ pub mod canvas;
 pub mod controls;
 pub mod state;
 
-use crate::app::SettingsModel;
+use icedtea_ui::layout::Align;
+use icedtea_ui::view::View;
+use icedtea_ui::view::builders::{BoxExt, box_, button, label};
+use icedtea_ui::widgets::types::Orientation;
+
+use crate::app::{Msg, SettingsModel};
 use crate::outputs::OutputsMsg;
 use crate::pages::displays::state::DisplaysState;
 
@@ -78,6 +83,92 @@ pub fn republish_view(st: &mut DisplaysState) {
 /// Clear an outstanding Test/Apply latch.
 fn end_request(m: &mut SettingsModel) {
     m.displays_in_flight = false;
+}
+
+/// Submit the current edit set as a preview (`is_test`) or a real apply.
+///
+/// Runs on the loop thread, inside `update`: this is a wayland request build
+/// plus a flush, not a blocking D-Bus round trip, and its synchronous error is
+/// the only thing that can keep the in-flight latch honest (plan P4-D8).
+pub fn submit(m: &mut SettingsModel, is_test: bool) {
+    if m.displays_in_flight {
+        return;
+    }
+    let Some(pump) = m.outputs.clone() else {
+        // No output management at all: the page is already showing its
+        // unavailable state and there is nothing to latch.
+        return;
+    };
+    let edits = m.displays.edits.clone();
+    let result = if is_test {
+        pump.test_configuration(&edits)
+    } else {
+        pump.build_and_send_configuration(&edits)
+    };
+    match result {
+        Ok(()) => {
+            m.displays_in_flight = true;
+            m.displays_status = if is_test {
+                STATUS_TESTING.to_string()
+            } else {
+                STATUS_APPLYING.to_string()
+            };
+        }
+        Err(err) => {
+            m.displays_status = if is_test {
+                format!("Test failed: {err}")
+            } else {
+                format!("Apply failed: {err}")
+            };
+        }
+    }
+}
+
+/// Drop the pending edits back to the last-known head snapshot.
+pub fn revert(m: &mut SettingsModel) {
+    reset_edits(&mut m.displays);
+    controls::repopulate(&mut m.displays);
+    republish_view(&mut m.displays);
+    m.displays_status = String::new();
+}
+
+/// The page's own footer: status, Test, Revert, Apply.
+///
+/// The shared model footer never touches Displays — this page does not go
+/// through the redb working copy at all, the compositor persists applied
+/// layouts on its side.
+///
+/// Apply is held insensitive while a request is outstanding so a
+/// `HeadsChanged`-driven repaint cannot re-enable it under one (state.rs
+/// finding #15); Test is held for the same reason.
+#[must_use]
+pub fn footer(m: &SettingsModel) -> View<Msg> {
+    let dirty = m.displays.dirty;
+    let busy = m.displays_in_flight;
+    let live = m.outputs_available;
+    box_(
+        Orientation::Horizontal,
+        [
+            label(&m.displays_status)
+                .id("displays_status")
+                .hexpand(true)
+                .halign(Align::Start),
+            button("Test")
+                .id("displays_test")
+                .sensitive(live && !busy)
+                .on_click(Msg::DisplaysTest),
+            button("Revert")
+                .id("displays_revert")
+                .sensitive(live && dirty)
+                .on_click(Msg::DisplaysRevert),
+            button("Apply")
+                .id("displays_apply")
+                .sensitive(live && dirty && !busy)
+                .on_click(Msg::DisplaysApply),
+        ],
+    )
+    .spacing(8u32)
+    .id("displays_footer")
 }
 
 /// Fold one `zwlr_output_management_v1` message into the model.
@@ -320,5 +411,118 @@ mod tests {
             "a 1920x1080 head in a 360x240 canvas scales down, got {}",
             m.displays.view.scale
         );
+    }
+
+    /// With no pump at all (no compositor, no second connection) a submit is a
+    /// status change and nothing else — never a panic, never a stuck latch.
+    ///
+    /// Mutation check: set `displays_in_flight = true` before the `None` check
+    /// in `submit`; this fails. Restore.
+    #[test]
+    fn a_submit_without_a_pump_never_latches() {
+        let mut m = dirty_model();
+        assert!(m.outputs.is_none(), "the test model has no pump");
+        submit(&mut m, true);
+        assert!(!m.displays_in_flight);
+        submit(&mut m, false);
+        assert!(!m.displays_in_flight);
+    }
+
+    /// A second submit while one is outstanding is refused.
+    ///
+    /// Mutation check: drop the `displays_in_flight` guard from `submit`; the
+    /// status is overwritten and this fails. Restore.
+    #[test]
+    fn a_submit_while_one_is_outstanding_is_refused() {
+        let mut m = dirty_model();
+        m.displays_in_flight = true;
+        m.displays_status = STATUS_TESTING.to_string();
+        submit(&mut m, false);
+        assert_eq!(
+            m.displays_status, STATUS_TESTING,
+            "the outstanding request's status survives"
+        );
+    }
+
+    /// Revert re-baselines the edits, clears dirty, and empties the status —
+    /// the GTK `revert_btn` handler exactly.
+    ///
+    /// Reconciliation (brief step 1): the brief's version of this test uses
+    /// `dirty_model()`'s single head and drags *its* position, expecting the
+    /// scale to shrink. `displays_canvas::content_bounds` unions rect
+    /// extents (`state.rs`/`displays_canvas.rs`), so a *single* rect's
+    /// bounding box is exactly its own width/height regardless of where it
+    /// sits — translating one head alone can never change the computed
+    /// scale, so that assertion can never pass no matter how `revert` is
+    /// implemented. This version drags one head of a *two*-head layout far
+    /// from the other, which does grow the union bbox (and shrink the
+    /// scale) the way the brief's docstring describes, then reverts it.
+    ///
+    /// Mutation check: drop the `republish_view` call from `revert`; the view
+    /// keeps the dragged layout's scale and this fails. Restore.
+    #[test]
+    fn revert_rebaselines_the_edits_and_republishes_the_view() {
+        let (mut m, _workers) = crate::app::tests::test_model();
+        let h1 = head("DP-1", true);
+        let mut h2 = head("HDMI-A-1", true);
+        h2.x = 1920;
+        m.displays.edits = vec![baseline_edit(&h1), baseline_edit(&h2)];
+        m.displays.heads = vec![h1, h2];
+        m.displays.selected = Some(1);
+        m.displays.dirty = true;
+        m.outputs_available = true;
+
+        m.displays.edits[1].position = Some((4000, 4000));
+        republish_view(&mut m.displays);
+        let dragged_scale = m.displays.view.scale;
+
+        revert(&mut m);
+        assert_eq!(m.displays.edits[1].position, Some((1920, 0)));
+        assert!(!m.displays.dirty);
+        assert_eq!(m.displays_status, "");
+        assert!(
+            m.displays.view.scale > dragged_scale,
+            "a smaller layout fits at a larger scale: {} vs {dragged_scale}",
+            m.displays.view.scale
+        );
+    }
+
+    /// Collect every `id` set anywhere in a `View` tree. `icedtea_ui` exposes
+    /// no `ids_of` (reconciliation, matching `pages::displays::controls`'s
+    /// own `view_ids`: contract §4.4's id is `PropName::Id` on `Props`, and
+    /// `View`'s `children` is a plain public field) — this walks the raw,
+    /// unbuilt tree `footer` returns directly.
+    fn view_ids(v: &icedtea_ui::view::View<crate::app::Msg>) -> Vec<String> {
+        fn walk(v: &icedtea_ui::view::View<crate::app::Msg>, out: &mut Vec<String>) {
+            if let Some(id) = v.props.str(icedtea_ui::view::PropName::Id) {
+                out.push(id.to_string());
+            }
+            for child in &v.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(v, &mut out);
+        out
+    }
+
+    /// Mutation check: drop `.sensitive(...)` from the Apply button; the
+    /// footer's id set is unchanged but the interaction gate in Task 11 fails.
+    /// Assert the ids here so a rename is caught early.
+    #[test]
+    fn the_footer_ids_are_the_contract_ids() {
+        let m = dirty_model();
+        let ids = view_ids(&footer(&m));
+        for id in [
+            "displays_status",
+            "displays_test",
+            "displays_revert",
+            "displays_apply",
+        ] {
+            assert!(
+                ids.iter().any(|got| got == id),
+                "missing id {id}; got {ids:?}"
+            );
+        }
     }
 }
