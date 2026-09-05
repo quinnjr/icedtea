@@ -45,6 +45,71 @@ pub const FIXED_ACTIONS: [&str; 10] = [
 ];
 pub const SNAP_RESTORE: &str = "snap:restore";
 
+/// Store a captured binding.
+///
+/// Returns `true` when a combo was stored -- the caller clears
+/// `m.capturing` and recomputes `m.conflicts` -- and `false` when
+/// [`combo_from_keysym`] declined the sym, which is what a lone
+/// Shift/Ctrl/Alt/Super press produces. In that case the capture stays
+/// armed and waits for the real key: the GTK handler's behaviour verbatim
+/// (contract §2.7 rule 5).
+///
+/// A conflicting combo is stored like any other. Conflicts are advisory
+/// styling only and never block Apply.
+pub fn apply_capture(
+    cfg: &mut icedtea_config::Config,
+    action: &str,
+    keysym: u32,
+    mods: CaptureMods,
+) -> bool {
+    let Some(combo) = crate::model::combo_from_keysym(keysym, mods) else {
+        return false;
+    };
+    report_binding(action, &combo);
+    cfg.keybindings.insert(action.to_string(), combo);
+    true
+}
+
+/// Append one `binding` line to `$ICEDTEA_PROBE_REPORT`, when it is set.
+///
+/// Deviation P3-D3. M5-D9's app-side report carries `probe` and `alloc`
+/// lines, neither of which can express a `KeyCombo`, so the harness capture
+/// test has nothing to assert against without this. A no-op in production,
+/// where the variable is unset; an I/O failure is logged once and dropped,
+/// never propagated into `update`.
+pub fn report_binding(action: &str, combo: &KeyCombo) {
+    let Some(path) = std::env::var_os("ICEDTEA_PROBE_REPORT") else {
+        return;
+    };
+    if let Err(err) = write_binding_line(std::path::Path::new(&path), action, combo) {
+        tracing::warn!(%err, "cannot append a binding line to $ICEDTEA_PROBE_REPORT");
+    }
+}
+
+/// `binding <action> <modifiers|-> <key>`, appended.
+///
+/// Appends rather than truncates: the same file carries the app's own
+/// `probe`/`alloc` batches. The raw `KeyCombo` field spellings are written,
+/// not [`format_combo`]'s display form, so a reader pins the exact
+/// serialization the compositor's matcher compares against.
+fn write_binding_line(
+    path: &std::path::Path,
+    action: &str,
+    combo: &KeyCombo,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mods = if combo.modifiers.is_empty() {
+        "-".to_string()
+    } else {
+        combo.modifiers.join("+")
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "binding {action} {mods} {}", combo.key)
+}
+
 /// The full action set for a config with `workspace_count` workspaces: the
 /// fixed actions plus a generated `workspace:N`/`move_to_workspace:N` pair
 /// for every `1..=workspace_count`.
@@ -422,5 +487,144 @@ mod tests {
             }
             other => panic!("expected KeyCaptured, got {other:?}"),
         }
+    }
+
+    /// A real capture stores the combo `combo_from_keysym` builds and
+    /// reports that the capture is finished.
+    ///
+    /// Mutation check: return `false` unconditionally; this fails. Restore.
+    #[test]
+    fn apply_capture_stores_the_combo_and_reports_done() {
+        let mut cfg = icedtea_config::default_config();
+        let stored = apply_capture(
+            &mut cfg,
+            "close",
+            xkbcommon::xkb::keysyms::KEY_a,
+            CaptureMods {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert!(stored, "a real key finishes the capture");
+        let combo = cfg.keybindings.get("close").expect("close is bound");
+        assert_eq!(combo.key, "KEY_a");
+        assert_eq!(combo.modifiers, vec!["SHIFT".to_string()]);
+    }
+
+    /// A lone modifier press leaves the capture armed and writes nothing:
+    /// holding Super while reaching for the real key must not bind bare
+    /// Super, and must not clobber the existing binding either.
+    ///
+    /// Mutation check: make `apply_capture` insert whatever
+    /// `combo_from_keysym` returns without the `else return false`; this
+    /// fails to compile, which is the point -- instead, make it return
+    /// `true` on `None`; the `still_armed` assertion fails. Restore.
+    #[test]
+    fn a_lone_modifier_leaves_the_capture_armed() {
+        let mut cfg = icedtea_config::default_config();
+        let before = cfg.keybindings.clone();
+        let stored = apply_capture(
+            &mut cfg,
+            "close",
+            xkbcommon::xkb::keysyms::KEY_Super_L,
+            CaptureMods {
+                logo: true,
+                ..Default::default()
+            },
+        );
+        assert!(!stored, "still armed: wait for the real key");
+        assert_eq!(cfg.keybindings, before, "nothing was written");
+    }
+
+    /// A conflict is stored, not refused: two actions may share a combo and
+    /// the page only flags it (contract §2.7 rule 6, "conflicts never block
+    /// Apply").
+    ///
+    /// Mutation check: make `apply_capture` return `false` when
+    /// `duplicate_bindings` would grow; this fails. Restore.
+    #[test]
+    fn apply_capture_allows_a_conflicting_binding() {
+        let mut cfg = icedtea_config::default_config();
+        assert!(apply_capture(
+            &mut cfg,
+            "close",
+            xkbcommon::xkb::keysyms::KEY_a,
+            CaptureMods::default()
+        ));
+        assert!(apply_capture(
+            &mut cfg,
+            "quit",
+            xkbcommon::xkb::keysyms::KEY_a,
+            CaptureMods::default()
+        ));
+        let conflicts = crate::model::duplicate_bindings(&cfg);
+        let flagged: Vec<_> = conflicts
+            .iter()
+            .flat_map(|(_, actions)| actions.iter().cloned())
+            .collect();
+        assert!(flagged.contains(&"close".to_string()));
+        assert!(flagged.contains(&"quit".to_string()));
+    }
+
+    /// The probe-report line format the harness gate parses (deviation
+    /// P3-D3): whitespace-separated, raw KeyCombo spellings, `-` for no
+    /// modifiers.
+    ///
+    /// Mutation check: write `format_combo(combo)` instead of the raw key;
+    /// the `KEY_a` assertion fails with `a`. Restore.
+    #[test]
+    fn a_binding_report_line_carries_the_raw_combo_spelling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report");
+
+        write_binding_line(
+            &path,
+            "close",
+            &icedtea_config::KeyCombo {
+                modifiers: vec!["SUPER".to_string(), "SHIFT".to_string()],
+                key: "KEY_q".to_string(),
+            },
+        )
+        .expect("write");
+        write_binding_line(
+            &path,
+            "reload",
+            &icedtea_config::KeyCombo {
+                modifiers: vec![],
+                key: "KEY_F5".to_string(),
+            },
+        )
+        .expect("write");
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["binding close SUPER+SHIFT KEY_q", "binding reload - KEY_F5"]
+        );
+    }
+
+    /// Writing appends; it never truncates. The report file also carries the
+    /// app's `probe`/`alloc` batches, and a capture that truncated them
+    /// would blind every gate in this part.
+    ///
+    /// Mutation check: use `File::create` instead of `OpenOptions::append`;
+    /// this fails -- the earlier line is gone. Restore.
+    #[test]
+    fn a_binding_report_line_appends_to_what_is_already_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report");
+        std::fs::write(&path, "probe root 10 20\n").expect("seed");
+        write_binding_line(
+            &path,
+            "close",
+            &icedtea_config::KeyCombo {
+                modifiers: vec![],
+                key: "KEY_a".to_string(),
+            },
+        )
+        .expect("write");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(text, "probe root 10 20\nbinding close - KEY_a\n");
     }
 }
