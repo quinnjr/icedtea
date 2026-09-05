@@ -877,4 +877,174 @@ mod tests {
             "a conflicting label must not resolve to the ordinary label colour"
         );
     }
+
+    /// The capture lifecycle through the real `update` fold: arm, capture,
+    /// disarm, and the conflicts list recomputed on the way out.
+    ///
+    /// Mutation check: drop the `m.capturing = None` from the
+    /// `Msg::KeyCaptured` arm; the `is_none` assertion fails. Restore.
+    #[test]
+    fn a_capture_arms_stores_and_disarms() {
+        let mut m = model_with_workspaces(1);
+        let _ = crate::app::update(&mut m, Msg::CaptureArmed("close".to_string()));
+        assert_eq!(m.capturing.as_deref(), Some("close"));
+
+        let _ = crate::app::update(
+            &mut m,
+            Msg::KeyCaptured {
+                keysym: xkbcommon::xkb::keysyms::KEY_a,
+                mods: CaptureMods {
+                    shift: true,
+                    ..Default::default()
+                },
+            },
+        );
+        assert!(m.capturing.is_none(), "a stored capture disarms the row");
+        let combo = m
+            .model
+            .working
+            .keybindings
+            .get("close")
+            .expect("close is bound");
+        assert_eq!(combo.key, "KEY_a");
+        assert_eq!(combo.modifiers, vec!["SHIFT".to_string()]);
+    }
+
+    /// A lone modifier press keeps the row armed and writes nothing.
+    ///
+    /// Mutation check: clear `m.capturing` regardless of `apply_capture`'s
+    /// answer; this fails. Restore.
+    #[test]
+    fn a_lone_modifier_press_leaves_the_capture_armed() {
+        let mut m = model_with_workspaces(1);
+        let before = m.model.working.keybindings.clone();
+        let _ = crate::app::update(&mut m, Msg::CaptureArmed("close".to_string()));
+        let _ = crate::app::update(
+            &mut m,
+            Msg::KeyCaptured {
+                keysym: xkbcommon::xkb::keysyms::KEY_Super_L,
+                mods: CaptureMods {
+                    logo: true,
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(
+            m.capturing.as_deref(),
+            Some("close"),
+            "still waiting for the real key"
+        );
+        assert_eq!(m.model.working.keybindings, before);
+    }
+
+    /// `Msg::KeyCaptured` with nothing armed is inert -- the belt to
+    /// `capture_key`'s braces (contract §2.7 rule 4).
+    ///
+    /// Mutation check: drop the `capturing.is_none()` guard; this fails
+    /// with a spurious binding on whatever action was last armed. Restore.
+    #[test]
+    fn an_unarmed_key_captured_message_changes_nothing() {
+        let mut m = model_with_workspaces(1);
+        let before = m.model.working.keybindings.clone();
+        let _ = crate::app::update(
+            &mut m,
+            Msg::KeyCaptured {
+                keysym: xkbcommon::xkb::keysyms::KEY_a,
+                mods: CaptureMods::default(),
+            },
+        );
+        assert_eq!(m.model.working.keybindings, before);
+    }
+
+    /// Escape disarms without writing.
+    ///
+    /// Mutation check: make the arm a no-op; this fails. Restore.
+    #[test]
+    fn cancelling_disarms_without_writing() {
+        let mut m = model_with_workspaces(1);
+        let before = m.model.working.keybindings.clone();
+        let _ = crate::app::update(&mut m, Msg::CaptureArmed("close".to_string()));
+        let _ = crate::app::update(&mut m, Msg::CaptureCancelled);
+        assert!(m.capturing.is_none());
+        assert_eq!(m.model.working.keybindings, before);
+    }
+
+    /// Leaving the page disarms: the GTK `connect_unmap` /
+    /// `EventControllerFocus` reset, now one line in the nav arm. Without
+    /// it an armed capture would survive a page switch and rebind on the
+    /// next keystroke typed anywhere.
+    ///
+    /// Mutation check: drop `m.capturing = None` from the
+    /// `Msg::PageSelected` arm; this fails. Restore.
+    #[test]
+    fn switching_pages_cancels_a_capture() {
+        let mut m = model_with_workspaces(1);
+        let _ = crate::app::update(&mut m, Msg::CaptureArmed("close".to_string()));
+        let _ = crate::app::update(&mut m, Msg::PageSelected(2));
+        assert!(m.capturing.is_none(), "a page switch disarms");
+        assert_eq!(m.page, crate::pages::PageId::Workspaces);
+    }
+
+    /// The conflicts list is recomputed after a capture, so the next
+    /// `view` flags both halves of a fresh collision.
+    ///
+    /// Mutation check: drop the `duplicate_bindings` recompute; this fails
+    /// with an empty list. Restore.
+    #[test]
+    fn a_capture_recomputes_the_conflicts_list() {
+        let mut m = model_with_workspaces(1);
+        m.model.working.keybindings.insert(
+            "quit".to_string(),
+            icedtea_config::KeyCombo {
+                modifiers: vec![],
+                key: "KEY_a".to_string(),
+            },
+        );
+        let _ = crate::app::update(&mut m, Msg::CaptureArmed("close".to_string()));
+        let _ = crate::app::update(
+            &mut m,
+            Msg::KeyCaptured {
+                keysym: xkbcommon::xkb::keysyms::KEY_a,
+                mods: CaptureMods::default(),
+            },
+        );
+        let flagged: Vec<String> = m
+            .conflicts
+            .iter()
+            .flat_map(|(_, actions)| actions.iter().cloned())
+            .collect();
+        assert!(flagged.contains(&"close".to_string()));
+        assert!(flagged.contains(&"quit".to_string()));
+    }
+
+    /// The root handler is armed from the model: with nothing armed it
+    /// declines every key, so a focused `Entry` keeps receiving text; with a
+    /// capture armed it answers. Firing the root's `KeyPressed` handler
+    /// directly is exactly what `GenericC::on_event` does.
+    ///
+    /// Mutation check: hard-code `true` for `armed` in `app::view`; the
+    /// first assertion fails. Restore.
+    #[test]
+    fn the_root_key_handler_is_armed_from_the_model() {
+        let mut m = model_with_workspaces(1);
+        let ev = press(
+            30,
+            xkbcommon::xkb::keysyms::KEY_a,
+            xkbcommon::xkb::keysyms::KEY_a,
+            Mods::empty(),
+        );
+
+        let idle = crate::app::view(&m);
+        assert!(
+            idle.handlers.fire_key(EventKind::KeyPressed, &ev).is_none(),
+            "an idle window must not swallow keystrokes"
+        );
+
+        m.capturing = Some("close".to_string());
+        let armed = crate::app::view(&m);
+        assert!(matches!(
+            armed.handlers.fire_key(EventKind::KeyPressed, &ev),
+            Some(Msg::KeyCaptured { .. })
+        ));
+    }
 }

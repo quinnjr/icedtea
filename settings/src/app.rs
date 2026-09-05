@@ -491,11 +491,33 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             pages::workspaces::remove_workspace(&mut m.model.working, index);
             Cmd::None
         }
-        // Task 4 (`capture_key`) and Task 6 (the Set button) only need
-        // `Msg` to carry these three variants so their return types
-        // compile; the arms that actually arm/store/cancel a capture are
-        // Task 7's (contract §2.7, deviation P3-D1).
-        Msg::CaptureArmed(_) | Msg::KeyCaptured { .. } | Msg::CaptureCancelled => Cmd::None,
+        // --- Keybindings (P3) -------------------------------------------
+        Msg::CaptureArmed(action) => {
+            // Starting a new capture supersedes any row already pending --
+            // the view renders "Press a key…" from `capturing` alone, so the
+            // superseded row's button goes back to "Set" on the same frame.
+            m.capturing = Some(action);
+            Cmd::None
+        }
+        Msg::CaptureCancelled => {
+            m.capturing = None;
+            Cmd::None
+        }
+        Msg::KeyCaptured { keysym, mods } => {
+            // `false` means `combo_from_keysym` declined -- a lone modifier
+            // press. Stay armed and wait for the real key (contract §2.7
+            // rule 5), the GTK behaviour verbatim. Nothing armed is inert:
+            // `capture_key` already declines an unarmed press (deviation
+            // P3-D1); this is the second gate, for a message that reached
+            // the queue some other way.
+            if let Some(action) = m.capturing.clone()
+                && pages::keybindings::apply_capture(&mut m.model.working, &action, keysym, mods)
+            {
+                m.capturing = None;
+                m.conflicts = crate::model::duplicate_bindings(&m.model.working);
+            }
+            Cmd::None
+        }
     };
     crate::probe::report(&format!("page {}", m.page.name()));
     crate::probe::report(&format!("status {}", footer_text(m)));
@@ -534,6 +556,14 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
         ],
     )
     .id("root")
+    .on_key({
+        // Armed from the model each frame (deviation P3-D1): an unarmed
+        // handler must decline, or `GenericC::on_event` sets `cx.handled`
+        // for every key press and M3's P4-D19 whole-dispatch stop swallows
+        // the keystroke a focused `Entry` was waiting for.
+        let armed = m.capturing.is_some();
+        move |ev| pages::keybindings::capture_key(armed, ev)
+    })
 }
 
 /// The page switcher. `Stack` + `StackSwitcher`, not `StackSidebar` (spec D7:
