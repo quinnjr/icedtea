@@ -540,4 +540,48 @@ mod tests {
             Some(Msg::WorkspaceAdded)
         ));
     }
+
+    /// The three Workspaces `update` arms are delegations, and this pins
+    /// that they delegate: folding the three messages through the real
+    /// `app::update` must produce exactly what calling the mutators does.
+    ///
+    /// Mutation check: make the `Msg::WorkspaceRemoved` arm call
+    /// `cfg.workspace_names.remove(i)` directly (no prune); the
+    /// `workspace:3` assertion fails. Restore.
+    #[test]
+    fn the_update_arms_delegate_to_the_workspace_mutators() {
+        let mut m = model_with(&["a", "b", "c"]);
+        m.model.working.keybindings.insert(
+            "workspace:3".to_string(),
+            icedtea_config::KeyCombo {
+                modifiers: vec![],
+                key: "KEY_3".to_string(),
+            },
+        );
+
+        let _ = crate::app::update(&mut m, Msg::WorkspaceRenamed(1, "beta".to_string()));
+        assert_eq!(m.model.working.workspace_names[1], "beta");
+
+        let _ = crate::app::update(&mut m, Msg::WorkspaceAdded);
+        assert_eq!(
+            m.model.working.workspace_names,
+            vec![
+                "a".to_string(),
+                "beta".to_string(),
+                "c".to_string(),
+                "1".to_string()
+            ]
+        );
+
+        let _ = crate::app::update(&mut m, Msg::WorkspaceRemoved(3));
+        let _ = crate::app::update(&mut m, Msg::WorkspaceRemoved(2));
+        assert_eq!(
+            m.model.working.workspace_names,
+            vec!["a".to_string(), "beta".to_string()]
+        );
+        assert!(
+            !m.model.working.keybindings.contains_key("workspace:3"),
+            "removing down to two workspaces prunes workspace:3"
+        );
+    }
 }
