@@ -2322,6 +2322,7 @@ edit may be made without a new §6 amendment:
 | P1 | `view/inbox.rs` (`Inbox::try_recv`), `view/app.rs`, `tests/ingress.rs` | P1-D4a: only a consumer with a worker round trip needs to observe the inbox without a running `App`. `view/app.rs` is added here in P2's fix wave: P1 edited it and this table omitted it (doc-only correction, no behaviour) |
 | P2 | `widgets/stack.rs` | P2-D17: `StackC` never told the layout side table about an inactive page, so no control inside *any* stack page was reachable by a pointer. It is a `ui/` defect with no fix inside a settings page, and P0 could not have specified it blind — no test in M1–M5 had clicked inside a stack page before P2's own gates |
 | P3 | `widgets/button.rs`, `widgets/box_.rs` | P3-D8/P3-D9: `ButtonC` never granted keyboard focus on `PointerDown`, and separately `BoxC` never fired its `Event::Key` handler at all, so a `.on_key` on a `box_(...)` root (as `settings/src/app.rs` wires) was unreachable regardless of focus. Both are `ui/` defects with no fix inside a settings page, and P0 could not have specified either blind — Task 8 is the first test anywhere in M1–M5 to send a real key press after a real button click, and the first to attach `.on_key` to a `Kind::Box` node |
+| P3 | `harness/src/lib.rs` (`VirtualKeyboardClient`) | P3-D10: the harness's virtual keyboard sent `key` without the `modifiers` request the protocol pairs with it, so an injected Shift was invisible to every client. A `harness/` defect with no fix inside `ui/` or `settings/`, and P0 could not have specified it blind — Task 8 is the first test anywhere in M1–M5 to inject a *modified* key press |
 | P4 | `widgets/drop_down.rs` | §7's pre-discharged exception (P4-D5); the right list height is knowable only from a real page in a 420 px window |
 | P5 | `view/app.rs`, `window/popup.rs`, `window/mod.rs`, new `tests/popup_input.rs`, `tests/app_frame_hook.rs` | P5-D1/D2/D4/D5/D8: §3.4's real-`xdg_popup` clipboard popover cannot work without surface-scoped input routing, a re-reconciled popup view, `App::on_popup`, a per-frame `&Window` hook and popup-scoped probe accessors — none of which M5-D1…D11 provides and none of which P0 could specify blind |
 | P0 | everything else | — |
@@ -3001,5 +3002,46 @@ centralised pointer-handler firing, would close the same gap for every
 `Kind::Box` is exercised by any `.on_key` call in M1–M5 today and widening
 the fix further than Task 8's own proof needs is not this round's call to
 make.
+
+---
+
+### P3-D10 — `VirtualKeyboardClient` sends `modifiers` alongside `key` (a `harness/` fix)
+
+**Task:** 8 (fix round 2). **Supersedes:** §1's "`harness/` … not touched by
+M5" for this one additive method-body change; the crate's public API is
+unchanged (no new, removed or re-signatured item).
+
+**Finding.** Task 8's fix round 1 concluded the missing `SHIFT` in the
+captured combo came from the externally-published `wlr` crate never
+forwarding a `wl_keyboard.modifiers` event for the injected Shift press. It
+does not: the defect is in this repository, in
+`harness/src/lib.rs`'s `VirtualKeyboardClient`, which only ever sent
+`zwp_virtual_keyboard_v1.key` and never the `modifiers` request that
+protocol pairs with it. wlroots' virtual-keyboard implementation passes
+`update_state = false` to `wlr_keyboard_notify_key`, deliberately: the
+protocol makes the *injecting client* the owner of xkb/modifier state, so a
+`key`-only injector can hold Shift down forever without the compositor's
+keyboard state — and therefore any focused client's — ever learning of it.
+The single zeroed `modifiers` event round 1 observed is exactly what that
+predicts (the one `wl_keyboard.enter` sends by itself). No `wlr`-crate or
+wlroots change is needed.
+
+**Change.** `VirtualKeyboardClient` now carries an `xkb::State` built from
+the same `us` keymap it already hands the compositor, plus the last masks it
+sent. A new private `send_key` runs every press/release through that state
+and emits `zwp_virtual_keyboard_v1.modifiers(depressed, latched, locked,
+group)` whenever the serialised masks change, ordered after the `key`
+request it follows — a real keyboard's ordering, so a Shift press's
+`modifiers` lands before the next key's `key` event. `key_press`, `key_down`
+and `key_up` are re-expressed on top of it; their signatures, semantics for
+non-modifier keys, and every existing caller are unchanged.
+
+**Ruling.** Accepted. Additive, inside a test-support crate, and required by
+Task 8's own acceptance step: with it, the plan-literal proof passes and both
+mutation checks are red in the expected way (`ev.base.raw()` →
+`ev.keysym.raw()` yields `binding close SHIFT KEY_A`; dropping the
+`modifiers` request yields `binding close - KEY_a`). Recorded in §6 E6's
+table, whose column is read as "frozen-crate files" rather than strictly
+`ui/` files for this row.
 
 ---
