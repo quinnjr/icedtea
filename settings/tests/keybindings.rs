@@ -714,3 +714,282 @@ fn adding_and_removing_a_workspace_reaches_the_model() {
         s.batch().join("\n")
     );
 }
+
+/// The pixel at an output coordinate, or `None` when it is outside the
+/// frame.
+///
+/// Reconciliation: the brief names `icedtea_harness::pixel_at`, but the
+/// harness exposes no such function -- `grep -n 'pub fn pixel_at'
+/// harness/src/lib.rs` finds nothing. `CapturedFrame` (`harness/src/lib.rs`)
+/// carries `width`/`height`/`stride`/`format`/`bytes`, not the brief's
+/// assumed `data` field with a hard-coded Bgr888-3bpp layout, and
+/// `settings/tests/support/mod.rs`'s own `pixel_at` (P2's proven rest-state
+/// gate this task mirrors) already decodes a captured frame generically via
+/// `icedtea_ui::shm::pixel_rgb`, which switches on `frame.format` rather
+/// than assuming one. This file does not depend on that support module
+/// (its own doc comment: one integration binary, single-sourced, no
+/// `settings/tests/support/` dependency), so the same proven approach is
+/// reimplemented locally here rather than duplicated by hand-rolling the
+/// Bgr888 arithmetic the brief offered as a fallback.
+fn pixel_at(frame: &CapturedFrame, x: i32, y: i32) -> Option<(u8, u8, u8)> {
+    if x < 0 || y < 0 || x as u32 >= frame.width || y as u32 >= frame.height {
+        return None;
+    }
+    icedtea_ui::shm::pixel_rgb(frame.format, &frame.bytes, frame.stride, x as u32, y as u32)
+}
+
+/// Whether anything inside `rect` (output coordinates) differs from
+/// `background`.
+///
+/// A full scan of the border box, the rule `ui/tests/support/mod.rs`'s
+/// `paints_something` settled on: a sparse grid misses a widget that drew
+/// only a 1px border, and "painted nothing" reported for something that
+/// plainly painted is worse than a slower gate.
+fn paints_something(
+    frame: &CapturedFrame,
+    rect: (i32, i32, i32, i32),
+    background: (u8, u8, u8),
+) -> bool {
+    let (x, y, w, h) = rect;
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    (y..y + h)
+        .any(|py| (x..x + w).any(|px| pixel_at(frame, px, py).is_some_and(|got| got != background)))
+}
+
+/// Run one page's rest-state gate in `theme_css`.
+///
+/// `page` is the switcher index; `prefixes` are the id prefixes that belong
+/// to the page; `required` are ids that must always be visible; `floor` is
+/// the smallest number of ids a healthy layout leaves fully inside the
+/// window.
+fn rest_state_gate(
+    theme_css: &str,
+    theme_name: &str,
+    page: usize,
+    prefixes: &[&str],
+    required: &[&str],
+    floor: usize,
+) {
+    let mut s = Settings::spawn(theme_css);
+    s.select_page(page);
+    s.wait_for_alloc(required[0]);
+    // One more settle so the page's first frame is the one on screen, not
+    // the switcher's own transition frame.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Reconciliation: the brief derives `(win_w, win_h)` from `#root`'s own
+    // allocation, but this layout engine's `ScrolledWindow` reports its full,
+    // unclipped content size as its natural height (documented on
+    // `Settings::wait_for_alloc` above: "a `scrolled_window` reports its
+    // full, unclipped content size"), and a plain `Box` above it has no
+    // ceiling of its own -- only a `MinWidth`/`MinHeight` floor
+    // (`ui/src/view/render.rs`'s `write_styles`, depth 0) -- so `#root`
+    // balloons to its content's natural size on a page taller than the
+    // window (confirmed empirically: `#root` reported `(0, 0, 670, 787)`
+    // against a real `640x372` client area on the Keybindings page). Using
+    // that inflated box as the clipping bound let rows genuinely below the
+    // window through the filter instead of excluding them. `content_size`
+    // -- the window's real client-area size from the compositor's own
+    // geometry -- is the correct bound: it is what `wait_for_click_target`
+    // already trusts for the same "is this actually on screen" question.
+    let (win_w, win_h) = s.content_size;
+    let frame = s.capture();
+    // The page background: two pixels in from the client area's top-left
+    // corner, which is the root box's own fill in every bundled theme.
+    let (bx, by) = s.to_screen(2, 2);
+    let background =
+        pixel_at(&frame, bx, by).expect("the client area's corner is inside the captured frame");
+
+    let batch = s.batch();
+    let mut checked: Vec<String> = Vec::new();
+    let mut blank: Vec<String> = Vec::new();
+    for line in &batch {
+        let Some(rest) = line.strip_prefix("alloc ") else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let Some(id) = fields.next() else { continue };
+        if !prefixes.iter().any(|p| id.starts_with(p)) {
+            continue;
+        }
+        let nums: Vec<i32> = fields.filter_map(|v| v.parse().ok()).collect();
+        if nums.len() != 4 {
+            continue;
+        }
+        let (x, y, w, h) = (nums[0], nums[1], nums[2], nums[3]);
+        // Skip what the ScrolledWindow legitimately clips away.
+        //
+        // Reconciliation: the page's own `ScrolledWindow` container (id
+        // suffix `_list`) is a documented exception to the brief's full-rect
+        // containment test (`Settings::wait_for_alloc`'s own doc: "a
+        // `scrolled_window` reports its full, unclipped content size") --
+        // `#keybindings_list` legitimately reports a box taller than the
+        // window on this 19-row page, even though its top-left corner, and
+        // the rows actually on screen inside it, paint normally. Requiring
+        // full containment for that one id would make `#keybindings_list`
+        // -- a required id -- impossible to ever check on this page.
+        // Ordinary rows still need the full-rect test: a row whose *origin*
+        // is on screen but whose bottom is not is exactly what the
+        // ScrolledWindow legitimately clips away.
+        let is_list_container = id.ends_with("_list");
+        if x < 0 || y < 0 || (!is_list_container && (x + w > win_w || y + h > win_h)) {
+            continue;
+        }
+        let (sx, sy) = s.to_screen(x, y);
+        if !paints_something(&frame, (sx, sy, w, h), background) {
+            blank.push(format!("#{id} ({x},{y},{w},{h})"));
+        }
+        checked.push(id.to_string());
+    }
+
+    assert!(
+        blank.is_empty(),
+        "these widgets painted nothing in the {theme_name} theme: {}",
+        blank.join(", ")
+    );
+    assert!(
+        checked.len() >= floor,
+        "only {} of the page's widgets were inside the window in the {theme_name} \
+         theme (expected at least {floor}): {checked:?}",
+        checked.len()
+    );
+    for id in required {
+        assert!(
+            checked.iter().any(|c| c == id),
+            "#{id} must be visible at rest in the {theme_name} theme; checked {checked:?}"
+        );
+    }
+
+    // Every probe point the window reported is addressable: inside the
+    // client rectangle and inside the frame.
+    for (label, x, y) in s.probes() {
+        if x < 0 || y < 0 || x >= win_w || y >= win_h {
+            continue;
+        }
+        let (sx, sy) = s.to_screen(x, y);
+        assert!(
+            pixel_at(&frame, sx, sy).is_some(),
+            "probe point {label} at ({x},{y}) is outside the captured frame in the \
+             {theme_name} theme"
+        );
+    }
+}
+
+/// Ids that belong to the Workspaces page.
+const WORKSPACES_PREFIXES: &[&str] = &["workspaces_", "ws_row_", "ws_name_", "ws_remove_"];
+/// Ids that belong to the Keybindings page.
+const KEYBINDINGS_PREFIXES: &[&str] = &["keybindings_", "kb_row_", "kb_combo_", "kb_set_"];
+
+/// Every Workspaces widget paints at rest.
+///
+/// Mutation check: give `ws_name_<i>` `.visible(false)`; the `#ws_name_0
+/// must be visible` assertion fails. Restore.
+#[test]
+fn workspaces_page_paints_every_probe_point_at_rest_in_the_light_theme() {
+    rest_state_gate(
+        icedtea_ui::BUNDLED_ADWAITA_LIGHT,
+        "light",
+        PAGE_WORKSPACES,
+        WORKSPACES_PREFIXES,
+        &[
+            "workspaces_list",
+            "workspaces_add",
+            "ws_name_0",
+            "ws_remove_0",
+        ],
+        6,
+    );
+}
+
+#[test]
+fn workspaces_page_paints_every_probe_point_at_rest_in_the_dark_theme() {
+    rest_state_gate(
+        icedtea_ui::BUNDLED_ADWAITA_DARK,
+        "dark",
+        PAGE_WORKSPACES,
+        WORKSPACES_PREFIXES,
+        &[
+            "workspaces_list",
+            "workspaces_add",
+            "ws_name_0",
+            "ws_remove_0",
+        ],
+        6,
+    );
+}
+
+#[test]
+fn workspaces_page_paints_every_probe_point_at_rest_in_the_high_contrast_theme() {
+    rest_state_gate(
+        icedtea_ui::BUNDLED_ADWAITA_HC,
+        "high contrast",
+        PAGE_WORKSPACES,
+        WORKSPACES_PREFIXES,
+        &[
+            "workspaces_list",
+            "workspaces_add",
+            "ws_name_0",
+            "ws_remove_0",
+        ],
+        6,
+    );
+}
+
+/// Every visible Keybindings widget paints at rest. The page scrolls, so
+/// rows below the viewport are excluded by the clipping filter and the
+/// floor plus the required ids keep the gate honest.
+///
+/// Mutation check: render the combo label with an empty string; `#kb_combo_
+/// close` paints nothing and the gate fails. Restore.
+#[test]
+fn keybindings_page_paints_every_probe_point_at_rest_in_the_light_theme() {
+    rest_state_gate(
+        icedtea_ui::BUNDLED_ADWAITA_LIGHT,
+        "light",
+        PAGE_KEYBINDINGS,
+        KEYBINDINGS_PREFIXES,
+        &[
+            "keybindings_list",
+            "kb_row_close",
+            "kb_combo_close",
+            "kb_set_close",
+        ],
+        8,
+    );
+}
+
+#[test]
+fn keybindings_page_paints_every_probe_point_at_rest_in_the_dark_theme() {
+    rest_state_gate(
+        icedtea_ui::BUNDLED_ADWAITA_DARK,
+        "dark",
+        PAGE_KEYBINDINGS,
+        KEYBINDINGS_PREFIXES,
+        &[
+            "keybindings_list",
+            "kb_row_close",
+            "kb_combo_close",
+            "kb_set_close",
+        ],
+        8,
+    );
+}
+
+#[test]
+fn keybindings_page_paints_every_probe_point_at_rest_in_the_high_contrast_theme() {
+    rest_state_gate(
+        icedtea_ui::BUNDLED_ADWAITA_HC,
+        "high contrast",
+        PAGE_KEYBINDINGS,
+        KEYBINDINGS_PREFIXES,
+        &[
+            "keybindings_list",
+            "kb_row_close",
+            "kb_combo_close",
+            "kb_set_close",
+        ],
+        8,
+    );
+}
