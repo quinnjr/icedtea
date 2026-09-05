@@ -672,10 +672,21 @@ last frame laid out. A client that sets `$ICEDTEA_PROBE_REPORT` writes them as
 `ui/tests/support/mod.rs` parses back. This is how a harness test addresses a
 widget on a *running* app: `App::probe` is offscreen-only.
 
-An app driven by `App::run` gets this for free: with `$ICEDTEA_PROBE_REPORT`
-set (or `App::with_probe_report(path)`), the loop writes those lines once per
-frame in which they change — deduplicated, so a settled app writes nothing.
-That is what M5's settings and shell gates read.
+An app driven by `App::run` or `App::run_offscreen` gets this for free: with
+`$ICEDTEA_PROBE_REPORT` set (or `App::with_probe_report(path)`), the loop
+appends one block per frame whose laid-out tree changed —
+
+```text
+frame <n>
+probe <label> <x> <y>
+alloc <id> <x> <y> <w> <h>
+```
+
+— deduplicated by content, so a settled app writes nothing and `frame`'s
+count is "how many distinct states this app has published", not a wall-clock
+frame count (M5-D9, deviation P1-D5). That is what M5's settings and shell
+gates read; the file is append-only, so a settings build appends its own
+`page`/`status`/`msg` lines (`settings/src/probe.rs`) to the same path.
 
 ## The P5 half of the widget catalogue, in detail
 

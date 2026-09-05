@@ -123,7 +123,10 @@ const _: fn() = || {
 /// Never blocks and never calls D-Bus: outbound work leaves through
 /// `Cmd::Task`, which `App` runs on the loop thread after the fold.
 pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
-    match msg {
+    // One line per fold, for the harness gates. A no-op without
+    // $ICEDTEA_PROBE_REPORT.
+    crate::probe::report(&format!("msg {msg:?}"));
+    let cmd = match msg {
         Msg::PageSelected(index) => {
             m.page = PageId::from_index(index);
             // Leaving the Keybindings page disarms a capture — the GTK
@@ -241,7 +244,10 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             }
             Cmd::None
         }
-    }
+    };
+    crate::probe::report(&format!("page {}", m.page.name()));
+    crate::probe::report(&format!("status {}", footer_text(m)));
+    cmd
 }
 
 /// What the footer's status label shows: the dirty indicator wins over the

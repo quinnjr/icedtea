@@ -849,6 +849,10 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             size,
             frames: Vec::new(),
         };
+        // M5-D9, P0-D4: same report, same dedup, as `run` -- offscreen just
+        // has no window to publish from.
+        let mut probe_reported: Vec<String> = Vec::new();
+        let mut probe_frame: u64 = 0;
 
         rebuild(
             &mut self, &mut rt, &sheet, &mut fonts, &mut icons, &dyn_clock,
@@ -861,6 +865,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             &dyn_clock,
             size,
             &mut surface,
+            self.probe_report
+                .as_deref()
+                .map(|path| (path, &mut probe_reported, &mut probe_frame)),
         )?;
 
         for step in script {
@@ -973,6 +980,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 &dyn_clock,
                 size,
                 &mut surface,
+                self.probe_report
+                    .as_deref()
+                    .map(|path| (path, &mut probe_reported, &mut probe_frame)),
             )?;
             render_popups(
                 &mut rt,
@@ -1069,6 +1079,10 @@ fn restyle_and_layout<Msg: Clone + 'static>(
 }
 
 /// Restyle, relayout and repaint into `surface`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site's worth of loop state plus the offscreen probe report"
+)]
 fn render_once<Msg: Clone + 'static>(
     rt: &mut Runtime<Msg>,
     sheet: &CompiledSheet,
@@ -1077,6 +1091,7 @@ fn render_once<Msg: Clone + 'static>(
     clock: &Rc<dyn Clock>,
     size: (u32, u32),
     surface: &mut skia_rs_safe::canvas::Surface,
+    probe: Option<(&std::path::Path, &mut Vec<String>, &mut u64)>,
 ) -> Result<(), AppError> {
     let now = clock.now();
     restyle_and_layout(
@@ -1093,6 +1108,13 @@ fn render_once<Msg: Clone + 'static>(
         &mut rt.layout,
         size,
     )?;
+    // M5-D9, P0-D4: `run_offscreen` never hands its window over, but its
+    // laid-out tree still lives only in this `Runtime` -- the same reason
+    // `run` publishes from inside its own loop.
+    if let Some((path, last, frame)) = probe {
+        let lines = probe_report_lines(rt);
+        write_probe_report(path, &lines, last, frame);
+    }
     surface
         .canvas()
         .clear(skia_rs_safe::core::Color::TRANSPARENT);
@@ -1630,15 +1652,23 @@ fn frame_deadline<T>(
         .min()
 }
 
-/// Append `lines` to `path` when they differ from `last`.
+/// Append `lines` to `path`, under a `frame <n>` marker, when they differ
+/// from `last`.
 ///
 /// Deduplicated by content: a settled app writes nothing, so the file stays
 /// bounded no matter how long the app runs, and a test that greps for a line
-/// still finds it.
-fn write_probe_report(path: &std::path::Path, lines: &[String], last: &mut Vec<String>) {
+/// still finds it. `frame` only advances on an actual write, so a reader can
+/// count it as "how many distinct states this app has published" (M5-D9,
+/// deviation P1-D5).
+fn write_probe_report(
+    path: &std::path::Path,
+    lines: &[String],
+    last: &mut Vec<String>,
+    frame: &mut u64,
+) {
     use std::io::Write;
 
-    if lines == last.as_slice() {
+    if lines.is_empty() || lines == last.as_slice() {
         return;
     }
     last.clear();
@@ -1650,10 +1680,13 @@ fn write_probe_report(path: &std::path::Path, lines: &[String], last: &mut Vec<S
     else {
         return;
     };
+    let _ = writeln!(file, "frame {frame}");
     for line in lines {
         let _ = writeln!(file, "{line}");
     }
-    let _ = file.flush();
+    if file.flush().is_ok() {
+        *frame += 1;
+    }
 }
 
 /// The report lines for one laid-out tree: every probe point, then one
@@ -1739,6 +1772,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
         // M5-D9, P0-D4: lines written by `write_probe_report` only when they
         // differ from what is already here.
         let mut reported: Vec<String> = Vec::new();
+        let mut probe_frame: u64 = 0;
 
         // M5-D2 §2: the inbox's wake pipe joins the window's poll set, and
         // leaves it on the way out.
@@ -1923,7 +1957,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
 
             if let Some(path) = self.probe_report.as_deref() {
                 let lines = probe_report_lines(&rt);
-                write_probe_report(path, &lines, &mut reported);
+                write_probe_report(path, &lines, &mut reported, &mut probe_frame);
             }
 
             let styles = &rt.styles;

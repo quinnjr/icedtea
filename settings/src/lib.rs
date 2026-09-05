@@ -10,3 +10,4 @@ pub mod ipc;
 pub mod model;
 pub mod outputs;
 pub mod pages;
+pub mod probe;

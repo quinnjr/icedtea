@@ -289,6 +289,85 @@ fn an_inbox_message_wakes_a_live_app() {
     );
 }
 
+/// An app running offscreen still publishes its geometry, so a settings or
+/// shell gate can locate widgets without hard-coding coordinates.
+///
+/// Mutation check: make `with_probe_report` store `None`; this test fails
+/// with an empty report. Restore.
+#[test]
+fn an_app_with_a_probe_report_publishes_probe_and_alloc_lines() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("report");
+    let app = icedtea_ui::view::App::new(
+        0u32,
+        |_m: &mut u32, _msg: u32| icedtea_ui::view::Cmd::None,
+        |_m: &u32| {
+            icedtea_ui::view::builders::box_(
+                icedtea_ui::widgets::Orientation::Vertical,
+                [icedtea_ui::widgets::button::button("Apply").id("apply")],
+            )
+            .id("root")
+        },
+    )
+    .with_probe_report(path.clone());
+    let clock = std::rc::Rc::new(icedtea_ui::anim::ManualClock::new());
+    app.run_offscreen(
+        (200, 100),
+        clock,
+        vec![icedtea_ui::view::app::ScriptStep::Capture],
+    )
+    .expect("offscreen run");
+
+    let text = std::fs::read_to_string(&path).expect("the report exists");
+    assert!(
+        text.lines().any(|l| l == "frame 0"),
+        "no frame marker in {text:?}"
+    );
+    assert!(
+        text.lines().any(|l| l.starts_with("probe apply ")),
+        "no probe point for #apply in {text:?}"
+    );
+    let alloc = text
+        .lines()
+        .find(|l| l.starts_with("alloc apply "))
+        .expect("no alloc line for #apply");
+    let fields: Vec<&str> = alloc.split_whitespace().collect();
+    assert_eq!(fields.len(), 6, "alloc lines carry id, x, y, w, h");
+    let width: f32 = fields[4].parse().expect("width parses");
+    assert!(width > 0.0, "#apply should have been laid out, got {alloc}");
+}
+
+/// A frame that changes nothing appends nothing: the report is a change log,
+/// not a per-frame dump, so a test can wait for a specific state.
+#[test]
+fn an_unchanged_tree_does_not_append_another_block() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("report");
+    let app = icedtea_ui::view::App::new(
+        0u32,
+        |_m: &mut u32, _msg: u32| icedtea_ui::view::Cmd::None,
+        |_m: &u32| icedtea_ui::widgets::label::label("steady").id("root"),
+    )
+    .with_probe_report(path.clone());
+    let clock = std::rc::Rc::new(icedtea_ui::anim::ManualClock::new());
+    app.run_offscreen(
+        (200, 100),
+        clock,
+        vec![
+            icedtea_ui::view::app::ScriptStep::Capture,
+            icedtea_ui::view::app::ScriptStep::Capture,
+            icedtea_ui::view::app::ScriptStep::Capture,
+        ],
+    )
+    .expect("offscreen run");
+    let text = std::fs::read_to_string(&path).expect("the report exists");
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("frame ")).count(),
+        1,
+        "three identical frames must publish one block, got {text:?}"
+    );
+}
+
 #[test]
 fn a_running_app_writes_its_probe_report() {
     // Why the toolkit does this and not the app (P0-D4): `App::run` owns the
