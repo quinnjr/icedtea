@@ -20,6 +20,11 @@
 //! exists (every fresh widget's very first frame) is queued in
 //! `pending_visible` and honoured the first time `place` finds a non-empty
 //! page list.
+//!
+//! Visibility: an inactive page is `display: none`, not merely marked with a
+//! `hidden` class -- see [`set_visible`], which records both. That is what
+//! keeps a stack behaving like `GtkStack` for layout, paint *and* pointer
+//! dispatch; the class on its own left every page laid out and hit-tested.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -31,17 +36,32 @@ use crate::view::{BuildCx, Controller, Event, EventCx, EventKind, Kind, Prop, Pr
 use crate::widgets::types::{StackPageInfo, StackTransition};
 use crate::widgets::{Universal, prop_i64, prop_str, prop_u16, props_of, set_container};
 
-/// Add or remove the `hidden` marker class -- the same bookkeeping
-/// [`super::notebook::NotebookC`]'s own private `set_visible` helper uses
-/// for "this page is not the one on top". Nothing in this crate's layout or
-/// paint walkers reads the class back yet; it exists for fixtures and future
-/// consumers, the same trade notebook's copy already makes.
+/// Add or remove the `hidden` marker class *and* fold the same decision into
+/// the layout side table, so an inactive page is `display: none`.
+///
+/// The class alone is bookkeeping the fixtures read (it is what
+/// [`super::notebook::NotebookC`]'s own private `set_visible` records). The
+/// [`crate::widgets::set_displayed`] call beside it is what makes a
+/// hidden page behave like `GtkStack`'s: taffy gives it `Display::None`, so
+/// it takes no space, paints nothing and -- because `window::pointer`'s
+/// `descend` skips a node with an empty border box -- receives no pointer
+/// events.
+///
+/// Without it every page in the stack is laid out as an ordinary grid child.
+/// `build` sets a `Container::Grid { columns: 1, rows: 1 }`, so pages past the
+/// first land in taffy's *implicit* rows and the stack lays its pages out
+/// sequentially, one below the next: later pages fall outside the window's
+/// rendered height (they are allocated but never painted), and `descend`'s
+/// reverse walk -- which `break`s on the first child whose border box contains
+/// the point, whether or not a deeper target was found -- terminates inside
+/// the wrong page, so no control inside the *active* page is ever reachable.
 fn set_visible(node: &Node, visible: bool) {
     if visible {
         node.remove_class("hidden");
     } else {
         node.add_class("hidden");
     }
+    crate::widgets::set_displayed(node, visible);
 }
 
 /// One page's identity and node.
@@ -377,6 +397,68 @@ mod tests {
         assert_eq!(StackC::progress_of(&*c), 1.0);
         assert_eq!(StackC::outgoing_of(&*c), None);
         assert_eq!(c.next_deadline(Duration::from_millis(200)), None);
+    }
+
+    /// An inactive page is `display: none`, so taffy gives it no box at all.
+    ///
+    /// That is the whole reason a control inside the active page is
+    /// reachable: `build` puts every page in a `Grid { columns: 1, rows: 1 }`,
+    /// so without this the pages past the first land in taffy's *implicit*
+    /// rows and lay out sequentially below one another -- painted off the
+    /// bottom of the window, and hit-tested ahead of the active page by
+    /// `window::pointer::descend`'s reverse walk.
+    ///
+    /// Mutation check: drop the `set_displayed` call from `set_visible` and
+    /// page "two" lays out at its full size right below page "one" (its
+    /// `border_box.height` is non-zero and its `y` is page one's height),
+    /// which is exactly the defect this asserts against. Restore.
+    #[test]
+    fn an_inactive_page_takes_no_space() {
+        use crate::layout::{FixedMeasure, LayoutTree};
+        use taffy::style::AvailableSpace;
+
+        let built = build_with_pages(["one", "two"]);
+        // `reserved_total` is the hook the reconciler calls once the real
+        // children are attached; it runs `place()`, which is what records
+        // each page's visibility.
+        assert_eq!(built.controller.reserved_total(2), 2);
+        assert_eq!(
+            StackC::visible_of(&*built.controller),
+            0,
+            "\"one\" is shown"
+        );
+
+        let mut tree = LayoutTree::new();
+        tree.sync(&built.node).expect("sync");
+        crate::widgets::flush_layout(&mut tree);
+        tree.compute(
+            &built.node,
+            taffy::Size {
+                width: AvailableSpace::Definite(200.0),
+                height: AvailableSpace::Definite(200.0),
+            },
+            &mut FixedMeasure(taffy::Size {
+                width: 40.0,
+                height: 20.0,
+            }),
+        )
+        .expect("compute");
+
+        let pages = built.node.children();
+        assert!(
+            tree.is_displayed(&pages[0]),
+            "the visible page is displayed"
+        );
+        assert!(
+            !tree.is_displayed(&pages[1]),
+            "the inactive page is display:none"
+        );
+        let hidden = tree.allocation(&pages[1]).expect("an allocation");
+        assert_eq!(
+            (hidden.border_box.width, hidden.border_box.height),
+            (0.0, 0.0),
+            "an inactive page occupies no area, so no pointer can hit it"
+        );
     }
 
     #[test]
