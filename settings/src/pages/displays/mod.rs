@@ -22,18 +22,40 @@ use crate::app::{Msg, SettingsModel};
 use crate::outputs::OutputsMsg;
 use crate::pages::displays::state::DisplaysState;
 
-/// The Displays page.
+/// The whole Displays page.
 ///
-/// P1 ships the page's frame only; P4 fills it in (contract §2.6).
+/// Either the "output management unavailable" explanation, or the canvas, the
+/// per-head panel and the page's own footer — the GTK page's `unavailable`
+/// label / `content` box pair, now a branch instead of two visibility flags.
 #[must_use]
-pub fn view(m: &crate::app::SettingsModel) -> icedtea_ui::view::View<crate::app::Msg> {
-    let _ = m;
-    icedtea_ui::view::builders::box_(
-        icedtea_ui::widgets::types::Orientation::Vertical,
-        [icedtea_ui::view::builders::label("Displays")],
+pub fn view(m: &SettingsModel) -> View<Msg> {
+    if !m.outputs_available {
+        return box_(
+            Orientation::Vertical,
+            [label(UNAVAILABLE_TEXT)
+                .id("displays_unavailable")
+                .halign(Align::Center)
+                .valign(Align::Center)
+                .vexpand(true)],
+        )
+        .id("displays");
+    }
+    box_(
+        Orientation::Vertical,
+        [
+            box_(
+                Orientation::Horizontal,
+                [canvas::view(m), controls::view(m)],
+            )
+            .spacing(12u32)
+            .vexpand(true)
+            .id("displays_content"),
+            footer(m),
+        ],
     )
-    .id("displays_page")
-    .margin(16, 16, 16, 16)
+    .spacing(8u32)
+    .margin(12, 12, 12, 12)
+    .id("displays")
 }
 
 /// Shown instead of the page when there is no compositor to talk to.
@@ -514,6 +536,47 @@ mod tests {
         let m = dirty_model();
         let ids = view_ids(&footer(&m));
         for id in [
+            "displays_status",
+            "displays_test",
+            "displays_revert",
+            "displays_apply",
+        ] {
+            assert!(
+                ids.iter().any(|got| got == id),
+                "missing id {id}; got {ids:?}"
+            );
+        }
+    }
+
+    /// Mutation check: return the content branch unconditionally from `view`;
+    /// the unavailable id disappears and this fails. Restore.
+    #[test]
+    fn an_unavailable_page_shows_only_its_explanation() {
+        let (mut m, _workers) = crate::app::tests::test_model();
+        m.outputs_available = false;
+        let ids = view_ids(&view(&m));
+        assert!(ids.iter().any(|id| id == "displays_unavailable"));
+        assert!(
+            !ids.iter().any(|id| id == "displays_canvas"),
+            "no canvas while output management is unavailable; got {ids:?}"
+        );
+    }
+
+    /// Mutation check: drop `controls::view(m)` from the content branch; the
+    /// `displays_enabled` id disappears and this fails. Restore.
+    #[test]
+    fn an_available_page_shows_canvas_controls_and_footer() {
+        let mut m = dirty_model();
+        m.outputs_available = true;
+        let ids = view_ids(&view(&m));
+        for id in [
+            "displays_canvas",
+            "displays_enabled",
+            "displays_resolution",
+            "displays_refresh",
+            "displays_scale",
+            "displays_transform",
+            "displays_position",
             "displays_status",
             "displays_test",
             "displays_revert",

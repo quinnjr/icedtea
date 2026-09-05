@@ -73,6 +73,23 @@ impl PageId {
     }
 }
 
+/// The `PageId` whose [`PageId::name`] is `name`, or `None`.
+#[must_use]
+pub fn page_named(name: &str) -> Option<PageId> {
+    PageId::ALL.into_iter().find(|p| p.name() == name)
+}
+
+/// The page `$ICEDTEA_SETTINGS_PAGE` names, if it names a real one.
+///
+/// Test-only ergonomics with a production-safe shape (plan P4-D9): a gate can
+/// open the Displays page directly instead of synthesising switcher clicks. An
+/// unset, empty or unrecognised value is simply ignored — an environment
+/// variable is untrusted input and never panics.
+#[must_use]
+pub fn page_from_env() -> Option<PageId> {
+    page_named(&std::env::var("ICEDTEA_SETTINGS_PAGE").ok()?)
+}
+
 /// The page list a `stack_switcher` takes.
 ///
 /// A function rather than the contract's `PAGES` constant (deviation P1-D3):
@@ -92,7 +109,7 @@ pub fn page_infos() -> std::rc::Rc<[icedtea_ui::widgets::StackPageInfo]> {
 
 #[cfg(test)]
 mod page_id_tests {
-    use super::{PageId, page_infos};
+    use super::{PageId, page_infos, page_named};
 
     /// The switcher hands back the index of the button pressed, and the
     /// stack selects by name — so the two orders must be the same one.
@@ -119,6 +136,17 @@ mod page_id_tests {
     fn an_out_of_range_index_clamps_to_the_last_page() {
         assert_eq!(PageId::from_index(99), PageId::Displays);
         assert_eq!(PageId::from_index(usize::MAX), PageId::Displays);
+    }
+
+    /// Mutation check: have `page_from_env` return `Some(PageId::Appearance)`
+    /// for an unknown name; the `None` assertion fails. Restore.
+    #[test]
+    fn the_initial_page_env_var_only_accepts_real_page_names() {
+        assert_eq!(page_named("displays"), Some(PageId::Displays));
+        assert_eq!(page_named("keybindings"), Some(PageId::Keybindings));
+        assert_eq!(page_named("Displays"), None, "the match is exact");
+        assert_eq!(page_named("nonsense"), None);
+        assert_eq!(page_named(""), None);
     }
 
     #[test]

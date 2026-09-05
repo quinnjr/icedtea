@@ -615,6 +615,9 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
     };
     crate::probe::report(&format!("page {}", m.page.name()));
     crate::probe::report(&format!("status {}", footer_text(m)));
+    for line in state_report_lines(m) {
+        crate::probe::report(&line);
+    }
     cmd
 }
 
@@ -673,6 +676,32 @@ fn clears_status(msg: &Msg) -> bool {
         | Msg::DisplaysRevert
         | Msg::DisplaysApply => false,
     }
+}
+
+/// The `state <key> <value…>` lines the probe report carries (plan P4-D10).
+///
+/// M5-D9's `probe`/`alloc` lines carry geometry only, and the Displays drag
+/// gate has to assert the *model's* rectangle. These four lines are what it
+/// reads; they are written by the same once-per-changed-frame writer as the
+/// other two kinds.
+#[must_use]
+pub fn state_report_lines(m: &SettingsModel) -> Vec<String> {
+    let position = m
+        .displays
+        .selected
+        .and_then(|i| m.displays.edits.get(i))
+        .and_then(|e| e.position)
+        .map_or_else(|| "none".to_string(), |(x, y)| format!("{x} {y}"));
+    let selected = m
+        .displays
+        .selected
+        .map_or_else(|| "none".to_string(), |i| i.to_string());
+    vec![
+        format!("state displays.position {position}"),
+        format!("state displays.selected {selected}"),
+        format!("state displays.dirty {}", m.displays.dirty),
+        format!("state displays.in_flight {}", m.displays_in_flight),
+    ]
 }
 
 /// What the footer's status label shows, in priority order: whatever the app
@@ -1308,7 +1337,7 @@ pub(crate) mod tests {
         let (mut m2, _dir2, _workers2) = model();
         m2.page = PageId::Displays;
         let ids = node_ids(&probe_of(m2));
-        assert!(ids.contains(&"displays_page".to_string()));
+        assert!(ids.contains(&"displays".to_string()));
     }
 
     /// The footer is computed, not pushed: `Unsaved changes` is what
@@ -1606,6 +1635,56 @@ pub(crate) mod tests {
             !m.model.is_dirty(),
             "dirty is computed from working != saved, never a latched flag"
         );
+    }
+
+    /// Mutation check: drop the `displays.position` line from
+    /// `state_report_lines`; the drag interaction gate (Task 11) has nothing
+    /// to read and this fails. Restore.
+    ///
+    /// Reconciliation (Task 8): the brief's `SettingsModel::for_test()` is not
+    /// a name this crate exposes; `test_model()` (P1-D8's `pub(crate)`
+    /// constructor, already used throughout this module and by
+    /// `pages::displays`'s own tests) is the equivalent it does, returning the
+    /// model alongside the worker queues.
+    #[test]
+    fn the_state_report_lines_carry_the_displays_model() {
+        let (mut m, _workers) = test_model();
+        m.displays.heads = Vec::new();
+        m.displays.edits = Vec::new();
+        m.displays.selected = None;
+        let none = super::state_report_lines(&m);
+        assert!(none.iter().any(|l| l == "state displays.selected none"));
+        assert!(none.iter().any(|l| l == "state displays.dirty false"));
+        assert!(none.iter().any(|l| l == "state displays.in_flight false"));
+        assert!(
+            none.iter().any(|l| l == "state displays.position none"),
+            "no selection reports `none`, not a coordinate; got {none:?}"
+        );
+
+        let head = crate::outputs::Head {
+            name: "DP-1".to_string(),
+            description: "DP-1".to_string(),
+            enabled: true,
+            modes: Vec::new(),
+            current_mode: None,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            transform: 0,
+        };
+        m.displays.edits = vec![crate::pages::displays::state::baseline_edit(&head)];
+        m.displays.heads = vec![head];
+        m.displays.selected = Some(0);
+        m.displays.edits[0].position = Some((1920, -180));
+        m.displays.dirty = true;
+        let lines = super::state_report_lines(&m);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "state displays.position 1920 -180")
+        );
+        assert!(lines.iter().any(|l| l == "state displays.selected 0"));
+        assert!(lines.iter().any(|l| l == "state displays.dirty true"));
     }
 
     #[test]

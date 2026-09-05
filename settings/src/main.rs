@@ -61,22 +61,6 @@ fn sheet() -> CompiledSheet {
     CompiledSheet::compile_with_env(&stylesheet, &env.media_env())
 }
 
-/// The page the window opens on (P2-D8).
-///
-/// A debug/test affordance with the same role as `gallery --widget`: it lets
-/// a rest-state gate photograph one page without synthesising a switcher
-/// click. An unknown name falls back to the first page rather than failing
-/// to start.
-fn initial_page() -> icedtea_settings::pages::PageId {
-    let Ok(name) = std::env::var("ICEDTEA_SETTINGS_PAGE") else {
-        return icedtea_settings::pages::PageId::Appearance;
-    };
-    icedtea_settings::pages::PageId::ALL
-        .into_iter()
-        .find(|page| page.name() == name)
-        .unwrap_or(icedtea_settings::pages::PageId::Appearance)
-}
-
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -135,7 +119,13 @@ fn main() {
 
     let mut model =
         SettingsModel::new(default_db_path(), workers.handles()).with_outputs(pump.clone());
-    model.page = initial_page();
+    // The page the window opens on (P2-D8/P4-D9): a debug/test affordance
+    // with the same role as `gallery --widget`, letting a rest-state gate
+    // photograph one page without synthesising a switcher click. An unknown
+    // or unset name falls back to the first page rather than failing to
+    // start — an environment variable is untrusted input.
+    model.page = icedtea_settings::pages::page_from_env()
+        .unwrap_or(icedtea_settings::pages::PageId::Appearance);
     let mut app = App::new(model, update, view).with_inbox(inbox);
     if let (Some(id), Some(pump)) = (watch, pump) {
         app = app.on_fd(id, move || pump.drain());

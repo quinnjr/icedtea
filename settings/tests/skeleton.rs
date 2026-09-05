@@ -138,8 +138,13 @@ fn the_first_toplevel_app_run_paints_and_navigates() {
     // widgets — the hidden ones included — from the first frame. Now that
     // it publishes only what is displayed, this really does assert that the
     // Displays page came on screen.)
+    //
+    // Reconciliation (P4 Task 8): P1's stub page rooted itself at
+    // `displays_page`; the real page P4 assembles roots at `displays` (both
+    // the unavailable-explanation branch and the canvas/controls/footer
+    // branch), so this probe id follows the rename.
     assert!(
-        app.wait_line("probe displays_page ", SETTLE).is_some(),
+        app.wait_line("probe displays ", SETTLE).is_some(),
         "the Displays page body never entered the tree\n{:?}",
         app.lines()
     );
