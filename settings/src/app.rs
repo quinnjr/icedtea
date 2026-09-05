@@ -119,6 +119,11 @@ pub enum Msg {
     /// One protocol message from the outputs connection, via `App::on_fd`.
     /// `Arc`, not `Rc`: `Msg` is `Send` (M5-D2).
     Outputs(std::sync::Arc<crate::outputs::OutputsMsg>),
+    /// The portal worker's file chooser returned a path (contract §2.2).
+    WallpaperChosen(std::path::PathBuf),
+    /// The portal worker could not produce a path; the status line shows why
+    /// (contract §2.2).
+    WallpaperPickerFailed(String),
 }
 
 const _: fn() = || {
@@ -278,6 +283,15 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
                 }
             }
         },
+        Msg::WallpaperChosen(path) => {
+            m.wallpaper_text = path.display().to_string();
+            m.wallpaper_error = None;
+            Cmd::None
+        }
+        Msg::WallpaperPickerFailed(reason) => {
+            m.status = reason;
+            Cmd::None
+        }
     };
     crate::probe::report(&format!("page {}", m.page.name()));
     crate::probe::report(&format!("status {}", footer_text(m)));
