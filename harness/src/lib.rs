@@ -131,15 +131,71 @@ const FALLBACK_SIZE: (i32, i32) = (200, 100);
 fn ensure_headless_env() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
+        let dir = private_runtime_dir();
         // SAFETY (icedtea unsafe exception (c)): `Once::call_once` above
         // guarantees this closure runs on exactly one thread and that every
         // other thread calling `ensure_headless_env` blocks until it
-        // finishes.
+        // finishes. `XDG_RUNTIME_DIR` is rewritten here, before the first
+        // display exists, so `add_socket_auto` (which reads it through
+        // libwayland's `getenv`) never sees the session's directory.
         unsafe {
             std::env::set_var("WLR_BACKENDS", "headless");
             std::env::set_var("WLR_HEADLESS_OUTPUTS", "1");
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
         }
+        RUNTIME_DIR.set(dir).expect("runtime dir set once");
     });
+}
+
+/// The private `XDG_RUNTIME_DIR` every harness compositor in this process
+/// creates its socket under, set by the first [`Compositor::spawn`].
+static RUNTIME_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The harness's own `XDG_RUNTIME_DIR`: `<session runtime dir>/icedtea-harness/<pid>`,
+/// mode 0700, created by the first [`Compositor::spawn`] in this process.
+///
+/// Why not the session's directory: `wl_display_add_socket_auto` probes
+/// `wayland-0` upward in `XDG_RUNTIME_DIR`. Under a live desktop that is the
+/// user's own display -- the harness used to fight its lock file
+/// ("unable to lock lockfile /run/user/1000/wayland-0.lock") and litter
+/// `wayland-N` sockets beside the real one, which is enough to keep new
+/// windows from reaching the user's session while a gate runs. A private
+/// directory keeps every harness socket, and every app the tests spawn, off
+/// the desktop's runtime dir entirely. Spawned apps must be handed this path
+/// explicitly (`.env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())`);
+/// the process env is rewritten too, so children inherit it either way.
+///
+/// The directory lives on the same tmpfs as the session's runtime dir and is
+/// named by pid; libwayland unlinks each socket when its display is
+/// destroyed, and the empty directory goes with the session at logout.
+///
+/// # Panics
+///
+/// If called before any compositor was spawned in this process.
+#[must_use]
+pub fn runtime_dir() -> &'static std::path::Path {
+    ensure_headless_env();
+    RUNTIME_DIR
+        .get()
+        .expect("runtime dir is set by ensure_headless_env")
+}
+
+/// Create the per-process private runtime directory (see [`runtime_dir`]).
+fn private_runtime_dir() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base
+        .join("icedtea-harness")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| panic!("creating harness runtime dir {}: {e}", dir.display()));
+    // Wayland refuses a runtime dir that is not 0700 (it checks
+    // `XDG_RUNTIME_DIR` permissions on connect in libwayland ≥ 1.22).
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|e| panic!("chmod 0700 on {}: {e}", dir.display()));
+    dir
 }
 
 /// Serializes compositor *creation* across test threads.
@@ -187,7 +243,8 @@ static BOOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// A headless compositor running the production event loop on its own thread.
 pub struct Compositor {
     /// The socket name `add_socket_auto` picked; a `WAYLAND_DISPLAY` value,
-    /// relative to `XDG_RUNTIME_DIR`.
+    /// relative to the harness's private [`runtime_dir`] (never the
+    /// session's `XDG_RUNTIME_DIR`).
     pub socket: String,
     /// The production event stream (`State::new`'s `dbus_tx`), exactly what
     /// the D-Bus emitter thread would consume.
@@ -394,10 +451,9 @@ impl Compositor {
         }
     }
 
-    /// Absolute path of this compositor's socket.
+    /// Absolute path of this compositor's socket, under [`runtime_dir`].
     pub fn socket_path(&self) -> std::path::PathBuf {
-        let dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR must be set");
-        std::path::Path::new(&dir).join(&self.socket)
+        runtime_dir().join(&self.socket)
     }
 
     /// Send a command the way `dbus::CompositorInterface::send` does: onto the
@@ -2065,8 +2121,7 @@ fn connect_and_bind(
     QueueHandle<ClientState>,
     ClientState,
 ) {
-    let dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR must be set");
-    let path = std::path::Path::new(&dir).join(socket);
+    let path = runtime_dir().join(socket);
     let stream = UnixStream::connect(&path)
         .unwrap_or_else(|e| panic!("connecting to {}: {e}", path.display()));
     let conn = Connection::from_socket(stream).expect("wayland connection");
@@ -4879,6 +4934,53 @@ impl GammaControlClient {
 #[cfg(test)]
 mod tests {
     use super::{Compositor, VirtualPointerClient};
+
+    /// The harness never touches the session's runtime directory: its
+    /// socket lives under a private, pid-named, 0700 `XDG_RUNTIME_DIR`, and
+    /// the process env points there so spawned apps inherit it.
+    ///
+    /// Mutation check: drop the `set_var("XDG_RUNTIME_DIR", ..)` in
+    /// `ensure_headless_env`; `add_socket_auto` puts the socket in the
+    /// session dir, `socket_path` (built from `runtime_dir`) names a file
+    /// that does not exist, and the `exists` assertion fails. Restore.
+    #[test]
+    fn the_harness_owns_a_private_runtime_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let compositor = Compositor::spawn();
+        let dir = super::runtime_dir();
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some(std::process::id().to_string().as_str()),
+            "runtime dir is named by pid: {}",
+            dir.display()
+        );
+        assert_eq!(
+            dir.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("icedtea-harness"),
+            "runtime dir sits under icedtea-harness/: {}",
+            dir.display()
+        );
+        let mode = std::fs::metadata(dir)
+            .expect("runtime dir exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "runtime dir is private");
+        assert_eq!(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            Some(dir.as_os_str()),
+            "the process env points spawned apps at the private dir"
+        );
+        let socket = compositor.socket_path();
+        assert_eq!(
+            socket.parent(),
+            Some(dir),
+            "the socket lives in the private dir"
+        );
+        assert!(socket.exists(), "the socket exists at {}", socket.display());
+    }
 
     /// The axis request the interaction gate's scroll test needs; the harness
     /// injector had motion and buttons but no axis at all.
