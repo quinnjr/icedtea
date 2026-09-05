@@ -177,6 +177,33 @@ impl DropDownC {
     }
 }
 
+/// One embedded list row's height, in device-independent pixels.
+///
+/// Adwaita's `.menu` popover row: `min-height: 26px` plus the 4px vertical
+/// padding either side, hand-resolved the same way `ScrollbarC`'s and
+/// `ScaleC`'s intrinsic sizes are — the list rows are controller-owned
+/// subnodes taffy never measures.
+pub const DROP_DOWN_ROW_PX: f32 = 34.0;
+
+/// The tallest an embedded list may be. Beyond this it scrolls.
+///
+/// This was M3's flat height for *every* list (P7-D54); it is a ceiling now.
+/// A 240px list clips inside settings' 420px window, which also carries a
+/// stack switcher and two footers (M5 contract §2.8).
+pub const DROP_DOWN_MAX_PX: u32 = 240;
+
+/// The height an embedded list of `rows` items asks for: its content, capped
+/// at [`DROP_DOWN_MAX_PX`], never zero.
+#[must_use]
+pub fn drop_down_list_height(rows: usize) -> u32 {
+    let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+    // `rows * DROP_DOWN_ROW_PX` in f32 saturates gracefully for a huge model;
+    // the clamp is what makes the result meaningful either way.
+    let px = (rows as f32 * DROP_DOWN_ROW_PX).ceil();
+    let px = if px.is_finite() { px } else { f32::MAX };
+    px.clamp(1.0, DROP_DOWN_MAX_PX as f32) as u32
+}
+
 impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
     fn kind(&self) -> Kind {
         Kind::DropDown
@@ -347,7 +374,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
             } else {
                 self.popover.open(
                     PopupAnchorPoint::Node(self.button.clone()),
-                    (rect.width.max(1.0) as u32, 240),
+                    (
+                        rect.width.max(1.0) as u32,
+                        drop_down_list_height(self.filtered.len()),
+                    ),
                     // The list lives under this widget's own `popover`
                     // node in the parent tree; a popup surface would
                     // duplicate it (P7-D54). `PopoverC::open` reveals that
@@ -581,5 +611,31 @@ mod tests {
             cmds.is_empty(),
             "an embedded popover opens no compositor surface"
         );
+    }
+
+    /// M3's P7-D54 embedded the list at a flat 240px, which clips inside a
+    /// 420px-tall settings window that also carries a switcher and two
+    /// footers. The list is sized to its content and capped instead.
+    ///
+    /// Mutation check: return `DROP_DOWN_MAX_PX` unconditionally from
+    /// `drop_down_list_height`; the two-row and empty cases fail. Restore.
+    #[test]
+    fn a_drop_down_list_is_sized_to_its_content_and_capped() {
+        use super::{DROP_DOWN_MAX_PX, DROP_DOWN_ROW_PX, drop_down_list_height};
+
+        // An empty model still asks for a positive height — a zero-size popup
+        // is a protocol error, not an empty list.
+        assert_eq!(drop_down_list_height(0), 1);
+        // Two rows: 68px, not 240.
+        assert_eq!(drop_down_list_height(2), (2.0 * DROP_DOWN_ROW_PX) as u32);
+        assert!(drop_down_list_height(2) < DROP_DOWN_MAX_PX);
+        // Ten rows is over the cap and scrolls.
+        assert_eq!(drop_down_list_height(10), DROP_DOWN_MAX_PX);
+        assert_eq!(drop_down_list_height(4000), DROP_DOWN_MAX_PX);
+        // The exact boundary: the cap divided by the row height.
+        let exact = (f32::from(u16::try_from(DROP_DOWN_MAX_PX).unwrap()) / DROP_DOWN_ROW_PX).floor()
+            as usize;
+        assert!(drop_down_list_height(exact) <= DROP_DOWN_MAX_PX);
+        assert_eq!(drop_down_list_height(exact + 1), DROP_DOWN_MAX_PX);
     }
 }
