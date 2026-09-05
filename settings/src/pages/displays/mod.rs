@@ -10,6 +10,7 @@
 //! connection) come back on the toolkit's `App::on_fd` pump.
 
 pub mod canvas;
+pub mod controls;
 pub mod state;
 
 /// The Displays page.

@@ -242,6 +242,21 @@ pub enum Msg {
     HeadDragged(f64, f64),
     /// The pointer released over the canvas, at canvas-space `(x, y)`.
     HeadDragEnded(f64, f64),
+    /// The control panel's Enabled switch. Task 4 only needs the variant to
+    /// exist so `pages::displays::controls::view` can emit it; the arm that
+    /// writes `m.displays.edits[i].enabled` is a later task's.
+    HeadEnabledToggled(bool),
+    /// The control panel's Resolution dropdown, by index into
+    /// `DisplaysState::res_options`.
+    ResolutionSelected(usize),
+    /// The control panel's Refresh dropdown, by index into
+    /// `DisplaysState::refresh_options`.
+    RefreshSelected(usize),
+    /// The control panel's Scale spinner.
+    HeadScaleChanged(f64),
+    /// The control panel's Transform dropdown, by index into
+    /// `TRANSFORM_VALUES`.
+    TransformSelected(usize),
 }
 
 const _: fn() = || {
@@ -601,7 +616,7 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
         // --- Displays (P4) -----------------------------------------------
         Msg::HeadDragBegan(x, y) => {
             crate::pages::displays::canvas::drag_began(&mut m.displays, x, y);
-            // crate::pages::displays::controls::repopulate(&mut m.displays); // Task 4
+            crate::pages::displays::controls::repopulate(&mut m.displays);
             Cmd::None
         }
         Msg::HeadDragged(x, y) => {
@@ -612,6 +627,15 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             crate::pages::displays::canvas::drag_ended(&mut m.displays, x, y);
             Cmd::None
         }
+        // The arms that actually write into `m.displays.edits` are a later
+        // task's (contract §2.6); Task 4 only needs the variants to exist so
+        // `controls::view` can emit them (the same forward-reference pattern
+        // as the drag trio above, P4 Task 2).
+        Msg::HeadEnabledToggled(_) => Cmd::None,
+        Msg::ResolutionSelected(_) => Cmd::None,
+        Msg::RefreshSelected(_) => Cmd::None,
+        Msg::HeadScaleChanged(_) => Cmd::None,
+        Msg::TransformSelected(_) => Cmd::None,
         Msg::KeyCaptured { keysym, mods } => {
             // `false` means `combo_from_keysym` declined -- a lone modifier
             // press. Stay armed and wait for the real key (contract §2.7
@@ -678,7 +702,12 @@ fn clears_status(msg: &Msg) -> bool {
         | Msg::CaptureCancelled
         | Msg::HeadDragBegan(..)
         | Msg::HeadDragged(..)
-        | Msg::HeadDragEnded(..) => false,
+        | Msg::HeadDragEnded(..)
+        | Msg::HeadEnabledToggled(_)
+        | Msg::ResolutionSelected(_)
+        | Msg::RefreshSelected(_)
+        | Msg::HeadScaleChanged(_)
+        | Msg::TransformSelected(_) => false,
     }
 }
 
