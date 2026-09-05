@@ -4,7 +4,9 @@
 //! beside the Browse button is always live and always authoritative
 //! (contract §2.6) — this worker is a convenience, and every one of its
 //! failure modes is a single `Msg::WallpaperPickerFailed` the status line
-//! shows, never a panic and never a hang.
+//! shows, never a panic and never a hang — and a *cancel* is neither of those
+//! (amendment P2-D16): it answers `Msg::WallpaperPickerCancelled`, which says
+//! so in the status line and leaves the Browse button live.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -97,19 +99,42 @@ pub fn image_filters() -> Vec<(String, Vec<(u32, String)>)> {
     vec![("Images".to_string(), globs)]
 }
 
+/// What one `OpenFile` exchange ended as.
+///
+/// Three states, not two (fix wave, contract amendment P2-D16). Contract
+/// §2.6's `portal_available` latch was written for "the portal is
+/// unavailable", and pressing Escape in a file chooser that works perfectly
+/// is not that: folding a cancel into the failure path greyed Browse out for
+/// the rest of the session the first time a user changed their mind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortalOutcome {
+    /// The portal returned a local path this app can open.
+    Chosen(PathBuf),
+    /// The user dismissed the chooser. Nothing is wrong with the portal.
+    Cancelled,
+    /// The portal is absent, wedged, or answered with something unusable.
+    /// The message is what the status line shows.
+    Failed(String),
+}
+
 /// Turn one `org.freedesktop.portal.Request.Response` body into an outcome.
 ///
 /// `response` is `0` for success, `1` for "the user cancelled" and `2` for
 /// "ended some other way" (which is also what our own `Request.Close` on a
-/// timeout produces).
+/// timeout produces — a wedged portal, so a failure).
+#[must_use]
 pub fn response_to_outcome(
     response: u32,
     results: &HashMap<String, zbus::zvariant::OwnedValue>,
-) -> Result<PathBuf, String> {
+) -> PortalOutcome {
     match response {
         0 => {}
-        1 => return Err("Wallpaper selection cancelled".to_string()),
-        other => return Err(format!("The file portal ended the request (code {other})")),
+        1 => return PortalOutcome::Cancelled,
+        other => {
+            return PortalOutcome::Failed(format!(
+                "The file portal ended the request (code {other})"
+            ));
+        }
     }
     let uris = results
         .get("uris")
@@ -117,7 +142,14 @@ pub fn response_to_outcome(
         .unwrap_or_default();
     uris.iter()
         .find_map(|uri| decode_file_uri(uri))
-        .ok_or_else(|| "The file portal returned no file this app can open".to_string())
+        .map_or_else(
+            || {
+                PortalOutcome::Failed(
+                    "The file portal returned no file this app can open".to_string(),
+                )
+            },
+            PortalOutcome::Chosen,
+        )
 }
 
 /// What the loop asks the portal worker for.
@@ -137,8 +169,9 @@ pub const PORTAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// One worker thread serving `rx` until every sender is dropped.
 ///
 /// Per request: run the whole `OpenFile` exchange, then send exactly one of
-/// [`Msg::WallpaperChosen`] or [`Msg::WallpaperPickerFailed`]. A send error
-/// means the app exited, and the thread returns.
+/// [`Msg::WallpaperChosen`], [`Msg::WallpaperPickerCancelled`] (amendment
+/// P2-D16) or [`Msg::WallpaperPickerFailed`]. A send error means the app
+/// exited, and the thread returns.
 ///
 /// **Superseding.** A request found waiting behind another is the one the
 /// user meant: the worker drains everything already queued and serves only
@@ -146,23 +179,33 @@ pub const PORTAL_TIMEOUT: Duration = Duration::from_secs(300);
 pub fn spawn(
     rx: crossbeam_channel::Receiver<PortalRequest>,
     tx: InboxSender<Msg>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        while let Ok(first) = rx.recv() {
-            let mut request = first;
-            while let Ok(newer) = rx.try_recv() {
-                request = newer;
+) -> Option<std::thread::JoinHandle<()>> {
+    // Named, and `Builder::spawn` rather than `std::thread::spawn`: under
+    // thread exhaustion the latter panics, and §2.4 wants this to degrade.
+    // The caller keeps a live `Sender` either way; with no worker behind it a
+    // Browse click simply never answers, which the status line already covers,
+    // and the app boots.
+    std::thread::Builder::new()
+        .name("settings-portal".to_string())
+        .spawn(move || {
+            while let Ok(first) = rx.recv() {
+                let mut request = first;
+                while let Ok(newer) = rx.try_recv() {
+                    request = newer;
+                }
+                let PortalRequest::OpenFile { current } = request;
+                let msg = match open_file(current.as_deref()) {
+                    PortalOutcome::Chosen(path) => Msg::WallpaperChosen(path),
+                    PortalOutcome::Cancelled => Msg::WallpaperPickerCancelled,
+                    PortalOutcome::Failed(reason) => Msg::WallpaperPickerFailed(reason),
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
             }
-            let PortalRequest::OpenFile { current } = request;
-            let msg = match open_file(current.as_deref()) {
-                Ok(path) => Msg::WallpaperChosen(path),
-                Err(reason) => Msg::WallpaperPickerFailed(reason),
-            };
-            if tx.send(msg).is_err() {
-                return;
-            }
-        }
-    })
+        })
+        .map_err(|err| tracing::warn!(%err, "no file-portal worker thread"))
+        .ok()
 }
 
 /// The whole exchange, blocking, on the worker thread.
@@ -170,7 +213,15 @@ pub fn spawn(
 /// Subscribe first (the request path is derived, not read off the reply, so a
 /// fast answer cannot be missed), then call `OpenFile`, then wait for the
 /// `Response` signal on that path.
-fn open_file(current: Option<&std::path::Path>) -> Result<PathBuf, String> {
+fn open_file(current: Option<&std::path::Path>) -> PortalOutcome {
+    match open_file_inner(current) {
+        Ok(outcome) => outcome,
+        Err(reason) => PortalOutcome::Failed(reason),
+    }
+}
+
+/// The body of [`open_file`], written with `?` over the failure strings.
+fn open_file_inner(current: Option<&std::path::Path>) -> Result<PortalOutcome, String> {
     let conn = Connection::session()
         .map_err(|err| format!("No session bus for the file portal: {err}"))?;
     let unique = conn
@@ -189,7 +240,7 @@ fn open_file(current: Option<&std::path::Path>) -> Result<PathBuf, String> {
         .path(path.as_str())
         .map_err(|err| format!("Bad portal request path: {err}"))?
         .build();
-    let mut signals = MessageIterator::for_match_rule(rule, &conn, Some(4))
+    let signals = MessageIterator::for_match_rule(rule, &conn, Some(4))
         .map_err(|err| format!("Cannot listen for the portal's answer: {err}"))?;
 
     let mut options: HashMap<&str, Value<'_>> = HashMap::new();
@@ -230,47 +281,71 @@ fn open_file(current: Option<&std::path::Path>) -> Result<PathBuf, String> {
         return await_response_on(&conn, handle.as_str());
     }
 
-    await_response(&mut signals, &conn, &path)
+    Ok(await_response(signals, &conn, &path))
 }
 
 /// Wait on an already-open subscription.
-fn await_response(
-    signals: &mut MessageIterator,
-    conn: &Connection,
-    path: &str,
-) -> Result<PathBuf, String> {
-    let (done_tx, done_rx) = crossbeam_channel::bounded::<Result<PathBuf, String>>(1);
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
+///
+/// The signal reader runs on a **detached** thread, not inside a
+/// `std::thread::scope` (fix wave). A scope's implicit join is what made
+/// [`PORTAL_TIMEOUT`] decorative: on expiry this function called
+/// `Request.Close` and waited five more seconds, but then the scope still
+/// blocked until the reader returned — and the reader is parked in
+/// `MessageIterator::next()`. A portal wedged badly enough not to answer its
+/// own `Close` (exactly the case the timeout exists for) therefore hung
+/// `open_file` for the process's lifetime, so [`spawn`]'s `rx.recv()` loop
+/// never ran again and every later Browse click vanished with no `Msg` at
+/// all: no status line, and a Browse button still sensitive because only a
+/// `WallpaperPickerFailed` clears that latch and none could be sent.
+///
+/// Detached, this function always returns within `PORTAL_TIMEOUT + 5s`. The
+/// reader may outlive it; the channel is `bounded(1)`, so its send never
+/// blocks and it exits the moment the connection produces anything at all,
+/// and it holds nothing the loop thread needs.
+///
+/// `signals` is taken by value because that is what detaching requires.
+fn await_response(signals: MessageIterator, conn: &Connection, path: &str) -> PortalOutcome {
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<PortalOutcome>(1);
+    let reader = std::thread::Builder::new()
+        .name("settings-portal-reply".to_string())
+        .spawn(move || {
+            let mut signals = signals;
             for message in signals.by_ref() {
                 let Ok(message) = message else { continue };
                 let body = message.body();
                 let outcome = match body.deserialize::<(u32, HashMap<String, OwnedValue>)>() {
                     Ok((response, results)) => response_to_outcome(response, &results),
-                    Err(err) => Err(format!("Unreadable portal answer: {err}")),
+                    Err(err) => PortalOutcome::Failed(format!("Unreadable portal answer: {err}")),
                 };
                 let _ = done_tx.send(outcome);
                 return;
             }
-            let _ = done_tx.send(Err("The file portal closed its connection".to_string()));
+            let _ = done_tx.send(PortalOutcome::Failed(
+                "The file portal closed its connection".to_string(),
+            ));
         });
-        match done_rx.recv_timeout(PORTAL_TIMEOUT) {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                // Close the request so the portal answers and the reader
-                // thread this scope is waiting on can finish.
-                let _ = conn.call_method(Some(PORTAL_BUS), path, Some(REQUEST_IFACE), "Close", &());
-                done_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap_or_else(|_| Err("The file portal did not answer".to_string()))
-            }
+    // Same degradation as `spawn`'s own: no reader thread is a failed pick,
+    // never a panic.
+    if let Err(err) = reader {
+        return PortalOutcome::Failed(format!("Cannot wait for the file portal's answer: {err}"));
+    }
+    match done_rx.recv_timeout(PORTAL_TIMEOUT) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            // Close the request so a merely slow portal still answers.
+            let _ = conn.call_method(Some(PORTAL_BUS), path, Some(REQUEST_IFACE), "Close", &());
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or(PortalOutcome::Failed(
+                    "The file portal did not answer".to_string(),
+                ))
         }
-    })
+    }
 }
 
 /// The same wait, but subscribing after the fact — only reached when a portal
 /// ignores `handle_token` and hands back a path of its own choosing.
-fn await_response_on(conn: &Connection, path: &str) -> Result<PathBuf, String> {
+fn await_response_on(conn: &Connection, path: &str) -> Result<PortalOutcome, String> {
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface(REQUEST_IFACE)
@@ -280,9 +355,9 @@ fn await_response_on(conn: &Connection, path: &str) -> Result<PathBuf, String> {
         .path(path)
         .map_err(|err| format!("Bad portal request path: {err}"))?
         .build();
-    let mut signals = MessageIterator::for_match_rule(rule, conn, Some(4))
+    let signals = MessageIterator::for_match_rule(rule, conn, Some(4))
         .map_err(|err| format!("Cannot listen for the portal's answer: {err}"))?;
-    await_response(&mut signals, conn, path)
+    Ok(await_response(signals, conn, path))
 }
 
 #[cfg(test)]
@@ -336,21 +411,37 @@ mod tests {
         );
     }
 
+    fn failure(outcome: PortalOutcome) -> String {
+        match outcome {
+            PortalOutcome::Failed(reason) => reason,
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// A cancel is its own outcome, not a failure.
+    ///
+    /// Mutation check: map `1` to `PortalOutcome::Failed` (what this code did
+    /// before amendment P2-D16) and the first assertion fails. Restore.
     #[test]
-    fn a_cancelled_response_is_a_failure_message_not_a_path() {
-        let err = response_to_outcome(1, &results(vec![])).expect_err("cancelled");
-        assert!(err.contains("cancelled"), "{err:?}");
-        let err = response_to_outcome(2, &results(vec![])).expect_err("ended");
+    fn a_cancelled_response_is_its_own_outcome_and_a_closed_request_is_a_failure() {
+        assert_eq!(
+            response_to_outcome(1, &results(vec![])),
+            PortalOutcome::Cancelled,
+            "pressing Escape in a working chooser must not latch Browse off"
+        );
+        let err = failure(response_to_outcome(2, &results(vec![])));
         assert!(!err.is_empty());
     }
 
     #[test]
     fn an_empty_or_missing_uri_list_is_a_failure_message() {
-        let err = response_to_outcome(0, &results(vec![])).expect_err("no uris key");
+        let err = failure(response_to_outcome(0, &results(vec![])));
         assert!(err.contains("no file"), "{err:?}");
         let empty: Vec<String> = Vec::new();
-        let err = response_to_outcome(0, &results(vec![("uris", Value::from(empty))]))
-            .expect_err("empty uris");
+        let err = failure(response_to_outcome(
+            0,
+            &results(vec![("uris", Value::from(empty))]),
+        ));
         assert!(err.contains("no file"), "{err:?}");
     }
 
@@ -358,8 +449,8 @@ mod tests {
     fn the_first_local_uri_wins() {
         let uris = vec!["file:///tmp/one.png".to_string()];
         assert_eq!(
-            response_to_outcome(0, &results(vec![("uris", Value::from(uris))])).expect("a path"),
-            PathBuf::from("/tmp/one.png")
+            response_to_outcome(0, &results(vec![("uris", Value::from(uris))])),
+            PortalOutcome::Chosen(PathBuf::from("/tmp/one.png"))
         );
     }
 

@@ -40,7 +40,7 @@ fn a_missing_session_bus_answers_with_a_picker_failure() {
 
     let (inbox, tx) = Inbox::<Msg>::new().expect("inbox");
     let (req_tx, req_rx) = crossbeam_channel::unbounded();
-    let worker = portal::spawn(req_rx, tx);
+    let worker = portal::spawn(req_rx, tx).expect("the portal worker thread starts");
 
     req_tx
         .send(PortalRequest::OpenFile { current: None })
@@ -82,7 +82,7 @@ fn a_request_queued_behind_another_supersedes_it() {
             current: Some(PathBuf::from("/tmp")),
         })
         .expect("second");
-    let worker = portal::spawn(req_rx, tx);
+    let worker = portal::spawn(req_rx, tx).expect("the portal worker thread starts");
 
     let first = wait_for_answer(&inbox);
     assert!(matches!(first, Msg::WallpaperPickerFailed(_)));
