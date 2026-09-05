@@ -3045,3 +3045,107 @@ table, whose column is read as "frozen-crate files" rather than strictly
 `ui/` files for this row.
 
 ---
+
+### P2-D21 — the P0–P2 review fix wave
+
+**Carried out by:** the fix wave over `/code-review max`'s P0–P2 findings
+(15 reported, 8 cut, all ruled fixed by the owner). **Added:** 2026-09-05.
+**Supersedes:** §6 E6's "`ui/` is frozen for P1–P6" for the toolkit half,
+on the same grounds P3-D8/P3-D9/P3-D10 were granted: each is a `ui/` defect
+with no fix available inside a settings page.
+
+**Toolkit (`ui/`).**
+
+* **Focus is pruned out of a hidden subtree.** `FocusRing` recorded an owner
+  and nothing checked the owner was still displayed, so keystrokes went on
+  landing in an invisible `Entry` on a `Stack` page the user had left.
+  `view::app::route` now clears the focus when its owner (or any ancestor)
+  is `display: none`, centrally rather than in each widget that hides one;
+  the new `view::app::is_hidden` is public for the same reason
+  `probe_points_of` is. Announced as an ordinary `FocusOut` by the
+  `sync_focus` that already ends every routed event.
+* **Capture and bubble localise the pointer point per node.** `deliver`
+  handed every node on the path the same `Event`, whose `local` is relative
+  to the node the event was *aimed* at; each node is now handed the point in
+  its own border-box frame. `ButtonC`'s release-inside check and every
+  `on_pointer_*` handler on an ancestor were reading a child's coordinates.
+* **`StackC`.** `StackTransition::None` is an instant swap (no armed 200 ms
+  transition leaving the outgoing page displayed), and every page is pinned
+  into the stack's single grid cell, as `overlay`'s `ONE_CELL` already does,
+  so no page can auto-flow into an implicit row and be laid out — and
+  hit-tested — over its sibling. `EventKind::Change` still fires, one tick
+  later, through a per-switch `active_ms` of `0`.
+* **`ColorDialogC::on_event`** hit-tests the `grid()` geometry `paint` and
+  `measure` share, not the `colorswatch` subnodes the real render loop sizes
+  0x0. A click on a painted swatch fired nothing at all before this.
+* **A `Duration::ZERO` wait polls once.** `wait_bounded` returned `Timeout`
+  before the poll set was built, so neither the Wayland socket nor a watched
+  fd was read; one controller reporting a zero deadline starved the loop.
+  `GridViewC::next_deadline` is now `dirty || kinetic_active`, `ListViewC`'s
+  own rule.
+* **Probe reporting.** `write_probe_report` commits its dedup cache only
+  after the write lands (a failed open used to drop those lines forever),
+  and `probe_points_of` / the `alloc` lines skip `display: none` subtrees:
+  a gate cannot aim a pointer at a hidden page's widget.
+* **`Window::open_at_path`** is new: a test reaches its own compositor by
+  socket path instead of an `unsafe set_var("WAYLAND_DISPLAY")` every other
+  test in the binary can see. `Inbox`'s stale `allow(dead_code)` is gone,
+  and `builders`' setter-coverage test covers every `EventKind` again rather
+  than the first eighteen.
+
+**Settings (`settings/`).**
+
+* **`Msg::Applied` carries the snapshot the worker wrote**
+  (`{ shipped: Arc<Config>, result }`) and `saved` is re-baselined from it.
+  An edit folded while the asynchronous apply was in flight used to be
+  marked saved without ever reaching disk.
+* **A third worker, `ipc::fs`.** `update` no longer calls `std::fs::metadata`
+  per keystroke or opens `redb` inside the fold (spec D8): wallpaper
+  validation and Revert's re-read leave through `Cmd::Task` and come back as
+  `Msg::WallpaperValidated` / `Msg::ConfigLoaded`. A validation answer for
+  text the field no longer holds is discarded.
+* **`ipc::spawn` returns `Workers`**, which keeps the join handles;
+  `main` calls `Workers::shutdown` after `App::run`, so closing the window
+  right after Apply waits (bounded, `SHUTDOWN_TIMEOUT`) for the write
+  instead of exiting under it. Both request enums gained a `Shutdown`
+  variant, and `WorkerHandles` reports whether a worker really started —
+  a spawn that degraded left Apply and Browse silently dead.
+* **`footer_text` gives the status priority** over the standing dirty hint
+  until the user's next edit; "Failed to save: …" (which deliberately keeps
+  the model dirty), "Applying…" and the picker's own lines were otherwise
+  unreadable, in the window and in the probe report alike.
+* **`nav()` passes `.selected(m.page.index())`**, so opening on a
+  non-default page does not check "Appearance" — and clicking the lit button
+  is no longer swallowed by `StackSwitcherC`'s `index == self.selected`.
+* **`browse_in_flight`** latches Browse while a chooser is open, the same
+  shape `displays_in_flight` already had.
+* **The picker offers icedtea's own defaults** (`#1e1e2e`, `#cdd6f4`,
+  `#89b4fa`) on the first row, deduplicated against GTK's palette: without
+  them a changed colour had no way back from inside the app, which has no
+  hex entry. `pages::appearance::picker_palette` is what the gate reads.
+* **`validate_wallpaper` absolutises** (and canonicalises where it can): a
+  relative path validated against settings' working directory and was then
+  resolved against the compositor's, where it silently never loaded.
+* **The portal worker is bounded and leaks nothing.** The connect runs on a
+  helper thread with `PORTAL_CONNECT_TIMEOUT`, the connection carries a
+  zbus `method_timeout`, and a timed-out request closes its connection —
+  which releases the reader thread, the connection and the match rule. One
+  subscription by interface+member, opened before `OpenFile`, covers a
+  portal that ignores `handle_token` too, so the post-hoc re-subscribe (and
+  its race) is gone. `portal::spawn_on_bus` takes the bus address per
+  connection, so no test writes `DBUS_SESSION_BUS_ADDRESS`.
+
+**Tests.** `ipc`'s worker unit test no longer calls the real `ipc::spawn`
+(which subscribed to the developer's *live* session bus and blocking-called
+`ReloadConfig` on whatever owned `org.icedtea.Compositor` there);
+`handles_for_test` gained the filesystem receiver and `test_model` is built
+on it. `settings/tests/support::open_test_window` uses
+`Window::open_at_path`, and every spawned child is handed
+`XDG_RUNTIME_DIR=icedtea_harness::runtime_dir()`.
+`ui/tests/support::wait_for_probe_window` polls the compositor's model
+instead of reading it once straight after the probe's `configure` line — the
+window is not mapped yet at that point, which failed three `window_events`
+tests roughly one parallel run in three.
+
+**Ruling.** Accepted. Every item is a defect fix with a covering,
+mutation-checked test; no gate's assertion was weakened.
