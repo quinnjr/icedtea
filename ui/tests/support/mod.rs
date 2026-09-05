@@ -104,6 +104,7 @@ pub fn spawn_themed_button(socket: &str, label: &str, classes: &str) -> Reaper {
     Reaper(
         themed_button(label, classes)
             .env("WAYLAND_DISPLAY", socket)
+            .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
             .spawn()
             .expect("failed to spawn themed-button"),
     )
@@ -127,6 +128,7 @@ pub fn spawn_themed_button_with_theme(
     Reaper(
         Command::new(env!("CARGO_BIN_EXE_themed-button"))
             .env("WAYLAND_DISPLAY", socket)
+            .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
             .env("ICEDTEA_UI_THEME", theme)
             .env("ICEDTEA_UI_LABEL", label)
             .env("ICEDTEA_UI_CLASSES", classes)
@@ -211,6 +213,7 @@ pub fn spawn_window_probe(
     Reaper(
         Command::new(env!("CARGO_BIN_EXE_window-probe"))
             .env("WAYLAND_DISPLAY", socket)
+            .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
             .env("ICEDTEA_UI_THEME", theme)
             .env("ICEDTEA_PROBE_MODE", mode)
             .env("ICEDTEA_PROBE_REPORT", report)
@@ -549,6 +552,7 @@ impl Drop for GalleryProc {
 fn spawn_gallery_command(mut command: Command, socket: &str) -> GalleryProc {
     let mut child = command
         .env("WAYLAND_DISPLAY", socket)
+        .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
