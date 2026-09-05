@@ -10,6 +10,14 @@
 //! actions that page shows.
 
 use icedtea_config::Config;
+use icedtea_ui::layout::Align;
+use icedtea_ui::view::View;
+use icedtea_ui::view::builders::{BoxExt, box_, list_box, list_box_row};
+use icedtea_ui::widgets::Orientation;
+use icedtea_ui::widgets::button::button;
+use icedtea_ui::widgets::entry::entry;
+
+use crate::app::{Msg, SettingsModel};
 
 /// Whether the Remove buttons are sensitive: never at the last row.
 #[must_use]
@@ -45,17 +53,54 @@ pub fn remove_workspace(cfg: &mut Config, index: usize) {
     prune_orphaned_workspace_bindings(cfg);
 }
 
-/// The Workspaces page.
+/// The Workspaces page body.
 ///
-/// P1 ships the page's frame only; P3 fills it in (contract §2.6).
+/// Pure: it reads `m.model.working.workspace_names` and nothing else, and it
+/// never writes. Every row is keyed by its index so a rename diffs the
+/// `Entry`'s text rather than rebuilding the widget and losing the caret
+/// (contract §2.3).
 #[must_use]
-pub fn view(m: &crate::app::SettingsModel) -> icedtea_ui::view::View<crate::app::Msg> {
-    let _ = m;
-    icedtea_ui::view::builders::box_(
-        icedtea_ui::widgets::types::Orientation::Vertical,
-        [icedtea_ui::view::builders::label("Workspaces")],
+pub fn view(m: &SettingsModel) -> View<Msg> {
+    let removable = can_remove(&m.model.working);
+    let rows: Vec<View<Msg>> = m
+        .model
+        .working
+        .workspace_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            list_box_row(
+                box_(
+                    Orientation::Horizontal,
+                    [
+                        entry(name)
+                            .id(&format!("ws_name_{i}"))
+                            .hexpand(true)
+                            .on_change(move |text| Msg::WorkspaceRenamed(i, text.to_string())),
+                        button("Remove")
+                            .id(&format!("ws_remove_{i}"))
+                            .sensitive(removable)
+                            .on_click(Msg::WorkspaceRemoved(i)),
+                    ],
+                )
+                .spacing(8),
+            )
+            .key(i)
+            .id(&format!("ws_row_{i}"))
+        })
+        .collect();
+
+    box_(
+        Orientation::Vertical,
+        [
+            list_box(rows).id("workspaces_list").vexpand(true),
+            button("Add workspace")
+                .id("workspaces_add")
+                .halign(Align::Start)
+                .on_click(Msg::WorkspaceAdded),
+        ],
     )
-    .id("workspaces_page")
+    .spacing(8)
     .margin(16, 16, 16, 16)
 }
 
@@ -358,5 +403,141 @@ mod tests {
         let mut cfg = icedtea_config::default_config();
         prune(&mut cfg);
         assert!(!cfg.workspace_names.is_empty());
+    }
+
+    use icedtea_ui::view::{EventKind, Kind, PropName};
+
+    /// A `SettingsModel` whose working config has `names` as its workspaces
+    /// and nothing else disturbed. Built through the same `SettingsModel::
+    /// new` the binary uses, so the view under test sees a real model.
+    fn model_with(names: &[&str]) -> crate::app::SettingsModel {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.redb");
+        let (workers, _rx, _portal_rx) = crate::ipc::handles_for_test();
+        let mut m = crate::app::SettingsModel::new(db_path, workers);
+        m.model.working.workspace_names = names.iter().map(|s| (*s).to_string()).collect();
+        m
+    }
+
+    /// The id/key/handler contract the gates and the reconciler depend on:
+    /// one keyed row per workspace, each with its own ids, and the row's
+    /// Entry emitting `WorkspaceRenamed` with *its own* index.
+    ///
+    /// Mutation check: drop `.key(i)` from the row; `keys_are_the_row_index`
+    /// below fails. Drop the `move |s|` capture of `i` and hard-code `0`;
+    /// this test fails on the second row. Restore both.
+    #[test]
+    fn each_workspace_row_carries_its_own_ids_and_index() {
+        let m = model_with(&["alpha", "beta"]);
+        let page = view(&m);
+        let list = &page.children[0];
+        assert_eq!(list.kind, Kind::ListBox);
+        assert_eq!(list.props.str(PropName::Id), Some("workspaces_list"));
+        assert_eq!(list.children.len(), 2, "one row per workspace name");
+
+        for (i, expected) in ["alpha", "beta"].iter().enumerate() {
+            let row = &list.children[i];
+            assert_eq!(row.kind, Kind::ListBoxRow);
+            assert_eq!(
+                row.props.str(PropName::Id),
+                Some(format!("ws_row_{i}").as_str())
+            );
+            let row_box = &row.children[0];
+            let name = &row_box.children[0];
+            assert_eq!(name.kind, Kind::Entry);
+            assert_eq!(
+                name.props.str(PropName::Id),
+                Some(format!("ws_name_{i}").as_str())
+            );
+            assert_eq!(name.props.str(PropName::Text), Some(*expected));
+
+            let renamed = name
+                .handlers
+                .fire_text(EventKind::Change, "typed")
+                .expect("the name Entry emits a Change message");
+            assert!(
+                matches!(&renamed, Msg::WorkspaceRenamed(index, text) if *index == i && text == "typed"),
+                "row {i} emitted {renamed:?}"
+            );
+
+            let remove = &row_box.children[1];
+            assert_eq!(
+                remove.props.str(PropName::Id),
+                Some(format!("ws_remove_{i}").as_str())
+            );
+            let removed = remove
+                .handlers
+                .fire_unit(EventKind::Click)
+                .expect("Remove emits a Click message");
+            assert!(
+                matches!(&removed, Msg::WorkspaceRemoved(index) if *index == i),
+                "row {i} Remove emitted {removed:?}"
+            );
+        }
+    }
+
+    /// Keyed by row index, so a rename diffs the Entry's text in place
+    /// instead of rebuilding the widget and dropping the caret.
+    ///
+    /// Mutation check: remove `.key(i)`; this fails with `None`. Restore.
+    #[test]
+    fn workspace_rows_are_keyed_by_index() {
+        let m = model_with(&["alpha", "beta", "gamma"]);
+        let page = view(&m);
+        let keys: Vec<_> = page.children[0]
+            .children
+            .iter()
+            .map(|row| row.key.clone())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                Some(icedtea_ui::view::Key::Index(0)),
+                Some(icedtea_ui::view::Key::Index(1)),
+                Some(icedtea_ui::view::Key::Index(2)),
+            ]
+        );
+    }
+
+    /// Remove is insensitive at the last row -- the computed form of the GTK
+    /// `set_remove_sensitivity` call.
+    ///
+    /// Mutation check: pass `true` instead of `can_remove(..)`; this fails.
+    /// Restore.
+    #[test]
+    fn the_last_workspaces_remove_button_is_insensitive() {
+        let one = model_with(&["only"]);
+        let page = view(&one);
+        let remove = &page.children[0].children[0].children[0].children[1];
+        assert_eq!(
+            remove.props.get(PropName::Sensitive),
+            Some(&icedtea_ui::view::Prop::Bool(false))
+        );
+
+        let two = model_with(&["one", "two"]);
+        let page = view(&two);
+        for row in &page.children[0].children {
+            let remove = &row.children[0].children[1];
+            assert_eq!(
+                remove.props.get(PropName::Sensitive),
+                Some(&icedtea_ui::view::Prop::Bool(true))
+            );
+        }
+    }
+
+    /// Add is the page's second child and emits `WorkspaceAdded`.
+    ///
+    /// Mutation check: change the message to `Msg::WorkspaceRemoved(0)`;
+    /// this fails. Restore.
+    #[test]
+    fn the_add_button_emits_workspace_added() {
+        let m = model_with(&["alpha"]);
+        let page = view(&m);
+        let add = &page.children[1];
+        assert_eq!(add.props.str(PropName::Id), Some("workspaces_add"));
+        assert!(matches!(
+            add.handlers.fire_unit(EventKind::Click),
+            Some(Msg::WorkspaceAdded)
+        ));
     }
 }

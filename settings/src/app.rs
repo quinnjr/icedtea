@@ -174,6 +174,14 @@ pub enum Msg {
     WallpaperPickerCancelled,
     /// The field's clear control.
     WallpaperCleared,
+
+    // --- Workspaces (P3) --------------------------------------------------
+    /// A workspace `Entry` changed, by row index.
+    WorkspaceRenamed(usize, String),
+    /// The Workspaces page's Add button.
+    WorkspaceAdded,
+    /// A row's Remove button, by row index.
+    WorkspaceRemoved(usize),
 }
 
 const _: fn() = || {
@@ -450,6 +458,18 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
         // a portal that is not there.
         Msg::WallpaperPickerCancelled => {
             m.status = "Wallpaper selection cancelled".to_string();
+            Cmd::None
+        }
+        Msg::WorkspaceRenamed(index, text) => {
+            pages::workspaces::rename_workspace(&mut m.model.working, index, &text);
+            Cmd::None
+        }
+        Msg::WorkspaceAdded => {
+            pages::workspaces::add_workspace(&mut m.model.working);
+            Cmd::None
+        }
+        Msg::WorkspaceRemoved(index) => {
+            pages::workspaces::remove_workspace(&mut m.model.working, index);
             Cmd::None
         }
     };
