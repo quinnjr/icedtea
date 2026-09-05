@@ -3092,6 +3092,14 @@ with no fix available inside a settings page.
   test in the binary can see. `Inbox`'s stale `allow(dead_code)` is gone,
   and `builders`' setter-coverage test covers every `EventKind` again rather
   than the first eighteen.
+* **A stack page's `ChildLayout` is the stack's, not the page's.**
+  `StackC::pin` writes `halign`/`valign` `Fill` with both expands on, beside
+  the one-cell grid placement, so a page fills the cell the way `GtkStack`'s
+  does. This *overrides* whatever alignment or expansion a page declared for
+  itself — the same trade `overlay::classify_overlay_child` already makes for
+  an overlay's main child, and the reason the pin is worth it: an unpinned
+  page auto-flows out of the cell entirely. A caller that wants a page's
+  content aligned puts the alignment on a child of the page, not on the page.
 
 **Settings (`settings/`).**
 
@@ -3126,6 +3134,11 @@ with no fix available inside a settings page.
 * **`validate_wallpaper` absolutises** (and canonicalises where it can): a
   relative path validated against settings' working directory and was then
   resolved against the compositor's, where it silently never loaded.
+* **`OutputsPump::attach_at_path`** is new public API: `attach`'s
+  `connect_to_env` was the second reader of the process-global
+  `$WAYLAND_DISPLAY` a test had to rewrite, and a pump-shaped door onto
+  `OutputsConnection::connect_to_path` is what closes it. `attach` itself is
+  unchanged, and `main` still uses it.
 * **The portal worker is bounded and leaks nothing.** The connect runs on a
   helper thread with `PORTAL_CONNECT_TIMEOUT`, the connection carries a
   zbus `method_timeout`, and a timed-out request closes its connection —
