@@ -13,12 +13,6 @@ use std::sync::Arc;
 use crossbeam_channel::{Receiver, Sender};
 
 /// The receiving half: what an [`App`](crate::view::App) drains once per frame.
-///
-/// `rx`, `read`, `watch_fd`, `drain_pipe` and `drain_into` have no caller
-/// until `App::with_inbox` wires this into the frame loop (M5-D2's other
-/// half, a later task in this part) — `allow(dead_code)` on them is
-/// temporary scaffolding, not a standing exception.
-#[allow(dead_code)]
 pub struct Inbox<Msg> {
     rx: Receiver<Msg>,
     tx: Sender<Msg>,

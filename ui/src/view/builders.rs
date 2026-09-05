@@ -1309,12 +1309,11 @@ mod tests {
             18,
             "two setters bound the same EventKind: {bound:?}"
         );
-        let eighteen: Vec<EventKind> = EventKind::ALL[..18].to_vec();
-        assert_eq!(sorted, eighteen);
 
         // M5-D5: each pointer kind has two setters -- a `Pair` builder and a
         // `_with_button` `PairButton` builder -- and both bind that kind
         // alone.
+        let mut pointer_bound: Vec<EventKind> = Vec::new();
         for (plain, with_button, kind) in [
             (
                 widget::<Msg>(Kind::Box).on_pointer_down(|_x, _y| Msg::Clicked),
@@ -1336,7 +1335,21 @@ mod tests {
             assert_eq!(with_button.handlers.len(), 1);
             assert!(plain.handlers.has(kind));
             assert!(with_button.handlers.has(kind));
+            pointer_bound.push(kind);
         }
+
+        // The breadth this test exists for: *every* `EventKind` has a setter,
+        // not merely the first eighteen. Narrowed to `EventKind::ALL[..18]`
+        // when the pointer kinds were appended, which left a kind added after
+        // them coverable by nothing at all.
+        sorted.extend(pointer_bound);
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted,
+            EventKind::ALL.to_vec(),
+            "an EventKind with no builder setter"
+        );
     }
 
     #[test]

@@ -87,6 +87,14 @@ pub struct GridViewC {
     press_origin: Option<(f32, f32)>,
     /// The pool slot, if any, the press landed on.
     press_hit: Option<usize>,
+    /// Something changed this frame the screen has not caught up with -- the
+    /// pool grew, the metrics moved, the offset moved -- so one more frame is
+    /// owed. See [`Controller::next_deadline`]'s impl below, and
+    /// `list_view::ListViewC`'s own pair of flags.
+    dirty: bool,
+    /// Whether a flick is still coasting, mirrored out of `kinetic` (which
+    /// keeps that flag private).
+    kinetic_active: bool,
     universal: Universal,
 }
 
@@ -132,6 +140,8 @@ impl GridViewC {
         if self.cell.1 <= 0.0 || !self.cell.1.is_finite() {
             return;
         }
+        // The pool is about to grow, shrink or rebind: one more frame is owed.
+        self.dirty = true;
         self.columns = self.columns_for(viewport.0).max(1);
         self.rewrite_grid();
         let range = self.visible_range(viewport);
@@ -350,6 +360,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for GridViewC {
             rubberband_enabled: props.bool(PropName::EnableRubberband, false),
             press_origin: None,
             press_hit: None,
+            dirty: true,
+            kinetic_active: false,
             universal: Universal::new(node, Kind::GridView),
         };
         me.rewrite_grid();
@@ -549,17 +561,30 @@ impl<Msg: Clone + 'static> Controller<Msg> for GridViewC {
     }
 
     fn tick(&mut self, now: Duration, _cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
+        // Cleared *before* the work, as `ListViewC::tick` does: this frame is
+        // the one that pays off whatever the last owed, and a coasting flick
+        // (through `rebind`) sets it again when it really changes something.
+        self.dirty = false;
         if let Some(delta) = self.kinetic.sample(now) {
             let viewport = self.viewport;
             self.offset = (self.offset + delta.1).clamp(0.0, self.max_offset(viewport.1));
             self.rebind(viewport);
+            self.kinetic_active = true;
+        } else {
+            self.kinetic_active = false;
         }
         Vec::new()
     }
 
     fn next_deadline(&self, now: Duration) -> Option<Duration> {
         let _ = now;
-        Some(Duration::ZERO)
+        // Frames are asked for only while something is actually owed --
+        // `ListViewC::next_deadline`'s own rule, and for its own reason: an
+        // unconditional `Some(Duration::ZERO)` is read by `App::run` as
+        // "render again immediately", so one `GridView` anywhere in the tree
+        // pinned the loop at a full repaint per iteration forever and starved
+        // the input it was supposed to be showing.
+        (self.dirty || self.kinetic_active).then_some(Duration::ZERO)
     }
 }
 
@@ -606,6 +631,36 @@ mod tests {
             ids,
             GridViewC::pool_ids(c.as_ref()),
             "cells were rebound, not rebuilt"
+        );
+    }
+
+    /// A settled grid view owes no frame, so it cannot pin `App::run`'s wait
+    /// at zero and starve the input the loop is there to deliver.
+    ///
+    /// Mutation check: return `Some(Duration::ZERO)` unconditionally again
+    /// (what this controller did) and the last assertion fails. Restore.
+    #[test]
+    fn a_settled_grid_view_asks_for_no_more_frames() {
+        use std::time::Duration;
+
+        use crate::widgets::Headless;
+
+        let built = build_widget::<()>(Kind::GridView, &crate::widgets::list_view::tests::props(8));
+        let mut c = built.controller;
+        GridViewC::set_metrics(c.as_mut(), (100.0, 80.0), (400.0, 320.0));
+        assert_eq!(
+            c.next_deadline(Duration::ZERO),
+            Some(Duration::ZERO),
+            "a pool that has just been rebound owes one frame"
+        );
+
+        let mut hx = Headless::new();
+        let mut cx = hx.event_cx(&built.node);
+        c.tick(Duration::from_millis(16), &mut cx);
+        assert_eq!(
+            c.next_deadline(Duration::from_millis(16)),
+            None,
+            "and nothing after it, with no flick coasting"
         );
     }
 }

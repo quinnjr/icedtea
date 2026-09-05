@@ -31,7 +31,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::css::node::Node;
-use crate::layout::Container;
+use crate::layout::{Align, ChildLayout, Container, GridPlacement};
 use crate::view::{BuildCx, Controller, Event, EventCx, EventKind, Kind, Prop, PropName, Props};
 use crate::widgets::types::{StackPageInfo, StackTransition};
 use crate::widgets::{Universal, prop_i64, prop_str, prop_u16, props_of, set_container};
@@ -62,6 +62,37 @@ fn set_visible(node: &Node, visible: bool) {
         node.add_class("hidden");
     }
     crate::widgets::set_displayed(node, visible);
+}
+
+/// The single cell every page is pinned into -- `overlay::ONE_CELL`'s own
+/// constant, for the same reason.
+///
+/// `build` gives the stack a `Container::Grid { columns: 1, rows: 1 }`, and a
+/// child with no explicit placement auto-flows: for the 200 ms of a
+/// transition *two* pages are displayed at once, so the outgoing one landed in
+/// an implicit second row and was laid out (and hit-tested, ahead of the
+/// incoming page under `window::pointer::descend`'s reverse walk) below it.
+/// Pinned, no implicit row can ever appear however many pages are displayed.
+const ONE_CELL: GridPlacement = GridPlacement {
+    column: 0,
+    row: 0,
+    column_span: 1,
+    row_span: 1,
+};
+
+/// Pin `node` into the stack's one grid cell, filling it.
+fn pin(node: &Node) {
+    crate::widgets::set_child_layout(
+        node,
+        ChildLayout {
+            halign: Align::Fill,
+            valign: Align::Fill,
+            hexpand: true,
+            vexpand: true,
+            grid: Some(ONE_CELL),
+            ..ChildLayout::default()
+        },
+    );
 }
 
 /// One page's identity and node.
@@ -98,6 +129,11 @@ pub struct StackC {
     pub transition: StackTransition,
     /// Its duration.
     pub duration_ms: u32,
+    /// The duration of the switch actually in flight: `duration_ms` for an
+    /// animated one, `0` for a `StackTransition::None` swap, which finishes on
+    /// the next tick (so `EventKind::Change` still fires) without ever
+    /// displaying two pages at once.
+    active_ms: u32,
     /// Every page. A `RefCell`, not a plain `Vec` -- see the module doc.
     pub pages: RefCell<Vec<StackPageState>>,
     started: Option<Duration>,
@@ -136,6 +172,7 @@ impl StackC {
         let visible = self.visible.get().min(pages.len() - 1);
         self.visible.set(visible);
         for (i, page) in pages.iter().enumerate() {
+            pin(&page.node);
             set_visible(&page.node, i == visible || Some(i) == self.outgoing);
         }
         *self.pages.borrow_mut() = pages;
@@ -181,7 +218,13 @@ impl StackC {
         if index == self.visible.get() {
             return false;
         }
-        self.outgoing = Some(self.visible.get());
+        // `StackTransition::None` is an instant swap, not a 200 ms one with
+        // nothing drawn: arming the timer regardless left the page the user
+        // just left displayed (and laid out, and hit-tested) for the whole
+        // duration, which is what `GtkStack` does not do.
+        let animated = self.transition != StackTransition::None && self.duration_ms > 0;
+        self.outgoing = animated.then(|| self.visible.get());
+        self.active_ms = if animated { self.duration_ms } else { 0 };
         self.visible.set(index);
         self.progress = 0.0;
         self.started = Some(now);
@@ -217,6 +260,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for StackC {
         // `node` before this ran.
         let pages: Vec<StackPageState> = node.children().iter().map(page_state_from).collect();
         for (i, page) in pages.iter().enumerate() {
+            pin(&page.node);
             set_visible(&page.node, i == 0);
         }
         let mut me = Self {
@@ -232,6 +276,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for StackC {
                     .clamp(0, 10_000),
             )
             .unwrap_or(200),
+            active_ms: 0,
             pages: RefCell::new(pages),
             started: None,
             node: node.clone(),
@@ -275,7 +320,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for StackC {
         let Some(started) = self.started else {
             return Vec::new();
         };
-        let d = f32::from(u16::try_from(self.duration_ms).unwrap_or(u16::MAX)).max(1.0);
+        let d = f32::from(u16::try_from(self.active_ms).unwrap_or(u16::MAX)).max(1.0);
         self.progress = (now.saturating_sub(started).as_secs_f32() * 1000.0 / d).clamp(0.0, 1.0);
         let visible = self.visible.get();
         {
@@ -305,7 +350,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for StackC {
 
     fn next_deadline(&self, now: Duration) -> Option<Duration> {
         self.started.map(|s| {
-            let end = s + Duration::from_millis(u64::from(self.duration_ms));
+            let end = s + Duration::from_millis(u64::from(self.active_ms));
             if now >= end {
                 Duration::ZERO
             } else {
@@ -458,6 +503,116 @@ mod tests {
             (hidden.border_box.width, hidden.border_box.height),
             (0.0, 0.0),
             "an inactive page occupies no area, so no pointer can hit it"
+        );
+    }
+
+    /// A `StackTransition::None` switch is instant: nothing is left displayed
+    /// behind, so nothing stale can be laid out or hit-tested.
+    ///
+    /// Mutation check: arm the transition unconditionally again (drop
+    /// `show`'s `animated` guard) and `outgoing_of` is `Some(0)` here, with
+    /// page "one" still displayed for the whole 200 ms. Restore.
+    #[test]
+    fn a_none_transition_swaps_without_leaving_the_old_page_displayed() {
+        use crate::layout::{FixedMeasure, LayoutTree};
+        use taffy::style::AvailableSpace;
+
+        let built = build_with_pages(["one", "two"]);
+        let mut c = built.controller;
+        assert_eq!(c.reserved_total(2), 2);
+        let mut hx = Headless::new();
+        c.set_prop(
+            &built.node,
+            PropName::Transition,
+            &Prop::Enum(StackTransition::None.to_u16()),
+            &mut hx.cx(),
+        );
+        c.set_prop(
+            &built.node,
+            PropName::VisibleChild,
+            &Prop::Str("two".into()),
+            &mut hx.cx(),
+        );
+
+        assert_eq!(StackC::visible_of(&*c), 1);
+        assert_eq!(
+            StackC::outgoing_of(&*c),
+            None,
+            "no page is left fading out of a transition that does not animate"
+        );
+
+        let mut tree = LayoutTree::new();
+        tree.sync(&built.node).expect("sync");
+        crate::widgets::flush_layout(&mut tree);
+        tree.compute(
+            &built.node,
+            taffy::Size {
+                width: AvailableSpace::Definite(200.0),
+                height: AvailableSpace::Definite(200.0),
+            },
+            &mut FixedMeasure(taffy::Size {
+                width: 40.0,
+                height: 20.0,
+            }),
+        )
+        .expect("compute");
+        let pages = built.node.children();
+        assert!(!tree.is_displayed(&pages[0]), "the page left is hidden now");
+        assert!(tree.is_displayed(&pages[1]));
+    }
+
+    /// Every page is pinned into the stack's single grid cell, so even while
+    /// two are displayed at once (mid-crossfade) neither auto-flows into an
+    /// implicit second row below the other.
+    ///
+    /// Mutation check: drop `place`'s/`build`'s `pin` call and page "two"
+    /// lands a row below page "one" -- exactly the geometry that made
+    /// `window::pointer::descend`'s reverse walk terminate inside the stale
+    /// page. Restore.
+    #[test]
+    fn both_pages_of_a_running_transition_share_the_one_cell() {
+        use crate::layout::{FixedMeasure, LayoutTree};
+        use taffy::style::AvailableSpace;
+
+        let built = build_with_pages(["one", "two"]);
+        let mut c = built.controller;
+        assert_eq!(c.reserved_total(2), 2);
+        let mut hx = Headless::new();
+        c.set_prop(
+            &built.node,
+            PropName::VisibleChild,
+            &Prop::Str("two".into()),
+            &mut hx.cx(),
+        );
+        assert_eq!(
+            StackC::outgoing_of(&*c),
+            Some(0),
+            "a crossfade really is animating"
+        );
+
+        let mut tree = LayoutTree::new();
+        tree.sync(&built.node).expect("sync");
+        crate::widgets::flush_layout(&mut tree);
+        tree.compute(
+            &built.node,
+            taffy::Size {
+                width: AvailableSpace::Definite(200.0),
+                height: AvailableSpace::Definite(200.0),
+            },
+            &mut FixedMeasure(taffy::Size {
+                width: 40.0,
+                height: 20.0,
+            }),
+        )
+        .expect("compute");
+        let pages = built.node.children();
+        let one = tree.allocation(&pages[0]).expect("one").border_box;
+        let two = tree.allocation(&pages[1]).expect("two").border_box;
+        assert!(one.height > 0.0 && two.height > 0.0, "both are displayed");
+        assert_eq!(
+            (one.x, one.y),
+            (two.x, two.y),
+            "both pages occupy the same single cell"
         );
     }
 

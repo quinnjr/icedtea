@@ -412,13 +412,20 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogC {
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
+        // Hit-tested against the very geometry `paint` draws -- `grid()` over
+        // the content box -- and not against the `colorswatch` subnodes'
+        // allocations: those are taffy children the real render loop sizes
+        // 0x0, so `PointerState::observe` was inside one only at its exact
+        // origin and a click on any *painted* swatch fired nothing at all.
+        // `ScaleC`/`CalendarC` derive their own hit regions the same way.
+        let Some(content) = crate::widgets::content_rect_local(cx.tree, cx.node) else {
+            return Vec::new();
+        };
+        let cells = self.grid(content);
         let mut picked = None;
-        for index in 0..self.swatches.len() {
+        for (index, (_, rect)) in cells.iter().enumerate().take(self.swatches.len()) {
             let swatch = self.swatches[index].clone();
-            let Some(rect) = local_rect(cx.tree, cx.node, &swatch) else {
-                continue;
-            };
-            let shifted = shift_event(ev, rect);
+            let shifted = shift_event(ev, *rect);
             let Some(state) = self.swatch_pointers.get_mut(index) else {
                 continue;
             };
@@ -573,14 +580,29 @@ mod tests {
         )
         .expect("the dialog lays out");
 
-        let root = tree.allocation(&node).expect("root allocation").border_box;
-        let centre = |sub: &Node| {
-            let b = tree.allocation(sub).expect("subnode allocation").border_box;
-            assert!(b.width > 0.0 && b.height > 0.0, "a clickable box");
-            (b.x - root.x + b.width / 2.0, b.y - root.y + b.height / 2.0)
-        };
+        // The click lands where the dialog *paints* -- `grid()` over the
+        // content box, the one geometry `paint` and `measure` share -- not on
+        // a `colorswatch` subnode's own allocation. That is the whole fix: the
+        // real render loop sizes those subnodes 0x0, so hit-testing them meant
+        // only the exact origin of each was ever inside, and a click on any
+        // painted swatch fired nothing at all.
+        //
+        // Mutation check: hit-test `local_rect(cx.tree, cx.node, &swatch)`
+        // again (the shape this replaced) and no `ValueChanged` is produced
+        // from this point. Restore.
+        let content =
+            crate::widgets::content_rect_local(&tree, &node).expect("the dialog is laid out");
+        let cells = controller.grid(content);
         let target_index = 2;
-        let swatch_at = centre(&controller.swatches[target_index]);
+        let painted = cells[target_index].1;
+        assert!(
+            painted.width > 0.0 && painted.height > 0.0,
+            "a painted swatch has an area"
+        );
+        let swatch_at = (
+            painted.x + painted.width / 2.0,
+            painted.y + painted.height / 2.0,
+        );
 
         let mut handlers: Handlers<usize> = Handlers::default();
         handlers.set(

@@ -918,6 +918,15 @@ fn wait_bounded(
     // dispatch below so a batch reads "Wayland events first, then FdReady",
     // which is the order M5-D1 §3 fixes.
     let mut fired: Vec<WatchId> = Vec::new();
+    // A `Duration::ZERO` wait is "drain what is there", not "do nothing": the
+    // deadline is already past on the first pass, and returning `Timeout`
+    // there — as this used to — never flushed, never read the Wayland socket
+    // and never polled a single watched fd. One controller reporting a zero
+    // deadline (`GridViewC` did so unconditionally) then pinned the loop on
+    // that early return and starved input, frame callbacks and every
+    // `App::on_fd`/inbox watch. The first expiry therefore still runs one
+    // non-blocking poll pass; the second time round is the real timeout.
+    let mut expired = false;
     loop {
         queue
             .dispatch_pending(state)
@@ -934,7 +943,12 @@ fn wait_bounded(
 
         let now = Instant::now();
         let remaining = match deadline {
-            Some(deadline) if now >= deadline => return Err(SurfaceError::Timeout(timeout)),
+            Some(deadline) if now >= deadline => {
+                if std::mem::replace(&mut expired, true) {
+                    return Err(SurfaceError::Timeout(timeout));
+                }
+                Some(Duration::ZERO)
+            }
             Some(deadline) => Some(deadline - now),
             None => None,
         };
@@ -1050,7 +1064,28 @@ pub fn probe_points_of(root: &Node, layout: &crate::layout::LayoutTree) -> Vec<P
     if let Some(alloc) = layout.allocation(root) {
         points.push(centre("root".to_string(), &alloc));
     }
-    let descendants: Vec<Node> = root.descendants().collect();
+    // A `display: none` subtree paints nothing and receives no pointer event,
+    // so reporting its nodes' centres as probe points published coordinates a
+    // gate cannot click — a hidden `Stack` page's widgets were listed beside
+    // the visible page's own. The whole subtree is skipped, not just the node
+    // that carries the flag: only the subtree root is ever recorded.
+    let descendants: Vec<Node> = root
+        .descendants()
+        .filter(|node| layout.is_displayed(node))
+        .filter(|node| {
+            let mut parent = node.parent();
+            while let Some(node) = parent {
+                if !layout.is_displayed(&node) {
+                    return false;
+                }
+                if node.ptr_eq(root) {
+                    break;
+                }
+                parent = node.parent();
+            }
+            true
+        })
+        .collect();
     let mut counts: BTreeMap<Rc<str>, usize> = BTreeMap::new();
     for node in &descendants {
         *counts.entry(node.name()).or_default() += 1;
@@ -1156,6 +1191,43 @@ impl Window {
         fonts: FontDatabase,
     ) -> Result<Self, SurfaceError> {
         let conn = Connection::connect_to_env().map_err(SurfaceError::Connect)?;
+        Self::open_on(conn, spec, sheet, fonts)
+    }
+
+    /// [`Window::open`] against one named socket, ignoring `$WAYLAND_DISPLAY`.
+    ///
+    /// The environment is process-global: a test that sets `WAYLAND_DISPLAY`
+    /// to reach its own compositor mutates it for every other test running
+    /// beside it in the same binary (and, on edition 2024, does so through an
+    /// `unsafe` call that is undefined behaviour the moment another thread
+    /// reads the environment). Naming the socket is the way out —
+    /// `outputs::OutputsConnection::connect_to_path`'s own reason for
+    /// existing.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Socket`] if the socket cannot be connected, and
+    /// everything [`Window::open`] answers with after that.
+    pub fn open_at_path(
+        path: impl AsRef<std::path::Path>,
+        spec: SurfaceSpec,
+        sheet: CompiledSheet,
+        fonts: FontDatabase,
+    ) -> Result<Self, SurfaceError> {
+        let stream =
+            std::os::unix::net::UnixStream::connect(path.as_ref()).map_err(SurfaceError::Socket)?;
+        let conn = Connection::from_socket(stream)
+            .map_err(|err| SurfaceError::Socket(std::io::Error::other(err.to_string())))?;
+        Self::open_on(conn, spec, sheet, fonts)
+    }
+
+    /// The body both constructors share, over a connection already made.
+    fn open_on(
+        conn: Connection,
+        spec: SurfaceSpec,
+        sheet: CompiledSheet,
+        fonts: FontDatabase,
+    ) -> Result<Self, SurfaceError> {
         let mut queue: EventQueue<WindowState> = conn.new_event_queue();
         let qh = queue.handle();
         conn.display().get_registry(&qh, ());
@@ -3419,6 +3491,100 @@ mod tests {
         let conn = wayland_client::Connection::from_socket(ours).expect("connection");
         let queue = conn.new_event_queue();
         (conn, queue, theirs)
+    }
+
+    /// A `display: none` subtree is not on screen, so it publishes no probe
+    /// point: a gate that aimed a pointer at one clicked the visible page.
+    ///
+    /// Mutation check: walk `root.descendants()` unfiltered again and the
+    /// hidden page's own node is reported with a centre of its own. Restore.
+    #[test]
+    fn probe_points_skip_a_hidden_subtree() {
+        use crate::css::node::Node;
+        use crate::layout::{FixedMeasure, LayoutTree};
+        use taffy::style::AvailableSpace;
+
+        let root = Node::new("window");
+        let shown = Node::new("box");
+        let hidden = Node::new("stackpage");
+        let buried = Node::new("entry");
+        hidden.append_child(&buried);
+        root.append_child(&shown);
+        root.append_child(&hidden);
+        crate::widgets::set_displayed(&hidden, false);
+
+        let mut layout = LayoutTree::new();
+        layout.sync(&root).expect("sync");
+        crate::widgets::flush_layout(&mut layout);
+        layout
+            .compute(
+                &root,
+                taffy::Size {
+                    width: AvailableSpace::Definite(200.0),
+                    height: AvailableSpace::Definite(200.0),
+                },
+                &mut FixedMeasure(taffy::Size {
+                    width: 40.0,
+                    height: 20.0,
+                }),
+            )
+            .expect("compute");
+
+        let labels: Vec<String> = super::probe_points_of(&root, &layout)
+            .into_iter()
+            .map(|point| point.label)
+            .collect();
+        assert!(labels.iter().any(|l| l == "box"), "{labels:?}");
+        assert!(
+            !labels.iter().any(|l| l == "stackpage"),
+            "the hidden page is not a probe target: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "entry"),
+            "and neither is anything buried in it: {labels:?}"
+        );
+    }
+
+    /// A `Duration::ZERO` wait still polls: it is "drain what is there", and
+    /// an app whose controllers report a zero deadline every frame
+    /// (`GridViewC` did) gets its watched fds and its Wayland socket read.
+    ///
+    /// Mutation check: return `Err(Timeout)` on the first expiry again (what
+    /// `wait_bounded` did before the poll set was ever built on a zero wait)
+    /// and no `FdReady` is produced -- the starvation this asserts against.
+    /// Restore.
+    #[test]
+    fn a_zero_wait_still_polls_the_watched_fds_once() {
+        use super::{InputEvent, Interest, Watches, wait_bounded};
+
+        let (conn, mut queue, _theirs) = silent_connection();
+        let mut state = super::WindowState::new();
+
+        let (read, write) = rustix::pipe::pipe().expect("pipe");
+        rustix::io::write(&write, b"x").expect("wake byte");
+        let mut watches = Watches::default();
+        let id = watches.add(read, Interest::Read);
+
+        let outcome = wait_bounded(
+            &conn,
+            &mut queue,
+            &mut state,
+            Duration::ZERO,
+            &watches,
+            |state| !state.events.is_empty(),
+        );
+        assert!(
+            outcome.is_ok(),
+            "the ready watch is an answer, not a timeout"
+        );
+        assert!(
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, InputEvent::FdReady(fired) if *fired == id)),
+            "the watch that was ready is reported: {:?}",
+            state.events
+        );
     }
 
     #[test]
