@@ -34,7 +34,7 @@ fn wait_for_answer(inbox: &Inbox<Msg>) -> Msg {
             let took = started.elapsed();
             assert!(
                 took < BUDGET,
-                "the worker answered, but only after {took:?} — a wedged                  portal must fail fast, not merely before the ceiling"
+                "the worker answered, but only after {took:?} — a wedged portal must fail fast, not merely before the ceiling"
             );
             return msg;
         }

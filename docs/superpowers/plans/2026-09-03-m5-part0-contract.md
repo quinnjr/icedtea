@@ -3162,3 +3162,112 @@ tests roughly one parallel run in three.
 
 **Ruling.** Accepted. Every item is a defect fix with a covering,
 mutation-checked test; no gate's assertion was weakened.
+
+### P3-D1 — `capture_key` takes an `armed: bool`
+
+**Carried out by:** P3 (`settings/src/pages/keybindings.rs`, `settings/src/app.rs`).
+
+**Contract says** (§2.7, §2.3): `pub fn capture_key(ev: &KeyEvent) -> Option<Msg>`,
+wired as `.on_key(|ev| pages::keybindings::capture_key(ev))`, with `update`
+ignoring `Msg::KeyCaptured` when `capturing.is_none()`.
+
+**As shipped:** `pub fn capture_key(armed: bool, ev: &KeyEvent) -> Option<Msg>`,
+returning `None` whenever `!armed`; the root wires
+`.on_key({ let armed = m.capturing.is_some(); move |ev| capture_key(armed, ev) })`.
+
+**Ruling:** `GenericC::on_event`'s `Event::Key` arm sets `cx.handled = true` for
+any message a `KeyPressed` handler returns (`ui/src/view/controller.rs:508-513`),
+and M3 P4-D19 makes a handled event end the whole dispatch — so a root handler
+that answers every press swallows every keystroke in the window, a focused
+`Entry`'s included. The arming gate belongs where `handled` is decided.
+`update` keeps its own `capturing.is_none()` guard as a second gate.
+
+### P3-D2 — P3 edits `settings/src/app.rs`
+
+**Carried out by:** P3.
+
+**Contract says** (§5, P3 *Owns*): the two page modules, `style.css`'s
+`.conflict` rule, `tests/keybindings.rs`, and the deletion of
+`tests/keybindings_gtk.rs`.
+
+**As shipped:** plus a bounded edit to `settings/src/app.rs` — the seven
+Workspaces/Keybindings `update` arms, `Msg::PageSelected`'s `capturing` reset,
+the root `.on_key` arming, and the two `stack_page` call sites.
+
+**Ruling:** §2.2 puts the whole `update` match and §2.3 the whole root `view`
+in `app.rs`, so no part can implement a page's behaviour without touching it.
+The same applies to P2 and P4; the *Owns* lists name new files, not the shared
+ones every page part necessarily edits.
+
+### P3-D3 — the app probe report gains a `binding` line
+
+**Carried out by:** P3 (`settings/src/pages/keybindings.rs`).
+
+**Contract says** (§2.7): the re-expressed capture test "asserts through the
+app's probe report that the stored combo is `{ modifiers: ["SHIFT"], key:
+"KEY_a" }`". §M5-D9 defines only `probe <label> <x> <y>` and
+`alloc <id> <x> <y> <w> <h>`.
+
+**As shipped:** when `$ICEDTEA_PROBE_REPORT` is set, `apply_capture` appends
+`binding <action> <modifiers joined by '+', or '-'> <key>`.
+
+**Ruling:** neither existing line can express a `KeyCombo`. The raw field
+spellings are written rather than `format_combo`'s display form, so the
+assertion pins the serialization `compositor/src/input.rs` matches on.
+Production is unaffected: the variable is unset and the writer is a no-op.
+
+### P3-D4 — both pages' gates live in `settings/tests/keybindings.rs`
+
+**Carried out by:** P3.
+
+**Contract says** (§5): P3 owns `tests/keybindings.rs (new)`. §2.7 names
+`workspaces_page_paints_every_probe_point_at_rest` without a file.
+
+**As shipped:** one integration binary carries both pages' harness tests and
+gates.
+
+**Ruling:** one file keeps the scaffolding single-sourced without creating a
+`settings/tests/support/` module P2 may also be creating in parallel.
+
+### P3-D5 — six pure helpers not named in the contract
+
+**Carried out by:** P3.
+
+**Contract says** (§2.7): the Workspaces mutation rules and the capture-store
+rule as prose inside `update`.
+
+**As shipped:** `pages::workspaces::{can_remove, add_workspace,
+remove_workspace, rename_workspace}` and `pages::keybindings::{apply_capture,
+report_binding}`, with `update`'s arms as one-line delegations.
+
+**Ruling:** `App::run_offscreen` returns `Frames` and no model, so a rule that
+lives only inside an `update` arm has no unit test. Moving each rule into a
+`pub fn` in a P3-owned page module makes all of them directly testable.
+
+### P3-D6 — `$ICEDTEA_UI_THEME` selects `icedtea-settings`' base theme
+
+**Carried out by:** P1 if it shipped the reading, otherwise P3
+(`settings/src/main.rs`).
+
+**Contract says:** nothing about how settings picks a theme; §2.7 and spec §7
+require rest-state gates in light, dark and high contrast.
+
+**As shipped:** `$ICEDTEA_UI_THEME` names a **complete** base theme file used
+whole — `ui/src/bin/window-probe.rs:41`'s convention — with `settings/style.css`
+still layered over it (§2.9).
+
+**Ruling:** reusing the toolkit's own existing convention beats inventing a
+settings-specific `--theme` flag, and it is the only hook the gates need.
+
+### P3-D7 — two ids beyond §2.3's normative list
+
+**Carried out by:** P3.
+
+**Contract says** (§2.3): `workspaces.{list, add}` + `ws_name_<i>`/
+`ws_remove_<i>`; `keybindings.{list}` + `kb_row_<action>`/`kb_set_<action>`.
+
+**As shipped:** plus `ws_row_<i>` (the `list_box_row`, so the rest-state gate
+can address a row as a unit) and `kb_combo_<action>` (the combo label).
+
+**Ruling:** additive; no listed id changes, and both are addressed by the P3
+gates.
