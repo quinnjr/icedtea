@@ -1,6 +1,21 @@
 //! Pointer and touch: hit testing the retained tree, the client-side implicit
 //! grab, scrolling and cursor shapes.
 
+/// `BTN_LEFT` from Linux's `input-event-codes.h`.
+///
+/// Re-exported rather than redefined (P0-D3): M1 put it in
+/// [`crate::window::layer`], `wayland::BTN_LEFT` and `window::BTN_LEFT` name
+/// that one, and `ui/tests/layer_shell_screencopy.rs` is a byte-identical gate
+/// that imports it from there.
+pub use crate::window::layer::BTN_LEFT;
+
+/// `BTN_RIGHT` from Linux's `input-event-codes.h`.
+pub const BTN_RIGHT: u32 = 0x111;
+
+/// `BTN_MIDDLE` from Linux's `input-event-codes.h` — the one M5's shell panel
+/// closes a window with.
+pub const BTN_MIDDLE: u32 = 0x112;
+
 use crate::css::node::{Node, PseudoStates};
 use crate::layout::{LayoutTree, Rect};
 use crate::window::{StyleMap, node_addr};

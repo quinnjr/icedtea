@@ -44,6 +44,12 @@ pub struct KeyEvent {
     /// The keysym for the current layout and level, composed if a dead-key
     /// sequence just completed.
     pub keysym: xkb::Keysym,
+    /// The `base_keysym(keycode)` of this event's keycode.
+    ///
+    /// Stamped by [`Keymap::translate`] so a view-layer `on_key` closure —
+    /// which has a `&KeyEvent` and no `Keymap` — can normalise a capture
+    /// without reaching into the window.
+    pub base: xkb::Keysym,
     /// The text to insert. `None` for a key with no text (modifiers, arrows,
     /// F-keys), for a release, for a control character, and for a keystroke
     /// swallowed mid-compose.
@@ -300,6 +306,29 @@ impl Keymap {
         self.state.update_key(xkb_keycode(keycode), direction);
     }
 
+    /// The keysym `keycode` produces at **group 0, level 0** — shift-, caps-
+    /// and group-agnostic.
+    ///
+    /// `keycode` is the `wl_keyboard.key` evdev code; xkb's is `+8`, applied
+    /// internally by the same helper [`Keymap::translate`] uses. A keycode the
+    /// keymap does not map, or one that maps to several syms at that level,
+    /// yields the first sym, or `Keysym::NoSymbol` when there is none — never
+    /// a panic.
+    ///
+    /// This is the equivalent of GDK's `translate_key(keycode, 0, 0)`, and the
+    /// only thing an accelerator capture may store: `icedtea_config`'s
+    /// `key_name_to_keysym` always encodes the unshifted keysym, so a capture
+    /// that stored `XK_Q` from `SUPER+SHIFT+q` would produce a binding the
+    /// compositor's `match_action` can never fire.
+    #[must_use]
+    pub fn base_keysym(&self, keycode: u32) -> xkb::Keysym {
+        self.keymap
+            .key_get_syms_by_level(xkb_keycode(keycode), 0, 0)
+            .first()
+            .copied()
+            .unwrap_or_else(|| xkb::Keysym::from(xkb::keysyms::KEY_NoSymbol))
+    }
+
     /// Translate one `wl_keyboard.key`.
     ///
     /// Called *before* any `update_key` for the same event: xkb resolves a
@@ -313,6 +342,7 @@ impl Keymap {
     ) -> KeyEvent {
         let key = xkb_keycode(keycode);
         let raw_sym = self.state.key_get_one_sym(key);
+        let base = self.base_keysym(keycode);
         let mods = self.mods();
         // `xkb_state_key_get_consumed_mods` is XKB-mode consumption (this
         // binding exposes no GTK-mode variant): for any two-level alphabetic
@@ -336,6 +366,7 @@ impl Keymap {
         KeyEvent {
             keycode,
             keysym,
+            base,
             utf8,
             mods,
             consumed,

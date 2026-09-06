@@ -32,7 +32,7 @@ GTK 4.22 core widget set with GTK-exact CSS node trees, and icon theming.
 | `paint/` | Backgrounds, borders, shadows, outlines, blur, text, icons |
 | `text.rs` | Font matching, shaping caches, wrap/ellipsize/caret/selection |
 | `window/` | `Surface::{Toplevel, Layer, Popup}`, keyboard, pointer, focus, selection |
-| `view/` | `View`, builders, the keyed reconciler, controllers, `App`, `Cmd` |
+| `view/` | `View`, builders, the keyed reconciler, controllers, `App`, `Cmd`, `inbox.rs` (`Inbox`/`InboxSender`) |
 | `widgets/` | One file per widget: node tree, controller, behaviour |
 | `icons/` | freedesktop icon themes, symbolic recolouring, builtins |
 | `gallery.rs` | Every widget on one page — the binary the M3 gate measures |
@@ -269,6 +269,11 @@ fn update(model: &mut Model, msg: Msg) -> Cmd<Msg> {
 App::new(Model { n: 0 }, update, view).run(window)?;
 ```
 
+`App::new` takes `impl FnMut(&mut M, Msg) -> Cmd<Msg>` and `impl Fn(&M) ->
+View<Msg>`, so an `update` can capture worker senders or a swappable command
+trait object. Plain `fn` items still coerce, which is what the gallery and the
+counter test use.
+
 Messages are queued and folded one at a time — an `update` that produces a
 `Cmd` producing a `Msg` enqueues it; the fold never re-enters. Commands run
 where they can: the clipboard, timer and focus ones inside the fold, the
@@ -293,6 +298,82 @@ what `ui/tests/counter_app.rs` and every controller unit test use.
 
 Widget builders (`button("Ok")`, `label("Hi")`, …) arrive with P5 and P6;
 `view::builders`' module docs carry the naming rule they follow.
+
+### External events
+
+A worker thread reaches the loop through an inbox: it holds the
+[`InboxSender`], the loop holds the [`Inbox`] via `App::with_inbox`.
+
+```rust
+let (inbox, tx) = Inbox::new()?;                  // tx: InboxSender, Send + Clone
+std::thread::spawn(move || { tx.send(Msg::Reloaded)?; Ok::<_, SendError<Msg>>(()) });
+App::new(model, update, view).with_inbox(inbox).run(window)?;
+```
+
+`InboxSender::send` pushes onto an unbounded channel and writes one byte to a
+wake pipe the window polls; a full pipe is not an error, because the byte
+already in it wakes the loop and the channel is the queue. A `send` after the
+app exits returns the message rather than panicking. `Msg` must be `Send`,
+which means a message carries `Arc<T>`, never `Rc<T>`.
+
+A second, independent source is `App::on_fd(id, f)`: `f` runs on the loop
+thread whenever `InputEvent::FdReady` names `id`, and its returned messages are
+enqueued in order. A handler for an id that has since been `unwatch`ed is
+simply never called again.
+
+Delivery order inside one frame is normative: the inbox's messages are folded
+first, in send order, then any `App::on_fd` messages, then the frame's input
+batch — so a click never runs against a model that has not yet seen the worker
+update that arrived on the same wake. `run_offscreen` drains at the same
+point, which is what makes an ingress test compositor-free.
+
+`Cmd::Task(Rc<dyn Fn()>)` runs a side effect on the loop thread after the fold
+that produced it — a channel push to a worker, never a blocking call. It has no
+return value on purpose: an answer comes back through the inbox as a message.
+
+`Cmd::Unwatch(WatchId)` retires a watch and closes its fd from inside `update`.
+It is the *only* way an app driven by `App::run` can do so — `run` takes the
+window by value, so `Window::unwatch` is out of reach once the loop owns it —
+and it is not optional bookkeeping: `poll(2)` is level-triggered and reports
+`HUP`/`ERR` as readiness whatever the `Interest`, so a hung-up or never-drained
+fd is ready on *every* poll and an `on_fd` handler that yields a message each
+time spins the loop with no exit. A connection whose dispatch failed therefore
+ends its story with `Cmd::Unwatch(id)`. Unwatching an id this window does not
+hold is a no-op, so unwatching twice is safe.
+
+### Pointer events at the view layer
+
+`on_pointer_down` / `on_pointer_motion` / `on_pointer_up` turn raw pointer
+phases into messages on **any** widget kind, with `(x, y)` in the node's own
+border box; each registers a `Handler::Pair(Rc<dyn Fn(f64, f64) -> Msg>)`.
+They fire from one place — `view::app::deliver`, at `Phase::Target`, and again
+on the ancestor chain at `Phase::Bubble` — so a container's handler still sees
+a gesture that landed on a child, hit-testing having resolved to the innermost
+instance. Bubbling obeys the same rule as every other dispatch: a controller
+that sets `cx.handled` ends it. `GenericC` — the controller behind a plain
+`box_`, `label` and every kind without one of its own — marks a **left** press
+and a completed left release handled, so a container above such a child sees
+bubbled motions and non-left buttons but not that left press. A handler that
+must see every left press goes on the leaf itself, or on a node whose children
+are a controller's own chrome rather than `Instance`s. The
+three `_with_button` variants (`on_pointer_down_with_button`,
+`on_pointer_motion_with_button`, `on_pointer_up_with_button`) are the other
+half of that pair of builders: they register a
+`Handler::PairButton(Rc<dyn Fn(f64, f64, u32) -> Msg>)` and add the Linux
+button code (`window::pointer::{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}`); a motion
+reports `0`, because it carries no button. M3's implicit grab already routes
+motion and the matching release to the node that took the press, so
+`PointerDown → PointerMotion* → PointerUp` is one node's whole gesture even
+when the pointer leaves it; a release outside still arrives, a `PointerLeave`
+mid-drag does not end the sequence, and a grab broken by a closed surface
+fabricates no synthetic release — an app treats a fresh `PointerDown` as
+re-anchoring. `EventKind::Click` is unaffected: a left press-release on a node
+carrying both `on_click` and `on_pointer_up_with_button` produces both messages.
+
+A `drawing_area`'s callback is `Fn(&mut Canvas, Rect, &mut PaintCx)`: the third
+argument is the same paint context every controller's `paint` receives, so a
+canvas can shape text, resolve an icon and read the theme's colours instead of
+being limited to fills and strokes.
 
 ## Fonts and text
 
@@ -419,41 +500,49 @@ outside the process.
 
 ```bash
 cargo test -p icedtea-ui --test gallery_gate       # rest state, 3 themes
-cargo test -p icedtea-ui --test interaction_gate   # 16 interactions, 15 driven
+cargo test -p icedtea-ui --test interaction_gate   # 19 interactions, all driven
 cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
 ```
 
 - `tests/gallery_gate.rs` walks the page in surface-height slices under the
   harness compositor and asserts every widget paints something in light, dark
-  and high-contrast Adwaita — except the nine entries listed in that file's
+  and high-contrast Adwaita — except the six entries listed in that file's
   `KNOWN_BLANK_AT_REST`, which are measured, not asserted on, because they
-  render nothing today (seven collapse to a zero-area allocation, and
-  `link_button`/`check_button` draw nothing into a real one; see contract
-  amendment P8-D69). The list was fifteen until the M3 close-out's first fix
-  wave, which made the universal size request reach every kind (P8-D75) and
-  gave a recycling view's pooled rows a measure and a paint, so
-  `progress_bar`, `stack_switcher`, `stack_sidebar`, `list_view`, `grid_view`
-  and `about_dialog` are now asserted on like everything else. Every entry,
-  exempt or not, must still appear whole in some slice. It further asserts that every `Kind` appears in `--list`, on the
+  render nothing today:
+<!-- known-blank:begin -->
+  five collapse to a zero-area allocation (`window_controls`, `font_dialog`,
+  `popover_menu`, `popover_menu_bar`, `alert_dialog`), and one has a real
+  allocation it draws nothing into (`link_button`).
+<!-- known-blank:end -->
+  The list was fifteen until the M3 close-out's first fix wave (P8-D75 and the
+  pooled-row measure), and nine until M5-D8 gave `color_dialog`,
+  `check_button` and `scrollbar` a rest paint. Every entry, exempt or not, must
+  still appear whole in some slice. It further asserts that every `Kind` appears in `--list`, on the
   page and (for sub-kinds) inside its parent's node tree; that at least one
-  probe point per widget differs between light and dark; that every widget's
+  probe point per widget differs between light and dark, except the four in
+  that file's `THEME_BLIND_BY_DESIGN` (`drawing_area`, `image`, `picture` and,
+  per M5 contract §6 P0-D9, `color_dialog`, whose sampled points all land on
+  fixed palette fill); that every widget's
   node tree matches its vendored GTK 4.22 fixture; and that this README's
   table lists every `Kind`.
 - `tests/interaction_gate.rs` drives interactions with a virtual pointer and
-  keyboard. **All sixteen of the contract's interactions ship; fifteen run**:
+  keyboard. **All nineteen ship and run**: the M3 contract's sixteen —
   click, toggle, check,
   switch, the pointer-click-without-focus-ring rule, typing with a placed
   caret, debounced search, password peek, held spin repeat, scale drag,
   drop-down pick, expander disclosure, stack-page switch, menu-button popover,
-  and Tab in geometric order. Each of the last ten landed with the
-  pre-existing production defect it was RED on — none is asserted around.
-  The sixteenth, `scrolling_a_list_view_recycles_rows_without_losing_
-  selection`, shipped `#[ignore]`d in M3 for a transport gap below this crate
-  — `wlr` 0.20.28 forwarded no `wl_pointer.axis` to any client — and runs
-  since the 0.20.29 bump; the same interaction is also proven offscreen by
+  scrolling a list view without losing selection, and Tab in geometric
+  order — plus M5's three: dragging across a `drawing_area` reports every
+  pointer phase, a middle click on a `drawing_area` reports `BTN_MIDDLE`, and
+  dragging a `scrollbar` slider moves what it paints. Ten of the sixteen
+  landed with the pre-existing production defect they were RED on — none is
+  asserted around. The list-view scroll shipped `#[ignore]`d in M3 for a
+  transport gap below this crate — `wlr` 0.20.28 forwarded no
+  `wl_pointer.axis` to any client — and has run since the 0.20.29 bump; the
+  same interaction is also proven offscreen by
   `widgets::list_view::tests::pixels::scrolling_recycles_the_pooled_rows_and_
   keeps_the_selection`. Contract amendments P8-D71, P8-D72 and P8-D74 carry
-  the whole trail.
+  that trail.
 - Colours are pinned in exactly one place — `tests/themed_button_offscreen.rs`,
   the M1 gate. The gallery gates assert *change*, not constants: 64 pinned
   colours would be a fixture to maintain, not a gate.
@@ -519,6 +608,23 @@ bounded pump that hands up a flat `InputEvent` stream.
   `libxkbcommon`, runs the compose table, reports the modifiers a keysym
   consumed (so `!` matches a plain-`!` accelerator), and owns the repeat timer
   xkbcommon does not have.
+
+### Base-level keysyms
+
+`Keymap::base_keysym(keycode)` is the sym a key produces at group 0, level 0 —
+GDK's `translate_key(keycode, 0, 0)` — and every `KeyEvent` carries it as
+`base`. An accelerator capture normalises with it, exactly as the compositor
+matches:
+
+```rust
+let sym = if ev.base != xkb::keysyms::KEY_NoSymbol { ev.base } else { ev.keysym };
+```
+
+The raw/latin sym, falling back to the modified one only when the keycode
+produces no base sym at all; modifiers come from `KeyEvent::mods`, the
+effective state, not from `consumed`. This is what makes a binding captured
+from `SUPER+SHIFT+q` match the `KEY_q` the config file encodes.
+
 - **Pointer** — `window::pointer` hit-tests the retained tree in reverse paint
   order, mirrors the compositor's implicit grab client-side, and coasts finger
   scrolls kinetically.
@@ -533,8 +639,54 @@ M1's `LayerWindow` is unchanged, at `window::layer` and still reachable as
 `wayland::LayerWindow`; the `themed-button` demo and its pixel gate run on it
 exactly as before.
 
+### Watching a foreign fd
+
+A window polls its own Wayland connection *and* any fd its owner registers,
+via `Window::watch_fd`:
+
+```rust
+let id = window.watch_fd(fd, Interest::Read);   // the window owns `fd` now
+// … `window.pump(..)` now yields `InputEvent::FdReady(id)` when it is ready …
+window.unwatch(id);                              // drops the watch, closes the fd
+```
+
+Element 0 of the poll set is always the connection, so a Wayland wake is never
+starved by a chatty watch; `FdReady`s come after the Wayland events of the same
+wake, one per ready watch, in registration order. `HUP` and `ERR` are reported
+as readiness whatever the `Interest`: the toolkit never decides a foreign fd is
+dead, it tells the owner, who calls `unwatch`. Nothing here adds a timer, so a
+registered-but-silent fd costs zero wakeups. An owner that has handed its window
+to `App::run` calls `unwatch` by returning `Cmd::Unwatch(id)` from `update`;
+see "External events" above.
+
 Not covered here: input methods (`text-input-v3`), drag and drop, client-side
 cursor themes (M6/see below).
+
+### Probing a live window
+
+`Window::probe_points()` labels and centres every laid-out node — id, else CSS
+node name with a repeat index — and `Window::allocation(id)` returns one node's
+border box, both in window-surface coordinates and both read off the tree the
+last frame laid out. A client that sets `$ICEDTEA_PROBE_REPORT` writes them as
+`probe <label> <x> <y>` and `alloc <id> <x> <y> <w> <h>` lines, which
+`ui/tests/support/mod.rs` parses back. This is how a harness test addresses a
+widget on a *running* app: `App::probe` is offscreen-only.
+
+An app driven by `App::run` or `App::run_offscreen` gets this for free: with
+`$ICEDTEA_PROBE_REPORT` set (or `App::with_probe_report(path)`), the loop
+appends one block per frame whose laid-out tree changed —
+
+```text
+frame <n>
+probe <label> <x> <y>
+alloc <id> <x> <y> <w> <h>
+```
+
+— deduplicated by content, so a settled app writes nothing and `frame`'s
+count is "how many distinct states this app has published", not a wall-clock
+frame count (M5-D9, deviation P1-D5). That is what M5's settings and shell
+gates read; the file is append-only, so a settings build appends its own
+`page`/`status`/`msg` lines (`settings/src/probe.rs`) to the same path.
 
 ## The P5 half of the widget catalogue, in detail
 
@@ -596,6 +748,14 @@ files with its own 32 kinds; P8's gallery gate wires the whole set together.
 | `PasswordEntry` | `entry.password` | `password_entry()` | `password_entry.txt` |
 | `SpinButton` | `spinbutton` | `spin_button(lower, upper)` | `spin_button.txt` |
 | `EditableLabel` | `editablelabel` | `editable_label(text)` | `editable_label.txt` |
+
+`ColorDialogButton` carries a **64x32** minimum size, not Adwaita's bare
+`button.color` minimum of 48x32: the controller fills the node's box with the
+colour and the `button` subnode's own gradient chrome paints over the centre of
+that fill afterwards, so the extra 16px of width is the margin that stays
+visible. One constant (`SWATCH_BUTTON_MIN`) is read by both the layout floor
+`build` sets and `Controller::measure`, so a caller measuring a detached
+instance is told the number layout actually honours (M5 contract §6 P0-D10).
 
 This table only carries the constructor signature and fixture path for P5's
 original 32 kinds; P6's remaining 32 (containers, lists, menus, dialogs) are

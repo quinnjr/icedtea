@@ -930,3 +930,121 @@ fn tabbing_through_a_form_moves_the_focus_ring_in_geometric_order() {
          {before0:?}\nringed: {ringed0:?}\nafter:  {left0:?}"
     );
 }
+
+/// The gesture P4's Displays canvas is built on: press, move, release, all
+/// delivered to the canvas with its own coordinates, through the compositor.
+///
+/// Mutation check: delete the `Event::PointerMotion` arm of
+/// `view::app::fire_pointer_handlers`; the `motion` line never appears and
+/// this fails. Restore.
+#[test]
+fn dragging_across_a_drawing_area_reports_every_pointer_phase() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "drawing_area");
+    let (x, y) = driver.point("drawing_area", "root");
+    let alloc = driver.allocation("drawing_area");
+    // Stay inside the canvas: a quarter of its width to the right.
+    let target = (x + (alloc.width as i32 / 4).max(4), y);
+
+    driver.drag((x, y), target);
+
+    assert!(
+        gallery.wait_msg("changed drawing_area down", REACT),
+        "no press reached the canvas; got {:?}",
+        gallery.messages()
+    );
+    assert!(
+        gallery.wait_msg("changed drawing_area motion", REACT),
+        "no motion reached the canvas; got {:?}",
+        gallery.messages()
+    );
+    assert!(
+        gallery.wait_msg("changed drawing_area up", REACT),
+        "no release reached the canvas; got {:?}",
+        gallery.messages()
+    );
+    let lines = gallery.messages();
+    // The very first move into the canvas is itself a real motion (the
+    // pointer's enter delivers `Event::PointerMotion` alongside
+    // `Event::PointerEnter` — `fire_pointer_handlers` at `view::app` fires
+    // both), so a `motion` line legitimately precedes `down` too. What
+    // matters for a drag is a `motion` line *between* the press and the
+    // release, not that the very first `motion` line comes after `down`.
+    let phase_of = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.starts_with(&format!("changed drawing_area {needle}")))
+    };
+    let down = phase_of("down").expect("checked by the wait_msg above");
+    let up = phase_of("up").expect("checked by the wait_msg above");
+    let motion_during_drag = lines[down..up]
+        .iter()
+        .any(|l| l.starts_with("changed drawing_area motion"));
+    assert!(
+        down < up && motion_during_drag,
+        "phases arrived out of order: {lines:?}"
+    );
+}
+
+/// The button code survives the trip: a middle press on the canvas reports
+/// `0x112`, which is how P5's middle-click-to-close is expressed.
+///
+/// Mutation check: fire `Handler::Pair` instead of `Handler::PairButton` in
+/// `fire_pair_button`'s first arm; the code becomes the left button's and
+/// this fails. Restore.
+#[test]
+fn a_middle_click_on_a_drawing_area_reports_the_middle_button_code() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "drawing_area");
+    let (x, y) = driver.point("drawing_area", "root");
+
+    driver.click_button(x, y, icedtea_ui::window::pointer::BTN_MIDDLE);
+
+    assert!(
+        gallery.wait_msg("changed drawing_area up", REACT),
+        "no release reached the canvas; got {:?}",
+        gallery.messages()
+    );
+    let up = gallery
+        .messages()
+        .into_iter()
+        .find(|l| l.starts_with("changed drawing_area up"))
+        .expect("the release line");
+    assert!(
+        up.ends_with(" 274"),
+        "the release must carry BTN_MIDDLE (274 decimal): {up}"
+    );
+}
+
+/// Ties the new paint to the hit geometry: dragging the slider must move the
+/// pixels the widget draws, not just the value it reports.
+///
+/// Mutation check: paint the slider from `self.value` while hit-testing from
+/// `self.adj.value` (they can disagree once `sanitized` clamps); the drag
+/// reports a value but the pixels do not follow, and this fails. Restore.
+#[test]
+fn dragging_a_scrollbar_slider_moves_what_it_paints() {
+    let mut driver = Driver::new();
+    let gallery = driver.open("light", "scrollbar");
+    let alloc = driver.allocation("scrollbar");
+    let (x, y) = driver.point("scrollbar", "root");
+    let left_edge = alloc.x as i32 + 2;
+    let target = (alloc.x as i32 + alloc.width as i32 - 3, y);
+    let before = driver.row(left_edge, target.0, y);
+
+    driver.drag((x, y), target);
+
+    assert!(
+        gallery
+            .messages()
+            .iter()
+            .any(|line| line.starts_with("value scrollbar ")),
+        "the drag reported no value; got {:?}",
+        gallery.messages()
+    );
+    let after = driver.wait_row_change(left_edge, target.0, y, &before);
+    assert!(
+        !support::row_matches(&after, &before),
+        "the slider's pixels did not move with the drag"
+    );
+}

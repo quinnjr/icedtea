@@ -627,14 +627,29 @@ pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
         ),
         Kind::DrawingArea => Sample::Own(
             w::drawing_area(
-                |canvas: &mut skia_rs_safe::canvas::Canvas<'_>, rect: Rect| {
+                |canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+                 rect: Rect,
+                 _cx: &mut crate::paint::PaintCx<'_>| {
                     let mut paint = Paint::new();
                     paint.set_color32(Color(0xFF33_D17A));
                     canvas.draw_rect(&rect.to_skia(), &paint);
                 },
             )
             .width_request(64)
-            .height_request(48),
+            .height_request(48)
+            // The interaction gate reads these back off stdout. `Changed`
+            // rather than a new `GalleryMsg` variant: the payload is already a
+            // flat string and `log_line` folds control characters, so the
+            // gate's substring matching needs nothing new.
+            .on_pointer_down_with_button(|x, y, b| {
+                GalleryMsg::Changed(Kind::DrawingArea, format!("down {x} {y} {b}"))
+            })
+            .on_pointer_motion(|x, y| {
+                GalleryMsg::Changed(Kind::DrawingArea, format!("motion {x} {y} 0"))
+            })
+            .on_pointer_up_with_button(|x, y, b| {
+                GalleryMsg::Changed(Kind::DrawingArea, format!("up {x} {y} {b}"))
+            }),
         ),
         Kind::WindowControls => Sample::Own(w::window_controls(Side::End)),
         Kind::Calendar => Sample::Own(

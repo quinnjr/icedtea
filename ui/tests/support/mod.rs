@@ -202,6 +202,41 @@ pub fn probe_theme() -> tempfile::NamedTempFile {
     file
 }
 
+/// The `window-probe`'s window in the compositor's model, once it is there.
+///
+/// The probe's own `configure` report is written by the client the moment it
+/// is configured, which is *before* it has attached a buffer and before
+/// wlroots' `map` signal has put it in the compositor's model: reading the
+/// snapshot straight after that line found no window at all roughly one
+/// parallel run in three. This polls instead of trusting a single read.
+///
+/// # Panics
+///
+/// If the window never appears -- every caller needs it, and skipping over a
+/// missing one would make the assertions that follow vacuous.
+#[must_use]
+pub fn wait_for_probe_window(
+    compositor: &icedtea_harness::Compositor,
+    timeout: Duration,
+) -> icedtea_contract::WindowInfo {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(window) = compositor
+            .snapshot()
+            .windows
+            .into_iter()
+            .find(|w| w.app_id == "org.icedtea.WindowProbe")
+        {
+            return window;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the probe's window never entered the compositor's model"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Spawn `window-probe` against `socket`, reaped when the guard drops.
 #[must_use]
 pub fn spawn_window_probe(
@@ -214,6 +249,32 @@ pub fn spawn_window_probe(
         Command::new(env!("CARGO_BIN_EXE_window-probe"))
             .env("WAYLAND_DISPLAY", socket)
             .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
+            .env("ICEDTEA_UI_THEME", theme)
+            .env("ICEDTEA_PROBE_MODE", mode)
+            .env("ICEDTEA_PROBE_REPORT", report)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn window-probe"),
+    )
+}
+
+/// `spawn_window_probe`, plus extra argv flags.
+///
+/// The probe's modes are environment-driven and its *variants within a mode*
+/// are argv-driven, so a test can ask for two watches or a silent one without
+/// a new mode name.
+#[must_use]
+pub fn spawn_window_probe_with(
+    socket: &str,
+    mode: &str,
+    theme: &std::path::Path,
+    report: &std::path::Path,
+    args: &[&str],
+) -> Reaper {
+    Reaper(
+        Command::new(env!("CARGO_BIN_EXE_window-probe"))
+            .args(args)
+            .env("WAYLAND_DISPLAY", socket)
             .env("ICEDTEA_UI_THEME", theme)
             .env("ICEDTEA_PROBE_MODE", mode)
             .env("ICEDTEA_PROBE_REPORT", report)
@@ -524,12 +585,16 @@ impl GalleryProc {
         self.messages.lock().expect("message log").clone()
     }
 
-    /// Wait until some message line equals `needle`, or `timeout` passes.
+    /// Wait until some message line starts with `needle`, or `timeout`
+    /// passes. A prefix rather than an exact match: `drawing_area`'s
+    /// per-phase lines carry coordinates and a button code after the phase
+    /// name, which a caller asserting only on the phase cannot spell out in
+    /// full.
     #[must_use]
     pub fn wait_msg(&self, needle: &str, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
-            if self.messages().iter().any(|line| line == needle) {
+            if self.messages().iter().any(|line| line.starts_with(needle)) {
                 return true;
             }
             if started.elapsed() >= timeout {
@@ -952,20 +1017,44 @@ impl Driver {
         }
     }
 
-    /// Press the left button at `(x, y)`.
-    pub fn press(&mut self, x: i32, y: i32) {
+    /// Press `button` (a Linux `BTN_*` code) at `(x, y)`.
+    pub fn press_button(&mut self, x: i32, y: i32, button: u32) {
         self.move_to(x, y);
-        self.pointer.button(icedtea_ui::wayland::BTN_LEFT, true);
+        self.pointer.button(button, true);
         self.pointer.frame();
         self.pointer.pump();
     }
 
-    /// Release the left button at `(x, y)`.
-    pub fn release(&mut self, x: i32, y: i32) {
+    /// Release `button` at `(x, y)`.
+    pub fn release_button(&mut self, x: i32, y: i32, button: u32) {
         self.move_to(x, y);
-        self.pointer.button(icedtea_ui::wayland::BTN_LEFT, false);
+        self.pointer.button(button, false);
         self.pointer.frame();
         self.pointer.pump();
+    }
+
+    /// Press and release `button` at `(x, y)`.
+    pub fn click_button(&mut self, x: i32, y: i32, button: u32) {
+        self.press_button(x, y, button);
+        self.release_button(x, y, button);
+    }
+
+    /// [`Driver::drag`] with a button other than the left one.
+    pub fn drag_with_button(&mut self, from: (i32, i32), to: (i32, i32), button: u32) {
+        self.press_button(from.0, from.1, button);
+        self.move_to((from.0 + to.0) / 2, (from.1 + to.1) / 2);
+        self.move_to(to.0, to.1);
+        self.release_button(to.0, to.1, button);
+    }
+
+    /// Press the left button at `(x, y)`.
+    pub fn press(&mut self, x: i32, y: i32) {
+        self.press_button(x, y, icedtea_ui::wayland::BTN_LEFT);
+    }
+
+    /// Release the left button at `(x, y)`.
+    pub fn release(&mut self, x: i32, y: i32) {
+        self.release_button(x, y, icedtea_ui::wayland::BTN_LEFT);
     }
 
     /// Press and release at `(x, y)`.

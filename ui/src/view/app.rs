@@ -19,7 +19,7 @@ use crate::view::reconcile::{BuildCx, Instance, containers_of, reconcile};
 use crate::view::render::{
     Animations, NodeAddr, NodePainter, StyleMap, layout_tree, paint_tree, restyle_tree,
 };
-use crate::view::{Kind, View};
+use crate::view::{EventKind, Handlers, Kind, View};
 use crate::window::focus::{
     Binding, FocusCause, FocusDirection, FocusRing, navigate, window_binding,
 };
@@ -101,6 +101,61 @@ pub fn path_to<Msg: Clone + 'static>(roots: &[Instance<Msg>], target: &Node) -> 
 /// would hand the event to the very node it just intercepted. `cx.phase` (D5)
 /// still tells a controller which phase it is in; what changed is the reach of
 /// `handled`.
+/// M5-D5's three pointer kinds, fired from one place (P0-D1).
+///
+/// The contract's text puts this in `GenericC::on_event` plus a forwarding arm
+/// per widget. `GenericC` is not on the dispatch path of a widget that has its
+/// own controller — `ButtonC`, `DrawingAreaC` and thirty others replace it —
+/// and P5 puts `on_pointer_up_with_button` on `button(..)` nodes while being
+/// forbidden from touching `ui/`. So the firing lives in `deliver`, once, for
+/// every kind alike, and no widget file is edited to opt in.
+///
+/// `button` is `0` for a motion, which carries none (P0-D2).
+fn fire_pointer_handlers<Msg: Clone + 'static>(
+    event: &Event,
+    handlers: &Handlers<Msg>,
+) -> Vec<Msg> {
+    let (kind, local, button) = match event {
+        Event::PointerDown { local, button, .. } => (EventKind::PointerDown, *local, *button),
+        Event::PointerMotion { local } => (EventKind::PointerMotion, *local, 0),
+        Event::PointerUp { local, button, .. } => (EventKind::PointerUp, *local, *button),
+        _ => return Vec::new(),
+    };
+    handlers
+        .fire_pair_button(kind, f64::from(local.0), f64::from(local.1), button)
+        .into_iter()
+        .collect()
+}
+
+/// The point `event` carries, in the node's own border-box space, if it
+/// carries one at all.
+fn event_local(event: &Event) -> Option<(f32, f32)> {
+    match event {
+        Event::PointerEnter { local } | Event::PointerMotion { local } => Some(*local),
+        Event::PointerDown { local, .. } | Event::PointerUp { local, .. } => Some(*local),
+        _ => None,
+    }
+}
+
+/// `event` with its point rewritten into another node's border-box space.
+fn with_local(event: &Event, local: (f32, f32)) -> Event {
+    match event {
+        Event::PointerEnter { .. } => Event::PointerEnter { local },
+        Event::PointerMotion { .. } => Event::PointerMotion { local },
+        Event::PointerDown { button, serial, .. } => Event::PointerDown {
+            button: *button,
+            local,
+            serial: *serial,
+        },
+        Event::PointerUp { button, serial, .. } => Event::PointerUp {
+            button: *button,
+            local,
+            serial: *serial,
+        },
+        other => other.clone(),
+    }
+}
+
 pub fn deliver<Msg: Clone + 'static>(
     roots: &mut [Instance<Msg>],
     path: &[Node],
@@ -112,6 +167,22 @@ pub fn deliver<Msg: Clone + 'static>(
     }
     let mut out = Vec::new();
     let last = path.len() - 1;
+    // P0-D8's bubble pass, and the capture pass before it, hand the *same*
+    // `Event` to every node on the path — and `local` is relative to the node
+    // the event was aimed at (`window::pointer::descend`). An ancestor
+    // therefore read a child's coordinate frame: a release five pixels past a
+    // button's right edge still fell inside the button's own `0..width` bounds
+    // check, and one in its left padding arrived as a negative x. The window
+    // point is recovered once, from the aimed node's own origin, and each node
+    // on the path is handed the point in *its* frame.
+    let tree = cx.tree;
+    let origin_of = |node: &Node| {
+        tree.allocation(node)
+            .map(|alloc| (alloc.border_box.x, alloc.border_box.y))
+    };
+    let window_point = event_local(event)
+        .zip(origin_of(&path[last]))
+        .map(|(local, origin)| (local.0 + origin.0, local.1 + origin.1));
 
     'phases: for phase in Phase::ALL {
         let order: Vec<usize> = match phase {
@@ -121,6 +192,16 @@ pub fn deliver<Msg: Clone + 'static>(
         };
         for index in order {
             let node = path[index].clone();
+            // `local` in this node's own frame; the aimed node keeps the
+            // event verbatim, so a widget with no allocation is unaffected.
+            let localised = if index == last {
+                None
+            } else {
+                window_point.zip(origin_of(&node)).map(|(point, origin)| {
+                    with_local(event, (point.0 - origin.0, point.1 - origin.1))
+                })
+            };
+            let event: &Event = localised.as_ref().unwrap_or(event);
             let Some(instance) = roots.iter_mut().find_map(|root| root.find_mut(&node)) else {
                 continue;
             };
@@ -147,6 +228,19 @@ pub fn deliver<Msg: Clone + 'static>(
                 phase,
                 handled: false,
             };
+            // M5-D5/P0-D1: the node the event is aimed at — the innermost
+            // `Instance` (P5-D33) — gets its pointer handlers fired before its
+            // controller runs, so a controller that sets `cx.handled` (as
+            // `GenericC` does on every left press) cannot swallow them.
+            //
+            // P0-D8: and again while bubbling, so a container whose press
+            // landed on a child instance still sees the gesture. `Bubble`'s
+            // node order excludes the target, so nothing fires twice, and
+            // P4-D19 still governs — a child that marked the event handled
+            // ends the dispatch and there is no bubble to fire on.
+            if phase == Phase::Target || phase == Phase::Bubble {
+                out.extend(fire_pointer_handlers(event, &*handlers));
+            }
             out.extend(controller.on_event(event, &mut ecx));
             // `cx.handled` ends the whole dispatch (deviation D19, recorded in
             // §10 as P4-D19): the node that set it is the last one this event
@@ -372,14 +466,32 @@ impl<Msg> Probe<Msg> {
     }
 }
 
+/// `App::update`'s field type (M5-D4). Named so `clippy::type_complexity`
+/// does not fire on the inline `Box<dyn FnMut(..)>` in the struct.
+type UpdateFn<M, Msg> = Box<dyn FnMut(&mut M, Msg) -> Cmd<Msg>>;
+/// `App::view`'s field type (M5-D4); see [`UpdateFn`].
+type ViewFn<M, Msg> = Box<dyn Fn(&M) -> View<Msg>>;
+
 /// The Elm loop over a retained tree.
 pub struct App<M, Msg> {
     model: M,
-    update: fn(&mut M, Msg) -> Cmd<Msg>,
-    view: fn(&M) -> View<Msg>,
+    /// Boxed, not a `fn` pointer (M5-D4): both M5 apps capture — settings a
+    /// `WorkerHandles`, shell an `Rc<dyn CompositorCommands>` its tests swap.
+    /// `FnMut`, because an `update` may own counters and senders.
+    update: UpdateFn<M, Msg>,
+    /// `Fn`, not `FnMut`: `view` runs during reconcile while the model is
+    /// borrowed, and must not mutate.
+    view: ViewFn<M, Msg>,
     sheet: Option<CompiledSheet>,
     fonts: Option<FontDatabase>,
     icons: Option<IconTheme>,
+    /// External messages (M5-D2). At most one per app.
+    inbox: Option<crate::view::inbox::Inbox<Msg>>,
+    /// `FdReady(id)` → messages (M5-D2's `on_fd`).
+    #[allow(clippy::type_complexity, reason = "one boxed closure per watched fd")]
+    fd_handlers: Vec<(crate::window::WatchId, Box<dyn Fn() -> Vec<Msg>>)>,
+    /// Where `run` writes `probe`/`alloc` lines, when asked (M5-D9, P0-D4).
+    probe_report: Option<std::path::PathBuf>,
 }
 
 impl<M: std::fmt::Debug, Msg> std::fmt::Debug for App<M, Msg> {
@@ -534,14 +646,21 @@ impl<Msg: Clone + 'static> NodePainter for ControllerPainter<'_, Msg> {
 impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     /// A new app over `model`, folded by `update`, described by `view`.
     #[must_use]
-    pub fn new(model: M, update: fn(&mut M, Msg) -> Cmd<Msg>, view: fn(&M) -> View<Msg>) -> Self {
+    pub fn new(
+        model: M,
+        update: impl FnMut(&mut M, Msg) -> Cmd<Msg> + 'static,
+        view: impl Fn(&M) -> View<Msg> + 'static,
+    ) -> Self {
         App {
             model,
-            update,
-            view,
+            update: Box::new(update),
+            view: Box::new(view),
             sheet: None,
             fonts: None,
             icons: None,
+            inbox: None,
+            fd_handlers: Vec::new(),
+            probe_report: std::env::var_os("ICEDTEA_PROBE_REPORT").map(std::path::PathBuf::from),
         }
     }
 
@@ -564,6 +683,44 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     #[must_use]
     pub fn with_icons(mut self, icons: IconTheme) -> Self {
         self.icons = Some(icons);
+        self
+    }
+
+    /// Feed `inbox`'s messages into this app's loop.
+    ///
+    /// At most one inbox per app; a second call replaces the first. `Msg: Send`
+    /// is what makes a worker thread able to hold the sender, and is why an M5
+    /// message carries `Arc<T>` and never `Rc<T>`.
+    #[must_use]
+    pub fn with_inbox(mut self, inbox: crate::view::inbox::Inbox<Msg>) -> Self
+    where
+        Msg: Send,
+    {
+        self.inbox = Some(inbox);
+        self
+    }
+
+    /// Map a foreign fd's readiness to messages.
+    ///
+    /// `f` runs on the loop thread whenever [`InputEvent::FdReady`] names `id`,
+    /// and its messages are enqueued in order — after the inbox's, before the
+    /// frame's input batch. A handler for an id that has since been
+    /// `unwatch`ed is simply never called again (M5-D1 §4).
+    #[must_use]
+    pub fn on_fd(mut self, id: crate::window::WatchId, f: impl Fn() -> Vec<Msg> + 'static) -> Self {
+        self.fd_handlers.push((id, Box::new(f)));
+        self
+    }
+
+    /// Write `probe <label> <x> <y>` and `alloc <id> <x> <y> <w> <h>` lines to
+    /// `path`, once per frame in which they change.
+    ///
+    /// `App::new` already picks `$ICEDTEA_PROBE_REPORT` up; this is the
+    /// explicit form. The lines are exactly what `ui/tests/support/mod.rs`
+    /// parses, and the labels are `Window::probe_points`'.
+    #[must_use]
+    pub fn with_probe_report(mut self, path: std::path::PathBuf) -> Self {
+        self.probe_report = Some(path);
         self
     }
 
@@ -747,6 +904,10 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             size,
             frames: Vec::new(),
         };
+        // M5-D9, P0-D4: same report, same dedup, as `run` -- offscreen just
+        // has no window to publish from.
+        let mut probe_reported: Vec<String> = Vec::new();
+        let mut probe_frame: u64 = 0;
 
         rebuild(
             &mut self, &mut rt, &sheet, &mut fonts, &mut icons, &dyn_clock,
@@ -759,9 +920,15 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             &dyn_clock,
             size,
             &mut surface,
+            self.probe_report
+                .as_deref()
+                .map(|path| (path, &mut probe_reported, &mut probe_frame)),
         )?;
 
         for step in script {
+            // The same drain, at the same point: an ingress test needs no
+            // compositor (M5-D2 §5).
+            drain_inbox(&self, &mut rt);
             let mut capture = false;
             match step {
                 ScriptStep::Capture => capture = true,
@@ -868,6 +1035,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 &dyn_clock,
                 size,
                 &mut surface,
+                self.probe_report
+                    .as_deref()
+                    .map(|path| (path, &mut probe_reported, &mut probe_frame)),
             )?;
             render_popups(
                 &mut rt,
@@ -964,6 +1134,10 @@ fn restyle_and_layout<Msg: Clone + 'static>(
 }
 
 /// Restyle, relayout and repaint into `surface`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site's worth of loop state plus the offscreen probe report"
+)]
 fn render_once<Msg: Clone + 'static>(
     rt: &mut Runtime<Msg>,
     sheet: &CompiledSheet,
@@ -972,6 +1146,7 @@ fn render_once<Msg: Clone + 'static>(
     clock: &Rc<dyn Clock>,
     size: (u32, u32),
     surface: &mut skia_rs_safe::canvas::Surface,
+    probe: Option<(&std::path::Path, &mut Vec<String>, &mut u64)>,
 ) -> Result<(), AppError> {
     let now = clock.now();
     restyle_and_layout(
@@ -988,6 +1163,13 @@ fn render_once<Msg: Clone + 'static>(
         &mut rt.layout,
         size,
     )?;
+    // M5-D9, P0-D4: `run_offscreen` never hands its window over, but its
+    // laid-out tree still lives only in this `Runtime` -- the same reason
+    // `run` publishes from inside its own loop.
+    if let Some((path, last, frame)) = probe {
+        let lines = probe_report_lines(rt);
+        write_probe_report(path, &lines, last, frame);
+    }
     surface
         .canvas()
         .clear(skia_rs_safe::core::Color::TRANSPARENT);
@@ -1223,6 +1405,35 @@ fn sync_focus<Msg: Clone + 'static>(
     out
 }
 
+/// Whether `node` or any ancestor of it is recorded `display: none`.
+///
+/// `LayoutTree::is_displayed` answers for the node it was asked about only,
+/// and only the subtree *root* a widget hides is ever recorded (a `Stack`
+/// marks the page, never the page's contents), so the walk to the root is what
+/// makes a buried descendant answer honestly. A node the tree has never seen
+/// counts as displayed, which keeps a widget the reconciler has just added
+/// (and not yet laid out) a focus candidate.
+#[must_use]
+pub fn is_hidden(tree: &crate::layout::LayoutTree, node: &Node) -> bool {
+    let mut current = Some(node.clone());
+    while let Some(node) = current {
+        if !tree.is_displayed(&node) {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+/// Drop the focus when its owner has been hidden.
+fn prune_hidden_focus<Msg: Clone + 'static>(rt: &mut Runtime<Msg>) {
+    if let Some(node) = rt.focus.focus()
+        && is_hidden(&rt.layout, &node)
+    {
+        rt.focus.set_focus(None, FocusCause::Programmatic);
+    }
+}
+
 /// Turn one `InputEvent` into controller events and return the messages.
 #[allow(
     clippy::too_many_arguments,
@@ -1237,6 +1448,16 @@ fn route<Msg: Clone + 'static>(
     clipboard: &mut Clipboard,
     clock: &Rc<dyn Clock>,
 ) -> Vec<Msg> {
+    // A subtree that has become `display: none` — a `Stack` page the user
+    // left, a collapsed `Expander`, a closed `Popover` — must not keep the
+    // keyboard focus: `FocusRing` records an owner and nothing else checks
+    // that the owner is still on screen, so every keystroke went on landing in
+    // an invisible `Entry` on a page nobody can see. Pruned centrally, here,
+    // once per routed event rather than in each of the widgets that hide a
+    // subtree; the `sync_focus` at the end of this function announces the
+    // resulting `FocusOut` like any other move.
+    prune_hidden_focus(rt);
+
     // The node an event is aimed at, and the point in its own space.
     let aim = |rt: &Runtime<Msg>, x: f32, y: f32| -> Option<(Node, (f32, f32))> {
         if let Some(target) = rt.grab.target() {
@@ -1421,6 +1642,19 @@ fn route<Msg: Clone + 'static>(
     out
 }
 
+/// M5-D2 §3 steps (a) and (b): read the wake pipe empty, then move every
+/// queued message onto the fold queue **in send order**.
+///
+/// Called once per loop iteration, before any input is routed, so a message a
+/// worker produced is folded against the same model the frame's clicks are.
+fn drain_inbox<M, Msg>(app: &App<M, Msg>, rt: &mut Runtime<Msg>) {
+    let Some(inbox) = app.inbox.as_ref() else {
+        return;
+    };
+    inbox.drain_pipe();
+    inbox.drain_into(&mut rt.queue);
+}
+
 /// Fold every queued message, run the commands they produced, and rebuild
 /// the view **once** per drained batch (contract §4.7).
 ///
@@ -1479,6 +1713,9 @@ fn drain<M: 'static, Msg: Clone + 'static>(
                 .focus
                 .set_focus(Some(&node), crate::window::focus::FocusCause::Programmatic),
             Cmd::Quit | Cmd::CloseWindow => rt.quit = true,
+            // Outside `update`, after every queued message has been folded
+            // (M5-D3). Not window-bound, so it is never returned to `run`.
+            Cmd::Task(f) => f(),
             // The window-bound commands are `run`'s (Task 17): only it has a
             // surface to title, minimise or open a popup on. They are handed
             // back to the caller rather than dropped here.
@@ -1507,6 +1744,79 @@ fn frame_deadline<T>(
         .into_iter()
         .flatten()
         .min()
+}
+
+/// Append `lines` to `path`, under a `frame <n>` marker, when they differ
+/// from `last`.
+///
+/// Deduplicated by content: a settled app writes nothing, so the file stays
+/// bounded no matter how long the app runs, and a test that greps for a line
+/// still finds it. `frame` only advances on an actual write, so a reader can
+/// count it as "how many distinct states this app has published" (M5-D9,
+/// deviation P1-D5).
+fn write_probe_report(
+    path: &std::path::Path,
+    lines: &[String],
+    last: &mut Vec<String>,
+    frame: &mut u64,
+) {
+    use std::io::Write;
+
+    if lines.is_empty() || lines == last.as_slice() {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "frame {frame}");
+    for line in lines {
+        let _ = writeln!(file, "{line}");
+    }
+    // The dedup cache is committed only once the lines are really on disk: it
+    // used to be updated before the fallible open, so a report that could not
+    // be opened (a directory removed under it, a full disk) silently dropped
+    // that state forever — the next differing batch was compared against
+    // lines nobody ever wrote.
+    if file.flush().is_ok() {
+        last.clear();
+        last.extend_from_slice(lines);
+        *frame += 1;
+    }
+}
+
+/// The report lines for one laid-out tree: every probe point, then one
+/// `alloc` line per node that has an id.
+fn probe_report_lines<Msg>(rt: &Runtime<Msg>) -> Vec<String> {
+    let mut lines: Vec<String> = crate::window::probe_points_of(&rt.root, &rt.layout)
+        .into_iter()
+        .map(|p| format!("probe {} {} {}", p.label, p.x, p.y))
+        .collect();
+    for node in rt.root.descendants() {
+        let Some(id) = node.id() else { continue };
+        // A `display: none` subtree is not on screen, and a report that lists
+        // a hidden page's widgets beside a visible one's is a report a gate
+        // cannot aim a pointer from.
+        if is_hidden(&rt.layout, &node) {
+            continue;
+        }
+        let Some(alloc) = rt.layout.allocation(&node) else {
+            continue;
+        };
+        let r = alloc.border_box;
+        lines.push(format!(
+            "alloc {} {} {} {} {}",
+            id.as_str(),
+            r.x,
+            r.y,
+            r.width,
+            r.height
+        ));
+    }
+    lines
 }
 
 impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
@@ -1564,6 +1874,23 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
 
         rebuild(&mut self, &mut rt, &sheet, &mut fonts, &mut icons, &clock);
 
+        // M5-D9, P0-D4: lines written by `write_probe_report` only when they
+        // differ from what is already here.
+        let mut reported: Vec<String> = Vec::new();
+        let mut probe_frame: u64 = 0;
+
+        // M5-D2 §2: the inbox's wake pipe joins the window's poll set, and
+        // leaves it on the way out.
+        let inbox_watch = match self.inbox.as_ref().map(crate::view::inbox::Inbox::watch_fd) {
+            Some(Ok(fd)) => Some(window.watch_fd(fd, crate::window::Interest::Read)),
+            Some(Err(err)) => {
+                tracing::warn!(%err, "the inbox pipe could not be registered; \
+                                      its messages will only be seen on other wakeups");
+                None
+            }
+            None => None,
+        };
+
         // Bug fix (found while wiring `gallery::run`, the first real caller
         // of this loop against a live compositor): a page with no running
         // animation or key-repeat has `frame_deadline` return `None` on the
@@ -1591,6 +1918,18 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 wait = Some(wait.unwrap_or(Duration::ZERO));
             }
             let events = window.pump(wait)?;
+
+            // M5-D2 §3: inbox first, then `on_fd`, then the input batch.
+            drain_inbox(&self, &mut rt);
+            for event in &events {
+                if let InputEvent::FdReady(id) = event {
+                    for (watch, handler) in &self.fd_handlers {
+                        if watch == id {
+                            rt.queue.extend(handler());
+                        }
+                    }
+                }
+            }
 
             for event in &events {
                 if matches!(event, InputEvent::Close) {
@@ -1683,6 +2022,11 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                         close_popup(&mut rt, key);
                         window.close_popup(key);
                     }
+                    // P0-D7: the only way out of a watch once `run` owns the
+                    // window. An id `run` minted for the inbox is not one an
+                    // app can name, and an unknown id is a no-op, so this can
+                    // only retire a watch the app registered itself.
+                    Cmd::Unwatch(id) => window.unwatch(id),
                     other => tracing::debug!(?other, "command not applicable to a window"),
                 }
             }
@@ -1715,6 +2059,11 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 &mut rt.layout,
                 (w, h),
             )?;
+
+            if let Some(path) = self.probe_report.as_deref() {
+                let lines = probe_report_lines(&rt);
+                write_probe_report(path, &lines, &mut reported, &mut probe_frame);
+            }
 
             let styles = &rt.styles;
             let layout = &rt.layout;
@@ -1808,6 +2157,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                     );
                 })?;
             }
+        }
+        if let Some(id) = inbox_watch {
+            window.unwatch(id);
         }
         Ok(())
     }
@@ -2004,6 +2356,131 @@ mod tests {
         assert_eq!(out.first(), Some(&Msg::Inner));
     }
 
+    /// An ancestor's pointer handlers see the point in the *ancestor's* own
+    /// frame, not the frame of whatever child the event was aimed at.
+    ///
+    /// Mutation check: hand the same `Event` to every node on the path again
+    /// (drop `deliver`'s `localised` rewrite) and the outer node reports the
+    /// inner node's `x`, ten pixels off -- which is how a release five pixels
+    /// past a button's right edge still passed the button's own `0..width`
+    /// bounds check, and one in its left padding arrived negative.
+    #[test]
+    fn bubbling_gives_each_ancestor_the_point_in_its_own_frame() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum P {
+            Outer(i64),
+            Inner(i64),
+        }
+
+        // 10px of padding on the outer box is the offset between the two
+        // frames; without it the test could not tell them apart.
+        let sheet = CompiledSheet::compile("box { padding: 10px; } button { padding: 0; }");
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", vec![]);
+        let clock: Rc<dyn Clock> = Rc::new(crate::anim::ManualClock::new());
+        let env = ResolveEnv::default();
+        let root = Node::new("window");
+        let mut instances: Vec<Instance<P>> = Vec::new();
+        {
+            let mut cx = BuildCx {
+                sheet: &sheet,
+                fonts: &mut fonts,
+                icons: &mut icons,
+                clock: &clock,
+                env: &env,
+            };
+            reconcile(
+                &root,
+                &mut instances,
+                vec![
+                    widget::<P>(Kind::Box)
+                        .key("outer")
+                        .on_pointer_up(|x, _y| P::Outer(x as i64))
+                        .child(
+                            widget::<P>(Kind::Box)
+                                .key("inner")
+                                .on_pointer_up(|x, _y| P::Inner(x as i64)),
+                        ),
+                ],
+                &mut cx,
+            );
+        }
+        let outer = instances[0].node.clone();
+        let inner = instances[0].children[0].node.clone();
+
+        let mut styles = StyleMap::new();
+        let mut anims = Animations::new();
+        crate::view::render::restyle_tree(
+            &root,
+            &sheet,
+            &env,
+            &mut styles,
+            &mut anims,
+            Duration::ZERO,
+        );
+        let mut containers: HashMap<crate::view::NodeAddr, crate::layout::Container> =
+            HashMap::new();
+        for addr in styles.keys() {
+            containers.insert(
+                *addr,
+                crate::layout::Container::Box {
+                    direction: crate::layout::BoxDirection::Column,
+                },
+            );
+        }
+        let mut layout = LayoutTree::new();
+        let mut measure = crate::layout::FixedMeasure(taffy::Size {
+            width: 60.0,
+            height: 32.0,
+        });
+        crate::view::render::layout_tree(
+            &root,
+            &styles,
+            &containers,
+            &mut layout,
+            &env,
+            (Some(200.0), Some(200.0)),
+            &mut measure,
+        )
+        .expect("the tree lays out");
+
+        let outer_box = layout.allocation(&outer).expect("outer").border_box;
+        let inner_box = layout.allocation(&inner).expect("inner").border_box;
+        let shift = inner_box.x - outer_box.x;
+        assert!(shift > 0.0, "the two frames really are offset");
+
+        let mut focus = <FocusRing as Default>::default();
+        let mut clipboard = crate::window::selection::Clipboard::offscreen();
+        let mut cmds: Vec<Cmd<P>> = Vec::new();
+        let mut cx = Dispatch {
+            styles: &styles,
+            tree: &layout,
+            focus: &mut focus,
+            clipboard: &mut clipboard,
+            icons: &mut icons,
+            fonts: &mut fonts,
+            clock: &clock,
+            env: &env,
+            cmds: &mut cmds,
+        };
+        let path = path_to(&instances, &inner);
+        let out = deliver(
+            &mut instances,
+            &path,
+            &Event::PointerUp {
+                button: crate::window::layer::BTN_LEFT,
+                local: (5.0, 5.0),
+                serial: 1,
+            },
+            &mut cx,
+        );
+        assert_eq!(
+            out,
+            vec![P::Inner(5), P::Outer(5 + shift as i64)],
+            "the target keeps its own point; the ancestor is handed its own"
+        );
+    }
+
     /// A `Runtime` over `root`/`instances` with everything else empty.
     fn runtime<Msg>(root: Node, instances: Vec<Instance<Msg>>) -> Runtime<Msg> {
         Runtime {
@@ -2121,6 +2598,110 @@ mod tests {
                 &clock,
             )
             .is_empty()
+        );
+    }
+
+    /// A report that could not be opened must not poison the dedup cache: the
+    /// lines it failed to write are still owed.
+    ///
+    /// Mutation check: commit `last` before the open again and the second
+    /// call writes nothing, because the failed first call already claimed
+    /// those lines. Restore.
+    #[test]
+    fn a_probe_report_that_cannot_be_opened_keeps_owing_its_lines() {
+        let dir = std::env::temp_dir().join(format!("icedtea-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let lines = vec!["probe root 1 2".to_string()];
+        let mut last: Vec<String> = Vec::new();
+        let mut frame = 0;
+
+        // A directory is never openable for append.
+        write_probe_report(&dir, &lines, &mut last, &mut frame);
+        assert!(last.is_empty(), "nothing was written, so nothing is cached");
+        assert_eq!(frame, 0);
+
+        let file = dir.join("report");
+        write_probe_report(&file, &lines, &mut last, &mut frame);
+        assert_eq!(frame, 1);
+        let text = std::fs::read_to_string(&file).expect("the report exists");
+        assert!(text.contains("probe root 1 2"), "{text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A widget hidden with `display: none` — a `Stack` page the user left —
+    /// must not keep the keyboard focus, or every keystroke goes on landing in
+    /// an invisible `Entry` on a page nobody can see.
+    ///
+    /// Mutation check: drop `route`'s `prune_hidden_focus` call and the key is
+    /// delivered to the hidden node (`vec![K::Typed]`) with the focus still on
+    /// it. Restore.
+    #[test]
+    fn a_key_never_reaches_a_widget_that_has_been_hidden() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum K {
+            Typed,
+        }
+
+        let sheet = CompiledSheet::compile("box { color: #000; }");
+        let mut fonts = crate::text::FontDatabase::probe_only();
+        let mut icons = crate::icons::IconTheme::with_name_and_roots("hicolor", vec![]);
+        let clock: Rc<dyn Clock> = Rc::new(crate::anim::ManualClock::new());
+        let env = ResolveEnv::default();
+        let root = Node::new("window");
+        let mut instances: Vec<Instance<K>> = Vec::new();
+        {
+            let mut cx = BuildCx {
+                sheet: &sheet,
+                fonts: &mut fonts,
+                icons: &mut icons,
+                clock: &clock,
+                env: &env,
+            };
+            reconcile(
+                &root,
+                &mut instances,
+                vec![
+                    widget::<K>(Kind::Box).key("page").child(
+                        widget::<K>(Kind::Box)
+                            .key("field")
+                            .on_key(|_| Some(K::Typed)),
+                    ),
+                ],
+                &mut cx,
+            );
+        }
+        let page = instances[0].node.clone();
+        let field = instances[0].children[0].node.clone();
+
+        let mut rt = runtime(root, instances);
+        // What `StackC::set_visible` records when a page stops being visible.
+        crate::widgets::set_displayed(&page, false);
+        rt.layout.sync(&rt.root).expect("sync");
+        crate::widgets::flush_layout(&mut rt.layout);
+        assert!(is_hidden(&rt.layout, &field), "the field is buried");
+
+        rt.focus.set_focus(Some(&field), FocusCause::Pointer);
+        let key = crate::window::keyboard::Keymap::from_string(include_str!(
+            "../../tests/fixtures/keymaps/us.xkb"
+        ))
+        .expect("the vendored us keymap compiles")
+        .translate(38, true, 1, 0); // evdev 38 == `a`
+
+        let mut clipboard = crate::window::selection::Clipboard::offscreen();
+        let out = route(
+            &mut rt,
+            &InputEvent::Key(key),
+            &sheet,
+            &mut fonts,
+            &mut icons,
+            &mut clipboard,
+            &clock,
+        );
+        assert_eq!(out, Vec::new(), "the hidden field never saw the key");
+        assert!(
+            rt.focus.focus().is_none(),
+            "and it does not still own the focus"
         );
     }
 

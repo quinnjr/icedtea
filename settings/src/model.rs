@@ -1,9 +1,10 @@
-//! GTK-free core of the settings app: working-copy state, the compositor's
-//! `apply` path, keybinding-capture translation, and validation helpers.
+//! Toolkit-free core of the settings app: working-copy state, the
+//! compositor's `apply` path, keybinding-capture translation, and validation
+//! helpers.
 //!
-//! Nothing here touches GTK -- the (GTK) view converts `gdk::ModifierType`
-//! into [`CaptureMods`] and calls into this module, so the logic here can be
-//! unit-tested without a display server.
+//! Nothing here touches a display server -- the view converts the toolkit's
+//! own key-event modifier state into [`CaptureMods`] and calls into this
+//! module, so the logic here can be unit-tested without one.
 
 use std::path::Path;
 
@@ -77,9 +78,10 @@ pub fn apply(cfg: &Config, db_path: &Path) -> Result<(), redb::Error> {
     cfg.save(&db)
 }
 
-/// GTK-free stand-in for `gdk::ModifierType` -- the (GTK) capture widget
-/// converts the modifier state of the key-press event it just captured into
-/// this before handing off to [`combo_from_keysym`].
+/// Toolkit-free stand-in for a raw key-event modifier mask -- the
+/// Keybindings page's capture handler converts the modifier state of the
+/// key-press event it just captured into this before handing off to
+/// [`combo_from_keysym`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CaptureMods {
     pub ctrl: bool,
@@ -254,12 +256,11 @@ mod tests {
     /// in an already-unshifted keysym (as every one of these `KEY_*` names
     /// is), so it says nothing about whether the *caller* handed in the
     /// right keysym in the first place. That's a separate concern this
-    /// module can't cover: shift/caps-lock normalization needs a live GDK
-    /// keymap, which is exactly why this crate is GTK-free (see the module
-    /// doc). The actual non-vacuous proof that a Shift-held capture still
+    /// module can't cover: shift/caps-lock normalization needs a live
+    /// keymap, which is exactly why this crate is toolkit-free (see the
+    /// module doc). The non-vacuous proof that a Shift-held capture still
     /// resolves to the unshifted key lives in
-    /// `pages::keybindings::tests::unshifted_keysym_normalizes_shift_and_capslock_to_the_base_key`,
-    /// which drives a real `gdk::Display` against a harness compositor.
+    /// `pages::keybindings::tests::normalise_keysym_prefers_the_base_sym`.
     #[test]
     fn combo_round_trips_to_the_compositor_format() {
         let mods = CaptureMods {

@@ -14,7 +14,7 @@ use icedtea_compositor::dbus::DbCommand;
 use icedtea_harness::{Compositor, ScreencopyClient, VirtualKeyboardClient, VirtualPointerClient};
 use support::{
     PROBE_BG, PROBE_ENTRY_BG, matches, pixel_at, probe_report, probe_theme, spawn_window_probe,
-    wait_for_report_line,
+    wait_for_probe_window, wait_for_report_line,
 };
 
 /// The compositor's server-side title bar, from `compositor/src/decoration.rs`.
@@ -40,12 +40,8 @@ fn a_toplevel_maps_under_server_side_decorations() {
         .collect();
     let (configured_w, configured_h) = (fields[0], fields[1]);
 
-    let snapshot = compositor.snapshot();
-    let window = snapshot
-        .windows
-        .iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window is in the model");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
+    let window = &window;
     assert_eq!(
         configured_w, window.geometry.width,
         "an SSD window is configured at the full frame width"
@@ -121,13 +117,7 @@ fn a_configure_resize_relayouts_and_repaints() {
     );
     let first = wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let id = compositor
-        .snapshot()
-        .windows
-        .iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window")
-        .id;
+    let id = wait_for_probe_window(&compositor, Duration::from_secs(10)).id;
 
     compositor.send(DbCommand::Maximize(id, true));
     // `wait_for_report_line` matches on prefix alone, and the report is
@@ -166,12 +156,7 @@ fn a_configure_resize_relayouts_and_repaints() {
     );
 
     let mut screencopy = ScreencopyClient::spawn(&compositor.socket_path().to_string_lossy());
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
     // The far corner of the *new* geometry is painted, which it would not be
     // if the buffer had stayed at its original size. The probe's own render
     // loop repaints asynchronously after the configure it just reported, so
@@ -197,6 +182,65 @@ fn a_configure_resize_relayouts_and_repaints() {
 const KEY_H: u32 = 35;
 const KEY_I: u32 = 23;
 const KEY_TAB: u32 = 15;
+const KEY_LEFTSHIFT: u32 = 42;
+
+/// A modifier held over a key must reach the client: the `KeyEvent` carries
+/// `Mods::SHIFT`, its `base` stays the unshifted sym, and the text it
+/// produces is the capital.
+///
+/// This is the toolkit-level proof of what `settings/tests/keybindings.rs`'s
+/// `shift_a_while_capturing_records_base_a_with_shift` needs end to end, and
+/// it lives here because the behaviour is not the settings page's: it is
+/// `icedtea_harness::VirtualKeyboardClient::send_key`'s derived `modifiers`
+/// request (`zwp_virtual_keyboard_v1.key` does *not* update the compositor's
+/// xkb state, so a virtual keyboard that only ever sends `key` holds Shift
+/// down without any client ever being told a modifier is active) plus
+/// `Keymap::translate`'s `mods`/`base` stamping. Nothing in the harness or
+/// the ui crate pinned it before; the only cover was one settings gate.
+///
+/// Mutation check: drop the `self.vk.modifiers(..)` call from
+/// `VirtualKeyboardClient::send_key`; the reported line becomes
+/// `key 0x68 base 0x68 shift false` and both assertions fail. Restore.
+#[test]
+fn a_held_modifier_reaches_the_client_with_the_key_it_modifies() {
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let socket = compositor.socket_path().to_string_lossy().to_string();
+    let _probe = spawn_window_probe(&socket, "entry", theme.path(), report.path());
+    wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
+        .expect("a first configure");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
+    // Same ordering as `a_virtual_keyboard_types_into_the_entry_and_the_
+    // glyphs_appear`: the headless seat advertises its keyboard capability
+    // only once a device exists on it, so the probe cannot bind
+    // `wl_keyboard` until the virtual keyboard has been created.
+    let mut keyboard = VirtualKeyboardClient::spawn(&socket);
+    compositor.send(DbCommand::Focus(window.id));
+    wait_for_report_line(report.path(), "keyboard-enter", Duration::from_secs(10))
+        .expect("the probe never got keyboard focus");
+
+    keyboard.key_down(KEY_LEFTSHIFT);
+    keyboard.key_press(KEY_H);
+    keyboard.key_up(KEY_LEFTSHIFT);
+    keyboard.pump();
+
+    // `0x48` is `XK_H`, `0x68` is `XK_h`: the level-1 sym for the press and
+    // the level-0 sym a capture would store, in one line.
+    let line = wait_for_report_line(report.path(), "key 0x48 ", Duration::from_secs(10));
+    assert_eq!(
+        line.as_deref(),
+        Some("key 0x48 base 0x68 shift true ctrl false alt false logo false"),
+        "Shift+h must arrive as `H` with the modifier held and `h` as its \
+         base: {:?}",
+        probe_report(report.path())
+    );
+    assert!(
+        wait_for_report_line(report.path(), "typed H", Duration::from_secs(10)).is_some(),
+        "and it must insert the capital: {:?}",
+        probe_report(report.path())
+    );
+}
 
 #[test]
 fn a_virtual_keyboard_types_into_the_entry_and_the_glyphs_appear() {
@@ -207,12 +251,7 @@ fn a_virtual_keyboard_types_into_the_entry_and_the_glyphs_appear() {
     let _probe = spawn_window_probe(&socket, "entry", theme.path(), report.path());
     wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
     // The headless backend advertises `wl_seat`'s Keyboard capability only
     // once a device exists on the seat -- a virtual keyboard, here -- so the
     // probe cannot bind `wl_keyboard` (and therefore cannot receive `enter`)
@@ -313,12 +352,7 @@ fn tab_moves_the_focus_ring_and_it_is_only_visible_after_a_key() {
     let _probe = spawn_window_probe(&socket, "entry", theme.path(), report.path());
     wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
     // See the ordering note in the sibling test: the seat only advertises
     // Keyboard once a device exists on it.
     let mut keyboard = VirtualKeyboardClient::spawn(&socket);
@@ -388,12 +422,7 @@ fn a_held_key_repeats_through_pump_and_types_more_than_one_glyph() {
     let _probe = spawn_window_probe(&socket, "entry", theme.path(), report.path());
     wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
 
     // Keyboard capability must exist on the seat before Focus can deliver
     // `keyboard-enter` (see reconciliation 1 above) -- spawn first.
@@ -473,12 +502,7 @@ fn a_popup_opened_from_a_menubutton_takes_the_grab_and_is_dismissed_outside_it()
     let _probe = spawn_window_probe(&socket, "menu", theme.path(), report.path());
     wait_for_report_line(report.path(), "configure ", Duration::from_secs(10))
         .expect("a first configure");
-    let window = compositor
-        .snapshot()
-        .windows
-        .into_iter()
-        .find(|w| w.app_id == "org.icedtea.WindowProbe")
-        .expect("the probe's window");
+    let window = wait_for_probe_window(&compositor, Duration::from_secs(10));
     compositor.send(DbCommand::Focus(window.id));
 
     // Click on the menubutton: the probe opens its popup with the serial that
@@ -533,5 +557,98 @@ fn a_popup_opened_from_a_menubutton_takes_the_grab_and_is_dismissed_outside_it()
         wait_for_report_line(report.path(), "popup-done", Duration::from_secs(10)).is_some(),
         "the grab did not dismiss the popup: {:?}",
         probe_report(report.path())
+    );
+}
+
+#[test]
+fn probe_points_locate_a_live_windows_widgets() {
+    // Every M5 gate addresses widgets by id rather than by hard-coded
+    // coordinates; on a live window `App::probe` (offscreen-only) cannot
+    // answer, so `Window::probe_points` must.
+    // mutation: return `Vec::new()` from `probe_points_of`; no `probe ` line
+    // is ever written and this fails.
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let _probe = support::spawn_window_probe_with(
+        &compositor.socket_path().to_string_lossy(),
+        "entry",
+        theme.path(),
+        report.path(),
+        &["--emit-probe"],
+    );
+    assert!(
+        wait_for_report_line(report.path(), "probe ", Duration::from_secs(20)).is_some(),
+        "the probe emitted no probe points: {:?}",
+        probe_report(report.path())
+    );
+    let points: Vec<support::ProbePoint> = probe_report(report.path())
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("probe ").map(str::to_owned))
+        // `parse_probe_line` wants `<widget> <label> <x> <y>`; a window's
+        // lines have no widget column, so the label stands in for both.
+        .filter_map(|rest| support::parse_probe_line(&format!("window {rest}")))
+        .collect();
+    assert!(
+        points.iter().any(|p| p.label == "entry"),
+        "the entry is not among the probe points: {points:?}"
+    );
+    assert!(
+        points.iter().any(|p| p.label == "menubutton"),
+        "the menubutton is not among the probe points: {points:?}"
+    );
+    for point in &points {
+        assert!(
+            point.x >= 0 && point.y >= 0,
+            "a probe point must be inside the surface: {point:?}"
+        );
+    }
+}
+
+#[test]
+fn allocation_by_id_matches_the_probe_point_centre() {
+    // mutation: return the border box un-floored (`as i32` on the raw centre)
+    // in `probe_points_of`; a half-pixel centre rounds the other way and the
+    // equality below fails.
+    let compositor = Compositor::spawn();
+    let theme = probe_theme();
+    let report = tempfile::NamedTempFile::new().expect("report file");
+    let _probe = support::spawn_window_probe_with(
+        &compositor.socket_path().to_string_lossy(),
+        "entry",
+        theme.path(),
+        report.path(),
+        &["--emit-probe"],
+    );
+    assert!(
+        wait_for_report_line(report.path(), "alloc entry ", Duration::from_secs(20)).is_some(),
+        "no allocation line for the entry: {:?}",
+        probe_report(report.path())
+    );
+    let lines = probe_report(report.path());
+    let alloc = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("alloc "))
+        .and_then(support::parse_allocation_line)
+        .expect("an allocation line parses");
+    // `probe_points_of` emits the window's own root point first (labelled
+    // "root", per its shared derivation with `gallery::probe_points_of`),
+    // then every descendant in tree order -- not "entry" first. Find the
+    // entry's own probe point by label rather than assuming it leads.
+    let point = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("probe "))
+        .map(|rest| format!("window {rest}"))
+        .filter_map(|line| support::parse_probe_line(&line))
+        .find(|p| p.label == "entry")
+        .expect("an entry probe line parses");
+    assert_eq!(alloc.widget, "entry", "the first alloc line is the entry's");
+    assert_eq!(
+        (point.x, point.y),
+        (
+            (alloc.x + alloc.width / 2.0).floor() as i32,
+            (alloc.y + alloc.height / 2.0).floor() as i32
+        ),
+        "the probe point is the floored centre of the allocation"
     );
 }

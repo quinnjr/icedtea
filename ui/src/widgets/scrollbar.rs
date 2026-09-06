@@ -306,6 +306,44 @@ impl<Msg: Clone + 'static> Controller<Msg> for ScrollbarC {
         }
     }
 
+    fn paint(
+        &mut self,
+        canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+        alloc: &crate::layout::Allocation,
+        style: &crate::css::computed::ComputedStyle,
+        _cx: &mut crate::view::controller::PaintCx<'_>,
+    ) -> bool {
+        // `range`/`trough`/`slider` are subnodes this controller appends
+        // itself, so they have no taffy box and M2's box painting never
+        // reaches them: nothing draws a scrollbar but this. The geometry is
+        // `slider_rect` over the leaf's own content box — the *same* rect
+        // `on_event` hit-tests through `content_rect_local` — so the drawn
+        // slider and the grabbed slider cannot drift.
+        let content = alloc.content_box;
+        if content.is_empty() {
+            return false;
+        }
+        let colour = style.color();
+        let trough_colour = crate::css::value::Rgba {
+            a: colour.a * 0.15,
+            ..colour
+        };
+        canvas.draw_rect(&content.to_skia(), &crate::paint::fill_paint(trough_colour));
+        let local = Rect::new(0.0, 0.0, content.width, content.height);
+        let slider = self.slider_rect(local, self.orientation);
+        let slider = Rect::new(
+            content.x + slider.x,
+            content.y + slider.y,
+            slider.width,
+            slider.height,
+        );
+        if slider.is_empty() {
+            return true;
+        }
+        canvas.draw_rect(&slider.to_skia(), &crate::paint::fill_paint(colour));
+        true
+    }
+
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         // The trough is a subnode this controller appends itself, so
         // `local_rect(cx.tree, cx.node, &self.trough)` is `None` on every

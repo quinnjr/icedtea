@@ -222,7 +222,7 @@ fn a_removed_key_s_controller_is_dropped_exactly_once() {
         let guard = Rc::new(Guard(Rc::clone(&drops)));
         let view: View<Msg> = widget::<Msg>(Kind::DrawingArea).key(1_u64).prop(
             PropName::DrawFn,
-            icedtea_ui::view::Prop::Draw(Rc::new(move |_canvas, _rect| {
+            icedtea_ui::view::Prop::Draw(Rc::new(move |_canvas, _rect, _cx| {
                 // Capturing the guard is the whole point; the body never runs.
                 let _ = &guard;
             })),

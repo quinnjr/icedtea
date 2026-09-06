@@ -2,7 +2,7 @@
 
 use crate::css::node::Node;
 use crate::layout::{BoxDirection, Container};
-use crate::view::{BuildCx, Controller, Event, EventCx, Kind, Prop, PropName, Props};
+use crate::view::{BuildCx, Controller, Event, EventCx, EventKind, Kind, Prop, PropName, Props};
 use crate::widgets::types::{BaselinePosition, Orientation};
 use crate::widgets::{Universal, WidgetEnum as _, prop_bool, prop_i64, prop_u16};
 
@@ -92,8 +92,26 @@ impl<Msg: Clone + 'static> Controller<Msg> for BoxC {
         self.apply(node);
     }
 
-    fn on_event(&mut self, _ev: &Event, _cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
-        Vec::new()
+    fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
+        // Reconciliation (Task 8 fix-round, recorded as P3-D9): matches
+        // `GenericC::on_event`'s own `Event::Key` arm. `Kind::Box` (this
+        // controller) is not the catch-all `GenericC` — `build_controller`
+        // gives every `box_(...)` node this dedicated controller — so a
+        // `.on_key` handler on a `box_(...)` root (as `settings/src/app.rs`
+        // wires its window-root capture handler, P3-D1) previously had no
+        // path to ever fire: `BoxC::on_event` ignored every event
+        // unconditionally, `deliver`'s only Key-firing call site was this
+        // arm inside `GenericC`, and D19 keys off `cx.handled`, which
+        // nothing here ever set for a `Key` event either way.
+        match ev {
+            Event::Key(key) if key.pressed => cx
+                .handlers
+                .fire_key(EventKind::KeyPressed, key)
+                .into_iter()
+                .inspect(|_| cx.handled = true)
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 

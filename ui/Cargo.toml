@@ -31,7 +31,8 @@ wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 xkbcommon = "0.9"
-rustix = { version = "1", features = ["fs", "event"] }
+rustix = { version = "1", features = ["fs", "event", "pipe"] }
+crossbeam-channel.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -46,6 +47,10 @@ fontconfig = ["dep:fontconfig"]
 
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }
+# `support::wait_for_probe_window` hands back the compositor's own
+# `WindowInfo`; a test's poll loop over `Compositor::snapshot` has nowhere
+# else to name that type.
+icedtea-contract = { path = "../contract" }
 icedtea-compositor = { path = "../compositor" }
 tempfile = "3"
 

@@ -1,0 +1,27 @@
+/* icedtea-settings' own sheet, layered over the GTK theme as a user-origin
+ * overlay — the mechanism the user's ~/.config/gtk-4.0/gtk.css uses.
+ *
+ * P3 adds the `.conflict` rule for duplicate keybindings. */
+
+#footer {
+  border-top: 1px solid alpha(currentColor, 0.15);
+}
+
+/* A keybinding bound to more than one action. Advisory only: conflicts
+   never block Apply (M5 spec §5.4). Replaces the GTK
+   `install_conflict_css` provider, which loaded the same declaration at
+   STYLE_PROVIDER_PRIORITY_APPLICATION. */
+.conflict {
+    color: #f38ba8;
+    font-weight: bold;
+}
+
+/* The Displays canvas: `Event::PointerDown`'s `local` is border-box relative
+   while `Prop::Draw`'s rect is the content box. With no padding, border or
+   margin the two coincide, which is what makes the canvas hit test correct
+   (plan P4-D4). */
+#displays_canvas {
+    padding: 0;
+    border: 0 none;
+    margin: 0;
+}

@@ -3834,6 +3834,18 @@ pub struct VirtualKeyboardClient {
     /// `VirtualPointerClient::time` -- the compositor only cares that it does
     /// not go backwards.
     time: u32,
+    /// Client-side xkb state, fed every `key` request so the matching
+    /// `modifiers` request can be derived. `zwp_virtual_keyboard_v1.key` does
+    /// **not** update the compositor's xkb state (wlroots' virtual-keyboard
+    /// implementation passes `update_state = false` to
+    /// `wlr_keyboard_notify_key`, precisely because the protocol makes the
+    /// client the owner of modifier state), so a virtual keyboard that only
+    /// ever sends `key` can hold Shift down forever without any client ever
+    /// being told a modifier is active.
+    xkb_state: xkb::State,
+    /// The last `(depressed, latched, locked, group)` sent, so `modifiers` is
+    /// only re-sent when it actually changes.
+    mods: (u32, u32, u32, u32),
 }
 
 /// `wl_keyboard`'s `keymap_format` enum value for `XKB_V1` -- the virtual
@@ -3900,12 +3912,15 @@ impl VirtualKeyboardClient {
         // the seat's capability change is on the wire before callers connect.
         queue.roundtrip(&mut state).expect("vk roundtrip");
         queue.roundtrip(&mut state).expect("vk settle");
+        let xkb_state = xkb::State::new(&keymap);
         VirtualKeyboardClient {
             conn,
             queue,
             state,
             vk,
             time: 0,
+            xkb_state,
+            mods: (0, 0, 0, 0),
         }
     }
 
@@ -3915,13 +3930,53 @@ impl VirtualKeyboardClient {
         self.time
     }
 
+    /// Send one `key` request and the `modifiers` request it implies.
+    ///
+    /// A real `wl_keyboard` gets its modifier state from the compositor's own
+    /// xkb state machine; a virtual keyboard's does not update on `key` (see
+    /// [`VirtualKeyboardClient::xkb_state`]), so this mirrors what a real
+    /// on-screen keyboard does: run the press through a client-side xkb state
+    /// and send `modifiers` whenever the serialised masks change. Ordering
+    /// matches a real keyboard's -- the `modifiers` for a Shift press lands
+    /// before the next key's `key` event, so the compositor translates that
+    /// key with Shift already held.
+    fn send_key(&mut self, key: u32, pressed: bool) {
+        let time = self.next_time();
+        self.vk.key(
+            time,
+            key,
+            if pressed {
+                KEY_STATE_PRESSED
+            } else {
+                KEY_STATE_RELEASED
+            },
+        );
+        // xkb keycodes are evdev keycodes + 8.
+        self.xkb_state.update_key(
+            xkb::Keycode::new(key + 8),
+            if pressed {
+                xkb::KeyDirection::Down
+            } else {
+                xkb::KeyDirection::Up
+            },
+        );
+        let next = (
+            self.xkb_state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            self.xkb_state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            self.xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED),
+            self.xkb_state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+        );
+        if next != self.mods {
+            self.mods = next;
+            self.vk.modifiers(next.0, next.1, next.2, next.3);
+        }
+    }
+
     /// Press then release `key` (a Linux input-event keycode, e.g. `30` for
     /// `KEY_A`) + flush. Requires the keymap `spawn` already set.
     pub fn key_press(&mut self, key: u32) {
-        let time = self.next_time();
-        self.vk.key(time, key, KEY_STATE_PRESSED);
-        let time = self.next_time();
-        self.vk.key(time, key, KEY_STATE_RELEASED);
+        self.send_key(key, true);
+        self.send_key(key, false);
         self.conn.flush().expect("flush key_press");
     }
 
@@ -3930,15 +3985,13 @@ impl VirtualKeyboardClient {
     /// to hold, not press-and-release, since `key_press` never leaves a key
     /// down long enough for a client's repeat timer to fire.
     pub fn key_down(&mut self, key: u32) {
-        let time = self.next_time();
-        self.vk.key(time, key, KEY_STATE_PRESSED);
+        self.send_key(key, true);
         self.conn.flush().expect("flush key_down");
     }
 
     /// Release a key previously held with [`Self::key_down`] + flush.
     pub fn key_up(&mut self, key: u32) {
-        let time = self.next_time();
-        self.vk.key(time, key, KEY_STATE_RELEASED);
+        self.send_key(key, false);
         self.conn.flush().expect("flush key_up");
     }
 

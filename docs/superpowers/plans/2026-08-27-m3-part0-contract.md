@@ -5180,3 +5180,115 @@ rules (`wlr_xdg_positioner_rules_get_geometry`) before unconstraining — wlroot
 path — so repeat calls with a different constraint box yield the correct configure. Fixed in
 wlr 0.20.28 (commit 02b1c90 on feature/wlr-xdg-popup). P2's
 `a_reactive_popup_is_reconfigured_when_its_parent_moves` is the end-to-end proof.
+
+### M5-D1 — `wait_bounded` polls N fds, not one (superseded §3.1)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §3.1's single-`PollFd`
+`wait_bounded` is replaced by a set whose element 0 is the Wayland queue and
+whose rest are `Window::watch_fd` registrations, reported as
+`InputEvent::FdReady(WatchId)`. Full text:
+`docs/superpowers/plans/2026-09-03-m5-part0-contract.md` §1 M5-D1.
+
+### M5-D4 — `App::new` takes closures, not `fn` pointers (amends §4.7)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §4.7's
+`new(model, update: fn(..), view: fn(..))` (this file, l. 1516-1521) becomes
+`impl FnMut`/`impl Fn`, a strict widening: every `fn`-item call site compiles
+unchanged. Full text: M5 contract §1 M5-D4.
+
+### M5-D2 — `App` grows an external-message hook (§4.7 had none)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §4.7's loop had no way for a
+worker thread to reach `update`; `App::with_inbox` and `App::on_fd` add one, on
+a normative per-frame drain order — the inbox's wake pipe, then its channel in
+send order, then `on_fd` messages, then the frame's own input batch, folded
+once. `run` registers the pipe with `Window::watch_fd` and unwatches it on
+exit; `run_offscreen` drains at the same point so an ingress test needs no
+compositor. Full text: M5 contract §1 M5-D2.
+
+### M5-D3 — `Cmd` grows a side-effect leaf (§4.7 had none)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. `Cmd::Task(Rc<dyn Fn()>)`
+runs a non-blocking side effect on the loop thread, outside `update`, after the
+fold that produced it — a `flatten` leaf, printed opaquely as `Task(..)`,
+executed identically by `drain` whether reached through `run` or
+`run_offscreen`. It has no return value: an answer comes back through the
+inbox (M5-D2) as a message. Full text: M5 contract §1 M5-D3.
+
+### M5-D5 — three pointer `EventKind`s and a button-carrying `Handler` (extends §4.4)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §4.4's `EventKind` gains
+`PointerDown`/`PointerMotion`/`PointerUp` (appended to `ALL`, now 21 entries)
+so raw pointer phases reach any widget kind, not only the ones with a typed
+gesture already. `Handler` gains `PairButton(Rc<dyn Fn(f64, f64, u32) ->
+Msg>)`; `Handlers::fire_pair_button` fires either a `PairButton` or a `Pair`
+binding on the same kind (button dropped for the latter), with no `Unit`
+fallthrough. Six builders (`on_pointer_down`/`_motion`/`_up`, each with a
+`_with_button` variant) and `BTN_RIGHT`/`BTN_MIDDLE` beside a re-exported
+`BTN_LEFT` in `window::pointer` (P0-D3). They are fired centrally, by
+`view::app::fire_pointer_handlers` from `view::app::deliver` (P0-D1) rather
+than from `GenericC::on_event`, at `Phase::Target` and again on the ancestor
+chain at `Phase::Bubble` (P0-D8); the gallery's `drawing_area` sample binds all
+three. Full text: M5 contract §6 P0-D1, P0-D2, P0-D3, P0-D8.
+
+### M5-D6 — `Prop::Draw` carries the paint context (widens §4.3)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §4.3's
+`Prop::Draw(Rc<dyn Fn(&mut Canvas<'_>, Rect)>)` widens to `Fn(&mut Canvas<'_>,
+Rect, &mut crate::paint::PaintCx<'_>)` so a `drawing_area` callback can shape
+text, resolve an icon or read the theme's colours — the same paint context
+every controller's `paint` receives — instead of being limited to fills and
+strokes. `Props::diff` still compares by `Rc` pointer, so no diff behaviour
+changes. Full text: M5 contract §1 M5-D6.
+
+### M5-D7 — `Keymap` exposes a level-0 lookup and `KeyEvent` carries it (extends §3.3)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. §3.3's `Keymap` gains
+`base_keysym(keycode) -> xkb::Keysym`, the sym at group 0, level 0 —
+GDK's `translate_key(keycode, 0, 0)` — never panicking on an unmapped
+keycode (`Keysym::NoSymbol` instead). Every `KeyEvent` gains a `base` field,
+stamped by `Keymap::translate` with `base_keysym(keycode)`, so a view-layer
+`on_key` closure can normalise an accelerator capture without reaching into
+the window. Settings' keybinding capture needs exactly this: `icedtea_config`'s
+`key_name_to_keysym` always encodes the unshifted keysym, so a capture that
+stored the modified sym would produce a binding the compositor's
+`match_action` can never fire. Full text: M5 contract §1 M5-D7.
+
+### M5-D9 — probing works on a live `Window`, not only offscreen (extends P8-D59/P8-D60)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. P8-D59/P8-D60 put probing on
+`App::probe`, which is offscreen-only — a harness test against a *running*
+process has no other way to ask where a widget ended up, and the gate rules
+forbid hard-coded coordinates. `window::probe_points_of`/`allocation_of` label
+and centre a laid-out tree with the gallery's own rule (id-or-node-name with a
+repeat index, floored centres), and `Window::probe_points`/`Window::allocation`
+expose them. `window-probe --emit-probe` writes the report lines
+`ui/tests/support` already parses (`probe <label> <x> <y>`,
+`alloc <id> <x> <y> <w> <h>`). Full text: M5 contract §1 M5-D9.
+
+### M5-D8 — four widgets paint at rest; `KNOWN_BLANK_AT_REST` drops to six (supersedes P8-D69)
+
+**Carried out by:** M5 P0. **Added:** 2026-09-03. P8-D69's fifteen-entry
+`KNOWN_BLANK_AT_REST` list is superseded: `ColorDialogButtonC`,
+`ColorDialogC`, `CheckButtonC` and `ScrollbarC` now paint at rest —
+respectively the swatch on a real intrinsic floor (P0-D10), the palette grid
+`measure` and `paint` both read from one `grid()`, the unchecked indicator box
+from `style.color()`/`style.border_colors()`, and the trough plus slider — so
+`ui/tests/gallery_gate.rs`'s list is exactly six entries
+(`window_controls`, `font_dialog`, `popover_menu`, `popover_menu_bar`,
+`alert_dialog` — all zero-area allocations — and `link_button`), pinned by `the_readme_names_every_known_blank_widget` against
+`ui/README.md`. P8-D69's own text is retained above as the record of what
+fifteen used to mean; the live number is this one. The gate's separate
+`THEME_BLIND_BY_DESIGN` carve-out grows to four with `color_dialog`, recorded
+as M5 contract §6 P0-D9. Full text: M5 contract §1 M5-D8, §6 P0-D9, P0-D10.
+
+### M5-P0-fix — `Cmd::Unwatch`, and pointer handlers that bubble
+
+**Carried out by:** M5 P0 (whole-part fix wave). **Added:** 2026-09-04.
+`Cmd` gains `Unwatch(WatchId)`, handled in `App::run`'s window-bound command
+match: without it an app that has handed its window to `App::run` cannot retire
+a watch at all, and a level-triggered `POLLHUP`/`POLLERR` on a foreign fd spins
+the loop with no exit (M5 contract §6 P0-D7). `fire_pointer_handlers` also runs
+at `Phase::Bubble`, so a container with a pointer handler sees a gesture that
+landed on a child instance, subject to P4-D19's `cx.handled` rule (§6 P0-D8).
+Full text: M5 contract §6 P0-D7, P0-D8.

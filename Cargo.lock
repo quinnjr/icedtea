@@ -1647,19 +1647,21 @@ name = "icedtea-settings"
 version = "0.1.0"
 dependencies = [
  "async-channel",
- "gio",
- "glib",
- "gtk4",
+ "crossbeam-channel",
+ "futures-util",
  "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
+ "icedtea-ui",
  "redb",
  "rustix 1.1.4",
+ "skia-rs-safe",
  "tempfile",
  "tracing",
  "tracing-subscriber",
  "wayland-client",
  "wayland-protocols-wlr",
+ "xkbcommon 0.9.0",
  "zbus",
 ]
 
@@ -1686,9 +1688,11 @@ name = "icedtea-ui"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
+ "crossbeam-channel",
  "cssparser",
  "fontconfig",
  "icedtea-compositor",
+ "icedtea-contract",
  "icedtea-harness",
  "precomputed-hash",
  "rustix 1.1.4",

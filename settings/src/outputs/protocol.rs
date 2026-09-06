@@ -1,12 +1,12 @@
-//! GTK-free `zwlr_output_management_v1` client core.
+//! Toolkit-free `zwlr_output_management_v1` client core.
 //!
-//! Owns a second `wayland-client` [`Connection`] (separate from GDK's) and the
-//! [`EventQueue`] that drives it, plus the `Dispatch` glue for every object in
-//! the output-management tree. Everything here is plain data and pure protocol
-//! logic — no `gtk4`, `gio`, or `glib` — so the whole enumerate/apply cycle is
-//! exercisable from a libtest binary against `icedtea-harness` with nothing but
-//! explicit roundtrips. The glib main-loop integration lives in
-//! [`super::client`], layered on top of this.
+//! Owns a second `wayland-client` [`Connection`] (separate from the
+//! toolkit's own window connection) and the [`EventQueue`] that drives it,
+//! plus the `Dispatch` glue for every object in the output-management tree.
+//! Everything here is plain data and pure protocol logic, so the whole
+//! enumerate/apply cycle is exercisable from a libtest binary against
+//! `icedtea-harness` with nothing but explicit roundtrips. The toolkit's poll
+//! loop integration lives in [`super::pump`], layered on top of this.
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -276,7 +276,7 @@ impl OutputsState {
 }
 
 /// The owned connection + queue + state. Drives protocol logic with explicit
-/// roundtrips (tests) or from a glib source ([`super::client`]).
+/// roundtrips (tests) or from the toolkit's poll loop ([`super::pump`]).
 pub struct OutputsConnection {
     conn: Connection,
     queue: EventQueue<OutputsState>,

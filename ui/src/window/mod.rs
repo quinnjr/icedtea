@@ -15,6 +15,7 @@ pub mod selection;
 pub mod toplevel;
 
 pub use layer::BTN_LEFT;
+pub use pointer::{BTN_MIDDLE, BTN_RIGHT};
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -641,6 +642,14 @@ pub enum InputEvent {
     },
     SelectionChanged,
     PrimaryChanged,
+    /// A watched fd is ready.
+    ///
+    /// Carries no readiness flags on purpose: the owner of the fd is the only
+    /// thing that knows what to do with it, and re-encoding `revents` here
+    /// would invite the toolkit to interpret a foreign protocol. One event per
+    /// ready watch per [`Window::pump`] batch, in registration order, after
+    /// whatever Wayland events the same wake dispatched.
+    FdReady(WatchId),
 }
 
 impl InputEvent {
@@ -806,6 +815,82 @@ impl WindowState {
     }
 }
 
+/// Opaque handle for one fd registered with [`Window::watch_fd`].
+///
+/// Ids are minted per window and never reused, so a stale id from a dropped
+/// watch can never name a later one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WatchId(u64);
+
+/// What a watch waits for.
+///
+/// `Read` is readability, `Write` writability, `ReadWrite` either. `HUP` and
+/// `ERR` are always reported whatever the interest, and always arrive as an
+/// [`InputEvent::FdReady`] — the toolkit never decides on its own that a
+/// foreign fd is dead. It reports, and the owner calls [`Window::unwatch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Interest {
+    /// Readable, or hung up.
+    Read,
+    /// Writable.
+    Write,
+    /// Either.
+    ReadWrite,
+}
+
+impl Interest {
+    fn flags(self) -> rustix::event::PollFlags {
+        use rustix::event::PollFlags;
+        match self {
+            Interest::Read => PollFlags::IN,
+            Interest::Write => PollFlags::OUT,
+            Interest::ReadWrite => PollFlags::IN | PollFlags::OUT,
+        }
+    }
+}
+
+/// One registered fd: the window owns it until [`Window::unwatch`] drops it.
+struct Watch {
+    id: WatchId,
+    fd: std::os::fd::OwnedFd,
+    flags: rustix::event::PollFlags,
+}
+
+/// Every live watch, in registration order.
+#[derive(Default)]
+struct Watches {
+    entries: Vec<Watch>,
+    next: u64,
+}
+
+impl Watches {
+    fn add(&mut self, fd: std::os::fd::OwnedFd, interest: Interest) -> WatchId {
+        let id = WatchId(self.next);
+        self.next += 1;
+        self.entries.push(Watch {
+            id,
+            fd,
+            flags: interest.flags(),
+        });
+        id
+    }
+
+    /// Drop the watch and close its fd. An unknown id is a no-op, not a panic:
+    /// an owner that unwatches twice is not a protocol error (M5-D1 §4).
+    fn remove(&mut self, id: WatchId) {
+        self.entries.retain(|w| w.id != id);
+    }
+
+    fn ids(&self) -> Vec<WatchId> {
+        self.entries.iter().map(|w| w.id).collect()
+    }
+
+    fn entries(&self) -> impl Iterator<Item = &Watch> {
+        self.entries.iter()
+    }
+}
+
 /// Block until `ready`, the surface closes, or `timeout` expires.
 ///
 /// wayland-client 0.31's bounded-wait shape: dispatch what is queued,
@@ -817,6 +902,9 @@ fn wait_bounded(
     queue: &mut EventQueue<WindowState>,
     state: &mut WindowState,
     timeout: Duration,
+    // M5-D1: the extra fds this window's owner registered. Empty for
+    // `Window::open`, which has no owner yet.
+    watches: &Watches,
     ready: impl Fn(&WindowState) -> bool,
 ) -> Result<(), SurfaceError> {
     use rustix::event::{PollFlags, Timespec};
@@ -826,10 +914,26 @@ fn wait_bounded(
     // `Instant + Duration::MAX` panics: an unrepresentable deadline is `None`,
     // which polls without a timespec rather than overflowing.
     let deadline = Instant::now().checked_add(timeout);
+    // M5-D1: watches that fired on the *previous* poll, published after the
+    // dispatch below so a batch reads "Wayland events first, then FdReady",
+    // which is the order M5-D1 §3 fixes.
+    let mut fired: Vec<WatchId> = Vec::new();
+    // A `Duration::ZERO` wait is "drain what is there", not "do nothing": the
+    // deadline is already past on the first pass, and returning `Timeout`
+    // there — as this used to — never flushed, never read the Wayland socket
+    // and never polled a single watched fd. One controller reporting a zero
+    // deadline (`GridViewC` did so unconditionally) then pinned the loop on
+    // that early return and starved input, frame callbacks and every
+    // `App::on_fd`/inbox watch. The first expiry therefore still runs one
+    // non-blocking poll pass; the second time round is the real timeout.
+    let mut expired = false;
     loop {
         queue
             .dispatch_pending(state)
             .map_err(SurfaceError::Dispatch)?;
+        state
+            .events
+            .extend(fired.drain(..).map(InputEvent::FdReady));
         if state.closed {
             return Err(SurfaceError::Closed);
         }
@@ -839,7 +943,12 @@ fn wait_bounded(
 
         let now = Instant::now();
         let remaining = match deadline {
-            Some(deadline) if now >= deadline => return Err(SurfaceError::Timeout(timeout)),
+            Some(deadline) if now >= deadline => {
+                if std::mem::replace(&mut expired, true) {
+                    return Err(SurfaceError::Timeout(timeout));
+                }
+                Some(Duration::ZERO)
+            }
             Some(deadline) => Some(deadline - now),
             None => None,
         };
@@ -852,22 +961,45 @@ fn wait_bounded(
         };
 
         let fd = queue.as_fd();
-        let mut fds = [rustix::event::PollFd::new(&fd, PollFlags::IN)];
+        // M5-D1: element 0 is always the Wayland queue's fd; elements 1..
+        // are the watches in registration order, which is what makes
+        // `fds[index + 1]` name `watches.entries().nth(index)`.
+        let mut fds = Vec::with_capacity(1 + watches.entries().count());
+        fds.push(rustix::event::PollFd::new(&fd, PollFlags::IN));
+        for watch in watches.entries() {
+            fds.push(rustix::event::PollFd::new(&watch.fd, watch.flags));
+        }
         let timespec = remaining.map(|remaining| Timespec {
             tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
             tv_nsec: i64::from(remaining.subsec_nanos()),
         });
         match rustix::event::poll(&mut fds, timespec.as_ref()) {
-            // Only reachable with a timespec: a `None` deadline means poll
-            // blocks until the fd speaks.
             Ok(0) => return Err(SurfaceError::Timeout(timeout)),
-            Ok(_) => match guard.read() {
-                Ok(_) => {}
-                // A racing reader on another queue drained the socket.
-                Err(wayland_client::backend::WaylandError::Io(err))
-                    if err.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(err) => return Err(socket_error(err)),
-            },
+            Ok(_) => {
+                // M5-D1: a wake caused only by a watch must not read the
+                // Wayland socket — `guard.read()` on a socket with nothing to
+                // say is at best a wasted syscall and at worst a block.
+                // Dropping the guard cancels the read intent.
+                if fds[0].revents().is_empty() {
+                    drop(guard);
+                } else {
+                    match guard.read() {
+                        Ok(_) => {}
+                        // A racing reader on another queue drained the socket.
+                        Err(wayland_client::backend::WaylandError::Io(err))
+                            if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(err) => return Err(socket_error(err)),
+                    }
+                }
+                // M5-D1 §2/§3: one `FdReady` per ready watch, whatever bits
+                // are set (`HUP`/`ERR` included, which poll reports without
+                // being asked). Published at the top of the next iteration.
+                for (index, watch) in watches.entries().enumerate() {
+                    if !fds[index + 1].revents().is_empty() {
+                        fired.push(watch.id);
+                    }
+                }
+            }
             Err(rustix::io::Errno::INTR) => {}
             Err(err) => return Err(SurfaceError::Socket(err.into())),
         }
@@ -879,6 +1011,109 @@ fn socket_error(err: wayland_client::backend::WaylandError) -> SurfaceError {
         wayland_client::backend::WaylandError::Io(io) => SurfaceError::Socket(io),
         other => SurfaceError::Socket(std::io::Error::other(other.to_string())),
     }
+}
+
+/// One probe point on a live window, in window-surface coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbePoint {
+    /// The node's `id` if it has one, else its CSS node name, indexed when the
+    /// name repeats — `gallery::probe_points_of`'s labelling rule.
+    pub label: String,
+    /// Centre of the border box, floored.
+    pub x: i32,
+    /// Centre of the border box, floored.
+    pub y: i32,
+}
+
+/// Label and centre every laid-out node under `root`.
+///
+/// Same derivation as `gallery::probe_points_of`: walk `root.descendants()`,
+/// label by id-or-node-name with a repeat index, take the centre of the border
+/// box **floored** (`f32::floor` before the cast, not `as i32`, which
+/// truncates toward zero, and not `round`, which ties away from it: only
+/// flooring makes an integer shift of a box shift its centre by that same
+/// integer). A node with no allocation is skipped. Cheap: it reads the layout
+/// tree the last frame already computed and lays nothing out.
+#[must_use]
+pub fn probe_points_of(root: &Node, layout: &crate::layout::LayoutTree) -> Vec<ProbePoint> {
+    use std::collections::BTreeMap;
+
+    let centre = |label: String, alloc: &crate::layout::Allocation| {
+        let r = alloc.border_box;
+        ProbePoint {
+            label,
+            x: (r.x + r.width / 2.0).floor() as i32,
+            y: (r.y + r.height / 2.0).floor() as i32,
+        }
+    };
+    let label_of = |node: &Node, index: usize, repeats: bool| -> String {
+        node.id().map_or_else(
+            || {
+                let name = node.name();
+                if repeats {
+                    format!("{name}{index}")
+                } else {
+                    name.to_string()
+                }
+            },
+            |id| id.as_str().to_string(),
+        )
+    };
+
+    let mut points = Vec::new();
+    if let Some(alloc) = layout.allocation(root) {
+        points.push(centre("root".to_string(), &alloc));
+    }
+    // A `display: none` subtree paints nothing and receives no pointer event,
+    // so reporting its nodes' centres as probe points published coordinates a
+    // gate cannot click — a hidden `Stack` page's widgets were listed beside
+    // the visible page's own. The whole subtree is skipped, not just the node
+    // that carries the flag: only the subtree root is ever recorded.
+    let descendants: Vec<Node> = root
+        .descendants()
+        .filter(|node| layout.is_displayed(node))
+        .filter(|node| {
+            let mut parent = node.parent();
+            while let Some(node) = parent {
+                if !layout.is_displayed(&node) {
+                    return false;
+                }
+                if node.ptr_eq(root) {
+                    break;
+                }
+                parent = node.parent();
+            }
+            true
+        })
+        .collect();
+    let mut counts: BTreeMap<Rc<str>, usize> = BTreeMap::new();
+    for node in &descendants {
+        *counts.entry(node.name()).or_default() += 1;
+    }
+    let mut seen: BTreeMap<Rc<str>, usize> = BTreeMap::new();
+    for node in &descendants {
+        let name = node.name();
+        let index = seen.entry(name.clone()).or_default();
+        let repeats = counts.get(&name).copied().unwrap_or(0) > 1;
+        let label = label_of(node, *index, repeats);
+        *index += 1;
+        if let Some(alloc) = layout.allocation(node) {
+            points.push(centre(label, &alloc));
+        }
+    }
+    points
+}
+
+/// The allocation of the node under `root` whose [`Node::id`] is `id`.
+#[must_use]
+pub fn allocation_of(
+    root: &Node,
+    layout: &crate::layout::LayoutTree,
+    id: &str,
+) -> Option<crate::layout::Allocation> {
+    root.descendants()
+        .find(|node| node.id().is_some_and(|found| found.as_str() == id))
+        .and_then(|node| layout.allocation(&node))
 }
 
 /// One window: a surface, its retained tree, and the pump that drives them.
@@ -933,6 +1168,8 @@ pub struct Window {
     /// glyphs on a real surface: one shaped run per node. P5 deletes this
     /// field in the commit that lands `TextLayout`.
     texts: std::collections::HashMap<NodeAddr, String>,
+    /// Foreign fds this window polls alongside its own connection (M5-D1).
+    watches: Watches,
 }
 
 /// How long [`Window::open`] waits for the first `configure`.
@@ -954,6 +1191,43 @@ impl Window {
         fonts: FontDatabase,
     ) -> Result<Self, SurfaceError> {
         let conn = Connection::connect_to_env().map_err(SurfaceError::Connect)?;
+        Self::open_on(conn, spec, sheet, fonts)
+    }
+
+    /// [`Window::open`] against one named socket, ignoring `$WAYLAND_DISPLAY`.
+    ///
+    /// The environment is process-global: a test that sets `WAYLAND_DISPLAY`
+    /// to reach its own compositor mutates it for every other test running
+    /// beside it in the same binary (and, on edition 2024, does so through an
+    /// `unsafe` call that is undefined behaviour the moment another thread
+    /// reads the environment). Naming the socket is the way out —
+    /// `outputs::OutputsConnection::connect_to_path`'s own reason for
+    /// existing.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Socket`] if the socket cannot be connected, and
+    /// everything [`Window::open`] answers with after that.
+    pub fn open_at_path(
+        path: impl AsRef<std::path::Path>,
+        spec: SurfaceSpec,
+        sheet: CompiledSheet,
+        fonts: FontDatabase,
+    ) -> Result<Self, SurfaceError> {
+        let stream =
+            std::os::unix::net::UnixStream::connect(path.as_ref()).map_err(SurfaceError::Socket)?;
+        let conn = Connection::from_socket(stream)
+            .map_err(|err| SurfaceError::Socket(std::io::Error::other(err.to_string())))?;
+        Self::open_on(conn, spec, sheet, fonts)
+    }
+
+    /// The body both constructors share, over a connection already made.
+    fn open_on(
+        conn: Connection,
+        spec: SurfaceSpec,
+        sheet: CompiledSheet,
+        fonts: FontDatabase,
+    ) -> Result<Self, SurfaceError> {
         let mut queue: EventQueue<WindowState> = conn.new_event_queue();
         let qh = queue.handle();
         conn.display().get_registry(&qh, ());
@@ -1032,9 +1306,14 @@ impl Window {
         wl_surface.commit();
         conn.flush().map_err(socket_error)?;
 
-        wait_bounded(&conn, &mut queue, &mut state, CONFIGURE_TIMEOUT, |state| {
-            state.configured.is_some()
-        })?;
+        wait_bounded(
+            &conn,
+            &mut queue,
+            &mut state,
+            CONFIGURE_TIMEOUT,
+            &Watches::default(),
+            |state| state.configured.is_some(),
+        )?;
         let (width, height) = state.configured.map_or((width, height), |(w, h)| {
             (
                 i32::try_from(w.max(1)).unwrap_or(width),
@@ -1076,6 +1355,7 @@ impl Window {
             next_popup_key: 1,
             clipboard: None,
             texts: std::collections::HashMap::new(),
+            watches: Watches::default(),
         })
     }
 
@@ -1096,6 +1376,7 @@ impl Window {
             &mut self.queue,
             &mut self.state,
             wait,
+            &self.watches,
             |state| !state.events.is_empty(),
         ) {
             Ok(()) | Err(SurfaceError::Timeout(_)) | Err(SurfaceError::Closed) => {}
@@ -1159,6 +1440,46 @@ impl Window {
     #[must_use]
     pub fn root(&self) -> &Node {
         &self.root
+    }
+
+    /// Every laid-out node of this window's tree, labelled and centred.
+    ///
+    /// The live counterpart of `App::probe`, which is offscreen-only: a
+    /// harness test against a running client has no other way to ask where a
+    /// widget ended up, and the gate rules forbid hard-coded coordinates.
+    /// Reads the tree the last [`Window::render`] laid out.
+    #[must_use]
+    pub fn probe_points(&self) -> Vec<ProbePoint> {
+        probe_points_of(&self.root, &self.layout)
+    }
+
+    /// The border box of the node whose [`Node::id`] is `id`, in
+    /// window-surface coordinates. `None` for an unknown id or a node that has
+    /// not been laid out.
+    #[must_use]
+    pub fn allocation(&self, id: &str) -> Option<crate::layout::Allocation> {
+        allocation_of(&self.root, &self.layout, id)
+    }
+
+    /// Register `fd` in this window's poll set.
+    ///
+    /// The window takes ownership so the caller cannot close the fd out from
+    /// under the loop; [`Window::unwatch`] is what closes it. Readiness is
+    /// reported as [`InputEvent::FdReady`] from [`Window::pump`], and nothing
+    /// is read from the fd by the toolkit — that is the owner's job.
+    pub fn watch_fd(&mut self, fd: std::os::fd::OwnedFd, interest: Interest) -> WatchId {
+        self.watches.add(fd, interest)
+    }
+
+    /// Drop a watch and close its fd. An unknown id is a no-op.
+    pub fn unwatch(&mut self, id: WatchId) {
+        self.watches.remove(id);
+    }
+
+    /// Every live watch, in registration order.
+    #[must_use]
+    pub fn watches(&self) -> Vec<WatchId> {
+        self.watches.ids()
     }
 
     /// The icon theme this window's own paints resolve through.
@@ -2904,6 +3225,48 @@ mod tests {
     }
 
     #[test]
+    fn interest_maps_onto_poll_flags() {
+        use rustix::event::PollFlags;
+        assert_eq!(super::Interest::Read.flags(), PollFlags::IN);
+        assert_eq!(super::Interest::Write.flags(), PollFlags::OUT);
+        assert_eq!(
+            super::Interest::ReadWrite.flags(),
+            PollFlags::IN | PollFlags::OUT
+        );
+    }
+
+    #[test]
+    fn a_watch_set_polls_the_wayland_fd_first_and_the_watches_in_registration_order() {
+        // The poll set's shape is the whole of M5-D1's semantics §1: element 0
+        // is always the connection, elements 1.. are the watches as registered.
+        // Building it is a pure function of the registry, so it is tested
+        // without a compositor; `ui/tests/ingress.rs` proves the live wake.
+        use rustix::event::PollFlags;
+        let (a_read, _a_write) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .expect("a pipe");
+        let (b_read, _b_write) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .expect("a pipe");
+        let mut watches = super::Watches::default();
+        let first = watches.add(a_read, super::Interest::Read);
+        let second = watches.add(b_read, super::Interest::ReadWrite);
+        assert_eq!(watches.ids(), vec![first, second]);
+        assert_ne!(first, second, "ids are never reused inside one window");
+        let flags: Vec<PollFlags> = watches.entries().map(|w| w.flags).collect();
+        assert_eq!(flags, vec![PollFlags::IN, PollFlags::IN | PollFlags::OUT]);
+
+        watches.remove(first);
+        assert_eq!(watches.ids(), vec![second]);
+        // Removing an id twice, or one that was never issued, is a no-op.
+        watches.remove(first);
+        watches.remove(super::WatchId(4242));
+        assert_eq!(watches.ids(), vec![second]);
+    }
+
+    #[test]
     fn a_pump_on_a_silent_compositor_times_out_rather_than_hanging() {
         // M1's `the_configure_wait_is_bounded`, generalised: a compositor that
         // accepts the connection and then says nothing must not hang the pump.
@@ -2915,6 +3278,7 @@ mod tests {
             &mut queue,
             &mut state,
             Duration::from_millis(120),
+            &super::Watches::default(),
             |state| !state.events.is_empty(),
         );
         assert!(
@@ -2939,6 +3303,7 @@ mod tests {
             &mut queue,
             &mut state,
             Duration::from_secs(5),
+            &super::Watches::default(),
             |_| false,
         );
         assert!(matches!(result, Err(SurfaceError::Closed)), "{result:?}");
@@ -2971,7 +3336,14 @@ mod tests {
         let (conn, mut queue, _peer) = silent_connection();
         let mut state = super::WindowState::new_for_test();
         state.close();
-        let result = super::wait_bounded(&conn, &mut queue, &mut state, Duration::MAX, |_| false);
+        let result = super::wait_bounded(
+            &conn,
+            &mut queue,
+            &mut state,
+            Duration::MAX,
+            &super::Watches::default(),
+            |_| false,
+        );
         assert!(matches!(result, Err(SurfaceError::Closed)), "{result:?}");
     }
 
@@ -3119,6 +3491,100 @@ mod tests {
         let conn = wayland_client::Connection::from_socket(ours).expect("connection");
         let queue = conn.new_event_queue();
         (conn, queue, theirs)
+    }
+
+    /// A `display: none` subtree is not on screen, so it publishes no probe
+    /// point: a gate that aimed a pointer at one clicked the visible page.
+    ///
+    /// Mutation check: walk `root.descendants()` unfiltered again and the
+    /// hidden page's own node is reported with a centre of its own. Restore.
+    #[test]
+    fn probe_points_skip_a_hidden_subtree() {
+        use crate::css::node::Node;
+        use crate::layout::{FixedMeasure, LayoutTree};
+        use taffy::style::AvailableSpace;
+
+        let root = Node::new("window");
+        let shown = Node::new("box");
+        let hidden = Node::new("stackpage");
+        let buried = Node::new("entry");
+        hidden.append_child(&buried);
+        root.append_child(&shown);
+        root.append_child(&hidden);
+        crate::widgets::set_displayed(&hidden, false);
+
+        let mut layout = LayoutTree::new();
+        layout.sync(&root).expect("sync");
+        crate::widgets::flush_layout(&mut layout);
+        layout
+            .compute(
+                &root,
+                taffy::Size {
+                    width: AvailableSpace::Definite(200.0),
+                    height: AvailableSpace::Definite(200.0),
+                },
+                &mut FixedMeasure(taffy::Size {
+                    width: 40.0,
+                    height: 20.0,
+                }),
+            )
+            .expect("compute");
+
+        let labels: Vec<String> = super::probe_points_of(&root, &layout)
+            .into_iter()
+            .map(|point| point.label)
+            .collect();
+        assert!(labels.iter().any(|l| l == "box"), "{labels:?}");
+        assert!(
+            !labels.iter().any(|l| l == "stackpage"),
+            "the hidden page is not a probe target: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "entry"),
+            "and neither is anything buried in it: {labels:?}"
+        );
+    }
+
+    /// A `Duration::ZERO` wait still polls: it is "drain what is there", and
+    /// an app whose controllers report a zero deadline every frame
+    /// (`GridViewC` did) gets its watched fds and its Wayland socket read.
+    ///
+    /// Mutation check: return `Err(Timeout)` on the first expiry again (what
+    /// `wait_bounded` did before the poll set was ever built on a zero wait)
+    /// and no `FdReady` is produced -- the starvation this asserts against.
+    /// Restore.
+    #[test]
+    fn a_zero_wait_still_polls_the_watched_fds_once() {
+        use super::{InputEvent, Interest, Watches, wait_bounded};
+
+        let (conn, mut queue, _theirs) = silent_connection();
+        let mut state = super::WindowState::new();
+
+        let (read, write) = rustix::pipe::pipe().expect("pipe");
+        rustix::io::write(&write, b"x").expect("wake byte");
+        let mut watches = Watches::default();
+        let id = watches.add(read, Interest::Read);
+
+        let outcome = wait_bounded(
+            &conn,
+            &mut queue,
+            &mut state,
+            Duration::ZERO,
+            &watches,
+            |state| !state.events.is_empty(),
+        );
+        assert!(
+            outcome.is_ok(),
+            "the ready watch is an answer, not a timeout"
+        );
+        assert!(
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, InputEvent::FdReady(fired) if *fired == id)),
+            "the watch that was ready is reported: {:?}",
+            state.events
+        );
     }
 
     #[test]

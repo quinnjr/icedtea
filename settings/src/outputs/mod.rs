@@ -8,14 +8,14 @@
 //!   configurations in. Drivable with explicit roundtrips, so the whole
 //!   enumerate/apply cycle is testable against `icedtea-harness` with no GTK,
 //!   gio, or glib in sight.
-//! * [`client`] — the [`OutputsClient`] handle the GTK page holds. It layers a
-//!   `gio::Socket` glib source over the core so the queue is pumped from GTK's
-//!   main loop without a dispatch thread and without ever blocking it.
+//! * [`pump`] — the [`pump::OutputsPump`] handle `main.rs` holds. It registers
+//!   the core's queue fd with `Window::watch_fd` so the queue is pumped from
+//!   the toolkit's own poll loop via `App::on_fd`, without a dispatch thread
+//!   and without ever blocking it.
 
-pub mod client;
 pub mod protocol;
+pub mod pump;
 
-pub use client::OutputsClient;
 pub use protocol::{
     ConfigData, Head, HeadEdit, Mode, ModeRequest, OutputsConnection, OutputsError, OutputsMsg,
 };

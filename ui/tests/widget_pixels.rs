@@ -632,6 +632,7 @@ pub fn key_char(ch: char, keycode: u32) -> icedtea_ui::window::keyboard::KeyEven
     icedtea_ui::window::keyboard::KeyEvent {
         keycode,
         keysym: xkbcommon::xkb::Keysym::from(u32::from(ch)),
+        base: xkbcommon::xkb::Keysym::from(u32::from(ch)),
         utf8: Some(ch.to_string()),
         mods: icedtea_ui::window::keyboard::Mods::empty(),
         consumed: icedtea_ui::window::keyboard::Mods::empty(),
@@ -649,6 +650,7 @@ pub fn key_named(keysym: u32, keycode: u32) -> icedtea_ui::window::keyboard::Key
     icedtea_ui::window::keyboard::KeyEvent {
         keycode,
         keysym: xkbcommon::xkb::Keysym::from(keysym),
+        base: xkbcommon::xkb::Keysym::from(keysym),
         utf8: None,
         mods: icedtea_ui::window::keyboard::Mods::empty(),
         consumed: icedtea_ui::window::keyboard::Mods::empty(),
@@ -1093,7 +1095,7 @@ fn a_drawing_area_runs_its_callback_against_the_allocated_rect() {
         (),
         |_m: &mut (), _msg: ()| Cmd::None,
         |_m: &()| {
-            drawing_area(|canvas, rect| {
+            drawing_area(|canvas, rect, _cx: &mut icedtea_ui::paint::PaintCx<'_>| {
                 canvas.draw_rect(
                     &rect.to_skia(),
                     &icedtea_ui::paint::fill_paint(Rgba {
@@ -1116,6 +1118,88 @@ fn a_drawing_area_runs_its_callback_against_the_allocated_rect() {
         frames.pixel(0, 32, 32).map(|p| (p.0, p.1, p.2)),
         Some((255, 0, 0))
     );
+}
+
+#[test]
+fn a_drawing_area_can_shape_text_through_its_paint_cx() {
+    // P4's Displays canvas draws a connector name and a resolution per head;
+    // without `&mut PaintCx` the callback cannot reach a FontDatabase and
+    // cannot shape a glyph at all.
+    // mutation: pass a fresh, empty `PaintCx` instead of the one `paint`
+    // received; the shaping finds no font and the row stays flat.
+    use icedtea_ui::css::value::{FontFamily, FontStyle, GenericFamily, Keyword, Rgba};
+    use icedtea_ui::text::{FontQuery, ShapeKey};
+    use icedtea_ui::view::builders::drawing_area;
+    use icedtea_ui::widgets::drawing_area::DrawingAreaExt;
+
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| {
+            drawing_area(|canvas, rect, cx| {
+                // A white ground, so a glyph is the only dark ink.
+                canvas.draw_rect(
+                    &rect.to_skia(),
+                    &icedtea_ui::paint::fill_paint(Rgba {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    }),
+                );
+                let families = [FontFamily::Generic(GenericFamily::SansSerif)];
+                let query = FontQuery {
+                    families: &families,
+                    weight: 400.0,
+                    style: FontStyle::Normal,
+                    stretch: 100.0,
+                    size_px: 24.0,
+                };
+                let Some(face) = cx.fonts.match_face(&query) else {
+                    return;
+                };
+                let shaped = cx.fonts.shape(&ShapeKey {
+                    text: "HH",
+                    face: &face,
+                    size_px: 24.0,
+                    letter_spacing_px: 0.0,
+                    features: &[],
+                    variations: &[],
+                    transform: Keyword::None,
+                });
+                if let Some(blob) = shaped.blob.as_ref() {
+                    canvas.draw_text_blob(
+                        blob,
+                        rect.x + 4.0,
+                        rect.y + 32.0,
+                        &icedtea_ui::paint::fill_paint(Rgba {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                    );
+                }
+            })
+            .content_width(120)
+            .content_height(48)
+            .hexpand(true)
+            .vexpand(true)
+        },
+        (120, 48),
+        vec![ScriptStep::Capture],
+    );
+    let mut dark = 0;
+    for x in 0..120 {
+        for y in 0..48 {
+            if let Some(px) = frames.pixel(0, x, y)
+                && (u32::from(px.0) + u32::from(px.1) + u32::from(px.2)) < 300
+            {
+                dark += 1;
+            }
+        }
+    }
+    assert!(dark > 20, "no glyph ink on the canvas: {dark} dark pixels");
 }
 
 #[test]
@@ -1377,6 +1461,62 @@ fn a_check_button_paints_the_builtin_check_glyph() {
         vec![ScriptStep::Capture],
     );
     assert!(has_ink(&frames, 0, (120, 40)), "the check glyph must ink");
+}
+
+#[test]
+fn an_unchecked_check_button_paints_its_box() {
+    // GTK draws the empty indicator: a background and a 1px border. Without
+    // it a settings page full of unchecked boxes shows nothing at all, which
+    // is why `check_button` was on KNOWN_BLANK_AT_REST.
+    // mutation: restore the early `if !self.active && !self.inconsistent {
+    // return false }`; this fails with a flat frame.
+    use icedtea_ui::view::builders::check_button;
+    use icedtea_ui::widgets::check_button::CheckButtonExt;
+
+    let frames = run(
+        false,
+        |model: &mut bool, on: bool| {
+            *model = on;
+            Cmd::None
+        },
+        // An empty label on purpose: `GenericC` shapes no glyphs for it, so
+        // any ink in the frame is the indicator this task draws.
+        |model: &bool| check_button("").active(*model),
+        (120, 40),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        has_ink(&frames, 0, (120, 40)),
+        "an unchecked check button painted nothing"
+    );
+}
+
+#[test]
+fn a_checked_check_button_still_paints_the_builtin() {
+    // The regression guard for the branch above: the checked path must still
+    // go through `paint::icon::paint_builtin`, and must differ from unchecked.
+    // mutation: return early for the *checked* state instead; the two frames
+    // become identical and this fails.
+    use icedtea_ui::view::builders::check_button;
+    use icedtea_ui::widgets::check_button::CheckButtonExt;
+
+    let unchecked = run(
+        false,
+        |_m: &mut bool, _on: bool| Cmd::None,
+        |model: &bool| check_button("Check").active(*model),
+        (120, 40),
+        vec![ScriptStep::Capture],
+    );
+    let checked = run(
+        true,
+        |_m: &mut bool, _on: bool| Cmd::None,
+        |model: &bool| check_button("Check").active(*model),
+        (120, 40),
+        vec![ScriptStep::Capture],
+    );
+    let differs =
+        (0..120).any(|x| (0..40).any(|y| unchecked.pixel(0, x, y) != checked.pixel(0, x, y)));
+    assert!(differs, "checked and unchecked paint the same pixels");
 }
 
 #[test]
@@ -2049,4 +2189,293 @@ fn a_password_entry_paints_its_caret_and_its_selection() {
         changed > 0,
         "clicking in paints a caret the resting frame does not have"
     );
+}
+
+#[test]
+fn event_kind_all_lists_twenty_one_kinds() {
+    // mutation: forget to add one of the three pointer kinds to
+    // `EventKind::ALL`; the count fails and so does any dispatcher that
+    // iterates ALL.
+    use icedtea_ui::view::EventKind;
+    assert_eq!(EventKind::ALL.len(), 21);
+    for kind in [
+        EventKind::PointerDown,
+        EventKind::PointerMotion,
+        EventKind::PointerUp,
+    ] {
+        assert!(
+            EventKind::ALL.contains(&kind),
+            "{kind:?} is missing from ALL"
+        );
+    }
+    // Declaration order: the three are appended, so nothing before them moved.
+    assert_eq!(EventKind::ALL[0], EventKind::Click);
+    assert_eq!(EventKind::ALL[18], EventKind::PointerDown);
+    assert_eq!(EventKind::ALL[19], EventKind::PointerMotion);
+    assert_eq!(EventKind::ALL[20], EventKind::PointerUp);
+}
+
+#[test]
+fn a_pair_button_handler_falls_back_to_a_pair_handler() {
+    // Why `fire_pair_button` accepts both arities: a caller that fires does
+    // not know which builder the view used, so `on_pointer_down` and
+    // `on_pointer_down_with_button` coexist without a second fire method.
+    // mutation: delete the `Handler::Pair` arm of `fire_pair_button`; the
+    // first assertion returns None.
+    use icedtea_ui::view::{EventKind, Handler, Handlers};
+    use std::rc::Rc;
+
+    let mut pair: Handlers<String> = Handlers::default();
+    pair.set(
+        EventKind::PointerDown,
+        Handler::Pair(Rc::new(|x, y| format!("{x},{y}"))),
+    );
+    assert_eq!(
+        pair.fire_pair_button(EventKind::PointerDown, 3.0, 4.0, 0x112),
+        Some("3,4".to_owned()),
+        "a Pair handler on a pointer kind receives (x, y) and drops the button"
+    );
+
+    let mut with_button: Handlers<String> = Handlers::default();
+    with_button.set(
+        EventKind::PointerUp,
+        Handler::PairButton(Rc::new(|x, y, b| format!("{x},{y},{b:#x}"))),
+    );
+    assert_eq!(
+        with_button.fire_pair_button(EventKind::PointerUp, 1.0, 2.0, 0x112),
+        Some("1,2,0x112".to_owned())
+    );
+    // A different kind, or an arity the binding cannot supply, fires nothing.
+    assert_eq!(
+        with_button.fire_pair_button(EventKind::PointerDown, 1.0, 2.0, 0x110),
+        None
+    );
+    assert_eq!(with_button.fire_unit(EventKind::PointerUp), None);
+}
+
+#[test]
+fn the_linux_button_codes_are_reachable_from_one_module() {
+    // P0-D3: `BTN_LEFT` keeps its M1 home and is re-exported beside the two
+    // new ones, so `window::BTN_LEFT` stays unambiguous and
+    // `layer_shell_screencopy.rs`'s import is untouched.
+    use icedtea_ui::window::pointer::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+    assert_eq!((BTN_LEFT, BTN_RIGHT, BTN_MIDDLE), (0x110, 0x111, 0x112));
+    assert_eq!(icedtea_ui::window::BTN_LEFT, BTN_LEFT);
+    assert_eq!(icedtea_ui::wayland::BTN_LEFT, BTN_LEFT);
+}
+
+/// Build a controller with a real `BuildCx` — the six-line pattern
+/// `ColorDialogC`'s own unit test uses (`ui/src/widgets/color_dialog.rs`).
+fn build_controller_for_test<C: icedtea_ui::view::controller::Controller<usize>>(
+    node: &icedtea_ui::css::node::Node,
+    props: &icedtea_ui::view::Props,
+) -> C {
+    let sheet = CompiledSheet::compile("");
+    let mut fonts = icedtea_ui::text::FontDatabase::probe_only();
+    let mut icons = icedtea_ui::icons::IconTheme::with_name_and_roots("hicolor", vec![]);
+    let clock: Rc<dyn icedtea_ui::anim::Clock> = Rc::new(ManualClock::new());
+    let env = icedtea_ui::css::computed::ResolveEnv::default();
+    let mut cx = icedtea_ui::view::reconcile::BuildCx {
+        sheet: &sheet,
+        fonts: &mut fonts,
+        icons: &mut icons,
+        clock: &clock,
+        env: &env,
+    };
+    C::build(node, props, &mut cx)
+}
+
+#[test]
+fn a_color_dialog_button_paints_its_swatch_at_rest() {
+    // `ColorDialogButtonC::paint` has always filled `alloc.content_box` with
+    // its colour; what it lacked was an intrinsic size, so the whole button
+    // collapsed to 0x0 (unlaid-out, not even hit-testable) — the
+    // `ScrollbarC::measure` / `ScaleC::measure` case in shape, though here
+    // `button` stays a real synced taffy child (`on_event`'s hit-testing
+    // needs it), so `node` is never a taffy leaf and `Controller::measure`
+    // is unreachable from this render loop; `build`'s `set_size_request`
+    // side-table floor is the mechanism that actually reaches layout. Its
+    // width also has to clear the margin `button`'s own real Adwaita
+    // gradient chrome paints over the fill afterwards — see `build`'s
+    // comment. mutation: delete the `set_size_request` call in `build`; the
+    // box collapses again and no red pixel appears.
+    use icedtea_ui::css::value::Rgba;
+    use icedtea_ui::view::builders::color_dialog_button;
+
+    let red = Rgba {
+        r: 1.0,
+        g: 0.0,
+        b: 0.0,
+        a: 1.0,
+    };
+    let frames = run(
+        red,
+        |_m: &mut Rgba, _msg: ()| Cmd::None,
+        |model: &Rgba| color_dialog_button(*model),
+        (80, 60),
+        vec![ScriptStep::Capture],
+    );
+    let mut reds = 0;
+    for x in 0..80 {
+        for y in 0..60 {
+            if frames.pixel(0, x, y).map(|p| (p.0, p.1, p.2)) == Some((255, 0, 0)) {
+                reds += 1;
+            }
+        }
+    }
+    assert!(
+        reds >= 48 * 32 / 2,
+        "the swatch did not fill its button: {reds} red pixels"
+    );
+}
+
+#[test]
+fn a_color_dialog_paints_its_palette_at_rest() {
+    // mutation: return `false` from `ColorDialogC::paint`; the frame is one
+    // flat colour and `has_ink` fails.
+    use icedtea_ui::css::value::Rgba;
+    use icedtea_ui::view::builders::color_dialog;
+
+    let start = Rgba {
+        r: 0.2,
+        g: 0.5,
+        b: 0.9,
+        a: 1.0,
+    };
+    let frames = run(
+        start,
+        |_m: &mut Rgba, _msg: ()| Cmd::None,
+        |model: &Rgba| color_dialog(*model),
+        (320, 240),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        has_ink(&frames, 0, (320, 240)),
+        "the palette painted nothing"
+    );
+    // More than one palette colour, not just a wash: count distinct pixels.
+    let mut seen = std::collections::HashSet::new();
+    for x in 0..320 {
+        for y in 0..240 {
+            if let Some(px) = frames.pixel(0, x, y) {
+                seen.insert(px);
+            }
+        }
+    }
+    assert!(
+        seen.len() > 8,
+        "a palette grid must show many colours, saw {}",
+        seen.len()
+    );
+}
+
+#[test]
+fn a_color_dialogs_measured_box_is_the_grid_it_paints() {
+    // The drift guard: `measure` and `paint` read one geometry function.
+    // mutation: hard-code a different column count in `intrinsic`; this fails.
+    use icedtea_ui::css::node::Node;
+    use icedtea_ui::layout::Rect;
+    use icedtea_ui::view::Props;
+    use icedtea_ui::widgets::color_dialog::ColorDialogC;
+
+    let node = Node::new("window");
+    let controller: ColorDialogC = build_controller_for_test(&node, &Props::default());
+    let (w, h) = controller.intrinsic();
+    let cells = controller.grid(Rect::new(0.0, 0.0, w, h));
+    assert_eq!(
+        cells.len(),
+        controller.palette.len() + usize::from(controller.custom.is_some()),
+        "every palette entry gets a cell"
+    );
+    for (_, rect) in &cells {
+        assert!(
+            rect.x >= 0.0
+                && rect.y >= 0.0
+                && rect.x + rect.width <= w + 0.01
+                && rect.y + rect.height <= h + 0.01,
+            "cell {rect:?} escapes the measured {w}x{h} box"
+        );
+    }
+}
+
+#[test]
+fn a_scrollbar_paints_its_trough_and_slider() {
+    // `range`/`trough`/`slider` are controller-owned subnodes with no taffy
+    // box, so M2's box painting never reaches them: this controller is the
+    // only thing that can draw a scrollbar at all.
+    // mutation: return `false` from `ScrollbarC::paint`; the frame is flat.
+    use icedtea_ui::view::builders::scrollbar;
+    use icedtea_ui::widgets::Orientation;
+    use icedtea_ui::widgets::scrollbar::ScrollbarExt;
+
+    let frames = run(
+        0.0_f64,
+        |model: &mut f64, v: f64| {
+            *model = v;
+            Cmd::None
+        },
+        |model: &f64| {
+            scrollbar(Orientation::Horizontal)
+                .lower(0.0)
+                .upper(100.0)
+                .page_size(20.0)
+                .value(*model)
+                .hexpand(true)
+        },
+        (200, 40),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        has_ink(&frames, 0, (200, 40)),
+        "the scrollbar painted nothing"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for x in 0..200 {
+        for y in 0..40 {
+            if let Some(px) = frames.pixel(0, x, y) {
+                seen.insert(px);
+            }
+        }
+    }
+    assert!(
+        seen.len() >= 3,
+        "trough and slider must differ from the background, saw {} colours",
+        seen.len()
+    );
+}
+
+#[test]
+fn a_scrollbars_slider_moves_with_its_value() {
+    // The paint reads the same `slider_rect` the hit test does, so a value
+    // change moves what is drawn.
+    // mutation: paint the slider at a fixed x; the two frames match and this
+    // fails.
+    use icedtea_ui::view::builders::scrollbar;
+    use icedtea_ui::widgets::Orientation;
+    use icedtea_ui::widgets::scrollbar::ScrollbarExt;
+
+    fn bar(model: &f64) -> View<f64> {
+        scrollbar(Orientation::Horizontal)
+            .lower(0.0)
+            .upper(100.0)
+            .page_size(20.0)
+            .value(*model)
+            .hexpand(true)
+    }
+    let left = run(
+        0.0_f64,
+        |_m: &mut f64, _v: f64| Cmd::None,
+        bar,
+        (200, 40),
+        vec![ScriptStep::Capture],
+    );
+    let right = run(
+        80.0_f64,
+        |_m: &mut f64, _v: f64| Cmd::None,
+        bar,
+        (200, 40),
+        vec![ScriptStep::Capture],
+    );
+    let differs = (0..200).any(|x| (0..40).any(|y| left.pixel(0, x, y) != right.pixel(0, x, y)));
+    assert!(differs, "the slider did not move with the value");
 }
