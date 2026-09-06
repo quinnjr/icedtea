@@ -445,7 +445,7 @@ mod tests {
 
     /// Mutation check: drop the `mode`-first branch of the detail text so it
     /// always reads the rect's rounded size; the 2x-scaled head then reports
-    /// 960x540 and this fails. Restore.
+    /// 1920x1080 and this fails. Restore.
     #[test]
     fn a_scaled_heads_detail_is_its_mode_not_its_logical_size() {
         let mut st = state_of(vec![head("DP-1", 3840, 2160, 0, 0, true)], Some(0));

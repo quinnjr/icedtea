@@ -205,16 +205,6 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
     .id("displays_controls")
 }
 
-/// Select head `index`, if it exists. Selecting is not an edit: `dirty` is
-/// untouched.
-pub fn select_head(st: &mut DisplaysState, index: usize) {
-    if index >= st.heads.len() || index >= st.edits.len() {
-        return;
-    }
-    st.selected = Some(index);
-    repopulate(st);
-}
-
 /// Toggle the selected head's `enabled` flag.
 ///
 /// Enabling a head whose edit names no mode would leave it unplaceable on the
@@ -627,39 +617,6 @@ mod tests {
         set_scale(&mut st, 1.75);
         assert_eq!(st.edits[0].scale, Some(1.75));
         assert!(st.dirty);
-    }
-
-    /// Selecting a head repopulates the option lists for *that* head.
-    ///
-    /// Mutation check: drop the `repopulate` call from `select_head`; the
-    /// 720p-only head's option list keeps the first head's entries and this
-    /// fails. Restore.
-    #[test]
-    fn selecting_a_head_repopulates_for_it() {
-        let mut st = state_with(multi_mode_head());
-        let mut second = multi_mode_head();
-        second.name = "HDMI-A-1".to_string();
-        second.modes = vec![mode(1280, 720, 60_000, true)];
-        second.current_mode = Some(mode(1280, 720, 60_000, true));
-        st.edits.push(baseline_edit(&second));
-        st.heads.push(second);
-
-        select_head(&mut st, 1);
-        assert_eq!(st.selected, Some(1));
-        assert_eq!(st.res_options, vec![(1280, 720)]);
-        assert!(!st.dirty, "selecting is not an edit");
-    }
-
-    /// An out-of-range selection is ignored rather than stored.
-    ///
-    /// Mutation check: drop the bounds check from `select_head`; the later
-    /// `position_text` reads an em dash but `st.selected` is `Some(7)`, and
-    /// this fails. Restore.
-    #[test]
-    fn selecting_a_head_that_does_not_exist_is_ignored() {
-        let mut st = state_with(multi_mode_head());
-        select_head(&mut st, 7);
-        assert_eq!(st.selected, Some(0));
     }
 
     /// Every mutator with nothing selected is a no-op, never a panic.

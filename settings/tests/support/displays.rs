@@ -483,24 +483,6 @@ impl SettingsDriver {
         false
     }
 
-    /// Whether a `msg <prefix>` line has been reported — `update`'s own
-    /// `crate::probe::report(&format!("msg {msg:?}"))`, once per fold.
-    ///
-    /// A click on an insensitive widget (`Prop::sensitive(false)`) never
-    /// reaches `update` at all, so this is what tells a gate that a retried
-    /// click landed as the real action rather than on a still-disabled
-    /// button — as opposed to polling geometry, which does not change with
-    /// sensitivity. `prefix` matches on a word boundary (`Apply` does not
-    /// also match `Applied { .. }`).
-    #[must_use]
-    pub fn has_message(&self, prefix: &str) -> bool {
-        let needle = format!("msg {prefix}");
-        self.lines().iter().any(|line| {
-            line.strip_prefix(needle.as_str())
-                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
-        })
-    }
-
     /// Poll until `key` reads something other than `before`, and return it.
     #[must_use]
     pub fn wait_state_change(
