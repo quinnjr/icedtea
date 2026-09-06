@@ -229,14 +229,20 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
         }
         let list = Node::new("listview");
         // Labelled `<id>_list` when the caller gave the drop-down itself an
-        // id, so a probe-report gate can read the embedded list's own
+        // id, so a probe-report gate can read the embedded list body's own
         // allocation (its height in particular) rather than only the closed
-        // button's. `node.id()` is not yet set at this point in `build` (the
-        // universal `Id` prop is applied to `node` after the controller
-        // builds it), so this reads straight off `props`, the full set the
-        // widget is being built with.
+        // button's. The id goes on the `contents` node, not the inner
+        // `listview`: `PopoverC::open` sizes `contents` to the requested list
+        // height (the retained-body analogue of the popup positioner —
+        // `drop_down_list_height(len)` here), while the `listview` inside is
+        // left to its own intrinsic size (the row nodes carry no text, so it
+        // collapses to ~16px and never reflects the content height). Reading
+        // `contents` is what proves "content-sized, not flat 240". `node.id()`
+        // is not yet set at this point in `build` (the universal `Id` prop is
+        // applied to `node` after the controller builds it), so this reads
+        // straight off `props`, the full set the widget is being built with.
         if let Some(id) = props.str(PropName::Id) {
-            list.set_id(Some(&format!("{id}_list")));
+            popover.contents.set_id(Some(&format!("{id}_list")));
         }
         popover.contents.append_child(&list);
 

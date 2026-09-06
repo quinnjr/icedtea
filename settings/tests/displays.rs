@@ -243,17 +243,38 @@ fn dragging_a_head_snaps_it_and_updates_the_model() {
     assert_eq!(driver.state("displays.selected").as_deref(), Some("0"));
 }
 
-/// Contract §2.8's P7-D54 regression: an embedded `DropDown` list must fit
-/// inside settings' window rather than being opened at a flat 240px.
+/// Contract §2.8's P7-D54 regression: an embedded `DropDown` list must open
+/// sized to its content rather than at a flat 240px.
 ///
-/// The transform dropdown has all eight variants and is the tallest list on
-/// the page; the resolution list is whatever the harness head advertises.
-/// Both must open with their whole body inside the window.
+/// What the probe report actually exposes for an open drop-down (observed
+/// live under this harness): the list body is retained in the settings
+/// window's own tree — `DropDownC` opens no `xdg_popup` surface — so its
+/// allocation is in the same window-local space as `root`, and the
+/// `<id>_list` id sits on the popover's `contents` node, which
+/// `PopoverC::open` floors to the height the caller asks for
+/// (`drop_down_list_height(len)`). The inner `listview` never carries that
+/// height: its `row` nodes hold no text and measure to zero, so it collapses
+/// to ~16px regardless of the model — which is exactly what the old
+/// tautological assertion (`list.h <= MAX && list.h > 0`) hid, since the id
+/// used to sit on that collapsed `listview`.
+///
+/// The harness head advertises a single resolution, so its one-row body is
+/// `drop_down_list_height(1)` = 34px of content (border box 36px), far below
+/// the 240px cap. Two facts prove it opened content-sized rather than flat:
+/// it is at least one row tall (not the old collapsed ~16px), and it is
+/// *strictly* below the cap (not the flat 240 the bug produced). It also fits
+/// inside the window.
+///
+/// The transform list is deliberately not asserted here: its eight variants
+/// clamp to exactly `DROP_DOWN_MAX_PX`, indistinguishable from the flat-240
+/// bug and, anchored low on the page, genuinely taller than the window — the
+/// short resolution list is the one that can tell content-sizing from the cap.
 ///
 /// Mutation check: restore the literal `240` in
-/// `ui/src/widgets/drop_down.rs`'s `popover.open` call; the assertion on the
-/// resolution list's height fails (the harness head advertises one or two
-/// modes, so 240px is far taller than its content). Restore the fix.
+/// `ui/src/widgets/drop_down.rs`'s `popover.open` call; the `contents` floor
+/// becomes 240 (border box 242), the strict-below-cap assertion fails, and so
+/// does the `<=` cap assertion (the 2px chrome pushes it past 240). Restore
+/// the fix.
 #[test]
 fn a_drop_down_list_fits_inside_the_settings_window() {
     use icedtea_ui::widgets::drop_down::{DROP_DOWN_MAX_PX, drop_down_list_height};
@@ -270,24 +291,28 @@ fn a_drop_down_list_fits_inside_the_settings_window() {
     driver.click(x, y);
 
     // The retained list body reports its own allocation once it is revealed.
+    // Poll past the collapsed intrinsic height: an unsized body reports ~16px,
+    // so wait until it has actually been floored to at least one row.
+    let one_row = i32::try_from(drop_down_list_height(1)).unwrap();
+    let cap = i32::try_from(DROP_DOWN_MAX_PX).unwrap();
     let list = {
         let mut found = None;
         let deadline = std::time::Instant::now() + REACT;
         while std::time::Instant::now() < deadline {
             if let Ok(a) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 driver.alloc("displays_resolution_list")
-            })) && a.h > 0
+            })) && a.h >= one_row
             {
                 found = Some(a);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        found.expect("the resolution list never reported an allocation")
+        found.expect("the resolution list never reached its content height")
     };
 
     assert!(
-        list.h <= i32::try_from(DROP_DOWN_MAX_PX).unwrap(),
+        list.h <= cap,
         "the list is {}px tall, past the {DROP_DOWN_MAX_PX}px cap",
         list.h
     );
@@ -295,12 +320,20 @@ fn a_drop_down_list_fits_inside_the_settings_window() {
         list.y + list.h <= root.y + root.h,
         "the list runs past the bottom of the window: list {list:?}, root {root:?}"
     );
-    // And it is content-sized, not flat: a short model gets a short list.
-    let expected = i32::try_from(drop_down_list_height(2)).unwrap();
+    // Content-sized, not flat: the single-resolution harness head yields a
+    // one-row body, so the opened list is at least one row tall (ruling out
+    // the old collapsed ~16px) *and* strictly below the 240px cap (ruling out
+    // the flat-240 bug, whose 240px content clamps at or past the cap).
     assert!(
-        list.h <= i32::try_from(DROP_DOWN_MAX_PX).unwrap() && list.h > 0,
-        "a content-sized list is somewhere in (0, {DROP_DOWN_MAX_PX}]; \
-         a two-row model would be {expected}px, got {}",
+        list.h >= one_row,
+        "the list collapsed to {}px, short of a single {one_row}px row — it \
+         was never sized to its content",
+        list.h
+    );
+    assert!(
+        list.h < cap,
+        "the list opened at the flat {DROP_DOWN_MAX_PX}px cap ({}px), not its \
+         content height (a single {one_row}px resolution row)",
         list.h
     );
 }
