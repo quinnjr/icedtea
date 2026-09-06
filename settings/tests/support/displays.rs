@@ -190,6 +190,23 @@ impl SettingsDriver {
     /// if the binary cannot be spawned, or if it never paints within [`BOOT`].
     #[must_use]
     pub fn open(theme: &str, page: &str) -> SettingsDriver {
+        Self::open_on_bus(theme, page, None)
+    }
+
+    /// [`SettingsDriver::open`], with the spawned process's session-bus
+    /// address overridden to `bus_address` when given.
+    ///
+    /// `icedtea_settings::compositor_reload::ReloadClient::new` (used by the
+    /// production reload worker, `ipc::reload::spawn_worker_on_bus(.., None)`)
+    /// resolves `$DBUS_SESSION_BUS_ADDRESS` through
+    /// `zbus::blocking::Connection::session()` — that env var is the *only*
+    /// knob it reads, so pointing the child's own copy of it at an isolated
+    /// bus (never the developer's live session bus) is what lets a gate
+    /// observe the real binary's `ReloadConfig` call land on a test-owned
+    /// mock instead of whatever really owns `org.icedtea.Compositor` on the
+    /// developer's desktop.
+    #[must_use]
+    pub fn open_on_bus(theme: &str, page: &str, bus_address: Option<&str>) -> SettingsDriver {
         let compositor = Compositor::spawn();
         let socket = compositor
             .socket_path()
@@ -209,16 +226,19 @@ impl SettingsDriver {
         let report = home.path().join("probe.txt");
         let theme_path = home.path().join("theme.css");
         std::fs::write(&theme_path, bundled_theme_content(theme)).expect("write the theme file");
-        let child = Command::new(env!("CARGO_BIN_EXE_icedtea-settings"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_icedtea-settings"));
+        command
             .env("WAYLAND_DISPLAY", &socket)
             .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
             .env("XDG_CONFIG_HOME", home.path())
             .env("ICEDTEA_UI_THEME", &theme_path)
             .env("ICEDTEA_SETTINGS_PAGE", page)
             .env("ICEDTEA_PROBE_REPORT", &report)
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn icedtea-settings");
+            .stderr(Stdio::null());
+        if let Some(address) = bus_address {
+            command.env("DBUS_SESSION_BUS_ADDRESS", address);
+        }
+        let child = command.spawn().expect("failed to spawn icedtea-settings");
 
         let pointer = VirtualPointerClient::spawn(&socket);
         let mut driver = SettingsDriver {
@@ -435,6 +455,50 @@ impl SettingsDriver {
             std::thread::sleep(POLL);
         }
         false
+    }
+
+    /// The most recent `frame <n>` marker — `ui/src/view/app.rs`'s
+    /// `write_probe_report` writes one before each batch of `probe`/`alloc`
+    /// lines that differ from the last paint, so this counts distinct
+    /// painted states, not folds. `0` before the first one.
+    #[must_use]
+    pub fn frame_count(&self) -> u64 {
+        self.lines()
+            .iter()
+            .rev()
+            .find_map(|line| line.strip_prefix("frame ")?.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Poll until [`frame_count`](Self::frame_count) is past `after`.
+    #[must_use]
+    pub fn wait_for_frame_after(&self, after: u64, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if self.frame_count() > after {
+                return true;
+            }
+            std::thread::sleep(POLL);
+        }
+        false
+    }
+
+    /// Whether a `msg <prefix>` line has been reported — `update`'s own
+    /// `crate::probe::report(&format!("msg {msg:?}"))`, once per fold.
+    ///
+    /// A click on an insensitive widget (`Prop::sensitive(false)`) never
+    /// reaches `update` at all, so this is what tells a gate that a retried
+    /// click landed as the real action rather than on a still-disabled
+    /// button — as opposed to polling geometry, which does not change with
+    /// sensitivity. `prefix` matches on a word boundary (`Apply` does not
+    /// also match `Applied { .. }`).
+    #[must_use]
+    pub fn has_message(&self, prefix: &str) -> bool {
+        let needle = format!("msg {prefix}");
+        self.lines().iter().any(|line| {
+            line.strip_prefix(needle.as_str())
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+        })
     }
 
     /// Poll until `key` reads something other than `before`, and return it.
