@@ -100,6 +100,24 @@ pub fn paints_something(
     })
 }
 
+/// The bundled sheet content a `theme` name (`light`/`dark`/`hc`) selects.
+///
+/// Reconciliation (Task 11): `open`'s `theme` parameter used to reach
+/// `$ICEDTEA_UI_THEME` unmodified, but `settings/src/main.rs`'s `sheet()`
+/// treats that variable as a *path* to a complete theme file (never a
+/// keyword) — so "light"/"dark"/"hc" each failed to read as a file and fell
+/// back to the same bundled light sheet, making the three rest-state gates
+/// indistinguishable. This mirrors `settings/tests/support/mod.rs`'s own
+/// `bundled_theme_content`: resolve the keyword to bundled CSS and write it
+/// to a file inside the isolated `XDG_CONFIG_HOME`.
+fn bundled_theme_content(theme: &str) -> &'static str {
+    match theme {
+        "dark" => icedtea_ui::BUNDLED_ADWAITA_DARK,
+        "hc" => icedtea_ui::BUNDLED_ADWAITA_HC,
+        _ => icedtea_ui::BUNDLED_ADWAITA_LIGHT,
+    }
+}
+
 /// Kill the child however the test ends.
 struct Reaper(Child);
 
@@ -121,8 +139,20 @@ pub struct SettingsDriver {
     screencopy: ScreencopyClient,
     pointer: VirtualPointerClient,
     output: (u32, u32),
-    background: (u8, u8, u8),
-    background_probe: (u32, u32),
+    /// The desktop's own colour, sampled *before* the window ever opened —
+    /// used only to detect the settings process's first paint
+    /// ([`wait_for_first_frame`](Self::wait_for_first_frame)). Never a stand-in
+    /// for the *window's* background: the window does not cover the whole
+    /// output (`output_size` is bigger than the fixed-content window), so a
+    /// point outside it is desktop wallpaper, not page chrome — see
+    /// [`background`](Self::background) for the one gates actually compare
+    /// widget pixels against.
+    boot_background: (u8, u8, u8),
+    /// The id of the page's own root box (`page_from_env`/every page module's
+    /// convention: `.id("displays")`, `.id("appearance")`, … match the page
+    /// name exactly), used to locate a guaranteed-blank point for
+    /// [`background`](Self::background).
+    page_root: String,
 }
 
 impl SettingsDriver {
@@ -144,18 +174,20 @@ impl SettingsDriver {
         let (w, h) = compositor.output_size();
         let mut screencopy = ScreencopyClient::spawn(&socket);
         // A column the settings window never covers: the far right edge.
-        let background_probe = (w as u32 - 3, h as u32 / 2);
+        // Desktop wallpaper, only ever used to notice the first paint.
         let empty = screencopy.capture();
-        let background = pixel_at(&empty, background_probe.0, background_probe.1)
+        let boot_background = pixel_at(&empty, w as u32 - 3, h as u32 / 2)
             .expect("the background probe is inside the frame");
 
         let home = tempfile::tempdir().expect("temp XDG_CONFIG_HOME");
         let report = home.path().join("probe.txt");
+        let theme_path = home.path().join("theme.css");
+        std::fs::write(&theme_path, bundled_theme_content(theme)).expect("write the theme file");
         let child = Command::new(env!("CARGO_BIN_EXE_icedtea-settings"))
             .env("WAYLAND_DISPLAY", &socket)
             .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
             .env("XDG_CONFIG_HOME", home.path())
-            .env("ICEDTEA_UI_THEME", theme)
+            .env("ICEDTEA_UI_THEME", &theme_path)
             .env("ICEDTEA_SETTINGS_PAGE", page)
             .env("ICEDTEA_PROBE_REPORT", &report)
             .stderr(Stdio::null())
@@ -171,8 +203,8 @@ impl SettingsDriver {
             screencopy,
             pointer,
             output: (w as u32, h as u32),
-            background,
-            background_probe,
+            boot_background,
+            page_root: page.to_string(),
         };
         driver.wait_for_first_frame();
         driver
@@ -194,9 +226,9 @@ impl SettingsDriver {
         while started.elapsed() < BOOT {
             let frame = self.screencopy.capture();
             let painted = (0..frame.height).step_by(4).any(|y| {
-                (0..frame.width)
-                    .step_by(4)
-                    .any(|x| pixel_at(&frame, x, y).is_some_and(|px| !matches(px, self.background)))
+                (0..frame.width).step_by(4).any(|x| {
+                    pixel_at(&frame, x, y).is_some_and(|px| !matches(px, self.boot_background))
+                })
             });
             if painted {
                 return;
@@ -206,10 +238,38 @@ impl SettingsDriver {
         panic!("icedtea-settings never painted within {BOOT:?}");
     }
 
-    /// The output's empty background colour.
-    #[must_use]
-    pub fn background(&self) -> (u8, u8, u8) {
-        self.background
+    /// The page's own background colour — sampled from inside the *window*,
+    /// never the desktop.
+    ///
+    /// Reconciliation (Task 11): the driver's own [`boot_background`]
+    /// (the far right edge of the *output*) is desktop wallpaper — `output_size`
+    /// is bigger than the window, which the harness places at the output's
+    /// origin rather than filling it (confirmed live: a 640x400 window on a
+    /// larger output). Comparing a widget's pixels against wallpaper is no
+    /// gate at all: the window itself already differs from the wallpaper
+    /// everywhere, so a widget that painted nothing would still read as
+    /// "painted something" by inheriting the plain page background.
+    ///
+    /// This instead samples a point just *below* the page's own root box —
+    /// inside its `.margin(12, 12, 12, 12)` band (every page module's
+    /// convention; `mod.rs`'s `view()` for Displays) and the window's own
+    /// remaining space beneath it. A point just *above* the root box lands in
+    /// the nav switcher's own chrome instead (confirmed live: a beige/tan
+    /// sample, not the plain page background every widget rect is measured
+    /// against), so only the bottom margin is used.
+    ///
+    /// [`boot_background`]: Self::boot_background
+    ///
+    /// # Panics
+    ///
+    /// If the page's root id never reported an allocation, or the sampled
+    /// point falls outside the captured frame.
+    pub fn background(&mut self) -> (u8, u8, u8) {
+        let root = self.alloc(&self.page_root.clone());
+        let frame = self.capture();
+        let x = (root.x + 10).max(0) as u32;
+        let y = (root.y + root.h + 10).max(0) as u32;
+        pixel_at(&frame, x, y).expect("a point below the page's own root box is inside the frame")
     }
 
     /// Every line the settings process has reported so far.

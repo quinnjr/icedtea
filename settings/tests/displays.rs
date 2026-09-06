@@ -7,6 +7,93 @@ use std::time::Duration;
 
 use support::{REACT, SettingsDriver, TEST_THEME};
 
+/// Every id the Displays page is contractually required to expose
+/// (M5 contract §2.3's widget-id list, the `displays.*` row).
+const DISPLAYS_IDS: &[&str] = &[
+    "displays_canvas",
+    "displays_enabled",
+    "displays_resolution",
+    "displays_refresh",
+    "displays_scale",
+    "displays_transform",
+    "displays_position",
+    "displays_status",
+    "displays_test",
+    "displays_revert",
+    "displays_apply",
+];
+
+/// The rest-state gate: at rest, in `theme`, every probe point of the Displays
+/// page paints something. No `KNOWN_BLANK` exemptions — the spec is explicit
+/// that app widgets get none (§7).
+fn displays_page_paints_at_rest(theme: &str) {
+    let mut driver = SettingsDriver::open(theme, "displays");
+    assert!(
+        driver.wait_state("displays.dirty", "false", REACT),
+        "the settings process never reported its model"
+    );
+
+    // Every contractual id must have reported an allocation…
+    for id in DISPLAYS_IDS {
+        let a = driver.alloc(id);
+        assert!(
+            a.w > 0 && a.h > 0,
+            "{id} has a zero-area allocation {a:?} in the {theme} theme"
+        );
+    }
+
+    // …and paint inside it.
+    let background = driver.background();
+    let frame = driver.capture();
+    let mut blank = Vec::new();
+    for id in DISPLAYS_IDS {
+        let a = driver.alloc(id);
+        if !support::paints_something(&frame, (a.x, a.y, a.w, a.h), background) {
+            blank.push(*id);
+        }
+    }
+    assert!(
+        blank.is_empty(),
+        "these Displays widgets paint nothing at rest in the {theme} theme: {blank:?}"
+    );
+}
+
+#[test]
+fn displays_page_paints_every_probe_point_at_rest_in_the_light_theme() {
+    displays_page_paints_at_rest("light");
+}
+
+#[test]
+fn displays_page_paints_every_probe_point_at_rest_in_the_dark_theme() {
+    displays_page_paints_at_rest("dark");
+}
+
+#[test]
+fn displays_page_paints_every_probe_point_at_rest_in_the_high_contrast_theme() {
+    displays_page_paints_at_rest("hc");
+}
+
+/// The canvas specifically: its own backdrop must differ from the window's, so
+/// a canvas that painted nothing but inherited the page background could not
+/// pass the gate above by accident.
+///
+/// Mutation check: make `CANVAS_BG` equal the theme's window background; this
+/// fails. Restore.
+#[test]
+fn the_canvas_paints_its_own_backdrop() {
+    let mut driver = SettingsDriver::open(TEST_THEME, "displays");
+    assert!(driver.wait_state("displays.dirty", "false", REACT));
+    let canvas = driver.alloc("displays_canvas");
+    let footer = driver.alloc("displays_footer");
+    // A point inside the canvas, and one inside the footer's chrome.
+    let inside = driver.pixel(canvas.x + canvas.w / 2, canvas.y + 4);
+    let page = driver.pixel(footer.x + 2, footer.y + footer.h / 2);
+    assert!(
+        !support::matches(inside, page),
+        "the canvas backdrop {inside:?} is indistinguishable from the page {page:?}"
+    );
+}
+
 /// The driver itself: the process boots on the page it was told to, and the
 /// report carries both geometry and model state for it.
 ///

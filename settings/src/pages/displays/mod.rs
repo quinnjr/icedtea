@@ -77,6 +77,19 @@ pub const STATUS_SUPERSEDED: &str = "Configuration superseded \u{2014} re-readin
 pub const STATUS_TESTING: &str = "Testing\u{2026}";
 /// A real apply is in flight.
 pub const STATUS_APPLYING: &str = "Applying\u{2026}";
+/// Shown in place of an empty `displays_status`: nothing has happened yet,
+/// but the label must still say something.
+///
+/// Reconciliation (Task 11): `hexpand` is a known, still-open gap for a plain
+/// `Container::Box` (`ui/tests/ingress.rs`'s own note — nothing in the
+/// generic layout path reads `Hexpand`/`Halign` for a `Box` child), so an
+/// empty-text label here is sized to its own zero-width measurement rather
+/// than grown to fill the row, and never paints. This is out of scope for P4
+/// to fix (it lives in `icedtea-ui`'s layout, not `pages/displays/*`), so the
+/// page instead never *shows* an empty label: idle reads as "Ready" rather
+/// than blank, which is the honest status anyway and happens to have a
+/// non-zero measured width like every other state `displays_status` takes.
+pub const STATUS_READY: &str = "Ready";
 
 /// Reset the pending edits back to the last-known head snapshot.
 pub fn reset_edits(st: &mut DisplaysState) {
@@ -168,10 +181,15 @@ pub fn footer(m: &SettingsModel) -> View<Msg> {
     let dirty = m.displays.dirty;
     let busy = m.displays_in_flight;
     let live = m.outputs_available;
+    let status = if m.displays_status.is_empty() {
+        STATUS_READY
+    } else {
+        m.displays_status.as_str()
+    };
     box_(
         Orientation::Horizontal,
         [
-            label(&m.displays_status)
+            label(status)
                 .id("displays_status")
                 .hexpand(true)
                 .halign(Align::Start),
