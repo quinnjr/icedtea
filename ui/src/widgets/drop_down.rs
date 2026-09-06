@@ -33,7 +33,9 @@ use crate::layout::Rect;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::popover::PopoverC;
-use crate::widgets::{ListItem, MatchMode, PointerState, WidgetEnum, local_rect, shift_event};
+use crate::widgets::{
+    ListItem, MatchMode, PointerState, WidgetEnum, local_rect, set_size_request, shift_event,
+};
 use crate::window::popup::PopupAnchorPoint;
 
 /// A `GtkDropDown` over string items.
@@ -388,12 +390,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
                 self.popover.close(cx);
                 self.open = false;
             } else {
+                let list_height = drop_down_list_height(self.filtered.len());
                 self.popover.open(
                     PopupAnchorPoint::Node(self.button.clone()),
-                    (
-                        rect.width.max(1.0) as u32,
-                        drop_down_list_height(self.filtered.len()),
-                    ),
+                    (rect.width.max(1.0) as u32, list_height),
                     // The list lives under this widget's own `popover`
                     // node in the parent tree; a popup surface would
                     // duplicate it (P7-D54). `PopoverC::open` reveals that
@@ -401,6 +401,18 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
                     None,
                     cx,
                 );
+                // `PopoverC::open`'s no-surface branch does nothing to the
+                // body's size (that floor belongs to whichever caller means
+                // it, not to every embedded popover — a menu passes a
+                // hardcoded `size` it never wants applied). A `DropDown`'s
+                // `contents` holds `row` nodes with no text, which measure
+                // to zero, so without this floor "open at content height"
+                // and "open at zero" would be the same laid-out node. This
+                // mirrors what a real popup surface's positioner would do:
+                // size the body to `list_height`, computed fresh from the
+                // current `filtered` length each time the list opens so a
+                // stale row count never lingers as a stale floor.
+                set_size_request(&self.popover.contents, 0.0, list_height as f32);
                 self.open = true;
             }
             self.button.set_state(PseudoStates::CHECKED, self.open);

@@ -233,17 +233,8 @@ impl PopoverC {
         self.reveal(true);
         let Some(content) = content else {
             // Nothing to build a surface from: the body is in the parent
-            // window's tree and is painted there (P7-D54). A real popup
-            // surface would be sized by its positioner to `size`; the retained
-            // body must be sized the same way, or it collapses to its
-            // near-empty intrinsic height (a `DropDown`'s `row` nodes carry no
-            // text and measure to zero) and "open at 240px" versus "open at
-            // content height" becomes a distinction no laid-out node could
-            // show. Flooring only the height leaves the body's natural width
-            // (and any embedder that never asked for one) untouched. This is a
-            // floor, not a fixed size, so a body whose own content is taller
-            // than `size` still wins — exactly `set_size_request`'s contract.
-            crate::widgets::set_size_request(&self.contents, 0.0, size.1 as f32);
+            // window's tree and is painted there (P7-D54), and the reveal
+            // above is the whole of opening it.
             return;
         };
         if !self.autohide {
