@@ -3821,11 +3821,12 @@ fn a_drop_down_list_fits_inside_the_settings_window() {
 }
 ```
 
-The `displays_resolution_list` id is `DropDownC`'s own `listview` subnode,
-labelled by the probe writer as `<id>_list` when the parent has an id. If the
-crate labels it by CSS node name instead, read the label the report actually
-carries (`driver.probe_points()` lists them all) and use that; do not add an id
-to `drop_down.rs` beyond the height fix.
+The `displays_resolution_list` id is the popover's `contents` node, which
+`DropDownC` labels `<id>_list` and floors to `drop_down_list_height(len)` when
+the drop-down carries an id (shipped under P4-D14 — the probe writer emits an
+`alloc` line only for id-bearing nodes, and the inner `listview`'s text-less
+rows collapse to ~16px, so the sized `contents` node is the one the fit gate
+must read). `driver.probe_points()` lists every label the report carries.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 

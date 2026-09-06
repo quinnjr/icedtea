@@ -3271,3 +3271,244 @@ can address a row as a unit) and `kb_combo_<action>` (the combo label).
 
 **Ruling:** additive; no listed id changes, and both are addressed by the P3
 gates.
+
+### P4-D1 — a self-contained settings test-support module
+
+**Carried out by:** P4 (`settings/tests/support/displays.rs`), commit `6e13655`.
+
+**Contract says** (§0): no shared settings test-support module is named, yet
+§2.6/§2.7/§2.8 all require harness-driven gates that need one.
+
+**As shipped:** P4 adds its own `settings/tests/support/displays.rs`, pulled in
+by `#[path]` from `settings/tests/displays.rs` and `settings/tests/interaction.rs`;
+it shares no items with any P2/P3 support module and edits none.
+
+**Ruling:** self-contained per-part support is what the gates need; nothing
+outside P4 depends on it.
+
+### P4-D2 — a fresh `Prop::Draw` closure every frame is intended
+
+**Carried out by:** P4 (`settings/src/pages/displays/canvas.rs`), commit `d3fe0da`.
+
+**Contract says** (§2.8): the canvas draw closure is rebuilt per `view` and
+must not capture the model.
+
+**As shipped:** `Props::diff` compares `Prop::Draw` by `Rc` pointer, so the
+canvas's draw prop diffs as changed every `view`.
+
+**Ruling:** the intended cost — one prop write and one repaint per frame the
+page is visible, no relayout; the alternative (caching the closure) would mean
+capturing the model, which §2.8 forbids.
+
+### P4-D3 — the canvas is fixed-size; `CANVAS_W`/`CANVAS_H` are the sole source of truth
+
+**Carried out by:** P4 (`settings/src/pages/displays/canvas.rs`), commit `7e791c7`.
+
+**Contract says** (§2.8): a paint callback may not mutate the model; `update`
+recomputes the view from the current allocation.
+
+**As shipped:** the drawing area is pinned to `CANVAS_W = 360.0` × `CANVAS_H =
+240.0` (the GTK `set_content_width`/`_height` values) with `hexpand(false)`/
+`vexpand(false)`; both `canvas::draw` and the drag mutators call
+`compute_view(&rects, CANVAS_W, CANVAS_H, CANVAS_MARGIN)`, so painted and
+hit-tested views cannot drift. `DisplaysState.view` is still written — by
+`update`, on `HeadDragBegan`/`HeadsChanged` — so `state.rs` is called, not edited.
+
+**Ruling:** `update` cannot read the allocation, so a fixed size is the only
+way painted and hit-tested geometry stay in lockstep without a paint-time model
+write.
+
+### P4-D4 — P4 appends one rule to `settings/style.css`
+
+**Carried out by:** P4 (`settings/style.css`), commit `597bccf`.
+
+**Contract says** (§2.9): anticipates "any page-local spacing a part needs".
+
+**As shipped:** `#displays_canvas { padding: 0; border: 0 none; margin: 0; }`.
+
+**Ruling:** `Event::PointerDown`'s `local` is border-box-relative while
+`Prop::Draw`'s `Rect` is the content box; with no padding/border the two
+coincide, which is what makes `hit_test` against the painted rects correct.
+
+### P4-D5 — `ui/src/widgets/drop_down.rs`'s list height
+
+**Carried out by:** P4 (`ui/src/widgets/drop_down.rs`), commit `f075cc5`.
+
+**Contract says** (§2.8, §7): the first discharged forward reference
+pre-authorises a `drop_down.rs` change to size the embedded list.
+
+**As shipped:** `DROP_DOWN_ROW_PX`/`DROP_DOWN_MAX_PX`/`drop_down_list_height`
+size the list to its content, capped at 240px with scroll beyond, replacing the
+flat 240px (§6 E6 authorises the whole file for P4).
+
+**Ruling:** pre-authorised; the sole `ui/` file P4 touches. See P4-D14 for the
+follow-on edits to the same file.
+
+### P4-D6 — P4 edits the Displays arm group of `settings/src/app.rs`'s `update`
+
+**Carried out by:** P4 (`settings/src/app.rs`), commits `597bccf`, `d83257d`,
+`1d97149`, `a4a8a21`, `7accaf1`.
+
+**Contract says:** §0's module map assigns `app.rs` to `[P1..P4]`; §5's
+"P4 — Owns" list omits it.
+
+**As shipped:** P4 replaces the stub bodies P1 left for the fourteen Displays
+`Msg` variants and touches no other arm.
+
+**Ruling:** §0 governs over §5's omission; the edit is confined to the Displays
+arms.
+
+### P4-D7 — `SettingsModel.outputs` is P1's field, consumed unchanged
+
+**Carried out by:** P4 (`settings/src/pages/displays/mod.rs`), commit `7accaf1`.
+
+**Contract says** (§2.5/§2.2): the field appears in a `main.rs` snippet but is
+omitted from the §2.2 field list.
+
+**As shipped:** P1 lands `pub outputs: Option<OutputsPump>` under P1-D2 (set via
+`with_outputs`, no `Rc` — `OutputsPump` is itself `Clone`); P4 consumes that
+shape verbatim in `submit`/`revert` and adds nothing.
+
+**Ruling:** consistency-check ruling E2 — the entry only names the field P4
+reads.
+
+### P4-D8 — the Displays submit runs inside `update`, and the pump's submit methods return `Result`
+
+**Carried out by:** P4 (`settings/src/outputs/pump.rs`,
+`settings/src/pages/displays/mod.rs`), commit `7accaf1`.
+
+**Contract says** (§2.5): `OutputsPump::{test_configuration,
+build_and_send_configuration}` are fire-and-forget `-> ()` "from `Cmd::Task`".
+
+**As shipped:** both return `Result<(), crate::outputs::OutputsError>`, and
+`displays::submit` calls them from `update`.
+
+**Ruling:** `Cmd::Task` has no return channel (M5-D3) and the pump holds no
+`InboxSender`, so a submit that fails before the wire could neither report
+itself nor clear `displays_in_flight`, leaving Test/Apply dead for the session.
+The call is a wayland request build plus `flush` on the loop thread — what the
+GTK handler did — not a blocking D-Bus round trip, so spec D8's "never inside
+`update`" is not engaged.
+
+### P4-D9 — `ICEDTEA_SETTINGS_PAGE` is P2's knob, consumed here
+
+**Carried out by:** P4 (`settings/src/pages/mod.rs`, `settings/src/main.rs`),
+commit `87e0934`.
+
+**Contract says:** nothing; P2 lands it first under P2-D8.
+
+**As shipped:** `page_from_env` reads the variable as the initial `PageId`
+(`.unwrap_or(PageId::Appearance)`); names not in `PageId::ALL` are ignored, so
+untrusted input never panics. P4 verified the knob and added nothing to its
+semantics.
+
+**Ruling:** consistency-check ruling E3 — recorded because P4's gates depend on
+it, not because P4 owns it.
+
+### P4-D10 — a third probe-report line kind, `state <key> <value…>`
+
+**Carried out by:** P4 (`settings/src/app.rs` `state_report_lines`,
+`settings/src/pages/displays/mod.rs`), commit `87e0934`.
+
+**Contract says** (§2.8): the drag gate asserts "the model's rect through the
+probe report", but M5-D9's `probe`/`alloc` lines carry only geometry.
+
+**As shipped:** a `state` line kind for `displays.position`, `displays.dirty`,
+`displays.selected`, `displays.in_flight`.
+
+**Ruling:** the gate needs model state, not pixels; additive to the report
+format.
+
+### P4-D11 — cairo baseline → `TextLayout` origin
+
+**Carried out by:** P4 (`settings/src/pages/displays/canvas.rs`), commit `d3fe0da`.
+
+**Contract says** (§2.8): the two canvas label offsets are "unchanged".
+
+**As shipped:** the two literals (`+16.0`, `+30.0`) are kept as baselines and
+converted to the layout box's top-left via `origin.y = baseline - CANVAS_FONT_PX`
+(cairo's `show_text` positions a baseline; `TextLayout::draw` takes a top-left).
+
+**Ruling:** the offsets are unchanged; only the coordinate convention differs
+between the two text APIs.
+
+### P4-D12 — `apply_reaches_reload_config_on_the_mock` lands in `settings/tests/interaction.rs`
+
+**Carried out by:** P4 (`settings/tests/interaction.rs`), commit `87bf6f5`.
+
+**Contract says** (§2.8): lists this gate under P4 although it exercises the
+footer P1 owns.
+
+**As shipped:** P4 adds it as a test only, editing no page source outside
+`pages/displays/`. `a_colour_pick_changes_the_swatch` is P2's (P2-D4/P2-D11),
+lands in `settings/tests/appearance.rs`, and is neither written nor owned here.
+
+**Ruling:** consistency-check ruling E4.
+
+### P4-D13 — the recording reload seam is a test-owned service on a private bus
+
+**Carried out by:** P4 (`settings/tests/interaction.rs`,
+`settings/tests/support/displays.rs` `open_on_bus`), commit `87bf6f5`.
+
+**Contract says** (§2.8): asks for "a recording `ReloadClient` seam";
+`compositor_reload.rs` is a file no part may touch.
+
+**As shipped:** the test stands up its own private `dbus-daemon` (`PrivateBus`),
+serves a `zbus` mock claiming `org.icedtea.Compositor` on that address, and
+points the spawned settings binary's `DBUS_SESSION_BUS_ADDRESS` at it via
+`open_on_bus`, recording the `ReloadConfig` calls. It skips visibly when no
+`dbus-daemon` is available.
+
+**Ruling:** a stronger posture than the plan's literal "claim the name on the
+session bus" — the developer's live session bus is never touched, directly
+satisfying the P0–P2 review's finding #15 (a test must never blocking-call
+`ReloadConfig` on whatever owns the name on the real bus).
+
+### P4-D14 — DropDown floors and labels its own list body
+
+**Carried out by:** P4 (`ui/src/widgets/drop_down.rs`), commit `36be53e`
+(superseding `025a1a9`/`019f3ad`, which briefly floored inside `PopoverC`).
+
+**Contract says** (§2.8, §7/E6): P4 may touch `drop_down.rs` for the list-height
+change (P4-D5); no other `ui/` file.
+
+**As shipped:** in addition to P4-D5, `DropDownC::build` sets the `<id>_list`
+id on the popover's `contents` node and `DropDownC` floors that node to
+`drop_down_list_height(self.filtered.len())` via `set_size_request`.
+
+**Ruling:** the probe writer emits an `alloc` line only for id-bearing nodes, so
+the fit gate needs the list body to carry an id and to be sized to its content;
+flooring is done in DropDown (not `PopoverC`, whose no-surface branch is shared
+by the menu callers who pass an inert size), keeping the change inside P4's
+`drop_down.rs` budget and leaving `PopoverC` and every menu untouched.
+
+### P4-D15 — the Displays status reads "Ready" at rest, not empty
+
+**Carried out by:** P4 (`settings/src/pages/displays/mod.rs`), commit `95dc8f9`.
+
+**Contract says** (§2.3/§2.8): `displays_status` shows the page's status; at
+rest, with no message, that is empty.
+
+**As shipped:** the page shows "Ready" at rest.
+
+**Ruling:** an empty-text label with `hexpand(true)` in the generic `Box`
+layout path collapses to zero width (a documented open `ui/` gap), which would
+make the rest-state gate see `displays_status` as unpainted. A real status
+string is a settings-side workaround (no `ui/` edit); the model field stays
+`String::new()`, and the window footer's own `status` label carries the same
+latent gap, left untouched as it is out of scope and in no gate's id list.
+
+### P4-D16 — `Msg::HeadSelected` is retired; canvas drag is the sole selection path
+
+**Carried out by:** P4 (`settings/src/pages/displays/controls.rs`), commit `35ea9f7`.
+
+**Contract says** (§2.1): names `Msg::HeadSelected(usize)`.
+
+**As shipped:** no `Msg::HeadSelected` variant exists and `select_head` is
+removed. Selection happens only through the canvas `drag_began` gesture (P4-D3),
+which every Displays task treats as sufficient.
+
+**Ruling:** no task needed list-based head selection, so wiring `HeadSelected`
+would have added an unreachable arm and `select_head` was unreachable from
+`update`; retiring both keeps the tree free of dead code. If list-selection is
+wanted later, re-introduce the variant and an `update` arm together.
