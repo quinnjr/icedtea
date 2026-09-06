@@ -17,6 +17,24 @@ use std::time::{Duration, Instant};
 
 use icedtea_harness::{CapturedFrame, Compositor, ScreencopyClient, VirtualPointerClient};
 
+/// `settings/src/main.rs`'s own `APP_ID`, duplicated here rather than shared
+/// (this module is self-contained by design, see the module docs above).
+const SETTINGS_APP_ID: &str = "org.icedtea.Settings";
+
+/// The server-side title bar height the harness compositor draws above every
+/// window's own content, in output pixels.
+///
+/// `settings/tests/support/mod.rs`'s own `TITLE_BAR_HEIGHT`, duplicated for
+/// the same self-containment reason. This driver's `alloc`/`point` are the
+/// app's own **window-local** layout coordinates (what the probe report
+/// carries); a screencopy capture is in **output** coordinates, and the two
+/// differ by exactly the window's placement (`geometry.x`, `geometry.y +
+/// TITLE_BAR_HEIGHT` — confirmed live: a probe-reported y of 45 painted at
+/// output y 73, a 28px gap that disappears entirely once this offset is
+/// added). Every coordinate this driver hands back from `alloc`/`point` is
+/// pre-translated to output space so callers never have to know this.
+const TITLE_BAR_HEIGHT: i32 = 28;
+
 /// The theme every gate pins its colours against. Never the developer's own
 /// `gtk.css`.
 pub const TEST_THEME: &str = "bundled";
@@ -48,7 +66,10 @@ pub struct ProbePoint {
     pub y: i32,
 }
 
-/// One `alloc <id> <x> <y> <w> <h>` line.
+/// One `alloc <id> <x> <y> <w> <h>` line, already translated from the report's
+/// window-local coordinates to output coordinates ([`SettingsDriver::alloc`]
+/// adds the window's [`origin`](SettingsDriver::origin)) — ready to feed
+/// straight to a screencopy pixel lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Alloc {
     pub id: String,
@@ -153,6 +174,11 @@ pub struct SettingsDriver {
     /// name exactly), used to locate a guaranteed-blank point for
     /// [`background`](Self::background).
     page_root: String,
+    /// The window's own top-left corner in output coordinates — its
+    /// compositor-assigned geometry, plus [`TITLE_BAR_HEIGHT`] for the
+    /// decoration drawn above the client area. Added to every window-local
+    /// coordinate `alloc`/`point` hands back before it reaches a caller.
+    origin: (i32, i32),
 }
 
 impl SettingsDriver {
@@ -205,9 +231,35 @@ impl SettingsDriver {
             output: (w as u32, h as u32),
             boot_background,
             page_root: page.to_string(),
+            origin: (0, 0),
         };
         driver.wait_for_first_frame();
+        driver.origin = driver.wait_for_window_origin();
         driver
+    }
+
+    /// Poll the compositor's own model for this settings window's placement.
+    ///
+    /// # Panics
+    ///
+    /// If the settings window never enters the compositor's model within
+    /// [`BOOT`].
+    fn wait_for_window_origin(&self) -> (i32, i32) {
+        let started = Instant::now();
+        while started.elapsed() < BOOT {
+            if let Some(window) = self
+                ._compositor
+                .snapshot()
+                .windows
+                .into_iter()
+                .find(|w| w.app_id == SETTINGS_APP_ID)
+            {
+                let g = window.geometry;
+                return (g.x, g.y + TITLE_BAR_HEIGHT);
+            }
+            std::thread::sleep(POLL);
+        }
+        panic!("the settings window never entered the compositor's model within {BOOT:?}");
     }
 
     /// Block until anything paints over the background.
@@ -250,13 +302,14 @@ impl SettingsDriver {
     /// everywhere, so a widget that painted nothing would still read as
     /// "painted something" by inheriting the plain page background.
     ///
-    /// This instead samples a point just *below* the page's own root box —
-    /// inside its `.margin(12, 12, 12, 12)` band (every page module's
-    /// convention; `mod.rs`'s `view()` for Displays) and the window's own
-    /// remaining space beneath it. A point just *above* the root box lands in
-    /// the nav switcher's own chrome instead (confirmed live: a beige/tan
+    /// This instead samples a point just *below* the page's own root box, in
+    /// the window's own remaining space beneath it — the app footer's chrome,
+    /// not the page's `.margin(12, 12, 12, 12)` band itself (`root.h` already
+    /// includes that margin, so `root.y + root.h` is the margin's *outer*
+    /// edge, not a point inside it). A point just *above* the root box lands
+    /// in the nav switcher's own chrome instead (confirmed live: a beige/tan
     /// sample, not the plain page background every widget rect is measured
-    /// against), so only the bottom margin is used.
+    /// against), so only the space below is used.
     ///
     /// [`boot_background`]: Self::boot_background
     ///
@@ -304,7 +357,8 @@ impl SettingsDriver {
         out
     }
 
-    /// The most recent centre reported for `label`.
+    /// The most recent centre reported for `label`, translated to output
+    /// coordinates (see [`origin`](Self::origin)).
     ///
     /// # Panics
     ///
@@ -315,7 +369,7 @@ impl SettingsDriver {
         points
             .iter()
             .find(|p| p.label == label)
-            .map(|p| (p.x, p.y))
+            .map(|p| (p.x + self.origin.0, p.y + self.origin.1))
             .unwrap_or_else(|| {
                 let labels: Vec<&str> = points.iter().map(|p| p.label.as_str()).collect();
                 panic!("no probe point {label:?}; got {labels:?}")
@@ -341,8 +395,8 @@ impl SettingsDriver {
             if let [x, y, w, h] = nums[..] {
                 found = Some(Alloc {
                     id: id.to_string(),
-                    x,
-                    y,
+                    x: x + self.origin.0,
+                    y: y + self.origin.1,
                     w,
                     h,
                 });

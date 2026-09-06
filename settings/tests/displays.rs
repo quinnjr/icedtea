@@ -5,7 +5,19 @@ mod support;
 
 use std::time::Duration;
 
+use icedtea_settings::pages::displays::canvas::CANVAS_BG;
 use support::{REACT, SettingsDriver, TEST_THEME};
+
+/// [`CANVAS_BG`] as the `u8` triple a screencopy pixel compares against —
+/// `settings/tests/appearance.rs`'s own `Rgba` → `(u8, u8, u8)` conversion,
+/// verbatim.
+fn canvas_bg_rgb() -> (u8, u8, u8) {
+    (
+        (CANVAS_BG.r * 255.0).round() as u8,
+        (CANVAS_BG.g * 255.0).round() as u8,
+        (CANVAS_BG.b * 255.0).round() as u8,
+    )
+}
 
 /// Every id the Displays page is contractually required to expose
 /// (M5 contract §2.3's widget-id list, the `displays.*` row).
@@ -73,21 +85,42 @@ fn displays_page_paints_every_probe_point_at_rest_in_the_high_contrast_theme() {
     displays_page_paints_at_rest("hc");
 }
 
-/// The canvas specifically: its own backdrop must differ from the window's, so
-/// a canvas that painted nothing but inherited the page background could not
-/// pass the gate above by accident.
+/// The canvas specifically: its own backdrop must be [`CANVAS_BG`], not
+/// merely "some colour that differs from the window background" — a
+/// transparent/gutted `draw()` lets the harness wallpaper bleed through the
+/// drawing area, which *also* differs from the plain page background and
+/// would pass a differs-from-page check by accident. Sampling a point inside
+/// the canvas rect but away from every head tile (the margin band
+/// `displays_canvas::compute_view` always leaves around the content, per
+/// `state::CANVAS_MARGIN`) and asserting it is [`CANVAS_BG`] catches that: the
+/// real `draw()` fills the whole rect with `CANVAS_BG` as its first
+/// statement, but a canvas that painted nothing shows wallpaper, not
+/// `CANVAS_BG`, at that point.
 ///
 /// Mutation check: make `CANVAS_BG` equal the theme's window background; this
-/// fails. Restore.
+/// fails (the assertion below no longer distinguishes canvas from page).
+/// Mutation check 2 (the whole gate, not just this assertion): gut
+/// `canvas::draw`'s body so it issues no `draw_rect` calls at all; the sampled
+/// point then reads harness wallpaper instead of `CANVAS_BG` and this fails.
+/// Restore both.
 #[test]
 fn the_canvas_paints_its_own_backdrop() {
     let mut driver = SettingsDriver::open(TEST_THEME, "displays");
     assert!(driver.wait_state("displays.dirty", "false", REACT));
     let canvas = driver.alloc("displays_canvas");
     let footer = driver.alloc("displays_footer");
-    // A point inside the canvas, and one inside the footer's chrome.
-    let inside = driver.pixel(canvas.x + canvas.w / 2, canvas.y + 4);
+    // Just inside the canvas rect's top-left corner: within the margin band
+    // every layout leaves around the content (`state::CANVAS_MARGIN`, 16
+    // canvas px), so no head tile ever reaches it regardless of how many
+    // heads the harness advertises.
+    let expected = canvas_bg_rgb();
     let page = driver.pixel(footer.x + 2, footer.y + footer.h / 2);
+    let inside = driver.pixel(canvas.x + 4, canvas.y + 4);
+    assert!(
+        support::matches(inside, expected),
+        "the canvas backdrop {inside:?} does not match CANVAS_BG {expected:?} \
+         (a blank/transparent draw() would show the harness wallpaper here instead)"
+    );
     assert!(
         !support::matches(inside, page),
         "the canvas backdrop {inside:?} is indistinguishable from the page {page:?}"
