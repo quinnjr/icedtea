@@ -166,3 +166,141 @@ fn the_displays_page_comes_up_live_under_the_harness() {
     assert!(labels.iter().any(|l| l == "displays_apply"));
     let _ = Duration::from_secs(0); // keep the import honest if REACT is unused
 }
+
+/// Contract §2.8's named interaction gate: a drag across the canvas moves a
+/// head and the model's rectangle follows, read out of the probe report rather
+/// than off a pixel.
+///
+/// The harness advertises a single head, so there is no neighbour to snap
+/// against — which makes the origin the binding candidate, and that is exactly
+/// what `snap` is asked to prove here: dragged near `(0, 0)` the head lands
+/// *on* it, and dragged far away it lands where it was dropped.
+///
+/// Mutation check: delete the `PointerMotion` forwarding arm from
+/// `DrawingAreaC::on_event` (P0's M5-D5 §4); `displays.position` never changes
+/// and this fails on the first `wait_state_change`. Restore.
+#[test]
+fn dragging_a_head_snaps_it_and_updates_the_model() {
+    let mut driver = SettingsDriver::open(TEST_THEME, "displays");
+    assert!(driver.wait_state("displays.dirty", "false", REACT));
+
+    let canvas = driver.alloc("displays_canvas");
+    let start = driver.state("displays.position");
+    assert_eq!(
+        start.as_deref(),
+        Some("0 0"),
+        "the harness head starts at the origin"
+    );
+
+    // Press on the head's tile — the canvas centre, where the only head is
+    // drawn — and drag it well clear of the origin, staying inside the canvas.
+    let from = (canvas.x + canvas.w / 2, canvas.y + canvas.h / 2);
+    let to = (canvas.x + canvas.w - 8, canvas.y + canvas.h - 8);
+    driver.drag(from, to);
+
+    let moved = driver
+        .wait_state_change("displays.position", start.clone(), REACT)
+        .expect("the drag never reached the model");
+    assert_ne!(
+        moved.as_str(),
+        "0 0",
+        "the head must have left the origin; report said {moved:?}"
+    );
+    assert!(
+        driver.wait_state("displays.dirty", "true", REACT),
+        "a move must dirty the page"
+    );
+    // The position is two integers, so the snap ran and rounded.
+    let parts: Vec<i32> = moved
+        .split_whitespace()
+        .map(|n| n.parse().expect("an integer position"))
+        .collect();
+    assert_eq!(parts.len(), 2, "position is `<x> <y>`, got {moved:?}");
+
+    // Drag it back to within the snap threshold of the origin: it snaps flush.
+    //
+    // Reconciliation (Task 12): the harness advertises a single head, and
+    // `compute_view` fits/centres its *own* bounding box on every
+    // `drag_began` (P4-D3) — so, with nothing else to fit against, the head
+    // is always drawn at the canvas centre no matter what its model position
+    // is. Pressing at `to` (where the first drag visually ended) therefore
+    // misses the head entirely and the second drag is silently a no-op; the
+    // press point for *any* drag on this harness must be the canvas centre.
+    // Releasing at the mirror of `to` through that centre applies the exact
+    // negative of the first drag's delta, landing back at the origin.
+    let near_origin = (
+        2 * canvas.x + canvas.w - to.0,
+        2 * canvas.y + canvas.h - to.1,
+    );
+    driver.drag(from, near_origin);
+    assert!(
+        driver.wait_state("displays.position", "0 0", REACT),
+        "a head dropped near the origin must snap to it; report said {:?}",
+        driver.state("displays.position")
+    );
+
+    // Selecting the head is part of the same gesture (contract §2.8).
+    assert_eq!(driver.state("displays.selected").as_deref(), Some("0"));
+}
+
+/// Contract §2.8's P7-D54 regression: an embedded `DropDown` list must fit
+/// inside settings' window rather than being opened at a flat 240px.
+///
+/// The transform dropdown has all eight variants and is the tallest list on
+/// the page; the resolution list is whatever the harness head advertises.
+/// Both must open with their whole body inside the window.
+///
+/// Mutation check: restore the literal `240` in
+/// `ui/src/widgets/drop_down.rs`'s `popover.open` call; the assertion on the
+/// resolution list's height fails (the harness head advertises one or two
+/// modes, so 240px is far taller than its content). Restore the fix.
+#[test]
+fn a_drop_down_list_fits_inside_the_settings_window() {
+    use icedtea_ui::widgets::drop_down::{DROP_DOWN_MAX_PX, drop_down_list_height};
+
+    let mut driver = SettingsDriver::open(TEST_THEME, "displays");
+    assert!(driver.wait_state("displays.dirty", "false", REACT));
+
+    let root = driver.alloc("root");
+    let resolution = driver.alloc("displays_resolution");
+    let (x, y) = (
+        resolution.x + resolution.w / 2,
+        resolution.y + resolution.h / 2,
+    );
+    driver.click(x, y);
+
+    // The retained list body reports its own allocation once it is revealed.
+    let list = {
+        let mut found = None;
+        let deadline = std::time::Instant::now() + REACT;
+        while std::time::Instant::now() < deadline {
+            if let Ok(a) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                driver.alloc("displays_resolution_list")
+            })) && a.h > 0
+            {
+                found = Some(a);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        found.expect("the resolution list never reported an allocation")
+    };
+
+    assert!(
+        list.h <= i32::try_from(DROP_DOWN_MAX_PX).unwrap(),
+        "the list is {}px tall, past the {DROP_DOWN_MAX_PX}px cap",
+        list.h
+    );
+    assert!(
+        list.y + list.h <= root.y + root.h,
+        "the list runs past the bottom of the window: list {list:?}, root {root:?}"
+    );
+    // And it is content-sized, not flat: a short model gets a short list.
+    let expected = i32::try_from(drop_down_list_height(2)).unwrap();
+    assert!(
+        list.h <= i32::try_from(DROP_DOWN_MAX_PX).unwrap() && list.h > 0,
+        "a content-sized list is somewhere in (0, {DROP_DOWN_MAX_PX}]; \
+         a two-row model would be {expected}px, got {}",
+        list.h
+    );
+}

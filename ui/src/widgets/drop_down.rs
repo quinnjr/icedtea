@@ -228,6 +228,16 @@ impl<Msg: Clone + 'static> Controller<Msg> for DropDownC {
                 .append_child(&Node::with_classes("entry", &["search"]));
         }
         let list = Node::new("listview");
+        // Labelled `<id>_list` when the caller gave the drop-down itself an
+        // id, so a probe-report gate can read the embedded list's own
+        // allocation (its height in particular) rather than only the closed
+        // button's. `node.id()` is not yet set at this point in `build` (the
+        // universal `Id` prop is applied to `node` after the controller
+        // builds it), so this reads straight off `props`, the full set the
+        // widget is being built with.
+        if let Some(id) = props.str(PropName::Id) {
+            list.set_id(Some(&format!("{id}_list")));
+        }
         popover.contents.append_child(&list);
 
         let items: Rc<[ListItem]> = match props.get(PropName::Model) {
