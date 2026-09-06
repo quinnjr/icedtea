@@ -149,8 +149,11 @@ pub enum Msg {
         shipped: std::sync::Arc<icedtea_config::Config>,
         result: Result<ReloadOutcome, String>,
     },
-    /// The filesystem worker read the config store back, for Revert.
-    ConfigLoaded(std::sync::Arc<icedtea_config::Config>),
+    /// The filesystem worker's answer to a Revert read of the config store:
+    /// `Ok` with the loaded config (or defaults, for a genuinely absent store),
+    /// or `Err` with a message when the store is present but unreadable
+    /// (corrupt/IO/locked) — in which case the saved copy is kept, not wiped.
+    ConfigLoaded(Result<std::sync::Arc<icedtea_config::Config>, String>),
     /// The compositor emitted `ConfigReloaded`.
     ConfigReloaded,
 
@@ -213,38 +216,34 @@ pub enum Msg {
     WorkspaceRemoved(usize),
 
     // --- Keybindings (P3) --------------------------------------------------
-    /// The Keybindings page's per-row Set button, by action string. Task 6
-    /// only needs the variant to exist so `pages::keybindings::view` can
-    /// emit it from the Set button; the arm that arms `m.capturing` is
-    /// Task 7's (contract §2.7).
+    /// The Keybindings page's per-row Set button, by action string. Its arm
+    /// sets `m.capturing` to that action, superseding any row already pending
+    /// capture (contract §2.7).
     CaptureArmed(String),
     /// The window-root capture handler resolved the pressed key and decided
-    /// it wasn't Escape (contract §2.7, Task 4). The full arm that stores it
-    /// into `m.model.working.keybindings` lands in Task 7; for now `update`
-    /// only needs an arm to stay exhaustive.
+    /// it wasn't Escape (contract §2.7). Its arm applies the combo to
+    /// `m.model.working.keybindings` via `apply_capture` while a row is armed,
+    /// then disarms the row and recomputes duplicate-binding conflicts.
     KeyCaptured {
         keysym: u32,
         mods: crate::model::CaptureMods,
     },
-    /// The window-root capture handler saw Escape while a row was armed.
-    /// Task 7 clears `m.capturing`; for now `update` only needs an arm to
-    /// stay exhaustive.
+    /// The window-root capture handler saw Escape while a row was armed. Its
+    /// arm clears `m.capturing`.
     CaptureCancelled,
 
     // --- Displays (P4) -----------------------------------------------------
-    /// A press on the Displays canvas, at canvas-space `(x, y)`. Task 2
-    /// (`pages::displays::canvas::view`) only needs the variant to exist so
-    /// the drawing area's pointer handlers can be registered; the arm that
-    /// starts a [`crate::pages::displays::state::Drag`] is a later task's
-    /// (contract §2.1's `HeadDragBegan`/`HeadDragged`/`HeadDragEnded` trio).
+    /// A press on the Displays canvas, at canvas-space `(x, y)`. Its arm starts
+    /// a [`crate::pages::displays::state::Drag`] via `canvas::drag_began` and
+    /// repopulates the control panel (contract §2.1's `HeadDragBegan`/
+    /// `HeadDragged`/`HeadDragEnded` trio).
     HeadDragBegan(f64, f64),
     /// A pointer motion over the canvas, at canvas-space `(x, y)`.
     HeadDragged(f64, f64),
     /// The pointer released over the canvas, at canvas-space `(x, y)`.
     HeadDragEnded(f64, f64),
-    /// The control panel's Enabled switch. Task 4 only needs the variant to
-    /// exist so `pages::displays::controls::view` can emit it; the arm that
-    /// writes `m.displays.edits[i].enabled` is a later task's.
+    /// The control panel's Enabled switch. Its arm writes the selected head's
+    /// `enabled` flag via `pages::displays::controls::set_enabled`.
     HeadEnabledToggled(bool),
     /// The control panel's Resolution dropdown, by index into
     /// `DisplaysState::res_options`.
@@ -348,7 +347,7 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             let db_path = m.db_path.clone();
             Cmd::Task(Rc::new(move || handles.load_config(db_path.clone())))
         }
-        Msg::ConfigLoaded(cfg) => {
+        Msg::ConfigLoaded(Ok(cfg)) => {
             m.model.working = (*cfg).clone();
             m.model.saved = (*cfg).clone();
             m.wallpaper_text = m
@@ -363,6 +362,15 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
             m.status = String::new();
             // Displays is deliberately not reverted: it owns its own Revert
             // and never routes through this working copy (main.rs:165-174).
+            Cmd::None
+        }
+        Msg::ConfigLoaded(Err(_)) => {
+            // The store is present but unreadable (corrupt/IO/locked).
+            // `load_reportable` distinguishes this from an absent store, so we
+            // must NOT adopt factory defaults here: leave `working` and `saved`
+            // untouched (a corrupt read is not a clean revert) and surface the
+            // failure instead of clearing the status line.
+            m.status = "Could not read your saved settings".to_string();
             Cmd::None
         }
         Msg::Applied { shipped, result } => {
@@ -856,7 +864,7 @@ pub(crate) mod tests {
                         }
                     }
                     crate::ipc::fs::FsRequest::LoadConfig { db_path } => Msg::ConfigLoaded(
-                        std::sync::Arc::new(icedtea_config::load_or_default(&db_path)),
+                        icedtea_config::load_reportable(&db_path).map(std::sync::Arc::new),
                     ),
                 };
                 update(m, msg);

@@ -242,6 +242,14 @@ fn an_fn_item_still_coerces_into_app_new() {
     fn view(model: &u32) -> View<u32> {
         icedtea_ui::widgets::label::label(&model.to_string())
     }
-    let app = App::new(7_u32, update, view);
-    assert_eq!(*app.model(), 7);
+    // `App::new(7, update, view)` compiling at all is the assertion: the
+    // whole point of this test is the `fn`-item coercion, and there is no
+    // way to fold `app` here and read the model back afterwards to make a
+    // runtime check non-vacuous — `run_offscreen` (the only driver `App`
+    // exposes for a test) takes `self` by value and returns `Frames`, which
+    // carries pixels, not the model, so the app is gone by the time a fold
+    // would have happened. `*app.model()` before any fold can only ever
+    // read back the `7` the literal put there — asserting it is vacuous, not
+    // a check of anything `App::new` could have gotten wrong.
+    let _app = App::new(7_u32, update, view);
 }

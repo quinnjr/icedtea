@@ -225,6 +225,39 @@ pub fn load_or_default(db_path: &Path) -> Config {
     }
 }
 
+/// Load config for a caller that must NOT silently substitute defaults when the
+/// store is present but unreadable (the settings app's Revert). Unlike
+/// [`load_or_default`], which folds every failure -- missing file, corrupt
+/// pages, IO error, open lock -- into `default_config()`, this returns:
+///
+/// * `Ok(config)` for a store that was read (with per-field defaults for
+///   anything missing/unparsable), AND for a genuinely ABSENT file, because a
+///   never-saved config *should* revert to defaults;
+/// * `Err(message)` when the file is present but cannot be opened or read --
+///   corrupt, IO error, or currently locked by another handle. The caller then
+///   keeps its current config and surfaces `message` instead of presenting
+///   factory defaults as a clean load.
+///
+/// A missing file is indistinguishable from a present one *after* [`open`],
+/// which creates the file when absent; but that same creation means a genuinely
+/// absent store opens cleanly and reads back as defaults (the `Ok` arm), while
+/// only a present-but-broken store reaches an `Err` from `open`. The one case
+/// this does NOT catch is a file that opens cleanly yet has corrupt page/table
+/// data surfacing only during the read: [`read_config_from_db`] degrades that
+/// to per-field defaults internally, exactly as it does for `load_or_default`.
+pub fn load_reportable(db_path: &Path) -> Result<Config, String> {
+    match open(db_path) {
+        Ok(db) => Ok(read_config_from_db(db)),
+        Err(redb::Error::DatabaseAlreadyOpen) => {
+            Err("the configuration file is in use by another program".to_string())
+        }
+        // `open` creates an absent file, so any `Err` here is a file that IS
+        // present but could not be opened (corrupt/IO). Never fold it into
+        // defaults -- report it.
+        Err(e) => Err(format!("could not open the configuration file: {e}")),
+    }
+}
+
 /// Read a `Config` out of an already-opened database, falling back per-field to
 /// [`default_config`] for anything missing or unparsable. The whole read path
 /// is wrapped in `catch_unwind_silently` because a file that opened cleanly can

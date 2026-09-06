@@ -186,22 +186,6 @@ pub fn format_combo(combo: &KeyCombo) -> String {
     parts.join("+")
 }
 
-/// Whether the shared window key controller should consume a key press as a
-/// binding capture. It must only act when the Keybindings page is the
-/// visible child (`page_visible`) AND a capture is actually armed
-/// (`capturing`). Extracted so the gate is unit-testable without a live
-/// window. (#4)
-pub fn should_capture(page_visible: bool, capturing: bool) -> bool {
-    page_visible && capturing
-}
-
-/// Clear an armed capture and report which action's row must have its Set
-/// button restored (`None` when nothing was armed). Pure so the reset decision
-/// is unit-testable; the caller performs the widget label restore. (#4)
-pub fn take_capture_reset(capturing: &mut Option<String>) -> Option<String> {
-    capturing.take()
-}
-
 /// Pick the keysym a capture stores, given the two the key event carries.
 ///
 /// `base` is the group-0/level-0 sym (`icedtea_ui::window::keyboard::KeyEvent::base`,
@@ -331,31 +315,6 @@ mod tests {
         assert_eq!(format_combo(&combo), "F5");
     }
 
-    #[test]
-    fn should_capture_only_when_page_visible_and_armed() {
-        // Both conditions required: an armed capture on a hidden page (the user
-        // switched away without completing) must NOT consume keystrokes.
-        assert!(should_capture(true, true));
-        assert!(
-            !should_capture(false, true),
-            "armed but page hidden: must not hijack"
-        );
-        assert!(
-            !should_capture(true, false),
-            "visible but nothing armed: pass through"
-        );
-        assert!(!should_capture(false, false));
-    }
-
-    #[test]
-    fn take_capture_reset_reports_and_clears_the_armed_action() {
-        let mut armed = Some("close".to_string());
-        assert_eq!(take_capture_reset(&mut armed), Some("close".to_string()));
-        assert_eq!(armed, None, "capture must be cleared after a reset");
-        // A second reset is a no-op once nothing is armed.
-        assert_eq!(take_capture_reset(&mut armed), None);
-    }
-
     /// `KEY_NoSymbol` is 0; a keycode the keymap does not map reports it as
     /// `base`, and the capture must then fall back to the modified sym rather
     /// than storing 0.
@@ -386,7 +345,6 @@ mod tests {
     fn the_pure_surface_is_public() {
         fn takes_fn(_: fn(usize) -> Vec<String>) {}
         takes_fn(crate::pages::keybindings::action_list);
-        assert!(crate::pages::keybindings::should_capture(true, true));
         assert_eq!(crate::pages::keybindings::FIXED_ACTIONS.len(), 10);
     }
 

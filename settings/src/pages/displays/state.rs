@@ -251,7 +251,12 @@ pub fn enabled_rects(st: &DisplaysState) -> (Vec<usize>, Vec<Rect>) {
         let (w, h) = e
             .mode
             .map(|m| (m.width, m.height))
-            .or_else(|| st.heads[i].current_mode.map(|m| (m.width, m.height)))
+            .or_else(|| {
+                st.heads
+                    .get(i)
+                    .and_then(|hd| hd.current_mode)
+                    .map(|m| (m.width, m.height))
+            })
             .unwrap_or((0, 0));
         if w == 0 || h == 0 {
             continue;

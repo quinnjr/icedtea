@@ -159,11 +159,19 @@ pub fn submit(m: &mut SettingsModel, is_test: bool) {
     }
 }
 
+/// Reset the pending edits, repopulate the option lists, and republish the
+/// canvas view, in that order. Shared by [`revert`] and the `ApplyFailed`
+/// (non-test) arm of [`on_outputs`], which both discard the in-flight edits
+/// back to the last-known head snapshot.
+fn reset_and_republish(st: &mut DisplaysState) {
+    reset_edits(st);
+    controls::repopulate(st);
+    republish_view(st);
+}
+
 /// Drop the pending edits back to the last-known head snapshot.
 pub fn revert(m: &mut SettingsModel) {
-    reset_edits(&mut m.displays);
-    controls::repopulate(&mut m.displays);
-    republish_view(&mut m.displays);
+    reset_and_republish(&mut m.displays);
     m.displays_status = String::new();
 }
 
@@ -265,9 +273,7 @@ pub fn on_outputs(m: &mut SettingsModel, msg: &OutputsMsg) {
                 // A preview was rejected: leave the edits intact to adjust.
                 m.displays_status = STATUS_TEST_REJECTED.to_string();
             } else {
-                reset_edits(&mut m.displays);
-                controls::repopulate(&mut m.displays);
-                republish_view(&mut m.displays);
+                reset_and_republish(&mut m.displays);
                 m.displays_status = STATUS_REJECTED.to_string();
             }
         }

@@ -17,7 +17,6 @@
 //! `Settings::capture`) exist for Tasks 9 and 10's Workspaces and
 //! rest-state gates in this same file (deviation P3-D4) and are unused
 //! until then.
-#![allow(dead_code)]
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

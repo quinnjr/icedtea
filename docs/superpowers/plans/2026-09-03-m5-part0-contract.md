@@ -3339,10 +3339,16 @@ pre-authorises a `drop_down.rs` change to size the embedded list.
 
 **As shipped:** `DROP_DOWN_ROW_PX`/`DROP_DOWN_MAX_PX`/`drop_down_list_height`
 size the list to its content, capped at 240px with scroll beyond, replacing the
-flat 240px (§6 E6 authorises the whole file for P4).
+flat 240px (§6 E6 authorises the whole file for P4). All three items ship as
+exported (`pub`) toolkit surface, not the private `const`/inline `let` §2.8
+sketched.
 
 **Ruling:** pre-authorised; the sole `ui/` file P4 touches. See P4-D14 for the
-follow-on edits to the same file.
+follow-on edits to the same file. The `pub` visibility is required, not
+incidental: `settings/tests/displays.rs` imports all three cross-crate
+(`use icedtea_ui::widgets::drop_down::{DROP_DOWN_MAX_PX, DROP_DOWN_ROW_PX,
+drop_down_list_height}`), so they must stay `pub` for the fit gate and any
+future caller to size list rows.
 
 ### P4-D6 — P4 edits the Displays arm group of `settings/src/app.rs`'s `update`
 

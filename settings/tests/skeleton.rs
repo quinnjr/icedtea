@@ -151,12 +151,27 @@ fn the_first_toplevel_app_run_paints_and_navigates() {
 
     // 3. The footer responds: Apply is insensitive while clean, and clicking
     //    it changes nothing — the model is not dirty.
+    //
+    // The window matters: the plan's original 2s is vacuous, because this
+    // file's own SETTLE budget (45s, above `appearance.rs`'s measured ~18s/
+    // frame report latency) shows a fold's status line takes many seconds to
+    // reach the report — so within 2s "status Applying" could not appear even
+    // if the regression this guards (a clean/insensitive Apply wrongly
+    // starting a save) were present, and the assertion would pass either way.
+    // Waiting the full SETTLE fixes that: a save started by the inert click
+    // *would* have surfaced "status Applying" well inside SETTLE (it is set
+    // synchronously in the `Apply` fold, before its `Cmd::Task`), so a `None`
+    // after SETTLE is real evidence of absence, not an unwinnable race. (A
+    // positive control driving a *sensitive* Apply was tried and rejected:
+    // the Apply path depends on a reload worker that has no compositor to
+    // reach on this headless harness bus, so it is gated insensitive here and
+    // cannot serve as a liveness proof — the durable full-window wait is the
+    // robust equivalent.)
     let apply_local = app.point("apply").expect("#apply is laid out");
     let (ax, ay) = to_screen(apply_local);
     support::click_fixed(&mut pointer, ax, ay);
     assert!(
-        app.wait_line("status Applying", Duration::from_secs(2))
-            .is_none(),
+        app.wait_line("status Applying", SETTLE).is_none(),
         "an insensitive Apply must not start a save\n{:?}",
         app.lines()
     );

@@ -33,6 +33,17 @@ const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 /// (contract §0, and `shell/src/clip_client.rs:37,41` proves both halves).
 const CONFIG_RELOADED: &str = "ConfigReloaded";
 
+/// How long [`watch_config_reloaded`] waits for a session-bus connection
+/// before giving up on the `ConfigReloaded` subscription and running without
+/// it.
+///
+/// `zbus::Connection::session()` is async but carries no deadline of its
+/// own: a bus socket that accepts and then never authenticates would park
+/// this detached watcher thread forever, and the "running without it"
+/// degradation log below only fires on an `Err` -- never on a hang. Mirrors
+/// `ipc::portal::PORTAL_CONNECT_TIMEOUT`, sized the same way.
+const WATCH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Start the worker. It returns when every `Inbox` is dropped (the app exited)
 /// or the request channel closes.
 ///
@@ -122,7 +133,7 @@ pub fn spawn_worker_on_bus(
 /// malformed signal body, because the body is never deserialised.
 fn watch_config_reloaded(tx: &InboxSender<Msg>) {
     let outcome = zbus::block_on(async {
-        let conn = zbus::Connection::session().await?;
+        let conn = connect_with_timeout()?;
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface(COMPOSITOR_IFACE)?
@@ -144,4 +155,32 @@ fn watch_config_reloaded(tx: &InboxSender<Msg>) {
     if let Err(err) = outcome {
         tracing::info!(%err, "no ConfigReloaded subscription; settings runs without it");
     }
+}
+
+/// [`zbus::Connection::session`], bounded by [`WATCH_CONNECT_TIMEOUT`].
+///
+/// The connect runs on its own short-lived thread (via the blocking API)
+/// because the async connect offers no deadline of its own; on expiry this
+/// returns and the helper is abandoned to finish or fail on its own, holding
+/// nothing the watcher needs. Mirrors `ipc::portal::connect` /
+/// `compositor_reload::connect`.
+fn connect_with_timeout() -> zbus::Result<zbus::Connection> {
+    let (tx, rx) = crossbeam_channel::bounded::<zbus::Result<zbus::blocking::Connection>>(1);
+    let spawned = std::thread::Builder::new()
+        .name("settings-config-reloaded-connect".to_string())
+        .spawn(move || {
+            let _ = tx.send(zbus::blocking::Connection::session());
+        });
+    if let Err(err) = spawned {
+        return Err(zbus::Error::Failure(format!(
+            "no connect-helper thread for the ConfigReloaded watcher: {err}"
+        )));
+    }
+    rx.recv_timeout(WATCH_CONNECT_TIMEOUT)
+        .unwrap_or_else(|_| {
+            Err(zbus::Error::Failure(
+                "the session bus did not answer".to_string(),
+            ))
+        })
+        .map(zbus::blocking::Connection::into_inner)
 }

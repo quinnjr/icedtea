@@ -45,9 +45,9 @@ pub fn spawn(
                         result: crate::pages::appearance::validate_wallpaper(&text)
                             .map(|path| path.display().to_string()),
                     },
-                    FsRequest::LoadConfig { db_path } => Msg::ConfigLoaded(std::sync::Arc::new(
-                        icedtea_config::load_or_default(&db_path),
-                    )),
+                    FsRequest::LoadConfig { db_path } => Msg::ConfigLoaded(
+                        icedtea_config::load_reportable(&db_path).map(std::sync::Arc::new),
+                    ),
                 };
                 if tx.send(msg).is_err() {
                     // Every Inbox is gone: the app exited.
