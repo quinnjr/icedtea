@@ -1,5 +1,5 @@
 //! The `org.icedtea.Clipboard` client: a worker re-fetches `get_history` on each
-//! `history_changed` and pushes it to the GTK thread; [`ClipProxy`] issues
+//! `history_changed` and pushes it onto the panel's inbox; [`ClipProxy`] issues
 //! activate/pin/remove/clear.
 
 use async_channel::Sender;
@@ -43,13 +43,13 @@ async fn run(tx: Sender<ClipUpdate>) -> zbus::Result<()> {
         if let Ok(history) = proxy.call::<_, _, Vec<ClipEntry>>("GetHistory", &()).await
             && tx.send(ClipUpdate::History(history)).await.is_err()
         {
-            break; // GTK side gone.
+            break; // The panel exited.
         }
     }
     Ok(())
 }
 
-/// Issues `org.icedtea.Clipboard` commands from the GTK thread.
+/// Issues `org.icedtea.Clipboard` commands from the panel's loop thread.
 pub struct ClipProxy {
     conn: zbus::blocking::Connection,
 }

@@ -1,7 +1,7 @@
 //! The panel's own style sheet, layered over the bundled Adwaita stack.
 //!
-//! GTK registered `style.css` display-wide with a `CssProvider` at
-//! `STYLE_PROVIDER_PRIORITY_APPLICATION`. `icedtea-ui` has no display-wide
+//! GTK registered `style.css` display-wide through a stylesheet provider at
+//! application priority. `icedtea-ui` has no display-wide
 //! provider registry: a sheet belongs to a `Window`, and an app sheet layers
 //! by being compiled *after* the theme in one source, which is exactly the
 //! cascade origin the theme override uses.

@@ -1,5 +1,5 @@
 //! A live D-Bus round-trip between the shell's real `ClipProxy` and the real
-//! `icedtea-clipboard` service. This is the coverage the taskbar/popover GTK
+//! `icedtea-clipboard` service. This is the coverage the taskbar/popover panel
 //! tests deliberately mock away — and the exact thing that hid the shipping bug
 //! where the shell called snake_case members (`activate`) while zbus exposes
 //! PascalCase (`Activate`). If the member names drift again, this fails.
