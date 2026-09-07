@@ -585,6 +585,12 @@ struct PopupSurface<Msg> {
     /// anchor rectangle.
     origin: (f32, f32),
     size: (u32, u32),
+    /// The payload `Cmd::OpenPopup` carried.
+    ///
+    /// Contract §6 P5-D2: kept, not dropped, so `rebuild_popups` can run it
+    /// again on every fold — an open popover tracks the model exactly as the
+    /// window's own tree does.
+    view: Rc<dyn Fn() -> View<Msg>>,
 }
 
 /// Bridges `Controller::measure` into taffy.
@@ -1139,6 +1145,41 @@ fn rebuild<M: 'static, Msg: Clone + 'static>(
     containers_of(&rt.instances, &mut rt.containers);
 }
 
+/// Re-run every open popup's payload and reconcile it into its own tree.
+///
+/// The window's counterpart is [`rebuild`]; this is the same three steps --
+/// describe, reconcile, refresh containers -- for each popup surface, in the
+/// order they were opened. Cheap when nothing changed: `reconcile` diffs, and
+/// a popup whose view returns the same tree produces no ops.
+fn rebuild_popups<Msg: Clone + 'static>(
+    rt: &mut Runtime<Msg>,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clock: &Rc<dyn Clock>,
+) {
+    for index in 0..rt.popups.len() {
+        let described = (Rc::clone(&rt.popups[index].view))();
+        let mut cx = BuildCx {
+            sheet,
+            fonts,
+            icons,
+            clock,
+            env: &rt.env,
+        };
+        let popup = &mut rt.popups[index];
+        reconcile(&popup.root, &mut popup.instances, vec![described], &mut cx);
+        popup.containers.clear();
+        popup.containers.insert(
+            crate::view::render::node_addr(&popup.root),
+            Container::Box {
+                direction: crate::layout::BoxDirection::Column,
+            },
+        );
+        containers_of(&popup.instances, &mut popup.containers);
+    }
+}
+
 /// Restyle the tree under `root`, then lay it out against `size`.
 ///
 /// Shared by [`render_once`] (called every frame `run`/`run_offscreen` draw)
@@ -1300,6 +1341,7 @@ fn open_popup<Msg: Clone + 'static>(
         // bottom-left corner.
         origin: (anchor_rect.x, anchor_rect.y + anchor_rect.height),
         size: positioner.size,
+        view: Rc::clone(view),
     };
     let described = view();
     let mut cx = BuildCx {
@@ -1866,6 +1908,7 @@ fn drain<M: 'static, Msg: Clone + 'static>(
     }
     if folded {
         rebuild(app, rt, sheet, fonts, icons, clock);
+        rebuild_popups(rt, sheet, fonts, icons, clock);
     }
     unhandled
 }
