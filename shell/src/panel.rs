@@ -15,6 +15,7 @@ use icedtea_ui::layout::Rect;
 use icedtea_ui::view::builders::{box_, button};
 use icedtea_ui::view::{Cmd, View};
 use icedtea_ui::widgets::Orientation;
+use icedtea_ui::window::pointer::BTN_MIDDLE;
 use icedtea_ui::window::popup::PopupKey;
 
 use crate::clip_client::ClipCommands;
@@ -166,8 +167,16 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
             let wm = m.wm.clone();
             Cmd::Task(Rc::new(move || wm.focus_window(id)))
         }
-        Msg::WindowPointerUp { .. }
-        | Msg::ClipButtonClicked
+        // Middle-click closes. A left release arrives here too and is ignored:
+        // focus is `EventKind::Click`'s job, and a node carrying both handlers
+        // produces both messages (M5-D5 §5), so this arm must be
+        // order-independent and must not act on `BTN_LEFT`.
+        Msg::WindowPointerUp { id, button } if button == BTN_MIDDLE => {
+            let wm = m.wm.clone();
+            Cmd::Task(Rc::new(move || wm.close_window(id)))
+        }
+        Msg::WindowPointerUp { .. } => Cmd::None,
+        Msg::ClipButtonClicked
         | Msg::PopoverOpened(_)
         | Msg::PopoverDismissed(_)
         | Msg::ClipActivated(_)
@@ -240,7 +249,8 @@ fn windows(m: &PanelModel) -> View<Msg> {
             let mut view = button(&label)
                 .key(u64::from(id))
                 .id(&format!("window_{id}"))
-                .on_click(Msg::WindowClicked(id));
+                .on_click(Msg::WindowClicked(id))
+                .on_pointer_up_with_button(move |_, _, button| Msg::WindowPointerUp { id, button });
             if w.focused {
                 view = view.class("focused");
             }
@@ -555,6 +565,57 @@ mod tests {
         let cmd = update(&mut m, msg);
         run_tasks(cmd);
         assert_eq!(wm.calls.borrow().as_slice(), [("focus".to_string(), 1)]);
+    }
+
+    #[test]
+    fn middle_clicking_a_window_button_closes_it() {
+        let (m, wm, _) = seeded();
+        let v = view(&m);
+        let msg = by_id(&v, "window_2")
+            .expect("window_2")
+            .handlers
+            .fire_pair_button(
+                EventKind::PointerUp,
+                4.0,
+                4.0,
+                icedtea_ui::window::pointer::BTN_MIDDLE,
+            )
+            .expect("a pointer-up handler");
+        assert!(matches!(
+            msg,
+            Msg::WindowPointerUp {
+                id: 2,
+                button: 0x112
+            }
+        ));
+        let mut m = m;
+        let cmd = update(&mut m, msg);
+        run_tasks(cmd);
+        assert_eq!(wm.calls.borrow().as_slice(), [("close".to_string(), 2)]);
+    }
+
+    #[test]
+    fn a_left_release_on_a_window_button_closes_nothing() {
+        let (m, wm, _) = seeded();
+        let v = view(&m);
+        let msg = by_id(&v, "window_2")
+            .expect("window_2")
+            .handlers
+            .fire_pair_button(
+                EventKind::PointerUp,
+                4.0,
+                4.0,
+                icedtea_ui::window::pointer::BTN_LEFT,
+            )
+            .expect("a pointer-up handler");
+        let mut m = m;
+        let cmd = update(&mut m, msg);
+        run_tasks(cmd);
+        assert!(
+            wm.calls.borrow().is_empty(),
+            "a left release is the focus path's business, not close's: {:?}",
+            wm.calls.borrow()
+        );
     }
 
     #[test]
