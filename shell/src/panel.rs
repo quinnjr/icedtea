@@ -16,7 +16,7 @@ use icedtea_ui::view::builders::{box_, button};
 use icedtea_ui::view::{Cmd, View};
 use icedtea_ui::widgets::Orientation;
 use icedtea_ui::window::pointer::BTN_MIDDLE;
-use icedtea_ui::window::popup::PopupKey;
+use icedtea_ui::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
 
 use crate::clip_client::ClipCommands;
 use crate::clipboard::{ClipUpdate, ClipboardModel};
@@ -176,10 +176,43 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
             Cmd::Task(Rc::new(move || wm.close_window(id)))
         }
         Msg::WindowPointerUp { .. } => Cmd::None,
-        Msg::ClipButtonClicked
-        | Msg::PopoverOpened(_)
-        | Msg::PopoverDismissed(_)
-        | Msg::ClipActivated(_)
+        Msg::ClipButtonClicked => match m.open_popover {
+            Some(key) => Cmd::ClosePopup(key),
+            None => {
+                // `update` has no `&Window`, and `PopupAnchorPoint::Node`
+                // wants a `Node` no handler can hand it, so the anchor is the
+                // rect the `App::on_frame` hook published for `#clip` last
+                // frame. Before the first frame there is none: fall back to a
+                // zero-width rect at the bar's right-hand end, which is where
+                // the button will be.
+                let anchor = m.clip_rect.get().unwrap_or_else(|| {
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "BAR_HEIGHT is a small positive constant"
+                    )]
+                    Rect::new(0.0, 0.0, 1.0, m.bar_height as f32)
+                });
+                let history = m.history.clone();
+                Cmd::OpenPopup {
+                    anchor: PopupAnchorPoint::Rect(anchor),
+                    positioner: Positioner::menu(anchor, POPOVER_SIZE),
+                    view: Rc::new(move || popover_rows(&history.borrow())),
+                }
+            }
+        },
+        Msg::PopoverOpened(key) => {
+            m.open_popover = Some(key);
+            Cmd::None
+        }
+        Msg::PopoverDismissed(key) => {
+            // Only for the key that was dismissed: a stale `popup_done` for a
+            // popup already replaced must not close the live one.
+            if m.open_popover == Some(key) {
+                m.open_popover = None;
+            }
+            Cmd::None
+        }
+        Msg::ClipActivated(_)
         | Msg::ClipPinToggled { .. }
         | Msg::ClipRemoved(_)
         | Msg::ClipCleared => Cmd::None,
@@ -275,6 +308,31 @@ fn clip_button(m: &PanelModel) -> View<Msg> {
     } else {
         view
     }
+}
+
+/// The popover's body, as a `Cmd::OpenPopup` payload can build it.
+///
+/// Reads the shared `history` mirror, not the model: the loop re-runs this
+/// closure on every fold (contract §6 P5-D2) and it cannot borrow
+/// `PanelModel`. Task 9 fills the rows; this task's stub is a real, tested
+/// tree, not a placeholder -- an empty history genuinely renders an empty
+/// list and a Clear button.
+#[must_use]
+pub fn popover_rows(_entries: &[ClipEntry]) -> View<Msg> {
+    box_(
+        Orientation::Vertical,
+        [
+            box_(Orientation::Vertical, Vec::<View<Msg>>::new()).id("history"),
+            button("Clear").id("clip_clear").on_click(Msg::ClipCleared),
+        ],
+    )
+    .id("popover")
+}
+
+/// Contract §3.4's spelling, for callers that do hold the model.
+#[must_use]
+pub fn popover_body(m: &PanelModel) -> View<Msg> {
+    popover_rows(&m.history.borrow())
 }
 
 #[cfg(test)]
@@ -632,5 +690,81 @@ mod tests {
         let cmd = update(&mut m, msg);
         run_tasks(cmd);
         assert_eq!(wm.calls.borrow().as_slice(), [("workspace".to_string(), 1)]);
+    }
+
+    #[test]
+    fn the_clip_button_opens_a_popup_anchored_to_its_own_box() {
+        let (mut m, _, _) = seeded();
+        m.clip_rect.set(Some(Rect::new(700.0, 0.0, 40.0, 28.0)));
+        let cmd = update(&mut m, Msg::ClipButtonClicked);
+        match cmd {
+            Cmd::OpenPopup {
+                anchor: PopupAnchorPoint::Rect(rect),
+                positioner,
+                ..
+            } => {
+                assert_eq!(
+                    (rect.x, rect.y, rect.width, rect.height),
+                    (700.0, 0.0, 40.0, 28.0),
+                    "the anchor is the clip button's own border box"
+                );
+                assert!(
+                    format!("{positioner:?}").contains("320"),
+                    "the popover is POPOVER_SIZE wide: {positioner:?}"
+                );
+            }
+            other => panic!("expected an OpenPopup, got {other:?}"),
+        }
+        assert!(
+            m.open_popover.is_none(),
+            "the key is not known until the loop reports it back"
+        );
+    }
+
+    #[test]
+    fn the_open_popover_key_comes_back_through_a_message_and_marks_the_button() {
+        let (mut m, _, _) = seeded();
+        let key = PopupKey::from_raw(3);
+        let _ = update(&mut m, Msg::PopoverOpened(key));
+        assert_eq!(m.open_popover, Some(key));
+        let v = view(&m);
+        let classes = match by_id(&v, "clip")
+            .expect("clip")
+            .props
+            .get(PropName::Classes)
+        {
+            Some(icedtea_ui::view::Prop::Classes(list)) => {
+                list.iter().map(|c| c.to_string()).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+        assert!(classes.contains(&"active".to_string()));
+    }
+
+    #[test]
+    fn a_second_click_on_the_clip_button_closes_the_open_popover() {
+        let (mut m, _, _) = seeded();
+        let key = PopupKey::from_raw(3);
+        let _ = update(&mut m, Msg::PopoverOpened(key));
+        let cmd = update(&mut m, Msg::ClipButtonClicked);
+        assert!(
+            matches!(cmd, Cmd::ClosePopup(k) if k == key),
+            "expected ClosePopup({key:?}), got {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn a_dismissal_clears_the_state_only_for_the_key_that_was_dismissed() {
+        let (mut m, _, _) = seeded();
+        let key = PopupKey::from_raw(3);
+        let _ = update(&mut m, Msg::PopoverOpened(key));
+        let _ = update(&mut m, Msg::PopoverDismissed(PopupKey::from_raw(9)));
+        assert_eq!(
+            m.open_popover,
+            Some(key),
+            "a stale key from an already-closed popup must not clear the live one"
+        );
+        let _ = update(&mut m, Msg::PopoverDismissed(key));
+        assert_eq!(m.open_popover, None);
     }
 }
