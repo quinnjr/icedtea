@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use icedtea_contract::ClipEntry;
-use icedtea_ui::layout::Rect;
+use icedtea_ui::layout::{Align, Rect};
 use icedtea_ui::view::builders::{box_, button};
 use icedtea_ui::view::{Cmd, View};
 use icedtea_ui::widgets::Orientation;
@@ -212,10 +212,29 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
             }
             Cmd::None
         }
-        Msg::ClipActivated(_)
-        | Msg::ClipPinToggled { .. }
-        | Msg::ClipRemoved(_)
-        | Msg::ClipCleared => Cmd::None,
+        // A paste dismisses; pin, remove and clear do not — the daemon answers
+        // each with a `history_changed`, the mirror follows it, and P5-D2
+        // rebuilds the open surface in place.
+        Msg::ClipActivated(id) => {
+            let clip = m.clip.clone();
+            let task = Cmd::Task(Rc::new(move || clip.activate(id)));
+            match m.open_popover {
+                Some(key) => Cmd::Batch(vec![task, Cmd::ClosePopup(key)]),
+                None => task,
+            }
+        }
+        Msg::ClipPinToggled { id, pinned } => {
+            let clip = m.clip.clone();
+            Cmd::Task(Rc::new(move || clip.pin(id, pinned)))
+        }
+        Msg::ClipRemoved(id) => {
+            let clip = m.clip.clone();
+            Cmd::Task(Rc::new(move || clip.remove(id)))
+        }
+        Msg::ClipCleared => {
+            let clip = m.clip.clone();
+            Cmd::Task(Rc::new(move || clip.clear()))
+        }
     }
 }
 
@@ -312,17 +331,50 @@ fn clip_button(m: &PanelModel) -> View<Msg> {
 
 /// The popover's body, as a `Cmd::OpenPopup` payload can build it.
 ///
-/// Reads the shared `history` mirror, not the model: the loop re-runs this
-/// closure on every fold (contract §6 P5-D2) and it cannot borrow
-/// `PanelModel`. Task 9 fills the rows; this task's stub is a real, tested
-/// tree, not a placeholder -- an empty history genuinely renders an empty
-/// list and a Clear button.
+/// Reads a slice, not the model: the loop re-runs this closure on every fold
+/// (contract §6 P5-D2), and a payload closure cannot borrow `PanelModel`.
+///
+/// Rows are buttons in a box rather than a `ListBox` (contract §6 P5-D3): a
+/// `ListBoxC` swallows the press in the capture phase, so a control inside a
+/// row can never receive its own click, and it reads the row index from
+/// coordinates that are local to the innermost instance rather than to itself.
+/// Three plain buttons per row is the path the interaction gate already
+/// proves, and it gives `remove` a trigger that a keyboard-less layer surface
+/// could never have offered.
 #[must_use]
-pub fn popover_rows(_entries: &[ClipEntry]) -> View<Msg> {
+pub fn popover_rows(entries: &[ClipEntry]) -> View<Msg> {
+    let rows: Vec<View<Msg>> = entries
+        .iter()
+        .map(|entry| {
+            let id = entry.id;
+            let pinned = entry.pinned;
+            box_(
+                Orientation::Horizontal,
+                [
+                    button(&entry.preview)
+                        .id(&format!("history_open_{id}"))
+                        .hexpand(true)
+                        .halign(Align::Start)
+                        .on_click(Msg::ClipActivated(id)),
+                    button(if pinned { "unpin" } else { "pin" })
+                        .id(&format!("history_pin_{id}"))
+                        .on_click(Msg::ClipPinToggled {
+                            id,
+                            pinned: !pinned,
+                        }),
+                    button("remove")
+                        .id(&format!("history_del_{id}"))
+                        .on_click(Msg::ClipRemoved(id)),
+                ],
+            )
+            .key(id)
+            .id(&format!("history_{id}"))
+        })
+        .collect();
     box_(
         Orientation::Vertical,
         [
-            box_(Orientation::Vertical, Vec::<View<Msg>>::new()).id("history"),
+            box_(Orientation::Vertical, rows).id("history"),
             button("Clear").id("clip_clear").on_click(Msg::ClipCleared),
         ],
     )
@@ -766,5 +818,168 @@ mod tests {
         );
         let _ = update(&mut m, Msg::PopoverDismissed(key));
         assert_eq!(m.open_popover, None);
+    }
+
+    fn clip_entry(id: u64, preview: &str, pinned: bool) -> ClipEntry {
+        ClipEntry {
+            id,
+            kind: icedtea_contract::ClipKind::Text,
+            preview: preview.into(),
+            mime: "text/plain".into(),
+            pinned,
+            source_app: None,
+        }
+    }
+
+    fn with_history(entries: Vec<ClipEntry>) -> (PanelModel, Rc<MockWm>, Rc<MockClip>) {
+        let (mut m, wm, clip) = seeded();
+        let _ = update(&mut m, Msg::Clip(Arc::new(ClipUpdate::History(entries))));
+        (m, wm, clip)
+    }
+
+    #[test]
+    fn the_popover_shows_one_row_per_history_entry_keyed_by_id() {
+        let (m, _, _) = with_history(vec![
+            clip_entry(10, "copied text", false),
+            clip_entry(11, "second entry", true),
+        ]);
+        let body = popover_body(&m);
+        let rows = by_id(&body, "history").expect("history").children.len();
+        assert_eq!(rows, 2, "expected two history rows");
+        assert!(by_id(&body, "history_10").is_some());
+        assert!(by_id(&body, "history_11").is_some());
+        assert_eq!(
+            by_id(&body, "history_open_10")
+                .expect("row 10's paste button")
+                .props
+                .str(PropName::Label),
+            Some("copied text")
+        );
+        assert_eq!(
+            by_id(&body, "history_pin_11")
+                .expect("row 11's pin button")
+                .props
+                .str(PropName::Label),
+            Some("unpin"),
+            "a pinned entry offers `unpin`, exactly as `clipboard::render` did"
+        );
+        assert_eq!(
+            by_id(&body, "history_pin_10")
+                .expect("row 10's pin button")
+                .props
+                .str(PropName::Label),
+            Some("pin")
+        );
+    }
+
+    #[test]
+    fn a_history_replacement_replaces_the_rows() {
+        let (mut m, _, _) = with_history(vec![
+            clip_entry(10, "copied text", false),
+            clip_entry(11, "second entry", false),
+        ]);
+        let _ = update(
+            &mut m,
+            Msg::Clip(Arc::new(ClipUpdate::History(vec![clip_entry(
+                12, "only", false,
+            )]))),
+        );
+        let body = popover_body(&m);
+        assert_eq!(
+            by_id(&body, "history").expect("history").children.len(),
+            1,
+            "history update did not replace rows"
+        );
+        assert!(by_id(&body, "history_12").is_some());
+    }
+
+    #[test]
+    fn activating_a_row_pastes_it_and_closes_the_popover() {
+        let (mut m, _, clip) = with_history(vec![clip_entry(10, "copied text", false)]);
+        let key = PopupKey::from_raw(3);
+        let _ = update(&mut m, Msg::PopoverOpened(key));
+        let body = popover_body(&m);
+        let msg = by_id(&body, "history_open_10")
+            .expect("row 10's paste button")
+            .handlers
+            .fire_unit(EventKind::Click)
+            .expect("a click handler");
+        assert!(matches!(msg, Msg::ClipActivated(10)));
+        let cmd = update(&mut m, msg);
+        assert!(
+            format!("{cmd:?}").contains("ClosePopup"),
+            "activating a row must dismiss the popover: {cmd:?}"
+        );
+        run_tasks(cmd);
+        assert_eq!(
+            clip.calls.borrow().as_slice(),
+            [("activate".to_string(), 10)]
+        );
+    }
+
+    #[test]
+    fn pinning_and_removing_a_row_reach_the_clip_command_surface() {
+        let (mut m, _, clip) = with_history(vec![clip_entry(10, "copied text", false)]);
+        let body = popover_body(&m);
+        let pin = by_id(&body, "history_pin_10")
+            .expect("pin")
+            .handlers
+            .fire_unit(EventKind::Click)
+            .expect("a click handler");
+        assert!(matches!(
+            pin,
+            Msg::ClipPinToggled {
+                id: 10,
+                pinned: true
+            }
+        ));
+        run_tasks(update(&mut m, pin));
+
+        let del = by_id(&body, "history_del_10")
+            .expect("remove")
+            .handlers
+            .fire_unit(EventKind::Click)
+            .expect("a click handler");
+        assert!(matches!(del, Msg::ClipRemoved(10)));
+        run_tasks(update(&mut m, del));
+
+        let clear = by_id(&body, "clip_clear")
+            .expect("clear")
+            .handlers
+            .fire_unit(EventKind::Click)
+            .expect("a click handler");
+        assert!(matches!(clear, Msg::ClipCleared));
+        run_tasks(update(&mut m, clear));
+
+        assert_eq!(
+            clip.calls.borrow().as_slice(),
+            [
+                ("pin".to_string(), 10),
+                ("remove".to_string(), 10),
+                ("clear".to_string(), 0)
+            ]
+        );
+    }
+
+    /// The popover stays open for pin and remove: the daemon answers with a
+    /// `history_changed`, the mirror follows, and P5-D2 rebuilds the open
+    /// surface. Only a paste dismisses.
+    #[test]
+    fn pinning_leaves_the_popover_open() {
+        let (mut m, _, _) = with_history(vec![clip_entry(10, "copied text", false)]);
+        let key = PopupKey::from_raw(3);
+        let _ = update(&mut m, Msg::PopoverOpened(key));
+        let cmd = update(
+            &mut m,
+            Msg::ClipPinToggled {
+                id: 10,
+                pinned: true,
+            },
+        );
+        assert!(
+            !format!("{cmd:?}").contains("ClosePopup"),
+            "pin must not dismiss the popover: {cmd:?}"
+        );
+        assert_eq!(m.open_popover, Some(key));
     }
 }
