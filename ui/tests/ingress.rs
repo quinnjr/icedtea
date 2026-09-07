@@ -684,7 +684,7 @@ fn pointer_handlers_fire_down_motion_up_in_order_with_local_coordinates() {
     );
 }
 
-/// P5-D10: `ButtonC`'s activation (the generic `EventKind::Click`, produced by
+/// P5-D11: `ButtonC`'s activation (the generic `EventKind::Click`, produced by
 /// the shared `PointerState::observe`) must fire on the primary button only,
 /// the way real GTK activates a `GtkButton` on `GDK_BUTTON_PRIMARY`. A middle
 /// or right press-release *inside* the button must not fire `Click`.

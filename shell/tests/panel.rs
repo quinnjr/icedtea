@@ -217,7 +217,7 @@ fn the_bar_spans_the_output_and_fits_its_surface() {
 /// spurious `focus_window(id)`. The old GTK test called `render` by hand and
 /// never exercised the button-2 gesture; this drives it through the live panel.
 ///
-/// The negative half is what P5-D10 (the `PointerState::observe` primary-button
+/// The negative half is what P5-D11 (the `PointerState::observe` primary-button
 /// gate) buys: before that fix, the middle release produced both the panel's
 /// own `WindowPointerUp{BTN_MIDDLE}` → `close_window` *and* a stray
 /// `EventKind::Click` → `focus_window`.

@@ -880,7 +880,7 @@ impl PointerState {
             }
             // Only the primary button drives `:active` and the click gesture,
             // the way real GTK activates a widget on `GDK_BUTTON_PRIMARY`
-            // (P5-D10). A middle/right press must not arm the pressed state, and
+            // (P5-D11). A middle/right press must not arm the pressed state, and
             // a non-left release must not clear it or report a click -- else a
             // middle-click on a widget that also carries its own middle-button
             // handler fires a spurious activation alongside it.
