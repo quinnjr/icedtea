@@ -511,6 +511,12 @@ pub struct App<M, Msg> {
     popup_hook: Option<Box<dyn Fn(PopupEvent) -> Option<Msg>>>,
     /// Where `run` writes `probe`/`alloc` lines, when asked (M5-D9, P0-D4).
     probe_report: Option<std::path::PathBuf>,
+    /// Observes the live window once per rendered frame (M5-D5's `on_frame`).
+    #[allow(
+        clippy::type_complexity,
+        reason = "one boxed closure, at most one per app"
+    )]
+    frame_hook: Option<Box<dyn FnMut(&crate::window::Window)>>,
 }
 
 impl<M: std::fmt::Debug, Msg> std::fmt::Debug for App<M, Msg> {
@@ -696,6 +702,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             fd_handlers: Vec::new(),
             popup_hook: None,
             probe_report: std::env::var_os("ICEDTEA_PROBE_REPORT").map(std::path::PathBuf::from),
+            frame_hook: None,
         }
     }
 
@@ -755,6 +762,23 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     #[must_use]
     pub fn on_popup(mut self, f: impl Fn(PopupEvent) -> Option<Msg> + 'static) -> Self {
         self.popup_hook = Some(Box::new(f));
+        self
+    }
+
+    /// Observe the live window once per rendered frame.
+    ///
+    /// Runs on the loop thread after the frame is painted, with the window's
+    /// layout tree already settled, so [`Window::probe_points`] and
+    /// [`Window::allocation`] answer for what was just drawn. It may not
+    /// mutate the model and gets no way to: this is the hook M5's apps write
+    /// their `$ICEDTEA_PROBE_REPORT` lines from, and the one an app caches a
+    /// widget's allocation through. Never called by `run_offscreen`, which has
+    /// no window.
+    ///
+    /// At most one hook per app; a second call replaces the first.
+    #[must_use]
+    pub fn on_frame(mut self, f: impl FnMut(&crate::window::Window) + 'static) -> Self {
+        self.frame_hook = Some(Box::new(f));
         self
     }
 
@@ -2356,6 +2380,17 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                         &mut painter,
                     );
                 })?;
+            }
+
+            if let Some(hook) = self.frame_hook.as_mut() {
+                // `Window::probe_points`/`allocation` read `Window`'s own
+                // layout tree, which `App::run` otherwise never touches (its
+                // reconcile loop keeps its own on `Runtime`, alive across
+                // frames for taffy's incremental dirty tracking). Swap it in
+                // for the span of the hook, then take it back.
+                window.set_layout(std::mem::take(&mut rt.layout));
+                hook(&window);
+                rt.layout = window.take_layout();
             }
         }
         if let Some(id) = inbox_watch {

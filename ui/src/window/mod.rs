@@ -1447,7 +1447,9 @@ impl Window {
     /// The live counterpart of `App::probe`, which is offscreen-only: a
     /// harness test against a running client has no other way to ask where a
     /// widget ended up, and the gate rules forbid hard-coded coordinates.
-    /// Reads the tree the last [`Window::render`] laid out.
+    /// Reads the tree the last [`Window::render`] laid out, or -- for a window
+    /// driven by `App::run` -- the tree its own reconcile loop last laid out,
+    /// published here for the run of an `App::on_frame` hook (P5-D5).
     #[must_use]
     pub fn probe_points(&self) -> Vec<ProbePoint> {
         probe_points_of(&self.root, &self.layout)
@@ -1459,6 +1461,26 @@ impl Window {
     #[must_use]
     pub fn allocation(&self, id: &str) -> Option<crate::layout::Allocation> {
         allocation_of(&self.root, &self.layout, id)
+    }
+
+    /// Hand this window's layout tree to its caller, leaving an empty one
+    /// behind.
+    ///
+    /// `App::run` keeps its own reconcile loop's [`crate::layout::LayoutTree`]
+    /// on its `Runtime` rather than on `Window` (it must survive across
+    /// frames for taffy's incremental dirty tracking), so [`Window::layout`]
+    /// itself is otherwise never touched once such a loop is driving the
+    /// window. `take_layout`/[`Window::set_layout`] let `App::run` swap the
+    /// loop's tree onto `self` for the span of an `on_frame` hook (P5-D5), so
+    /// [`Window::probe_points`] and [`Window::allocation`] answer for what the
+    /// loop just laid out, then take it back for the next iteration.
+    pub(crate) fn take_layout(&mut self) -> crate::layout::LayoutTree {
+        std::mem::take(&mut self.layout)
+    }
+
+    /// See [`Window::take_layout`].
+    pub(crate) fn set_layout(&mut self, layout: crate::layout::LayoutTree) {
+        self.layout = layout;
     }
 
     /// Register `fd` in this window's poll set.
