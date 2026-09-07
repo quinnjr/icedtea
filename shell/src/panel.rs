@@ -17,6 +17,8 @@ use icedtea_ui::view::{Cmd, View};
 use icedtea_ui::widgets::Orientation;
 use icedtea_ui::window::pointer::BTN_MIDDLE;
 use icedtea_ui::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
+use icedtea_ui::window::{LayerSpec, Role, SurfaceSpec};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::clip_client::ClipCommands;
 use crate::clipboard::{ClipUpdate, ClipboardModel};
@@ -32,6 +34,43 @@ pub const BAR_HEIGHT: i32 = 28;
 
 /// The clipboard popover's surface size.
 pub const POPOVER_SIZE: (u32, u32) = (320, 280);
+
+/// The panel's surface: anchored left/right/top, `Layer::Top`, no keyboard.
+///
+/// Every value is the layer-shell call it replaces. Anchored **top**, not
+/// bottom: the source comment stands — a bottom bar lands below the visible
+/// area on a display whose viewport is shorter than the reported output (a VM
+/// console). `keyboard: None` matches GTK4 layer-shell's unset default; the
+/// panel takes no keyboard focus, and the popover's search field has no IME
+/// until M6. `exclusive_zone` is the literal `BAR_HEIGHT` because `LayerSpec`
+/// has no "auto" (contract §6 P5-D6). The initial size is `(800, 28)`, the
+/// pair `set_default_size(800, 28)` + `set_size_request(-1, 28)` forced: a
+/// 0-height layer surface never commits a real buffer.
+///
+/// Public and in the library (P5 Task 12) so the integration harness drives
+/// exactly the surface the binary opens, not a copy that can drift.
+#[must_use]
+pub fn spec() -> SurfaceSpec {
+    SurfaceSpec {
+        role: Role::Layer(LayerSpec {
+            layer: zwlr_layer_shell_v1::Layer::Top,
+            anchor: zwlr_layer_surface_v1::Anchor::Left
+                | zwlr_layer_surface_v1::Anchor::Right
+                | zwlr_layer_surface_v1::Anchor::Top,
+            margin: [0, 0, 0, 0],
+            exclusive_zone: BAR_HEIGHT,
+            keyboard: zwlr_layer_surface_v1::KeyboardInteractivity::None,
+        }),
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "BAR_HEIGHT is a positive literal constant"
+        )]
+        size: (800, BAR_HEIGHT as u32),
+        // A layer surface has no `namespace` field: `title` is the namespace.
+        title: "icedtea-shell".to_string(),
+        app_id: "org.icedtea.Shell".to_string(),
+    }
+}
 
 pub struct PanelModel {
     /// Verbatim from `taskbar.rs`; `apply`/`merge` and their 5 tests unchanged.
