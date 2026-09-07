@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use icedtea_contract::ClipEntry;
 use icedtea_ui::layout::Rect;
-use icedtea_ui::view::builders::box_;
+use icedtea_ui::view::builders::{box_, button};
 use icedtea_ui::view::{Cmd, View};
 use icedtea_ui::widgets::Orientation;
 use icedtea_ui::window::popup::PopupKey;
@@ -158,9 +158,15 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
             *m.history.borrow_mut() = m.clipboard.entries.clone();
             Cmd::None
         }
-        Msg::WorkspaceClicked(_)
-        | Msg::WindowClicked(_)
-        | Msg::WindowPointerUp { .. }
+        Msg::WorkspaceClicked(id) => {
+            let wm = m.wm.clone();
+            Cmd::Task(Rc::new(move || wm.set_workspace(id)))
+        }
+        Msg::WindowClicked(id) => {
+            let wm = m.wm.clone();
+            Cmd::Task(Rc::new(move || wm.focus_window(id)))
+        }
+        Msg::WindowPointerUp { .. }
         | Msg::ClipButtonClicked
         | Msg::PopoverOpened(_)
         | Msg::PopoverDismissed(_)
@@ -172,14 +178,116 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
 }
 
 /// The whole bar. `#bar` is what `style.css`'s first selector names.
-pub fn view(_m: &PanelModel) -> View<Msg> {
-    box_(Orientation::Horizontal, Vec::<View<Msg>>::new()).id("bar")
+pub fn view(m: &PanelModel) -> View<Msg> {
+    box_(
+        Orientation::Horizontal,
+        [workspaces(m), windows(m), clip_button(m)],
+    )
+    .id("bar")
+}
+
+/// One button per workspace, keyed by workspace id.
+///
+/// Label, one-indexed fallback and the `active` class are `taskbar::render`'s
+/// rules verbatim; what changed is that they are now computed from the model
+/// on every `view` instead of being written into a widget on every rebuild.
+fn workspaces(m: &PanelModel) -> View<Msg> {
+    let buttons: Vec<View<Msg>> = m
+        .taskbar
+        .workspaces
+        .iter()
+        .map(|ws| {
+            let id = ws.id;
+            let label = if ws.name.is_empty() {
+                (id + 1).to_string()
+            } else {
+                ws.name.clone()
+            };
+            let view = button(&label)
+                .key(u64::from(id))
+                .id(&format!("ws_{id}"))
+                .on_click(Msg::WorkspaceClicked(id));
+            if id == m.taskbar.active_workspace {
+                view.class("active")
+            } else {
+                view
+            }
+        })
+        .collect();
+    box_(Orientation::Horizontal, buttons).id("workspaces")
+}
+
+/// One button per window, keyed by window id.
+///
+/// `hexpand` lives here, not on a wrapper: the GTK panel kept the taskbar in
+/// its own child box only so the clipboard button survived
+/// `taskbar::render`'s clear-and-rebuild. There is no rebuild to survive.
+///
+/// `attention` surfaces the compositor's refused-activation flag
+/// (`State::request_activate`), which is the whole point of the bit.
+fn windows(m: &PanelModel) -> View<Msg> {
+    let buttons: Vec<View<Msg>> = m
+        .taskbar
+        .windows
+        .iter()
+        .map(|w| {
+            let id = w.id.0;
+            let label = if w.title.is_empty() {
+                w.app_id.clone()
+            } else {
+                w.title.clone()
+            };
+            let mut view = button(&label)
+                .key(u64::from(id))
+                .id(&format!("window_{id}"))
+                .on_click(Msg::WindowClicked(id));
+            if w.focused {
+                view = view.class("focused");
+            }
+            if w.attention {
+                view = view.class("attention");
+            }
+            view
+        })
+        .collect();
+    box_(Orientation::Horizontal, buttons)
+        .id("windows")
+        .hexpand(true)
+}
+
+/// The clipboard popover's trigger. `active` while the popover is open, the
+/// same class `#workspaces button.active` uses for the same "this is the one"
+/// meaning.
+fn clip_button(m: &PanelModel) -> View<Msg> {
+    let view = button("clip").id("clip").on_click(Msg::ClipButtonClicked);
+    if m.open_popover.is_some() {
+        view.class("active")
+    } else {
+        view
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use icedtea_contract::{Rectangle, Snapshot, WindowId, WindowInfo, WorkspaceInfo};
+    use icedtea_ui::view::{EventKind, PropName};
+
+    /// Run a `Cmd`'s side effects the way the loop does: `Cmd::Task` bodies,
+    /// in order, after the fold. Anything else is inert here — `Cmd::OpenPopup`
+    /// and `Cmd::ClosePopup` need a window, and the tests that care about them
+    /// assert on the command's shape instead.
+    fn run_tasks(cmd: Cmd<Msg>) {
+        match cmd {
+            Cmd::Task(f) => f(),
+            Cmd::Batch(list) => {
+                for c in list {
+                    run_tasks(c);
+                }
+            }
+            _ => {}
+        }
+    }
 
     /// A recording `CompositorCommands`. `RefCell`, not `Mutex`: these unit
     /// tests are single-threaded, and so is `update`. The cross-thread mock
@@ -310,5 +418,158 @@ mod tests {
             vec![10],
             "the popover's mirror must follow the model"
         );
+    }
+
+    /// Find the first descendant of `v` whose `id` prop is `id`.
+    fn by_id<'a>(v: &'a View<Msg>, id: &str) -> Option<&'a View<Msg>> {
+        if v.props.str(PropName::Id) == Some(id) {
+            return Some(v);
+        }
+        v.children.iter().find_map(|c| by_id(c, id))
+    }
+
+    /// The `Label` prop of every direct child of the container `id` names.
+    fn labels(v: &View<Msg>, id: &str) -> Vec<String> {
+        by_id(v, id)
+            .expect("container")
+            .children
+            .iter()
+            .map(|c| c.props.str(PropName::Label).unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn seeded() -> (PanelModel, Rc<MockWm>, Rc<MockClip>) {
+        let (mut m, wm, clip) = panel();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(snapshot(
+                vec![win(1, "One"), win(2, "Two")],
+                vec![
+                    WorkspaceInfo {
+                        id: 0,
+                        name: String::new(),
+                    },
+                    WorkspaceInfo {
+                        id: 1,
+                        name: "web".into(),
+                    },
+                ],
+            )))),
+        );
+        (m, wm, clip)
+    }
+
+    #[test]
+    fn the_bar_holds_workspaces_windows_and_the_clip_button() {
+        let (m, _, _) = seeded();
+        let v = view(&m);
+        assert_eq!(v.props.str(PropName::Id), Some("bar"));
+        let ids: Vec<Option<&str>> = v
+            .children
+            .iter()
+            .map(|c| c.props.str(PropName::Id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("workspaces"), Some("windows"), Some("clip")],
+            "contract §3.3's order: workspaces, windows, clip"
+        );
+    }
+
+    #[test]
+    fn a_window_button_is_labelled_by_title_then_app_id() {
+        let (mut m, _, _) = seeded();
+        assert_eq!(labels(&view(&m), "windows"), vec!["One", "Two"]);
+        // A window with no title falls back to its app id, verbatim from
+        // `taskbar::render`.
+        let mut untitled = win(3, "");
+        untitled.app_id = "org.example.Thing".into();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Opened(untitled))),
+        );
+        assert_eq!(
+            labels(&view(&m), "windows"),
+            vec!["One", "Two", "org.example.Thing"]
+        );
+    }
+
+    #[test]
+    fn a_workspace_button_is_labelled_by_name_then_one_indexed_id() {
+        let (m, _, _) = seeded();
+        assert_eq!(
+            labels(&view(&m), "workspaces"),
+            vec!["1", "web"],
+            "an unnamed workspace shows `id + 1`; a named one shows its name"
+        );
+    }
+
+    #[test]
+    fn the_active_workspace_and_the_focused_window_carry_their_classes() {
+        let (mut m, _, _) = seeded();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::WorkspaceSet {
+                id: 1,
+                active: true,
+            })),
+        );
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Updated {
+                id: 2,
+                update: icedtea_contract::WindowUpdate {
+                    focused: Some(true),
+                    attention: Some(true),
+                    ..Default::default()
+                },
+            })),
+        );
+        let v = view(&m);
+        let classes = |id: &str| -> Vec<String> {
+            match by_id(&v, id).expect("button").props.get(PropName::Classes) {
+                Some(icedtea_ui::view::Prop::Classes(list)) => {
+                    list.iter().map(|c| c.to_string()).collect()
+                }
+                _ => Vec::new(),
+            }
+        };
+        assert!(classes("ws_1").contains(&"active".to_string()));
+        assert!(!classes("ws_0").contains(&"active".to_string()));
+        assert!(classes("window_2").contains(&"focused".to_string()));
+        assert!(classes("window_2").contains(&"attention".to_string()));
+        assert!(classes("window_1").is_empty());
+    }
+
+    #[test]
+    fn clicking_a_window_button_reaches_focus_window_on_the_command_surface() {
+        let (m, wm, _) = seeded();
+        let v = view(&m);
+        let msg = by_id(&v, "window_1")
+            .expect("window_1")
+            .handlers
+            .fire_unit(EventKind::Click)
+            .expect("a click handler");
+        assert!(matches!(msg, Msg::WindowClicked(1)));
+        let mut m = m;
+        let cmd = update(&mut m, msg);
+        run_tasks(cmd);
+        assert_eq!(wm.calls.borrow().as_slice(), [("focus".to_string(), 1)]);
+    }
+
+    #[test]
+    fn clicking_a_workspace_button_reaches_set_workspace() {
+        let (m, wm, _) = seeded();
+        let v = view(&m);
+        let msg = by_id(&v, "ws_1")
+            .expect("ws_1")
+            .handlers
+            .fire_unit(EventKind::Click)
+            .expect("a click handler");
+        assert!(matches!(msg, Msg::WorkspaceClicked(1)));
+        let mut m = m;
+        let cmd = update(&mut m, msg);
+        run_tasks(cmd);
+        assert_eq!(wm.calls.borrow().as_slice(), [("workspace".to_string(), 1)]);
     }
 }
