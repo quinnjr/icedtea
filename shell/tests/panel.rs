@@ -210,3 +210,90 @@ fn the_bar_spans_the_output_and_fits_its_surface() {
         panel::BAR_HEIGHT
     );
 }
+
+/// Task 14, gate 1: a middle-click on a `window_<id>` button reaches
+/// `close_window(id)` — the taskbar wiring — and does *not* also fire a
+/// spurious `focus_window(id)`. The old GTK test called `render` by hand and
+/// never exercised the button-2 gesture; this drives it through the live panel.
+///
+/// The negative half is what P5-D10 (the `PointerState::observe` primary-button
+/// gate) buys: before that fix, the middle release produced both the panel's
+/// own `WindowPointerUp{BTN_MIDDLE}` → `close_window` *and* a stray
+/// `EventKind::Click` → `focus_window`.
+#[test]
+fn middle_clicking_a_window_button_closes_it() {
+    // mutation: drop the `PointerUp` BTN_LEFT guard in `observe` → the middle
+    // release also fires `EventKind::Click` → `focus_window(id)` recorded →
+    // the `!contains(("focus",id))` assert goes RED.
+    let mut panel = Panel::spawn(Theme::Dark);
+    panel.send(Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(
+        snapshot(
+            vec![win(7, "Seven")],
+            vec![WorkspaceInfo {
+                id: 0,
+                name: String::new(),
+            }],
+        ),
+    ))));
+    let (x, y) = panel.point("window_7");
+    panel.click_button(x, y, icedtea_ui::window::pointer::BTN_MIDDLE);
+    panel.wait_for_calls(
+        |calls| calls.contains(&("close".to_string(), 7)),
+        "the middle click reached close_window(7)",
+    );
+    assert!(
+        !panel.wm_calls().contains(&("focus".to_string(), 7)),
+        "a middle click must not also focus: {:?}",
+        panel.wm_calls()
+    );
+}
+
+/// Task 14, gate 2: a signal arriving while the panel is running — the
+/// worker→inbox seam the GTK test could never reach, since it called `render`
+/// by hand — re-renders the model. A `WindowOpened` pushed through the inbox
+/// adds a live `window_<id>` button, and the freshly added button works: a
+/// click on it reaches the command surface, which a clear-and-rebuild would
+/// have silently broken by dropping the handler.
+#[test]
+fn a_window_opened_signal_through_the_inbox_adds_a_button() {
+    // mutation: a clear-and-rebuild of the windows container on `Opened`
+    // drops the new button's click handler → the final `wait_for_calls(focus,id)`
+    // times out → RED.
+    let mut panel = Panel::spawn(Theme::Dark);
+    panel.send(Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(
+        snapshot(
+            vec![win(1, "One")],
+            vec![WorkspaceInfo {
+                id: 0,
+                name: String::new(),
+            }],
+        ),
+    ))));
+    panel.wait_for("alloc window_1 ");
+    assert_eq!(
+        panel.labels_under("windows", "window_"),
+        vec!["window_1".to_string()]
+    );
+
+    // What `compositor_client`'s `WindowOpened` arm produces, arriving the way
+    // the forward thread delivers it.
+    panel.send(Msg::Compositor(Arc::new(CompositorUpdate::Opened(win(
+        4, "Four",
+    )))));
+    panel.wait_for("alloc window_4 ");
+    assert_eq!(
+        panel.labels_under("windows", "window_"),
+        vec!["window_1".to_string(), "window_4".to_string()],
+        "an inbox signal must add a button without a rebuild of the bar"
+    );
+
+    // And the new button works: a click on it reaches the command surface,
+    // which is what a clear-and-rebuild would have silently broken by
+    // dropping the handler.
+    let (x, y) = panel.point("window_4");
+    panel.click(x, y);
+    panel.wait_for_calls(
+        |calls| calls.contains(&("focus".to_string(), 4)),
+        "the freshly added button is live",
+    );
+}
