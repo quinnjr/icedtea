@@ -57,7 +57,7 @@ impl Model {
 /// `redb::Database::create` directly) so its `catch_unwind` guard + parent
 /// `create_dir_all` apply: a corrupt config file returns `Err` here ("Failed
 /// to save") instead of tripping an internal redb `assert!` and panicking the
-/// GTK app.
+/// settings app.
 ///
 /// `cfg.displays` is deliberately **not** written from the caller's working
 /// copy. The Displays page never routes through this working-copy `Config`:
