@@ -170,6 +170,7 @@ impl Panel {
                 Err(err) => panic!("the panel could not open its layer surface: {err}"),
             };
             let (inbox, tx) = Inbox::<Msg>::new().expect("inbox");
+            let width_tx = tx.clone();
             if handshake_tx.send(tx).is_err() {
                 return;
             }
@@ -184,6 +185,7 @@ impl Panel {
             // so the harness names its path with `with_probe_report` rather
             // than through a `panel::frame_hook`.
             let clip_rect = model.clip_rect.clone();
+            let last_width = std::cell::Cell::new(model.bar_width);
             let _ = App::new(model, panel::update, panel::view)
                 .with_inbox(inbox)
                 .on_popup(|ev| match ev {
@@ -193,6 +195,19 @@ impl Panel {
                 })
                 .on_frame(move |w| {
                     clip_rect.set(w.allocation("clip").map(|a| a.border_box));
+                    // M5 Task 13: mirrors `shell/src/main.rs`'s own
+                    // `on_frame` wiring for `panel::PanelModel::bar_width` --
+                    // a real `Msg`, diffed so an unchanging surface does not
+                    // refold every frame.
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "a layer surface's width is well within i32"
+                    )]
+                    let width = w.size().0 as i32;
+                    if width != last_width.get() {
+                        last_width.set(width);
+                        let _ = width_tx.send(Msg::SurfaceWidth(width));
+                    }
                 })
                 .with_probe_report(thread_report)
                 .run(window);
@@ -300,6 +315,44 @@ impl Panel {
         panic!(
             "{what} did not happen within {TIMEOUT:?}; report holds {:?}",
             self.report()
+        );
+    }
+
+    /// Poll the recorded commands until `want` accepts them.
+    ///
+    /// # Panics
+    ///
+    /// If it does not within [`TIMEOUT`].
+    pub fn wait_for_calls(&self, want: impl Fn(&[(String, u32)]) -> bool, what: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline {
+            if want(&self.wm_calls()) {
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
+        panic!(
+            "{what} did not happen within {TIMEOUT:?}; wm calls were {:?}",
+            self.wm_calls()
+        );
+    }
+
+    /// The `ClipCommands` counterpart.
+    ///
+    /// # Panics
+    ///
+    /// If it does not within [`TIMEOUT`].
+    pub fn wait_for_clip_calls(&self, want: impl Fn(&[(String, u64)]) -> bool, what: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline {
+            if want(&self.clip_calls()) {
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
+        panic!(
+            "{what} did not happen within {TIMEOUT:?}; clip calls were {:?}",
+            self.clip_calls()
         );
     }
 

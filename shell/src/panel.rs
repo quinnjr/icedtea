@@ -95,6 +95,21 @@ pub struct PanelModel {
     /// loop re-runs each frame (contract §6 P5-D2) and therefore cannot borrow
     /// the model; this is what it reads instead.
     pub history: Rc<RefCell<Vec<ClipEntry>>>,
+    /// The layer surface's current committed width.
+    ///
+    /// `#bar` must span the output like a taskbar (M5 Task 13, controller
+    /// ruling on Task 12's review), but it is `root`'s only child in a plain
+    /// box, which centres a child with no explicit `ChildLayout` at its own
+    /// content size -- and neither `View::hexpand`/`halign` nor a percentage
+    /// `min-width` reach around that (see `style.css`'s `#bar` rule for the
+    /// full reconciliation). A pixel `width_request` does reach taffy, so
+    /// `view` floors `#bar` to this width -- and unlike `clip_rect` (a
+    /// side-channel `update` only ever reads inside a handler a real click
+    /// message already triggered), this value feeds `view` itself, so it
+    /// must arrive through a real `Msg` fold (`Msg::SurfaceWidth`) rather
+    /// than a `Cell` `view` polls: nothing else guarantees another frame
+    /// ever runs to pick up a bare `Cell` write once the initial one lands.
+    pub bar_width: i32,
 }
 
 impl PanelModel {
@@ -109,6 +124,13 @@ impl PanelModel {
             bar_height: BAR_HEIGHT,
             clip_rect: Rc::new(Cell::new(None)),
             history: Rc::new(RefCell::new(Vec::new())),
+            // `spec()`'s own initial size, the same width the surface opens
+            // with before its first real configure arrives.
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "spec()'s initial width is a small literal constant"
+            )]
+            bar_width: spec().size.0 as i32,
         }
     }
 }
@@ -117,6 +139,10 @@ impl PanelModel {
 pub enum Msg {
     /// One compositor update, from the inbox. `Arc`, not `Rc`: `Msg` is `Send`.
     Compositor(Arc<CompositorUpdate>),
+    /// The layer surface's committed width changed, from `on_frame` (M5
+    /// Task 13; see `PanelModel::bar_width`'s doc comment for why this has
+    /// to be a real message and not a side-channel `Cell` `view` polls).
+    SurfaceWidth(i32),
     /// One clipboard history update, from the inbox.
     Clip(Arc<ClipUpdate>),
 
@@ -191,6 +217,10 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
     match msg {
         Msg::Compositor(u) => {
             m.taskbar.apply(Arc::unwrap_or_clone(u));
+            Cmd::None
+        }
+        Msg::SurfaceWidth(w) => {
+            m.bar_width = w;
             Cmd::None
         }
         Msg::Clip(u) => {
@@ -284,6 +314,10 @@ pub fn view(m: &PanelModel) -> View<Msg> {
         [workspaces(m), windows(m), clip_button(m)],
     )
     .id("bar")
+    // See `bar_width`'s doc comment and `style.css`'s `#bar` rule: this is
+    // the one mechanism that actually reaches taffy for a plain box's
+    // centred, non-`ChildLayout` child.
+    .width_request(m.bar_width)
 }
 
 /// One button per workspace, keyed by workspace id.

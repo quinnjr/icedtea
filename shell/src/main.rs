@@ -3,6 +3,7 @@
 //! `org.icedtea.Clipboard`. One `App` on one surface, one loop thread; D-Bus
 //! runs on its own workers and reaches the loop through the inbox.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -98,6 +99,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _comp_forward = forward(comp_rx, tx.clone(), |u| Msg::Compositor(Arc::new(u)));
     compositor_client::spawn(comp_tx);
 
+    let width_tx = tx.clone();
+
     let (clip_tx, clip_rx) = async_channel::unbounded::<ClipUpdate>();
     let _clip_forward = forward(clip_rx, tx, |u| Msg::Clip(Arc::new(u)));
     clip_client::spawn(clip_tx);
@@ -107,6 +110,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // it — the popover's anchor.
     let model = PanelModel::new(wm, clip);
     let clip_rect = model.clip_rect.clone();
+    let last_width = Cell::new(model.bar_width);
 
     App::new(model, panel::update, panel::view)
         .with_inbox(inbox)
@@ -120,6 +124,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_frame(move |w| {
             clip_rect.set(clip_border_box(|id| w.allocation(id)));
+            // M5 Task 13: `#bar`'s span. A real `Msg`, not a bare `Cell`
+            // write (`panel::PanelModel::bar_width`'s doc comment) --
+            // `on_frame` has no `&mut PanelModel`, only the inbox `update`
+            // itself is folded from. Diffed against `last_width` so an
+            // unchanging surface does not refold (and thus re-render) every
+            // single frame forever.
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "a layer surface's width is well within i32"
+            )]
+            let width = w.size().0 as i32;
+            if width != last_width.get() {
+                last_width.set(width);
+                let _ = width_tx.send(Msg::SurfaceWidth(width));
+            }
         })
         .run(window)?;
     Ok(())
