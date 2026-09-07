@@ -33,8 +33,8 @@ fn main() {
 /// Drain `rx` on its own thread, wrapping each value into a `Msg` for the
 /// app's inbox.
 ///
-/// The replacement for `bridge.rs`'s `glib::spawn_future_local`: there is no
-/// GLib main loop to post onto, and the `App`'s loop is a hand-rolled poll
+/// The replacement for the GLib `spawn_future_local` future `bridge.rs` used:
+/// there is no GLib main loop to post onto, and the `App`'s loop is a hand-rolled poll
 /// over the Wayland fd plus whatever `Window::watch_fd` was given. The inbox
 /// *is* that hook — `send` queues the message and writes one byte to the pipe
 /// the loop already polls.
