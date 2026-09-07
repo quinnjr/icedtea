@@ -6,10 +6,11 @@ rust-version.workspace = true
 
 [dependencies]
 icedtea-contract = { path = "../contract" }
-gtk4 = "0.11"
-gtk4-layer-shell = "0.8"
+icedtea-ui = { path = "../ui" }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 zbus.workspace = true
 async-channel = "2"
+crossbeam-channel.workspace = true
 futures-util = "0.3"
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -17,6 +18,3 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }
 icedtea-clipboard = { path = "../clipboard" }
-icedtea-contract = { path = "../contract" }
-wayland-client = "0.31"
-crossbeam-channel = "0.5"

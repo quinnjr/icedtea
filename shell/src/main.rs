@@ -1,25 +1,18 @@
-//! `icedtea-shell` — a GTK4 layer-shell panel: a window/workspace taskbar
-//! driven by `org.icedtea.Compositor`, and a clipboard popover driven by
-//! `org.icedtea.Clipboard`. All widgets live on the GTK main thread; D-Bus runs
-//! on a worker, bridged by a glib channel.
+//! `icedtea-shell` — a layer-shell panel: a window/workspace taskbar driven by
+//! `org.icedtea.Compositor`, and a clipboard popover driven by
+//! `org.icedtea.Clipboard`. One `App` on one surface, one loop thread; D-Bus
+//! runs on its own workers and reaches the loop through the inbox.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4::prelude::*;
-use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, ListBox, MenuButton,
-    Orientation, Popover,
-};
-use gtk4_layer_shell::{Edge, Layer, LayerShell};
-
-use icedtea_shell::bridge;
-use icedtea_shell::clip_client::{self, ClipCommands, ClipProxy};
-use icedtea_shell::clipboard::{self, ClipboardModel};
-use icedtea_shell::compositor_client::{self, CompositorCommands, CompositorProxy};
-use icedtea_shell::taskbar::{self, TaskbarModel};
-
-const APP_ID: &str = "org.icedtea.Shell";
+use icedtea_shell::clip_client::{ClipCommands, ClipProxy};
+use icedtea_shell::compositor_client::{CompositorCommands, CompositorProxy};
+use icedtea_shell::panel::{self, BAR_HEIGHT, Offline, PanelModel};
+use icedtea_shell::style;
+use icedtea_ui::text::FontDatabase;
+use icedtea_ui::view::App;
+use icedtea_ui::window::{LayerSpec, Role, SurfaceSpec, Window};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -28,119 +21,62 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| load_css());
-    app.connect_activate(build_panel);
-    app.run();
-}
-
-fn load_css() {
-    let provider = CssProvider::new();
-    provider.load_from_data(include_str!("../style.css"));
-    if let Some(display) = gtk4::gdk::Display::default() {
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+    if let Err(err) = run() {
+        tracing::error!(%err, "icedtea-shell exited");
+        std::process::exit(1);
     }
 }
 
-fn build_panel(app: &Application) {
-    let window = ApplicationWindow::new(app);
-
-    // Layer-shell: a bottom bar reserving its own height.
-    window.init_layer_shell();
-    window.set_layer(Layer::Top);
-    window.auto_exclusive_zone_enable();
-    // Anchored to the top edge (plus left/right for full width). Top rather
-    // than bottom because a bottom bar lands below the visible area on displays
-    // whose viewport is shorter than the reported output (e.g. a VM console).
-    for edge in [Edge::Left, Edge::Right, Edge::Top] {
-        window.set_anchor(edge, true);
+/// The panel's surface: anchored left/right/top, `Layer::Top`, no keyboard.
+///
+/// Every value is the layer-shell call it replaces. Anchored **top**, not
+/// bottom: the source comment stands — a bottom bar lands below the visible
+/// area on a display whose viewport is shorter than the reported output (a VM
+/// console). `keyboard: None` matches GTK4 layer-shell's unset default; the
+/// panel takes no keyboard focus, and the popover's search field has no IME
+/// until M6. `exclusive_zone` is the literal `BAR_HEIGHT` because `LayerSpec`
+/// has no "auto" (contract §6 P5-D6). The initial size is `(800, 28)`, the
+/// pair `set_default_size(800, 28)` + `set_size_request(-1, 28)` forced: a
+/// 0-height layer surface never commits a real buffer.
+fn spec() -> SurfaceSpec {
+    SurfaceSpec {
+        role: Role::Layer(LayerSpec {
+            layer: zwlr_layer_shell_v1::Layer::Top,
+            anchor: zwlr_layer_surface_v1::Anchor::Left
+                | zwlr_layer_surface_v1::Anchor::Right
+                | zwlr_layer_surface_v1::Anchor::Top,
+            margin: [0, 0, 0, 0],
+            exclusive_zone: BAR_HEIGHT,
+            keyboard: zwlr_layer_surface_v1::KeyboardInteractivity::None,
+        }),
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "BAR_HEIGHT is a positive literal constant"
+        )]
+        size: (800, BAR_HEIGHT as u32),
+        // A layer surface has no `namespace` field: `title` is the namespace.
+        title: "icedtea-shell".to_string(),
+        app_id: "org.icedtea.Shell".to_string(),
     }
-
-    let bar = GtkBox::new(Orientation::Horizontal, 6);
-    bar.set_widget_name("bar");
-    // A layer surface anchored left/right/top takes its width from the
-    // compositor but its height from content; force a definite, visible height
-    // and initial size so it commits a real buffer (a 0-height surface never
-    // renders).
-    bar.set_size_request(-1, 28);
-    window.set_child(Some(&bar));
-    window.set_default_size(800, 28);
-
-    // The taskbar lives in its own box: `taskbar::render` clears and rebuilds
-    // its container, so it must not own the whole bar (the clipboard button is
-    // a sibling that has to survive).
-    let taskbar_box = GtkBox::new(Orientation::Horizontal, 6);
-    taskbar_box.set_hexpand(true);
-    bar.append(&taskbar_box);
-
-    wire_taskbar(&taskbar_box);
-    wire_clipboard(&bar);
-
-    window.present();
 }
 
-fn wire_taskbar(container: &GtkBox) {
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let wm: Rc<dyn CompositorCommands> = match CompositorProxy::new() {
-        Ok(wm) => Rc::new(wm),
+        Ok(proxy) => Rc::new(proxy),
         Err(err) => {
-            tracing::error!(%err, "no session bus; taskbar disabled");
-            return;
+            tracing::error!(%err, "no session bus; window commands disabled");
+            Rc::new(Offline)
         }
     };
-    let model = Rc::new(RefCell::new(TaskbarModel::default()));
-    let tx = {
-        let container = container.clone();
-        let wm = wm.clone();
-        let model = model.clone();
-        bridge::channel(move |update| {
-            model.borrow_mut().apply(update);
-            taskbar::render(&model.borrow(), &container, &wm);
-        })
-    };
-    compositor_client::spawn(tx);
-}
-
-fn wire_clipboard(bar: &GtkBox) {
     let clip: Rc<dyn ClipCommands> = match ClipProxy::new() {
-        Ok(c) => Rc::new(c),
+        Ok(proxy) => Rc::new(proxy),
         Err(err) => {
-            tracing::error!(%err, "no session bus; clipboard popover disabled");
-            return;
+            tracing::error!(%err, "no session bus; clipboard commands disabled");
+            Rc::new(Offline)
         }
     };
-    let model = Rc::new(RefCell::new(ClipboardModel::default()));
 
-    let list = ListBox::new();
-    clipboard::connect_activation(&list, clip.clone(), model.clone());
-
-    let content = GtkBox::new(Orientation::Vertical, 4);
-    content.append(&list);
-    let clear = Button::with_label("Clear");
-    {
-        let clip = clip.clone();
-        clear.connect_clicked(move |_| clip.clear());
-    }
-    content.append(&clear);
-
-    let popover = Popover::new();
-    popover.set_child(Some(&content));
-    let menu = MenuButton::new();
-    menu.set_label("clip");
-    menu.set_popover(Some(&popover));
-    bar.append(&menu);
-
-    let tx = {
-        let list = list.clone();
-        let clip = clip.clone();
-        let model = model.clone();
-        bridge::channel(move |update| {
-            model.borrow_mut().apply(update);
-            clipboard::render(&model.borrow(), &list, &clip);
-        })
-    };
-    clip_client::spawn(tx);
+    let window = Window::open(spec(), style::sheet(), FontDatabase::new())?;
+    App::new(PanelModel::new(wm, clip), panel::update, panel::view).run(window)?;
+    Ok(())
 }
