@@ -90,6 +90,23 @@ fn forward<T: Send + 'static>(
     })
 }
 
+/// The popover's anchor: the `clip` button's border box, if the window has
+/// resolved it.
+///
+/// A pure function of `Window::allocation`, so the publication is testable
+/// without a compositor. `App::run` already writes `$ICEDTEA_PROBE_REPORT`'s
+/// `probe`/`alloc` lines itself (`with_probe_report` plus the env pickup);
+/// `on_frame` must not re-derive and rewrite them itself, or every line in
+/// the report would double and a driver parsing the file would see each
+/// frame twice (consistency-check ruling E1). The only geometry `on_frame`
+/// needs to publish is this one box, into the cell `panel::update` reads as
+/// the popover's anchor rect.
+fn clip_border_box(
+    allocation: impl Fn(&str) -> Option<icedtea_ui::layout::Allocation>,
+) -> Option<icedtea_ui::layout::Rect> {
+    allocation("clip").map(|a| a.border_box)
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let wm: Rc<dyn CompositorCommands> = match CompositorProxy::new() {
         Ok(proxy) => Rc::new(proxy),
@@ -119,7 +136,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _clip_forward = forward(clip_rx, tx, |u| Msg::Clip(Arc::new(u)));
     clip_client::spawn(clip_tx);
 
-    App::new(PanelModel::new(wm, clip), panel::update, panel::view)
+    // P5-D9: `update` has no `&Window`, so the `clip` button's box is
+    // published here, once per frame, into the cell the model shares with
+    // it — the popover's anchor.
+    let model = PanelModel::new(wm, clip);
+    let clip_rect = model.clip_rect.clone();
+
+    App::new(model, panel::update, panel::view)
         .with_inbox(inbox)
         .on_popup(|ev| match ev {
             PopupEvent::Opened(key) => Some(Msg::PopoverOpened(key)),
@@ -128,6 +151,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // shell does not yet know about is simply not turned into a
             // message.
             _ => None,
+        })
+        .on_frame(move |w| {
+            clip_rect.set(clip_border_box(|id| w.allocation(id)));
         })
         .run(window)?;
     Ok(())
@@ -138,7 +164,38 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use icedtea_shell::panel::Msg;
+    use icedtea_ui::layout::{Allocation, Rect};
     use icedtea_ui::view::Inbox;
+
+    fn alloc(x: f32, y: f32, w: f32, h: f32) -> Allocation {
+        Allocation {
+            border_box: Rect::new(x, y, w, h),
+            content_box: Rect::new(x, y, w, h),
+            border: [0.0; 4],
+            padding: [0.0; 4],
+        }
+    }
+
+    /// `on_frame`'s clip-rect publication in isolation from `Window`: the
+    /// popover's anchor is the `clip` button's border box, when the window
+    /// can resolve it.
+    #[test]
+    fn the_clip_box_is_published_when_the_button_resolves() {
+        let got = super::clip_border_box(|id| match id {
+            "clip" => Some(alloc(700.0, 0.0, 40.0, 28.0)),
+            _ => None,
+        });
+        assert_eq!(got, Some(Rect::new(700.0, 0.0, 40.0, 28.0)));
+    }
+
+    /// Before the first layout (or if the id ever goes missing), the anchor
+    /// is `None` rather than a stale box: `update` falls back to a sane
+    /// default when it is.
+    #[test]
+    fn the_clip_box_is_none_when_the_button_has_not_resolved() {
+        let got = super::clip_border_box(|_| None);
+        assert_eq!(got, None);
+    }
 
     /// Finding F7 is an architectural invariant, not a style preference: the
     /// shell and compositor marshal the contract types independently, so a
