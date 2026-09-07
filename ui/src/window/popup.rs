@@ -17,6 +17,27 @@ use crate::window::SurfaceError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PopupKey(pub(crate) u64);
 
+impl PopupKey {
+    /// This key's opaque number. Stable for the life of the window; never
+    /// reused after a popup closes.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuild a key from [`PopupKey::raw`].
+    ///
+    /// For tests and for an app that persists a key across a fold: the
+    /// offscreen loop mints keys from zero upwards, so `from_raw(0)` names the
+    /// first popup a `run_offscreen` script opens. A windowed run's keys come
+    /// from `Window::open_popup`, and a key that names no live popup is inert
+    /// everywhere it is accepted.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        PopupKey(raw)
+    }
+}
+
 /// The toolkit's positioner, converted to `xdg_positioner` requests on use.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Positioner {

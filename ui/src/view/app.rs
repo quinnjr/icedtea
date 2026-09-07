@@ -473,6 +473,23 @@ type UpdateFn<M, Msg> = Box<dyn FnMut(&mut M, Msg) -> Cmd<Msg>>;
 type ViewFn<M, Msg> = Box<dyn Fn(&M) -> View<Msg>>;
 
 /// The Elm loop over a retained tree.
+/// What happened to one of this app's popup surfaces.
+///
+/// Contract §6 P5-D4: `Cmd::OpenPopup` produces a key the loop keeps to
+/// itself, and `InputEvent::PopupDone` is routed to the focused *controller*,
+/// so an `update` that owns the open/closed state — which contract §3.4 makes
+/// the panel's single source of truth — had no way to see either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PopupEvent {
+    /// `Cmd::OpenPopup` succeeded and this is the key it produced.
+    Opened(PopupKey),
+    /// The compositor dismissed it (`xdg_popup.popup_done`) — an outside
+    /// click, a grab break, or the parent going away. The surface is already
+    /// gone by the time the message reaches `update`.
+    Dismissed(PopupKey),
+}
+
 pub struct App<M, Msg> {
     model: M,
     /// Boxed, not a `fn` pointer (M5-D4): both M5 apps capture — settings a
@@ -490,6 +507,8 @@ pub struct App<M, Msg> {
     /// `FdReady(id)` → messages (M5-D2's `on_fd`).
     #[allow(clippy::type_complexity, reason = "one boxed closure per watched fd")]
     fd_handlers: Vec<(crate::window::WatchId, Box<dyn Fn() -> Vec<Msg>>)>,
+    /// Turns popup lifecycle into messages (M5-D4's `on_popup`).
+    popup_hook: Option<Box<dyn Fn(PopupEvent) -> Option<Msg>>>,
     /// Where `run` writes `probe`/`alloc` lines, when asked (M5-D9, P0-D4).
     probe_report: Option<std::path::PathBuf>,
 }
@@ -660,6 +679,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             icons: None,
             inbox: None,
             fd_handlers: Vec::new(),
+            popup_hook: None,
             probe_report: std::env::var_os("ICEDTEA_PROBE_REPORT").map(std::path::PathBuf::from),
         }
     }
@@ -709,6 +729,17 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     #[must_use]
     pub fn on_fd(mut self, id: crate::window::WatchId, f: impl Fn() -> Vec<Msg> + 'static) -> Self {
         self.fd_handlers.push((id, Box::new(f)));
+        self
+    }
+
+    /// Turn popup lifecycle into messages. `None` drops the event.
+    ///
+    /// At most one hook per app; a second call replaces the first. It runs on
+    /// the loop thread, and the messages it returns are queued exactly like an
+    /// inbox message — never folded re-entrantly.
+    #[must_use]
+    pub fn on_popup(mut self, f: impl Fn(PopupEvent) -> Option<Msg> + 'static) -> Self {
+        self.popup_hook = Some(Box::new(f));
         self
     }
 
@@ -934,6 +965,12 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 ScriptStep::Capture => capture = true,
                 ScriptStep::Message(msg) => rt.queue.push_back(msg),
                 ScriptStep::Event(ev) => {
+                    if let InputEvent::PopupDone(key) = &ev {
+                        close_popup(&mut rt, *key);
+                        if let Some(msg) = popup_msg(&self, PopupEvent::Dismissed(*key)) {
+                            rt.queue.push_back(msg);
+                        }
+                    }
                     let produced = route(
                         &mut rt,
                         &ev,
@@ -1011,6 +1048,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                             &mut icons,
                             &dyn_clock,
                         );
+                        if let Some(msg) = popup_msg(&self, PopupEvent::Opened(key)) {
+                            rt.queue.push_back(msg);
+                        }
                     }
                     Cmd::ClosePopup(key) => close_popup(&mut rt, key),
                     // There is still no surface to title or minimise.
@@ -1283,6 +1323,11 @@ fn close_popup<Msg>(rt: &mut Runtime<Msg>, key: PopupKey) {
     if let Some(index) = rt.popups.iter().position(|p| p.key == key) {
         rt.popups.truncate(index);
     }
+}
+
+/// Ask the app's popup hook for a message, if it has one.
+fn popup_msg<M, Msg>(app: &App<M, Msg>, ev: PopupEvent) -> Option<Msg> {
+    app.popup_hook.as_ref().and_then(|f| f(ev))
 }
 
 /// Restyle, relayout and paint every open popup into `surface`, at its own
@@ -1939,6 +1984,16 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 if let InputEvent::ScaleChanged(factor) = event {
                     icons.set_scale(u32::try_from(*factor).unwrap_or(1));
                 }
+                if let InputEvent::PopupDone(key) = event {
+                    // The compositor has already destroyed the surface; drop
+                    // our retained copy (and every popup opened after it, as
+                    // xdg-shell requires) before telling the model.
+                    close_popup(&mut rt, *key);
+                    window.close_popup(*key);
+                    if let Some(msg) = popup_msg(&self, PopupEvent::Dismissed(*key)) {
+                        rt.queue.push_back(msg);
+                    }
+                }
                 let produced = {
                     let clipboard = window.clipboard();
                     route(
@@ -2014,6 +2069,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                                     &clock,
                                 );
                                 window.popup_mark_dirty(key);
+                            }
+                            if let Some(msg) = popup_msg(&self, PopupEvent::Opened(key)) {
+                                rt.queue.push_back(msg);
                             }
                         }
                         Err(error) => tracing::warn!(?error, "opening a popup failed"),
