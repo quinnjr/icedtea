@@ -16,8 +16,8 @@ use icedtea_ui::text::FontDatabase;
 use icedtea_ui::view::builders::{box_, button};
 use icedtea_ui::view::{App, Cmd, PopupEvent, ScriptStep};
 use icedtea_ui::widgets::Orientation;
-use icedtea_ui::window::InputEvent;
 use icedtea_ui::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
+use icedtea_ui::window::{BTN_LEFT, InputEvent, SurfaceTarget};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Msg {
@@ -103,5 +103,182 @@ fn an_app_learns_the_key_of_the_popup_it_opened_and_of_its_dismissal() {
         log.borrow().as_slice(),
         ["opened 0".to_string(), "dismissed 0".to_string()],
         "on_popup must report both halves of a popup's life, in order"
+    );
+}
+
+#[test]
+fn a_click_inside_a_popup_reaches_the_popups_own_handler() {
+    let clock = Rc::new(ManualClock::new());
+    let picked: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = picked.clone();
+
+    let app = App::new(
+        Model::default(),
+        move |m: &mut Model, msg: Msg| match msg {
+            Msg::Open => Cmd::OpenPopup {
+                anchor: PopupAnchorPoint::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)),
+                positioner: Positioner::menu(Rect::new(0.0, 0.0, 40.0, 20.0), (80, 40)),
+                view: Rc::new(|| {
+                    box_(
+                        Orientation::Vertical,
+                        [button::<Msg>("row").on_click(Msg::Picked(7))],
+                    )
+                }),
+            },
+            Msg::Opened(key) => {
+                m.open = Some(key);
+                Cmd::None
+            }
+            Msg::Dismissed(_) => {
+                m.open = None;
+                Cmd::None
+            }
+            Msg::Picked(id) => {
+                sink.borrow_mut().push(id);
+                Cmd::None
+            }
+        },
+        |_m: &Model| box_(Orientation::Horizontal, [button::<Msg>("clip")]),
+    )
+    .with_sheet(sheet())
+    .with_fonts(FontDatabase::probe_only())
+    .on_popup(|ev| match ev {
+        PopupEvent::Opened(key) => Some(Msg::Opened(key)),
+        PopupEvent::Dismissed(key) => Some(Msg::Dismissed(key)),
+        #[allow(unreachable_patterns, reason = "PopupEvent is #[non_exhaustive]")]
+        _ => None,
+    });
+
+    let popup = SurfaceTarget::Popup(PopupKey::from_raw(0));
+    app.run_offscreen(
+        (200, 60),
+        clock,
+        vec![
+            ScriptStep::Message(Msg::Open),
+            ScriptStep::Advance(Duration::from_millis(16)),
+            // Enter the *popup* surface: its coordinates are its own, so the
+            // row's centre is a few pixels in, not wherever the window's tree
+            // happens to have a button.
+            ScriptStep::Event(InputEvent::PointerEnter {
+                x: 20.0,
+                y: 10.0,
+                serial: 1,
+                target: popup,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: true,
+                serial: 2,
+                time_ms: 0,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: false,
+                serial: 3,
+                time_ms: 1,
+            }),
+            ScriptStep::Advance(Duration::from_millis(16)),
+        ],
+    )
+    .expect("offscreen run");
+
+    assert_eq!(
+        picked.borrow().as_slice(),
+        [7],
+        "a click on a popup surface must be hit-tested against that popup's tree"
+    );
+}
+
+#[test]
+fn a_click_on_the_window_still_reaches_the_window_after_a_popup_opened() {
+    let clock = Rc::new(ManualClock::new());
+    let picked: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = picked.clone();
+
+    let app = App::new(
+        Model::default(),
+        move |m: &mut Model, msg: Msg| match msg {
+            Msg::Open => Cmd::OpenPopup {
+                anchor: PopupAnchorPoint::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)),
+                positioner: Positioner::menu(Rect::new(0.0, 0.0, 40.0, 20.0), (80, 40)),
+                view: Rc::new(|| {
+                    box_(
+                        Orientation::Vertical,
+                        [button::<Msg>("row").on_click(Msg::Picked(7))],
+                    )
+                }),
+            },
+            Msg::Opened(key) => {
+                m.open = Some(key);
+                Cmd::None
+            }
+            Msg::Dismissed(_) => {
+                m.open = None;
+                Cmd::None
+            }
+            Msg::Picked(id) => {
+                sink.borrow_mut().push(id);
+                Cmd::None
+            }
+        },
+        |_m: &Model| {
+            box_(
+                Orientation::Horizontal,
+                [button::<Msg>("clip").on_click(Msg::Picked(1))],
+            )
+        },
+    )
+    .with_sheet(sheet())
+    .with_fonts(FontDatabase::probe_only())
+    .on_popup(|ev| match ev {
+        PopupEvent::Opened(key) => Some(Msg::Opened(key)),
+        PopupEvent::Dismissed(key) => Some(Msg::Dismissed(key)),
+        #[allow(unreachable_patterns, reason = "PopupEvent is #[non_exhaustive]")]
+        _ => None,
+    });
+
+    let popup = SurfaceTarget::Popup(PopupKey::from_raw(0));
+    app.run_offscreen(
+        (200, 60),
+        clock,
+        vec![
+            ScriptStep::Message(Msg::Open),
+            ScriptStep::Advance(Duration::from_millis(16)),
+            ScriptStep::Event(InputEvent::PointerEnter {
+                x: 20.0,
+                y: 10.0,
+                serial: 1,
+                target: popup,
+            }),
+            ScriptStep::Event(InputEvent::PointerLeave),
+            // Back on the window: the enter carries `SurfaceTarget::Window`,
+            // which is what puts routing back on the window's tree. The
+            // window's box centres its lone child (`layout::container_style`,
+            // "GTK's box centres a child that asked for nothing"), so the
+            // "clip" button sits at (80, 20)-(120, 40) in this 200x60 canvas
+            // -- its centre, not the popup row's local (20, 10), is what a
+            // click on the window itself must land on.
+            ScriptStep::Event(InputEvent::pointer_enter(100.0, 30.0, 4)),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: true,
+                serial: 5,
+                time_ms: 2,
+            }),
+            ScriptStep::Event(InputEvent::PointerButton {
+                button: BTN_LEFT,
+                pressed: false,
+                serial: 6,
+                time_ms: 3,
+            }),
+            ScriptStep::Advance(Duration::from_millis(16)),
+        ],
+    )
+    .expect("offscreen run");
+
+    assert_eq!(
+        picked.borrow().as_slice(),
+        [1],
+        "leaving a popup must put routing back on the window's own tree"
     );
 }

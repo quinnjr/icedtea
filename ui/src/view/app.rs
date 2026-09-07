@@ -26,7 +26,7 @@ use crate::window::focus::{
 use crate::window::pointer::{ImplicitGrab, hit_chain};
 use crate::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
 use crate::window::selection::Clipboard;
-use crate::window::{InputEvent, SurfaceError};
+use crate::window::{InputEvent, SurfaceError, SurfaceTarget};
 
 /// The borrows one dispatch pass needs, minus the per-node ones.
 pub struct Dispatch<'a, Msg> {
@@ -541,6 +541,15 @@ struct Runtime<Msg> {
     /// The last pointer position in window-frame space, so a button event
     /// (which carries none) can be aimed and localised.
     last_pointer: (f32, f32),
+    /// Which surface the pointer is on, from the last `PointerEnter`.
+    ///
+    /// Contract §6 P5-D1: `route` hit-tests one retained tree, and a popup is
+    /// a second surface with its own. Wayland's own rule is the rule here —
+    /// an enter names the surface and everything up to the matching leave
+    /// belongs to it.
+    pointer_target: SurfaceTarget,
+    /// Which surface has the keyboard, from the last `KeyboardEnter`.
+    keyboard_target: SurfaceTarget,
     queue: VecDeque<Msg>,
     cmds: Vec<Cmd<Msg>>,
     timers: Vec<(Duration, Rc<dyn Fn() -> Msg>)>,
@@ -916,6 +925,8 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
+            pointer_target: SurfaceTarget::Window,
+            keyboard_target: SurfaceTarget::Window,
             queue: VecDeque::new(),
             cmds: Vec::new(),
             timers: Vec::new(),
@@ -1479,12 +1490,98 @@ fn prune_hidden_focus<Msg: Clone + 'static>(rt: &mut Runtime<Msg>) {
     }
 }
 
-/// Turn one `InputEvent` into controller events and return the messages.
+/// Swap popup `index`'s retained tree into the runtime's window slots.
+///
+/// Called twice around a routing pass, so the popup's tree is what `route_surface`
+/// hit-tests, dispatches into and mutates. Destructured rather than indexed so
+/// the four swaps borrow disjoint fields of `rt`.
+fn swap_popup_tree<Msg>(rt: &mut Runtime<Msg>, index: usize) {
+    let Runtime {
+        root,
+        instances,
+        styles,
+        layout,
+        popups,
+        ..
+    } = rt;
+    let popup = &mut popups[index];
+    std::mem::swap(root, &mut popup.root);
+    std::mem::swap(instances, &mut popup.instances);
+    std::mem::swap(styles, &mut popup.styles);
+    std::mem::swap(layout, &mut popup.layout);
+}
+
+/// Route one input event to the surface it arrived on.
+///
+/// Contract §6 P5-D1. `InputEvent`'s two `Enter` variants carry a
+/// [`SurfaceTarget`]; everything after an enter belongs to that surface until
+/// the matching leave, which is how Wayland itself defines focus and is what
+/// `SurfaceTarget`'s own doc comment says. Coordinates on a popup event are
+/// already popup-surface-local, so no offset arithmetic is needed: the popup's
+/// tree starts at its own (0, 0), exactly as `paint_tree` paints it.
 #[allow(
     clippy::too_many_arguments,
     reason = "one routing pass threading the whole per-frame context"
 )]
 fn route<Msg: Clone + 'static>(
+    rt: &mut Runtime<Msg>,
+    event: &InputEvent,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clipboard: &mut Clipboard,
+    clock: &Rc<dyn Clock>,
+) -> Vec<Msg> {
+    let target = match event {
+        InputEvent::PointerEnter { target, .. } => {
+            rt.pointer_target = *target;
+            *target
+        }
+        InputEvent::PointerLeave => {
+            let was = rt.pointer_target;
+            rt.pointer_target = SurfaceTarget::Window;
+            was
+        }
+        InputEvent::KeyboardEnter { target, .. } => {
+            rt.keyboard_target = *target;
+            *target
+        }
+        InputEvent::KeyboardLeave => {
+            let was = rt.keyboard_target;
+            rt.keyboard_target = SurfaceTarget::Window;
+            was
+        }
+        InputEvent::Key(_) => rt.keyboard_target,
+        _ => rt.pointer_target,
+    };
+    let index = match target {
+        SurfaceTarget::Window => None,
+        // A key for a popup this app no longer retains routes nowhere rather
+        // than falling back to the window: the event belonged to a surface
+        // that is gone, and replaying it on the window would fire the wrong
+        // handler at the wrong coordinates.
+        SurfaceTarget::Popup(key) => match rt.popups.iter().position(|p| p.key == key) {
+            Some(index) => Some(index),
+            None => return Vec::new(),
+        },
+    };
+    let Some(index) = index else {
+        return route_surface(rt, event, sheet, fonts, icons, clipboard, clock);
+    };
+    swap_popup_tree(rt, index);
+    let out = route_surface(rt, event, sheet, fonts, icons, clipboard, clock);
+    // Unconditionally, with nothing fallible between the two swaps: leaving
+    // the popup's tree in the window's slots would corrupt every later frame.
+    swap_popup_tree(rt, index);
+    out
+}
+
+/// Turn one `InputEvent` into controller events and return the messages.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one routing pass threading the whole per-frame context"
+)]
+fn route_surface<Msg: Clone + 'static>(
     rt: &mut Runtime<Msg>,
     event: &InputEvent,
     _sheet: &CompiledSheet,
@@ -1907,6 +2004,8 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
+            pointer_target: SurfaceTarget::Window,
+            keyboard_target: SurfaceTarget::Window,
             queue: VecDeque::new(),
             cmds: Vec::new(),
             timers: Vec::new(),
@@ -2553,6 +2652,8 @@ mod tests {
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
+            pointer_target: SurfaceTarget::Window,
+            keyboard_target: SurfaceTarget::Window,
             queue: VecDeque::new(),
             cmds: Vec::new(),
             timers: Vec::new(),
