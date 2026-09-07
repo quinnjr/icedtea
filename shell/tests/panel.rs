@@ -427,3 +427,196 @@ fn the_clipboard_popover_opens_pastes_and_dismisses() {
         panel.clip_calls()
     );
 }
+
+/// Every widget the panel puts on screen paints something at rest.
+///
+/// The gallery gate's rule, applied to an app: sample each reported
+/// allocation and require at least one pixel that is not the wallpaper. No
+/// exemption list — an app widget that renders nothing is a bug, not a known
+/// gap (spec §7).
+fn panel_paints_every_probe_point_at_rest(theme: Theme) {
+    let mut panel = Panel::spawn(theme);
+    panel.send(Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(
+        snapshot(
+            vec![win(1, "One"), win(2, "Two")],
+            vec![
+                WorkspaceInfo {
+                    id: 0,
+                    name: String::new(),
+                },
+                WorkspaceInfo {
+                    id: 1,
+                    name: "web".into(),
+                },
+            ],
+        ),
+    ))));
+    for id in [
+        "bar",
+        "workspaces",
+        "windows",
+        "clip",
+        "ws_0",
+        "ws_1",
+        "window_1",
+        "window_2",
+    ] {
+        panel.wait_for(&format!("alloc {id} "));
+    }
+
+    // The seeded layout must *converge* before it is sampled, not merely
+    // exist: `#bar`'s own `Msg::SurfaceWidth` round trip
+    // (`the_bar_spans_the_output_and_fits_its_surface`) takes one extra frame
+    // beyond the snapshot's own, and until it lands `#workspaces`/`#windows`
+    // report a stale, pre-reflow box. Waiting on `#bar`'s width, the same
+    // signal the other gates in this file already wait on, is what makes the
+    // rest-state check "at rest" rather than "mid-reflow".
+    let (out_w, _) = panel.output();
+    let out_w = out_w as i32;
+    panel.wait_until(
+        |lines| {
+            lines
+                .iter()
+                .rev()
+                .find(|l| l.starts_with("alloc bar "))
+                .is_some_and(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    let width: f32 = f[4].parse().unwrap_or(0.0);
+                    (width - out_w as f32).abs() <= 2.0
+                })
+        },
+        "the seeded layout converged before the rest-state sample",
+    );
+
+    let background = panel.background();
+    // `capture_settled`, not `capture`: the report's own convergence and the
+    // compositor actually presenting that layout are two different events
+    // (see its doc comment) — a plain `capture` here caught the *previous*
+    // frame's buttons in the *previous* frame's positions live.
+    let frame = panel.capture_settled();
+    // The report is append-only across frames (`wait_for`'s doc comment): an
+    // id that moved during convergence carries one `alloc` line per frame it
+    // changed in, and only the last one describes what is on screen now — the
+    // same "latest wins" rule `labels_under` already applies per id. Reading
+    // every line unfiltered would flag an id's own stale, pre-convergence box
+    // (or a since-superseded one another widget now occupies) as blank.
+    let mut latest: std::collections::HashMap<String, (i32, i32, i32, i32)> =
+        std::collections::HashMap::new();
+    for line in panel.report() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() != 6 || f[0] != "alloc" {
+            continue;
+        }
+        latest.insert(
+            f[1].to_string(),
+            (
+                f[2].parse().unwrap_or(0),
+                f[3].parse().unwrap_or(0),
+                f[4].parse().unwrap_or(0),
+                f[5].parse().unwrap_or(0),
+            ),
+        );
+    }
+    let mut blank: Vec<String> = Vec::new();
+    for (id, rect) in latest {
+        if !support::paints_something(&frame, rect, background) {
+            blank.push(format!("{id} at {rect:?}"));
+        }
+    }
+    assert!(
+        blank.is_empty(),
+        "{}: these widgets painted nothing at rest: {blank:?}",
+        theme.name()
+    );
+}
+
+#[test]
+fn panel_paints_every_probe_point_at_rest_in_the_light_theme() {
+    panel_paints_every_probe_point_at_rest(Theme::Light);
+}
+
+#[test]
+fn panel_paints_every_probe_point_at_rest_in_the_dark_theme() {
+    panel_paints_every_probe_point_at_rest(Theme::Dark);
+}
+
+#[test]
+fn panel_paints_every_probe_point_at_rest_in_the_high_contrast_theme() {
+    panel_paints_every_probe_point_at_rest(Theme::HighContrast);
+}
+
+/// The focused and attention states are visible, not just set.
+///
+/// Finding F10: `taskbar::render` added both classes and nothing styled
+/// either, so the compositor's focus and attention bits were invisible on the
+/// bar. `style.css`'s left-accent gradients are what fixed that, and this is
+/// what keeps them fixed — a CSS engine that silently dropped
+/// `background-image: linear-gradient` on a button would pass every other test
+/// in this file.
+#[test]
+fn a_focused_window_button_looks_different_from_an_unfocused_one() {
+    let mut panel = Panel::spawn(Theme::Dark);
+    panel.send(Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(
+        snapshot(
+            vec![win(1, "One"), win(2, "Two")],
+            vec![WorkspaceInfo {
+                id: 0,
+                name: String::new(),
+            }],
+        ),
+    ))));
+    panel.wait_for("alloc window_2 ");
+
+    // The seeded layout must converge (the same `Msg::SurfaceWidth` round
+    // trip `the_bar_spans_the_output_and_fits_its_surface` and the rest-state
+    // gate above both wait on) before the "before" sample is taken -- a
+    // sample caught mid-reflow would differ from the "after" one just from
+    // the layout still settling, with or without the `focused` class ever
+    // changing anything, and would make this gate pass for the wrong reason.
+    let (out_w, _) = panel.output();
+    let out_w = out_w as i32;
+    panel.wait_until(
+        |lines| {
+            lines
+                .iter()
+                .rev()
+                .find(|l| l.starts_with("alloc bar "))
+                .is_some_and(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    let width: f32 = f[4].parse().unwrap_or(0.0);
+                    (width - out_w as f32).abs() <= 2.0
+                })
+        },
+        "the seeded layout converged before the before/after sample",
+    );
+
+    let sample = |panel: &mut Panel, id: &str| -> (u8, u8, u8) {
+        let (x, y, _, h) = panel.allocation(id);
+        // `capture_settled`, not `capture`: see its doc comment -- a plain
+        // capture here caught a stale, pre-convergence frame live, which
+        // made "before" and "after" differ from layout settling alone.
+        let frame = panel.capture_settled();
+        // Two pixels in from the left edge: the accent stripe is 3px wide.
+        support::pixel(&frame, (x + 1) as u32, (y + h / 2) as u32).expect("inside the frame")
+    };
+    let before = sample(&mut panel, "window_1");
+
+    panel.send(Msg::Compositor(Arc::new(CompositorUpdate::Updated {
+        id: 1,
+        update: icedtea_contract::WindowUpdate {
+            focused: Some(true),
+            ..Default::default()
+        },
+    })));
+    // The class change does not move anything, so wait on the pixel.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut after = before;
+    while std::time::Instant::now() < deadline && support::same(after, before) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        after = sample(&mut panel, "window_1");
+    }
+    assert!(
+        !support::same(after, before),
+        "the `focused` class must change what the button paints: {before:?} -> {after:?}"
+    );
+}

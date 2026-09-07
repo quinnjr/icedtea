@@ -231,15 +231,10 @@ impl Panel {
         let tx = handshake_rx
             .recv_timeout(TIMEOUT)
             .expect("the panel never opened its window");
-        let mut screencopy = ScreencopyClient::spawn(&socket);
-        let empty = screencopy.capture();
-        // The bar is anchored to the top, so the bottom-right corner is
-        // always wallpaper: that is the background every "did it paint?"
-        // assertion compares against.
-        let background = pixel(&empty, output.0 - 3, output.1 - 3).expect("background probe");
+        let screencopy = ScreencopyClient::spawn(&socket);
         let pointer = VirtualPointerClient::spawn(&socket);
 
-        let panel = Panel {
+        let mut panel = Panel {
             wm,
             clip,
             tx,
@@ -248,12 +243,46 @@ impl Panel {
             report,
             popup_report,
             output,
-            background,
+            // Replaced below, before this constructor returns: `background`
+            // is never read with this placeholder still in it.
+            background: (0, 0, 0),
             _dir: dir,
             _panel: panel_thread,
             _compositor: compositor,
         };
         let _ = panel.wait_for("alloc bar ");
+
+        // The panel's own chrome colour, sampled *inside* the layer surface —
+        // never a point outside it. `output.0 - 3, output.1 - 3` (the bottom
+        // right corner) used to stand in for "background", but the bar only
+        // occupies the output's top `BAR_HEIGHT` pixels: that corner is
+        // desktop wallpaper, not the panel's own `#bar` background-color, so
+        // a widget that painted nothing but inherited the bar's own
+        // background would still read as "painted something" by differing
+        // from the wallpaper underneath it. This is the exact lesson
+        // `settings/tests/support/displays.rs::background` already learned,
+        // applied here to a bar instead of a page.
+        //
+        // Reconciliation (P5 Task 16): a point just inside `#windows`'s own
+        // right edge (this constructor's first attempt) is not safe — live
+        // capture showed `#bar`'s three children (`#workspaces`, `#windows`,
+        // `#clip`) packed as one horizontally-*centred* cluster rather than
+        // spread taskbar-style across the bar (`#windows`'s own
+        // `.hexpand(true)` does not reach taffy here, the same per-child
+        // `ChildLayout` gap `style.css`'s `#bar` rule already documents one
+        // level up), so a point derived from `#windows`'s edge lands right
+        // next to -- sometimes inside -- `#clip`, sampling *its* background
+        // instead of the bar's plain chrome. `#bar` itself does span the
+        // whole output (`the_bar_spans_the_output_and_fits_its_surface`), and
+        // that centred cluster is far narrower than a real output, so a
+        // point pinned to the bar's own far-left edge stays outside it
+        // regardless of how many buttons the cluster ever grows to hold.
+        let (bx, by, _, bh) = panel.allocation("bar");
+        let frame = panel.capture();
+        let sample_x = (bx + 10).max(0) as u32;
+        let sample_y = (by + bh / 2) as u32;
+        panel.background =
+            pixel(&frame, sample_x, sample_y).expect("the background probe is inside the frame");
         panel
     }
 
@@ -519,6 +548,63 @@ impl Panel {
     /// One screencopy frame of the whole output.
     pub fn capture(&mut self) -> CapturedFrame {
         self.screencopy.capture()
+    }
+
+    /// How many consecutive identical captures [`Panel::capture_settled`]
+    /// requires before it trusts the output has actually stopped changing.
+    ///
+    /// Live capture during Task 16 found a genuine plateau: two consecutive
+    /// captures already read back byte-identical a moment after the report
+    /// converged, then the very next capture changed anyway (`#workspaces`'s
+    /// and `#windows`' buttons had not painted yet). A single repeat is not
+    /// proof of settling, only of two frames landing inside the same
+    /// composited-output tick; `STABLE_STREAK` at [`POLL`]'s cadence held
+    /// for the remainder of a multi-second observation window in every case
+    /// this module hit, well past where the true plateau above broke.
+    const STABLE_STREAK: u32 = 10;
+
+    /// A screencopy frame taken only once the compositor's own output has
+    /// stopped changing — [`STABLE_STREAK`] consecutive captures with
+    /// identical bytes, not merely two.
+    ///
+    /// `wait_until`/`wait_for` confirm the panel's *report* converged (its
+    /// `on_frame` hook ran and published the laid-out geometry), but
+    /// publishing that report and the corresponding surface commit actually
+    /// reaching a composited output frame are two different events with a
+    /// gap between them (observed live: several hundred milliseconds after
+    /// the report already read as converged, a screencopy capture still
+    /// showed the *previous* layout's buttons in the *previous* positions —
+    /// and, more surprisingly, that stale frame could itself repeat
+    /// byte-for-byte across a couple of captures before the real one
+    /// landed, defeating a naive "two in a row" check). A rest-state gate
+    /// that samples pixels — unlike every other gate in this file, which
+    /// only ever reads the report or clicks a point — has to wait out that
+    /// gap itself, the same way
+    /// `a_focused_window_button_looks_different_from_an_unfocused_one`
+    /// already resamples in a loop rather than trusting a single capture.
+    ///
+    /// # Panics
+    ///
+    /// If the output never holds [`STABLE_STREAK`] identical captures in a
+    /// row within [`TIMEOUT`].
+    pub fn capture_settled(&mut self) -> CapturedFrame {
+        let deadline = Instant::now() + TIMEOUT;
+        let mut previous = self.capture();
+        let mut streak = 1u32;
+        while Instant::now() < deadline {
+            std::thread::sleep(POLL);
+            let next = self.capture();
+            if next.bytes == previous.bytes {
+                streak += 1;
+                if streak >= Self::STABLE_STREAK {
+                    return next;
+                }
+            } else {
+                streak = 1;
+            }
+            previous = next;
+        }
+        panic!("the output never settled within {TIMEOUT:?}");
     }
 
     #[must_use]
