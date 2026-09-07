@@ -11,10 +11,11 @@ mod support;
 use std::sync::Arc;
 
 use icedtea_contract::WorkspaceInfo;
+use icedtea_shell::clipboard::ClipUpdate;
 use icedtea_shell::panel::{self, Msg};
 use icedtea_shell::taskbar::CompositorUpdate;
 use icedtea_ui::gallery::Theme;
-use support::{Panel, snapshot, win};
+use support::{Panel, clip_entry, snapshot, win};
 
 /// The scaffolding's own smoke test: booting `Panel` runs the real
 /// `panel::view`/`update` on a layer surface under the harness compositor and
@@ -295,5 +296,134 @@ fn a_window_opened_signal_through_the_inbox_adds_a_button() {
     panel.wait_for_calls(
         |calls| calls.contains(&("focus".to_string(), 4)),
         "the freshly added button is live",
+    );
+}
+
+/// Task 15, the clipboard popover gate: contract §3.6's steps 5-8. Open the
+/// popover with a real click, assert two rows, activate row 0 and see
+/// `("activate", 10)` on the mock, then dismiss with an outside click and see
+/// the model let go — every row coordinate read off the popover's own probe
+/// points (`Window::popup_probe_points`/`popup_position`, P5-D8), never a
+/// literal, because M5-D9's window probe cannot see a second surface the
+/// compositor may have slid.
+///
+/// Reconciliation (P5 Task 15). The brief wrote the dismissal and replacement
+/// checks as whole-report `!any("popup ...")` scans, which assume a report
+/// that forgets. `$ICEDTEA_PROBE_REPORT` is append-only (Task 11 moved its
+/// writer into `App::run`), so the popover's *current* rows are a separate,
+/// truncate-written file (`panel::write_popup_report`) that `support::Panel`
+/// folds into `report()`; against that current-state view the brief's scans
+/// hold as written.
+#[test]
+fn the_clipboard_popover_opens_pastes_and_dismisses() {
+    let mut panel = Panel::spawn(Theme::Dark);
+    panel.send(Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(
+        snapshot(
+            vec![win(1, "One")],
+            vec![WorkspaceInfo {
+                id: 0,
+                name: String::new(),
+            }],
+        ),
+    ))));
+    panel.send(Msg::Clip(Arc::new(ClipUpdate::History(vec![
+        clip_entry(10, "copied text"),
+        clip_entry(11, "second entry"),
+    ]))));
+
+    // Wait for the seeded layout to *converge* before reading `#clip`'s point,
+    // not merely for an `alloc clip` line to exist. On the first, pre-snapshot
+    // frame `#clip` is the only right-hand button and sits where `window_1`
+    // will land once the snapshot renders and the surface width converges on
+    // the output (`Msg::SurfaceWidth`'s one-frame round trip, per
+    // `the_bar_spans_the_output_and_fits_its_surface`). Reading its point off
+    // that stale frame and clicking there lands on `window_1` after the reflow
+    // — the click reaches `focus_window(1)`, never `ClipButtonClicked`, and the
+    // popover never opens. The converged frame is the one where `window_1` is
+    // laid out (the snapshot landed) *and* `#bar` spans the output (the width
+    // settled); `#clip` has taken its final x by then.
+    let (out_w, _) = panel.output();
+    let out_w = out_w as i32;
+    panel.wait_until(
+        |lines| {
+            let window_1 = lines.iter().any(|l| l.starts_with("alloc window_1 "));
+            let bar_spans = lines
+                .iter()
+                .rev()
+                .find(|l| l.starts_with("alloc bar "))
+                .and_then(|l| l.split_whitespace().nth(4).map(str::to_owned))
+                .and_then(|w| w.parse::<f32>().ok())
+                .is_some_and(|w| (w - out_w as f32).abs() <= 2.0);
+            window_1 && bar_spans
+        },
+        "the seeded layout converged before reading #clip's point",
+    );
+
+    // 5. Open the popover and assert two rows.
+    let (cx, cy) = panel.point("clip");
+    panel.click(cx, cy);
+    panel.wait_until(
+        |lines| {
+            lines
+                .iter()
+                .any(|l| l.starts_with("popup history_open_10 "))
+                && lines
+                    .iter()
+                    .any(|l| l.starts_with("popup history_open_11 "))
+        },
+        "the popover opened with two rows",
+    );
+
+    // 6. Activate row 0 and assert it pasted entry 10.
+    let (rx, ry) = panel.popup_point("history_open_10");
+    panel.click(rx, ry);
+    panel.wait_for_clip_calls(
+        |calls| calls.contains(&("activate".to_string(), 10)),
+        "activating row 0 reached activate(10)",
+    );
+
+    // The paste dismissed the popover: no popup lines remain.
+    panel.wait_until(
+        |lines| !lines.iter().any(|l| l.starts_with("popup ")),
+        "the popover closed after a paste",
+    );
+
+    // 7. Reopen, replace the history underneath it, and assert one row — the
+    //    open surface tracks the model (contract §6 P5-D2).
+    panel.click(cx, cy);
+    panel.wait_until(
+        |lines| {
+            lines
+                .iter()
+                .any(|l| l.starts_with("popup history_open_10 "))
+        },
+        "the popover reopened",
+    );
+    panel.send(Msg::Clip(Arc::new(ClipUpdate::History(vec![clip_entry(
+        12, "only",
+    )]))));
+    panel.wait_until(
+        |lines| {
+            lines
+                .iter()
+                .any(|l| l.starts_with("popup history_open_12 "))
+                && !lines
+                    .iter()
+                    .any(|l| l.starts_with("popup history_open_10 "))
+        },
+        "the open popover followed the history update",
+    );
+
+    // 8. An outside click dismisses it, and the model lets go.
+    let (ox, oy) = (panel.output().0 as i32 / 2, panel.output().1 as i32 - 20);
+    panel.click(ox, oy);
+    panel.wait_until(
+        |lines| !lines.iter().any(|l| l.starts_with("popup ")),
+        "an outside click dismissed the popover",
+    );
+    assert!(
+        !panel.clip_calls().iter().any(|(a, _)| a == "clear"),
+        "dismissing must not have pressed anything: {:?}",
+        panel.clip_calls()
     );
 }

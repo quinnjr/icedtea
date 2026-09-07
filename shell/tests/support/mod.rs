@@ -117,6 +117,10 @@ pub struct Panel {
     pointer: VirtualPointerClient,
     screencopy: ScreencopyClient,
     report: PathBuf,
+    /// The open popover's own probe lines, truncate-written beside `report`
+    /// (see `panel::write_popup_report` for why it is a separate, current-state
+    /// file rather than an append to `report`).
+    popup_report: PathBuf,
     output: (u32, u32),
     background: (u8, u8, u8),
     _dir: TempDir,
@@ -151,6 +155,7 @@ impl Panel {
 
         let dir = TempDir::new(theme.name());
         let report = dir.path().join("report");
+        let popup_report = report.with_extension("popups");
 
         let wm = MockWm::default();
         let clip = MockClip::default();
@@ -185,7 +190,12 @@ impl Panel {
             // so the harness names its path with `with_probe_report` rather
             // than through a `panel::frame_hook`.
             let clip_rect = model.clip_rect.clone();
+            let open_popover = model.open_popover_cell.clone();
             let last_width = std::cell::Cell::new(model.bar_width);
+            // The popover's own probe lines, beside the probe report (which
+            // `App::run` owns, append-only, for the window's own lines).
+            let popup_report = thread_report.with_extension("popups");
+            let mut last_popup: Vec<String> = Vec::new();
             let _ = App::new(model, panel::update, panel::view)
                 .with_inbox(inbox)
                 .on_popup(|ev| match ev {
@@ -195,6 +205,11 @@ impl Panel {
                 })
                 .on_frame(move |w| {
                     clip_rect.set(w.allocation("clip").map(|a| a.border_box));
+                    let lines = open_popover
+                        .get()
+                        .map(|key| panel::popup_report_lines(w, key))
+                        .unwrap_or_default();
+                    panel::write_popup_report(&popup_report, &lines, &mut last_popup);
                     // M5 Task 13: mirrors `shell/src/main.rs`'s own
                     // `on_frame` wiring for `panel::PanelModel::bar_width` --
                     // a real `Msg`, diffed so an unchanging surface does not
@@ -231,6 +246,7 @@ impl Panel {
             pointer,
             screencopy,
             report,
+            popup_report,
             output,
             background,
             _dir: dir,
@@ -256,14 +272,52 @@ impl Panel {
         self.clip.0.lock().expect("clip calls").clone()
     }
 
-    /// Every line of the panel's current report.
+    /// Every line of the panel's current report, followed by the open
+    /// popover's `popup <label> <x> <y>` lines.
+    ///
+    /// The window's `probe`/`alloc` lines are append-only across frames (see
+    /// `wait_for`); the popover's lines are the *current* state of a separate,
+    /// truncate-written file (`panel::write_popup_report`), so a dismissal or
+    /// a replacement shows up as those `popup ` lines simply being gone — the
+    /// current-state semantics the gate reads with a whole-report scan.
     #[must_use]
     pub fn report(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.report)
+        let mut lines: Vec<String> = std::fs::read_to_string(&self.report)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.extend(self.popup_report());
+        lines
+    }
+
+    /// The open popover's current probe lines, or empty when it is closed.
+    #[must_use]
+    pub fn popup_report(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.popup_report)
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// The output-space centre of a probe point inside the open popover.
+    ///
+    /// The popover's own lines already carry output coordinates
+    /// (`panel::popup_report_lines` adds the compositor-assigned popup
+    /// position), so a gate clicks a row exactly as it clicks a bar button.
+    ///
+    /// # Panics
+    ///
+    /// If the popover exposes no such point within [`TIMEOUT`].
+    #[must_use]
+    pub fn popup_point(&self, label: &str) -> (i32, i32) {
+        let line = self.wait_for(&format!("popup {label} "));
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        (
+            fields[2].parse().expect("popup x"),
+            fields[3].parse().expect("popup y"),
+        )
     }
 
     /// Poll the report until a line starting with `prefix` appears, and return

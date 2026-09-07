@@ -110,7 +110,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // it — the popover's anchor.
     let model = PanelModel::new(wm, clip);
     let clip_rect = model.clip_rect.clone();
+    let open_popover = model.open_popover_cell.clone();
     let last_width = Cell::new(model.bar_width);
+    // The open popover's own probe lines, written beside `$ICEDTEA_PROBE_REPORT`
+    // (App::run owns that append-only file for the window's own lines). Only a
+    // harness sets the env var, so this is inert in a real session.
+    let popup_report = std::env::var_os("ICEDTEA_PROBE_REPORT").map(|value| {
+        let mut path = std::path::PathBuf::from(value);
+        path.set_extension("popups");
+        path
+    });
+    let mut last_popup: Vec<String> = Vec::new();
 
     App::new(model, panel::update, panel::view)
         .with_inbox(inbox)
@@ -124,6 +134,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_frame(move |w| {
             clip_rect.set(clip_border_box(|id| w.allocation(id)));
+            if let Some(path) = popup_report.as_ref() {
+                let lines = open_popover
+                    .get()
+                    .map(|key| panel::popup_report_lines(w, key))
+                    .unwrap_or_default();
+                panel::write_popup_report(path, &lines, &mut last_popup);
+            }
             // M5 Task 13: `#bar`'s span. A real `Msg`, not a bare `Cell`
             // write (`panel::PanelModel::bar_width`'s doc comment) --
             // `on_frame` has no `&mut PanelModel`, only the inbox `update`

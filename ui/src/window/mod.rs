@@ -2049,6 +2049,37 @@ impl Window {
             .map(|p| p.root.clone())
     }
 
+    /// Where the compositor last placed popup `key`, in this window's frame
+    /// space. `None` for an unknown key or one that has taken no configure.
+    ///
+    /// P5-D8: the enumerated exception to M5-D9's window-only probe. A popover
+    /// is a second surface the compositor may have slid to keep it on screen,
+    /// so a gate that clicks a row needs where the surface actually landed, not
+    /// where the window's own tree thinks it is.
+    #[must_use]
+    pub fn popup_position(&self, key: PopupKey) -> Option<(i32, i32)> {
+        self.popups
+            .iter()
+            .find(|p| p.key == key)
+            .and_then(|p| p.popup().map(Popup::position))
+    }
+
+    /// [`Window::probe_points`] for one popup's own tree, in that popup's
+    /// surface coordinates (its own top-left is the origin).
+    ///
+    /// P5-D8: shares `probe_points_of`'s one labelling rule with the window's
+    /// own probe. Empty for an unknown key; empty, too, until the reactive loop
+    /// has laid the popup's tree out onto this `Window` (`App::run` keeps that
+    /// layout on its `Runtime` and swaps it in only for the span of an
+    /// `on_frame` hook — see `App::run`'s popup-layout swap).
+    #[must_use]
+    pub fn popup_probe_points(&self, key: PopupKey) -> Vec<ProbePoint> {
+        self.popups
+            .iter()
+            .find(|p| p.key == key)
+            .map_or_else(Vec::new, |p| probe_points_of(&p.root, &p.layout))
+    }
+
     pub fn popup_layout(&mut self, key: PopupKey) -> Option<&mut crate::layout::LayoutTree> {
         self.popups
             .iter_mut()

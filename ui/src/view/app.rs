@@ -2389,7 +2389,24 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 // frames for taffy's incremental dirty tracking). Swap it in
                 // for the span of the hook, then take it back.
                 window.set_layout(std::mem::take(&mut rt.layout));
+                // The same swap for every open popup: each popup's laid-out
+                // tree lives on `rt.popups` (same taffy-incremental reason),
+                // not on the `Window` popup the hook's `popup_probe_points`
+                // reads, so without this a popover's own probe points are
+                // always empty under a windowed run (P5-D8, authorised T15
+                // extension). SWAP-SAFE: no early exit between swap-in, hook
+                // and swap-out, so the loop's trees are always restored.
+                for popup in &mut rt.popups {
+                    if let Some(win_layout) = window.popup_layout(popup.key) {
+                        std::mem::swap(&mut popup.layout, win_layout);
+                    }
+                }
                 hook(&window);
+                for popup in &mut rt.popups {
+                    if let Some(win_layout) = window.popup_layout(popup.key) {
+                        std::mem::swap(&mut popup.layout, win_layout);
+                    }
+                }
                 rt.layout = window.take_layout();
             }
         }

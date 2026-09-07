@@ -7,6 +7,7 @@
 //! having no reconciler, not a design (spec D9).
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use icedtea_ui::view::{Cmd, View};
 use icedtea_ui::widgets::Orientation;
 use icedtea_ui::window::pointer::BTN_MIDDLE;
 use icedtea_ui::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
-use icedtea_ui::window::{LayerSpec, Role, SurfaceSpec};
+use icedtea_ui::window::{LayerSpec, Role, SurfaceSpec, Window};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::clip_client::ClipCommands;
@@ -79,6 +80,12 @@ pub struct PanelModel {
     pub clipboard: ClipboardModel,
     /// The single source of truth for the clipboard popover.
     pub open_popover: Option<PopupKey>,
+    /// `open_popover`, republished for the `App::on_frame` hook, which runs
+    /// outside any borrow of the model and so cannot read `open_popover`
+    /// directly. `update` writes both together on every open and every close —
+    /// app-initiated ones included — and nothing else writes either, so the
+    /// two never disagree (the hook uses it to know which popup to report).
+    pub open_popover_cell: Rc<Cell<Option<PopupKey>>>,
     /// Kept behind the traits so the tests can pass mocks (spec D8). `Rc`, not
     /// `Arc`: they never cross a thread — `update` runs on the loop thread and
     /// so does `Cmd::Task`.
@@ -119,6 +126,7 @@ impl PanelModel {
             taskbar: TaskbarModel::default(),
             clipboard: ClipboardModel::default(),
             open_popover: None,
+            open_popover_cell: Rc::new(Cell::new(None)),
             wm,
             clip,
             bar_height: BAR_HEIGHT,
@@ -246,7 +254,16 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
         }
         Msg::WindowPointerUp { .. } => Cmd::None,
         Msg::ClipButtonClicked => match m.open_popover {
-            Some(key) => Cmd::ClosePopup(key),
+            Some(key) => {
+                // An app-initiated close: `Cmd::ClosePopup` tears the surface
+                // down but sends no `Msg::PopoverDismissed` back (that comes
+                // only from a compositor outside-click), so `update` must let
+                // go of the key itself — else the button keeps its `active`
+                // class and a reopen click reads as a second toggle-close.
+                m.open_popover = None;
+                m.open_popover_cell.set(None);
+                Cmd::ClosePopup(key)
+            }
             None => {
                 // `update` has no `&Window`, and `PopupAnchorPoint::Node`
                 // wants a `Node` no handler can hand it, so the anchor is the
@@ -271,6 +288,7 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
         },
         Msg::PopoverOpened(key) => {
             m.open_popover = Some(key);
+            m.open_popover_cell.set(Some(key));
             Cmd::None
         }
         Msg::PopoverDismissed(key) => {
@@ -278,6 +296,7 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
             // popup already replaced must not close the live one.
             if m.open_popover == Some(key) {
                 m.open_popover = None;
+                m.open_popover_cell.set(None);
             }
             Cmd::None
         }
@@ -288,7 +307,14 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
             let clip = m.clip.clone();
             let task = Cmd::Task(Rc::new(move || clip.activate(id)));
             match m.open_popover {
-                Some(key) => Cmd::Batch(vec![task, Cmd::ClosePopup(key)]),
+                Some(key) => {
+                    // Same app-initiated close as `ClipButtonClicked`: the
+                    // paste closes the popover, and no `PopoverDismissed`
+                    // answers a `ClosePopup`, so drop the key here.
+                    m.open_popover = None;
+                    m.open_popover_cell.set(None);
+                    Cmd::Batch(vec![task, Cmd::ClosePopup(key)])
+                }
                 None => task,
             }
         }
@@ -458,6 +484,54 @@ pub fn popover_rows(entries: &[ClipEntry]) -> View<Msg> {
 #[must_use]
 pub fn popover_body(m: &PanelModel) -> View<Msg> {
     popover_rows(&m.history.borrow())
+}
+
+/// The open popover's own probe points, as `popup <label> <x> <y>` lines in
+/// **output** coordinates — the compositor-assigned popup position plus the
+/// point's own offset — so a gate clicks a popover row exactly as it clicks a
+/// bar button. Empty when `key` names no live, configured popup, which is how
+/// a gate reads a dismissal (P5-D8).
+///
+/// The line kind nothing else writes: `App::run` owns `$ICEDTEA_PROBE_REPORT`
+/// and emits the *window's* `probe`/`alloc` lines there, but a popover is a
+/// second surface it does not report. `write_popup_report` is the deduped
+/// writer the `on_frame` hook pairs with this.
+#[must_use]
+pub fn popup_report_lines(w: &Window, key: PopupKey) -> Vec<String> {
+    let Some((ox, oy)) = w.popup_position(key) else {
+        return Vec::new();
+    };
+    w.popup_probe_points(key)
+        .into_iter()
+        .map(|p| format!("popup {} {} {}", p.label, ox + p.x, oy + p.y))
+        .collect()
+}
+
+/// Truncate-write the open popover's probe lines to `path`, deduped against
+/// `last` so a settled popover rewrites nothing.
+///
+/// A dedicated file, *not* `$ICEDTEA_PROBE_REPORT`. That report is append-only
+/// (`App::run` writes a fresh `frame N` block per changed state, so a driver
+/// can grep a coordinate out of any past frame), and an append-only file
+/// cannot express "these rows are gone": once `popup history_open_10` is on
+/// disk it stays, so a whole-file scan could never see a dismissal or a
+/// replacement. The popover's *current* rows are truncate-written here
+/// instead — empty file when closed — which is exactly the current-state
+/// semantics the gate's dismissal and replacement steps read (T15
+/// reconciliation of the brief's single-file design).
+pub fn write_popup_report(path: &Path, lines: &[String], last: &mut Vec<String>) {
+    if lines == last.as_slice() {
+        return;
+    }
+    let body = if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n") + "\n"
+    };
+    if std::fs::write(path, body).is_ok() {
+        last.clear();
+        last.extend_from_slice(lines);
+    }
 }
 
 #[cfg(test)]
@@ -891,6 +965,42 @@ mod tests {
         );
         let _ = update(&mut m, Msg::PopoverDismissed(key));
         assert_eq!(m.open_popover, None);
+    }
+
+    /// The cell the `on_frame` hook reads must track `open_popover` through
+    /// every path: an open, a stale dismissal it ignores, and the real
+    /// dismissal that clears it. One field, two readers, never two truths.
+    #[test]
+    fn the_published_popover_key_never_disagrees_with_the_model() {
+        let (mut m, _, _) = panel();
+        let key = PopupKey::from_raw(3);
+        let _ = update(&mut m, Msg::PopoverOpened(key));
+        assert_eq!(m.open_popover_cell.get(), m.open_popover);
+        let _ = update(&mut m, Msg::PopoverDismissed(PopupKey::from_raw(9)));
+        assert_eq!(m.open_popover_cell.get(), m.open_popover);
+        let _ = update(&mut m, Msg::PopoverDismissed(key));
+        assert_eq!(m.open_popover_cell.get(), m.open_popover);
+        assert_eq!(m.open_popover_cell.get(), None);
+    }
+
+    /// An app-initiated close — a second click on the trigger, and a paste —
+    /// gets no `PopoverDismissed` back, so `update` must clear both the model
+    /// and the published cell itself, or the button stays `active` and a
+    /// reopen click toggles closed instead of opening.
+    #[test]
+    fn an_app_initiated_close_lets_go_of_the_key() {
+        let (mut m, _, _) = seeded();
+        let key = PopupKey::from_raw(3);
+
+        let _ = update(&mut m, Msg::PopoverOpened(key));
+        let _ = update(&mut m, Msg::ClipButtonClicked);
+        assert_eq!(m.open_popover, None, "a second click closes and lets go");
+        assert_eq!(m.open_popover_cell.get(), None);
+
+        let _ = update(&mut m, Msg::PopoverOpened(key));
+        let _ = update(&mut m, Msg::ClipActivated(10));
+        assert_eq!(m.open_popover, None, "a paste closes and lets go");
+        assert_eq!(m.open_popover_cell.get(), None);
     }
 
     fn clip_entry(id: u64, preview: &str, pinned: bool) -> ClipEntry {
