@@ -1447,7 +1447,9 @@ impl Window {
     /// The live counterpart of `App::probe`, which is offscreen-only: a
     /// harness test against a running client has no other way to ask where a
     /// widget ended up, and the gate rules forbid hard-coded coordinates.
-    /// Reads the tree the last [`Window::render`] laid out.
+    /// Reads the tree the last [`Window::render`] laid out, or -- for a window
+    /// driven by `App::run` -- the tree its own reconcile loop last laid out,
+    /// published here for the run of an `App::on_frame` hook (P5-D5).
     #[must_use]
     pub fn probe_points(&self) -> Vec<ProbePoint> {
         probe_points_of(&self.root, &self.layout)
@@ -1459,6 +1461,26 @@ impl Window {
     #[must_use]
     pub fn allocation(&self, id: &str) -> Option<crate::layout::Allocation> {
         allocation_of(&self.root, &self.layout, id)
+    }
+
+    /// Hand this window's layout tree to its caller, leaving an empty one
+    /// behind.
+    ///
+    /// `App::run` keeps its own reconcile loop's [`crate::layout::LayoutTree`]
+    /// on its `Runtime` rather than on `Window` (it must survive across
+    /// frames for taffy's incremental dirty tracking), so [`Window::layout`]
+    /// itself is otherwise never touched once such a loop is driving the
+    /// window. `take_layout`/[`Window::set_layout`] let `App::run` swap the
+    /// loop's tree onto `self` for the span of an `on_frame` hook (P5-D5), so
+    /// [`Window::probe_points`] and [`Window::allocation`] answer for what the
+    /// loop just laid out, then take it back for the next iteration.
+    pub(crate) fn take_layout(&mut self) -> crate::layout::LayoutTree {
+        std::mem::take(&mut self.layout)
+    }
+
+    /// See [`Window::take_layout`].
+    pub(crate) fn set_layout(&mut self, layout: crate::layout::LayoutTree) {
+        self.layout = layout;
     }
 
     /// Register `fd` in this window's poll set.
@@ -2025,6 +2047,37 @@ impl Window {
             .iter()
             .find(|p| p.key == key)
             .map(|p| p.root.clone())
+    }
+
+    /// Where the compositor last placed popup `key`, in this window's frame
+    /// space. `None` for an unknown key or one that has taken no configure.
+    ///
+    /// P5-D8: the enumerated exception to M5-D9's window-only probe. A popover
+    /// is a second surface the compositor may have slid to keep it on screen,
+    /// so a gate that clicks a row needs where the surface actually landed, not
+    /// where the window's own tree thinks it is.
+    #[must_use]
+    pub fn popup_position(&self, key: PopupKey) -> Option<(i32, i32)> {
+        self.popups
+            .iter()
+            .find(|p| p.key == key)
+            .and_then(|p| p.popup().map(Popup::position))
+    }
+
+    /// [`Window::probe_points`] for one popup's own tree, in that popup's
+    /// surface coordinates (its own top-left is the origin).
+    ///
+    /// P5-D8: shares `probe_points_of`'s one labelling rule with the window's
+    /// own probe. Empty for an unknown key; empty, too, until the reactive loop
+    /// has laid the popup's tree out onto this `Window` (`App::run` keeps that
+    /// layout on its `Runtime` and swaps it in only for the span of an
+    /// `on_frame` hook — see `App::run`'s popup-layout swap).
+    #[must_use]
+    pub fn popup_probe_points(&self, key: PopupKey) -> Vec<ProbePoint> {
+        self.popups
+            .iter()
+            .find(|p| p.key == key)
+            .map_or_else(Vec::new, |p| probe_points_of(&p.root, &p.layout))
     }
 
     pub fn popup_layout(&mut self, key: PopupKey) -> Option<&mut crate::layout::LayoutTree> {

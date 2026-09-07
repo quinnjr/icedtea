@@ -1,6 +1,34 @@
 #bar {
-    min-height: 24px;
-    padding: 2px 6px;
+    /* `#bar` is `root`'s only child in a plain (GTK-semantics) box, and a
+       plain box's child that never opts into an explicit `ChildLayout` is
+       centred at its own content size -- the same as a real `GtkBox` centres
+       a child with no `hexpand`/`halign` of its own
+       (`layout::LayoutTree::container_style`'s "GTK's box centres a child
+       that asked for nothing" rule). Nothing in this crate's `view::render`
+       yet wires a plain `Box`'s `hexpand`/`halign` props through to that
+       per-child `ChildLayout` (`widgets/frame.rs`'s own finding, verbatim:
+       "PropName::Halign/Vexpand are accepted by View but nothing in
+       view::render consumes them yet"), and a percentage `min-width` does
+       not reach around that either: taffy resolves a flex item's own
+       percentage min-size against an indefinite cross size whenever the item
+       is not itself stretched, which a centred, non-`ChildLayout` item never
+       is, however definite the container's own final width turns out to be.
+       So the span in `panel::view` is a *pixel* `width_request` instead
+       (`panel::PanelModel::bar_width`, republished from `Window::size` by the
+       same once-a-frame `on_frame` hook that already carries the `clip`
+       button's rect (P5-D9) -- `set_size_request` is a floor in device
+       pixels, the one path proven to actually reach taffy's layout, unlike
+       the percentage above). `width-request` floors the CONTENT box, not the
+       border box (`layout::LayoutTree::box_model_style`'s doc comment), so
+       `#bar` itself carries zero padding: any padding here would widen the
+       border box past the surface's own committed width and overflow its
+       right edge. The buttons keep their own `padding: 1px 8px` for visible
+       chrome; that is inside their own boxes, not `#bar`'s.
+       Height: bounded to the 28px layer-surface exclusive zone
+       (`panel::BAR_HEIGHT`), zero padding either axis, so the border box
+       cannot overflow it. */
+    min-height: 28px;
+    padding: 0;
     background-color: rgba(20, 20, 24, 0.92);
     color: #e6e6e6;
 }

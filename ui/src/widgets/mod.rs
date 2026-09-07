@@ -878,11 +878,19 @@ impl PointerState {
                 self.hovered = inside(*local);
                 node.set_state(PseudoStates::HOVER, self.hovered);
             }
-            Event::PointerDown { local, .. } if inside(*local) => {
+            // Only the primary button drives `:active` and the click gesture,
+            // the way real GTK activates a widget on `GDK_BUTTON_PRIMARY`
+            // (P5-D11). A middle/right press must not arm the pressed state, and
+            // a non-left release must not clear it or report a click -- else a
+            // middle-click on a widget that also carries its own middle-button
+            // handler fires a spurious activation alongside it.
+            Event::PointerDown { local, button, .. }
+                if *button == crate::window::layer::BTN_LEFT && inside(*local) =>
+            {
                 self.pressed = true;
                 node.set_state(PseudoStates::ACTIVE, true);
             }
-            Event::PointerUp { local, .. } => {
+            Event::PointerUp { local, button, .. } if *button == crate::window::layer::BTN_LEFT => {
                 let was = self.pressed;
                 self.pressed = false;
                 node.set_state(PseudoStates::ACTIVE, false);

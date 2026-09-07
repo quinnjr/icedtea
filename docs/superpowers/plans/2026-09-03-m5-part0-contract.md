@@ -3518,3 +3518,260 @@ which every Displays task treats as sufficient.
 would have added an unreachable arm and `select_head` was unreachable from
 `update`; retiring both keeps the tree free of dead code. If list-selection is
 wanted later, re-introduce the variant and an `update` arm together.
+
+### P5-D1 — input is routed to the surface it arrived on; P5 edits `ui/src/view/app.rs`
+
+**Carried out by:** P5 (`ui/src/view/app.rs`, `ui/src/window/popup.rs`,
+`ui/tests/popup_input.rs`), commit `f004f53`.
+
+**Contract says** (§5, P5's "Must not touch"): `ui/`.
+
+**As shipped:** `route` tracks `pointer_target`/`keyboard_target` from
+`InputEvent`'s two `Enter` variants and swaps the addressed popup's retained
+tree into the runtime for the dispatch, so an event that arrives on a popup
+surface is hit-tested against that popup's own tree.
+
+**Ruling.** `App::run`/`run_offscreen`'s `route` hit-tested `rt.root`/
+`rt.instances`/`rt.layout` — the window's tree — for every event and ignored
+`InputEvent::PointerEnter`'s `target: SurfaceTarget` entirely, so a click inside
+a real `xdg_popup` never reached that popup's own handlers: it was hit-tested
+against the window in popup-local coordinates. §3.4 makes the clipboard popover
+a real popup surface (`Cmd::OpenPopup` with a `Some` payload) — it must be one,
+because the panel's layer surface is 28 px tall and an embedded popover would be
+clipped by it — and §3.6's gate `the_clipboard_popover_opens_pastes_and_dismisses`
+requires a click inside it to reach `MockClip::activate`. So P5 adds
+surface-scoped routing. An enumerated exception in the same shape as P4's
+`drop_down.rs` exception (§7): confined to `ui/src/view/app.rs` and
+`ui/src/window/popup.rs`, additive, landing with its own test file
+`ui/tests/popup_input.rs`. Not a precedent for further app-part edits under `ui/`.
+
+### P5-D2 — a popup surface keeps its view closure and is re-reconciled every frame
+
+**Carried out by:** P5 (`ui/src/view/app.rs`, `ui/src/window/popup.rs`),
+commit `dc8205d`.
+
+**Contract says** (§3.4): `open_popover` "is the single source of truth"; spec
+D9 says the panel is "genuinely reactive".
+
+**As shipped:** P5 stores the `Rc<dyn Fn() -> View<Msg>>` on `PopupSurface` and
+reconciles it each frame, exactly as the window's own tree is reconciled.
+
+**Ruling.** As shipped, `open_popup` (`ui/src/view/app.rs`) built the payload
+view once and dropped the closure, so an open popover never tracked the model:
+a `history_changed` that lands while it is open, or a pin toggle inside it,
+could not change what it shows. Retaining and re-reconciling the closure makes
+the popup genuinely reactive, as spec D9 requires.
+
+### P5-D3 — the popover's history rows are buttons in a box, not a `ListBox`
+
+**Carried out by:** P5 (`shell/src/panel.rs`, `pub fn popover_body`), commit
+`6bac27df`.
+
+**Contract says** (§3.4): the body is `list_box(rows).on_item_activated(..)`.
+
+**As shipped:** every popover interaction is a plain `button` click; the history
+rows are `button`s in a `box_`, not a `ListBox` with `on_item_activated`.
+`pub fn popover_body(m: &PanelModel) -> View<Msg>` keeps its contract signature.
+
+**Ruling.** Two shipped `ListBoxC` defects make the contract spelling unusable
+here and neither is M5 work to fix (recorded as P5-D10, routed around here):
+(a) `ListBoxC::on_event` sets `cx.handled = true` on `PointerDown` with no phase
+guard (`ui/src/widgets/list_box.rs`), and P4-D19 makes a handled capture end the
+whole dispatch — so a `pin`/`remove` button inside a row can never receive its
+own click, the ListBox activates instead; (b) `row_at` is fed
+`Event::PointerDown::local`, which P5-D33's `aim` computes relative to the
+innermost instance (the row's label), not to the ListBox, so the row index is
+wrong for every row but the first. Both are pre-existing M3 defects with no gate
+covering them; P5 routes around them with the best-proven path in the crate
+(`ui/tests/interaction_gate.rs`), a plain `button` click.
+
+### P5-D4 — `App::on_popup`/`PopupEvent`; `PopupKey::raw`/`from_raw`
+
+**Carried out by:** P5 (`ui/src/view/app.rs`, `ui/src/window/popup.rs`),
+commit `d243ff0`.
+
+**Contract says** (§3.1): declares `Msg::PopoverOpened(PopupKey)` and
+`Msg::PopoverDismissed(PopupKey)`; §3.4 says "an outside click produces
+`InputEvent::PopupDone` → `Msg::PopoverDismissed`".
+
+**As shipped:** P5 adds `App::on_popup` and `PopupEvent`, the hook the contract
+already assumes, plus `PopupKey::from_raw`/`raw`.
+
+**Ruling.** The toolkit shipped no mechanism for either message:
+`Cmd::OpenPopup` returned nothing to the model, and `InputEvent::PopupDone` was
+routed to the focused controller (`ui/src/view/app.rs`), never to `update`. P5
+adds the hook. `PopupKey::from_raw`/`raw` come with it so an offscreen test can
+name the key the loop minted (`PopupKey(pub(crate) u64)` is otherwise unnameable
+outside the crate).
+
+### P5-D5 — `App::on_frame`
+
+**Carried out by:** P5 (`ui/src/view/app.rs`), commit `a1e6516`.
+
+**Contract says** (§1, M5-D9): both apps write `$ICEDTEA_PROBE_REPORT` lines
+"once per frame in which the tree changed — the mechanism
+`ui/src/bin/window-probe.rs` already uses".
+
+**As shipped:** P5 adds `App::on_frame(impl FnMut(&Window))`, a per-frame hook
+handed the live `&Window`.
+
+**Ruling.** `window-probe` drives a raw `Window` loop by hand; an app that hands
+its window to `App::run` has no per-frame hook and no `&Window`. `App::on_frame`
+supplies both. (Task 4 opened with the check for an already-landed identically
+typed hook from P1; none existed, so P5 implemented it.)
+
+### P5-D6 — `auto_exclusive_zone_enable()` becomes a literal `exclusive_zone: 28`
+
+**Carried out by:** P5 (`shell/src/panel.rs`, `LayerSpec`), commit `60f06be`.
+
+**Contract says** (§3.2 ruling 2, §4.3 item 6): pre-declares the literal
+exclusive zone.
+
+**As shipped:** the panel opens with `exclusive_zone: BAR_HEIGHT` (28) rather
+than `auto_exclusive_zone_enable()`.
+
+**Ruling.** Pre-declared by contract §3.2 ruling 2 and §4.3 item 6; recorded
+here as landed.
+
+### P5-D7 — `shell/Cargo.toml` also gains `wayland-protocols-wlr`
+
+**Carried out by:** P5 (`shell/Cargo.toml`), commit `60f06be`.
+
+**Contract says** (§3.5): lists only `icedtea-ui` and `crossbeam-channel` as
+shell's additions.
+
+**As shipped:** `shell/Cargo.toml` also carries
+`wayland-protocols-wlr = { version = "0.3", features = ["client"] }`.
+
+**Ruling.** `LayerSpec`'s `layer`, `anchor` and `keyboard` fields are typed with
+`zwlr_layer_shell_v1::Layer`, `zwlr_layer_surface_v1::Anchor` and
+`zwlr_layer_surface_v1::KeyboardInteractivity`, and `icedtea-ui` re-exports none
+of them (`ui/src/wayland.rs` re-exports only `BTN_LEFT`, `MARGIN`,
+`CONFIGURE_TIMEOUT`, `LayerWindow*`, `AppState`). The dep is the same pin
+`ui/Cargo.toml` and `settings/Cargo.toml` (contract §2.1) already carry; it is
+not a GTK dependency and does not affect §4.1's audit.
+
+### P5-D8 — `Window::popup_position` and `Window::popup_probe_points`
+
+**Carried out by:** P5 (`ui/src/window/mod.rs`), commit `674a21f`.
+
+**Contract says** (M5-D9): a live window has `probe_points`/`allocation`, both
+reading `self.root` and `self.layout` — the window's tree.
+
+**As shipped:** two accessors on `Window`, in the same enumerated exception as
+P5-D1: `popup_position(key) -> Option<(i32, i32)>` (the last
+`xdg_popup.configure` position, which `Popup::position` already stores) and
+`popup_probe_points(key) -> Vec<ProbePoint>` (M5-D9's walk, run against that
+popup's root and layout). `Window::probe_points`'s body is extracted into a
+private `probe_points_of(root, layout)` both call.
+
+**Ruling.** A popup is a second surface with its own tree and its own
+compositor-assigned position, so §3.6's popover gate ("open the popover,
+activate row 0, assert `("activate", 10)`") has no way to say where row 0 is;
+hard-coding a coordinate is exactly what the M3 gate rules forbid, and deriving
+one from the anchor is wrong the moment the compositor slides a constrained
+popup. Extracting `probe_points_of` keeps one labelling rule, not two.
+
+### P5-D9 — the popover anchors on `PopupAnchorPoint::Rect`, and `PanelModel` gains `clip_rect`
+
+**Carried out by:** P5 (`shell/src/panel.rs`), commit `e2632ab`.
+
+**Contract says** (§3.4): the open is
+`Cmd::OpenPopup { anchor: PopupAnchorPoint::Node(/* the `clip` button's node */), .. }`.
+
+**As shipped:** `PanelModel` carries `pub clip_rect: Rc<Cell<Option<Rect>>>` — a
+field beyond §3.1's struct listing, and legitimately `Rc` because `PanelModel`
+never crosses a thread (only `Msg` does, and `Msg` stays `Send`) — published
+each frame by `App::on_frame` (P5-D5) from `Window::allocation("clip")`, and the
+popover opens with `PopupAnchorPoint::Rect(rect)` + `Positioner::menu(rect,
+POPOVER_SIZE)`. Everything else in §3.4 is unchanged.
+
+**Ruling.** `update` has neither a `&Window` nor a `Node`, so `PopupAnchorPoint::
+Node` is unreachable from where the command is built; a `Rect` published each
+frame from the live allocation is. (Recorded on the consistency check's ruling
+E7; it was undeclared in the plan's deviation list at freeze.)
+
+### P5-D10 — two `ListBoxC` defects recorded, not fixed
+
+**Carried out by:** P5 (recorded, and routed around by P5-D3 in
+`shell/src/panel.rs`), commit `6bac27df`.
+
+**Contract says** (§3.4): the popover body is
+`list_box(rows).on_item_activated(..)`.
+
+**As shipped:** the defects are recorded here and routed around (P5-D3); M5 is
+not the milestone that fixes them.
+
+**Ruling.** Recorded so M6 has them written down: (a) `ListBoxC::on_event` sets
+`cx.handled` on `PointerDown` with no phase guard, and P4-D19 makes a handled
+capture end the whole dispatch, so a control inside a row never receives its own
+click; (b) `row_at` is fed `Event::PointerDown::local`, which P5-D33's `aim`
+computes relative to the innermost instance, so the resolved row index is wrong
+for every row but the first.
+
+### P5-D11 — `PointerState::observe` activates on the primary button only
+
+**Carried out by:** P5 (`ui/src/widgets/mod.rs`, `PointerState::observe`),
+commit `d1768e7`.
+
+**Contract says** (toolkit): `observe` (public, in `ui/src/widgets/PointerState`)
+fired `EventKind::Click`/`:active` on any pointer button.
+
+**As shipped:** `observe` is gated on `BTN_LEFT` (GTK's `GDK_BUTTON_PRIMARY`);
+a middle/right press does not arm `:active` and a non-left release neither clears
+it nor reports a click.
+
+**Ruling.** Without it a middle-click on a window button fired both
+`close_window` (its own middle handler) and a spurious `focus_window` (the
+button's own click). All 26 `observe` callers are activate-on-primary surfaces
+(none needed any-button), so left-only is correct toolkit-wide; verified no
+regression across the full `ui` + `settings` suites. Cosmetic deltas:
+`scrollbar.rs`/`scale.rs` lose `:active` paint on a non-left drag (the drag
+still works via their own `PointerDown`), and `entry.rs`'s icon-press narrows to
+left-only (its `Selected` carried no button anyway). A 7-dimension /lex-review
+approved it. This deviation was not anticipated by the plan.
+
+### P5-D12 — the panel bar spans the layer surface via `Msg::SurfaceWidth`
+
+**Carried out by:** P5 (`shell/src/panel.rs`, `shell/src/main.rs`), commit
+`5247b12`.
+
+**Contract says** (§3.1): `PanelModel`/`Msg` do not list a surface-width field or
+message.
+
+**As shipped:** `PanelModel.bar_width` + `Msg::SurfaceWidth(i32)`, published each
+frame by `App::on_frame` from `Window::size()`, sets `#bar`'s `width_request`.
+
+**Ruling.** A plain `Box` never wires a child's `Halign`/`Hexpand` into taffy
+layout (only `CenterBox`/`Stack`/`Grid`/`Overlay` do — `ui/src/widgets/frame.rs`
+documents this), and CSS `min-width:100%` is inert under taffy's indefinite
+cross size, so a shell-side `width_request` driven by a real message is the only
+way to make the bar span the output like a taskbar; a bare `Cell` write is not
+picked up without a `Msg` re-running `view`. (The underlying `box_` hexpand gap
+is a post-M5 `ui/` follow-up.) This deviation was not anticipated by the plan.
+
+### P5-D13 — `App::on_frame` swaps each open popup's layout onto the Window for the hook span
+
+**Carried out by:** P5 (`ui/src/view/app.rs`, `ui/src/window/mod.rs`,
+`shell/src/panel.rs`), commit `674a21f`.
+
+**Contract says** (M5-D9/P5-D8): a popup has
+`popup_probe_points`/`popup_position` reading the popup's own laid-out tree.
+
+**As shipped:** `App::run` keeps each open popup's `LayoutTree` on
+`Runtime::popups` (taffy-incremental), not on the `Window` the accessors read,
+so `on_frame` `mem::swap`s each `rt.popups[i].layout` onto its `Window` popup via
+`pub(crate) Window::popup_layout(key)` immediately before `hook(&window)` and
+back after (swap-safe: no early exit between swap-in/hook/swap-out) — mirroring
+P5-D5's window-layout swap. Plus `PanelModel.open_popover_cell:
+Rc<Cell<Option<PopupKey>>>` published to the hook; `on_frame` writes the open
+popover's own `popup …` lines to a separate `$ICEDTEA_PROBE_REPORT`-derived
+`.popups` file; and an app-initiated close (2nd clip click / clear Batch) clears
+`open_popover` + cell itself (no `PopoverDismissed` returns for an app-initiated
+close).
+
+**Ruling.** The P5-D8 accessors read the `Window`'s popup tree, but the live
+laid-out tree lives on `Runtime::popups`; swapping it onto the `Window` only for
+the hook span makes the accessors read the real, incrementally laid-out tree
+without moving ownership. Additive, behind the `on_frame` hook only. This
+deviation was not anticipated by the plan.

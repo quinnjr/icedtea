@@ -684,6 +684,197 @@ fn pointer_handlers_fire_down_motion_up_in_order_with_local_coordinates() {
     );
 }
 
+/// P5-D11: `ButtonC`'s activation (the generic `EventKind::Click`, produced by
+/// the shared `PointerState::observe`) must fire on the primary button only,
+/// the way real GTK activates a `GtkButton` on `GDK_BUTTON_PRIMARY`. A middle
+/// or right press-release *inside* the button must not fire `Click`.
+///
+/// Without the guard, a middle-click on the shell panel's `window_<id>` button
+/// fires both `close_window` (its own middle-button handler) and a spurious
+/// `focus_window` (this stray `Click`); that is the exact defect Task 14
+/// surfaced.
+///
+/// mutation: drop the `button == BTN_LEFT` guard from the `PointerDown`/
+/// `PointerUp` arms of `PointerState::observe`; the middle and right releases
+/// now fire `Click` too, the log becomes `["click", "click", "click"]`, and
+/// this fails.
+#[test]
+fn a_button_activates_on_the_primary_button_only() {
+    use icedtea_ui::window::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+    use std::cell::RefCell;
+    use std::rc::Rc as StdRc;
+
+    let log: StdRc<RefCell<Vec<String>>> = StdRc::new(RefCell::new(Vec::new()));
+    let recorder = StdRc::clone(&log);
+    let clock = Rc::new(ManualClock::new());
+
+    // enter once, then three full press/release gestures inside the button:
+    // left (must click), middle (must not), right (must not).
+    let mut script = vec![ScriptStep::Event(InputEvent::pointer_enter(80.0, 20.0, 1))];
+    let mut serial = 2u32;
+    let mut time = 0u32;
+    for button in [BTN_LEFT, BTN_MIDDLE, BTN_RIGHT] {
+        for pressed in [true, false] {
+            script.push(ScriptStep::Event(InputEvent::PointerButton {
+                button,
+                pressed,
+                serial,
+                time_ms: time,
+            }));
+            serial += 1;
+            time += 1;
+        }
+    }
+    script.push(ScriptStep::Capture);
+
+    let _ = App::new(
+        (),
+        move |_m: &mut (), _msg: String| {
+            recorder.borrow_mut().push("click".to_owned());
+            Cmd::None
+        },
+        |_m: &()| -> View<String> { button("Go").on_click("go".to_owned()).id("target") },
+    )
+    .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+    .run_offscreen((160, 40), clock, script)
+    .expect("the offscreen app runs");
+
+    assert_eq!(
+        *log.borrow(),
+        vec!["click".to_owned()],
+        "only the left press-release fires Click; middle and right must not: {:?}",
+        log.borrow()
+    );
+}
+
+/// The mixed-chord case the primary-button gate in `PointerUp` owns, that
+/// `a_button_activates_on_the_primary_button_only` never drives because it
+/// only ever runs same-button gestures: a left press followed by a *different*
+/// button's release must neither fire a click nor cancel the in-progress left
+/// press. Only the trailing left release should complete the click.
+///
+/// mutation: dropping the `button == BTN_LEFT` guard from the `PointerUp` arm
+/// makes the middle release clear `pressed`, so the trailing left release
+/// yields no click -> log empty -> RED.
+#[test]
+fn a_middle_release_mid_press_does_not_cancel_or_fire_the_pending_left_click() {
+    use icedtea_ui::window::BTN_LEFT;
+    use icedtea_ui::window::pointer::BTN_MIDDLE;
+    use std::cell::RefCell;
+    use std::rc::Rc as StdRc;
+
+    let log: StdRc<RefCell<Vec<String>>> = StdRc::new(RefCell::new(Vec::new()));
+    let recorder = StdRc::clone(&log);
+    let clock = Rc::new(ManualClock::new());
+
+    let script = vec![
+        ScriptStep::Event(InputEvent::pointer_enter(80.0, 20.0, 1)),
+        ScriptStep::Event(InputEvent::PointerButton {
+            button: BTN_LEFT,
+            pressed: true,
+            serial: 2,
+            time_ms: 0,
+        }),
+        ScriptStep::Event(InputEvent::PointerButton {
+            button: BTN_MIDDLE,
+            pressed: false,
+            serial: 3,
+            time_ms: 1,
+        }),
+        ScriptStep::Event(InputEvent::PointerButton {
+            button: BTN_LEFT,
+            pressed: false,
+            serial: 4,
+            time_ms: 2,
+        }),
+        ScriptStep::Capture,
+    ];
+
+    let _ = App::new(
+        (),
+        move |_m: &mut (), _msg: String| {
+            recorder.borrow_mut().push("click".to_owned());
+            Cmd::None
+        },
+        |_m: &()| -> View<String> { button("Go").on_click("go".to_owned()).id("target") },
+    )
+    .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+    .run_offscreen((160, 40), clock, script)
+    .expect("the offscreen app runs");
+
+    assert_eq!(
+        *log.borrow(),
+        vec!["click".to_owned()],
+        "the intervening middle release must neither click nor cancel the pending \
+         left press; the trailing left release must still complete the click: {:?}",
+        log.borrow()
+    );
+}
+
+/// The other half of the `PointerUp` gate's cancel path: releasing the left
+/// button *outside* the node it was pressed on must not fire a click, even
+/// though the node still holds the grab.
+///
+/// mutation: changing `was && inside(*local)` to `was` -> this gesture would
+/// click -> RED.
+#[test]
+fn releasing_the_left_button_outside_the_node_after_a_press_inside_does_not_click() {
+    use std::cell::RefCell;
+    use std::rc::Rc as StdRc;
+
+    let log: StdRc<RefCell<Vec<String>>> = StdRc::new(RefCell::new(Vec::new()));
+    let recorder = StdRc::clone(&log);
+    let clock = Rc::new(ManualClock::new());
+
+    let script = vec![
+        // Inside the 80x60 button, centred in the 200x100 window.
+        ScriptStep::Event(InputEvent::pointer_enter(100.0, 50.0, 1)),
+        ScriptStep::Event(InputEvent::PointerButton {
+            button: icedtea_ui::window::BTN_LEFT,
+            pressed: true,
+            serial: 2,
+            time_ms: 0,
+        }),
+        // Outside the button's box before the release.
+        ScriptStep::Event(InputEvent::PointerMotion {
+            x: 190.0,
+            y: 90.0,
+            time_ms: 1,
+        }),
+        ScriptStep::Event(InputEvent::PointerButton {
+            button: icedtea_ui::window::BTN_LEFT,
+            pressed: false,
+            serial: 3,
+            time_ms: 2,
+        }),
+        ScriptStep::Capture,
+    ];
+
+    let _ = App::new(
+        (),
+        move |_m: &mut (), _msg: String| {
+            recorder.borrow_mut().push("click".to_owned());
+            Cmd::None
+        },
+        |_m: &()| -> View<String> {
+            button("Go")
+                .on_click("go".to_owned())
+                .id("target")
+                .width_request(80)
+                .height_request(60)
+        },
+    )
+    .with_sheet(CompiledSheet::compile(BUNDLED_ADWAITA_LIGHT))
+    .run_offscreen((200, 100), clock, script)
+    .expect("the offscreen app runs");
+
+    assert!(
+        log.borrow().is_empty(),
+        "a release outside the pressed node's box must not click: {:?}",
+        log.borrow()
+    );
+}
+
 /// P0-D8: hit-testing resolves to the innermost `Instance` (P5-D33), so a
 /// press on a populated container lands on the *child*. The container's own
 /// pointer handlers still fire, on the bubble.

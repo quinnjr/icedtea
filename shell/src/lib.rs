@@ -1,12 +1,9 @@
 //! `icedtea-shell` internals as a library, so integration tests can build the
-//! panel and drive the pure models directly.
+//! panel, drive the pure models and swap the command surface for a mock.
 
-pub mod bridge;
 pub mod clip_client;
 pub mod clipboard;
 pub mod compositor_client;
+pub mod panel;
+pub mod style;
 pub mod taskbar;
-
-// Re-exported so integration tests can drive real widgets without a second
-// gtk4 dependency edge.
-pub use gtk4;

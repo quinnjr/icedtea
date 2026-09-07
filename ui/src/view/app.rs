@@ -26,7 +26,7 @@ use crate::window::focus::{
 use crate::window::pointer::{ImplicitGrab, hit_chain};
 use crate::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
 use crate::window::selection::Clipboard;
-use crate::window::{InputEvent, SurfaceError};
+use crate::window::{InputEvent, SurfaceError, SurfaceTarget};
 
 /// The borrows one dispatch pass needs, minus the per-node ones.
 pub struct Dispatch<'a, Msg> {
@@ -473,6 +473,23 @@ type UpdateFn<M, Msg> = Box<dyn FnMut(&mut M, Msg) -> Cmd<Msg>>;
 type ViewFn<M, Msg> = Box<dyn Fn(&M) -> View<Msg>>;
 
 /// The Elm loop over a retained tree.
+/// What happened to one of this app's popup surfaces.
+///
+/// Contract §6 P5-D4: `Cmd::OpenPopup` produces a key the loop keeps to
+/// itself, and `InputEvent::PopupDone` is routed to the focused *controller*,
+/// so an `update` that owns the open/closed state — which contract §3.4 makes
+/// the panel's single source of truth — had no way to see either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PopupEvent {
+    /// `Cmd::OpenPopup` succeeded and this is the key it produced.
+    Opened(PopupKey),
+    /// The compositor dismissed it (`xdg_popup.popup_done`) — an outside
+    /// click, a grab break, or the parent going away. The surface is already
+    /// gone by the time the message reaches `update`.
+    Dismissed(PopupKey),
+}
+
 pub struct App<M, Msg> {
     model: M,
     /// Boxed, not a `fn` pointer (M5-D4): both M5 apps capture — settings a
@@ -490,8 +507,16 @@ pub struct App<M, Msg> {
     /// `FdReady(id)` → messages (M5-D2's `on_fd`).
     #[allow(clippy::type_complexity, reason = "one boxed closure per watched fd")]
     fd_handlers: Vec<(crate::window::WatchId, Box<dyn Fn() -> Vec<Msg>>)>,
+    /// Turns popup lifecycle into messages (M5-D4's `on_popup`).
+    popup_hook: Option<Box<dyn Fn(PopupEvent) -> Option<Msg>>>,
     /// Where `run` writes `probe`/`alloc` lines, when asked (M5-D9, P0-D4).
     probe_report: Option<std::path::PathBuf>,
+    /// Observes the live window once per rendered frame (M5-D5's `on_frame`).
+    #[allow(
+        clippy::type_complexity,
+        reason = "one boxed closure, at most one per app"
+    )]
+    frame_hook: Option<Box<dyn FnMut(&crate::window::Window)>>,
 }
 
 impl<M: std::fmt::Debug, Msg> std::fmt::Debug for App<M, Msg> {
@@ -522,6 +547,15 @@ struct Runtime<Msg> {
     /// The last pointer position in window-frame space, so a button event
     /// (which carries none) can be aimed and localised.
     last_pointer: (f32, f32),
+    /// Which surface the pointer is on, from the last `PointerEnter`.
+    ///
+    /// Contract §6 P5-D1: `route` hit-tests one retained tree, and a popup is
+    /// a second surface with its own. Wayland's own rule is the rule here —
+    /// an enter names the surface and everything up to the matching leave
+    /// belongs to it.
+    pointer_target: SurfaceTarget,
+    /// Which surface has the keyboard, from the last `KeyboardEnter`.
+    keyboard_target: SurfaceTarget,
     queue: VecDeque<Msg>,
     cmds: Vec<Cmd<Msg>>,
     timers: Vec<(Duration, Rc<dyn Fn() -> Msg>)>,
@@ -557,6 +591,12 @@ struct PopupSurface<Msg> {
     /// anchor rectangle.
     origin: (f32, f32),
     size: (u32, u32),
+    /// The payload `Cmd::OpenPopup` carried.
+    ///
+    /// Contract §6 P5-D2: kept, not dropped, so `rebuild_popups` can run it
+    /// again on every fold — an open popover tracks the model exactly as the
+    /// window's own tree does.
+    view: Rc<dyn Fn() -> View<Msg>>,
 }
 
 /// Bridges `Controller::measure` into taffy.
@@ -660,7 +700,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             icons: None,
             inbox: None,
             fd_handlers: Vec::new(),
+            popup_hook: None,
             probe_report: std::env::var_os("ICEDTEA_PROBE_REPORT").map(std::path::PathBuf::from),
+            frame_hook: None,
         }
     }
 
@@ -709,6 +751,34 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     #[must_use]
     pub fn on_fd(mut self, id: crate::window::WatchId, f: impl Fn() -> Vec<Msg> + 'static) -> Self {
         self.fd_handlers.push((id, Box::new(f)));
+        self
+    }
+
+    /// Turn popup lifecycle into messages. `None` drops the event.
+    ///
+    /// At most one hook per app; a second call replaces the first. It runs on
+    /// the loop thread, and the messages it returns are queued exactly like an
+    /// inbox message — never folded re-entrantly.
+    #[must_use]
+    pub fn on_popup(mut self, f: impl Fn(PopupEvent) -> Option<Msg> + 'static) -> Self {
+        self.popup_hook = Some(Box::new(f));
+        self
+    }
+
+    /// Observe the live window once per rendered frame.
+    ///
+    /// Runs on the loop thread after the frame is painted, with the window's
+    /// layout tree already settled, so [`Window::probe_points`] and
+    /// [`Window::allocation`] answer for what was just drawn. It may not
+    /// mutate the model and gets no way to: this is the hook M5's apps write
+    /// their `$ICEDTEA_PROBE_REPORT` lines from, and the one an app caches a
+    /// widget's allocation through. Never called by `run_offscreen`, which has
+    /// no window.
+    ///
+    /// At most one hook per app; a second call replaces the first.
+    #[must_use]
+    pub fn on_frame(mut self, f: impl FnMut(&crate::window::Window) + 'static) -> Self {
+        self.frame_hook = Some(Box::new(f));
         self
     }
 
@@ -885,6 +955,8 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
+            pointer_target: SurfaceTarget::Window,
+            keyboard_target: SurfaceTarget::Window,
             queue: VecDeque::new(),
             cmds: Vec::new(),
             timers: Vec::new(),
@@ -934,6 +1006,12 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 ScriptStep::Capture => capture = true,
                 ScriptStep::Message(msg) => rt.queue.push_back(msg),
                 ScriptStep::Event(ev) => {
+                    if let InputEvent::PopupDone(key) = &ev {
+                        close_popup(&mut rt, *key);
+                        if let Some(msg) = popup_msg(&self, PopupEvent::Dismissed(*key)) {
+                            rt.queue.push_back(msg);
+                        }
+                    }
                     let produced = route(
                         &mut rt,
                         &ev,
@@ -1011,6 +1089,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                             &mut icons,
                             &dyn_clock,
                         );
+                        if let Some(msg) = popup_msg(&self, PopupEvent::Opened(key)) {
+                            rt.queue.push_back(msg);
+                        }
                     }
                     Cmd::ClosePopup(key) => close_popup(&mut rt, key),
                     // There is still no surface to title or minimise.
@@ -1086,6 +1167,41 @@ fn rebuild<M: 'static, Msg: Clone + 'static>(
         },
     );
     containers_of(&rt.instances, &mut rt.containers);
+}
+
+/// Re-run every open popup's payload and reconcile it into its own tree.
+///
+/// The window's counterpart is [`rebuild`]; this is the same three steps --
+/// describe, reconcile, refresh containers -- for each popup surface, in the
+/// order they were opened. Cheap when nothing changed: `reconcile` diffs, and
+/// a popup whose view returns the same tree produces no ops.
+fn rebuild_popups<Msg: Clone + 'static>(
+    rt: &mut Runtime<Msg>,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clock: &Rc<dyn Clock>,
+) {
+    for index in 0..rt.popups.len() {
+        let described = (Rc::clone(&rt.popups[index].view))();
+        let mut cx = BuildCx {
+            sheet,
+            fonts,
+            icons,
+            clock,
+            env: &rt.env,
+        };
+        let popup = &mut rt.popups[index];
+        reconcile(&popup.root, &mut popup.instances, vec![described], &mut cx);
+        popup.containers.clear();
+        popup.containers.insert(
+            crate::view::render::node_addr(&popup.root),
+            Container::Box {
+                direction: crate::layout::BoxDirection::Column,
+            },
+        );
+        containers_of(&popup.instances, &mut popup.containers);
+    }
 }
 
 /// Restyle the tree under `root`, then lay it out against `size`.
@@ -1249,6 +1365,7 @@ fn open_popup<Msg: Clone + 'static>(
         // bottom-left corner.
         origin: (anchor_rect.x, anchor_rect.y + anchor_rect.height),
         size: positioner.size,
+        view: Rc::clone(view),
     };
     let described = view();
     let mut cx = BuildCx {
@@ -1283,6 +1400,11 @@ fn close_popup<Msg>(rt: &mut Runtime<Msg>, key: PopupKey) {
     if let Some(index) = rt.popups.iter().position(|p| p.key == key) {
         rt.popups.truncate(index);
     }
+}
+
+/// Ask the app's popup hook for a message, if it has one.
+fn popup_msg<M, Msg>(app: &App<M, Msg>, ev: PopupEvent) -> Option<Msg> {
+    app.popup_hook.as_ref().and_then(|f| f(ev))
 }
 
 /// Restyle, relayout and paint every open popup into `surface`, at its own
@@ -1434,12 +1556,98 @@ fn prune_hidden_focus<Msg: Clone + 'static>(rt: &mut Runtime<Msg>) {
     }
 }
 
-/// Turn one `InputEvent` into controller events and return the messages.
+/// Swap popup `index`'s retained tree into the runtime's window slots.
+///
+/// Called twice around a routing pass, so the popup's tree is what `route_surface`
+/// hit-tests, dispatches into and mutates. Destructured rather than indexed so
+/// the four swaps borrow disjoint fields of `rt`.
+fn swap_popup_tree<Msg>(rt: &mut Runtime<Msg>, index: usize) {
+    let Runtime {
+        root,
+        instances,
+        styles,
+        layout,
+        popups,
+        ..
+    } = rt;
+    let popup = &mut popups[index];
+    std::mem::swap(root, &mut popup.root);
+    std::mem::swap(instances, &mut popup.instances);
+    std::mem::swap(styles, &mut popup.styles);
+    std::mem::swap(layout, &mut popup.layout);
+}
+
+/// Route one input event to the surface it arrived on.
+///
+/// Contract §6 P5-D1. `InputEvent`'s two `Enter` variants carry a
+/// [`SurfaceTarget`]; everything after an enter belongs to that surface until
+/// the matching leave, which is how Wayland itself defines focus and is what
+/// `SurfaceTarget`'s own doc comment says. Coordinates on a popup event are
+/// already popup-surface-local, so no offset arithmetic is needed: the popup's
+/// tree starts at its own (0, 0), exactly as `paint_tree` paints it.
 #[allow(
     clippy::too_many_arguments,
     reason = "one routing pass threading the whole per-frame context"
 )]
 fn route<Msg: Clone + 'static>(
+    rt: &mut Runtime<Msg>,
+    event: &InputEvent,
+    sheet: &CompiledSheet,
+    fonts: &mut FontDatabase,
+    icons: &mut IconTheme,
+    clipboard: &mut Clipboard,
+    clock: &Rc<dyn Clock>,
+) -> Vec<Msg> {
+    let target = match event {
+        InputEvent::PointerEnter { target, .. } => {
+            rt.pointer_target = *target;
+            *target
+        }
+        InputEvent::PointerLeave => {
+            let was = rt.pointer_target;
+            rt.pointer_target = SurfaceTarget::Window;
+            was
+        }
+        InputEvent::KeyboardEnter { target, .. } => {
+            rt.keyboard_target = *target;
+            *target
+        }
+        InputEvent::KeyboardLeave => {
+            let was = rt.keyboard_target;
+            rt.keyboard_target = SurfaceTarget::Window;
+            was
+        }
+        InputEvent::Key(_) => rt.keyboard_target,
+        _ => rt.pointer_target,
+    };
+    let index = match target {
+        SurfaceTarget::Window => None,
+        // A key for a popup this app no longer retains routes nowhere rather
+        // than falling back to the window: the event belonged to a surface
+        // that is gone, and replaying it on the window would fire the wrong
+        // handler at the wrong coordinates.
+        SurfaceTarget::Popup(key) => match rt.popups.iter().position(|p| p.key == key) {
+            Some(index) => Some(index),
+            None => return Vec::new(),
+        },
+    };
+    let Some(index) = index else {
+        return route_surface(rt, event, sheet, fonts, icons, clipboard, clock);
+    };
+    swap_popup_tree(rt, index);
+    let out = route_surface(rt, event, sheet, fonts, icons, clipboard, clock);
+    // Unconditionally, with nothing fallible between the two swaps: leaving
+    // the popup's tree in the window's slots would corrupt every later frame.
+    swap_popup_tree(rt, index);
+    out
+}
+
+/// Turn one `InputEvent` into controller events and return the messages.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one routing pass threading the whole per-frame context"
+)]
+fn route_surface<Msg: Clone + 'static>(
     rt: &mut Runtime<Msg>,
     event: &InputEvent,
     _sheet: &CompiledSheet,
@@ -1724,6 +1932,7 @@ fn drain<M: 'static, Msg: Clone + 'static>(
     }
     if folded {
         rebuild(app, rt, sheet, fonts, icons, clock);
+        rebuild_popups(rt, sheet, fonts, icons, clock);
     }
     unhandled
 }
@@ -1862,6 +2071,8 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
+            pointer_target: SurfaceTarget::Window,
+            keyboard_target: SurfaceTarget::Window,
             queue: VecDeque::new(),
             cmds: Vec::new(),
             timers: Vec::new(),
@@ -1939,6 +2150,16 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 if let InputEvent::ScaleChanged(factor) = event {
                     icons.set_scale(u32::try_from(*factor).unwrap_or(1));
                 }
+                if let InputEvent::PopupDone(key) = event {
+                    // The compositor has already destroyed the surface; drop
+                    // our retained copy (and every popup opened after it, as
+                    // xdg-shell requires) before telling the model.
+                    close_popup(&mut rt, *key);
+                    window.close_popup(*key);
+                    if let Some(msg) = popup_msg(&self, PopupEvent::Dismissed(*key)) {
+                        rt.queue.push_back(msg);
+                    }
+                }
                 let produced = {
                     let clipboard = window.clipboard();
                     route(
@@ -2014,6 +2235,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                                     &clock,
                                 );
                                 window.popup_mark_dirty(key);
+                            }
+                            if let Some(msg) = popup_msg(&self, PopupEvent::Opened(key)) {
+                                rt.queue.push_back(msg);
                             }
                         }
                         Err(error) => tracing::warn!(?error, "opening a popup failed"),
@@ -2156,6 +2380,34 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                         &mut painter,
                     );
                 })?;
+            }
+
+            if let Some(hook) = self.frame_hook.as_mut() {
+                // `Window::probe_points`/`allocation` read `Window`'s own
+                // layout tree, which `App::run` otherwise never touches (its
+                // reconcile loop keeps its own on `Runtime`, alive across
+                // frames for taffy's incremental dirty tracking). Swap it in
+                // for the span of the hook, then take it back.
+                window.set_layout(std::mem::take(&mut rt.layout));
+                // The same swap for every open popup: each popup's laid-out
+                // tree lives on `rt.popups` (same taffy-incremental reason),
+                // not on the `Window` popup the hook's `popup_probe_points`
+                // reads, so without this a popover's own probe points are
+                // always empty under a windowed run (P5-D8, authorised T15
+                // extension). SWAP-SAFE: no early exit between swap-in, hook
+                // and swap-out, so the loop's trees are always restored.
+                for popup in &mut rt.popups {
+                    if let Some(win_layout) = window.popup_layout(popup.key) {
+                        std::mem::swap(&mut popup.layout, win_layout);
+                    }
+                }
+                hook(&window);
+                for popup in &mut rt.popups {
+                    if let Some(win_layout) = window.popup_layout(popup.key) {
+                        std::mem::swap(&mut popup.layout, win_layout);
+                    }
+                }
+                rt.layout = window.take_layout();
             }
         }
         if let Some(id) = inbox_watch {
@@ -2495,6 +2747,8 @@ mod tests {
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
+            pointer_target: SurfaceTarget::Window,
+            keyboard_target: SurfaceTarget::Window,
             queue: VecDeque::new(),
             cmds: Vec::new(),
             timers: Vec::new(),

@@ -1,25 +1,21 @@
-//! `icedtea-shell` — a GTK4 layer-shell panel: a window/workspace taskbar
-//! driven by `org.icedtea.Compositor`, and a clipboard popover driven by
-//! `org.icedtea.Clipboard`. All widgets live on the GTK main thread; D-Bus runs
-//! on a worker, bridged by a glib channel.
+//! `icedtea-shell` — a layer-shell panel: a window/workspace taskbar driven by
+//! `org.icedtea.Compositor`, and a clipboard popover driven by
+//! `org.icedtea.Clipboard`. One `App` on one surface, one loop thread; D-Bus
+//! runs on its own workers and reaches the loop through the inbox.
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use gtk4::prelude::*;
-use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, ListBox, MenuButton,
-    Orientation, Popover,
-};
-use gtk4_layer_shell::{Edge, Layer, LayerShell};
-
-use icedtea_shell::bridge;
 use icedtea_shell::clip_client::{self, ClipCommands, ClipProxy};
-use icedtea_shell::clipboard::{self, ClipboardModel};
+use icedtea_shell::clipboard::ClipUpdate;
 use icedtea_shell::compositor_client::{self, CompositorCommands, CompositorProxy};
-use icedtea_shell::taskbar::{self, TaskbarModel};
-
-const APP_ID: &str = "org.icedtea.Shell";
+use icedtea_shell::panel::{self, Msg, Offline, PanelModel};
+use icedtea_shell::style;
+use icedtea_shell::taskbar::CompositorUpdate;
+use icedtea_ui::text::FontDatabase;
+use icedtea_ui::view::{App, Inbox, InboxSender, PopupEvent};
+use icedtea_ui::window::Window;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -28,119 +24,221 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| load_css());
-    app.connect_activate(build_panel);
-    app.run();
+    if let Err(err) = run() {
+        tracing::error!(%err, "icedtea-shell exited");
+        std::process::exit(1);
+    }
 }
 
-fn load_css() {
-    let provider = CssProvider::new();
-    provider.load_from_data(include_str!("../style.css"));
-    if let Some(display) = gtk4::gdk::Display::default() {
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+/// Drain `rx` on its own thread, wrapping each value into a `Msg` for the
+/// app's inbox.
+///
+/// The replacement for the GLib `spawn_future_local` future `bridge.rs` used:
+/// there is no GLib main loop to post onto, and the `App`'s loop is a hand-rolled poll
+/// over the Wayland fd plus whatever `Window::watch_fd` was given. The inbox
+/// *is* that hook — `send` queues the message and writes one byte to the pipe
+/// the loop already polls.
+///
+/// `recv_blocking` rather than an async runtime: this thread has exactly one
+/// job, the D-Bus client already owns its own executor, and a blocking receive
+/// costs nothing while idle. A failed send means the app dropped its `Inbox`,
+/// which is how the thread learns to end.
+fn forward<T: Send + 'static>(
+    rx: async_channel::Receiver<T>,
+    tx: InboxSender<Msg>,
+    wrap: impl Fn(T) -> Msg + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while let Ok(value) = rx.recv_blocking() {
+            if tx.send(wrap(value)).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// The popover's anchor: the `clip` button's border box, if the window has
+/// resolved it.
+///
+/// A pure function of `Window::allocation`, so the publication is testable
+/// without a compositor. `App::run` already writes `$ICEDTEA_PROBE_REPORT`'s
+/// `probe`/`alloc` lines itself (`with_probe_report` plus the env pickup);
+/// `on_frame` must not re-derive and rewrite them itself, or every line in
+/// the report would double and a driver parsing the file would see each
+/// frame twice (consistency-check ruling E1). The only geometry `on_frame`
+/// needs to publish is this one box, into the cell `panel::update` reads as
+/// the popover's anchor rect.
+fn clip_border_box(
+    allocation: impl Fn(&str) -> Option<icedtea_ui::layout::Allocation>,
+) -> Option<icedtea_ui::layout::Rect> {
+    allocation("clip").map(|a| a.border_box)
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let wm: Rc<dyn CompositorCommands> = match CompositorProxy::new() {
+        Ok(proxy) => Rc::new(proxy),
+        Err(err) => {
+            tracing::error!(%err, "no session bus; window commands disabled");
+            Rc::new(Offline)
+        }
+    };
+    let clip: Rc<dyn ClipCommands> = match ClipProxy::new() {
+        Ok(proxy) => Rc::new(proxy),
+        Err(err) => {
+            tracing::error!(%err, "no session bus; clipboard commands disabled");
+            Rc::new(Offline)
+        }
+    };
+
+    let window = Window::open(panel::spec(), style::sheet(), FontDatabase::new())?;
+    let (inbox, tx) = Inbox::<Msg>::new()?;
+
+    // Both clients keep their own `async_channel`, their own worker thread and
+    // their own connection; only where their output lands has changed.
+    let (comp_tx, comp_rx) = async_channel::unbounded::<CompositorUpdate>();
+    let _comp_forward = forward(comp_rx, tx.clone(), |u| Msg::Compositor(Arc::new(u)));
+    compositor_client::spawn(comp_tx);
+
+    let width_tx = tx.clone();
+
+    let (clip_tx, clip_rx) = async_channel::unbounded::<ClipUpdate>();
+    let _clip_forward = forward(clip_rx, tx, |u| Msg::Clip(Arc::new(u)));
+    clip_client::spawn(clip_tx);
+
+    // P5-D9: `update` has no `&Window`, so the `clip` button's box is
+    // published here, once per frame, into the cell the model shares with
+    // it — the popover's anchor.
+    let model = PanelModel::new(wm, clip);
+    let clip_rect = model.clip_rect.clone();
+    let open_popover = model.open_popover_cell.clone();
+    let last_width = Cell::new(model.bar_width);
+    // The open popover's own probe lines, written beside `$ICEDTEA_PROBE_REPORT`
+    // (App::run owns that append-only file for the window's own lines). Only a
+    // harness sets the env var, so this is inert in a real session.
+    let popup_report = std::env::var_os("ICEDTEA_PROBE_REPORT").map(|value| {
+        let mut path = std::path::PathBuf::from(value);
+        path.set_extension("popups");
+        path
+    });
+    let mut last_popup: Vec<String> = Vec::new();
+
+    App::new(model, panel::update, panel::view)
+        .with_inbox(inbox)
+        .on_popup(|ev| match ev {
+            PopupEvent::Opened(key) => Some(Msg::PopoverOpened(key)),
+            PopupEvent::Dismissed(key) => Some(Msg::PopoverDismissed(key)),
+            // `PopupEvent` is `#[non_exhaustive]`; a future variant this
+            // shell does not yet know about is simply not turned into a
+            // message.
+            _ => None,
+        })
+        .on_frame(move |w| {
+            clip_rect.set(clip_border_box(|id| w.allocation(id)));
+            if let Some(path) = popup_report.as_ref() {
+                let lines = open_popover
+                    .get()
+                    .map(|key| panel::popup_report_lines(w, key))
+                    .unwrap_or_default();
+                panel::write_popup_report(path, &lines, &mut last_popup);
+            }
+            // M5 Task 13: `#bar`'s span. A real `Msg`, not a bare `Cell`
+            // write (`panel::PanelModel::bar_width`'s doc comment) --
+            // `on_frame` has no `&mut PanelModel`, only the inbox `update`
+            // itself is folded from. Diffed against `last_width` so an
+            // unchanging surface does not refold (and thus re-render) every
+            // single frame forever.
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "a layer surface's width is well within i32"
+            )]
+            let width = w.size().0 as i32;
+            if width != last_width.get() {
+                last_width.set(width);
+                let _ = width_tx.send(Msg::SurfaceWidth(width));
+            }
+        })
+        .run(window)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use icedtea_shell::panel::Msg;
+    use icedtea_ui::layout::{Allocation, Rect};
+    use icedtea_ui::view::Inbox;
+
+    fn alloc(x: f32, y: f32, w: f32, h: f32) -> Allocation {
+        Allocation {
+            border_box: Rect::new(x, y, w, h),
+            content_box: Rect::new(x, y, w, h),
+            border: [0.0; 4],
+            padding: [0.0; 4],
+        }
+    }
+
+    /// `on_frame`'s clip-rect publication in isolation from `Window`: the
+    /// popover's anchor is the `clip` button's border box, when the window
+    /// can resolve it.
+    #[test]
+    fn the_clip_box_is_published_when_the_button_resolves() {
+        let got = super::clip_border_box(|id| match id {
+            "clip" => Some(alloc(700.0, 0.0, 40.0, 28.0)),
+            _ => None,
+        });
+        assert_eq!(got, Some(Rect::new(700.0, 0.0, 40.0, 28.0)));
+    }
+
+    /// Before the first layout (or if the id ever goes missing), the anchor
+    /// is `None` rather than a stale box: `update` falls back to a sane
+    /// default when it is.
+    #[test]
+    fn the_clip_box_is_none_when_the_button_has_not_resolved() {
+        let got = super::clip_border_box(|_| None);
+        assert_eq!(got, None);
+    }
+
+    /// Finding F7 is an architectural invariant, not a style preference: the
+    /// shell and compositor marshal the contract types independently, so a
+    /// `SignatureMismatch` on `GetState` must take the process down —
+    /// `Restart=always` in `shell/systemd/icedtea-shell.service` is what then
+    /// replaces the stale binary with a matching build. Logging and continuing
+    /// would leave a permanently stale taskbar that systemd never restarts.
+    /// A source-level assertion because the call path needs a live session bus
+    /// and a running compositor.
+    #[test]
+    fn the_fatal_worker_path_still_exits() {
+        let source = include_str!("compositor_client.rs");
+        assert!(
+            source.contains("std::process::exit(1)"),
+            "compositor_client::spawn must still kill the process on a fatal \
+             worker error (finding F7); no part may soften this into a log"
         );
     }
-}
 
-fn build_panel(app: &Application) {
-    let window = ApplicationWindow::new(app);
-
-    // Layer-shell: a bottom bar reserving its own height.
-    window.init_layer_shell();
-    window.set_layer(Layer::Top);
-    window.auto_exclusive_zone_enable();
-    // Anchored to the top edge (plus left/right for full width). Top rather
-    // than bottom because a bottom bar lands below the visible area on displays
-    // whose viewport is shorter than the reported output (e.g. a VM console).
-    for edge in [Edge::Left, Edge::Right, Edge::Top] {
-        window.set_anchor(edge, true);
-    }
-
-    let bar = GtkBox::new(Orientation::Horizontal, 6);
-    bar.set_widget_name("bar");
-    // A layer surface anchored left/right/top takes its width from the
-    // compositor but its height from content; force a definite, visible height
-    // and initial size so it commits a real buffer (a 0-height surface never
-    // renders).
-    bar.set_size_request(-1, 28);
-    window.set_child(Some(&bar));
-    window.set_default_size(800, 28);
-
-    // The taskbar lives in its own box: `taskbar::render` clears and rebuilds
-    // its container, so it must not own the whole bar (the clipboard button is
-    // a sibling that has to survive).
-    let taskbar_box = GtkBox::new(Orientation::Horizontal, 6);
-    taskbar_box.set_hexpand(true);
-    bar.append(&taskbar_box);
-
-    wire_taskbar(&taskbar_box);
-    wire_clipboard(&bar);
-
-    window.present();
-}
-
-fn wire_taskbar(container: &GtkBox) {
-    let wm: Rc<dyn CompositorCommands> = match CompositorProxy::new() {
-        Ok(wm) => Rc::new(wm),
-        Err(err) => {
-            tracing::error!(%err, "no session bus; taskbar disabled");
-            return;
+    /// A forward thread must not outlive the app: once the `Inbox` is dropped
+    /// every `send` fails, and the thread's job is to notice and end. A leaked
+    /// thread per client would keep a D-Bus connection alive after the panel
+    /// closed.
+    #[test]
+    fn a_forward_thread_ends_when_the_app_drops_its_inbox() {
+        let (inbox, tx) = Inbox::<Msg>::new().expect("inbox");
+        let (value_tx, value_rx) = async_channel::unbounded::<u32>();
+        let handle = super::forward(value_rx, tx, Msg::WorkspaceClicked);
+        drop(inbox);
+        // Enough traffic that the thread must attempt at least one send.
+        for i in 0..4 {
+            value_tx.send_blocking(i).expect("queue");
         }
-    };
-    let model = Rc::new(RefCell::new(TaskbarModel::default()));
-    let tx = {
-        let container = container.clone();
-        let wm = wm.clone();
-        let model = model.clone();
-        bridge::channel(move |update| {
-            model.borrow_mut().apply(update);
-            taskbar::render(&model.borrow(), &container, &wm);
-        })
-    };
-    compositor_client::spawn(tx);
-}
-
-fn wire_clipboard(bar: &GtkBox) {
-    let clip: Rc<dyn ClipCommands> = match ClipProxy::new() {
-        Ok(c) => Rc::new(c),
-        Err(err) => {
-            tracing::error!(%err, "no session bus; clipboard popover disabled");
-            return;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
-    };
-    let model = Rc::new(RefCell::new(ClipboardModel::default()));
-
-    let list = ListBox::new();
-    clipboard::connect_activation(&list, clip.clone(), model.clone());
-
-    let content = GtkBox::new(Orientation::Vertical, 4);
-    content.append(&list);
-    let clear = Button::with_label("Clear");
-    {
-        let clip = clip.clone();
-        clear.connect_clicked(move |_| clip.clear());
+        assert!(
+            handle.is_finished(),
+            "the forward thread must end once the inbox is gone"
+        );
+        handle.join().expect("forward thread");
     }
-    content.append(&clear);
-
-    let popover = Popover::new();
-    popover.set_child(Some(&content));
-    let menu = MenuButton::new();
-    menu.set_label("clip");
-    menu.set_popover(Some(&popover));
-    bar.append(&menu);
-
-    let tx = {
-        let list = list.clone();
-        let clip = clip.clone();
-        let model = model.clone();
-        bridge::channel(move |update| {
-            model.borrow_mut().apply(update);
-            clipboard::render(&model.borrow(), &list, &clip);
-        })
-    };
-    clip_client::spawn(tx);
 }
