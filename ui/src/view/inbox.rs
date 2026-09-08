@@ -127,9 +127,14 @@ impl<Msg> Inbox<Msg> {
     pub fn try_recv(&self) -> Option<Msg> {
         let msg = self.rx.try_recv().ok()?;
         let mut byte = [0u8; 1];
-        // A short read or `WouldBlock` is fine: the channel is the queue, the
-        // pipe is only the wakeup, and one spurious wake costs one empty frame.
-        let _ = rustix::io::read(&self.read, &mut byte[..]);
+        // A short read or `EAGAIN`/`EINTR` is fine: the channel is the queue,
+        // the pipe is only the wakeup, and one spurious wake costs one empty
+        // frame. Any other error is unexpected on a pipe we own, so log it —
+        // behaviour is unchanged, the read is still best-effort.
+        match rustix::io::read(&self.read, &mut byte[..]) {
+            Ok(_) | Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
+            Err(err) => tracing::debug!(?err, "inbox wake-pipe read failed"),
+        }
         Some(msg)
     }
 }
@@ -145,8 +150,13 @@ impl<Msg> InboxSender<Msg> {
         self.tx.send(msg).map_err(|err| SendError(err.0))?;
         // One byte. An `EAGAIN` on a full pipe is deliberately ignored: the
         // byte already in it wakes the loop just as well, and blocking here
-        // would block a worker on the UI thread (M5-D2 §4).
-        let _ = rustix::io::write(&*self.write, b"\0");
+        // would block a worker on the UI thread (M5-D2 §4). `EINTR` is equally
+        // harmless. Any other error is unexpected, so log it — the send still
+        // succeeded (the message is on the channel) and behaviour is unchanged.
+        match rustix::io::write(&*self.write, b"\0") {
+            Ok(_) | Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
+            Err(err) => tracing::debug!(?err, "inbox wake-pipe write failed"),
+        }
         Ok(())
     }
 }

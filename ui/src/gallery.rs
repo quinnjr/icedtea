@@ -1378,6 +1378,9 @@ pub fn probe_points_of(
 
 /// The centre of a border box, floored to the pixel below.
 ///
+/// The flooring here and in `window::probe_points_of` is identical and
+/// load-bearing; keep the two in step.
+///
 /// `f32::floor` before the cast, not a bare `as i32` (which truncates toward
 /// zero) or `f32::round` (ties away from zero): both move a positive and a
 /// negative half-pixel centre in opposite directions, so shifting a box by

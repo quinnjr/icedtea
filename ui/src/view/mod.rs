@@ -1407,8 +1407,8 @@ impl<Msg: Clone + 'static> Handlers<Msg> {
     /// [`Handlers::fire_pair`] there is no `Unit` fallthrough: a `Unit`
     /// binding on a pointer kind is a builder that meant a different arity.
     ///
-    /// `button` is `0` for a motion, which carries none (P0-D2); no real
-    /// `BTN_*` code is zero.
+    /// `button` is [`BTN_NONE`](crate::window::pointer::BTN_NONE) (`0`) for a
+    /// motion, which carries none (P0-D2); no real `BTN_*` code is zero.
     #[must_use]
     pub fn fire_pair_button(&self, kind: EventKind, x: f64, y: f64, button: u32) -> Option<Msg> {
         match self.get(kind)? {

@@ -31,12 +31,10 @@ enum Msg {
 #[test]
 fn on_frame_sees_the_live_windows_probe_points() {
     let compositor = Compositor::spawn();
-    let socket = compositor
-        .socket_path()
-        .file_name()
-        .expect("socket name")
-        .to_string_lossy()
-        .to_string();
+    // The full socket path, connected by name so this test never mutates the
+    // process-global `WAYLAND_DISPLAY` beside its neighbours — `Window::open_at_path`
+    // is exactly `ui/tests/ingress.rs`'s way out of that shared environment.
+    let socket_path = compositor.socket_path().to_path_buf();
 
     let frames = Arc::new(AtomicUsize::new(0));
     let labels: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -44,9 +42,6 @@ fn on_frame_sees_the_live_windows_probe_points() {
     let labels_in = labels.clone();
 
     std::thread::spawn(move || {
-        // SAFETY: this thread is the only one that touches the environment,
-        // and it does so before opening any Wayland connection.
-        unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket) };
         let spec = SurfaceSpec {
             role: Role::Toplevel,
             size: (200, 60),
@@ -57,7 +52,8 @@ fn on_frame_sees_the_live_windows_probe_points() {
             "window { background-color: #ffffff; } \
              button { min-width: 40px; min-height: 20px; background-color: #808080; }",
         );
-        let Ok(window) = Window::open(spec, sheet, FontDatabase::new()) else {
+        let Ok(window) = Window::open_at_path(&socket_path, spec, sheet, FontDatabase::new())
+        else {
             return;
         };
         let _ = App::new(

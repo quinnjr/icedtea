@@ -231,7 +231,9 @@ impl StackC {
         self.outgoing = animated.then(|| self.visible.get());
         self.active_ms = if animated { self.duration_ms } else { 0 };
         self.visible.set(index);
-        self.progress = 0.0;
+        // An instant swap is complete the moment it is armed; only an animated
+        // one starts at 0.0 and climbs (see the matching guard in `tick`).
+        self.progress = if self.active_ms == 0 { 1.0 } else { 0.0 };
         self.started = Some(now);
         for (i, page) in pages.iter().enumerate() {
             set_visible(
@@ -325,8 +327,17 @@ impl<Msg: Clone + 'static> Controller<Msg> for StackC {
         let Some(started) = self.started else {
             return Vec::new();
         };
-        let d = f32::from(u16::try_from(self.active_ms).unwrap_or(u16::MAX)).max(1.0);
-        self.progress = (now.saturating_sub(started).as_secs_f32() * 1000.0 / d).clamp(0.0, 1.0);
+        // An instant swap (`StackTransition::None`, `active_ms == 0`) is
+        // already complete: force `progress` to 1.0 so the completion branch
+        // below fires on this first tick even under a non-advancing clock,
+        // rather than reading 0.0 from `(now - started) * 1000 / 1` when the
+        // clock has not moved since `show`.
+        self.progress = if self.active_ms == 0 {
+            1.0
+        } else {
+            let d = f32::from(u16::try_from(self.active_ms).unwrap_or(u16::MAX)).max(1.0);
+            (now.saturating_sub(started).as_secs_f32() * 1000.0 / d).clamp(0.0, 1.0)
+        };
         let visible = self.visible.get();
         {
             let pages = self.pages.borrow();

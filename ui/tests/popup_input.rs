@@ -24,9 +24,6 @@ enum Msg {
     Open,
     Opened(PopupKey),
     Dismissed(PopupKey),
-    // Only Task 1's scenario is implemented here; later tasks in this SDD
-    // exercise row-picking through this same file's `Model`/`Msg`.
-    #[allow(dead_code, reason = "used by later tasks sharing this test file")]
     Picked(u32),
 }
 
@@ -34,10 +31,6 @@ enum Msg {
 #[derive(Default)]
 struct Model {
     open: Option<PopupKey>,
-    #[allow(dead_code, reason = "used by later tasks sharing this test file")]
-    picked: Vec<u32>,
-    #[allow(dead_code, reason = "used by later tasks sharing this test file")]
-    rows: Vec<u32>,
 }
 
 fn sheet() -> CompiledSheet {
@@ -332,12 +325,10 @@ fn an_open_popup_is_rebuilt_from_the_model_every_fold() {
                 // the fold this produces is what `rebuild_popups` must pick
                 // up before the next click.
                 *swap_rows.borrow_mut() = vec![9];
-                m.rows.push(0);
                 sink.borrow_mut().push(0);
                 Cmd::None
             }
             Msg::Picked(id) => {
-                m.rows.push(id);
                 sink.borrow_mut().push(id);
                 Cmd::None
             }

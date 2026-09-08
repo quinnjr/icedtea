@@ -16,6 +16,11 @@ pub const BTN_RIGHT: u32 = 0x111;
 /// closes a window with.
 pub const BTN_MIDDLE: u32 = 0x112;
 
+/// The button code a `PointerMotion` carries — it has no button. No real Linux
+/// `BTN_*` code is 0 (they start at 0x110), so 0 is an unambiguous sentinel
+/// (P0-D2).
+pub const BTN_NONE: u32 = 0;
+
 use crate::css::node::{Node, PseudoStates};
 use crate::layout::{LayoutTree, Rect};
 use crate::window::{StyleMap, node_addr};

@@ -949,17 +949,17 @@ fn dragging_across_a_drawing_area_reports_every_pointer_phase() {
     driver.drag((x, y), target);
 
     assert!(
-        gallery.wait_msg("changed drawing_area down", REACT),
+        gallery.wait_msg_prefix("changed drawing_area down", REACT),
         "no press reached the canvas; got {:?}",
         gallery.messages()
     );
     assert!(
-        gallery.wait_msg("changed drawing_area motion", REACT),
+        gallery.wait_msg_prefix("changed drawing_area motion", REACT),
         "no motion reached the canvas; got {:?}",
         gallery.messages()
     );
     assert!(
-        gallery.wait_msg("changed drawing_area up", REACT),
+        gallery.wait_msg_prefix("changed drawing_area up", REACT),
         "no release reached the canvas; got {:?}",
         gallery.messages()
     );
@@ -1001,7 +1001,7 @@ fn a_middle_click_on_a_drawing_area_reports_the_middle_button_code() {
     driver.click_button(x, y, icedtea_ui::window::pointer::BTN_MIDDLE);
 
     assert!(
-        gallery.wait_msg("changed drawing_area up", REACT),
+        gallery.wait_msg_prefix("changed drawing_area up", REACT),
         "no release reached the canvas; got {:?}",
         gallery.messages()
     );
