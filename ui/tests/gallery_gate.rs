@@ -149,9 +149,10 @@ fn visible_in_slice(
 /// M5-D8 removed `color_dialog`, `check_button` and `scrollbar`: all three now
 /// paint at rest (`ColorDialogC::paint`, `CheckButtonC::paint`'s empty-box
 /// branch, `ScrollbarC::paint`). `color_dialog_button` was never on the list.
-/// M6-0 cleared four widget defects (above) and fixed `popover_menu_bar`'s,
-/// leaving `popover_menu` (a popup, blank by design) and `popover_menu_bar`
-/// (fixed but not locatable by this compositor-driven gate) on the list.
+/// M6-0 cleared four widget defects (above) and fixed `popover_menu_bar`'s; then
+/// M6-FUP1 fixed the probe layout that had kept `popover_menu_bar`'s short title
+/// unlocatable at page depth. The sole entry left is `popover_menu` (a popup,
+/// blank by design).
 ///
 /// Mutation check: re-add `"scrollbar"`; nothing fails, which shows the entry
 /// would now be hiding a widget that paints — that is why it is gone. The
@@ -161,43 +162,18 @@ const KNOWN_BLANK_AT_REST: &[&str] = &[
     // A popup: correctly blank until opened. `popover_menu`'s entry is the
     // closed menu, which draws nothing at rest the same way a real
     // `GtkPopoverMenu` is unmapped until its button is clicked — no rest-state
-    // paint to assert. Four of the five widgets that used to live here were
-    // cleared in M6-0 and are now held to the assertion: `link_button` (writes
-    // its label text and keeps it past reconcile via `reserved_total`),
-    // `window_controls` (min/max/close paint symbolic icons bound with
-    // `widgets::set_icon` and drawn by `paint_row`), `alert_dialog` (its
-    // gallery sample now has a height) and `font_dialog` (its chooser lists
-    // the families the database can match).
-    //
-    // `popover_menu_bar` is NOT here: it paints its titles at rest and is held
-    // to that by `the_popover_menu_bar_paints_its_titles_at_rest` below, which
-    // asserts in single-widget mode. It cannot be checked by the full-page walk
-    // above for an infrastructure reason, not a paint defect: `App::probe`'s
-    // cumulative vertical layout runs ~1.3% taller than `App::run` renders, so
-    // under the live compositor every widget paints slightly above its reported
-    // allocation, the drift growing with page depth (~0 at the top, ~44px at the
-    // bottom). Every other bottom-of-page widget is tall enough that its ink
-    // still overlaps its drifted box; this uniquely short (27px) bar with thin,
-    // centred title ink is the only one a ~44px shift clears entirely. The
-    // probe-vs-live divergence itself is a tracked follow-up, M6-FUP1 (it moves
-    // every gate's page coordinates, so fixing it is a dedicated layout task;
-    // recorded in ui/README.md's known-blank note).
+    // paint to assert. It is the sole exemption: the five widgets that used to
+    // sit here were fixed in M6-0 (`link_button` writes its label text and keeps
+    // it past reconcile via `reserved_total`; `window_controls` paints symbolic
+    // icons via `widgets::set_icon`/`paint_row`; `alert_dialog`'s gallery sample
+    // gained a height; `font_dialog`'s chooser lists the matchable families; and
+    // `popover_menu_bar`'s per-menu `item`s carry a `label`) and are now all held
+    // to the full-page assertion below. `popover_menu_bar`'s titles became
+    // locatable once M6-FUP1 made `App::probe` settle to the same layout the live
+    // app renders — before it, the probe stopped after one tick and reported every
+    // widget below a `column_view` above where the running app actually paints it.
     "popover_menu",
 ];
-
-/// Paints at rest, but skipped by the full-page walk and asserted instead by
-/// `the_popover_menu_bar_paints_its_titles_at_rest_*` in single-widget mode.
-///
-/// This is NOT "blank at rest" (that is `KNOWN_BLANK_AT_REST`): `popover_menu_bar`
-/// renders its titles. The full-page walk simply cannot locate them — `App::probe`
-/// lays the page out ~1.3% taller than `App::run` renders it, so a widget's painted
-/// ink drifts above its reported box as page depth grows (~44px at the bottom),
-/// clearing this uniquely short (27px) bar's whole box while leaving the taller
-/// widgets around it overlapping their own drifted ink. Fixing that probe-vs-live
-/// divergence moves every gate's page coordinates and is a dedicated layout
-/// follow-up (M6-FUP1, recorded in ui/README.md); until then this widget is held
-/// to the rest-paint bar out of band.
-const PAINTS_BUT_UNLOCATABLE_IN_FULL_WALK: &[&str] = &["popover_menu_bar"];
 
 /// Every own-kind entry paints something, in `theme`.
 ///
@@ -254,9 +230,7 @@ fn every_widget_renders_at_rest(theme: &str) {
             if seen.contains(&widget) {
                 continue;
             }
-            if KNOWN_BLANK_AT_REST.contains(&widget.as_str())
-                || PAINTS_BUT_UNLOCATABLE_IN_FULL_WALK.contains(&widget.as_str())
-            {
+            if KNOWN_BLANK_AT_REST.contains(&widget.as_str()) {
                 seen.push(widget);
                 continue;
             }
@@ -321,16 +295,12 @@ fn every_widget_renders_at_rest_in_the_high_contrast_theme() {
 
 /// `popover_menu_bar` paints its menu titles at rest, in `theme`.
 ///
-/// Held to the same "paints something at rest" bar as every other kind, but
-/// verified in single-widget mode (one framed entry at the page origin) rather
-/// than by `every_widget_renders_at_rest`'s full-page walk. The walk cannot see
-/// this widget's ink: `App::probe`'s cumulative vertical layout runs ~1.3%
-/// taller than `App::run` renders, so under the live compositor every widget
-/// paints a little above its reported allocation, the drift growing with page
-/// depth to ~44px at the bottom -- more than this uniquely short (27px) bar's
-/// whole box, though harmless to the taller widgets around it (see the note on
-/// `KNOWN_BLANK_AT_REST`). Single-widget mode has no long page, so the drift is
-/// ~0 and the reported box coincides with the painted ink.
+/// `every_widget_renders_at_rest`'s full-page walk already covers this widget
+/// (M6-FUP1 made `App::probe` settle to the live layout, so its short title is
+/// now locatable at page depth). This single-widget check is kept as a *fast*
+/// targeted guard: one framed entry at the page origin, ~1s, versus the full
+/// walk's minutes — a quick way to catch a `popover_menu_bar` paint regression
+/// without the whole 3-theme page.
 ///
 /// Mutation check: revert `PopoverMenuBarC`'s per-menu `label`/`reserved_total`
 /// (the M6-0 fix) so the bar trims back to 0x0 -- this fails with
