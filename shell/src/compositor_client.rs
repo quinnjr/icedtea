@@ -27,7 +27,7 @@ const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 /// far as the service manager can tell, `Restart=always` never fires and the
 /// upgraded shell binary is never picked up. A non-zero exit is the only
 /// signal that actually gets the session restarted onto the matching build,
-/// so any error out of [`run`] takes the process down with it.
+/// so any error out of `run` takes the process down with it.
 pub fn spawn(tx: Sender<CompositorUpdate>) {
     std::thread::spawn(move || {
         zbus::block_on(async move {

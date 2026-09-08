@@ -22,7 +22,7 @@
 //! page list.
 //!
 //! Visibility: an inactive page is `display: none`, not merely marked with a
-//! `hidden` class -- see [`set_visible`], which records both. That is what
+//! `hidden` class -- see `set_visible`, which records both. That is what
 //! keeps a stack behaving like `GtkStack` for layout, paint *and* pointer
 //! dispatch; the class on its own left every page laid out and hit-tested.
 

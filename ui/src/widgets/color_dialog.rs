@@ -198,7 +198,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for ColorDialogButtonC {
         Vec::new()
     }
 
-    /// The same floor `build` puts on the node: [`SWATCH_BUTTON_MIN`].
+    /// The same floor `build` puts on the node: `SWATCH_BUTTON_MIN`.
     ///
     /// Unlike `ScrollbarC`/`ScaleC`'s chrome, `button` is a *synced* subnode
     /// here (`build`'s comment) — hit-testing needs it laid out — so `node`
