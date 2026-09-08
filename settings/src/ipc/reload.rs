@@ -57,15 +57,27 @@ pub fn spawn(
     let signal_tx = tx.clone();
     // The signal subscription is its own thread so a long blocking
     // `ReloadConfig` cannot delay a `ConfigReloaded` and vice versa.
-    std::thread::Builder::new()
-        .name("settings-config-reloaded".to_string())
-        .spawn(move || watch_config_reloaded(&signal_tx))
-        .map_or_else(
-            |err| tracing::warn!(%err, "no ConfigReloaded watcher thread"),
-            drop,
-        );
+    spawn_watch_on_bus(signal_tx, None);
 
     spawn_worker(rx, tx)
+}
+
+/// Spawn the `ConfigReloaded` watcher thread, against `address` when named or
+/// `$DBUS_SESSION_BUS_ADDRESS` (via `connect_with_timeout`) when `None`.
+///
+/// The `address` seam mirrors [`spawn_worker_on_bus`] and exists for the same
+/// reason: a hermetic test can point the watcher at a private bus it owns
+/// (`settings/tests/reload_watch.rs`) instead of the developer's live session
+/// bus. Production always passes `None`.
+pub fn spawn_watch_on_bus(
+    tx: InboxSender<Msg>,
+    address: Option<String>,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("settings-config-reloaded".to_string())
+        .spawn(move || watch_config_reloaded(&tx, address.as_deref()))
+        .map_err(|err| tracing::warn!(%err, "no ConfigReloaded watcher thread"))
+        .ok()
 }
 
 /// The request-serving half of [`spawn`], without the `ConfigReloaded`
@@ -131,9 +143,15 @@ pub fn spawn_worker_on_bus(
 /// Every failure — no session bus, no compositor, a stream error — ends the
 /// watcher quietly: the app stays usable without it. Nothing here panics on a
 /// malformed signal body, because the body is never deserialised.
-fn watch_config_reloaded(tx: &InboxSender<Msg>) {
+///
+/// `address` selects the bus: `None` is the session bus (production), `Some`
+/// is a named address a test owns (see [`spawn_watch_on_bus`]).
+fn watch_config_reloaded(tx: &InboxSender<Msg>, address: Option<&str>) {
     let outcome = zbus::block_on(async {
-        let conn = connect_with_timeout()?;
+        let conn = match address {
+            Some(addr) => zbus::connection::Builder::address(addr)?.build().await?,
+            None => connect_with_timeout()?,
+        };
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface(COMPOSITOR_IFACE)?

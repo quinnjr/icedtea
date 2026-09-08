@@ -3,7 +3,6 @@
 //! `org.icedtea.Clipboard`. One `App` on one surface, one loop thread; D-Bus
 //! runs on its own workers and reaches the loop through the inbox.
 
-use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -49,69 +48,76 @@ fn forward<T: Send + 'static>(
     wrap: impl Fn(T) -> Msg + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        while let Ok(value) = rx.recv_blocking() {
-            if tx.send(wrap(value)).is_err() {
-                break;
+        loop {
+            match rx.recv_blocking() {
+                Ok(value) => {
+                    if tx.send(wrap(value)).is_err() {
+                        // The app dropped its `Inbox`: the expected shutdown
+                        // path, so this stays quiet.
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // The D-Bus worker's sender dropped — the worker thread
+                    // died. For `clip_client` this is non-fatal, so the panel
+                    // is otherwise left with a permanently stale pipeline and
+                    // no trace; log it so a dead worker is visible.
+                    tracing::warn!(
+                        "a D-Bus worker's channel closed; its updates have stopped reaching the panel"
+                    );
+                    break;
+                }
             }
         }
     })
 }
 
-/// The popover's anchor: the `clip` button's border box, if the window has
-/// resolved it.
-///
-/// A pure function of `Window::allocation`, so the publication is testable
-/// without a compositor. `App::run` already writes `$ICEDTEA_PROBE_REPORT`'s
-/// `probe`/`alloc` lines itself (`with_probe_report` plus the env pickup);
-/// `on_frame` must not re-derive and rewrite them itself, or every line in
-/// the report would double and a driver parsing the file would see each
-/// frame twice (consistency-check ruling E1). The only geometry `on_frame`
-/// needs to publish is this one box, into the cell `panel::update` reads as
-/// the popover's anchor rect.
-fn clip_border_box(
-    allocation: impl Fn(&str) -> Option<icedtea_ui::layout::Allocation>,
-) -> Option<icedtea_ui::layout::Rect> {
-    allocation("clip").map(|a| a.border_box)
-}
-
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let window = Window::open(panel::spec(), style::sheet(), FontDatabase::new())?;
+    let (inbox, tx) = Inbox::<Msg>::new()?;
+    let width_tx = tx.clone();
+
+    // Each client's proxy, forward thread and worker are created together: when
+    // `*Proxy::new()` fails (no session bus) the arm installs `Offline` and
+    // starts no worker at all. Spawning a worker anyway would run a
+    // `Connection::session()` that fails the very same way — and the compositor
+    // worker's `process::exit(1)` (finding F7) would then crash-loop the whole
+    // panel under systemd `Restart=always`, taking the working clipboard half
+    // down with it, instead of degrading gracefully behind `Offline`.
     let wm: Rc<dyn CompositorCommands> = match CompositorProxy::new() {
-        Ok(proxy) => Rc::new(proxy),
+        Ok(proxy) => {
+            let (comp_tx, comp_rx) = async_channel::unbounded::<CompositorUpdate>();
+            let _comp_forward = forward(comp_rx, tx.clone(), |u| Msg::Compositor(Arc::new(u)));
+            compositor_client::spawn(comp_tx);
+            Rc::new(proxy)
+        }
         Err(err) => {
             tracing::error!(%err, "no session bus; window commands disabled");
             Rc::new(Offline)
         }
     };
     let clip: Rc<dyn ClipCommands> = match ClipProxy::new() {
-        Ok(proxy) => Rc::new(proxy),
+        Ok(proxy) => {
+            let (clip_tx, clip_rx) = async_channel::unbounded::<ClipUpdate>();
+            let _clip_forward = forward(clip_rx, tx.clone(), |u| Msg::Clip(Arc::new(u)));
+            clip_client::spawn(clip_tx);
+            Rc::new(proxy)
+        }
         Err(err) => {
             tracing::error!(%err, "no session bus; clipboard commands disabled");
             Rc::new(Offline)
         }
     };
 
-    let window = Window::open(panel::spec(), style::sheet(), FontDatabase::new())?;
-    let (inbox, tx) = Inbox::<Msg>::new()?;
-
-    // Both clients keep their own `async_channel`, their own worker thread and
-    // their own connection; only where their output lands has changed.
-    let (comp_tx, comp_rx) = async_channel::unbounded::<CompositorUpdate>();
-    let _comp_forward = forward(comp_rx, tx.clone(), |u| Msg::Compositor(Arc::new(u)));
-    compositor_client::spawn(comp_tx);
-
-    let width_tx = tx.clone();
-
-    let (clip_tx, clip_rx) = async_channel::unbounded::<ClipUpdate>();
-    let _clip_forward = forward(clip_rx, tx, |u| Msg::Clip(Arc::new(u)));
-    clip_client::spawn(clip_tx);
-
-    // P5-D9: `update` has no `&Window`, so the `clip` button's box is
-    // published here, once per frame, into the cell the model shares with
-    // it — the popover's anchor.
+    // P5-D9: `update` has no `&Window`, so the `clip` button's box is published
+    // once per frame into the cell the model shares with it — the popover's
+    // anchor. The whole frame hook is `panel::frame_hook`, the one factory the
+    // integration harness calls too (M5 finding #3), so there is a single
+    // source of truth for what a frame publishes.
     let model = PanelModel::new(wm, clip);
     let clip_rect = model.clip_rect.clone();
     let open_popover = model.open_popover_cell.clone();
-    let last_width = Cell::new(model.bar_width);
+    let bar_width = model.bar_width;
     // The open popover's own probe lines, written beside `$ICEDTEA_PROBE_REPORT`
     // (App::run owns that append-only file for the window's own lines). Only a
     // harness sets the env var, so this is inert in a real session.
@@ -120,7 +126,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         path.set_extension("popups");
         path
     });
-    let mut last_popup: Vec<String> = Vec::new();
 
     App::new(model, panel::update, panel::view)
         .with_inbox(inbox)
@@ -132,31 +137,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // message.
             _ => None,
         })
-        .on_frame(move |w| {
-            clip_rect.set(clip_border_box(|id| w.allocation(id)));
-            if let Some(path) = popup_report.as_ref() {
-                let lines = open_popover
-                    .get()
-                    .map(|key| panel::popup_report_lines(w, key))
-                    .unwrap_or_default();
-                panel::write_popup_report(path, &lines, &mut last_popup);
-            }
-            // M5 Task 13: `#bar`'s span. A real `Msg`, not a bare `Cell`
-            // write (`panel::PanelModel::bar_width`'s doc comment) --
-            // `on_frame` has no `&mut PanelModel`, only the inbox `update`
-            // itself is folded from. Diffed against `last_width` so an
-            // unchanging surface does not refold (and thus re-render) every
-            // single frame forever.
-            #[allow(
-                clippy::cast_possible_wrap,
-                reason = "a layer surface's width is well within i32"
-            )]
-            let width = w.size().0 as i32;
-            if width != last_width.get() {
-                last_width.set(width);
-                let _ = width_tx.send(Msg::SurfaceWidth(width));
-            }
-        })
+        .on_frame(panel::frame_hook(
+            clip_rect,
+            open_popover,
+            popup_report,
+            width_tx,
+            bar_width,
+        ))
         .run(window)?;
     Ok(())
 }
@@ -178,12 +165,13 @@ mod tests {
         }
     }
 
-    /// `on_frame`'s clip-rect publication in isolation from `Window`: the
+    /// `frame_hook`'s clip-rect publication in isolation from `Window`: the
     /// popover's anchor is the `clip` button's border box, when the window
-    /// can resolve it.
+    /// can resolve it. (`clip_border_box` now lives in the lib alongside
+    /// `frame_hook`, its sole non-test caller.)
     #[test]
     fn the_clip_box_is_published_when_the_button_resolves() {
-        let got = super::clip_border_box(|id| match id {
+        let got = icedtea_shell::panel::clip_border_box(|id| match id {
             "clip" => Some(alloc(700.0, 0.0, 40.0, 28.0)),
             _ => None,
         });
@@ -195,7 +183,7 @@ mod tests {
     /// default when it is.
     #[test]
     fn the_clip_box_is_none_when_the_button_has_not_resolved() {
-        let got = super::clip_border_box(|_| None);
+        let got = icedtea_shell::panel::clip_border_box(|_| None);
         assert_eq!(got, None);
     }
 

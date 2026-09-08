@@ -210,6 +210,67 @@ pub fn valid_hex(s: &str) -> bool {
 /// The bar's allowed `position` values.
 pub const BAR_POSITIONS: [&str; 2] = ["top", "bottom"];
 
+/// Image extensions the wallpaper field accepts, lower-case.
+///
+/// The compositor's wallpaper worker decodes with the same set; anything
+/// outside it would be accepted at the UI and silently ignored there, which is
+/// what the inline error the Appearance `Entry` shows exists to prevent. It
+/// lives here in the toolkit-free core (not on the UI page) so the IPC workers
+/// (`ipc::fs`, `ipc::portal`) can reach it without depending on a page.
+pub const WALLPAPER_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "bmp"];
+
+/// Validate a typed or portal-supplied wallpaper path.
+///
+/// `Ok(path)` is what goes into `working.appearance.wallpaper`; `Err(message)`
+/// is what the page shows beside the field and is never written to the model.
+/// The caller has already decided that an empty string means "no wallpaper",
+/// so this function's caller never passes one.
+///
+/// Untrusted input: the string comes from a text field or a portal reply, so
+/// every failure is a message and never a panic.
+pub fn validate_wallpaper(text: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a path to an image".to_string());
+    }
+    // A relative path is stored *verbatim* nowhere: the compositor resolves
+    // what it reads against its own working directory, which is not this
+    // app's, so `wall.png` validated here and then silently never loaded
+    // there. Resolved against the directory the user typed it in, and
+    // canonicalised when the filesystem allows, so what reaches the config is
+    // a path anybody can open.
+    let typed = std::path::PathBuf::from(trimmed);
+    let path = if typed.is_absolute() {
+        typed
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&typed))
+            .map_err(|_| format!("Cannot resolve a relative path: {trimmed}"))?
+    };
+    let meta = std::fs::metadata(&path).map_err(|_| format!("No such file: {trimmed}"))?;
+    if !meta.is_file() {
+        return Err(format!("Not a file: {trimmed}"));
+    }
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !WALLPAPER_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!(
+            "Unsupported image type: {}",
+            if ext.is_empty() {
+                "no extension".to_string()
+            } else {
+                format!(".{ext}")
+            }
+        ));
+    }
+    // `canonicalize` also flattens `..` and follows symlinks; when the
+    // filesystem refuses (a path that stops resolving between the two calls),
+    // the absolutised path is already correct enough to store.
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,6 +13,57 @@ pub mod canvas;
 pub mod controls;
 pub mod state;
 
+/// Shared `Head`/`Mode` test fixtures for this page's submodules.
+///
+/// The four test modules under `pages::displays` (`mod`, `canvas`, `state`,
+/// `controls`) used to each carry their own `head`/`mode` builders with
+/// drifting signatures; this is the single home they now share.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use crate::outputs::{Head, Mode};
+
+    /// A `Mode` with the given geometry.
+    #[must_use]
+    pub(crate) fn mode(w: i32, h: i32, refresh_mhz: i32, preferred: bool) -> Mode {
+        Mode {
+            width: w,
+            height: h,
+            refresh_mhz,
+            preferred,
+        }
+    }
+
+    /// A `Head` advertising exactly `modes` (its `current_mode` is the first),
+    /// named `name`, positioned at (`x`, `y`), scale 1.0, transform 0.
+    #[must_use]
+    pub(crate) fn head_with_modes(
+        name: &str,
+        modes: Vec<Mode>,
+        x: i32,
+        y: i32,
+        enabled: bool,
+    ) -> Head {
+        let current_mode = modes.first().copied();
+        Head {
+            name: name.to_string(),
+            description: format!("{name} display"),
+            enabled,
+            modes,
+            current_mode,
+            x,
+            y,
+            scale: 1.0,
+            transform: 0,
+        }
+    }
+
+    /// A single-mode `Head`: `w`x`h`@60Hz (preferred) at (`x`, `y`).
+    #[must_use]
+    pub(crate) fn head(name: &str, w: i32, h: i32, x: i32, y: i32, enabled: bool) -> Head {
+        head_with_modes(name, vec![mode(w, h, 60_000, true)], x, y, enabled)
+    }
+}
+
 use icedtea_ui::layout::Align;
 use icedtea_ui::view::View;
 use icedtea_ui::view::builders::{BoxExt, box_, button, label};
@@ -292,27 +343,12 @@ pub fn on_outputs(m: &mut SettingsModel, msg: &OutputsMsg) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outputs::{Head, Mode, OutputsMsg};
+    use crate::outputs::OutputsMsg;
+    use crate::pages::displays::fixtures;
     use crate::pages::displays::state::baseline_edit;
 
-    fn head(name: &str, enabled: bool) -> Head {
-        let mode = Mode {
-            width: 1920,
-            height: 1080,
-            refresh_mhz: 60_000,
-            preferred: true,
-        };
-        Head {
-            name: name.to_string(),
-            description: format!("{name} display"),
-            enabled,
-            modes: vec![mode],
-            current_mode: Some(mode),
-            x: 0,
-            y: 0,
-            scale: 1.0,
-            transform: 0,
-        }
+    fn head(name: &str, enabled: bool) -> crate::outputs::Head {
+        fixtures::head(name, 1920, 1080, 0, 0, enabled)
     }
 
     /// A model with one enabled head and a pending, unapplied edit.

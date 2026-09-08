@@ -245,17 +245,9 @@ pub fn spawn_window_probe(
     theme: &std::path::Path,
     report: &std::path::Path,
 ) -> Reaper {
-    Reaper(
-        Command::new(env!("CARGO_BIN_EXE_window-probe"))
-            .env("WAYLAND_DISPLAY", socket)
-            .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
-            .env("ICEDTEA_UI_THEME", theme)
-            .env("ICEDTEA_PROBE_MODE", mode)
-            .env("ICEDTEA_PROBE_REPORT", report)
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn window-probe"),
-    )
+    // Delegate so there is one env list: the extra-argv form used to omit
+    // `XDG_RUNTIME_DIR`, which only this one carried.
+    spawn_window_probe_with(socket, mode, theme, report, &[])
 }
 
 /// `spawn_window_probe`, plus extra argv flags.
@@ -275,6 +267,7 @@ pub fn spawn_window_probe_with(
         Command::new(env!("CARGO_BIN_EXE_window-probe"))
             .args(args)
             .env("WAYLAND_DISPLAY", socket)
+            .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
             .env("ICEDTEA_UI_THEME", theme)
             .env("ICEDTEA_PROBE_MODE", mode)
             .env("ICEDTEA_PROBE_REPORT", report)
@@ -585,16 +578,31 @@ impl GalleryProc {
         self.messages.lock().expect("message log").clone()
     }
 
-    /// Wait until some message line starts with `needle`, or `timeout`
-    /// passes. A prefix rather than an exact match: `drawing_area`'s
-    /// per-phase lines carry coordinates and a button code after the phase
-    /// name, which a caller asserting only on the phase cannot spell out in
-    /// full.
+    /// Wait until some message line equals `needle` exactly, or `timeout`
+    /// passes.
+    ///
+    /// Exact so a `"selected list_view 1"` cannot be satisfied by a
+    /// `"selected list_view 12"`. A caller that must match only a line's prefix
+    /// — `drawing_area`'s per-phase lines carry coordinates and a button code
+    /// after the phase name — uses [`GalleryProc::wait_msg_prefix`] instead.
     #[must_use]
     pub fn wait_msg(&self, needle: &str, timeout: Duration) -> bool {
+        self.wait_msg_matching(timeout, |line| line == needle)
+    }
+
+    /// Wait until some message line starts with `prefix`, or `timeout` passes.
+    ///
+    /// For lines with a variable tail the caller cannot spell out in full,
+    /// such as `drawing_area`'s `"changed drawing_area down <x> <y> <b>"`.
+    #[must_use]
+    pub fn wait_msg_prefix(&self, prefix: &str, timeout: Duration) -> bool {
+        self.wait_msg_matching(timeout, |line| line.starts_with(prefix))
+    }
+
+    fn wait_msg_matching(&self, timeout: Duration, pred: impl Fn(&str) -> bool) -> bool {
         let started = Instant::now();
         loop {
-            if self.messages().iter().any(|line| line.starts_with(needle)) {
+            if self.messages().iter().any(|line| pred(line)) {
                 return true;
             }
             if started.elapsed() >= timeout {

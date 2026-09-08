@@ -7,14 +7,14 @@
 //! having no reconciler, not a design (spec D9).
 
 use std::cell::{Cell, RefCell};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use icedtea_contract::ClipEntry;
 use icedtea_ui::layout::{Align, Rect};
 use icedtea_ui::view::builders::{box_, button};
-use icedtea_ui::view::{Cmd, View};
+use icedtea_ui::view::{Cmd, InboxSender, View};
 use icedtea_ui::widgets::Orientation;
 use icedtea_ui::window::pointer::BTN_MIDDLE;
 use icedtea_ui::window::popup::{PopupAnchorPoint, PopupKey, Positioner};
@@ -274,9 +274,9 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
                 let anchor = m.clip_rect.get().unwrap_or_else(|| {
                     #[allow(
                         clippy::cast_precision_loss,
-                        reason = "BAR_HEIGHT is a small positive constant"
+                        reason = "the bar width and BAR_HEIGHT are small positive constants"
                     )]
-                    Rect::new(0.0, 0.0, 1.0, m.bar_height as f32)
+                    Rect::new(m.bar_width as f32 - 1.0, 0.0, 1.0, m.bar_height as f32)
                 });
                 let history = m.history.clone();
                 Cmd::OpenPopup {
@@ -359,7 +359,10 @@ fn workspaces(m: &PanelModel) -> View<Msg> {
         .map(|ws| {
             let id = ws.id;
             let label = if ws.name.is_empty() {
-                (id + 1).to_string()
+                // `saturating_add`, not `id + 1`: an unnamed workspace whose id
+                // is `u32::MAX` would otherwise overflow-panic in debug and
+                // wrap to `0` in release.
+                id.saturating_add(1).to_string()
             } else {
                 ws.name.clone()
             };
@@ -377,6 +380,20 @@ fn workspaces(m: &PanelModel) -> View<Msg> {
     box_(Orientation::Horizontal, buttons).id("workspaces")
 }
 
+/// Clamp an attacker-controlled label to something text-shaping can survive
+/// every frame: at most 256 characters (on char boundaries), with control
+/// characters and newlines stripped.
+///
+/// Window titles, app ids and clipboard previews are unbounded and hostile. CSS
+/// ellipsize only clips what is *rendered* — the full string still reaches
+/// text-shaping on every frame — so a multi-megabyte or pathological title can
+/// stall or OOM the panel into a restart loop. The old GTK panel's label
+/// ellipsization bounded this implicitly; the migration dropped it, so the cap
+/// lives here.
+fn clamp_label(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(256).collect()
+}
+
 /// One button per window, keyed by window id.
 ///
 /// `hexpand` lives here, not on a wrapper: the GTK panel kept the taskbar in
@@ -392,10 +409,13 @@ fn windows(m: &PanelModel) -> View<Msg> {
         .iter()
         .map(|w| {
             let id = w.id.0;
+            // Both sources are unbounded, attacker-controlled strings; clamp
+            // before they reach text-shaping (see `clamp_label`). The
+            // title-then-app_id fallback is unchanged.
             let label = if w.title.is_empty() {
-                w.app_id.clone()
+                clamp_label(&w.app_id)
             } else {
-                w.title.clone()
+                clamp_label(&w.title)
             };
             let mut view = button(&label)
                 .key(u64::from(id))
@@ -447,10 +467,13 @@ pub fn popover_rows(entries: &[ClipEntry]) -> View<Msg> {
         .map(|entry| {
             let id = entry.id;
             let pinned = entry.pinned;
+            // Attacker-controlled and unbounded, same as a window title: clamp
+            // it before text-shaping (see `clamp_label`).
+            let preview = clamp_label(&entry.preview);
             box_(
                 Orientation::Horizontal,
                 [
-                    button(&entry.preview)
+                    button(&preview)
                         .id(&format!("history_open_{id}"))
                         .hexpand(true)
                         .halign(Align::Start)
@@ -481,9 +504,29 @@ pub fn popover_rows(entries: &[ClipEntry]) -> View<Msg> {
 }
 
 /// Contract §3.4's spelling, for callers that do hold the model.
+///
+/// Test-only: production builds the popover body from the shared `history`
+/// mirror via `popover_rows` inside `update` (a `Cmd::OpenPopup` payload cannot
+/// borrow the model), so the only callers of this model-borrowing convenience
+/// are the unit tests below.
+#[cfg(test)]
 #[must_use]
 pub fn popover_body(m: &PanelModel) -> View<Msg> {
     popover_rows(&m.history.borrow())
+}
+
+/// The popover's anchor: the `clip` button's border box, if the window has
+/// resolved it.
+///
+/// A pure function of `Window::allocation`, so the publication is testable
+/// without a compositor. Before the first layout (or if the id ever goes
+/// missing) it is `None` rather than a stale box, and `update` falls back to a
+/// sane default.
+#[must_use]
+pub fn clip_border_box(
+    allocation: impl Fn(&str) -> Option<icedtea_ui::layout::Allocation>,
+) -> Option<Rect> {
+    allocation("clip").map(|a| a.border_box)
 }
 
 /// The open popover's own probe points, as `popup <label> <x> <y>` lines in
@@ -528,9 +571,60 @@ pub fn write_popup_report(path: &Path, lines: &[String], last: &mut Vec<String>)
     } else {
         lines.join("\n") + "\n"
     };
-    if std::fs::write(path, body).is_ok() {
-        last.clear();
-        last.extend_from_slice(lines);
+    match std::fs::write(path, body) {
+        Ok(()) => {
+            last.clear();
+            last.extend_from_slice(lines);
+        }
+        // A harness's probe file failed to write: surface it here so the
+        // failure is diagnosable, rather than as a downstream `wait_for`
+        // timeout with no cause. `last` is left untouched, so the next frame
+        // retries.
+        Err(err) => tracing::warn!(?path, %err, "failed to write popup probe report"),
+    }
+}
+
+/// The `App::on_frame` hook the panel installs, as one factory both the binary
+/// (`main.rs`) and the integration harness (`shell/tests/support/mod.rs`) call,
+/// so there is a single source of truth for what a frame publishes rather than
+/// two hand-copied closures that drift (M5 finding #3).
+///
+/// Each frame it: republishes `#clip`'s border box into `clip_rect` (the anchor
+/// `update` reads for `Cmd::OpenPopup`, since `update` has no `&Window`); when
+/// `popup_report` is set — only a harness sets `$ICEDTEA_PROBE_REPORT` — writes
+/// the open popover's probe lines, deduped against an internally-held `last`;
+/// and forwards a `Msg::SurfaceWidth` when the surface's committed width
+/// changes, diffed against an internally-held last width so an unchanging
+/// surface does not refold (and thus re-render) every frame forever. The width
+/// must arrive as a real `Msg` fold, not a bare `Cell` write, because
+/// `on_frame` has no `&mut PanelModel` (see `PanelModel::bar_width`).
+pub fn frame_hook(
+    clip_rect: Rc<Cell<Option<Rect>>>,
+    open_popover: Rc<Cell<Option<PopupKey>>>,
+    popup_report: Option<PathBuf>,
+    width_tx: InboxSender<Msg>,
+    bar_width: i32,
+) -> impl FnMut(&Window) {
+    let mut last_width = bar_width;
+    let mut last_popup: Vec<String> = Vec::new();
+    move |w: &Window| {
+        clip_rect.set(clip_border_box(|id| w.allocation(id)));
+        if let Some(path) = popup_report.as_ref() {
+            let lines = open_popover
+                .get()
+                .map(|key| popup_report_lines(w, key))
+                .unwrap_or_default();
+            write_popup_report(path, &lines, &mut last_popup);
+        }
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "a layer surface's width is well within i32"
+        )]
+        let width = w.size().0 as i32;
+        if width != last_width {
+            last_width = width;
+            let _ = width_tx.send(Msg::SurfaceWidth(width));
+        }
     }
 }
 
@@ -576,23 +670,25 @@ mod tests {
         }
     }
 
+    /// Records `(op, id, on)`. The `on` flag carries `pin`'s direction so a
+    /// test can assert it; non-pin calls use `false` as a sentinel.
     #[derive(Default)]
     pub(crate) struct MockClip {
-        pub(crate) calls: RefCell<Vec<(String, u64)>>,
+        pub(crate) calls: RefCell<Vec<(String, u64, bool)>>,
     }
 
     impl ClipCommands for MockClip {
         fn activate(&self, id: u64) {
-            self.calls.borrow_mut().push(("activate".into(), id));
+            self.calls.borrow_mut().push(("activate".into(), id, false));
         }
-        fn pin(&self, id: u64, _on: bool) {
-            self.calls.borrow_mut().push(("pin".into(), id));
+        fn pin(&self, id: u64, on: bool) {
+            self.calls.borrow_mut().push(("pin".into(), id, on));
         }
         fn remove(&self, id: u64) {
-            self.calls.borrow_mut().push(("remove".into(), id));
+            self.calls.borrow_mut().push(("remove".into(), id, false));
         }
         fn clear(&self) {
-            self.calls.borrow_mut().push(("clear".into(), 0));
+            self.calls.borrow_mut().push(("clear".into(), 0, false));
         }
     }
 
@@ -1096,7 +1192,7 @@ mod tests {
         run_tasks(cmd);
         assert_eq!(
             clip.calls.borrow().as_slice(),
-            [("activate".to_string(), 10)]
+            [("activate".to_string(), 10, false)]
         );
     }
 
@@ -1137,10 +1233,42 @@ mod tests {
         assert_eq!(
             clip.calls.borrow().as_slice(),
             [
-                ("pin".to_string(), 10),
-                ("remove".to_string(), 10),
-                ("clear".to_string(), 0)
-            ]
+                ("pin".to_string(), 10, true),
+                ("remove".to_string(), 10, false),
+                ("clear".to_string(), 0, false)
+            ],
+            "pin must forward `pinned: true` for an unpinned entry"
+        );
+    }
+
+    /// The pin *direction* reaches the clip surface both ways: `update`
+    /// forwards `ClipPinToggled`'s `pinned` flag verbatim to `pin(id, on)`, so
+    /// a regression that always pins `true` (or stops negating `pinned`) is
+    /// caught rather than silently passing.
+    #[test]
+    fn pin_toggle_forwards_its_direction_to_the_clip_surface() {
+        let (mut m, _, clip) = with_history(vec![clip_entry(10, "copied text", false)]);
+        run_tasks(update(
+            &mut m,
+            Msg::ClipPinToggled {
+                id: 10,
+                pinned: true,
+            },
+        ));
+        run_tasks(update(
+            &mut m,
+            Msg::ClipPinToggled {
+                id: 10,
+                pinned: false,
+            },
+        ));
+        assert_eq!(
+            clip.calls.borrow().as_slice(),
+            [
+                ("pin".to_string(), 10, true),
+                ("pin".to_string(), 10, false)
+            ],
+            "pin must forward its direction, not a constant"
         );
     }
 

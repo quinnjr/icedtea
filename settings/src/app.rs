@@ -715,18 +715,29 @@ pub fn state_report_lines(m: &SettingsModel) -> Vec<String> {
 /// What the footer's status label shows, in priority order: whatever the app
 /// last said, then the standing degraded-worker warning, then the dirty hint.
 ///
-/// The warning outranks "Unsaved changes" because it is the reason the
-/// unsaved changes cannot be saved, and no fold clears it — it is not a
-/// status line but a fact about this process.
+/// The warning outranks "Unsaved changes" only when a **save-path** worker is
+/// down (the reload or fs worker), because that is the reason the unsaved
+/// changes cannot be saved; no fold clears it — it is not a status line but a
+/// fact about this process. A dead *portal* worker (the file chooser) does not
+/// affect saving, so it must not mask the dirty hint: when only the portal
+/// worker is down, "Unsaved changes" shows, and the portal warning sits below
+/// it (shown when the model is clean).
 #[must_use]
 pub fn footer_text(m: &SettingsModel) -> &str {
     if !m.status.is_empty() {
         return &m.status;
     }
+    let save_path_down = !m.workers.reload_available() || !m.workers.fs_available();
+    if save_path_down {
+        return &m.worker_warning;
+    }
+    if m.is_dirty() {
+        return "Unsaved changes";
+    }
     if !m.worker_warning.is_empty() {
         return &m.worker_warning;
     }
-    if m.is_dirty() { "Unsaved changes" } else { "" }
+    ""
 }
 
 /// The whole window, rebuilt from the model on every frame.

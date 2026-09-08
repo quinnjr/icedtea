@@ -12,42 +12,38 @@ use icedtea_ui::view::builders::{self as w, GridExt, SpinButtonExt};
 
 use crate::app::{Msg, SettingsModel};
 use crate::pages::appearance::SPIN_MAX_PX;
-
-/// One labelled grid row.
-fn row(index: u16, text: &str, control: View<Msg>) -> [View<Msg>; 2] {
-    [
-        w::label(text).halign(Align::Start).at(0, index),
-        control.halign(Align::Start).at(1, index),
-    ]
-}
+use crate::pages::labeled_row;
 
 /// The Behavior page.
 #[must_use]
 pub fn view(m: &SettingsModel) -> View<Msg> {
     let b = &m.model.working.behavior;
     let children = [
-        row(
+        labeled_row(
             0,
             "Raise on focus",
             w::switch(b.raise_on_focus)
+                .halign(Align::Start)
                 .id("behavior_raise_on_focus")
                 .on_toggle(Msg::RaiseOnFocusToggled),
         ),
-        row(
+        labeled_row(
             1,
             "Hide bar on fullscreen",
             w::switch(b.hide_bar_on_fullscreen)
+                .halign(Align::Start)
                 .id("behavior_hide_bar_on_fullscreen")
                 .on_toggle(Msg::HideBarOnFullscreenToggled),
         ),
-        row(
+        labeled_row(
             2,
             "Snap enabled",
             w::switch(b.snap_enabled)
+                .halign(Align::Start)
                 .id("behavior_snap_enabled")
                 .on_toggle(Msg::SnapEnabledToggled),
         ),
-        row(
+        labeled_row(
             3,
             "Snap gap",
             w::spin_button(
@@ -55,6 +51,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
                 0.0,
                 f64::from(SPIN_MAX_PX),
             )
+            .halign(Align::Start)
             .step(1.0)
             .id("behavior_snap_gap")
             .on_value_changed(Msg::SnapGapChanged),

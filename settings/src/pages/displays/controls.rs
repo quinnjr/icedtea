@@ -125,11 +125,6 @@ pub fn position_text(st: &DisplaysState) -> String {
     }
 }
 
-/// One labelled grid row: a start-aligned label in column 0, the control in 1.
-fn row(text: &str, r: u16, control: View<Msg>) -> [View<Msg>; 2] {
-    [label(text).halign(Align::Start).at(0, r), control.at(1, r)]
-}
-
 /// The per-head panel: enabled, resolution, refresh, scale, transform,
 /// position — the same six controls, in the same order, as the GTK grid.
 #[must_use]
@@ -144,36 +139,36 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
     let ref_refs: Vec<&str> = ref_labels.iter().map(String::as_str).collect();
 
     let mut children: Vec<View<Msg>> = Vec::with_capacity(12);
-    children.extend(row(
-        "Enabled",
+    children.extend(crate::pages::labeled_row(
         0,
+        "Enabled",
         switch(enabled)
             .id("displays_enabled")
             .halign(Align::Start)
             .sensitive(live)
             .on_toggle(Msg::HeadEnabledToggled),
     ));
-    children.extend(row(
-        "Resolution",
+    children.extend(crate::pages::labeled_row(
         1,
+        "Resolution",
         drop_down(&res_refs)
             .selected(resolution_index(st))
             .id("displays_resolution")
             .sensitive(live && !res_refs.is_empty())
             .on_selected(Msg::ResolutionSelected),
     ));
-    children.extend(row(
-        "Refresh",
+    children.extend(crate::pages::labeled_row(
         2,
+        "Refresh",
         drop_down(&ref_refs)
             .selected(refresh_index(st))
             .id("displays_refresh")
             .sensitive(live && !ref_refs.is_empty())
             .on_selected(Msg::RefreshSelected),
     ));
-    children.extend(row(
-        "Scale",
+    children.extend(crate::pages::labeled_row(
         3,
+        "Scale",
         spin_button(scale_value(st), SCALE_MIN, SCALE_MAX)
             .step(SCALE_STEP)
             .digits(SCALE_DIGITS)
@@ -181,18 +176,18 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
             .sensitive(live)
             .on_value_changed(Msg::HeadScaleChanged),
     ));
-    children.extend(row(
-        "Transform",
+    children.extend(crate::pages::labeled_row(
         4,
+        "Transform",
         drop_down(&TRANSFORM_LABELS)
             .selected(transform_index(st))
             .id("displays_transform")
             .sensitive(live)
             .on_selected(Msg::TransformSelected),
     ));
-    children.extend(row(
-        "Position",
+    children.extend(crate::pages::labeled_row(
         5,
+        "Position",
         label(&position_text(st))
             .id("displays_position")
             .halign(Align::Start),
@@ -290,35 +285,23 @@ pub fn set_scale(st: &mut DisplaysState, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outputs::{Head, Mode, ModeRequest};
+    use crate::outputs::{Head, ModeRequest};
+    use crate::pages::displays::fixtures::{head_with_modes, mode};
     use crate::pages::displays::state::{DisplaysState, baseline_edit};
-
-    fn mode(w: i32, h: i32, mhz: i32, preferred: bool) -> Mode {
-        Mode {
-            width: w,
-            height: h,
-            refresh_mhz: mhz,
-            preferred,
-        }
-    }
 
     /// A head advertising 1920x1080@60/144 and 1280x720@60.
     fn multi_mode_head() -> Head {
-        Head {
-            name: "DP-1".to_string(),
-            description: "DP-1 display".to_string(),
-            enabled: true,
-            modes: vec![
+        head_with_modes(
+            "DP-1",
+            vec![
                 mode(1920, 1080, 60_000, true),
                 mode(1920, 1080, 144_000, false),
                 mode(1280, 720, 60_000, false),
             ],
-            current_mode: Some(mode(1920, 1080, 60_000, true)),
-            x: 0,
-            y: 0,
-            scale: 1.0,
-            transform: 0,
-        }
+            0,
+            0,
+            true,
+        )
     }
 
     fn state_with(head: Head) -> DisplaysState {

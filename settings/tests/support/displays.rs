@@ -9,7 +9,10 @@
 //! an isolated `XDG_CONFIG_HOME`, a screencopy client and a virtual pointer,
 //! and coordinates read out of `$ICEDTEA_PROBE_REPORT` rather than hard-coded.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared test-support module; not every test binary uses every helper"
+)]
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -41,7 +44,9 @@ pub const TEST_THEME: &str = "bundled";
 
 /// How far apart two channel bytes may be and still count as the same colour
 /// on a screencopy capture — the output goes through a format conversion an
-/// offscreen sample does not. `ui/tests/support/mod.rs`'s ceiling, verbatim.
+/// offscreen sample does not. `ui/tests/support/mod.rs`'s ceiling, verbatim;
+/// `settings/tests/support/mod.rs`'s `SCREENCOPY_TOLERANCE` is the settings
+/// crate's source of truth, deliberately duplicated here (plan P4-D1).
 pub const SCREENCOPY_TOLERANCE: u8 = 12;
 
 /// How long an interaction gets to reach the model and the screen.

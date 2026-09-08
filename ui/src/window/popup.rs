@@ -32,6 +32,12 @@ impl PopupKey {
     /// first popup a `run_offscreen` script opens. A windowed run's keys come
     /// from `Window::open_popup`, and a key that names no live popup is inert
     /// everywhere it is accepted.
+    ///
+    /// A minted key is only meaningful to the exact window (or offscreen loop)
+    /// that produced it: the raw numbers are per-window and are reused across
+    /// windows, so a `from_raw` value carried between two windows names an
+    /// unrelated popup, or none. Round-trip a key through `raw`/`from_raw`
+    /// within one window's lifetime only; do not fabricate one out of band.
     #[must_use]
     pub const fn from_raw(raw: u64) -> Self {
         PopupKey(raw)

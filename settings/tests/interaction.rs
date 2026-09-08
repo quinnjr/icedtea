@@ -112,6 +112,13 @@ impl RecordingCompositor {
 
 /// Contract §2.8: Apply reaches `ReloadConfig`.
 ///
+/// This is the sole end-to-end Apply->ReloadConfig proof. It skips visibly
+/// (emitting a distinctive, greppable `LEXSKIP:` marker) when no `dbus-daemon`
+/// is on `PATH`, so a green run without it is machine-detectable rather than
+/// silently vacuous. **CI must provide `dbus-daemon` for this gate to actually
+/// run** — grep the test log for `LEXSKIP: apply_reaches_reload_config_on_the_mock`
+/// and fail the pipeline if it appears.
+///
 /// Mutation check: rename `reload_config` below to some other name (e.g.
 /// `reload_cfg`) so `zbus::interface`'s default PascalCase conversion no
 /// longer produces the `ReloadConfig` member `settings/src/
@@ -121,7 +128,9 @@ impl RecordingCompositor {
 #[test]
 fn apply_reaches_reload_config_on_the_mock() {
     let Some(bus) = PrivateBus::spawn() else {
-        eprintln!("skipping: could not start a private session bus (no dbus-daemon?)");
+        eprintln!(
+            "LEXSKIP: apply_reaches_reload_config_on_the_mock skipped — no dbus-daemon (could not start a private session bus)"
+        );
         return;
     };
 

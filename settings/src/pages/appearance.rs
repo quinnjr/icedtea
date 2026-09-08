@@ -66,64 +66,12 @@ pub fn packed_to_hex(packed: f64) -> String {
     rgba_to_hex(ColorDialogC::unpack(packed))
 }
 
-/// Image extensions the wallpaper field accepts, lower-case.
-///
-/// The compositor's wallpaper worker decodes with the same set; anything
-/// outside it would be accepted here and silently ignored there, which is
-/// what the inline error the `Entry` shows exists to prevent.
-pub const WALLPAPER_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "bmp"];
-
-/// Validate a typed or portal-supplied wallpaper path.
-///
-/// `Ok(path)` is what goes into `working.appearance.wallpaper`; `Err(message)`
-/// is what the page shows beside the field and is never written to the model.
-/// The caller has already decided that an empty string means "no wallpaper",
-/// so this function's caller never passes one.
-///
-/// Untrusted input: the string comes from a text field or a portal reply, so
-/// every failure is a message and never a panic.
-pub fn validate_wallpaper(text: &str) -> Result<std::path::PathBuf, String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err("Enter a path to an image".to_string());
-    }
-    // A relative path is stored *verbatim* nowhere: the compositor resolves
-    // what it reads against its own working directory, which is not this
-    // app's, so `wall.png` validated here and then silently never loaded
-    // there. Resolved against the directory the user typed it in, and
-    // canonicalised when the filesystem allows, so what reaches the config is
-    // a path anybody can open.
-    let typed = std::path::PathBuf::from(trimmed);
-    let path = if typed.is_absolute() {
-        typed
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(&typed))
-            .map_err(|_| format!("Cannot resolve a relative path: {trimmed}"))?
-    };
-    let meta = std::fs::metadata(&path).map_err(|_| format!("No such file: {trimmed}"))?;
-    if !meta.is_file() {
-        return Err(format!("Not a file: {trimmed}"));
-    }
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    if !WALLPAPER_EXTENSIONS.contains(&ext.as_str()) {
-        return Err(format!(
-            "Unsupported image type: {}",
-            if ext.is_empty() {
-                "no extension".to_string()
-            } else {
-                format!(".{ext}")
-            }
-        ));
-    }
-    // `canonicalize` also flattens `..` and follows symlinks; when the
-    // filesystem refuses (a path that stops resolving between the two calls),
-    // the absolutised path is already correct enough to store.
-    Ok(std::fs::canonicalize(&path).unwrap_or(path))
-}
+/// Wallpaper validation now lives in the toolkit-free [`crate::model`] so the
+/// IPC workers can reach it without depending on this UI page (moved out of
+/// here per a lex-review finding). Re-exported so existing
+/// `pages::appearance::{validate_wallpaper, WALLPAPER_EXTENSIONS}` call sites
+/// and this module's own tests keep resolving.
+pub use crate::model::{WALLPAPER_EXTENSIONS, validate_wallpaper};
 
 /// The pixel value a `SpinButton` on this page reports, as the config stores
 /// it.
@@ -168,20 +116,6 @@ pub fn swatch(rgba: Rgba) -> View<Msg> {
     })
     .content_width(SWATCH_W)
     .content_height(SWATCH_H)
-}
-
-/// One labelled grid row: the label in column 0, the control in column 1.
-fn row(index: u16, text: &str, control: View<Msg>) -> [View<Msg>; 2] {
-    [
-        w::label(text).halign(Align::Start).at(0, index),
-        control.at(1, index),
-    ]
-}
-
-/// One row whose control spans both columns (the wallpaper buttons and the
-/// palette panel, which have no label of their own).
-fn wide(index: u16, control: View<Msg>) -> [View<Msg>; 1] {
-    [control.at(0, index).span(2, 1)]
 }
 
 /// icedtea's own shipped colours: the config's default background,
@@ -258,7 +192,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
     // id `opening_a_slot_reveals_the_palette_panel` (this module's own test)
     // asserts on, and the rest-state gate never opens a picker.
     if let Some(slot) = m.color_picker {
-        return w::grid(wide(0, picker(slot)))
+        return w::grid(crate::pages::wide_row(0, picker(slot)))
             .row_spacing(10)
             .column_spacing(16)
             .margin(16, 16, 16, 16)
@@ -272,7 +206,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
         .unwrap_or(0);
 
     let mut children: Vec<View<Msg>> = Vec::new();
-    children.extend(row(
+    children.extend(crate::pages::labeled_row(
         0,
         "Bar position",
         w::drop_down(&BAR_POSITIONS)
@@ -280,7 +214,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
             .id("appearance_bar_position")
             .on_selected(Msg::BarPositionSelected),
     ));
-    children.extend(row(
+    children.extend(crate::pages::labeled_row(
         1,
         "Bar height",
         w::spin_button(f64::from(a.bar_height), 0.0, f64::from(SPIN_MAX_PX))
@@ -288,7 +222,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
             .id("appearance_bar_height")
             .on_value_changed(Msg::BarHeightChanged),
     ));
-    children.extend(row(
+    children.extend(crate::pages::labeled_row(
         2,
         "Corner radius",
         w::spin_button(f64::from(a.corner_radius), 0.0, f64::from(SPIN_MAX_PX))
@@ -319,7 +253,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
     .into_iter()
     .enumerate()
     {
-        children.extend(row(
+        children.extend(crate::pages::labeled_row(
             3 + index as u16,
             text,
             w::button_from(swatch(hex_to_rgba(hex)))
@@ -328,7 +262,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
                 .on_click(Msg::ColorPickerOpened(slot)),
         ));
     }
-    children.extend(row(
+    children.extend(crate::pages::labeled_row(
         6,
         "Wallpaper",
         w::entry(&m.wallpaper_text)
@@ -337,7 +271,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
             .hexpand(true)
             .on_change(|s| Msg::WallpaperEdited(s.to_string())),
     ));
-    children.extend(wide(
+    children.extend(crate::pages::wide_row(
         7,
         w::box_(
             Orientation::Horizontal,
@@ -356,7 +290,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
         )
         .halign(Align::Start),
     ));
-    children.extend(wide(8, wallpaper_status(m)));
+    children.extend(crate::pages::wide_row(8, wallpaper_status(m)));
 
     w::grid(children)
         .row_spacing(10)

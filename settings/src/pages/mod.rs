@@ -1,5 +1,32 @@
 //! The switcher's page identity and the page list `stack_switcher` takes.
 
+use icedtea_ui::layout::Align;
+use icedtea_ui::view::View;
+use icedtea_ui::view::builders::{self as w, GridExt};
+
+use crate::app::Msg;
+
+/// One labelled grid row: a start-aligned label in column 0, `control` in
+/// column 1 of grid row `row`.
+///
+/// The single source of truth for the three pages that lay controls out on a
+/// grid (Appearance, Behavior, and the Displays per-head panel), which used to
+/// carry three private `row` helpers with a drifting argument order. It does
+/// not touch the control's own alignment: a caller that wants the control
+/// start-aligned (as Behavior does) passes `control.halign(Align::Start)`.
+pub(crate) fn labeled_row(row: u16, text: &str, control: View<Msg>) -> [View<Msg>; 2] {
+    [
+        w::label(text).halign(Align::Start).at(0, row),
+        control.at(1, row),
+    ]
+}
+
+/// One row whose `control` spans both columns, for controls with no label of
+/// their own (Appearance's wallpaper buttons and palette panel).
+pub(crate) fn wide_row(row: u16, control: View<Msg>) -> [View<Msg>; 1] {
+    [control.at(0, row).span(2, 1)]
+}
+
 pub mod appearance;
 pub mod behavior;
 pub mod displays;

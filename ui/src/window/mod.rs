@@ -828,6 +828,11 @@ pub struct WatchId(u64);
 /// `ERR` are always reported whatever the interest, and always arrive as an
 /// [`InputEvent::FdReady`] — the toolkit never decides on its own that a
 /// foreign fd is dead. It reports, and the owner calls [`Window::unwatch`].
+///
+/// By design an `FdReady` says only that the fd is ready, not which bit fired:
+/// a `ReadWrite` (or hung-up) watcher must probe the fd itself to learn read
+/// vs write vs EOF. A fd left at `POLLHUP` re-fires every poll, so the owner
+/// MUST `unwatch` on EOF/HUP (`wait_bounded` warns once when one does not).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Interest {
@@ -850,11 +855,26 @@ impl Interest {
     }
 }
 
+/// How many consecutive poll passes a watch may fire on before the loop warns
+/// that it is likely a hung-up fd the app is not unwatching. At ~60 fps this is
+/// about ten seconds of a fd stuck at `POLLHUP` re-firing every frame.
+const WATCH_HUNG_WARN_FRAMES: u32 = 600;
+
 /// One registered fd: the window owns it until [`Window::unwatch`] drops it.
 struct Watch {
     id: WatchId,
     fd: std::os::fd::OwnedFd,
     flags: rustix::event::PollFlags,
+    /// Consecutive poll passes this watch has fired on. A fd hung up at
+    /// `POLLHUP` re-reports ready every poll forever (the toolkit never
+    /// unwatches on the owner's behalf — M5-D1 §2), so this climbs until the
+    /// owner `unwatch`es. `Cell` so [`wait_bounded`] can bump it through the
+    /// `&Watches` it already holds, without a signature change.
+    fired_count: std::cell::Cell<u32>,
+    /// Whether the hung-fd warning has already fired for the current run of
+    /// consecutive fires; reset once the watch goes quiet, so a genuinely busy
+    /// fd is not warned about twice for one stall.
+    warned: std::cell::Cell<bool>,
 }
 
 /// Every live watch, in registration order.
@@ -872,6 +892,8 @@ impl Watches {
             id,
             fd,
             flags: interest.flags(),
+            fired_count: std::cell::Cell::new(0),
+            warned: std::cell::Cell::new(false),
         });
         id
     }
@@ -995,8 +1017,29 @@ fn wait_bounded(
                 // are set (`HUP`/`ERR` included, which poll reports without
                 // being asked). Published at the top of the next iteration.
                 for (index, watch) in watches.entries().enumerate() {
-                    if !fds[index + 1].revents().is_empty() {
-                        fired.push(watch.id);
+                    if fds[index + 1].revents().is_empty() {
+                        // Quiet this pass: a later run of fires starts fresh
+                        // and may warn again.
+                        watch.fired_count.set(0);
+                        watch.warned.set(false);
+                        continue;
+                    }
+                    fired.push(watch.id);
+                    // Cheap observability for a hung-up fd (`POLLHUP` re-fires
+                    // every poll): count consecutive fires and warn once when
+                    // the run gets long. The loop still keeps reporting — the
+                    // owner alone decides to `unwatch` — this only makes a
+                    // silent busy-loop visible.
+                    let count = watch.fired_count.get().saturating_add(1);
+                    watch.fired_count.set(count);
+                    if count >= WATCH_HUNG_WARN_FRAMES && !watch.warned.get() {
+                        watch.warned.set(true);
+                        tracing::warn!(
+                            id = ?watch.id,
+                            consecutive = count,
+                            "a watched fd has been continuously ready for many polls; \
+                             if it has hung up (EOF/HUP) the app must Cmd::Unwatch it"
+                        );
                     }
                 }
             }
@@ -1029,11 +1072,12 @@ pub struct ProbePoint {
 ///
 /// Same derivation as `gallery::probe_points_of`: walk `root.descendants()`,
 /// label by id-or-node-name with a repeat index, take the centre of the border
-/// box **floored** (`f32::floor` before the cast, not `as i32`, which
-/// truncates toward zero, and not `round`, which ties away from it: only
-/// flooring makes an integer shift of a box shift its centre by that same
-/// integer). A node with no allocation is skipped. Cheap: it reads the layout
-/// tree the last frame already computed and lays nothing out.
+/// box **floored**. The flooring is load-bearing and must stay identical to
+/// `gallery::centre`'s — see that function's doc for why `f32::floor` (not a
+/// bare `as i32` truncation or `f32::round`) is what keeps a scrolled box's
+/// centre exactly `--scroll` pixels from its unscrolled original. A node
+/// with no allocation is skipped. Cheap: it reads the layout tree the last
+/// frame already computed and lays nothing out.
 #[must_use]
 pub fn probe_points_of(root: &Node, layout: &crate::layout::LayoutTree) -> Vec<ProbePoint> {
     use std::collections::BTreeMap;
@@ -1071,20 +1115,7 @@ pub fn probe_points_of(root: &Node, layout: &crate::layout::LayoutTree) -> Vec<P
     // that carries the flag: only the subtree root is ever recorded.
     let descendants: Vec<Node> = root
         .descendants()
-        .filter(|node| layout.is_displayed(node))
-        .filter(|node| {
-            let mut parent = node.parent();
-            while let Some(node) = parent {
-                if !layout.is_displayed(&node) {
-                    return false;
-                }
-                if node.ptr_eq(root) {
-                    break;
-                }
-                parent = node.parent();
-            }
-            true
-        })
+        .filter(|node| !crate::view::app::is_hidden(layout, node))
         .collect();
     let mut counts: BTreeMap<Rc<str>, usize> = BTreeMap::new();
     for node in &descendants {

@@ -1,5 +1,5 @@
 //! The pure clipboard-history model + its popover rendering. The model is the
-//! `Vec<ClipEntry>` the daemon serves; `panel::popover_body` renders it.
+//! `Vec<ClipEntry>` the daemon serves; `panel::popover_rows` renders it.
 
 use icedtea_contract::ClipEntry;
 

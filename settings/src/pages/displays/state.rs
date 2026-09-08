@@ -307,14 +307,12 @@ pub fn all_rects(st: &DisplaysState) -> (Vec<usize>, Vec<Rect>, Vec<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pages::displays::fixtures::mode;
 
-    fn mode(w: i32, h: i32, r: i32, preferred: bool) -> Mode {
-        Mode {
-            width: w,
-            height: h,
-            refresh_mhz: r,
-            preferred,
-        }
+    /// A single-mode `Head` named `name`, enabled at the origin — the common
+    /// shape this module's reconcile/`same_connector_set` tests want.
+    fn head(name: &str) -> Head {
+        crate::pages::displays::fixtures::head(name, 1920, 1080, 0, 0, true)
     }
 
     #[test]
@@ -370,20 +368,6 @@ mod tests {
         assert_eq!(e.position, Some((10, 20)));
         assert_eq!(e.scale, Some(1.5));
         assert_eq!(e.transform, Some(2));
-    }
-
-    fn head(name: &str) -> Head {
-        Head {
-            name: name.into(),
-            description: name.into(),
-            enabled: true,
-            modes: vec![mode(1920, 1080, 60000, true)],
-            current_mode: Some(mode(1920, 1080, 60000, true)),
-            x: 0,
-            y: 0,
-            scale: 1.0,
-            transform: 0,
-        }
     }
 
     #[test]

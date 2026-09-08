@@ -15,7 +15,10 @@
 //! and their two P1 call sites (`skeleton.rs`, `outputs_pump.rs`) updated to
 //! match; `pixel_at` itself is widened to Task 9's `i32` signature since its
 //! one existing call site (`skeleton.rs`, literal `1, 1`) is unaffected.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared test-support module; not every test binary uses every helper"
+)]
 
 use std::collections::HashMap;
 use std::io::Read as _;

@@ -110,14 +110,19 @@ pub fn path_to<Msg: Clone + 'static>(roots: &[Instance<Msg>], target: &Node) -> 
 /// forbidden from touching `ui/`. So the firing lives in `deliver`, once, for
 /// every kind alike, and no widget file is edited to opt in.
 ///
-/// `button` is `0` for a motion, which carries none (P0-D2).
+/// `button` is [`BTN_NONE`](crate::window::pointer::BTN_NONE) for a motion,
+/// which carries none (P0-D2).
 fn fire_pointer_handlers<Msg: Clone + 'static>(
     event: &Event,
     handlers: &Handlers<Msg>,
 ) -> Vec<Msg> {
     let (kind, local, button) = match event {
         Event::PointerDown { local, button, .. } => (EventKind::PointerDown, *local, *button),
-        Event::PointerMotion { local } => (EventKind::PointerMotion, *local, 0),
+        Event::PointerMotion { local } => (
+            EventKind::PointerMotion,
+            *local,
+            crate::window::pointer::BTN_NONE,
+        ),
         Event::PointerUp { local, button, .. } => (EventKind::PointerUp, *local, *button),
         _ => return Vec::new(),
     };
@@ -748,8 +753,12 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     /// and its messages are enqueued in order — after the inbox's, before the
     /// frame's input batch. A handler for an id that has since been
     /// `unwatch`ed is simply never called again (M5-D1 §4).
+    ///
+    /// A second `on_fd` for the same `id` replaces the first, so this stays
+    /// consistent with `with_inbox`/`on_popup`/`on_frame`.
     #[must_use]
     pub fn on_fd(mut self, id: crate::window::WatchId, f: impl Fn() -> Vec<Msg> + 'static) -> Self {
+        self.fd_handlers.retain(|(w, _)| *w != id);
         self.fd_handlers.push((id, Box::new(f)));
         self
     }
@@ -1577,6 +1586,21 @@ fn swap_popup_tree<Msg>(rt: &mut Runtime<Msg>, index: usize) {
     std::mem::swap(layout, &mut popup.layout);
 }
 
+/// Lend every open popup's laid-out tree to the `Window`, or take it back.
+///
+/// The frame hook's mirror of [`swap_popup_tree`]: each popup's tree lives on
+/// `rt.popups` (for taffy's incremental dirty tracking), not on the `Window`
+/// popup whose `popup_probe_points` the hook reads, so it is swapped in for the
+/// span of the hook and swapped straight back. The swap is its own inverse, so
+/// one function serves both the swap-in and the swap-out call.
+fn swap_popup_layouts<Msg>(rt: &mut Runtime<Msg>, window: &mut crate::window::Window) {
+    for popup in &mut rt.popups {
+        if let Some(win_layout) = window.popup_layout(popup.key) {
+            std::mem::swap(&mut popup.layout, win_layout);
+        }
+    }
+}
+
 /// Route one input event to the surface it arrived on.
 ///
 /// Contract §6 P5-D1. `InputEvent`'s two `Enter` variants carry a
@@ -1923,7 +1947,13 @@ fn drain<M: 'static, Msg: Clone + 'static>(
             Cmd::Quit | Cmd::CloseWindow => rt.quit = true,
             // Outside `update`, after every queued message has been folded
             // (M5-D3). Not window-bound, so it is never returned to `run`.
-            Cmd::Task(f) => f(),
+            // Guarded: a panic in the closure must drop the task, not unwind
+            // through and kill the whole event loop.
+            Cmd::Task(f) => {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f())).is_err() {
+                    tracing::error!("a Cmd::Task closure panicked; dropping it");
+                }
+            }
             // The window-bound commands are `run`'s (Task 17): only it has a
             // surface to title, minimise or open a popup on. They are handed
             // back to the caller rather than dropped here.
@@ -1979,6 +2009,10 @@ fn write_probe_report(
         .append(true)
         .open(path)
     else {
+        tracing::warn!(
+            ?path,
+            "could not open the probe report; skipping this frame's lines"
+        );
         return;
     };
     let _ = writeln!(file, "frame {frame}");
@@ -2250,7 +2284,13 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                     // window. An id `run` minted for the inbox is not one an
                     // app can name, and an unknown id is a no-op, so this can
                     // only retire a watch the app registered itself.
-                    Cmd::Unwatch(id) => window.unwatch(id),
+                    Cmd::Unwatch(id) => {
+                        window.unwatch(id);
+                        // Drop the handler too: leaving it in `fd_handlers`
+                        // would keep firing a closure for a watch that no
+                        // longer exists (and leak it for the app's lifetime).
+                        self.fd_handlers.retain(|(w, _)| *w != id);
+                    }
                     other => tracing::debug!(?other, "command not applicable to a window"),
                 }
             }
@@ -2389,24 +2429,14 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 // frames for taffy's incremental dirty tracking). Swap it in
                 // for the span of the hook, then take it back.
                 window.set_layout(std::mem::take(&mut rt.layout));
-                // The same swap for every open popup: each popup's laid-out
-                // tree lives on `rt.popups` (same taffy-incremental reason),
-                // not on the `Window` popup the hook's `popup_probe_points`
-                // reads, so without this a popover's own probe points are
-                // always empty under a windowed run (P5-D8, authorised T15
-                // extension). SWAP-SAFE: no early exit between swap-in, hook
-                // and swap-out, so the loop's trees are always restored.
-                for popup in &mut rt.popups {
-                    if let Some(win_layout) = window.popup_layout(popup.key) {
-                        std::mem::swap(&mut popup.layout, win_layout);
-                    }
-                }
+                // The same swap for every open popup, so a popover's own probe
+                // points are not always empty under a windowed run (P5-D8,
+                // authorised T15 extension). SWAP-SAFE: no early exit between
+                // swap-in, hook and swap-out, so the loop's trees are always
+                // restored. See [`swap_popup_layouts`].
+                swap_popup_layouts(&mut rt, &mut window);
                 hook(&window);
-                for popup in &mut rt.popups {
-                    if let Some(win_layout) = window.popup_layout(popup.key) {
-                        std::mem::swap(&mut popup.layout, win_layout);
-                    }
-                }
+                swap_popup_layouts(&mut rt, &mut window);
                 rt.layout = window.take_layout();
             }
         }
