@@ -809,18 +809,24 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
         &self.model
     }
 
-    /// Run view → reconcile → restyle → layout → **one settling tick** →
-    /// restyle → layout, against `size`, with no surface, and hand back the
-    /// result.
+    /// Run view → reconcile → restyle → layout → **settle to a fixpoint**
+    /// (tick → restyle → layout, repeated until the allocations stop changing,
+    /// capped at `PROBE_MAX_SETTLE_TICKS`), against `size`, with no surface, and
+    /// hand back the result.
     ///
-    /// The tick is not decoration. A controller that learns its own geometry
+    /// The settling is not decoration. A controller that learns its own geometry
     /// from the frame it was just laid out in does so in
     /// [`Controller::tick`](crate::view::Controller::tick) —
-    /// `ListViewC::adopt_metrics` grows its pool from one placeholder row to
-    /// the viewport's worth there — and this is what the gallery's
-    /// `--print-allocation`/`--probe-points` publish and what both §8 gates
-    /// locate every widget by. Without the tick a probe describes a tree a
-    /// running app never shows.
+    /// `ListViewC::adopt_metrics` grows its pool from one placeholder row to the
+    /// viewport's worth there. A fixed-extent list reaches that in one tick, but
+    /// `column_view`'s inner list has no fixed extent, so each tick grows it and
+    /// it takes several to converge; [`App::run`] ticks every frame and reaches
+    /// the fixpoint, so a probe must too. This settled tree is what the gallery's
+    /// `--print-allocation`/`--probe-points` publish and what the gates locate
+    /// every widget by. A single tick (M6-FUP1) described a tree a running app
+    /// never shows: every widget below such a list came out above where it
+    /// paints. The tick uses a single frozen clock instant so the fixpoint is
+    /// over tree state alone, not a moving animation clock.
     ///
     /// `sheet`, `fonts` and `icons` are parameters rather than fields because
     /// [`App::run`] takes them from the `Window` it is handed; a probe has no
@@ -895,10 +901,27 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
         // allocations stop changing, capped so a tree that never converges still
         // terminates.
         const PROBE_MAX_SETTLE_TICKS: usize = 16;
-        let mut settled: Vec<crate::layout::Allocation> = root
-            .descendants()
-            .filter_map(|n| tree.allocation(&n))
-            .collect();
+        // Freeze the clock for the settle loop. `tick_all` and
+        // `restyle_and_layout` both advance animations against the clock, but a
+        // *layout* fixpoint must be over tree state alone — a widget whose
+        // allocation is a function of time would otherwise never satisfy
+        // `now == settled` and we would return an arbitrary animation phase (a
+        // flaky probe). A running app settles its geometry the same way; only
+        // the moving animation clock is excluded here.
+        let frozen: Rc<dyn Clock> = {
+            let c = ManualClock::new();
+            c.set_ms(u64::try_from(clock.now().as_millis()).unwrap_or(u64::MAX));
+            Rc::new(c)
+        };
+        // Snapshot every descendant's allocation in traversal order. `Option`,
+        // not `filter_map`, so a node that gains or loses an allocation between
+        // ticks is a detected change rather than silently dropped; two equal
+        // snapshots in a row is the fixpoint.
+        let snapshot = |root: &Node, tree: &LayoutTree| -> Vec<Option<crate::layout::Allocation>> {
+            root.descendants().map(|n| tree.allocation(&n)).collect()
+        };
+        let mut settled = snapshot(&root, &tree);
+        let mut converged = false;
         for _ in 0..PROBE_MAX_SETTLE_TICKS {
             {
                 let mut clipboard = Clipboard::offscreen();
@@ -911,11 +934,11 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                     clipboard: &mut clipboard,
                     icons: &mut icons,
                     fonts: &mut fonts,
-                    clock: &clock,
+                    clock: &frozen,
                     env: &env,
                     cmds: &mut cmds,
                 };
-                tick_all(&mut instances, clock.now(), &mut cx);
+                tick_all(&mut instances, frozen.now(), &mut cx);
             }
             restyle_and_layout(
                 &root,
@@ -924,7 +947,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 &env,
                 &mut fonts,
                 &mut icons,
-                &clock,
+                &frozen,
                 &containers,
                 &mut styles,
                 &mut anims,
@@ -932,14 +955,19 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
                 size,
             )
             .map_err(AppError::Layout)?;
-            let now: Vec<crate::layout::Allocation> = root
-                .descendants()
-                .filter_map(|n| tree.allocation(&n))
-                .collect();
+            let now = snapshot(&root, &tree);
             if now == settled {
+                converged = true;
                 break;
             }
             settled = now;
+        }
+        if !converged {
+            tracing::warn!(
+                ticks = PROBE_MAX_SETTLE_TICKS,
+                "probe layout did not settle within the tick cap; reported \
+                 allocations may not match a running app"
+            );
         }
         Ok(Probe {
             root,
@@ -3328,6 +3356,87 @@ mod tests {
             alloc.border_box.width > 0.0 && alloc.border_box.height > 0.0,
             "a label with text must have a non-empty allocation, got {:?}",
             alloc.border_box
+        );
+    }
+
+    // M6-FUP1: `App::probe` must settle to the same fixpoint a running app
+    // converges to, not stop after one tick. The gallery page's `column_view`
+    // grows its inner list's pool over several ticks (`ListViewC::adopt_metrics`),
+    // so a single-tick probe reports every widget below it (here `popover_menu_bar`,
+    // css name `menubar`) ~100px above where `run_offscreen` (which ticks every
+    // frame) settles it. Compare the probe's floored-centre for that widget against
+    // the settled `run_offscreen` probe report — in process, ~seconds, versus the
+    // minutes-long full gallery_gate walk.
+    //
+    // Mutation check: revert `App::probe` to a single `tick_all` + one relayout
+    // and this fails -- the probe centre is ~100px above the settled centre.
+    #[test]
+    fn probe_settles_the_gallery_page_like_a_running_app() {
+        use crate::gallery::{GalleryModel, GalleryMsg, Theme, scrolled_page, update};
+
+        let size = (1280, 720);
+        // popover_menu_bar's root css name — a uniquely-named widget below the
+        // gallery's column_view, so its probe label is just "menubar".
+        let target = "menubar";
+
+        // Settled reference: run_offscreen ticks every frame. Over-drive it and
+        // read the last `probe <target> <x> <y>` (floored centre) line it wrote.
+        let report = std::env::temp_dir().join(format!(
+            "icedtea-m6fup1-{}-{}.probe",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let clock = Rc::new(ManualClock::new());
+        let script: Vec<ScriptStep<GalleryMsg>> = (0..16)
+            .map(|_| ScriptStep::Advance(std::time::Duration::from_millis(16)))
+            .chain(std::iter::once(ScriptStep::Capture))
+            .collect();
+        App::new(GalleryModel::new(Theme::Light, None), update, scrolled_page)
+            .with_probe_report(report.clone())
+            .run_offscreen(size, clock, script)
+            .expect("run_offscreen lays out");
+        let text = std::fs::read_to_string(&report).expect("probe report written");
+        let _ = std::fs::remove_file(&report);
+        let settled_y: i32 = text
+            .lines()
+            .rev()
+            .find_map(|l| {
+                let mut f = l.split_whitespace();
+                (f.next() == Some("probe") && f.next() == Some(target))
+                    .then(|| f.nth(1).and_then(|s| s.parse::<i32>().ok()))
+                    .flatten()
+            })
+            .expect("run_offscreen reported a probe point for the target");
+
+        // Probe the same page, matching run_offscreen's default sheet/fonts/icons,
+        // and compute the target's floored centre the same way `probe_points_of` does.
+        let dyn_clock: Rc<dyn Clock> = Rc::new(ManualClock::new());
+        let probe = App::new(GalleryModel::new(Theme::Light, None), update, scrolled_page)
+            .probe(
+                size,
+                CompiledSheet::compile(crate::BUNDLED_ADWAITA_LIGHT),
+                FontDatabase::default(),
+                IconTheme::from_env(),
+                dyn_clock,
+            )
+            .expect("probe lays out");
+        let node = probe
+            .root()
+            .descendants()
+            .find(|n| n.name().as_ref() == target)
+            .expect("the page has the target widget");
+        let r = probe
+            .allocation(&node)
+            .expect("the target has an allocation")
+            .border_box;
+        let probe_y = (r.y + r.height / 2.0).floor() as i32;
+
+        assert_eq!(
+            probe_y, settled_y,
+            "App::probe put {target}'s centre at y={probe_y}, but a settled run has \
+             it at y={settled_y} -- the probe did not settle to the fixpoint"
         );
     }
 }
