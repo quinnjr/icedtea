@@ -768,8 +768,8 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     /// Observe the live window once per rendered frame.
     ///
     /// Runs on the loop thread after the frame is painted, with the window's
-    /// layout tree already settled, so [`Window::probe_points`] and
-    /// [`Window::allocation`] answer for what was just drawn. It may not
+    /// layout tree already settled, so `Window::probe_points` and
+    /// `Window::allocation` answer for what was just drawn. It may not
     /// mutate the model and gets no way to: this is the hook M5's apps write
     /// their `$ICEDTEA_PROBE_REPORT` lines from, and the one an app caches a
     /// widget's allocation through. Never called by `run_offscreen`, which has

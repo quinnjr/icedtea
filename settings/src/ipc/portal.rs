@@ -175,7 +175,7 @@ pub const PORTAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// `Connection::session()` is blocking with no deadline of its own: a bus
 /// socket that accepts and then never authenticates parked the sole worker
 /// thread forever, and every later Browse click vanished with no `Msg` at
-/// all — exactly the hang [`await_response`]'s own doc claims was fixed.
+/// all — exactly the hang `await_response`'s own doc claims was fixed.
 /// The connect runs on a helper thread and this is how long its answer is
 /// waited for.
 pub const PORTAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

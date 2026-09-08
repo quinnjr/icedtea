@@ -4,7 +4,7 @@
 //! will talk to). zbus's `#[interface]` macro implements the `Interface`
 //! trait once per macro invocation, and a type can't implement the same
 //! trait twice — so this is two thin wrapper structs sharing one
-//! [`Shared`] core via `Arc`, both registered at the same object path,
+//! `Shared` core via `Arc`, both registered at the same object path,
 //! rather than two `#[interface]` blocks on one struct (which wouldn't
 //! compile).
 //!
@@ -12,7 +12,7 @@
 //! non-`Send` Wayland-owning thread via a command channel), `Store` is
 //! plain data any thread can lock directly — see the design spec's framing
 //! of why this daemon's concurrency shape is simpler. Method impls lock
-//! [`Shared::store`], mutate it, and push the resulting `Change` onto
+//! `Shared::store`, mutate it, and push the resulting `Change` onto
 //! `Shared::changes` for the emitter thread below to turn into signals.
 
 use std::collections::HashMap;

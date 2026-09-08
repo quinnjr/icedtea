@@ -148,7 +148,7 @@ struct SsdVisual {
 /// Borrowed rather than owned so a sync whose title has not changed costs no
 /// copy at all -- the common case by a wide margin, since a drag re-syncs
 /// per pointer motion. `generation` names these exact pixels; see
-/// [`SsdVisual::title_generation`].
+/// `SsdVisual::title_generation`.
 pub struct TitleRaster<'a> {
     pub width: i32,
     pub height: i32,
@@ -158,7 +158,7 @@ pub struct TitleRaster<'a> {
 
 /// A rasterized button glyph, borrowed from the caller's own memo -- the
 /// glyph analogue of [`TitleRaster`]. `width`/`height`/`fg` double as the
-/// cache key `sync_ssd` compares against [`SsdVisual::button_glyph_keys`];
+/// cache key `sync_ssd` compares against `SsdVisual::button_glyph_keys`;
 /// there is no separate generation counter because, unlike a title, a
 /// glyph's pixels are a pure function of that triple, so the triple itself
 /// is all the "has this changed" check needs.
@@ -764,7 +764,7 @@ impl Wayland {
     /// `active_button` names the one button, if any, currently hovered or
     /// pressed (`decoration`'s own hit-test order: 0 minimize, 1 maximize, 2
     /// close) and shifts only that button's color -- brighter on hover,
-    /// darker on press ([`shift_button_color`]) -- leaving the glyph node
+    /// darker on press (`shift_button_color`) -- leaving the glyph node
     /// itself untouched, since color is a rect property and the glyph
     /// buffer just rides on top of it.
     ///

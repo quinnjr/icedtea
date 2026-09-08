@@ -101,7 +101,7 @@ pub const SNAP_RESTORE: &str = "snap:restore";
 ///
 /// Returns `true` when a combo was stored -- the caller clears
 /// `m.capturing` and recomputes `m.conflicts` -- and `false` when
-/// [`combo_from_keysym`] declined the sym, which is what a lone
+/// `combo_from_keysym` declined the sym, which is what a lone
 /// Shift/Ctrl/Alt/Super press produces. In that case the capture stays
 /// armed and waits for the real key: the GTK handler's behaviour verbatim
 /// (contract §2.7 rule 5).

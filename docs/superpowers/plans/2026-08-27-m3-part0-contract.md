@@ -4742,6 +4742,14 @@ a model index, not a `:selected` flag on the view's own node — so writing a
 pseudo-state for them centrally would be wrong. The remaining §4.3 names
 have no universal writer and stay where they are.
 
+### P8-D76 — `App::new`'s signature is superseded by M5-D4
+
+`§4.7`'s `App::new(model, update: fn(..), view: fn(..))` was widened to
+`impl FnMut` / `impl Fn` by M5-D4
+(`docs/superpowers/plans/2026-09-03-m5-part0-contract.md` §1). `fn` items still
+coerce, so every M3 call site compiles unchanged; read that amendment before
+this section's signature.
+
 
 ---
 

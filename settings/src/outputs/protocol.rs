@@ -111,7 +111,7 @@ pub enum OutputsMsg {
     /// compositor made meanwhile); the client should re-read and retry.
     ApplyCancelled,
     /// The second wayland connection died (compositor exited, socket error).
-    /// The glib source detaches after emitting this; the page should treat
+    /// The pump detaches after emitting this; the page should treat
     /// output management as gone.
     Disconnected,
 }
@@ -331,7 +331,7 @@ impl OutputsConnection {
         this
     }
 
-    /// Borrow the queue's readiness fd — the glib source watches this.
+    /// Borrow the queue's readiness fd — the pump watches this.
     pub fn queue(&self) -> &EventQueue<OutputsState> {
         &self.queue
     }
@@ -352,13 +352,13 @@ impl OutputsConnection {
     }
 
     /// Non-blocking drain of already-buffered events — the first half of the
-    /// glib callback. Returns the number dispatched.
+    /// pump's drain. Returns the number dispatched.
     pub fn dispatch_pending(&mut self) -> Result<usize, wayland_client::DispatchError> {
         self.queue.dispatch_pending(&mut self.state)
     }
 
     /// Read whatever is ready on the socket, then dispatch it — the second half
-    /// of the glib callback, run only when `dispatch_pending` found nothing.
+    /// of the pump's drain, run only when `dispatch_pending` found nothing.
     /// Never blocks: `prepare_read` yields `None` if another reader raced in,
     /// in which case the events are already ours to dispatch. A `WouldBlock`
     /// from the read is benign (the fd woke us but was already drained) and is
@@ -379,7 +379,7 @@ impl OutputsConnection {
         self.queue.dispatch_pending(&mut self.state)
     }
 
-    /// Notify the view that the connection is gone. Called by the glib source
+    /// Notify the view that the connection is gone. Called by the pump
     /// when a dispatch/read errors so the page can drop into its
     /// unavailable state instead of the source busy-looping on a dead fd.
     pub fn notify_disconnected(&self) {

@@ -1,7 +1,7 @@
 //! The `org.icedtea.Compositor` client. A worker thread receives the compositor's
-//! signals (seeded by a `GetState` snapshot) and pushes [`CompositorUpdate`]s to the
-//! GTK thread; [`CompositorProxy`] issues commands (focus/close/workspace) with a
-//! separate blocking connection.
+//! signals (seeded by a `GetState` snapshot) and pushes [`CompositorUpdate`]s onto the
+//! panel's loop thread through its inbox; [`CompositorProxy`] issues commands
+//! (focus/close/workspace) with a separate blocking connection.
 
 use async_channel::Sender;
 use futures_util::StreamExt as _;
@@ -22,12 +22,12 @@ const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 /// so a compositor upgrade that changes a signature (`GetState`'s reply
 /// gaining `WindowInfo.attention`) makes an *older* shell's typed call fail
 /// with `zbus::Error::SignatureMismatch`. Logging and letting this worker
-/// thread end leaves GTK running with a permanently empty, permanently
+/// thread end leaves the panel running with a permanently empty, permanently
 /// stale taskbar -- and, because the process is still alive and healthy as
 /// far as the service manager can tell, `Restart=always` never fires and the
 /// upgraded shell binary is never picked up. A non-zero exit is the only
 /// signal that actually gets the session restarted onto the matching build,
-/// so any error out of [`run`] takes the process down with it.
+/// so any error out of `run` takes the process down with it.
 pub fn spawn(tx: Sender<CompositorUpdate>) {
     std::thread::spawn(move || {
         zbus::block_on(async move {
@@ -131,7 +131,7 @@ async fn run(tx: Sender<CompositorUpdate>) -> zbus::Result<()> {
         if let Some(update) = update
             && tx.send(update).await.is_err()
         {
-            break; // GTK side gone.
+            break; // The panel exited.
         }
     }
     Ok(())
@@ -145,8 +145,8 @@ pub trait CompositorCommands {
     fn set_workspace(&self, id: u32);
 }
 
-/// Issues `org.icedtea.Compositor` commands from the GTK thread. Method calls are
-/// no-reply and sub-millisecond, so a blocking connection here is fine.
+/// Issues `org.icedtea.Compositor` commands from the panel's loop thread.
+/// Method calls are no-reply and sub-millisecond, so a blocking connection here is fine.
 pub struct CompositorProxy {
     conn: zbus::blocking::Connection,
 }

@@ -85,7 +85,7 @@ impl InfoBarC {
     /// GTK packs the close button at the trailing edge of the bar, centred on
     /// the cross axis; it shrinks rather than overflowing a bar smaller than
     /// itself. `content` is the bar's own content box in its event space, i.e.
-    /// what [`content_rect_local`] returns.
+    /// what `content_rect_local` returns.
     #[must_use]
     pub fn close_rect(content: Rect) -> Rect {
         let side = CLOSE_BUTTON_SIZE

@@ -243,7 +243,7 @@ pub fn load_or_default(db_path: &Path) -> Config {
 /// absent store opens cleanly and reads back as defaults (the `Ok` arm), while
 /// only a present-but-broken store reaches an `Err` from `open`. The one case
 /// this does NOT catch is a file that opens cleanly yet has corrupt page/table
-/// data surfacing only during the read: [`read_config_from_db`] degrades that
+/// data surfacing only during the read: `read_config_from_db` degrades that
 /// to per-field defaults internally, exactly as it does for `load_or_default`.
 pub fn load_reportable(db_path: &Path) -> Result<Config, String> {
     match open(db_path) {

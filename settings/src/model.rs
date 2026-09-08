@@ -57,7 +57,7 @@ impl Model {
 /// `redb::Database::create` directly) so its `catch_unwind` guard + parent
 /// `create_dir_all` apply: a corrupt config file returns `Err` here ("Failed
 /// to save") instead of tripping an internal redb `assert!` and panicking the
-/// GTK app.
+/// settings app.
 ///
 /// `cfg.displays` is deliberately **not** written from the caller's working
 /// copy. The Displays page never routes through this working-copy `Config`:
@@ -134,7 +134,7 @@ fn is_bare_modifier(key_name: &str) -> bool {
 /// `key` is `keysym_to_key_name(keysym)`.
 ///
 /// Returns `None` when `keysym` itself names a bare modifier key (see
-/// [`is_bare_modifier`]) -- a lone Shift/Ctrl/Alt/Super press mid-capture
+/// `is_bare_modifier`) -- a lone Shift/Ctrl/Alt/Super press mid-capture
 /// should never become a binding.
 pub fn combo_from_keysym(keysym: u32, modifiers: CaptureMods) -> Option<KeyCombo> {
     let key = keysym_to_key_name(keysym);
@@ -182,7 +182,7 @@ fn combo_identity(combo: &KeyCombo) -> (String, Vec<String>) {
 /// paired with the actions that share it. Two bindings count as the same
 /// combo when they name the same key and the same *set* of modifiers
 /// (order-independent), matching how the compositor's matcher compares them —
-/// see [`combo_identity`].
+/// see `combo_identity`.
 pub fn duplicate_bindings(cfg: &Config) -> Vec<(KeyCombo, Vec<String>)> {
     let mut groups: Vec<(KeyCombo, Vec<String>)> = Vec::new();
     for (action, combo) in &cfg.keybindings {

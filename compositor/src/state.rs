@@ -98,7 +98,7 @@ pub struct LayerEntry {
     /// placed on. Resolved once, at `new_layer_surface`, from
     /// [`wlr::LayerSurface::output_id`] via `output_ids`, falling back to
     /// `output_for_pointer` -- see `new_layer_surface`'s own doc. May be
-    /// [`NO_OUTPUT`], a sentinel meaning "no output existed at all when
+    /// `NO_OUTPUT`, a sentinel meaning "no output existed at all when
     /// this surface was announced" (review finding M5); every reader that
     /// looks it up in `self.outputs` already treats a miss as "nothing to
     /// do yet", which is exactly right for the sentinel too, and
@@ -213,7 +213,7 @@ pub struct PopupEntry {
     /// The chain's bottom, resolved once at record time. Never re-derived:
     /// the host may die before this popup does.
     pub root: PopupRoot,
-    /// The model output index the root sits on, or [`NO_OUTPUT`] when the
+    /// The model output index the root sits on, or `NO_OUTPUT` when the
     /// root had no output at record time -- exactly [`LayerEntry::output`]'s
     /// convention, and every reader treats a miss the same way.
     pub output: u32,
@@ -710,7 +710,7 @@ pub struct State {
     /// Set by `apply_action("quit")`; the event loop (task 5 reintroduces
     /// one) checks this each iteration and calls `stop()` once true.
     pub quitting: bool,
-    /// Set by [`SeatHandler::session_lock_changed`] while an
+    /// Set by `SeatHandler::session_lock_changed` while an
     /// `ext-session-lock-v1` client holds the session locked. The crate
     /// already refuses normal keyboard/pointer focus in this state (see
     /// `wlr::Runtime::is_session_locked`); this flag exists only so this
@@ -1530,7 +1530,7 @@ impl State {
     /// it) and each *mapped* (review finding J2 -- an unmapped surface
     /// reserves nothing, see [`LayerEntry::mapped`]'s doc) layer entry's
     /// positive exclusive zone shrinks the respective edge via
-    /// [`fold_exclusive_zone`] -- `exclusive <= 0` reserves nothing, per
+    /// `fold_exclusive_zone` -- `exclusive <= 0` reserves nothing, per
     /// wlr-layer-shell's own definition (see [`LayerEntry::exclusive`]'s
     /// doc).
     ///
@@ -1910,7 +1910,7 @@ impl State {
     /// would be -- translated by minus the root's surface origin.
     ///
     /// `None` if the popup is unknown, or its root or that root's output is
-    /// gone (including the [`NO_OUTPUT`] sentinel, which never resolves).
+    /// gone (including the `NO_OUTPUT` sentinel, which never resolves).
     pub fn popup_constraint_box(&self, popup: crate::wayland::PopupKey) -> Option<Rectangle> {
         let entry = self.popups.get(&popup)?;
         let (origin_x, origin_y) = self.root_surface_origin(entry.root)?;
@@ -4220,7 +4220,7 @@ impl State {
     /// cursor. `XCURSOR_SIZE` is deliberately *not* forced here: the output scale
     /// is unknown at boot, and forcing a fixed `24` would both lose HiDPI sizing
     /// and (since the env var outranks the X resource in Xcursor's lookup)
-    /// override the scale-aware `Xcursor.size` that [`export_x11_dpi`] writes to
+    /// override the scale-aware `Xcursor.size` that `export_x11_dpi` writes to
     /// the root `RESOURCE_MANAGER` once the scale is known. A session that
     /// explicitly exported `XCURSOR_SIZE` still wins, exactly as intended.
     pub fn publish_xwayland_env(display_name: Option<&str>) {
@@ -6324,7 +6324,7 @@ impl wlr::ToplevelHandler for State {
         self.begin_client_move(window_id);
     }
 
-    /// Locked-session gate, for the same reason as [`Self::request_move`].
+    /// Locked-session gate, for the same reason as `Self::request_move`.
     ///
     /// The reason is *nearly* the same: `begin_client_resize` does not
     /// focus, it only starts a `ResizeMachine` grab. What a hidden client
@@ -6422,7 +6422,7 @@ impl wlr::ToplevelHandler for State {
     /// A client created a wlr-layer-shell surface. Resolve its output --
     /// what it asked for (`output_id` via `output_ids`), or the output
     /// under the pointer (which itself falls back to the lowest index) --
-    /// and park it under the [`NO_OUTPUT`] sentinel if neither resolves,
+    /// and park it under the `NO_OUTPUT` sentinel if neither resolves,
     /// i.e. no output exists yet at all (review finding M5): the surface
     /// is *not* dropped, because `State::resolve_orphaned_layers` re-homes
     /// every `NO_OUTPUT` entry (and configures it) the moment `new_output`
@@ -6951,7 +6951,7 @@ impl wlr::ToplevelHandler for State {
     /// *honor* the request for any mapped, non-minimized window on the
     /// active workspace -- so an X11 client could take the keyboard from
     /// under the user at will, while the very same ask over
-    /// `xdg-activation-v1` was refused by [`activation_may_steal_focus`].
+    /// `xdg-activation-v1` was refused by `activation_may_steal_focus`.
     /// Two protocols, one behavior: an `_NET_ACTIVE_WINDOW` message carries
     /// no activation token, so it has no seat serial (`has_seat = false`)
     /// and names no requesting toplevel (`requester = None`) -- exactly the

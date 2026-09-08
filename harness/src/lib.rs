@@ -465,7 +465,7 @@ impl Compositor {
         icedtea_compositor::backend::wake(&self.wake);
     }
 
-    /// `GetState` round trip, with a [`TIMEOUT`] deadline.
+    /// `GetState` round trip, with a `TIMEOUT` deadline.
     pub fn snapshot(&self) -> Snapshot {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::GetState(reply_tx));
@@ -655,7 +655,7 @@ impl Compositor {
     }
 
     /// The primary output's real geometry, via `State::outputs`. Panics if
-    /// no output ever appears within [`TIMEOUT`].
+    /// no output ever appears within `TIMEOUT`.
     ///
     /// Review finding F11: the honest answer to "how big is the screen",
     /// replacing the maximize-a-window-and-read-its-geometry dance the
@@ -2108,7 +2108,7 @@ pub struct TestClient {
 
 /// Connect to `socket` and bind every global this harness knows about.
 ///
-/// Factored out of [`TestClient::map`] so [`LayerPanelClient::spawn`] can
+/// Factored out of `TestClient::map` so [`LayerPanelClient::spawn`] can
 /// share the identical connect-and-bind sequence -- both clients need the
 /// same registry roundtrip, and a second implementation of it would be one
 /// more place for the "twice: globals, then binds settle" comment below to
@@ -2319,7 +2319,7 @@ pub fn read_selection_from_data_control(
 }
 
 /// Build a `w`x`h` shm-backed buffer, solid opaque grey. Shared by
-/// [`TestClient::map`] and [`LayerPanelClient::spawn`] -- both need exactly
+/// `TestClient::map` and [`LayerPanelClient::spawn`] -- both need exactly
 /// this to answer their respective compositor-chosen size with a real
 /// attach.
 fn create_shm_buffer(
@@ -2604,7 +2604,7 @@ impl TestClient {
         }
     }
 
-    /// Pump the client queue until `pred(self)` holds or [`TIMEOUT`] elapses.
+    /// Pump the client queue until `pred(self)` holds or `TIMEOUT` elapses.
     /// Returns whether the predicate ever held.
     ///
     /// A `roundtrip` rather than `blocking_dispatch`: a roundtrip always
@@ -2617,7 +2617,7 @@ impl TestClient {
     }
 
     /// As [`Self::wait_until`], but with an explicit timeout rather than
-    /// [`TIMEOUT`] -- for a negative assertion ("this must not happen")
+    /// `TIMEOUT` -- for a negative assertion ("this must not happen")
     /// where waiting the full default timeout on every green run would slow
     /// the suite down for no benefit.
     pub fn wait_until_timeout(
@@ -2647,7 +2647,7 @@ impl TestClient {
     }
 
     /// The size of the buffer actually attached at map time -- the
-    /// compositor's configure size, or [`FALLBACK_SIZE`] if it configured
+    /// compositor's configure size, or `FALLBACK_SIZE` if it configured
     /// `0x0`. A caller that derives a press point from the model's snapshot
     /// geometry should check it against this rather than assume the two
     /// agree.
@@ -2854,7 +2854,7 @@ impl TestClient {
     /// Panics if a popup from this client is already live (use
     /// [`TestClient::open_popup_from_popup`] for a nested one), on a
     /// non-positive size, or if the compositor never configures within
-    /// [`TIMEOUT`].
+    /// `TIMEOUT`.
     pub fn open_popup(&mut self, spec: PopupSpec) {
         assert!(
             self.popups.is_empty(),
@@ -3061,7 +3061,7 @@ impl TestClient {
 
     /// As [`TestClient::start_drag_text`], but with a visible drag icon: a
     /// second `wl_surface` sized `icon_w`x`icon_h`, backed by the same
-    /// solid-grey shm buffer machinery [`TestClient::map`] uses for the
+    /// solid-grey shm buffer machinery `TestClient::map` uses for the
     /// toplevel.
     ///
     /// Order matters here, and was resolved empirically:
@@ -3531,7 +3531,7 @@ impl LayerPanelClient {
     /// commit, wait for `Configure`, ack (inside the `Dispatch` impl), then
     /// a real shm-backed attach at the compositor-chosen size and a second
     /// commit -- the same "commit, await configure, ack, attach, commit"
-    /// shape [`TestClient::map`] follows for a toplevel.
+    /// shape `TestClient::map` follows for a toplevel.
     fn spawn(socket: &str, exclusive: i32) -> LayerPanelClient {
         let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
 
@@ -3605,7 +3605,7 @@ impl LayerPanelClient {
         }
     }
 
-    /// Pump the client queue until `pred(self)` holds or [`TIMEOUT`]
+    /// Pump the client queue until `pred(self)` holds or `TIMEOUT`
     /// elapses. Mirrors [`TestClient::wait_until`] exactly.
     pub fn wait_until(&mut self, pred: impl Fn(&LayerPanelClient) -> bool) -> bool {
         let deadline = Instant::now() + TIMEOUT;
@@ -3680,7 +3680,7 @@ impl LayerPanelClient {
     }
 
     /// How many `zwlr_layer_surface_v1.configure` events have arrived, ever.
-    /// See [`ClientState::layer_configures`] for why a remap test cannot use
+    /// See `ClientState::layer_configures` for why a remap test cannot use
     /// [`Self::layer_configure`] instead.
     pub fn layer_configure_count(&self) -> u32 {
         self.state.layer_configures
@@ -3694,7 +3694,7 @@ impl LayerPanelClient {
     /// `zwlr_layer_surface_v1.get_popup`, before the popup's initial commit.
     ///
     /// Panics if a popup is already live, on a non-positive size, or if the
-    /// compositor never configures within [`TIMEOUT`].
+    /// compositor never configures within `TIMEOUT`.
     pub fn open_popup(&mut self, spec: PopupSpec) {
         assert!(
             self.popup.is_none(),
@@ -3790,7 +3790,7 @@ impl LayerPanelClient {
     /// `Dispatch` impl — the buffer attach and the commit that maps it.
     ///
     /// Returns whether the mandatory configure actually arrived within
-    /// [`TIMEOUT`]. `false` is the exact symptom of final review I1: the
+    /// `TIMEOUT`. `false` is the exact symptom of final review I1: the
     /// compositor recomputes the identical placement, its storm guard
     /// suppresses the send, and the client waits forever for a configure it
     /// can never map without.
@@ -4145,7 +4145,7 @@ pub struct DataControlClient {
 
 impl DataControlClient {
     /// Connect and bind; the data-control device is created inside
-    /// [`connect_and_bind`]. Panics if the compositor did not advertise
+    /// `connect_and_bind`. Panics if the compositor did not advertise
     /// `zwlr_data_control_manager_v1`.
     pub fn spawn(socket: &str) -> DataControlClient {
         let (conn, queue, qh, state) = connect_and_bind(socket);
@@ -4254,7 +4254,7 @@ impl DataControlClient {
         }
     }
 
-    /// Pump the queue until `pred` holds or [`TIMEOUT`] elapses.
+    /// Pump the queue until `pred` holds or `TIMEOUT` elapses.
     pub fn wait_until(&mut self, pred: impl Fn(&DataControlClient) -> bool) -> bool {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -4458,7 +4458,7 @@ impl SessionLockClient {
         }
     }
 
-    /// Pump until the `locked` event arrives, bounded by [`TIMEOUT`]. Returns
+    /// Pump until the `locked` event arrives, bounded by `TIMEOUT`. Returns
     /// whether it did.
     pub fn wait_locked(&mut self) -> bool {
         let deadline = Instant::now() + TIMEOUT;
@@ -4568,7 +4568,7 @@ impl IdleNotifyClient {
         let _ = self.queue.roundtrip(&mut self.state);
     }
 
-    /// Pump bounded by [`TIMEOUT`] (5s -- generous relative to the short
+    /// Pump bounded by `TIMEOUT` (5s -- generous relative to the short
     /// timeouts these tests request) until `idled` arrives. Returns whether
     /// it did.
     pub fn wait_idled(&mut self) -> bool {
@@ -4903,7 +4903,7 @@ impl GammaControlClient {
         }
     }
 
-    /// Pump until `pred` holds or [`TIMEOUT`] elapses; returns whether it
+    /// Pump until `pred` holds or `TIMEOUT` elapses; returns whether it
     /// ever held. A bounded `roundtrip` loop for the same reason
     /// [`TestClient::wait_until`] is one -- the deadline stays honest even
     /// against a compositor that has nothing to say.

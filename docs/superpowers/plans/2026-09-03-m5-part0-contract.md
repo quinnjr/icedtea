@@ -2027,12 +2027,48 @@ owning part's fix wave, not in the close-out.
 
 ## 6. Amendments
 
-*(Empty at freeze. Every deviation a part discovers is appended here as
-`### <Part>-D<n> — <one-line ruling>` with the conflicting texts quoted, the
-ruling, and which part carries it out — the same shape as the M3 contract's §10.
-P0's eleven items above are the pre-declared set and are already numbered
-`M5-D1 … M5-D11`; a part's own discoveries start at `P1-D1`, `P4-D1`, and so on,
-so the two sets never collide.)*
+*Frozen at the M5 close-out (P6). The eleven pre-declared M5-D items are recorded
+as landed with their commits; each part's own discoveries follow in the M3 §10
+shape (**Carried out by / Added / Contract says / As shipped / Ruling**), and
+P6's close-out deviations come last. Placement note (P6 reconciliation): P0's own
+discoveries — `P0-D1 … P0-D10` — sit in this section directly below the landed
+table; the app parts appended theirs (`P2-D*`, `P3-D*`, `P4-D*`, `P5-D*`) at the
+tail of the document during their own fix waves, immediately after §7's execution
+notes, rather than here, and they are left where each part wrote them, unrenumbered
+and unreworded. P6's twelve enumerated deviations plus this section's own
+`P6-D13` are recorded in §6 below, after the P0 block. P1 recorded none as `P1-D*`
+headings; its two structural choices are carried as §7's E2/E5 and cited as
+`P1-D2` from there.*
+
+### M5-D1 … M5-D11 — landed
+
+| Item | What it added | Landed in |
+|---|---|---|
+| M5-D1 | `Window::watch_fd`/`unwatch`/`watches`, `WatchId`, `Interest`, `InputEvent::FdReady`, the N-fd `wait_bounded` | `ebf1db2` |
+| M5-D2 | `Inbox`/`InboxSender`/`SendError`, `App::with_inbox`, `App::on_fd`, the drain order | `1a76564` |
+| M5-D3 | `Cmd::Task(Rc<dyn Fn()>)`, executed in `drain` outside `update` | `befe30c` |
+| M5-D4 | `App::new` takes `impl FnMut`/`impl Fn`; `fn` items still coerce | `d6be951` |
+| M5-D5 | `EventKind::{PointerDown,PointerMotion,PointerUp}`, `Handler::PairButton`, six builders, `BTN_*` | `e2e1cab` |
+| M5-D6 | `Prop::Draw` carries `&mut PaintCx` so a canvas can shape text | `50c5704` |
+| M5-D7 | `Keymap::base_keysym`, `KeyEvent::base`, the normalisation rule | `47c08bf` |
+| M5-D8 | Rest paint for `ColorDialogButton`/`ColorDialog`/`CheckButton`/`Scrollbar`; `KNOWN_BLANK_AT_REST` 9 → 6 | `7391569` |
+| M5-D9 | `Window::probe_points`/`allocation`, `ProbePoint`, `$ICEDTEA_PROBE_REPORT` | `966bb6f` |
+| M5-D10 | `ui/Cargo.toml`: `rustix` gains `pipe`, `crossbeam-channel` added | `ebf1db2`, `1a76564` |
+| M5-D11 | `ui/README.md`'s five new sections and the `KNOWN_BLANK` correction | `f34d355` |
+
+**Gate run at close-out** (`feature/pure-rust-gtk-m5-p6` @ `f7d7de2`, full set, one tree):
+`cargo fmt --check` exit 0; `cargo clippy --workspace --all-targets -D warnings`
+and `cargo clippy -p icedtea-ui --no-default-features -D warnings` both Finished;
+`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` green (after the
+`P6-D13` doc-only fix); and the app suites —
+
+- `icedtea-ui`: `test result: ok. 1091 passed; 0 failed` (lib) plus every
+  integration suite green, incl. `gallery_gate` 10 in 167.6s (full-page slices
+  in three themes under the harness compositor) and `interaction_gate` 19.
+- `icedtea-settings` (`--test-threads=1`): 235 passed, 0 failed across all suites,
+  incl. the 128s/50s/47s/41s/33s compositor-harness output runners.
+- `icedtea-shell` (`--test-threads=1`): 56 passed, 0 failed (lib 32 + audits 9 +
+  ledger 4 + compositor_client/live_dbus 1 + panel 10).
 
 ### P0-D1 — pointer handlers fire centrally in `view::app::deliver`, not from `GenericC::on_event` plus per-widget forwarding
 
@@ -2208,6 +2244,236 @@ which now gets the same answer layout gets. Named in `ui/README.md`'s widget
 catalogue. Carried out by P0 (whole-part fix wave).
 
 ---
+
+### P6-D1 — the close-out sweeps stale GTK doc comments out of must-not-touch files
+
+**Carried out by:** P6 (`settings/src/model.rs`, `settings/src/outputs/mod.rs`,
+`settings/src/outputs/protocol.rs`, `shell/src/compositor_client.rs`,
+`shell/src/clip_client.rs`, `shell/tests/live_dbus.rs`, `shell/src/taskbar.rs`).
+**Added:** 2026-09-03, at the close-out.
+
+**Contract §4.1 says** the source grep over `settings/src settings/tests
+shell/src shell/tests` "must also be empty", while §0/§2.1 list `model.rs`,
+`outputs/{mod,protocol}.rs` as **unchanged** and §5 makes
+`compositor_client.rs`/`clip_client.rs`'s bodies must-not-touch for P5. Both
+cannot hold: those files describe GTK machinery in prose
+(`gdk::ModifierType`, "a `gio::Socket` glib source", "pushes it to the GTK
+thread") that no longer exists.
+
+**As shipped:** P6 rewrites those comment lines and nothing else. The diff for
+every one of the seven files contains only `//!`, `///` and `//` lines, checked
+mechanically in Task 1 Step 4 and Task 2 Step 4.
+
+**Ruling.** Stale documentation of a deleted dependency is exactly the residue a
+close-out exists to remove, and a comment is not behaviour: no signature, no
+expression and no test changed, and `live_dbus` was re-run green immediately
+after. The must-not-touch rules protect behaviour, and they are intact.
+
+### P6-D2 — the dependency audit ships as tests, not only as shell commands
+
+**Carried out by:** P6 (`settings/tests/dependency_audit.rs`,
+`shell/tests/dependency_audit.rs`). **Added:** 2026-09-03.
+
+**Contract §4.1 states** the audit as `cargo tree` invocations and two `grep`s
+run once.
+
+**As shipped:** nine hermetic assertions across two files — manifest, sources,
+stale prose, deferred work, and two workspace-scope `Cargo.lock` checks — that
+never invoke `cargo`. §4.1's exact commands are still run once by hand and their
+output is in the audit commits' messages.
+
+**Ruling.** A command run once at close-out proves the tree on that day; a test
+proves it on every commit after. Invoking `cargo` from inside `cargo test` was
+rejected: it contends for the build lock and can hang the suite.
+
+### P6-D3 — the workspace-scope lockfile assertions live in the settings crate
+
+**Carried out by:** P6 (`settings/tests/dependency_audit.rs`).
+**Added:** 2026-09-03.
+
+**The contract has no home** for a workspace-scope test: `harness/`,
+`contract/`, `config/`, `compositor/`, `clipboard/` and `notifications/` are all
+out of M5 scope (contract header).
+
+**As shipped:** `the_workspace_lockfile_has_no_gtk_stack_package` and
+`no_new_gtk_stack_package_slips_into_the_lockfile` live in settings' audit file,
+documented there as workspace-scope. Shell's audit is crate-scope only.
+
+**Ruling.** One owner, arbitrary but recorded, beats two copies that can drift.
+The lockfile listed twenty-four GTK-stack packages at freeze and must list none;
+by the close-out it lists zero (P5 removed the last), and settings was chosen as
+the owner because it held the larger GTK surface.
+
+### P6-D4 — `cargo tree -i <absent>` fails; it does not print "package ID not found"
+
+**Carried out by:** P6 (Task 1 Step 5, Task 2 Step 5). **Added:** 2026-09-03.
+
+**Contract §4.1 says** the invert query "must print `package ID not found`".
+
+**As shipped:** the corroboration asserts a **non-zero exit**. The real message,
+measured on 2026-09-03, is exit `101` with ``error: package ID specification
+`gtk4` did not match any packages``.
+
+**Ruling.** Grepping for a string cargo never emits would have passed
+vacuously — the failure mode a dependency audit exists to prevent.
+
+### P6-D5 — `cargo doc` is run with `RUSTDOCFLAGS="-D warnings"`
+
+**Carried out by:** P6 (Task 5). **Added:** 2026-09-03.
+
+**Contract §4.4 writes** `cargo doc --workspace --no-deps  # -D warnings`.
+`-D warnings` is not a `cargo doc` flag.
+
+**As shipped:** `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`,
+the M3 P8 precedent. See P6-D13 for what running it for the first time revealed.
+
+### P6-D6 — §4.2's deletions get a ledger test each
+
+**Carried out by:** P6 (`settings/tests/deletion_ledger.rs`,
+`shell/tests/deletion_ledger.rs`). **Added:** 2026-09-03.
+
+**Contract §4.2 lists** six deleted files and thirteen deleted-in-place items
+with no proof mechanism, while the milestone rule is "every deletion is paired
+with the test that proves the replacement".
+
+**As shipped:** four data tables per crate — deleted-path→replacement→proof,
+forbidden identifiers, moved/kept suite test counts, and required gate names.
+
+**Ruling.** The pairing is data, so it cannot drift from prose. The one deletion
+with no replacement test — `settings/tests/appearance_gtk.rs` — is paired
+explicitly with P6-D7 below, so the table stays total rather than silently
+short.
+
+### P6-D7 — `appearance_gtk.rs`'s populate guard is not ported: it is true by construction
+
+**Carried out by:** P2 (deletion), P6 (record). **Added:** 2026-09-03.
+
+**`settings/tests/appearance_gtk.rs`'s
+`populate_never_writes_a_widget_fallback_back_into_the_model`** guarded the GTK
+`Ctx`/`Page`/`populating: Rc<Cell<bool>>` machinery
+(`settings/src/pages/mod.rs:28-43`), which existed because a *programmatic*
+widget write fires the same handler a user edit does.
+
+**As shipped:** not ported. On an Elm loop there is no write-back at all —
+`view` renders `model.working`, and a handler runs only from real input — so the
+property holds by construction and there is nothing left to guard. `Ctx`,
+`Page`, `Page::refresh`, `populating` and the `keybindings_page_slot`
+forward-reference are deleted, and `settings/tests/deletion_ledger.rs`'s
+`every_deleted_settings_identifier_is_gone` is what keeps them gone.
+
+### P6-D8 — the IME regression: both apps' text entries lose input methods until M6
+
+**Carried out by:** P6 (record); the whole milestone carries it.
+**Added:** 2026-09-03.
+
+**GTK4's `Entry` speaks `text-input-v3`** through GTK's IM context. The toolkit
+does not: `text-input-v3` is M6 scope by policy (spec §2 decision 8, §11).
+
+**As shipped:** settings' wallpaper path, workspace-name and keybinding fields,
+and the clipboard popover's search field, accept direct key events only. Users
+of an input method — CJK, Korean, any compose-heavy layout — lose composition in
+these two apps at this merge and regain it at M6.
+
+**Ruling.** Stated here **and in the PR body**, in plain words, rather than
+discovered by a user. It is not softened by "most users are unaffected": it is a
+regression, it is deliberate, and it is scheduled.
+
+### P6-D9 — the `DropDown` fixed 240 px list is sized to content, capped
+
+**Carried out by:** P4 (`ui/src/widgets/drop_down.rs`), P6 (record).
+**Added:** 2026-09-03.
+
+**M3 P7-D54 embeds** a `DropDown`'s list at a fixed 240 px
+(`ui/src/widgets/drop_down.rs:350`), which clips inside settings' 420 px-tall
+window with a switcher and two footers above and below.
+
+**As shipped:** the retained list is `rows * DROP_DOWN_ROW_PX` clamped to
+`DROP_DOWN_MAX_PX = 240` and scrolls beyond it, so a two-item list is 68 px.
+`ui/tests/interaction_gate.rs::opening_a_drop_down_and_picking_an_item_updates_the_button`
+stayed green unchanged, and
+`settings/tests/displays.rs::a_drop_down_list_fits_inside_the_settings_window`
+is the regression test.
+
+**Ruling.** This is the one enumerated exception to "`ui/` belongs to P0"
+(contract §7): the correct height is knowable only once a real settings page is
+laid out at 420 px. It is not a precedent for further app-part edits under
+`ui/`.
+
+### P6-D10 — the M3 contract's `App::new` signature is superseded by M5-D4
+
+**Carried out by:** P0, P6 (cross-reference). **Added:** 2026-09-03.
+
+**M3 contract §4.7 (`2026-08-27-m3-part0-contract.md:1516-1521`) ships**
+`App::new(model, update: fn(&mut M, Msg) -> Cmd<Msg>, view: fn(&M) ->
+View<Msg>)`.
+
+**As shipped:** M5-D4's `impl FnMut` / `impl Fn` widening. Both M5 apps need
+captured state in `update` (worker senders; `Rc<dyn CompositorCommands>` so the
+mocks can be swapped), and a bare `fn` item cannot capture. `fn` items still
+coerce, so the gallery, `ui/tests/counter_app.rs` and every M3 call site compile
+unchanged.
+
+**Ruling.** Recorded here, and a one-line pointer is added to the M3 contract's
+own §10 so a reader of the older document is not misled.
+
+### P6-D11 — `auto_exclusive_zone_enable()` becomes a literal `exclusive_zone: 28`
+
+**Carried out by:** P5, P6 (record). **Added:** 2026-09-03.
+
+**`shell/src/main.rs:49-84` called** `window.auto_exclusive_zone_enable()`,
+which asks gtk4-layer-shell to track the surface's own height.
+
+**As shipped:** `LayerSpec::exclusive_zone` is a concrete `i32`, so the panel
+passes `BAR_HEIGHT` (28) — the height `set_size_request(-1, 28)` forced anyway.
+
+**Ruling.** The two are equivalent for a bar of fixed height, which this bar is.
+A future variable-height bar needs a real `auto` mode in `LayerSpec`, and that
+is toolkit work, not app work.
+
+### P6-D12 — `async-channel` is retained in both app crates
+
+**Carried out by:** P1, P5, P6 (record). **Added:** 2026-09-03.
+
+**Decision 1 drops** `gtk4`/`gio`/`glib`/`gobject`/`pango`/`cairo`/`gdk` from a
+migrated app.
+
+**As shipped:** `async-channel` stays in both `settings/Cargo.toml` and
+`shell/Cargo.toml`. It is not a GTK crate: `settings/src/outputs/protocol.rs`
+keeps its `connect_to_env(tx: async_channel::Sender<OutputsMsg>)` signature
+unchanged (spec §5.3), and shell's two D-Bus workers keep theirs (§3.5). The
+inbox side uses `crossbeam-channel`.
+
+**Ruling.** The rule bans the GNOME toolkit, not every channel crate the old
+code happened to sit beside. Changing `protocol.rs`'s signature to remove a
+dependency it does not have would have broken "reuse the pure core unchanged".
+
+### P6-D13 — the workspace `cargo doc -D warnings` gate had never been green: inherited doc-link debt
+
+**Carried out by:** P6 (Task 5). **Added:** 2026-09-08, running the P6-D5 gate for real.
+
+**P6-D5 defines** the doc gate as `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps` and calls it "the M3 P8 precedent" — implying it had
+passed. Run for the first time across the whole workspace, it was **red**: 25
+public doc comments in eight crates (`harness`, `compositor`, `config`,
+`notifications`, `settings`, `shell`, `ui`) linked, via `[`Ident`]` intra-doc
+syntax, to items private to their own module, which rustdoc rejects under
+`-D warnings` ("public documentation for `X` links to private item `Y`"), plus a
+few plain "unresolved link" residues of renamed helpers.
+
+**As shipped:** the whole class is fixed doc-only in `f7d7de2`. Every offending
+`[`Ident`]` becomes a plain `` `Ident` `` code span — the symbol reads
+identically; it simply no longer asks rustdoc to hyperlink a private item. The
+diff is 44 insertions / 44 deletions, every one a `///` or `//!` line (verified:
+zero non-doc changed lines); `cargo fmt --check` stays clean; the gate is now
+green workspace-wide.
+
+**Ruling.** This is pre-existing debt, not an M5 regression — `harness`,
+`compositor`, `config` and `notifications` are not migrated app crates and
+`develop` carries the identical lines; the gate had simply never been executed to
+completion. It is fixed here rather than deferred or carved out of a gate the
+contract defines as workspace-wide: the fix is doc-only, the same risk-class as
+P6-D1's comment sweeps, and it touches non-app crates only because the gate is
+workspace-scoped by definition. No code, signature, test or behaviour changed.
 
 ## 7. Execution notes
 
