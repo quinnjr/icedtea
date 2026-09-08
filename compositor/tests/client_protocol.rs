@@ -329,6 +329,43 @@ fn enable_activates_ime_and_relays_surrounding_text() {
     assert!(comp.input_method_active(), "oracle: IME must be active");
 }
 
+/// B5 test (M6.1 coverage gap): once a text-input is already active, a
+/// SUBSEQUENT commit with NEW surrounding text must be re-forwarded to the
+/// IME with the UPDATED values -- not just the initial forward at
+/// activation time. Exercises `on_text_input_commit`'s re-forward path.
+#[test]
+fn commit_after_activation_reforwards_updated_surrounding() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket); // IME bound first
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+
+    // Step 1: activate, and establish the initial surrounding relay.
+    ti.enable();
+    ti.commit_with("first", 5, 5, (10, 20, 2, 16));
+    assert!(
+        im.wait_until(|s| s.surroundings().last() == Some(&("first".to_string(), 5, 5))),
+        "IME never saw the initial surrounding relay; saw {:?}",
+        im.surroundings()
+    );
+    assert!(comp.input_method_active(), "oracle: IME must be active");
+
+    // Step 2: the re-forward assertion. A second commit on the
+    // ALREADY-ACTIVE text-input carries new surrounding text; the IME must
+    // observe the UPDATED (text, cursor, anchor), not remain stuck on the
+    // initial "first" values.
+    ti.commit_with("second value", 3, 8, (11, 21, 3, 17));
+    assert!(
+        im.wait_until(|s| s.surroundings().last() == Some(&("second value".to_string(), 3, 8))),
+        "IME never saw the re-forwarded, UPDATED surrounding relay; saw {:?}",
+        im.surroundings()
+    );
+}
+
 /// B5 test 4 (the Spec-2 unblock): an IME's preedit + commit_string relay
 /// through to the focused app's `zwp_text_input_v3`. Asserts on the app side
 /// (the text-input double's captured `preedit_string`/`commit_string`).
