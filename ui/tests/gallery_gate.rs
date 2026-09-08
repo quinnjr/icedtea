@@ -14,8 +14,9 @@ use icedtea_ui::gallery::{
 use icedtea_ui::view::Kind;
 use icedtea_ui::widgets::{fixture_matches, node_tree_of};
 use support::{
-    EntryAllocation, ProbePoint, entry_allocations, paints_something, parse_allocation_line,
-    parse_probe_line, pixel_at, probe_points, spawn_gallery, wait_for_gallery,
+    EntryAllocation, ProbePoint, allocation_sized, entry_allocations, paints_something,
+    parse_allocation_line, parse_probe_line, pixel_at, probe_points, spawn_gallery,
+    spawn_gallery_widget_sized, wait_for_gallery,
 };
 
 /// How far the page scrolls between captures.
@@ -168,22 +169,33 @@ const KNOWN_BLANK_AT_REST: &[&str] = &[
     // gallery sample now has a height) and `font_dialog` (its chooser lists
     // the families the database can match).
     //
-    // `popover_menu_bar` stays exempt for a different reason than the popup:
-    // its P8-D72 defect *is* fixed — `reserved_total` keeps its per-menu
-    // `item`s (they were trimmed to a 0x0 bar) and each now carries a `label`
-    // with the menu name, so it renders "File" at rest in every offscreen
-    // form this crate can build (`build_widget`, `App::run_offscreen` bare,
-    // and wrapped in the gallery's own `frame`). Only *this* gate, driving the
-    // real headless compositor over the full framed page, fails to find that
-    // 18px-wide title inside the widget's own reported box: the label's ink
-    // lands a dozen-odd px above the box the print-allocation pass reports for
-    // it, so the short (27px) entry's scan misses it. `window_controls` (30px,
-    // icon ink) clears the same gate, so the miss is specific to this
-    // widget's small top-anchored text under the real compositor, not a paint
-    // defect — tracked as an M6-0 follow-up rather than blocking the gate.
+    // `popover_menu_bar` is NOT here: it paints its titles at rest and is held
+    // to that by `the_popover_menu_bar_paints_its_titles_at_rest` below, which
+    // asserts in single-widget mode. It cannot be checked by the full-page walk
+    // above for an infrastructure reason, not a paint defect: `App::probe`'s
+    // cumulative vertical layout runs ~1.3% taller than `App::run` renders, so
+    // under the live compositor every widget paints slightly above its reported
+    // allocation, the drift growing with page depth (~0 at the top, ~44px at the
+    // bottom). Every other bottom-of-page widget is tall enough that its ink
+    // still overlaps its drifted box; this uniquely short (27px) bar with thin,
+    // centred title ink is the only one a ~44px shift clears entirely. The
+    // probe-vs-live divergence itself is a tracked follow-up (it moves every
+    // gate's page coordinates, so fixing it is a dedicated layout task).
     "popover_menu",
-    "popover_menu_bar",
 ];
+
+/// Paints at rest, but skipped by the full-page walk and asserted instead by
+/// `the_popover_menu_bar_paints_its_titles_at_rest_*` in single-widget mode.
+///
+/// This is NOT "blank at rest" (that is `KNOWN_BLANK_AT_REST`): `popover_menu_bar`
+/// renders its titles. The full-page walk simply cannot locate them — `App::probe`
+/// lays the page out ~1.3% taller than `App::run` renders it, so a widget's painted
+/// ink drifts above its reported box as page depth grows (~44px at the bottom),
+/// clearing this uniquely short (27px) bar's whole box while leaving the taller
+/// widgets around it overlapping their own drifted ink. Fixing that probe-vs-live
+/// divergence moves every gate's page coordinates and is a dedicated layout
+/// follow-up; until then this widget is held to the rest-paint bar out of band.
+const PAINTS_BUT_UNLOCATABLE_IN_FULL_WALK: &[&str] = &["popover_menu_bar"];
 
 /// Every own-kind entry paints something, in `theme`.
 ///
@@ -240,7 +252,9 @@ fn every_widget_renders_at_rest(theme: &str) {
             if seen.contains(&widget) {
                 continue;
             }
-            if KNOWN_BLANK_AT_REST.contains(&widget.as_str()) {
+            if KNOWN_BLANK_AT_REST.contains(&widget.as_str())
+                || PAINTS_BUT_UNLOCATABLE_IN_FULL_WALK.contains(&widget.as_str())
+            {
                 seen.push(widget);
                 continue;
             }
@@ -301,6 +315,73 @@ fn every_widget_renders_at_rest_in_the_dark_theme() {
 #[test]
 fn every_widget_renders_at_rest_in_the_high_contrast_theme() {
     every_widget_renders_at_rest("hc");
+}
+
+/// `popover_menu_bar` paints its menu titles at rest, in `theme`.
+///
+/// Held to the same "paints something at rest" bar as every other kind, but
+/// verified in single-widget mode (one framed entry at the page origin) rather
+/// than by `every_widget_renders_at_rest`'s full-page walk. The walk cannot see
+/// this widget's ink: `App::probe`'s cumulative vertical layout runs ~1.3%
+/// taller than `App::run` renders, so under the live compositor every widget
+/// paints a little above its reported allocation, the drift growing with page
+/// depth to ~44px at the bottom -- more than this uniquely short (27px) bar's
+/// whole box, though harmless to the taller widgets around it (see the note on
+/// `KNOWN_BLANK_AT_REST`). Single-widget mode has no long page, so the drift is
+/// ~0 and the reported box coincides with the painted ink.
+///
+/// Mutation check: revert `PopoverMenuBarC`'s per-menu `label`/`reserved_total`
+/// (the M6-0 fix) so the bar trims back to 0x0 -- this fails with
+/// "popover_menu_bar painted nothing ...".
+fn popover_menu_bar_paints_at_rest(theme: &str) {
+    let compositor = Compositor::spawn();
+    let socket = compositor
+        .socket_path()
+        .file_name()
+        .expect("socket name")
+        .to_string_lossy()
+        .to_string();
+    let (ow, oh) = compositor.output_size();
+    let output = (ow as u32, oh as u32);
+    let mut screencopy = ScreencopyClient::spawn(&socket);
+    let empty = screencopy.capture();
+    let background_probe = (output.0 - 3, output.1 / 2);
+    let wallpaper = pixel_at(&empty, background_probe.0, background_probe.1)
+        .expect("the background probe is inside the frame");
+
+    let gallery = spawn_gallery_widget_sized(&socket, theme, "popover_menu_bar", output);
+    let frame = wait_for_gallery(&mut screencopy, background_probe, wallpaper);
+    let page_background =
+        pixel_at(&frame, background_probe.0, background_probe.1).expect("inside the frame");
+
+    let alloc = allocation_sized(theme, "popover_menu_bar", output);
+    let rect = (
+        alloc.x as i32,
+        alloc.y as i32,
+        alloc.width as i32,
+        alloc.height as i32,
+    );
+    assert!(
+        paints_something(&frame, rect, page_background),
+        "popover_menu_bar painted nothing at rest in the {theme} theme \
+         (single-widget mode); its box is {rect:?}"
+    );
+    drop(gallery);
+}
+
+#[test]
+fn the_popover_menu_bar_paints_its_titles_at_rest_in_the_light_theme() {
+    popover_menu_bar_paints_at_rest("light");
+}
+
+#[test]
+fn the_popover_menu_bar_paints_its_titles_at_rest_in_the_dark_theme() {
+    popover_menu_bar_paints_at_rest("dark");
+}
+
+#[test]
+fn the_popover_menu_bar_paints_its_titles_at_rest_in_the_high_contrast_theme() {
+    popover_menu_bar_paints_at_rest("hc");
 }
 
 /// Capture every slice of `theme` and index the probe pixels by

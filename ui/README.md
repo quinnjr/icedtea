@@ -518,10 +518,9 @@ cargo test -p icedtea-ui --test ingress            # M5 external-event ingress
   `KNOWN_BLANK_AT_REST`, which are measured, not asserted on:
 <!-- known-blank:begin -->
   `popover_menu` is a popup, correctly unmapped and blank until its button is
-  clicked, so it has no rest-state paint to assert; `popover_menu_bar`'s own
-  defect is fixed (it renders its menu title in every offscreen form) but this
-  compositor-driven gate cannot locate that small top-anchored title inside its
-  short reported box, tracked as an M6-0 follow-up.
+  clicked, so it has no rest-state paint to assert — the sole exemption. (The
+  menu *bar* is held to the assertion in single-widget mode; the full-page walk
+  can't see its short title at page depth, a probe-vs-live layout follow-up.)
 <!-- known-blank:end -->
   The list was fifteen until the M3 close-out's first fix wave (P8-D75 and the
   pooled-row measure), nine until M5-D8 gave `color_dialog`, `check_button` and
