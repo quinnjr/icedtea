@@ -2063,7 +2063,8 @@ and `cargo clippy -p icedtea-ui --no-default-features -D warnings` both Finished
 `P6-D13` doc-only fix); and the app suites —
 
 - `icedtea-ui`: `test result: ok. 1091 passed; 0 failed` (lib) plus every
-  integration suite green, incl. `interaction_gate` 10 in 167.6s.
+  integration suite green, incl. `gallery_gate` 10 in 167.6s (full-page slices
+  in three themes under the harness compositor) and `interaction_gate` 19.
 - `icedtea-settings` (`--test-threads=1`): 235 passed, 0 failed across all suites,
   incl. the 128s/50s/47s/41s/33s compositor-harness output runners.
 - `icedtea-shell` (`--test-threads=1`): 56 passed, 0 failed (lib 32 + audits 9 +
