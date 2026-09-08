@@ -87,12 +87,12 @@ fn percent_decode(s: &str) -> Option<Vec<u8>> {
 ///
 /// The `a(sa(us))` signature is `(name, [(kind, pattern)])`; kind `0` is a
 /// shell glob and kind `1` is a MIME type. Globs, not MIME types, because the
-/// same extension list is what [`crate::pages::appearance::validate_wallpaper`]
+/// same extension list is what [`crate::model::validate_wallpaper`]
 /// enforces on the way back in — offering a MIME filter the validator does not
 /// share would let the portal return a file the field then rejects.
 #[must_use]
 pub fn image_filters() -> Vec<(String, Vec<(u32, String)>)> {
-    let globs = crate::pages::appearance::WALLPAPER_EXTENSIONS
+    let globs = crate::model::WALLPAPER_EXTENSIONS
         .iter()
         .map(|ext| (0u32, format!("*.{ext}")))
         .collect();
@@ -548,7 +548,7 @@ mod tests {
             .iter()
             .flat_map(|(_, globs)| globs.iter().map(|(_, g)| g.clone()))
             .collect();
-        for ext in crate::pages::appearance::WALLPAPER_EXTENSIONS {
+        for ext in crate::model::WALLPAPER_EXTENSIONS {
             assert!(
                 patterns.iter().any(|p| p == &format!("*.{ext}")),
                 "the portal filter offers .{ext}"

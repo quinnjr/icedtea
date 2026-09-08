@@ -17,9 +17,8 @@ use std::time::{Duration, Instant};
 const SETTLE: Duration = Duration::from_secs(45);
 
 /// The server-side title bar `compositor/src/decoration.rs` reserves above a
-/// window's content area — the same constant `ui/tests/window_events.rs`
-/// uses to translate a window's frame geometry into a content-area origin.
-const TITLE_BAR_HEIGHT: i32 = 28;
+/// window's content area, from the shared support module (was redeclared here).
+use support::TITLE_BAR_HEIGHT;
 
 /// Poll `comp`'s model until a window with `app_id` is mapped, returning its
 /// frame geometry. The model row is only created on the wlr `mapped` signal,
@@ -44,7 +43,17 @@ fn wait_for_window(
     }
 }
 
-/// The window opens, paints, and both the switcher and the footer respond.
+/// The window opens, paints, and the switcher navigates; the footer step here
+/// proves only that an **insensitive** Apply (the model is clean) dispatches
+/// nothing — not Apply's dirty-guard behaviour.
+///
+/// The sensitive-Apply path (a dirty model queues a save task and sets the
+/// "Applying" status) is not exercisable on this bus-less harness — the Apply
+/// path needs a reload worker with a compositor to reach, which does not exist
+/// here — so it is covered instead by the unit test
+/// `apply_queues_a_task_and_says_so` in `settings/src/app.rs`
+/// (`icedtea_settings::app::tests`). That is the real sensitive-Apply gate;
+/// this test only pins the disabled-button-does-nothing half.
 ///
 /// Mutation check: remove `.on_selected(Msg::PageSelected)` from `nav`; the
 /// `page displays` wait fails. Restore.

@@ -27,6 +27,9 @@ use icedtea_harness::{
 
 /// The compositor's server-side title bar (`compositor/src/decoration.rs`),
 /// so window-surface coordinates can be mapped onto the output.
+///
+/// `settings/tests/support/mod.rs`'s `TITLE_BAR_HEIGHT` is the settings crate's
+/// source of truth; this copy is deliberately self-contained (plan P3-D4/P4-D1).
 const TITLE_BAR_HEIGHT: i32 = 28;
 
 /// Linux evdev keycodes.

@@ -42,7 +42,7 @@ pub fn spawn(
                     FsRequest::Shutdown => return,
                     FsRequest::ValidateWallpaper { text } => Msg::WallpaperValidated {
                         text: text.clone(),
-                        result: crate::pages::appearance::validate_wallpaper(&text)
+                        result: crate::model::validate_wallpaper(&text)
                             .map(|path| path.display().to_string()),
                     },
                     FsRequest::LoadConfig { db_path } => Msg::ConfigLoaded(

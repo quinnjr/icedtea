@@ -251,9 +251,11 @@ fn the_workspace_lockfile_has_no_gtk_stack_package() {
 /// Workspace scope (P6-D3). Catches a GTK-stack package the explicit list
 /// above could not know about.
 ///
-/// Mutation check: add `"gtk-fake"` to `GTK_STACK_PREFIXES`' input by
-/// inserting a `name = "gtk-fake"` line into a scratch copy of the lockfile
-/// string; the assertion must fire. (Do not edit `Cargo.lock` itself.)
+/// Mutation check (verifiable against the real, unmodified `Cargo.lock`):
+/// temporarily add a prefix that the workspace *does* lock — e.g. `"serde"` —
+/// to `GTK_STACK_PREFIXES`; `found` becomes non-empty (serde is locked) and
+/// the assertion fires. Remove it to restore. (This test reads the real
+/// lockfile; do not edit `Cargo.lock` itself.)
 #[test]
 fn no_new_gtk_stack_package_slips_into_the_lockfile() {
     let lock =

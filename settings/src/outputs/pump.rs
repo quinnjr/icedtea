@@ -180,11 +180,8 @@ impl OutputsPump {
         &self,
         edits: &[HeadEdit],
     ) -> Result<(), crate::outputs::OutputsError> {
-        let result = self.conn.borrow_mut().test_configuration(edits);
-        if result.is_ok() {
-            self.flush();
-        }
-        result
+        self.conn.borrow_mut().test_configuration(edits)?;
+        self.flush()
     }
 
     /// Ship `edits` as a **real** configuration. See
@@ -196,21 +193,33 @@ impl OutputsPump {
         &self,
         edits: &[HeadEdit],
     ) -> Result<(), crate::outputs::OutputsError> {
-        let result = self.conn.borrow_mut().build_and_send_configuration(edits);
-        if result.is_ok() {
-            self.flush();
-        }
-        result
+        self.conn.borrow_mut().build_and_send_configuration(edits)?;
+        self.flush()
     }
 
     /// Push queued requests out. The toolkit's loop flushes its own
     /// connection, never this one.
-    pub fn flush(&self) {
+    ///
+    /// A flush failure that does not HUP the fd would otherwise be swallowed
+    /// (warn-only) while the build path returned `Ok`, so no reply ever lands
+    /// and `submit()`'s in-flight latch never clears. Instead: latch the pump
+    /// `dead`, emit `Disconnected` so `update` can unwatch and tear down, and
+    /// return the error so `submit()`'s `Err` arm surfaces it and leaves the
+    /// busy state cleared (plan P4-D8).
+    ///
+    /// # Errors
+    /// [`crate::outputs::OutputsError::Protocol`] wrapping the flush failure.
+    pub fn flush(&self) -> Result<(), crate::outputs::OutputsError> {
         if self.dead.get() {
-            return;
+            return Ok(());
         }
-        if let Err(err) = self.conn.borrow().flush() {
+        let conn = self.conn.borrow();
+        if let Err(err) = conn.flush() {
             tracing::warn!(%err, "flushing the outputs connection failed");
+            self.dead.set(true);
+            conn.notify_disconnected();
+            return Err(crate::outputs::OutputsError::Protocol(err));
         }
+        Ok(())
     }
 }

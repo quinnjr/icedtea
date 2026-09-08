@@ -348,6 +348,14 @@ pub fn dragged(st: &mut DisplaysState, x: f64, y: f64) {
         st.drag = None;
         return;
     }
+    // `draw()` recomputes a fresh view from the live edits every frame, so the
+    // drag maths must read the latest view too — otherwise a moved head drifts
+    // out from under the cursor in multi-head layouts (a regression from the
+    // GTK page, which read the latest view). Recompute and republish `st.view`
+    // from the current edits before taking the delta, matching the
+    // draw-then-drag ordering.
+    let (_idxs, rects, _enabled) = state::all_rects(st);
+    st.view = displays_canvas::compute_view(&rects, CANVAS_W, CANVAS_H, state::CANVAS_MARGIN);
     let (dx, dy) = st
         .view
         .canvas_delta_to_layout(x - drag.origin.0, y - drag.origin.1);
@@ -386,32 +394,12 @@ pub fn drag_ended(st: &mut DisplaysState, x: f64, y: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outputs::{Head, Mode, ModeRequest};
+    use crate::outputs::ModeRequest;
+    use crate::pages::displays::fixtures::head;
     use crate::pages::displays::state::{DisplaysState, baseline_edit};
 
-    /// A head with one mode, at `(x, y)`.
-    fn head(name: &str, w: i32, h: i32, x: i32, y: i32, enabled: bool) -> Head {
-        let mode = Mode {
-            width: w,
-            height: h,
-            refresh_mhz: 60_000,
-            preferred: true,
-        };
-        Head {
-            name: name.to_string(),
-            description: format!("{name} display"),
-            enabled,
-            modes: vec![mode],
-            current_mode: Some(mode),
-            x,
-            y,
-            scale: 1.0,
-            transform: 0,
-        }
-    }
-
     /// A state with `heads`, baseline edits, and `selected` selected.
-    fn state_of(heads: Vec<Head>, selected: Option<usize>) -> DisplaysState {
+    fn state_of(heads: Vec<crate::outputs::Head>, selected: Option<usize>) -> DisplaysState {
         let mut st = DisplaysState::new();
         st.edits = heads.iter().map(baseline_edit).collect();
         st.heads = heads;
