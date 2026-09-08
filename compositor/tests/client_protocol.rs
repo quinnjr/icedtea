@@ -13,7 +13,7 @@ use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
     Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, PointerConstraintsClient,
-    SessionLockClient, TestClient, VirtualKeyboardClient, VirtualPointerClient,
+    SessionLockClient, TestClient, TextInputClient, VirtualKeyboardClient, VirtualPointerClient,
 };
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
@@ -236,6 +236,21 @@ fn text_input_and_input_method_globals_are_advertised() {
     assert!(
         globals.iter().any(|g| g == "zwp_input_method_manager_v2"),
         "input-method global missing; saw {globals:?}"
+    );
+}
+
+/// B3 smoke test: [`TextInputClient::spawn`] maps a toplevel, gains keyboard
+/// focus via the existing auto-focus-on-map path, and its `zwp_text_input_v3`
+/// receives `enter` -- proof the double actually binds and wires up, ahead of
+/// B5's full relay coverage.
+#[test]
+fn text_input_client_enters_on_keyboard_focus() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket); // seat needs a keyboard
+    let mut ti = TextInputClient::spawn(&comp.socket); // maps + auto-focused
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never got enter on focus"
     );
 }
 

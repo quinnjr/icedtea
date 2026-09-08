@@ -68,6 +68,9 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
 use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3, zwp_text_input_v3,
+};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{
@@ -1061,6 +1064,36 @@ struct ClientState {
     /// Set true on the gamma control's `failed` event -- what wlroots sends
     /// instead of `gamma_size` for an output whose gamma LUT size is 0.
     gamma_failed: bool,
+
+    // --- text-input (M6.1) ---
+    /// Bound whenever advertised; used by [`TextInputClient::spawn`].
+    text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
+    /// This client's `zwp_text_input_v3`, created by
+    /// [`TestClient::map_toplevel_with_text_input`] -- *before* the surface's
+    /// first commit, so it is already registered when the compositor's
+    /// keyboard-focus relay (`relay_keyboard_focus`, wlr crate) fires the
+    /// auto-focus-on-map `enter`. A text-input created only after mapping
+    /// (on an already-focused surface) never receives that `enter`, leaving
+    /// its wlroots-side `focused_surface` null; a later `leave` (e.g. at
+    /// teardown) then trips wlroots' own `wlr_text_input_v3_send_leave`
+    /// assertion, since `relay_keyboard_focus` matches outgoing text-inputs
+    /// by *client*, not by per-object entered state. `None` for every other
+    /// [`TestClient`], which never creates this object at all.
+    text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
+    /// How many `zwp_text_input_v3.enter` events this client has received.
+    text_input_enters: u32,
+    /// How many `zwp_text_input_v3.leave` events this client has received.
+    text_input_leaves: u32,
+    /// Every `preedit_string` event's text, in arrival order (a `None` text
+    /// -- the protocol allows a null preedit string -- is recorded as `""`).
+    text_input_preedit_strings: Vec<String>,
+    /// Every `commit_string` event's text, in arrival order.
+    text_input_commit_strings: Vec<String>,
+    /// Every `delete_surrounding_text` event, as `(before_length,
+    /// after_length)`, in arrival order.
+    text_input_deletes: Vec<(u32, u32)>,
+    /// How many `zwp_text_input_v3.done` events this client has received.
+    text_input_dones: u32,
 }
 
 impl ClientState {
@@ -1194,6 +1227,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zwlr_gamma_control_manager_v1" => {
                     state.gamma_control_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_text_input_manager_v3" => {
+                    state.text_input_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -1878,6 +1914,49 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for ClientState
     }
 }
 
+// --- text-input (M6.1) ---
+delegate_noop!(ClientState: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
+
+impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_text_input_v3::ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::Enter { .. } => {
+                state.text_input_enters = state.text_input_enters.saturating_add(1);
+            }
+            zwp_text_input_v3::Event::Leave { .. } => {
+                state.text_input_leaves = state.text_input_leaves.saturating_add(1);
+            }
+            zwp_text_input_v3::Event::PreeditString { text, .. } => {
+                state
+                    .text_input_preedit_strings
+                    .push(text.unwrap_or_default());
+            }
+            zwp_text_input_v3::Event::CommitString { text } => {
+                state
+                    .text_input_commit_strings
+                    .push(text.unwrap_or_default());
+            }
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } => {
+                state.text_input_deletes.push((before_length, after_length));
+            }
+            zwp_text_input_v3::Event::Done { .. } => {
+                state.text_input_dones = state.text_input_dones.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+}
+
 // --- A2 batch-1 passive protocols (Task 7-9) ---
 delegate_noop!(ClientState: ignore wp_viewporter::WpViewporter);
 delegate_noop!(ClientState: ignore wp_viewport::WpViewport);
@@ -2540,8 +2619,37 @@ impl TestClient {
         Self::map(socket, app_id, title, true)
     }
 
+    /// As [`TestClient::map_toplevel`], but also creates a `zwp_text_input_v3`
+    /// on the client's seat *before* the surface's first commit -- see
+    /// [`ClientState::text_input`]'s doc for why that ordering matters.
+    /// [`TextInputClient::spawn`]'s own constructor.
+    pub(crate) fn map_toplevel_with_text_input(
+        socket: &str,
+        app_id: &str,
+        title: &str,
+    ) -> TestClient {
+        Self::map_with(socket, app_id, title, false, |state, qh| {
+            if let (Some(mgr), Some(seat)) =
+                (state.text_input_manager.as_ref(), state.seat.as_ref())
+            {
+                state.text_input = Some(mgr.get_text_input(seat, qh, ()));
+            }
+        })
+    }
+
     fn map(socket: &str, app_id: &str, title: &str, decorated: bool) -> TestClient {
+        Self::map_with(socket, app_id, title, decorated, |_, _| {})
+    }
+
+    fn map_with(
+        socket: &str,
+        app_id: &str,
+        title: &str,
+        decorated: bool,
+        pre_map: impl FnOnce(&mut ClientState, &QueueHandle<ClientState>),
+    ) -> TestClient {
         let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+        pre_map(&mut state, &qh);
 
         let compositor = state
             .compositor
@@ -4879,6 +4987,131 @@ impl PointerConstraintsClient {
     /// One roundtrip.
     pub fn pump(&mut self) {
         let _ = self.client.queue.roundtrip(&mut self.client.state);
+    }
+}
+
+/// A `zwp_text_input_v3` app double: maps a focusable toplevel (via
+/// [`TestClient`], so it gains keyboard focus via the existing
+/// auto-focus-on-map path), creates a text-input on the seat, and records
+/// relay events (enter/leave/preedit/commit/delete/done). M6.1 tests 2-5's
+/// app side.
+pub struct TextInputClient {
+    client: TestClient,
+    text_input: zwp_text_input_v3::ZwpTextInputV3,
+}
+
+impl TextInputClient {
+    /// Connect, create a `zwp_text_input_v3` on this client's seat, then map
+    /// a toplevel -- in that order, so the text-input is already registered
+    /// when the compositor's auto-focus-on-map path fires `enter` (see
+    /// [`ClientState::text_input`]'s doc). Panics if the compositor did not
+    /// advertise `zwp_text_input_manager_v3` or a seat.
+    pub fn spawn(socket: &str) -> TextInputClient {
+        let client = TestClient::map_toplevel_with_text_input(
+            socket,
+            "icedtea-harness-text-input",
+            "text-input",
+        );
+        let text_input = client
+            .state
+            .text_input
+            .clone()
+            .expect("compositor did not advertise zwp_text_input_manager_v3 or wl_seat");
+
+        let mut this = TextInputClient { client, text_input };
+        this.pump();
+        this
+    }
+
+    /// Enable text input on the current surface and commit.
+    pub fn enable(&mut self) {
+        self.text_input.enable();
+        self.text_input.commit();
+        self.flush();
+    }
+
+    /// Set the surrounding text, cursor rectangle, and commit -- the
+    /// double-buffered state a real IME-aware app sends whenever its text
+    /// state changes.
+    pub fn commit_with(
+        &mut self,
+        surrounding: &str,
+        cursor: u32,
+        anchor: u32,
+        cursor_rect: (i32, i32, i32, i32),
+    ) {
+        self.text_input
+            .set_surrounding_text(surrounding.to_string(), cursor as i32, anchor as i32);
+        self.text_input.set_cursor_rectangle(
+            cursor_rect.0,
+            cursor_rect.1,
+            cursor_rect.2,
+            cursor_rect.3,
+        );
+        self.text_input.commit();
+        self.flush();
+    }
+
+    /// Disable text input on the current surface and commit.
+    pub fn disable(&mut self) {
+        self.text_input.disable();
+        self.text_input.commit();
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        self.client.conn.flush().expect("flush text-input request");
+        self.pump();
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        let _ = self.client.queue.roundtrip(&mut self.client.state);
+    }
+
+    /// Pump the queue until `pred` holds or `TIMEOUT` elapses.
+    pub fn wait_until(&mut self, pred: impl Fn(&TextInputClient) -> bool) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.client.queue.roundtrip(&mut self.client.state);
+        }
+    }
+
+    /// How many `zwp_text_input_v3.enter` events this client has received.
+    pub fn entered(&self) -> u32 {
+        self.client.state.text_input_enters
+    }
+
+    /// How many `zwp_text_input_v3.leave` events this client has received.
+    pub fn left(&self) -> u32 {
+        self.client.state.text_input_leaves
+    }
+
+    /// Every `preedit_string` event's text, in arrival order.
+    pub fn preedits(&self) -> &[String] {
+        &self.client.state.text_input_preedit_strings
+    }
+
+    /// Every `commit_string` event's text, in arrival order.
+    pub fn commits(&self) -> &[String] {
+        &self.client.state.text_input_commit_strings
+    }
+
+    /// Every `delete_surrounding_text` event, as `(before_length,
+    /// after_length)`, in arrival order.
+    pub fn deletes(&self) -> &[(u32, u32)] {
+        &self.client.state.text_input_deletes
+    }
+
+    /// How many `zwp_text_input_v3.done` events this client has received.
+    pub fn dones(&self) -> u32 {
+        self.client.state.text_input_dones
     }
 }
 
