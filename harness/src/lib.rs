@@ -341,6 +341,15 @@ impl Compositor {
             runtime
                 .create_relative_pointer_manager(&display)
                 .expect("zwp_relative_pointer_manager_v1");
+            // Same "harness cannot degrade" tone: the IME relay tests bind
+            // these globals directly and would assert against ones that were
+            // never advertised.
+            runtime
+                .create_text_input_manager(&display)
+                .expect("zwp_text_input_manager_v3");
+            runtime
+                .create_input_method_manager(&display)
+                .expect("zwp_input_method_manager_v2");
             // Same "harness cannot degrade" tone: the output-management test
             // binds `zwlr_output_manager_v1` directly and would assert against
             // one that was never advertised.

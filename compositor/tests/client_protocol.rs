@@ -220,6 +220,25 @@ fn relative_pointer_manager_global_is_advertised() {
     );
 }
 
+/// M6.1 adds the IME relay: `zwp_text_input_manager_v3` lets an app opt a
+/// text field into IME composition, and `zwp_input_method_manager_v2` lets
+/// an external IME (fcitx5/ibus) or on-screen keyboard (squeekboard) attach
+/// to relay that composition. Both globals must be advertised even with no
+/// IME bound, and the compositor must boot non-fatally either way.
+#[test]
+fn text_input_and_input_method_globals_are_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwp_text_input_manager_v3"),
+        "text-input global missing; saw {globals:?}"
+    );
+    assert!(
+        globals.iter().any(|g| g == "zwp_input_method_manager_v2"),
+        "input-method global missing; saw {globals:?}"
+    );
+}
+
 /// The Displays feature adds output management: `zwlr_output_manager_v1` lets a
 /// client (a settings app, kanshi, wlr-randr) enumerate output heads and
 /// request an atomic reconfiguration — resolution, position, scale, transform,

@@ -128,6 +128,16 @@ pub fn run() {
     if let Err(err) = runtime.create_relative_pointer_manager(&display) {
         tracing::error!(%err, "relative pointer motion is unavailable");
     }
+    // Lets external IMEs (fcitx5/ibus) and on-screen keyboards (squeekboard)
+    // relay composition to apps' text fields. Non-fatal: without them,
+    // IME/OSK clients simply cannot attach and apps fall back to raw key
+    // input.
+    if let Err(err) = runtime.create_text_input_manager(&display) {
+        tracing::error!(%err, "text-input (IME app side) is unavailable");
+    }
+    if let Err(err) = runtime.create_input_method_manager(&display) {
+        tracing::error!(%err, "input-method (IME/OSK side) is unavailable");
+    }
     // Non-fatal, matching the other `create_*_manager` calls above: a
     // compositor that cannot advertise output-management still runs, it just
     // cannot be reconfigured by a settings client. `new_output`/`destroyed`
