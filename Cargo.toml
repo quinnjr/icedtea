@@ -24,3 +24,6 @@ image = "0.25"
 # dependency graph is optimised, and only once per target dir.
 [profile.dev.package."*"]
 opt-level = 2
+
+[patch.crates-io]
+wlr = { path = "/home/joseph/Projects/wlroots-sys/.worktrees/wlr-a6.1/crates/wlr" }
