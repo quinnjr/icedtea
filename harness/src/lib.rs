@@ -5097,6 +5097,39 @@ impl TextInputClient {
         this
     }
 
+    /// As [`Self::spawn`], but the `zwp_text_input_v3` is created *after* the
+    /// toplevel is mapped and already keyboard-focused, rather than before its
+    /// first commit. This is the exact scenario the wlr relay's
+    /// enter-on-create-if-focused fix and its `leave` guard close: a
+    /// text-input born onto an already-focused surface must still receive
+    /// `enter` (wlroots' `relay_keyboard_focus` only sends `enter` on a
+    /// focus *change*, so the crate has to synthesise it on create), and a
+    /// later focus change or teardown must not trip wlroots'
+    /// `wlr_text_input_v3_send_leave` assertion -- which SIGABRTs the whole
+    /// compositor process. Panics if the compositor did not advertise
+    /// `zwp_text_input_manager_v3` or a seat.
+    pub fn spawn_on_focused_surface(socket: &str) -> TextInputClient {
+        let mut client =
+            TestClient::map_toplevel(socket, "icedtea-harness-text-input", "text-input");
+        let manager = client
+            .state
+            .text_input_manager
+            .clone()
+            .expect("compositor did not advertise zwp_text_input_manager_v3");
+        let seat = client
+            .state
+            .seat
+            .clone()
+            .expect("compositor did not advertise wl_seat");
+        let text_input = manager.get_text_input(&seat, &client.qh, ());
+        client.state.text_input = Some(text_input.clone());
+        client.conn.flush().expect("flush get_text_input");
+
+        let mut this = TextInputClient { client, text_input };
+        this.pump();
+        this
+    }
+
     /// Enable text input on the current surface and commit.
     pub fn enable(&mut self) {
         self.text_input.enable();
