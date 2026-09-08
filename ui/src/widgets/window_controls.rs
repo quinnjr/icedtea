@@ -98,6 +98,15 @@ impl WindowControlsC {
 
     /// Rebuild the children from `layout`, `side` and the maximized state.
     fn rebuild(&mut self, node: &Node) {
+        // A `windowcontrols` is a horizontal strip of buttons; without an
+        // explicit row container it establishes no flex context and measured
+        // 0x0 even once its buttons had icons.
+        crate::widgets::set_container(
+            node,
+            crate::layout::Container::Box {
+                direction: crate::layout::BoxDirection::Row,
+            },
+        );
         for (_, child) in self.buttons.drain(..) {
             child.detach();
         }
@@ -108,6 +117,32 @@ impl WindowControlsC {
                 WindowButton::Maximize => Node::with_classes("button", &["maximize"]),
                 WindowButton::Close => Node::with_classes("button", &["close"]),
             };
+            // Each control button carries an `image` child, exactly as GTK's
+            // own `gtk_button_new_from_icon_name` gives it one, and the
+            // symbolic icon name is bound straight onto that node with
+            // `set_icon` — GTK sets these programmatically, so the vendored
+            // Adwaita sheet carries no `-gtk-icon-source` rule for them.
+            // `paint_row` draws the bound glyph the same controllerless way it
+            // draws a pooled row's text; without it the buttons were empty
+            // boxes and the whole strip drew nothing at rest. The maximize
+            // button shows the restore glyph while the surface is maximized,
+            // GTK's own `notify::maximized` behaviour.
+            if let Some(name) = match token {
+                WindowButton::Minimize => Some("window-minimize-symbolic"),
+                WindowButton::Maximize if self.maximized => Some("window-restore-symbolic"),
+                WindowButton::Maximize => Some("window-maximize-symbolic"),
+                WindowButton::Close => Some("window-close-symbolic"),
+                WindowButton::Icon => None,
+            } {
+                let image = Node::new("image");
+                crate::widgets::set_icon(
+                    &image,
+                    crate::css::value::image::IconRef::Theme {
+                        name: Rc::from(name),
+                    },
+                );
+                child.append_child(&image);
+            }
             node.append_child(&child);
             self.buttons.push((token, child));
         }
@@ -152,6 +187,20 @@ impl<Msg: Clone + 'static> Controller<Msg> for WindowControlsC {
             _ => return,
         }
         self.rebuild(node);
+    }
+
+    /// The control buttons (and the icon) are this controller's own children,
+    /// built from the decoration layout before any view child could arrive
+    /// (this widget takes none), so reconcile's trim step must be told they
+    /// are there — otherwise it detaches every one the first time it runs and
+    /// the strip collapses to 0x0, the P8-D72 `StackSwitcher` defect in the
+    /// same shape.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + self.buttons.len()
+    }
+
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + self.buttons.len()
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {

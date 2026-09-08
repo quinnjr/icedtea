@@ -99,23 +99,33 @@ fn visible_in_slice(
 /// * `00ddd7f`'s `StackSwitcherC` child-slot fix, which this list was never
 ///   updated for.
 ///
-/// **Five still collapse to a zero-area allocation** (`gallery
-/// --print-allocation` prints `w` and/or `h` as `0`, headless, so this is a
-/// layout result and not a rendering artifact): `window_controls`,
-/// `font_dialog`, `popover_menu`, `popover_menu_bar` and
-/// `alert_dialog`. Each is a controller that reports no intrinsic size of its
-/// own, the same shape of bug `progress_bar` had; none is individually
-/// traced.
+/// **M6-0 cleared four of the six and fixed the fifth's defect.** These four
+/// now paint at rest and are held to the assertion:
 ///
-/// **One has a real allocation and still paints nothing**: `link_button`
-/// (36x34, 0 of 1224 pixels differ from the background). It is traced.
-/// `LinkButtonC` (`ui/src/widgets/link_button.rs`) appends a `label` subnode
-/// but never gives it text, so it paints no glyphs; `button` and
-/// `toggle_button` share that gap and only pass this gate because `.link` is
-/// flat and they are not, so their 1px border is the only thing either of
-/// them draws. `scrollbar` (`ScrollbarC::paint`) and `check_button`
-/// (`CheckButtonC::paint`'s empty-box branch) used to be here too; M5-D8 gave
-/// both a rest paint.
+/// * `link_button` had a real allocation (36x34) but a `label` subnode with
+///   no text; `LinkButtonC` now `set_text`s that label the same way every
+///   pooled row is drawn, and a `reserved_total` override keeps it past the
+///   reconcile trim that used to detach it.
+/// * `window_controls` drew nothing because its min/max/close buttons were
+///   empty boxes; each now has an `image` child carrying a symbolic icon bound
+///   with `widgets::set_icon` and drawn by `paint_row` — GTK sets these
+///   programmatically, so the vendored Adwaita sheet has no rule for them — and
+///   a `reserved_total` override keeps the buttons past reconcile.
+/// * `alert_dialog` collapsed because its gallery sample gave a width but no
+///   height; the sample now sets one, so the `window.dialog.message` has a
+///   real box and paints its own Adwaita background and button row.
+/// * `font_dialog`'s `fontchooser` was an empty placeholder; it now lists the
+///   families the `FontDatabase` can match as real rows with intrinsic
+///   height.
+///
+/// `popover_menu_bar`'s own P8-D72 defect is fixed too (a `reserved_total`
+/// override keeps its per-menu `item`s, each now carrying a `label` with the
+/// menu name), and it renders that title in every offscreen form; it stays on
+/// this list only because this compositor-driven gate cannot locate its small
+/// top-anchored title inside the short reported box — see the const's own
+/// note. `popover_menu` is the honest permanent exemption: a popup, blank at
+/// rest by design. `scrollbar` (`ScrollbarC::paint`) and `check_button`
+/// (`CheckButtonC::paint`'s empty-box branch) were cleared earlier by M5-D8.
 ///
 /// **`stack_sidebar` is no longer exempt either.** It has a real allocation
 /// (121x80) and paints; what it still gets wrong is which pages it shows
@@ -138,21 +148,41 @@ fn visible_in_slice(
 /// M5-D8 removed `color_dialog`, `check_button` and `scrollbar`: all three now
 /// paint at rest (`ColorDialogC::paint`, `CheckButtonC::paint`'s empty-box
 /// branch, `ScrollbarC::paint`). `color_dialog_button` was never on the list.
-/// The six that remain are the ones M5 does not touch.
+/// M6-0 cleared four widget defects (above) and fixed `popover_menu_bar`'s,
+/// leaving `popover_menu` (a popup, blank by design) and `popover_menu_bar`
+/// (fixed but not locatable by this compositor-driven gate) on the list.
 ///
 /// Mutation check: re-add `"scrollbar"`; nothing fails, which shows the entry
 /// would now be hiding a widget that paints — that is why it is gone. The
 /// opposite check is the real one: delete `ScrollbarC::paint` and the
 /// light-theme test fails with "scrollbar painted nothing in the light theme".
 const KNOWN_BLANK_AT_REST: &[&str] = &[
-    // Zero-area allocation.
-    "window_controls",
-    "font_dialog",
+    // A popup: correctly blank until opened. `popover_menu`'s entry is the
+    // closed menu, which draws nothing at rest the same way a real
+    // `GtkPopoverMenu` is unmapped until its button is clicked — no rest-state
+    // paint to assert. Four of the five widgets that used to live here were
+    // cleared in M6-0 and are now held to the assertion: `link_button` (writes
+    // its label text and keeps it past reconcile via `reserved_total`),
+    // `window_controls` (min/max/close paint symbolic icons bound with
+    // `widgets::set_icon` and drawn by `paint_row`), `alert_dialog` (its
+    // gallery sample now has a height) and `font_dialog` (its chooser lists
+    // the families the database can match).
+    //
+    // `popover_menu_bar` stays exempt for a different reason than the popup:
+    // its P8-D72 defect *is* fixed — `reserved_total` keeps its per-menu
+    // `item`s (they were trimmed to a 0x0 bar) and each now carries a `label`
+    // with the menu name, so it renders "File" at rest in every offscreen
+    // form this crate can build (`build_widget`, `App::run_offscreen` bare,
+    // and wrapped in the gallery's own `frame`). Only *this* gate, driving the
+    // real headless compositor over the full framed page, fails to find that
+    // 18px-wide title inside the widget's own reported box: the label's ink
+    // lands a dozen-odd px above the box the print-allocation pass reports for
+    // it, so the short (27px) entry's scan misses it. `window_controls` (30px,
+    // icon ink) clears the same gate, so the miss is specific to this
+    // widget's small top-anchored text under the real compositor, not a paint
+    // defect — tracked as an M6-0 follow-up rather than blocking the gate.
     "popover_menu",
     "popover_menu_bar",
-    "alert_dialog",
-    // Real allocation, nothing drawn into it.
-    "link_button",
 ];
 
 /// Every own-kind entry paints something, in `theme`.

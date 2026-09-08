@@ -19,10 +19,14 @@
 use std::rc::Rc;
 
 use crate::css::node::Node;
-use crate::layout::Rect;
+use crate::css::value::{FontFamily, FontStyle, GenericFamily};
+use crate::layout::{BoxDirection, Container, Rect};
+use crate::text::FontQuery;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
-use crate::widgets::{FontLevel, PointerState, WidgetEnum, local_rect, shift_event};
+use crate::widgets::{
+    FontLevel, PointerState, WidgetEnum, local_rect, set_container, set_text, shift_event,
+};
 
 /// A `GtkFontDialogButton` showing `desc` (a Pango-style description).
 #[must_use]
@@ -163,9 +167,73 @@ pub struct FontDialogC {
     pub preview: String,
     /// The `fontchooser` subnode; P6 replaces it with a real `ListViewC`.
     pub list: Node,
+    /// One `row` subnode per family, in the same order as `families`.
+    pub rows: Vec<Node>,
     /// A detached, never-attached sink: see
     /// `crate::widgets::color_dialog::ColorDialogButtonC::sink`.
     pub sink: Node,
+}
+
+impl FontDialogC {
+    /// The families this database can actually match, in a stable order.
+    ///
+    /// `FontDatabase` has no "list every installed family" call (fontconfig's
+    /// `FcFontList` is not exposed, and `probe_only` has only a fixed file
+    /// list), so — exactly as the module doc says — the chooser lists the
+    /// families the database *can match*: each CSS generic is resolved through
+    /// [`FontDatabase::match_face`](crate::text::FontDatabase::match_face) and
+    /// the concrete family it lands on is recorded once. With real fontconfig
+    /// that is a handful of distinct faces; with the stripped-container probe
+    /// it is whatever `FONT_CANDIDATES` files exist. Either way the list has
+    /// real, measurable rows rather than the old single desc-derived entry.
+    fn matchable_families(cx: &mut BuildCx<'_>) -> Vec<Rc<str>> {
+        const GENERICS: &[GenericFamily] = &[
+            GenericFamily::SansSerif,
+            GenericFamily::Serif,
+            GenericFamily::Monospace,
+            GenericFamily::SystemUi,
+            GenericFamily::Cursive,
+            GenericFamily::Fantasy,
+        ];
+        let mut seen: Vec<Rc<str>> = Vec::new();
+        for generic in GENERICS {
+            let families = [FontFamily::Generic(*generic)];
+            let query = FontQuery {
+                families: &families,
+                weight: 400.0,
+                style: FontStyle::Normal,
+                stretch: 100.0,
+                size_px: 11.0,
+            };
+            if let Some(face) = cx.fonts.match_face(&query) {
+                let name: Rc<str> = Rc::from(face.family.as_str());
+                if !seen.iter().any(|f| f.as_ref() == name.as_ref()) {
+                    seen.push(name);
+                }
+            }
+        }
+        seen
+    }
+
+    /// Fill `list` with one `row` per family, each carrying the family name so
+    /// [`measure_row`](crate::widgets::measure_row)/`paint_row` give it a real
+    /// height and glyphs. `:selected` marks the chosen one. Detaches whatever
+    /// rows were there before, so `set_prop` can refresh the body.
+    fn rebuild_rows(&mut self) {
+        for old in self.rows.drain(..) {
+            old.detach();
+        }
+        for (i, family) in self.families.iter().enumerate() {
+            let row = Node::with_classes("row", &["activatable"]);
+            set_text(&row, family);
+            row.set_state(
+                crate::css::node::PseudoStates::SELECTED,
+                self.selected == Some(i),
+            );
+            self.list.append_child(&row);
+            self.rows.push(row);
+        }
+    }
 }
 
 impl<Msg: Clone + 'static> Controller<Msg> for FontDialogC {
@@ -173,20 +241,38 @@ impl<Msg: Clone + 'static> Controller<Msg> for FontDialogC {
         Kind::FontDialog
     }
 
-    fn build(node: &Node, props: &Props, _cx: &mut BuildCx<'_>) -> Self {
+    fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {
         node.add_class("dialog");
         let list = Node::new("fontchooser");
+        // A vertical stack, so each family is its own full-width row.
+        set_container(
+            &list,
+            Container::Box {
+                direction: BoxDirection::Column,
+            },
+        );
         node.append_child(&list);
         // The description is `"<family> <size>"`, Pango's own shorthand.
         let desc = props.str(PropName::Text).unwrap_or("");
         let (family, size) = desc.rsplit_once(' ').unwrap_or((desc, "11"));
-        FontDialogC {
-            families: if family.is_empty() {
-                Vec::new()
-            } else {
-                vec![Rc::from(family)]
-            },
-            selected: (!family.is_empty()).then_some(0),
+        // The body is the families the database can match; the desc's own
+        // family leads the list (and is the selected row) when it is not
+        // already one of them.
+        let mut families = Self::matchable_families(cx);
+        let selected = if family.is_empty() {
+            None
+        } else {
+            match families.iter().position(|f| f.as_ref() == family) {
+                Some(i) => Some(i),
+                None => {
+                    families.insert(0, Rc::from(family));
+                    Some(0)
+                }
+            }
+        };
+        let mut this = FontDialogC {
+            families,
+            selected,
             size: size
                 .parse::<f32>()
                 .ok()
@@ -194,24 +280,35 @@ impl<Msg: Clone + 'static> Controller<Msg> for FontDialogC {
                 .unwrap_or(11.0),
             preview: "The quick brown fox".to_owned(),
             list,
+            rows: Vec::new(),
             sink: Node::new("sink"),
-        }
+        };
+        this.rebuild_rows();
+        this
     }
 
-    fn set_prop(&mut self, _node: &Node, name: PropName, value: &Prop, _cx: &mut BuildCx<'_>) {
+    fn set_prop(&mut self, _node: &Node, name: PropName, value: &Prop, cx: &mut BuildCx<'_>) {
         if let (PropName::Text, Prop::Str(desc)) = (name, value) {
             let (family, size) = desc.rsplit_once(' ').unwrap_or((desc.as_ref(), "11"));
-            self.families = if family.is_empty() {
-                Vec::new()
+            let mut families = Self::matchable_families(cx);
+            self.selected = if family.is_empty() {
+                None
             } else {
-                vec![Rc::from(family)]
+                match families.iter().position(|f| f.as_ref() == family) {
+                    Some(i) => Some(i),
+                    None => {
+                        families.insert(0, Rc::from(family));
+                        Some(0)
+                    }
+                }
             };
-            self.selected = (!family.is_empty()).then_some(0);
+            self.families = families;
             self.size = size
                 .parse::<f32>()
                 .ok()
                 .filter(|s| s.is_finite() && *s > 0.0)
                 .unwrap_or(11.0);
+            self.rebuild_rows();
         }
     }
 

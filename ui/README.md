@@ -514,17 +514,20 @@ cargo test -p icedtea-ui --test ingress            # M5 external-event ingress
 
 - `tests/gallery_gate.rs` walks the page in surface-height slices under the
   harness compositor and asserts every widget paints something in light, dark
-  and high-contrast Adwaita — except the six entries listed in that file's
-  `KNOWN_BLANK_AT_REST`, which are measured, not asserted on, because they
-  render nothing today:
+  and high-contrast Adwaita — except the entries listed in that file's
+  `KNOWN_BLANK_AT_REST`, which are measured, not asserted on:
 <!-- known-blank:begin -->
-  five collapse to a zero-area allocation (`window_controls`, `font_dialog`,
-  `popover_menu`, `popover_menu_bar`, `alert_dialog`), and one has a real
-  allocation it draws nothing into (`link_button`).
+  `popover_menu` is a popup, correctly unmapped and blank until its button is
+  clicked, so it has no rest-state paint to assert; `popover_menu_bar`'s own
+  defect is fixed (it renders its menu title in every offscreen form) but this
+  compositor-driven gate cannot locate that small top-anchored title inside its
+  short reported box, tracked as an M6-0 follow-up.
 <!-- known-blank:end -->
   The list was fifteen until the M3 close-out's first fix wave (P8-D75 and the
-  pooled-row measure), and nine until M5-D8 gave `color_dialog`,
-  `check_button` and `scrollbar` a rest paint. Every entry, exempt or not, must
+  pooled-row measure), nine until M5-D8 gave `color_dialog`, `check_button` and
+  `scrollbar` a rest paint, and six until M6-0 gave `link_button`,
+  `window_controls`, `alert_dialog` and `font_dialog` theirs. Every entry,
+  exempt or not, must
   still appear whole in some slice. It further asserts that every `Kind` appears in `--list`, on the
   page and (for sub-kinds) inside its parent's node tree; that at least one
   probe point per widget differs between light and dark, except the four in

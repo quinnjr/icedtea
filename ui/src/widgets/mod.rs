@@ -834,7 +834,7 @@ pub(crate) use state::{
     apply_universal, child_layout_of, container_of, forget_subtree, mark_grid_children,
     mark_overlay_children, measure_row, paint_row, props_of, record_props, row_index_of,
     row_text_height, set_child_layout, set_container, set_displayed, set_gap, set_homogeneous,
-    set_row_classes, set_row_index, set_size_request, set_text, set_transition_progress,
+    set_icon, set_row_classes, set_row_index, set_size_request, set_text, set_transition_progress,
     size_request_of, text_of,
 };
 

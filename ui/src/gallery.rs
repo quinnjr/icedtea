@@ -1073,7 +1073,13 @@ pub fn sample(kind: Kind, model: &GalleryModel) -> Sample {
                 ["Cancel", "Delete"],
             )
             .on_response(|i| GalleryMsg::Selected(Kind::AlertDialog, i))
-            .width_request(240),
+            .width_request(240)
+            // Like `AboutDialog` above, the `window.dialog.message` needs an
+            // explicit height or it collapses to a zero-area box at rest: its
+            // heading/detail labels are bare chrome nodes with no intrinsic
+            // measure. With a real box the window paints its own Adwaita
+            // background and the button row.
+            .height_request(140),
         ),
     }
 }

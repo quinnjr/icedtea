@@ -3,8 +3,10 @@
 //! ```text
 //! menubar
 //! ├── item[.active]
+//! ┊   ├── label
 //! ┊   ╰── popover
 //! ╰── item
+//!     ├── label
 //!     ╰── popover
 //! ```
 //!
@@ -55,16 +57,15 @@
 //! [`crate::widgets::Headless::place_row`], `place_columns`'s own approach
 //! applied to `node`'s direct children instead of a `header`'s.
 //!
-//! Reconciliation: with `place_row`'s `FixedMeasure`, a leaf's rendered
-//! width comes out *double* the `width` argument (its `height` is exact) --
-//! reproducible, not a one-off: two 40px-measured items land at `x`
-//! `[0, 80)` and `[80, 160)`. This crate's own leaf-measuring test coverage
-//! does not otherwise exercise `Container::Box { Row }` over more than one
-//! `FixedMeasure` leaf, so nothing already-green pins the right number down
-//! this deep in taffy's flex pass; the hover-switch test below simply asks
-//! for double what it wants (`40.0` for 80px items) rather than changing
-//! `PopoverMenuBarC::item_at`, which reads real allocations and is
-//! correct regardless of what produced them.
+//! Reconciliation: with `place_row`'s `FixedMeasure`, an `item` now carrying
+//! a `label` child lays out to a 120px box (its `height` is the exact 30px),
+//! so two items land at `x` `[0, 120)` and `[120, 240)`. This crate's own
+//! leaf-measuring test coverage does not otherwise exercise `Container::Box {
+//! Row }` over more than one measured child this deep in taffy's flex pass, so
+//! nothing already-green pins the number down; the hover-switch test below
+//! simply hovers past 120 rather than changing `PopoverMenuBarC::item_at`,
+//! which reads real allocations and is correct regardless of what produced
+//! them.
 
 use std::rc::Rc;
 
@@ -137,16 +138,38 @@ impl PopoverMenuBarC {
             item.detach();
         }
         self.menus.clear();
-        for _ in &self.names {
+        for name in &self.names {
             let item = Node::new("item");
+            set_container(
+                &item,
+                Container::Box {
+                    direction: BoxDirection::Row,
+                },
+            );
             node.append_child(&item);
+            // The menu title. Without an in-flow child an `item`'s only child
+            // is the out-of-flow `popover` below, so it (and the whole
+            // `menubar`) measured 0x0 — the same P8-D72 defect `StackSwitcher`
+            // had. The `label` is a controllerless subnode, so its text lives
+            // on the row-binding side table and is measured/painted by
+            // `measure_row`/`paint_row`; that intrinsic width, plus the
+            // `menubar > item` padding, is what gives the bar a real box.
+            let label = Node::new("label");
+            crate::widgets::set_text(&label, name);
+            item.append_child(&label);
             let popover_node = Node::with_classes(
                 Kind::PopoverMenu.css_name(),
                 Kind::PopoverMenu.base_classes(),
             );
             item.append_child(&popover_node);
-            let menu =
+            let mut menu =
                 <PopoverMenuC as Controller<Msg>>::build(&popover_node, &Props::default(), cx);
+            // The popover is a child of `item` in the retained tree (the
+            // fixture lists it), but a *closed* one must take no layout space
+            // or it, not the `label`, sizes the item — leaving the bar 200x0.
+            // `hide_when_closed` hides it without detaching it (dropdown's own
+            // `popover` does the same), and `open`/`close` reveal it.
+            menu.popover.hide_when_closed();
             self.menus.push(menu);
             self.items.push(item);
         }
@@ -230,6 +253,20 @@ impl<Msg: Clone + 'static> Controller<Msg> for PopoverMenuBarC {
             self.names = list.to_vec();
             self.rebuild::<Msg>(node, cx);
         }
+    }
+
+    /// The `item` nodes are this controller's own children, built from
+    /// `PropName::Menus` before any view child could arrive (a menu bar takes
+    /// none anyway), so they sit ahead of the view's children and reconcile's
+    /// trim step must be told they are there — otherwise it detaches every
+    /// one the first time it runs and the bar collapses to 0x0, the P8-D72
+    /// `StackSwitcher` defect in the same shape.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + self.items.len()
+    }
+
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + self.items.len()
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
@@ -321,7 +358,7 @@ mod tests {
         let built = build_widget::<()>(Kind::PopoverMenuBar, &two_menus());
         matches_fixture(
             &built.node,
-            "menubar\n├── item[.active]\n┊   ╰── popover\n╰── item\n    ╰── popover\n",
+            "menubar\n├── item[.active]\n┊   ├── label\n┊   ╰── popover\n╰── item\n    ├── label\n    ╰── popover\n",
         )
         .expect("popover_menu_bar fixture");
     }
@@ -345,9 +382,12 @@ mod tests {
             &mut cx,
         );
         assert_eq!(PopoverMenuBarC::open_of(c.as_ref()), Some(0));
+        // The two items now carry a `label`, so `place_row`'s `FixedMeasure`
+        // gives each a 120px box (`[0,120)` and `[120,240)`); the sibling to
+        // hover is past 120, not the old bare-item 80.
         c.on_event(
             &Event::PointerMotion {
-                local: (100.0, 5.0),
+                local: (150.0, 5.0),
             },
             &mut cx,
         );

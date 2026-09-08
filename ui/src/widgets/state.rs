@@ -404,6 +404,13 @@ struct RowBinding {
     text: Rc<str>,
     index: usize,
     classes: Rc<[Rc<str>]>,
+    /// A symbolic/themed icon bound to a controllerless node, drawn by
+    /// [`paint_row`] the way GTK's `gtk_image_set_from_icon_name` gives an
+    /// otherwise-empty `image` node its glyph. This is the node-level analog
+    /// of [`set_text`]: `windowcontrols`' min/max/close buttons carry an
+    /// `image` child with no controller of its own, and this is what makes it
+    /// draw.
+    icon: Option<crate::css::value::image::IconRef>,
 }
 
 impl Default for RowBinding {
@@ -412,12 +419,26 @@ impl Default for RowBinding {
             text: Rc::from(""),
             index: 0,
             classes: Rc::from(&[][..]),
+            icon: None,
         }
     }
 }
 
 thread_local! {
     static ROW_BINDING: RefCell<NodeTable<RowBinding>> = RefCell::new(NodeTable::new());
+}
+
+/// Bind a themed icon to a controllerless node, drawn by [`paint_row`]. The
+/// node-level analog of [`set_text`] — see [`RowBinding::icon`].
+pub(crate) fn set_icon(node: &Node, icon: crate::css::value::image::IconRef) {
+    ROW_BINDING.with(|m| {
+        m.borrow_mut().entry_mut(node).icon = Some(icon);
+    });
+}
+
+/// The icon last bound to `node`, if any.
+fn icon_of(node: &Node) -> Option<crate::css::value::image::IconRef> {
+    ROW_BINDING.with(|m| m.borrow().get(node).and_then(|b| b.icon.clone()))
 }
 
 /// Set a pooled row's displayed text.
@@ -514,8 +535,9 @@ pub(crate) fn measure_row(
     ))
 }
 
-/// Paint a pooled row's bound text into its own content box. `true` when
-/// anything was drawn. See [`measure_row`].
+/// Paint a controllerless node's bound content — a themed icon and/or its
+/// text — into its own content box. `true` when anything was drawn. See
+/// [`measure_row`].
 pub(crate) fn paint_row(
     node: &Node,
     canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
@@ -523,17 +545,36 @@ pub(crate) fn paint_row(
     style: &crate::css::computed::ComputedStyle,
     cx: &mut crate::paint::PaintCx<'_>,
 ) -> bool {
-    let Some((_, shaped)) = shaped_row(node, style, cx.fonts) else {
-        return false;
-    };
-    crate::paint::text::paint_text(
-        canvas,
-        &shaped,
-        alloc.content_box,
-        style,
-        &cx.base_length_ctx(),
-    );
-    true
+    let mut drew = false;
+    // A bound icon (see [`set_icon`]) draws centred in the content box at
+    // GTK's 16px normal icon size, clamped to the box — the same fit
+    // `ImageC::paint` uses. Symbolic names follow the node's `color`, so a
+    // title button's glyph tracks the theme.
+    if let Some(icon) = icon_of(node) {
+        let content = alloc.content_box;
+        let size = 16.0_f32.min(content.width).min(content.height);
+        if size.is_finite() && size > 0.0 {
+            let rect = crate::layout::Rect::new(
+                content.x + (content.width - size) / 2.0,
+                content.y + (content.height - size) / 2.0,
+                size,
+                size,
+            );
+            crate::paint::icon::paint_icon(canvas, &icon, rect, style, cx);
+            drew = true;
+        }
+    }
+    if let Some((_, shaped)) = shaped_row(node, style, cx.fonts) {
+        crate::paint::text::paint_text(
+            canvas,
+            &shaped,
+            alloc.content_box,
+            style,
+            &cx.base_length_ctx(),
+        );
+        drew = true;
+    }
+    drew
 }
 
 /// Record which *model* index a pooled row currently displays -- never its

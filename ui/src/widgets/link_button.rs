@@ -77,6 +77,14 @@ impl<Msg: Clone + 'static> Controller<Msg> for LinkButtonC {
 
     fn build(node: &Node, props: &Props, _cx: &mut BuildCx<'_>) -> Self {
         let label = Node::new("label");
+        // The `label` subnode carries no controller of its own, so its text
+        // lives on the row-binding side table and is drawn by `paint_row`
+        // (the same path `ButtonC`'s label and every recycling view's rows
+        // take). Without this the link measured 36x34 but painted no glyphs —
+        // `.link` is flat, so the text was the only thing it could ever draw.
+        if let Some(text) = props.str(PropName::Label) {
+            crate::widgets::set_text(&label, text);
+        }
         node.append_child(&label);
         let this = LinkButtonC {
             uri: props
@@ -95,6 +103,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for LinkButtonC {
     fn set_prop(&mut self, node: &Node, name: PropName, value: &Prop, _cx: &mut BuildCx<'_>) {
         match (name, value) {
             (PropName::Uri, Prop::Str(uri)) => self.uri = Rc::clone(uri),
+            (PropName::Label, Prop::Str(text)) => crate::widgets::set_text(&self.label, text),
             // `Checked` doubles as `visited` here (`LinkButtonExt::visited`),
             // ahead of `Universal`'s own generic handling of that name so
             // this controller's meaning wins.
@@ -105,6 +114,19 @@ impl<Msg: Clone + 'static> Controller<Msg> for LinkButtonC {
             }
         }
         self.apply(node);
+    }
+
+    /// The `label` is this controller's own child, built before any view
+    /// child could arrive (a link button takes none), so reconcile's trim
+    /// step must be told it is there — otherwise it detaches the label the
+    /// first time it runs and the flat `.link` button, with no border of its
+    /// own, draws nothing at all. Same P8-D72 shape as `StackSwitcher`.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + 1
+    }
+
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + 1
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
