@@ -1107,10 +1107,13 @@ struct ClientState {
     /// How many `zwp_input_method_v2.deactivate` events this client has
     /// received.
     im_deactivates: u32,
-    /// Every `surrounding_text` event's text, in arrival order.
-    im_surroundings: Vec<String>,
+    /// Every `surrounding_text` event's `(text, cursor, anchor)`, in
+    /// arrival order.
+    im_surroundings: Vec<(String, u32, u32)>,
     /// Every `content_type` event's `(hint, purpose)`, in arrival order.
     im_content_types: Vec<(u32, u32)>,
+    /// Every `text_change_cause` event's raw `cause`, in arrival order.
+    im_text_change_causes: Vec<u32>,
     /// How many `zwp_input_method_v2.done` events this client has received
     /// -- also the serial [`InputMethodClient::send_commit`] echoes back on
     /// its `commit` request, per the protocol ("the value of the serial
@@ -2004,8 +2007,15 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for ClientState {
             zwp_input_method_v2::Event::Deactivate => {
                 state.im_deactivates = state.im_deactivates.saturating_add(1);
             }
-            zwp_input_method_v2::Event::SurroundingText { text, .. } => {
-                state.im_surroundings.push(text);
+            zwp_input_method_v2::Event::SurroundingText {
+                text,
+                cursor,
+                anchor,
+            } => {
+                state.im_surroundings.push((text, cursor, anchor));
+            }
+            zwp_input_method_v2::Event::TextChangeCause { cause } => {
+                state.im_text_change_causes.push(cause.into());
             }
             zwp_input_method_v2::Event::ContentType { hint, purpose } => {
                 state.im_content_types.push((hint.into(), purpose.into()));
@@ -5281,14 +5291,20 @@ impl InputMethodClient {
         self.state.im_deactivates
     }
 
-    /// Every `surrounding_text` event's text, in arrival order.
-    pub fn surroundings(&self) -> &[String] {
+    /// Every `surrounding_text` event's `(text, cursor, anchor)`, in
+    /// arrival order.
+    pub fn surroundings(&self) -> &[(String, u32, u32)] {
         &self.state.im_surroundings
     }
 
     /// Every `content_type` event's `(hint, purpose)`, in arrival order.
     pub fn content_types(&self) -> &[(u32, u32)] {
         &self.state.im_content_types
+    }
+
+    /// Every `text_change_cause` event's raw `cause`, in arrival order.
+    pub fn text_change_causes(&self) -> &[u32] {
+        &self.state.im_text_change_causes
     }
 
     /// How many `zwp_input_method_v2.done` events this client has received.
