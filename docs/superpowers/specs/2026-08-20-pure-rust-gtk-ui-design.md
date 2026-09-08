@@ -3,7 +3,8 @@
 **Date:** 2026-08-20
 **Status:** M1 and M2 implemented and merged; M3 implemented on
 `rebuild/pure-rust-gtk-m3` (widget toolkit, popups, windows, icons — the parent
-plan's M4 folded in); M5–M6 proposed
+plan's M4 folded in); M5 implemented on `rebuild/pure-rust-gtk-m5` (settings
+and the shell panel migrated, the GTK stack dropped); M6 proposed
 **Branch:** `rebuild/pure-rust-gtk`
 
 ## Goal
@@ -162,10 +163,15 @@ get their own spec** when reached; this document details M1 and sketches the res
    P7. Client-side cursor themes were dropped: icedtea supports
    `wp_cursor_shape_v1`, so the toolkit maps the `cursor` property to shape
    names instead.
-5. **M5 — App migrations**: rebuild `settings`, then `shell`/bar, then the
-   clipboard shell on the toolkit, each reusing its pure core and dropping
-   `gtk4`. Ordered settings → shell → clipboard (settings is the richest widget
-   exerciser; shell adds layer-shell surface roles; clipboard is smallest).
+5. **M5 — App migrations** *(implemented)*: `settings` and the `shell` panel
+   rebuilt on the toolkit, each reusing its pure core verbatim, and `gtk4`,
+   `gtk4-layer-shell`, `glib`, `gio`, `gdk4`, `pango` and `cairo` dropped from
+   the workspace. The understand pass corrected the ordering the original plan
+   assumed: the shell's taskbar and its clipboard popover share one layer-shell
+   window and one process, so they are one migration; the clipboard *daemon* has
+   no GTK and needed no work. Measured by five settings rest-state page gates,
+   the panel gate, the interaction gates, and the dependency and deletion
+   ledgers in each app crate.
 6. **M6 — Polish**: CSS transitions/animations, `accesskit`, input methods,
    drag-and-drop, settings-portal-ish integration.
 

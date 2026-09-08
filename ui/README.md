@@ -10,6 +10,13 @@ M1 proved one themed `button` end to end. M2 widened the CSS layer to the whole
 GTK 4.22 property table. **M3 turns that engine into a widget toolkit:** real
 windows and popups, a keyboard/pointer/focus model, a reactive view layer, the
 GTK 4.22 core widget set with GTK-exact CSS node trees, and icon theming.
+**M5 rebuilds the two applications on it:** `icedtea-settings` (five pages, a
+second Wayland connection for `zwlr_output_management_v1`, a portal file
+chooser) and `icedtea-shell` (a layer-shell panel with a clipboard popover).
+The toolkit additions M5 needed — external-event ingress (`Window::watch_fd`,
+`Inbox`, `App::on_fd`, `Cmd::Task`), view-layer pointer events, base-level
+keysyms, live-window probing and four widgets' rest paint — are documented in
+their own sections below.
 
 | Layer | Crate |
 |---|---|
@@ -502,6 +509,7 @@ outside the process.
 cargo test -p icedtea-ui --test gallery_gate       # rest state, 3 themes
 cargo test -p icedtea-ui --test interaction_gate   # 19 interactions, all driven
 cargo test -p icedtea-ui --test node_trees         # GTK node-tree conformance
+cargo test -p icedtea-ui --test ingress            # M5 external-event ingress
 ```
 
 - `tests/gallery_gate.rs` walks the page in surface-height slices under the

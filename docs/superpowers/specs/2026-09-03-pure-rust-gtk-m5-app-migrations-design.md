@@ -1,7 +1,9 @@
 # Pure-Rust GTK UI rebuild — Milestone 5: App migrations
 
-**Status:** design approved section by section on 2026-09-03; awaiting written-spec
-review, then `writing-plans`.
+**Status:** implemented on `rebuild/pure-rust-gtk-m5` (parts 0–6 of
+`docs/superpowers/plans/2026-09-03-m5-part0-contract.md`); `gtk4`,
+`gtk4-layer-shell`, `glib`, `gio`, `gdk4`, `pango` and `cairo` are gone from
+the workspace lockfile; awaiting owner review before merge
 **Parent:** `2026-08-20-pure-rust-gtk-ui-design.md` (program spec; M5 is item 5 of
 its decomposition). **Predecessor:** `2026-08-27-pure-rust-gtk-m3-widget-toolkit-design.md`
 (M3, merged to develop @ `488e7a1`; wlr 0.20.29 follow-up @ `d9cee52`).
