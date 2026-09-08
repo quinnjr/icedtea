@@ -148,6 +148,12 @@ pub enum DbCommand {
     SessionLocked {
         reply: Sender<bool>,
     },
+    /// Test-only: read `wlr::Runtime::input_method_active` via `wayland`'s
+    /// runtime handle. Not reachable from `CompositorInterface` -- only the
+    /// test harness sends this, same reasoning as `SessionLocked`.
+    InputMethodActive {
+        reply: Sender<bool>,
+    },
     /// Test-only: read `wlr::Runtime::cursor_position` via `wayland`'s
     /// runtime handle. Not reachable from `CompositorInterface` -- only the test
     /// harness sends this, same reasoning as `SessionLocked`.

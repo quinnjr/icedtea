@@ -637,6 +637,17 @@ impl Compositor {
             .expect("compositor never answered SessionLocked")
     }
 
+    /// Whether an IME is currently activated for a focused+enabled
+    /// text-input, via `wlr::Runtime::input_method_active`. Blocks on the
+    /// reply -- see [`Self::inject_touch_down`]'s doc.
+    pub fn input_method_active(&self) -> bool {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InputMethodActive { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InputMethodActive")
+    }
+
     /// The pointer's current position, via `wlr::Runtime::cursor_position`.
     /// Blocks on the reply -- see [`Self::inject_touch_down`]'s doc.
     pub fn cursor_position(&self) -> (f64, f64) {
