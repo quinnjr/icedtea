@@ -880,47 +880,67 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             size,
         )
         .map_err(AppError::Layout)?;
-        // One settling tick, then lay out again. A `Probe` is what the
-        // gallery's `--print-allocation`/`--probe-points` publish and what
-        // the gates locate every widget by, so it has to agree with what a
-        // *running* app shows — and a controller that learns its own
-        // geometry from the frame it was just laid out in only does so in
-        // `tick` (`ListViewC::adopt_metrics`, whose pool goes from one
-        // placeholder row to the viewport's worth). Without this the printed
-        // allocation of every widget below a `ListView` on the page was the
-        // one-row tree's, and the live frame's was the settled tree's.
-        {
-            let mut clipboard = Clipboard::offscreen();
-            let mut focus = <FocusRing as Default>::default();
-            let mut cmds: Vec<Cmd<Msg>> = Vec::new();
-            let mut cx = Dispatch {
-                styles: &styles,
-                tree: &tree,
-                focus: &mut focus,
-                clipboard: &mut clipboard,
-                icons: &mut icons,
-                fonts: &mut fonts,
-                clock: &clock,
-                env: &env,
-                cmds: &mut cmds,
-            };
-            tick_all(&mut instances, clock.now(), &mut cx);
+        // Settle to a fixpoint, not just one tick. A controller learns its own
+        // geometry from the frame it was just laid out in and adjusts in `tick`
+        // (`ListViewC::adopt_metrics`, whose pool goes from one placeholder row
+        // to the viewport's worth). A fixed-extent list converges in a single
+        // tick, but `column_view`'s inner list has no fixed extent: each tick
+        // grows its pool, the taller layout feeds the next tick's `adopt_metrics`,
+        // and it takes several ticks to reach the fixpoint. `App::run` and
+        // `run_offscreen` tick every frame and so converge; a `Probe` is what the
+        // gallery's `--print-allocation`/`--probe-points` publish and what the
+        // gates locate every widget by, so it must report that same settled tree
+        // — otherwise every widget below such a list is reported above where a
+        // running app paints it (M6-FUP1). Loop tick + relayout until the
+        // allocations stop changing, capped so a tree that never converges still
+        // terminates.
+        const PROBE_MAX_SETTLE_TICKS: usize = 16;
+        let mut settled: Vec<crate::layout::Allocation> = root
+            .descendants()
+            .filter_map(|n| tree.allocation(&n))
+            .collect();
+        for _ in 0..PROBE_MAX_SETTLE_TICKS {
+            {
+                let mut clipboard = Clipboard::offscreen();
+                let mut focus = <FocusRing as Default>::default();
+                let mut cmds: Vec<Cmd<Msg>> = Vec::new();
+                let mut cx = Dispatch {
+                    styles: &styles,
+                    tree: &tree,
+                    focus: &mut focus,
+                    clipboard: &mut clipboard,
+                    icons: &mut icons,
+                    fonts: &mut fonts,
+                    clock: &clock,
+                    env: &env,
+                    cmds: &mut cmds,
+                };
+                tick_all(&mut instances, clock.now(), &mut cx);
+            }
+            restyle_and_layout(
+                &root,
+                &mut instances,
+                &sheet,
+                &env,
+                &mut fonts,
+                &mut icons,
+                &clock,
+                &containers,
+                &mut styles,
+                &mut anims,
+                &mut tree,
+                size,
+            )
+            .map_err(AppError::Layout)?;
+            let now: Vec<crate::layout::Allocation> = root
+                .descendants()
+                .filter_map(|n| tree.allocation(&n))
+                .collect();
+            if now == settled {
+                break;
+            }
+            settled = now;
         }
-        restyle_and_layout(
-            &root,
-            &mut instances,
-            &sheet,
-            &env,
-            &mut fonts,
-            &mut icons,
-            &clock,
-            &containers,
-            &mut styles,
-            &mut anims,
-            &mut tree,
-            size,
-        )
-        .map_err(AppError::Layout)?;
         Ok(Probe {
             root,
             instances,
