@@ -15,9 +15,15 @@ use crate::layout::{Allocation, Rect};
 use crate::paint::{PaintCx, fill_paint, radii_for_box, rounded_rect_path};
 
 /// Paint the background colour and every layer of `layers`.
+///
+/// `color` is `background-color`, used only for the flat fill underneath the
+/// layers. `current` is the node's own `color` -- the `currentColor` base
+/// every layer's image resolves against (CSS Color L4 §4.4: `currentColor`
+/// is always the `color` property, never `background-color`).
 pub fn paint_backgrounds(
     canvas: &mut Canvas<'_>,
     color: Rgba,
+    current: Rgba,
     layers: &[BackgroundLayer],
     alloc: &Allocation,
     radii: &[[f32; 2]; 4],
@@ -33,7 +39,7 @@ pub fn paint_backgrounds(
     }
 
     for layer in layers.iter().rev() {
-        paint_layer(canvas, layer, alloc, radii, cx, color);
+        paint_layer(canvas, layer, alloc, radii, cx, current);
     }
 }
 
@@ -127,9 +133,8 @@ fn paint_layer(
         Image::Icon(icon) => {
             // `-gtk-icontheme()`, `-gtk-recolor()` and `-gtk-scaled()` as a
             // background layer: each tile is one icon box, and the palette's
-            // foreground is the node's `currentColor` -- the only colour a
-            // background layer has (contract §6; `paint_layer` keeps its
-            // M2 signature).
+            // foreground is the node's `currentColor` -- the node's `color`
+            // property, threaded in as `current` (contract §6).
             let palette = crate::icons::Palette::for_color(current);
             for rect in &rects {
                 crate::paint::icon::paint_icon_image(canvas, icon, *rect, &palette, cx);
@@ -668,6 +673,7 @@ mod tests {
             paint_backgrounds(
                 &mut canvas,
                 style.get::<Rgba>(Prop::BackgroundColor),
+                style.color(),
                 &layers,
                 &alloc,
                 &radii,

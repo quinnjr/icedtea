@@ -319,7 +319,15 @@ pub fn paint_node_with_children<'cx>(
 
     let layers = style.background_layers();
     let background_color: Rgba = style.get(Prop::BackgroundColor);
-    paint_backgrounds(canvas, background_color, &layers, alloc, &radii, cx);
+    paint_backgrounds(
+        canvas,
+        background_color,
+        current,
+        &layers,
+        alloc,
+        &radii,
+        cx,
+    );
 
     let source: Image = style.get(Prop::BorderImageSource);
     let slice: BorderImageSlice = match style.raw(Prop::BorderImageSlice) {

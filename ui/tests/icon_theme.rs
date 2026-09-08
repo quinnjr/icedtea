@@ -56,6 +56,7 @@ fn painted(css: &str, side: i32) -> Surface {
         paint_backgrounds(
             &mut canvas,
             style.get::<Rgba>(Prop::BackgroundColor),
+            style.color(),
             &layers,
             &alloc,
             &radii,
