@@ -728,7 +728,7 @@ pub fn footer_text(m: &SettingsModel) -> &str {
         return &m.status;
     }
     let save_path_down = !m.workers.reload_available() || !m.workers.fs_available();
-    if save_path_down && !m.worker_warning.is_empty() {
+    if save_path_down {
         return &m.worker_warning;
     }
     if m.is_dirty() {

@@ -1072,14 +1072,10 @@ pub struct ProbePoint {
 ///
 /// Same derivation as `gallery::probe_points_of`: walk `root.descendants()`,
 /// label by id-or-node-name with a repeat index, take the centre of the border
-/// box **floored**. The flooring is load-bearing and identical to
-/// `gallery::centre`'s: `f32::floor` before the cast, not a
-/// bare `as i32` (which truncates toward zero) or `f32::round` (ties away from
-/// zero): both move a positive and a negative half-pixel centre in opposite
-/// directions, so shifting a box by an integer number of pixels would not
-/// always shift its rounded centre by that same integer. `floor(v - k) ==
-/// floor(v) - k` for every real `v` and integer `k`, so a scrolled copy of a
-/// box centres exactly that many pixels from its unscrolled original. A node
+/// box **floored**. The flooring is load-bearing and must stay identical to
+/// `gallery::centre`'s — see that function's doc for why `f32::floor` (not a
+/// bare `as i32` truncation or `f32::round`) is what keeps a scrolled box's
+/// centre exactly `--scroll` pixels from its unscrolled original. A node
 /// with no allocation is skipped. Cheap: it reads the layout tree the last
 /// frame already computed and lays nothing out.
 #[must_use]
