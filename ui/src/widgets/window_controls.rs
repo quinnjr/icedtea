@@ -96,18 +96,66 @@ impl WindowControlsC {
             .collect()
     }
 
+    /// The child's node kind, CSS class and symbolic icon name for `token`,
+    /// given whether the surface is maximized. Folding both the class and
+    /// icon-name selection into one match (a single tuple return) means a new
+    /// `WindowButton` variant is threaded through exactly once, instead of
+    /// being picked twice a few lines apart; it also lets the icon mapping —
+    /// including the maximize/restore swap — be unit tested without touching
+    /// the node tree at all.
+    #[must_use]
+    fn button_spec(
+        token: WindowButton,
+        maximized: bool,
+    ) -> (&'static str, &'static str, Option<&'static str>) {
+        match token {
+            WindowButton::Icon => ("image", "icon", None),
+            WindowButton::Minimize => ("button", "minimize", Some("window-minimize-symbolic")),
+            WindowButton::Maximize if maximized => {
+                ("button", "maximize", Some("window-restore-symbolic"))
+            }
+            WindowButton::Maximize => ("button", "maximize", Some("window-maximize-symbolic")),
+            WindowButton::Close => ("button", "close", Some("window-close-symbolic")),
+        }
+    }
+
     /// Rebuild the children from `layout`, `side` and the maximized state.
     fn rebuild(&mut self, node: &Node) {
+        // A `windowcontrols` is a horizontal strip of buttons; without an
+        // explicit row container it establishes no flex context and measured
+        // 0x0 even once its buttons had icons.
+        crate::widgets::set_container(
+            node,
+            crate::layout::Container::Box {
+                direction: crate::layout::BoxDirection::Row,
+            },
+        );
         for (_, child) in self.buttons.drain(..) {
             child.detach();
         }
         for token in Self::tokens(&self.layout, self.side) {
-            let child = match token {
-                WindowButton::Icon => Node::with_classes("image", &["icon"]),
-                WindowButton::Minimize => Node::with_classes("button", &["minimize"]),
-                WindowButton::Maximize => Node::with_classes("button", &["maximize"]),
-                WindowButton::Close => Node::with_classes("button", &["close"]),
-            };
+            // Each control button carries an `image` child, exactly as GTK's
+            // own `gtk_button_new_from_icon_name` gives it one, and the
+            // symbolic icon name is bound straight onto that node with
+            // `set_icon` — GTK sets these programmatically, so the vendored
+            // Adwaita sheet carries no `-gtk-icon-source` rule for them.
+            // `paint_row` draws the bound glyph the same controllerless way it
+            // draws a pooled row's text; without it the buttons were empty
+            // boxes and the whole strip drew nothing at rest. The maximize
+            // button shows the restore glyph while the surface is maximized,
+            // GTK's own `notify::maximized` behaviour.
+            let (node_kind, class, icon_name) = Self::button_spec(token, self.maximized);
+            let child = Node::with_classes(node_kind, &[class]);
+            if let Some(name) = icon_name {
+                let image = Node::new("image");
+                crate::widgets::set_icon(
+                    &image,
+                    crate::css::value::image::IconRef::Theme {
+                        name: Rc::from(name),
+                    },
+                );
+                child.append_child(&image);
+            }
             node.append_child(&child);
             self.buttons.push((token, child));
         }
@@ -154,6 +202,20 @@ impl<Msg: Clone + 'static> Controller<Msg> for WindowControlsC {
         self.rebuild(node);
     }
 
+    /// The control buttons (and the icon) are this controller's own children,
+    /// built from the decoration layout before any view child could arrive
+    /// (this widget takes none), so reconcile's trim step must be told they
+    /// are there — otherwise it detaches every one the first time it runs and
+    /// the strip collapses to 0x0, the P8-D72 `StackSwitcher` defect in the
+    /// same shape.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + self.buttons.len()
+    }
+
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + self.buttons.len()
+    }
+
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
         // A `Configure` that flipped MAXIMIZED changes the maximize button's
         // icon, so the children are rebuilt — GTK does the same on
@@ -187,5 +249,136 @@ impl<Msg: Clone + 'static> Controller<Msg> for WindowControlsC {
             }
         }
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widgets::Headless;
+
+    fn props(layout: &str, side: Side) -> Props {
+        let mut props = Props::default();
+        props.set(PropName::Decoration, Prop::Str(Rc::from(layout)));
+        props.set(PropName::Side, side.to_prop());
+        props
+    }
+
+    /// `WindowControlsC::button_spec` is the single place the icon mapping
+    /// lives now, so this pins the class + icon name for every non-maximize
+    /// token directly, without going through the node tree.
+    #[test]
+    fn button_spec_maps_each_token_to_its_class_and_icon() {
+        assert_eq!(
+            WindowControlsC::button_spec(WindowButton::Icon, false),
+            ("image", "icon", None)
+        );
+        assert_eq!(
+            WindowControlsC::button_spec(WindowButton::Minimize, false),
+            ("button", "minimize", Some("window-minimize-symbolic"))
+        );
+        assert_eq!(
+            WindowControlsC::button_spec(WindowButton::Close, false),
+            ("button", "close", Some("window-close-symbolic"))
+        );
+    }
+
+    /// Mutation check: a backwards swap here (restore at rest, maximize while
+    /// maximized) would leave the button showing the wrong affordance in
+    /// both states, and `gallery_gate`'s "paints something" cannot tell the
+    /// two symbolic names apart.
+    #[test]
+    fn button_spec_swaps_the_maximize_icon_with_the_maximized_state() {
+        assert_eq!(
+            WindowControlsC::button_spec(WindowButton::Maximize, false),
+            ("button", "maximize", Some("window-maximize-symbolic"))
+        );
+        assert_eq!(
+            WindowControlsC::button_spec(WindowButton::Maximize, true),
+            ("button", "maximize", Some("window-restore-symbolic"))
+        );
+    }
+
+    /// At rest, each rendered button's `image` child is present exactly when
+    /// `button_spec` says it should be -- `rebuild` wiring the icon-bearing
+    /// children to the right buttons, not just the mapping in isolation.
+    #[test]
+    fn at_rest_each_button_carries_an_image_child_iff_its_spec_has_an_icon() {
+        let node = Node::new("windowcontrols");
+        let mut hx = Headless::new();
+        let controller = <WindowControlsC as Controller<()>>::build(
+            &node,
+            &props(DEFAULT_DECORATION_LAYOUT, Side::End),
+            &mut hx.cx(),
+        );
+        assert_eq!(
+            controller.button_names(),
+            vec!["minimize", "maximize", "close"]
+        );
+        assert!(!controller.maximized);
+        for (token, child) in &controller.buttons {
+            let (_, _, icon_name) = WindowControlsC::button_spec(*token, controller.maximized);
+            let image_children = child
+                .children()
+                .into_iter()
+                .filter(|c| c.name().as_ref() == "image")
+                .count();
+            assert_eq!(
+                image_children,
+                usize::from(icon_name.is_some()),
+                "token {token:?} should carry an image child iff it has an icon"
+            );
+        }
+        // The maximize button, specifically, is the one whose icon flips.
+        let maximize = controller
+            .buttons
+            .iter()
+            .find(|(token, _)| *token == WindowButton::Maximize)
+            .expect("maximize button present");
+        assert_eq!(maximize.1.children().len(), 1);
+    }
+
+    /// A `Configure` that flips `MAXIMIZED` rebuilds the children with the
+    /// restore icon, mirroring GTK's own `notify::maximized` -- the exact
+    /// wiring the LOW/MEDIUM findings were about, exercised end to end
+    /// through the real `on_event` path rather than by calling `rebuild`
+    /// directly.
+    #[test]
+    fn a_configure_flipping_maximized_swaps_the_maximize_button_icon() {
+        let node = Node::new("windowcontrols");
+        let mut hx = Headless::new();
+        let mut controller = <WindowControlsC as Controller<()>>::build(
+            &node,
+            &props(DEFAULT_DECORATION_LAYOUT, Side::End),
+            &mut hx.cx(),
+        );
+        assert!(!controller.maximized);
+        assert_eq!(
+            WindowControlsC::button_spec(WindowButton::Maximize, controller.maximized).2,
+            Some("window-maximize-symbolic")
+        );
+
+        let mut cx = hx.event_cx::<()>(&node);
+        controller.on_event(
+            &Event::Configure {
+                size: (800, 600),
+                states: SurfaceStates::MAXIMIZED,
+            },
+            &mut cx,
+        );
+
+        assert!(controller.maximized);
+        assert_eq!(
+            WindowControlsC::button_spec(WindowButton::Maximize, controller.maximized).2,
+            Some("window-restore-symbolic")
+        );
+        // The button that got rebuilt is still there, still carrying exactly
+        // one image child -- `rebuild` didn't drop or duplicate it.
+        let maximize = controller
+            .buttons
+            .iter()
+            .find(|(token, _)| *token == WindowButton::Maximize)
+            .expect("maximize button present after rebuild");
+        assert_eq!(maximize.1.children().len(), 1);
     }
 }

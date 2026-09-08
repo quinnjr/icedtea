@@ -1102,6 +1102,75 @@ fn premultiply(color: [f32; 4], alpha: f32) -> [f32; 4] {
     [color[0] * a, color[1] * a, color[2] * a, a]
 }
 
+/// Word-splits a `"spawn"` action's command string into a program plus its
+/// argument vector, for a direct (no-shell) `Command::new(program).args(..)`
+/// exec. This intentionally does NOT implement shell semantics: no pipes,
+/// redirection, `$VAR` expansion, or globbing -- only whitespace splitting
+/// with single/double-quote grouping (a backslash inside a quoted or bare
+/// word escapes the following character; an unterminated quote consumes the
+/// rest of the string literally, matching a simple shlex-style reader).
+/// Returns `None` when the command is empty or splits to zero words (e.g.
+/// all whitespace).
+fn parse_spawn_argv(cmd: &str) -> Option<(String, Vec<String>)> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    // Backslash escapes inside double quotes (matches
+                    // common shell behavior); single quotes are literal.
+                    if let Some(&next) = chars.peek() {
+                        current.push(next);
+                        chars.next();
+                    } else {
+                        current.push(c);
+                    }
+                } else {
+                    current.push(c);
+                }
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    in_word = true;
+                } else if c == '\\' {
+                    if let Some(&next) = chars.peek() {
+                        current.push(next);
+                        chars.next();
+                        in_word = true;
+                    }
+                } else if c.is_whitespace() {
+                    if in_word {
+                        words.push(std::mem::take(&mut current));
+                        in_word = false;
+                    }
+                } else {
+                    current.push(c);
+                    in_word = true;
+                }
+            }
+        }
+    }
+    if in_word || quote.is_some() {
+        words.push(current);
+    }
+    let mut words = words.into_iter();
+    // Review finding (LOW): an all-quotes input like `""` splits to one
+    // *empty* word rather than zero words, so a bare `words.next()?` would
+    // return `Some("")` instead of taking the "empty or unparseable
+    // command" `None` path that `apply_action`'s `"spawn"` arm logs and
+    // ignores. Filtering the empty program out here routes `""` / `"" ""`
+    // through that same `None` path.
+    let program = words.next().filter(|p| !p.is_empty())?;
+    Some((program, words.collect()))
+}
+
 impl State {
     pub fn new(config: Config, dbus_tx: crossbeam_channel::Sender<SeqEvent>) -> Self {
         let workspace_names = config.workspace_names.clone();
@@ -4681,8 +4750,14 @@ impl State {
         self.emit_pending();
     }
 
-    /// Dispatch a keybinding action string (e.g. from `handle_key`, or a
-    /// D-Bus-triggered action). Returns `None` for unrecognized actions or
+    /// Dispatch a keybinding action string (from `handle_key`, i.e. a config
+    /// keybinding). Today this is reachable only from config keybindings --
+    /// the D-Bus interface (`dbus.rs`'s `DbCommand`) has no action
+    /// passthrough. The `"spawn"` arm in particular must never be wired
+    /// into a future D-Bus action passthrough: it execs a program directly
+    /// (see `parse_spawn_argv`), and a config-sourced command string
+    /// reaching that arm from an untrusted D-Bus caller would be a remote
+    /// code-execution path. Returns `None` for unrecognized actions or
     /// when a precondition (no focused window, unknown output, etc.) isn't
     /// met; `Some(())` on success. Always drains pending events on success.
     pub fn apply_action(&mut self, action: &str) -> Option<()> {
@@ -4756,13 +4831,25 @@ impl State {
                     index: idx,
                 }));
             }
+            // Security hardening: `cmd` comes from a config keybinding's
+            // action string (see this fn's doc). It used to be handed to
+            // `sh -c`, which gives full shell interpretation (pipes,
+            // metacharacters, `$VAR` expansion) to that config-sourced
+            // string, at the compositor's own privilege level. Instead it's
+            // word-split into a direct argv and exec'd with no shell in
+            // between -- `parse_spawn_argv` is the pure, unit-tested core
+            // of that split. An empty or unparseable command is logged and
+            // ignored rather than spawning anything.
             "spawn" => {
                 let cmd = arg?;
-                std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&cmd)
-                    .spawn()
-                    .ok();
+                match parse_spawn_argv(&cmd) {
+                    Some((program, args)) => {
+                        std::process::Command::new(program).args(args).spawn().ok();
+                    }
+                    None => {
+                        tracing::warn!("spawn action: empty or unparseable command: {cmd:?}");
+                    }
+                }
             }
             // Task 11 review #4: `n: u32` from an externally-parseable
             // action string (this dispatcher's own doc says it's also
@@ -7583,6 +7670,159 @@ mod tests {
         );
         state.apply_action("snap:restore").unwrap();
         assert_eq!(state.window_manager.get(id).unwrap().geometry.width, 640);
+    }
+
+    // These pin `parse_spawn_argv` as a direct argv builder, not a shell
+    // invocation: it must never see `sh -c` semantics (no pipes, no `$VAR`
+    // expansion) and must split quoted words correctly. A revert to
+    // `Command::new("sh").arg("-c").arg(cmd)` -- or a naive
+    // `cmd.split_whitespace()` that ignores quoting -- fails these.
+    #[test]
+    fn parse_spawn_argv_splits_program_and_args() {
+        assert_eq!(
+            parse_spawn_argv("firefox --new-window https://example.com"),
+            Some((
+                "firefox".to_string(),
+                vec![
+                    "--new-window".to_string(),
+                    "https://example.com".to_string()
+                ],
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_spawn_argv_handles_quoted_arguments() {
+        // A double-quoted argument with an embedded space must survive as
+        // one argv element, not two -- the exact case `sh -c` would have
+        // handled via shell quoting, and a naive whitespace split would
+        // shatter into `["My", "Documents"]`.
+        assert_eq!(
+            parse_spawn_argv(r#"nautilus "My Documents""#),
+            Some(("nautilus".to_string(), vec!["My Documents".to_string()],))
+        );
+        // Single quotes too.
+        assert_eq!(
+            parse_spawn_argv("echo 'hello world'"),
+            Some(("echo".to_string(), vec!["hello world".to_string()]))
+        );
+    }
+
+    #[test]
+    fn parse_spawn_argv_collapses_extra_whitespace() {
+        assert_eq!(
+            parse_spawn_argv("  ls   -la   /tmp  "),
+            Some((
+                "ls".to_string(),
+                vec!["-la".to_string(), "/tmp".to_string()],
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_spawn_argv_rejects_empty_or_whitespace_only() {
+        assert_eq!(parse_spawn_argv(""), None);
+        assert_eq!(parse_spawn_argv("   "), None);
+    }
+
+    #[test]
+    fn parse_spawn_argv_does_not_expand_shell_metacharacters() {
+        // `$HOME`, `;`, `|`, `&&` etc. must come through as literal argv
+        // text -- there is no shell here to interpret them. This is the
+        // regression test for the `sh -c` removal: if `apply_action`
+        // reverted to shelling out, this string would run two commands
+        // instead of passing `rm;`, `-rf`, `/;`, `$HOME` as literal
+        // (harmless, since no such program exists) arguments to a program
+        // named `echo`.
+        assert_eq!(
+            parse_spawn_argv("echo $HOME; rm -rf /"),
+            Some((
+                "echo".to_string(),
+                vec![
+                    "$HOME;".to_string(),
+                    "rm".to_string(),
+                    "-rf".to_string(),
+                    "/".to_string(),
+                ],
+            ))
+        );
+    }
+
+    // Review finding (LOW): an all-quotes input like `""` used to set
+    // `in_word = true` on the opening quote and push one empty-string word,
+    // so `program` came back as `""` -- distinct from the intended "empty or
+    // unparseable command" `None` path (which `apply_action`'s `"spawn"` arm
+    // logs and ignores) -- and would instead reach
+    // `Command::new("").args([]).spawn()`, which fails at spawn time with no
+    // warning logged. An empty program must be treated the same as no words
+    // at all.
+    #[test]
+    fn parse_spawn_argv_rejects_empty_program_from_all_quotes() {
+        assert_eq!(parse_spawn_argv(r#""""#), None);
+        assert_eq!(parse_spawn_argv("''"), None);
+        assert_eq!(parse_spawn_argv(r#"""  """#), None);
+    }
+
+    // Review finding (HIGH, lex-review testing): every test above drives
+    // `parse_spawn_argv` directly, so a revert of the `"spawn"` arm in
+    // `apply_action` back to `Command::new("sh").arg("-c").arg(cmd)` (the
+    // exact regression `parse_spawn_argv_does_not_expand_shell_metacharacters`
+    // means to guard against) would leave all of them green -- none of them
+    // ever calls `apply_action` at all. This test drives the real
+    // `apply_action("spawn:...")` wiring end-to-end and asserts an
+    // observable difference between a direct argv exec and a shell exec: the
+    // spawned program (a tiny shell script acting purely as a probe -- it is
+    // never invoked as a shell by `apply_action` itself) records its raw
+    // `$@` to a marker file. A command string containing `$HOME` is
+    // dispatched through `apply_action`; if `apply_action` execs directly
+    // (the fix), the probe receives the two literal characters `$HOME` as
+    // its argv, unexpanded. If `apply_action` reverted to `sh -c`, the outer
+    // shell would expand `$HOME` to the real home directory *before* the
+    // probe ever saw it, so the marker would contain a real path instead of
+    // the literal string -- a safe (non-destructive), reliably observable
+    // stand-in for the metacharacter-injection risk the fix closes.
+    #[test]
+    fn apply_action_spawn_execs_directly_without_shell_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe_path = dir.path().join("probe.sh");
+        let marker_path = dir.path().join("marker.txt");
+        std::fs::write(
+            &probe_path,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$1\".out\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&probe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let action = format!(
+            "spawn:{} {} $HOME",
+            probe_path.display(),
+            marker_path.display()
+        );
+        assert_eq!(state.apply_action(&action), Some(()));
+
+        let out_path = format!("{}.out", marker_path.display());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut contents = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&out_path) {
+                contents = Some(s);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let contents = contents.expect("probe script must run and write its marker");
+        let lines: Vec<&str> = contents.lines().collect();
+        // argv[0] (the probe's own $1) is the marker path itself, echoed
+        // back as the first word of "$@"; argv[1] must be the literal,
+        // unexpanded `$HOME` -- a shell-exec revert would put a real
+        // filesystem path (or empty string) there instead.
+        assert_eq!(lines.last().copied(), Some("$HOME"));
     }
 
     #[test]

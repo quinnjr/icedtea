@@ -32,7 +32,7 @@ use crate::layout::Allocation;
 use crate::text::{FontDatabase, ShapedText};
 
 pub use crate::css::computed::BackgroundLayer;
-pub use background::paint_backgrounds;
+pub(crate) use background::paint_backgrounds;
 pub use border::{is_visible_border_style, paint_border_image, paint_borders};
 pub use effects::{begin_effects, end_effects};
 pub use geometry::{
@@ -319,7 +319,15 @@ pub fn paint_node_with_children<'cx>(
 
     let layers = style.background_layers();
     let background_color: Rgba = style.get(Prop::BackgroundColor);
-    paint_backgrounds(canvas, background_color, &layers, alloc, &radii, cx);
+    paint_backgrounds(
+        canvas,
+        background_color,
+        current,
+        &layers,
+        alloc,
+        &radii,
+        cx,
+    );
 
     let source: Image = style.get(Prop::BorderImageSource);
     let slice: BorderImageSlice = match style.raw(Prop::BorderImageSlice) {

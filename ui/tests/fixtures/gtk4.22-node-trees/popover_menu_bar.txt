@@ -1,5 +1,7 @@
 menubar
 ├── item[.active]
+┊   ├── label
 ┊   ╰── popover
 ╰── item
+    ├── label
     ╰── popover

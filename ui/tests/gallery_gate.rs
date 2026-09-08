@@ -14,8 +14,9 @@ use icedtea_ui::gallery::{
 use icedtea_ui::view::Kind;
 use icedtea_ui::widgets::{fixture_matches, node_tree_of};
 use support::{
-    EntryAllocation, ProbePoint, entry_allocations, paints_something, parse_allocation_line,
-    parse_probe_line, pixel_at, probe_points, spawn_gallery, wait_for_gallery,
+    EntryAllocation, ProbePoint, allocation_sized, entry_allocations, paints_something,
+    parse_allocation_line, parse_probe_line, pixel_at, probe_points, spawn_gallery,
+    spawn_gallery_widget_sized, wait_for_gallery,
 };
 
 /// How far the page scrolls between captures.
@@ -99,23 +100,33 @@ fn visible_in_slice(
 /// * `00ddd7f`'s `StackSwitcherC` child-slot fix, which this list was never
 ///   updated for.
 ///
-/// **Five still collapse to a zero-area allocation** (`gallery
-/// --print-allocation` prints `w` and/or `h` as `0`, headless, so this is a
-/// layout result and not a rendering artifact): `window_controls`,
-/// `font_dialog`, `popover_menu`, `popover_menu_bar` and
-/// `alert_dialog`. Each is a controller that reports no intrinsic size of its
-/// own, the same shape of bug `progress_bar` had; none is individually
-/// traced.
+/// **M6-0 cleared four of the six and fixed the fifth's defect.** These four
+/// now paint at rest and are held to the assertion:
 ///
-/// **One has a real allocation and still paints nothing**: `link_button`
-/// (36x34, 0 of 1224 pixels differ from the background). It is traced.
-/// `LinkButtonC` (`ui/src/widgets/link_button.rs`) appends a `label` subnode
-/// but never gives it text, so it paints no glyphs; `button` and
-/// `toggle_button` share that gap and only pass this gate because `.link` is
-/// flat and they are not, so their 1px border is the only thing either of
-/// them draws. `scrollbar` (`ScrollbarC::paint`) and `check_button`
-/// (`CheckButtonC::paint`'s empty-box branch) used to be here too; M5-D8 gave
-/// both a rest paint.
+/// * `link_button` had a real allocation (36x34) but a `label` subnode with
+///   no text; `LinkButtonC` now `set_text`s that label the same way every
+///   pooled row is drawn, and a `reserved_total` override keeps it past the
+///   reconcile trim that used to detach it.
+/// * `window_controls` drew nothing because its min/max/close buttons were
+///   empty boxes; each now has an `image` child carrying a symbolic icon bound
+///   with `widgets::set_icon` and drawn by `paint_row` — GTK sets these
+///   programmatically, so the vendored Adwaita sheet has no rule for them — and
+///   a `reserved_total` override keeps the buttons past reconcile.
+/// * `alert_dialog` collapsed because its gallery sample gave a width but no
+///   height; the sample now sets one, so the `window.dialog.message` has a
+///   real box and paints its own Adwaita background and button row.
+/// * `font_dialog`'s `fontchooser` was an empty placeholder; it now lists the
+///   families the `FontDatabase` can match as real rows with intrinsic
+///   height.
+///
+/// `popover_menu_bar`'s own P8-D72 defect is fixed too (a `reserved_total`
+/// override keeps its per-menu `item`s, each now carrying a `label` with the
+/// menu name), and it renders that title in every offscreen form; it stays on
+/// this list only because this compositor-driven gate cannot locate its small
+/// top-anchored title inside the short reported box — see the const's own
+/// note. `popover_menu` is the honest permanent exemption: a popup, blank at
+/// rest by design. `scrollbar` (`ScrollbarC::paint`) and `check_button`
+/// (`CheckButtonC::paint`'s empty-box branch) were cleared earlier by M5-D8.
 ///
 /// **`stack_sidebar` is no longer exempt either.** It has a real allocation
 /// (121x80) and paints; what it still gets wrong is which pages it shows
@@ -138,22 +149,55 @@ fn visible_in_slice(
 /// M5-D8 removed `color_dialog`, `check_button` and `scrollbar`: all three now
 /// paint at rest (`ColorDialogC::paint`, `CheckButtonC::paint`'s empty-box
 /// branch, `ScrollbarC::paint`). `color_dialog_button` was never on the list.
-/// The six that remain are the ones M5 does not touch.
+/// M6-0 cleared four widget defects (above) and fixed `popover_menu_bar`'s,
+/// leaving `popover_menu` (a popup, blank by design) and `popover_menu_bar`
+/// (fixed but not locatable by this compositor-driven gate) on the list.
 ///
 /// Mutation check: re-add `"scrollbar"`; nothing fails, which shows the entry
 /// would now be hiding a widget that paints — that is why it is gone. The
 /// opposite check is the real one: delete `ScrollbarC::paint` and the
 /// light-theme test fails with "scrollbar painted nothing in the light theme".
 const KNOWN_BLANK_AT_REST: &[&str] = &[
-    // Zero-area allocation.
-    "window_controls",
-    "font_dialog",
+    // A popup: correctly blank until opened. `popover_menu`'s entry is the
+    // closed menu, which draws nothing at rest the same way a real
+    // `GtkPopoverMenu` is unmapped until its button is clicked — no rest-state
+    // paint to assert. Four of the five widgets that used to live here were
+    // cleared in M6-0 and are now held to the assertion: `link_button` (writes
+    // its label text and keeps it past reconcile via `reserved_total`),
+    // `window_controls` (min/max/close paint symbolic icons bound with
+    // `widgets::set_icon` and drawn by `paint_row`), `alert_dialog` (its
+    // gallery sample now has a height) and `font_dialog` (its chooser lists
+    // the families the database can match).
+    //
+    // `popover_menu_bar` is NOT here: it paints its titles at rest and is held
+    // to that by `the_popover_menu_bar_paints_its_titles_at_rest` below, which
+    // asserts in single-widget mode. It cannot be checked by the full-page walk
+    // above for an infrastructure reason, not a paint defect: `App::probe`'s
+    // cumulative vertical layout runs ~1.3% taller than `App::run` renders, so
+    // under the live compositor every widget paints slightly above its reported
+    // allocation, the drift growing with page depth (~0 at the top, ~44px at the
+    // bottom). Every other bottom-of-page widget is tall enough that its ink
+    // still overlaps its drifted box; this uniquely short (27px) bar with thin,
+    // centred title ink is the only one a ~44px shift clears entirely. The
+    // probe-vs-live divergence itself is a tracked follow-up, M6-FUP1 (it moves
+    // every gate's page coordinates, so fixing it is a dedicated layout task;
+    // recorded in ui/README.md's known-blank note).
     "popover_menu",
-    "popover_menu_bar",
-    "alert_dialog",
-    // Real allocation, nothing drawn into it.
-    "link_button",
 ];
+
+/// Paints at rest, but skipped by the full-page walk and asserted instead by
+/// `the_popover_menu_bar_paints_its_titles_at_rest_*` in single-widget mode.
+///
+/// This is NOT "blank at rest" (that is `KNOWN_BLANK_AT_REST`): `popover_menu_bar`
+/// renders its titles. The full-page walk simply cannot locate them — `App::probe`
+/// lays the page out ~1.3% taller than `App::run` renders it, so a widget's painted
+/// ink drifts above its reported box as page depth grows (~44px at the bottom),
+/// clearing this uniquely short (27px) bar's whole box while leaving the taller
+/// widgets around it overlapping their own drifted ink. Fixing that probe-vs-live
+/// divergence moves every gate's page coordinates and is a dedicated layout
+/// follow-up (M6-FUP1, recorded in ui/README.md); until then this widget is held
+/// to the rest-paint bar out of band.
+const PAINTS_BUT_UNLOCATABLE_IN_FULL_WALK: &[&str] = &["popover_menu_bar"];
 
 /// Every own-kind entry paints something, in `theme`.
 ///
@@ -210,7 +254,9 @@ fn every_widget_renders_at_rest(theme: &str) {
             if seen.contains(&widget) {
                 continue;
             }
-            if KNOWN_BLANK_AT_REST.contains(&widget.as_str()) {
+            if KNOWN_BLANK_AT_REST.contains(&widget.as_str())
+                || PAINTS_BUT_UNLOCATABLE_IN_FULL_WALK.contains(&widget.as_str())
+            {
                 seen.push(widget);
                 continue;
             }
@@ -271,6 +317,73 @@ fn every_widget_renders_at_rest_in_the_dark_theme() {
 #[test]
 fn every_widget_renders_at_rest_in_the_high_contrast_theme() {
     every_widget_renders_at_rest("hc");
+}
+
+/// `popover_menu_bar` paints its menu titles at rest, in `theme`.
+///
+/// Held to the same "paints something at rest" bar as every other kind, but
+/// verified in single-widget mode (one framed entry at the page origin) rather
+/// than by `every_widget_renders_at_rest`'s full-page walk. The walk cannot see
+/// this widget's ink: `App::probe`'s cumulative vertical layout runs ~1.3%
+/// taller than `App::run` renders, so under the live compositor every widget
+/// paints a little above its reported allocation, the drift growing with page
+/// depth to ~44px at the bottom -- more than this uniquely short (27px) bar's
+/// whole box, though harmless to the taller widgets around it (see the note on
+/// `KNOWN_BLANK_AT_REST`). Single-widget mode has no long page, so the drift is
+/// ~0 and the reported box coincides with the painted ink.
+///
+/// Mutation check: revert `PopoverMenuBarC`'s per-menu `label`/`reserved_total`
+/// (the M6-0 fix) so the bar trims back to 0x0 -- this fails with
+/// "popover_menu_bar painted nothing ...".
+fn popover_menu_bar_paints_at_rest(theme: &str) {
+    let compositor = Compositor::spawn();
+    let socket = compositor
+        .socket_path()
+        .file_name()
+        .expect("socket name")
+        .to_string_lossy()
+        .to_string();
+    let (ow, oh) = compositor.output_size();
+    let output = (ow as u32, oh as u32);
+    let mut screencopy = ScreencopyClient::spawn(&socket);
+    let empty = screencopy.capture();
+    let background_probe = (output.0 - 3, output.1 / 2);
+    let wallpaper = pixel_at(&empty, background_probe.0, background_probe.1)
+        .expect("the background probe is inside the frame");
+
+    let gallery = spawn_gallery_widget_sized(&socket, theme, "popover_menu_bar", output);
+    let frame = wait_for_gallery(&mut screencopy, background_probe, wallpaper);
+    let page_background =
+        pixel_at(&frame, background_probe.0, background_probe.1).expect("inside the frame");
+
+    let alloc = allocation_sized(theme, "popover_menu_bar", output);
+    let rect = (
+        alloc.x as i32,
+        alloc.y as i32,
+        alloc.width as i32,
+        alloc.height as i32,
+    );
+    assert!(
+        paints_something(&frame, rect, page_background),
+        "popover_menu_bar painted nothing at rest in the {theme} theme \
+         (single-widget mode); its box is {rect:?}"
+    );
+    drop(gallery);
+}
+
+#[test]
+fn the_popover_menu_bar_paints_its_titles_at_rest_in_the_light_theme() {
+    popover_menu_bar_paints_at_rest("light");
+}
+
+#[test]
+fn the_popover_menu_bar_paints_its_titles_at_rest_in_the_dark_theme() {
+    popover_menu_bar_paints_at_rest("dark");
+}
+
+#[test]
+fn the_popover_menu_bar_paints_its_titles_at_rest_in_the_high_contrast_theme() {
+    popover_menu_bar_paints_at_rest("hc");
 }
 
 /// Capture every slice of `theme` and index the probe pixels by
