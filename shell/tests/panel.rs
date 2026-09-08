@@ -84,11 +84,20 @@ fn the_panel_opens_a_layer_surface_and_reports_its_geometry() {
     );
 }
 
-/// Contract §3.6's re-expression of `shell_gtk.rs`, steps 1-4: the same seed
-/// snapshot, the same `["One", "Two"]`, the same `("focus", 1)`, the same
-/// `["Two"]` after a close, and the same `"workspace"` entry -- asserted
-/// through the panel's own report and a real pointer instead of a GTK tree
-/// walk and `emit_clicked`.
+/// Contract §3.6's re-expression of `shell_gtk.rs`, steps 1-4: the seed
+/// snapshot, the `("focus", 1)` command, the surviving button after a close,
+/// and the `"workspace"` entry -- asserted through the panel's own report and a
+/// real pointer instead of a GTK tree walk and `emit_clicked`.
+///
+/// Coverage boundary (M5 finding #6): what this gate proves is the button
+/// *ids*, their left-to-right order and their positions --- `labels_under`
+/// returns the report's `window_<id>`/`ws_<id>` ids, not rendered label text
+/// --- and that a click at a button's reported point reaches the command for
+/// *that* id. The rendered label *text* (title, with the app-id fallback) is a
+/// pure-function property of `view`, checked by the unit test
+/// `panel::tests::a_window_button_is_labelled_by_title_then_app_id`; extending
+/// the probe report to carry text is out of scope here, so the two tests
+/// together are the label coverage.
 #[test]
 fn a_panel_click_reaches_the_command_surface() {
     let mut panel = Panel::spawn(Theme::Dark);
@@ -242,6 +251,18 @@ fn middle_clicking_a_window_button_closes_it() {
         |calls| calls.contains(&("close".to_string(), 7)),
         "the middle click reached close_window(7)",
     );
+    // Settle before the negative assertion: a stray `focus` from the same
+    // release would land *after* the `close`, so poll until the recorded calls
+    // stop growing rather than reading them the instant `close` appears.
+    let mut settled = panel.wm_calls().len();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now = panel.wm_calls().len();
+        if now == settled {
+            break;
+        }
+        settled = now;
+    }
     assert!(
         !panel.wm_calls().contains(&("focus".to_string(), 7)),
         "a middle click must not also focus: {:?}",
@@ -378,7 +399,7 @@ fn the_clipboard_popover_opens_pastes_and_dismisses() {
     let (rx, ry) = panel.popup_point("history_open_10");
     panel.click(rx, ry);
     panel.wait_for_clip_calls(
-        |calls| calls.contains(&("activate".to_string(), 10)),
+        |calls| calls.contains(&("activate".to_string(), 10, false)),
         "activating row 0 reached activate(10)",
     );
 
@@ -422,7 +443,7 @@ fn the_clipboard_popover_opens_pastes_and_dismisses() {
         "an outside click dismissed the popover",
     );
     assert!(
-        !panel.clip_calls().iter().any(|(a, _)| a == "clear"),
+        !panel.clip_calls().iter().any(|(a, _, _)| a == "clear"),
         "dismissing must not have pressed anything: {:?}",
         panel.clip_calls()
     );

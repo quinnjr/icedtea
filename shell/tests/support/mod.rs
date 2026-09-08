@@ -5,7 +5,10 @@
 //! Not every test uses every helper, hence the blanket `dead_code` allow: this
 //! module is compiled once per test binary that declares it.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared test-support module compiled per test binary; not every binary uses every helper"
+)]
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -56,27 +59,36 @@ impl CompositorCommands for MockWm {
 }
 
 /// A recording `ClipCommands`, shared with the panel's thread.
+///
+/// Records `(op, id, on)`: the `on` flag carries `pin`'s direction so a gate
+/// can assert it; non-pin calls use `false` as a sentinel.
 #[derive(Clone, Default)]
-pub struct MockClip(pub Arc<Mutex<Vec<(String, u64)>>>);
+pub struct MockClip(pub Arc<Mutex<Vec<(String, u64, bool)>>>);
 
 impl ClipCommands for MockClip {
     fn activate(&self, id: u64) {
         self.0
             .lock()
             .expect("clip calls")
-            .push(("activate".into(), id));
+            .push(("activate".into(), id, false));
     }
-    fn pin(&self, id: u64, _on: bool) {
-        self.0.lock().expect("clip calls").push(("pin".into(), id));
+    fn pin(&self, id: u64, on: bool) {
+        self.0
+            .lock()
+            .expect("clip calls")
+            .push(("pin".into(), id, on));
     }
     fn remove(&self, id: u64) {
         self.0
             .lock()
             .expect("clip calls")
-            .push(("remove".into(), id));
+            .push(("remove".into(), id, false));
     }
     fn clear(&self) {
-        self.0.lock().expect("clip calls").push(("clear".into(), 0));
+        self.0
+            .lock()
+            .expect("clip calls")
+            .push(("clear".into(), 0, false));
     }
 }
 
@@ -183,19 +195,19 @@ impl Panel {
                 Rc::new(thread_wm) as Rc<dyn CompositorCommands>,
                 Rc::new(thread_clip) as Rc<dyn ClipCommands>,
             );
-            // The `App::on_frame` hook the binary installs, inlined: publish
-            // `#clip`'s border box into the cell `update` reads as the
-            // popover's anchor. The probe report itself is written by
-            // `App::run` (P5 Task 11 moved it there from a panel-owned hook),
-            // so the harness names its path with `with_probe_report` rather
-            // than through a `panel::frame_hook`.
+            // The exact `App::on_frame` hook the binary installs, from the one
+            // shared factory (`panel::frame_hook`, M5 finding #3) so this path
+            // cannot drift from `main.rs`'s. The window's own `probe`/`alloc`
+            // report is written by `App::run` (P5 Task 11 moved it there from a
+            // panel-owned hook), so the harness still names its path with
+            // `with_probe_report`; the hook only publishes the anchor rect, the
+            // popover's own probe lines, and the surface-width message.
             let clip_rect = model.clip_rect.clone();
             let open_popover = model.open_popover_cell.clone();
-            let last_width = std::cell::Cell::new(model.bar_width);
-            // The popover's own probe lines, beside the probe report (which
+            let bar_width = model.bar_width;
+            // The popover's own probe lines go beside the probe report (which
             // `App::run` owns, append-only, for the window's own lines).
             let popup_report = thread_report.with_extension("popups");
-            let mut last_popup: Vec<String> = Vec::new();
             let _ = App::new(model, panel::update, panel::view)
                 .with_inbox(inbox)
                 .on_popup(|ev| match ev {
@@ -203,27 +215,13 @@ impl Panel {
                     PopupEvent::Dismissed(key) => Some(Msg::PopoverDismissed(key)),
                     _ => None,
                 })
-                .on_frame(move |w| {
-                    clip_rect.set(w.allocation("clip").map(|a| a.border_box));
-                    let lines = open_popover
-                        .get()
-                        .map(|key| panel::popup_report_lines(w, key))
-                        .unwrap_or_default();
-                    panel::write_popup_report(&popup_report, &lines, &mut last_popup);
-                    // M5 Task 13: mirrors `shell/src/main.rs`'s own
-                    // `on_frame` wiring for `panel::PanelModel::bar_width` --
-                    // a real `Msg`, diffed so an unchanging surface does not
-                    // refold every frame.
-                    #[allow(
-                        clippy::cast_possible_wrap,
-                        reason = "a layer surface's width is well within i32"
-                    )]
-                    let width = w.size().0 as i32;
-                    if width != last_width.get() {
-                        last_width.set(width);
-                        let _ = width_tx.send(Msg::SurfaceWidth(width));
-                    }
-                })
+                .on_frame(panel::frame_hook(
+                    clip_rect,
+                    open_popover,
+                    Some(popup_report),
+                    width_tx,
+                    bar_width,
+                ))
                 .with_probe_report(thread_report)
                 .run(window);
         });
@@ -297,7 +295,7 @@ impl Panel {
     }
 
     #[must_use]
-    pub fn clip_calls(&self) -> Vec<(String, u64)> {
+    pub fn clip_calls(&self) -> Vec<(String, u64, bool)> {
         self.clip.0.lock().expect("clip calls").clone()
     }
 
@@ -401,23 +399,41 @@ impl Panel {
         );
     }
 
-    /// Poll the recorded commands until `want` accepts them.
+    /// Poll `current()` until `want` accepts it, panicking with the last
+    /// observed state if [`TIMEOUT`] elapses first.
+    ///
+    /// The shared body behind [`Panel::wait_for_calls`] and
+    /// [`Panel::wait_for_clip_calls`], which differ only in the state they read.
+    ///
+    /// # Panics
+    ///
+    /// If `want` never accepts within [`TIMEOUT`].
+    fn wait_for_state<T: std::fmt::Debug>(
+        &self,
+        current: impl Fn() -> T,
+        want: impl Fn(&T) -> bool,
+        what: &str,
+    ) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state = current();
+            if want(&state) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("{what} did not happen within {TIMEOUT:?}; state was {state:?}");
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Poll the recorded compositor commands until `want` accepts them.
     ///
     /// # Panics
     ///
     /// If it does not within [`TIMEOUT`].
     pub fn wait_for_calls(&self, want: impl Fn(&[(String, u32)]) -> bool, what: &str) {
-        let deadline = Instant::now() + TIMEOUT;
-        while Instant::now() < deadline {
-            if want(&self.wm_calls()) {
-                return;
-            }
-            std::thread::sleep(POLL);
-        }
-        panic!(
-            "{what} did not happen within {TIMEOUT:?}; wm calls were {:?}",
-            self.wm_calls()
-        );
+        self.wait_for_state(|| self.wm_calls(), |c| want(c.as_slice()), what);
     }
 
     /// The `ClipCommands` counterpart.
@@ -425,18 +441,8 @@ impl Panel {
     /// # Panics
     ///
     /// If it does not within [`TIMEOUT`].
-    pub fn wait_for_clip_calls(&self, want: impl Fn(&[(String, u64)]) -> bool, what: &str) {
-        let deadline = Instant::now() + TIMEOUT;
-        while Instant::now() < deadline {
-            if want(&self.clip_calls()) {
-                return;
-            }
-            std::thread::sleep(POLL);
-        }
-        panic!(
-            "{what} did not happen within {TIMEOUT:?}; clip calls were {:?}",
-            self.clip_calls()
-        );
+    pub fn wait_for_clip_calls(&self, want: impl Fn(&[(String, u64, bool)]) -> bool, what: &str) {
+        self.wait_for_state(|| self.clip_calls(), |c| want(c.as_slice()), what);
     }
 
     /// The output-space centre of the probe point `label`.
