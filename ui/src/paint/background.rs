@@ -20,7 +20,7 @@ use crate::paint::{PaintCx, fill_paint, radii_for_box, rounded_rect_path};
 /// layers. `current` is the node's own `color` -- the `currentColor` base
 /// every layer's image resolves against (CSS Color L4 §4.4: `currentColor`
 /// is always the `color` property, never `background-color`).
-pub fn paint_backgrounds(
+pub(crate) fn paint_backgrounds(
     canvas: &mut Canvas<'_>,
     color: Rgba,
     current: Rgba,

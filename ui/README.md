@@ -520,7 +520,10 @@ cargo test -p icedtea-ui --test ingress            # M5 external-event ingress
   `popover_menu` is a popup, correctly unmapped and blank until its button is
   clicked, so it has no rest-state paint to assert — the sole exemption. (The
   menu *bar* is held to the assertion in single-widget mode; the full-page walk
-  can't see its short title at page depth, a probe-vs-live layout follow-up.)
+  can't see its short title at page depth, a probe-vs-live layout follow-up
+  tracked as M6-FUP1: App::probe lays the page out ~1.3% taller than App::run
+  renders it, so a widget's ink drifts above its reported box with page depth;
+  aligning the two moves every gate's page coordinates, a dedicated layout task.)
 <!-- known-blank:end -->
   The list was fifteen until the M3 close-out's first fix wave (P8-D75 and the
   pooled-row measure), nine until M5-D8 gave `color_dialog`, `check_button` and

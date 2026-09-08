@@ -5,12 +5,11 @@
 use icedtea_ui::css::cascade::CompiledSheet;
 use icedtea_ui::css::computed::{ComputedStyle, ResolveEnv};
 use icedtea_ui::css::node::Node;
-use icedtea_ui::css::registry::Prop;
 use icedtea_ui::css::select::MatchCx;
 use icedtea_ui::css::value::Rgba;
 use icedtea_ui::icons::{IconEnv, IconTheme, Palette};
 use icedtea_ui::layout::{Allocation, Rect};
-use icedtea_ui::paint::{ImageCache, PaintCx, paint_backgrounds};
+use icedtea_ui::paint::{ImageCache, PaintCx, paint_node};
 use icedtea_ui::text::FontDatabase;
 use skia_rs_safe::canvas::Surface;
 use skia_rs_safe::core::Color;
@@ -21,7 +20,14 @@ fn fixture_roots() -> Vec<PathBuf> {
     vec![base.join("root-a"), base.join("root-b")]
 }
 
-/// Paint `css` on a `side × side` surface, backgrounds only.
+/// Paint `css` on a `side × side` surface through the crate's public
+/// full-pipeline entry ([`paint_node`]).
+///
+/// These fixtures set only `background-*`, so `paint_node`'s later stages
+/// (borders, shadows, outline, icon-source, text) draw nothing and the
+/// asserted pixels are the background layers' output -- but the icon layer's
+/// `currentColor` is threaded exactly as production does it, without touching
+/// the now crate-private `paint_backgrounds`.
 fn painted(css: &str, side: i32) -> Surface {
     let sheet = CompiledSheet::compile(css);
     let node = Node::new("image");
@@ -36,8 +42,6 @@ fn painted(css: &str, side: i32) -> Surface {
         border: [0.0; 4],
         padding: [0.0; 4],
     };
-    let radii = style.border_radii(side as f32, side as f32);
-    let layers = style.background_layers();
     let mut fonts = FontDatabase::probe_only();
     let mut images = ImageCache::new();
     let mut icons = IconTheme::with_name_and_roots("MiniTheme", fixture_roots());
@@ -53,15 +57,7 @@ fn painted(css: &str, side: i32) -> Surface {
     {
         let mut canvas = surface.canvas();
         canvas.clear(Color::TRANSPARENT);
-        paint_backgrounds(
-            &mut canvas,
-            style.get::<Rgba>(Prop::BackgroundColor),
-            style.color(),
-            &layers,
-            &alloc,
-            &radii,
-            &mut cx,
-        );
+        paint_node(&mut canvas, &node, &style, &alloc, None, &mut cx);
     }
     surface
 }
@@ -86,19 +82,15 @@ fn a_background_image_icon_theme_layer_paints() {
     assert_eq!(pixel(&surface, 8, 8), Color(0xFFFF_0000));
 }
 
-// A background icon takes its foreground from the node's `color`, since a
-// background layer has no style of its own to read a palette from.
-//
-// Reconciliation (task-16-report.md): `paint_layer`'s `current: Rgba`
-// parameter is, at the one production call site
-// (`paint_node_with_children`, `paint/mod.rs:325`), the resolved
-// `background-color` -- not the element's `color` -- so a background icon
-// only ever recolours to the node's true `currentColor` when
-// `background-color` itself resolves to it. `background-color:
-// currentColor` here makes that resolution explicit and CSS-legal, and
-// exercises the `Palette::for_color(current)` path Task 16 adds without
-// touching the frozen `paint_backgrounds`/`paint_layer` signatures or the
-// out-of-scope `paint/mod.rs` call site.
+// A background icon takes its foreground from the node's `color` (its
+// `currentColor`), since a background layer has no style of its own to read a
+// palette from. M6-0 threads that `color` into the icon layer independently of
+// `background-color` (see `background_current_color_offscreen.rs`, which pins it
+// with `color` and `background-color` set to *different* values). This test only
+// smoke-checks the recolour through the full paint pipeline: `background-color:
+// currentColor` here just makes the whole 16px box one colour so the single
+// pixel sampled below is that colour wherever the glyph happens to ink -- it is
+// no longer working around a paint bug.
 // Mutation check: use a fixed foreground and this paints the fixture's
 // placeholder grey.
 #[test]

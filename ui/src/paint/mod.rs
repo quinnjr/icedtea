@@ -32,7 +32,7 @@ use crate::layout::Allocation;
 use crate::text::{FontDatabase, ShapedText};
 
 pub use crate::css::computed::BackgroundLayer;
-pub use background::paint_backgrounds;
+pub(crate) use background::paint_backgrounds;
 pub use border::{is_visible_border_style, paint_border_image, paint_borders};
 pub use effects::{begin_effects, end_effects};
 pub use geometry::{

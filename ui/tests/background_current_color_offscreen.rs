@@ -16,12 +16,10 @@
 use icedtea_ui::css::cascade::CompiledSheet;
 use icedtea_ui::css::computed::{ComputedStyle, ResolveEnv};
 use icedtea_ui::css::node::Node;
-use icedtea_ui::css::registry::Prop;
 use icedtea_ui::css::select::MatchCx;
-use icedtea_ui::css::value::Rgba;
 use icedtea_ui::icons::IconTheme;
 use icedtea_ui::layout::{Allocation, Rect};
-use icedtea_ui::paint::{ImageCache, PaintCx, paint_backgrounds};
+use icedtea_ui::paint::{ImageCache, PaintCx, paint_node};
 use icedtea_ui::text::FontDatabase;
 use skia_rs_safe::canvas::Surface;
 use skia_rs_safe::core::Color;
@@ -32,8 +30,15 @@ fn fixture_roots() -> Vec<PathBuf> {
     vec![base.join("root-a"), base.join("root-b")]
 }
 
-/// Paint a flush `side` x `side` node (no border, no padding) from `css` and
-/// return the resulting surface.
+/// Paint a flush `side` x `side` node (no border, no padding) from `css`
+/// through the crate's public full-pipeline entry ([`paint_node`]) and return
+/// the resulting surface.
+///
+/// The CSS these tests use sets only `background-*`, so `paint_node`'s later
+/// stages (borders, shadows, outline, icon-source, text) contribute nothing
+/// and the asserted pixels are exactly the background layers' output -- but it
+/// exercises the same currentColor threading end-to-end, without reaching into
+/// the crate-private `paint_backgrounds`.
 fn painted(css: &str, side: i32) -> Surface {
     let sheet = CompiledSheet::compile(css);
     let window = Node::new("window");
@@ -50,10 +55,6 @@ fn painted(css: &str, side: i32) -> Surface {
         border: [0.0; 4],
         padding: [0.0; 4],
     };
-    let radii = style.border_radii(side as f32, side as f32);
-    let layers = style.background_layers();
-    let current = style.color();
-    let background_color: Rgba = style.get(Prop::BackgroundColor);
 
     let mut fonts = FontDatabase::probe_only();
     let mut images = ImageCache::new();
@@ -71,15 +72,7 @@ fn painted(css: &str, side: i32) -> Surface {
     surface.canvas().clear(Color::TRANSPARENT);
     {
         let mut canvas = surface.canvas();
-        paint_backgrounds(
-            &mut canvas,
-            background_color,
-            current,
-            &layers,
-            &alloc,
-            &radii,
-            &mut paint_cx,
-        );
+        paint_node(&mut canvas, &button, &style, &alloc, None, &mut paint_cx);
     }
     surface
 }
@@ -92,13 +85,17 @@ fn pixel(surface: &Surface, x: i32, y: i32) -> Color {
 }
 
 #[test]
-fn a_solid_image_layers_currentcolor_is_the_nodes_color_not_its_background_color() {
-    // `color: red`, `background-color: green` -- an `image(currentColor)`
-    // layer must paint red, the node's `color`, and not green, its
-    // `background-color`. `Image::Solid`'s `currentColor` is resolved at
-    // computed-style time against the node's own colour regardless of this
-    // bug, so this assertion holds even on the unfixed code -- it stays here
-    // as a straightforward regression pin, matching the fix's contract.
+fn a_solid_image_layers_currentcolor_is_unaffected_by_the_background_color_currentcolor_bug() {
+    // NOT a regression pin for the paint-time currentColor fix: it passes on
+    // both the buggy and the fixed code. `Image::Solid`'s `currentColor` is
+    // resolved at *computed-style* time against the node's own `color`, so it
+    // never carries an unresolved `currentColor` into `paint_layer` and the
+    // `background-color`-vs-`color` mix-up this fix corrects could not reach
+    // it. It stays only to document that the `Image::Solid` path is correct
+    // and untouched; the load-bearing pin is the `-gtk-icontheme()` test
+    // below (and its sibling in `icon_theme.rs`), whose `Image::Icon` layer
+    // *is* recoloured at paint time. Here: `color: red`, `background-color:
+    // green`, and an `image(currentColor)` layer must paint red.
     let surface = painted(
         "image { color: #ff0000; background-color: #00ff00; \
          background-image: image(currentColor); \

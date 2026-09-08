@@ -115,7 +115,14 @@ impl StackSidebarC {
     /// is read as the *old* order and overwritten here.
     fn reconcile_pages(&mut self, new_titles: Vec<Rc<str>>) {
         let old_rows = self.list_node.children();
-        let selected_row = old_rows.get(self.selected).cloned();
+        // `self.selected` doubles `0` as both a real index and its "nothing
+        // selected" value, so only trust it while the selection is non-empty;
+        // otherwise a later reconcile would read `old_rows.get(0)` back and
+        // resurrect a selection onto page 0 that the user never picked.
+        let selected_row = (!self.list.selection.is_empty())
+            .then(|| old_rows.get(self.selected))
+            .flatten()
+            .cloned();
 
         // Pool of reusable (old title, node), each consumable once.
         let mut pool: Vec<(Rc<str>, Node)> = self.titles.iter().cloned().zip(old_rows).collect();
@@ -428,6 +435,24 @@ mod tests {
         assert!(
             !is_selected(&after[0]) && !is_selected(&after[1]),
             "the selection was dropped, not shifted onto another page"
+        );
+
+        // A SECOND reconcile that must not touch selection (a `NeedsAttention`
+        // write reuses every row) must NOT resurrect the dropped selection onto
+        // page 0. The `selected: usize` mirror uses `0` both as a valid index
+        // and as its "nothing selected" value, so a naive reconcile reads
+        // `old_rows.get(0)` back and re-selects the page the user never picked.
+        c.set_prop(
+            &built.node,
+            PropName::NeedsAttention,
+            &Prop::Int(0),
+            &mut hx.cx(),
+        );
+        let after2 = rows(&built.node);
+        assert_eq!(after2.len(), 2);
+        assert!(
+            !is_selected(&after2[0]) && !is_selected(&after2[1]),
+            "an empty selection stays empty across a later reconcile"
         );
     }
 

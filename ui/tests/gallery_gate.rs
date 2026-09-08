@@ -179,8 +179,9 @@ const KNOWN_BLANK_AT_REST: &[&str] = &[
     // bottom). Every other bottom-of-page widget is tall enough that its ink
     // still overlaps its drifted box; this uniquely short (27px) bar with thin,
     // centred title ink is the only one a ~44px shift clears entirely. The
-    // probe-vs-live divergence itself is a tracked follow-up (it moves every
-    // gate's page coordinates, so fixing it is a dedicated layout task).
+    // probe-vs-live divergence itself is a tracked follow-up, M6-FUP1 (it moves
+    // every gate's page coordinates, so fixing it is a dedicated layout task;
+    // recorded in ui/README.md's known-blank note).
     "popover_menu",
 ];
 
@@ -194,7 +195,8 @@ const KNOWN_BLANK_AT_REST: &[&str] = &[
 /// clearing this uniquely short (27px) bar's whole box while leaving the taller
 /// widgets around it overlapping their own drifted ink. Fixing that probe-vs-live
 /// divergence moves every gate's page coordinates and is a dedicated layout
-/// follow-up; until then this widget is held to the rest-paint bar out of band.
+/// follow-up (M6-FUP1, recorded in ui/README.md); until then this widget is held
+/// to the rest-paint bar out of band.
 const PAINTS_BUT_UNLOCATABLE_IN_FULL_WALK: &[&str] = &["popover_menu_bar"];
 
 /// Every own-kind entry paints something, in `theme`.
