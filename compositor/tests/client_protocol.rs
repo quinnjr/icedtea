@@ -12,8 +12,9 @@
 use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
-    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, PointerConstraintsClient,
-    SessionLockClient, TestClient, TextInputClient, VirtualKeyboardClient, VirtualPointerClient,
+    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, InputMethodClient,
+    PointerConstraintsClient, SessionLockClient, TestClient, TextInputClient,
+    VirtualKeyboardClient, VirtualPointerClient,
 };
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
@@ -252,6 +253,17 @@ fn text_input_client_enters_on_keyboard_focus() {
         ti.wait_until(|c| c.entered() >= 1),
         "text-input never got enter on focus"
     );
+}
+
+/// B4 smoke test: [`InputMethodClient::spawn`] binds the manager and creates
+/// an input-method with no text-input enabled yet -- proof the double
+/// actually binds and wires up, ahead of B5's full relay coverage.
+#[test]
+fn input_method_client_binds_without_activation() {
+    let comp = Compositor::spawn();
+    let im = InputMethodClient::spawn(&comp.socket);
+    assert!(!comp.input_method_active(), "no text-input enabled yet");
+    assert_eq!(im.activates(), 0);
 }
 
 /// The Displays feature adds output management: `zwlr_output_manager_v1` lets a

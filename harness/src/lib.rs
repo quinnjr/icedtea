@@ -79,6 +79,9 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
+use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_manager_v2, zwp_input_method_v2,
+};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
 };
@@ -1094,6 +1097,28 @@ struct ClientState {
     text_input_deletes: Vec<(u32, u32)>,
     /// How many `zwp_text_input_v3.done` events this client has received.
     text_input_dones: u32,
+
+    // --- input-method (M6.1) ---
+    /// Bound whenever advertised; used by [`InputMethodClient::spawn`].
+    input_method_manager: Option<zwp_input_method_manager_v2::ZwpInputMethodManagerV2>,
+    /// How many `zwp_input_method_v2.activate` events this client has
+    /// received.
+    im_activates: u32,
+    /// How many `zwp_input_method_v2.deactivate` events this client has
+    /// received.
+    im_deactivates: u32,
+    /// Every `surrounding_text` event's text, in arrival order.
+    im_surroundings: Vec<String>,
+    /// Every `content_type` event's `(hint, purpose)`, in arrival order.
+    im_content_types: Vec<(u32, u32)>,
+    /// How many `zwp_input_method_v2.done` events this client has received
+    /// -- also the serial [`InputMethodClient::send_commit`] echoes back on
+    /// its `commit` request, per the protocol ("the value of the serial
+    /// argument must be equal to the number of done events already issued").
+    im_dones: u32,
+    /// Set true on the input-method's `unavailable` event -- sent when
+    /// another input method is already associated with this seat.
+    im_unavailable: bool,
 }
 
 impl ClientState {
@@ -1230,6 +1255,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zwp_text_input_manager_v3" => {
                     state.text_input_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_input_method_manager_v2" => {
+                    state.input_method_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -1951,6 +1979,42 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for ClientState {
             }
             zwp_text_input_v3::Event::Done { .. } => {
                 state.text_input_dones = state.text_input_dones.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+}
+
+// --- input-method (M6.1) ---
+delegate_noop!(ClientState: ignore zwp_input_method_manager_v2::ZwpInputMethodManagerV2);
+
+impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_input_method_v2::ZwpInputMethodV2,
+        event: zwp_input_method_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_input_method_v2::Event::Activate => {
+                state.im_activates = state.im_activates.saturating_add(1);
+            }
+            zwp_input_method_v2::Event::Deactivate => {
+                state.im_deactivates = state.im_deactivates.saturating_add(1);
+            }
+            zwp_input_method_v2::Event::SurroundingText { text, .. } => {
+                state.im_surroundings.push(text);
+            }
+            zwp_input_method_v2::Event::ContentType { hint, purpose } => {
+                state.im_content_types.push((hint.into(), purpose.into()));
+            }
+            zwp_input_method_v2::Event::Done => {
+                state.im_dones = state.im_dones.saturating_add(1);
+            }
+            zwp_input_method_v2::Event::Unavailable => {
+                state.im_unavailable = true;
             }
             _ => {}
         }
@@ -5112,6 +5176,130 @@ impl TextInputClient {
     /// How many `zwp_text_input_v3.done` events this client has received.
     pub fn dones(&self) -> u32 {
         self.client.state.text_input_dones
+    }
+}
+
+/// A `zwp_input_method_v2` IME/OSK double: binds the manager (surfaceless, like
+/// a real IME daemon), creates an input-method, records activate/deactivate/
+/// surrounding_text/content_type/done/unavailable, and can send preedit/commit/
+/// delete + commit. M6.1 tests 3-6's IME side.
+///
+/// Its own connection rather than a [`TestClient`] method, for the same
+/// reason as [`GammaControlClient`]: the real thing (an IME/OSK daemon)
+/// never holds focus and never maps a surface at all -- a bare `wl_seat`
+/// bind suffices, mirroring `DataControlClient`'s "never holds focus"
+/// rationale.
+pub struct InputMethodClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    state: ClientState,
+    input_method: zwp_input_method_v2::ZwpInputMethodV2,
+}
+
+impl InputMethodClient {
+    /// Connect, bind `zwp_input_method_manager_v2`, and create this seat's
+    /// `zwp_input_method_v2`. Panics if the compositor did not advertise the
+    /// manager or a seat.
+    pub fn spawn(socket: &str) -> InputMethodClient {
+        let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+        let manager = state
+            .input_method_manager
+            .clone()
+            .expect("compositor did not advertise zwp_input_method_manager_v2");
+        let seat = state
+            .seat
+            .clone()
+            .expect("compositor did not advertise wl_seat");
+        let input_method = manager.get_input_method(&seat, &qh, ());
+        conn.flush().expect("flush get_input_method");
+        queue.roundtrip(&mut state).expect("input-method roundtrip");
+        InputMethodClient {
+            conn,
+            queue,
+            state,
+            input_method,
+        }
+    }
+
+    /// Send any combination of preedit/commit/delete, then `commit` --
+    /// mirroring how a real IME batches double-buffered state before
+    /// applying it. The `commit` request's serial echoes back the number of
+    /// `done` events received so far, per the protocol.
+    pub fn send_commit(
+        &mut self,
+        preedit: Option<&str>,
+        commit: Option<&str>,
+        delete: Option<(u32, u32)>,
+    ) {
+        if let Some(p) = preedit {
+            self.input_method
+                .set_preedit_string(p.to_string(), 0, p.len() as i32);
+        }
+        if let Some(c) = commit {
+            self.input_method.commit_string(c.to_string());
+        }
+        if let Some((before, after)) = delete {
+            self.input_method.delete_surrounding_text(before, after);
+        }
+        self.input_method.commit(self.state.im_dones);
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        self.conn.flush().expect("flush input-method request");
+        self.pump();
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Pump the queue until `pred` holds or `TIMEOUT` elapses.
+    pub fn wait_until(&mut self, pred: impl Fn(&InputMethodClient) -> bool) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+        }
+    }
+
+    /// How many `zwp_input_method_v2.activate` events this client has
+    /// received.
+    pub fn activates(&self) -> u32 {
+        self.state.im_activates
+    }
+
+    /// How many `zwp_input_method_v2.deactivate` events this client has
+    /// received.
+    pub fn deactivates(&self) -> u32 {
+        self.state.im_deactivates
+    }
+
+    /// Every `surrounding_text` event's text, in arrival order.
+    pub fn surroundings(&self) -> &[String] {
+        &self.state.im_surroundings
+    }
+
+    /// Every `content_type` event's `(hint, purpose)`, in arrival order.
+    pub fn content_types(&self) -> &[(u32, u32)] {
+        &self.state.im_content_types
+    }
+
+    /// How many `zwp_input_method_v2.done` events this client has received.
+    pub fn dones(&self) -> u32 {
+        self.state.im_dones
+    }
+
+    /// Whether the compositor sent `unavailable` -- another input method was
+    /// already associated with this seat.
+    pub fn unavailable(&self) -> bool {
+        self.state.im_unavailable
     }
 }
 
