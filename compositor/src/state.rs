@@ -1161,7 +1161,13 @@ fn parse_spawn_argv(cmd: &str) -> Option<(String, Vec<String>)> {
         words.push(current);
     }
     let mut words = words.into_iter();
-    let program = words.next()?;
+    // Review finding (LOW): an all-quotes input like `""` splits to one
+    // *empty* word rather than zero words, so a bare `words.next()?` would
+    // return `Some("")` instead of taking the "empty or unparseable
+    // command" `None` path that `apply_action`'s `"spawn"` arm logs and
+    // ignores. Filtering the empty program out here routes `""` / `"" ""`
+    // through that same `None` path.
+    let program = words.next().filter(|p| !p.is_empty())?;
     Some((program, words.collect()))
 }
 
@@ -7740,6 +7746,83 @@ mod tests {
                 ],
             ))
         );
+    }
+
+    // Review finding (LOW): an all-quotes input like `""` used to set
+    // `in_word = true` on the opening quote and push one empty-string word,
+    // so `program` came back as `""` -- distinct from the intended "empty or
+    // unparseable command" `None` path (which `apply_action`'s `"spawn"` arm
+    // logs and ignores) -- and would instead reach
+    // `Command::new("").args([]).spawn()`, which fails at spawn time with no
+    // warning logged. An empty program must be treated the same as no words
+    // at all.
+    #[test]
+    fn parse_spawn_argv_rejects_empty_program_from_all_quotes() {
+        assert_eq!(parse_spawn_argv(r#""""#), None);
+        assert_eq!(parse_spawn_argv("''"), None);
+        assert_eq!(parse_spawn_argv(r#"""  """#), None);
+    }
+
+    // Review finding (HIGH, lex-review testing): every test above drives
+    // `parse_spawn_argv` directly, so a revert of the `"spawn"` arm in
+    // `apply_action` back to `Command::new("sh").arg("-c").arg(cmd)` (the
+    // exact regression `parse_spawn_argv_does_not_expand_shell_metacharacters`
+    // means to guard against) would leave all of them green -- none of them
+    // ever calls `apply_action` at all. This test drives the real
+    // `apply_action("spawn:...")` wiring end-to-end and asserts an
+    // observable difference between a direct argv exec and a shell exec: the
+    // spawned program (a tiny shell script acting purely as a probe -- it is
+    // never invoked as a shell by `apply_action` itself) records its raw
+    // `$@` to a marker file. A command string containing `$HOME` is
+    // dispatched through `apply_action`; if `apply_action` execs directly
+    // (the fix), the probe receives the two literal characters `$HOME` as
+    // its argv, unexpanded. If `apply_action` reverted to `sh -c`, the outer
+    // shell would expand `$HOME` to the real home directory *before* the
+    // probe ever saw it, so the marker would contain a real path instead of
+    // the literal string -- a safe (non-destructive), reliably observable
+    // stand-in for the metacharacter-injection risk the fix closes.
+    #[test]
+    fn apply_action_spawn_execs_directly_without_shell_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe_path = dir.path().join("probe.sh");
+        let marker_path = dir.path().join("marker.txt");
+        std::fs::write(
+            &probe_path,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$1\".out\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&probe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        let action = format!(
+            "spawn:{} {} $HOME",
+            probe_path.display(),
+            marker_path.display()
+        );
+        assert_eq!(state.apply_action(&action), Some(()));
+
+        let out_path = format!("{}.out", marker_path.display());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut contents = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&out_path) {
+                contents = Some(s);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let contents = contents.expect("probe script must run and write its marker");
+        let lines: Vec<&str> = contents.lines().collect();
+        // argv[0] (the probe's own $1) is the marker path itself, echoed
+        // back as the first word of "$@"; argv[1] must be the literal,
+        // unexpanded `$HOME` -- a shell-exec revert would put a real
+        // filesystem path (or empty string) there instead.
+        assert_eq!(lines.last().copied(), Some("$HOME"));
     }
 
     #[test]
