@@ -25,5 +25,3 @@ image = "0.25"
 [profile.dev.package."*"]
 opt-level = 2
 
-[patch.crates-io]
-wlr = { path = "/home/joseph/Projects/wlroots-sys/.worktrees/wlr-a6.1/crates/wlr" }
