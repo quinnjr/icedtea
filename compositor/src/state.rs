@@ -4514,6 +4514,15 @@ impl State {
                 let _ = reply.send(locked);
                 return Some(());
             }
+            DbCommand::InputMethodActive { reply } => {
+                let active = self
+                    .wayland
+                    .runtime()
+                    .map(|rt| rt.input_method_active())
+                    .unwrap_or(false);
+                let _ = reply.send(active);
+                return Some(());
+            }
             DbCommand::CursorPosition { reply } => {
                 let pos = self
                     .wayland

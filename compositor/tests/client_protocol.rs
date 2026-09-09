@@ -12,8 +12,9 @@
 use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
-    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, PointerConstraintsClient,
-    SessionLockClient, TestClient, VirtualKeyboardClient, VirtualPointerClient,
+    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, InputMethodClient,
+    PointerConstraintsClient, SessionLockClient, TestClient, TextInputClient,
+    VirtualKeyboardClient, VirtualPointerClient,
 };
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
@@ -217,6 +218,332 @@ fn relative_pointer_manager_global_is_advertised() {
             .iter()
             .any(|g| g == "zwp_relative_pointer_manager_v1"),
         "relative pointer manager global missing; saw {globals:?}"
+    );
+}
+
+/// M6.1 adds the IME relay: `zwp_text_input_manager_v3` lets an app opt a
+/// text field into IME composition, and `zwp_input_method_manager_v2` lets
+/// an external IME (fcitx5/ibus) or on-screen keyboard (squeekboard) attach
+/// to relay that composition. Both globals must be advertised even with no
+/// IME bound, and the compositor must boot non-fatally either way.
+#[test]
+fn text_input_and_input_method_globals_are_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    assert!(
+        globals.iter().any(|g| g == "zwp_text_input_manager_v3"),
+        "text-input global missing; saw {globals:?}"
+    );
+    assert!(
+        globals.iter().any(|g| g == "zwp_input_method_manager_v2"),
+        "input-method global missing; saw {globals:?}"
+    );
+}
+
+/// B3 smoke test: [`TextInputClient::spawn`] maps a toplevel, gains keyboard
+/// focus via the existing auto-focus-on-map path, and its `zwp_text_input_v3`
+/// receives `enter` -- proof the double actually binds and wires up, ahead of
+/// B5's full relay coverage.
+#[test]
+fn text_input_client_enters_on_keyboard_focus() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket); // seat needs a keyboard
+    let mut ti = TextInputClient::spawn(&comp.socket); // maps + auto-focused
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never got enter on focus"
+    );
+}
+
+/// B4 smoke test: [`InputMethodClient::spawn`] binds the manager and creates
+/// an input-method with no text-input enabled yet -- proof the double
+/// actually binds and wires up, ahead of B5's full relay coverage.
+#[test]
+fn input_method_client_binds_without_activation() {
+    let comp = Compositor::spawn();
+    let im = InputMethodClient::spawn(&comp.socket);
+    assert!(!comp.input_method_active(), "no text-input enabled yet");
+    assert_eq!(im.activates(), 0);
+}
+
+/// B5 test 2: `zwp_text_input_v3.enter` follows *keyboard* focus, not pointer
+/// focus. A second surface (`other`) holds the pointer the whole time; the
+/// text-input surface maps last, taking keyboard focus, and gets `enter` even
+/// though the pointer is over `other` -- non-vacuous proof enter is not gated
+/// on the pointer being over the text-input surface. Mapping a `third`
+/// toplevel then steals keyboard focus, and `leave` must fire.
+#[test]
+fn text_input_enter_follows_keyboard_focus_not_pointer() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket); // seat needs a keyboard
+    let _other = TestClient::map_toplevel(&comp.socket, "other", "other");
+    // Park the pointer over `other`, so pointer focus is emphatically NOT on
+    // the text-input surface that maps next.
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    vp.motion_absolute(10.0, 10.0, 100, 100);
+    vp.frame();
+    vp.pump();
+
+    let mut ti = TextInputClient::spawn(&comp.socket); // maps last -> keyboard-focused
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "enter must follow keyboard focus even with the pointer over another surface"
+    );
+
+    // Move keyboard focus away by mapping (and auto-focusing) a third toplevel.
+    let _third = TestClient::map_toplevel(&comp.socket, "third", "third");
+    assert!(
+        ti.wait_until(|c| c.left() >= 1),
+        "leave must fire when keyboard focus is lost"
+    );
+}
+
+/// B5 test 3: enabling a focused text-input activates a bound IME and relays
+/// the surrounding text. Asserts on BOTH sides -- the IME double's captured
+/// `activate` + `surrounding_text` events AND the compositor's
+/// `input_method_active` oracle.
+#[test]
+fn enable_activates_ime_and_relays_surrounding_text() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket); // IME bound first
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+
+    ti.enable();
+    ti.commit_with("hello", 5, 5, (10, 20, 2, 16));
+
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+    assert!(
+        im.wait_until(|s| s
+            .surroundings()
+            .iter()
+            .any(|t| t == &("hello".to_string(), 5, 5))),
+        "IME never saw the (text, cursor, anchor) surrounding relay; saw {:?}",
+        im.surroundings()
+    );
+    // Both sides: the oracle must agree the IME is active.
+    assert!(comp.input_method_active(), "oracle: IME must be active");
+}
+
+/// B5 test (M6.1 coverage gap): once a text-input is already active, a
+/// SUBSEQUENT commit with NEW surrounding text must be re-forwarded to the
+/// IME with the UPDATED values -- not just the initial forward at
+/// activation time. Exercises `on_text_input_commit`'s re-forward path.
+#[test]
+fn commit_after_activation_reforwards_updated_surrounding() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket); // IME bound first
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+
+    // Step 1: activate, and establish the initial surrounding relay.
+    ti.enable();
+    ti.commit_with("first", 5, 5, (10, 20, 2, 16));
+    assert!(
+        im.wait_until(|s| s.surroundings().last() == Some(&("first".to_string(), 5, 5))),
+        "IME never saw the initial surrounding relay; saw {:?}",
+        im.surroundings()
+    );
+    assert!(comp.input_method_active(), "oracle: IME must be active");
+
+    // Step 2: the re-forward assertion. A second commit on the
+    // ALREADY-ACTIVE text-input carries new surrounding text; the IME must
+    // observe the UPDATED (text, cursor, anchor), not remain stuck on the
+    // initial "first" values.
+    ti.commit_with("second value", 3, 8, (11, 21, 3, 17));
+    assert!(
+        im.wait_until(|s| s.surroundings().last() == Some(&("second value".to_string(), 3, 8))),
+        "IME never saw the re-forwarded, UPDATED surrounding relay; saw {:?}",
+        im.surroundings()
+    );
+}
+
+/// B5 test 4 (the Spec-2 unblock): an IME's preedit + commit_string relay
+/// through to the focused app's `zwp_text_input_v3`. Asserts on the app side
+/// (the text-input double's captured `preedit_string`/`commit_string`).
+#[test]
+fn ime_commit_relays_preedit_and_commit_to_app() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("", 0, 0, (0, 0, 1, 1));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+
+    im.send_commit(Some("に"), Some("日本"), None);
+
+    assert!(
+        ti.wait_until(|c| c.preedits().last().map(String::as_str) == Some("に")),
+        "app never got the preedit; saw {:?}",
+        ti.preedits()
+    );
+    assert!(
+        ti.wait_until(|c| c.commits().last().map(String::as_str) == Some("日本")),
+        "app never got the committed text; saw {:?}",
+        ti.commits()
+    );
+}
+
+/// B5 test 5: disabling the text-input deactivates the IME, and losing
+/// keyboard focus sends `leave`. Asserts on BOTH sides -- the IME double's
+/// captured `deactivate` AND the `input_method_active` oracle -- plus the
+/// app-side `leave`.
+#[test]
+fn disable_deactivates_and_focus_away_leaves() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("hello", 5, 5, (10, 20, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+    assert!(comp.input_method_active(), "oracle: IME must be active");
+
+    ti.disable();
+    assert!(
+        im.wait_until(|s| s.deactivates() >= 1),
+        "IME never deactivated on disable"
+    );
+    assert!(
+        !comp.input_method_active(),
+        "oracle: IME must no longer be active after disable"
+    );
+
+    let _third = TestClient::map_toplevel(&comp.socket, "third", "third"); // steal keyboard focus
+    assert!(
+        ti.wait_until(|c| c.left() >= 1),
+        "text-input never left on focus loss"
+    );
+}
+
+/// M6.1 M1 guard: destroying an ACTIVE text-input OBJECT -- while its surface
+/// keeps keyboard focus -- must deactivate the IME. This exercises wlroots'
+/// `on_text_input_destroy` path specifically, NOT the keyboard-focus `leave`
+/// path (`relay_keyboard_focus`): the toplevel is never unmapped and the
+/// client is never dropped, so focus never changes; only the
+/// `zwp_text_input_v3.destroy` request fires. Before the M1 fix,
+/// `on_text_input_destroy` tore the object down WITHOUT sending the IME
+/// `deactivate`, leaving it stuck active with a dangling text-input; the fix
+/// makes it send deactivate -> done -> clear. Asserts on BOTH sides -- the IME
+/// double's captured `deactivate` AND the compositor's `input_method_active`
+/// oracle turning false.
+#[test]
+fn destroying_active_text_input_deactivates_ime() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket); // IME bound first
+    let mut ti = TextInputClient::spawn(&comp.socket); // maps + auto-focused
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+
+    // Establish the ACTIVE state: enabled + focused, driving the IME.
+    ti.enable();
+    ti.commit_with("hi", 2, 2, (0, 0, 1, 1));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+    assert!(comp.input_method_active(), "oracle: IME must be active");
+
+    // Destroy ONLY the zwp_text_input_v3 object. The toplevel stays mapped and
+    // keyboard-focused, so this drives `on_text_input_destroy`, not the
+    // focus-leave path.
+    ti.destroy_text_input();
+
+    // The M1 assertion: destroying the active object deactivates the IME.
+    assert!(
+        im.wait_until(|s| s.deactivates() >= 1),
+        "IME never deactivated when its active text-input object was destroyed"
+    );
+    assert!(
+        !comp.input_method_active(),
+        "oracle: IME must no longer be active after the text-input object is destroyed"
+    );
+}
+
+/// B5 test 6: only one input-method may bind a seat. A second `get_input_method`
+/// gets `unavailable` and never activates, while the first stays fully
+/// functional. Asserts on both IME doubles' captured events.
+#[test]
+fn second_input_method_is_refused() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut first = InputMethodClient::spawn(&comp.socket);
+    let mut second = InputMethodClient::spawn(&comp.socket);
+    assert!(
+        second.wait_until(|s| s.unavailable()),
+        "second IME must get `unavailable`"
+    );
+
+    // Even when a text-input enables, only the first ever activates.
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("x", 1, 1, (0, 0, 1, 1));
+
+    assert!(
+        first.wait_until(|s| s.activates() >= 1),
+        "the first IME activates"
+    );
+    second.pump();
+    assert_eq!(second.activates(), 0, "the refused IME never activates");
+}
+
+/// B5 regression guard for the crash the relay fix closed: a text-input created
+/// *after* its surface already holds keyboard focus (via
+/// [`TextInputClient::spawn_on_focused_surface`], NOT the map-first
+/// constructor) must (a) still receive `enter` -- the crate synthesises it on
+/// create, since wlroots' `relay_keyboard_focus` only sends `enter` on a focus
+/// *change* -- and (b) survive a later focus change and teardown without the
+/// compositor aborting. Before the fix, the stray `leave` tripped wlroots'
+/// `wlr_text_input_v3_send_leave` assertion and SIGABRT'd the whole test
+/// binary; the test simply reaching its end (with the oracle still answering)
+/// is the assertion that it no longer does.
+#[test]
+fn text_input_created_on_focused_surface_enters_and_survives_teardown() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn_on_focused_surface(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "a text-input created on an already-focused surface must still get enter"
+    );
+
+    // Steal keyboard focus -> the compositor sends `leave` to the
+    // after-created text-input; this is the path that used to SIGABRT.
+    let _second = TestClient::map_toplevel(&comp.socket, "second", "second");
+    assert!(
+        ti.wait_until(|c| c.left() >= 1),
+        "text-input never left on focus loss"
+    );
+
+    // Tear the text-input client down entirely -> another leave path.
+    drop(ti);
+
+    // The compositor is still alive: the oracle answers rather than the
+    // blocking reply timing out because the process aborted.
+    assert!(
+        !comp.input_method_active(),
+        "compositor survived a text-input created-on-focus + teardown"
     );
 }
 

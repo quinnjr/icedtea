@@ -68,6 +68,9 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
 use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3, zwp_text_input_v3,
+};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{
@@ -75,6 +78,9 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 };
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
+use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_manager_v2, zwp_input_method_v2,
 };
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
@@ -341,6 +347,15 @@ impl Compositor {
             runtime
                 .create_relative_pointer_manager(&display)
                 .expect("zwp_relative_pointer_manager_v1");
+            // Same "harness cannot degrade" tone: the IME relay tests bind
+            // these globals directly and would assert against ones that were
+            // never advertised.
+            runtime
+                .create_text_input_manager(&display)
+                .expect("zwp_text_input_manager_v3");
+            runtime
+                .create_input_method_manager(&display)
+                .expect("zwp_input_method_manager_v2");
             // Same "harness cannot degrade" tone: the output-management test
             // binds `zwlr_output_manager_v1` directly and would assert against
             // one that was never advertised.
@@ -626,6 +641,17 @@ impl Compositor {
         reply_rx
             .recv_timeout(TIMEOUT)
             .expect("compositor never answered SessionLocked")
+    }
+
+    /// Whether an IME is currently activated for a focused+enabled
+    /// text-input, via `wlr::Runtime::input_method_active`. Blocks on the
+    /// reply -- see [`Self::inject_touch_down`]'s doc.
+    pub fn input_method_active(&self) -> bool {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InputMethodActive { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InputMethodActive")
     }
 
     /// The pointer's current position, via `wlr::Runtime::cursor_position`.
@@ -1041,6 +1067,61 @@ struct ClientState {
     /// Set true on the gamma control's `failed` event -- what wlroots sends
     /// instead of `gamma_size` for an output whose gamma LUT size is 0.
     gamma_failed: bool,
+
+    // --- text-input (M6.1) ---
+    /// Bound whenever advertised; used by [`TextInputClient::spawn`].
+    text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
+    /// This client's `zwp_text_input_v3`, created by
+    /// [`TestClient::map_toplevel_with_text_input`] -- *before* the surface's
+    /// first commit, so it is already registered when the compositor's
+    /// keyboard-focus relay (`relay_keyboard_focus`, wlr crate) fires the
+    /// auto-focus-on-map `enter`. A text-input created only after mapping
+    /// (on an already-focused surface) never receives that `enter`, leaving
+    /// its wlroots-side `focused_surface` null; a later `leave` (e.g. at
+    /// teardown) then trips wlroots' own `wlr_text_input_v3_send_leave`
+    /// assertion, since `relay_keyboard_focus` matches outgoing text-inputs
+    /// by *client*, not by per-object entered state. `None` for every other
+    /// [`TestClient`], which never creates this object at all.
+    text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
+    /// How many `zwp_text_input_v3.enter` events this client has received.
+    text_input_enters: u32,
+    /// How many `zwp_text_input_v3.leave` events this client has received.
+    text_input_leaves: u32,
+    /// Every `preedit_string` event's text, in arrival order (a `None` text
+    /// -- the protocol allows a null preedit string -- is recorded as `""`).
+    text_input_preedit_strings: Vec<String>,
+    /// Every `commit_string` event's text, in arrival order.
+    text_input_commit_strings: Vec<String>,
+    /// Every `delete_surrounding_text` event, as `(before_length,
+    /// after_length)`, in arrival order.
+    text_input_deletes: Vec<(u32, u32)>,
+    /// How many `zwp_text_input_v3.done` events this client has received.
+    text_input_dones: u32,
+
+    // --- input-method (M6.1) ---
+    /// Bound whenever advertised; used by [`InputMethodClient::spawn`].
+    input_method_manager: Option<zwp_input_method_manager_v2::ZwpInputMethodManagerV2>,
+    /// How many `zwp_input_method_v2.activate` events this client has
+    /// received.
+    im_activates: u32,
+    /// How many `zwp_input_method_v2.deactivate` events this client has
+    /// received.
+    im_deactivates: u32,
+    /// Every `surrounding_text` event's `(text, cursor, anchor)`, in
+    /// arrival order.
+    im_surroundings: Vec<(String, u32, u32)>,
+    /// Every `content_type` event's `(hint, purpose)`, in arrival order.
+    im_content_types: Vec<(u32, u32)>,
+    /// Every `text_change_cause` event's raw `cause`, in arrival order.
+    im_text_change_causes: Vec<u32>,
+    /// How many `zwp_input_method_v2.done` events this client has received
+    /// -- also the serial [`InputMethodClient::send_commit`] echoes back on
+    /// its `commit` request, per the protocol ("the value of the serial
+    /// argument must be equal to the number of done events already issued").
+    im_dones: u32,
+    /// Set true on the input-method's `unavailable` event -- sent when
+    /// another input method is already associated with this seat.
+    im_unavailable: bool,
 }
 
 impl ClientState {
@@ -1174,6 +1255,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zwlr_gamma_control_manager_v1" => {
                     state.gamma_control_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_text_input_manager_v3" => {
+                    state.text_input_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_input_method_manager_v2" => {
+                    state.input_method_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -1858,6 +1945,92 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for ClientState
     }
 }
 
+// --- text-input (M6.1) ---
+delegate_noop!(ClientState: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
+
+impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_text_input_v3::ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::Enter { .. } => {
+                state.text_input_enters = state.text_input_enters.saturating_add(1);
+            }
+            zwp_text_input_v3::Event::Leave { .. } => {
+                state.text_input_leaves = state.text_input_leaves.saturating_add(1);
+            }
+            zwp_text_input_v3::Event::PreeditString { text, .. } => {
+                state
+                    .text_input_preedit_strings
+                    .push(text.unwrap_or_default());
+            }
+            zwp_text_input_v3::Event::CommitString { text } => {
+                state
+                    .text_input_commit_strings
+                    .push(text.unwrap_or_default());
+            }
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } => {
+                state.text_input_deletes.push((before_length, after_length));
+            }
+            zwp_text_input_v3::Event::Done { .. } => {
+                state.text_input_dones = state.text_input_dones.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+}
+
+// --- input-method (M6.1) ---
+delegate_noop!(ClientState: ignore zwp_input_method_manager_v2::ZwpInputMethodManagerV2);
+
+impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_input_method_v2::ZwpInputMethodV2,
+        event: zwp_input_method_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_input_method_v2::Event::Activate => {
+                state.im_activates = state.im_activates.saturating_add(1);
+            }
+            zwp_input_method_v2::Event::Deactivate => {
+                state.im_deactivates = state.im_deactivates.saturating_add(1);
+            }
+            zwp_input_method_v2::Event::SurroundingText {
+                text,
+                cursor,
+                anchor,
+            } => {
+                state.im_surroundings.push((text, cursor, anchor));
+            }
+            zwp_input_method_v2::Event::TextChangeCause { cause } => {
+                state.im_text_change_causes.push(cause.into());
+            }
+            zwp_input_method_v2::Event::ContentType { hint, purpose } => {
+                state.im_content_types.push((hint.into(), purpose.into()));
+            }
+            zwp_input_method_v2::Event::Done => {
+                state.im_dones = state.im_dones.saturating_add(1);
+            }
+            zwp_input_method_v2::Event::Unavailable => {
+                state.im_unavailable = true;
+            }
+            _ => {}
+        }
+    }
+}
+
 // --- A2 batch-1 passive protocols (Task 7-9) ---
 delegate_noop!(ClientState: ignore wp_viewporter::WpViewporter);
 delegate_noop!(ClientState: ignore wp_viewport::WpViewport);
@@ -2520,8 +2693,37 @@ impl TestClient {
         Self::map(socket, app_id, title, true)
     }
 
+    /// As [`TestClient::map_toplevel`], but also creates a `zwp_text_input_v3`
+    /// on the client's seat *before* the surface's first commit -- see
+    /// [`ClientState::text_input`]'s doc for why that ordering matters.
+    /// [`TextInputClient::spawn`]'s own constructor.
+    pub(crate) fn map_toplevel_with_text_input(
+        socket: &str,
+        app_id: &str,
+        title: &str,
+    ) -> TestClient {
+        Self::map_with(socket, app_id, title, false, |state, qh| {
+            if let (Some(mgr), Some(seat)) =
+                (state.text_input_manager.as_ref(), state.seat.as_ref())
+            {
+                state.text_input = Some(mgr.get_text_input(seat, qh, ()));
+            }
+        })
+    }
+
     fn map(socket: &str, app_id: &str, title: &str, decorated: bool) -> TestClient {
+        Self::map_with(socket, app_id, title, decorated, |_, _| {})
+    }
+
+    fn map_with(
+        socket: &str,
+        app_id: &str,
+        title: &str,
+        decorated: bool,
+        pre_map: impl FnOnce(&mut ClientState, &QueueHandle<ClientState>),
+    ) -> TestClient {
         let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+        pre_map(&mut state, &qh);
 
         let compositor = state
             .compositor
@@ -4859,6 +5061,308 @@ impl PointerConstraintsClient {
     /// One roundtrip.
     pub fn pump(&mut self) {
         let _ = self.client.queue.roundtrip(&mut self.client.state);
+    }
+}
+
+/// A `zwp_text_input_v3` app double: maps a focusable toplevel (via
+/// [`TestClient`], so it gains keyboard focus via the existing
+/// auto-focus-on-map path), creates a text-input on the seat, and records
+/// relay events (enter/leave/preedit/commit/delete/done). M6.1 tests 2-5's
+/// app side.
+pub struct TextInputClient {
+    client: TestClient,
+    text_input: zwp_text_input_v3::ZwpTextInputV3,
+}
+
+impl TextInputClient {
+    /// Connect, create a `zwp_text_input_v3` on this client's seat, then map
+    /// a toplevel -- in that order, so the text-input is already registered
+    /// when the compositor's auto-focus-on-map path fires `enter` (see
+    /// [`ClientState::text_input`]'s doc). Panics if the compositor did not
+    /// advertise `zwp_text_input_manager_v3` or a seat.
+    pub fn spawn(socket: &str) -> TextInputClient {
+        let client = TestClient::map_toplevel_with_text_input(
+            socket,
+            "icedtea-harness-text-input",
+            "text-input",
+        );
+        let text_input = client
+            .state
+            .text_input
+            .clone()
+            .expect("compositor did not advertise zwp_text_input_manager_v3 or wl_seat");
+
+        let mut this = TextInputClient { client, text_input };
+        this.pump();
+        this
+    }
+
+    /// As [`Self::spawn`], but the `zwp_text_input_v3` is created *after* the
+    /// toplevel is mapped and already keyboard-focused, rather than before its
+    /// first commit. This is the exact scenario the wlr relay's
+    /// enter-on-create-if-focused fix and its `leave` guard close: a
+    /// text-input born onto an already-focused surface must still receive
+    /// `enter` (wlroots' `relay_keyboard_focus` only sends `enter` on a
+    /// focus *change*, so the crate has to synthesise it on create), and a
+    /// later focus change or teardown must not trip wlroots'
+    /// `wlr_text_input_v3_send_leave` assertion -- which SIGABRTs the whole
+    /// compositor process. Panics if the compositor did not advertise
+    /// `zwp_text_input_manager_v3` or a seat.
+    pub fn spawn_on_focused_surface(socket: &str) -> TextInputClient {
+        let mut client =
+            TestClient::map_toplevel(socket, "icedtea-harness-text-input", "text-input");
+        let manager = client
+            .state
+            .text_input_manager
+            .clone()
+            .expect("compositor did not advertise zwp_text_input_manager_v3");
+        let seat = client
+            .state
+            .seat
+            .clone()
+            .expect("compositor did not advertise wl_seat");
+        let text_input = manager.get_text_input(&seat, &client.qh, ());
+        client.state.text_input = Some(text_input.clone());
+        client.conn.flush().expect("flush get_text_input");
+
+        let mut this = TextInputClient { client, text_input };
+        this.pump();
+        this
+    }
+
+    /// Enable text input on the current surface and commit.
+    pub fn enable(&mut self) {
+        self.text_input.enable();
+        self.text_input.commit();
+        self.flush();
+    }
+
+    /// Set the surrounding text, cursor rectangle, and commit -- the
+    /// double-buffered state a real IME-aware app sends whenever its text
+    /// state changes.
+    pub fn commit_with(
+        &mut self,
+        surrounding: &str,
+        cursor: u32,
+        anchor: u32,
+        cursor_rect: (i32, i32, i32, i32),
+    ) {
+        self.text_input
+            .set_surrounding_text(surrounding.to_string(), cursor as i32, anchor as i32);
+        self.text_input.set_cursor_rectangle(
+            cursor_rect.0,
+            cursor_rect.1,
+            cursor_rect.2,
+            cursor_rect.3,
+        );
+        self.text_input.commit();
+        self.flush();
+    }
+
+    /// Disable text input on the current surface and commit.
+    pub fn disable(&mut self) {
+        self.text_input.disable();
+        self.text_input.commit();
+        self.flush();
+    }
+
+    /// Destroy ONLY the `zwp_text_input_v3` object -- the
+    /// `zwp_text_input_v3.destroy` request -- while leaving the toplevel
+    /// mapped and keyboard-focused and the client connection alive. This is
+    /// the exact wire event that drives wlroots' `on_text_input_destroy`,
+    /// deliberately kept distinct from unmapping the toplevel or dropping the
+    /// whole client (either of which would move keyboard focus and take the
+    /// `relay_keyboard_focus` leave path instead). `destroy` is a `&self`
+    /// destructor request, so the proxy is left inert afterwards -- do not
+    /// enable/commit on this client again.
+    pub fn destroy_text_input(&mut self) {
+        self.text_input.destroy();
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        self.client.conn.flush().expect("flush text-input request");
+        self.pump();
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        let _ = self.client.queue.roundtrip(&mut self.client.state);
+    }
+
+    /// Pump the queue until `pred` holds or `TIMEOUT` elapses.
+    pub fn wait_until(&mut self, pred: impl Fn(&TextInputClient) -> bool) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.client.queue.roundtrip(&mut self.client.state);
+        }
+    }
+
+    /// How many `zwp_text_input_v3.enter` events this client has received.
+    pub fn entered(&self) -> u32 {
+        self.client.state.text_input_enters
+    }
+
+    /// How many `zwp_text_input_v3.leave` events this client has received.
+    pub fn left(&self) -> u32 {
+        self.client.state.text_input_leaves
+    }
+
+    /// Every `preedit_string` event's text, in arrival order.
+    pub fn preedits(&self) -> &[String] {
+        &self.client.state.text_input_preedit_strings
+    }
+
+    /// Every `commit_string` event's text, in arrival order.
+    pub fn commits(&self) -> &[String] {
+        &self.client.state.text_input_commit_strings
+    }
+
+    /// Every `delete_surrounding_text` event, as `(before_length,
+    /// after_length)`, in arrival order.
+    pub fn deletes(&self) -> &[(u32, u32)] {
+        &self.client.state.text_input_deletes
+    }
+
+    /// How many `zwp_text_input_v3.done` events this client has received.
+    pub fn dones(&self) -> u32 {
+        self.client.state.text_input_dones
+    }
+}
+
+/// A `zwp_input_method_v2` IME/OSK double: binds the manager (surfaceless, like
+/// a real IME daemon), creates an input-method, records activate/deactivate/
+/// surrounding_text/content_type/done/unavailable, and can send preedit/commit/
+/// delete + commit. M6.1 tests 3-6's IME side.
+///
+/// Its own connection rather than a [`TestClient`] method, for the same
+/// reason as [`GammaControlClient`]: the real thing (an IME/OSK daemon)
+/// never holds focus and never maps a surface at all -- a bare `wl_seat`
+/// bind suffices, mirroring `DataControlClient`'s "never holds focus"
+/// rationale.
+pub struct InputMethodClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    state: ClientState,
+    input_method: zwp_input_method_v2::ZwpInputMethodV2,
+}
+
+impl InputMethodClient {
+    /// Connect, bind `zwp_input_method_manager_v2`, and create this seat's
+    /// `zwp_input_method_v2`. Panics if the compositor did not advertise the
+    /// manager or a seat.
+    pub fn spawn(socket: &str) -> InputMethodClient {
+        let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+        let manager = state
+            .input_method_manager
+            .clone()
+            .expect("compositor did not advertise zwp_input_method_manager_v2");
+        let seat = state
+            .seat
+            .clone()
+            .expect("compositor did not advertise wl_seat");
+        let input_method = manager.get_input_method(&seat, &qh, ());
+        conn.flush().expect("flush get_input_method");
+        queue.roundtrip(&mut state).expect("input-method roundtrip");
+        InputMethodClient {
+            conn,
+            queue,
+            state,
+            input_method,
+        }
+    }
+
+    /// Send any combination of preedit/commit/delete, then `commit` --
+    /// mirroring how a real IME batches double-buffered state before
+    /// applying it. The `commit` request's serial echoes back the number of
+    /// `done` events received so far, per the protocol.
+    pub fn send_commit(
+        &mut self,
+        preedit: Option<&str>,
+        commit: Option<&str>,
+        delete: Option<(u32, u32)>,
+    ) {
+        if let Some(p) = preedit {
+            self.input_method
+                .set_preedit_string(p.to_string(), 0, p.len() as i32);
+        }
+        if let Some(c) = commit {
+            self.input_method.commit_string(c.to_string());
+        }
+        if let Some((before, after)) = delete {
+            self.input_method.delete_surrounding_text(before, after);
+        }
+        self.input_method.commit(self.state.im_dones);
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        self.conn.flush().expect("flush input-method request");
+        self.pump();
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        let _ = self.queue.roundtrip(&mut self.state);
+    }
+
+    /// Pump the queue until `pred` holds or `TIMEOUT` elapses.
+    pub fn wait_until(&mut self, pred: impl Fn(&InputMethodClient) -> bool) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+        }
+    }
+
+    /// How many `zwp_input_method_v2.activate` events this client has
+    /// received.
+    pub fn activates(&self) -> u32 {
+        self.state.im_activates
+    }
+
+    /// How many `zwp_input_method_v2.deactivate` events this client has
+    /// received.
+    pub fn deactivates(&self) -> u32 {
+        self.state.im_deactivates
+    }
+
+    /// Every `surrounding_text` event's `(text, cursor, anchor)`, in
+    /// arrival order.
+    pub fn surroundings(&self) -> &[(String, u32, u32)] {
+        &self.state.im_surroundings
+    }
+
+    /// Every `content_type` event's `(hint, purpose)`, in arrival order.
+    pub fn content_types(&self) -> &[(u32, u32)] {
+        &self.state.im_content_types
+    }
+
+    /// Every `text_change_cause` event's raw `cause`, in arrival order.
+    pub fn text_change_causes(&self) -> &[u32] {
+        &self.state.im_text_change_causes
+    }
+
+    /// How many `zwp_input_method_v2.done` events this client has received.
+    pub fn dones(&self) -> u32 {
+        self.state.im_dones
+    }
+
+    /// Whether the compositor sent `unavailable` -- another input method was
+    /// already associated with this seat.
+    pub fn unavailable(&self) -> bool {
+        self.state.im_unavailable
     }
 }
 
