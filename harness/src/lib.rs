@@ -5166,6 +5166,20 @@ impl TextInputClient {
         self.flush();
     }
 
+    /// Destroy ONLY the `zwp_text_input_v3` object -- the
+    /// `zwp_text_input_v3.destroy` request -- while leaving the toplevel
+    /// mapped and keyboard-focused and the client connection alive. This is
+    /// the exact wire event that drives wlroots' `on_text_input_destroy`,
+    /// deliberately kept distinct from unmapping the toplevel or dropping the
+    /// whole client (either of which would move keyboard focus and take the
+    /// `relay_keyboard_focus` leave path instead). `destroy` is a `&self`
+    /// destructor request, so the proxy is left inert afterwards -- do not
+    /// enable/commit on this client again.
+    pub fn destroy_text_input(&mut self) {
+        self.text_input.destroy();
+        self.flush();
+    }
+
     fn flush(&mut self) {
         self.client.conn.flush().expect("flush text-input request");
         self.pump();

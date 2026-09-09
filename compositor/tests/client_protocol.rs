@@ -433,6 +433,50 @@ fn disable_deactivates_and_focus_away_leaves() {
     );
 }
 
+/// M6.1 M1 guard: destroying an ACTIVE text-input OBJECT -- while its surface
+/// keeps keyboard focus -- must deactivate the IME. This exercises wlroots'
+/// `on_text_input_destroy` path specifically, NOT the keyboard-focus `leave`
+/// path (`relay_keyboard_focus`): the toplevel is never unmapped and the
+/// client is never dropped, so focus never changes; only the
+/// `zwp_text_input_v3.destroy` request fires. Before the M1 fix,
+/// `on_text_input_destroy` tore the object down WITHOUT sending the IME
+/// `deactivate`, leaving it stuck active with a dangling text-input; the fix
+/// makes it send deactivate -> done -> clear. Asserts on BOTH sides -- the IME
+/// double's captured `deactivate` AND the compositor's `input_method_active`
+/// oracle turning false.
+#[test]
+fn destroying_active_text_input_deactivates_ime() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket); // IME bound first
+    let mut ti = TextInputClient::spawn(&comp.socket); // maps + auto-focused
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+
+    // Establish the ACTIVE state: enabled + focused, driving the IME.
+    ti.enable();
+    ti.commit_with("hi", 2, 2, (0, 0, 1, 1));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+    assert!(comp.input_method_active(), "oracle: IME must be active");
+
+    // Destroy ONLY the zwp_text_input_v3 object. The toplevel stays mapped and
+    // keyboard-focused, so this drives `on_text_input_destroy`, not the
+    // focus-leave path.
+    ti.destroy_text_input();
+
+    // The M1 assertion: destroying the active object deactivates the IME.
+    assert!(
+        im.wait_until(|s| s.deactivates() >= 1),
+        "IME never deactivated when its active text-input object was destroyed"
+    );
+    assert!(
+        !comp.input_method_active(),
+        "oracle: IME must no longer be active after the text-input object is destroyed"
+    );
+}
+
 /// B5 test 6: only one input-method may bind a seat. A second `get_input_method`
 /// gets `unavailable` and never activates, while the first stays fully
 /// functional. Asserts on both IME doubles' captured events.
