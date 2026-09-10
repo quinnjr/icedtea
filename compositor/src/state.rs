@@ -1039,6 +1039,14 @@ pub struct State {
     /// accessor, and the value exported into the environment session children
     /// inherit.
     xwayland_display: Option<String>,
+    /// Scene nodes of currently-placed input-method candidate popups, keyed by
+    /// the crate's [`wlr::InputPopupSurfaceId`]. Written in
+    /// `SeatHandler::new_popup_surface` (the node `add_input_popup_in_band`
+    /// returned) and removed in `popup_surface_destroyed`. The crate exposes no
+    /// by-id popup-position accessor, so the compositor keeps this so the
+    /// test-only `DbCommand::InputPopupPosition` oracle can resolve a placed
+    /// popup's scene position through `wlr::Runtime::node_position`.
+    input_popup_nodes: HashMap<wlr::InputPopupSurfaceId, wlr::NodeId>,
 }
 
 /// What a cached title raster depends on: the title text, the pixel width
@@ -1238,6 +1246,7 @@ impl State {
             override_redirect: HashMap::new(),
             or_keyboard_stack: Vec::new(),
             xwayland_display: None,
+            input_popup_nodes: HashMap::new(),
         }
     }
 
@@ -4532,6 +4541,21 @@ impl State {
                 let _ = reply.send(pos);
                 return Some(());
             }
+            DbCommand::InputPopupPosition { reply } => {
+                // The scene position of any currently-placed candidate popup.
+                // One is expected in tests; if several are somehow live, the
+                // first the map yields is reported (order is irrelevant to the
+                // single-popup oracle). `None` when none is placed, when the
+                // node went stale, or before the runtime is attached.
+                let pos = self.wayland.runtime().and_then(|rt| {
+                    self.input_popup_nodes
+                        .values()
+                        .next()
+                        .and_then(|&node| rt.node_position(node))
+                });
+                let _ = reply.send(pos);
+                return Some(());
+            }
             DbCommand::CursorShape { reply } => {
                 // Load-bearing since wlr 0.20.26: read the crate's own
                 // record of what it handed wlroots (`None` = the default
@@ -7503,6 +7527,9 @@ impl wlr::SeatHandler for State {
         let (x, y) = crate::input_method::place_below_clamped(anchor, popup_size, output);
 
         rt.set_node_position(node, x, y);
+        // Record the placed node so the test-only InputPopupPosition oracle can
+        // read its scene position back (the crate has no by-id accessor).
+        self.input_popup_nodes.insert(popup, node);
         // Tell the popup which rectangle it was anchored against, in the
         // coordinate space the input-method-v2 protocol defines (the
         // text_input_rectangle the IME committed) so it can lay out candidates.
@@ -7510,12 +7537,12 @@ impl wlr::SeatHandler for State {
         rt.send_input_popup_rectangle(popup, anchor_box);
     }
 
-    fn popup_surface_destroyed(&mut self, _popup: wlr::InputPopupSurfaceId) {
-        // The crate tears down the popup's scene node on destroy (FIX-A10-NODE),
-        // and the compositor keeps no per-popup bookkeeping of its own — the
-        // node id lived only inside the crate's popup entry. So there is nothing
-        // to undo here; the callback exists so the routing arm is live and a
-        // future compositor that does track popups has the hook.
+    fn popup_surface_destroyed(&mut self, popup: wlr::InputPopupSurfaceId) {
+        // Drop the compositor's record of the placed node. The crate itself
+        // tears down the popup's scene node on destroy (FIX-A10-NODE); this only
+        // clears our by-id lookup so the InputPopupPosition oracle stops
+        // reporting a gone popup.
+        self.input_popup_nodes.remove(&popup);
     }
 }
 

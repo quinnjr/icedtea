@@ -665,6 +665,17 @@ impl Compositor {
             .expect("compositor never answered CursorPosition")
     }
 
+    /// The scene position of the currently-placed input-method candidate
+    /// popup, or `None` when none is placed. Blocks on the reply -- see
+    /// [`Self::inject_touch_down`]'s doc. The compositor half of A6.2 test 8.
+    pub fn input_popup_position(&self) -> Option<(i32, i32)> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InputPopupPosition { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InputPopupPosition")
+    }
+
     /// The `Debug` name of the named cursor shape currently in force
     /// (e.g. `"Default"`, `"Text"`), read straight off
     /// `wlr::Runtime::cursor_shape` -- the crate's own record of what it

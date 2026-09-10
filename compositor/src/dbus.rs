@@ -160,6 +160,16 @@ pub enum DbCommand {
     CursorPosition {
         reply: Sender<(f64, f64)>,
     },
+    /// Test-only: the scene position of the currently-placed input-method
+    /// candidate popup, as the compositor positioned it (`set_node_position`
+    /// on the node `add_input_popup_in_band` returned). `None` when no popup is
+    /// placed. Read from `State`'s own record of the placed node (the crate
+    /// exposes no by-id popup-position accessor), then resolved through
+    /// `wlr::Runtime::node_position`. Not reachable from `CompositorInterface`
+    /// -- only the test harness sends this, same reasoning as `CursorPosition`.
+    InputPopupPosition {
+        reply: Sender<Option<(i32, i32)>>,
+    },
     /// Test-only: read `wlr::Runtime::cursor_shape` -- the named shape
     /// currently in force as the crate itself records it, `None` rendered as
     /// `"Default"` -- as its `Debug` name. Not reachable from `CompositorInterface` --
