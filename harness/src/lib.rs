@@ -5284,6 +5284,14 @@ impl TextInputClient {
         self.client.state.text_input_leaves
     }
 
+    /// How many `wl_keyboard.key` events the underlying app client has
+    /// received — the app's *ordinary* keyboard delivery, distinct from the
+    /// text-input relay. A6.2 test 9 asserts this advances before an IME
+    /// keyboard grab and then stops once the grab intercepts.
+    pub fn wl_keyboard_key_events(&self) -> u32 {
+        self.client.state.key_events
+    }
+
     /// Every `preedit_string` event's text, in arrival order.
     pub fn preedits(&self) -> &[String] {
         &self.client.state.text_input_preedit_strings
@@ -5425,6 +5433,18 @@ impl InputMethodClient {
     /// until the compositor sends one. The popup half of A6.2 test 8.
     pub fn popup_text_input_rectangle(&self) -> Option<(i32, i32, i32, i32)> {
         self.state.im_popup_text_input_rectangle
+    }
+
+    /// Destroy the `zwp_input_method_v2` object itself (its `destroy` request),
+    /// leaving the client connection alive. This is the exact wire event that
+    /// drives wlroots' input-method teardown -- deliberately distinct from
+    /// dropping the whole client -- so a test can assert the compositor cascades
+    /// the IME's still-live candidate popups away with it. `destroy` is a
+    /// destructor request, so the proxy is inert afterwards; do not call popup/
+    /// grab/commit on this client again.
+    pub fn destroy(&mut self) {
+        self.input_method.destroy();
+        self.flush();
     }
 
     /// How many `key` events the keyboard grab has intercepted.
