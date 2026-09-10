@@ -9,6 +9,7 @@ pub mod config_combo;
 pub mod dbus;
 pub mod decoration;
 pub mod input;
+pub mod input_method;
 pub mod layout;
 pub mod render;
 pub mod state;

@@ -7443,6 +7443,80 @@ impl wlr::SeatHandler for State {
         }
         self.emit_pending();
     }
+
+    fn new_popup_surface(&mut self, popup: wlr::InputPopupSurfaceId) {
+        // Placement needs the runtime (for the scene node + the anchor rect);
+        // no runtime means no scene, so there is nothing to place.
+        let Some(rt) = self.wayland.runtime() else {
+            return;
+        };
+        // Create the popup's scene node in the top band. `None` if the popup is
+        // already gone, has no surface yet, or a scene walk is live — all cases
+        // where placing nothing is correct.
+        let Some(node) = rt.add_input_popup_in_band(popup, wlr::Band::Top) else {
+            return;
+        };
+
+        // Anchor against the focused text input's last-committed cursor
+        // rectangle. `None` (no focused input, or it went stale) → a zero
+        // anchor, which places the popup at the output origin — the best we can
+        // do without a caret to sit under.
+        let anchor = rt
+            .focused_text_input_cursor_rectangle()
+            .map(|b| icedtea_contract::Rectangle {
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            })
+            .unwrap_or(icedtea_contract::Rectangle {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+
+        // The lowest-index output's geometry — the only one the headless
+        // harness has, and the same "which screen" choice `DbCommand::OutputSize`
+        // makes at state.rs:4547.
+        let output = self
+            .outputs
+            .keys()
+            .min()
+            .copied()
+            .and_then(|idx| self.outputs.get(&idx))
+            .map(|o| o.geometry);
+
+        // The popup's own committed size is not known at creation (the IME has
+        // not necessarily attached a buffer yet, and the A6.2 crate API exposes
+        // no popup-surface size accessor). Place against a zero size: the
+        // below-the-cursor anchor and origin clamp still apply; right/bottom
+        // clamping only matters once a real size is known, which would arrive
+        // via a reposition event the frozen A6.2 API deliberately does not ship
+        // (see the module doc and the SDD ledger's B7 deviation note).
+        let popup_size = icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        let (x, y) = crate::input_method::place_below_clamped(anchor, popup_size, output);
+
+        rt.set_node_position(node, x, y);
+        // Tell the popup which rectangle it was anchored against, in the
+        // coordinate space the input-method-v2 protocol defines (the
+        // text_input_rectangle the IME committed) so it can lay out candidates.
+        let anchor_box = wlr::Box2D::new(anchor.x, anchor.y, anchor.width, anchor.height);
+        rt.send_input_popup_rectangle(popup, anchor_box);
+    }
+
+    fn popup_surface_destroyed(&mut self, _popup: wlr::InputPopupSurfaceId) {
+        // The crate tears down the popup's scene node on destroy (FIX-A10-NODE),
+        // and the compositor keeps no per-popup bookkeeping of its own — the
+        // node id lived only inside the crate's popup entry. So there is nothing
+        // to undo here; the callback exists so the routing arm is live and a
+        // future compositor that does track popups has the hook.
+    }
 }
 
 #[cfg(test)]
