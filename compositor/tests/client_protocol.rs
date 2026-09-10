@@ -3266,7 +3266,10 @@ fn compositor_keybindings_fire_during_a_grab() {
 /// the `InputPopupPosition` oracle, which reports `Some` while the popup is
 /// placed and must return to `None` once the IME is destroyed -- our
 /// `popup_surface_destroyed` handler only clears the record when the crate
-/// fires the popup destroy.
+/// fires the popup destroy. Plus the teardown tripwire: the captured scene
+/// node itself must stop resolving afterwards, which is what fails if the
+/// crate's `destroy_node` call is ever deleted (the position oracle alone
+/// would stay green through bookkeeping).
 #[test]
 fn destroying_the_input_method_cascades_its_popups_away() {
     let comp = Compositor::spawn();
@@ -3290,6 +3293,13 @@ fn destroying_the_input_method_cascades_its_popups_away() {
     assert!(
         comp.input_popup_position().is_some(),
         "precondition: the popup must be placed before we tear the IME down"
+    );
+    // Capture the scene node itself while placed. The position oracle above
+    // clears via bookkeeping whether or not the crate destroyed the node, so
+    // it cannot pin the teardown; the node id can.
+    let node = comp.input_popup_node().expect(
+        "precondition: the placed popup must have a scene node before we tear \
+         the IME down",
     );
 
     // Tear down the input-method itself. wlroots must cascade-destroy its
@@ -3315,5 +3325,15 @@ fn destroying_the_input_method_cascades_its_popups_away() {
         "destroying the input-method must cascade its candidate popup away \
          (the scene node would otherwise leak); the popup is still placed at {:?}",
         comp.input_popup_position()
+    );
+
+    // Tripwire for the crate's scene-node teardown: the captured node must be
+    // stale now, not merely unrecorded. Deleting the `destroy_node` call in
+    // `on_input_method_popup_destroy` leaves the assertions above green and
+    // fails exactly this one.
+    assert!(
+        comp.scene_node_position(node).is_none(),
+        "the popup's scene node must be destroyed with the popup, not just \
+         unrecorded; node {node:?} still resolves"
     );
 }

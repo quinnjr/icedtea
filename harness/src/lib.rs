@@ -676,6 +676,31 @@ impl Compositor {
             .expect("compositor never answered InputPopupPosition")
     }
 
+    /// The scene node of the currently-placed input-method candidate popup,
+    /// or `None` when none is placed. The first half of the popup-teardown
+    /// tripwire (test 10b): capture while placed, tear down, then assert
+    /// [`Self::scene_node_position`] reads `None` for it.
+    pub fn input_popup_node(&self) -> Option<wlr::NodeId> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InputPopupNode { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InputPopupNode")
+    }
+
+    /// The scene position of an arbitrary node by id, or `None` for an
+    /// unknown or destroyed id. The second half of the tripwire.
+    pub fn scene_node_position(&self, node: wlr::NodeId) -> Option<(i32, i32)> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::SceneNodePosition {
+            node,
+            reply: reply_tx,
+        });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered SceneNodePosition")
+    }
+
     /// The `Debug` name of the named cursor shape currently in force
     /// (e.g. `"Default"`, `"Text"`), read straight off
     /// `wlr::Runtime::cursor_shape` -- the crate's own record of what it

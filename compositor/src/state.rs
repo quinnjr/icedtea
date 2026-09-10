@@ -4556,6 +4556,20 @@ impl State {
                 let _ = reply.send(pos);
                 return Some(());
             }
+            DbCommand::InputPopupNode { reply } => {
+                // The node itself (not its position) behind the
+                // `InputPopupPosition` oracle: the first tracked popup's node.
+                // Captured while placed, it lets a test assert the node is
+                // destroyed — not merely unrecorded — after teardown.
+                let node = self.input_popup_nodes.values().next().copied();
+                let _ = reply.send(node);
+                return Some(());
+            }
+            DbCommand::SceneNodePosition { node, reply } => {
+                let pos = self.wayland.runtime().and_then(|rt| rt.node_position(node));
+                let _ = reply.send(pos);
+                return Some(());
+            }
             DbCommand::CursorShape { reply } => {
                 // Load-bearing since wlr 0.20.26: read the crate's own
                 // record of what it handed wlroots (`None` = the default
