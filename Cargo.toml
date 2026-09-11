@@ -25,14 +25,3 @@ image = "0.25"
 [profile.dev.package."*"]
 opt-level = 2
 
-# Dev-only: develop the compositor against the unreleased A6.2 relay work
-# (input-method popups + keyboard-grab) living in the wlr-a6.2 worktree, before
-# it is frozen and published as wlr 0.20.31 (task A13). The patch must live here
-# at the workspace root, not as a dep swap in `compositor/Cargo.toml`: `wlr-sys`
-# carries `links = "wlroots"`, so a path `wlr` and the published `wlr` cannot
-# coexist in one graph — patching the registry source is the only way to keep a
-# single `wlr`/`wlr-sys` pair. Dropped in B-FINAL(A6.2) once 0.20.31 is on
-# crates.io, exactly as the A6.1 patch was. (B6; mirrors B0's A6.1 patch.)
-[patch.crates-io]
-wlr = { path = "/home/joseph/Projects/wlroots-sys/.worktrees/wlr-a6.2/crates/wlr" }
-
