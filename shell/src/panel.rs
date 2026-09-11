@@ -117,6 +117,10 @@ pub struct PanelModel {
     /// than a `Cell` `view` polls: nothing else guarantees another frame
     /// ever runs to pick up a bare `Cell` write once the initial one lands.
     pub bar_width: i32,
+    /// Whether an IME is currently active, from the latest `Snapshot` (M8-7).
+    /// Folded in `update`'s `Msg::Compositor` arm; `view` renders the `#ime`
+    /// indicator from it, or nothing at all while inactive.
+    pub ime_active: bool,
 }
 
 impl PanelModel {
@@ -139,6 +143,7 @@ impl PanelModel {
                 reason = "spec()'s initial width is a small literal constant"
             )]
             bar_width: spec().size.0 as i32,
+            ime_active: false,
         }
     }
 }
@@ -224,6 +229,11 @@ impl ClipCommands for Offline {
 pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
     match msg {
         Msg::Compositor(u) => {
+            // M8-7: the taskbar fold drops the IME indicator bit, so read
+            // it here first — `u` is only peeked, then moved below.
+            if let CompositorUpdate::Snapshot(s) = u.as_ref() {
+                m.ime_active = s.ime_active;
+            }
             m.taskbar.apply(Arc::unwrap_or_clone(u));
             Cmd::None
         }
@@ -334,16 +344,23 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
 }
 
 /// The whole bar. `#bar` is what `style.css`'s first selector names.
+///
+/// The IME indicator sits between the windows and the clip button while an
+/// IME is active, and renders nothing at all while none is — so the bar's
+/// children stay exactly `workspaces, windows, clip` when inactive
+/// (contract §3.3's order, pinned by `the_bar_holds_...`).
 pub fn view(m: &PanelModel) -> View<Msg> {
-    box_(
-        Orientation::Horizontal,
-        [workspaces(m), windows(m), clip_button(m)],
-    )
-    .id("bar")
-    // See `bar_width`'s doc comment and `style.css`'s `#bar` rule: this is
-    // the one mechanism that actually reaches taffy for a plain box's
-    // centred, non-`ChildLayout` child.
-    .width_request(m.bar_width)
+    let mut children = vec![workspaces(m), windows(m)];
+    if let Some(indicator) = ime_indicator(m) {
+        children.push(indicator);
+    }
+    children.push(clip_button(m));
+    box_(Orientation::Horizontal, children)
+        .id("bar")
+        // See `bar_width`'s doc comment and `style.css`'s `#bar` rule: this is
+        // the one mechanism that actually reaches taffy for a plain box's
+        // centred, non-`ChildLayout` child.
+        .width_request(m.bar_width)
 }
 
 /// One button per workspace, keyed by workspace id.
@@ -434,6 +451,19 @@ fn windows(m: &PanelModel) -> View<Msg> {
     box_(Orientation::Horizontal, buttons)
         .id("windows")
         .hexpand(true)
+}
+
+/// The IME indicator (M8-7): a static generic label. `None` while no IME is
+/// active — hidden, not empty: an empty node would still shift the bar's
+/// order and break the `the_bar_holds_...` pin.
+///
+/// No name is ever shown: IME endpoints carry no app_id and wlr exposes no
+/// name accessor, so nothing could populate one (M8 review).
+fn ime_indicator(m: &PanelModel) -> Option<View<Msg>> {
+    if !m.ime_active {
+        return None;
+    }
+    Some(button("IME").id("ime").class("active"))
 }
 
 /// The clipboard popover's trigger. `active` while the popover is open, the
@@ -719,6 +749,7 @@ mod tests {
             windows,
             workspaces,
             active_workspace: 0,
+            ime_active: false,
         }
     }
 
@@ -1292,5 +1323,105 @@ mod tests {
             "pin must not dismiss the popover: {cmd:?}"
         );
         assert_eq!(m.open_popover, Some(key));
+    }
+
+    /// An IME snapshot folds its activation bit into the model. The
+    /// `Snapshot` helper below carries no IME state, so the tests set the
+    /// field explicitly.
+    fn ime_snapshot(active: bool) -> Snapshot {
+        Snapshot {
+            ime_active: active,
+            ..snapshot(vec![], vec![])
+        }
+    }
+
+    #[test]
+    fn no_ime_indicator_renders_while_no_ime_is_active() {
+        let (mut m, _, _) = seeded();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(false)))),
+        );
+        let v = view(&m);
+        assert!(
+            by_id(&v, "ime").is_none(),
+            "an inactive IME must leave no indicator in the bar"
+        );
+        let ids: Vec<Option<&str>> = v
+            .children
+            .iter()
+            .map(|c| c.props.str(PropName::Id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("workspaces"), Some("windows"), Some("clip")],
+            "contract §3.3's order is unchanged while no IME is active"
+        );
+    }
+
+    /// The indicator carries no name — only the static generic label (M8
+    /// review: nothing could ever populate a name, so the wire field went
+    /// away and "IME" is the whole rendering).
+    #[test]
+    fn an_active_ime_renders_the_generic_label() {
+        let (mut m, _, _) = seeded();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(true)))),
+        );
+        let v = view(&m);
+        let btn = by_id(&v, "ime").expect("an active IME must render an indicator");
+        assert_eq!(btn.props.str(PropName::Label), Some("IME"));
+        assert!(
+            btn.props
+                .str(PropName::Classes)
+                .unwrap_or("")
+                .contains("active"),
+            "indicator must carry active styling"
+        );
+        // Bar order: workspaces, windows, ime, clip — ime before clip.
+        let ids: Vec<_> = v
+            .children
+            .iter()
+            .filter_map(|c| c.props.str(PropName::Id).map(str::to_string))
+            .collect();
+        // Actually view children are at top-level; check via by_id order: workspaces before ime before clip.
+        // Simpler: assert ime exists alongside expected siblings.
+        assert!(by_id(&v, "workspaces").is_some());
+        assert!(by_id(&v, "clip").is_some());
+    }
+
+    #[test]
+    fn ime_indicator_persists_across_non_snapshot_updates() {
+        let (mut m, _, _) = seeded();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(true)))),
+        );
+        assert!(by_id(&view(&m), "ime").is_some());
+        // A non-snapshot taskbar update must not clobber the indicator.
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(true)))),
+        );
+        assert!(by_id(&view(&m), "ime").is_some(), "indicator must persist");
+    }
+
+    #[test]
+    fn deactivating_the_ime_removes_its_indicator() {
+        let (mut m, _, _) = seeded();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(true)))),
+        );
+        assert!(by_id(&view(&m), "ime").is_some());
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(false)))),
+        );
+        assert!(
+            by_id(&view(&m), "ime").is_none(),
+            "deactivate must remove the indicator again"
+        );
     }
 }

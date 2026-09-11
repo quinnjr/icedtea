@@ -49,6 +49,12 @@ pub struct Snapshot {
     pub windows: Vec<WindowInfo>,
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace: u32,
+    /// Whether an IME is currently active for a focused+enabled text-input
+    /// (M8-7). `false` by default so snapshots encoded as JSON before this
+    /// field existed still decode; the D-Bus form remains version-gated
+    /// (contract v3 — mixed versions fail loudly via `SignatureMismatch`).
+    #[serde(default)]
+    pub ime_active: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
@@ -141,6 +147,7 @@ mod tests {
                 },
             ],
             active_workspace: 0,
+            ime_active: false,
         }
     }
 
@@ -165,7 +172,7 @@ mod tests {
         assert_eq!(WorkspaceInfo::SIGNATURE.to_string(), "(us)");
         assert_eq!(
             Snapshot::SIGNATURE.to_string(),
-            "(ta(ussuu(iiii)bbbbb)a(us)u)"
+            "(ta(ussuu(iiii)bbbbb)a(us)ub)"
         );
         // `index: usize` marshals as `t` (u64) on 64-bit targets.
         assert_eq!(AltTabState::SIGNATURE.to_string(), "(baut)");
@@ -177,6 +184,21 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: Snapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    /// M8-7: the IME indicator field is additive-optional — a snapshot
+    /// encoded before it existed (no `ime_active` key) still
+    /// decodes, defaulting to inactive.
+    #[test]
+    fn snapshot_json_without_ime_fields_defaults_to_inactive() {
+        let legacy = serde_json::json!({
+            "seq": 7,
+            "windows": [],
+            "workspaces": [],
+            "active_workspace": 0,
+        });
+        let back: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!back.ime_active, "a legacy snapshot names no active IME");
     }
 
     #[test]

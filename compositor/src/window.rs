@@ -673,6 +673,9 @@ impl WindowManager {
             windows: self.windows.values().map(|w| self.to_info(w)).collect(),
             workspaces: self.workspace_info(),
             active_workspace: self.active_workspace,
+            // The model knows no IME state; `State::handle_command`'s
+            // `GetState` arm fills it from the live runtime (M8-7).
+            ime_active: false,
         }
     }
 

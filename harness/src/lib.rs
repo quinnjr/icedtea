@@ -701,6 +701,50 @@ impl Compositor {
             .expect("compositor never answered SceneNodePosition")
     }
 
+    /// The scene position of the preedit overlay, or `None` when no
+    /// composing text is shown. The compositor half of the M8-6 overlay
+    /// tests: `Some` after an IME preedit commit, `None` after
+    /// commit-string, deactivate, or keyboard-focus change.
+    pub fn preedit_overlay(&self) -> Option<(i32, i32)> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::PreeditOverlay { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered PreeditOverlay")
+    }
+
+    /// Poll `preedit_overlay()` until `pred` accepts or `TIMEOUT` elapses,
+    /// mirroring `TestClient::wait_until` but for the compositor oracle.
+    pub fn wait_until_preedit_overlay(&self, pred: impl Fn(Option<(i32, i32)>) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let v = self.preedit_overlay();
+            if pred(v) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Poll `input_popup_position()` until `pred` accepts or `TIMEOUT`
+    /// elapses.
+    pub fn wait_until_popup_position(&self, pred: impl Fn(Option<(i32, i32)>) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let v = self.input_popup_position();
+            if pred(v) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// The `Debug` name of the named cursor shape currently in force
     /// (e.g. `"Default"`, `"Text"`), read straight off
     /// `wlr::Runtime::cursor_shape` -- the crate's own record of what it
@@ -1134,6 +1178,9 @@ struct ClientState {
     text_input_deletes: Vec<(u32, u32)>,
     /// How many `zwp_text_input_v3.done` events this client has received.
     text_input_dones: u32,
+    /// Every `zwp_text_input_v3.done` event's serial, in arrival order (the
+    /// M8-8 pairing counterpart to the IME commit serial).
+    text_input_done_serials: Vec<u32>,
 
     // --- input-method (M6.1) ---
     /// Bound whenever advertised; used by [`InputMethodClient::spawn`].
@@ -1156,6 +1203,9 @@ struct ClientState {
     /// its `commit` request, per the protocol ("the value of the serial
     /// argument must be equal to the number of done events already issued").
     im_dones: u32,
+    /// Every `commit` request's serial this client has sent, in send order
+    /// (the M8-8 pairing counterpart to the text-input done serial).
+    im_commit_serials: Vec<u32>,
     /// Set true on the input-method's `unavailable` event -- sent when
     /// another input method is already associated with this seat.
     im_unavailable: bool,
@@ -2028,8 +2078,9 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for ClientState {
             } => {
                 state.text_input_deletes.push((before_length, after_length));
             }
-            zwp_text_input_v3::Event::Done { .. } => {
+            zwp_text_input_v3::Event::Done { serial } => {
                 state.text_input_dones = state.text_input_dones.saturating_add(1);
+                state.text_input_done_serials.push(serial);
             }
             _ => {}
         }
@@ -5337,6 +5388,11 @@ impl TextInputClient {
     pub fn dones(&self) -> u32 {
         self.client.state.text_input_dones
     }
+
+    /// Every `zwp_text_input_v3.done` event's serial, in arrival order.
+    pub fn done_serials(&self) -> &[u32] {
+        &self.client.state.text_input_done_serials
+    }
 }
 
 /// A `zwp_input_method_v2` IME/OSK double: binds the manager (surfaceless, like
@@ -5502,6 +5558,7 @@ impl InputMethodClient {
         if let Some((before, after)) = delete {
             self.input_method.delete_surrounding_text(before, after);
         }
+        self.state.im_commit_serials.push(self.state.im_dones);
         self.input_method.commit(self.state.im_dones);
         self.flush();
     }
@@ -5561,6 +5618,11 @@ impl InputMethodClient {
     /// How many `zwp_input_method_v2.done` events this client has received.
     pub fn dones(&self) -> u32 {
         self.state.im_dones
+    }
+
+    /// Every `commit` request's serial this client has sent, in send order.
+    pub fn commit_serials(&self) -> &[u32] {
+        &self.state.im_commit_serials
     }
 
     /// Whether the compositor sent `unavailable` -- another input method was
