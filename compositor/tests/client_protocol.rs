@@ -3484,4 +3484,11 @@ fn ime_popup_repositions_when_the_caret_moves() {
         (300, 444),
         "repositioned translated below the new caret: content origin (0, 28) + (300, 400+16)"
     );
+    // And the popup must be re-told the new surface-local rectangle (not the
+    // translated anchor): the echo half of the reposition contract.
+    assert!(
+        im.wait_until(|s| s.popup_text_input_rectangle() == Some((300, 400, 2, 16))),
+        "popup was never re-told its moved anchor rectangle; saw {:?}",
+        im.popup_text_input_rectangle()
+    );
 }

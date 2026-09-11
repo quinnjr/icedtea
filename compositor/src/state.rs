@@ -7674,9 +7674,17 @@ impl wlr::SeatHandler for State {
         // popup destroyed while this event was queued already cleared it via
         // `popup_surface_destroyed` — an unknown id is a silent no-op.
         let Some(node) = self.input_popup_nodes.get(&popup).copied() else {
+            tracing::debug!(
+                ?popup,
+                "input popup reposition for untracked popup; dropping"
+            );
             return;
         };
         if rt.set_node_position(node, x, y).is_none() {
+            tracing::debug!(
+                ?popup,
+                "popup scene node went stale before repositioning; dropping"
+            );
             return;
         }
         // Re-tell the popup its (possibly moved) rectangle, surface-local —
