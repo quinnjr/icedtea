@@ -13,8 +13,8 @@ use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
     Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, InputMethodClient,
-    PointerConstraintsClient, SessionLockClient, TestClient, TextInputClient,
-    VirtualKeyboardClient, VirtualPointerClient,
+    PointerConstraintsClient, SessionLockClient, ShortcutsInhibitClient, TestClient,
+    TextInputClient, VirtualKeyboardClient, VirtualPointerClient,
 };
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
@@ -3440,6 +3440,169 @@ fn destroying_the_input_method_cascades_its_popups_away() {
         "the popup's scene node must be destroyed with the popup, not just \
          unrecorded; node {node:?} still resolves"
     );
+}
+
+/// Task 4: a keyboard-shortcuts inhibitor blocks the compositor's own
+/// keybindings while active and releases them after.
+///
+/// Non-vacuous in both directions. While inhibited, SUPER+2 (the default
+/// `workspace:2` binding) must NOT switch the workspace -- yet the keys must
+/// still reach the focused client (inhibition reroutes, it does not swallow).
+/// After destroying the inhibitor, the same chord MUST switch again, proving
+/// the gate was the inhibitor and not a broken injector.
+///
+/// The inhibiting surface must itself hold keyboard focus: wlroots only
+/// activates an inhibitor naming the focused surface, so the double maps its
+/// own toplevel and waits for focus before inhibiting.
+#[test]
+fn shortcuts_inhibit_blocks_binding_while_active() {
+    /// evdev `KEY_LEFTMETA` (the SUPER modifier) and `KEY_2`.
+    const KEY_LEFTMETA: u32 = 125;
+    const KEY_2: u32 = 3;
+
+    let comp = Compositor::spawn();
+    let mut vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut app = TestClient::map_toplevel(&comp.socket, "app", "app");
+    assert!(
+        app.wait_until(|c| c.has_input_serial()),
+        "app never gained keyboard focus"
+    );
+    assert_eq!(
+        comp.snapshot().active_workspace,
+        0,
+        "default active workspace is index 0"
+    );
+    // The live keyboard carries the harness virtual keyboard's "us" keymap,
+    // so the snapshot names its layout from the very first `GetState`.
+    assert_eq!(
+        comp.snapshot().keyboard_layout.as_deref(),
+        Some("English (US)"),
+        "the snapshot must name the live keyboard's layout"
+    );
+
+    let mut shcut = ShortcutsInhibitClient::spawn(&comp.socket);
+    assert!(
+        shcut.wait_until(|c| c.has_input_serial()),
+        "inhibitor surface never gained keyboard focus, so its inhibitor \
+         could never activate and the test would be vacuous"
+    );
+
+    shcut.inhibit();
+    assert_eq!(
+        shcut.transitions(),
+        &[true],
+        "the double must record the inhibit it just sent"
+    );
+    // Synchronize with activation: the inhibit request (shortcuts-inhibit
+    // connection) and the snapshot poll (test thread) race, so wait until
+    // the compositor itself reports inhibited before driving keys.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut inhibited = false;
+    while std::time::Instant::now() < deadline {
+        shcut.pump();
+        if comp.snapshot().shortcuts_inhibited {
+            inhibited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        inhibited,
+        "compositor never reported shortcuts inhibited after the focused \
+         surface inhibited them"
+    );
+
+    // The binding chord while inhibited: no workspace switch ...
+    let keys_before = shcut.key_events();
+    vk.key_down(KEY_LEFTMETA);
+    vk.key_press(KEY_2);
+    vk.key_up(KEY_LEFTMETA);
+    // ... but the keys still reach the focused client.
+    assert!(
+        shcut.wait_until(|c| c.key_events() > keys_before),
+        "inhibited keys never reached the focused client; inhibition must \
+         reroute keys around the compositor, not swallow them"
+    );
+    assert_eq!(
+        comp.snapshot().active_workspace,
+        0,
+        "SUPER+2 switched the workspace while an inhibitor was active -- \
+         the compositor binding was not gated"
+    );
+    assert!(
+        comp.snapshot().shortcuts_inhibited,
+        "inhibition lifted mid-test"
+    );
+
+    // Release: the same chord must switch again, proving the gate above was
+    // the inhibitor and not a broken injector.
+    shcut.destroy();
+    assert_eq!(
+        shcut.transitions(),
+        &[true, false],
+        "the double must record the destroy it just sent"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut released = false;
+    while std::time::Instant::now() < deadline {
+        shcut.pump();
+        if !comp.snapshot().shortcuts_inhibited {
+            released = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        released,
+        "compositor still reported shortcuts inhibited after the inhibitor \
+         was destroyed"
+    );
+
+    vk.key_down(KEY_LEFTMETA);
+    vk.key_press(KEY_2);
+    vk.key_up(KEY_LEFTMETA);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut switched = false;
+    while std::time::Instant::now() < deadline {
+        vk.pump();
+        shcut.pump();
+        if comp.snapshot().active_workspace == 1 {
+            switched = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        switched,
+        "SUPER+2 must switch to workspace index 1 once the inhibitor is \
+         gone; active_workspace is still {}",
+        comp.snapshot().active_workspace
+    );
+}
+
+/// Task 4: the M8 input-manager globals are advertised -- the shortcuts-inhibit
+/// manager the inhibit e2e above binds, and the tablet manager tablet clients
+/// bind. A real client lists the registry: both sides are real.
+///
+/// There is deliberately no "tablet tool tip reaches a surface" e2e here:
+/// wlroots 0.20 has no virtual-tablet injection protocol (unlike virtual
+/// keyboard/pointer), and the headless backend has no physical tablet, so no
+/// client can produce tool traffic. The tablet half is covered by the manager
+/// being bindable plus the backend's own cursor-attach of tablet devices;
+/// the compositor adds no surface type and no pad UI (spec §6).
+#[test]
+fn m8_input_manager_globals_are_advertised() {
+    let comp = Compositor::spawn();
+    let globals = icedtea_harness::advertised_globals(&comp.socket);
+    for want in [
+        "zwp_keyboard_shortcuts_inhibit_manager_v1",
+        "zwp_tablet_manager_v2",
+    ] {
+        assert!(
+            globals.iter().any(|g| g == want),
+            "{want} global missing; saw {globals:?}"
+        );
+    }
 }
 
 /// M8-5: a caret commit under a live IME popup re-places the popup's scene

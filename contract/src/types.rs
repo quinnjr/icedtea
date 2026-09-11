@@ -52,9 +52,21 @@ pub struct Snapshot {
     /// Whether an IME is currently active for a focused+enabled text-input
     /// (M8-7). `false` by default so snapshots encoded as JSON before this
     /// field existed still decode; the D-Bus form remains version-gated
-    /// (contract v3 — mixed versions fail loudly via `SignatureMismatch`).
+    /// (contract v3 -- mixed versions fail loudly via `SignatureMismatch`).
     #[serde(default)]
     pub ime_active: bool,
+    /// Human-readable name of the live keyboard's effective layout (M8
+    /// remainder), or `None` when no keyboard is tracked. `None` by default
+    /// so snapshots encoded as JSON before this field existed still decode;
+    /// the D-Bus form remains version-gated (contract v4 -- mixed versions
+    /// fail loudly via `SignatureMismatch`).
+    #[serde(default)]
+    pub keyboard_layout: Option<String>,
+    /// Whether any keyboard-shortcuts inhibitor is currently active (M8
+    /// remainder). `false` by default, same additive-optional discipline as
+    /// `keyboard_layout` above.
+    #[serde(default)]
+    pub shortcuts_inhibited: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
@@ -148,6 +160,8 @@ mod tests {
             ],
             active_workspace: 0,
             ime_active: false,
+            keyboard_layout: None,
+            shortcuts_inhibited: false,
         }
     }
 
@@ -172,7 +186,7 @@ mod tests {
         assert_eq!(WorkspaceInfo::SIGNATURE.to_string(), "(us)");
         assert_eq!(
             Snapshot::SIGNATURE.to_string(),
-            "(ta(ussuu(iiii)bbbbb)a(us)ub)"
+            "(ta(ussuu(iiii)bbbbb)a(us)ubasb)"
         );
         // `index: usize` marshals as `t` (u64) on 64-bit targets.
         assert_eq!(AltTabState::SIGNATURE.to_string(), "(baut)");
@@ -184,6 +198,30 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: Snapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    /// M8 remainder: the keyboard-layout and shortcuts-inhibit indicator
+    /// fields are additive-optional -- a snapshot encoded before they
+    /// existed (neither key present) still decodes, defaulting to no layout
+    /// and uninhibited.
+    #[test]
+    fn snapshot_json_without_m8_fields_defaults_to_uninhibited() {
+        let legacy = serde_json::json!({
+            "seq": 7,
+            "windows": [],
+            "workspaces": [],
+            "active_workspace": 0,
+        });
+        let back: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!back.ime_active, "a legacy snapshot names no active IME");
+        assert_eq!(
+            back.keyboard_layout, None,
+            "a legacy snapshot names no layout"
+        );
+        assert!(
+            !back.shortcuts_inhibited,
+            "a legacy snapshot names no active inhibitor"
+        );
     }
 
     /// M8-7: the IME indicator field is additive-optional — a snapshot

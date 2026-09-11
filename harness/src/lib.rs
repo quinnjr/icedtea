@@ -57,6 +57,9 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
 };
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
+    zwp_keyboard_shortcuts_inhibit_manager_v1, zwp_keyboard_shortcuts_inhibitor_v1,
+};
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_confined_pointer_v1, zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
 };
@@ -339,6 +342,18 @@ impl Compositor {
             runtime
                 .create_idle_inhibit_manager(&display)
                 .expect("zwp_idle_inhibit_manager_v1");
+            // Same "harness cannot degrade" tone: the shortcuts-inhibit e2e
+            // binds this global directly and would assert against one that
+            // was never advertised.
+            runtime
+                .create_shortcuts_inhibit_manager(&display)
+                .expect("zwp_keyboard_shortcuts_inhibit_manager_v1");
+            // Same "harness cannot degrade" tone: the M8 globals test binds
+            // this global directly and would assert against one that was
+            // never advertised.
+            runtime
+                .create_tablet_manager(&display)
+                .expect("zwp_tablet_manager_v2");
             // Same "harness cannot degrade" tone: the pointer-constraints
             // tests bind these globals directly and would assert against
             // ones that were never advertised.
@@ -1099,6 +1114,11 @@ struct ClientState {
     /// As `idle_idled`, for `resumed`.
     idle_resumed: bool,
 
+    // --- keyboard shortcuts-inhibit (M8) ---
+    /// Bound whenever advertised; used by [`ShortcutsInhibitClient`].
+    shortcuts_inhibit_manager:
+        Option<zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1>,
+
     // --- pointer-constraints (M4.5) ---
     pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
     relative_pointer_manager: Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
@@ -1327,6 +1347,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zwp_idle_inhibit_manager_v1" => {
                     state.idle_inhibit_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_keyboard_shortcuts_inhibit_manager_v1" => {
+                    state.shortcuts_inhibit_manager =
+                        Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 "zwp_pointer_constraints_v1" => {
                     state.pointer_constraints = Some(registry.bind(name, version.min(1), qh, ()));
@@ -2012,6 +2036,14 @@ impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for ClientSta
 
 delegate_noop!(ClientState: ignore zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1);
 delegate_noop!(ClientState: ignore zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1);
+
+// --- keyboard shortcuts-inhibit (M8) ---
+// Neither object carries events this harness asserts on (the protocol is
+// fire-and-forget plus destroy): what matters is the compositor's own
+// behavior while an inhibitor lives, observed through `Snapshot` and the
+// forwarded keys, independently of these two objects.
+delegate_noop!(ClientState: ignore zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1);
+delegate_noop!(ClientState: ignore zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1);
 
 // --- pointer-constraints (M4.5) ---
 delegate_noop!(ClientState: ignore wl_region::WlRegion);
@@ -5025,6 +5057,124 @@ impl IdleInhibitClient {
         inhibitor.destroy();
         self.conn.flush().expect("flush destroy_inhibitor");
         let _ = self.queue.roundtrip(&mut self.state);
+    }
+}
+
+/// A `zwp_keyboard_shortcuts_inhibit_manager_v1` client: maps one toplevel
+/// (via [`TestClient`], so it holds keyboard focus -- an inhibitor only
+/// activates on the currently focused surface) and can inhibit the
+/// compositor's own keybindings on it, then release them again. Task 4's
+/// inhibit e2e driver.
+///
+/// The protocol carries no events back to the client (fire-and-forget plus
+/// destroy), so this double records what IT did -- every `inhibit`/`destroy`
+/// transition in send order -- and the test observes the compositor side
+/// independently through `Snapshot::shortcuts_inhibited` and the forwarded
+/// keys. That split is what keeps the e2e from asserting against its own
+/// requests.
+pub struct ShortcutsInhibitClient {
+    client: TestClient,
+    manager: zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+    /// The live inhibitor, if [`Self::inhibit`] has been called without a
+    /// matching [`Self::destroy`]. Kept alive: dropping it destroys the
+    /// object and ends the inhibition.
+    inhibitor: Option<zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1>,
+    /// Every transition this client sent, in order: `true` per `inhibit`,
+    /// `false` per `destroy`.
+    transitions: Vec<bool>,
+}
+
+impl ShortcutsInhibitClient {
+    /// Connect and map a toplevel. Panics if the compositor did not advertise
+    /// `zwp_keyboard_shortcuts_inhibit_manager_v1` or a seat.
+    pub fn spawn(socket: &str) -> ShortcutsInhibitClient {
+        let client = TestClient::map_toplevel(
+            socket,
+            "icedtea-harness-shortcuts-inhibit",
+            "shortcuts-inhibit",
+        );
+        let manager = client
+            .state
+            .shortcuts_inhibit_manager
+            .clone()
+            .expect("compositor did not advertise zwp_keyboard_shortcuts_inhibit_manager_v1");
+        ShortcutsInhibitClient {
+            client,
+            manager,
+            inhibitor: None,
+            transitions: Vec::new(),
+        }
+    }
+
+    /// Inhibit the compositor's keybindings on this client's (focused)
+    /// surface. Panics if one is already active -- callers destroy before
+    /// inhibiting again.
+    pub fn inhibit(&mut self) {
+        assert!(self.inhibitor.is_none(), "an inhibitor is already active");
+        let seat = self.client.state.seat.clone().expect("no seat");
+        let inhibitor =
+            self.manager
+                .inhibit_shortcuts(&self.client.surface, &seat, &self.client.qh, ());
+        self.client.conn.flush().expect("flush inhibit_shortcuts");
+        self.inhibitor = Some(inhibitor);
+        self.transitions.push(true);
+        self.pump();
+    }
+
+    /// Destroy the active inhibitor, releasing the compositor's keybindings.
+    /// Panics if none is active.
+    pub fn destroy(&mut self) {
+        let inhibitor = self
+            .inhibitor
+            .take()
+            .expect("no active inhibitor to destroy");
+        inhibitor.destroy();
+        self.client.conn.flush().expect("flush destroy inhibitor");
+        self.transitions.push(false);
+        self.pump();
+    }
+
+    /// Every transition this client sent, in order (`true` = inhibit,
+    /// `false` = destroy).
+    pub fn transitions(&self) -> &[bool] {
+        &self.transitions
+    }
+
+    /// Whether this client currently holds a live inhibitor.
+    pub fn is_active(&self) -> bool {
+        self.inhibitor.is_some()
+    }
+
+    /// How many `wl_keyboard.key` events this client's surface has received,
+    /// ever -- the inhibited-keys-still-reach-the-client observable.
+    pub fn key_events(&self) -> u32 {
+        self.client.state.key_events
+    }
+
+    /// Whether this client's surface currently holds keyboard focus input.
+    pub fn has_input_serial(&self) -> bool {
+        self.client.has_input_serial()
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        let _ = self.client.queue.roundtrip(&mut self.client.state);
+    }
+
+    /// Pump until `pred` accepts or the harness `TIMEOUT` elapses, mirroring
+    /// [`TestClient::wait_until`] for this wrapper's own state.
+    pub fn wait_until(&mut self, pred: impl Fn(&ShortcutsInhibitClient) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + crate::TIMEOUT;
+        loop {
+            self.pump();
+            if pred(self) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 

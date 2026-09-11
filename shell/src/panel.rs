@@ -121,6 +121,15 @@ pub struct PanelModel {
     /// Folded in `update`'s `Msg::Compositor` arm; `view` renders the `#ime`
     /// indicator from it, or nothing at all while inactive.
     pub ime_active: bool,
+    /// Whether the compositor reports a shortcuts inhibitor active, from the
+    /// latest `Snapshot` (M8). Folded in `update`'s `Msg::Compositor` arm;
+    /// `view` renders the `#inhibit` badge from it, or nothing at all while
+    /// uninhibited.
+    pub shortcuts_inhibited: bool,
+    /// The live keyboard's layout name, from the latest `Snapshot` (M8), or
+    /// `None` when no keyboard is tracked. `view` renders the `#layout`
+    /// label from it, or nothing at all while `None`.
+    pub keyboard_layout: Option<String>,
 }
 
 impl PanelModel {
@@ -144,6 +153,8 @@ impl PanelModel {
             )]
             bar_width: spec().size.0 as i32,
             ime_active: false,
+            shortcuts_inhibited: false,
+            keyboard_layout: None,
         }
     }
 }
@@ -229,10 +240,12 @@ impl ClipCommands for Offline {
 pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
     match msg {
         Msg::Compositor(u) => {
-            // M8-7: the taskbar fold drops the IME indicator bit, so read
-            // it here first — `u` is only peeked, then moved below.
+            // The taskbar fold drops the indicator bits, so read them here
+            // first -- `u` is only peeked, then moved below.
             if let CompositorUpdate::Snapshot(s) = u.as_ref() {
                 m.ime_active = s.ime_active;
+                m.shortcuts_inhibited = s.shortcuts_inhibited;
+                m.keyboard_layout = s.keyboard_layout.clone();
             }
             m.taskbar.apply(Arc::unwrap_or_clone(u));
             Cmd::None
@@ -345,13 +358,19 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
 
 /// The whole bar. `#bar` is what `style.css`'s first selector names.
 ///
-/// The IME indicator sits between the windows and the clip button while an
-/// IME is active, and renders nothing at all while none is — so the bar's
-/// children stay exactly `workspaces, windows, clip` when inactive
-/// (contract §3.3's order, pinned by `the_bar_holds_...`).
+/// The input indicators sit between the windows and the clip button while
+/// active, and render nothing at all while inactive -- so the bar's children
+/// stay exactly `workspaces, windows, clip` when none shows (contract
+/// §3.3's order, pinned by `the_bar_holds_...`).
 pub fn view(m: &PanelModel) -> View<Msg> {
     let mut children = vec![workspaces(m), windows(m)];
     if let Some(indicator) = ime_indicator(m) {
+        children.push(indicator);
+    }
+    if let Some(indicator) = layout_indicator(m) {
+        children.push(indicator);
+    }
+    if let Some(indicator) = inhibit_indicator(m) {
         children.push(indicator);
     }
     children.push(clip_button(m));
@@ -464,6 +483,29 @@ fn ime_indicator(m: &PanelModel) -> Option<View<Msg>> {
         return None;
     }
     Some(button("IME").id("ime").class("active"))
+}
+
+/// The shortcuts-inhibit badge (M8): a static generic label. `None` while no
+/// inhibitor is active -- hidden, not empty: an empty node would still shift
+/// the bar's order and break the `the_bar_holds_...` pin.
+///
+/// `active` while inhibited, the same class `#workspaces button.active` uses
+/// for the same "this is the one" meaning.
+fn inhibit_indicator(m: &PanelModel) -> Option<View<Msg>> {
+    if !m.shortcuts_inhibited {
+        return None;
+    }
+    Some(button("INHIBIT").id("inhibit").class("active"))
+}
+
+/// The keyboard-layout label (M8): the live layout's name, clamped like
+/// every other client-controlled string before it reaches text-shaping (see
+/// `clamp_label` -- the name is derived from the client's own keymap).
+/// `None` while no keyboard is tracked -- hidden, not empty, for the same
+/// reason `inhibit_indicator` is.
+fn layout_indicator(m: &PanelModel) -> Option<View<Msg>> {
+    let layout = m.keyboard_layout.as_ref()?;
+    Some(button(&clamp_label(layout)).id("layout"))
 }
 
 /// The clipboard popover's trigger. `active` while the popover is open, the
@@ -750,6 +792,8 @@ mod tests {
             workspaces,
             active_workspace: 0,
             ime_active: false,
+            keyboard_layout: None,
+            shortcuts_inhibited: false,
         }
     }
 
@@ -1325,6 +1369,16 @@ mod tests {
         assert_eq!(m.open_popover, Some(key));
     }
 
+    /// A `Snapshot` carrying the M8 keyboard indicator bits. The shared
+    /// `snapshot` helper carries neither, so tests set them explicitly.
+    fn m8_snapshot(layout: Option<&str>, inhibited: bool) -> Snapshot {
+        Snapshot {
+            keyboard_layout: layout.map(str::to_string),
+            shortcuts_inhibited: inhibited,
+            ..snapshot(vec![], vec![])
+        }
+    }
+
     /// An IME snapshot folds its activation bit into the model. The
     /// `Snapshot` helper below carries no IME state, so the tests set the
     /// field explicitly.
@@ -1333,6 +1387,38 @@ mod tests {
             ime_active: active,
             ..snapshot(vec![], vec![])
         }
+    }
+
+    #[test]
+    fn no_keyboard_indicators_render_while_uninhibited_without_layout() {
+        let (mut m, _, _) = seeded();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(m8_snapshot(
+                None, false,
+            )))),
+        );
+        assert!(!m.shortcuts_inhibited);
+        assert_eq!(m.keyboard_layout, None);
+        let v = view(&m);
+        assert!(
+            by_id(&v, "inhibit").is_none(),
+            "an uninhibited seat must leave no badge in the bar"
+        );
+        assert!(
+            by_id(&v, "layout").is_none(),
+            "an untracked layout must leave no label in the bar"
+        );
+        let ids: Vec<Option<&str>> = v
+            .children
+            .iter()
+            .map(|c| c.props.str(PropName::Id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("workspaces"), Some("windows"), Some("clip")],
+            "contract §3.3's order is unchanged while no indicator shows"
+        );
     }
 
     #[test]
@@ -1359,6 +1445,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_active_inhibitor_renders_the_badge() {
+        let (mut m, _, _) = seeded();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(m8_snapshot(
+                None, true,
+            )))),
+        );
+        assert!(m.shortcuts_inhibited);
+        let v = view(&m);
+        let badge = by_id(&v, "inhibit").expect("an active inhibitor must badge the bar");
+        assert_eq!(
+            badge.props.str(PropName::Label).unwrap_or_default(),
+            "INHIBIT",
+            "the badge is a static generic label, like the IME precedent"
+        );
+        let ids: Vec<Option<&str>> = v
+            .children
+            .iter()
+            .map(|c| c.props.str(PropName::Id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                Some("workspaces"),
+                Some("windows"),
+                Some("inhibit"),
+                Some("clip")
+            ],
+            "the badge sits between the windows and the clip button"
+        );
+    }
+
+    #[test]
+    fn a_tracked_layout_renders_its_label() {
+        let (mut m, _, _) = seeded();
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(m8_snapshot(
+                Some("English (US)"),
+                false,
+            )))),
+        );
+        assert_eq!(m.keyboard_layout.as_deref(), Some("English (US)"));
+        let v = view(&m);
+        let label = by_id(&v, "layout").expect("a tracked layout must label the bar");
+        assert_eq!(
+            label.props.str(PropName::Label).unwrap_or_default(),
+            "English (US)"
+        );
+        let ids: Vec<Option<&str>> = v
+            .children
+            .iter()
+            .map(|c| c.props.str(PropName::Id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                Some("workspaces"),
+                Some("windows"),
+                Some("layout"),
+                Some("clip")
+            ],
+            "the label sits between the windows and the clip button"
+        );
+    }
+
     /// The indicator carries no name — only the static generic label (M8
     /// review: nothing could ever populate a name, so the wire field went
     /// away and "IME" is the whole rendering).
@@ -1372,11 +1526,14 @@ mod tests {
         let v = view(&m);
         let btn = by_id(&v, "ime").expect("an active IME must render an indicator");
         assert_eq!(btn.props.str(PropName::Label), Some("IME"));
+        let classes = match btn.props.get(PropName::Classes) {
+            Some(icedtea_ui::view::Prop::Classes(list)) => {
+                list.iter().map(|c| c.to_string()).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
         assert!(
-            btn.props
-                .str(PropName::Classes)
-                .unwrap_or("")
-                .contains("active"),
+            classes.contains(&"active".to_string()),
             "indicator must carry active styling"
         );
         // Bar order: workspaces, windows, ime, clip — ime before clip.

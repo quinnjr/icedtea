@@ -4470,14 +4470,17 @@ impl State {
             }
             DbCommand::GetState(reply_tx) => {
                 let mut snapshot = self.window_manager.snapshot();
-                // M8-7: the model snapshot carries no IME state, so fill the
-                // indicator fields here from the live runtime. No runtime (a
-                // model-only build) reads as inactive, matching the default.
+                // The model snapshot carries no input state, so fill the
+                // indicator fields here from the live runtime. No runtime
+                // (every model-only unit test) reads as inactive / no
+                // layout / uninhibited, matching the defaults.
                 snapshot.ime_active = self
                     .wayland
                     .runtime()
                     .map(|rt| rt.input_method_active())
                     .unwrap_or(false);
+                snapshot.keyboard_layout = self.keyboard_layout_name();
+                snapshot.shortcuts_inhibited = self.shortcuts_inhibited();
                 let _ = reply_tx.send(snapshot);
                 // No model mutation happened; nothing new to flush. Return
                 // early so the unconditional `emit_pending()` below (a
@@ -5016,6 +5019,55 @@ impl State {
             .get("cycle:alt_tab")
             .map(|combo| input::modifiers_for_tokens(&combo.modifiers))
             .unwrap_or(input::Modifiers::SUPER)
+    }
+
+    /// Whether the compositor's own keybindings are currently suppressed by a
+    /// live keyboard-shortcuts inhibitor (M8).
+    ///
+    /// Polled straight off the runtime on every call -- never cached from
+    /// `SeatHandler::shortcuts_inhibitor_toggled`. The wlr review's recorded
+    /// constraint: `Runtime::set_shortcuts_inhibitor_active` announces
+    /// NOTHING, so an event arm alone cannot see transitions the compositor
+    /// itself drove; only lifecycle birth/destroy announce. The compositor
+    /// never drives an inhibitor itself (clients do), so polling is the whole
+    /// source of truth here. No runtime (every model-only unit test) reads as
+    /// uninhibited.
+    fn shortcuts_inhibited(&self) -> bool {
+        self.wayland
+            .runtime()
+            .is_some_and(|rt| rt.shortcuts_inhibited())
+    }
+
+    /// Human-readable name of the live keyboard's layout (M8), or `None`
+    /// when no keyboard is tracked or its keymap cannot be read.
+    ///
+    /// The runtime only exposes the full keymap string
+    /// (`KeyboardState::keymap`), which is kilobytes of xkb source -- not an
+    /// indicator. The name is resolved through this crate's own `xkbcommon`
+    /// copy (already a dependency for the keybinding matcher): compile the
+    /// keymap, read layout 0's name (`"us"` compiles to `"English (US)"`).
+    /// An uncompilable keymap (a hostile client uploaded garbage the seat
+    /// accepted) or an empty layout set reads as `None`, never a panic, and
+    /// an empty layout name (an unnamed layout) reads as `None` rather than
+    /// an empty badge. No runtime reads as `None`, matching the default.
+    fn keyboard_layout_name(&self) -> Option<String> {
+        let keymap = self
+            .wayland
+            .runtime()
+            .and_then(|rt| rt.keyboard_state())
+            .and_then(|state| state.keymap)?;
+        let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        let map = xkbcommon::xkb::Keymap::new_from_string(
+            &context,
+            keymap,
+            xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )?;
+        if map.num_layouts() == 0 {
+            return None;
+        }
+        let name = map.layout_get_name(0);
+        (!name.is_empty()).then(|| name.to_string())
     }
 
     /// Snap `id` to `zone` on the (first) output, saving its pre-snap
@@ -7565,6 +7617,17 @@ impl wlr::SeatHandler for State {
         // Releases are never consumed: a client that is sent a press but not
         // its release believes the key is still held forever.
         if !event.pressed() {
+            return false;
+        }
+
+        // M8: while a shortcuts inhibitor is active the compositor's own
+        // bindings are skipped entirely -- every key goes to the focused
+        // client, which is what inhibition promises. Polled, not event-gated
+        // (see `shortcuts_inhibited`'s doc): the `shortcuts_inhibitor_toggled`
+        // arm only ever sees lifecycle birth/destroy. Returning `false`, not
+        // `true`: the key is not consumed, it is rerouted -- swallowing it
+        // here would starve the very client that asked for it.
+        if self.shortcuts_inhibited() {
             return false;
         }
 
