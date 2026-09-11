@@ -701,6 +701,18 @@ impl Compositor {
             .expect("compositor never answered SceneNodePosition")
     }
 
+    /// The scene position of the preedit overlay, or `None` when no
+    /// composing text is shown. The compositor half of the M8-6 overlay
+    /// tests: `Some` after an IME preedit commit, `None` after
+    /// commit-string, deactivate, or keyboard-focus change.
+    pub fn preedit_overlay(&self) -> Option<(i32, i32)> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::PreeditOverlay { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered PreeditOverlay")
+    }
+
     /// The `Debug` name of the named cursor shape currently in force
     /// (e.g. `"Default"`, `"Text"`), read straight off
     /// `wlr::Runtime::cursor_shape` -- the crate's own record of what it

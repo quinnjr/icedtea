@@ -3492,3 +3492,170 @@ fn ime_popup_repositions_when_the_caret_moves() {
         im.popup_text_input_rectangle()
     );
 }
+
+/// M8-6: an IME preedit commit shows the overlay under the caret; the
+/// following commit-string clears it. Preamble mirrors test 8 (enable +
+/// commit a caret, activate); the show position is the same translated
+/// anchor test 8 pins — content origin (0, 28) + (100, 200+16).
+#[test]
+fn preedit_overlay_shows_composing_text_then_clears_on_commit() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+
+    im.send_commit(Some("nihon"), None, None);
+    assert!(
+        ti.wait_until(|c| c.preedits().last().map(String::as_str) == Some("nihon")),
+        "app never got the preedit; saw {:?}",
+        ti.preedits()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut shown = None;
+    while std::time::Instant::now() < deadline {
+        im.pump();
+        if let Some(pos) = comp.preedit_overlay() {
+            shown = Some(pos);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        shown,
+        Some((100, 244)),
+        "overlay must sit translated below the caret while composing"
+    );
+
+    im.send_commit(None, Some("日本"), None);
+    assert!(
+        ti.wait_until(|c| c.commits().last().map(String::as_str) == Some("日本")),
+        "app never got the committed text; saw {:?}",
+        ti.commits()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut hidden = false;
+    while std::time::Instant::now() < deadline {
+        im.pump();
+        if comp.preedit_overlay().is_none() {
+            hidden = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(hidden, "commit-string must clear the composing overlay");
+}
+
+/// M8-6: moving keyboard focus away mid-compose hides the overlay. The
+/// compositor drives focus changes itself, so no client-driven deactivate
+/// fires for this path — the focus helper is the only hide path, and this
+/// test is what proves it.
+#[test]
+fn preedit_overlay_hides_when_focus_moves_away_mid_compose() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+
+    im.send_commit(Some("nihon"), None, None);
+    assert!(
+        ti.wait_until(|c| c.preedits().last().map(String::as_str) == Some("nihon")),
+        "app never got the preedit; saw {:?}",
+        ti.preedits()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        im.pump();
+        if comp.preedit_overlay().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        comp.preedit_overlay().is_some(),
+        "precondition: the overlay must be showing before focus moves"
+    );
+
+    let _third = TestClient::map_toplevel(&comp.socket, "third", "third"); // steal keyboard focus
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut hidden = false;
+    while std::time::Instant::now() < deadline {
+        im.pump();
+        ti.pump();
+        if comp.preedit_overlay().is_none() {
+            hidden = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        hidden,
+        "moving keyboard focus away mid-compose must hide the overlay"
+    );
+}
+
+/// M8-6: disabling the text-input mid-compose hides the overlay through
+/// the client-driven deactivated path.
+#[test]
+fn preedit_overlay_hides_on_text_input_disable() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+
+    im.send_commit(Some("nihon"), None, None);
+    assert!(
+        ti.wait_until(|c| c.preedits().last().map(String::as_str) == Some("nihon")),
+        "app never got the preedit; saw {:?}",
+        ti.preedits()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        im.pump();
+        if comp.preedit_overlay().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        comp.preedit_overlay().is_some(),
+        "precondition: the overlay must be showing before disable"
+    );
+
+    ti.disable();
+    assert!(
+        im.wait_until(|s| s.deactivates() >= 1),
+        "IME never deactivated on disable"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut hidden = false;
+    while std::time::Instant::now() < deadline {
+        im.pump();
+        if comp.preedit_overlay().is_none() {
+            hidden = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(hidden, "text-input disable must hide the composing overlay");
+}

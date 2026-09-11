@@ -195,6 +195,17 @@ pub enum DbCommand {
         node: wlr::NodeId,
         reply: Sender<Option<(i32, i32)>>,
     },
+    /// Test-only: the scene position of the preedit overlay, or `None` when
+    /// no composing text is shown. The position is the compositor's own
+    /// placement record (the crate exposes no buffer-position accessor), so
+    /// the visibility half — `Some` while composing, `None` after
+    /// commit-string/deactivate/focus-away — is the load-bearing assertion;
+    /// the coordinates pin the caret-anchored placement. Not reachable from
+    /// `CompositorInterface` -- only the test harness sends this, same
+    /// reasoning as `CursorPosition`.
+    PreeditOverlay {
+        reply: Sender<Option<(i32, i32)>>,
+    },
     /// Test-only: read `wlr::Runtime::cursor_shape` -- the named shape
     /// currently in force as the crate itself records it, `None` rendered as
     /// `"Default"` -- as its `Debug` name. Not reachable from `CompositorInterface` --

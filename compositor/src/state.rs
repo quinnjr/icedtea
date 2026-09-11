@@ -1047,6 +1047,12 @@ pub struct State {
     /// test-only `DbCommand::InputPopupPosition` oracle can resolve a placed
     /// popup's scene position through `wlr::Runtime::node_position`.
     input_popup_nodes: HashMap<wlr::InputPopupSurfaceId, wlr::NodeId>,
+    /// The live preedit overlay, if composing text is currently shown. A
+    /// dedicated field — not `input_popup_nodes`, whose lifecycle is the
+    /// candidate popup's — written by the IME-commit hook and cleared by
+    /// every hide path (commit-string, deactivate, keyboard-focus change).
+    /// Read back by the test-only `DbCommand::PreeditOverlay` oracle.
+    preedit_overlay: Option<crate::ime_overlay::PreeditOverlay>,
 }
 
 /// What a cached title raster depends on: the title text, the pixel width
@@ -1247,6 +1253,7 @@ impl State {
             or_keyboard_stack: Vec::new(),
             xwayland_display: None,
             input_popup_nodes: HashMap::new(),
+            preedit_overlay: None,
         }
     }
 
@@ -2134,9 +2141,12 @@ impl State {
                 self.emit_pending();
             }
             PopupRoot::Layer(id) if self.layers.contains_key(&id) => {
-                if let Some(runtime) = self.wayland.runtime()
-                    && runtime.focus_layer_keyboard(id).is_some()
-                {
+                // Through the focus helper: restoring layer focus can itself
+                // move the seat off a composing text input.
+                let took = self
+                    .change_keyboard_focus(|rt| rt.focus_layer_keyboard(id))
+                    .is_some_and(|took| took.is_some());
+                if took {
                     self.layer_focus = Some(id);
                 } else {
                     self.sync_seat_focus();
@@ -2469,9 +2479,10 @@ impl State {
             // runtime attached (every unit test in this file), `took` is
             // `true` so the bookkeeping stays observable without a live
             // `wlr::Runtime`; with one attached, only an actual grab
-            // records the claim.
-            let took = match self.wayland.runtime() {
-                Some(rt) => rt.focus_layer_keyboard(id).is_some(),
+            // records the claim. Through the focus helper, so taking the
+            // keyboard off a composing text input hides its overlay.
+            let took = match self.change_keyboard_focus(|rt| rt.focus_layer_keyboard(id)) {
+                Some(took) => took.is_some(),
                 None => true,
             };
             if took {
@@ -3021,7 +3032,11 @@ impl State {
             .focused_id()
             .filter(|&id| self.window_manager.is_visible_id(id))
             .filter(|&id| self.wayland.is_backed(id));
-        self.wayland.keyboard_focus(focused);
+        // Through the focus helper, not `keyboard_focus` directly: a focus
+        // change away from a composing text input deactivates the IME with
+        // no hook fired, and the overlay must hide with it.
+        let key = self.wayland.focus_key(focused);
+        self.change_keyboard_focus(|rt| crate::wayland::Wayland::apply_focus_key(rt, key));
     }
 
     /// Drop `layer_focus`, if held, so the next `sync_seat_focus` reaches
@@ -3479,11 +3494,13 @@ impl State {
     /// Hand the seat keyboard to a focus-taking OR pop-up and remember it holds
     /// it, so `sync_seat_focus` leaves it alone until it goes away.
     fn focus_override_redirect(&mut self, sid: wlr::XwaylandSurfaceId) {
-        let Some(rt) = self.wayland.runtime() else {
-            return;
-        };
-        rt.activate_xwayland_surface(sid, true);
-        if rt.focus_xwayland_surface_keyboard(sid).is_some() {
+        // Activation and the keyboard push go through the focus helper
+        // together: either can move the seat off a composing text input.
+        let focused = self.change_keyboard_focus(|rt| {
+            rt.activate_xwayland_surface(sid, true);
+            rt.focus_xwayland_surface_keyboard(sid)
+        });
+        if focused.is_some_and(|focused| focused.is_some()) {
             // Push onto the keyboard stack as the new top holder; move it up if
             // it was already present (a re-focus), so the stack never grows a
             // duplicate and `last()` always names the true current holder.
@@ -4563,6 +4580,13 @@ impl State {
             }
             DbCommand::SceneNodePosition { node, reply } => {
                 let pos = self.wayland.runtime().and_then(|rt| rt.node_position(node));
+                let _ = reply.send(pos);
+                return Some(());
+            }
+            DbCommand::PreeditOverlay { reply } => {
+                // The overlay's own placement record: `Some` while composing
+                // text is shown, `None` once every hide path cleared it.
+                let pos = self.preedit_overlay.as_ref().map(|o| o.position);
                 let _ = reply.send(pos);
                 return Some(());
             }
@@ -6680,10 +6704,14 @@ impl wlr::ToplevelHandler for State {
         if !entry.interactive {
             return;
         }
-        let Some(runtime) = self.wayland.runtime() else {
+        // Through the focus helper: an interactive panel taking the keyboard
+        // off a composing text input hides its overlay. No runtime (every
+        // unit test) returns silently, exactly like the old early return —
+        // only a live miss logs.
+        let Some(took) = self.change_keyboard_focus(|rt| rt.focus_layer_keyboard(id)) else {
             return;
         };
-        if runtime.focus_layer_keyboard(id).is_some() {
+        if took.is_some() {
             self.layer_focus = Some(id);
         } else {
             // Finding 8, errors: an interactive panel that just mapped and
@@ -7177,7 +7205,12 @@ impl wlr::ToplevelHandler for State {
                 // leave the seat alone.
                 if was_holder && let Some(&wid) = self.xwayland_windows.get(&sid) {
                     self.window_manager.focus(wid);
-                    self.wayland.keyboard_focus(Some(wid));
+                    // Same helper as every other focus push: keeping the seat
+                    // while promoted must not strand a composing overlay.
+                    let key = self.wayland.focus_key(Some(wid));
+                    self.change_keyboard_focus(|rt| {
+                        crate::wayland::Wayland::apply_focus_key(rt, key)
+                    });
                 }
             }
         }
@@ -7206,13 +7239,12 @@ impl State {
         self.input_popup_nodes.values().next().copied()
     }
 
-    /// The placement inputs an IME candidate popup is positioned against,
-    /// read fresh on every call: the caret anchor translated into output
-    /// coordinates, the output to clamp against, and the surface-local caret
-    /// rectangle echoed back to the IME. Shared by `new_popup_surface` and
-    /// `popup_repositioned` so the two arms cannot disagree on what "under
-    /// the caret" means; the reposition arm simply re-reads this after the
-    /// caret commit instead of reusing the creation-time position.
+    /// The placement inputs IME UI positions against, read fresh on every
+    /// call: the caret anchor translated into output coordinates, the
+    /// output to clamp against, and the surface-local caret rectangle
+    /// echoed back to the IME. Shared by the candidate popup arms
+    /// (`new_popup_surface`, `popup_repositioned`) and the preedit overlay
+    /// so the three cannot disagree on what "under the caret" means.
     ///
     /// The cursor rectangle the client commits is in its surface's local
     /// space (text-input-v3), so the anchor is translated into output
@@ -7227,16 +7259,16 @@ impl State {
     /// local coordinates") — NOT the translated output-space anchor, which
     /// is only for scene placement (A6.2 review lesson).
     ///
-    /// `popup` only names the placement in the no-caret debug log: a zero
-    /// rect echoed to the IME is otherwise indistinguishable from a real
-    /// top-left caret when debugging misplaced popups.
-    fn popup_anchor(
+    /// `had_caret` is `false` exactly when no caret was found (no runtime,
+    /// no focused input, or it went stale): the popup arm logs the popup id
+    /// for that case, the overlay arm ignores it.
+    fn anchor_inputs(
         &self,
-        popup: wlr::InputPopupSurfaceId,
     ) -> (
         icedtea_contract::Rectangle,
         Option<icedtea_contract::Rectangle>,
         icedtea_contract::Rectangle,
+        bool,
     ) {
         let (origin, frame) = match self.window_manager.focused_window() {
             Some(w) => {
@@ -7264,6 +7296,7 @@ impl State {
             .wayland
             .runtime()
             .and_then(|rt| rt.focused_text_input_cursor_rectangle());
+        let had_caret = caret.is_some();
         let anchor = match &caret {
             Some(b) => icedtea_contract::Rectangle {
                 x: origin.0.saturating_add(b.x),
@@ -7271,18 +7304,12 @@ impl State {
                 width: b.width,
                 height: b.height,
             },
-            None => {
-                tracing::debug!(
-                    ?popup,
-                    "placing input popup with no focused caret; using origin anchor"
-                );
-                icedtea_contract::Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: 0,
-                    height: 0,
-                }
-            }
+            None => icedtea_contract::Rectangle {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
         };
         let echo = caret
             .map(|b| icedtea_contract::Rectangle {
@@ -7297,7 +7324,219 @@ impl State {
                 width: 0,
                 height: 0,
             });
+        (anchor, output, echo, had_caret)
+    }
+
+    /// The placement inputs an IME candidate popup is positioned against:
+    /// [`Self::anchor_inputs`], plus the no-caret debug log.
+    ///
+    /// `popup` only names the placement in that log: a zero rect echoed to
+    /// the IME is otherwise indistinguishable from a real top-left caret
+    /// when debugging misplaced popups.
+    fn popup_anchor(
+        &self,
+        popup: wlr::InputPopupSurfaceId,
+    ) -> (
+        icedtea_contract::Rectangle,
+        Option<icedtea_contract::Rectangle>,
+        icedtea_contract::Rectangle,
+    ) {
+        let (anchor, output, echo, had_caret) = self.anchor_inputs();
+        if !had_caret {
+            tracing::debug!(
+                ?popup,
+                "placing input popup with no focused caret; using origin anchor"
+            );
+        }
         (anchor, output, echo)
+    }
+
+    /// Run `f` — a seat keyboard-focus change — against the runtime, hiding
+    /// the preedit overlay when the IME deactivates across the call.
+    ///
+    /// Client-driven deactivates arrive via
+    /// `SeatHandler::input_method_deactivated`; compositor-driven
+    /// keyboard-focus changes fire no such hook (the crate has no focus
+    /// dispatcher), yet they still deactivate the IME inside wlroots. Every
+    /// focus push in this file routes through here so a mid-compose focus
+    /// change can never leave a stale overlay behind. Returns `f`'s value
+    /// (`None` with no runtime attached, in which case `f` never runs).
+    fn change_keyboard_focus<R>(&mut self, f: impl FnOnce(&wlr::Runtime) -> R) -> Option<R> {
+        let before = self.wayland.runtime().map(|rt| rt.input_method_active());
+        let rt = self.wayland.runtime()?;
+        let out = f(rt);
+        let after = self.wayland.runtime().map(|rt| rt.input_method_active());
+        if before == Some(true) && after != Some(true) {
+            self.hide_preedit_overlay();
+        }
+        Some(out)
+    }
+
+    /// Hide the preedit overlay, if shown: destroy its scene node and clear
+    /// the record. Idempotent — every hide path calls this blindly, and a
+    /// node already gone (or never created, with no runtime) clears cleanly
+    /// rather than double-destroying.
+    fn hide_preedit_overlay(&mut self) {
+        let Some(overlay) = self.preedit_overlay.take() else {
+            return;
+        };
+        if let Some(rt) = self.wayland.runtime() {
+            rt.remove_buffer(overlay.node);
+        }
+    }
+
+    /// Refresh the preedit overlay from the IME's committed generation:
+    /// show or update while it carries composing text, hide otherwise.
+    /// Called from `SeatHandler::input_method_committed`, which fires at the
+    /// end of every IME commit.
+    fn refresh_preedit_overlay(&mut self) {
+        let Some(rt) = self.wayland.runtime().cloned() else {
+            // No scene: nothing can be shown; drop any record rather than
+            // report a node that was never created.
+            self.preedit_overlay = None;
+            return;
+        };
+        let show = rt
+            .committed_ime_state()
+            .is_some_and(|committed| crate::ime_overlay::should_show(&committed));
+        if !show {
+            self.hide_preedit_overlay();
+            return;
+        };
+        // `should_show` held, so this re-read names the same generation's
+        // preedit; the `let-else` is the panic-free spelling of that, not a
+        // case with any behavior of its own.
+        let Some(committed) = rt.committed_ime_state() else {
+            self.hide_preedit_overlay();
+            return;
+        };
+        let Some(preedit) = committed.preedit else {
+            self.hide_preedit_overlay();
+            return;
+        };
+        self.show_preedit_overlay(&rt, &preedit.text, preedit.cursor_end);
+    }
+
+    /// Show (or update, in place) the overlay for `text` with the IME cursor
+    /// at `cursor_end`. The anchor and clamp target come from
+    /// [`Self::anchor_inputs`] — the same translated caret the candidate
+    /// popup uses; the popup's surface-local echo is discarded here.
+    ///
+    /// Degrades to hidden wherever the scene refuses: no node kept without
+    /// pixels (`rasterize_title` shapes to nothing), no record kept without
+    /// a placed node.
+    fn show_preedit_overlay(&mut self, rt: &wlr::Runtime, text: &str, cursor_end: i32) {
+        let (anchor, output, _, _) = self.anchor_inputs();
+        self.fonts.get_or_init(|| {
+            (
+                cosmic_text::FontSystem::new(),
+                cosmic_text::SwashCache::new(),
+            )
+        });
+        // Same panic-free spelling as `ensure_title_raster`'s: `get_mut`
+        // cannot miss right after `get_or_init`.
+        let Some((fonts, swash)) = self.fonts.get_mut() else {
+            self.hide_preedit_overlay();
+            return;
+        };
+        let measured = crate::ime_overlay::measure_preedit(fonts, text, cursor_end);
+        let at = crate::ime_overlay::layout_overlay(anchor, &measured, output);
+        let Some(px) = Self::rasterize_preedit(fonts, swash, text, &at) else {
+            self.hide_preedit_overlay();
+            return;
+        };
+        match self.preedit_overlay.take() {
+            Some(overlay) => {
+                // In place, like the title path: keeps the node's place in
+                // the stacking order instead of re-adding it on top.
+                if rt
+                    .update_buffer(overlay.node, at.width, at.height, &px)
+                    .is_none()
+                {
+                    rt.remove_buffer(overlay.node);
+                    self.preedit_overlay = Self::add_overlay_node(rt, &at, &px);
+                } else if rt.set_buffer_position(overlay.node, at.x, at.y).is_some() {
+                    self.preedit_overlay = Some(crate::ime_overlay::PreeditOverlay {
+                        node: overlay.node,
+                        position: (at.x, at.y),
+                    });
+                } else {
+                    rt.remove_buffer(overlay.node);
+                }
+            }
+            None => {
+                self.preedit_overlay = Self::add_overlay_node(rt, &at, &px);
+            }
+        }
+    }
+
+    /// Rasterize the overlay's pixels for a placed `at`: dark translucent
+    /// box, white text, white caret bar at the cursor. `None` when the text
+    /// shapes to nothing (whitespace-only preedit, or no font on this
+    /// machine with the glyphs) — the caller hides instead of showing an
+    /// empty box, the same degradation a title that didn't shape gets.
+    fn rasterize_preedit(
+        fonts: &mut cosmic_text::FontSystem,
+        swash: &mut cosmic_text::SwashCache,
+        text: &str,
+        at: &crate::ime_overlay::OverlayLayout,
+    ) -> Option<Vec<u8>> {
+        let mut px = crate::text::rasterize_title(
+            fonts,
+            swash,
+            text,
+            at.width,
+            at.height,
+            crate::ime_overlay::OVERLAY_PAD_X,
+            [255, 255, 255, 255],
+        )?;
+        // Dark translucent backdrop wherever no glyph pixel landed, so the
+        // text reads over any app content. Premultiplied: each channel
+        // already scaled by the alpha, which is what the scene graph
+        // composites.
+        const BG: [u8; 4] = [17, 17, 17, 220];
+        for p in px.chunks_exact_mut(4) {
+            if p[3] == 0 {
+                p.copy_from_slice(&BG);
+            }
+        }
+        // Caret bar at the cursor: two pixels wide, inset from the band's
+        // top and bottom, clamped into the buffer so a measure/raster
+        // disagreement can never panic.
+        let caret_x = (crate::ime_overlay::OVERLAY_PAD_X + at.cursor_x)
+            .max(0)
+            .min(at.width.saturating_sub(1));
+        for y in 4..at.height.saturating_sub(4).max(5) {
+            for dx in 0..2 {
+                let x = caret_x.saturating_add(dx).min(at.width.saturating_sub(1));
+                if x < 0 || y < 0 || x >= at.width || y >= at.height {
+                    continue;
+                }
+                let i = ((y * at.width + x) * 4) as usize;
+                if i + 4 <= px.len() {
+                    px[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        Some(px)
+    }
+
+    /// Create the overlay's scene node in the top band and place it. `None`
+    /// (leaving nothing recorded) wherever the scene refuses.
+    fn add_overlay_node(
+        rt: &wlr::Runtime,
+        at: &crate::ime_overlay::OverlayLayout,
+        px: &[u8],
+    ) -> Option<crate::ime_overlay::PreeditOverlay> {
+        let node = rt.add_buffer_in_band(wlr::Band::Top, at.width, at.height, px)?;
+        if rt.set_buffer_position(node, at.x, at.y).is_none() {
+            rt.remove_buffer(node);
+            return None;
+        }
+        Some(crate::ime_overlay::PreeditOverlay {
+            node,
+            position: (at.x, at.y),
+        })
     }
 }
 
@@ -7699,6 +7938,22 @@ impl wlr::SeatHandler for State {
         // clears our by-id lookup so the InputPopupPosition oracle stops
         // reporting a gone popup.
         self.input_popup_nodes.remove(&popup);
+    }
+
+    /// The bound IME committed: the relay to the focused text input already
+    /// went out, so this only refreshes the preedit overlay from the fresh
+    /// committed generation — show/update while it carries composing text,
+    /// hide on commit-string, delete, or preedit-clear.
+    fn input_method_committed(&mut self) {
+        self.refresh_preedit_overlay();
+    }
+
+    /// The bound IME deactivated (client-driven: text-input disable or
+    /// destroy, IME destroy, session lock/unlock — never a keyboard-focus
+    /// change, whose hide path is `change_keyboard_focus`): whatever was
+    /// composing is gone, so the overlay goes with it, unconditionally.
+    fn input_method_deactivated(&mut self) {
+        self.hide_preedit_overlay();
     }
 }
 
