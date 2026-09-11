@@ -4469,7 +4469,19 @@ impl State {
                 self.dismiss_popups_of_hidden_roots();
             }
             DbCommand::GetState(reply_tx) => {
-                let _ = reply_tx.send(self.window_manager.snapshot());
+                let mut snapshot = self.window_manager.snapshot();
+                // M8-7: the model snapshot carries no IME state, so fill the
+                // indicator fields here from the live runtime. No runtime (a
+                // model-only build) reads as inactive, matching the default.
+                snapshot.ime_active = self
+                    .wayland
+                    .runtime()
+                    .map(|rt| rt.input_method_active())
+                    .unwrap_or(false);
+                // `None`: wlr exposes no IME name accessor, so the name is a
+                // placeholder until one exists (see `Snapshot::ime_name`).
+                snapshot.ime_name = None;
+                let _ = reply_tx.send(snapshot);
                 // No model mutation happened; nothing new to flush. Return
                 // early so the unconditional `emit_pending()` below (a
                 // no-op here, but let's not rely on that) stays meaningful

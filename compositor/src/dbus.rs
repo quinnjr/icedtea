@@ -361,6 +361,8 @@ impl CompositorInterface {
             windows: vec![],
             workspaces: vec![],
             active_workspace: 0,
+            ime_active: false,
+            ime_name: None,
         })
     }
     /// The wire-contract revision this compositor speaks

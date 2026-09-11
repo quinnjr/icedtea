@@ -3659,3 +3659,33 @@ fn preedit_overlay_hides_on_text_input_disable() {
     }
     assert!(hidden, "text-input disable must hide the composing overlay");
 }
+
+/// M8-7: the `GetState` snapshot carries the IME's activation state.
+/// Preamble mirrors test 8 (enable + commit a caret, activate); deactivation
+/// mirrors test 8b (destroy the text-input, wait for the deactivate) — the
+/// snapshot must report active in between and clear afterwards.
+#[test]
+fn snapshot_reports_ime_activation() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+
+    let snap = comp.snapshot();
+    assert!(snap.ime_active, "snapshot must report the active IME");
+
+    ti.destroy_text_input();
+    assert!(
+        im.wait_until(|s| s.deactivates() >= 1),
+        "IME never deactivated after its text-input was destroyed"
+    );
+    let snap = comp.snapshot();
+    assert!(!snap.ime_active, "snapshot must clear on deactivate");
+}
