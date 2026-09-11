@@ -1146,6 +1146,9 @@ struct ClientState {
     text_input_deletes: Vec<(u32, u32)>,
     /// How many `zwp_text_input_v3.done` events this client has received.
     text_input_dones: u32,
+    /// Every `zwp_text_input_v3.done` event's serial, in arrival order (the
+    /// M8-8 pairing counterpart to the IME commit serial).
+    text_input_done_serials: Vec<u32>,
 
     // --- input-method (M6.1) ---
     /// Bound whenever advertised; used by [`InputMethodClient::spawn`].
@@ -1168,6 +1171,9 @@ struct ClientState {
     /// its `commit` request, per the protocol ("the value of the serial
     /// argument must be equal to the number of done events already issued").
     im_dones: u32,
+    /// Every `commit` request's serial this client has sent, in send order
+    /// (the M8-8 pairing counterpart to the text-input done serial).
+    im_commit_serials: Vec<u32>,
     /// Set true on the input-method's `unavailable` event -- sent when
     /// another input method is already associated with this seat.
     im_unavailable: bool,
@@ -2040,8 +2046,9 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for ClientState {
             } => {
                 state.text_input_deletes.push((before_length, after_length));
             }
-            zwp_text_input_v3::Event::Done { .. } => {
+            zwp_text_input_v3::Event::Done { serial } => {
                 state.text_input_dones = state.text_input_dones.saturating_add(1);
+                state.text_input_done_serials.push(serial);
             }
             _ => {}
         }
@@ -5349,6 +5356,11 @@ impl TextInputClient {
     pub fn dones(&self) -> u32 {
         self.client.state.text_input_dones
     }
+
+    /// Every `zwp_text_input_v3.done` event's serial, in arrival order.
+    pub fn done_serials(&self) -> &[u32] {
+        &self.client.state.text_input_done_serials
+    }
 }
 
 /// A `zwp_input_method_v2` IME/OSK double: binds the manager (surfaceless, like
@@ -5514,6 +5526,7 @@ impl InputMethodClient {
         if let Some((before, after)) = delete {
             self.input_method.delete_surrounding_text(before, after);
         }
+        self.state.im_commit_serials.push(self.state.im_dones);
         self.input_method.commit(self.state.im_dones);
         self.flush();
     }
@@ -5573,6 +5586,11 @@ impl InputMethodClient {
     /// How many `zwp_input_method_v2.done` events this client has received.
     pub fn dones(&self) -> u32 {
         self.state.im_dones
+    }
+
+    /// Every `commit` request's serial this client has sent, in send order.
+    pub fn commit_serials(&self) -> &[u32] {
+        &self.state.im_commit_serials
     }
 
     /// Whether the compositor sent `unavailable` -- another input method was

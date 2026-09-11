@@ -3689,3 +3689,166 @@ fn snapshot_reports_ime_activation() {
     let snap = comp.snapshot();
     assert!(!snap.ime_active, "snapshot must clear on deactivate");
 }
+
+/// M8-8: the IME commit's serial reaches the app's text-input done.
+/// Preamble mirrors test 8 (enable + commit a caret, activate). Each app
+/// commit is re-forwarded to the IME with its own done, so the serial the
+/// IME carries on its next commit and the serial the app observes on the
+/// paired text-input done must agree — across two generations, so the
+/// equality tracks the lockstep rather than coinciding once.
+#[test]
+fn ime_commit_serial_reaches_text_input_done() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+
+    // Generation 1: the IME commits; the app must observe the relayed text
+    // (proving the commit was processed) with a done serial equal to the
+    // serial the IME carried.
+    im.send_commit(None, Some("a"), None);
+    assert!(
+        ti.wait_until(|c| c.commits().last().map(String::as_str) == Some("a")),
+        "app never got the committed text; saw {:?}",
+        ti.commits()
+    );
+    let sent = *im
+        .commit_serials()
+        .last()
+        .expect("IME recorded no commit serial");
+    let got = *ti
+        .done_serials()
+        .last()
+        .expect("app observed no done serial");
+    assert_eq!(
+        got,
+        sent,
+        "the text-input done serial must equal the IME commit serial \
+         (sent {sent}, observed done serials {:?})",
+        ti.done_serials()
+    );
+
+    // Generation 2: another app commit advances both sides' counters in
+    // lockstep; a second IME commit must pair again at the new serial.
+    ti.commit_with("qw", 2, 2, (100, 200, 2, 16));
+    assert!(
+        im.wait_until(|s| s.surroundings().last() == Some(&("qw".to_string(), 2, 2))),
+        "IME never saw the second surrounding relay; saw {:?}",
+        im.surroundings()
+    );
+    im.send_commit(None, Some("b"), None);
+    assert!(
+        ti.wait_until(|c| c.commits().last().map(String::as_str) == Some("b")),
+        "app never got the second committed text; saw {:?}",
+        ti.commits()
+    );
+    let sent2 = *im
+        .commit_serials()
+        .last()
+        .expect("IME recorded no second commit serial");
+    let got2 = *ti
+        .done_serials()
+        .last()
+        .expect("app observed no second done serial");
+    assert_eq!(
+        got2,
+        sent2,
+        "the second text-input done serial must equal the second IME commit \
+         serial (sent {sent2}, observed done serials {:?})",
+        ti.done_serials()
+    );
+    assert_ne!(
+        (sent2, got2),
+        (sent, got),
+        "generations must advance: a repeated serial would pair without proving lockstep"
+    );
+}
+
+/// M8-8 (reviewer-mandated adversarial gate, non-UTF-8 legs): spec-violating
+/// non-UTF-8 bytes through both relay directions must arrive as the
+/// DOCUMENTED `to_string_lossy` replacement (`U+FFFD`), never as a panic,
+/// protocol error, or dropped relay. Each leg uses a distinct payload so no
+/// assertion can pass off a neighboring leg's recording.
+///
+/// DEVIATION from the plan's mandated `..._non_utf8_and_interior_nul_...`
+/// name: the interior-NUL leg is undrivable from this Rust harness, so this
+/// test pins only the non-UTF-8 legs and says so. Every client-side string
+/// request is code-generated as `CString::new(s).unwrap()` (wayland-scanner
+/// `common.rs`), which panics on interior NUL before anything reaches the
+/// wire, and `Argument::Str` itself holds a `Box<CString>` — so even a
+/// hand-built message cannot carry an interior NUL without
+/// `CString::from_vec_unchecked` (documented UB: no interior NUL allowed) or
+/// a hand-rolled raw-socket Wayland client (disproportionate surgery). The
+/// crate-side truncation (`relay_cstring`) is additionally unreachable end
+/// to end by construction: snapshots are read from NUL-terminated C strings,
+/// so no snapshot string can ever contain the NUL the truncation arm handles.
+/// The interior-NUL half of the gate needs a C driver or stays a unit-level
+/// property; it is NOT covered here.
+#[test]
+fn m8_relay_non_utf8_pins_documented_lossy_wire_bytes() {
+    /// Deliberately non-UTF-8 bytes over an ASCII skeleton, as `&str`.
+    /// Fixed payloads, so the returned slice borrows a leaked box rather
+    /// than a caller-side buffer (nine bytes per test run).
+    fn adversarial(prefix: u8, suffix: u8) -> &'static str {
+        let bytes: Box<[u8]> = Box::new([prefix, 0xFF, suffix]);
+        let leaked: &'static [u8] = Box::leak(bytes);
+        // SAFETY: the bytes are invalid UTF-8 by design — this is the
+        // spec-violating input under test. Nothing here decodes them as
+        // `str`: the harness builders only copy (`to_string`) and measure
+        // (`len`) the bytes before the generated code re-wraps them as
+        // `CString` (which rejects only NUL, not invalid UTF-8) for the
+        // wire. The replacement happens downstream in the crate's snapshot
+        // layer (`to_string_lossy`).
+        unsafe { std::str::from_utf8_unchecked(leaked) }
+    }
+
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+
+    // Leg 1 (app → IME): non-UTF-8 surrounding text must reach the IME as
+    // the lossy replacement. Cursor/anchor track the 3 wire bytes, so no
+    // out-of-bounds validation can fire.
+    let surrounding = adversarial(b'f', b'u');
+    ti.commit_with(surrounding, 3, 3, (100, 200, 2, 16));
+    assert!(
+        im.wait_until(|s| s.surroundings().last() == Some(&("f\u{FFFD}u".to_string(), 3, 3))),
+        "IME never saw the lossy surrounding relay; saw {:?}",
+        im.surroundings()
+    );
+
+    // Leg 2 (IME → app, preedit): non-UTF-8 preedit must reach the app as
+    // the lossy replacement.
+    let preedit = adversarial(b'p', b'q');
+    im.send_commit(Some(preedit), None, None);
+    assert!(
+        ti.wait_until(|c| c.preedits().last().map(String::as_str) == Some("p\u{FFFD}q")),
+        "app never got the lossy preedit; saw {:?}",
+        ti.preedits()
+    );
+
+    // Leg 3 (IME → app, commit string): same replacement guarantee on the
+    // commit channel.
+    let commit = adversarial(b'c', b'd');
+    im.send_commit(None, Some(commit), None);
+    assert!(
+        ti.wait_until(|c| c.commits().last().map(String::as_str) == Some("c\u{FFFD}d")),
+        "app never got the lossy commit string; saw {:?}",
+        ti.commits()
+    );
+}
