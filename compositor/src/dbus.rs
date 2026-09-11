@@ -74,6 +74,10 @@ use zbus::interface;
 
 /// Commands sent from the D-Bus interface thread to the compositor's main
 /// loop. Applied to `State` by `State::handle_command`.
+///
+/// The `Test-only` variants are an internal harness channel, not wire API:
+/// they are never exposed through `CompositorInterface` and remain subject
+/// to additive change as tests need new oracles.
 #[derive(Debug, Clone)]
 pub enum DbCommand {
     Focus(WindowId),
@@ -159,6 +163,37 @@ pub enum DbCommand {
     /// harness sends this, same reasoning as `SessionLocked`.
     CursorPosition {
         reply: Sender<(f64, f64)>,
+    },
+    /// Test-only: the scene position of the currently-placed input-method
+    /// candidate popup, as the compositor positioned it (`set_node_position`
+    /// on the node `add_input_popup_in_band` returned). `None` when no popup is
+    /// placed. Read from `State`'s own record of the placed node (the crate
+    /// exposes no by-id popup-position accessor), then resolved through
+    /// `wlr::Runtime::node_position`. Not reachable from `CompositorInterface`
+    /// -- only the test harness sends this, same reasoning as `CursorPosition`.
+    InputPopupPosition {
+        reply: Sender<Option<(i32, i32)>>,
+    },
+    /// Test-only: the scene node of the currently-placed input-method
+    /// candidate popup (the `NodeId` `add_input_popup_in_band` returned, as
+    /// `State` recorded it). `None` when no popup is placed. Paired with
+    /// `SceneNodePosition`: a test captures the node while placed, tears the
+    /// popup down, and asserts the node itself is gone — the tripwire that the
+    /// crate destroys the popup's scene node on popup destroy (if the destroy
+    /// call were deleted, `InputPopupPosition` would still return to `None`
+    /// via bookkeeping while the node leaked). Not reachable from
+    /// `CompositorInterface` -- only the test harness sends this.
+    InputPopupNode {
+        reply: Sender<Option<wlr::NodeId>>,
+    },
+    /// Test-only: the scene position of an arbitrary node by id, resolved
+    /// through `wlr::Runtime::node_position`. `None` for an unknown or stale
+    /// (destroyed) id. The second half of the popup-teardown tripwire: after
+    /// capturing `InputPopupNode` and destroying the IME, the node must read
+    /// `None`. Not reachable from `CompositorInterface`.
+    SceneNodePosition {
+        node: wlr::NodeId,
+        reply: Sender<Option<(i32, i32)>>,
     },
     /// Test-only: read `wlr::Runtime::cursor_shape` -- the named shape
     /// currently in force as the crate itself records it, `None` rendered as

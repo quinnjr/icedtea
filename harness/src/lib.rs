@@ -80,7 +80,8 @@ use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::{
-    zwp_input_method_manager_v2, zwp_input_method_v2,
+    zwp_input_method_keyboard_grab_v2, zwp_input_method_manager_v2, zwp_input_method_v2,
+    zwp_input_popup_surface_v2,
 };
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
@@ -664,6 +665,42 @@ impl Compositor {
             .expect("compositor never answered CursorPosition")
     }
 
+    /// The scene position of the currently-placed input-method candidate
+    /// popup, or `None` when none is placed. Blocks on the reply -- see
+    /// [`Self::inject_touch_down`]'s doc. The compositor half of A6.2 test 8.
+    pub fn input_popup_position(&self) -> Option<(i32, i32)> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InputPopupPosition { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InputPopupPosition")
+    }
+
+    /// The scene node of the currently-placed input-method candidate popup,
+    /// or `None` when none is placed. The first half of the popup-teardown
+    /// tripwire (test 10b): capture while placed, tear down, then assert
+    /// [`Self::scene_node_position`] reads `None` for it.
+    pub fn input_popup_node(&self) -> Option<wlr::NodeId> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InputPopupNode { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InputPopupNode")
+    }
+
+    /// The scene position of an arbitrary node by id, or `None` for an
+    /// unknown or destroyed id. The second half of the tripwire.
+    pub fn scene_node_position(&self, node: wlr::NodeId) -> Option<(i32, i32)> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::SceneNodePosition {
+            node,
+            reply: reply_tx,
+        });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered SceneNodePosition")
+    }
+
     /// The `Debug` name of the named cursor shape currently in force
     /// (e.g. `"Default"`, `"Text"`), read straight off
     /// `wlr::Runtime::cursor_shape` -- the crate's own record of what it
@@ -1122,6 +1159,17 @@ struct ClientState {
     /// Set true on the input-method's `unavailable` event -- sent when
     /// another input method is already associated with this seat.
     im_unavailable: bool,
+    /// The most recent `zwp_input_popup_surface_v2.text_input_rectangle`
+    /// event's `(x, y, width, height)`, or `None` until one arrives. This is
+    /// the anchor rectangle the compositor told the popup to sit against
+    /// (`send_input_popup_rectangle`), the popup half of M6.1 A6.2 test 8.
+    im_popup_text_input_rectangle: Option<(i32, i32, i32, i32)>,
+    /// How many `zwp_input_method_keyboard_grab_v2.key` events this client has
+    /// received -- the count test 9 asserts a grab intercepts.
+    im_grab_key_events: u32,
+    /// How many `zwp_input_method_keyboard_grab_v2.modifiers` events this
+    /// client has received.
+    im_grab_modifier_events: u32,
 }
 
 impl ClientState {
@@ -2025,6 +2073,53 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for ClientState {
             }
             zwp_input_method_v2::Event::Unavailable => {
                 state.im_unavailable = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
+        event: zwp_input_popup_surface_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // The only event on this interface: the anchor rectangle the compositor
+        // placed the popup against. Overwrite (not push): the popup is told its
+        // *current* rectangle each time, and test 8 asserts the latest.
+        if let zwp_input_popup_surface_v2::Event::TextInputRectangle {
+            x,
+            y,
+            width,
+            height,
+        } = event
+        {
+            state.im_popup_text_input_rectangle = Some((x, y, width, height));
+        }
+    }
+}
+
+impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
+        event: zwp_input_method_keyboard_grab_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Count the two events test 9 asserts a grab intercepts; keymap and
+        // repeat_info carry nothing this harness needs.
+        match event {
+            zwp_input_method_keyboard_grab_v2::Event::Key { .. } => {
+                state.im_grab_key_events = state.im_grab_key_events.saturating_add(1);
+            }
+            zwp_input_method_keyboard_grab_v2::Event::Modifiers { .. } => {
+                state.im_grab_modifier_events = state.im_grab_modifier_events.saturating_add(1);
             }
             _ => {}
         }
@@ -5214,6 +5309,14 @@ impl TextInputClient {
         self.client.state.text_input_leaves
     }
 
+    /// How many `wl_keyboard.key` events the underlying app client has
+    /// received — the app's *ordinary* keyboard delivery, distinct from the
+    /// text-input relay. A6.2 test 9 asserts this advances before an IME
+    /// keyboard grab and then stops once the grab intercepts.
+    pub fn wl_keyboard_key_events(&self) -> u32 {
+        self.client.state.key_events
+    }
+
     /// Every `preedit_string` event's text, in arrival order.
     pub fn preedits(&self) -> &[String] {
         &self.client.state.text_input_preedit_strings
@@ -5243,14 +5346,27 @@ impl TextInputClient {
 ///
 /// Its own connection rather than a [`TestClient`] method, for the same
 /// reason as [`GammaControlClient`]: the real thing (an IME/OSK daemon)
-/// never holds focus and never maps a surface at all -- a bare `wl_seat`
-/// bind suffices, mirroring `DataControlClient`'s "never holds focus"
-/// rationale.
+/// never holds keyboard focus and binds a bare `wl_seat`, mirroring
+/// `DataControlClient`'s "never holds focus" rationale. It does map one
+/// surface -- the candidate popup ([`create_popup`](InputMethodClient::create_popup)) --
+/// which is exactly what a real IME does; that surface never takes focus.
 pub struct InputMethodClient {
     conn: Connection,
     queue: EventQueue<ClientState>,
+    qh: QueueHandle<ClientState>,
     state: ClientState,
     input_method: zwp_input_method_v2::ZwpInputMethodV2,
+    /// The candidate popup surface, once [`create_popup`](InputMethodClient::create_popup)
+    /// has made one. Kept alive here (dropping the proxy would send the
+    /// destructor and tear the popup down).
+    popup: Option<zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2>,
+    /// The `wl_surface` the popup wraps, kept alive for the same reason.
+    popup_surface: Option<wl_surface::WlSurface>,
+    /// Kept alive so the popup's shm buffer/pool file are not dropped mid-test.
+    _popup_shm: Option<(std::fs::File, wl_shm_pool::WlShmPool, wl_buffer::WlBuffer)>,
+    /// The active keyboard grab, once [`grab_keyboard`](InputMethodClient::grab_keyboard)
+    /// has taken one. Kept alive (dropping it releases the grab).
+    grab: Option<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2>,
 }
 
 impl InputMethodClient {
@@ -5273,9 +5389,97 @@ impl InputMethodClient {
         InputMethodClient {
             conn,
             queue,
+            qh,
             state,
             input_method,
+            popup: None,
+            popup_surface: None,
+            _popup_shm: None,
+            grab: None,
         }
+    }
+
+    /// Create the IME's candidate popup surface: a real `wl_surface` given the
+    /// `input_popup` role via `get_input_popup_surface`, with a small opaque
+    /// buffer attached and committed so it has a mapped size. This is what
+    /// drives the compositor's `new_popup_surface` handler (placement +
+    /// `send_input_popup_rectangle`). Panics if the compositor advertised
+    /// neither `wl_compositor` nor `wl_shm`, or if a popup already exists.
+    pub fn create_popup(&mut self) {
+        assert!(
+            self.popup.is_none(),
+            "create_popup called with a popup already live"
+        );
+        let compositor = self
+            .state
+            .compositor
+            .clone()
+            .expect("compositor did not advertise wl_compositor");
+        let shm = self
+            .state
+            .shm
+            .clone()
+            .expect("compositor did not advertise wl_shm");
+
+        let surface = compositor.create_surface(&self.qh, ());
+        let popup = self
+            .input_method
+            .get_input_popup_surface(&surface, &self.qh, ());
+
+        // Attach a small opaque buffer and commit so the popup surface maps
+        // with a real size, exactly as a real IME does before its candidate
+        // list can be shown.
+        let (file, pool, buffer) = create_shm_buffer(&shm, &self.qh, 120, 80);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage(0, 0, 120, 80);
+        surface.commit();
+
+        self.popup = Some(popup);
+        self.popup_surface = Some(surface);
+        self._popup_shm = Some((file, pool, buffer));
+        self.flush();
+    }
+
+    /// Take a hardware keyboard grab (`grab_keyboard`). While held, the
+    /// compositor forwards seat key/modifier events to the returned grab
+    /// object rather than to any client's `wl_keyboard`. Panics if a grab is
+    /// already live.
+    pub fn grab_keyboard(&mut self) {
+        assert!(
+            self.grab.is_none(),
+            "grab_keyboard called with a grab already live"
+        );
+        let grab = self.input_method.grab_keyboard(&self.qh, ());
+        self.grab = Some(grab);
+        self.flush();
+    }
+
+    /// The most recent `text_input_rectangle` the popup was told, or `None`
+    /// until the compositor sends one. The popup half of A6.2 test 8.
+    pub fn popup_text_input_rectangle(&self) -> Option<(i32, i32, i32, i32)> {
+        self.state.im_popup_text_input_rectangle
+    }
+
+    /// Destroy the `zwp_input_method_v2` object itself (its `destroy` request),
+    /// leaving the client connection alive. This is the exact wire event that
+    /// drives wlroots' input-method teardown -- deliberately distinct from
+    /// dropping the whole client -- so a test can assert the compositor cascades
+    /// the IME's still-live candidate popups away with it. `destroy` is a
+    /// destructor request, so the proxy is inert afterwards; do not call popup/
+    /// grab/commit on this client again.
+    pub fn destroy(&mut self) {
+        self.input_method.destroy();
+        self.flush();
+    }
+
+    /// How many `key` events the keyboard grab has intercepted.
+    pub fn grab_key_events(&self) -> u32 {
+        self.state.im_grab_key_events
+    }
+
+    /// How many `modifiers` events the keyboard grab has intercepted.
+    pub fn grab_modifier_events(&self) -> u32 {
+        self.state.im_grab_modifier_events
     }
 
     /// Send any combination of preedit/commit/delete, then `commit` --
