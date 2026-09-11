@@ -55,11 +55,6 @@ pub struct Snapshot {
     /// `wlr::Runtime::input_method_active`.
     #[serde(default)]
     pub ime_active: bool,
-    /// The active IME's name, if the compositor knows one. Always `None` for
-    /// now: wlr exposes no IME name accessor, so this is a placeholder the
-    /// panel renders as a generic label until one exists.
-    #[serde(default)]
-    pub ime_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
@@ -153,7 +148,6 @@ mod tests {
             ],
             active_workspace: 0,
             ime_active: false,
-            ime_name: None,
         }
     }
 
@@ -178,7 +172,7 @@ mod tests {
         assert_eq!(WorkspaceInfo::SIGNATURE.to_string(), "(us)");
         assert_eq!(
             Snapshot::SIGNATURE.to_string(),
-            "(ta(ussuu(iiii)bbbbb)a(us)ubas)"
+            "(ta(ussuu(iiii)bbbbb)a(us)ub)"
         );
         // `index: usize` marshals as `t` (u64) on 64-bit targets.
         assert_eq!(AltTabState::SIGNATURE.to_string(), "(baut)");
@@ -192,9 +186,9 @@ mod tests {
         assert_eq!(s, back);
     }
 
-    /// M8-7: the IME indicator fields are additive-optional — a snapshot
-    /// encoded before they existed (no `ime_active`/`ime_name` keys) still
-    /// decodes, defaulting to inactive with no name.
+    /// M8-7: the IME indicator field is additive-optional — a snapshot
+    /// encoded before it existed (no `ime_active` key) still
+    /// decodes, defaulting to inactive.
     #[test]
     fn snapshot_json_without_ime_fields_defaults_to_inactive() {
         let legacy = serde_json::json!({
@@ -205,7 +199,6 @@ mod tests {
         });
         let back: Snapshot = serde_json::from_value(legacy).unwrap();
         assert!(!back.ime_active, "a legacy snapshot names no active IME");
-        assert_eq!(back.ime_name, None);
     }
 
     #[test]

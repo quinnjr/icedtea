@@ -4478,9 +4478,6 @@ impl State {
                     .runtime()
                     .map(|rt| rt.input_method_active())
                     .unwrap_or(false);
-                // `None`: wlr exposes no IME name accessor, so the name is a
-                // placeholder until one exists (see `Snapshot::ime_name`).
-                snapshot.ime_name = None;
                 let _ = reply_tx.send(snapshot);
                 // No model mutation happened; nothing new to flush. Return
                 // early so the unconditional `emit_pending()` below (a

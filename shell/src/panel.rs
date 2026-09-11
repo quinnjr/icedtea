@@ -121,9 +121,6 @@ pub struct PanelModel {
     /// Folded in `update`'s `Msg::Compositor` arm; `view` renders the `#ime`
     /// indicator from it, or nothing at all while inactive.
     pub ime_active: bool,
-    /// The active IME's name, if the snapshot knew one. `None` renders a
-    /// generic label (wlr exposes no IME name yet).
-    pub ime_name: Option<String>,
 }
 
 impl PanelModel {
@@ -147,7 +144,6 @@ impl PanelModel {
             )]
             bar_width: spec().size.0 as i32,
             ime_active: false,
-            ime_name: None,
         }
     }
 }
@@ -233,11 +229,10 @@ impl ClipCommands for Offline {
 pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
     match msg {
         Msg::Compositor(u) => {
-            // M8-7: the taskbar fold drops the IME indicator fields, so read
-            // them here first — `u` is only peeked, then moved below.
+            // M8-7: the taskbar fold drops the IME indicator bit, so read
+            // it here first — `u` is only peeked, then moved below.
             if let CompositorUpdate::Snapshot(s) = u.as_ref() {
                 m.ime_active = s.ime_active;
-                m.ime_name = s.ime_name.clone();
             }
             m.taskbar.apply(Arc::unwrap_or_clone(u));
             Cmd::None
@@ -458,22 +453,17 @@ fn windows(m: &PanelModel) -> View<Msg> {
         .hexpand(true)
 }
 
-/// The IME indicator (M8-7): the active IME's name, or a generic label when
-/// the snapshot knows none. `None` while no IME is active — hidden, not
-/// empty: an empty node would still shift the bar's order and break the
-/// `the_bar_holds_...` pin.
+/// The IME indicator (M8-7): a static generic label. `None` while no IME is
+/// active — hidden, not empty: an empty node would still shift the bar's
+/// order and break the `the_bar_holds_...` pin.
+///
+/// No name is ever shown: IME endpoints carry no app_id and wlr exposes no
+/// name accessor, so nothing could populate one (M8 review).
 fn ime_indicator(m: &PanelModel) -> Option<View<Msg>> {
     if !m.ime_active {
         return None;
     }
-    let label = m
-        .ime_name
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("IME");
-    // Attacker-controlled like a window title when named: clamp before
-    // text-shaping (see `clamp_label`).
-    Some(button(&clamp_label(label)).id("ime").class("active"))
+    Some(button("IME").id("ime").class("active"))
 }
 
 /// The clipboard popover's trigger. `active` while the popover is open, the
@@ -760,7 +750,6 @@ mod tests {
             workspaces,
             active_workspace: 0,
             ime_active: false,
-            ime_name: None,
         }
     }
 
@@ -1336,13 +1325,12 @@ mod tests {
         assert_eq!(m.open_popover, Some(key));
     }
 
-    /// An IME snapshot folds its activation state into the model: active with
-    /// a name, then cleared again on deactivate. The `Snapshot` helper below
-    /// carries no IME state, so the tests set the fields explicitly.
-    fn ime_snapshot(active: bool, name: Option<&str>) -> Snapshot {
+    /// An IME snapshot folds its activation bit into the model. The
+    /// `Snapshot` helper below carries no IME state, so the tests set the
+    /// field explicitly.
+    fn ime_snapshot(active: bool) -> Snapshot {
         Snapshot {
             ime_active: active,
-            ime_name: name.map(str::to_string),
             ..snapshot(vec![], vec![])
         }
     }
@@ -1352,9 +1340,7 @@ mod tests {
         let (mut m, _, _) = seeded();
         let _ = update(
             &mut m,
-            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(
-                false, None,
-            )))),
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(false)))),
         );
         let v = view(&m);
         assert!(
@@ -1373,15 +1359,15 @@ mod tests {
         );
     }
 
+    /// The indicator carries no name — only the static generic label (M8
+    /// review: nothing could ever populate a name, so the wire field went
+    /// away and "IME" is the whole rendering).
     #[test]
-    fn an_active_ime_renders_its_name_in_the_bar() {
+    fn an_active_ime_renders_the_generic_label() {
         let (mut m, _, _) = seeded();
         let _ = update(
             &mut m,
-            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(
-                true,
-                Some("mozc"),
-            )))),
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(true)))),
         );
         let v = view(&m);
         assert_eq!(
@@ -1389,23 +1375,7 @@ mod tests {
                 .expect("an active IME must render an indicator")
                 .props
                 .str(PropName::Label),
-            Some("mozc")
-        );
-    }
-
-    #[test]
-    fn an_active_ime_without_a_name_renders_a_generic_label() {
-        let (mut m, _, _) = seeded();
-        let _ = update(
-            &mut m,
-            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(
-                true, None,
-            )))),
-        );
-        let v = view(&m);
-        assert!(
-            by_id(&v, "ime").is_some(),
-            "an active but unnamed IME must still render an indicator"
+            Some("IME")
         );
     }
 
@@ -1414,17 +1384,12 @@ mod tests {
         let (mut m, _, _) = seeded();
         let _ = update(
             &mut m,
-            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(
-                true,
-                Some("mozc"),
-            )))),
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(true)))),
         );
         assert!(by_id(&view(&m), "ime").is_some());
         let _ = update(
             &mut m,
-            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(
-                false, None,
-            )))),
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(ime_snapshot(false)))),
         );
         assert!(
             by_id(&view(&m), "ime").is_none(),
