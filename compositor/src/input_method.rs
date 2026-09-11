@@ -17,8 +17,14 @@
 use icedtea_contract::Rectangle;
 
 /// Where an input-method candidate popup of size `popup` should be placed,
-/// given the text cursor `anchor` (both in output-local coordinates) and the
-/// output geometry to stay within.
+/// given the text cursor `anchor` and the output geometry to stay within.
+///
+/// `anchor` MUST already be in output-local coordinates: the cursor rectangle
+/// a client commits is in its surface's local space (text-input-v3), so the
+/// caller translates it through the focused surface's content origin first
+/// (see `State::new_popup_surface`). Only `anchor.x/y/height` are read (the
+/// seat below the cursor's bottom edge); only `popup.width/height` are read
+/// (`popup.x/y` are ignored); `anchor.width` is ignored.
 ///
 /// The popup sits directly below the cursor rectangle — its top-left at the
 /// anchor's left edge, one pixel below the anchor's bottom — which is where a
@@ -48,8 +54,10 @@ pub fn place_below_clamped(
     output: Option<Rectangle>,
 ) -> (i32, i32) {
     // Preferred spot: left-aligned with the cursor, just under it.
+    // Saturating: the anchor is client-committed and unbounded, so extreme
+    // values must clamp, never panic (debug) or wrap (release).
     let mut x = anchor.x;
-    let mut y = anchor.y + anchor.height;
+    let mut y = anchor.y.saturating_add(anchor.height);
 
     let Some(out) = output else {
         // No output to clamp against — hand back the naive placement.
@@ -59,17 +67,17 @@ pub fn place_below_clamped(
     let pw = popup.width.max(0);
     let ph = popup.height.max(0);
 
-    let out_right = out.x + out.width;
-    let out_bottom = out.y + out.height;
+    let out_right = out.x.saturating_add(out.width);
+    let out_bottom = out.y.saturating_add(out.height);
 
     // Right spill: slide left so the popup's right edge meets the output's.
-    if x + pw > out_right {
-        x = out_right - pw;
+    if x.saturating_add(pw) > out_right {
+        x = out_right.saturating_sub(pw);
     }
     // Bottom spill: flip above the cursor rather than let the list cover the
     // caret or run off the bottom edge.
-    if y + ph > out_bottom {
-        y = anchor.y - ph;
+    if y.saturating_add(ph) > out_bottom {
+        y = anchor.y.saturating_sub(ph);
     }
 
     // Final origin clamp: never place off the top-left, even when the popup is
@@ -162,6 +170,32 @@ mod tests {
     }
 
     #[test]
+    fn spills_against_a_non_zero_output_origin() {
+        // Right spill is measured against the output's own right edge, not
+        // the origin: 1750 + 120 = 1870 > 1800 (= 1000 + 800) → slide to 1680.
+        // A (0,0)-relative clamp would park this at 1500 instead.
+        let (x, y) = place_below_clamped(
+            rect(1750, 300, 2, 16),
+            rect(0, 0, 120, 80),
+            Some(rect(1000, 0, 800, 600)),
+        );
+        assert_eq!(x, 1680);
+        assert_eq!(y, 316);
+    }
+
+    #[test]
+    fn oversized_popup_pins_to_a_non_zero_output_origin() {
+        // A popup larger than an offset output pins to the output's origin,
+        // not (0, 0).
+        let (x, y) = place_below_clamped(
+            rect(1010, 10, 2, 16),
+            rect(0, 0, 400, 400),
+            Some(rect(1000, 0, 200, 200)),
+        );
+        assert_eq!((x, y), (1000, 0));
+    }
+
+    #[test]
     fn naive_placement_when_no_output() {
         // No output to clamp against: just below the cursor, unclamped.
         let (x, y) = place_below_clamped(rect(100, 200, 2, 16), rect(0, 0, 120, 80), None);
@@ -175,6 +209,19 @@ mod tests {
         let (x, y) = place_below_clamped(
             rect(100, 200, 2, 16),
             rect(0, 0, 0, 0),
+            Some(rect(0, 0, 1920, 1080)),
+        );
+        assert_eq!((x, y), (100, 216));
+    }
+
+    #[test]
+    fn negative_size_popup_only_uses_the_anchor() {
+        // Uninitialized geometry reported as negative clamps exactly like
+        // zero: without the `.max(0)` calls the spill comparisons would
+        // invert and misplace the popup.
+        let (x, y) = place_below_clamped(
+            rect(100, 200, 2, 16),
+            rect(0, 0, -50, -30),
             Some(rect(0, 0, 1920, 1080)),
         );
         assert_eq!((x, y), (100, 216));

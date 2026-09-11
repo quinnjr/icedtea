@@ -4543,15 +4543,11 @@ impl State {
             }
             DbCommand::InputPopupPosition { reply } => {
                 // The scene position of any currently-placed candidate popup.
-                // One is expected in tests; if several are somehow live, the
-                // first the map yields is reported (order is irrelevant to the
-                // single-popup oracle). `None` when none is placed, when the
-                // node went stale, or before the runtime is attached.
+                // `None` when none is placed, when the node went stale, or
+                // before the runtime is attached.
                 let pos = self.wayland.runtime().and_then(|rt| {
-                    self.input_popup_nodes
-                        .values()
-                        .next()
-                        .and_then(|&node| rt.node_position(node))
+                    self.first_input_popup_node()
+                        .and_then(|node| rt.node_position(node))
                 });
                 let _ = reply.send(pos);
                 return Some(());
@@ -4561,7 +4557,7 @@ impl State {
                 // `InputPopupPosition` oracle: the first tracked popup's node.
                 // Captured while placed, it lets a test assert the node is
                 // destroyed — not merely unrecorded — after teardown.
-                let node = self.input_popup_nodes.values().next().copied();
+                let node = self.first_input_popup_node();
                 let _ = reply.send(node);
                 return Some(());
             }
@@ -4591,13 +4587,7 @@ impl State {
                 // `usable`: this answers "how big is the screen", and a
                 // caller that wanted the space windows may occupy would be
                 // asking a different question (see `OutputSurface::usable`).
-                let geo = self
-                    .outputs
-                    .keys()
-                    .min()
-                    .copied()
-                    .and_then(|idx| self.outputs.get(&idx))
-                    .map(|o| o.geometry);
+                let geo = self.lowest_index_output_geometry();
                 let _ = reply.send(geo);
                 return Some(());
             }
@@ -7193,6 +7183,30 @@ impl wlr::ToplevelHandler for State {
         }
     }
 }
+
+impl State {
+    /// Geometry of the lowest-index output — the single "which screen"
+    /// fallback shared by the `DbCommand::OutputSize` arm and popup placement
+    /// when focus names no window. `None` before any output exists.
+    fn lowest_index_output_geometry(&self) -> Option<icedtea_contract::Rectangle> {
+        self.outputs
+            .keys()
+            .min()
+            .copied()
+            .and_then(|idx| self.outputs.get(&idx))
+            .map(|o| o.geometry)
+    }
+
+    /// The node of an arbitrary currently-placed IME candidate popup, for the
+    /// test-only position/node oracles. At most one popup is placed in
+    /// practice; if several ever coexist this picks an unspecified one
+    /// (kept in one helper so the two oracle arms cannot disagree on what
+    /// "first" means — and if multi-popup ever matters, sort here).
+    fn first_input_popup_node(&self) -> Option<wlr::NodeId> {
+        self.input_popup_nodes.values().next().copied()
+    }
+}
+
 impl wlr::SeatHandler for State {
     fn key(&mut self, event: &wlr::KeyEvent<'_>) -> bool {
         let m = event.modifiers();
@@ -7489,41 +7503,69 @@ impl wlr::SeatHandler for State {
             return;
         };
         // Create the popup's scene node in the top band. `None` if the popup is
-        // already gone, has no surface yet, or a scene walk is live — all cases
-        // where placing nothing is correct.
+        // already gone or has no surface yet — cases where placing nothing is
+        // correct — or while a scene walk is live. The walk refusal is
+        // believed unreachable from single-threaded event dispatch (this
+        // signal fires from client request handling, never inside a
+        // compositor scene walk), so there is no retry: a refused popup is
+        // dropped, and logged.
         let Some(node) = rt.add_input_popup_in_band(popup, wlr::Band::Top) else {
+            tracing::debug!(?popup, "input popup placement refused; dropping");
             return;
         };
 
+        // The cursor rectangle the client commits is in its surface's local
+        // space (text-input-v3), so translate it into output coordinates
+        // through the focused window's content origin — the same translation
+        // xdg popups get via `root_surface_origin` — and clamp against the
+        // focused window's own output. Either lookup can miss (focus not on
+        // a window at all): then there is no caret to sit under and no
+        // screen to prefer, so fall back to the lowest-index output.
+        let (origin, frame) = match self.window_manager.focused_window() {
+            Some(w) => {
+                let ssd = crate::decoration::has_ssd(
+                    &w.app_id,
+                    w.client_decorations_requested,
+                    w.fullscreen,
+                );
+                let content = crate::decoration::content_rect(w.geometry, ssd);
+                ((content.x, content.y), Some(w.geometry))
+            }
+            None => ((0, 0), None),
+        };
+        let output = frame
+            .and_then(|g| self.output_for_window(g))
+            .and_then(|idx| self.outputs.get(&idx))
+            .map(|o| o.geometry)
+            .or_else(|| self.lowest_index_output_geometry());
+
         // Anchor against the focused text input's last-committed cursor
         // rectangle. `None` (no focused input, or it went stale) → a zero
-        // anchor, which places the popup at the output origin — the best we can
-        // do without a caret to sit under.
-        let anchor = rt
-            .focused_text_input_cursor_rectangle()
-            .map(|b| icedtea_contract::Rectangle {
-                x: b.x,
-                y: b.y,
+        // anchor, which places the popup at the output origin — the best we
+        // can do without a caret to sit under. Logged: a zero rect echoed
+        // to the IME is otherwise indistinguishable from a real top-left
+        // caret when debugging misplaced popups.
+        let caret = rt.focused_text_input_cursor_rectangle();
+        let anchor = match &caret {
+            Some(b) => icedtea_contract::Rectangle {
+                x: origin.0.saturating_add(b.x),
+                y: origin.1.saturating_add(b.y),
                 width: b.width,
                 height: b.height,
-            })
-            .unwrap_or(icedtea_contract::Rectangle {
-                x: 0,
-                y: 0,
-                width: 0,
-                height: 0,
-            });
-
-        // The lowest-index output's geometry — the only one the headless
-        // harness has, and the same "which screen" choice `DbCommand::OutputSize`
-        // makes at state.rs:4547.
-        let output = self
-            .outputs
-            .keys()
-            .min()
-            .copied()
-            .and_then(|idx| self.outputs.get(&idx))
-            .map(|o| o.geometry);
+            },
+            None => {
+                tracing::debug!(
+                    ?popup,
+                    "placing input popup with no focused caret; using origin anchor"
+                );
+                icedtea_contract::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                }
+            }
+        };
 
         // The popup's own committed size is not known at creation (the IME has
         // not necessarily attached a buffer yet, and the A6.2 crate API exposes
@@ -7540,14 +7582,39 @@ impl wlr::SeatHandler for State {
         };
         let (x, y) = crate::input_method::place_below_clamped(anchor, popup_size, output);
 
-        rt.set_node_position(node, x, y);
+        if rt.set_node_position(node, x, y).is_none() {
+            // The node went stale between creation two lines above and this
+            // call (a teardown racing placement on the same thread): its
+            // position was never applied, so neither record it nor tell the
+            // IME it was placed against the anchor.
+            tracing::debug!(
+                ?popup,
+                "popup scene node went stale before positioning; dropping placement"
+            );
+            return;
+        }
         // Record the placed node so the test-only InputPopupPosition oracle can
         // read its scene position back (the crate has no by-id accessor).
         self.input_popup_nodes.insert(popup, node);
-        // Tell the popup which rectangle it was anchored against, in the
-        // coordinate space the input-method-v2 protocol defines (the
-        // text_input_rectangle the IME committed) so it can lay out candidates.
-        let anchor_box = wlr::Box2D::new(anchor.x, anchor.y, anchor.width, anchor.height);
+        // Tell the popup which rectangle it was anchored against. The echo
+        // stays in the text input's surface-local space
+        // (input-method-v2: `text_input_rectangle` is "a rectangle in surface
+        // local coordinates") — NOT the translated output-space anchor above,
+        // which is only for scene placement.
+        let echo = caret
+            .map(|b| icedtea_contract::Rectangle {
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            })
+            .unwrap_or(icedtea_contract::Rectangle {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+        let anchor_box = wlr::Box2D::new(echo.x, echo.y, echo.width, echo.height);
         rt.send_input_popup_rectangle(popup, anchor_box);
     }
 

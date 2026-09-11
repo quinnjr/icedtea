@@ -3129,18 +3129,19 @@ fn ime_popup_is_positioned_and_told_its_rectangle() {
     );
 
     // And the compositor must have actually placed the popup's scene node --
-    // below the cursor rectangle (y at or past the rectangle's bottom edge).
-    // The exact clamp behaviour is covered by the pure-fn unit tests in
-    // `compositor::input_method`; here we only assert it was placed and sits
-    // below the caret.
+    // below the cursor rectangle, translated into output coordinates. Exact
+    // position, not a loose bound: the headless output sits at (0, 0), the
+    // server-side-decorated test window cascades at its top-left so its
+    // content starts 28px down (TITLE_BAR), so the committed (100, 200, 2, 16)
+    // caret anchors at (100, 228) and the zero-size popup lands at (100, 244).
+    // A naive surface-local placement would read (100, 216) and fail this.
     let pos = comp
         .input_popup_position()
         .expect("compositor never placed the popup");
-    assert!(
-        pos.1 >= 200 + 16,
-        "popup must sit below the cursor rectangle (y={} < {})",
-        pos.1,
-        200 + 16
+    assert_eq!(
+        pos,
+        (100, 244),
+        "popup must sit translated below the caret in output coordinates"
     );
 }
 
@@ -3172,15 +3173,38 @@ fn keyboard_grab_intercepts_physical_keys() {
         ti.wait_until(|c| c.wl_keyboard_key_events() >= 1),
         "pre-grab key must reach the focused surface's wl_keyboard"
     );
-    let pre = ti.wl_keyboard_key_events();
 
     // Take the grab. From now on the compositor forwards seat keys to the grab
     // object rather than the app's wl_keyboard.
     im.grab_keyboard();
 
+    // Synchronize with grab establishment: the grab request (IME connection)
+    // and subsequent keys (virtual-keyboard connection) race through separate
+    // sockets. Press an unbound key until the grab observes it; a key pressed
+    // before the grab exists would land in the app keyboard instead and
+    // poison the frozen-count assertion below, so baselines are read only
+    // after this loop.
+    /// evdev `KEY_C`: unbound, like KEY_A/KEY_B above.
+    const KEY_C: u32 = 46;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut live = false;
+    while std::time::Instant::now() < deadline {
+        vk.key_press(KEY_C);
+        vk.pump();
+        im.pump();
+        ti.pump();
+        if im.grab_key_events() >= 1 {
+            live = true;
+            break;
+        }
+    }
+    assert!(live, "grab never established (liveness key unobserved)");
+    let g0 = im.grab_key_events();
+    let pre = ti.wl_keyboard_key_events();
+
     vk.key_press(KEY_B);
     assert!(
-        im.wait_until(|s| s.grab_key_events() >= 1),
+        im.wait_until(|s| s.grab_key_events() > g0),
         "grab never received the key it was supposed to intercept"
     );
 
@@ -3228,7 +3252,26 @@ fn compositor_keybindings_fire_during_a_grab() {
     );
 
     // Hold the grab, then inject the compositor's SUPER+2 workspace binding.
+    // Synchronize with grab establishment first (see test 9): without this,
+    // the binding could be exercised with no grab held and the "during a
+    // grab" qualifier would be vacuous.
     im.grab_keyboard();
+
+    /// evdev `KEY_C`: unbound, for the liveness check.
+    const KEY_C: u32 = 46;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut live = false;
+    while std::time::Instant::now() < deadline {
+        vk.key_press(KEY_C);
+        vk.pump();
+        im.pump();
+        ti.pump();
+        if im.grab_key_events() >= 1 {
+            live = true;
+            break;
+        }
+    }
+    assert!(live, "grab never established (liveness key unobserved)");
 
     vk.key_down(KEY_LEFTMETA);
     vk.key_press(KEY_2);
@@ -3237,7 +3280,7 @@ fn compositor_keybindings_fire_during_a_grab() {
     // Pump so the compositor has a chance to process the binding, then assert
     // the workspace actually switched -- proving the dispatcher ran ahead of
     // the grab-forward branch. `workspace:2` maps to internal index 1
-    // (`apply_action` does `n - 1`, state.rs:4898), a fixed target a stuck
+    // (`apply_action` subtracts one), a fixed target a stuck
     // dispatcher would never reach (it would stay on index 0).
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     let mut switched = false;
@@ -3255,6 +3298,57 @@ fn compositor_keybindings_fire_during_a_grab() {
          grab is active (the binding dispatcher runs before the grab-forward \
          branch); active_workspace started at {initial_workspace} and is now {}",
         comp.snapshot().active_workspace
+    );
+
+    // The modifiers held during the binding must have reached the grab (it
+    // was live throughout): this also pins the harness's grab-`Modifiers`
+    // recording arm, which no other test exercises.
+    assert!(
+        im.wait_until(|s| s.grab_modifier_events() >= 1),
+        "grab never saw the modifiers held during the binding"
+    );
+}
+
+/// Test 8b: a popup opened with no focused caret falls back to the output
+/// origin and tells the IME a zero rectangle. Drives the
+/// `cursor_rectangle() → None` branch: destroying the active text-input
+/// deactivates the IME-side focus with no focus change (M1), so the caret
+/// accessor reads `None` afterwards — synchronized by waiting for the
+/// deactivation before opening the popup.
+#[test]
+fn ime_popup_without_a_caret_falls_back_to_the_origin() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+
+    ti.destroy_text_input();
+    assert!(
+        im.wait_until(|s| s.deactivates() >= 1),
+        "IME never deactivated after its text-input was destroyed"
+    );
+
+    // The IME object itself is still bound: it can open a popup, but the
+    // compositor has no caret to anchor it against.
+    im.create_popup();
+    assert!(
+        im.wait_until(|s| s.popup_text_input_rectangle() == Some((0, 0, 0, 0))),
+        "popup was never told the zero fallback rectangle; saw {:?}",
+        im.popup_text_input_rectangle()
+    );
+    // Zero anchor against the headless output at (0, 0): pins to its origin.
+    assert_eq!(
+        comp.input_popup_position(),
+        Some((0, 0)),
+        "caret-less popup must fall back to the output origin"
     );
 }
 
@@ -3330,9 +3424,19 @@ fn destroying_the_input_method_cascades_its_popups_away() {
     // Tripwire for the crate's scene-node teardown: the captured node must be
     // stale now, not merely unrecorded. Deleting the `destroy_node` call in
     // `on_input_method_popup_destroy` leaves the assertions above green and
-    // fails exactly this one.
+    // fails exactly this one. Map removal and node destruction are separate
+    // steps, so poll with a deadline rather than asserting once.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut destroyed = false;
+    while std::time::Instant::now() < deadline {
+        if comp.scene_node_position(node).is_none() {
+            destroyed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(
-        comp.scene_node_position(node).is_none(),
+        destroyed,
         "the popup's scene node must be destroyed with the popup, not just \
          unrecorded; node {node:?} still resolves"
     );

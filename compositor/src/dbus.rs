@@ -74,6 +74,10 @@ use zbus::interface;
 
 /// Commands sent from the D-Bus interface thread to the compositor's main
 /// loop. Applied to `State` by `State::handle_command`.
+///
+/// The `Test-only` variants are an internal harness channel, not wire API:
+/// they are never exposed through `CompositorInterface` and remain subject
+/// to additive change as tests need new oracles.
 #[derive(Debug, Clone)]
 pub enum DbCommand {
     Focus(WindowId),
