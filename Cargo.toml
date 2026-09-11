@@ -25,14 +25,4 @@ image = "0.25"
 [profile.dev.package."*"]
 opt-level = 2
 
-# Dev-only: develop the compositor against the unreleased M8 remainder work
-# (keyboard depth, shortcuts-inhibit, tablet, virtual input, transient seats)
-# living in the wlr-m8-remainder worktree, before it is frozen and published
-# as wlr 0.20.33. The patch must live here at the workspace root, not as a
-# dep swap in `compositor/Cargo.toml`: `wlr-sys` carries `links = "wlroots"`,
-# so a path `wlr` and the published `wlr` cannot coexist in one graph —
-# patching the registry source is the only way to keep a single `wlr`/`wlr-sys`
-# pair. Dropped when 0.20.33 publishes.
-[patch.crates-io]
-wlr = { path = "/home/joseph/Projects/wlroots-sys/.worktrees/wlr-m8-remainder/crates/wlr" }
 
