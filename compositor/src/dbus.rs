@@ -195,6 +195,17 @@ pub enum DbCommand {
         node: wlr::NodeId,
         reply: Sender<Option<(i32, i32)>>,
     },
+    /// Test-only: the scene position of the preedit overlay, or `None` when
+    /// no composing text is shown. The position is the compositor's own
+    /// placement record (the crate exposes no buffer-position accessor), so
+    /// the visibility half — `Some` while composing, `None` after
+    /// commit-string/deactivate/focus-away — is the load-bearing assertion;
+    /// the coordinates pin the caret-anchored placement. Not reachable from
+    /// `CompositorInterface` -- only the test harness sends this, same
+    /// reasoning as `CursorPosition`.
+    PreeditOverlay {
+        reply: Sender<Option<(i32, i32)>>,
+    },
     /// Test-only: read `wlr::Runtime::cursor_shape` -- the named shape
     /// currently in force as the crate itself records it, `None` rendered as
     /// `"Default"` -- as its `Debug` name. Not reachable from `CompositorInterface` --
@@ -350,6 +361,7 @@ impl CompositorInterface {
             windows: vec![],
             workspaces: vec![],
             active_workspace: 0,
+            ime_active: false,
             keyboard_layout: None,
             shortcuts_inhibited: false,
         })
@@ -431,9 +443,10 @@ pub fn spawn_service(
             // SIXTH `ab` to `WindowUpdate` -- whose bools run
             // maximized/minimized/fullscreen/focused/mapped/attention --
             // which is what `COMPOSITOR_CONTRACT_VERSION` 2 names.
-            // Version 3 appends `Snapshot.keyboard_layout` /
-            // `Snapshot.shortcuts_inhibited` to `GetState`'s reply
-            // (signature `...uasb`), which no signal below carries):
+            // Version 3 appended `Snapshot.ime_active` to `GetState`'s
+            // reply; version 4 appends `Snapshot.keyboard_layout` /
+            // `Snapshot.shortcuts_inhibited` (signature `...ubasb`),
+            // which no signal below carries):
             //   WindowOpened   t(ussuu(iiii)bbbbb)
             //   WindowClosed   tu
             //   WindowUpdated  tu(asa(iiii)auabababababab)

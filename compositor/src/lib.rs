@@ -8,6 +8,7 @@ pub mod backend;
 pub mod config_combo;
 pub mod dbus;
 pub mod decoration;
+pub mod ime_overlay;
 pub mod input;
 pub mod input_method;
 pub mod layout;
