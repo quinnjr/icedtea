@@ -204,6 +204,12 @@ fn snapshot_reports_ime_activation() {
 
 ### Task M8-8: Serial pairing e2e + B-FINAL(M8)
 
+**Reviewer-mandated gate (M8-2 review):** the token rewrite blesses lossy
+non-UTF-8 relay bytes (spec-violating input only; valid UTF-8 is
+byte-identical). The byte-identity claim is unproven for adversarial inputs
+until an e2e pins the documented behavior — M8-4 publish is BLOCKED on the
+test below as well as the serial test.
+
 **Files:**
 - Modify: `compositor/tests/client_protocol.rs` (serial test); workspace `Cargo.toml` (drop `[patch]`); `compositor/Cargo.toml`, `harness/Cargo.toml` (pin `0.20.32`); `Cargo.lock` (regenerated)
 - Test: the serial e2e below is the R1 gate for the wlr publish
