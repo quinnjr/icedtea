@@ -350,6 +350,8 @@ impl CompositorInterface {
             windows: vec![],
             workspaces: vec![],
             active_workspace: 0,
+            keyboard_layout: None,
+            shortcuts_inhibited: false,
         })
     }
     /// The wire-contract revision this compositor speaks
@@ -428,7 +430,10 @@ pub fn spawn_service(
             // `attention` bit added the fifth `b` to `WindowInfo` and a
             // SIXTH `ab` to `WindowUpdate` -- whose bools run
             // maximized/minimized/fullscreen/focused/mapped/attention --
-            // which is what `COMPOSITOR_CONTRACT_VERSION` 2 names):
+            // which is what `COMPOSITOR_CONTRACT_VERSION` 2 names.
+            // Version 3 appends `Snapshot.keyboard_layout` /
+            // `Snapshot.shortcuts_inhibited` to `GetState`'s reply
+            // (signature `...uasb`), which no signal below carries):
             //   WindowOpened   t(ussuu(iiii)bbbbb)
             //   WindowClosed   tu
             //   WindowUpdated  tu(asa(iiii)auabababababab)

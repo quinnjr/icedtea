@@ -673,6 +673,12 @@ impl WindowManager {
             windows: self.windows.values().map(|w| self.to_info(w)).collect(),
             workspaces: self.workspace_info(),
             active_workspace: self.active_workspace,
+            // The model carries no input state: `State::handle_command`'s
+            // `GetState` arm fills both indicator fields from the live
+            // runtime, exactly like M8-7's `ime_active` precedent. No runtime
+            // (every model-only unit test) reads as no layout, uninhibited.
+            keyboard_layout: None,
+            shortcuts_inhibited: false,
         }
     }
 

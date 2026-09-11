@@ -712,6 +712,8 @@ pub fn snapshot(windows: Vec<WindowInfo>, workspaces: Vec<WorkspaceInfo>) -> Sna
         windows,
         workspaces,
         active_workspace: 0,
+        keyboard_layout: None,
+        shortcuts_inhibited: false,
     }
 }
 
