@@ -3441,3 +3441,47 @@ fn destroying_the_input_method_cascades_its_popups_away() {
          unrecorded; node {node:?} still resolves"
     );
 }
+
+/// M8-5: a caret commit under a live IME popup re-places the popup's scene
+/// node. Preamble mirrors test 8 (enable + commit a caret, activate, open the
+/// popup); then a second commit carrying a new cursor rectangle must move the
+/// node to below the new caret, translated through the focused content
+/// origin — and the popup must be re-told the new surface-local rectangle.
+#[test]
+fn ime_popup_repositions_when_the_caret_moves() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+    im.create_popup();
+    let before = comp
+        .input_popup_position()
+        .expect("compositor never placed the popup");
+    // Move the caret with a second commit carrying a new rectangle.
+    ti.commit_with("qw", 2, 2, (300, 400, 2, 16));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut after = None;
+    while std::time::Instant::now() < deadline {
+        im.pump();
+        if let Some(pos) = comp.input_popup_position()
+            && pos != before
+        {
+            after = Some(pos);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let after = after.expect("popup never repositioned after the caret commit");
+    assert_eq!(
+        after,
+        (300, 444),
+        "repositioned translated below the new caret: content origin (0, 28) + (300, 400+16)"
+    );
+}

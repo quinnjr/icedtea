@@ -7205,6 +7205,100 @@ impl State {
     fn first_input_popup_node(&self) -> Option<wlr::NodeId> {
         self.input_popup_nodes.values().next().copied()
     }
+
+    /// The placement inputs an IME candidate popup is positioned against,
+    /// read fresh on every call: the caret anchor translated into output
+    /// coordinates, the output to clamp against, and the surface-local caret
+    /// rectangle echoed back to the IME. Shared by `new_popup_surface` and
+    /// `popup_repositioned` so the two arms cannot disagree on what "under
+    /// the caret" means; the reposition arm simply re-reads this after the
+    /// caret commit instead of reusing the creation-time position.
+    ///
+    /// The cursor rectangle the client commits is in its surface's local
+    /// space (text-input-v3), so the anchor is translated into output
+    /// coordinates through the focused window's content origin — the same
+    /// translation xdg popups get via `root_surface_origin` — and clamped
+    /// against the focused window's own output. Either lookup can miss
+    /// (focus not on a window at all): then there is no caret to sit under
+    /// and no screen to prefer, so fall back to the lowest-index output.
+    ///
+    /// The echo stays in the text input's surface-local space
+    /// (input-method-v2: `text_input_rectangle` is "a rectangle in surface
+    /// local coordinates") — NOT the translated output-space anchor, which
+    /// is only for scene placement (A6.2 review lesson).
+    ///
+    /// `popup` only names the placement in the no-caret debug log: a zero
+    /// rect echoed to the IME is otherwise indistinguishable from a real
+    /// top-left caret when debugging misplaced popups.
+    fn popup_anchor(
+        &self,
+        popup: wlr::InputPopupSurfaceId,
+    ) -> (
+        icedtea_contract::Rectangle,
+        Option<icedtea_contract::Rectangle>,
+        icedtea_contract::Rectangle,
+    ) {
+        let (origin, frame) = match self.window_manager.focused_window() {
+            Some(w) => {
+                let ssd = crate::decoration::has_ssd(
+                    &w.app_id,
+                    w.client_decorations_requested,
+                    w.fullscreen,
+                );
+                let content = crate::decoration::content_rect(w.geometry, ssd);
+                ((content.x, content.y), Some(w.geometry))
+            }
+            None => ((0, 0), None),
+        };
+        let output = frame
+            .and_then(|g| self.output_for_window(g))
+            .and_then(|idx| self.outputs.get(&idx))
+            .map(|o| o.geometry)
+            .or_else(|| self.lowest_index_output_geometry());
+
+        // Anchor against the focused text input's last-committed cursor
+        // rectangle. `None` (no runtime, no focused input, or it went stale)
+        // → a zero anchor, which places the popup at the output origin — the
+        // best we can do without a caret to sit under.
+        let caret = self
+            .wayland
+            .runtime()
+            .and_then(|rt| rt.focused_text_input_cursor_rectangle());
+        let anchor = match &caret {
+            Some(b) => icedtea_contract::Rectangle {
+                x: origin.0.saturating_add(b.x),
+                y: origin.1.saturating_add(b.y),
+                width: b.width,
+                height: b.height,
+            },
+            None => {
+                tracing::debug!(
+                    ?popup,
+                    "placing input popup with no focused caret; using origin anchor"
+                );
+                icedtea_contract::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                }
+            }
+        };
+        let echo = caret
+            .map(|b| icedtea_contract::Rectangle {
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            })
+            .unwrap_or(icedtea_contract::Rectangle {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+        (anchor, output, echo)
+    }
 }
 
 impl wlr::SeatHandler for State {
@@ -7514,66 +7608,16 @@ impl wlr::SeatHandler for State {
             return;
         };
 
-        // The cursor rectangle the client commits is in its surface's local
-        // space (text-input-v3), so translate it into output coordinates
-        // through the focused window's content origin — the same translation
-        // xdg popups get via `root_surface_origin` — and clamp against the
-        // focused window's own output. Either lookup can miss (focus not on
-        // a window at all): then there is no caret to sit under and no
-        // screen to prefer, so fall back to the lowest-index output.
-        let (origin, frame) = match self.window_manager.focused_window() {
-            Some(w) => {
-                let ssd = crate::decoration::has_ssd(
-                    &w.app_id,
-                    w.client_decorations_requested,
-                    w.fullscreen,
-                );
-                let content = crate::decoration::content_rect(w.geometry, ssd);
-                ((content.x, content.y), Some(w.geometry))
-            }
-            None => ((0, 0), None),
-        };
-        let output = frame
-            .and_then(|g| self.output_for_window(g))
-            .and_then(|idx| self.outputs.get(&idx))
-            .map(|o| o.geometry)
-            .or_else(|| self.lowest_index_output_geometry());
-
-        // Anchor against the focused text input's last-committed cursor
-        // rectangle. `None` (no focused input, or it went stale) → a zero
-        // anchor, which places the popup at the output origin — the best we
-        // can do without a caret to sit under. Logged: a zero rect echoed
-        // to the IME is otherwise indistinguishable from a real top-left
-        // caret when debugging misplaced popups.
-        let caret = rt.focused_text_input_cursor_rectangle();
-        let anchor = match &caret {
-            Some(b) => icedtea_contract::Rectangle {
-                x: origin.0.saturating_add(b.x),
-                y: origin.1.saturating_add(b.y),
-                width: b.width,
-                height: b.height,
-            },
-            None => {
-                tracing::debug!(
-                    ?popup,
-                    "placing input popup with no focused caret; using origin anchor"
-                );
-                icedtea_contract::Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: 0,
-                    height: 0,
-                }
-            }
-        };
+        // Anchor + output + surface-local echo, shared with the reposition arm
+        // (see `State::popup_anchor`).
+        let (anchor, output, echo) = self.popup_anchor(popup);
 
         // The popup's own committed size is not known at creation (the IME has
-        // not necessarily attached a buffer yet, and the A6.2 crate API exposes
-        // no popup-surface size accessor). Place against a zero size: the
+        // not necessarily attached a buffer yet — `input_popup_size` reads
+        // (0, 0) before the first commit). Place against a zero size: the
         // below-the-cursor anchor and origin clamp still apply; right/bottom
-        // clamping only matters once a real size is known, which would arrive
-        // via a reposition event the frozen A6.2 API deliberately does not ship
-        // (see the module doc and the SDD ledger's B7 deviation note).
+        // clamping only matters once a real size is known, which arrives with
+        // the reposition event (`popup_repositioned`).
         let popup_size = icedtea_contract::Rectangle {
             x: 0,
             y: 0,
@@ -7596,24 +7640,47 @@ impl wlr::SeatHandler for State {
         // Record the placed node so the test-only InputPopupPosition oracle can
         // read its scene position back (the crate has no by-id accessor).
         self.input_popup_nodes.insert(popup, node);
-        // Tell the popup which rectangle it was anchored against. The echo
-        // stays in the text input's surface-local space
-        // (input-method-v2: `text_input_rectangle` is "a rectangle in surface
-        // local coordinates") — NOT the translated output-space anchor above,
-        // which is only for scene placement.
-        let echo = caret
-            .map(|b| icedtea_contract::Rectangle {
-                x: b.x,
-                y: b.y,
-                width: b.width,
-                height: b.height,
-            })
-            .unwrap_or(icedtea_contract::Rectangle {
-                x: 0,
-                y: 0,
-                width: 0,
-                height: 0,
-            });
+        // Tell the popup which rectangle it was anchored against
+        // (surface-local — see `State::popup_anchor` for why the echo is not
+        // the translated anchor).
+        let anchor_box = wlr::Box2D::new(echo.x, echo.y, echo.width, echo.height);
+        rt.send_input_popup_rectangle(popup, anchor_box);
+    }
+
+    fn popup_repositioned(&mut self, popup: wlr::InputPopupSurfaceId) {
+        // Re-placement needs the runtime (for the node move + the fresh
+        // anchor); no runtime means no scene, so there is nothing to move.
+        let Some(rt) = self.wayland.runtime() else {
+            return;
+        };
+        // Same translated-anchor computation as creation: the caret moved
+        // under the live popup, so re-read the anchor (plus the output and
+        // the surface-local echo) fresh rather than reusing the
+        // creation-time position.
+        let (anchor, output, echo) = self.popup_anchor(popup);
+        // The popup's own extent, now that it may have committed a buffer.
+        // Unknown id, destroyed popup, or no surface yet → (0, 0): the same
+        // zero-size placement creation uses, harmless for a popup whose node
+        // lookup below then misses anyway.
+        let size = rt.input_popup_size(popup).unwrap_or((0, 0));
+        let popup_rect = icedtea_contract::Rectangle {
+            x: 0,
+            y: 0,
+            width: size.0,
+            height: size.1,
+        };
+        let (x, y) = crate::input_method::place_below_clamped(anchor, popup_rect, output);
+        // The record is untouched: the node was tracked at creation, and a
+        // popup destroyed while this event was queued already cleared it via
+        // `popup_surface_destroyed` — an unknown id is a silent no-op.
+        let Some(node) = self.input_popup_nodes.get(&popup).copied() else {
+            return;
+        };
+        if rt.set_node_position(node, x, y).is_none() {
+            return;
+        }
+        // Re-tell the popup its (possibly moved) rectangle, surface-local —
+        // never the translated anchor (see `State::popup_anchor`).
         let anchor_box = wlr::Box2D::new(echo.x, echo.y, echo.width, echo.height);
         rt.send_input_popup_rectangle(popup, anchor_box);
     }
