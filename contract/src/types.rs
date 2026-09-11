@@ -50,9 +50,9 @@ pub struct Snapshot {
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace: u32,
     /// Whether an IME is currently active for a focused+enabled text-input
-    /// (M8-7). `false` by default so snapshots encoded before this field
-    /// existed still decode; filled by the compositor's `GetState` arm from
-    /// `wlr::Runtime::input_method_active`.
+    /// (M8-7). `false` by default so snapshots encoded as JSON before this
+    /// field existed still decode; the D-Bus form remains version-gated
+    /// (contract v3 — mixed versions fail loudly via `SignatureMismatch`).
     #[serde(default)]
     pub ime_active: bool,
 }

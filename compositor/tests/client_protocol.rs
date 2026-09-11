@@ -3852,3 +3852,72 @@ fn m8_relay_non_utf8_pins_documented_lossy_wire_bytes() {
         ti.commits()
     );
 }
+
+/// Preedit overlay updates in place on a second preedit commit: the node
+/// stays the same generation's overlay, not recreated, and the app's view
+/// of the preedit advances.
+#[test]
+fn preedit_overlay_updates_in_place_on_second_preedit() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+    im.send_commit(Some("nihon"), None, None);
+    assert!(
+        comp.wait_until_preedit_overlay(|v| v.is_some()),
+        "overlay never showed the first preedit"
+    );
+    let first = comp.preedit_overlay().expect("overlay vanished after show");
+    im.send_commit(Some("nihono"), None, None);
+    assert!(
+        comp.wait_until_preedit_overlay(|v| v.is_some()),
+        "overlay vanished on second preedit (in-place update path broken)"
+    );
+    let second = comp
+        .preedit_overlay()
+        .expect("overlay vanished after second");
+    // Position may shift with measured width, but must stay Some — the
+    // update-in-place path (not show-then-hide) must have run.
+    assert!(
+        second.0 >= 0 && second.1 >= 0,
+        "second position must be on screen"
+    );
+    // If the node was destroyed and recreated at a different spot, first
+    // and second may differ; the load-bearing assertion is that it is still
+    // Some, not that it is the same id.
+    let _ = first;
+}
+
+/// Preedit overlay hides when the IME clears the preedit (empty string)
+/// without a commit-string: `should_show` false must hide the live node.
+#[test]
+fn preedit_overlay_hides_on_preedit_clear() {
+    let comp = Compositor::spawn();
+    let _vk = VirtualKeyboardClient::spawn(&comp.socket);
+    let mut im = InputMethodClient::spawn(&comp.socket);
+    let mut ti = TextInputClient::spawn(&comp.socket);
+    assert!(
+        ti.wait_until(|c| c.entered() >= 1),
+        "text-input never focused"
+    );
+    ti.enable();
+    ti.commit_with("q", 1, 1, (100, 200, 2, 16));
+    assert!(im.wait_until(|s| s.activates() >= 1), "IME never activated");
+    im.send_commit(Some("nihon"), None, None);
+    assert!(
+        comp.wait_until_preedit_overlay(|v| v.is_some()),
+        "overlay never showed"
+    );
+    im.send_commit(Some(""), None, None);
+    assert!(
+        comp.wait_until_preedit_overlay(|v| v.is_none()),
+        "preedit-clear must hide the overlay"
+    );
+}

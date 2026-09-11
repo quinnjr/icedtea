@@ -29,14 +29,17 @@ pub const OVERLAY_HEIGHT: i32 = 28;
 pub const OVERLAY_PAD_X: i32 = 8;
 
 /// The single hide rule: show if and only if the committed generation
-/// carries non-empty preedit text. A commit-string, a delete, a
-/// preedit-clear, and deactivation all converge here — none of them leaves
-/// preedit text behind, so none of them may leave the overlay up.
+/// carries preedit text that shapes to something visible. A commit-string,
+/// a delete, a preedit-clear, and deactivation all converge here. Whitespace-
+/// only preedit shapes to nothing (see `rasterize_title`'s `None` case) and
+/// is treated as hidden, matching the show path which hides on `None`.
 pub fn should_show(committed: &wlr::CommittedImeState) -> bool {
-    committed
-        .preedit
-        .as_ref()
-        .is_some_and(|preedit| !preedit.text.is_empty())
+    committed.preedit.as_ref().is_some_and(|preedit| {
+        // `rasterize_title` returns `None` for empty *or* whitespace-only
+        // text with no glyphs, so a spaces-only composition must not claim
+        // to be visible — it would vanish mid-compose.
+        !preedit.text.trim().is_empty()
+    })
 }
 
 /// The shaped size of a preedit string: its pixel width and the cursor's x
@@ -127,9 +130,11 @@ pub struct PreeditOverlay {
 
 /// Where a measured preedit overlay goes, and how big it is.
 pub struct OverlayLayout {
-    /// Scene position (output-local), below the caret when it fits.
+    /// Horizontal scene position (output-local), below the caret when it
+    /// fits and clamped to the output.
     pub x: i32,
-    /// Scene position (output-local), below the caret when it fits.
+    /// Vertical scene position (output-local), below the caret when it fits
+    /// and flipped above when it would spill off the bottom.
     pub y: i32,
     /// Full overlay width including both pads.
     pub width: i32,
@@ -310,5 +315,39 @@ mod tests {
         let m = measure_preedit(&mut fonts, "", 0);
         assert_eq!(m.width, 0);
         assert_eq!(m.cursor_x, 0);
+    }
+
+    #[test]
+    fn cursor_clamps_on_mid_codepoint() {
+        let mut fonts = cosmic_text::FontSystem::new();
+        // "日本" is 6 bytes, 2 chars; index 1 lands inside the first char.
+        let m = measure_preedit(&mut fonts, "日本", 1);
+        assert!(
+            m.cursor_x >= 0 && m.cursor_x <= m.width,
+            "mid-codepoint cursor must clamp inside [0, width]"
+        );
+    }
+
+    #[test]
+    fn layout_with_no_output_falls_back() {
+        let measured = PreeditMeasure {
+            width: 60,
+            cursor_x: 60,
+        };
+        let at = layout_overlay(rect(100, 228, 2, 16), &measured, None);
+        assert_eq!((at.x, at.y), (100, 244));
+    }
+
+    #[test]
+    fn layout_clamps_wild_cursor_x() {
+        let at = layout_overlay(
+            rect(100, 228, 2, 16),
+            &PreeditMeasure {
+                width: 60,
+                cursor_x: 999,
+            },
+            Some(rect(0, 0, 1920, 1080)),
+        );
+        assert_eq!(at.cursor_x, 60);
     }
 }

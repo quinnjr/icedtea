@@ -713,6 +713,38 @@ impl Compositor {
             .expect("compositor never answered PreeditOverlay")
     }
 
+    /// Poll `preedit_overlay()` until `pred` accepts or `TIMEOUT` elapses,
+    /// mirroring `TestClient::wait_until` but for the compositor oracle.
+    pub fn wait_until_preedit_overlay(&self, pred: impl Fn(Option<(i32, i32)>) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let v = self.preedit_overlay();
+            if pred(v) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Poll `input_popup_position()` until `pred` accepts or `TIMEOUT`
+    /// elapses.
+    pub fn wait_until_popup_position(&self, pred: impl Fn(Option<(i32, i32)>) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let v = self.input_popup_position();
+            if pred(v) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// The `Debug` name of the named cursor shape currently in force
     /// (e.g. `"Default"`, `"Text"`), read straight off
     /// `wlr::Runtime::cursor_shape` -- the crate's own record of what it

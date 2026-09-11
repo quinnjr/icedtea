@@ -7226,6 +7226,16 @@ impl wlr::ToplevelHandler for State {
     }
 }
 
+/// Inputs for placing IME UI: the caret anchor in output coordinates, the
+/// output to clamp against, the original surface-local caret rectangle, and
+/// whether a real caret existed.
+struct AnchorInputs {
+    anchor: icedtea_contract::Rectangle,
+    output: Option<icedtea_contract::Rectangle>,
+    echo: icedtea_contract::Rectangle,
+    had_caret: bool,
+}
+
 impl State {
     /// Geometry of the lowest-index output — the single "which screen"
     /// fallback shared by the `DbCommand::OutputSize` arm and popup placement
@@ -7271,14 +7281,7 @@ impl State {
     /// `had_caret` is `false` exactly when no caret was found (no runtime,
     /// no focused input, or it went stale): the popup arm logs the popup id
     /// for that case, the overlay arm ignores it.
-    fn anchor_inputs(
-        &self,
-    ) -> (
-        icedtea_contract::Rectangle,
-        Option<icedtea_contract::Rectangle>,
-        icedtea_contract::Rectangle,
-        bool,
-    ) {
+    fn anchor_inputs(&self) -> AnchorInputs {
         let (origin, frame) = match self.window_manager.focused_window() {
             Some(w) => {
                 let ssd = crate::decoration::has_ssd(
@@ -7333,7 +7336,12 @@ impl State {
                 width: 0,
                 height: 0,
             });
-        (anchor, output, echo, had_caret)
+        AnchorInputs {
+            anchor,
+            output,
+            echo,
+            had_caret,
+        }
     }
 
     /// The placement inputs an IME candidate popup is positioned against:
@@ -7342,22 +7350,15 @@ impl State {
     /// `popup` only names the placement in that log: a zero rect echoed to
     /// the IME is otherwise indistinguishable from a real top-left caret
     /// when debugging misplaced popups.
-    fn popup_anchor(
-        &self,
-        popup: wlr::InputPopupSurfaceId,
-    ) -> (
-        icedtea_contract::Rectangle,
-        Option<icedtea_contract::Rectangle>,
-        icedtea_contract::Rectangle,
-    ) {
-        let (anchor, output, echo, had_caret) = self.anchor_inputs();
-        if !had_caret {
+    fn popup_anchor(&self, popup: wlr::InputPopupSurfaceId) -> AnchorInputs {
+        let a = self.anchor_inputs();
+        if !a.had_caret {
             tracing::debug!(
                 ?popup,
                 "placing input popup with no focused caret; using origin anchor"
             );
         }
-        (anchor, output, echo)
+        a
     }
 
     /// Run `f` — a seat keyboard-focus change — against the runtime, hiding
@@ -7405,20 +7406,14 @@ impl State {
             self.preedit_overlay = None;
             return;
         };
-        let show = rt
-            .committed_ime_state()
-            .is_some_and(|committed| crate::ime_overlay::should_show(&committed));
-        if !show {
-            self.hide_preedit_overlay();
-            return;
-        };
-        // `should_show` held, so this re-read names the same generation's
-        // preedit; the `let-else` is the panic-free spelling of that, not a
-        // case with any behavior of its own.
         let Some(committed) = rt.committed_ime_state() else {
             self.hide_preedit_overlay();
             return;
         };
+        if !crate::ime_overlay::should_show(&committed) {
+            self.hide_preedit_overlay();
+            return;
+        }
         let Some(preedit) = committed.preedit else {
             self.hide_preedit_overlay();
             return;
@@ -7435,7 +7430,9 @@ impl State {
     /// pixels (`rasterize_title` shapes to nothing), no record kept without
     /// a placed node.
     fn show_preedit_overlay(&mut self, rt: &wlr::Runtime, text: &str, cursor_end: i32) {
-        let (anchor, output, _, _) = self.anchor_inputs();
+        let a = self.anchor_inputs();
+        let anchor = a.anchor;
+        let output = a.output;
         self.fonts.get_or_init(|| {
             (
                 cosmic_text::FontSystem::new(),
@@ -7515,16 +7512,14 @@ impl State {
         let caret_x = (crate::ime_overlay::OVERLAY_PAD_X + at.cursor_x)
             .max(0)
             .min(at.width.saturating_sub(1));
+        debug_assert!(caret_x >= 0 && caret_x < at.width);
         for y in 4..at.height.saturating_sub(4).max(5) {
             for dx in 0..2 {
                 let x = caret_x.saturating_add(dx).min(at.width.saturating_sub(1));
-                if x < 0 || y < 0 || x >= at.width || y >= at.height {
-                    continue;
-                }
+                debug_assert!(x >= 0 && x < at.width && y >= 0 && y < at.height);
                 let i = ((y * at.width + x) * 4) as usize;
-                if i + 4 <= px.len() {
-                    px[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
-                }
+                debug_assert!(i + 4 <= px.len());
+                px[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
             }
         }
         Some(px)
@@ -7858,7 +7853,10 @@ impl wlr::SeatHandler for State {
 
         // Anchor + output + surface-local echo, shared with the reposition arm
         // (see `State::popup_anchor`).
-        let (anchor, output, echo) = self.popup_anchor(popup);
+        let a = self.popup_anchor(popup);
+        let anchor = a.anchor;
+        let output = a.output;
+        let echo = a.echo;
 
         // The popup's own committed size is not known at creation (the IME has
         // not necessarily attached a buffer yet — `input_popup_size` reads
@@ -7898,6 +7896,10 @@ impl wlr::SeatHandler for State {
     fn popup_repositioned(&mut self, popup: wlr::InputPopupSurfaceId) {
         // Re-placement needs the runtime (for the node move + the fresh
         // anchor); no runtime means no scene, so there is nothing to move.
+        // Known limitation: the crate only emits this when a popup is
+        // tracked, so a caret commit with no popup re-anchors nothing;
+        // the overlay then stays stale until the next IME commit. A future
+        // wlr version should emit ungated when the IME is active.
         let Some(rt) = self.wayland.runtime() else {
             return;
         };
@@ -7905,7 +7907,10 @@ impl wlr::SeatHandler for State {
         // under the live popup, so re-read the anchor (plus the output and
         // the surface-local echo) fresh rather than reusing the
         // creation-time position.
-        let (anchor, output, echo) = self.popup_anchor(popup);
+        let a = self.popup_anchor(popup);
+        let anchor = a.anchor;
+        let output = a.output;
+        let echo = a.echo;
         // The popup's own extent, now that it may have committed a buffer.
         // Unknown id, destroyed popup, or no surface yet → (0, 0): the same
         // zero-size placement creation uses, harmless for a popup whose node
@@ -7939,6 +7944,14 @@ impl wlr::SeatHandler for State {
         // never the translated anchor (see `State::popup_anchor`).
         let anchor_box = wlr::Box2D::new(echo.x, echo.y, echo.width, echo.height);
         rt.send_input_popup_rectangle(popup, anchor_box);
+
+        // Keep the preedit overlay glued to the caret: a caret commit
+        // without an IME commit moves the popup via this hook but not the
+        // overlay via `input_method_committed`, so refresh it here while
+        // it is shown.
+        if self.preedit_overlay.is_some() {
+            self.refresh_preedit_overlay();
+        }
     }
 
     fn popup_surface_destroyed(&mut self, popup: wlr::InputPopupSurfaceId) {
