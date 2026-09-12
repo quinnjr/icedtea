@@ -9,6 +9,7 @@ use crate::anim::{Clock, ManualClock};
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::ResolveEnv;
 use crate::css::node::Node;
+use crate::dnd::{DragOutcome, DragPayload, DragSession, DragTransition};
 use crate::icons::IconTheme;
 use crate::layout::{Container, LayoutError, LayoutTree, Measure};
 use crate::paint::{ImageCache, PaintCx};
@@ -81,6 +82,46 @@ pub fn path_to<Msg: Clone + 'static>(roots: &[Instance<Msg>], target: &Node) -> 
         out.clear();
     }
     Vec::new()
+}
+
+/// The instance that owns `target`, if the tree still holds it.
+fn instance_for<'a, Msg: Clone + 'static>(
+    roots: &'a [Instance<Msg>],
+    target: &Node,
+) -> Option<&'a Instance<Msg>> {
+    fn walk<'a, Msg: Clone + 'static>(
+        instance: &'a Instance<Msg>,
+        target: &Node,
+    ) -> Option<&'a Instance<Msg>> {
+        if instance.node.ptr_eq(target) {
+            return Some(instance);
+        }
+        instance.children.iter().find_map(|child| walk(child, target))
+    }
+    roots.iter().find_map(|root| walk(root, target))
+}
+
+/// The innermost instance in `chain` (a `hit_chain`, outermost first) that
+/// accepts a drop of anything in `offered`, ignoring the implicit grab.
+///
+/// Drags deliberately bypass `aim`'s grab override: while buttons are held
+/// the grab pins every motion to the press node, and a drop target under
+/// the cursor would never highlight.
+fn accepting_target<Msg: Clone + 'static>(
+    roots: &[Instance<Msg>],
+    chain: &[crate::window::pointer::Hit],
+    offered: &[&str],
+) -> Option<Node> {
+    chain
+        .iter()
+        .rev()
+        .map(|hit| &hit.node)
+        .filter(|node| !path_to(roots, node).is_empty())
+        .find(|node| {
+            instance_for(roots, node)
+                .is_some_and(|instance| instance.controller.drop_accepts(offered))
+        })
+        .cloned()
 }
 
 /// Deliver `event` along `path` in GTK's three phases: capture from the
@@ -576,6 +617,23 @@ struct Runtime<Msg> {
     /// The next offscreen [`PopupKey`] to mint. A windowed run takes its keys
     /// from `Window::open_popup` instead.
     next_popup_key: u64,
+    /// The in-flight toolkit drag, if any: the [`DragSession`] plus the
+    /// source/target nodes it is between. `None` is the overwhelmingly
+    /// common case — no press is tracked and routing is exactly what it was
+    /// before M6.
+    dnd: Option<ActiveDrag>,
+}
+
+/// One window's in-flight drag: the position machine plus the nodes.
+///
+/// The session owns the armed/dragging distinction; the nodes say where
+/// `DragStart`/`DragEnd` (source) and
+/// `DragEnter`/`DragMotion`/`DragLeave`/`Drop` (target) are delivered.
+struct ActiveDrag {
+    session: DragSession,
+    source: Node,
+    payload: DragPayload,
+    target: Option<Node>,
 }
 
 /// One open popup surface's own retained tree.
@@ -1009,6 +1067,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             layout: LayoutTree::new(),
             focus: <FocusRing as Default>::default(),
             grab: ImplicitGrab::default(),
+            dnd: None,
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
@@ -1791,6 +1850,50 @@ fn route_surface<Msg: Clone + 'static>(
             if let Some((node, local)) = target {
                 pending.push((node, Event::PointerMotion { local }));
             }
+            // M6 drag-and-drop: advance the session, then route target
+            // events. The hover/click processing above is untouched
+            // (deviation D1): during a drag the source keeps its normal
+            // grabbed motion events and DnD delivery is additional.
+            if rt.dnd.is_some() {
+                let mut drag = rt.dnd.take().expect("presence checked above");
+                match drag.session.motion(point) {
+                    DragTransition::BeganDragging => {
+                        pending.push((drag.source.clone(), Event::DragStart));
+                    }
+                    DragTransition::None
+                    | DragTransition::StillArmed
+                    | DragTransition::Moved => {}
+                }
+                if drag.session.is_dragging() {
+                    // Bypass `aim`'s grab override on purpose: while buttons
+                    // are held the grab pins every motion to the press node
+                    // and a target under the cursor would never highlight.
+                    let offered = drag.payload.offered_mimes();
+                    let chain = hit_chain(&rt.root, &rt.layout, &rt.styles, (point.0, point.1));
+                    let next = accepting_target(&rt.instances, &chain, &offered);
+                    let same = match (&drag.target, &next) {
+                        (Some(old), Some(new)) => old.ptr_eq(new),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same {
+                        if let Some(old) = drag.target.take() {
+                            pending.push((old, Event::DragLeave));
+                        }
+                        if let Some(new) = next.clone() {
+                            pending.push((new, Event::DragEnter));
+                        }
+                        drag.target = next;
+                    }
+                    if let Some(current) = drag.target.clone() {
+                        let local = rt.layout.allocation(&current).map_or(point, |a| {
+                            (point.0 - a.border_box.x, point.1 - a.border_box.y)
+                        });
+                        pending.push((current, Event::DragMotion { local }));
+                    }
+                }
+                rt.dnd = Some(drag);
+            }
         }
         InputEvent::PointerLeave => {
             if let Some(old) = rt.hovered.take() {
@@ -1810,14 +1913,33 @@ fn route_surface<Msg: Clone + 'static>(
             if let Some((node, local)) = aim(rt, x, y) {
                 if *pressed {
                     rt.grab.press(*button, &node);
+                    // M6: arm a drag before `node` moves into `pending`. One
+                    // drag at a time — a press while one is tracked is only
+                    // a press — and only `BTN_LEFT` arms.
+                    let offer = if *button == crate::window::layer::BTN_LEFT && rt.dnd.is_none() {
+                        instance_for(&rt.instances, &node)
+                            .and_then(|instance| instance.controller.drag_offer())
+                    } else {
+                        None
+                    };
                     pending.push((
-                        node,
+                        node.clone(),
                         Event::PointerDown {
                             button: *button,
                             local,
                             serial: *serial,
                         },
                     ));
+                    if let Some(payload) = offer {
+                        let mut session = DragSession::new();
+                        session.begin_press((x, y), *button, *serial);
+                        rt.dnd = Some(ActiveDrag {
+                            session,
+                            source: node,
+                            payload,
+                            target: None,
+                        });
+                    }
                 } else {
                     rt.grab.release(*button);
                     pending.push((
@@ -1828,6 +1950,27 @@ fn route_surface<Msg: Clone + 'static>(
                             serial: *serial,
                         },
                     ));
+                    // M6: settling the drag slot. Armed-only is a click, so
+                    // the slot just clears; a finished drag drops onto the
+                    // hovered target (if any) and always ends at the source.
+                    // Any other button leaves a drag alone.
+                    if *button == crate::window::layer::BTN_LEFT {
+                        if let Some(drag) = rt.dnd.take() {
+                            let ActiveDrag {
+                                mut session,
+                                source,
+                                payload,
+                                mut target,
+                            } = drag;
+                            if session.release() == DragOutcome::FinishedDrag {
+                                let dropped = target.is_some();
+                                if let Some(node) = target.take() {
+                                    pending.push((node, Event::Drop { payload }));
+                                }
+                                pending.push((source, Event::DragEnd { dropped }));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1837,6 +1980,23 @@ fn route_surface<Msg: Clone + 'static>(
             }
         }
         InputEvent::Key(key) => {
+            // M6: `Escape` cancels an in-flight drag before normal key
+            // routing. A merely-armed press clears silently (no drag began,
+            // so the source owes nothing); a dragging session notifies the
+            // target and the source, then every path below sees no drag.
+            if key.pressed && u32::from(key.keysym) == xkbcommon::xkb::keysyms::KEY_Escape {
+                if let Some(drag) = rt.dnd.take() {
+                    if drag.session.is_dragging() {
+                        let ActiveDrag {
+                            source, mut target, ..
+                        } = drag;
+                        if let Some(node) = target.take() {
+                            pending.push((node, Event::DragLeave));
+                        }
+                        pending.push((source, Event::DragEnd { dropped: false }));
+                    }
+                }
+            }
             // GTK's focus-visible rule (`_gtk_window_update_focus_visible`),
             // fed every key both ways *before* the key is acted on, so the
             // press records the focus this key found and the release can ask
@@ -2150,6 +2310,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             layout: LayoutTree::new(),
             focus: <FocusRing as Default>::default(),
             grab: ImplicitGrab::default(),
+            dnd: None,
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
@@ -2822,6 +2983,7 @@ mod tests {
             layout: LayoutTree::new(),
             focus: <FocusRing as Default>::default(),
             grab: ImplicitGrab::default(),
+            dnd: None,
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),

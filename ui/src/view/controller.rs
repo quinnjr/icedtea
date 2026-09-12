@@ -96,6 +96,31 @@ pub enum Event {
     /// Space/Enter, or a click that completed inside — the "activate" GTK
     /// means.
     Activate,
+    /// A press-move past the drag threshold began a drag on this node.
+    /// The controller must disarm its click latch: the completing release
+    /// is a drop/cancel, never a click.
+    DragStart,
+    /// An in-flight drag entered this drop target.
+    DragEnter,
+    /// An in-flight drag moved within this drop target.
+    DragMotion {
+        /// Point in the node's border-box space.
+        local: (f32, f32),
+    },
+    /// An in-flight drag left this drop target without dropping.
+    DragLeave,
+    /// An in-flight drag was released over this drop target, carrying the
+    /// whole offered payload — the controller negotiates against what it
+    /// accepts and fires `Drop` with the winner.
+    Drop {
+        /// Everything the source offered, in preference order.
+        payload: crate::dnd::DragPayload,
+    },
+    /// A drag this node started has ended.
+    DragEnd {
+        /// Whether it ended in a drop (`true`) or a cancel (`false`).
+        dropped: bool,
+    },
     /// A popup this controller opened was dismissed by the compositor.
     PopupDone,
     /// The window's size or states changed.
@@ -207,6 +232,21 @@ pub trait Controller<Msg>: std::any::Any {
         None
     }
 
+    /// The `text/plain` payload this node offers when a press here arms a
+    /// drag, or `None` when this node is not a drag source. The default is
+    /// `None`: existing widgets are never sources until they opt in.
+    fn drag_offer(&self) -> Option<crate::dnd::DragPayload> {
+        None
+    }
+
+    /// Whether this node accepts a drop of anything in `offered` (MIME
+    /// types in source preference order). The default is `false`: existing
+    /// widgets are never targets until they opt in.
+    fn drop_accepts(&self, offered: &[&str]) -> bool {
+        let _ = offered;
+        false
+    }
+
     /// Extra painting inside the node's own effect layer, after M2's box
     /// painting and before children. `true` if anything was drawn.
     fn paint(
@@ -271,6 +311,17 @@ pub struct GenericC {
     /// The `Classes` prop's extra classes, kept so the class list can be
     /// rewritten whenever `focusable` changes.
     extra_classes: Vec<Rc<str>>,
+    /// The `DragSource` prop's payload text. `Some` makes this node a drag
+    /// source (deviation M6-D2: only `GenericC` nodes can be sources or
+    /// targets v1 — no dedicated widget controller implements the DnD
+    /// arms yet, and the trait defaults keep every other controller out).
+    drag_text: Option<String>,
+    /// The `DropAccept` prop's target state, plus the live hover flag.
+    drop_target: Option<crate::dnd::DropTarget>,
+    /// Set by `DragStart`, cleared by `DragEnd`. While set the completing
+    /// release is a drop/cancel (never a click) and a second press is
+    /// ignored.
+    dragging: bool,
 }
 
 impl std::fmt::Debug for GenericC {
@@ -295,6 +346,12 @@ impl GenericC {
     #[must_use]
     pub fn is_pressed(&self) -> bool {
         self.pressed
+    }
+
+    /// Whether a drag started on this node is in flight.
+    #[must_use]
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
     }
 
     /// Whether the pointer is over this node.
@@ -323,9 +380,10 @@ impl GenericC {
     }
 
     /// Rewrite the node's whole class list: the kind's base classes, then the
-    /// `Classes` prop's, then [`FOCUSABLE_CLASS`] when the node takes focus.
+    /// `Classes` prop's, then [`FOCUSABLE_CLASS`] when the node takes focus,
+    /// then [`crate::dnd::DROP_ACTIVE_CLASS`] while a drag hovers a target.
     ///
-    /// One function writes all three because `Node::set_classes` replaces the
+    /// One function writes all four because `Node::set_classes` replaces the
     /// list wholesale, so `Classes` and `Focusable` arriving in either prop
     /// order must produce the same result.
     fn sync_classes(&self, node: &Node) {
@@ -333,6 +391,14 @@ impl GenericC {
         list.extend(self.extra_classes.iter().map(|c| &**c));
         if self.focusable && !list.contains(&FOCUSABLE_CLASS) {
             list.push(FOCUSABLE_CLASS);
+        }
+        if self
+            .drop_target
+            .as_ref()
+            .is_some_and(crate::dnd::DropTarget::is_highlighted)
+            && !list.contains(&crate::dnd::DROP_ACTIVE_CLASS)
+        {
+            list.push(crate::dnd::DROP_ACTIVE_CLASS);
         }
         node.set_classes(&list);
     }
@@ -394,11 +460,49 @@ impl GenericC {
             _ => false,
         }
     }
+
+    /// Write one M6 drag-and-drop prop onto the controller. Returns whether
+    /// `name` was a DnD prop.
+    fn apply_dnd(&mut self, node: &Node, name: PropName, value: &Prop) -> bool {
+        match name {
+            PropName::DragSource => {
+                self.drag_text = match value {
+                    Prop::Str(s) => Some((**s).to_owned()),
+                    _ => None,
+                };
+                true
+            }
+            PropName::DropAccept => {
+                self.drop_target = match value {
+                    Prop::Bool(true) => Some(crate::dnd::DropTarget::accept_plain()),
+                    Prop::Str(mimes) => Some(crate::dnd::DropTarget::accept_list(mimes)),
+                    _ => None,
+                };
+                // A fresh target starts unhighlighted; resync so removing the
+                // prop mid-hover also drops the class.
+                self.sync_classes(node);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl<Msg: Clone + 'static> Controller<Msg> for GenericC {
     fn kind(&self) -> Kind {
         self.kind
+    }
+
+    fn drag_offer(&self) -> Option<crate::dnd::DragPayload> {
+        self.drag_text
+            .as_deref()
+            .map(crate::dnd::DragPayload::offer_text)
+    }
+
+    fn drop_accepts(&self, offered: &[&str]) -> bool {
+        self.drop_target
+            .as_ref()
+            .is_some_and(|target| target.accepts(offered))
     }
 
     fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {
@@ -417,6 +521,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for GenericC {
             // `build_controller` sets the real default once it has set `kind`.
             focusable: false,
             extra_classes: Vec::new(),
+            drag_text: None,
+            drop_target: None,
+            dragging: false,
         };
         me.reshape(node, cx);
         me
@@ -424,6 +531,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for GenericC {
 
     fn set_prop(&mut self, node: &Node, name: PropName, value: &Prop, cx: &mut BuildCx<'_>) {
         if self.apply_universal(node, name, value) {
+            return;
+        }
+        if self.apply_dnd(node, name, value) {
             return;
         }
         if matches!(name, PropName::Label | PropName::Text) {
@@ -467,6 +577,12 @@ impl<Msg: Clone + 'static> Controller<Msg> for GenericC {
                 Vec::new()
             }
             Event::PointerDown { button, .. } if *button == crate::window::layer::BTN_LEFT => {
+                // A second press while this node's drag is in flight is not
+                // a new press: it must not arm a click the drag's release
+                // would then fire.
+                if self.dragging {
+                    return Vec::new();
+                }
                 self.pressed = true;
                 self.hovered = true;
                 cx.node.set_state(PseudoStates::ACTIVE, true);
@@ -494,6 +610,103 @@ impl<Msg: Clone + 'static> Controller<Msg> for GenericC {
                     cx.handled = true;
                 }
                 out
+            }
+            // Drag arms only answer when this node opted in (deviation
+            // M6-D2): a node that never set `DragSource`/`DropAccept` lets
+            // the event bubble to an ancestor that did, and the innermost
+            // opt-in node consumes it so exactly one target highlights and
+            // exactly one source observes each drag.
+            Event::DragStart => {
+                if self.drag_text.is_none() {
+                    return Vec::new();
+                }
+                // The completing release is a drop/cancel, never a click.
+                self.dragging = true;
+                self.pressed = false;
+                cx.node.set_state(PseudoStates::ACTIVE, false);
+                cx.handled = true;
+                cx.handlers
+                    .fire_unit(EventKind::DragStart)
+                    .into_iter()
+                    .collect()
+            }
+            Event::DragEnter => {
+                if self.drop_target.is_none() {
+                    return Vec::new();
+                };
+                if let Some(target) = self.drop_target.as_mut() {
+                    target.set_highlighted(true);
+                }
+                self.sync_classes(cx.node);
+                cx.handled = true;
+                cx.handlers
+                    .fire_unit(EventKind::DragEnter)
+                    .into_iter()
+                    .collect()
+            }
+            Event::DragMotion { local } => {
+                if self.drop_target.is_none() {
+                    return Vec::new();
+                }
+                cx.handled = true;
+                cx.handlers
+                    .fire_pair(
+                        EventKind::DragMotion,
+                        f64::from(local.0),
+                        f64::from(local.1),
+                    )
+                    .into_iter()
+                    .collect()
+            }
+            Event::DragLeave => {
+                if self.drop_target.is_none() {
+                    return Vec::new();
+                };
+                if let Some(target) = self.drop_target.as_mut() {
+                    target.set_highlighted(false);
+                }
+                self.sync_classes(cx.node);
+                cx.handled = true;
+                cx.handlers
+                    .fire_unit(EventKind::DragLeave)
+                    .into_iter()
+                    .collect()
+            }
+            Event::Drop { payload } => {
+                if self.drop_target.is_none() {
+                    return Vec::new();
+                };
+                if let Some(target) = self.drop_target.as_mut() {
+                    target.set_highlighted(false);
+                }
+                self.sync_classes(cx.node);
+                cx.handled = true;
+                // Re-negotiated here so a stale route can never push bytes
+                // somewhere the current props reject.
+                let accepted = self
+                    .drop_target
+                    .as_ref()
+                    .map(|target| target.accepted_mimes())
+                    .unwrap_or_default();
+                match payload.data_for(&accepted) {
+                    Some((_, data)) => cx
+                        .handlers
+                        .fire_text(EventKind::Drop, &String::from_utf8_lossy(data))
+                        .into_iter()
+                        .collect(),
+                    None => Vec::new(),
+                }
+            }
+            Event::DragEnd { dropped } => {
+                if self.drag_text.is_none() {
+                    return Vec::new();
+                }
+                self.dragging = false;
+                cx.handled = true;
+                cx.handlers
+                    .fire_bool(EventKind::DragEnd, *dropped)
+                    .into_iter()
+                    .collect()
             }
             Event::FocusIn { .. } => cx
                 .handlers

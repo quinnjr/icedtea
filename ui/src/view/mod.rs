@@ -259,6 +259,17 @@ pub enum PropName {
     WrapLicense,
     DefaultButton,
     CancelButton,
+    // M6 · drag-and-drop (deviation M6-D1: additive names appended after the
+    // last P6 variant, exactly as P6-D3 did, so no existing discriminant and
+    // no `Props` ordering changes; `ALL` stays the contract's 97 and these
+    // are pinned by `all_m6` below).
+    /// A `Prop::Str` text payload this node offers as `text/plain`.
+    /// Presence makes the node a drag source.
+    DragSource,
+    /// What this node accepts as a drop target: `Prop::Bool(true)` for
+    /// `text/plain`, or a `Prop::Str` comma-separated MIME list.
+    /// Presence makes the node a drop target.
+    DropAccept,
 }
 
 impl PropName {
@@ -464,6 +475,17 @@ impl PropName {
             DefaultButton,
             CancelButton,
         ]
+    }
+
+    /// Every `PropName` M6's drag-and-drop introduced, in declaration order.
+    ///
+    /// Same ratchet as [`PropName::all_p6`]: `ALL` stays the contract's own
+    /// table, and a rebase that drops one fails a test instead of failing a
+    /// drag at run time.
+    #[must_use]
+    pub fn all_m6() -> &'static [PropName] {
+        use PropName::*;
+        &[DragSource, DropAccept]
     }
 }
 
@@ -1177,6 +1199,18 @@ pub enum EventKind {
     PointerMotion,
     /// A raw pointer release, delivered even when it lands outside the node.
     PointerUp,
+    /// A press-move past the drag threshold began a drag on this node.
+    DragStart,
+    /// An in-flight drag entered this drop target.
+    DragEnter,
+    /// An in-flight drag moved within this drop target.
+    DragMotion,
+    /// An in-flight drag left this drop target without dropping.
+    DragLeave,
+    /// An in-flight drag was released over this drop target.
+    Drop,
+    /// A drag this node started has ended; the flag is whether it dropped.
+    DragEnd,
 }
 
 impl EventKind {
@@ -1203,6 +1237,12 @@ impl EventKind {
         EventKind::PointerDown,
         EventKind::PointerMotion,
         EventKind::PointerUp,
+        EventKind::DragStart,
+        EventKind::DragEnter,
+        EventKind::DragMotion,
+        EventKind::DragLeave,
+        EventKind::Drop,
+        EventKind::DragEnd,
     ];
 }
 
@@ -1722,14 +1762,18 @@ mod tests {
 
     #[test]
     fn the_event_kind_table_is_the_contract_s_eighteen_plus_m5_d5s_three() {
-        assert_eq!(EventKind::ALL.len(), 21);
+        assert_eq!(EventKind::ALL.len(), 27);
         assert_eq!(EventKind::ALL[0], EventKind::Click);
         assert_eq!(EventKind::ALL[17], EventKind::DateSelected);
         assert_eq!(EventKind::ALL[20], EventKind::PointerUp);
+        // M6's drag-and-drop bindings, appended after `PointerUp` so no
+        // existing index moves.
+        assert_eq!(EventKind::ALL[21], EventKind::DragStart);
+        assert_eq!(EventKind::ALL[26], EventKind::DragEnd);
         let mut sorted = EventKind::ALL.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 21);
+        assert_eq!(sorted.len(), 27);
     }
 
     #[test]
@@ -1825,6 +1869,14 @@ mod tests {
             97,
             "PropName has a duplicate or an ordering gap"
         );
+    }
+
+    #[test]
+    fn the_m6_prop_names_are_pinned_outside_the_contract_table() {
+        // `ALL` stays the contract's 97; M6's names live in `all_m6` by the
+        // same ratchet P6 established.
+        assert_eq!(PropName::all_m6(), &[PropName::DragSource, PropName::DropAccept]);
+        assert_eq!(PropName::ALL.len(), 97);
     }
 
     #[test]
