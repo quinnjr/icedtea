@@ -1,5 +1,9 @@
 //! M6 accesskit acceptance: roles, names and states through the adapter,
 //! plus focus/disabled/checked transitions keeping stable node ids.
+//!
+//! Requires the `a11y` cargo feature (on by default).
+
+#![cfg(feature = "a11y")]
 
 use std::rc::Rc;
 
@@ -15,6 +19,7 @@ use icedtea_ui::view::reconcile::{Instance, reconcile};
 use icedtea_ui::view::{BuildCx, Kind, Prop, PropName, View};
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 enum Msg {
     Unused,
 }
