@@ -2196,8 +2196,11 @@ fn event_kind_all_lists_twenty_one_kinds() {
     // mutation: forget to add one of the three pointer kinds to
     // `EventKind::ALL`; the count fails and so does any dispatcher that
     // iterates ALL.
+    //
+    // M6 appends six drag-and-drop kinds after `PointerUp` (same ratchet):
+    // 21 → 27, earlier indices unmoved.
     use icedtea_ui::view::EventKind;
-    assert_eq!(EventKind::ALL.len(), 21);
+    assert_eq!(EventKind::ALL.len(), 27);
     for kind in [
         EventKind::PointerDown,
         EventKind::PointerMotion,
@@ -2213,6 +2216,9 @@ fn event_kind_all_lists_twenty_one_kinds() {
     assert_eq!(EventKind::ALL[18], EventKind::PointerDown);
     assert_eq!(EventKind::ALL[19], EventKind::PointerMotion);
     assert_eq!(EventKind::ALL[20], EventKind::PointerUp);
+    // M6's six drag kinds follow, in contract order.
+    assert_eq!(EventKind::ALL[21], EventKind::DragStart);
+    assert_eq!(EventKind::ALL[26], EventKind::DragEnd);
 }
 
 #[test]

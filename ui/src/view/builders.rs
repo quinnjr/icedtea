@@ -1165,6 +1165,61 @@ impl<Msg: Clone + 'static> View<Msg> {
     pub fn on_pointer_up_with_button(self, f: impl Fn(f64, f64, u32) -> Msg + 'static) -> Self {
         self.on(EventKind::PointerUp, Handler::PairButton(Rc::new(f)))
     }
+
+    /// Offer `text` as a `text/plain` drag payload. Presence makes this node
+    /// a drag source: a `BTN_LEFT` press here arms a drag, and motion past
+    /// the threshold starts one.
+    #[must_use]
+    pub fn drag_source(self, text: &str) -> Self {
+        self.prop(PropName::DragSource, text)
+    }
+
+    /// Accept drops of the comma-separated MIME list (e.g.
+    /// `"text/plain, text/uri-list"`). Presence makes this node a drop
+    /// target: while a drag hovers it the node carries
+    /// [`crate::dnd::DROP_ACTIVE_CLASS`].
+    #[must_use]
+    pub fn drop_accept(self, mimes: &str) -> Self {
+        self.prop(PropName::DropAccept, mimes)
+    }
+
+    /// A press-move past the drag threshold began a drag on this node.
+    #[must_use]
+    pub fn on_drag_start(self, msg: Msg) -> Self {
+        self.on(EventKind::DragStart, Handler::Unit(msg))
+    }
+
+    /// An in-flight drag entered this drop target.
+    #[must_use]
+    pub fn on_drag_enter(self, msg: Msg) -> Self {
+        self.on(EventKind::DragEnter, Handler::Unit(msg))
+    }
+
+    /// An in-flight drag moved within this drop target, in node-local space.
+    #[must_use]
+    pub fn on_drag_motion(self, f: impl Fn(f64, f64) -> Msg + 'static) -> Self {
+        self.on(EventKind::DragMotion, Handler::Pair(Rc::new(f)))
+    }
+
+    /// An in-flight drag left this drop target without dropping.
+    #[must_use]
+    pub fn on_drag_leave(self, msg: Msg) -> Self {
+        self.on(EventKind::DragLeave, Handler::Unit(msg))
+    }
+
+    /// An in-flight drag was released here. The message carries the
+    /// negotiated payload decoded as text (`text/plain`, `text/uri-list`).
+    #[must_use]
+    pub fn on_drop(self, f: impl Fn(&str) -> Msg + 'static) -> Self {
+        self.on(EventKind::Drop, Handler::Text(Rc::new(f)))
+    }
+
+    /// A drag this node started has ended; the flag reports a drop (`true`)
+    /// or a cancel (`false`).
+    #[must_use]
+    pub fn on_drag_end(self, f: impl Fn(bool) -> Msg + 'static) -> Self {
+        self.on(EventKind::DragEnd, Handler::Bool(Rc::new(f)))
+    }
 }
 
 // The per-widget builders themselves live beside their controllers under
@@ -1270,7 +1325,8 @@ mod tests {
         // else, plus M5-D5's three pointer kinds -- each of which has two
         // setters (a `Pair` and a `PairButton` builder), so those three are
         // asserted separately below rather than folded into the "exactly
-        // one" list. A new EventKind without any setter fails this test.
+        // one" list -- plus M6's six drag-and-drop kinds, one setter each.
+        // A new EventKind without any setter fails this test.
         let bound: Vec<EventKind> = vec![
             widget::<Msg>(Kind::Button).on_click(Msg::Clicked),
             widget::<Msg>(Kind::Button).on_activate(Msg::Clicked),
@@ -1290,6 +1346,13 @@ mod tests {
             widget::<Msg>(Kind::Scale).on_value_changed(|v| Msg::Value(v as u64)),
             widget::<Msg>(Kind::ScrolledWindow).on_scrolled(|v| Msg::Value(v as u64)),
             widget::<Msg>(Kind::Entry).on_key(|_| Some(Msg::Clicked)),
+            // M6: the six drag-and-drop kinds, each with its setter.
+            widget::<Msg>(Kind::Box).on_drag_start(Msg::Clicked),
+            widget::<Msg>(Kind::Box).on_drag_enter(Msg::Clicked),
+            widget::<Msg>(Kind::Box).on_drag_motion(|_x, _y| Msg::Clicked),
+            widget::<Msg>(Kind::Box).on_drag_leave(Msg::Clicked),
+            widget::<Msg>(Kind::Box).on_drop(|s| Msg::Text(s.to_owned())),
+            widget::<Msg>(Kind::Box).on_drag_end(Msg::Flag),
         ]
         .into_iter()
         .map(|v| {
@@ -1306,7 +1369,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(
             sorted.len(),
-            18,
+            24,
             "two setters bound the same EventKind: {bound:?}"
         );
 
