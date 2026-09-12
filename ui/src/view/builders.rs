@@ -1325,7 +1325,8 @@ mod tests {
         // else, plus M5-D5's three pointer kinds -- each of which has two
         // setters (a `Pair` and a `PairButton` builder), so those three are
         // asserted separately below rather than folded into the "exactly
-        // one" list. A new EventKind without any setter fails this test.
+        // one" list -- plus M6's six drag-and-drop kinds, one setter each.
+        // A new EventKind without any setter fails this test.
         let bound: Vec<EventKind> = vec![
             widget::<Msg>(Kind::Button).on_click(Msg::Clicked),
             widget::<Msg>(Kind::Button).on_activate(Msg::Clicked),
@@ -1345,6 +1346,13 @@ mod tests {
             widget::<Msg>(Kind::Scale).on_value_changed(|v| Msg::Value(v as u64)),
             widget::<Msg>(Kind::ScrolledWindow).on_scrolled(|v| Msg::Value(v as u64)),
             widget::<Msg>(Kind::Entry).on_key(|_| Some(Msg::Clicked)),
+            // M6: the six drag-and-drop kinds, each with its setter.
+            widget::<Msg>(Kind::Box).on_drag_start(Msg::Clicked),
+            widget::<Msg>(Kind::Box).on_drag_enter(Msg::Clicked),
+            widget::<Msg>(Kind::Box).on_drag_motion(|_x, _y| Msg::Clicked),
+            widget::<Msg>(Kind::Box).on_drag_leave(Msg::Clicked),
+            widget::<Msg>(Kind::Box).on_drop(|s| Msg::Text(s.to_owned())),
+            widget::<Msg>(Kind::Box).on_drag_end(Msg::Flag),
         ]
         .into_iter()
         .map(|v| {
@@ -1361,7 +1369,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(
             sorted.len(),
-            18,
+            24,
             "two setters bound the same EventKind: {bound:?}"
         );
 

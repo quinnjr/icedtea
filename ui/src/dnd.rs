@@ -164,9 +164,7 @@ impl DropTarget {
     /// Whether any of `offered` is acceptable.
     #[must_use]
     pub fn accepts(&self, offered: &[&str]) -> bool {
-        offered
-            .iter()
-            .any(|m| self.accepted.iter().any(|a| a == m))
+        offered.iter().any(|m| self.accepted.iter().any(|a| a == m))
     }
 
     /// Whether this target and `payload` share a flavor.
@@ -532,11 +530,8 @@ mod tests {
             mimes: vec![TEXT_PLAIN.to_owned()],
         };
         let mut accepting = StubSeat::accepting();
-        assert_eq!(
-            accepting.offer_drag(&request),
-            SeatDragResult::Accepted
-        );
-        assert_eq!(accepting.log(), &[request.clone()]);
+        assert_eq!(accepting.offer_drag(&request), SeatDragResult::Accepted);
+        assert_eq!(accepting.log(), std::slice::from_ref(&request));
 
         let mut refusing = StubSeat::refusing();
         assert_eq!(refusing.offer_drag(&request), SeatDragResult::Refused);

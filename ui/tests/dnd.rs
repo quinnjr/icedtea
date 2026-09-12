@@ -194,14 +194,23 @@ fn press_drag_drop_delivers_the_payload_and_highlights_the_target() {
     // a drag is never also a click.
     assert_eq!(
         log.borrow().as_slice(),
-        &["started", "entered", "moved", "dropped:chip-payload", "ended:true"],
+        &[
+            "started",
+            "entered",
+            "moved",
+            "dropped:chip-payload",
+            "ended:true"
+        ],
     );
 
     // Pixel proof: the target paints the drop class exactly while hovered.
     let sample = |frame: usize| frames.pixel(frame, target.0 as u32, target.1 as u32);
     let rest = sample(0).expect("the target pixel exists");
     let hovered = sample(1).expect("the hovered frame exists");
-    assert_ne!(hovered, rest, "hovering the target mid-drag painted nothing");
+    assert_ne!(
+        hovered, rest,
+        "hovering the target mid-drag painted nothing"
+    );
     let (r, g, b, _) = hovered;
     assert!(
         r > 200 && g < 100 && b < 100,
@@ -274,7 +283,14 @@ fn escape_mid_drag_cancels_and_clears_the_highlight() {
 
     assert_eq!(
         log.borrow().as_slice(),
-        &["started", "entered", "moved", "left", "ended:false", "clicked"],
+        &[
+            "started",
+            "entered",
+            "moved",
+            "left",
+            "ended:false",
+            "clicked"
+        ],
         "Escape must leave the target and end the drag un-dropped"
     );
 }

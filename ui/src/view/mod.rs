@@ -1875,7 +1875,10 @@ mod tests {
     fn the_m6_prop_names_are_pinned_outside_the_contract_table() {
         // `ALL` stays the contract's 97; M6's names live in `all_m6` by the
         // same ratchet P6 established.
-        assert_eq!(PropName::all_m6(), &[PropName::DragSource, PropName::DropAccept]);
+        assert_eq!(
+            PropName::all_m6(),
+            &[PropName::DragSource, PropName::DropAccept]
+        );
         assert_eq!(PropName::ALL.len(), 97);
     }
 

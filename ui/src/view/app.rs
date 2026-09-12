@@ -96,7 +96,10 @@ fn instance_for<'a, Msg: Clone + 'static>(
         if instance.node.ptr_eq(target) {
             return Some(instance);
         }
-        instance.children.iter().find_map(|child| walk(child, target))
+        instance
+            .children
+            .iter()
+            .find_map(|child| walk(child, target))
     }
     roots.iter().find_map(|root| walk(root, target))
 }
@@ -1860,9 +1863,7 @@ fn route_surface<Msg: Clone + 'static>(
                     DragTransition::BeganDragging => {
                         pending.push((drag.source.clone(), Event::DragStart));
                     }
-                    DragTransition::None
-                    | DragTransition::StillArmed
-                    | DragTransition::Moved => {}
+                    DragTransition::None | DragTransition::StillArmed | DragTransition::Moved => {}
                 }
                 if drag.session.is_dragging() {
                     // Bypass `aim`'s grab override on purpose: while buttons
@@ -1954,21 +1955,21 @@ fn route_surface<Msg: Clone + 'static>(
                     // the slot just clears; a finished drag drops onto the
                     // hovered target (if any) and always ends at the source.
                     // Any other button leaves a drag alone.
-                    if *button == crate::window::layer::BTN_LEFT {
-                        if let Some(drag) = rt.dnd.take() {
-                            let ActiveDrag {
-                                mut session,
-                                source,
-                                payload,
-                                mut target,
-                            } = drag;
-                            if session.release() == DragOutcome::FinishedDrag {
-                                let dropped = target.is_some();
-                                if let Some(node) = target.take() {
-                                    pending.push((node, Event::Drop { payload }));
-                                }
-                                pending.push((source, Event::DragEnd { dropped }));
+                    if *button == crate::window::layer::BTN_LEFT
+                        && let Some(drag) = rt.dnd.take()
+                    {
+                        let ActiveDrag {
+                            mut session,
+                            source,
+                            payload,
+                            mut target,
+                        } = drag;
+                        if session.release() == DragOutcome::FinishedDrag {
+                            let dropped = target.is_some();
+                            if let Some(node) = target.take() {
+                                pending.push((node, Event::Drop { payload }));
                             }
+                            pending.push((source, Event::DragEnd { dropped }));
                         }
                     }
                 }
@@ -1984,18 +1985,18 @@ fn route_surface<Msg: Clone + 'static>(
             // routing. A merely-armed press clears silently (no drag began,
             // so the source owes nothing); a dragging session notifies the
             // target and the source, then every path below sees no drag.
-            if key.pressed && u32::from(key.keysym) == xkbcommon::xkb::keysyms::KEY_Escape {
-                if let Some(drag) = rt.dnd.take() {
-                    if drag.session.is_dragging() {
-                        let ActiveDrag {
-                            source, mut target, ..
-                        } = drag;
-                        if let Some(node) = target.take() {
-                            pending.push((node, Event::DragLeave));
-                        }
-                        pending.push((source, Event::DragEnd { dropped: false }));
-                    }
+            if key.pressed
+                && u32::from(key.keysym) == xkbcommon::xkb::keysyms::KEY_Escape
+                && let Some(drag) = rt.dnd.take()
+                && drag.session.is_dragging()
+            {
+                let ActiveDrag {
+                    source, mut target, ..
+                } = drag;
+                if let Some(node) = target.take() {
+                    pending.push((node, Event::DragLeave));
                 }
+                pending.push((source, Event::DragEnd { dropped: false }));
             }
             // GTK's focus-visible rule (`_gtk_window_update_focus_visible`),
             // fed every key both ways *before* the key is acted on, so the
