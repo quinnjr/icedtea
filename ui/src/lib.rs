@@ -7,6 +7,8 @@
 
 pub mod anim;
 pub mod app;
+#[cfg(feature = "a11y")]
+pub mod a11y;
 pub mod css;
 pub mod gallery;
 pub mod icons;
