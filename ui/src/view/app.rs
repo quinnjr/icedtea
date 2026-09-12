@@ -1690,6 +1690,11 @@ fn route<Msg: Clone + 'static>(
             was
         }
         InputEvent::Key(_) => rt.keyboard_target,
+        // Composition lands on the keyboard-focused surface's focused
+        // widget, exactly like a key does.
+        InputEvent::ImePreedit { .. } | InputEvent::ImeCommit(_) | InputEvent::ImeDelete { .. } => {
+            rt.keyboard_target
+        }
         _ => rt.pointer_target,
     };
     let index = match target {
@@ -1885,6 +1890,33 @@ fn route_surface<Msg: Clone + 'static>(
         InputEvent::PopupDone(_) => {
             if let Some(node) = rt.focus.focus() {
                 pending.push((node, Event::PopupDone));
+            }
+        }
+        // IME batches land on the focused node; with no focus they belong
+        // to no widget and are dropped rather than misdelivered.
+        InputEvent::ImePreedit { text, cursor_begin, cursor_end } => {
+            if let Some(node) = rt.focus.focus() {
+                pending.push((
+                    node,
+                    Event::ImePreedit {
+                        text: text.clone(),
+                        cursor_begin: *cursor_begin,
+                        cursor_end: *cursor_end,
+                    },
+                ));
+            }
+        }
+        InputEvent::ImeCommit(text) => {
+            if let Some(node) = rt.focus.focus() {
+                pending.push((node, Event::ImeCommit(text.clone())));
+            }
+        }
+        InputEvent::ImeDelete { before, after } => {
+            if let Some(node) = rt.focus.focus() {
+                pending.push((
+                    node,
+                    Event::ImeDelete { before: *before, after: *after },
+                ));
             }
         }
         _ => {}
@@ -2293,6 +2325,9 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             for cmd in window_cmds {
                 match cmd {
                     Cmd::SetTitle(title) => window.set_title(&title),
+                    Cmd::ImeEnable { hint, purpose } => window.ime_enable(hint, purpose),
+                    Cmd::ImeSync(snapshot) => window.ime_sync(snapshot),
+                    Cmd::ImeDisable => window.ime_disable(),
                     Cmd::Minimize => window.minimize(),
                     Cmd::ToggleMaximized => window.toggle_maximized(),
                     Cmd::OpenPopup {
