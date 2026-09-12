@@ -33,6 +33,9 @@ use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_manager_v1;
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3, zwp_text_input_v3,
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
@@ -626,6 +629,27 @@ pub enum InputEvent {
     },
     KeyboardLeave,
     Key(KeyEvent),
+    /// An IME `preedit_string` for the focused text field: display-only
+    /// composing text. The focused controller stages it; the buffer is
+    /// untouched until `ImeCommit`.
+    ImePreedit {
+        /// The composing text.
+        text: String,
+        /// Byte offset of the cursor within `text`.
+        cursor_begin: i32,
+        /// Selection end within `text`.
+        cursor_end: i32,
+    },
+    /// An IME `commit_string` for the focused text field.
+    ImeCommit(String),
+    /// An IME `delete_surrounding_text` for the focused text field, as
+    /// UTF-8 byte lengths around the cursor.
+    ImeDelete {
+        /// Bytes to delete before the cursor.
+        before: u32,
+        /// Bytes to delete after the cursor.
+        after: u32,
+    },
     Configure {
         size: (u32, u32),
         states: SurfaceStates,
@@ -707,6 +731,24 @@ pub(crate) struct WindowState {
     clipboard_shared: Option<Rc<RefCell<ClipboardShared>>>,
     /// Compiled from `wl_keyboard.keymap`; `None` until it arrives.
     keymap: Option<Keymap>,
+    /// The `zwp_text_input_manager_v3` global, when the compositor
+    /// advertises one. Absence is not fatal (like `primary_manager`):
+    /// typing works everywhere, IME composition just never starts.
+    text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
+    /// This window's `zwp_text_input_v3`, created from the manager + seat
+    /// once both exist. `None` on a compositor without the manager.
+    text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
+    /// Whether an IME session is live (between `enable` and `disable`).
+    /// Guards `ime_sync`: surrounding text is only meaningful inside a
+    /// session, and sending it outside one is a protocol error.
+    ime_enabled: bool,
+    /// The double-buffered client state: staged snapshots are diffed so
+    /// unchanged surrounding text is never re-sent.
+    ime_pending: crate::text_input::PendingState,
+    /// Every `zwp_text_input_v3.done` serial, in arrival order. Recorded
+    /// for tests; the dispatch applies each batch on arrival (the protocol
+    /// guarantees a batch's events precede its `done`).
+    ime_done_serials: Vec<u32>,
     /// The events `pump` will hand up, in arrival order.
     events: Vec<InputEvent>,
     /// Buffers the compositor released, by `wl_buffer` id: one window has
@@ -770,6 +812,11 @@ impl WindowState {
             primary_manager: None,
             clipboard_shared: None,
             keymap: None,
+            text_input_manager: None,
+            text_input: None,
+            ime_enabled: false,
+            ime_pending: crate::text_input::PendingState::new(),
+            ime_done_serials: Vec::new(),
             events: Vec::new(),
             released: Vec::new(),
             seat_serial: None,
@@ -1298,6 +1345,13 @@ impl Window {
             .zip(state.pointer.as_ref())
             .map(|(manager, pointer)| manager.get_pointer(pointer, &qh, ()));
 
+        // One text-input per window, the same shape: the manager and the
+        // seat are both bound already if the compositor advertised them in
+        // the roundtrips above. `maybe_create_text_input` also runs from
+        // the registry and capabilities handlers, so whichever of the two
+        // arrives last still completes the pair.
+        maybe_create_text_input(&mut state, &qh);
+
         let mut surface = match &spec.role {
             Role::Toplevel => {
                 let wm_base = state
@@ -1681,6 +1735,69 @@ impl Window {
     pub fn minimize(&self) {
         if let Surface::Toplevel(toplevel) = &self.surface {
             toplevel.set_minimized();
+        }
+    }
+
+    /// Whether this window holds a `zwp_text_input_v3`: the compositor
+    /// advertised the manager and the seat completed the pair. An app can
+    /// use this to decide whether IME composition is even possible.
+    #[must_use]
+    pub fn ime_ready(&self) -> bool {
+        self.state.text_input.is_some()
+    }
+
+    /// Enable IME composition for the focused text field: `enable` plus the
+    /// field's content type, committed as one unit.
+    ///
+    /// A no-op without a text-input (the compositor never advertised
+    /// `zwp_text_input_manager_v3`): typing works everywhere, composition
+    /// just never starts. Enable is fresh state for the relay, so the last
+    /// commit is forgotten and the sync that follows always sends.
+    pub fn ime_enable(&mut self, hint: u32, purpose: u32) {
+        let Some(text_input) = self.state.text_input.clone() else {
+            return;
+        };
+        self.state.ime_enabled = true;
+        self.state.ime_pending.reset();
+        text_input.enable();
+        text_input.set_content_type(wire_hint(hint), wire_purpose(purpose));
+        text_input.commit();
+    }
+
+    /// Push fresh buffer state to a live IME session: surrounding text,
+    /// content type and cursor rectangle, committed as one unit.
+    ///
+    /// A no-op outside a session (`ime_enable` was never called, or
+    /// `ime_disable` ended it) and without a text-input. Unchanged state is
+    /// never re-sent: the snapshot is diffed against the last commit.
+    pub fn ime_sync(&mut self, snapshot: crate::text_input::Snapshot) {
+        if !self.state.ime_enabled {
+            return;
+        }
+        let Some(text_input) = self.state.text_input.clone() else {
+            return;
+        };
+        self.state.ime_pending.stage(snapshot);
+        let Some(commit) = self.state.ime_pending.take_commit() else {
+            return;
+        };
+        let (x, y, width, height) = commit.cursor_rect;
+        text_input.set_surrounding_text(commit.surrounding, commit.cursor, commit.anchor);
+        text_input.set_content_type(wire_hint(commit.hint), wire_purpose(commit.purpose));
+        text_input.set_cursor_rectangle(x, y, width, height);
+        text_input.commit();
+    }
+
+    /// End the IME session for the formerly focused field: `disable`,
+    /// committed as one unit. A no-op outside a session.
+    pub fn ime_disable(&mut self) {
+        if !self.state.ime_enabled {
+            return;
+        }
+        self.state.ime_enabled = false;
+        if let Some(text_input) = self.state.text_input.clone() {
+            text_input.disable();
+            text_input.commit();
         }
     }
 
@@ -2568,7 +2685,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WindowState {
             "zwlr_layer_shell_v1" => {
                 state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
             }
-            "wl_seat" => state.seat = Some(registry.bind(name, version.min(7), qh, ())),
+            "wl_seat" => {
+                state.seat = Some(registry.bind(name, version.min(7), qh, ()));
+                maybe_create_text_input(state, qh);
+            }
             "wp_cursor_shape_manager_v1" => {
                 state.cursor_manager = Some(registry.bind(name, version.min(2), qh, ()));
             }
@@ -2578,9 +2698,48 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WindowState {
             "zwp_primary_selection_device_manager_v1" => {
                 state.primary_manager = Some(registry.bind(name, version.min(1), qh, ()));
             }
+            // Bound at 1: every request and event the client uses
+            // (enable/disable, surrounding text, content type, cursor
+            // rectangle, commit, enter/leave, preedit/commit/delete, done)
+            // is version 1. Version 2 only adds IME actions and language
+            // reporting, which no entry-family widget needs.
+            "zwp_text_input_manager_v3" => {
+                state.text_input_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                maybe_create_text_input(state, qh);
+            }
             _ => {}
         }
     }
+}
+
+/// Create the window's `zwp_text_input_v3` once the manager and the seat
+/// both exist, whichever arrives last. Idempotent: exactly one text-input
+/// per window, created from the first manager+seat pair and never replaced.
+fn maybe_create_text_input(state: &mut WindowState, qh: &QueueHandle<WindowState>) {
+    if state.text_input.is_some() {
+        return;
+    }
+    if let (Some(manager), Some(seat)) = (state.text_input_manager.clone(), state.seat.clone()) {
+        state.text_input = Some(manager.get_text_input(&seat, qh, ()));
+    }
+}
+
+/// The wire `content_hint` bits for a snapshot's raw value.
+///
+/// `TryFrom` is strict (unknown bits fail); the fallback is `empty`, which
+/// is also what a snapshot that never named a hint carries. The toolkit's
+/// own [`crate::text_input::ContentHint`] only ever produces known bits, so
+/// the fallback is purely defensive.
+fn wire_hint(hint: u32) -> zwp_text_input_v3::ContentHint {
+    zwp_text_input_v3::ContentHint::try_from(hint)
+        .unwrap_or(zwp_text_input_v3::ContentHint::empty())
+}
+
+/// The wire `content_purpose` for a snapshot's raw value. Same fallback
+/// reasoning as [`wire_hint`]: unknown values read as `Normal`.
+fn wire_purpose(purpose: u32) -> zwp_text_input_v3::ContentPurpose {
+    zwp_text_input_v3::ContentPurpose::try_from(purpose)
+        .unwrap_or(zwp_text_input_v3::ContentPurpose::Normal)
 }
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WindowState {
@@ -2825,6 +2984,7 @@ impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for WindowState {
 delegate_noop!(WindowState: ignore wl_compositor::WlCompositor);
 delegate_noop!(WindowState: ignore wl_shm::WlShm);
 delegate_noop!(WindowState: ignore wl_shm_pool::WlShmPool);
+delegate_noop!(WindowState: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
 delegate_noop!(WindowState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(WindowState: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
 delegate_noop!(WindowState: ignore wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
@@ -2875,6 +3035,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for WindowState {
                 }
             },
         );
+        // A seat arriving (or re-announcing) after the text-input manager
+        // completes the pair `maybe_create_text_input` waits for.
+        maybe_create_text_input(state, qh);
         if state.keyboard.is_none() {
             state.keymap = None;
         }
@@ -3103,6 +3266,51 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState {
                 if let Some(keymap) = state.keymap.as_mut() {
                     keymap.set_repeat_info(rate, delay);
                 }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WindowState {
+    /// Record-only: these callbacks run on Wayland dispatch, so they never
+    /// `unwrap`/`expect` — `pump` drains the recorded events and the app
+    /// asserts after the run. Untrusted strings default rather than panic
+    /// (the protocol allows null preedit/commit strings); `enter`/`leave`
+    /// mirror the compositor's keyboard focus, which is the focus ring's
+    /// own job to track, so they never surface.
+    fn event(
+        state: &mut Self,
+        _: &zwp_text_input_v3::ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => state.events.push(InputEvent::ImePreedit {
+                text: text.unwrap_or_default(),
+                cursor_begin,
+                cursor_end,
+            }),
+            zwp_text_input_v3::Event::CommitString { text } => {
+                state
+                    .events
+                    .push(InputEvent::ImeCommit(text.unwrap_or_default()));
+            }
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } => state.events.push(InputEvent::ImeDelete {
+                before: before_length,
+                after: after_length,
+            }),
+            zwp_text_input_v3::Event::Done { serial } => {
+                state.ime_done_serials.push(serial);
             }
             _ => {}
         }
