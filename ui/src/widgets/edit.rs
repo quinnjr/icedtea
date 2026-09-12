@@ -396,7 +396,7 @@ impl TextEditState {
             self.anchor,
             hint,
             purpose,
-            caret_surface_rect(tree, node, &caret, self.scroll_offset),
+            caret_surface_rect(tree, node, &caret, (self.scroll_offset, 0.0)),
         ))
     }
 
@@ -500,8 +500,8 @@ impl TextEditState {
     }
 
     /// Paint the pending preedit at the caret, if one is staged: the display
-    /// string over a throwaway single-line layout at the caret origin, then
-    /// the caret itself after it. A no-op without a preedit.
+    /// string over a throwaway single-line layout at the caret origin. A
+    /// no-op without a preedit.
     pub fn paint_preedit(
         &self,
         canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
@@ -513,19 +513,14 @@ impl TextEditState {
             return;
         };
         let caret = self.layout.caret_rect(self.cursor);
-        let style = TextStyle::from_computed(&ComputedStyle::initial(cx.env));
-        let preedit = TextLayout::build(
-            &text,
-            &style,
-            cx.fonts,
-            None,
-            WrapMode::None,
-            Ellipsize::None,
-        );
-        preedit.draw(
+        paint_preedit_run(
             canvas,
-            (content.x - self.scroll_offset + caret.x, content.y + caret.y),
+            content,
             color,
+            &caret,
+            (self.scroll_offset, 0.0),
+            &text,
+            cx,
         );
     }
 
@@ -739,6 +734,30 @@ impl TextEditState {
         // embedding controller can build, so Ctrl+V is handled there.
         outcome
     }
+}
+
+/// Paint one preedit run at `caret` (line-local), scrolled by `scroll`.
+///
+/// The shared tail of [`TextEditState::paint_preedit`] for controllers that
+/// do not embed a [`TextEditState`] (a text view owns its buffer and scroll
+/// itself). A throwaway single-line layout over `text`; the caller decides
+/// what `text` is (already masked for a password field, raw otherwise).
+pub fn paint_preedit_run(
+    canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+    content: &crate::layout::Rect,
+    color: crate::css::value::Rgba,
+    caret: &crate::layout::Rect,
+    scroll: (f32, f32),
+    text: &str,
+    cx: &mut crate::paint::PaintCx<'_>,
+) {
+    let style = TextStyle::from_computed(&ComputedStyle::initial(cx.env));
+    let preedit = TextLayout::build(text, &style, cx.fonts, None, WrapMode::None, Ellipsize::None);
+    preedit.draw(
+        canvas,
+        (content.x - scroll.0 + caret.x, content.y - scroll.1 + caret.y),
+        color,
+    );
 }
 
 #[cfg(test)]

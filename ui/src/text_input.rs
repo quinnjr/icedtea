@@ -172,21 +172,21 @@ impl Snapshot {
 ///
 /// `tree.allocation(node)` is absolute (surface space); the `caret` rect the
 /// layout reports is relative to the shaped line's origin, which paints at
-/// the content-box origin minus the horizontal scroll. Falls back to an
-/// empty rect at the origin when nothing is laid out yet — the next sync
-/// after layout repairs it.
+/// the content-box origin minus the scroll offset. Falls back to an empty
+/// rect at the origin when nothing is laid out yet — the next sync after
+/// layout repairs it.
 #[must_use]
 pub fn caret_surface_rect(
     tree: &LayoutTree,
     node: &Node,
     caret: &Rect,
-    scroll_offset: f32,
+    scroll: (f32, f32),
 ) -> (i32, i32, i32, i32) {
     let Some(alloc) = tree.allocation(node) else {
         return (0, 0, 0, 0);
     };
-    let x = alloc.content_box.x - scroll_offset + caret.x;
-    let y = alloc.content_box.y + caret.y;
+    let x = alloc.content_box.x - scroll.0 + caret.x;
+    let y = alloc.content_box.y - scroll.1 + caret.y;
     (
         x as i32,
         y as i32,

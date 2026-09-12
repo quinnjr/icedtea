@@ -19,8 +19,13 @@ use std::time::Duration;
 
 use crate::css::computed::ComputedStyle;
 use crate::css::node::Node;
-use crate::layout::Rect;
+use crate::layout::{LayoutTree, Rect};
 use crate::text::{Ellipsize, TextLayout, TextStyle, WrapMode};
+use crate::text_input::{
+    ContentHint, ContentPurpose, Preedit, Snapshot, apply_commit_string, apply_delete_surrounding,
+    caret_surface_rect,
+};
+use crate::view::cmd::Cmd;
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{UndoStack, clamp_to_boundary};
@@ -119,6 +124,9 @@ pub struct TextViewC {
     pub text_node: Node,
     /// The `selection` subnode, present only while a selection exists.
     pub selection_node: Option<Node>,
+    /// The in-flight IME preedit: display-only text that never touches
+    /// [`TextViewC::buffer`] until a `commit_string` arrives.
+    pub preedit: Option<Preedit>,
     /// The undo stack, honouring `GtkTextView:enable-undo`.
     pub undo: UndoStack,
     editable: bool,
@@ -152,6 +160,74 @@ impl TextViewC {
             (false, Some(node)) => node.detach(),
             (false, None) => {}
         }
+    }
+
+    /// The `ImeEnable` + `ImeSync` pair for `FocusIn`: a wrapped view is
+    /// multiline, so the IME offers a matching layout.
+    fn ime_enable_cmds<Msg>(&self, tree: &LayoutTree, node: &Node) -> [Cmd<Msg>; 2] {
+        [
+            Cmd::ImeEnable {
+                hint: ContentHint::MULTILINE.wire(),
+                purpose: ContentPurpose::Normal.wire(),
+            },
+            self.ime_sync_cmd(tree, node),
+        ]
+    }
+
+    /// The `ImeSync` for a buffer or caret move while focused.
+    fn ime_sync_cmd<Msg>(&self, tree: &LayoutTree, node: &Node) -> Cmd<Msg> {
+        let caret = self.layout.caret_rect(self.cursor);
+        Cmd::ImeSync(Snapshot::new(
+            &self.buffer,
+            self.cursor,
+            self.anchor,
+            ContentHint::MULTILINE,
+            ContentPurpose::Normal,
+            caret_surface_rect(tree, node, &caret, self.scroll),
+        ))
+    }
+
+    /// Push the `ImeSync` for a buffer or caret move while focused.
+    fn ime_resync<Msg>(&self, cx: &mut EventCx<'_, Msg>) {
+        let tree = cx.tree;
+        let node = cx.node;
+        cx.cmds.push(self.ime_sync_cmd(tree, node));
+    }
+
+    /// Apply an IME `commit_string`: splice over the selection, record one
+    /// undo step, and consume any pending preedit. Returns whether the
+    /// buffer changed.
+    fn apply_ime_commit(&mut self, text: &str, now: Duration) -> bool {
+        let before = self.buffer.clone();
+        let (buffer, cursor) = apply_commit_string(&self.buffer, self.cursor, self.anchor, text);
+        self.preedit = None;
+        if buffer == before {
+            return false;
+        }
+        self.buffer = buffer;
+        self.cursor = cursor;
+        self.anchor = None;
+        self.undo.record(&before, &self.buffer, self.cursor, now);
+        self.sync_selection();
+        true
+    }
+
+    /// Apply an IME `delete_surrounding_text` (UTF-8 byte lengths around the
+    /// cursor, clamped to whole characters). Returns whether the buffer
+    /// changed.
+    fn apply_ime_delete(&mut self, before_len: u32, after_len: u32, now: Duration) -> bool {
+        let before = self.buffer.clone();
+        let (buffer, cursor) =
+            apply_delete_surrounding(&self.buffer, self.cursor, before_len, after_len);
+        if buffer == before {
+            return false;
+        }
+        self.buffer = buffer;
+        self.cursor = cursor;
+        self.anchor = None;
+        self.undo.record(&before, &self.buffer, self.cursor, now);
+        self.sync_selection();
+        true
     }
 
     /// Apply one key to the buffer. Returns `true` if the buffer changed.
@@ -315,6 +391,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
             kinetic: Kinetic::default(),
             text_node,
             selection_node: None,
+            preedit: None,
             undo: UndoStack::new(props.bool(PropName::EnableUndo, true)),
             editable: props.bool(PropName::Editable, true),
             wrap: match props.get(PropName::Wrap) {
@@ -336,6 +413,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
                     self.buffer = text.to_string();
                     self.cursor = clamp_to_boundary(&self.buffer, self.cursor);
                     self.anchor = None;
+                    self.preedit = None;
                     self.reshape(cx, None);
                     self.sync_selection();
                 }
@@ -392,11 +470,53 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
             self.sync_selection();
             if changed {
                 cx.handled = true;
+                self.ime_resync(cx);
                 let text = self.buffer.clone();
                 if let Some(msg) = cx.handlers.fire_text(EventKind::Change, &text) {
                     return vec![msg];
                 }
             }
+        }
+        // An IME session follows the focus; composition applies to the
+        // buffer above. Only a real buffer change fires `Change` (and
+        // re-syncs the new surrounding text back to the IME).
+        match ev {
+            Event::FocusIn { .. } => {
+                let tree = cx.tree;
+                let node = cx.node;
+                cx.cmds.extend(self.ime_enable_cmds(tree, node));
+            }
+            Event::FocusOut => {
+                cx.cmds.push(Cmd::ImeDisable);
+            }
+            Event::ImePreedit { text, cursor_begin, cursor_end } => {
+                self.preedit = Some(Preedit {
+                    text: text.clone(),
+                    cursor_begin: *cursor_begin,
+                    cursor_end: *cursor_end,
+                });
+            }
+            Event::ImeCommit(text) => {
+                if self.apply_ime_commit(text, cx.clock.now()) {
+                    cx.handled = true;
+                    self.ime_resync(cx);
+                    let buffer = self.buffer.clone();
+                    if let Some(msg) = cx.handlers.fire_text(EventKind::Change, &buffer) {
+                        return vec![msg];
+                    }
+                }
+            }
+            Event::ImeDelete { before, after } => {
+                if self.apply_ime_delete(*before, *after, cx.clock.now()) {
+                    cx.handled = true;
+                    self.ime_resync(cx);
+                    let buffer = self.buffer.clone();
+                    if let Some(msg) = cx.handlers.fire_text(EventKind::Change, &buffer) {
+                        return vec![msg];
+                    }
+                }
+            }
+            _ => {}
         }
         Vec::new()
     }
@@ -422,7 +542,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
         canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
         alloc: &crate::layout::Allocation,
         style: &ComputedStyle,
-        _cx: &mut crate::view::controller::PaintCx<'_>,
+        cx: &mut crate::view::controller::PaintCx<'_>,
     ) -> bool {
         let content = alloc.content_box;
         for rect in self.layout.selection_rects(self.selection_range()) {
@@ -439,6 +559,20 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
             (content.x - self.scroll.0, content.y - self.scroll.1),
             style.color(),
         );
+        // An in-flight composition paints at the caret, ahead of it. A text
+        // view never masks, so the raw preedit text is what shows.
+        if let Some(preedit) = self.preedit.as_ref() {
+            let caret = self.layout.caret_rect(self.cursor);
+            crate::widgets::edit::paint_preedit_run(
+                canvas,
+                &content,
+                style.color(),
+                &caret,
+                self.scroll,
+                &preedit.text,
+                cx,
+            );
+        }
         true
     }
 }
@@ -490,5 +624,60 @@ mod tests {
             cx.focus.focus().is_some(),
             "a left-click focuses the view, as GTK does"
         );
+    }
+
+    #[test]
+    fn focus_in_reports_multiline_and_a_commit_fires_change() {
+        // mutation: enable with no multiline hint and the IME offers a
+        // single-line layout for a wrapped view; mutation: skip the commit
+        // apply and the composed text never lands.
+        use std::rc::Rc;
+
+        use crate::view::cmd::Cmd;
+        use crate::view::controller::Event;
+        use crate::view::{EventKind, Handler, Handlers, Kind, Prop, PropName, Props};
+        use crate::widgets::{Headless, build_widget};
+        use crate::window::focus::FocusCause;
+
+        let mut props = Props::default();
+        props.set(PropName::Text, Prop::Str("hi".into()));
+        let (mut hx, built) = (
+            Headless::new(),
+            build_widget::<String>(Kind::TextView, &props),
+        );
+        let mut c = built.controller;
+        let mut cx = hx.event_cx::<String>(&built.node);
+        c.on_event(&Event::FocusIn { cause: FocusCause::Pointer }, &mut cx);
+        let enables: Vec<_> = cx
+            .cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::ImeEnable { hint, purpose } => Some((*hint, *purpose)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            enables,
+            vec![(0x200, 0)],
+            "a text view enables multiline/normal, saw {:?}",
+            cx.cmds
+        );
+
+        let mut cx = hx.event_cx_with_handlers(
+            &built.node,
+            |handlers: &mut Handlers<String>| {
+                handlers.set(
+                    EventKind::Change,
+                    Handler::Text(Rc::new(|text: &str| text.to_owned())),
+                );
+            },
+        );
+        let msgs = {
+            // `TextViewC` builds with the cursor at 0; move it to the end
+            // through the public key path before composing.
+            c.on_event(&Event::Key(Headless::key("End")), &mut cx);
+            c.on_event(&Event::ImeCommit("\nthere".to_owned()), &mut cx)
+        };
+        assert_eq!(msgs, vec!["hi\nthere".to_owned()]);
     }
 }
