@@ -5,6 +5,8 @@
 //! onto a `zwlr_layer_shell_v1` surface. See
 //! `docs/superpowers/specs/2026-08-20-pure-rust-gtk-ui-design.md`.
 
+#[cfg(feature = "a11y")]
+pub mod a11y;
 pub mod anim;
 pub mod app;
 pub mod css;

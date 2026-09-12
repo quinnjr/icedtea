@@ -16,6 +16,10 @@ skia-rs-safe = { version = "0.4.0", default-features = false, features = [
     "svg",
 ] }
 bitflags = "2"
+# M6 accesskit slice: the in-process a11y tree (`ui/src/a11y.rs`) builds
+# `accesskit::TreeUpdate`s. Optional so `--no-default-features` keeps the
+# old tree; the AT-SPI bus adapter is a follow-up.
+accesskit = { version = "0.25", optional = true }
 cssparser = "0.37"
 selectors = "0.40"
 precomputed-hash = "0.1"
@@ -37,13 +41,15 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
-default = ["fontconfig"]
+default = ["fontconfig", "a11y"]
 # Real `fc-match` parity: aliases, generic families and the user's own
 # `~/.config/fontconfig` rules. Off, `FontDatabase::new` is
 # `FontDatabase::probe_only` -- the fixed `FONT_CANDIDATES` list -- which is
 # what a stripped container or a build that must not link libfontconfig
 # wants, and is already the fallback when `FcInit` fails.
 fontconfig = ["dep:fontconfig"]
+# M6 accesskit slice: `ui/src/a11y.rs` and its `ui/tests/a11y.rs` gate.
+a11y = ["dep:accesskit"]
 
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }
