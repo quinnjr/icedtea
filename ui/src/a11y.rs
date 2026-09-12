@@ -68,7 +68,16 @@ impl A11yTree {
         root.set_children(children);
         out.push((ROOT_ID, root));
 
-        let focus_id = focus.map(|node| self.id_for(node)).unwrap_or(ROOT_ID);
+        let focus_id = focus
+            .and_then(|node| {
+                self.ids
+                    .iter()
+                    .find(|(known, _)| known.ptr_eq(node))
+                    .map(|(_, id)| *id)
+            })
+            // A focus ring can outlive the instance it points at; a focus no
+            // node owns rests on the root rather than dangling.
+            .unwrap_or(ROOT_ID);
         let update = TreeUpdate {
             nodes: out,
             tree: Some(TreeInfo::new(ROOT_ID)),

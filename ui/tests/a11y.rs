@@ -247,3 +247,20 @@ fn password_value_is_never_exposed() {
         node.value()
     );
 }
+
+#[test]
+fn focus_on_a_gone_node_falls_back_to_the_root() {
+    let mut hx = Harness::new();
+    let (_root, instances) = build_all(&mut hx, vec![button("Save")]);
+
+    let mut tree = A11yTree::new();
+    // A focus ring can outlive the instance it points at: the node below
+    // was never reconciled, so it owns no a11y id.
+    let gone = Node::new("button");
+    let update = tree.build_full(&instances, Some(&gone));
+    assert_eq!(
+        update.focus,
+        accesskit::NodeId(0),
+        "a focus no node owns must rest on the root, never dangle"
+    );
+}
