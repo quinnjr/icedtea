@@ -235,11 +235,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
             }
             EditOutcome::Changed => {
                 cx.handled = true;
-                self.edit.ime_resync(
-                    cx,
-                    ContentHint::SENSITIVE_DATA,
-                    ContentPurpose::Password,
-                );
+                self.edit
+                    .ime_resync(cx, ContentHint::SENSITIVE_DATA, ContentPurpose::Password);
                 let text = self.edit.buffer.clone();
                 cx.handlers
                     .fire_text(EventKind::Change, &text)
@@ -326,7 +323,12 @@ mod tests {
         );
         let mut c = built.controller;
         let mut cx = hx.event_cx::<String>(&built.node);
-        c.on_event(&Event::FocusIn { cause: FocusCause::Pointer }, &mut cx);
+        c.on_event(
+            &Event::FocusIn {
+                cause: FocusCause::Pointer,
+            },
+            &mut cx,
+        );
         let enables: Vec<_> = cx
             .cmds
             .iter()
@@ -342,15 +344,12 @@ mod tests {
             cx.cmds
         );
 
-        let mut cx = hx.event_cx_with_handlers(
-            &built.node,
-            |handlers: &mut Handlers<String>| {
-                handlers.set(
-                    EventKind::Change,
-                    Handler::Text(Rc::new(|text: &str| text.to_owned())),
-                );
-            },
-        );
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
         let msgs = c.on_event(&Event::ImeCommit("x".to_owned()), &mut cx);
         assert_eq!(msgs, vec!["hix".to_owned()]);
     }

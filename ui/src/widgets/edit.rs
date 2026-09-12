@@ -441,7 +441,11 @@ impl TextEditState {
                 cx.cmds.push(Cmd::ImeDisable);
                 Some(Vec::new())
             }
-            Event::ImePreedit { text, cursor_begin, cursor_end } => {
+            Event::ImePreedit {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => {
                 self.apply_ime_preedit(Some(Preedit {
                     text: text.clone(),
                     cursor_begin: *cursor_begin,
@@ -752,10 +756,20 @@ pub fn paint_preedit_run(
     cx: &mut crate::paint::PaintCx<'_>,
 ) {
     let style = TextStyle::from_computed(&ComputedStyle::initial(cx.env));
-    let preedit = TextLayout::build(text, &style, cx.fonts, None, WrapMode::None, Ellipsize::None);
+    let preedit = TextLayout::build(
+        text,
+        &style,
+        cx.fonts,
+        None,
+        WrapMode::None,
+        Ellipsize::None,
+    );
     preedit.draw(
         canvas,
-        (content.x - scroll.0 + caret.x, content.y - scroll.1 + caret.y),
+        (
+            content.x - scroll.0 + caret.x,
+            content.y - scroll.1 + caret.y,
+        ),
         color,
     );
 }

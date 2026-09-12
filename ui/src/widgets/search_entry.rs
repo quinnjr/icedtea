@@ -141,9 +141,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
         }
         // An IME session follows the focus; composition applies to the
         // shared engine. See `TextEditState::ime_event`.
-        if let Some(msgs) =
-            self.edit
-                .ime_event(ev, cx, ContentHint::NONE, ContentPurpose::Normal)
+        if let Some(msgs) = self
+            .edit
+            .ime_event(ev, cx, ContentHint::NONE, ContentPurpose::Normal)
         {
             return msgs;
         }
@@ -158,7 +158,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
             }
             EditOutcome::Changed => {
                 cx.handled = true;
-                self.edit.ime_resync(cx, ContentHint::NONE, ContentPurpose::Normal);
+                self.edit
+                    .ime_resync(cx, ContentHint::NONE, ContentPurpose::Normal);
                 // Every edit restarts the debounce window.
                 self.pending_since =
                     Some(cx.clock.now() + Duration::from_millis(u64::from(self.delay_ms)));
@@ -252,7 +253,10 @@ mod tests {
     fn search_hi() -> (Headless, crate::widgets::BuiltWidget<String>) {
         let mut props = Props::default();
         props.set(PropName::Text, Prop::Str("hi".into()));
-        (Headless::new(), build_widget::<String>(Kind::SearchEntry, &props))
+        (
+            Headless::new(),
+            build_widget::<String>(Kind::SearchEntry, &props),
+        )
     }
 
     #[test]
@@ -262,23 +266,29 @@ mod tests {
         let (mut hx, built) = search_hi();
         let mut c = built.controller;
         let mut cx = hx.event_cx::<String>(&built.node);
-        c.on_event(&Event::FocusIn { cause: FocusCause::Pointer }, &mut cx);
+        c.on_event(
+            &Event::FocusIn {
+                cause: FocusCause::Pointer,
+            },
+            &mut cx,
+        );
         let enables = cx
             .cmds
             .iter()
             .filter(|cmd| matches!(cmd, Cmd::ImeEnable { purpose: 0, .. }))
             .count();
-        assert_eq!(enables, 1, "a search entry enables purpose normal, saw {:?}", cx.cmds);
-
-        let mut cx = hx.event_cx_with_handlers(
-            &built.node,
-            |handlers: &mut Handlers<String>| {
-                handlers.set(
-                    EventKind::Change,
-                    Handler::Text(Rc::new(|text: &str| text.to_owned())),
-                );
-            },
+        assert_eq!(
+            enables, 1,
+            "a search entry enables purpose normal, saw {:?}",
+            cx.cmds
         );
+
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
         let msgs = c.on_event(&Event::ImeCommit("に".to_owned()), &mut cx);
         assert_eq!(msgs, vec!["hiに".to_owned()]);
     }

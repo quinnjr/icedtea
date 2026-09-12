@@ -217,7 +217,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for EditableLabelC {
                 // above), not per keystroke. The IME still needs the fresh
                 // surrounding text, so it re-syncs silently.
                 cx.handled = true;
-                self.edit.ime_resync(cx, ContentHint::NONE, ContentPurpose::Normal);
+                self.edit
+                    .ime_resync(cx, ContentHint::NONE, ContentPurpose::Normal);
                 Vec::new()
             }
             EditOutcome::Moved => {
@@ -274,7 +275,10 @@ mod tests {
     fn label_hi() -> (Headless, crate::widgets::BuiltWidget<String>) {
         let mut props = Props::default();
         props.set(PropName::Text, Prop::Str("hi".into()));
-        (Headless::new(), build_widget::<String>(Kind::EditableLabel, &props))
+        (
+            Headless::new(),
+            build_widget::<String>(Kind::EditableLabel, &props),
+        )
     }
 
     fn has_enable(cmds: &[Cmd<String>]) -> bool {
@@ -288,7 +292,12 @@ mod tests {
         let (mut hx, built) = label_hi();
         let mut c = built.controller;
         let mut cx = hx.event_cx::<String>(&built.node);
-        c.on_event(&Event::FocusIn { cause: FocusCause::Pointer }, &mut cx);
+        c.on_event(
+            &Event::FocusIn {
+                cause: FocusCause::Pointer,
+            },
+            &mut cx,
+        );
         assert!(
             cx.cmds.is_empty(),
             "no session outside editing, saw {:?}",
@@ -304,17 +313,18 @@ mod tests {
         let mut c = built.controller;
         let mut cx = hx.event_cx::<String>(&built.node);
         c.on_event(&Event::Key(Headless::key("Return")), &mut cx);
-        assert!(has_enable(cx.cmds), "editing start enables IME, saw {:?}", cx.cmds);
-
-        let mut cx = hx.event_cx_with_handlers(
-            &built.node,
-            |handlers: &mut Handlers<String>| {
-                handlers.set(
-                    EventKind::Change,
-                    Handler::Text(Rc::new(|text: &str| text.to_owned())),
-                );
-            },
+        assert!(
+            has_enable(cx.cmds),
+            "editing start enables IME, saw {:?}",
+            cx.cmds
         );
+
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
         let msgs = c.on_event(&Event::ImeCommit("!".to_owned()), &mut cx);
         assert_eq!(msgs, vec!["hi!".to_owned()]);
     }

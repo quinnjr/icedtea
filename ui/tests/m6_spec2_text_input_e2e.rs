@@ -36,11 +36,7 @@ fn update(model: &mut Model, msg: Msg) -> Cmd<Msg> {
     match msg {
         Msg::Changed(text) => {
             model.text = text.clone();
-            model
-                .seen
-                .lock()
-                .expect("seen")
-                .push(text);
+            model.seen.lock().expect("seen").push(text);
             Cmd::None
         }
     }
@@ -137,7 +133,8 @@ fn an_ime_commit_reaches_a_toolkit_entry_through_the_relay() {
     let socket_path = compositor.socket_path().to_path_buf();
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_in = seen.clone();
-    let frames: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let frames: Arc<std::sync::atomic::AtomicUsize> =
+        Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let frames_in = frames.clone();
     // The live window's probe points, republished every frame: the click
     // below needs the entry's window-local centre.
@@ -160,7 +157,10 @@ fn an_ime_commit_reaches_a_toolkit_entry_through_the_relay() {
             return;
         };
         let _ = App::new(
-            Model { text: String::new(), seen: seen_in },
+            Model {
+                text: String::new(),
+                seen: seen_in,
+            },
             update,
             view,
         )

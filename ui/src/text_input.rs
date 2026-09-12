@@ -307,7 +307,11 @@ mod tests {
         pending.stage(snapshot("hi"));
         assert!(pending.take_commit().is_some());
         pending.stage(snapshot("hi"));
-        assert_eq!(pending.take_commit(), None, "identical state must not recommit");
+        assert_eq!(
+            pending.take_commit(),
+            None,
+            "identical state must not recommit"
+        );
         pending.stage(snapshot("hi!"));
         assert!(pending.take_commit().is_some(), "changed state must commit");
     }
@@ -320,7 +324,10 @@ mod tests {
         assert!(pending.take_commit().is_some());
         pending.reset();
         pending.stage(snapshot("hi"));
-        assert!(pending.take_commit().is_some(), "post-enable state always sends");
+        assert!(
+            pending.take_commit().is_some(),
+            "post-enable state always sends"
+        );
     }
 
     #[test]

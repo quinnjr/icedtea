@@ -1894,7 +1894,11 @@ fn route_surface<Msg: Clone + 'static>(
         }
         // IME batches land on the focused node; with no focus they belong
         // to no widget and are dropped rather than misdelivered.
-        InputEvent::ImePreedit { text, cursor_begin, cursor_end } => {
+        InputEvent::ImePreedit {
+            text,
+            cursor_begin,
+            cursor_end,
+        } => {
             if let Some(node) = rt.focus.focus() {
                 pending.push((
                     node,
@@ -1915,7 +1919,10 @@ fn route_surface<Msg: Clone + 'static>(
             if let Some(node) = rt.focus.focus() {
                 pending.push((
                     node,
-                    Event::ImeDelete { before: *before, after: *after },
+                    Event::ImeDelete {
+                        before: *before,
+                        after: *after,
+                    },
                 ));
             }
         }

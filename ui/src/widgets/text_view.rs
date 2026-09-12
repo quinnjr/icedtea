@@ -489,7 +489,11 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
             Event::FocusOut => {
                 cx.cmds.push(Cmd::ImeDisable);
             }
-            Event::ImePreedit { text, cursor_begin, cursor_end } => {
+            Event::ImePreedit {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => {
                 self.preedit = Some(Preedit {
                     text: text.clone(),
                     cursor_begin: *cursor_begin,
@@ -506,14 +510,14 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
                     }
                 }
             }
-            Event::ImeDelete { before, after } => {
-                if self.apply_ime_delete(*before, *after, cx.clock.now()) {
-                    cx.handled = true;
-                    self.ime_resync(cx);
-                    let buffer = self.buffer.clone();
-                    if let Some(msg) = cx.handlers.fire_text(EventKind::Change, &buffer) {
-                        return vec![msg];
-                    }
+            Event::ImeDelete { before, after }
+                if self.apply_ime_delete(*before, *after, cx.clock.now()) =>
+            {
+                cx.handled = true;
+                self.ime_resync(cx);
+                let buffer = self.buffer.clone();
+                if let Some(msg) = cx.handlers.fire_text(EventKind::Change, &buffer) {
+                    return vec![msg];
                 }
             }
             _ => {}
@@ -647,7 +651,12 @@ mod tests {
         );
         let mut c = built.controller;
         let mut cx = hx.event_cx::<String>(&built.node);
-        c.on_event(&Event::FocusIn { cause: FocusCause::Pointer }, &mut cx);
+        c.on_event(
+            &Event::FocusIn {
+                cause: FocusCause::Pointer,
+            },
+            &mut cx,
+        );
         let enables: Vec<_> = cx
             .cmds
             .iter()
@@ -663,15 +672,12 @@ mod tests {
             cx.cmds
         );
 
-        let mut cx = hx.event_cx_with_handlers(
-            &built.node,
-            |handlers: &mut Handlers<String>| {
-                handlers.set(
-                    EventKind::Change,
-                    Handler::Text(Rc::new(|text: &str| text.to_owned())),
-                );
-            },
-        );
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
         let msgs = {
             // `TextViewC` builds with the cursor at 0; move it to the end
             // through the public key path before composing.

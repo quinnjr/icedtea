@@ -277,9 +277,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
         }
         // An IME session follows the focus; composition applies to the
         // shared engine. See `TextEditState::ime_event`.
-        if let Some(msgs) =
-            self.edit
-                .ime_event(ev, cx, ContentHint::NONE, ContentPurpose::Normal)
+        if let Some(msgs) = self
+            .edit
+            .ime_event(ev, cx, ContentHint::NONE, ContentPurpose::Normal)
         {
             return msgs;
         }
@@ -312,7 +312,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
             }
             EditOutcome::Changed => {
                 cx.handled = true;
-                self.edit.ime_resync(cx, ContentHint::NONE, ContentPurpose::Normal);
+                self.edit
+                    .ime_resync(cx, ContentHint::NONE, ContentPurpose::Normal);
                 let text = self.edit.buffer.clone();
                 cx.handlers
                     .fire_text(EventKind::Change, &text)
@@ -409,7 +410,12 @@ mod tests {
         let (mut hx, built) = entry_hi();
         let mut c = built.controller;
         let mut cx = hx.event_cx::<String>(&built.node);
-        c.on_event(&Event::FocusIn { cause: FocusCause::Pointer }, &mut cx);
+        c.on_event(
+            &Event::FocusIn {
+                cause: FocusCause::Pointer,
+            },
+            &mut cx,
+        );
         let (enable, sync, _) = ime_cmds(cx.cmds);
         assert!(enable, "FocusIn must enable IME, saw {:?}", cx.cmds);
         assert!(sync, "FocusIn must sync surrounding, saw {:?}", cx.cmds);
@@ -433,15 +439,12 @@ mod tests {
         // never learns the composed text.
         let (mut hx, built) = entry_hi();
         let mut c = built.controller;
-        let mut cx = hx.event_cx_with_handlers(
-            &built.node,
-            |handlers: &mut Handlers<String>| {
-                handlers.set(
-                    EventKind::Change,
-                    Handler::Text(Rc::new(|text: &str| text.to_owned())),
-                );
-            },
-        );
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
         let msgs = c.on_event(&Event::ImeCommit("に".to_owned()), &mut cx);
         assert_eq!(msgs, vec!["hiに".to_owned()]);
     }
@@ -452,21 +455,29 @@ mod tests {
         // the user has not committed.
         let (mut hx, built) = entry_hi();
         let mut c = built.controller;
-        let mut cx = hx.event_cx_with_handlers(
-            &built.node,
-            |handlers: &mut Handlers<String>| {
-                handlers.set(
-                    EventKind::Change,
-                    Handler::Text(Rc::new(|text: &str| text.to_owned())),
-                );
-            },
-        );
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
         let msgs = c.on_event(
-            &Event::ImePreedit { text: "に".to_owned(), cursor_begin: 3, cursor_end: 3 },
+            &Event::ImePreedit {
+                text: "に".to_owned(),
+                cursor_begin: 3,
+                cursor_end: 3,
+            },
             &mut cx,
         );
-        assert!(msgs.is_empty(), "a preedit must not fire Change, saw {msgs:?}");
-        assert!(cx.cmds.is_empty(), "a preedit sends nothing, saw {:?}", cx.cmds);
+        assert!(
+            msgs.is_empty(),
+            "a preedit must not fire Change, saw {msgs:?}"
+        );
+        assert!(
+            cx.cmds.is_empty(),
+            "a preedit sends nothing, saw {:?}",
+            cx.cmds
+        );
     }
 
     #[test]
