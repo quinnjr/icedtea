@@ -15,6 +15,7 @@ use std::rc::Rc;
 
 use crate::css::node::{Node, PseudoStates};
 use crate::layout::Rect;
+use crate::text_input::{ContentHint, ContentPurpose};
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{EditOutcome, TextEditState};
@@ -202,6 +203,19 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
                 cx.handled = true;
             }
         }
+        // An IME session follows the focus; composition applies to the
+        // shared engine. See `TextEditState::ime_event`. A password field
+        // reports the password purpose with the sensitive-data hint, so the
+        // IME offers a non-storing layout; the staged preedit still paints
+        // masked (see `paint` below).
+        if let Some(msgs) = self.edit.ime_event(
+            ev,
+            cx,
+            ContentHint::SENSITIVE_DATA,
+            ContentPurpose::Password,
+        ) {
+            return msgs;
+        }
         let Event::Key(key) = ev else {
             return Vec::new();
         };
@@ -221,6 +235,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
             }
             EditOutcome::Changed => {
                 cx.handled = true;
+                self.edit
+                    .ime_resync(cx, ContentHint::SENSITIVE_DATA, ContentPurpose::Password);
                 let text = self.edit.buffer.clone();
                 cx.handlers
                     .fire_text(EventKind::Change, &text)
@@ -255,7 +271,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
         canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
         alloc: &crate::layout::Allocation,
         style: &crate::css::computed::ComputedStyle,
-        _cx: &mut crate::view::controller::PaintCx<'_>,
+        cx: &mut crate::view::controller::PaintCx<'_>,
     ) -> bool {
         let content = alloc.content_box;
         // Selection behind the text, caret in front -- the same three steps,
@@ -275,9 +291,66 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
         self.edit
             .layout
             .draw(canvas, (content.x, content.y), style.color());
+        // Masked like the buffer itself (`preedit_display` bullets the raw
+        // composing text while `visibility` is off).
+        self.edit.paint_preedit(canvas, &content, style.color(), cx);
         let caret = self.edit.layout.caret_rect(self.edit.cursor);
         let placed = Rect::new(content.x + caret.x, content.y + caret.y, 1.0, caret.height);
         canvas.draw_rect(&placed.to_skia(), &crate::paint::fill_paint(style.color()));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::view::cmd::Cmd;
+    use crate::view::controller::Event;
+    use crate::view::{EventKind, Handler, Handlers, Kind, Prop, PropName, Props};
+    use crate::widgets::{Headless, build_widget};
+    use crate::window::focus::FocusCause;
+
+    #[test]
+    fn focus_in_reports_a_password_purpose_and_a_commit_fires_change() {
+        // mutation: enable with purpose normal and an IME offers an
+        // autocorrecting layout for a password field.
+        let mut props = Props::default();
+        props.set(PropName::Text, Prop::Str("hi".into()));
+        let (mut hx, built) = (
+            Headless::new(),
+            build_widget::<String>(Kind::PasswordEntry, &props),
+        );
+        let mut c = built.controller;
+        let mut cx = hx.event_cx::<String>(&built.node);
+        c.on_event(
+            &Event::FocusIn {
+                cause: FocusCause::Pointer,
+            },
+            &mut cx,
+        );
+        let enables: Vec<_> = cx
+            .cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::ImeEnable { hint, purpose } => Some((*hint, *purpose)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            enables,
+            vec![(0x80, 8)],
+            "a password entry enables sensitive-data/password, saw {:?}",
+            cx.cmds
+        );
+
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
+        let msgs = c.on_event(&Event::ImeCommit("x".to_owned()), &mut cx);
+        assert_eq!(msgs, vec!["hix".to_owned()]);
     }
 }

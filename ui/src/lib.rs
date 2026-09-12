@@ -16,6 +16,7 @@ pub mod layout;
 pub mod paint;
 pub mod shm;
 pub mod text;
+pub mod text_input;
 pub mod view;
 pub mod wayland;
 pub mod widget;

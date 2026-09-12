@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use icedtea_contract::ClipEntry;
 use icedtea_ui::layout::{Align, Rect};
-use icedtea_ui::view::builders::{box_, button};
+use icedtea_ui::view::builders::{SearchEntryExt, box_, button, search_entry};
 use icedtea_ui::view::{Cmd, InboxSender, View};
 use icedtea_ui::widgets::Orientation;
 use icedtea_ui::window::pointer::BTN_MIDDLE;
@@ -42,8 +42,9 @@ pub const POPOVER_SIZE: (u32, u32) = (320, 280);
 /// bottom: the source comment stands — a bottom bar lands below the visible
 /// area on a display whose viewport is shorter than the reported output (a VM
 /// console). `keyboard: None` matches GTK4 layer-shell's unset default; the
-/// panel takes no keyboard focus, and the popover's search field has no IME
-/// until M6. `exclusive_zone` is the literal `BAR_HEIGHT` because `LayerSpec`
+/// panel takes no keyboard focus. The popover's search field is a toolkit
+/// `SearchEntry` (M6.1 Spec 2), so it joins the entry-family IME sessions
+/// whenever it takes focus. `exclusive_zone` is the literal `BAR_HEIGHT` because `LayerSpec`
 /// has no "auto" (contract §6 P5-D6). The initial size is `(800, 28)`, the
 /// pair `set_default_size(800, 28)` + `set_size_request(-1, 28)` forced: a
 /// 0-height layer surface never commits a real buffer.
@@ -102,6 +103,14 @@ pub struct PanelModel {
     /// loop re-runs each frame (contract §6 P5-D2) and therefore cannot borrow
     /// the model; this is what it reads instead.
     pub history: Rc<RefCell<Vec<ClipEntry>>>,
+    /// The clipboard popover's search text (M6.1 Spec 2: the popover's
+    /// `SearchEntry` filters rows as you type, and composes through the
+    /// entry-family IME session like every toolkit text field).
+    pub clip_query: String,
+    /// `clip_query`, republished for the `Cmd::OpenPopup` payload, which
+    /// cannot borrow the model — the same mirror rationale as `history`.
+    /// `update` writes both together on every `Msg::ClipSearch`.
+    pub clip_query_cell: Rc<RefCell<String>>,
     /// The layer surface's current committed width.
     ///
     /// `#bar` must span the output like a taskbar (M5 Task 13, controller
@@ -145,6 +154,8 @@ impl PanelModel {
             bar_height: BAR_HEIGHT,
             clip_rect: Rc::new(Cell::new(None)),
             history: Rc::new(RefCell::new(Vec::new())),
+            clip_query: String::new(),
+            clip_query_cell: Rc::new(RefCell::new(String::new())),
             // `spec()`'s own initial size, the same width the surface opens
             // with before its first real configure arrives.
             #[allow(
@@ -190,6 +201,10 @@ pub enum Msg {
     },
     ClipRemoved(u64),
     ClipCleared,
+    /// The popover's search field changed (M6.1 Spec 2). Fires per keystroke
+    /// like every entry-family `Change` — including IME commits, which land
+    /// as buffer writes — so CJK/compose input filters rows as it commits.
+    ClipSearch(String),
 }
 
 /// Contract §3.1: the inbox carries `Msg` across a thread, so it must be `Send`.
@@ -302,10 +317,11 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
                     Rect::new(m.bar_width as f32 - 1.0, 0.0, 1.0, m.bar_height as f32)
                 });
                 let history = m.history.clone();
+                let query = m.clip_query_cell.clone();
                 Cmd::OpenPopup {
                     anchor: PopupAnchorPoint::Rect(anchor),
                     positioner: Positioner::menu(anchor, POPOVER_SIZE),
-                    view: Rc::new(move || popover_rows(&history.borrow())),
+                    view: Rc::new(move || popover_rows(&history.borrow(), &query.borrow())),
                 }
             }
         },
@@ -352,6 +368,11 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
         Msg::ClipCleared => {
             let clip = m.clip.clone();
             Cmd::Task(Rc::new(move || clip.clear()))
+        }
+        Msg::ClipSearch(query) => {
+            m.clip_query = query.clone();
+            *m.clip_query_cell.borrow_mut() = query;
+            Cmd::None
         }
     }
 }
@@ -543,8 +564,15 @@ fn clip_button(m: &PanelModel) -> View<Msg> {
 
 /// The popover's body, as a `Cmd::OpenPopup` payload can build it.
 ///
-/// Reads a slice, not the model: the loop re-runs this closure on every fold
+/// Reads slices, not the model: the loop re-runs this closure on every fold
 /// (contract §6 P5-D2), and a payload closure cannot borrow `PanelModel`.
+///
+/// The search field is a toolkit `SearchEntry` (M6.1 Spec 2): it enables an
+/// IME session on focus like every entry-family field, so CJK/compose input
+/// reaches it through the text-input relay, and each commit re-fires
+/// `Msg::ClipSearch` to re-filter. Its text rides the `query` mirror — the
+/// loop rebuilds this body every frame, and a field that did not echo the
+/// query would clear itself on every rebuild.
 ///
 /// Rows are buttons in a box rather than a `ListBox` (contract §6 P5-D3): a
 /// `ListBoxC` swallows the press in the capture phase, so a control inside a
@@ -554,9 +582,11 @@ fn clip_button(m: &PanelModel) -> View<Msg> {
 /// proves, and it gives `remove` a trigger that a keyboard-less layer surface
 /// could never have offered.
 #[must_use]
-pub fn popover_rows(entries: &[ClipEntry]) -> View<Msg> {
+pub fn popover_rows(entries: &[ClipEntry], query: &str) -> View<Msg> {
+    let needle = query.to_lowercase();
     let rows: Vec<View<Msg>> = entries
         .iter()
+        .filter(|entry| needle.is_empty() || entry.preview.to_lowercase().contains(&needle))
         .map(|entry| {
             let id = entry.id;
             let pinned = entry.pinned;
@@ -589,6 +619,10 @@ pub fn popover_rows(entries: &[ClipEntry]) -> View<Msg> {
     box_(
         Orientation::Vertical,
         [
+            search_entry(query)
+                .id("clip_search")
+                .placeholder("Search clipboard")
+                .on_change(|text: &str| Msg::ClipSearch(text.to_owned())),
             box_(Orientation::Vertical, rows).id("history"),
             button("Clear").id("clip_clear").on_click(Msg::ClipCleared),
         ],
@@ -605,7 +639,7 @@ pub fn popover_rows(entries: &[ClipEntry]) -> View<Msg> {
 #[cfg(test)]
 #[must_use]
 pub fn popover_body(m: &PanelModel) -> View<Msg> {
-    popover_rows(&m.history.borrow())
+    popover_rows(&m.history.borrow(), &m.clip_query)
 }
 
 /// The popover's anchor: the `clip` button's border box, if the window has
@@ -1324,6 +1358,45 @@ mod tests {
             "history update did not replace rows"
         );
         assert!(by_id(&body, "history_12").is_some());
+    }
+
+    #[test]
+    fn the_popover_search_field_filters_rows_as_you_type() {
+        let (mut m, _, _) = with_history(vec![
+            clip_entry(10, "copied text", false),
+            clip_entry(11, "second entry", false),
+        ]);
+        let body = popover_body(&m);
+        let change = by_id(&body, "clip_search")
+            .expect("search field")
+            .handlers
+            .fire_text(EventKind::Change, "second")
+            .expect("a change handler");
+        let _ = update(&mut m, change);
+        assert_eq!(m.clip_query, "second", "the query folds into the model");
+        let body = popover_body(&m);
+        assert!(by_id(&body, "history_11").is_some());
+        assert!(
+            by_id(&body, "history_10").is_none(),
+            "a non-matching row filters out"
+        );
+    }
+
+    #[test]
+    fn clearing_the_search_query_restores_every_row() {
+        let (mut m, _, _) = with_history(vec![
+            clip_entry(10, "copied text", false),
+            clip_entry(11, "second entry", false),
+        ]);
+        let _ = update(&mut m, Msg::ClipSearch("second".to_string()));
+        assert!(
+            by_id(&popover_body(&m), "history_10").is_none(),
+            "the query filters first"
+        );
+        let _ = update(&mut m, Msg::ClipSearch(String::new()));
+        let body = popover_body(&m);
+        assert!(by_id(&body, "history_10").is_some());
+        assert!(by_id(&body, "history_11").is_some());
     }
 
     #[test]

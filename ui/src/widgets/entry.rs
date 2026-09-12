@@ -16,6 +16,7 @@ use std::rc::Rc;
 use crate::css::node::Node;
 use crate::css::value::image::IconRef;
 use crate::layout::Rect;
+use crate::text_input::{ContentHint, ContentPurpose};
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{EditOutcome, TextEditState, UndoStack};
@@ -274,6 +275,14 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
                 cx.handled = true;
             }
         }
+        // An IME session follows the focus; composition applies to the
+        // shared engine. See `TextEditState::ime_event`.
+        if let Some(msgs) = self
+            .edit
+            .ime_event(ev, cx, ContentHint::NONE, ContentPurpose::Normal)
+        {
+            return msgs;
+        }
         let Event::Key(key) = ev else {
             return Vec::new();
         };
@@ -303,6 +312,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
             }
             EditOutcome::Changed => {
                 cx.handled = true;
+                self.edit
+                    .ime_resync(cx, ContentHint::NONE, ContentPurpose::Normal);
                 let text = self.edit.buffer.clone();
                 cx.handlers
                     .fire_text(EventKind::Change, &text)
@@ -332,7 +343,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
         canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
         alloc: &crate::layout::Allocation,
         style: &crate::css::computed::ComputedStyle,
-        _cx: &mut crate::view::controller::PaintCx<'_>,
+        cx: &mut crate::view::controller::PaintCx<'_>,
     ) -> bool {
         let content = alloc.content_box;
         for rect in self.edit.layout.selection_rects(self.edit.selection()) {
@@ -349,11 +360,144 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
             (content.x - self.edit.scroll_offset, content.y),
             style.color(),
         );
+        // An in-flight composition paints at the caret, ahead of it.
+        self.edit.paint_preedit(canvas, &content, style.color(), cx);
         // The caret.
         let caret = self.edit.layout.caret_rect(self.edit.cursor);
         let placed = Rect::new(content.x + caret.x, content.y + caret.y, 1.0, caret.height);
         canvas.draw_rect(&placed.to_skia(), &crate::paint::fill_paint(style.color()));
         let _ = &self.menu;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::view::cmd::Cmd;
+    use crate::view::controller::Event;
+    use crate::view::{EventKind, Handler, Handlers, Kind, Prop, PropName, Props};
+    use crate::widgets::{BuiltWidget, Headless, build_widget};
+    use crate::window::focus::FocusCause;
+
+    fn entry_hi() -> (Headless, BuiltWidget<String>) {
+        let mut props = Props::default();
+        props.set(PropName::Text, Prop::Str("hi".into()));
+        (Headless::new(), build_widget::<String>(Kind::Entry, &props))
+    }
+
+    fn ime_cmds(cmds: &[Cmd<String>]) -> (bool, bool, bool) {
+        let mut enable = false;
+        let mut sync = false;
+        let mut disable = false;
+        for cmd in cmds {
+            match cmd {
+                Cmd::ImeEnable { .. } => enable = true,
+                Cmd::ImeSync(sync_snapshot) if sync_snapshot.surrounding == "hi" => sync = true,
+                Cmd::ImeSync(_) => {}
+                Cmd::ImeDisable => disable = true,
+                _ => {}
+            }
+        }
+        (enable, sync, disable)
+    }
+
+    #[test]
+    fn focus_in_enables_ime_and_syncs_the_buffer() {
+        // mutation: push only `ImeEnable` and the IME activates with no
+        // surrounding text; mutation: push neither and this sees no cmds.
+        let (mut hx, built) = entry_hi();
+        let mut c = built.controller;
+        let mut cx = hx.event_cx::<String>(&built.node);
+        c.on_event(
+            &Event::FocusIn {
+                cause: FocusCause::Pointer,
+            },
+            &mut cx,
+        );
+        let (enable, sync, _) = ime_cmds(cx.cmds);
+        assert!(enable, "FocusIn must enable IME, saw {:?}", cx.cmds);
+        assert!(sync, "FocusIn must sync surrounding, saw {:?}", cx.cmds);
+    }
+
+    #[test]
+    fn focus_out_disables_ime() {
+        // mutation: drop the `FocusOut` arm and the IME session leaks across
+        // focus moves.
+        let (mut hx, built) = entry_hi();
+        let mut c = built.controller;
+        let mut cx = hx.event_cx::<String>(&built.node);
+        c.on_event(&Event::FocusOut, &mut cx);
+        let (_, _, disable) = ime_cmds(cx.cmds);
+        assert!(disable, "FocusOut must disable IME, saw {:?}", cx.cmds);
+    }
+
+    #[test]
+    fn an_ime_commit_applies_and_fires_change() {
+        // mutation: apply the commit without firing `Change` and the model
+        // never learns the composed text.
+        let (mut hx, built) = entry_hi();
+        let mut c = built.controller;
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
+        let msgs = c.on_event(&Event::ImeCommit("に".to_owned()), &mut cx);
+        assert_eq!(msgs, vec!["hiに".to_owned()]);
+    }
+
+    #[test]
+    fn an_ime_preedit_is_display_only() {
+        // mutation: fire `Change` for a preedit and the model learns text
+        // the user has not committed.
+        let (mut hx, built) = entry_hi();
+        let mut c = built.controller;
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
+        let msgs = c.on_event(
+            &Event::ImePreedit {
+                text: "に".to_owned(),
+                cursor_begin: 3,
+                cursor_end: 3,
+            },
+            &mut cx,
+        );
+        assert!(
+            msgs.is_empty(),
+            "a preedit must not fire Change, saw {msgs:?}"
+        );
+        assert!(
+            cx.cmds.is_empty(),
+            "a preedit sends nothing, saw {:?}",
+            cx.cmds
+        );
+    }
+
+    #[test]
+    fn a_key_edit_resyncs_the_ime() {
+        // mutation: skip the sync on `Changed` and the IME keeps composing
+        // against stale surrounding text.
+        let (mut hx, built) = entry_hi();
+        let mut c = built.controller;
+        let mut cx = hx.event_cx::<String>(&built.node);
+        let mut key = Headless::key("a");
+        key.utf8 = Some("!".to_owned());
+        c.on_event(&Event::Key(key), &mut cx);
+        let syncs: Vec<_> = cx
+            .cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::ImeSync(snapshot) => Some(snapshot.surrounding.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(syncs, vec!["hi!".to_owned()], "saw {:?}", cx.cmds);
     }
 }

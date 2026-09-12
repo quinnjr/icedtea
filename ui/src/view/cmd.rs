@@ -29,6 +29,20 @@ pub enum Cmd<Msg> {
     SetPrimary(String),
     /// Read the primary selection.
     Primary(Rc<dyn Fn(Option<String>) -> Msg>),
+    /// Enable IME composition for the focused text field, with the wire
+    /// `content_hint` bits and `content_purpose` value the field reports.
+    ImeEnable {
+        /// Wire `content_hint` bits.
+        hint: u32,
+        /// Wire `content_purpose` value.
+        purpose: u32,
+    },
+    /// Push fresh buffer state to a live IME session: the double-buffered
+    /// `surrounding_text` + `content_type` + `cursor_rectangle`, committed as
+    /// one unit by the window.
+    ImeSync(crate::text_input::Snapshot),
+    /// End the IME session for the formerly focused field.
+    ImeDisable,
     /// Open a child popup surface rendering `view`.
     OpenPopup {
         /// Where it hangs off the parent window.
@@ -95,6 +109,14 @@ impl<Msg> std::fmt::Debug for Cmd<Msg> {
             Cmd::Paste(_) => f.write_str("Paste(..)"),
             Cmd::SetPrimary(text) => write!(f, "SetPrimary({} bytes)", text.len()),
             Cmd::Primary(_) => f.write_str("Primary(..)"),
+            Cmd::ImeEnable { hint, purpose } => {
+                write!(f, "ImeEnable(hint={hint}, purpose={purpose})")
+            }
+            Cmd::ImeSync(snapshot) => f
+                .debug_tuple("ImeSync")
+                .field(&snapshot.surrounding)
+                .finish(),
+            Cmd::ImeDisable => f.write_str("ImeDisable"),
             Cmd::OpenPopup { positioner, .. } => f
                 .debug_struct("OpenPopup")
                 .field("positioner", positioner)

@@ -23,10 +23,15 @@ use std::time::Duration;
 
 use crate::css::computed::ComputedStyle;
 use crate::css::node::Node;
+use crate::layout::LayoutTree;
 use crate::text::{Ellipsize, TextLayout, TextStyle, WrapMode};
+use crate::text_input::{
+    ContentHint, ContentPurpose, Preedit, Snapshot, apply_commit_string, apply_delete_surrounding,
+    caret_surface_rect,
+};
 use crate::view::BuildCx;
 use crate::view::cmd::Cmd;
-use crate::view::controller::EventCx;
+use crate::view::controller::{Event, EventCx};
 use crate::window::keyboard::{KeyEvent, Mods};
 
 /// Clamp `offset` into `s`, walking *down* to the nearest `char` boundary.
@@ -183,6 +188,10 @@ pub struct TextEditState {
     pub text_node: Node,
     /// The `placeholder` subnode.
     pub placeholder_node: Node,
+    /// The in-flight IME preedit: display-only text that never touches
+    /// [`TextEditState::buffer`] until a `commit_string` arrives. Painted by
+    /// the embedding controller after the buffer's own text.
+    pub preedit: Option<Preedit>,
     /// The `selection` subnode, present only while a selection exists.
     pub selection_node: Option<Node>,
 }
@@ -218,6 +227,7 @@ impl TextEditState {
             max_length: None,
             text_node,
             placeholder_node,
+            preedit: None,
             selection_node: None,
         };
         this.reshape(cx);
@@ -225,7 +235,8 @@ impl TextEditState {
     }
 
     /// Replace the buffer from a prop, without recording an undo step — the
-    /// model, not the user, made this change.
+    /// model, not the user, made this change. A model write supersedes any
+    /// in-flight composition, so a pending preedit is dropped with it.
     pub fn set_text(&mut self, text: &str, cx: &mut BuildCx<'_>) {
         if self.buffer == text {
             return;
@@ -233,6 +244,7 @@ impl TextEditState {
         self.buffer = text.to_owned();
         self.cursor = clamp_to_boundary(&self.buffer, self.cursor);
         self.anchor = None;
+        self.preedit = None;
         self.reshape(cx);
         self.sync_selection_node();
     }
@@ -340,6 +352,218 @@ impl TextEditState {
         self.cursor = range.start + text.len();
         self.anchor = None;
         self.undo.record(&before, &self.buffer, self.cursor, now);
+        true
+    }
+
+    /// Stage an IME `preedit_string`: display-only, never touches the buffer.
+    /// `None` clears a pending preedit (the protocol's null preedit string).
+    pub fn apply_ime_preedit(&mut self, preedit: Option<Preedit>) {
+        self.preedit = preedit;
+    }
+
+    /// The `ImeEnable` + `ImeSync` pair a controller pushes on `FocusIn`:
+    /// enable first (the relay treats enable as fresh state), then the
+    /// buffer's current surrounding text, content type and cursor rectangle.
+    pub fn ime_enable_cmds<Msg>(
+        &self,
+        hint: ContentHint,
+        purpose: ContentPurpose,
+        tree: &LayoutTree,
+        node: &Node,
+    ) -> [Cmd<Msg>; 2] {
+        [
+            Cmd::ImeEnable {
+                hint: hint.wire(),
+                purpose: purpose.wire(),
+            },
+            self.ime_sync_cmd(hint, purpose, tree, node),
+        ]
+    }
+
+    /// The `ImeSync` a controller pushes whenever the buffer or the caret
+    /// moves while focused.
+    pub fn ime_sync_cmd<Msg>(
+        &self,
+        hint: ContentHint,
+        purpose: ContentPurpose,
+        tree: &LayoutTree,
+        node: &Node,
+    ) -> Cmd<Msg> {
+        let caret = self.layout.caret_rect(self.cursor);
+        Cmd::ImeSync(Snapshot::new(
+            &self.buffer,
+            self.cursor,
+            self.anchor,
+            hint,
+            purpose,
+            caret_surface_rect(tree, node, &caret, (self.scroll_offset, 0.0)),
+        ))
+    }
+
+    /// Push the `ImeSync` for a buffer or caret move while focused.
+    pub fn ime_resync<Msg>(
+        &self,
+        cx: &mut EventCx<'_, Msg>,
+        hint: ContentHint,
+        purpose: ContentPurpose,
+    ) {
+        let tree = cx.tree;
+        let node = cx.node;
+        cx.cmds.push(self.ime_sync_cmd(hint, purpose, tree, node));
+    }
+
+    /// Handle `FocusIn`/`FocusOut` and the IME event family for the embedding
+    /// controller. Returns `Some(messages)` when handled — pushing any
+    /// `Cmd::Ime*` into `cx.cmds` — or `None` when `ev` is none of those and
+    /// the controller should keep going (pointer, key, …).
+    ///
+    /// An IME session follows the focus: `FocusIn` enables (with the
+    /// buffer's current state), `FocusOut` disables. Composition applies to
+    /// the engine; only a real buffer change fires `Change` (and re-syncs
+    /// the new surrounding text back to the IME, which is what lets the
+    /// relay re-forward it).
+    pub fn ime_event<Msg: Clone + 'static>(
+        &mut self,
+        ev: &Event,
+        cx: &mut EventCx<'_, Msg>,
+        hint: ContentHint,
+        purpose: ContentPurpose,
+    ) -> Option<Vec<Msg>> {
+        match ev {
+            Event::FocusIn { .. } => {
+                let tree = cx.tree;
+                let node = cx.node;
+                cx.cmds
+                    .extend(self.ime_enable_cmds(hint, purpose, tree, node));
+                Some(Vec::new())
+            }
+            Event::FocusOut => {
+                cx.cmds.push(Cmd::ImeDisable);
+                Some(Vec::new())
+            }
+            Event::ImePreedit {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => {
+                self.apply_ime_preedit(Some(Preedit {
+                    text: text.clone(),
+                    cursor_begin: *cursor_begin,
+                    cursor_end: *cursor_end,
+                }));
+                Some(Vec::new())
+            }
+            Event::ImeCommit(text) => {
+                let now = cx.clock.now();
+                if self.apply_ime_commit(text, now) {
+                    cx.handled = true;
+                    self.ime_resync(cx, hint, purpose);
+                    let buffer = self.buffer.clone();
+                    Some(
+                        cx.handlers
+                            .fire_text(crate::view::EventKind::Change, &buffer)
+                            .map_or_else(Vec::new, |m| vec![m]),
+                    )
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            Event::ImeDelete { before, after } => {
+                let now = cx.clock.now();
+                if self.apply_ime_delete(*before, *after, now) {
+                    cx.handled = true;
+                    self.ime_resync(cx, hint, purpose);
+                    let buffer = self.buffer.clone();
+                    Some(
+                        cx.handlers
+                            .fire_text(crate::view::EventKind::Change, &buffer)
+                            .map_or_else(Vec::new, |m| vec![m]),
+                    )
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// What the pending preedit paints as, or `None` when no composition is
+    /// staged. Masked (one bullet per character) while `visibility` is off,
+    /// so a password entry never paints raw composing text.
+    #[must_use]
+    pub fn preedit_display(&self) -> Option<String> {
+        self.preedit.as_ref().map(|preedit| {
+            if self.visibility {
+                preedit.text.clone()
+            } else {
+                Self::INVISIBLE
+                    .to_string()
+                    .repeat(preedit.text.chars().count())
+            }
+        })
+    }
+
+    /// Paint the pending preedit at the caret, if one is staged: the display
+    /// string over a throwaway single-line layout at the caret origin. A
+    /// no-op without a preedit.
+    pub fn paint_preedit(
+        &self,
+        canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+        content: &crate::layout::Rect,
+        color: crate::css::value::Rgba,
+        cx: &mut crate::paint::PaintCx<'_>,
+    ) {
+        let Some(text) = self.preedit_display() else {
+            return;
+        };
+        let caret = self.layout.caret_rect(self.cursor);
+        paint_preedit_run(
+            canvas,
+            content,
+            color,
+            &caret,
+            (self.scroll_offset, 0.0),
+            &text,
+            cx,
+        );
+    }
+
+    /// Apply an IME `commit_string`: splice `text` over the selection, record
+    /// one undo step, and consume any pending preedit. Returns whether the
+    /// buffer changed (an empty commit over no selection is a no-op, so the
+    /// controller fires `Change` — and re-syncs surrounding text — only on
+    /// `true`).
+    pub fn apply_ime_commit(&mut self, text: &str, now: Duration) -> bool {
+        let before = self.buffer.clone();
+        let (buffer, cursor) = apply_commit_string(&self.buffer, self.cursor, self.anchor, text);
+        self.preedit = None;
+        if buffer == before {
+            return false;
+        }
+        self.buffer = buffer;
+        self.cursor = cursor;
+        self.anchor = None;
+        self.undo.record(&before, &self.buffer, self.cursor, now);
+        self.sync_selection_node();
+        true
+    }
+
+    /// Apply an IME `delete_surrounding_text`: delete `before_len` bytes
+    /// before the cursor and `after_len` bytes after it (UTF-8 bytes per the
+    /// protocol, clamped to whole characters). Records one undo step.
+    /// Returns whether the buffer changed.
+    pub fn apply_ime_delete(&mut self, before_len: u32, after_len: u32, now: Duration) -> bool {
+        let before = self.buffer.clone();
+        let (buffer, cursor) =
+            apply_delete_surrounding(&self.buffer, self.cursor, before_len, after_len);
+        if buffer == before {
+            return false;
+        }
+        self.buffer = buffer;
+        self.cursor = cursor;
+        self.anchor = None;
+        self.undo.record(&before, &self.buffer, self.cursor, now);
+        self.sync_selection_node();
         true
     }
 
@@ -516,10 +740,54 @@ impl TextEditState {
     }
 }
 
+/// Paint one preedit run at `caret` (line-local), scrolled by `scroll`.
+///
+/// The shared tail of [`TextEditState::paint_preedit`] for controllers that
+/// do not embed a [`TextEditState`] (a text view owns its buffer and scroll
+/// itself). A throwaway single-line layout over `text`; the caller decides
+/// what `text` is (already masked for a password field, raw otherwise).
+pub fn paint_preedit_run(
+    canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+    content: &crate::layout::Rect,
+    color: crate::css::value::Rgba,
+    caret: &crate::layout::Rect,
+    scroll: (f32, f32),
+    text: &str,
+    cx: &mut crate::paint::PaintCx<'_>,
+) {
+    let style = TextStyle::from_computed(&ComputedStyle::initial(cx.env));
+    let preedit = TextLayout::build(
+        text,
+        &style,
+        cx.fonts,
+        None,
+        WrapMode::None,
+        Ellipsize::None,
+    );
+    preedit.draw(
+        canvas,
+        (
+            content.x - scroll.0 + caret.x,
+            content.y - scroll.1 + caret.y,
+        ),
+        color,
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{UndoStack, clamp_to_boundary};
+    use super::{TextEditState, UndoStack, clamp_to_boundary};
+    use crate::css::node::Node;
+    use crate::text_input::Preedit;
+    use crate::widgets::Headless;
     use std::time::Duration;
+
+    fn edit_with(text: &str) -> (Headless, TextEditState) {
+        let mut hx = Headless::new();
+        let parent = Node::new("entry");
+        let state = TextEditState::build(&parent, text, &mut hx.cx());
+        (hx, state)
+    }
 
     #[test]
     fn a_caret_landing_inside_a_codepoint_walks_back_to_its_start() {
@@ -597,5 +865,80 @@ mod tests {
             assert!(depth <= UndoStack::MAX_STEPS, "the stack must be bounded");
         }
         assert_eq!(depth, UndoStack::MAX_STEPS);
+    }
+
+    #[test]
+    fn an_ime_commit_replaces_the_selection_and_records_one_undo_step() {
+        // mutation: splice at the cursor instead of the selection and
+        // " world" survives; mutation: skip `undo.record` and the undo below
+        // returns `None`.
+        let (_hx, mut edit) = edit_with("hello world");
+        edit.cursor = 5;
+        edit.anchor = Some(11);
+        assert!(edit.apply_ime_commit("there", Duration::ZERO));
+        assert_eq!(edit.buffer, "hellothere");
+        assert_eq!(edit.cursor, 10);
+        assert_eq!(edit.anchor, None);
+        assert_eq!(
+            edit.undo.undo(),
+            Some(("hello world".to_owned(), 10)),
+            "one step back to the pre-commit buffer"
+        );
+    }
+
+    #[test]
+    fn an_ime_commit_with_no_change_reports_unchanged() {
+        // mutation: always return `true` and the controller fires a spurious
+        // `Change` (and an `ime_sync`) for an empty commit.
+        let (_hx, mut edit) = edit_with("hi");
+        assert!(!edit.apply_ime_commit("", Duration::ZERO));
+        assert_eq!(edit.buffer, "hi");
+    }
+
+    #[test]
+    fn a_preedit_is_display_only_until_the_commit_lands() {
+        // mutation: write the preedit text into `buffer` and the assertion
+        // below sees it early; mutation: leave `preedit` set after the commit
+        // and a stale composition keeps painting.
+        let (_hx, mut edit) = edit_with("hi");
+        edit.apply_ime_preedit(Some(Preedit {
+            text: "に".to_owned(),
+            cursor_begin: 3,
+            cursor_end: 3,
+        }));
+        assert_eq!(edit.buffer, "hi", "preedit must not touch the buffer");
+        assert!(edit.preedit.is_some());
+        assert!(edit.apply_ime_commit("に", Duration::ZERO));
+        assert_eq!(edit.buffer, "hiに");
+        assert_eq!(edit.preedit, None, "the commit consumes the preedit");
+    }
+
+    #[test]
+    fn an_ime_delete_clamps_to_char_boundaries() {
+        // mutation: slice at the raw byte offsets and this panics inside the
+        // emoji; mutation: ignore the undo record and Ctrl+Z cannot restore.
+        let (_hx, mut edit) = edit_with("a\u{1F600}c");
+        edit.cursor = 5;
+        assert!(edit.apply_ime_delete(4, 0, Duration::ZERO));
+        assert_eq!(edit.buffer, "ac");
+        assert_eq!(edit.cursor, 1);
+        assert_eq!(
+            edit.undo.undo().map(|(buffer, _)| buffer),
+            Some("a\u{1F600}c".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_model_text_write_clears_a_pending_preedit() {
+        // mutation: drop the clear in `set_text` and a model-driven buffer
+        // swap leaves a stale composition painting over the new text.
+        let (mut hx, mut edit) = edit_with("hi");
+        edit.apply_ime_preedit(Some(Preedit {
+            text: "に".to_owned(),
+            cursor_begin: 3,
+            cursor_end: 3,
+        }));
+        edit.set_text("bye", &mut hx.cx());
+        assert_eq!(edit.preedit, None);
     }
 }

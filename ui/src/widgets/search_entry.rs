@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::css::node::Node;
 use crate::layout::Rect;
+use crate::text_input::{ContentHint, ContentPurpose};
 use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{EditOutcome, TextEditState};
@@ -138,6 +139,14 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
                 cx.handled = true;
             }
         }
+        // An IME session follows the focus; composition applies to the
+        // shared engine. See `TextEditState::ime_event`.
+        if let Some(msgs) = self
+            .edit
+            .ime_event(ev, cx, ContentHint::NONE, ContentPurpose::Normal)
+        {
+            return msgs;
+        }
         let Event::Key(key) = ev else {
             return Vec::new();
         };
@@ -149,6 +158,8 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
             }
             EditOutcome::Changed => {
                 cx.handled = true;
+                self.edit
+                    .ime_resync(cx, ContentHint::NONE, ContentPurpose::Normal);
                 // Every edit restarts the debounce window.
                 self.pending_since =
                     Some(cx.clock.now() + Duration::from_millis(u64::from(self.delay_ms)));
@@ -203,7 +214,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
         canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
         alloc: &crate::layout::Allocation,
         style: &crate::css::computed::ComputedStyle,
-        _cx: &mut crate::view::controller::PaintCx<'_>,
+        cx: &mut crate::view::controller::PaintCx<'_>,
     ) -> bool {
         let content = alloc.content_box;
         for rect in self.edit.layout.selection_rects(self.edit.selection()) {
@@ -220,9 +231,65 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
             (content.x - self.edit.scroll_offset, content.y),
             style.color(),
         );
+        // An in-flight composition paints at the caret, ahead of it.
+        self.edit.paint_preedit(canvas, &content, style.color(), cx);
         let caret = self.edit.layout.caret_rect(self.edit.cursor);
         let placed = Rect::new(content.x + caret.x, content.y + caret.y, 1.0, caret.height);
         canvas.draw_rect(&placed.to_skia(), &crate::paint::fill_paint(style.color()));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::view::cmd::Cmd;
+    use crate::view::controller::Event;
+    use crate::view::{EventKind, Handler, Handlers, Kind, Prop, PropName, Props};
+    use crate::widgets::{Headless, build_widget};
+    use crate::window::focus::FocusCause;
+
+    fn search_hi() -> (Headless, crate::widgets::BuiltWidget<String>) {
+        let mut props = Props::default();
+        props.set(PropName::Text, Prop::Str("hi".into()));
+        (
+            Headless::new(),
+            build_widget::<String>(Kind::SearchEntry, &props),
+        )
+    }
+
+    #[test]
+    fn focus_in_enables_ime_and_a_commit_fires_change() {
+        // mutation: skip the `ime_event` call and FocusIn emits nothing
+        // while the commit never reaches the buffer.
+        let (mut hx, built) = search_hi();
+        let mut c = built.controller;
+        let mut cx = hx.event_cx::<String>(&built.node);
+        c.on_event(
+            &Event::FocusIn {
+                cause: FocusCause::Pointer,
+            },
+            &mut cx,
+        );
+        let enables = cx
+            .cmds
+            .iter()
+            .filter(|cmd| matches!(cmd, Cmd::ImeEnable { purpose: 0, .. }))
+            .count();
+        assert_eq!(
+            enables, 1,
+            "a search entry enables purpose normal, saw {:?}",
+            cx.cmds
+        );
+
+        let mut cx = hx.event_cx_with_handlers(&built.node, |handlers: &mut Handlers<String>| {
+            handlers.set(
+                EventKind::Change,
+                Handler::Text(Rc::new(|text: &str| text.to_owned())),
+            );
+        });
+        let msgs = c.on_event(&Event::ImeCommit("に".to_owned()), &mut cx);
+        assert_eq!(msgs, vec!["hiに".to_owned()]);
     }
 }
