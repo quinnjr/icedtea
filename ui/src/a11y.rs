@@ -82,11 +82,7 @@ impl A11yTree {
     /// Rebuild after a reconcile. Identical to [`A11yTree::build_full`] in
     /// this slice — ids are stable by construction, which is what the
     /// transition test asserts; true diffing is bus-slice work.
-    pub fn update<Msg>(
-        &mut self,
-        instances: &[Instance<Msg>],
-        focus: Option<&Node>,
-    ) -> TreeUpdate {
+    pub fn update<Msg>(&mut self, instances: &[Instance<Msg>], focus: Option<&Node>) -> TreeUpdate {
         self.build_full(instances, focus)
     }
 
@@ -99,13 +95,11 @@ impl A11yTree {
     /// The node built for `id` in the last update, if any.
     #[must_use]
     pub fn node_for(&self, id: NodeId) -> Option<&A11yNode> {
-        self.last.as_ref()?.nodes.iter().find_map(|(nid, node)| {
-            if *nid == id {
-                Some(node)
-            } else {
-                None
-            }
-        })
+        self.last.as_ref()?.nodes.iter().find_map(
+            |(nid, node)| {
+                if *nid == id { Some(node) } else { None }
+            },
+        )
     }
 
     /// The stable id for a retained node, allocating on first sight.
@@ -267,12 +261,7 @@ fn fill<Msg>(instance: &Instance<Msg>, node: &mut A11yNode, option_at: Option<(u
             if let Some(name) = label_text(instance) {
                 node.set_label(name);
             }
-            node.set_selected(
-                instance
-                    .node
-                    .states()
-                    .contains(PseudoStates::SELECTED),
-            );
+            node.set_selected(instance.node.states().contains(PseudoStates::SELECTED));
             if let Some((position, total)) = option_at {
                 node.set_position_in_set(position);
                 node.set_size_of_set(total);
@@ -302,11 +291,7 @@ fn fill<Msg>(instance: &Instance<Msg>, node: &mut A11yNode, option_at: Option<(u
 
 /// Disabled, hidden, focusable, tooltip — the flags every node shares.
 fn apply_common<Msg>(instance: &Instance<Msg>, node: &mut A11yNode) {
-    if instance
-        .node
-        .states()
-        .contains(PseudoStates::DISABLED)
-    {
+    if instance.node.states().contains(PseudoStates::DISABLED) {
         node.set_disabled();
     }
     if !instance.props.bool(PropName::Visible, true) {

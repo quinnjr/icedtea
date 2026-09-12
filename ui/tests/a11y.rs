@@ -88,10 +88,7 @@ fn list() -> View<Msg> {
     let row = |id: u64, text: &str| {
         View::new(Kind::ListBoxRow)
             .key(id)
-            .child(
-                View::new(Kind::Label)
-                    .prop(PropName::Label, Prop::Str(Rc::from(text))),
-            )
+            .child(View::new(Kind::Label).prop(PropName::Label, Prop::Str(Rc::from(text))))
     };
     View::new(Kind::ListBox)
         .key("list")
@@ -110,7 +107,7 @@ fn node_with_label(update: &TreeUpdate, label: &str) -> (accesskit::NodeId, acce
     update
         .nodes
         .iter()
-        .find(|(_, n)| n.label().as_deref() == Some(label) || n.value().as_deref() == Some(label))
+        .find(|(_, n)| n.label() == Some(label) || n.value() == Some(label))
         .map(|(id, n)| (*id, n.clone()))
         .unwrap_or_else(|| panic!("no a11y node named {label:?}"))
 }
@@ -176,15 +173,20 @@ fn focus_disabled_checked_transitions_update_the_tree() {
     let root = Node::new("window");
     let _ = &root;
     let mut disabled_entry = entry("abc");
-    disabled_entry.props.set(PropName::Sensitive, Prop::Bool(false));
-    let mut checked_switch = switch();
-    checked_switch
+    disabled_entry
         .props
-        .set(PropName::Active, Prop::Bool(true));
+        .set(PropName::Sensitive, Prop::Bool(false));
+    let mut checked_switch = switch();
+    checked_switch.props.set(PropName::Active, Prop::Bool(true));
     reconcile(
         &_root,
         &mut instances,
-        vec![button("Save"), disabled_entry, check("Agree"), checked_switch],
+        vec![
+            button("Save"),
+            disabled_entry,
+            check("Agree"),
+            checked_switch,
+        ],
         &mut hx.cx(),
     );
     let focus_node = instances[0].node.clone();
@@ -240,7 +242,7 @@ fn password_value_is_never_exposed() {
         .map(|(id, n)| (*id, n.clone()))
         .expect("a PasswordInput node");
     assert!(
-        node.value().is_none() || node.value().as_deref() == Some(""),
+        node.value().is_none() || node.value() == Some(""),
         "password text must not leak, got {:?}",
         node.value()
     );
