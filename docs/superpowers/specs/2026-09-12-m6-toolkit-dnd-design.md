@@ -137,6 +137,12 @@ clear, covered by a deletion-verified test.
 
 ## 6. What is NOT in scope
 
+- **Dedicated widget controllers.** v1 sources/targets are `GenericC`
+  nodes (deviation M6-D2: e.g. `ListBoxRow`; `Button`/`Box`/`Label` have
+  their own controllers whose trait defaults keep them out). Adopting the
+  shared widget helper / per-kind overrides (`drag_offer` + `drop_accepts`
+  + the six `Event` arms) is a mechanical follow-up — three lines per
+  kind — deliberately left for the widget owners.
 - **Touch drags.** Pointer only. (M4.2 covers touch crate-side; a toolkit
   touch-drag arm is a follow-up, same shape as §5's motion arm.)
 - **Drag icons / drag cursors.** No pixmap follows the pointer v1; noted
