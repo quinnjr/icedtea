@@ -93,6 +93,26 @@ pub enum Event {
     },
     /// This node lost the focus.
     FocusOut,
+    /// An IME `preedit_string` landed for the focused node: display-only
+    /// composing text, never written to the buffer.
+    ImePreedit {
+        /// The composing text.
+        text: String,
+        /// Byte offset of the cursor within `text`.
+        cursor_begin: i32,
+        /// Selection end within `text`.
+        cursor_end: i32,
+    },
+    /// An IME `commit_string` landed for the focused node.
+    ImeCommit(String),
+    /// An IME `delete_surrounding_text` landed for the focused node, as
+    /// UTF-8 byte lengths around the cursor.
+    ImeDelete {
+        /// Bytes to delete before the cursor.
+        before: u32,
+        /// Bytes to delete after the cursor.
+        after: u32,
+    },
     /// Space/Enter, or a click that completed inside — the "activate" GTK
     /// means.
     Activate,

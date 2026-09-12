@@ -8,6 +8,8 @@
 //! map to the wire `content_type` values. The live proxy wrapper
 //! ([`TextInputConn`]) and the `Window` wiring sit on top of this.
 
+use crate::css::node::Node;
+use crate::layout::{LayoutTree, Rect};
 use crate::widgets::edit::clamp_to_boundary;
 
 /// Apply an IME `commit_string` to `buffer`: replace the selection
@@ -134,6 +136,63 @@ pub struct Snapshot {
     pub purpose: u32,
     /// Cursor rectangle in surface-local coordinates (x, y, w, h).
     pub cursor_rect: (i32, i32, i32, i32),
+}
+
+impl Snapshot {
+    /// Build a snapshot from live widget state. Offsets are clamped to
+    /// `char` boundaries and saturated to the wire's `i32`: controllers
+    /// always hold valid offsets, but this is the trust boundary, so it
+    /// does not assume that.
+    #[must_use]
+    pub fn new(
+        buffer: &str,
+        cursor: usize,
+        anchor: Option<usize>,
+        hint: ContentHint,
+        purpose: ContentPurpose,
+        cursor_rect: (i32, i32, i32, i32),
+    ) -> Self {
+        fn wire(offset: usize) -> i32 {
+            i32::try_from(offset).unwrap_or(i32::MAX)
+        }
+        let cursor = clamp_to_boundary(buffer, cursor);
+        let anchor = clamp_to_boundary(buffer, anchor.unwrap_or(cursor));
+        Snapshot {
+            surrounding: buffer.to_owned(),
+            cursor: wire(cursor),
+            anchor: wire(anchor),
+            hint: hint.wire(),
+            purpose: purpose.wire(),
+            cursor_rect,
+        }
+    }
+}
+
+/// The caret's surface-local rectangle for `set_cursor_rectangle`.
+///
+/// `tree.allocation(node)` is absolute (surface space); the `caret` rect the
+/// layout reports is relative to the shaped line's origin, which paints at
+/// the content-box origin minus the horizontal scroll. Falls back to an
+/// empty rect at the origin when nothing is laid out yet — the next sync
+/// after layout repairs it.
+#[must_use]
+pub fn caret_surface_rect(
+    tree: &LayoutTree,
+    node: &Node,
+    caret: &Rect,
+    scroll_offset: f32,
+) -> (i32, i32, i32, i32) {
+    let Some(alloc) = tree.allocation(node) else {
+        return (0, 0, 0, 0);
+    };
+    let x = alloc.content_box.x - scroll_offset + caret.x;
+    let y = alloc.content_box.y + caret.y;
+    (
+        x as i32,
+        y as i32,
+        caret.width.max(1.0) as i32,
+        caret.height as i32,
+    )
 }
 
 /// The double-buffered client state: staged values are diffed against the

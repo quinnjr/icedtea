@@ -23,11 +23,15 @@ use std::time::Duration;
 
 use crate::css::computed::ComputedStyle;
 use crate::css::node::Node;
+use crate::layout::LayoutTree;
 use crate::text::{Ellipsize, TextLayout, TextStyle, WrapMode};
-use crate::text_input::{Preedit, apply_commit_string, apply_delete_surrounding};
+use crate::text_input::{
+    ContentHint, ContentPurpose, Preedit, Snapshot, apply_commit_string, apply_delete_surrounding,
+    caret_surface_rect,
+};
 use crate::view::BuildCx;
 use crate::view::cmd::Cmd;
-use crate::view::controller::EventCx;
+use crate::view::controller::{Event, EventCx};
 use crate::window::keyboard::{KeyEvent, Mods};
 
 /// Clamp `offset` into `s`, walking *down* to the nearest `char` boundary.
@@ -355,6 +359,174 @@ impl TextEditState {
     /// `None` clears a pending preedit (the protocol's null preedit string).
     pub fn apply_ime_preedit(&mut self, preedit: Option<Preedit>) {
         self.preedit = preedit;
+    }
+
+    /// The `ImeEnable` + `ImeSync` pair a controller pushes on `FocusIn`:
+    /// enable first (the relay treats enable as fresh state), then the
+    /// buffer's current surrounding text, content type and cursor rectangle.
+    pub fn ime_enable_cmds<Msg>(
+        &self,
+        hint: ContentHint,
+        purpose: ContentPurpose,
+        tree: &LayoutTree,
+        node: &Node,
+    ) -> [Cmd<Msg>; 2] {
+        [
+            Cmd::ImeEnable {
+                hint: hint.wire(),
+                purpose: purpose.wire(),
+            },
+            self.ime_sync_cmd(hint, purpose, tree, node),
+        ]
+    }
+
+    /// The `ImeSync` a controller pushes whenever the buffer or the caret
+    /// moves while focused.
+    pub fn ime_sync_cmd<Msg>(
+        &self,
+        hint: ContentHint,
+        purpose: ContentPurpose,
+        tree: &LayoutTree,
+        node: &Node,
+    ) -> Cmd<Msg> {
+        let caret = self.layout.caret_rect(self.cursor);
+        Cmd::ImeSync(Snapshot::new(
+            &self.buffer,
+            self.cursor,
+            self.anchor,
+            hint,
+            purpose,
+            caret_surface_rect(tree, node, &caret, self.scroll_offset),
+        ))
+    }
+
+    /// Push the `ImeSync` for a buffer or caret move while focused.
+    pub fn ime_resync<Msg>(
+        &self,
+        cx: &mut EventCx<'_, Msg>,
+        hint: ContentHint,
+        purpose: ContentPurpose,
+    ) {
+        let tree = cx.tree;
+        let node = cx.node;
+        cx.cmds.push(self.ime_sync_cmd(hint, purpose, tree, node));
+    }
+
+    /// Handle `FocusIn`/`FocusOut` and the IME event family for the embedding
+    /// controller. Returns `Some(messages)` when handled — pushing any
+    /// `Cmd::Ime*` into `cx.cmds` — or `None` when `ev` is none of those and
+    /// the controller should keep going (pointer, key, …).
+    ///
+    /// An IME session follows the focus: `FocusIn` enables (with the
+    /// buffer's current state), `FocusOut` disables. Composition applies to
+    /// the engine; only a real buffer change fires `Change` (and re-syncs
+    /// the new surrounding text back to the IME, which is what lets the
+    /// relay re-forward it).
+    pub fn ime_event<Msg: Clone + 'static>(
+        &mut self,
+        ev: &Event,
+        cx: &mut EventCx<'_, Msg>,
+        hint: ContentHint,
+        purpose: ContentPurpose,
+    ) -> Option<Vec<Msg>> {
+        match ev {
+            Event::FocusIn { .. } => {
+                let tree = cx.tree;
+                let node = cx.node;
+                cx.cmds
+                    .extend(self.ime_enable_cmds(hint, purpose, tree, node));
+                Some(Vec::new())
+            }
+            Event::FocusOut => {
+                cx.cmds.push(Cmd::ImeDisable);
+                Some(Vec::new())
+            }
+            Event::ImePreedit { text, cursor_begin, cursor_end } => {
+                self.apply_ime_preedit(Some(Preedit {
+                    text: text.clone(),
+                    cursor_begin: *cursor_begin,
+                    cursor_end: *cursor_end,
+                }));
+                Some(Vec::new())
+            }
+            Event::ImeCommit(text) => {
+                let now = cx.clock.now();
+                if self.apply_ime_commit(text, now) {
+                    cx.handled = true;
+                    self.ime_resync(cx, hint, purpose);
+                    let buffer = self.buffer.clone();
+                    Some(
+                        cx.handlers
+                            .fire_text(crate::view::EventKind::Change, &buffer)
+                            .map_or_else(Vec::new, |m| vec![m]),
+                    )
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            Event::ImeDelete { before, after } => {
+                let now = cx.clock.now();
+                if self.apply_ime_delete(*before, *after, now) {
+                    cx.handled = true;
+                    self.ime_resync(cx, hint, purpose);
+                    let buffer = self.buffer.clone();
+                    Some(
+                        cx.handlers
+                            .fire_text(crate::view::EventKind::Change, &buffer)
+                            .map_or_else(Vec::new, |m| vec![m]),
+                    )
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// What the pending preedit paints as, or `None` when no composition is
+    /// staged. Masked (one bullet per character) while `visibility` is off,
+    /// so a password entry never paints raw composing text.
+    #[must_use]
+    pub fn preedit_display(&self) -> Option<String> {
+        self.preedit.as_ref().map(|preedit| {
+            if self.visibility {
+                preedit.text.clone()
+            } else {
+                Self::INVISIBLE
+                    .to_string()
+                    .repeat(preedit.text.chars().count())
+            }
+        })
+    }
+
+    /// Paint the pending preedit at the caret, if one is staged: the display
+    /// string over a throwaway single-line layout at the caret origin, then
+    /// the caret itself after it. A no-op without a preedit.
+    pub fn paint_preedit(
+        &self,
+        canvas: &mut skia_rs_safe::canvas::Canvas<'_>,
+        content: &crate::layout::Rect,
+        color: crate::css::value::Rgba,
+        cx: &mut crate::paint::PaintCx<'_>,
+    ) {
+        let Some(text) = self.preedit_display() else {
+            return;
+        };
+        let caret = self.layout.caret_rect(self.cursor);
+        let style = TextStyle::from_computed(&ComputedStyle::initial(cx.env));
+        let preedit = TextLayout::build(
+            &text,
+            &style,
+            cx.fonts,
+            None,
+            WrapMode::None,
+            Ellipsize::None,
+        );
+        preedit.draw(
+            canvas,
+            (content.x - self.scroll_offset + caret.x, content.y + caret.y),
+            color,
+        );
     }
 
     /// Apply an IME `commit_string`: splice `text` over the selection, record
