@@ -82,7 +82,7 @@ maintain (`DISABLED`, `CHECKED`, `SELECTED`) plus the window focus ring.
 | `PasswordEntry` | `PasswordInput` | masked value **not** exposed (empty `value`) | `Disabled`, `ReadOnly` as above |
 | `CheckButton` | `CheckBox` | `Label` | `Toggled::True/False` ← `:checked`; `Mixed` ← `:indeterminate`; `Disabled` |
 | `Switch` | `Switch` | `Label` or tooltip | `Toggled` ← `:checked`; `Disabled` |
-| `DropDown` | `ComboBox` + `ListBoxOption` children | `Selected` index → child `Selected` + parent `value` | `Expanded` ← open state; `Disabled` |
+| `DropDown` | `ComboBox` (value = selected item text from `Model`+`Selected` props) | `Selected` index → parent `value` | `Disabled`; option children + `Expanded` deferred to the bus slice (options are controller-owned CSS subnodes, not `Instance`s) |
 | `ListBox` + `ListBoxRow`, `ListView` rows | `ListBox` + `ListBoxOption` | row text | `Selected` ← `:selected`; `Multiselectable` ← `SelectionMode::Multiple` |
 | `SpinButton`, `Scale`, `ProgressBar`, `LevelBar` | `SpinButton`, `Slider`, `ProgressIndicator`, `Meter` | `Label`/tooltip | numeric value/min/max |
 | Panel/taskbar items (shell `Button`/`MenuButton` instances) | same as their `Kind` | same | same; window root is `Role::Window` with `Label` = app id |
