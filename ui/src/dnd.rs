@@ -226,6 +226,9 @@ enum SessionState {
     Dragging {
         origin: (f32, f32),
         pos: (f32, f32),
+        /// The arming press serial, kept for the seat offer (§7): the
+        /// compositor validates it when the drag leaves the surface.
+        serial: u32,
     },
 }
 
@@ -288,12 +291,15 @@ impl DragSession {
     }
 
     /// The arming press serial, for the future seat offer (§7 of the design).
-    /// `None` unless armed.
+    /// `None` when idle; kept through the whole drag so `DragStart` can
+    /// still hand it to the seat.
     #[must_use]
     pub fn serial(&self) -> Option<u32> {
         match self.state {
-            SessionState::Armed { serial, .. } => Some(serial),
-            SessionState::Dragging { .. } | SessionState::Idle => None,
+            SessionState::Armed { serial, .. } | SessionState::Dragging { serial, .. } => {
+                Some(serial)
+            }
+            SessionState::Idle => None,
         }
     }
 
@@ -302,16 +308,24 @@ impl DragSession {
     pub fn motion(&mut self, at: (f32, f32)) -> DragTransition {
         match self.state {
             SessionState::Idle => DragTransition::None,
-            SessionState::Armed { origin, .. } => {
+            SessionState::Armed { origin, serial, .. } => {
                 if beyond_threshold(origin, at) {
-                    self.state = SessionState::Dragging { origin, pos: at };
+                    self.state = SessionState::Dragging {
+                        origin,
+                        pos: at,
+                        serial,
+                    };
                     DragTransition::BeganDragging
                 } else {
                     DragTransition::StillArmed
                 }
             }
-            SessionState::Dragging { origin, .. } => {
-                self.state = SessionState::Dragging { origin, pos: at };
+            SessionState::Dragging { origin, serial, .. } => {
+                self.state = SessionState::Dragging {
+                    origin,
+                    pos: at,
+                    serial,
+                };
                 DragTransition::Moved
             }
         }
@@ -496,9 +510,13 @@ mod tests {
         // The threshold crossing reports exactly once.
         assert_eq!(session.motion((0.0, 9.0)), DragTransition::BeganDragging);
         assert!(session.is_dragging());
+        // The arming serial survives into the drag: it is what the future
+        // seat offer validates (§7 of the design).
+        assert_eq!(session.serial(), Some(7));
         assert_eq!(session.motion((0.0, 20.0)), DragTransition::Moved);
         assert_eq!(session.release(), DragOutcome::FinishedDrag);
         assert!(session.is_idle());
+        assert_eq!(session.serial(), None);
     }
 
     #[test]
