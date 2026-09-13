@@ -425,14 +425,29 @@ fn read_config_from_db(db: Database) -> Config {
         // A3 would otherwise load with those keys unbound while
         // `icedtea-session` still takes logind's power-key block inhibitor —
         // every power key a silent no-op. Only *missing* entries are added, so
-        // a user's own binding for one of these actions is never overwritten.
+        // a user's own binding for one of these actions is never overwritten;
+        // and a default whose keysym the user already bound to *another* action
+        // is skipped, so the backfill never introduces a duplicate chord.
         for (action, key) in defaults::POWER_KEY_BINDINGS {
-            cfg.keybindings
-                .entry(action.to_string())
-                .or_insert_with(|| KeyCombo {
+            if cfg.keybindings.contains_key(action) {
+                continue;
+            }
+            let keysym_taken = cfg.keybindings.values().any(|combo| combo.key == key);
+            if keysym_taken {
+                tracing::debug!(
+                    action,
+                    key,
+                    "power-key default skipped: the keysym is already bound"
+                );
+                continue;
+            }
+            cfg.keybindings.insert(
+                action.to_string(),
+                KeyCombo {
                     modifiers: Vec::new(),
                     key: key.to_string(),
-                });
+                },
+            );
         }
         Ok::<Config, redb::Error>(cfg)
     }));
@@ -899,6 +914,53 @@ mod tests {
             );
             assert_eq!(combo.key, key, "{action:?} is bound to {key}");
         }
+    }
+
+    /// If the user already bound a power keysym to a different action (here
+    /// `close`), the backfill must skip the corresponding default rather than
+    /// introduce a second action on the same keysym.
+    #[test]
+    fn the_power_key_backfill_does_not_duplicate_an_already_bound_keysym() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        let mut cfg = default_config();
+        for (action, _) in defaults::POWER_KEY_BINDINGS {
+            cfg.keybindings.remove(action);
+        }
+        cfg.keybindings.insert(
+            "close".into(),
+            KeyCombo {
+                modifiers: Vec::new(),
+                key: "XF86_PowerOff".into(),
+            },
+        );
+        {
+            let db = open(&path).unwrap();
+            cfg.save(&db).unwrap();
+        }
+
+        let loaded = load_or_default(&path);
+        assert!(
+            !loaded
+                .keybindings
+                .contains_key("spawn:icedtea-session lock"),
+            "the power-key default must be skipped when its keysym is taken"
+        );
+        assert_eq!(
+            loaded
+                .keybindings
+                .get("close")
+                .map(|combo| combo.key.as_str()),
+            Some("XF86_PowerOff"),
+            "the user's own binding is preserved"
+        );
+        let on_power_off = loaded
+            .keybindings
+            .iter()
+            .filter(|(_, combo)| combo.key == "XF86_PowerOff")
+            .count();
+        assert_eq!(on_power_off, 1, "exactly one action binds XF86_PowerOff");
     }
 
     #[test]

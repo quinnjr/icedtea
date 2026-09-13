@@ -5,14 +5,16 @@
 //! ordering (confirmation before release) and the bound (never held past the
 //! budget) are observed directly.
 
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use icedtea_session::flow::LockFlow;
-use icedtea_session::logind::{InhibitMode, LogindCall, RecordingLogind};
+use icedtea_session::logind::{InhibitMode, Logind, LogindCall, RecordingLogind};
 use icedtea_session::wm_client::{RecordingWm, WmClient};
+use zbus::zvariant::OwnedObjectPath;
 
 /// A [`WmClient`] whose lock state is "the marker file exists". The stub
 /// locker only marks itself locked by creating that file, so this double
@@ -46,6 +48,105 @@ impl WmClient for MarkerWm {
 
     fn quit(&self) -> bool {
         false
+    }
+}
+
+/// A [`WmClient`] whose lock state the test flips explicitly. Unlike
+/// [`MarkerWm`], confirmation can be withheld while the test checks that the
+/// sleep inhibitor is still held, so the "held until confirmed" ordering is
+/// observed without racing a poll.
+struct GateWm {
+    locked: Arc<AtomicBool>,
+    calls: AtomicUsize,
+    observed_locked: AtomicBool,
+}
+
+impl GateWm {
+    fn new(locked: Arc<AtomicBool>) -> Self {
+        Self {
+            locked,
+            calls: AtomicUsize::new(0),
+            observed_locked: AtomicBool::new(false),
+        }
+    }
+}
+
+impl WmClient for GateWm {
+    fn is_locked(&self) -> bool {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let locked = self.locked.load(Ordering::SeqCst);
+        if locked {
+            self.observed_locked.store(true, Ordering::SeqCst);
+        }
+        locked
+    }
+
+    fn quit(&self) -> bool {
+        false
+    }
+}
+
+/// A [`Logind`] double whose `Session.Lock()` does **not** echo synchronously:
+/// it enqueues a pending `Lock` signal that only the "signal loop" pumps. This
+/// mirrors the real dispatch — `Lock()` returns on the caller's thread while
+/// the `Lock` signal is delivered to the single signal loop, the same loop
+/// that dispatched `PrepareForSleep`.
+struct DeferredLogind {
+    inner: RecordingLogind,
+    lock_tx: Mutex<mpsc::Sender<()>>,
+}
+
+impl DeferredLogind {
+    fn new(session_path: &str, lock_tx: mpsc::Sender<()>) -> Self {
+        Self {
+            inner: RecordingLogind::new(session_path),
+            lock_tx: Mutex::new(lock_tx),
+        }
+    }
+
+    fn live_inhibitors(&self) -> usize {
+        self.inner.live_inhibitors()
+    }
+}
+
+impl Logind for DeferredLogind {
+    fn session_path(&self) -> OwnedObjectPath {
+        self.inner.session_path()
+    }
+
+    fn inhibit(&self, what: &str, why: &str, mode: InhibitMode) -> std::io::Result<OwnedFd> {
+        self.inner.inhibit(what, why, mode)
+    }
+
+    fn lock(&self) -> std::io::Result<()> {
+        // Record the call, but defer the echo: the signal loop delivers it.
+        self.inner.lock()?;
+        self.lock_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(())
+            .ok();
+        Ok(())
+    }
+
+    fn unlock(&self) -> std::io::Result<()> {
+        self.inner.unlock()
+    }
+
+    fn suspend(&self) -> std::io::Result<()> {
+        self.inner.suspend()
+    }
+
+    fn hibernate(&self) -> std::io::Result<()> {
+        self.inner.hibernate()
+    }
+
+    fn power_off(&self) -> std::io::Result<()> {
+        self.inner.power_off()
+    }
+
+    fn reboot(&self) -> std::io::Result<()> {
+        self.inner.reboot()
     }
 }
 
@@ -118,6 +219,23 @@ fn wait_for_call(logind: &RecordingLogind, call: &LogindCall) -> bool {
     false
 }
 
+/// Wait until `count()` reports exactly `expected` live inhibitors. The sleep
+/// delay inhibitor is released by the pre-sleep worker asynchronously, so its
+/// close (and therefore `live_inhibitors` dropping) is the observable for
+/// "suspend was released".
+fn wait_for_inhibitors(count: impl Fn() -> usize, expected: usize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if count() == expected {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return count() == expected;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Build a flow and wire `RecordingLogind`'s `Lock` echo to its funnel.
 /// `on_idle`/`on_prepare_for_sleep` only *request* a lock from logind; in
 /// production logind answers with the `Lock` signal, and the signal loop calls
@@ -148,11 +266,74 @@ fn wired_flow(
     flow
 }
 
+/// The regression test for the pre-sleep deadlock: `PrepareForSleep` is
+/// dispatched on the logind signal-loop thread, and the `Lock` signal that
+/// spawns the locker can only be delivered by that same thread. Here `lock()`
+/// does not echo synchronously; the pending `Lock` is pumped by the "signal
+/// loop" thread, which is also the thread that dispatched `PrepareForSleep`.
+/// If `on_prepare_for_sleep` blocks that loop, the funnel is starved: the
+/// locker never spawns, the budget burns, and the delay inhibitor is released
+/// with the screen still unlocked.
+#[test]
+fn prepare_for_sleep_does_not_starve_the_lock_funnel() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("presleep");
+    let (lock_tx, lock_rx) = mpsc::channel();
+    let logind = Arc::new(DeferredLogind::new(session_path(), lock_tx));
+    let locked = Arc::new(AtomicBool::new(false));
+    let wm = Arc::new(GateWm::new(Arc::clone(&locked)));
+    let flow = Arc::new(LockFlow::with_timing(
+        logind.clone(),
+        wm.clone(),
+        Some(locker_command(&marker, 0.0, 30.0)),
+        true,
+        Duration::from_millis(10),
+        Duration::from_secs(3),
+    ));
+
+    // The signal loop: dispatch `PrepareForSleep` on this thread, then keep
+    // pumping the deferred `Lock` signals. A prepare that blocks here never
+    // reaches `recv`, so the funnel is deadlocked.
+    let loop_flow = Arc::clone(&flow);
+    std::thread::spawn(move || {
+        loop_flow.on_prepare_for_sleep(true);
+        while lock_rx.recv().is_ok() {
+            loop_flow.on_lock();
+        }
+    });
+
+    // The funnel must stay alive: the locker spawns while the delay inhibitor
+    // is still held, because the compositor has not confirmed the lock yet.
+    assert!(
+        wait_for_marker(&marker, Duration::from_secs(2)),
+        "PrepareForSleep starved the signal loop; the locker never spawned"
+    );
+    assert!(
+        !wm.observed_locked.load(Ordering::SeqCst),
+        "the lock gate is still closed; no confirmation yet"
+    );
+    assert_eq!(
+        logind.live_inhibitors(),
+        2,
+        "the sleep delay inhibitor must still be held while the lock is unconfirmed"
+    );
+
+    // Confirming the lock lets the worker proceed and release the delay
+    // inhibitor, within the budget.
+    locked.store(true, Ordering::SeqCst);
+    assert!(
+        wait_for_inhibitors(|| logind.live_inhibitors(), 1, Duration::from_secs(2)),
+        "the delay inhibitor must be released once the lock is confirmed"
+    );
+    assert!(wm.observed_locked.load(Ordering::SeqCst));
+
+    flow.on_unlock();
+}
+
 /// `PrepareForSleep(true)` with a configured locker: exactly one locker is
-/// spawned, and the flow only returns — releasing the sleep inhibitor, via the
-/// `Drop` guard — after the compositor has observed the lock (the marker). The
-/// `observed_locked` flag is set inside a poll that only runs before the
-/// release, so it proves the waiter was still held when the marker appeared.
+/// spawned, and the sleep inhibitor is only released after the compositor has
+/// observed the lock (the marker). The worker holds the delay guard across the
+/// bounded wait, so the release `live_inhibitors` observes is the confirmation.
 #[test]
 fn prepare_for_sleep_spawns_one_locker_and_releases_after_the_marker() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -168,19 +349,20 @@ fn prepare_for_sleep_spawns_one_locker_and_releases_after_the_marker() {
         Duration::from_secs(2),
     );
 
-    let start = Instant::now();
     flow.on_prepare_for_sleep(true);
-    let elapsed = start.elapsed();
 
-    assert!(marker.exists(), "the locker ran and marked itself locked");
+    assert!(
+        wait_for_marker(&marker, Duration::from_secs(2)),
+        "the locker ran and marked itself locked"
+    );
     assert_eq!(marker_lines(&marker), 1, "exactly one locker spawned");
     assert!(
-        wm.observed_locked.load(Ordering::SeqCst),
-        "the flow waited until the lock was confirmed (marker) before proceeding"
+        wait_for_inhibitors(|| logind.live_inhibitors(), 1, Duration::from_secs(2)),
+        "the sleep delay inhibitor was released only after the lock was confirmed"
     );
     assert!(
-        elapsed >= Duration::from_millis(250),
-        "did not proceed before the marker: {elapsed:?}"
+        wm.observed_locked.load(Ordering::SeqCst),
+        "the flow waited until the lock was confirmed (marker) before releasing"
     );
     assert!(
         acquired_inhibitor(&logind, InhibitMode::Delay),
@@ -218,18 +400,19 @@ fn prepare_for_sleep_waits_for_an_unconfirmed_running_locker() {
         "the running locker has not taken the lock yet"
     );
 
-    let start = Instant::now();
     flow.on_prepare_for_sleep(true);
-    let elapsed = start.elapsed();
 
-    assert!(marker.exists());
+    assert!(
+        wait_for_marker(&marker, Duration::from_secs(2)),
+        "the running locker confirmed the lock"
+    );
+    assert!(
+        wait_for_inhibitors(|| logind.live_inhibitors(), 1, Duration::from_secs(2)),
+        "the delay was held until the running locker confirmed"
+    );
     assert!(
         wm.observed_locked.load(Ordering::SeqCst),
         "prepare-for-sleep waited for the running locker to confirm the lock"
-    );
-    assert!(
-        elapsed >= Duration::from_millis(250),
-        "did not skip the wait on an unconfirmed locker: {elapsed:?}"
     );
     assert_eq!(marker_lines(&marker), 1, "no second locker spawned");
 
@@ -279,7 +462,7 @@ fn lock_before_sleep_disabled_does_not_wait_on_a_running_locker() {
 }
 
 /// A locker that never confirms the lock still must not hold sleep past the
-/// budget: the flow returns (releasing the inhibitor) anyway.
+/// budget: the worker releases the inhibitor anyway.
 #[test]
 fn a_locker_that_never_confirms_is_released_within_the_budget() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -297,6 +480,11 @@ fn a_locker_that_never_confirms_is_released_within_the_budget() {
 
     let start = Instant::now();
     flow.on_prepare_for_sleep(true);
+
+    assert!(
+        wait_for_inhibitors(|| logind.live_inhibitors(), 1, Duration::from_secs(2)),
+        "the un-confirmed lock was released"
+    );
     let elapsed = start.elapsed();
 
     assert!(!marker.exists(), "the never-confirming stub wrote nothing");
