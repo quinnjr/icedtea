@@ -633,6 +633,32 @@ mod tests {
         );
     }
 
+    /// Pins the wire member the shell's logout path calls into (pinned on
+    /// that side by `compositor_client.rs`'s
+    /// `quit_member_matches_the_compositor_interface`): member `Quit`
+    /// taking no arguments and returning none. Generated from the live
+    /// interface object, not a repeated literal — removing or renaming the
+    /// method fails here instead of degrading to a silent no-method call
+    /// (logout doing nothing) at runtime.
+    #[test]
+    fn quit_is_exposed_as_quit_with_no_arguments() {
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let (_held, wake) =
+            std::os::unix::net::UnixStream::pair().expect("wake pair for interface probe");
+        let iface = CompositorInterface { cmd_tx, wake };
+        let mut xml = String::new();
+        iface.introspect_to_writer(&mut xml, 0);
+        let method = xml
+            .split("<method")
+            .find(|chunk| chunk.contains("name=\"Quit\""))
+            .expect("Quit member present in introspection XML: {xml}");
+        let body = &method[..method.find("</method>").unwrap_or(method.len())];
+        assert!(
+            !body.contains("direction=\"in\"") && !body.contains("direction=\"out\""),
+            "Quit takes no arguments and returns nothing: {body}"
+        );
+    }
+
     #[test]
     fn event_names_match_interface() {
         assert_eq!(

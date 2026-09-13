@@ -455,7 +455,14 @@ impl Config {
         let write_txn = db.begin_write()?;
         {
             let mut launcher = write_txn.open_table(DB_LAUNCHER)?;
-            let launcher_bytes = serde_json::to_vec(&self.launcher).unwrap();
+            // No `unwrap`: unlike the main-thread saves above, this runs on
+            // the launcher's foreign write-back thread (`run_surface` →
+            // `persist_launcher_config`), where the crate's never-panic
+            // contract holds absolutely. Serialization of this section is
+            // infallible in practice (string-keyed maps, no floats), so the
+            // mapping below is unreachable hardening, not a live error path.
+            let launcher_bytes =
+                serde_json::to_vec(&self.launcher).map_err(std::io::Error::other)?;
             launcher.insert(KEY_LAUNCHER, launcher_bytes.as_slice())?;
         }
         Ok(write_txn.commit()?)
