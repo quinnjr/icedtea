@@ -5,6 +5,10 @@ pub mod types;
 
 pub const COMPOSITOR_BUS_NAME: &str = "org.icedtea.Compositor";
 pub const COMPOSITOR_PATH: &str = "/org/icedtea/Compositor";
+/// The `org.icedtea.Compositor` D-Bus interface name. Shared by the shell's
+/// proxy, the session daemon's `WmClient`, and the settings reload path so the
+/// literal lives in exactly one place.
+pub const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 
 /// The `org.icedtea.Compositor` wire-contract revision, exposed on the bus as
 /// the interface's read-only `Version` property and compiled into every

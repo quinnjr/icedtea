@@ -8,13 +8,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_PATH};
+use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_IFACE, COMPOSITOR_PATH};
 use zbus::blocking::Connection;
-
-/// The compositor's D-Bus interface name. `contract` exports the bus name and
-/// object path but not the interface literal, so it is pinned here (and in
-/// `shell/src/compositor_client.rs`).
-const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 
 /// Wire member for [`WmClient::is_locked`], kept named so the pin test below
 /// can check it against the compositor's `IsLocked` introspection test

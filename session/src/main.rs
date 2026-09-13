@@ -54,16 +54,27 @@ fn call_session(member: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match conn.call_method(
-        Some(SESSION_BUS_NAME),
-        SESSION_PATH,
-        Some(SESSION_IFACE),
-        member,
-        &(),
-    ) {
-        Ok(_) => ExitCode::SUCCESS,
+    call_outcome(
+        conn.call_method(
+            Some(SESSION_BUS_NAME),
+            SESSION_PATH,
+            Some(SESSION_IFACE),
+            member,
+            &(),
+        )
+        .map(|_| ()),
+    )
+}
+
+/// Map a session method's result to an exit code: a successful call exits `0`,
+/// and any error — including the `org.icedtea.Session` service replying with a
+/// D-Bus error such as `Failed` (a logind operation that did not go through) —
+/// exits non-zero.
+fn call_outcome(result: zbus::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            tracing::error!(%err, member, "org.icedtea.Session call failed");
+            tracing::error!(%err, "org.icedtea.Session call failed");
             ExitCode::FAILURE
         }
     }
@@ -113,7 +124,9 @@ fn run_daemon() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_subcommand;
+    use std::process::ExitCode;
+
+    use super::{call_outcome, parse_subcommand};
 
     #[test]
     fn subcommands_map_to_their_session_wire_members() {
@@ -129,5 +142,17 @@ mod tests {
     fn an_unknown_subcommand_has_no_wire_member() {
         assert_eq!(parse_subcommand("frobnicate"), None);
         assert_eq!(parse_subcommand(""), None);
+    }
+
+    /// A success reply exits `0`; any error reply — e.g. the service's
+    /// `fdo::Error::Failed` after logind rejected a power action — exits
+    /// non-zero instead of silently reporting success.
+    #[test]
+    fn a_failed_method_call_exits_non_zero() {
+        assert_eq!(call_outcome(Ok(())), ExitCode::SUCCESS);
+        assert_eq!(
+            call_outcome(Err(zbus::Error::Failure("suspend failed".to_string()))),
+            ExitCode::FAILURE
+        );
     }
 }

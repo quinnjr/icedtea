@@ -7,10 +7,13 @@
 //! state and `Quit`), so the whole surface is unit-testable with
 //! `RecordingLogind`/`RecordingWm` and no bus.
 //!
-//! A method never panics on a foreign (D-Bus dispatch) thread: logind/power
-//! errors are logged and dropped, and the compositor seam already collapses
-//! every failure to `false`.
+//! A method never panics on a foreign (D-Bus dispatch) thread: the logind
+//! methods propagate their `io::Error` as a [`zbus::fdo::Error::Failed`] so the
+//! caller's `call_method` sees a D-Bus error reply (and the CLI exits
+//! non-zero), and the compositor seam already collapses every failure to
+//! `false`.
 
+use std::io;
 use std::sync::Arc;
 
 use zbus::blocking::Connection;
@@ -45,43 +48,44 @@ impl SessionInterface {
     }
 }
 
+/// Run one logind operation and, on failure, turn its `io::Error` into a D-Bus
+/// error reply naming the operation. A successful logind call replies `Ok`;
+/// a failed one makes the caller's `call_method` return `Err`, which the CLI
+/// turns into a non-zero exit — the action's outcome is never swallowed.
+fn call_logind(operation: &str, result: io::Result<()>) -> zbus::fdo::Result<()> {
+    result.map_err(|err| {
+        tracing::warn!(%err, operation, "org.icedtea.Session logind call failed");
+        zbus::fdo::Error::Failed(format!("{operation} failed: {err}"))
+    })
+}
+
 #[interface(name = "org.icedtea.Session")]
 impl SessionInterface {
     /// `Session.Lock()` on the login1 proxy.
-    fn lock(&self) {
-        if let Err(err) = self.logind.lock() {
-            tracing::warn!(%err, "org.icedtea.Session.Lock failed");
-        }
+    fn lock(&self) -> zbus::fdo::Result<()> {
+        call_logind("lock", self.logind.lock())
     }
 
     /// `Manager.Suspend(false)`: `false` is logind's non-interactive flag (this
     /// call already comes from the authenticated session's own daemon; see
     /// `ZbusLogind`).
-    fn suspend(&self) {
-        if let Err(err) = self.logind.suspend() {
-            tracing::warn!(%err, "org.icedtea.Session.Suspend failed");
-        }
+    fn suspend(&self) -> zbus::fdo::Result<()> {
+        call_logind("suspend", self.logind.suspend())
     }
 
     /// `Manager.Hibernate(false)`.
-    fn hibernate(&self) {
-        if let Err(err) = self.logind.hibernate() {
-            tracing::warn!(%err, "org.icedtea.Session.Hibernate failed");
-        }
+    fn hibernate(&self) -> zbus::fdo::Result<()> {
+        call_logind("hibernate", self.logind.hibernate())
     }
 
     /// `Manager.PowerOff(false)`.
-    fn power_off(&self) {
-        if let Err(err) = self.logind.power_off() {
-            tracing::warn!(%err, "org.icedtea.Session.PowerOff failed");
-        }
+    fn power_off(&self) -> zbus::fdo::Result<()> {
+        call_logind("power_off", self.logind.power_off())
     }
 
     /// `Manager.Reboot(false)`.
-    fn reboot(&self) {
-        if let Err(err) = self.logind.reboot() {
-            tracing::warn!(%err, "org.icedtea.Session.Reboot failed");
-        }
+    fn reboot(&self) -> zbus::fdo::Result<()> {
+        call_logind("reboot", self.logind.reboot())
     }
 
     /// Forward to `org.icedtea.Compositor`'s `Quit` via [`WmClient`].
@@ -109,12 +113,15 @@ pub fn spawn(logind: SharedLogind, wm: SharedWm) -> zbus::Result<Connection> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::os::fd::OwnedFd;
     use std::sync::Arc;
 
     use zbus::object_server::Interface as _;
+    use zbus::zvariant::OwnedObjectPath;
 
     use super::*;
-    use crate::logind::{LogindCall, RecordingLogind};
+    use crate::logind::{Logind, LogindCall, RecordingLogind};
     use crate::wm_client::{RecordingWm, WmCall};
 
     fn service(locked: bool) -> (SessionInterface, Arc<RecordingLogind>, Arc<RecordingWm>) {
@@ -122,6 +129,39 @@ mod tests {
         let wm = Arc::new(RecordingWm::new(locked));
         let iface = SessionInterface::new(logind.clone(), wm.clone());
         (iface, logind, wm)
+    }
+
+    /// A [`Logind`] whose every fallible operation fails, to prove the service
+    /// turns a failed logind call into a D-Bus error reply rather than a
+    /// success reply.
+    struct FailingLogind;
+
+    impl Logind for FailingLogind {
+        fn session_path(&self) -> OwnedObjectPath {
+            OwnedObjectPath::try_from("/org/freedesktop/login1/session/c1")
+                .expect("a logind session path is a valid D-Bus object path")
+        }
+        fn inhibit(&self, _what: &str, _why: &str) -> io::Result<OwnedFd> {
+            Err(io::Error::other("logind unavailable"))
+        }
+        fn lock(&self) -> io::Result<()> {
+            Err(io::Error::other("logind unavailable"))
+        }
+        fn unlock(&self) -> io::Result<()> {
+            Err(io::Error::other("logind unavailable"))
+        }
+        fn suspend(&self) -> io::Result<()> {
+            Err(io::Error::other("logind unavailable"))
+        }
+        fn hibernate(&self) -> io::Result<()> {
+            Err(io::Error::other("logind unavailable"))
+        }
+        fn power_off(&self) -> io::Result<()> {
+            Err(io::Error::other("logind unavailable"))
+        }
+        fn reboot(&self) -> io::Result<()> {
+            Err(io::Error::other("logind unavailable"))
+        }
     }
 
     /// `LogOut()` must reach the compositor's `Quit()` exactly once — not zero
@@ -136,35 +176,35 @@ mod tests {
     #[test]
     fn lock_calls_logind_once() {
         let (iface, logind, _wm) = service(false);
-        iface.lock();
+        iface.lock().expect("recording logind succeeds");
         assert_eq!(logind.calls(), vec![LogindCall::Lock]);
     }
 
     #[test]
     fn suspend_calls_logind_once() {
         let (iface, logind, _wm) = service(false);
-        iface.suspend();
+        iface.suspend().expect("recording logind succeeds");
         assert_eq!(logind.calls(), vec![LogindCall::Suspend]);
     }
 
     #[test]
     fn hibernate_calls_logind_once() {
         let (iface, logind, _wm) = service(false);
-        iface.hibernate();
+        iface.hibernate().expect("recording logind succeeds");
         assert_eq!(logind.calls(), vec![LogindCall::Hibernate]);
     }
 
     #[test]
     fn power_off_calls_logind_once() {
         let (iface, logind, _wm) = service(false);
-        iface.power_off();
+        iface.power_off().expect("recording logind succeeds");
         assert_eq!(logind.calls(), vec![LogindCall::PowerOff]);
     }
 
     #[test]
     fn reboot_calls_logind_once() {
         let (iface, logind, _wm) = service(false);
-        iface.reboot();
+        iface.reboot().expect("recording logind succeeds");
         assert_eq!(logind.calls(), vec![LogindCall::Reboot]);
     }
 
@@ -175,6 +215,32 @@ mod tests {
 
         let (iface, _logind, _wm) = service(false);
         assert!(!iface.is_locked());
+    }
+
+    /// A failed logind operation must be an error reply, never a success
+    /// reply: the caller's `call_method` then returns `Err` and the CLI exits
+    /// non-zero instead of reporting a power action that never happened.
+    #[test]
+    fn a_failing_logind_call_is_reported_as_an_fdo_error_reply() {
+        let iface =
+            SessionInterface::new(Arc::new(FailingLogind), Arc::new(RecordingWm::new(false)));
+        for (operation, result) in [
+            ("lock", iface.lock()),
+            ("suspend", iface.suspend()),
+            ("hibernate", iface.hibernate()),
+            ("power_off", iface.power_off()),
+            ("reboot", iface.reboot()),
+        ] {
+            match result {
+                Err(zbus::fdo::Error::Failed(message)) => {
+                    assert!(
+                        message.contains(operation),
+                        "{operation}: error reply names the operation: {message}"
+                    );
+                }
+                other => panic!("{operation}: expected fdo::Error::Failed, got {other:?}"),
+            }
+        }
     }
 
     /// Pin the wire surface: every spec method is exposed under its PascalCase

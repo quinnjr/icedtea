@@ -6,13 +6,11 @@
 use async_channel::Sender;
 use futures_util::StreamExt as _;
 use icedtea_contract::{
-    COMPOSITOR_BUS_NAME, COMPOSITOR_CONTRACT_VERSION, COMPOSITOR_PATH, Snapshot, WindowInfo,
-    WindowUpdate, WorkspaceInfo,
+    COMPOSITOR_BUS_NAME, COMPOSITOR_CONTRACT_VERSION, COMPOSITOR_IFACE, COMPOSITOR_PATH, Snapshot,
+    WindowInfo, WindowUpdate, WorkspaceInfo,
 };
 
 use crate::taskbar::CompositorUpdate;
-
-const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 
 /// Wire member for `CompositorCommands::spawn_app`, kept as a named
 /// constant (rather than an inline literal at the call) so the unit test
