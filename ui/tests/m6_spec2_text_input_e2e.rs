@@ -136,6 +136,10 @@ fn an_ime_commit_reaches_a_toolkit_entry_through_the_relay() {
     let frames: Arc<std::sync::atomic::AtomicUsize> =
         Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let frames_in = frames.clone();
+    // The relay applies the entry's `enable` only to an entered text-input.
+    // Publishing the enter lets the click wait for it instead of racing it.
+    let text_input_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let text_input_entered_in = text_input_entered.clone();
     // The live window's probe points, republished every frame: the click
     // below needs the entry's window-local centre.
     let points: Arc<Mutex<Vec<(String, i32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -166,6 +170,10 @@ fn an_ime_commit_reaches_a_toolkit_entry_through_the_relay() {
         )
         .on_frame(move |window| {
             frames_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            text_input_entered_in.store(
+                window.text_input_entered(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
             let mut published = points_in.lock().expect("points");
             published.clear();
             published.extend(
@@ -224,24 +232,53 @@ fn an_ime_commit_reaches_a_toolkit_entry_through_the_relay() {
     // geometry starts at the server-side title bar, so the click adds its
     // height (the `window_events` gate's own `TITLE_BAR_HEIGHT`).
     const TITLE_BAR_HEIGHT: i32 = 28;
+    // The seat advertises the Keyboard capability only once a device exists on
+    // it, so no keyboard focus (and therefore no text-input `enter`) reaches
+    // the app until a keyboard is spawned. Attach the keyboard and an input
+    // method first, then wait for the text-input enter: an `enable` sent
+    // before the text-input has entered is dropped by the relay, and the entry
+    // only enables on the focus this click causes.
+    let mut vk = VirtualKeyboardClient::spawn(&compositor.socket);
+    let socket = compositor.socket.clone();
+    let mut im = InputMethodClient::spawn(&socket);
+    assert!(
+        poll_until(Instant::now() + Duration::from_secs(20), || {
+            text_input_entered.load(std::sync::atomic::Ordering::SeqCst)
+        }),
+        "the app's text-input never entered after the keyboard attached"
+    );
     let mut pointer = VirtualPointerClient::spawn(&compositor.socket);
     let click = (
         (surface.geometry.x + entry.1) as f64,
         (surface.geometry.y + TITLE_BAR_HEIGHT + entry.2) as f64,
     );
-    pointer.motion_absolute(click.0, click.1, output_w as u32, output_h as u32);
-    pointer.frame();
-    pointer.pump();
-    pointer.button(BTN_LEFT, true);
-    pointer.frame();
-    pointer.pump();
-    pointer.button(BTN_LEFT, false);
-    pointer.frame();
-    pointer.pump();
-
-    let socket = compositor.socket.clone();
-    let mut vk = VirtualKeyboardClient::spawn(&socket);
-    let mut im = InputMethodClient::spawn(&socket);
+    // Click until the entry takes focus and enables IME. A single click can
+    // race the app's focus assignment (the panel carries the same retry for
+    // its buttons): the pointer press is what calls `set_focus`, and if it
+    // lands before the app has settled, no `FocusIn` follows, so the enable
+    // never fires. Re-clicking is safe — while the entry is unfocused each
+    // press is a fresh focus attempt, and once it is focused `ime_active`
+    // flips and the loop stops.
+    let click_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        pointer.motion_absolute(click.0, click.1, output_w as u32, output_h as u32);
+        pointer.frame();
+        pointer.pump();
+        pointer.button(BTN_LEFT, true);
+        pointer.frame();
+        pointer.pump();
+        pointer.button(BTN_LEFT, false);
+        pointer.frame();
+        pointer.pump();
+        let settle = Instant::now() + Duration::from_millis(300);
+        if poll_until(settle, || compositor.input_method_active()) {
+            break;
+        }
+        assert!(
+            Instant::now() < click_deadline,
+            "the entry never enabled IME after 20s of clicks"
+        );
+    }
 
     // The click focuses the entry, which enables IME: the IME-side
     // surrounding text is the oracle.
