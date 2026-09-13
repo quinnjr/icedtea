@@ -78,14 +78,17 @@ impl SessionResolver for Connection {
 ///
 /// `xdg_session_id` is `$XDG_SESSION_ID` when set (the `pam_systemd` path); it
 /// is preferred because it does not depend on this process sharing the login
-/// session's cgroup. With no id (an unusual/manual launch), the pid fallback
-/// walks the cgroup membership, matching `loginctl`'s own "current session".
+/// session's cgroup. An empty string is treated as absent (a misconfigured or
+/// blank `$XDG_SESSION_ID` must not be handed to `GetSession`), so it falls
+/// back to the pid path. With no id (an unusual/manual launch), the pid
+/// fallback walks the cgroup membership, matching `loginctl`'s own "current
+/// session".
 pub fn resolve_session<C: SessionResolver + ?Sized>(
     conn: &C,
     xdg_session_id: Option<&str>,
     pid: u32,
 ) -> zbus::Result<OwnedObjectPath> {
-    match xdg_session_id {
+    match xdg_session_id.filter(|id| !id.is_empty()) {
         Some(session_id) => conn.get_session(session_id),
         None => conn.get_session_by_pid(pid),
     }
@@ -333,6 +336,14 @@ mod tests {
         let logind = RecordingLogind::new("/org/freedesktop/login1/session/c1");
         let _ = resolve_session(&logind, Some("c1"), 4242).expect("resolves");
         assert!(!logind.calls().contains(&LogindCall::GetSessionByPid(4242)));
+    }
+
+    #[test]
+    fn resolve_session_treats_an_empty_xdg_session_id_as_absent() {
+        let logind = RecordingLogind::new("/org/freedesktop/login1/session/c1");
+        let path = resolve_session(&logind, Some(""), 4242).expect("resolves");
+        assert_eq!(path.as_str(), "/org/freedesktop/login1/session/c1");
+        assert_eq!(logind.calls(), vec![LogindCall::GetSessionByPid(4242)]);
     }
 
     #[test]

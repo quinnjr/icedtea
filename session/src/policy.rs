@@ -3,9 +3,15 @@
 //! lock-before-sleep preference, say whether to spawn the locker.
 //!
 //! This is the single place the "refuse to lock without a configured locker"
-//! rule (Decision 2) lives, and it is where the idle-vs-sleep interleaving is
-//! pinned: whichever trigger fires first spawns, the second sees `locked` and
-//! no-ops, so a race can never start two lockers.
+//! rule (Decision 2) lives.
+//!
+//! **Caller obligation:** [`decide`] is pure and carries no state, so it
+//! cannot itself prevent two near-simultaneous triggers (an idle timeout and a
+//! `PrepareForSleep` landing together) from both spawning a locker. The wiring
+//! must re-query `IsLocked()` (or otherwise pass the current `locked`) *immediately
+//! before each* `decide` call; then the second trigger observes `locked == true`
+//! and no-ops. The no-double-spawn property is enforced by that caller-side
+//! re-query, not by `decide` remembering anything.
 
 /// Why a lock is being considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,9 +36,12 @@ pub enum Decision {
 /// `locked` is the session's current lock state (`IsLocked()`); a session that
 /// is already locked is never locked again. `locker_configured` is whether
 /// `config::Power::locker_command` is set; locking is refused without one so a
-/// screen nothing can unlock is never produced. `lock_before_sleep` only
-/// applies to [`LockReason::PrepareForSleep`] — idle-lock is governed by
-/// `lock_idle_timeout_ms` at the call site, not this flag.
+/// screen nothing can unlock is never produced.
+///
+/// `lock_before_sleep` mirrors `config::Power::lock_before_sleep` and gates
+/// lock-before-sleep ([`LockReason::PrepareForSleep`]) **only**; idle-lock is
+/// gated by `lock_idle_timeout_ms` alone, checked at the call site, never by
+/// this flag.
 pub fn decide(
     reason: LockReason,
     locked: bool,
