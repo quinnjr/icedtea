@@ -197,6 +197,48 @@ fn prepare_for_sleep_waits_for_an_unconfirmed_running_locker() {
     flow.on_unlock();
 }
 
+/// `lock_before_sleep=false` disables pre-sleep locking outright: a running
+/// but unconfirmed locker (from an idle trigger) must not delay sleep. The
+/// trigger warns and releases immediately, and does not spawn a second locker.
+#[test]
+fn lock_before_sleep_disabled_does_not_wait_on_a_running_locker() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("disabled");
+    let logind = Arc::new(RecordingLogind::new(session_path()));
+    let wm = Arc::new(MarkerWm::new(&marker));
+    let flow = LockFlow::with_timing(
+        logind,
+        wm.clone(),
+        Some(locker_command(&marker, 0.3, 2.0)),
+        false,
+        Duration::from_millis(10),
+        Duration::from_secs(2),
+    );
+
+    flow.on_idle();
+    assert!(flow.locker_running(), "idle spawned a locker");
+
+    let start = Instant::now();
+    flow.on_prepare_for_sleep(true);
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "lock_before_sleep=false must not delay sleep: {elapsed:?}"
+    );
+    assert!(
+        !wm.observed_locked.load(Ordering::SeqCst),
+        "did not wait for an unconfirmed lock"
+    );
+
+    // The idle locker is the only spawn; sleep must not have added another.
+    assert!(wait_for_marker(&marker, Duration::from_secs(2)));
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(marker_lines(&marker), 1, "no second locker spawned");
+
+    flow.on_unlock();
+}
+
 /// A locker that never confirms the lock still must not hold sleep past the
 /// budget: the flow returns (releasing the inhibitor) anyway.
 #[test]

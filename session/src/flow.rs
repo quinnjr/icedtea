@@ -147,21 +147,28 @@ impl LockFlow {
     /// `false` (resume) re-arms a fresh one-shot delay inhibitor.
     ///
     /// A locker process already running is *not* proof the screen is secured:
-    /// an idle-triggered locker may still be starting up. So the wait is
-    /// entered whenever the compositor has not *confirmed* the lock, whether
-    /// the trigger just spawned the locker or found one already running. It is
-    /// only skipped when the compositor already reports locked, or when policy
-    /// refused to lock at all.
+    /// an idle-triggered locker may still be starting up. So, when
+    /// `lock_before_sleep` is enabled, the wait is entered whenever the
+    /// compositor has not *confirmed* the lock, whether the trigger just
+    /// spawned the locker or found one already running. It is skipped when the
+    /// compositor already reports locked, when `lock_before_sleep` is disabled
+    /// (the user setting wins outright — a running-but-unconfirmed locker must
+    /// not delay sleep), or when policy refused to lock at all.
     pub fn on_prepare_for_sleep(&self, going_to_sleep: bool) {
         if !going_to_sleep {
             self.acquire_sleep();
             return;
         }
-        match self.request_lock(LockReason::PrepareForSleep) {
-            LockAttempt::Spawned | LockAttempt::AlreadyRunning => {
-                self.wait_until_locked();
-            }
-            LockAttempt::Locked | LockAttempt::Refused => {}
+        let attempt = self.request_lock(LockReason::PrepareForSleep);
+        // A confirmed lock needs no wait. With `lock_before_sleep` disabled the
+        // user setting wins outright: even a running-but-unconfirmed locker
+        // must not delay sleep. Otherwise (enabled, unconfirmed — whether the
+        // trigger just spawned a locker or found one already running) wait for
+        // the compositor to confirm, bounded by the budget.
+        if self.lock_before_sleep
+            && matches!(attempt, LockAttempt::Spawned | LockAttempt::AlreadyRunning)
+        {
+            self.wait_until_locked();
         }
         // Release on every path: confirmed, budget exceeded, or a policy no-op.
         self.release_sleep();
@@ -283,14 +290,20 @@ impl LockFlow {
     /// the session is not left with an unmanaged locked state. No-op if a
     /// newer locker has already replaced this one.
     fn abandon_locker(&self, generation: u64) {
-        let slot = {
-            let mut guard = self.state();
-            match guard.locker.as_ref() {
-                Some(slot) if slot.generation == generation => guard.locker.take(),
-                _ => None,
-            }
-        };
-        if let Some(mut slot) = slot {
+        // Hold the state lock across the kill/reap/unlock: otherwise a trigger
+        // could pass policy in the gap (the slot is already empty), spawn a
+        // newer locker, and this stale `Session.Unlock` would kill it. The
+        // generation check and the unlock stay in one critical section, the
+        // same discipline as `finish_locker`.
+        let mut guard = self.state();
+        let current = guard
+            .locker
+            .as_ref()
+            .is_some_and(|slot| slot.generation == generation);
+        if !current || guard.active_generation != generation {
+            return;
+        }
+        if let Some(mut slot) = guard.locker.take() {
             let _ = slot.child.kill();
             let _ = slot.child.wait();
             if let Err(err) = self.logind.unlock() {
@@ -439,9 +452,8 @@ mod tests {
     }
 
     fn sleeping_child() -> Child {
-        Command::new("sh")
-            .arg("-c")
-            .arg("sleep 30")
+        Command::new("sleep")
+            .arg("30")
             .spawn()
             .expect("spawn a stub locker")
     }
@@ -508,6 +520,50 @@ mod tests {
 
         assert!(finish_locker(&flow.state, &*logind, 7));
         assert!(logind.calls().contains(&LogindCall::Unlock));
+    }
+
+    /// The waiter-spawn-failure teardown for the *current* generation kills,
+    /// reaps, and unlocks the locker.
+    #[test]
+    fn abandon_locker_tears_down_and_unlocks_the_current_locker() {
+        let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
+        let flow = test_flow(logind.clone());
+        {
+            let mut state = flow.state();
+            state.active_generation = 3;
+            state.locker = Some(LockerSlot {
+                generation: 3,
+                child: sleeping_child(),
+            });
+        }
+
+        flow.abandon_locker(3);
+
+        assert!(!flow.locker_running());
+        assert!(logind.calls().contains(&LogindCall::Unlock));
+    }
+
+    /// A stale teardown (its generation was superseded) must not touch the
+    /// newer locker, and must not issue an `Unlock` that could kill it.
+    #[test]
+    fn abandon_locker_does_not_tear_down_a_newer_locker() {
+        let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
+        let flow = test_flow(logind.clone());
+        {
+            let mut state = flow.state();
+            state.active_generation = 2;
+            state.locker = Some(LockerSlot {
+                generation: 2,
+                child: sleeping_child(),
+            });
+        }
+
+        flow.abandon_locker(1);
+
+        assert!(flow.locker_running(), "the newer locker survived");
+        assert!(!logind.calls().contains(&LogindCall::Unlock));
+
+        flow.on_unlock();
     }
 
     /// The pre-sleep wait is `SLEEP_LOCK_BUDGET` plus at most one bounded
