@@ -23,6 +23,12 @@ const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 /// launch silently reports `false`.
 const SPAWN_APP_MEMBER: &str = "SpawnApp";
 
+/// Wire member for `CompositorCommands::quit`, kept as a named constant for
+/// the same reason as [`SPAWN_APP_MEMBER`] below: the literal must agree
+/// with the member `compositor/src/dbus.rs` exposes (`fn quit` → `Quit`),
+/// or the logout call reaches no method and the session never ends.
+const QUIT_MEMBER: &str = "Quit";
+
 /// Spawn the signal worker. It seeds with `GetState`, then forwards every
 /// `org.icedtea.Compositor` signal as a [`CompositorUpdate`] until the bus drops.
 ///
@@ -173,6 +179,10 @@ pub trait CompositorCommands {
     /// unknown id, an unparseable `Exec`, a spawn failure, or a dead bus) --
     /// never panics: this runs on the panel's loop thread.
     fn spawn_app(&self, app_id: &str) -> bool;
+    /// End the session through the compositor's `Quit` path (the launcher
+    /// power row's log-out). Fire-and-forget like the focus/close/workspace
+    /// commands above: a dead bus means the session is already going away.
+    fn quit(&self);
 }
 
 /// Issues `org.icedtea.Compositor` commands from the panel's loop thread.
@@ -217,6 +227,19 @@ impl CompositorCommands for CompositorProxy {
             Some(COMPOSITOR_IFACE),
             "SetWorkspace",
             &(id,),
+        );
+    }
+    // The logout path: `Quit` ends the session through the same
+    // `CompositorInterface` the other commands call into (see
+    // `compositor/src/dbus.rs`'s `quit`). Fire-and-forget: the reply (none)
+    // carries nothing the launcher could act on.
+    fn quit(&self) {
+        let _ = self.conn.call_method(
+            Some(COMPOSITOR_BUS_NAME),
+            COMPOSITOR_PATH,
+            Some(COMPOSITOR_IFACE),
+            QUIT_MEMBER,
+            &(),
         );
     }
     // The wire member is `SpawnApp` (see `focus_window`'s comment), and
@@ -266,5 +289,13 @@ mod tests {
     #[test]
     fn spawn_app_member_matches_the_compositor_interface() {
         assert_eq!(SPAWN_APP_MEMBER, "SpawnApp");
+    }
+
+    /// Pins the `Quit` wire member the logout path calls: it must stay
+    /// identical to the member `compositor/src/dbus.rs`'s `quit` exposes
+    /// (`fn quit` → `Quit`, the same zbus PascalCase rule as `SpawnApp`).
+    #[test]
+    fn quit_member_matches_the_compositor_interface() {
+        assert_eq!(QUIT_MEMBER, "Quit");
     }
 }

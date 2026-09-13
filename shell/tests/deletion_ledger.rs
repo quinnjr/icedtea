@@ -76,7 +76,11 @@ const KEPT_SUITES: &[(&str, usize)] = &[
     // fold arms).
     ("src/taskbar.rs", 8),
     ("src/clipboard.rs", 2),
-    ("src/compositor_client.rs", 1),
+    // B1: 1 -> 3 (Task 4 added `spawn_app_member_...` for the `SpawnApp`
+    // wire member, Task 6 added `quit_member_...` for the logout `Quit`
+    // member; the count was already 2 when Task 6 started — Task 4 had
+    // not recorded its addition).
+    ("src/compositor_client.rs", 3),
     ("tests/live_dbus.rs", 1),
 ];
 

@@ -8,8 +8,9 @@
 //! right-click pin/unpin) and [`view()`] (search box, pinned rail, All-apps
 //! list, tiles pane, power row).
 //!
-//! The power row is a UI shell with no-op handlers: Task 6 wires the
-//! backends. Every such stub is marked `TASK-6`.
+//! The power row shells out per `launcher::power_argv` (logout takes the
+//! compositor quit path); every failure surfaces as `status`, never
+//! silently.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -29,6 +30,7 @@ use xkbcommon::xkb;
 use crate::compositor_client::CompositorCommands;
 use crate::launcher::{
     DesktopEntry, DesktopIndex, Matcher, PinStore, RecencyStore, TileStore, default_dirs,
+    power_argv, power_error_message,
 };
 
 /// The launcher's initial surface size: a menu, not a bar — fixed, modest,
@@ -72,16 +74,9 @@ pub fn spec(bar_position: &str) -> SurfaceSpec {
     }
 }
 
-/// The launcher's power/session actions. Task 5 renders the row and folds
-/// the messages as no-ops; Task 6 wires the backends.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PowerAction {
-    Lock,
-    Logout,
-    Suspend,
-    Reboot,
-    PowerOff,
-}
+/// Re-exported for the power row's existing call sites: the enum itself
+/// lives in the pure core (`launcher`) beside its argv contract.
+pub use crate::launcher::PowerAction;
 
 #[derive(Clone, Debug)]
 pub enum LauncherMsg {
@@ -105,7 +100,8 @@ pub enum LauncherMsg {
     Ignore,
     /// A single-letter jump in the All-apps list (empty query only).
     LetterJump(char),
-    /// The power row. TASK-6: no-op shells until the backends land.
+    /// The power row: shell-outs per `launcher::power_argv`, logout via
+    /// the compositor quit path.
     Power(PowerAction),
     /// Escape or the Start button toggling shut. No *keyboard* focus-loss
     /// path exists under `Exclusive` on a compliant compositor; a
@@ -143,6 +139,51 @@ pub struct LauncherModel {
     /// Fires after a close fold (successful launch, Escape): the supervisor
     /// resets the panel's `launcher_open` bit through it.
     pub on_close: Option<Rc<dyn Fn()>>,
+    /// How a power action shells out. Defaults to [`run_power_command`];
+    /// tests override it so no test ever execs `loginctl`/`systemctl`.
+    power_run: fn(&str, &[&str]) -> std::io::Result<()>,
+    /// Write-back for the pin/tile/recency stores. Called with
+    /// [`LauncherModel::snapshot`] on every close (successful launch,
+    /// power action, Escape); `run_surface` points it at the config DB,
+    /// so a reopened menu still shows the pins and recency. `None` (unit
+    /// tests) means no write-back.
+    pub on_persist: Option<Rc<dyn Fn(icedtea_config::LauncherConfig)>>,
+}
+
+/// Persist one launcher snapshot through the scoped
+/// [`icedtea_config::Config::save_launcher`] (launcher table only — never
+/// a full [`icedtea_config::Config::save`], which would clobber a
+/// concurrent settings-app edit with this process's stale in-memory
+/// copy). Reads the current file first so the other sections survive;
+/// every failure comes back as `Err`, never a panic.
+pub fn persist_launcher_config(
+    db_path: &std::path::Path,
+    launcher: &icedtea_config::LauncherConfig,
+) -> Result<(), String> {
+    let mut full = icedtea_config::load_or_default(db_path);
+    full.launcher = launcher.clone();
+    let db = icedtea_config::open(db_path)
+        .map_err(|err| format!("launcher write-back: cannot open config db: {err}"))?;
+    full.save_launcher(&db)
+        .map_err(|err| format!("launcher write-back: cannot save: {err}"))?;
+    Ok(())
+}
+
+/// The one real power shell-out (spec §Spawn+power): `program` + `args` is
+/// exactly [`power_argv`]'s output. Both an io failure (binary missing) and
+/// a non-zero exit (polkit-denied, the spec's own risk) are failures, so a
+/// refusal surfaces as a launcher status line, never silently.
+// A3-logind: replace with logind client.
+fn run_power_command(program: &str, args: &[&str]) -> std::io::Result<()> {
+    // A3-logind: replace with logind client.
+    let status = std::process::Command::new(program).args(args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "{program} exited with {status}"
+        )))
+    }
 }
 
 impl LauncherModel {
@@ -161,11 +202,14 @@ impl LauncherModel {
             scanned: None,
             wm,
             on_close: None,
+            power_run: run_power_command,
+            on_persist: None,
         }
     }
 
     /// Seed the pin/tile/recency stores from the persisted config (read
-    /// path; write-back is a Task-6/merge-review concern — see the report).
+    /// path; the write-back is [`LauncherModel::close`] → `on_persist` →
+    /// [`persist_launcher_config`], wired in `run_surface`).
     pub fn seed(&mut self, config: &icedtea_config::LauncherConfig) {
         for id in &config.pinned {
             self.pins.pin(id);
@@ -234,11 +278,38 @@ impl LauncherModel {
         }
     }
 
+    /// The pin/tile/recency stores as one persistable config section: what
+    /// [`LauncherModel::close`] hands to `on_persist`, and what
+    /// [`LauncherModel::seed`] reads back on the next open.
+    pub fn snapshot(&self) -> icedtea_config::LauncherConfig {
+        icedtea_config::LauncherConfig {
+            pinned: self.pins.pinned().to_vec(),
+            tile_groups: self
+                .tiles
+                .groups()
+                .iter()
+                .map(|group| icedtea_config::TileGroup {
+                    name: group.name.clone(),
+                    ids: group.ids.clone(),
+                    size: group.size,
+                })
+                .collect(),
+            recency: self.recency.snapshot(),
+        }
+    }
+
     /// Dismiss the menu and leave the loop; the panel learns through
     /// `on_close` (a `Cmd::Task`: the loop runs it after the fold, before
     /// `Quit` takes effect — `Cmd::flatten` preserves the order).
+    ///
+    /// The close also writes the stores back through `on_persist` first,
+    /// so pin/unpin + recency mutations reach `Config::save` even when the
+    /// menu shuts without a launch (Escape, power action).
     fn close(&mut self) -> Cmd<LauncherMsg> {
         self.open = false;
+        if let Some(persist) = self.on_persist.clone() {
+            persist(self.snapshot());
+        }
         match self.on_close.clone() {
             Some(notify) => Cmd::Batch(vec![Cmd::Task(Rc::new(move || notify())), Cmd::Quit]),
             None => Cmd::Quit,
@@ -352,21 +423,27 @@ pub fn update(m: &mut LauncherModel, msg: LauncherMsg) -> Cmd<LauncherMsg> {
                 .position(|e| e.name.to_lowercase().starts_with(&needle));
             Cmd::None
         }
-        // TASK-6: wire the power backends here. Each arm shells out
-        // (`loginctl lock-session`, the compositor quit path for logout,
-        // `systemctl suspend/poweroff/reboot`); every failure surfaces as
-        // `m.status`, never silently; every call site is marked
-        // `// A3-logind: replace with logind client`.
-        LauncherMsg::Power(action) => {
-            match action {
-                PowerAction::Lock => {}     // TASK-6: `loginctl lock-session`
-                PowerAction::Logout => {}   // TASK-6: compositor quit path
-                PowerAction::Suspend => {}  // TASK-6: `systemctl suspend`
-                PowerAction::Reboot => {}   // TASK-6: `systemctl reboot`
-                PowerAction::PowerOff => {} // TASK-6: `systemctl poweroff`
+        // Power backends (spec §Spawn+power): each action shells out per
+        // [`power_argv`], except logout, which takes the compositor quit
+        // path. A shell-out failure surfaces as `m.status`, never silently;
+        // a success dismisses the menu (the session is going away, or the
+        // locker covers it).
+        LauncherMsg::Power(action) => match power_argv(action) {
+            // A3-logind: replace with logind client (the exec lives in
+            // `run_power_command`; this arm only routes its outcome).
+            Some((program, args)) => match (m.power_run)(program, args) {
+                Ok(()) => m.close(),
+                Err(err) => {
+                    m.status = Some(power_error_message(action, &err.to_string()));
+                    Cmd::None
+                }
+            },
+            // Logout: the compositor quit path, never a shell-out.
+            None => {
+                m.wm.quit();
+                m.close()
             }
-            Cmd::None
-        }
+        },
         LauncherMsg::Close => m.close(),
     }
 }
@@ -792,8 +869,18 @@ fn run_surface(
         }
     };
     let mut model = LauncherModel::new(wm);
-    model.seed(&icedtea_config::load_or_default(&icedtea_config::default_db_path()).launcher);
+    let db_path = icedtea_config::default_db_path();
+    model.seed(&icedtea_config::load_or_default(&db_path).launcher);
     model.on_close = Some(notify.clone());
+    // Write-back for the next open: pin/unpin + recency mutations reach
+    // the launcher table on every close. Failures warn and drop — a dead
+    // or locked DB must degrade to "the menu never persists", never a
+    // panic on this foreign thread, and never the panel.
+    model.on_persist = Some(Rc::new(move |launcher| {
+        if let Err(err) = persist_launcher_config(&db_path, &launcher) {
+            tracing::warn!(%err, "launcher write-back failed; reopen may show stale pins/recency");
+        }
+    }));
     model.open();
     let window = match icedtea_ui::window::Window::open(
         spec(bar_position),
@@ -843,6 +930,7 @@ mod tests {
     struct MockWm {
         spawns: RefCell<Vec<String>>,
         succeed: Cell<bool>,
+        quits: Cell<u32>,
     }
 
     impl MockWm {
@@ -850,6 +938,7 @@ mod tests {
             Self {
                 spawns: RefCell::new(Vec::new()),
                 succeed: Cell::new(true),
+                quits: Cell::new(0),
             }
         }
 
@@ -857,6 +946,7 @@ mod tests {
             Self {
                 spawns: RefCell::new(Vec::new()),
                 succeed: Cell::new(false),
+                quits: Cell::new(0),
             }
         }
     }
@@ -869,6 +959,24 @@ mod tests {
             self.spawns.borrow_mut().push(app_id.to_string());
             self.succeed.get()
         }
+        fn quit(&self) {
+            self.quits.set(self.quits.get() + 1);
+        }
+    }
+
+    /// A power runner that always succeeds, standing in for the real
+    /// `loginctl`/`systemctl` shell-out (which no test may execute).
+    fn ok_power(_program: &str, _args: &[&str]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// A power runner that always fails, standing in for a denied or
+    /// missing `loginctl`/`systemctl`.
+    fn denied_power(_program: &str, _args: &[&str]) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
     }
 
     fn entry(id: &str, name: &str) -> DesktopEntry {
@@ -1214,26 +1322,8 @@ mod tests {
     }
 
     #[test]
-    fn power_buttons_are_noop_shells_for_task_6() {
-        // Task 6 wires the backends; Task 5 only proves the row exists and
-        // its messages reach `update` without side effects.
-        let (mut m, wm) = seeded();
-        m.open = true;
-        for action in [
-            PowerAction::Lock,
-            PowerAction::Logout,
-            PowerAction::Suspend,
-            PowerAction::Reboot,
-            PowerAction::PowerOff,
-        ] {
-            let cmd = update(&mut m, LauncherMsg::Power(action));
-            assert!(!quits(&cmd), "{action:?} must not dismiss the menu yet");
-        }
-        assert!(m.open);
-        assert!(
-            wm.spawns.borrow().is_empty(),
-            "no launch from the power row"
-        );
+    fn power_row_renders_all_five_buttons() {
+        let (m, _) = seeded();
         let v = view(&m);
         for id in [
             "power_lock",
@@ -1244,6 +1334,84 @@ mod tests {
         ] {
             assert!(by_id(&v, id).is_some(), "#{id} renders at rest");
         }
+    }
+
+    #[test]
+    fn power_shell_out_success_closes_the_menu() {
+        let (mut m, wm) = seeded();
+        m.open = true;
+        m.power_run = ok_power;
+        let cmd = update(&mut m, LauncherMsg::Power(PowerAction::Suspend));
+        assert!(!m.open, "a successful power action dismisses the menu");
+        assert!(quits(&cmd), "dismissal leaves the loop");
+        assert!(m.status.is_none(), "no status line on success");
+        assert!(
+            wm.spawns.borrow().is_empty(),
+            "no launch from the power row"
+        );
+    }
+
+    #[test]
+    fn power_shell_out_failure_reports_a_status_line_and_stays_open() {
+        let (mut m, _) = seeded();
+        m.open = true;
+        m.power_run = denied_power;
+        let cmd = update(&mut m, LauncherMsg::Power(PowerAction::Suspend));
+        assert!(m.open, "a failed power action keeps the menu open");
+        assert!(!quits(&cmd));
+        let status = m.status.clone().expect("a status line");
+        assert!(
+            status.contains("Suspend") && status.contains("permission denied"),
+            "names the action and the cause: {status}"
+        );
+        assert!(by_id(&view(&m), "launcher_status").is_some());
+    }
+
+    #[test]
+    fn close_persists_pins_tiles_and_recency_for_reopen() {
+        let (mut m, _) = seeded();
+        let saved: Rc<RefCell<Vec<icedtea_config::LauncherConfig>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let probe = saved.clone();
+        m.on_persist = Some(Rc::new(move |cfg| probe.borrow_mut().push(cfg)));
+        // One pin mutation, then one recorded launch whose success closes
+        // the menu — the close is what writes back.
+        let _ = update(&mut m, LauncherMsg::TogglePin("music".into()));
+        m.open = true;
+        let _ = update(&mut m, LauncherMsg::ActivateApp("firefox".into()));
+        let snapshots = saved.borrow();
+        assert_eq!(snapshots.len(), 1, "one close, one write-back");
+        let cfg = &snapshots[0];
+        assert!(
+            cfg.pinned.contains(&"music".to_string()),
+            "pins persist: {:?}",
+            cfg.pinned
+        );
+        assert!(
+            cfg.tile_groups.iter().any(|g| g.name == "Web"),
+            "tiles round-trip: {:?}",
+            cfg.tile_groups
+        );
+        assert_eq!(
+            cfg.recency.get("firefox").map(|(count, _)| *count),
+            Some(1),
+            "recency persists: {:?}",
+            cfg.recency
+        );
+    }
+
+    #[test]
+    fn power_logout_quits_the_session_and_closes_the_menu() {
+        let (mut m, wm) = seeded();
+        m.open = true;
+        let cmd = update(&mut m, LauncherMsg::Power(PowerAction::Logout));
+        assert_eq!(wm.quits.get(), 1, "logout takes the compositor quit path");
+        assert!(
+            wm.spawns.borrow().is_empty(),
+            "no launch from the power row"
+        );
+        assert!(!m.open, "logout dismisses the menu");
+        assert!(quits(&cmd), "dismissal leaves the loop");
     }
 
     #[test]

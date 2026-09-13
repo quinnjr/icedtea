@@ -441,6 +441,26 @@ impl Config {
         Ok(write_txn.commit()?)
     }
 
+    /// Persist ONLY the launcher section, touching no other table (B1
+    /// launcher write-back). The shell is a *second* writer of the shared
+    /// config DB -- it saves on every launcher close -- but it must never
+    /// own the appearance/keybindings/workspaces/displays sections, which
+    /// the settings app and the compositor write. [`Config::save`]
+    /// rewrites the entire file and would clobber a concurrent edit to
+    /// those sections with this process's (possibly stale) in-memory copy.
+    /// This scoped save writes `DB_LAUNCHER` alone, so a pin or a recorded
+    /// launch can never revert an unrelated on-disk edit. It is the ONLY
+    /// save the launcher's persist path calls.
+    pub fn save_launcher(&self, db: &Database) -> Result<(), redb::Error> {
+        let write_txn = db.begin_write()?;
+        {
+            let mut launcher = write_txn.open_table(DB_LAUNCHER)?;
+            let launcher_bytes = serde_json::to_vec(&self.launcher).unwrap();
+            launcher.insert(KEY_LAUNCHER, launcher_bytes.as_slice())?;
+        }
+        Ok(write_txn.commit()?)
+    }
+
     /// Persist ONLY the displays section, touching no other table (review
     /// findings #2/#5). The compositor is a *second* writer of the shared
     /// config DB -- it saves after every applied output configuration -- but it
@@ -630,6 +650,57 @@ mod tests {
         assert_eq!(loaded.keybindings, seeded.keybindings);
         assert_eq!(loaded.behavior, seeded.behavior);
         assert_eq!(loaded.launcher, seeded.launcher);
+    }
+
+    #[test]
+    fn save_launcher_round_trips_through_its_scoped_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let mut cfg = default_config();
+        cfg.launcher.pinned.push("firefox".to_string());
+        cfg.launcher.recency.insert("firefox".to_string(), (2, 5));
+        {
+            let db = open(&path).unwrap();
+            cfg.save_launcher(&db).unwrap();
+        }
+        let loaded = load_or_default(&path);
+        assert_eq!(loaded.launcher.pinned, vec!["firefox".to_string()]);
+        assert_eq!(loaded.launcher.recency.get("firefox"), Some(&(2, 5)));
+    }
+
+    #[test]
+    fn save_launcher_leaves_other_sections_intact() {
+        // The launcher's write-back persists its stores through this scoped
+        // save, which must NEVER touch appearance/behavior/workspaces/
+        // displays/keybindings (the same rule `save_displays` keeps for the
+        // compositor's scoped save).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        let mut seeded = default_config();
+        seeded.workspace_names = vec!["keepme".into()];
+        seeded.appearance.wallpaper = Some("/custom/wall.png".into());
+        {
+            let db = open(&path).unwrap();
+            seeded.save(&db).unwrap();
+        }
+
+        // A launcher-only view that agrees on nothing but its own section.
+        let mut launcher_view = default_config();
+        launcher_view.workspace_names = vec!["SHOULD_NOT_PERSIST".into()];
+        launcher_view.launcher.pinned.push("music".to_string());
+        {
+            let db = open(&path).unwrap();
+            launcher_view.save_launcher(&db).unwrap();
+        }
+
+        let loaded = load_or_default(&path);
+        assert_eq!(loaded.launcher.pinned, vec!["music".to_string()]);
+        assert_eq!(loaded.workspace_names, seeded.workspace_names);
+        assert_eq!(loaded.appearance, seeded.appearance);
+        assert_eq!(loaded.keybindings, seeded.keybindings);
+        assert_eq!(loaded.behavior, seeded.behavior);
+        assert_eq!(loaded.displays, seeded.displays);
     }
 
     #[test]

@@ -119,6 +119,39 @@ fn spawn_app_known_id_spawns_entry_exec() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Task 6: one `State` serves the launcher's back-to-back commands, so a
+/// failed lookup must leave later launches working — the e2e's launch half
+/// runs on exactly this shared-state path.
+#[test]
+fn spawn_app_failure_leaves_later_launches_working() {
+    if !touch_on_path() {
+        eprintln!("SKIP: `touch` is not on PATH; the SpawnApp spawn-positive test cannot run");
+        return;
+    }
+    let dir = tmpdir("back-to-back");
+    let sentinel = dir.join("launched.ok");
+    seed_touch_entry(&dir, "probe", &sentinel);
+    let mut state = state_with_app_dir(&dir);
+
+    assert!(
+        !spawn_app(&mut state, "no-such-app"),
+        "unknown app id must reply false"
+    );
+    assert!(
+        spawn_app(&mut state, "probe"),
+        "a later known app id must still reply true"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sentinel.exists() {
+        if Instant::now() >= deadline {
+            panic!("SpawnApp replied true but the entry's program never ran ({sentinel:?} absent)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn spawn_app_unparseable_exec_returns_false_and_spawns_nothing() {
     let dir = tmpdir("unparseable");

@@ -271,6 +271,9 @@ impl CompositorCommands for Offline {
         tracing::warn!(app_id, "no session bus; spawn_app dropped");
         false
     }
+    fn quit(&self) {
+        tracing::warn!("no session bus; quit dropped");
+    }
 }
 
 impl ClipCommands for Offline {
@@ -873,6 +876,9 @@ mod tests {
         fn spawn_app(&self, app_id: &str) -> bool {
             self.spawns.borrow_mut().push(app_id.to_string());
             true
+        }
+        fn quit(&self) {
+            self.calls.borrow_mut().push(("quit".into(), 0));
         }
     }
 

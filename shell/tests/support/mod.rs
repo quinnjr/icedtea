@@ -72,6 +72,12 @@ impl CompositorCommands for MockWm {
             .push(app_id.to_string());
         true
     }
+    fn quit(&self) {
+        self.calls
+            .lock()
+            .expect("wm calls")
+            .push(("quit".into(), 0));
+    }
 }
 
 /// A recording `ClipCommands`, shared with the panel's thread.

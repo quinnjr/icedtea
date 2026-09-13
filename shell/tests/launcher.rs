@@ -39,6 +39,7 @@ impl CompositorCommands for MockWm {
         self.spawns.borrow_mut().push(app_id.to_string());
         self.succeed.get()
     }
+    fn quit(&self) {}
 }
 
 /// Three fixture apps on disk: `dirs` + [`LauncherModel::open`] is the
@@ -201,25 +202,165 @@ fn dismissal_quits_the_offscreen_loop() {
     );
 }
 
+/// Remainder (b): pin/unpin + recency mutations reach `Config::save` on
+/// close, so a reopened menu still shows them. Session 1 pins one app and
+/// launches another (the launch's close writes back); session 2 is a fresh
+/// model seeded from disk, and the pin renders in its pinned rail.
+#[test]
+fn pin_and_recency_survive_close_and_reopen() {
+    use icedtea_shell::launcher_view::persist_launcher_config;
+
+    let dir = app_dir();
+    let db_dir = TempDir::new("launcher-persist");
+    let db_path = db_dir.path().join("cfg.redb");
+
+    // Session 1: pin first (no close yet), then launch — the successful
+    // launch closes the menu, and the close writes pins + recency back.
+    {
+        let wm = Rc::new(MockWm {
+            spawns: RefCell::new(Vec::new()),
+            succeed: Cell::new(true),
+        });
+        let mut model = LauncherModel::new(wm);
+        model.dirs = vec![dir.path().to_path_buf()];
+        model.open();
+        let path = db_path.clone();
+        model.on_persist = Some(Rc::new(move |cfg| {
+            persist_launcher_config(&path, &cfg).expect("test write-back")
+        }));
+        let _ = launcher_view::update(&mut model, LauncherMsg::TogglePin("music".into()));
+        let _ = launcher_view::update(&mut model, LauncherMsg::ActivateApp("firefox".into()));
+    }
+
+    let stored = icedtea_config::load_or_default(&db_path).launcher;
+    assert!(
+        stored.pinned.contains(&"music".to_string()),
+        "the pin survived the close: {:?}",
+        stored.pinned
+    );
+    assert_eq!(
+        stored.recency.get("firefox").map(|(count, _)| *count),
+        Some(1),
+        "the launch survived the close: {:?}",
+        stored.recency
+    );
+
+    // Session 2: a fresh model seeded from disk renders the pin.
+    let wm = Rc::new(MockWm {
+        spawns: RefCell::new(Vec::new()),
+        succeed: Cell::new(true),
+    });
+    let mut reopened = LauncherModel::new(wm);
+    reopened.dirs = vec![dir.path().to_path_buf()];
+    reopened.seed(&stored);
+    reopened.open();
+    let probe = probe(Theme::Dark, reopened);
+    node_by_id(&probe, "pinned_music");
+}
+
+/// Full launch path (Task 6 Step 4): open → type a real query → launch.
+/// The typed keys travel the live route (compositor `KeyboardEnter`, then
+/// key events into the focused search box); the launch folds through the
+/// real `update` into the `MockWm`-recorded `spawn_app`, and the success
+/// closes the menu, whose write-back persists the recency. Deletion-tested
+/// during development: gutting the `spawn_app` call in `LauncherModel::launch`
+/// fails this test (no recorded spawn), restoring it passes again.
+#[test]
+fn open_type_launch_reaches_the_compositor_and_records_recency() {
+    use icedtea_shell::launcher_view::persist_launcher_config;
+    use icedtea_ui::window::InputEvent;
+    use icedtea_ui::window::keyboard::{KeyEvent, Mods};
+
+    fn key(keysym: u32, text: &str) -> InputEvent {
+        InputEvent::Key(KeyEvent {
+            keycode: 0,
+            keysym: xkbcommon::xkb::Keysym::from(keysym),
+            base: xkbcommon::xkb::Keysym::from(keysym),
+            utf8: Some(text.to_string()),
+            mods: Mods::empty(),
+            consumed: Mods::empty(),
+            pressed: true,
+            repeat: false,
+            serial: 0,
+            time_ms: 0,
+        })
+    }
+
+    let dir = app_dir();
+    let db_dir = TempDir::new("launcher-launch-e2e");
+    let db_path = db_dir.path().join("cfg.redb");
+
+    let wm = Rc::new(MockWm {
+        spawns: RefCell::new(Vec::new()),
+        succeed: Cell::new(true),
+    });
+    let mut model = LauncherModel::new(wm.clone());
+    model.dirs = vec![dir.path().to_path_buf()];
+    model.open();
+    let path = db_path.clone();
+    model.on_persist = Some(Rc::new(move |cfg| {
+        persist_launcher_config(&path, &cfg).expect("test write-back")
+    }));
+
+    let clock = Rc::new(ManualClock::new());
+    App::new(model, launcher_view::update, launcher_view::view)
+        .with_sheet(style::sheet_for(Theme::Dark))
+        .with_fonts(FontDatabase::new())
+        .with_icons(IconTheme::with_name_and_roots("hicolor", vec![]))
+        .run_offscreen(
+            LAUNCHER_SIZE,
+            clock,
+            vec![
+                // The live open path: the compositor grants the Exclusive
+                // surface the keyboard, the user types, then the top hit
+                // launches.
+                ScriptStep::Event(InputEvent::keyboard_enter(1)),
+                ScriptStep::Event(key(xkbcommon::xkb::keysyms::KEY_m, "m")),
+                ScriptStep::Event(key(xkbcommon::xkb::keysyms::KEY_u, "u")),
+                ScriptStep::Event(key(xkbcommon::xkb::keysyms::KEY_s, "s")),
+                ScriptStep::Message(LauncherMsg::ActivateSelected),
+            ],
+        )
+        .expect("the open → type → launch script runs offscreen");
+
+    // The spawn reached the compositor side (the MockWm-recorded call).
+    assert_eq!(
+        wm.spawns.borrow().as_slice(),
+        ["music".to_string()],
+        "typing 'mus' then Enter launches Music"
+    );
+    // The success closed the menu, and the close persisted the recency.
+    let stored = icedtea_config::load_or_default(&db_path).launcher;
+    assert_eq!(
+        stored.recency.get("music").map(|(count, _)| *count),
+        Some(1),
+        "the launch recorded recency: {:?}",
+        stored.recency
+    );
+}
+
 /// Typing at open reaches the search box with no prior Tab or click.
 ///
-/// The spec's keyboard model binds this ("open focuses search"), and Task
-/// 6's live e2e (open from Start → type → launch) cannot pass without it.
-/// It fails today for a precise reason: with an empty focus ring `App`'s
-/// `Key` routing drops the event before any view sees it
-/// (`ui/src/view/app.rs`, `else if let Some(node) = rt.focus.focus()`),
-/// and no *open-time* focus path is wired yet — focusing needs a
-/// post-layout `Node` handle after `KeyboardEnter` on the new surface,
-/// which is non-trivial and owned by Task 6. The mechanism itself exists
-/// (`Cmd::Focus(node)`, with the `KeyboardEnter`-when-empty precedent in
-/// `ui/src/bin/window-probe.rs`); only the open-time wiring is missing.
-/// The menu is fully mouse-usable meanwhile (click focuses the search box
-/// through the entry controller's pointer path), and one Tab focuses it
-/// by reading order.
+/// The spec's keyboard model binds this ("open focuses search"). The
+/// open-time wiring lives in `App`'s `KeyboardEnter` arm
+/// (`ui/src/view/app.rs::route`): when the compositor hands a window
+/// surface the keyboard while its focus ring is empty, the first
+/// focusable node — the search box, first in reading order — takes the
+/// focus, so the typed keys land in it.
 ///
-/// Parked for Task 6: land the open-time wiring, then un-ignore this
-/// test — it is Task 6's RED.
-#[ignore = "no open-time focus path wired yet; see the doc comment"]
+/// Why not `Cmd::Focus` from the launcher's `update`: that command
+/// carries a retained `Node` handle, and only the runtime (or a
+/// controller's `cx.node`) can mint one — `update` has no access to the
+/// tree, so no app-level code can construct it for its own search box.
+/// The route arm performs the same move one level down
+/// (`FocusRing::set_focus` with `Programmatic`, exactly what the
+/// `Cmd::Focus` arm in `drain` does), following the
+/// `KeyboardEnter`-when-empty precedent `window-probe` runs in its own
+/// loop. See the arm's own comment for the full reasoning.
+///
+/// The script models the live open path: the compositor maps the
+/// `Exclusive` launcher surface and sends `KeyboardEnter`, then the user
+/// types. No Tab, no click.
 #[test]
 fn typing_at_open_reaches_the_search_box_without_a_prior_tab() {
     use icedtea_ui::window::InputEvent;
@@ -252,6 +393,9 @@ fn typing_at_open_reaches_the_search_box_without_a_prior_tab() {
             clock,
             vec![
                 ScriptStep::Capture,
+                // What the compositor sends when the Exclusive launcher
+                // surface opens: the keyboard now belongs to this surface.
+                ScriptStep::Event(icedtea_ui::window::InputEvent::keyboard_enter(1)),
                 ScriptStep::Event(key(xkbcommon::xkb::keysyms::KEY_m, "m")),
                 ScriptStep::Event(key(xkbcommon::xkb::keysyms::KEY_u, "u")),
                 ScriptStep::Event(key(xkbcommon::xkb::keysyms::KEY_s, "s")),

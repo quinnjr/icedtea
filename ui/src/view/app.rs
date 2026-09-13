@@ -1744,6 +1744,35 @@ fn route<Msg: Clone + 'static>(
         }
         InputEvent::KeyboardEnter { target, .. } => {
             rt.keyboard_target = *target;
+            // Open-time focus landing (B1 launcher): a surface whose focus
+            // ring is empty would otherwise swallow every key until the
+            // first Tab or click — `route_surface` delivers `Key` only to
+            // the focused node. When the compositor hands a *window*
+            // surface the keyboard and nothing holds the focus yet, grant
+            // it to the first focusable node in reading order, so typing
+            // reaches (e.g.) the launcher's search box with no prior Tab.
+            //
+            // Why here and not as `Cmd::Focus` from the app's `update`:
+            // `Cmd::Focus` carries a retained `Node` handle, and only the
+            // runtime (or a controller's `cx.node`) can mint one — an
+            // `update` has no access to the tree, so no app-level code can
+            // construct the command for its own search box. This arm
+            // performs the same move one level down (`FocusRing::set_focus`
+            // with `Programmatic`, exactly what the `Cmd::Focus` arm in
+            // `drain` does), following the `KeyboardEnter`-when-empty
+            // precedent `window-probe` runs in its own loop. The move is
+            // announced as `FocusIn` by `route_surface`'s trailing
+            // `sync_focus`, like any other programmatic move.
+            //
+            // Window surfaces only: a popup's tree is swapped in below,
+            // after this point, so a popup enter must not focus the
+            // window's first widget underneath it.
+            if *target == SurfaceTarget::Window && rt.focus.focus().is_none() {
+                let next = navigate(&rt.root, &rt.layout, None, FocusDirection::TabForward);
+                if let Some(node) = next {
+                    rt.focus.set_focus(Some(&node), FocusCause::Programmatic);
+                }
+            }
             *target
         }
         InputEvent::KeyboardLeave => {
@@ -3359,6 +3388,80 @@ mod tests {
         let a: Vec<Option<(u8, u8, u8, u8)>> = (0..80).map(|x| frames.pixel(0, x, 20)).collect();
         let b: Vec<Option<(u8, u8, u8, u8)>> = (0..80).map(|x| frames.pixel(1, x, 20)).collect();
         assert_ne!(a, b, "the label did not repaint after the model changed");
+    }
+
+    /// B1 launcher open-time focus, pinned at the framework level: the
+    /// compositor hands an `Exclusive` surface the keyboard via
+    /// `KeyboardEnter`, and with an empty ring the first focusable node
+    /// takes it — so a typed key lands in the search entry with no prior
+    /// Tab or click. The second run is the negative control: without the
+    /// enter, keys route only to the focused node (of which there is
+    /// none), and the frame never changes.
+    #[test]
+    fn keyboard_enter_with_an_empty_ring_focuses_the_first_widget() {
+        use crate::view::builders::search_entry;
+
+        #[derive(Clone)]
+        struct Typed(String);
+
+        fn update(model: &mut String, msg: Typed) -> Cmd<Typed> {
+            model.clone_from(&msg.0);
+            Cmd::None
+        }
+        #[allow(
+            clippy::ptr_arg,
+            reason = "the `App::new` view signature names `&Model`, here `&String`"
+        )]
+        fn view(model: &String) -> crate::view::View<Typed> {
+            search_entry(model).on_change(|text: &str| Typed(text.to_owned()))
+        }
+
+        fn key_a() -> crate::window::InputEvent {
+            let key = crate::window::keyboard::Keymap::from_string(include_str!(
+                "../../tests/fixtures/keymaps/us.xkb"
+            ))
+            .expect("the vendored us keymap compiles")
+            .translate(38, true, 1, 0); // evdev 38 == `a`
+            crate::window::InputEvent::Key(key)
+        }
+
+        fn run(with_enter: bool) -> crate::view::app::Frames {
+            let mut script = vec![ScriptStep::Capture];
+            if with_enter {
+                script.push(ScriptStep::Event(
+                    crate::window::InputEvent::keyboard_enter(1),
+                ));
+            }
+            script.push(ScriptStep::Event(key_a()));
+            script.push(ScriptStep::Capture);
+            App::new(String::new(), update, view)
+                .with_fonts(crate::text::FontDatabase::probe_only())
+                .with_icons(crate::icons::IconTheme::with_name_and_roots(
+                    "hicolor",
+                    vec![],
+                ))
+                .run_offscreen((200, 40), Rc::new(crate::anim::ManualClock::new()), script)
+                .expect("the offscreen loop runs")
+        }
+
+        fn row(frames: &crate::view::app::Frames, frame: usize) -> Vec<Option<(u8, u8, u8, u8)>> {
+            (0..200).map(|x| frames.pixel(frame, x, 20)).collect()
+        }
+
+        let entered = run(true);
+        assert_eq!(entered.len(), 2);
+        assert_ne!(
+            row(&entered, 0),
+            row(&entered, 1),
+            "after KeyboardEnter the typed key must reach the search entry"
+        );
+        let unentered = run(false);
+        assert_eq!(unentered.len(), 2);
+        assert_eq!(
+            row(&unentered, 0),
+            row(&unentered, 1),
+            "without KeyboardEnter the key must go nowhere"
+        );
     }
 
     #[test]

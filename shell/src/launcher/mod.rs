@@ -131,6 +131,13 @@ impl RecencyStore {
         }
     }
 
+    /// The whole `(count, last-seen)` map: what the launcher's write-back
+    /// persists through `Config::save`, and what [`RecencyStore::restore`]
+    /// reads back on the next open.
+    pub fn snapshot(&self) -> HashMap<String, (u64, u64)> {
+        self.counts.clone()
+    }
+
     /// Launch count for `app_id` (0 when never recorded).
     pub fn count(&self, app_id: &str) -> u64 {
         self.counts
@@ -335,6 +342,51 @@ impl TileStore {
             size,
         });
     }
+}
+
+/// The launcher's power/session actions (spec §Layout, bottom row).
+///
+/// Lives in the pure core so the argv contract is unit-testable without a
+/// compositor; the view (`launcher_view`) renders the row and folds the
+/// messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerAction {
+    Lock,
+    Logout,
+    Suspend,
+    Reboot,
+    PowerOff,
+}
+
+/// The exact shell-out a [`PowerAction`] runs: program plus its args.
+///
+/// `Logout` is `None`: it takes the compositor quit path (no shell-out).
+/// Every other action is the spec §Spawn+power shell-out until A3 logind
+/// replaces it.
+#[must_use]
+pub fn power_argv(action: PowerAction) -> Option<(&'static str, &'static [&'static str])> {
+    match action {
+        PowerAction::Lock => Some(("loginctl", &["lock-session"])),
+        PowerAction::Logout => None,
+        PowerAction::Suspend => Some(("systemctl", &["suspend"])),
+        PowerAction::Reboot => Some(("systemctl", &["reboot"])),
+        PowerAction::PowerOff => Some(("systemctl", &["poweroff"])),
+    }
+}
+
+/// The launcher status line for a failed [`PowerAction`]: it names the
+/// action and carries the underlying cause, so a shell-out failure is never
+/// silent (spec §Spawn+power). Tested as a pure mapping, not via exec.
+#[must_use]
+pub fn power_error_message(action: PowerAction, detail: &str) -> String {
+    let name = match action {
+        PowerAction::Lock => "Lock",
+        PowerAction::Logout => "Log out",
+        PowerAction::Suspend => "Suspend",
+        PowerAction::Reboot => "Reboot",
+        PowerAction::PowerOff => "PowerOff",
+    };
+    format!("Could not {name}: {detail}")
 }
 
 #[cfg(test)]
@@ -621,6 +673,65 @@ mod tests {
         // A fresh record keeps the restored count and bumps it.
         rec.record("firefox");
         assert_eq!(rec.count("firefox"), 5);
+    }
+
+    #[test]
+    fn power_argv_matches_the_shell_out_contract() {
+        assert_eq!(
+            power_argv(PowerAction::Lock),
+            Some(("loginctl", ["lock-session"].as_slice()))
+        );
+        assert_eq!(
+            power_argv(PowerAction::Suspend),
+            Some(("systemctl", ["suspend"].as_slice()))
+        );
+        assert_eq!(
+            power_argv(PowerAction::Reboot),
+            Some(("systemctl", ["reboot"].as_slice()))
+        );
+        assert_eq!(
+            power_argv(PowerAction::PowerOff),
+            Some(("systemctl", ["poweroff"].as_slice()))
+        );
+        assert_eq!(
+            power_argv(PowerAction::Logout),
+            None,
+            "logout takes the compositor quit path, never a shell-out"
+        );
+    }
+
+    #[test]
+    fn power_error_names_the_action_and_the_cause() {
+        for (action, name) in [
+            (PowerAction::Lock, "Lock"),
+            (PowerAction::Logout, "Log out"),
+            (PowerAction::Suspend, "Suspend"),
+            (PowerAction::Reboot, "Reboot"),
+            (PowerAction::PowerOff, "PowerOff"),
+        ] {
+            let msg = power_error_message(action, "permission denied");
+            assert!(
+                msg.contains(name) && msg.contains("permission denied"),
+                "{action:?}: status line must name the action and the cause, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recency_snapshot_round_trips_through_restore() {
+        let mut rec = RecencyStore::default();
+        rec.record("a");
+        rec.record("b");
+        rec.record("a");
+        let snap = rec.snapshot();
+        assert_eq!(snap.get("a").map(|(count, _)| *count), Some(2));
+        assert_eq!(snap.get("b").map(|(count, _)| *count), Some(1));
+        // The snapshot feeds `Config::save` and comes back through
+        // `restore` with counts and order intact.
+        let mut back = RecencyStore::default();
+        back.restore(&snap);
+        assert_eq!(back.count("a"), 2);
+        assert_eq!(back.count("b"), 1);
     }
 
     #[test]
