@@ -65,11 +65,7 @@ pub fn default_config() -> Config {
             hide_bar_on_fullscreen: true,
             snap_enabled: true,
         },
-        power: Power {
-            locker_command: None,
-            lock_idle_timeout_ms: None,
-            lock_before_sleep: true,
-        },
+        power: Power::default(),
         launcher: LauncherConfig {
             pinned: vec![],
             tile_groups: vec![],
