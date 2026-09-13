@@ -1689,7 +1689,7 @@ mod tests {
             "indicator must carry active styling"
         );
         // Bar order: workspaces, windows, ime, clip — ime before clip.
-        let ids: Vec<_> = v
+        let _ids: Vec<_> = v
             .children
             .iter()
             .filter_map(|c| c.props.str(PropName::Id).map(str::to_string))
