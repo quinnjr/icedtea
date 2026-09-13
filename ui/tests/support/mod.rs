@@ -418,7 +418,23 @@ pub fn parse_allocation_line(line: &str) -> Option<EntryAllocation> {
 fn gallery(theme: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_gallery"));
     command.arg("--theme").arg(theme);
+    // Hermetic icon theme: the gallery resolves theme icons through
+    // `$XDG_CONFIG_HOME/gtk-4.0/settings.ini`, and a runner naming an
+    // uninstalled theme there (or none at all) would make icon coverage
+    // depend on the machine. An empty config dir falls back to the default
+    // theme per `IconTheme::theme_name`, which the test host provides.
+    // Scoped to the child: the test process and the compositor keep the
+    // runner's own environment.
+    command.env("XDG_CONFIG_HOME", empty_config_dir());
     command
+}
+
+/// A config dir containing nothing, so `IconTheme::theme_name` falls back
+/// to the default theme. Created once; empty by construction.
+fn empty_config_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("icedtea-gallery-no-config");
+    std::fs::create_dir_all(&dir).expect("scratch config dir");
+    dir
 }
 
 /// Run `gallery --probe-points` (headless) and parse every line.
