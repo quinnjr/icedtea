@@ -77,7 +77,9 @@ use zbus::interface;
 ///
 /// The `Test-only` variants are an internal harness channel, not wire API:
 /// they are never exposed through `CompositorInterface` and remain subject
-/// to additive change as tests need new oracles.
+/// to additive change as tests need new oracles. Test-only variants churn,
+/// so downstream exhaustive matches should include a wildcard arm.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum DbCommand {
     Focus(WindowId),
@@ -300,6 +302,72 @@ pub enum DbCommand {
         scale: f64,
         reply: Sender<bool>,
     },
+    /// Test-only: move a software output cursor to `(x, y)` on the next
+    /// frame -- the damage stimulus for the commit/damage round-trip test.
+    /// Staged commit damage never emits `output_damaged` (only software
+    /// cursors and backend-specific logic do), so a scene rect cannot serve
+    /// as the stimulus; an output-cursor move can, exactly as the `wlr`
+    /// crate's own `output_feedback.rs` harness proves. Replies with a
+    /// [`DamageProbeReport`]. Not reachable from `CompositorInterface` --
+    /// only the test harness sends this, same reasoning as `SessionLocked`.
+    MoveOutputCursorForTest {
+        x: f64,
+        y: f64,
+        reply: Sender<DamageProbeReport>,
+    },
+    /// Test-only: emit one `request_state` signal on the next frame's live
+    /// `wlr::Output` -- the request-state round-trip test's stimulus.
+    /// `send_request_state` needs a live output handle plus a staged
+    /// transaction, and `frame` is the only place after boot that has one
+    /// (same shape as `MoveOutputCursorForTest`), so the emission -- stage
+    /// a scale + transform that differ from live, emit, drop uncommitted
+    /// (see the frame arm for why they must differ) -- waits there
+    /// rather than running in the `DbCommand` handler itself. Replies with
+    /// a [`RequestStateProbeReport`]. Not reachable from
+    /// `CompositorInterface` -- only the test harness sends this, same
+    /// reasoning as `SessionLocked`.
+    EmitRequestStateForTest {
+        reply: Sender<RequestStateProbeReport>,
+    },
+}
+
+/// What [`DbCommand::MoveOutputCursorForTest`] reports back: whether the
+/// stimulus landed, and the loop-thread snapshot the test anchors its
+/// "subsequent frame commits" assertions to.
+///
+/// The damage entry the test asserts is the authoritative ordering key;
+/// `kicked`/`frames`/`commits` are diagnostic snapshots of reach and
+/// progress at stimulus time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageProbeReport {
+    /// The cursor moved (wlroots accepted the move).
+    pub moved: bool,
+    /// How many live outputs the frame kick reached.
+    pub kicked: usize,
+    /// `State::frames` at stimulus time -- the test asserts it advanced.
+    pub frames: u64,
+    /// `State::commit_log.len()` at stimulus time -- the test asserts it grew.
+    pub commits: usize,
+}
+
+/// What [`DbCommand::EmitRequestStateForTest`] reports back: whether the
+/// emission ran, and on which live output with which staged mask, so the
+/// test can pin `State::last_request` to exactly this delivery.
+///
+/// `id` + `fields` are the authoritative routing key the test pins
+/// `State::last_request` against; the remaining fields are diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestStateProbeReport {
+    /// `send_request_state` accepted the staged transaction and emitted.
+    pub emitted: bool,
+    /// The live output the emission ran on.
+    pub id: wlr::OutputId,
+    /// The staged mask at emission -- the test asserts `last_request`
+    /// recorded exactly this for `id`.
+    pub fields: wlr::CommittedFields,
+    /// Frame kick reach at arming, mirroring `DamageProbeReport`; 0 means
+    /// no frame will arrive.
+    pub kicked: usize,
 }
 
 /// One mapped override-redirect X11 pop-up, as the test-only
