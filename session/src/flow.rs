@@ -21,6 +21,7 @@
 //! signal is delivered on the logind signal-loop thread, the pre-sleep wait
 //! runs on a dedicated worker — blocking the loop would starve the funnel.
 
+use std::collections::VecDeque;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -62,13 +63,44 @@ struct FlowState {
     /// one was spawned cannot issue a stale `Session.Unlock` (which compositor
     /// bookkeeping would turn into a kill of the newer locker).
     active_generation: u64,
-    /// The generation whose exit prompted the `Session.Unlock()` this daemon
-    /// issued most recently, while its logind `Unlock` echo is in flight.
-    /// [`LockFlow::on_unlock`] consumes it, so the echo is never mistaken for a
-    /// genuine external unlock. Correlating by generation (rather than a flat
-    /// counter) means an external unlock arriving before the echo cannot
-    /// swallow the echo's token and be mishandled.
-    self_unlock_gen: Option<u64>,
+    /// The generations whose exits prompted `Session.Unlock()` calls this
+    /// daemon issued whose logind `Unlock` echoes are still in flight, oldest
+    /// first. [`LockFlow::on_unlock`] consumes one per echo, so a daemon-issued
+    /// unlock is never mistaken for a genuine external unlock. A FIFO (rather
+    /// than a single slot) is needed because two lockers can exit back-to-back
+    /// and queue two echoes before either is delivered: the first echo must not
+    /// consume the second's marker, or the second would be misread as external
+    /// and kill an unrelated running locker.
+    self_unlock_gens: VecDeque<u64>,
+}
+
+/// Defensive ceiling on [`FlowState::self_unlock_gens`]. Only a handful of
+/// self-unlock echoes can be in flight at once (one per locker that exited
+/// without a newer spawn); this bound keeps a wedged or lost echo from growing
+/// the queue without limit. The oldest marker is dropped past the cap.
+const MAX_SELF_UNLOCK_MARKERS: usize = 64;
+
+/// Record that the daemon issued a `Session.Unlock()` for `generation`; its
+/// echo is now in flight. Appends to the FIFO, pruning the oldest marker at the
+/// defensive cap.
+fn push_self_unlock(state: &mut FlowState, generation: u64) {
+    if state.self_unlock_gens.len() >= MAX_SELF_UNLOCK_MARKERS {
+        state.self_unlock_gens.pop_front();
+    }
+    state.self_unlock_gens.push_back(generation);
+}
+
+/// Drop one recorded marker for `generation` after a failed `Session.Unlock()`
+/// call. A failed call produces no echo, so the marker must not linger and
+/// swallow a later external unlock.
+fn remove_self_unlock(state: &mut FlowState, generation: u64) {
+    if let Some(idx) = state
+        .self_unlock_gens
+        .iter()
+        .rposition(|&g| g == generation)
+    {
+        state.self_unlock_gens.remove(idx);
+    }
 }
 
 /// What [`LockFlow::request_lock`] did, so the sleep path knows whether a
@@ -132,7 +164,7 @@ impl LockFlow {
                 power_key: None,
                 locker: None,
                 active_generation: 0,
-                self_unlock_gen: None,
+                self_unlock_gens: VecDeque::new(),
             })),
         };
         flow.arm();
@@ -249,14 +281,16 @@ impl LockFlow {
     /// Wayland unlock already happened, so this does not round-trip another
     /// `Session.Unlock`.
     ///
-    /// The echo is correlated by generation: `self_unlock_gen` records the
-    /// locker whose exit prompted the `Session.Unlock()` we issued. A marker
-    /// means the unlock is ours; a locker that spawned *after* it (a greater
-    /// generation) therefore survives, and no locker is killed. With no
-    /// marker the signal is external, so the current locker is killed.
+    /// The echo is correlated by generation: `self_unlock_gens` is a FIFO of
+    /// the locker exits whose `Session.Unlock()` requests we issued. Each echo
+    /// consumes the oldest marker, so two back-to-back exits cannot have the
+    /// first echo eat the second's marker. A marker means the unlock is ours;
+    /// a locker that spawned *after* it (a greater generation) therefore
+    /// survives, and no locker is killed. With no marker the signal is
+    /// external, so the current locker is killed.
     pub fn on_unlock(&self) {
         let mut guard = self.state();
-        let Some(marker) = guard.self_unlock_gen.take() else {
+        let Some(marker) = guard.self_unlock_gens.pop_front() else {
             let slot = guard.locker.take();
             drop(guard);
             if let Some(mut slot) = slot {
@@ -421,7 +455,7 @@ impl LockFlow {
             }
             let slot = guard.locker.take();
             if slot.is_some() {
-                guard.self_unlock_gen = Some(generation);
+                push_self_unlock(&mut guard, generation);
             }
             slot
         };
@@ -435,9 +469,7 @@ impl LockFlow {
             // A failed call produces no echo; do not let an unconsumed marker
             // swallow a later external unlock.
             let mut state = self.state();
-            if state.self_unlock_gen == Some(generation) {
-                state.self_unlock_gen = None;
-            }
+            remove_self_unlock(&mut state, generation);
         }
     }
 
@@ -517,12 +549,13 @@ fn run_pre_sleep_lock(
 
 /// Issue the post-exit `Session.Unlock` for a waiter, but only while its
 /// `generation` is still the most recent spawn. The generation check and the
-/// `self_unlock_gen` marker happen under the state lock so a new spawn cannot
+/// `self_unlock_gens` marker happen under the state lock so a new spawn cannot
 /// install itself between the check and the commit; the blocking logind call
 /// itself is made outside the lock, so a stalled system bus cannot block the
 /// sleep-inhibitor release or any other flow path. The marker records *which*
 /// generation's exit prompted the unlock, so [`LockFlow::on_unlock`] can tell
-/// the echo apart from an external unlock and lets a newer locker survive.
+/// the echo apart from an external unlock and lets a newer locker survive; the
+/// FIFO keeps two back-to-back exits' echoes distinct.
 fn finish_locker(
     state: &Mutex<FlowState>,
     logind: &(dyn Logind + Send + Sync),
@@ -533,16 +566,14 @@ fn finish_locker(
         if guard.active_generation != generation {
             return false;
         }
-        guard.self_unlock_gen = Some(generation);
+        push_self_unlock(&mut guard, generation);
     }
     if let Err(err) = logind.unlock() {
         tracing::warn!(%err, "Session.Unlock after locker exit failed");
         // A failed call produces no echo; do not let an unconsumed marker
         // swallow a later external unlock.
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.self_unlock_gen == Some(generation) {
-            guard.self_unlock_gen = None;
-        }
+        remove_self_unlock(&mut guard, generation);
     }
     true
 }
@@ -794,7 +825,7 @@ mod tests {
                 child: sleeping_child(),
             });
             // `finish_locker` already issued an Unlock whose echo is in flight.
-            state.self_unlock_gen = Some(5);
+            state.self_unlock_gens.push_back(5);
         }
 
         flow.on_unlock();
@@ -802,9 +833,8 @@ mod tests {
             flow.locker_running(),
             "the echo of our own unlock must not kill the locker"
         );
-        assert_eq!(
-            flow.state().self_unlock_gen,
-            None,
+        assert!(
+            flow.state().self_unlock_gens.is_empty(),
             "the echo consumed the marker"
         );
 
@@ -828,7 +858,7 @@ mod tests {
                 child: sleeping_child(),
             });
             // The unlock was issued for generation 2; locker 3 is newer.
-            state.self_unlock_gen = Some(2);
+            state.self_unlock_gens.push_back(2);
         }
 
         flow.on_unlock();
@@ -836,13 +866,65 @@ mod tests {
             flow.locker_running(),
             "a newer locker must survive our earlier unlock's echo"
         );
-        assert_eq!(
-            flow.state().self_unlock_gen,
-            None,
+        assert!(
+            flow.state().self_unlock_gens.is_empty(),
             "the echo cleared the marker"
         );
 
         // Cleanup: now an external unlock kills the surviving locker.
+        flow.on_unlock();
+        assert!(!flow.locker_running());
+    }
+
+    /// Two lockers exiting back-to-back queue two self-unlock echoes. The first
+    /// echo must consume only the first marker: the old single-slot code let it
+    /// eat the second's marker, after which the second echo looked external and
+    /// killed the unrelated newer locker.
+    #[test]
+    fn two_in_flight_self_unlocks_are_consumed_in_order_without_killing_the_newer_locker() {
+        let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
+        let flow = test_flow(logind);
+        {
+            let mut state = flow.state();
+            state.active_generation = 3;
+            state.locker = Some(LockerSlot {
+                generation: 3,
+                child: sleeping_child(),
+            });
+            // Unlocks for generations 1 and 2 were issued; both echoes are in
+            // flight while newer locker 3 is running.
+            state.self_unlock_gens.push_back(1);
+            state.self_unlock_gens.push_back(2);
+        }
+
+        // First echo: consumes marker 1, leaves marker 2, kills nothing.
+        flow.on_unlock();
+        assert!(
+            flow.locker_running(),
+            "the first echo must not kill locker 3"
+        );
+        assert_eq!(
+            flow.state()
+                .self_unlock_gens
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the first echo consumed only the first marker"
+        );
+
+        // Second echo: consumes marker 2, kills nothing.
+        flow.on_unlock();
+        assert!(
+            flow.locker_running(),
+            "the second echo must not kill locker 3"
+        );
+        assert!(
+            flow.state().self_unlock_gens.is_empty(),
+            "both markers were consumed"
+        );
+
+        // No markers remain: an unlock is external and kills locker 3.
         flow.on_unlock();
         assert!(!flow.locker_running());
     }
@@ -859,7 +941,7 @@ mod tests {
                 generation: 9,
                 child: sleeping_child(),
             });
-            assert_eq!(state.self_unlock_gen, None);
+            assert!(state.self_unlock_gens.is_empty());
         }
 
         flow.on_unlock();
@@ -882,7 +964,14 @@ mod tests {
 
         assert!(finish_locker(&flow.state, &*logind, 7));
         assert!(logind.calls().contains(&LogindCall::Unlock));
-        assert_eq!(flow.state().self_unlock_gen, Some(7));
+        assert_eq!(
+            flow.state()
+                .self_unlock_gens
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
     }
 
     /// Two triggers hammering the funnel at once must commit exactly one
