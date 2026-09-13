@@ -4,3 +4,5 @@
 
 pub mod logind;
 pub mod policy;
+pub mod service;
+pub mod wm_client;
