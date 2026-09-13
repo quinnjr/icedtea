@@ -14,6 +14,15 @@ use crate::taskbar::CompositorUpdate;
 
 const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 
+/// Wire member for `CompositorCommands::spawn_app`, kept as a named
+/// constant (rather than an inline literal at the call) so the unit test
+/// below can pin it against the compositor's
+/// `CompositorInterface::spawn_app` (see `compositor/src/dbus.rs`'s
+/// `spawn_app_is_exposed_as_SpawnApp_with_string_in_bool_out`): the two
+/// literals must agree, or the proxy call reaches no method and every
+/// launch silently reports `false`.
+const SPAWN_APP_MEMBER: &str = "SpawnApp";
+
 /// Spawn the signal worker. It seeds with `GetState`, then forwards every
 /// `org.icedtea.Compositor` signal as a [`CompositorUpdate`] until the bus drops.
 ///
@@ -220,7 +229,7 @@ impl CompositorCommands for CompositorProxy {
                 Some(COMPOSITOR_BUS_NAME),
                 COMPOSITOR_PATH,
                 Some(COMPOSITOR_IFACE),
-                "SpawnApp",
+                SPAWN_APP_MEMBER,
                 &(app_id,),
             )
             .ok()
@@ -249,5 +258,13 @@ mod tests {
         assert!(older.contains("v1") && older.contains("v2"), "{older}");
         let absent = version_mismatch(None, 2).expect("no property at all is a mismatch");
         assert!(absent.contains("Version"), "{absent}");
+    }
+
+    /// Pins the `SpawnApp` wire member the proxy calls: it must stay
+    /// identical to the member `compositor/src/dbus.rs` exposes (pinned on
+    /// that side by `spawn_app_is_exposed_as_SpawnApp_with_string_in_bool_out`).
+    #[test]
+    fn spawn_app_member_matches_the_compositor_interface() {
+        assert_eq!(SPAWN_APP_MEMBER, "SpawnApp");
     }
 }

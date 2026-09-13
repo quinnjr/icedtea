@@ -113,3 +113,65 @@ fn spawn_app_unparseable_exec_returns_false_and_spawns_nothing() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn spawn_app_rejects_traversal_and_non_stem_ids_without_spawning() {
+    let dir = tmpdir("traversal");
+    let sentinel = dir.join("escaped.ok");
+    // A live entry the traversal ids below must NOT be able to reach:
+    // `sub/../evil` resolves through the filesystem to this file, so it
+    // replies `true` (and touches the sentinel) the moment the file-stem
+    // charset guard in `lookup_app_exec` is loosened -- the loud failure
+    // that pins the allowlist boundary.
+    std::fs::write(
+        dir.join("evil.desktop"),
+        format!(
+            "[Desktop Entry]\nName=Evil\nExec=touch {}\n",
+            sentinel.display()
+        ),
+    )
+    .expect("seed evil.desktop");
+    // `sub/` exists so `sub/../evil` resolves through the filesystem to
+    // the entry above -- without the guard it would reply `true`.
+    std::fs::create_dir_all(dir.join("sub")).expect("seed sub dir");
+    let mut state = state_with_app_dir(&dir);
+
+    for bad_id in [
+        "",
+        ".",
+        "..",
+        "../evil",
+        "sub/../evil",
+        "/usr/share/applications/probe",
+        "a/b",
+        "a\\b",
+    ] {
+        assert!(
+            !spawn_app(&mut state, bad_id),
+            "traversal/non-stem id {bad_id:?} must reply false"
+        );
+    }
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !sentinel.exists(),
+        "traversal ids must spawn nothing, yet {sentinel:?} exists"
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read app dir")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["evil.desktop".to_string(), "sub".to_string()],
+        "traversal ids must create no new files"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

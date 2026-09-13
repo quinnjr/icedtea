@@ -601,6 +601,37 @@ mod tests {
     use icedtea_contract::{
         AltTabState, Appearance, Rectangle, WindowInfo, WindowUpdate, WorkspaceInfo,
     };
+    use zbus::object_server::Interface as _;
+
+    /// Pins the wire contract the shell's `CompositorProxy::spawn_app`
+    /// calls into (pinned on that side by `compositor_client.rs`'s
+    /// `spawn_app_member_matches_the_compositor_interface`): member
+    /// `SpawnApp` taking one string and returning one bool. Generated from
+    /// the live interface object, not a repeated literal -- a method rename
+    /// or signature change fails here instead of degrading to a silent
+    /// no-method call (every launch reporting `false`) at runtime.
+    #[test]
+    fn spawn_app_is_exposed_as_SpawnApp_with_string_in_bool_out() {
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let (_held, wake) =
+            std::os::unix::net::UnixStream::pair().expect("wake pair for interface probe");
+        let iface = CompositorInterface { cmd_tx, wake };
+        let mut xml = String::new();
+        iface.introspect_to_writer(&mut xml, 0);
+        let method = xml
+            .split("<method")
+            .find(|chunk| chunk.contains("name=\"SpawnApp\""))
+            .expect("SpawnApp member present in introspection XML: {xml}");
+        let body = &method[..method.find("</method>").unwrap_or(method.len())];
+        assert!(
+            body.contains("type=\"s\"") && body.contains("direction=\"in\""),
+            "SpawnApp takes one string in-arg: {body}"
+        );
+        assert!(
+            body.contains("type=\"b\"") && body.contains("direction=\"out\""),
+            "SpawnApp returns one bool out-arg: {body}"
+        );
+    }
 
     #[test]
     fn event_names_match_interface() {
