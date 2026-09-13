@@ -38,10 +38,40 @@ pub struct Behavior {
     pub snap_enabled: bool,
 }
 
+/// One named tile group holding ordered app ids.
+///
+/// Mirrors `shell::launcher::TileGroup` (Task 1): the config crate cannot
+/// depend on the shell crate, so the shape is duplicated here for
+/// persistence and converted at the shell boundary.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TileGroup {
+    /// Group display name.
+    pub name: String,
+    /// Member app ids in tile order.
+    pub ids: Vec<String>,
+}
+
+/// Launcher stores persisted beside `appearance`: ordered pinned app ids,
+/// ordered tile groups, and launch-frequency/recency counts
+/// (app id → (launch count, last-seen seq), mirroring Task 1's
+/// `RecencyStore` map). `Default` (all empty) is what a pre-launcher
+/// config degrades to via `#[serde(default)]`.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LauncherConfig {
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    #[serde(default)]
+    pub tile_groups: Vec<TileGroup>,
+    #[serde(default)]
+    pub recency: HashMap<String, (u64, u64)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub keybindings: HashMap<String, KeyCombo>,
     pub appearance: Appearance,
+    #[serde(default)]
+    pub launcher: LauncherConfig,
     pub behavior: Behavior,
     pub workspace_names: Vec<String>,
     pub displays: Vec<DisplayConfig>,
@@ -628,6 +658,40 @@ mod tests {
         // And `load_or_default` (the fresh-boot wrapper) still degrades to
         // defaults on that same lock, as documented.
         assert_eq!(load_or_default(&path), default_config());
+    }
+
+    #[test]
+    fn default_launcher_stores_are_empty() {
+        let cfg = default_config();
+        assert!(cfg.launcher.pinned.is_empty());
+        assert!(cfg.launcher.tile_groups.is_empty());
+        assert!(cfg.launcher.recency.is_empty());
+    }
+
+    #[test]
+    fn launcher_config_serde_round_trip() {
+        let mut cfg = default_config();
+        cfg.launcher.pinned.push("firefox".to_string());
+        cfg.launcher.tile_groups.push(TileGroup {
+            name: "Web".to_string(),
+            ids: vec!["firefox".to_string()],
+        });
+        cfg.launcher.recency.insert("firefox".to_string(), (3, 7));
+        let bytes = serde_json::to_vec(&cfg).unwrap();
+        let back: Config = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn missing_launcher_field_deserializes_to_empty() {
+        // Config JSON saved before the launcher field existed must still
+        // parse, degrading the launcher stores to empty.
+        let mut value = serde_json::to_value(default_config()).unwrap();
+        value.as_object_mut().unwrap().remove("launcher");
+        let back: Config = serde_json::from_value(value).unwrap();
+        assert!(back.launcher.pinned.is_empty());
+        assert!(back.launcher.tile_groups.is_empty());
+        assert!(back.launcher.recency.is_empty());
     }
 
     #[test]

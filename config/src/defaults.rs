@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{Behavior, Config, KeyCombo};
+use crate::{Behavior, Config, KeyCombo, LauncherConfig};
 use contract::Appearance;
 
 pub fn default_config() -> Config {
@@ -64,6 +64,11 @@ pub fn default_config() -> Config {
             raise_on_focus: true,
             hide_bar_on_fullscreen: true,
             snap_enabled: true,
+        },
+        launcher: LauncherConfig {
+            pinned: vec![],
+            tile_groups: vec![],
+            recency: HashMap::new(),
         },
         workspace_names: vec!["1".into(), "2".into(), "3".into(), "4".into()],
         displays: vec![],
