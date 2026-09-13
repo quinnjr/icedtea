@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{Behavior, Config, KeyCombo, LauncherConfig};
+use crate::{Behavior, Config, KeyCombo, LauncherConfig, Power};
 use contract::Appearance;
 
 pub fn default_config() -> Config {
@@ -64,6 +64,11 @@ pub fn default_config() -> Config {
             raise_on_focus: true,
             hide_bar_on_fullscreen: true,
             snap_enabled: true,
+        },
+        power: Power {
+            locker_command: None,
+            lock_idle_timeout_ms: None,
+            lock_before_sleep: true,
         },
         launcher: LauncherConfig {
             pinned: vec![],

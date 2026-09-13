@@ -38,6 +38,38 @@ pub struct Behavior {
     pub snap_enabled: bool,
 }
 
+/// Session/power policy consumed by the `icedtea-session` logind integration.
+///
+/// All locking is opt-in: `locker_command` defaults to `None`, and both
+/// idle-lock and lock-before-sleep are refused without a configured locker
+/// (Decision 2). `lock_before_sleep` defaults to `true` so the attempt is armed
+/// the moment a locker is configured, while remaining a no-op until then.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Power {
+    /// Shell command spawned to actually secure the screen (must itself bind
+    /// ext_session_lock_manager_v1 and authenticate before unlocking).
+    pub locker_command: Option<String>,
+    /// Lock after this many milliseconds of seat idle. `None` disables
+    /// idle-lock even with a locker configured (opt-in, matches swayidle).
+    pub lock_idle_timeout_ms: Option<u64>,
+    /// Attempt to lock before suspend/hibernate. A no-op without a configured
+    /// `locker_command`.
+    pub lock_before_sleep: bool,
+}
+
+// Manual rather than derived: `lock_before_sleep` defaults to `true`, which a
+// derive could not express, and serde's field-level `default` on
+// `Config.power` relies on this `Default` for legacy configs.
+impl Default for Power {
+    fn default() -> Self {
+        Self {
+            locker_command: None,
+            lock_idle_timeout_ms: None,
+            lock_before_sleep: true,
+        }
+    }
+}
+
 /// Standard 1x1 tile span: the size a tile group gets when none was stored
 /// (pre-size configs) or newly created.
 pub fn default_tile_size() -> u32 {
@@ -94,6 +126,8 @@ pub struct Config {
     #[serde(default)]
     pub launcher: LauncherConfig,
     pub behavior: Behavior,
+    #[serde(default)]
+    pub power: Power,
     pub workspace_names: Vec<String>,
     pub displays: Vec<DisplayConfig>,
 }
@@ -348,6 +382,11 @@ fn read_config_from_db(db: Database) -> Config {
         {
             cfg.behavior = b;
         }
+        if let Ok(power_table) = read_txn.open_table(DB_POWER)
+            && let Some(p) = read_json::<Power>(&power_table, KEY_POWER)
+        {
+            cfg.power = p;
+        }
         if let Ok(ws_table) = read_txn.open_table(DB_WORKSPACES)
             && let Some(names) = read_json::<Vec<String>>(&ws_table, KEY_WORKSPACES)
             && !names.is_empty()
@@ -429,6 +468,9 @@ impl Config {
             let behavior_bytes =
                 serde_json::to_vec(&self.behavior).map_err(std::io::Error::other)?;
             behavior.insert(KEY_BEHAVIOR, behavior_bytes.as_slice())?;
+            let mut power = write_txn.open_table(DB_POWER)?;
+            let power_bytes = serde_json::to_vec(&self.power).map_err(std::io::Error::other)?;
+            power.insert(KEY_POWER, power_bytes.as_slice())?;
             let mut workspaces = write_txn.open_table(DB_WORKSPACES)?;
             let workspace_bytes =
                 serde_json::to_vec(&self.workspace_names).map_err(std::io::Error::other)?;
@@ -936,6 +978,92 @@ mod tests {
         assert!(back.launcher.pinned.is_empty());
         assert!(back.launcher.tile_groups.is_empty());
         assert!(back.launcher.recency.is_empty());
+    }
+
+    #[test]
+    fn default_power_matches_spec() {
+        let cfg = default_config();
+        assert_eq!(
+            cfg.power,
+            Power {
+                locker_command: None,
+                lock_idle_timeout_ms: None,
+                lock_before_sleep: true,
+            }
+        );
+    }
+
+    #[test]
+    fn power_serde_round_trip() {
+        let power = Power {
+            locker_command: Some("gtklock".into()),
+            lock_idle_timeout_ms: Some(300_000),
+            lock_before_sleep: false,
+        };
+        let bytes = serde_json::to_vec(&power).unwrap();
+        let back: Power = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, power);
+    }
+
+    #[test]
+    fn legacy_config_without_power_decodes_to_defaults() {
+        let mut value = serde_json::to_value(default_config()).unwrap();
+        value.as_object_mut().unwrap().remove("power");
+        let back: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            back.power,
+            Power {
+                locker_command: None,
+                lock_idle_timeout_ms: None,
+                lock_before_sleep: true,
+            }
+        );
+    }
+
+    #[test]
+    fn save_then_load_round_trips_power() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let mut cfg = default_config();
+        cfg.power = Power {
+            locker_command: Some("swaylock".into()),
+            lock_idle_timeout_ms: Some(60_000),
+            lock_before_sleep: false,
+        };
+        {
+            let db = open(&path).unwrap();
+            cfg.save(&db).unwrap();
+        }
+        let loaded = load_or_default(&path);
+        assert_eq!(loaded.power, cfg.power);
+    }
+
+    #[test]
+    fn missing_power_table_loads_default() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let db = open(&path).unwrap();
+        {
+            // An "old-format" DB written before this section existed must
+            // degrade the power section to its default, not fail the load.
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(DB_APPEARANCE).unwrap();
+                let bytes = serde_json::to_vec(&default_config().appearance).unwrap();
+                table.insert(KEY_APPEARANCE, bytes.as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        drop(db);
+        let cfg = load_or_default(&path);
+        assert_eq!(
+            cfg.power,
+            Power {
+                locker_command: None,
+                lock_idle_timeout_ms: None,
+                lock_before_sleep: true,
+            }
+        );
     }
 
     #[test]
