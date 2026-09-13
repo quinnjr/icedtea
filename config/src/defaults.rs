@@ -45,6 +45,24 @@ pub fn default_config() -> Config {
             &key,
         );
     }
+    insert(
+        &mut keybindings,
+        "spawn:icedtea-session lock",
+        &[],
+        "XF86_PowerOff",
+    );
+    insert(
+        &mut keybindings,
+        "spawn:icedtea-session suspend",
+        &[],
+        "XF86_Sleep",
+    );
+    insert(
+        &mut keybindings,
+        "spawn:icedtea-session hibernate",
+        &[],
+        "XF86_Hibernate",
+    );
 
     Config {
         keybindings,
@@ -73,5 +91,35 @@ pub fn default_config() -> Config {
         },
         workspace_names: vec!["1".into(), "2".into(), "3".into(), "4".into()],
         displays: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_binds_the_power_keys_to_the_session_cli() {
+        let config = default_config();
+        for (action, key) in [
+            ("spawn:icedtea-session lock", "XF86_PowerOff"),
+            ("spawn:icedtea-session suspend", "XF86_Sleep"),
+            ("spawn:icedtea-session hibernate", "XF86_Hibernate"),
+        ] {
+            let combo = config
+                .keybindings
+                .get(action)
+                .unwrap_or_else(|| panic!("default config is missing {action:?}"));
+            assert!(
+                combo.modifiers.is_empty(),
+                "{action:?} must carry no modifiers"
+            );
+            assert_eq!(combo.key, key, "{action:?} must be bound to {key}");
+            assert_ne!(
+                crate::key_name_to_keysym(&combo.key),
+                0,
+                "{action:?} key {key} must resolve to a real keysym"
+            );
+        }
     }
 }
