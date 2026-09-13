@@ -1839,14 +1839,7 @@ mod tests {
             classes.contains(&"active".to_string()),
             "indicator must carry active styling"
         );
-        // Bar order: workspaces, windows, ime, clip — ime before clip.
-        let _ids: Vec<_> = v
-            .children
-            .iter()
-            .filter_map(|c| c.props.str(PropName::Id).map(str::to_string))
-            .collect();
-        // Actually view children are at top-level; check via by_id order: workspaces before ime before clip.
-        // Simpler: assert ime exists alongside expected siblings.
+        // Bar order: workspaces, windows, ime, clip — checked via by_id order below.
         assert!(by_id(&v, "workspaces").is_some());
         assert!(by_id(&v, "clip").is_some());
     }

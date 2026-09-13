@@ -476,6 +476,54 @@ impl Panel {
         self.wait_for_state(|| self.wm_calls(), |c| want(c.as_slice()), what);
     }
 
+    /// Non-panicking `wait_for_calls`: true if `want` accepts within
+    /// `timeout`, false on expiry. For retry loops where a single miss is
+    /// expected — wlroots silently drops a button with no focused surface,
+    /// so a click raced past focus assignment must be re-driven, not
+    /// treated as failure.
+    pub fn try_wait_for_calls(
+        &self,
+        want: impl Fn(&[(String, u32)]) -> bool,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if want(self.wm_calls().as_slice()) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Click the named button until its call lands, re-querying the point
+    /// each attempt: layout shifts and focus-assignment races both miss
+    /// silently through `click_button`, so a single drive is flaky under
+    /// load. Bounded at three attempts (~30s worst case, matching the old
+    /// `TIMEOUT` budget); panics only when all attempts miss.
+    ///
+    /// # Panics
+    ///
+    /// If no attempt delivers within budget.
+    pub fn click_until_calls(
+        &mut self,
+        label: &str,
+        button: u32,
+        want: impl Fn(&[(String, u32)]) -> bool,
+        what: &str,
+    ) {
+        for _ in 0..3 {
+            let (x, y) = self.point(label);
+            self.click_button(x, y, button);
+            if self.try_wait_for_calls(&want, std::time::Duration::from_secs(10)) {
+                return;
+            }
+        }
+        panic!("{what} within 3 click attempts");
+    }
+
     /// The `ClipCommands` counterpart.
     ///
     /// # Panics

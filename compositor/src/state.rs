@@ -634,6 +634,59 @@ struct OverrideRedirectSurface {
     geometry: Rectangle,
 }
 
+/// One commit-family delivery, in arrival order. Recording the sequence (not
+/// just the last of each kind in `last_commit`) is what makes a swapped
+/// commit/precommit wiring fail: transposed callbacks still produce equal
+/// masks, but never in this order with both timestamps set. Mirrors the
+/// `wlr` crate's own `output_feedback.rs` harness shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitEvent {
+    /// `OutputHandler::output_precommitted`: staged mask, not yet applied.
+    Pre {
+        fields: wlr::CommittedFields,
+        when: std::time::Duration,
+    },
+    /// `OutputHandler::output_committed`: applied mask.
+    Commit {
+        fields: wlr::CommittedFields,
+        when: std::time::Duration,
+    },
+}
+
+/// One deferred test-harness probe stashed for the next live
+/// `OutputHandler::frame` (see `State::pending_test_action`). One enum
+/// rather than one `Option` stash field per probe: the arming sites and the
+/// single `frame` dispatch arm all speak this one type.
+enum TestAction {
+    /// A scale `DbCommand::SetOutputScaleForTest` wants pushed onto the
+    /// *live* `wlr::Output` (not just this model's `OutputSurface::scale`
+    /// mirror): the target output id, the guarded scale, and the reply
+    /// `frame` answers once the live output has actually adopted it -- not
+    /// the `DbCommand` handler itself, since anything reading the *live*
+    /// `wlr_output.scale` (the fractional-scale protocol's auto-sent
+    /// `preferred_scale`, notably) needs the real thing.
+    Scale(wlr::OutputId, f32, crossbeam_channel::Sender<bool>),
+    /// A cursor move `DbCommand::MoveOutputCursorForTest` wants performed:
+    /// the damage stimulus for the commit/damage round-trip test. Carries
+    /// the target position plus the frame-kick count the command arm
+    /// observed so the deferred report stays complete.
+    CursorMove {
+        x: f64,
+        y: f64,
+        kicked: usize,
+        reply: crossbeam_channel::Sender<crate::dbus::DamageProbeReport>,
+    },
+    /// A `DbCommand::EmitRequestStateForTest` reply waiting for the next
+    /// `frame` to emit one `request_state` signal on its live
+    /// `&wlr::Output`: the request-state round-trip test's stimulus.
+    /// Carries the frame-kick count the command arm observed, mirroring
+    /// `CursorMove`, so the deferred report stays complete.
+    RequestState {
+        kicked: usize,
+        reply: crossbeam_channel::Sender<crate::dbus::RequestStateProbeReport>,
+    },
+}
+
 pub struct State {
     pub window_manager: WindowManager,
     pub config: Config,
@@ -797,20 +850,70 @@ pub struct State {
     /// Kept because `OutputHandler::destroyed` is given only an id, and the
     /// model's geometry map is keyed by index.
     output_ids: HashMap<wlr::OutputId, u32>,
-    /// A scale `DbCommand::SetOutputScaleForTest` wants pushed onto the
-    /// *live* `wlr::Output` (not just this model's `OutputSurface::scale`
-    /// mirror) the next time `OutputHandler::frame` hands one back for that
-    /// output id -- the only place after boot this crate has a live
-    /// `&wlr::Output` to call `wlr::Output::set_scale` on (there is no
-    /// `Runtime` method that reaches an output by id outside a handler
-    /// callback). The reply is answered from `frame`, once the live output
-    /// has actually adopted the scale, not from the `DbCommand` handler
-    /// itself -- anything that reads the *live* `wlr_output.scale` (the
-    /// fractional-scale protocol's auto-sent `preferred_scale`, notably)
-    /// needs the real thing, and this crate's own `primary_output_scale`
-    /// mirror was never a substitute for it. `None` when no test scale
-    /// override is outstanding, which is true almost all the time.
-    pending_test_output_scale: Option<(wlr::OutputId, f32, crossbeam_channel::Sender<bool>)>,
+    /// The last commit observed per live output: the staged-field mask plus
+    /// wlroots' commit timestamp, written by both
+    /// `OutputHandler::output_committed` (applied) and
+    /// `OutputHandler::output_precommitted` (staged, not yet applied) in
+    /// emission order, so the surviving entry is the commit's view. Keyed by
+    /// the always-unique [`wlr::OutputId`], like `output_ids`. Observation
+    /// only -- the state is already applied (or, for precommit, staged) by
+    /// the time either handler runs, so nothing here vetoes or recommits.
+    /// `pub` so later wire-up tasks and integration tests can read it; the
+    /// commit handlers only ever `insert`, while `destroyed` prunes the dead
+    /// id alongside `output_ids` so the map keeps covering exactly the live
+    /// set instead of leaking one entry per unplugged output.
+    pub last_commit: HashMap<wlr::OutputId, (wlr::CommittedFields, std::time::Duration)>,
+    /// The last damage extents observed per live output: the smallest box
+    /// containing every rectangle of the region
+    /// `OutputHandler::output_damaged` was given, via `Region::extents`.
+    /// Written in emission order, so the surviving entry is the latest
+    /// damage's view. Keyed by the always-unique [`wlr::OutputId`], like
+    /// `output_ids`. Observation only -- damage recorded here never touches
+    /// the render loop (the frame callback commits the scene on its own
+    /// schedule). `pub` so later wire-up tasks and integration tests can
+    /// read it; the damage handler only ever `insert`s, while `destroyed`
+    /// prunes the dead id alongside `output_ids` so the map keeps covering
+    /// exactly the live set instead of leaking one entry per unplugged
+    /// output.
+    pub last_damage: HashMap<wlr::OutputId, wlr::Box2D>,
+    /// Every damage delivery in arrival order: `(output id, extents)`
+    /// pushed by `OutputHandler::output_damaged` alongside the
+    /// `last_damage` insert. `last_damage` keeps only the surviving entry
+    /// per output, which can never show which output damaged last -- this
+    /// log can, which is its only reason to exist (the last-writer guard
+    /// for the commit/damage round-trip tests: it pins the damage that
+    /// actually arrived most recently). Observation only, same
+    /// dispatch-path rules as the maps (record, never panic). Capped at
+    /// the newest [`COMMIT_LOG_CAP`] entries, like `commit_log`;
+    /// `destroyed` prunes the dead id alongside the maps. `pub` so
+    /// integration tests can assert the order after a run.
+    pub damage_log: Vec<(wlr::OutputId, wlr::Box2D)>,
+    /// Every commit-family delivery in arrival order: `(output id, event)`
+    /// pushed by `OutputHandler::output_precommitted` (`Pre`: staged, not yet
+    /// applied) and `OutputHandler::output_committed` (`Commit`: applied).
+    /// `last_commit` keeps only the surviving entry per output, which can
+    /// never show that precommit preceded commit -- this log can, which is
+    /// its only reason to exist (task 7 wire-up proof). Observation only,
+    /// same dispatch-path rules as the maps (record, never panic). Capped at
+    /// the newest [`COMMIT_LOG_CAP`] entries so a long session cannot grow
+    /// it without bound; `destroyed` prunes the dead id alongside the maps. `pub` so
+    /// integration tests can assert the order after a run.
+    pub commit_log: Vec<(wlr::OutputId, CommitEvent)>,
+    /// The last client-requested output state per live output: the
+    /// field mask `OutputHandler::output_state_requested` was given (the
+    /// output-management protocol's ask, not what was applied). Mask only
+    /// -- a literal apply from a mask is impossible; the full apply lives
+    /// in `output_configuration_applied`. Same insert-only handler plus
+    /// `destroyed`-prunes shape as `last_commit`/`last_damage`.
+    pub last_request: HashMap<wlr::OutputId, wlr::CommittedFields>,
+    /// One deferred test-harness probe awaiting the next live
+    /// `OutputHandler::frame` -- the only place after boot this crate has a
+    /// live `&wlr::Output` to act on (there is no `Runtime` method that
+    /// reaches an output by id outside a handler callback). Single-shot by
+    /// design: arming while one is outstanding overwrites it (with a warn),
+    /// and `frame` takes it before acting so a rejection still consumes the
+    /// entry rather than retrying forever. `None` almost all the time.
+    pending_test_action: Option<TestAction>,
     /// Connector name -> the live `wlr::OutputId` of an output that is
     /// currently *disabled* and therefore has NO entry in `self.outputs` /
     /// `self.output_ids`. Populated both by `new_output`'s persisted-disabled
@@ -1461,7 +1564,12 @@ impl State {
             config_reload_tx: None,
             config_reload_rx: None,
             output_ids: HashMap::new(),
-            pending_test_output_scale: None,
+            last_commit: HashMap::new(),
+            last_damage: HashMap::new(),
+            damage_log: Vec::new(),
+            commit_log: Vec::new(),
+            last_request: HashMap::new(),
+            pending_test_action: None,
             disabled_outputs: HashMap::new(),
             config_db_lock: Arc::new(Mutex::new(())),
             background: None,
@@ -5137,12 +5245,19 @@ impl State {
                 }
                 match self.wlr_output_id_for(idx) {
                     // A live output backs this index: defer the ack to
-                    // `frame` (see `pending_test_output_scale`'s doc), which
+                    // `frame` (see `pending_test_action`'s doc), which
                     // pushes `guarded` onto the *real* `wlr::Output` -- the
                     // model mirror this branch just wrote is not itself what
                     // the fractional-scale protocol's auto-sent
                     // `preferred_scale` reads from.
-                    Some(oid) => self.pending_test_output_scale = Some((oid, guarded, reply)),
+                    Some(oid) => {
+                        if self.pending_test_action.is_some() {
+                            tracing::warn!(
+                                "SetOutputScaleForTest: overwriting outstanding test action (single-shot slot)"
+                            );
+                        }
+                        self.pending_test_action = Some(TestAction::Scale(oid, guarded, reply));
+                    }
                     // No live output backs this index -- a `State` built
                     // straight through `State::new` with no `wlr::Runtime`
                     // attached, as unit tests do. Nothing to defer onto, so
@@ -5152,6 +5267,98 @@ impl State {
                         let _ = reply.send(true);
                     }
                 }
+                return Some(());
+            }
+            DbCommand::MoveOutputCursorForTest { x, y, reply } => {
+                // Loop-thread arming for the damage round-trip test: clear
+                // past damage, kick the frame clock everywhere (the kick is
+                // load-bearing -- nothing else schedules a frame this late in
+                // a run), and stash the move for the next `frame`, which owns
+                // the only live `&wlr::Output` a cursor can be created on.
+                // The reply waits for that frame (see `frame`), so a missing
+                // frame surfaces as a loud receive-timeout in the test rather
+                // than a silent ack here.
+                //
+                // The clear runs after the `runtime()` borrow below: with no
+                // runtime attached no frame will ever arrive to run the
+                // move on, so -- mirroring the scale arm -- reply
+                // immediately (`moved: false`) without clearing the live
+                // maps and without stashing, rather than leaving a probe
+                // that can never run.
+                let kicked = match self.wayland.runtime() {
+                    Some(rt) => rt.schedule_frame_all(),
+                    None => {
+                        let _ = reply.send(crate::dbus::DamageProbeReport {
+                            moved: false,
+                            kicked: 0,
+                            frames: self.frames,
+                            commits: self.commit_log.len(),
+                        });
+                        return Some(());
+                    }
+                };
+                self.last_damage.clear();
+                if self.pending_test_action.is_some() {
+                    tracing::warn!(
+                        "MoveOutputCursorForTest: overwriting outstanding test action (single-shot slot)"
+                    );
+                }
+                self.pending_test_action = Some(TestAction::CursorMove {
+                    x,
+                    y,
+                    kicked,
+                    reply,
+                });
+                return Some(());
+            }
+            DbCommand::EmitRequestStateForTest { reply } => {
+                // Loop-thread arming for the request-state round-trip test:
+                // clear past requests so the surviving `last_request` entry
+                // can only be the stimulus delivery (the same clear the
+                // damage arm runs on `last_damage`), kick the frame clock
+                // everywhere so a frame arrives to run the emission on, and
+                // stash the reply for the next `frame`, which owns the only
+                // live `&wlr::Output` a transaction can be staged on. The
+                // reply waits for that frame, so a missing frame surfaces
+                // as a loud receive-timeout in the test rather than a
+                // silent ack here. With no runtime attached no frame will
+                // ever arrive, so -- mirroring the scale arm -- bail out
+                // before the clear and without stashing, rather than
+                // leaving a probe that can never run. No immediate reply is
+                // possible here (unlike the cursor arm):
+                // `RequestStateProbeReport` needs the emitting output's
+                // `wlr::OutputId`, which nothing outside the `wlr` crate can
+                // construct, and with no runtime attached no live id exists
+                // either -- so this degrades to a loud warn (plus the
+                // harness's existing receive-timeout), never a silent stash.
+                // The report struct itself lives in `dbus.rs`, so no shape
+                // change is made here.
+                let kicked = match self.wayland.runtime() {
+                    Some(rt) => rt.schedule_frame_all(),
+                    None => {
+                        tracing::warn!(
+                            "EmitRequestStateForTest: no runtime; request-state emission skipped"
+                        );
+                        return Some(());
+                    }
+                };
+                // A 0 kick means no frame will arrive to run the stashed
+                // emission on, so the test's reply waits on a
+                // receive-timeout: loud here, not silent. (`kicked` still
+                // rides along in the report for the harness to assert on --
+                // that struct lives in `dbus.rs`, another agent's file.)
+                if kicked == 0 {
+                    tracing::warn!(
+                        "EmitRequestStateForTest: frame kick reached 0 outputs; no frame will run the emission"
+                    );
+                }
+                self.last_request.clear();
+                if self.pending_test_action.is_some() {
+                    tracing::warn!(
+                        "EmitRequestStateForTest: overwriting outstanding test action (single-shot slot)"
+                    );
+                }
+                self.pending_test_action = Some(TestAction::RequestState { kicked, reply });
                 return Some(());
             }
         }
@@ -6294,6 +6501,35 @@ impl State {
 // bodies — a condition that cannot be handled is recorded in `State` and
 // acted on once control is back on the loop.
 
+/// How many entries `commit_log` and `damage_log` each keep: newest wins,
+/// oldest past the cap is dropped, so a long session cannot grow either
+/// without bound.
+const COMMIT_LOG_CAP: usize = 64;
+
+impl State {
+    /// Push one commit-family delivery onto `commit_log`, dropping the
+    /// oldest entry past the cap so the log stays bounded over a session.
+    /// `Vec::remove(0)` is linear, but the cap is [`COMMIT_LOG_CAP`] and
+    /// this fires at most a few times per commit -- unmeasurable against
+    /// the commit itself.
+    fn record_commit(&mut self, id: wlr::OutputId, ev: CommitEvent) {
+        self.commit_log.push((id, ev));
+        if self.commit_log.len() > COMMIT_LOG_CAP {
+            self.commit_log.remove(0);
+        }
+    }
+
+    /// Push one damage delivery onto `damage_log`, dropping the oldest
+    /// entry past the cap -- the same [`COMMIT_LOG_CAP`] bound
+    /// `record_commit` keeps, for the same reason.
+    fn record_damage(&mut self, id: wlr::OutputId, extents: wlr::Box2D) {
+        self.damage_log.push((id, extents));
+        if self.damage_log.len() > COMMIT_LOG_CAP {
+            self.damage_log.remove(0);
+        }
+    }
+}
+
 impl wlr::OutputHandler for State {
     fn new_output(&mut self, output: &wlr::Output<'_>) {
         let Some(runtime) = self.wayland.runtime().cloned() else {
@@ -6518,21 +6754,119 @@ impl wlr::OutputHandler for State {
 
     fn frame(&mut self, output: &wlr::Output<'_>) {
         self.frames += 1;
-        // See `pending_test_output_scale`'s own doc: this is the only place
-        // after boot with a live `&wlr::Output` to push a
-        // `DbCommand::SetOutputScaleForTest` scale onto. `take` first so a
-        // rejected `set_scale` still consumes the pending entry rather than
-        // retrying forever against every future frame of every output.
-        if self
-            .pending_test_output_scale
-            .as_ref()
-            .is_some_and(|(oid, ..)| *oid == output.id())
-        {
-            let (_, scale, reply) = self.pending_test_output_scale.take().unwrap();
-            if let Err(err) = output.set_scale(scale) {
-                tracing::warn!(?err, "SetOutputScaleForTest: live scale rejected");
+        // See `pending_test_action`'s own doc: this is the only place
+        // after boot with a live `&wlr::Output` to run a deferred test
+        // probe on. `take` first so a rejected probe still consumes the
+        // pending entry rather than retrying forever against every future
+        // frame of every output -- except a scale probe for a *different*
+        // output, which is re-stashed to keep waiting for its own frame.
+        if let Some(action) = self.pending_test_action.take() {
+            match action {
+                TestAction::Scale(oid, scale, reply) => {
+                    if oid != output.id() {
+                        // A different output framed first: keep waiting for
+                        // the right one rather than dropping the probe.
+                        self.pending_test_action = Some(TestAction::Scale(oid, scale, reply));
+                    } else {
+                        if let Err(err) = output.set_scale(scale) {
+                            tracing::warn!(?err, "SetOutputScaleForTest: live scale rejected");
+                        }
+                        let _ = reply.send(true);
+                    }
+                }
+                // The damage stimulus for the round-trip test. The move
+                // needs an image: an 8x8 linear ARGB8888 buffer off the
+                // runtime's own allocator, exactly as the `wlr` crate's
+                // `output_feedback.rs` harness builds its cursor. The
+                // cursor is destroyed in the same frame (a `Drop` that frees
+                // would race wlroots' teardown ordering, so the crate
+                // deliberately has none). The move's damage alone earns no
+                // further headless frame, so kick one explicitly for the
+                // output that moved -- that follow-up is what the test's
+                // "subsequent frame commits" asserts on. The report
+                // snapshots `frames`/`commit_log` at the move, so
+                // "subsequent" is anchored to the stimulus, not to boot.
+                TestAction::CursorMove {
+                    x,
+                    y,
+                    kicked,
+                    reply,
+                } => {
+                    let mut moved = false;
+                    if let Some(rt) = self.wayland.runtime() {
+                        if let Some(alloc) = rt.allocator_ref() {
+                            let fmt =
+                                wlr::DrmFormat::new(wlr::FourCc::ARGB8888, [wlr::Modifier::LINEAR]);
+                            match alloc.create_buffer(8, 8, &fmt) {
+                                Ok(buf) => {
+                                    if let Some(mut cursor) = output.create_cursor() {
+                                        let image: &wlr::Buffer = &buf;
+                                        cursor.set_buffer(image, 1, 1);
+                                        moved = cursor.move_to(x, y);
+                                        cursor.destroy();
+                                    } else {
+                                        tracing::warn!(
+                                            "MoveOutputCursorForTest: no cursor for output; move skipped"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        ?err,
+                                        "MoveOutputCursorForTest: cursor buffer rejected"
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "MoveOutputCursorForTest: no allocator; cursor move skipped"
+                            );
+                        }
+                    } else {
+                        tracing::warn!("MoveOutputCursorForTest: no runtime; cursor move skipped");
+                    }
+                    output.schedule_frame();
+                    let _ = reply.send(crate::dbus::DamageProbeReport {
+                        moved,
+                        kicked,
+                        frames: self.frames,
+                        commits: self.commit_log.len(),
+                    });
+                }
+                // The request-state round-trip test's stimulus. Stages a
+                // scale and transform that DIFFER from the live output's own
+                // (headless boots at 1.0/`Normal`) on a fresh transaction --
+                // staging without committing changes nothing on the output;
+                // the mask alone is what `output_state_requested` records --
+                // emits the `request_state` signal through wlroots, then
+                // drops the transaction uncommitted. The differing values are
+                // load-bearing, not decorative: wlroots'
+                // `wlr_output_send_request_state` filters the staged mask
+                // through `output_compare_state` and SKIPS the emission
+                // entirely when nothing differs (staging the live 1.0 scale
+                // round-trips `Ok` yet delivers nothing). A rejected emission
+                // is warned and reported, never panicked: this runs on the
+                // dispatch path, where a panic aborts through C.
+                TestAction::RequestState { kicked, reply } => {
+                    let mut staged = output.state();
+                    staged.set_scale(2.0);
+                    staged.set_transform(wlr::Transform::Flipped180);
+                    let fields = staged.committed_fields();
+                    let emitted = match output.send_request_state(&staged) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            tracing::warn!(?err, "EmitRequestStateForTest: emission rejected");
+                            false
+                        }
+                    };
+                    let _ = reply.send(crate::dbus::RequestStateProbeReport {
+                        emitted,
+                        id: output.id(),
+                        fields,
+                        kicked,
+                    });
+                }
             }
-            let _ = reply.send(true);
         }
         let Some(runtime) = self.wayland.runtime() else {
             return;
@@ -6552,6 +6886,14 @@ impl wlr::OutputHandler for State {
         // outlive the physical output and a reconnected connector reusing the
         // name could rehydrate a dead id.
         self.disabled_outputs.remove(&id);
+        // The commit-observation record covers exactly the live set: drop the
+        // dead id's entry (if any) with the rest of its model state rather
+        // than leaking one entry per unplugged output.
+        self.last_commit.remove(&id);
+        self.last_damage.remove(&id);
+        self.last_request.remove(&id);
+        self.commit_log.retain(|(oid, _)| *oid != id);
+        self.damage_log.retain(|(oid, _)| *oid != id);
         // `remove` on an unknown id, not indexing: this can name an output
         // this handler was never told about (see the library's own docs), and
         // a panic here aborts.
@@ -6804,6 +7146,244 @@ impl wlr::OutputHandler for State {
         // The trait doc REQUIRES this once the layout is settled and
         // persisted, so other bound managers see the fresh state + serial.
         runtime.update_output_manager_state();
+    }
+
+    /// A client requested an output power mode: power the output off
+    /// ([`wlr::PowerMode::Off`]) or back on ([`wlr::PowerMode::On`]).
+    /// Off mirrors `output_configuration_applied`'s disable branch for this
+    /// id (model-side only: drop from the active set, record in
+    /// `disabled_outputs` keyed by id, migrate windows, run the settle
+    /// sequence); On mirrors its re-enable path via `take_disabled_output`
+    /// by connector name, rehydrating the output into the active set. The
+    /// strand guard is honored with `batch_enables = false`: a lone power
+    /// request names no batch enabling to replace the output, so powering
+    /// off the last active output is refused exactly like the interactive
+    /// path refuses it. Unknown modes never arrive (`wlr` misses them to
+    /// `None` upstream); the wildcard arm exists only because the enum is
+    /// non-exhaustive. No unwrap/expect/assert/indexing: same dispatch
+    /// path, same abort-through-C rule as the commit arms.
+    fn output_power_mode_requested(&mut self, output: wlr::OutputId, mode: wlr::PowerMode) {
+        match mode {
+            wlr::PowerMode::Off => {
+                let Some(runtime) = self.wayland.runtime().cloned() else {
+                    return;
+                };
+                // Index via `output_ids`: an unknown or already-disabled id
+                // simply has no model state to drop. Name and geometry come
+                // from the active surface -- no `AppliedHead` is needed, so
+                // the disable branch mirrors cleanly.
+                let Some(index) = self.output_ids.get(&output).copied() else {
+                    return;
+                };
+                let Some(surface) = self.outputs.get(&index) else {
+                    return;
+                };
+                let head_name = surface.name.clone();
+                let old_geometry = surface.geometry;
+                if self.disable_would_strand_session(index, false) {
+                    tracing::warn!(
+                        %head_name,
+                        "refusing to power off the last active output; keeping >=1 enabled to avoid a black screen"
+                    );
+                    return;
+                }
+                self.outputs.remove(&index);
+                self.disabled_outputs.insert(output, head_name);
+                self.output_ids.remove(&output);
+                // The observation record covers exactly the live set: drop
+                // the victim id's entries with the rest of its model state,
+                // mirroring `destroyed`, rather than leaking one entry per
+                // powered-off output. (The power test sources the victim id
+                // from `last_commit` *before* Off, so this pruning does not
+                // disturb it.)
+                self.last_commit.remove(&output);
+                self.last_damage.remove(&output);
+                self.last_request.remove(&output);
+                self.commit_log.retain(|(oid, _)| *oid != output);
+                self.damage_log.retain(|(oid, _)| *oid != output);
+                self.migrate_windows_from(old_geometry);
+                // Settle exactly as `output_configuration_applied` does
+                // after its batch: reclaim, exclusive zones, scene,
+                // re-advertise.
+                self.reclaim_offscreen_windows();
+                self.arrange_layers();
+                self.sync_wallpaper_nodes();
+                self.sync_scene();
+                self.emit_pending();
+                self.resolve_orphaned_layers();
+                runtime.update_output_manager_state();
+            }
+            wlr::PowerMode::On => {
+                let Some(runtime) = self.wayland.runtime().cloned() else {
+                    return;
+                };
+                // An id that is not currently disabled has nothing to
+                // re-enable. `take_disabled_output`'s `None` covers both the
+                // no-match and the ambiguous same-name case (which it already
+                // warned about) -- either way there is nothing safe to
+                // rehydrate.
+                let Some(head_name) = self.disabled_outputs.get(&output).cloned() else {
+                    return;
+                };
+                let Some(oid) = self.take_disabled_output(&head_name) else {
+                    return;
+                };
+                let index = self.next_output_index;
+                self.next_output_index += 1;
+                // No `AppliedHead` here, so the head-dims middle fallback the
+                // applied path uses is unavailable: layout box straight to
+                // the same 1920x1080 last resort.
+                let geometry = runtime
+                    .output_layout_box(oid)
+                    .map(|(x, y, w, h)| icedtea_contract::Rectangle {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    })
+                    .unwrap_or(icedtea_contract::Rectangle {
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                    });
+                self.create_output(index, geometry);
+                if let Some(surface) = self.outputs.get_mut(&index) {
+                    surface.name = head_name;
+                }
+                self.output_ids.insert(oid, index);
+                // First-frame parity with `new_output`, as the applied
+                // path's rehydrate branch does.
+                let _ = runtime.schedule_frame(oid);
+                self.reclaim_offscreen_windows();
+                self.arrange_layers();
+                self.sync_wallpaper_nodes();
+                self.sync_scene();
+                self.emit_pending();
+                self.resolve_orphaned_layers();
+                runtime.update_output_manager_state();
+            }
+            _ => {}
+        }
+    }
+
+    /// An output state committed: record the staged-field mask plus wlroots'
+    /// commit timestamp under the output's id, then -- only when the commit
+    /// staged a MODE -- re-derive that output's geometry through the same
+    /// layout path `output_configuration_applied`'s enabled branch uses and
+    /// settle the scene behind it. This fires for every commit, including
+    /// ones this compositor did not make (backend-driven mode repair, for
+    /// instance): it is observation, not a veto point, so nothing here
+    /// stages new state or recommits -- only the model is brought back in
+    /// step with what wlroots already applied. No unwrap/expect/assert/
+    /// indexing: this runs on the dispatch path, where a panic aborts
+    /// through C.
+    fn output_committed(
+        &mut self,
+        output: &wlr::Output<'_>,
+        fields: wlr::CommittedFields,
+        when: std::time::Duration,
+    ) {
+        self.last_commit.insert(output.id(), (fields, when));
+        self.record_commit(output.id(), CommitEvent::Commit { fields, when });
+        if !fields.contains(wlr::CommittedFields::MODE) {
+            return;
+        }
+        let Some(runtime) = self.wayland.runtime().cloned() else {
+            return;
+        };
+        let oid = output.id();
+        // Mirror `output_configuration_applied`'s enabled branch: id -> our
+        // index via `get` (an unknown id simply has no model state to
+        // re-derive), geometry from the layout box wlroots just committed,
+        // falling back to the prior box so the output is never collapsed to
+        // nothing. Deliberately no other fallback: inventing a box from the
+        // live size here would be a new geometry path, not the mirror.
+        let Some(index) = self.output_ids.get(&oid).copied() else {
+            return;
+        };
+        let old_geometry = self.outputs.get(&index).map(|o| o.geometry);
+        let geometry = runtime
+            .output_layout_box(oid)
+            .map(|(x, y, w, h)| icedtea_contract::Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+            })
+            .or(old_geometry);
+        if let (Some(surface), Some(geometry)) = (self.outputs.get_mut(&index), geometry) {
+            surface.geometry = geometry;
+            // `arrange_layers`/exclusive zones recompute `usable`; reset it
+            // to the full box for now, exactly as a fresh `create_output`
+            // and the applied-config handler do.
+            surface.usable = geometry;
+        } else {
+            return;
+        }
+        // Mirror the settle sequence `output_configuration_applied` runs
+        // after re-deriving: a mode change can shrink an output and strand
+        // windows, so reclaim against the fully-updated geometry, recompute
+        // exclusive zones, and re-run the scene sequence a hotplug runs.
+        self.reclaim_offscreen_windows();
+        self.arrange_layers();
+        self.sync_wallpaper_nodes();
+        self.sync_scene();
+        self.emit_pending();
+        self.resolve_orphaned_layers();
+        // The layout moved under a live output: re-advertise so bound
+        // managers see the fresh state, as the applied-config handler does
+        // once its own layout is settled.
+        runtime.update_output_manager_state();
+    }
+
+    /// An output state is about to commit: record the staged-field mask plus
+    /// wlroots' timestamp under the output's id, exactly as
+    /// `output_committed` does. Staged, not yet applied -- so unlike the
+    /// commit arm there is no geometry to re-derive here; the commit that
+    /// follows (same emission order, same mask) overwrites this entry with
+    /// the applied view. No unwrap/expect/assert/indexing: same dispatch
+    /// path, same abort-through-C rule.
+    fn output_precommitted(
+        &mut self,
+        output: &wlr::Output<'_>,
+        fields: wlr::CommittedFields,
+        when: std::time::Duration,
+    ) {
+        self.last_commit.insert(output.id(), (fields, when));
+        self.record_commit(output.id(), CommitEvent::Pre { fields, when });
+    }
+
+    /// An output reported damage: record the damaged region's extents under
+    /// the output's id. Record only -- this must not touch the render loop
+    /// (the frame callback commits the scene on its own schedule). No
+    /// unwrap/expect/assert/indexing: same dispatch path, same
+    /// abort-through-C rule as the commit arms above.
+    fn output_damaged(&mut self, output: &wlr::Output<'_>, damage: wlr::Region) {
+        let extents = damage.extents();
+        self.last_damage.insert(output.id(), extents);
+        self.record_damage(output.id(), extents);
+        tracing::debug!(?damage, "output damaged");
+    }
+
+    /// A client bound this output's global. Notification-only (see the trait
+    /// doc): there is nothing to stash here, only a trace for anyone reading
+    /// logs. No unwrap/expect/assert/indexing.
+    fn output_bound(&mut self, output: &wlr::Output<'_>) {
+        tracing::info!("client bound output global");
+        let _ = output;
+    }
+
+    /// A client requested an output state change: record the requested field
+    /// mask under the output's id. Mask only -- a literal apply from a mask
+    /// is impossible; the full apply lives in
+    /// `output_configuration_applied`. No unwrap/expect/assert/indexing.
+    fn output_state_requested(&mut self, output: &wlr::Output<'_>, fields: wlr::CommittedFields) {
+        self.last_request.insert(output.id(), fields);
+        tracing::info!(
+            ?fields,
+            "client requested output state (mask only; full apply lives in output_configuration_applied)"
+        );
     }
 
     /// A `gamma-control-v1` client set (or wlroots otherwise changed) this

@@ -127,9 +127,15 @@ fn a_panel_click_reaches_the_command_surface() {
     );
 
     // 2. Click the button for window 1 and assert it reached `focus_window(1)`.
-    let (x, y) = panel.point("window_1");
-    panel.click(x, y);
-    panel.wait_for_calls(
+    // Retry with a fresh point each time: wlroots silently drops a button
+    // with no focused surface, so under parallel load the 200ms settle in
+    // `click_button` can lose the race to focus assignment — and a layout
+    // shift between `point` and `click` misses the button the same silent
+    // way. Both are transient; three attempts bound the total wait near the
+    // old single 30s budget.
+    panel.click_until_calls(
+        "window_1",
+        icedtea_ui::window::pointer::BTN_LEFT,
         |calls| calls.contains(&("focus".to_string(), 1)),
         "the click reached focus_window(1)",
     );
@@ -163,9 +169,9 @@ fn a_panel_click_reaches_the_command_surface() {
     );
 
     // 4. Click workspace 0 and assert a `workspace` entry.
-    let (wx, wy) = panel.point("ws_0");
-    panel.click(wx, wy);
-    panel.wait_for_calls(
+    panel.click_until_calls(
+        "ws_0",
+        icedtea_ui::window::pointer::BTN_LEFT,
         |calls| {
             calls
                 .iter()
@@ -245,9 +251,9 @@ fn middle_clicking_a_window_button_closes_it() {
             }],
         ),
     ))));
-    let (x, y) = panel.point("window_7");
-    panel.click_button(x, y, icedtea_ui::window::pointer::BTN_MIDDLE);
-    panel.wait_for_calls(
+    panel.click_until_calls(
+        "window_7",
+        icedtea_ui::window::pointer::BTN_MIDDLE,
         |calls| calls.contains(&("close".to_string(), 7)),
         "the middle click reached close_window(7)",
     );
@@ -312,9 +318,9 @@ fn a_window_opened_signal_through_the_inbox_adds_a_button() {
     // And the new button works: a click on it reaches the command surface,
     // which is what a clear-and-rebuild would have silently broken by
     // dropping the handler.
-    let (x, y) = panel.point("window_4");
-    panel.click(x, y);
-    panel.wait_for_calls(
+    panel.click_until_calls(
+        "window_4",
+        icedtea_ui::window::pointer::BTN_LEFT,
         |calls| calls.contains(&("focus".to_string(), 4)),
         "the freshly added button is live",
     );
