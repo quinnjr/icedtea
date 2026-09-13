@@ -77,7 +77,9 @@ use zbus::interface;
 ///
 /// The `Test-only` variants are an internal harness channel, not wire API:
 /// they are never exposed through `CompositorInterface` and remain subject
-/// to additive change as tests need new oracles.
+/// to additive change as tests need new oracles. Test-only variants churn,
+/// so downstream exhaustive matches should include a wildcard arm.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum DbCommand {
     Focus(WindowId),
@@ -318,7 +320,8 @@ pub enum DbCommand {
     /// `send_request_state` needs a live output handle plus a staged
     /// transaction, and `frame` is the only place after boot that has one
     /// (same shape as `MoveOutputCursorForTest`), so the emission -- stage
-    /// SCALE on a fresh transaction, emit, drop uncommitted -- waits there
+    /// a scale + transform that differ from live, emit, drop uncommitted
+    /// (see the frame arm for why they must differ) -- waits there
     /// rather than running in the `DbCommand` handler itself. Replies with
     /// a [`RequestStateProbeReport`]. Not reachable from
     /// `CompositorInterface` -- only the test harness sends this, same
@@ -331,6 +334,10 @@ pub enum DbCommand {
 /// What [`DbCommand::MoveOutputCursorForTest`] reports back: whether the
 /// stimulus landed, and the loop-thread snapshot the test anchors its
 /// "subsequent frame commits" assertions to.
+///
+/// The damage entry the test asserts is the authoritative ordering key;
+/// `kicked`/`frames`/`commits` are diagnostic snapshots of reach and
+/// progress at stimulus time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DamageProbeReport {
     /// The cursor moved (wlroots accepted the move).
@@ -346,6 +353,9 @@ pub struct DamageProbeReport {
 /// What [`DbCommand::EmitRequestStateForTest`] reports back: whether the
 /// emission ran, and on which live output with which staged mask, so the
 /// test can pin `State::last_request` to exactly this delivery.
+///
+/// `id` + `fields` are the authoritative routing key the test pins
+/// `State::last_request` against; the remaining fields are diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestStateProbeReport {
     /// `send_request_state` accepted the staged transaction and emitted.
@@ -355,6 +365,9 @@ pub struct RequestStateProbeReport {
     /// The staged mask at emission -- the test asserts `last_request`
     /// recorded exactly this for `id`.
     pub fields: wlr::CommittedFields,
+    /// Frame kick reach at arming, mirroring `DamageProbeReport`; 0 means
+    /// no frame will arrive.
+    pub kicked: usize,
 }
 
 /// One mapped override-redirect X11 pop-up, as the test-only
