@@ -120,6 +120,17 @@ impl RecencyStore {
         }
     }
 
+    /// Restore persisted `(count, last-seen)` pairs (config seeding).
+    /// Later [`RecencyStore::record`] calls keep the restored counts and
+    /// continue the sequence past the restored maximum, so ranking order
+    /// survives a restart.
+    pub fn restore(&mut self, entries: &HashMap<String, (u64, u64)>) {
+        for (id, (count, seen)) in entries {
+            self.counts.insert(id.clone(), (*count, *seen));
+            self.seq = self.seq.max(*seen);
+        }
+    }
+
     /// Launch count for `app_id` (0 when never recorded).
     pub fn count(&self, app_id: &str) -> u64 {
         self.counts
@@ -307,6 +318,21 @@ impl TileStore {
             name: group.to_string(),
             ids: vec![app_id.to_string()],
             size: default_tile_size(),
+        });
+    }
+
+    /// Restore one persisted group whole (config seeding): replaces any
+    /// group of the same name, keeping its stored tile `size`.
+    pub fn ingest(&mut self, group: &str, ids: &[String], size: u32) {
+        if let Some(slot) = self.groups.iter_mut().find(|slot| slot.name == group) {
+            slot.ids = ids.to_vec();
+            slot.size = size;
+            return;
+        }
+        self.groups.push(TileGroup {
+            name: group.to_string(),
+            ids: ids.to_vec(),
+            size,
         });
     }
 }
@@ -543,6 +569,31 @@ mod tests {
     }
 
     #[test]
+    fn tile_store_ingest_restores_a_group_with_its_size() {
+        let mut tiles = TileStore::default();
+        tiles.ingest("Web", &["firefox".to_string(), "epiphany".to_string()], 2);
+        let groups = tiles.groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Web");
+        assert_eq!(
+            groups[0].ids,
+            vec!["firefox".to_string(), "epiphany".to_string()]
+        );
+        assert_eq!(groups[0].size, 2);
+    }
+
+    #[test]
+    fn tile_store_ingest_replaces_an_existing_group() {
+        let mut tiles = TileStore::default();
+        tiles.assign("Web", "firefox");
+        tiles.ingest("Web", &["epiphany".to_string()], 3);
+        let groups = tiles.groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].ids, vec!["epiphany".to_string()]);
+        assert_eq!(groups[0].size, 3);
+    }
+
+    #[test]
     fn recency_record_counts_and_caps_at_200() {
         let mut rec = RecencyStore::default();
         rec.record("a");
@@ -555,6 +606,21 @@ mod tests {
         assert_eq!(rec.len(), MAX_RECENCY_ENTRIES);
         assert_eq!(rec.count("a"), 0, "stalest pruned first");
         assert_eq!(rec.count("app-209"), 1);
+    }
+
+    #[test]
+    fn recency_restore_reloads_persisted_counts() {
+        let mut saved = HashMap::new();
+        saved.insert("firefox".to_string(), (4u64, 9u64));
+        saved.insert("music".to_string(), (1u64, 3u64));
+        let mut rec = RecencyStore::default();
+        rec.restore(&saved);
+        assert_eq!(rec.count("firefox"), 4);
+        assert_eq!(rec.count("music"), 1);
+        assert_eq!(rec.len(), 2);
+        // A fresh record keeps the restored count and bumps it.
+        rec.record("firefox");
+        assert_eq!(rec.count("firefox"), 5);
     }
 
     #[test]

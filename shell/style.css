@@ -56,3 +56,34 @@
     background-image: linear-gradient(to right, #f38ba8 3px, rgba(243, 139, 168, 0.18) 3px);
     color: #f5e0dc;
 }
+
+/* B1 Task 5: the launcher menu. A floating `Layer::Top` surface with no
+   exclusive zone (`launcher_view::spec`), so unlike `#bar` it needs no
+   width floor and no zero-padding discipline: its 400x500 committed size
+   (`LAUNCHER_SIZE`) is all its own. Colours follow the bar's own dark
+   chrome; the per-theme Adwaita stack underneath still owns every widget's
+   own paint (buttons, entries, `.suggested-action`'s accent). */
+#launcher {
+    background-color: rgba(20, 20, 24, 0.96);
+    color: #e6e6e6;
+    padding: 8px;
+}
+
+#launcher_search {
+    margin-bottom: 8px;
+}
+
+#launcher_power {
+    margin-top: 8px;
+}
+
+#launcher_power button {
+    padding: 2px 10px;
+    margin: 0 2px;
+}
+
+/* The keyboard selection: the same `active` vocabulary `#workspaces
+   button.active` uses for the same "this is the one" meaning. */
+#launcher button.active {
+    font-weight: bold;
+}

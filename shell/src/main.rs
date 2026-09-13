@@ -9,6 +9,7 @@ use std::sync::Arc;
 use icedtea_shell::clip_client::{self, ClipCommands, ClipProxy};
 use icedtea_shell::clipboard::ClipUpdate;
 use icedtea_shell::compositor_client::{self, CompositorCommands, CompositorProxy};
+use icedtea_shell::launcher_view;
 use icedtea_shell::panel::{self, Msg, Offline, PanelModel};
 use icedtea_shell::style;
 use icedtea_shell::taskbar::CompositorUpdate;
@@ -88,6 +89,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (inbox, tx) = Inbox::<Msg>::new()?;
     let width_tx = tx.clone();
 
+    // B1 Task 5: the launcher's second surface lives on its own thread
+    // under `launcher_view::supervise`. The panel's Start toggle reports
+    // down `launcher_tx`; the supervisor reports self-closes back through
+    // the panel inbox as `Msg::LauncherClosed`.
+    let (launcher_tx, launcher_rx) = std::sync::mpsc::channel::<bool>();
+    let launcher_panel_tx = tx.clone();
+    let launcher_bar = bar_position.clone();
+    std::thread::spawn(move || {
+        launcher_view::supervise(launcher_rx, launcher_panel_tx, launcher_bar);
+    });
+
     // Each client's proxy, forward thread and worker are created together: when
     // `*Proxy::new()` fails (no session bus) the arm installs `Offline` and
     // starts no worker at all. Spawning a worker anyway would run a
@@ -125,7 +137,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // anchor. The whole frame hook is `panel::frame_hook`, the one factory the
     // integration harness calls too (M5 finding #3), so there is a single
     // source of truth for what a frame publishes.
-    let model = PanelModel::new(wm, clip);
+    let mut model = PanelModel::new(wm, clip);
+    model.launcher_ctl = Some(launcher_tx);
     let clip_rect = model.clip_rect.clone();
     let open_popover = model.open_popover_cell.clone();
     let bar_width = model.bar_width;

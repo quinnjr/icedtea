@@ -157,6 +157,12 @@ pub struct PanelModel {
     /// Folded in `update`'s `Msg::StartClicked` arm; `view` marks `#start`
     /// `active` from it. Task 5 opens the launcher surface itself off this bit.
     pub launcher_open: bool,
+    /// The launcher supervisor thread's control channel (B1 Task 5): the
+    /// second surface lives on its own thread with its own `App`, and this
+    /// is how the toggle reaches it. `None` wherever no supervisor runs
+    /// (unit tests, the panel-only integration harness) — the bit still
+    /// folds, only the surface boot is skipped.
+    pub launcher_ctl: Option<std::sync::mpsc::Sender<bool>>,
 }
 
 impl PanelModel {
@@ -186,6 +192,7 @@ impl PanelModel {
             shortcuts_inhibited: false,
             keyboard_layout: None,
             launcher_open: false,
+            launcher_ctl: None,
         }
     }
 }
@@ -215,6 +222,10 @@ pub enum Msg {
     /// The Start button was clicked (B1 Task 3): `update` toggles
     /// `launcher_open`. Task 5 opens the launcher surface itself off that bit.
     StartClicked,
+    /// The launcher surface closed itself (B1 Task 5: Escape, successful
+    /// launch), reported back by the supervisor thread through
+    /// the panel inbox. Clears `launcher_open` so `#start` drops `active`.
+    LauncherClosed,
     PopoverOpened(PopupKey),
     PopoverDismissed(PopupKey),
     ClipActivated(u64),
@@ -320,6 +331,20 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
         Msg::WindowPointerUp { .. } => Cmd::None,
         Msg::StartClicked => {
             m.launcher_open = !m.launcher_open;
+            // Report the new state to the supervisor thread that owns the
+            // launcher surface (B1 Task 5). `None` means no supervisor runs
+            // — the bit still folds, only the surface boot is skipped. A
+            // dead receiver means the supervisor thread died; the menu
+            // simply never opens, and the warning is the diagnosis.
+            if let Some(tx) = &m.launcher_ctl
+                && tx.send(m.launcher_open).is_err()
+            {
+                tracing::warn!("the launcher supervisor is gone; Start does nothing");
+            }
+            Cmd::None
+        }
+        Msg::LauncherClosed => {
+            m.launcher_open = false;
             Cmd::None
         }
         Msg::ClipButtonClicked => match m.open_popover {
@@ -1882,5 +1907,43 @@ mod tests {
         assert!(classes(&m).contains(&"active".to_string()));
         let _ = update(&mut m, Msg::StartClicked);
         assert!(!classes(&m).contains(&"active".to_string()));
+    }
+
+    /// B1 Task 5 (RED): the toggle reports its new state to the launcher
+    /// supervisor thread, which owns the second surface. The bit folds
+    /// first; the channel carries the outcome.
+    #[test]
+    fn start_click_reports_the_new_state_to_the_launcher_supervisor() {
+        let (mut m, _, _) = panel();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        m.launcher_ctl = Some(tx);
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(m.launcher_open);
+        assert_eq!(rx.try_recv(), Ok(true));
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(!m.launcher_open);
+        assert_eq!(rx.try_recv(), Ok(false));
+    }
+
+    /// B1 Task 5 (RED): without a supervisor (the integration harness, unit
+    /// tests) the toggle only folds the bit — no channel, no panic.
+    #[test]
+    fn start_click_without_a_supervisor_only_folds_the_bit() {
+        let (mut m, _, _) = panel();
+        assert!(m.launcher_ctl.is_none());
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(m.launcher_open);
+    }
+
+    /// B1 Task 5 (RED): the launcher's own close paths (Escape, launch)
+    /// report back through `LauncherClosed`, clearing the bit
+    /// the Start button's `active` class reads.
+    #[test]
+    fn the_launcher_close_notification_clears_the_open_bit() {
+        let (mut m, _, _) = panel();
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(m.launcher_open);
+        let _ = update(&mut m, Msg::LauncherClosed);
+        assert!(!m.launcher_open);
     }
 }

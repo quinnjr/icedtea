@@ -5,6 +5,7 @@ pub mod clip_client;
 pub mod clipboard;
 pub mod compositor_client;
 pub mod launcher;
+pub mod launcher_view;
 pub mod panel;
 pub mod style;
 pub mod taskbar;
