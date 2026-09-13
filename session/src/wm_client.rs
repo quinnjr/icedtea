@@ -94,14 +94,23 @@ pub enum WmCall {
 #[derive(Debug, Clone)]
 pub struct RecordingWm {
     locked: bool,
+    quit_result: bool,
     calls: Arc<Mutex<Vec<WmCall>>>,
 }
 
 impl RecordingWm {
-    /// Build a recording double that reports `locked` from `is_locked`.
+    /// Build a recording double that reports `locked` from `is_locked` and
+    /// succeeds at `quit`.
     pub fn new(locked: bool) -> Self {
+        Self::with_quit_result(locked, true)
+    }
+
+    /// Build a recording double whose `quit` returns `quit_result`, so the
+    /// service's "compositor unreachable" path is testable.
+    pub fn with_quit_result(locked: bool, quit_result: bool) -> Self {
         Self {
             locked,
+            quit_result,
             calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -127,7 +136,7 @@ impl WmClient for RecordingWm {
 
     fn quit(&self) -> bool {
         self.record(WmCall::Quit);
-        true
+        self.quit_result
     }
 }
 
@@ -151,6 +160,13 @@ mod tests {
     fn recording_wm_records_quit_and_reports_it_issued() {
         let wm = RecordingWm::new(false);
         assert!(wm.quit());
+        assert_eq!(wm.calls(), vec![WmCall::Quit]);
+    }
+
+    #[test]
+    fn recording_wm_can_refuse_quit() {
+        let wm = RecordingWm::with_quit_result(false, false);
+        assert!(!wm.quit());
         assert_eq!(wm.calls(), vec![WmCall::Quit]);
     }
 

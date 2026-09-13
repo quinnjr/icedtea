@@ -88,9 +88,18 @@ impl SessionInterface {
         call_logind("reboot", self.logind.reboot())
     }
 
-    /// Forward to `org.icedtea.Compositor`'s `Quit` via [`WmClient`].
-    fn log_out(&self) {
-        let _ = self.wm.quit();
+    /// Forward to `org.icedtea.Compositor`'s `Quit` via [`WmClient`]. A `false`
+    /// from `quit` (compositor unreachable) is an error reply, so the CLI's
+    /// `logout` exits non-zero rather than reporting a logout that did not
+    /// happen.
+    fn log_out(&self) -> zbus::fdo::Result<()> {
+        if self.wm.quit() {
+            return Ok(());
+        }
+        tracing::warn!("org.icedtea.Session.LogOut failed: compositor unreachable");
+        Err(zbus::fdo::Error::Failed(
+            "log out failed: compositor unreachable".to_string(),
+        ))
     }
 
     /// Mirror the compositor's `IsLocked` value.
@@ -169,8 +178,28 @@ mod tests {
     #[test]
     fn log_out_forwards_exactly_once_to_quit() {
         let (iface, _logind, wm) = service(false);
-        iface.log_out();
+        iface.log_out().expect("recording wm accepts quit");
         assert_eq!(wm.calls(), vec![WmCall::Quit]);
+    }
+
+    /// A compositor that refuses `Quit` (unreachable/dead bus) must be an error
+    /// reply: the CLI's `logout` then exits non-zero instead of reporting a
+    /// logout that never happened.
+    #[test]
+    fn log_out_is_an_error_reply_when_the_compositor_refuses() {
+        let iface = SessionInterface::new(
+            Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1")),
+            Arc::new(RecordingWm::with_quit_result(false, false)),
+        );
+        match iface.log_out() {
+            Err(zbus::fdo::Error::Failed(message)) => {
+                assert!(
+                    message.contains("log out"),
+                    "names the operation: {message}"
+                );
+            }
+            other => panic!("expected fdo::Error::Failed, got {other:?}"),
+        }
     }
 
     #[test]

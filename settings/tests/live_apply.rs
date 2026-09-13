@@ -34,11 +34,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use icedtea_contract::{Appearance, COMPOSITOR_BUS_NAME, COMPOSITOR_PATH};
+use icedtea_contract::{Appearance, COMPOSITOR_BUS_NAME, COMPOSITOR_IFACE, COMPOSITOR_PATH};
 use icedtea_settings::compositor_reload::{ReloadClient, ReloadOutcome};
 use icedtea_settings::model;
 
-const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 const NEW_ACCENT: &str = "#ff00aa";
 /// How long to wait for the subprocess compositor to boot and claim the bus
 /// name -- generous because a debug build under test-suite load can be slow
