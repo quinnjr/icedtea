@@ -634,6 +634,19 @@ struct OverrideRedirectSurface {
     geometry: Rectangle,
 }
 
+/// One commit-family delivery, in arrival order. Recording the sequence (not
+/// just the last of each kind in `last_commit`) is what makes a swapped
+/// commit/precommit wiring fail: transposed callbacks still produce equal
+/// masks, but never in this order with both timestamps set. Mirrors the
+/// `wlr` crate's own `output_feedback.rs` harness shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitEv {
+    /// `OutputHandler::output_precommitted`: staged mask, not yet applied.
+    Pre(wlr::CommittedFields, std::time::Duration),
+    /// `OutputHandler::output_committed`: applied mask.
+    Commit(wlr::CommittedFields, std::time::Duration),
+}
+
 pub struct State {
     pub window_manager: WindowManager,
     pub config: Config,
@@ -814,6 +827,17 @@ pub struct State {
     /// exactly the live set instead of leaking one entry per unplugged
     /// output.
     pub last_damage: HashMap<wlr::OutputId, wlr::Box2D>,
+    /// Every commit-family delivery in arrival order: `(output id, event)`
+    /// pushed by `OutputHandler::output_precommitted` (`Pre`: staged, not yet
+    /// applied) and `OutputHandler::output_committed` (`Commit`: applied).
+    /// `last_commit` keeps only the surviving entry per output, which can
+    /// never show that precommit preceded commit -- this log can, which is
+    /// its only reason to exist (task 7 wire-up proof). Observation only,
+    /// same dispatch-path rules as the maps (record, never panic). Capped at
+    /// the newest 64 entries so a long session cannot grow it without bound;
+    /// `destroyed` prunes the dead id alongside the maps. `pub` so
+    /// integration tests can assert the order after a run.
+    pub commit_log: Vec<(wlr::OutputId, CommitEv)>,
     /// The last client-requested output state per live output: the
     /// field mask `OutputHandler::output_state_requested` was given (the
     /// output-management protocol's ask, not what was applied). Mask only
@@ -835,6 +859,21 @@ pub struct State {
     /// mirror was never a substitute for it. `None` when no test scale
     /// override is outstanding, which is true almost all the time.
     pending_test_output_scale: Option<(wlr::OutputId, f32, crossbeam_channel::Sender<bool>)>,
+    /// A cursor move `DbCommand::MoveOutputCursorForTest` wants performed on
+    /// the next `OutputHandler::frame` for a live output: the damage
+    /// stimulus for the commit/damage round-trip test. Same shape as
+    /// `pending_test_output_scale` -- `frame` is the only place after boot
+    /// with a live `&wlr::Output` to call `create_cursor` on, so the move
+    /// (and its reply) waits there rather than running in the `DbCommand`
+    /// handler itself. Carries the frame-kick count the command arm observed
+    /// so the deferred report stays complete. `None` when no test cursor
+    /// move is outstanding, which is true almost all the time.
+    pending_test_cursor_move: Option<(
+        f64,
+        f64,
+        usize,
+        crossbeam_channel::Sender<crate::dbus::DamageProbeReport>,
+    )>,
     /// Connector name -> the live `wlr::OutputId` of an output that is
     /// currently *disabled* and therefore has NO entry in `self.outputs` /
     /// `self.output_ids`. Populated both by `new_output`'s persisted-disabled
@@ -1292,8 +1331,10 @@ impl State {
             output_ids: HashMap::new(),
             last_commit: HashMap::new(),
             last_damage: HashMap::new(),
+            commit_log: Vec::new(),
             last_request: HashMap::new(),
             pending_test_output_scale: None,
+            pending_test_cursor_move: None,
             disabled_outputs: HashMap::new(),
             config_db_lock: Arc::new(Mutex::new(())),
             background: None,
@@ -4846,6 +4887,27 @@ impl State {
                 }
                 return Some(());
             }
+            DbCommand::MoveOutputCursorForTest { x, y, reply } => {
+                // Loop-thread arming for the damage round-trip test: clear
+                // past damage, kick the frame clock everywhere (the kick is
+                // load-bearing -- nothing else schedules a frame this late in
+                // a run), and stash the move for the next `frame`, which owns
+                // the only live `&wlr::Output` a cursor can be created on.
+                // The reply waits for that frame (see `frame`), so a missing
+                // frame surfaces as a loud receive-timeout in the test rather
+                // than a silent ack here.
+                //
+                // The clear runs before the `runtime()` borrow below: that
+                // method takes `&self`, so the map mutation cannot sit
+                // inside its borrow.
+                self.last_damage.clear();
+                let kicked = match self.wayland.runtime() {
+                    Some(rt) => rt.schedule_frame_all(),
+                    None => 0,
+                };
+                self.pending_test_cursor_move = Some((x, y, kicked, reply));
+                return Some(());
+            }
         }
         self.emit_pending();
         Some(())
@@ -5986,6 +6048,19 @@ impl State {
 // bodies — a condition that cannot be handled is recorded in `State` and
 // acted on once control is back on the loop.
 
+impl State {
+    /// Push one commit-family delivery onto `commit_log`, dropping the
+    /// oldest entry past the cap so the log stays bounded over a session.
+    /// `Vec::remove(0)` is linear, but the cap is 64 and this fires at most
+    /// a few times per commit -- unmeasurable against the commit itself.
+    fn record_commit(&mut self, id: wlr::OutputId, ev: CommitEv) {
+        self.commit_log.push((id, ev));
+        if self.commit_log.len() > 64 {
+            self.commit_log.remove(0);
+        }
+    }
+}
+
 impl wlr::OutputHandler for State {
     fn new_output(&mut self, output: &wlr::Output<'_>) {
         let Some(runtime) = self.wayland.runtime().cloned() else {
@@ -6226,6 +6301,41 @@ impl wlr::OutputHandler for State {
             }
             let _ = reply.send(true);
         }
+        // See `pending_test_cursor_move`'s own doc: the damage stimulus for
+        // the round-trip test. `take` first, same one-shot reasoning as the
+        // scale arm above. The move needs an image: an 8x8 linear ARGB8888
+        // buffer off the runtime's own allocator, exactly as the `wlr`
+        // crate's `output_feedback.rs` harness builds its cursor. The
+        // cursor is destroyed in the same frame (a `Drop` that frees would
+        // race wlroots' teardown ordering, so the crate deliberately has
+        // none). The move's damage alone earns no further headless frame,
+        // so kick one explicitly for the output that moved -- that
+        // follow-up is what the test's "subsequent frame commits" asserts
+        // on. The report snapshots `frames`/`commit_log` at the move, so
+        // "subsequent" is anchored to the stimulus, not to boot.
+        if let Some((x, y, kicked, reply)) = self.pending_test_cursor_move.take() {
+            let mut moved = false;
+            if let Some(rt) = self.wayland.runtime()
+                && let Some(alloc) = rt.allocator_ref()
+            {
+                let fmt = wlr::DrmFormat::new(wlr::FourCc::ARGB8888, [wlr::Modifier::LINEAR]);
+                if let Ok(buf) = alloc.create_buffer(8, 8, &fmt)
+                    && let Some(mut cursor) = output.create_cursor()
+                {
+                    let image: &wlr::Buffer = &buf;
+                    cursor.set_buffer(image, 1, 1);
+                    moved = cursor.move_to(x, y);
+                    cursor.destroy();
+                }
+            }
+            output.schedule_frame();
+            let _ = reply.send(crate::dbus::DamageProbeReport {
+                moved,
+                kicked,
+                frames: self.frames,
+                commits: self.commit_log.len(),
+            });
+        }
         let Some(runtime) = self.wayland.runtime() else {
             return;
         };
@@ -6250,6 +6360,7 @@ impl wlr::OutputHandler for State {
         self.last_commit.remove(&id);
         self.last_damage.remove(&id);
         self.last_request.remove(&id);
+        self.commit_log.retain(|(oid, _)| *oid != id);
         // `remove` on an unknown id, not indexing: this can name an output
         // this handler was never told about (see the library's own docs), and
         // a panic here aborts.
@@ -6630,6 +6741,7 @@ impl wlr::OutputHandler for State {
         when: std::time::Duration,
     ) {
         self.last_commit.insert(output.id(), (fields, when));
+        self.record_commit(output.id(), CommitEv::Commit(fields, when));
         if !fields.contains(wlr::CommittedFields::MODE) {
             return;
         }
@@ -6695,6 +6807,7 @@ impl wlr::OutputHandler for State {
         when: std::time::Duration,
     ) {
         self.last_commit.insert(output.id(), (fields, when));
+        self.record_commit(output.id(), CommitEv::Pre(fields, when));
     }
 
     /// An output reported damage: record the damaged region's extents under
@@ -6721,7 +6834,10 @@ impl wlr::OutputHandler for State {
     /// `output_configuration_applied`. No unwrap/expect/assert/indexing.
     fn output_state_requested(&mut self, output: &wlr::Output<'_>, fields: wlr::CommittedFields) {
         self.last_request.insert(output.id(), fields);
-        tracing::info!(?fields, "client requested output state (mask only; full apply lives in output_configuration_applied)");
+        tracing::info!(
+            ?fields,
+            "client requested output state (mask only; full apply lives in output_configuration_applied)"
+        );
     }
 
     /// A `gamma-control-v1` client set (or wlroots otherwise changed) this

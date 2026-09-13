@@ -300,6 +300,34 @@ pub enum DbCommand {
         scale: f64,
         reply: Sender<bool>,
     },
+    /// Test-only: move a software output cursor to `(x, y)` on the next
+    /// frame -- the damage stimulus for the commit/damage round-trip test.
+    /// Staged commit damage never emits `output_damaged` (only software
+    /// cursors and backend-specific logic do), so a scene rect cannot serve
+    /// as the stimulus; an output-cursor move can, exactly as the `wlr`
+    /// crate's own `output_feedback.rs` harness proves. Replies with a
+    /// [`DamageProbeReport`]. Not reachable from `CompositorInterface` --
+    /// only the test harness sends this, same reasoning as `SessionLocked`.
+    MoveOutputCursorForTest {
+        x: f64,
+        y: f64,
+        reply: Sender<DamageProbeReport>,
+    },
+}
+
+/// What [`DbCommand::MoveOutputCursorForTest`] reports back: whether the
+/// stimulus landed, and the loop-thread snapshot the test anchors its
+/// "subsequent frame commits" assertions to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageProbeReport {
+    /// The cursor moved (wlroots accepted the move).
+    pub moved: bool,
+    /// How many live outputs the frame kick reached.
+    pub kicked: usize,
+    /// `State::frames` at stimulus time -- the test asserts it advanced.
+    pub frames: u64,
+    /// `State::commit_log.len()` at stimulus time -- the test asserts it grew.
+    pub commits: usize,
 }
 
 /// One mapped override-redirect X11 pop-up, as the test-only
