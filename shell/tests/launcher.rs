@@ -205,18 +205,21 @@ fn dismissal_quits_the_offscreen_loop() {
 ///
 /// The spec's keyboard model binds this ("open focuses search"), and Task
 /// 6's live e2e (open from Start → type → launch) cannot pass without it.
-/// It fails today for a precise toolkit reason: with an empty focus ring
-/// `App`'s `Key` routing drops the event before any view sees it
+/// It fails today for a precise reason: with an empty focus ring `App`'s
+/// `Key` routing drops the event before any view sees it
 /// (`ui/src/view/app.rs`, `else if let Some(node) = rt.focus.focus()`),
-/// and nothing in the toolkit focuses a node on open — no autofocus prop,
-/// no `KeyboardEnter` autofocus, no `Window` focus setter. The menu is
-/// fully mouse-usable meanwhile (click focuses the search box through the
-/// entry controller's pointer path), and one Tab focuses it by reading
-/// order.
+/// and no *open-time* focus path is wired yet — focusing needs a
+/// post-layout `Node` handle after `KeyboardEnter` on the new surface,
+/// which is non-trivial and owned by Task 6. The mechanism itself exists
+/// (`Cmd::Focus(node)`, with the `KeyboardEnter`-when-empty precedent in
+/// `ui/src/bin/window-probe.rs`); only the open-time wiring is missing.
+/// The menu is fully mouse-usable meanwhile (click focuses the search box
+/// through the entry controller's pointer path), and one Tab focuses it
+/// by reading order.
 ///
-/// Tracked for Task 6: land the focus mechanism (autofocus prop or
-/// equivalent), then un-ignore this test — it is Task 6's RED.
-#[ignore = "no open-focus mechanism exists yet; see the doc comment"]
+/// Parked for Task 6: land the open-time wiring, then un-ignore this
+/// test — it is Task 6's RED.
+#[ignore = "no open-time focus path wired yet; see the doc comment"]
 #[test]
 fn typing_at_open_reaches_the_search_box_without_a_prior_tab() {
     use icedtea_ui::window::InputEvent;

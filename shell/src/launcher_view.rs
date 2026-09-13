@@ -107,10 +107,10 @@ pub enum LauncherMsg {
     LetterJump(char),
     /// The power row. TASK-6: no-op shells until the backends land.
     Power(PowerAction),
-    /// Escape or the Start button toggling shut. (Focus-loss close is
-    /// vacuous under `Exclusive`: the compositor holds the seat's focus on
-    /// the top-most exclusive layer by protocol, so focus cannot leak to a
-    /// normal window while the menu is mapped.)
+    /// Escape or the Start button toggling shut. No *keyboard* focus-loss
+    /// path exists under `Exclusive` on a compliant compositor; a
+    /// compositor-driven unmap/kill is covered by the supervisor's
+    /// done-channel reap.
     Close,
 }
 
@@ -625,10 +625,14 @@ fn power_row() -> View<LauncherMsg> {
 ///
 /// Precondition: some node must hold the keyboard focus — with an empty
 /// focus ring `App` drops keys before any view sees them. `Exclusive`
-/// gives the *surface* the seat's focus on open, but no toolkit mechanism
-/// focuses the search entry itself yet (no autofocus prop, no
-/// `KeyboardEnter` autofocus, no `Window` focus setter): until that lands
-/// (tracked for Task 6, pinned by the ignored
+/// gives the *surface* the seat's focus on open, but no *open-time* focus
+/// path is wired yet: focusing needs a post-layout `Node` handle after
+/// `KeyboardEnter` on the new surface, which is non-trivial and owned by
+/// Task 6. The focus mechanism itself exists — `Cmd::Focus(node)` moves
+/// the ring (`ui/src/view/app.rs`, with the `KeyboardEnter`-when-empty
+/// precedent in `ui/src/bin/window-probe.rs`) — it is the open-time
+/// wiring, not the mechanism, that is missing. Until that lands (pinned
+/// by the ignored
 /// `typing_at_open_reaches_the_search_box_without_a_prior_tab` gate) one
 /// Tab — first focusable in reading order — or one click focuses search,
 /// and everything below holds from there.
