@@ -126,6 +126,24 @@ pub fn run(conn: Connection, timeout_ms: u32, flow: Arc<LockFlow>) {
     }
     client.ensure_notification(&qh);
 
+    // A compositor may not implement the idle protocol (or have a seat). The
+    // globals are settled by the roundtrip above, so a missing one never
+    // arrives later: log why idle-lock is inactive and end the thread rather
+    // than blocking on events that can never fire.
+    if client.notifier.is_none() {
+        tracing::warn!("compositor did not advertise ext_idle_notifier_v1; idle-lock is inactive");
+        return;
+    }
+    if client.seat.is_none() {
+        tracing::warn!("compositor advertised no wl_seat; idle-lock is inactive");
+        return;
+    }
+    if client.notification.is_none() {
+        tracing::warn!("could not request an idle notification; idle-lock is inactive");
+        return;
+    }
+    tracing::debug!(timeout_ms, "ext-idle-notify armed");
+
     loop {
         match queue.blocking_dispatch(&mut client) {
             Ok(_) => {}

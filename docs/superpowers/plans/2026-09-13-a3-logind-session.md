@@ -6,7 +6,7 @@
 
 **Architecture:** One new workspace crate `session` (binary `icedtea-session`), shaped exactly like `clipboard`: a `#[interface]` D-Bus service, a `wayland-client` protocol client (`ext_idle_notifier_v1`), and `systemd --user` unit. Policy is pure (`session/src/policy.rs`); logind and the compositor are reached through trait seams so every decision is unit-testable without real D-Bus. The only compositor change is additive: `IsLocked()` on `org.icedtea.Compositor` and a `SessionLockChanged` signal.
 
-**Tech Stack:** Rust, `zbus` 5 (blocking + `zbus::block_on` async signal streams, no tokio), `wayland-client` + `wayland-protocols-wlr`, `icedtea-contract`, `icedtea-config`, `crossbeam-channel`, `tracing`.
+**Tech Stack:** Rust, `zbus` 5 (blocking + `zbus::block_on` async signal streams, no tokio), `wayland-client` + `wayland-protocols` (`staging`, for `ext-idle-notify-v1`) + `wayland-protocols-wlr`, `icedtea-contract`, `icedtea-config`, `crossbeam-channel`, `tracing`.
 
 **Spec:** `../specs/2026-08-20-icedtea-logind-session-design.md`
 

@@ -126,7 +126,9 @@ fn run_daemon() -> ExitCode {
 
     // Idle→lock rides the same `LockFlow` funnel as lock-before-sleep, so an
     // idle timeout and an imminent suspend cannot spawn two lockers. `None`
-    // leaves idle-lock disabled and starts no client (spec Decision 7).
+    // leaves idle-lock disabled and starts no client (spec Decision 7). The
+    // idle thread is daemon-lifetime, so its handle is deliberately dropped
+    // (detached) here.
     match idle::spawn(Arc::clone(&flow), config.power.lock_idle_timeout_ms) {
         Ok(Some(_idle)) => tracing::info!("idle-lock client armed"),
         Ok(None) => {}
