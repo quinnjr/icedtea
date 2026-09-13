@@ -24,12 +24,14 @@ use icedtea_session::logind::RecordingLogind;
 use icedtea_session::wm_client::{RecordingWm, WmCall};
 use wayland_client::Connection;
 
-/// A `sh -c` stub locker that marks itself locked by appending one line to
+/// A `sh -c` stub locker that marks itself locked by writing one line to
 /// `marker`, then lingers `linger` seconds so it is still running while the
-/// test counts the spawns.
+/// test counts the spawns. Written-then-renamed so the marker never exists
+/// empty (the tests read "marker exists" as "the lock is confirmed").
 fn locker_command(marker: &Path, linger: f64) -> String {
+    let tmp = format!("{}.tmp", marker.display());
     format!(
-        "printf 'locked\\n' >> '{}'; sleep {linger}",
+        "printf 'locked\\n' > '{tmp}' && mv '{tmp}' '{}'; sleep {linger}",
         marker.display()
     )
 }
@@ -80,13 +82,22 @@ fn one_idle_timeout_spawns_exactly_one_locker() {
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(RecordingWm::new(false));
     let flow = Arc::new(LockFlow::with_timing(
-        logind,
+        logind.clone(),
         wm.clone(),
         Some(locker_command(&marker, 30.0)),
         true,
         Duration::from_millis(10),
         Duration::from_millis(200),
     ));
+    // The idle path only asks logind to lock; logind's `Lock` signal echo is
+    // what drives the funnel's spawn. Wire it so this exercises the real
+    // single-funnel path, not a direct spawn.
+    let weak = Arc::downgrade(&flow);
+    logind.set_lock_echo(move || {
+        if let Some(flow) = weak.upgrade() {
+            flow.on_lock();
+        }
+    });
 
     let stream = UnixStream::connect(comp.socket_path()).expect("connect to harness compositor");
     let conn = Connection::from_socket(stream).expect("wayland connection");

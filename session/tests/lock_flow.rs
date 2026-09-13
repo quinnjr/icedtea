@@ -50,14 +50,23 @@ impl WmClient for MarkerWm {
 }
 
 /// A `sh -c` locker command that (optionally) waits `delay` seconds, marks
-/// itself locked by appending to `marker`, then (optionally) lingers for
+/// itself locked by writing a line to `marker`, then (optionally) lingers for
 /// `linger` seconds so it is still running when a later trigger arrives.
+///
+/// The marker is written to a temp file and renamed into place, so it never
+/// exists empty: the tests treat "the marker exists" as "the lock is confirmed",
+/// and a bare `printf > marker` redirect would create the file a moment before
+/// writing, letting that check observe a zero-line file.
 fn locker_command(marker: &Path, delay: f64, linger: f64) -> String {
     let mut command = String::new();
     if delay > 0.0 {
         command.push_str(&format!("sleep {delay}; "));
     }
-    command.push_str(&format!("printf 'locked\\n' >> '{}'", marker.display()));
+    let tmp = format!("{}.tmp", marker.display());
+    command.push_str(&format!(
+        "printf 'locked\\n' > '{tmp}' && mv '{tmp}' '{}'",
+        marker.display()
+    ));
     if linger > 0.0 {
         command.push_str(&format!("; sleep {linger}"));
     }
@@ -109,6 +118,36 @@ fn wait_for_call(logind: &RecordingLogind, call: &LogindCall) -> bool {
     false
 }
 
+/// Build a flow and wire `RecordingLogind`'s `Lock` echo to its funnel.
+/// `on_idle`/`on_prepare_for_sleep` only *request* a lock from logind; in
+/// production logind answers with the `Lock` signal, and the signal loop calls
+/// `on_lock`. This models that, so the tests exercise the single funnel rather
+/// than a direct spawn.
+fn wired_flow(
+    logind: &Arc<RecordingLogind>,
+    wm: Arc<dyn WmClient + Send + Sync>,
+    command: Option<String>,
+    lock_before_sleep: bool,
+    poll: Duration,
+    budget: Duration,
+) -> Arc<LockFlow> {
+    let flow = Arc::new(LockFlow::with_timing(
+        logind.clone(),
+        wm,
+        command,
+        lock_before_sleep,
+        poll,
+        budget,
+    ));
+    let weak = Arc::downgrade(&flow);
+    logind.set_lock_echo(move || {
+        if let Some(flow) = weak.upgrade() {
+            flow.on_lock();
+        }
+    });
+    flow
+}
+
 /// `PrepareForSleep(true)` with a configured locker: exactly one locker is
 /// spawned, and the flow only returns — releasing the sleep inhibitor, via the
 /// `Drop` guard — after the compositor has observed the lock (the marker). The
@@ -120,8 +159,8 @@ fn prepare_for_sleep_spawns_one_locker_and_releases_after_the_marker() {
     let marker = dir.path().join("locked");
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(MarkerWm::new(&marker));
-    let flow = LockFlow::with_timing(
-        logind.clone(),
+    let flow = wired_flow(
+        &logind,
         wm.clone(),
         Some(locker_command(&marker, 0.3, 0.0)),
         true,
@@ -163,8 +202,8 @@ fn prepare_for_sleep_waits_for_an_unconfirmed_running_locker() {
     let marker = dir.path().join("unconfirmed");
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(MarkerWm::new(&marker));
-    let flow = LockFlow::with_timing(
-        logind,
+    let flow = wired_flow(
+        &logind,
         wm.clone(),
         Some(locker_command(&marker, 0.3, 2.0)),
         true,
@@ -206,8 +245,8 @@ fn lock_before_sleep_disabled_does_not_wait_on_a_running_locker() {
     let marker = dir.path().join("disabled");
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(MarkerWm::new(&marker));
-    let flow = LockFlow::with_timing(
-        logind,
+    let flow = wired_flow(
+        &logind,
         wm.clone(),
         Some(locker_command(&marker, 0.3, 2.0)),
         false,
@@ -247,8 +286,8 @@ fn a_locker_that_never_confirms_is_released_within_the_budget() {
     let marker = dir.path().join("never-confirms");
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(RecordingWm::new(false));
-    let flow = LockFlow::with_timing(
-        logind,
+    let flow = wired_flow(
+        &logind,
         wm,
         Some("sleep 30".to_string()),
         true,
@@ -282,8 +321,8 @@ fn resume_re_arms_a_fresh_delay_inhibitor() {
     let marker = dir.path().join("resume");
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(RecordingWm::new(false));
-    let flow = LockFlow::with_timing(
-        logind.clone(),
+    let flow = wired_flow(
+        &logind,
         wm,
         Some(locker_command(&marker, 0.0, 0.0)),
         true,
@@ -314,8 +353,8 @@ fn no_locker_configured_never_spawns_and_never_delays() {
     let marker = dir.path().join("never-spawned");
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(MarkerWm::new(&marker));
-    let flow = LockFlow::with_timing(
-        logind,
+    let flow = wired_flow(
+        &logind,
         wm,
         None,
         true,
@@ -342,8 +381,8 @@ fn idle_and_sleep_race_spawns_only_one_locker() {
     let marker = dir.path().join("race");
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(RecordingWm::new(false));
-    let flow = LockFlow::with_timing(
-        logind,
+    let flow = wired_flow(
+        &logind,
         wm,
         Some(locker_command(&marker, 0.0, 2.0)),
         true,
@@ -372,8 +411,8 @@ fn lock_signal_funnel_spawns_and_unlocks_when_the_locker_exits() {
     let marker = dir.path().join("funnel");
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(RecordingWm::new(false));
-    let flow = LockFlow::with_timing(
-        logind.clone(),
+    let flow = wired_flow(
+        &logind,
         wm,
         Some(locker_command(&marker, 0.0, 0.0)),
         true,
@@ -402,8 +441,8 @@ fn external_unlock_kills_a_running_locker() {
     let marker = dir.path().join("external");
     let logind = Arc::new(RecordingLogind::new(session_path()));
     let wm = Arc::new(RecordingWm::new(false));
-    let flow = LockFlow::with_timing(
-        logind.clone(),
+    let flow = wired_flow(
+        &logind,
         wm,
         Some(locker_command(&marker, 0.0, 30.0)),
         true,

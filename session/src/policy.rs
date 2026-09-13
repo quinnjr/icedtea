@@ -11,7 +11,10 @@
 //! must re-query `IsLocked()` (or otherwise pass the current `locked`) *immediately
 //! before each* `decide` call; then the second trigger observes `locked == true`
 //! and no-ops. The no-double-spawn property is enforced by that caller-side
-//! re-query, not by `decide` remembering anything.
+//! re-query *and* by the flow's atomic spawn commit (the loser of the race
+//! stands down), not by `decide` remembering anything. The request half of the
+//! funnel deliberately passes `locked: false`: it only gates on configuration,
+//! and the already-locked check belongs to the funnel's own `decide` call.
 
 /// Why a lock is being considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

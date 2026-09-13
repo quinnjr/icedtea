@@ -13,12 +13,23 @@ use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use zbus::blocking::Connection;
 use zbus::zvariant::OwnedObjectPath;
 
 /// Named the daemon claims in the `who` field of every `Inhibit` call.
 const INHIBIT_WHO: &str = "icedtea-session";
+
+/// Deadline on every method call to the system bus.
+///
+/// Without a bound, a stalled `systemd-logind` (or a hung system bus) would
+/// block the caller indefinitely; `Icedtea-session` makes these calls from the
+/// pre-sleep path, where the sleep delay inhibitor is only released after them.
+/// 750ms mirrors [`crate::wm_client::COMPOSITOR_CALL_TIMEOUT`] and keeps the
+/// worst-case pre-sleep path (`Session.Lock` + the 3s budget + one in-flight
+/// `IsLocked`) under logind's 5s `InhibitDelayMaxSec`.
+pub const LOGIND_CALL_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// `what` for the sleep delay inhibitor (spec Decision 5).
 pub const SLEEP_INHIBIT_WHAT: &str = "sleep";
@@ -209,7 +220,9 @@ impl ZbusLogind {
     /// `Err` if the bus is unavailable or no session can be resolved — the
     /// binary treats that as fatal.
     pub fn connect(xdg_session_id: Option<&str>, pid: u32) -> zbus::Result<Self> {
-        let conn = Connection::system()?;
+        let conn = zbus::blocking::connection::Builder::system()?
+            .method_timeout(LOGIND_CALL_TIMEOUT)
+            .build()?;
         Self::with_connection(conn, xdg_session_id, pid)
     }
 
@@ -309,6 +322,18 @@ pub enum LogindCall {
     Reboot,
 }
 
+/// A test hook invoked synchronously when [`RecordingLogind::lock`] runs,
+/// standing in for the `Lock` signal logind would emit on the bus. Kept
+/// `Debug` so the double's derives are unchanged.
+#[derive(Clone)]
+struct LockEcho(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for LockEcho {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LockEcho")
+    }
+}
+
 /// A [`Logind`] test double: records every call in order and answers with a
 /// configured session path. Every policy/discovery decision is testable
 /// against this with no real D-Bus.
@@ -320,6 +345,10 @@ pub struct RecordingLogind {
     /// out, so [`Self::live_inhibitors`] can tell whether the caller's guard
     /// still holds it open.
     inhibitors: Arc<Mutex<Vec<File>>>,
+    /// Optional `Lock` signal echo: invoked after recording a [`Logind::lock`]
+    /// call, so a test can drive the single funnel (`LockFlow::on_lock`) the
+    /// way the real logind signal loop does.
+    lock_echo: Arc<Mutex<Option<LockEcho>>>,
 }
 
 impl RecordingLogind {
@@ -331,7 +360,16 @@ impl RecordingLogind {
             session_path,
             calls: Arc::new(Mutex::new(Vec::new())),
             inhibitors: Arc::new(Mutex::new(Vec::new())),
+            lock_echo: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Register the `Lock` signal echo invoked synchronously from
+    /// [`Logind::lock`]. The real logind emits the signal on the bus and the
+    /// daemon's signal loop calls `events.lock()`; this models that without a
+    /// bus, so the funnel can be driven in tests.
+    pub fn set_lock_echo(&self, echo: impl Fn() + Send + Sync + 'static) {
+        *self.lock_echo.lock().unwrap_or_else(|e| e.into_inner()) = Some(LockEcho(Arc::new(echo)));
     }
 
     /// Every call recorded so far, in order.
@@ -393,6 +431,14 @@ impl Logind for RecordingLogind {
 
     fn lock(&self) -> io::Result<()> {
         self.record(LogindCall::Lock);
+        let echo = self
+            .lock_echo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(echo) = echo {
+            (echo.0)();
+        }
         Ok(())
     }
 
