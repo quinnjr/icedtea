@@ -838,3 +838,232 @@ fn output_damage_roundtrip_frame_commits_after_damage() {
         state.last_damage
     );
 }
+
+/// Task 8 step 1 (wlr 0.20.34 wire-up): a `send_request_state` emission on a
+/// live output is delivered to `output_state_requested`, which records the
+/// staged mask in `state.last_request` under that output's id.
+///
+/// One run, stimulus mid-run from a helper thread. After boot settles, the
+/// helper queues an `EmitRequestStateForTest` command -- which the loop
+/// drains on its own thread, clearing past requests and kicking the frame
+/// clock; the next frame stages a scale + transform that differ from the
+/// live output's own on a fresh transaction (staging without committing
+/// changes nothing on the output), emits the `request_state` signal through
+/// wlroots, and drops the transaction uncommitted. The report carries the emission's output id plus the staged
+/// mask, so the assertions below pin `last_request` to exactly this
+/// delivery. Record-only handlers, assert-after-run (a panic inside a
+/// handler body aborts through C).
+///
+/// Why a command rather than emitting from the helper thread:
+/// `wlr::Runtime` is `!Send`, and only the loop thread ever holds a live
+/// `&wlr::Output` to stage a transaction on -- the channel (`Send`) is the
+/// only bridge. Same shape as `MoveOutputCursorForTest`.
+#[test]
+fn output_request_state_roundtrip_records_staged_mask() {
+    let boot = boot_lock();
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime.clone());
+
+    let background = runtime
+        .add_rect(
+            1,
+            1,
+            icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+        )
+        .expect("background rect");
+    runtime.lower_rect_to_bottom(background);
+    state.set_background(background);
+
+    // The command channel and wake pipe, shared with the helper thread that
+    // fires the stimulus mid-run and the bounded backstop Quit after it.
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+    let (probe_tx, probe_rx) = crossbeam_channel::bounded(1);
+    let stim_tx = cmd_tx.clone();
+    let stim_wake = cmd_wake_write
+        .try_clone()
+        .expect("wake pipe must clone for the helper thread");
+    std::thread::spawn(move || {
+        // Boot settle: the existing 150ms backstop shape is what every other
+        // test in this file trusts for both headless outputs to arrive.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        stim_tx
+            .send(icedtea_compositor::dbus::DbCommand::EmitRequestStateForTest { reply: probe_tx })
+            .expect("the request-state stimulus command must queue");
+        icedtea_compositor::backend::wake(&stim_wake);
+        // Settle: the kicked frame emits, and the deferred
+        // `OutputStateRequested` event is delivered.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let _ = stim_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&stim_wake);
+    });
+
+    backend
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
+        .expect("run_all");
+
+    assert!(
+        state.quitting,
+        "the backstop Quit command must have stopped the loop"
+    );
+    assert_eq!(
+        state.outputs.len(),
+        2,
+        "both headless outputs must have reached the model"
+    );
+
+    let report = probe_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the request-state stimulus must have been drained on the loop thread");
+    assert!(
+        report.emitted,
+        "send_request_state must have accepted the staged transaction"
+    );
+    assert!(
+        !report.fields.is_empty(),
+        "the emission must carry a staged mask, not an empty one"
+    );
+    assert!(
+        report.fields.contains(wlr::CommittedFields::SCALE),
+        "the emission staged SCALE, got {:?}",
+        report.fields
+    );
+    assert_eq!(
+        state.last_request.get(&report.id),
+        Some(&report.fields),
+        "output_state_requested must have recorded the staged mask under the emitting output's id, got {:?}",
+        state.last_request
+    );
+}
+
+/// Task 8 step 2 (wlr 0.20.34 wire-up): powering an output Off drops it from
+/// the active set and powering it back On rehydrates it -- the
+/// `output_power_mode_requested` disable/enable round trip.
+///
+/// Driven by direct handler invocation on `State` after the loop stops
+/// (same shape as the `output_configuration_applied` disable/re-enable
+/// test above): the `wlr` crate exposes no synthetic emission path for the
+/// power signal -- `Output::send_request_state` proves the request path
+/// needs no client, but there is no `send_power_mode` analogue; the signal
+/// behind `output_power_mode_requested` (`on_output_power_set_mode` in the
+/// crate's `backend.rs`) fires only on a real
+/// `zwlr_output_power_v1.set_mode` client request. The e2e remainder is a
+/// protocol-client `set_mode` round trip. What this pins is the handler
+/// code itself, with a live runtime so layout-box lookup and the settle
+/// sequence run for real.
+///
+/// `disabled_outputs` is private, so the externally observable proxy stands
+/// in: 2 active -> Off one -> exactly 1 active (the victim's connector name
+/// gone) -> On the same id -> 2 active with the name set restored.
+#[test]
+fn output_power_cycle_disables_then_reenables() {
+    let boot = boot_lock();
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime.clone());
+
+    let background = runtime
+        .add_rect(
+            1,
+            1,
+            icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+        )
+        .expect("background rect");
+    runtime.lower_rect_to_bottom(background);
+    state.set_background(background);
+
+    // Bounded backstop: the 300ms shape from the commit-observation test,
+    // so boot enable commits have populated `last_request`-adjacent
+    // per-output records -- here `last_commit`, the live-id source the
+    // direct handler invocation below needs (`output_ids` is private).
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = cmd_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&cmd_wake_write);
+    });
+
+    backend
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
+        .expect("run_all");
+
+    assert!(
+        state.quitting,
+        "the backstop Quit command must have stopped the loop"
+    );
+    assert_eq!(
+        state.outputs.len(),
+        2,
+        "both headless outputs must have reached the model"
+    );
+    assert_eq!(
+        state.last_commit.len(),
+        2,
+        "both outputs must have committed at boot, supplying live ids"
+    );
+
+    let names_before: Vec<String> = state.outputs.values().map(|o| o.name.clone()).collect();
+    // `OutputId` is deliberately unordered (no `Ord`); any live id drives
+    // the cycle.
+    let victim = *state.last_commit.keys().next().expect("a live output id");
+
+    // Power Off: mirrors the applied-config disable branch -- one of two
+    // may go, so the strand guard must not refuse this.
+    state.output_power_mode_requested(victim, wlr::PowerMode::Off);
+    assert_eq!(
+        state.outputs.len(),
+        1,
+        "the powered-off output left the active set"
+    );
+    let names_after_off: Vec<String> = state.outputs.values().map(|o| o.name.clone()).collect();
+    assert_eq!(
+        names_before.len() - names_after_off.len(),
+        1,
+        "exactly one connector name left the active set, got {names_after_off:?}"
+    );
+    assert!(
+        names_after_off.iter().all(|n| names_before.contains(n)),
+        "the survivor keeps its connector name, got {names_after_off:?}"
+    );
+
+    // Power On the same id: mirrors the re-enable path via
+    // `take_disabled_output` by connector name.
+    state.output_power_mode_requested(victim, wlr::PowerMode::On);
+    assert_eq!(
+        state.outputs.len(),
+        2,
+        "the powered-on output rejoined the active set"
+    );
+    let mut names_after_on: Vec<String> = state.outputs.values().map(|o| o.name.clone()).collect();
+    names_after_on.sort();
+    let mut names_sorted = names_before.clone();
+    names_sorted.sort();
+    assert_eq!(
+        names_after_on, names_sorted,
+        "the connector-name set is restored after the power cycle"
+    );
+}

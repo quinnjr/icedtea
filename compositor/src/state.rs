@@ -874,6 +874,17 @@ pub struct State {
         usize,
         crossbeam_channel::Sender<crate::dbus::DamageProbeReport>,
     )>,
+    /// A `DbCommand::EmitRequestStateForTest` reply waiting for the next
+    /// `OutputHandler::frame` to emit one `request_state` signal on its live
+    /// `&wlr::Output`: the request-state round-trip test's stimulus. Same
+    /// shape as `pending_test_cursor_move` -- `frame` is the only place
+    /// after boot with a live handle to stage a transaction on and call
+    /// `send_request_state` with, so the emission (and its reply) waits
+    /// there rather than running in the `DbCommand` handler itself. `None`
+    /// when no test request-state emission is outstanding, which is true
+    /// almost all the time.
+    pending_test_request_state:
+        Option<crossbeam_channel::Sender<crate::dbus::RequestStateProbeReport>>,
     /// Connector name -> the live `wlr::OutputId` of an output that is
     /// currently *disabled* and therefore has NO entry in `self.outputs` /
     /// `self.output_ids`. Populated both by `new_output`'s persisted-disabled
@@ -1335,6 +1346,7 @@ impl State {
             last_request: HashMap::new(),
             pending_test_output_scale: None,
             pending_test_cursor_move: None,
+            pending_test_request_state: None,
             disabled_outputs: HashMap::new(),
             config_db_lock: Arc::new(Mutex::new(())),
             background: None,
@@ -4908,6 +4920,24 @@ impl State {
                 self.pending_test_cursor_move = Some((x, y, kicked, reply));
                 return Some(());
             }
+            DbCommand::EmitRequestStateForTest { reply } => {
+                // Loop-thread arming for the request-state round-trip test:
+                // clear past requests so the surviving `last_request` entry
+                // can only be the stimulus delivery (the same clear the
+                // damage arm runs on `last_damage`), kick the frame clock
+                // everywhere so a frame arrives to run the emission on, and
+                // stash the reply for the next `frame`, which owns the only
+                // live `&wlr::Output` a transaction can be staged on. The
+                // reply waits for that frame, so a missing frame surfaces
+                // as a loud receive-timeout in the test rather than a
+                // silent ack here.
+                self.last_request.clear();
+                if let Some(rt) = self.wayland.runtime() {
+                    rt.schedule_frame_all();
+                }
+                self.pending_test_request_state = Some(reply);
+                return Some(());
+            }
         }
         self.emit_pending();
         Some(())
@@ -6334,6 +6364,38 @@ impl wlr::OutputHandler for State {
                 kicked,
                 frames: self.frames,
                 commits: self.commit_log.len(),
+            });
+        }
+        // See `pending_test_request_state`'s own doc: the request-state
+        // round-trip test's stimulus. `take` first, same one-shot reasoning
+        // as the scale arm above. Stages a scale and transform that DIFFER
+        // from the live output's own (headless boots at 1.0/`Normal`) on a
+        // fresh transaction -- staging without committing changes nothing
+        // on the output; the mask alone is what `output_state_requested`
+        // records -- emits the `request_state` signal through wlroots, then
+        // drops the transaction uncommitted. The differing values are
+        // load-bearing, not decorative: wlroots' `wlr_output_send_request_state`
+        // filters the staged mask through `output_compare_state` and SKIPS
+        // the emission entirely when nothing differs (staging the live
+        // 1.0 scale round-trips `Ok` yet delivers nothing). A rejected
+        // emission is warned and reported, never panicked: this runs on
+        // the dispatch path, where a panic aborts through C.
+        if let Some(reply) = self.pending_test_request_state.take() {
+            let mut staged = output.state();
+            staged.set_scale(2.0);
+            staged.set_transform(wlr::Transform::Flipped180);
+            let fields = staged.committed_fields();
+            let emitted = match output.send_request_state(&staged) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(?err, "EmitRequestStateForTest: emission rejected");
+                    false
+                }
+            };
+            let _ = reply.send(crate::dbus::RequestStateProbeReport {
+                emitted,
+                id: output.id(),
+                fields,
             });
         }
         let Some(runtime) = self.wayland.runtime() else {

@@ -313,6 +313,19 @@ pub enum DbCommand {
         y: f64,
         reply: Sender<DamageProbeReport>,
     },
+    /// Test-only: emit one `request_state` signal on the next frame's live
+    /// `wlr::Output` -- the request-state round-trip test's stimulus.
+    /// `send_request_state` needs a live output handle plus a staged
+    /// transaction, and `frame` is the only place after boot that has one
+    /// (same shape as `MoveOutputCursorForTest`), so the emission -- stage
+    /// SCALE on a fresh transaction, emit, drop uncommitted -- waits there
+    /// rather than running in the `DbCommand` handler itself. Replies with
+    /// a [`RequestStateProbeReport`]. Not reachable from
+    /// `CompositorInterface` -- only the test harness sends this, same
+    /// reasoning as `SessionLocked`.
+    EmitRequestStateForTest {
+        reply: Sender<RequestStateProbeReport>,
+    },
 }
 
 /// What [`DbCommand::MoveOutputCursorForTest`] reports back: whether the
@@ -328,6 +341,20 @@ pub struct DamageProbeReport {
     pub frames: u64,
     /// `State::commit_log.len()` at stimulus time -- the test asserts it grew.
     pub commits: usize,
+}
+
+/// What [`DbCommand::EmitRequestStateForTest`] reports back: whether the
+/// emission ran, and on which live output with which staged mask, so the
+/// test can pin `State::last_request` to exactly this delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestStateProbeReport {
+    /// `send_request_state` accepted the staged transaction and emitted.
+    pub emitted: bool,
+    /// The live output the emission ran on.
+    pub id: wlr::OutputId,
+    /// The staged mask at emission -- the test asserts `last_request`
+    /// recorded exactly this for `id`.
+    pub fields: wlr::CommittedFields,
 }
 
 /// One mapped override-redirect X11 pop-up, as the test-only
