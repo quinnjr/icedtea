@@ -81,8 +81,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let bar_position = icedtea_config::load_or_default(&icedtea_config::default_db_path())
         .appearance
         .bar_position;
+    // Parse once at the config boundary: warn here on unrecognized values
+    // (panel::spec would warn again on its own &str path, which is why the
+    // binary calls spec_for with the already-parsed position instead).
+    if bar_position != "top" && bar_position != "bottom" {
+        tracing::warn!(
+            value = %bar_position,
+            "unrecognized Appearance.bar_position, falling back to bottom"
+        );
+    }
+    let position = panel::BarPosition::from(bar_position.as_str());
     let window = Window::open(
-        panel::spec(&bar_position),
+        panel::spec_for(position),
         style::sheet(),
         FontDatabase::new(),
     )?;

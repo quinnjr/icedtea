@@ -31,7 +31,9 @@ pub const COMPOSITOR_PATH: &str = "/org/icedtea/Compositor";
 /// * `5` -- M7 pointer/cursor/touch: `Snapshot.cursor_visible` /
 ///   `cursor_pos` / `touch_active`, plus the `GestureBegan` / `GestureEnded`
 ///   / `SwitchToggled` signals.
-pub const COMPOSITOR_CONTRACT_VERSION: u32 = 5;
+/// * `6` -- B1 launcher: `SpawnApp(s)->(b)` (launch-by-id method taking one
+///   app-id string and returning one bool).
+pub const COMPOSITOR_CONTRACT_VERSION: u32 = 6;
 
 pub use clipboard::{CLIP_BUS_NAME, CLIP_PATH, ClipEntry, ClipKind};
 pub use event::{Event, SeqEvent};

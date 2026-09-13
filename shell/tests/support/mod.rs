@@ -40,6 +40,12 @@ const POLL: Duration = Duration::from_millis(50);
 ///
 /// `Arc<Mutex<_>>`, unlike `panel.rs`'s unit-test mock: the panel runs on its
 /// own thread here and the assertions read from the test's.
+///
+/// One of four `MockWm`s (the others: `shell/tests/launcher.rs`,
+/// `shell/src/launcher_view.rs`'s unit tests, `shell/src/panel.rs`'s unit
+/// tests — threading genuinely differs, so no structural unification).
+/// Each must implement every `CompositorCommands` method: `focus_window`,
+/// `close_window`, `set_workspace`, `spawn_app`, `quit`.
 #[derive(Clone, Default)]
 pub struct MockWm {
     pub calls: Arc<Mutex<Vec<(String, u32)>>>,
@@ -72,11 +78,12 @@ impl CompositorCommands for MockWm {
             .push(app_id.to_string());
         true
     }
-    fn quit(&self) {
+    fn quit(&self) -> bool {
         self.calls
             .lock()
             .expect("wm calls")
             .push(("quit".into(), 0));
+        true
     }
 }
 
@@ -570,6 +577,9 @@ impl Panel {
     /// a 200ms settle pressed before focus was assigned and the click
     /// vanished without a trace (B1 Task 3 diagnosis). The extra 400ms costs
     /// seconds across the suite but buys clicks that actually land.
+    ///
+    /// Stays a fixed settle: focus assignment lives inside the compositor,
+    /// so no pollable condition exists on the test side to wait on instead.
     pub fn click_button(&mut self, x: i32, y: i32, button: u32) {
         self.pointer
             .motion_absolute(f64::from(x), f64::from(y), self.output.0, self.output.1);

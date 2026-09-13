@@ -238,6 +238,32 @@ fn every_shell_gate_the_contract_names_exists() {
     );
 }
 
+/// Mutation check: delete the `spawn_app` call in
+/// `LauncherModel::launch` (`shell/src/launcher_view.rs`); this must fail
+/// naming it. Restore.
+///
+/// The e2e (`open_type_launch_reaches_the_compositor_and_records_recency`)
+/// claims deletion-testing for that call; this gate pins the claim to the
+/// source so a refactor that reroutes launching around `spawn_app` fails
+/// loudly instead of silently voiding the e2e's premise.
+#[test]
+fn launcher_launch_reaches_spawn_app() {
+    let source = std::fs::read_to_string(crate_dir().join("src/launcher_view.rs"))
+        .expect("read shell/src/launcher_view.rs");
+    let launch_at = source.find("fn launch(&mut self, id: &str)").expect(
+        "shell/src/launcher_view.rs still has LauncherModel::launch (the deletion-tested function)",
+    );
+    let body = &source[launch_at..];
+    let body = &body[..body
+        .find("\n    fn ")
+        .expect("launch has a following sibling")];
+    assert!(
+        body.contains("self.wm.spawn_app(id)"),
+        "LauncherModel::launch no longer calls spawn_app -- \
+         the launch e2e's deletion-tested claim is void"
+    );
+}
+
 /// Contract §3.5, verbatim and non-negotiable: a post-connect D-Bus error in
 /// the compositor worker calls `std::process::exit(1)` so systemd's
 /// `Restart=always` replaces the process with a matching build. Logging and

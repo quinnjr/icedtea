@@ -8,8 +8,8 @@ rust-version.workspace = true
 icedtea-config = { path = "../config" }
 icedtea-contract = { path = "../contract" }
 icedtea-ui = { path = "../ui" }
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-xkbcommon = "0.9"
+wayland-protocols-wlr.workspace = true
+xkbcommon.workspace = true
 zbus.workspace = true
 async-channel = "2"
 futures-util = "0.3"

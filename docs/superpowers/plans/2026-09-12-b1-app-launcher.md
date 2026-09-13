@@ -25,7 +25,7 @@
 
 - `shell/src/launcher/mod.rs` — pure core façade: `DesktopIndex::scan(dirs)`, `Matcher::rank(query)`, `PinStore`/`TileStore`/`RecencyStore` ops. No Wayland imports.
 - `shell/src/launcher/entry.rs` — `DesktopEntry { id, name, exec, icon, categories, keywords }` + `.desktop` file parser (Name/Exec/Icon/Categories/Keywords/NoDisplay/OnlyShowIn/NotShowIn, `Exec` field-code handling, locale `Name[xx]` fallback to `Name`).
-- `shell/src/launcher/config_ext.rs` — `LauncherConfig { pinned: Vec<String>, tile_groups: Vec<TileGroup>, recency: HashMap<String, (u64, u64)> }` + serde defaults merged into `config::Config` beside `appearance` (see `config/src/lib.rs:42`), defaults in `config/src/defaults.rs` (follows `bar_position: "bottom"` at `defaults.rs:52`).
+- `config/src/lib.rs` — `LauncherConfig { pinned: Vec<String>, tile_groups: Vec<TileGroup>, recency: HashMap<String, (u64, u64)> }` + `TileGroup` (both live here, not in a `shell/src/launcher/config_ext.rs`) with serde defaults merged into `config::Config` beside `appearance` (see `config/src/lib.rs:42`), defaults in `config/src/defaults.rs` (follows `bar_position: "bottom"` at `defaults.rs:52`).
 - `shell/src/launcher_view.rs` — `LauncherModel`, `LauncherMsg`, `view()` (search box, pinned rail, All-apps list, tiles pane, power row), open/close/focus behavior.
 - `shell/src/panel.rs` — Start button (bar left end) + toggle wiring; `spec()` reads `bar_position` (see Task 3).
 - `contract/src/types.rs` — `Appearance` already carries `bar_position: String`; no contract change (launcher reads config locally; snapshot untouched).

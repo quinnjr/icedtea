@@ -16,6 +16,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 
 use icedtea_ui::view::builders::{SearchEntryExt, box_, button, label, search_entry};
@@ -30,15 +31,24 @@ use xkbcommon::xkb;
 use crate::compositor_client::CompositorCommands;
 use crate::launcher::{
     DesktopEntry, DesktopIndex, Matcher, PinStore, RecencyStore, TileStore, default_dirs,
-    power_argv, power_error_message,
+    desktop_paths, power_argv, power_error_message, run_power_command as core_run_power_command,
 };
 
 /// The launcher's initial surface size: a menu, not a bar — fixed, modest,
-/// content-laid-out inside it.
+/// content-laid-out inside it. Fixed so the layer surface never resizes
+/// under the compositor mid-session.
 pub const LAUNCHER_SIZE: (u32, u32) = (400, 500);
 
 /// One tile grid unit in px: a size-`n` tile requests `n` units of width.
+/// 96px keeps a 1x1 tile finger-sized without overflowing the 400px menu.
 pub const TILE_PX: i32 = 96;
+
+/// Ceiling for a tile group's span in [`TILE_PX`] units. `size` is
+/// config-controlled (hand-editable redb), so the width product must clamp
+/// instead of wrapping (debug) or running off the surface (release):
+/// 1024 units is already an absurd menu, and `1024 * TILE_PX` sits far
+/// below `i32::MAX`, so the clamped product cannot overflow.
+pub const MAX_TILE_SPAN: u32 = 1024;
 
 /// The launcher's surface: corner-anchored `Layer::Top`, keyboard-exclusive,
 /// no exclusive zone.
@@ -131,10 +141,14 @@ pub struct LauncherModel {
     selected: Option<usize>,
     open: bool,
     status: Option<String>,
+    /// Logout needs a confirm press: the first `Power(Logout)` arms (with
+    /// an arming status), the second quits. Any other message or a fresh
+    /// [`LauncherModel::open`] disarms, so a stale arming never surprises.
+    logout_armed: bool,
     /// XDG dirs rescanned on [`LauncherModel::open`]. `pub` for the
     /// supervisor (production) and hermetic tmpdirs (tests).
     pub dirs: Vec<PathBuf>,
-    scanned: Option<SystemTime>,
+    scanned: (usize, Option<SystemTime>),
     wm: Rc<dyn CompositorCommands>,
     /// Fires after a close fold (successful launch, Escape): the supervisor
     /// resets the panel's `launcher_open` bit through it.
@@ -150,13 +164,55 @@ pub struct LauncherModel {
     pub on_persist: Option<Rc<dyn Fn(icedtea_config::LauncherConfig)>>,
 }
 
+/// Consecutive launcher write-back failures, sticky across closes: the
+/// final fallback only warns and drops, so the streak rides along in the
+/// message instead of vanishing with the dismissed menu.
+static WRITE_BACK_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// True when a write-back failure message looks like lock/busy contention
+/// (another writer holds the config DB) rather than corruption or I/O:
+/// only contention is worth a retry with backoff.
+fn is_lock_busy(message: &str) -> bool {
+    message.contains("Cannot acquire lock") || message.contains("still in progress")
+}
+
 /// Persist one launcher snapshot through the scoped
 /// [`icedtea_config::Config::save_launcher`] (launcher table only — never
 /// a full [`icedtea_config::Config::save`], which would clobber a
 /// concurrent settings-app edit with this process's stale in-memory
 /// copy). Reads the current file first so the other sections survive;
 /// every failure comes back as `Err`, never a panic.
+///
+/// A lock/busy failure (the settings app or compositor holds the DB)
+/// retries with a short backoff before giving up; the streak of
+/// consecutive failures rides in the returned message, and the caller
+/// keeps warn-and-drop as the final fallback.
 pub fn persist_launcher_config(
+    db_path: &std::path::Path,
+    launcher: &icedtea_config::LauncherConfig,
+) -> Result<(), String> {
+    const ATTEMPTS: u32 = 3;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match persist_launcher_config_once(db_path, launcher) {
+            Ok(()) => {
+                WRITE_BACK_FAILURES.store(0, Ordering::Relaxed);
+                return Ok(());
+            }
+            Err(err) if attempt < ATTEMPTS && is_lock_busy(&err) => {
+                std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(attempt)));
+            }
+            Err(err) => {
+                let streak = WRITE_BACK_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                return Err(format!("{err} (write-back failure #{streak})"));
+            }
+        }
+    }
+}
+
+/// One write-back attempt: what [`persist_launcher_config`] retries.
+fn persist_launcher_config_once(
     db_path: &std::path::Path,
     launcher: &icedtea_config::LauncherConfig,
 ) -> Result<(), String> {
@@ -173,10 +229,13 @@ pub fn persist_launcher_config(
 /// exactly [`power_argv`]'s output. Both an io failure (binary missing) and
 /// a non-zero exit (polkit-denied, the spec's own risk) are failures, so a
 /// refusal surfaces as a launcher status line, never silently.
-// A3-logind: replace with logind client.
+///
+/// A thin adapter over the core's bounded runner (internal ~30s bound, so
+/// a hung helper can never wedge the fold); kept under this name so the
+/// `power_run` call sites and tests never exec through another path.
+// A3-logind (DE roadmap A3, no ticket system): replace run_power_command's core shell-out with logind client; delete power_run when done.
 fn run_power_command(program: &str, args: &[&str]) -> std::io::Result<()> {
-    // A3-logind: replace with logind client.
-    let status = std::process::Command::new(program).args(args).status()?;
+    let status = core_run_power_command(program, args)?;
     if status.success() {
         Ok(())
     } else {
@@ -184,6 +243,16 @@ fn run_power_command(program: &str, args: &[&str]) -> std::io::Result<()> {
             "{program} exited with {status}"
         )))
     }
+}
+
+/// Which visual pane a row belongs to: the pinned rail, the All-apps list,
+/// or the tiles pane. One index space orders them Pinned → All → Tiled,
+/// which is what the Left/Right pane jumps navigate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Pinned,
+    All,
+    Tiled,
 }
 
 impl LauncherModel {
@@ -198,8 +267,9 @@ impl LauncherModel {
             selected: None,
             open: false,
             status: None,
+            logout_armed: false,
             dirs: default_dirs(),
-            scanned: None,
+            scanned: (0, None),
             wm,
             on_close: None,
             power_run: run_power_command,
@@ -215,7 +285,11 @@ impl LauncherModel {
             self.pins.pin(id);
         }
         for group in &config.tile_groups {
-            self.tiles.ingest(&group.name, &group.ids, group.size);
+            // Clamp at the boundary: `size` is hand-editable redb, so a 0
+            // (or absurd) span must never persist into the store — the tile
+            // width math assumes at least one unit.
+            self.tiles
+                .ingest(&group.name, &group.ids, group.size.clamp(1, MAX_TILE_SPAN));
         }
         self.recency.restore(&config.recency);
     }
@@ -226,12 +300,25 @@ impl LauncherModel {
     pub fn open(&mut self) {
         let current = fingerprint(&self.dirs);
         if self.scanned != current {
-            self.index = DesktopIndex::from_entries(DesktopIndex::scan(&self.dirs));
+            let entries = DesktopIndex::scan(&self.dirs);
+            if entries.is_empty() {
+                // Nothing parseable came back: say how many `.desktop`
+                // files the scan read, so an empty menu points at its
+                // cause (no files vs. all files skipped) instead of
+                // silence. Rare path only — no extra walk otherwise.
+                let scanned = desktop_paths(&self.dirs).len();
+                tracing::debug!(
+                    scanned,
+                    "launcher scan yielded 0 apps; all files skipped or no .desktop files present"
+                );
+            }
+            self.index = DesktopIndex::from_entries(entries);
             self.scanned = current;
         }
         self.query.clear();
         self.selected = None;
         self.status = None;
+        self.logout_armed = false;
         self.open = true;
     }
 
@@ -244,21 +331,47 @@ impl LauncherModel {
             .rank(&self.query)
     }
 
-    /// Which pane an entry renders in: pinned rail (0), All-apps (1), tiles
-    /// (2). Pinned wins over tiled — a pinned tile still reads as pinned.
-    fn section_of(&self, entry: &DesktopEntry) -> u8 {
+    /// Which pane an entry renders in. Pinned wins over tiled — a pinned
+    /// tile still reads as pinned.
+    fn section_of(&self, entry: &DesktopEntry) -> Section {
         if self.pins.is_pinned(&entry.id) {
-            0
+            Section::Pinned
         } else if self
             .tiles
             .groups()
             .iter()
             .any(|group| group.ids.iter().any(|id| id == &entry.id))
         {
-            2
+            Section::Tiled
         } else {
-            1
+            Section::All
         }
+    }
+
+    /// The keyboard's one index space, in visual order: the pinned rail's
+    /// rows, then every All-apps row, then the tiles pane's rows (group and
+    /// member order — the exact order [`tiles_pane`] renders). Entries can
+    /// render in several panes at once (a pinned tile appears three times),
+    /// so one filtered index may own several visual rows; each row carries
+    /// its pane and its filtered index.
+    fn visual_rows(&self, filtered: &[&DesktopEntry]) -> Vec<(Section, usize)> {
+        let mut rows = Vec::new();
+        rows.extend(
+            filtered
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| self.section_of(entry) == Section::Pinned)
+                .map(|(i, _)| (Section::Pinned, i)),
+        );
+        rows.extend((0..filtered.len()).map(|i| (Section::All, i)));
+        for group in self.tiles.groups() {
+            for id in &group.ids {
+                if let Some(i) = filtered.iter().position(|entry| entry.id == *id) {
+                    rows.push((Section::Tiled, i));
+                }
+            }
+        }
+        rows
     }
 
     /// Launch one app id: `spawn_app` on success records recency and closes;
@@ -340,6 +453,11 @@ impl LauncherModel {
 /// proxy maps every bus failure to `false`, never a panic, so the fold
 /// never blocks longer than a local D-Bus round trip.
 pub fn update(m: &mut LauncherModel, msg: LauncherMsg) -> Cmd<LauncherMsg> {
+    // A logout press arms; anything else disarms, so a stale arming can
+    // never surprise a later menu.
+    if !matches!(&msg, LauncherMsg::Power(PowerAction::Logout)) {
+        m.logout_armed = false;
+    }
     match msg {
         LauncherMsg::SearchChanged(query) => {
             m.query = query;
@@ -348,59 +466,10 @@ pub fn update(m: &mut LauncherModel, msg: LauncherMsg) -> Cmd<LauncherMsg> {
         }
         LauncherMsg::SearchActivated | LauncherMsg::ActivateSelected => m.launch_selected(),
         LauncherMsg::MoveUp | LauncherMsg::MoveDown => {
-            let up = matches!(msg, LauncherMsg::MoveUp);
-            let len = m.filtered().len();
-            m.selected = match (m.selected, len) {
-                (_, 0) => None,
-                (None, _) => {
-                    if up {
-                        Some(len - 1)
-                    } else {
-                        Some(0)
-                    }
-                }
-                (Some(i), _) => {
-                    // Defensive clamp: every list-shrinking path resets the
-                    // selection today, but an index must never escape it.
-                    let current = i.min(len - 1);
-                    if up {
-                        Some(current.saturating_sub(1))
-                    } else {
-                        Some((current + 1).min(len - 1))
-                    }
-                }
-            };
-            Cmd::None
+            move_vertical(m, matches!(msg, LauncherMsg::MoveUp))
         }
         LauncherMsg::MoveLeft | LauncherMsg::MoveRight => {
-            let right = matches!(msg, LauncherMsg::MoveRight);
-            let entries = m.filtered();
-            if entries.is_empty() {
-                m.selected = None;
-                return Cmd::None;
-            }
-            // Pane runs over the filtered list: consecutive entries in the
-            // same section (pinned rail / All-apps / tiles) form one run.
-            // Left/Right jump between run starts — Up/Down own the
-            // within-pane steps.
-            let sections: Vec<u8> = entries.iter().map(|e| m.section_of(e)).collect();
-            let mut starts = vec![0usize];
-            for i in 1..sections.len() {
-                if sections[i] != sections[i - 1] {
-                    starts.push(i);
-                }
-            }
-            let current = m.selected.unwrap_or(0).min(entries.len() - 1);
-            m.selected = if right {
-                starts
-                    .iter()
-                    .find(|&&s| s > current)
-                    .copied()
-                    .or(Some(entries.len() - 1))
-            } else {
-                starts.iter().rfind(|&&s| s < current).copied().or(Some(0))
-            };
-            Cmd::None
+            move_pane(m, matches!(msg, LauncherMsg::MoveRight))
         }
         LauncherMsg::ActivateApp(id) => m.launch(&id),
         LauncherMsg::TogglePin(id) => {
@@ -428,47 +497,138 @@ pub fn update(m: &mut LauncherModel, msg: LauncherMsg) -> Cmd<LauncherMsg> {
         // path. A shell-out failure surfaces as `m.status`, never silently;
         // a success dismisses the menu (the session is going away, or the
         // locker covers it).
-        LauncherMsg::Power(action) => match power_argv(action) {
-            // A3-logind: replace with logind client (the exec lives in
-            // `run_power_command`; this arm only routes its outcome).
-            Some((program, args)) => match (m.power_run)(program, args) {
-                Ok(()) => m.close(),
-                Err(err) => {
-                    m.status = Some(power_error_message(action, &err.to_string()));
-                    Cmd::None
-                }
-            },
-            // Logout: the compositor quit path, never a shell-out.
-            None => {
-                m.wm.quit();
-                m.close()
-            }
-        },
+        LauncherMsg::Power(action) => handle_power(m, action),
         LauncherMsg::Close => m.close(),
     }
 }
 
-/// The `.desktop` world's mtime fingerprint: the newest modification time
-/// over `dirs`' `*.desktop` children (metadata only — no file reads, so a
-/// steady-state [`LauncherModel::open`] does no I/O). `None` when no dir
-/// holds a `.desktop` file; any install, removal or edit moves it.
-fn fingerprint(dirs: &[PathBuf]) -> Option<SystemTime> {
-    let mut latest: Option<SystemTime> = None;
-    for dir in dirs {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
-                continue;
+/// One power action (extracted from [`update`]): shell-outs route through
+/// [`power_argv`] and `power_run`, logout takes the compositor quit path.
+/// Logout needs a confirm press — the first arms with a status, the second
+/// quits — and a refused quit (`false`, a dead bus) is a logout-failed
+/// status, never a silent dismissal.
+fn handle_power(m: &mut LauncherModel, action: PowerAction) -> Cmd<LauncherMsg> {
+    match power_argv(action) {
+        // A3-logind (DE roadmap A3, no ticket system): replace power_run routing with logind client; delete power_run when done.
+        Some((program, args)) => match (m.power_run)(program, args) {
+            Ok(()) => m.close(),
+            Err(err) => {
+                m.status = Some(power_error_message(action, &err.to_string()));
+                Cmd::None
             }
-            let modified = entry.metadata().and_then(|md| md.modified()).ok();
-            latest = latest.max(modified);
+        },
+        // Logout: the compositor quit path, never a shell-out.
+        None => {
+            if !m.logout_armed {
+                m.logout_armed = true;
+                m.status = Some("Press Log out again to confirm".to_string());
+                return Cmd::None;
+            }
+            if m.wm.quit() {
+                m.close()
+            } else {
+                m.status = Some(power_error_message(
+                    action,
+                    "the compositor did not respond",
+                ));
+                Cmd::None
+            }
         }
     }
-    latest
+}
+
+/// Left/Right across panes (extracted from [`update`]): jump between the
+/// section starts of [`LauncherModel::visual_rows`] — pinned rail, then
+/// All-apps, then tiles — so the tiles pane is reachable even when every
+/// tile is also pinned. The selection stays a filtered index (what
+/// Up/Down, launch and highlight all address); a duplicated entry resolves
+/// to its first visual row, and every occurrence shares one id, so all of
+/// them light together.
+fn move_pane(m: &mut LauncherModel, right: bool) -> Cmd<LauncherMsg> {
+    let entries = m.filtered();
+    let rows = m.visual_rows(&entries);
+    if rows.is_empty() {
+        m.selected = None;
+        return Cmd::None;
+    }
+    let mut starts = vec![0usize];
+    for i in 1..rows.len() {
+        if rows[i].0 != rows[i - 1].0 {
+            starts.push(i);
+        }
+    }
+    let current = m
+        .selected
+        .and_then(|selected| rows.iter().position(|&(_, i)| i == selected))
+        .unwrap_or(0);
+    let landing = if right {
+        starts
+            .iter()
+            .find(|&&s| s > current)
+            .copied()
+            .unwrap_or(rows.len() - 1)
+    } else {
+        starts.iter().rfind(|&&s| s < current).copied().unwrap_or(0)
+    };
+    m.selected = Some(rows[landing].1);
+    Cmd::None
+}
+
+/// Up/Down within the filtered list (extracted from [`update`]: pure
+/// selection fold, no behavior of its own).
+fn move_vertical(m: &mut LauncherModel, up: bool) -> Cmd<LauncherMsg> {
+    let len = m.filtered().len();
+    m.selected = match (m.selected, len) {
+        (_, 0) => None,
+        (None, _) => {
+            if up {
+                Some(len - 1)
+            } else {
+                Some(0)
+            }
+        }
+        (Some(i), _) => {
+            // Defensive clamp: every list-shrinking path resets the
+            // selection today, but an index must never escape it.
+            let current = i.min(len - 1);
+            if up {
+                Some(current.saturating_sub(1))
+            } else {
+                Some((current + 1).min(len - 1))
+            }
+        }
+    };
+    Cmd::None
+}
+
+/// The `.desktop` world's fingerprint: the file count paired with the
+/// newest modification time over exactly the file set a scan would read
+/// ([`desktop_paths`], metadata only — no file reads, so a steady-state
+/// [`LauncherModel::open`] does no I/O). The count catches what mtime
+/// alone misses: a removal, or an add carrying an old mtime, leaves the
+/// newest stamp untouched while the set changed. `(0, None)` when no dir
+/// holds a `.desktop` file; any install, removal or edit moves the pair.
+fn fingerprint(dirs: &[PathBuf]) -> (usize, Option<SystemTime>) {
+    let paths = desktop_paths(dirs);
+    let mut skipped = 0usize;
+    let mut latest: Option<SystemTime> = None;
+    for path in &paths {
+        match std::fs::metadata(path).and_then(|md| md.modified()) {
+            Ok(modified) => {
+                latest = latest.max(Some(modified));
+            }
+            Err(_) => {
+                skipped += 1;
+                tracing::debug!(path = %path.display(), "launcher fingerprint: skipping entry without mtime");
+            }
+        }
+    }
+    tracing::debug!(
+        count = paths.len(),
+        skipped,
+        "launcher fingerprint scanned the desktop file set"
+    );
+    (paths.len(), latest)
 }
 
 /// The whole menu. `#launcher` is what `style.css`'s launcher rule names.
@@ -511,7 +671,7 @@ fn body(m: &LauncherModel, filtered: &[&DesktopEntry], top: Option<&str>) -> Vie
     let ids: Vec<&str> = filtered.iter().map(|e| e.id.as_str()).collect();
     box_(
         Orientation::Horizontal,
-        [left_rail(m, filtered, top), tiles_pane(m, &ids)],
+        [left_rail(m, filtered, top), tiles_pane(m, filtered, &ids)],
     )
     .id("launcher_body")
 }
@@ -564,8 +724,12 @@ fn left_rail(
 
 /// The tiles pane: one group container per tile group, holding the member
 /// rows that match the filter. Each tile's width follows its group's
-/// [`TileGroup`](crate::launcher::TileGroup) `size` in [`TILE_PX`] units.
-fn tiles_pane(m: &LauncherModel, filtered_ids: &[&str]) -> View<LauncherMsg> {
+/// [`TileGroup`](icedtea_config::TileGroup) `size` in [`TILE_PX`] units.
+fn tiles_pane(
+    m: &LauncherModel,
+    filtered: &[&DesktopEntry],
+    filtered_ids: &[&str],
+) -> View<LauncherMsg> {
     let groups: Vec<View<LauncherMsg>> = m
         .tiles
         .groups()
@@ -576,7 +740,7 @@ fn tiles_pane(m: &LauncherModel, filtered_ids: &[&str]) -> View<LauncherMsg> {
                 .iter()
                 .filter(|id| filtered_ids.contains(&id.as_str()))
                 .filter_map(|id| m.index.find(id))
-                .map(|e| tile_row(e, group.size))
+                .map(|e| tile_row(e, group.size, m.selected_for(&e.id, filtered)))
                 .collect();
             if members.is_empty() {
                 return None;
@@ -600,24 +764,22 @@ enum RowKind {
     All,
 }
 
-/// One app row: click launches, right-click pins/unpins, any other button
-/// is inert. Exactly one handler (`on_pointer_up_with_button`) so a left
-/// release can never double-fire through a second `on_click` (M5-D5 §5).
-fn app_row(
-    entry: &DesktopEntry,
-    kind: RowKind,
-    selected: bool,
-    top: Option<&str>,
+/// One row button: click launches, right-click pins/unpins, any other
+/// button is inert. Exactly one handler (`on_pointer_up_with_button`) so a
+/// left release can never double-fire through a second `on_click`
+/// (M5-D5 §5). `width` is `Some` for tiles (group-size units), `None` for
+/// plain app rows.
+fn row_button(
+    prefix: &str,
+    key: u64,
+    name: &str,
+    id: &str,
+    width: Option<i32>,
 ) -> View<LauncherMsg> {
-    let prefix = match kind {
-        RowKind::Pinned => "pinned",
-        RowKind::All => "app",
-    };
-    let id = entry.id.clone();
-    let launch_id = id.clone();
-    let pin_id = id.clone();
-    let mut row = button(&entry.name)
-        .key(stable_key(&id))
+    let launch_id = id.to_string();
+    let pin_id = id.to_string();
+    let mut row = button(name)
+        .key(key)
         .id(&format!("{prefix}_{id}"))
         .on_pointer_up_with_button(move |_, _, pressed| {
             if pressed == BTN_RIGHT {
@@ -628,7 +790,26 @@ fn app_row(
                 LauncherMsg::Ignore
             }
         });
-    if top == Some(id.as_str()) {
+    if let Some(width) = width {
+        row = row.width_request(width);
+    }
+    row
+}
+
+/// One app row: a [`row_button`] with the pane's id prefix, plus the
+/// top-hit and keyboard-selection classes.
+fn app_row(
+    entry: &DesktopEntry,
+    kind: RowKind,
+    selected: bool,
+    top: Option<&str>,
+) -> View<LauncherMsg> {
+    let prefix = match kind {
+        RowKind::Pinned => "pinned",
+        RowKind::All => "app",
+    };
+    let mut row = row_button(prefix, stable_key(&entry.id), &entry.name, &entry.id, None);
+    if top == Some(entry.id.as_str()) {
         row = row.class("suggested-action");
     }
     if selected {
@@ -637,38 +818,37 @@ fn app_row(
     row
 }
 
-/// One tile: same launch/right-click model as an app row, `id`-prefixed
-/// `tile_`, width in group-size units.
-fn tile_row(entry: &DesktopEntry, size: u32) -> View<LauncherMsg> {
-    let id = entry.id.clone();
-    let launch_id = id.clone();
-    let pin_id = id.clone();
-    // Saturating width math: `size` is config-controlled (hand-editable
-    // redb), so a huge span must clamp, never wrap (debug) or truncate the
-    // surface (release). 1024 units is already an absurd menu; the product
-    // below cannot overflow `i32`.
+/// One tile: a [`row_button`] with the `tile_` prefix and the group-size
+/// width, plus the keyboard-selection class so a pane jump into the tiles
+/// pane lights the tile, not just its All-apps twin.
+fn tile_row(entry: &DesktopEntry, size: u32, selected: bool) -> View<LauncherMsg> {
+    // Clamped width math: `size` is config-controlled (hand-editable
+    // redb), so a 0 span must still paint one unit and a huge span must
+    // clamp, never wrap (debug) or truncate the surface (release). The
+    // product below cannot overflow `i32` (see [`MAX_TILE_SPAN`]).
     #[allow(
         clippy::cast_possible_wrap,
-        reason = "the span is capped at 1024 units, far below i32::MAX / TILE_PX"
+        reason = "the span is capped at MAX_TILE_SPAN units, far below i32::MAX / TILE_PX"
     )]
-    let width = size.min(1024) as i32 * TILE_PX;
-    button(&entry.name)
-        .key(stable_key(&format!("tile:{id}")))
-        .id(&format!("tile_{id}"))
-        .width_request(width)
-        .on_pointer_up_with_button(move |_, _, pressed| {
-            if pressed == BTN_RIGHT {
-                LauncherMsg::TogglePin(pin_id.clone())
-            } else if pressed == BTN_LEFT {
-                LauncherMsg::ActivateApp(launch_id.clone())
-            } else {
-                LauncherMsg::Ignore
-            }
-        })
+    let width = size.clamp(1, MAX_TILE_SPAN) as i32 * TILE_PX;
+    let mut row = row_button(
+        "tile",
+        stable_key(&format!("tile:{}", entry.id)),
+        &entry.name,
+        &entry.id,
+        Some(width),
+    );
+    if selected {
+        row = row.class("active");
+    }
+    row
 }
 
-/// The bottom row: lock / log out / suspend / restart / shut down. UI shell
-/// only — every handler is a Task-6 no-op (see `update`).
+/// The bottom row: lock / log out / suspend / restart / shut down.
+/// View-only: each button folds `LauncherMsg::Power`, which [`update`]
+/// routes through [`power_argv`] (shell-out via `power_run`, logout via
+/// the compositor quit path with a confirm press); every failure surfaces
+/// as `status`, never silently.
 fn power_row() -> View<LauncherMsg> {
     box_(
         Orientation::Horizontal,
@@ -745,6 +925,47 @@ fn stable_key(id: &str) -> u64 {
     hasher.finish()
 }
 
+/// A live menu: how to ask it to dismiss itself, the thread running
+/// it, and its completion signal.
+struct LiveMenu {
+    stop: icedtea_ui::view::InboxSender<LauncherMsg>,
+    handle: std::thread::JoinHandle<()>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+/// Reap a menu that dismissed itself (or died): a finished handle joins
+/// immediately; a received completion joins after thread teardown only
+/// (microseconds — the child sent it past `App::run`). A disconnected
+/// channel means the child died without completing — free the slot all
+/// the same, or Start would brick forever on one dead menu. A panicked
+/// child logs its payload as an error; the slot frees either way.
+fn reap(running: &mut Option<LiveMenu>) {
+    use std::sync::mpsc::TryRecvError;
+
+    let finished = running.as_ref().is_some_and(|menu| {
+        menu.handle.is_finished() || !matches!(menu.done.try_recv(), Err(TryRecvError::Empty))
+    });
+    if !finished {
+        return;
+    }
+    let Some(menu) = running.take() else {
+        return;
+    };
+    if let Err(payload) = menu.handle.join() {
+        // The payload is `Box<dyn Any>`: report a string one, note any
+        // other, and free the slot either way.
+        if let Some(msg) = payload.downcast_ref::<String>() {
+            tracing::error!(%msg, "the launcher surface thread panicked; its slot is free");
+        } else if let Some(msg) = payload.downcast_ref::<&str>() {
+            tracing::error!(%msg, "the launcher surface thread panicked; its slot is free");
+        } else {
+            tracing::error!(
+                "the launcher surface thread panicked with a non-string payload; its slot is free"
+            );
+        }
+    }
+}
+
 /// The launcher supervisor (B1 Task 5): the second surface's whole
 /// lifecycle on its own thread, beside the panel's loop.
 ///
@@ -764,70 +985,50 @@ pub fn supervise(
     panel_tx: icedtea_ui::view::InboxSender<crate::panel::Msg>,
     bar_position: String,
 ) {
-    use std::sync::mpsc::{Receiver, TryRecvError};
-    use std::thread::JoinHandle;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
 
-    /// A live menu: how to ask it to dismiss itself, the thread running
-    /// it, and its completion signal.
-    struct LiveMenu {
-        stop: icedtea_ui::view::InboxSender<LauncherMsg>,
-        handle: JoinHandle<()>,
-        done: Receiver<()>,
-    }
-
-    // Reap a menu that dismissed itself (or died): a finished handle joins
-    // immediately; a received completion joins after thread teardown only
-    // (microseconds — the child sent it past `App::run`). A disconnected
-    // channel means the child died without completing — free the slot all
-    // the same, or Start would brick forever on one dead menu.
+    // The reap tick: a reopen that arrives while the old menu is still
+    // tearing down (a `true` during shutdown) cannot spawn yet — the slot
+    // is held — so the intent waits in `pending_open` until a tick's reap
+    // frees the slot, then spawns. A `false` clears it: an explicit close
+    // cancels the reopen. Without the tick the intent could only fire on
+    // the next message, and a reopen sent during shutdown would drop.
+    const REAP_TICK: Duration = Duration::from_millis(50);
     let mut running: Option<LiveMenu> = None;
-    let reap = |running: &mut Option<LiveMenu>| {
-        let finished = running.as_ref().is_some_and(|menu| {
-            menu.handle.is_finished() || !matches!(menu.done.try_recv(), Err(TryRecvError::Empty))
-        });
-        if finished && let Some(menu) = running.take() {
-            let _ = menu.handle.join();
-        }
-    };
+    let mut pending_open = false;
 
-    while let Ok(want_open) = rx.recv() {
-        reap(&mut running);
-        if want_open {
-            if running.is_some() {
-                continue;
-            }
-            let (inbox, stop) = match icedtea_ui::view::Inbox::<LauncherMsg>::new() {
-                Ok(pair) => pair,
-                Err(err) => {
-                    tracing::warn!(%err, "the launcher inbox failed; Start does nothing");
-                    let _ = panel_tx.send(crate::panel::Msg::LauncherClosed);
+    loop {
+        match rx.recv_timeout(REAP_TICK) {
+            Ok(want_open) => {
+                reap(&mut running);
+                if !want_open {
+                    pending_open = false;
+                    if let Some(menu) = &running {
+                        // Ask the live menu to dismiss itself through its
+                        // own close path: it notifies the panel and quits
+                        // its loop. A failed send means it already left;
+                        // the next reap collects it.
+                        let _ = menu.stop.send(LauncherMsg::Close);
+                    }
                     continue;
                 }
-            };
-            let position = bar_position.clone();
-            let closed = panel_tx.clone();
-            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-            match std::thread::Builder::new()
-                .name("launcher-surface".into())
-                .spawn(move || run_surface(&position, closed, inbox, done_tx))
-            {
-                Ok(handle) => {
-                    running = Some(LiveMenu {
-                        stop,
-                        handle,
-                        done: done_rx,
-                    });
+                if running.is_some() {
+                    pending_open = true;
+                    continue;
                 }
-                Err(err) => {
-                    tracing::warn!(%err, "the launcher thread failed to spawn");
-                    let _ = panel_tx.send(crate::panel::Msg::LauncherClosed);
+                // This spawn consumes a fresh `true` or a waiting reopen.
+                pending_open = false;
+                spawn_menu(&panel_tx, &bar_position, &mut running);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                reap(&mut running);
+                if pending_open && running.is_none() {
+                    pending_open = false;
+                    spawn_menu(&panel_tx, &bar_position, &mut running);
                 }
             }
-        } else if let Some(menu) = &running {
-            // Ask the live menu to dismiss itself through its own close
-            // path: it notifies the panel and quits its loop. A failed send
-            // means it already left; the next reap collects it.
-            let _ = menu.stop.send(LauncherMsg::Close);
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     // The panel dropped its end (process teardown): ask a live menu to
@@ -835,6 +1036,46 @@ pub fn supervise(
     // joining a loop that may never fold again would hang teardown.
     if let Some(menu) = running.take() {
         let _ = menu.stop.send(LauncherMsg::Close);
+    }
+}
+
+/// Spawn one launcher surface into `running`: the `supervise` loop's spawn
+/// step, shared by fresh `true`s and waiting reopens. Every failure here
+/// degrades to "the menu never opens", never a panic and never the panel:
+///
+/// this runs on a foreign thread, so no `unwrap`/`expect` below — errors
+/// log and notify the panel shut.
+fn spawn_menu(
+    panel_tx: &icedtea_ui::view::InboxSender<crate::panel::Msg>,
+    bar_position: &str,
+    running: &mut Option<LiveMenu>,
+) {
+    let (inbox, stop) = match icedtea_ui::view::Inbox::<LauncherMsg>::new() {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::warn!(%err, "the launcher inbox failed; Start does nothing");
+            let _ = panel_tx.send(crate::panel::Msg::LauncherClosed);
+            return;
+        }
+    };
+    let position = bar_position.to_string();
+    let closed = panel_tx.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    match std::thread::Builder::new()
+        .name("launcher-surface".into())
+        .spawn(move || run_surface(&position, closed, inbox, done_tx))
+    {
+        Ok(handle) => {
+            *running = Some(LiveMenu {
+                stop,
+                handle,
+                done: done_rx,
+            });
+        }
+        Err(err) => {
+            tracing::warn!(%err, "the launcher thread failed to spawn");
+            let _ = panel_tx.send(crate::panel::Msg::LauncherClosed);
+        }
     }
 }
 
@@ -903,7 +1144,9 @@ fn run_surface(
         path.set_extension("launchers");
         path
     });
-    let mut app = icedtea_ui::view::App::new(model, update, view).with_inbox(inbox);
+    let mut app = icedtea_ui::view::App::new(model, update, view)
+        .with_inbox(inbox)
+        .with_autofocus_first(true);
     if let Some(path) = probe_report {
         app = app.with_probe_report(path);
     }
@@ -927,6 +1170,12 @@ mod tests {
     /// A recording [`CompositorCommands`]: `RefCell`, not `Mutex` — the unit
     /// tests and `update` are single-threaded. The cross-thread mock the
     /// harness needs lives in `shell/tests/support/mod.rs`.
+    ///
+    /// One of four `MockWm`s (the others: `shell/tests/support/mod.rs`,
+    /// `shell/tests/launcher.rs`, `shell/src/panel.rs`'s unit tests —
+    /// threading genuinely differs, so no structural unification). Each
+    /// must implement every [`CompositorCommands`] method: `focus_window`,
+    /// `close_window`, `set_workspace`, `spawn_app`, `quit`.
     struct MockWm {
         spawns: RefCell<Vec<String>>,
         succeed: Cell<bool>,
@@ -959,8 +1208,9 @@ mod tests {
             self.spawns.borrow_mut().push(app_id.to_string());
             self.succeed.get()
         }
-        fn quit(&self) {
+        fn quit(&self) -> bool {
             self.quits.set(self.quits.get() + 1);
+            self.succeed.get()
         }
     }
 
@@ -1193,19 +1443,43 @@ mod tests {
 
     #[test]
     fn left_and_right_jump_across_panes() {
-        // Filtered order is index order: firefox(pinned) 0, firetools 1,
-        // music 2, files 3. firefox is also tiled, but pinned wins the
-        // section split, so sections are Pinned{0} All{1,2,3}.
+        // Visual order mirrors the layout: the pinned rail's rows, then
+        // every All-apps row, then the tiles pane's rows. firefox is pinned
+        // AND tiled, so it owns a row in each pane: the visual rows are
+        // [(Pinned,0), (All,0..3), (Tiled,0)] with section starts {0, 1, 5}.
         let (mut m, _) = seeded();
         let _ = update(&mut m, LauncherMsg::MoveDown);
         let _ = update(&mut m, LauncherMsg::MoveDown);
         assert_eq!(m.selected, Some(1));
         let _ = update(&mut m, LauncherMsg::MoveLeft);
-        assert_eq!(m.selected, Some(0), "Left jumps to the pinned section");
+        assert_eq!(
+            m.selected,
+            Some(0),
+            "Left jumps to the pinned section's app"
+        );
         let _ = update(&mut m, LauncherMsg::MoveRight);
-        assert_eq!(m.selected, Some(1), "Right jumps to the next section");
+        assert_eq!(
+            m.selected,
+            Some(0),
+            "Right steps from the rail into the All pane on the same app"
+        );
+        // Reach the tiles pane: from Music, Right jumps to the tile
+        // section, and the tile itself carries the selection.
+        let _ = update(&mut m, LauncherMsg::MoveDown);
+        let _ = update(&mut m, LauncherMsg::MoveDown);
+        assert_eq!(m.selected, Some(2));
         let _ = update(&mut m, LauncherMsg::MoveRight);
-        assert_eq!(m.selected, Some(3), "Right past the last section clamps");
+        assert_eq!(m.selected, Some(0), "Right jumps to the tiles section");
+        assert!(
+            classes(&view(&m), "tile_firefox").contains(&"active".to_string()),
+            "the tile lights with the selection, not just its All-apps twin"
+        );
+        // No rows, no selection — in either direction.
+        let _ = update(&mut m, LauncherMsg::SearchChanged("zzzz".into()));
+        let _ = update(&mut m, LauncherMsg::MoveLeft);
+        assert_eq!(m.selected, None);
+        let _ = update(&mut m, LauncherMsg::MoveRight);
+        assert_eq!(m.selected, None);
     }
 
     #[test]
@@ -1367,6 +1641,46 @@ mod tests {
         assert!(by_id(&view(&m), "launcher_status").is_some());
     }
 
+    /// The real [`run_power_command`] against stub executables: hermetic
+    /// exit-code mapping with no external deps. The stubs are data files
+    /// (temp-dir `#!/bin/sh` scripts, `exit 0` / `exit 3`) executed through
+    /// the real exec path; the missing-binary case is a nonexistent path.
+    /// Success maps to `Ok`, any non-zero exit or io failure to `Err`.
+    #[test]
+    fn power_real_runner_maps_exit_codes_hermetically() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "icedtea-power-{}-{}",
+            std::process::id(),
+            COUNT.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("power temp dir");
+
+        fn stub(dir: &std::path::Path, name: &str, code: u8) -> String {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\nexit {code}\n")).expect("stub script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("stub executable");
+            path.to_string_lossy().into_owned()
+        }
+
+        let ok = stub(&dir, "ok.sh", 0);
+        let denied = stub(&dir, "denied.sh", 3);
+        assert!(run_power_command(&ok, &[]).is_ok(), "exit 0 is success");
+        assert!(
+            run_power_command(&denied, &[]).is_err(),
+            "exit 3 is a refusal"
+        );
+        assert!(
+            run_power_command(&dir.join("no-such-binary").to_string_lossy(), &[]).is_err(),
+            "a missing binary is an io failure, never a panic"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn close_persists_pins_tiles_and_recency_for_reopen() {
         let (mut m, _) = seeded();
@@ -1401,9 +1715,25 @@ mod tests {
     }
 
     #[test]
-    fn power_logout_quits_the_session_and_closes_the_menu() {
+    fn power_logout_needs_a_confirm_press_then_quits_and_closes() {
         let (mut m, wm) = seeded();
         m.open = true;
+        // First press arms: no quit, menu stays open, arming status shows.
+        let cmd = update(&mut m, LauncherMsg::Power(PowerAction::Logout));
+        assert_eq!(wm.quits.get(), 0, "the first press only arms");
+        assert!(m.open, "arming keeps the menu open");
+        assert!(!quits(&cmd));
+        let status = m.status.clone().expect("an arming status");
+        assert!(
+            status.contains("again to confirm"),
+            "arming status: {status}"
+        );
+        assert!(by_id(&view(&m), "launcher_status").is_some());
+        // An intervening message disarms: the next press arms anew.
+        let _ = update(&mut m, LauncherMsg::SearchChanged("x".into()));
+        let _ = update(&mut m, LauncherMsg::Power(PowerAction::Logout));
+        assert_eq!(wm.quits.get(), 0, "disarmed by the typing; arms again");
+        // Second consecutive press quits through the compositor path.
         let cmd = update(&mut m, LauncherMsg::Power(PowerAction::Logout));
         assert_eq!(wm.quits.get(), 1, "logout takes the compositor quit path");
         assert!(
@@ -1412,6 +1742,22 @@ mod tests {
         );
         assert!(!m.open, "logout dismisses the menu");
         assert!(quits(&cmd), "dismissal leaves the loop");
+    }
+
+    #[test]
+    fn power_logout_refused_quit_reports_a_status_line_and_stays_open() {
+        let (mut m, _) = seeded();
+        let failing = Rc::new(MockWm::failing());
+        m.wm = failing.clone();
+        m.open = true;
+        let _ = update(&mut m, LauncherMsg::Power(PowerAction::Logout));
+        let cmd = update(&mut m, LauncherMsg::Power(PowerAction::Logout));
+        assert_eq!(failing.quits.get(), 1, "the quit was attempted");
+        assert!(m.open, "a refused logout keeps the menu open");
+        assert!(!quits(&cmd));
+        let status = m.status.clone().expect("a status line");
+        assert!(status.contains("Log out"), "names the action: {status}");
+        assert!(by_id(&view(&m), "launcher_status").is_some());
     }
 
     #[test]
@@ -1456,6 +1802,34 @@ mod tests {
     }
 
     #[test]
+    fn tile_size_zero_clamps_to_one_unit_instead_of_vanishing() {
+        let wm = Rc::new(MockWm::ok());
+        let mut m = LauncherModel::new(wm);
+        m.index = DesktopIndex::from_entries(vec![entry("music", "Music")]);
+        // A 0 span in hand-editable redb: the seed clamps it to one unit,
+        // so the tile still paints instead of collapsing to zero width.
+        m.seed(&icedtea_config::LauncherConfig {
+            pinned: Vec::new(),
+            tile_groups: vec![icedtea_config::TileGroup {
+                name: "Media".to_string(),
+                ids: vec!["music".to_string()],
+                size: 0,
+            }],
+            recency: std::collections::HashMap::new(),
+        });
+        assert_eq!(
+            m.tiles.groups()[0].size,
+            1,
+            "a 0 span cannot persist into the store"
+        );
+        let width = by_id(&view(&m), "tile_music")
+            .expect("tile")
+            .props
+            .int(PropName::WidthRequest, 0);
+        assert_eq!(width, i64::from(TILE_PX), "a clamped tile is one unit wide");
+    }
+
+    #[test]
     fn opening_rescans_only_when_the_app_dirs_changed() {
         // The spec's mtime-gated rescan: steady-state opens do no I/O.
         let dir = std::env::temp_dir().join(format!("icedtea-launcher-fp-{}", std::process::id()));
@@ -1486,6 +1860,47 @@ mod tests {
         assert_ne!(fingerprint(&m.dirs), first);
         m.open();
         assert_eq!(m.index.apps().len(), 2);
+        std::fs::remove_dir_all(&dir).expect("temp dir");
+    }
+
+    #[test]
+    fn fingerprint_moves_on_removal_even_when_the_newest_mtime_survives() {
+        // The stale-index bug: mtime alone misses a removal (or an add
+        // carrying an old mtime) whenever the newest stamp survives the
+        // change. The count half of the fingerprint catches it.
+        let dir =
+            std::env::temp_dir().join(format!("icedtea-launcher-fprem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("a.desktop"),
+            "[Desktop Entry]\nName=App A\nExec=a\n",
+        )
+        .expect("fixture");
+        std::fs::write(
+            dir.join("b.desktop"),
+            "[Desktop Entry]\nName=App B\nExec=b\n",
+        )
+        .expect("fixture");
+        let before = fingerprint(std::slice::from_ref(&dir));
+        assert_eq!(before.0, 2, "two files fingerprinted");
+        // Remove the older file: the newest mtime (b's) is untouched, so
+        // only the count moves the fingerprint.
+        std::fs::remove_file(dir.join("a.desktop")).expect("fixture");
+        let after = fingerprint(std::slice::from_ref(&dir));
+        assert_eq!(after.0, 1, "one file left");
+        assert_eq!(
+            after.1, before.1,
+            "the newest mtime survived, pinning the stale-index scenario"
+        );
+        assert_ne!(after, before, "the count moves the fingerprint on removal");
+        // And the open path rescans on it: the removed app is gone.
+        let wm = Rc::new(MockWm::ok());
+        let mut m = LauncherModel::new(wm);
+        m.dirs = vec![dir.clone()];
+        m.open();
+        assert_eq!(m.index.apps().len(), 1);
+        assert!(m.index.find("b").is_some());
         std::fs::remove_dir_all(&dir).expect("temp dir");
     }
 

@@ -49,35 +49,33 @@ impl DesktopEntry {
     /// whether standalone (`"foo %f bar"` → `"foo bar"`) or embedded
     /// (`"foo%fbar"` → `"foobar"`); `%%` becomes a literal `%` (`"%%f"`
     /// → `"%f"`); any other `%x` sequence and a lone `%` are kept
-    /// verbatim. Stripping runs before unescaping so `"%%f"` reads as an
-    /// escaped percent plus `f`, not as a field code.
+    /// verbatim. The scan pushes `%` for `%%` inline, so a literal
+    /// placeholder-looking char (e.g. U+E000) in the input passes through
+    /// untouched instead of being rewritten.
     pub fn display_exec(&self) -> String {
-        // Placeholder for an escaped percent: strip first, unescape after,
-        // in a single scan so `"%%f"` cannot collapse into a field code.
-        const ESCAPED: char = '\u{E000}';
-        let mut stripped = String::with_capacity(self.exec.len());
+        // Single pass, no placeholder: `%%` pushes a literal `%` inline,
+        // so `"%%f"` reads as an escaped percent plus `f`, never as a
+        // field code — and input that happens to contain U+E000 is kept
+        // verbatim.
+        let mut out = String::with_capacity(self.exec.len());
         let mut chars = self.exec.chars().peekable();
         while let Some(c) = chars.next() {
             if c != '%' {
-                stripped.push(c);
+                out.push(c);
                 continue;
             }
             match chars.peek() {
                 Some('%') => {
                     chars.next();
-                    stripped.push(ESCAPED);
+                    out.push('%');
                 }
                 Some(next) if DISPLAY_STRIP_CODES.contains(next) => {
                     chars.next();
                 }
-                _ => stripped.push('%'),
+                _ => out.push('%'),
             }
         }
-        stripped
-            .replace(ESCAPED, "%")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// First whitespace-separated token of the display `Exec`, reduced to its

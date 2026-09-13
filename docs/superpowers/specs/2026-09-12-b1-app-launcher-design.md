@@ -52,8 +52,11 @@ never its own setting. One knob, two surfaces follow.
 ## Index + stores
 
 - **Index:** XDG `.desktop` scan (system + user dirs), honoring
-  `NoDisplay`, `OnlyShowIn`/`NotShowIn`, localized `Name`, `Exec`
-  (with field codes stripped for display, expanded for launch),
+  `NoDisplay`, `OnlyShowIn`/`NotShowIn`, localized `Name`,   `Exec`
+  (field codes stripped for display via the shell's `display_exec`;
+  verified against the compositor lookup path — `lookup_app_exec`
+  strips field codes via `strip_exec_field_codes` before spawn,
+  mirroring the display rule with `%%` unescaped),
   `Icon`, `Categories`. Rescanned on open with an mtime cache so
   steady-state opens do no I/O.
 - **Matcher:** fuzzy match over name + keywords + exec basename;
@@ -82,9 +85,12 @@ Win7 left rail + Win10 right pane:
 
 ## Spawn + power backends
 
-- **Launch** is a D-Bus call to the compositor's spawn action with the
-  entry's argv (exec'd directly per the M6.0 path). Recency is recorded
-  on success.
+- **Launch** is a D-Bus call to the compositor's `SpawnApp` method
+  which takes an app id; the compositor resolves it against its own
+  index copy and execs the result directly (per the M6.0
+  `parse_spawn_argv` + `Command::spawn` path) — no argv crosses the bus
+  (see the `apply_action` hardening ban on wiring `spawn` to D-Bus).
+  Recency is recorded on success.
 - **Power row** shells out (`loginctl lock-session`, session quit via
   the compositor quit path, `systemctl suspend/poweroff/reboot`).
   Every failure surfaces as a status line in the launcher (never
@@ -98,8 +104,8 @@ Win7 left rail + Win10 right pane:
 - **Offscreen render tests** (the M1/M5 pattern): rest state per theme;
   open → search → launch dismissal states.
 - **Harness e2e** (both sides, real relay): open from Start, type a
-  query, launch — assert the spawn request carries the entry's argv
-  and recency recorded; power row dry-run asserts the exact argv that
+  query, launch — assert the spawn request carries the app id (never
+  argv — no argv crosses the bus) and recency recorded; power row dry-run asserts the exact argv that
   would run. Deletion-tested: gutting the spawn call fails the e2e.
 - **Gates:** `cargo test --workspace -- --test-threads=1`,
   `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`.

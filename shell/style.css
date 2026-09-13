@@ -1,3 +1,4 @@
+/* contrast: unverified — see rest-gate follow-up */
 #bar {
     /* `#bar` is `root`'s only child in a plain (GTK-semantics) box, and a
        plain box's child that never opts into an explicit `ChildLayout` is
@@ -57,6 +58,7 @@
     color: #f5e0dc;
 }
 
+/* contrast: unverified — rest gates assert layout only */
 /* B1 Task 5: the launcher menu. A floating `Layer::Top` surface with no
    exclusive zone (`launcher_view::spec`), so unlike `#bar` it needs no
    width floor and no zero-padding discipline: its 400x500 committed size

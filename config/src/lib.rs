@@ -87,6 +87,7 @@ pub struct LauncherConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Config {
     pub keybindings: HashMap<String, KeyCombo>,
     pub appearance: Appearance,
@@ -400,26 +401,45 @@ fn read_config_from_db(db: Database) -> Config {
 }
 
 impl Config {
+    /// Persist the whole config: every section table is rewritten from this
+    /// in-memory copy.
+    ///
+    /// Last-writer-wins: a caller holding a stale copy clobbers fresher rows
+    /// another writer persisted since (notably the launcher's
+    /// [`Config::save_launcher`] rows — a full `save` from a stale config
+    /// reverts fresh pins/recency; see
+    /// `full_save_with_stale_launcher_clobbers_fresh_rows` for the pinned
+    /// behavior). Prefer the scoped saves ([`Config::save_launcher`],
+    /// [`Config::save_displays`]) wherever the caller does not own every
+    /// section; the settings app is currently the only full-`save` caller
+    /// and owns all sections, but it is still racy against the launcher's
+    /// write-back, which is why this is documented as still-open.
     pub fn save(&self, db: &Database) -> Result<(), redb::Error> {
         let write_txn = db.begin_write()?;
         {
             let mut meta = write_txn.open_table(DB_META)?;
-            let version = serde_json::to_vec(&crate::SCHEMA_VERSION).unwrap();
+            let version =
+                serde_json::to_vec(&crate::SCHEMA_VERSION).map_err(std::io::Error::other)?;
             meta.insert(KEY_SCHEMA_VERSION, version.as_slice())?;
             let mut appearance = write_txn.open_table(DB_APPEARANCE)?;
-            let appearance_bytes = serde_json::to_vec(&self.appearance).unwrap();
+            let appearance_bytes =
+                serde_json::to_vec(&self.appearance).map_err(std::io::Error::other)?;
             appearance.insert(KEY_APPEARANCE, appearance_bytes.as_slice())?;
             let mut behavior = write_txn.open_table(DB_BEHAVIOR)?;
-            let behavior_bytes = serde_json::to_vec(&self.behavior).unwrap();
+            let behavior_bytes =
+                serde_json::to_vec(&self.behavior).map_err(std::io::Error::other)?;
             behavior.insert(KEY_BEHAVIOR, behavior_bytes.as_slice())?;
             let mut workspaces = write_txn.open_table(DB_WORKSPACES)?;
-            let workspace_bytes = serde_json::to_vec(&self.workspace_names).unwrap();
+            let workspace_bytes =
+                serde_json::to_vec(&self.workspace_names).map_err(std::io::Error::other)?;
             workspaces.insert(KEY_WORKSPACES, workspace_bytes.as_slice())?;
             let mut displays = write_txn.open_table(DB_DISPLAYS)?;
-            let displays_bytes = serde_json::to_vec(&self.displays).unwrap();
+            let displays_bytes =
+                serde_json::to_vec(&self.displays).map_err(std::io::Error::other)?;
             displays.insert(KEY_DISPLAYS, displays_bytes.as_slice())?;
             let mut launcher = write_txn.open_table(DB_LAUNCHER)?;
-            let launcher_bytes = serde_json::to_vec(&self.launcher).unwrap();
+            let launcher_bytes =
+                serde_json::to_vec(&self.launcher).map_err(std::io::Error::other)?;
             launcher.insert(KEY_LAUNCHER, launcher_bytes.as_slice())?;
             let mut keybindings = write_txn.open_table(DB_KEYBINDINGS)?;
             // Review finding #3: clear every existing row FIRST. `insert`
@@ -430,11 +450,12 @@ impl Config {
             // any user deletion. Wiping the table makes the write authoritative:
             // exactly the current set persists, nothing more.
             keybindings.retain(|_k, _v| false)?;
-            let count = serde_json::to_vec(&(self.keybindings.len() as u64)).unwrap();
+            let count = serde_json::to_vec(&(self.keybindings.len() as u64))
+                .map_err(std::io::Error::other)?;
             keybindings.insert(KEY_ACTION_COUNT, count.as_slice())?;
             for (action, combo) in &self.keybindings {
                 let key = format!("{KEY_ACTION}{action}");
-                let combo_bytes = serde_json::to_vec(combo).unwrap();
+                let combo_bytes = serde_json::to_vec(combo).map_err(std::io::Error::other)?;
                 keybindings.insert(key.as_str(), combo_bytes.as_slice())?;
             }
         }
@@ -708,6 +729,51 @@ mod tests {
         assert_eq!(loaded.keybindings, seeded.keybindings);
         assert_eq!(loaded.behavior, seeded.behavior);
         assert_eq!(loaded.displays, seeded.displays);
+    }
+
+    #[test]
+    fn full_save_with_stale_launcher_clobbers_fresh_rows() {
+        // Mirror of `save_launcher_leaves_other_sections_intact`, in the
+        // other direction: a full `save` from a config that is stale in the
+        // launcher section reverts fresher launcher rows another writer
+        // persisted since. This pins the actual last-writer-wins behavior —
+        // making the stale full save merge instead would need restructuring
+        // (read-merge-write or per-section ownership everywhere), so this
+        // stays open and the scoped saves remain the mitigation.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        let mut seeded = default_config();
+        seeded.launcher.pinned.push("old-pin".to_string());
+        {
+            let db = open(&path).unwrap();
+            seeded.save(&db).unwrap();
+        }
+
+        // The launcher's write-back persists fresh rows through its scoped
+        // save (it never touches other sections).
+        let mut fresh = default_config();
+        fresh.launcher.pinned.push("fresh-pin".to_string());
+        {
+            let db = open(&path).unwrap();
+            fresh.save_launcher(&db).unwrap();
+        }
+        assert_eq!(
+            load_or_default(&path).launcher.pinned,
+            vec!["fresh-pin".to_string()]
+        );
+
+        // A stale full save (e.g. the settings app holding a pre-write
+        // in-memory copy) clobbers those fresh rows with its own.
+        {
+            let db = open(&path).unwrap();
+            seeded.save(&db).unwrap();
+        }
+        assert_eq!(
+            load_or_default(&path).launcher.pinned,
+            vec!["old-pin".to_string()],
+            "full save is last-writer-wins: still open, use scoped saves"
+        );
     }
 
     #[test]

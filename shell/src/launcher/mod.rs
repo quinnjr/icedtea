@@ -12,20 +12,50 @@ pub use entry::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use icedtea_config::{TileGroup, default_tile_size};
+
 /// Desktop name this launcher shows up as for `OnlyShowIn`/`NotShowIn`.
+// SYNC: mirrored in compositor/src/state.rs; launcher_parity test is the sync gate.
 pub const SHOW_IN_ENV: &str = "icedtea";
 
-/// Default XDG application directories scanned for `.desktop` files.
+/// Default XDG application directories scanned for `.desktop` files, in
+/// precedence order: the user dir first, then the system dir.
+/// [`DesktopIndex::scan`] keeps the first dir's copy of a duplicated app id,
+/// so a user override shadows the system entry (same order as the
+/// compositor's lookup).
 pub fn default_dirs() -> Vec<PathBuf> {
     let user = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"))
         .join(".local/share/applications");
-    vec![PathBuf::from("/usr/share/applications"), user]
+    vec![user, PathBuf::from("/usr/share/applications")]
 }
 
 /// Cap on distinct apps tracked by [`RecencyStore`]; oldest prune first.
 pub const MAX_RECENCY_ENTRIES: usize = 200;
+
+/// Every `*.desktop` path under `dirs`, in dir order. Unreadable dirs are
+/// skipped, never fatal; `read_dir` errors on individual entries are
+/// flattened away and only the `.desktop` extension is kept.
+///
+/// Split out (not inlined in [`DesktopIndex::scan`]) so the fingerprint
+/// half of the contract can hash exactly the file set a scan would read.
+pub(crate) fn desktop_paths(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("desktop") {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
 
 /// Index of visible desktop entries.
 #[derive(Debug, Default)]
@@ -48,40 +78,30 @@ impl DesktopIndex {
     /// sorted by app id for a deterministic order. Unreadable files and
     /// unparseable content are skipped, never fatal. An app id appearing in
     /// more than one dir is kept once — the first dir in `dirs` order wins
-    /// (system dirs precede the user dir in [`default_dirs`], so the
-    /// system entry shadows the user's), matching the first-hit-wins
+    /// (the user dir precedes the system dir in [`default_dirs`], so the
+    /// user entry shadows the system's), matching the first-hit-wins
     /// compositor lookup.
     pub fn scan(dirs: &[PathBuf]) -> Vec<DesktopEntry> {
         use std::collections::HashSet;
         let mut seen: HashSet<String> = HashSet::new();
         let mut apps = Vec::new();
-        for dir in dirs {
-            let dir_entries = match std::fs::read_dir(dir) {
-                Ok(entries) => entries,
+        for path in desktop_paths(dirs) {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
                 Err(_) => continue,
             };
-            for dir_entry in dir_entries.flatten() {
-                let path = dir_entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
-                    continue;
-                }
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                };
-                let id = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("");
-                if id.is_empty() || seen.contains(id) {
-                    continue;
-                }
-                let visible =
-                    parse_entry_with_id(id, &text).filter(|entry| entry.visible_in(SHOW_IN_ENV));
-                if let Some(entry) = visible {
-                    seen.insert(id.to_string());
-                    apps.push(entry);
-                }
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("");
+            if id.is_empty() || seen.contains(id) {
+                continue;
+            }
+            let visible =
+                parse_entry_with_id(id, &text).filter(|entry| entry.visible_in(SHOW_IN_ENV));
+            if let Some(entry) = visible {
+                seen.insert(id.to_string());
+                apps.push(entry);
             }
         }
         apps.sort_by(|a, b| a.id.cmp(&b.id));
@@ -279,37 +299,10 @@ impl PinStore {
     }
 }
 
-/// Standard 1x1 tile span assigned to newly created groups.
-pub fn default_tile_size() -> u32 {
-    1
-}
-
-/// One named tile group holding ordered app ids.
-///
-/// Mirrored by `config::TileGroup` for persistence (the config crate cannot
-/// depend on this crate; conversion happens at the shell boundary in
-/// `config_ext.rs`). Keep the two shapes in sync when either changes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TileGroup {
-    /// Group display name.
-    pub name: String,
-    /// Member app ids in tile order.
-    pub ids: Vec<String>,
-    /// Tile span in grid units (`1` = standard 1x1 tile).
-    pub size: u32,
-}
-
-impl Default for TileGroup {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            ids: Vec::new(),
-            size: default_tile_size(),
-        }
-    }
-}
-
 /// Named tile groups (ordered) with ordered member ids.
+///
+/// The group shape is `icedtea_config::TileGroup` (single owner: the config
+/// crate persists it, this core operates on it).
 #[derive(Debug, Default, Clone)]
 pub struct TileStore {
     groups: Vec<TileGroup>,
@@ -371,15 +364,16 @@ pub enum PowerAction {
 ///
 /// `Logout` is `None`: it takes the compositor quit path (no shell-out).
 /// Every other action is the spec §Spawn+power shell-out until A3 logind
-/// replaces it.
+/// replaces it. Programs are absolute paths so the launch never depends on
+/// the caller's `PATH`.
 #[must_use]
 pub fn power_argv(action: PowerAction) -> Option<(&'static str, &'static [&'static str])> {
     match action {
-        PowerAction::Lock => Some(("loginctl", &["lock-session"])),
+        PowerAction::Lock => Some(("/usr/bin/loginctl", &["lock-session"])),
         PowerAction::Logout => None,
-        PowerAction::Suspend => Some(("systemctl", &["suspend"])),
-        PowerAction::Reboot => Some(("systemctl", &["reboot"])),
-        PowerAction::PowerOff => Some(("systemctl", &["poweroff"])),
+        PowerAction::Suspend => Some(("/usr/bin/systemctl", &["suspend"])),
+        PowerAction::Reboot => Some(("/usr/bin/systemctl", &["reboot"])),
+        PowerAction::PowerOff => Some(("/usr/bin/systemctl", &["poweroff"])),
     }
 }
 
@@ -396,6 +390,39 @@ pub fn power_error_message(action: PowerAction, detail: &str) -> String {
         PowerAction::PowerOff => "PowerOff",
     };
     format!("Could not {name}: {detail}")
+}
+
+/// Run one [`power_argv`] shell-out with an internal ~30s bound, so a slow
+/// or hung helper can never wedge the caller: the child is polled to exit,
+/// killed (and reaped) on timeout, and a timed-out [`std::io::Error`] is
+/// returned.
+///
+/// The sibling view calls this instead of shelling out directly, so the
+/// argv contract ([`power_argv`]) and the execution bound live together in
+/// the unit-testable core.
+pub(crate) fn run_power_command(
+    program: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::time::{Duration, Instant};
+    const BOUND: Duration = Duration::from_secs(30);
+    const POLL: Duration = Duration::from_millis(50);
+    let mut child = std::process::Command::new(program).args(args).spawn()?;
+    let deadline = Instant::now() + BOUND;
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("{program} did not exit within {}s", BOUND.as_secs()),
+                ));
+            }
+            None => std::thread::sleep(POLL),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +520,16 @@ mod tests {
     }
 
     #[test]
+    fn display_exec_keeps_a_literal_placeholder_char_verbatim() {
+        // The old implementation used U+E000 as an internal `%%` stand-in
+        // and rewrote it back afterwards, corrupting input that genuinely
+        // contained it. The single-pass push has no stand-in to leak.
+        let mut e = entry("F", "f");
+        e.exec = "foo\u{e000} %f bar".to_string();
+        assert_eq!(e.display_exec(), "foo\u{e000} bar");
+    }
+
+    #[test]
     fn display_exec_strips_embedded_codes_and_keeps_unknown_sequences() {
         // Rule: `%x` for a known field code is dropped wherever it occurs;
         // `%%` unescapes after; any other `%x` and a lone `%` stay verbatim.
@@ -517,6 +554,61 @@ mod tests {
         };
         let e = parse_entry_with_id_and_locale("files", text, Some(&fr)).unwrap();
         assert_eq!(e.name, "Fichiers", "LANGUAGE order decides");
+    }
+
+    #[test]
+    fn locale_selection_follows_the_documented_precedence_table() {
+        // Rule (entry.rs): exact `$LANG` (full value, then without the
+        // codeset/modifier, then the bare language) → each `$LANGUAGE`
+        // entry in order → first `Name[xx]` in file order → plain `Name`.
+        let text = "[Desktop Entry]\nName=Files\nName[fr]=Fichiers\nName[de]=Dateien\nExec=files\n";
+        let plain = "[Desktop Entry]\nName=Files\nExec=files\n";
+        let locale = |lang: Option<&str>, language: &[&str]| Locale {
+            lang: lang.map(str::to_string),
+            language: language.iter().map(|s| s.to_string()).collect(),
+        };
+        let cases: &[(&str, Option<Locale>, &str, &str)] = &[
+            (
+                "bare LANG beats a later variant",
+                Some(locale(Some("de"), &[])),
+                text,
+                "Dateien",
+            ),
+            (
+                "full LANG strips codeset/modifier to the bare language",
+                Some(locale(Some("de_DE.UTF-8"), &[])),
+                text,
+                "Dateien",
+            ),
+            (
+                "LANGUAGE order decides when LANG matches nothing",
+                Some(locale(Some("es"), &["de", "fr"])),
+                text,
+                "Dateien",
+            ),
+            (
+                "no exact match anywhere falls back to the first variant",
+                Some(locale(Some("es"), &[])),
+                text,
+                "Fichiers",
+            ),
+            (
+                "no locale falls back to the first variant",
+                None,
+                text,
+                "Fichiers",
+            ),
+            (
+                "no variant at all falls back to plain Name",
+                Some(locale(Some("de"), &["fr"])),
+                plain,
+                "Files",
+            ),
+        ];
+        for (desc, loc, input, expected) in cases {
+            let e = parse_entry_with_id_and_locale("files", input, loc.as_ref()).unwrap();
+            assert_eq!(e.name, *expected, "{desc}");
+        }
     }
 
     #[test]
@@ -769,25 +861,37 @@ mod tests {
     fn power_argv_matches_the_shell_out_contract() {
         assert_eq!(
             power_argv(PowerAction::Lock),
-            Some(("loginctl", ["lock-session"].as_slice()))
+            Some(("/usr/bin/loginctl", ["lock-session"].as_slice()))
         );
         assert_eq!(
             power_argv(PowerAction::Suspend),
-            Some(("systemctl", ["suspend"].as_slice()))
+            Some(("/usr/bin/systemctl", ["suspend"].as_slice()))
         );
         assert_eq!(
             power_argv(PowerAction::Reboot),
-            Some(("systemctl", ["reboot"].as_slice()))
+            Some(("/usr/bin/systemctl", ["reboot"].as_slice()))
         );
         assert_eq!(
             power_argv(PowerAction::PowerOff),
-            Some(("systemctl", ["poweroff"].as_slice()))
+            Some(("/usr/bin/systemctl", ["poweroff"].as_slice()))
         );
         assert_eq!(
             power_argv(PowerAction::Logout),
             None,
             "logout takes the compositor quit path, never a shell-out"
         );
+        for action in [
+            PowerAction::Lock,
+            PowerAction::Suspend,
+            PowerAction::Reboot,
+            PowerAction::PowerOff,
+        ] {
+            let (program, _) = power_argv(action).expect("a shell-out");
+            assert!(
+                program.starts_with('/'),
+                "{action:?}: the program must be absolute, got {program:?}"
+            );
+        }
     }
 
     #[test]
@@ -825,10 +929,10 @@ mod tests {
     }
 
     #[test]
-    fn default_dirs_lists_the_two_xdg_locations() {
+    fn default_dirs_lists_the_two_xdg_locations_user_first() {
         let dirs = default_dirs();
         assert_eq!(dirs.len(), 2);
-        assert!(dirs[0].ends_with("usr/share/applications"));
-        assert!(dirs[1].ends_with(".local/share/applications"));
+        assert!(dirs[0].ends_with(".local/share/applications"));
+        assert!(dirs[1].ends_with("usr/share/applications"));
     }
 }

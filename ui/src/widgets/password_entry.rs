@@ -20,7 +20,7 @@ use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{EditOutcome, TextEditState};
 use crate::widgets::{PointerState, content_rect_local, shift_event};
-use crate::window::focus::FocusCause;
+use crate::window::focus::{FOCUSABLE_CLASS, FocusCause};
 use crate::window::keyboard::Mods;
 
 /// A `GtkPasswordEntry` holding `text`.
@@ -96,6 +96,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for PasswordEntryC {
 
     fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {
         node.add_class("password");
+        // The focus ring only walks nodes carrying `FOCUSABLE_CLASS`
+        // (mirrors `SearchEntryC::build`); without this no password entry
+        // is ever a Tab stop.
+        node.add_class(FOCUSABLE_CLASS);
         let mut edit = TextEditState::build(node, props.str(PropName::Text).unwrap_or(""), cx);
         edit.visibility = false;
         edit.reshape(cx);

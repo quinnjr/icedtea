@@ -30,6 +30,7 @@ use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{UndoStack, clamp_to_boundary};
 use crate::widgets::{PointerState, local_rect, shift_event};
+use crate::window::focus::FOCUSABLE_CLASS;
 use crate::window::keyboard::Mods;
 use crate::window::pointer::Kinetic;
 
@@ -365,6 +366,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for TextViewC {
 
     fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {
         node.add_class("view");
+        // The focus ring only walks nodes carrying `FOCUSABLE_CLASS`
+        // (mirrors `SearchEntryC::build`); without this no text view is
+        // ever a Tab stop.
+        node.add_class(FOCUSABLE_CLASS);
         for side in ["top", "left"] {
             let border = Node::with_classes("border", &[side]);
             node.append_child(&border);

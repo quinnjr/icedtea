@@ -271,6 +271,29 @@ mod tests {
     }
 
     #[test]
+    fn all_entry_family_widgets_are_tab_stops() {
+        // The focus ring only walks nodes carrying `FOCUSABLE_CLASS`: every
+        // text-entry kind must seed it at build, or Tab (and the C4
+        // open-time focus landing) walks straight past it.
+        for kind in [
+            Kind::Entry,
+            Kind::SearchEntry,
+            Kind::PasswordEntry,
+            Kind::TextView,
+        ] {
+            let built = build_widget::<String>(kind, &Props::default());
+            assert!(
+                built
+                    .node
+                    .classes()
+                    .iter()
+                    .any(|c| c.as_str() == crate::window::focus::FOCUSABLE_CLASS),
+                "{kind:?} must carry FOCUSABLE_CLASS to be a Tab stop"
+            );
+        }
+    }
+
+    #[test]
     fn focus_in_enables_ime_and_a_commit_fires_change() {
         // mutation: skip the `ime_event` call and FocusIn emits nothing
         // while the commit never reaches the buffer.

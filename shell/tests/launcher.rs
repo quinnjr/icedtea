@@ -26,6 +26,12 @@ use support::TempDir;
 
 /// A recording [`CompositorCommands`]. Single-threaded (`RefCell`, not
 /// `Mutex`): the offscreen loop runs on this thread.
+///
+/// One of four `MockWm`s (the others: `shell/tests/support/mod.rs`,
+/// `shell/src/launcher_view.rs`'s unit tests, `shell/src/panel.rs`'s unit
+/// tests — threading genuinely differs, so no structural unification).
+/// Each must implement every `CompositorCommands` method: `focus_window`,
+/// `close_window`, `set_workspace`, `spawn_app`, `quit`.
 struct MockWm {
     spawns: RefCell<Vec<String>>,
     succeed: Cell<bool>,
@@ -39,7 +45,9 @@ impl CompositorCommands for MockWm {
         self.spawns.borrow_mut().push(app_id.to_string());
         self.succeed.get()
     }
-    fn quit(&self) {}
+    fn quit(&self) -> bool {
+        self.succeed.get()
+    }
 }
 
 /// Three fixture apps on disk: `dirs` + [`LauncherModel::open`] is the
@@ -126,8 +134,12 @@ const REST_IDS: &[&str] = &[
     "launcher_power",
 ];
 
+/// Layout only, by name: the offscreen `Probe` carries allocations but no
+/// pixels (and no known background to sample against), so per-id paint
+/// sampling like the panel gate is infeasible here — the pixel oracle lives
+/// in `typing_at_open_reaches_the_search_box_without_a_prior_tab` instead.
 #[test]
-fn launcher_rest_state_renders_in_light_and_dark() {
+fn launcher_rest_state_lays_out_in_light_and_dark() {
     for theme in [Theme::Light, Theme::Dark] {
         let dir = app_dir();
         let (model, _) = seeded_model(&dir);
@@ -304,6 +316,7 @@ fn open_type_launch_reaches_the_compositor_and_records_recency() {
 
     let clock = Rc::new(ManualClock::new());
     App::new(model, launcher_view::update, launcher_view::view)
+        .with_autofocus_first(true)
         .with_sheet(style::sheet_for(Theme::Dark))
         .with_fonts(FontDatabase::new())
         .with_icons(IconTheme::with_name_and_roots("hicolor", vec![]))
@@ -398,6 +411,7 @@ fn typing_at_open_reaches_the_search_box_without_a_prior_tab() {
     let (model, _) = seeded_model(&dir);
     let clock = Rc::new(ManualClock::new());
     let frames = App::new(model, launcher_view::update, launcher_view::view)
+        .with_autofocus_first(true)
         .with_sheet(style::sheet_for(Theme::Dark))
         .with_fonts(FontDatabase::new())
         .with_icons(IconTheme::with_name_and_roots("hicolor", vec![]))
@@ -439,5 +453,27 @@ fn typing_at_open_reaches_the_search_box_without_a_prior_tab() {
     assert!(
         !same,
         "typing narrowed nothing: the keys never reached search"
+    );
+    // Model oracle first, pixels second: the same query through the real
+    // `update` fold must hold "mus" in search and leave Music the top hit.
+    let dir = app_dir();
+    let (mut model, _) = seeded_model(&dir);
+    let _ = launcher_view::update(&mut model, LauncherMsg::SearchChanged("mus".into()));
+    let probe = probe(Theme::Dark, model);
+    let mut rows: Vec<String> = probe
+        .root()
+        .descendants()
+        .filter_map(|n| n.id())
+        .map(|id| id.as_str().to_string())
+        .filter(|id| id.starts_with("app_"))
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec!["app_music"], "search holds the query");
+    assert!(
+        node_by_id(&probe, "app_music")
+            .classes()
+            .iter()
+            .any(|c| c.as_str() == "suggested-action"),
+        "Music is the top hit"
     );
 }

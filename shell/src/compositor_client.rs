@@ -18,15 +18,19 @@ const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 /// constant (rather than an inline literal at the call) so the unit test
 /// below can pin it against the compositor's
 /// `CompositorInterface::spawn_app` (see `compositor/src/dbus.rs`'s
-/// `spawn_app_is_exposed_as_spawn_app_with_string_in_bool_out`): the two
-/// literals must agree, or the proxy call reaches no method and every
-/// launch silently reports `false`.
+/// `spawn_app_is_exposed_as_spawn_app_with_string_in_bool_out`).
+///
+/// A reminder, not a guard — the real pin is that compositor introspection
+/// test: if the literals disagree, the proxy call reaches no method and
+/// every launch silently reports `false`.
 const SPAWN_APP_MEMBER: &str = "SpawnApp";
 
 /// Wire member for `CompositorCommands::quit`, kept as a named constant for
-/// the same reason as [`SPAWN_APP_MEMBER`] below: the literal must agree
-/// with the member `compositor/src/dbus.rs` exposes (`fn quit` → `Quit`),
-/// or the logout call reaches no method and the session never ends.
+/// the same reason as [`SPAWN_APP_MEMBER`].
+///
+/// A reminder, not a guard — the real pin is the compositor introspection
+/// test (`quit_is_exposed_as_quit_with_no_arguments`): if the literals
+/// disagree, the logout call reaches no method and the session never ends.
 const QUIT_MEMBER: &str = "Quit";
 
 /// Spawn the signal worker. It seeds with `GetState`, then forwards every
@@ -180,9 +184,10 @@ pub trait CompositorCommands {
     /// never panics: this runs on the panel's loop thread.
     fn spawn_app(&self, app_id: &str) -> bool;
     /// End the session through the compositor's `Quit` path (the launcher
-    /// power row's log-out). Fire-and-forget like the focus/close/workspace
-    /// commands above: a dead bus means the session is already going away.
-    fn quit(&self);
+    /// power row's log-out). Returns whether the call was issued: a dead
+    /// bus means the session is already going away (`false`), never a
+    /// panic on the panel's loop thread.
+    fn quit(&self) -> bool;
 }
 
 /// Issues `org.icedtea.Compositor` commands from the panel's loop thread.
@@ -231,33 +236,50 @@ impl CompositorCommands for CompositorProxy {
     }
     // The logout path: `Quit` ends the session through the same
     // `CompositorInterface` the other commands call into (see
-    // `compositor/src/dbus.rs`'s `quit`). Fire-and-forget: the reply (none)
-    // carries nothing the launcher could act on.
-    fn quit(&self) {
-        let _ = self.conn.call_method(
-            Some(COMPOSITOR_BUS_NAME),
-            COMPOSITOR_PATH,
-            Some(COMPOSITOR_IFACE),
-            QUIT_MEMBER,
-            &(),
-        );
-    }
-    // The wire member is `SpawnApp` (see `focus_window`'s comment), and
-    // unlike the fire-and-forget commands above this one reads the reply:
-    // every failure -- no bus, rejected call, bad body -- is `false`, never
-    // a panic on this foreign (panel loop) thread.
-    fn spawn_app(&self, app_id: &str) -> bool {
+    // `compositor/src/dbus.rs`'s `quit`). The bool is whether the call
+    // was issued, so the launcher can tell a dead bus (already going
+    // away) from a delivered logout.
+    fn quit(&self) -> bool {
         self.conn
             .call_method(
                 Some(COMPOSITOR_BUS_NAME),
                 COMPOSITOR_PATH,
                 Some(COMPOSITOR_IFACE),
-                SPAWN_APP_MEMBER,
-                &(app_id,),
+                QUIT_MEMBER,
+                &(),
             )
-            .ok()
-            .and_then(|msg| msg.body().deserialize::<bool>().ok())
-            .unwrap_or(false)
+            .is_ok()
+    }
+    // The wire member is `SpawnApp` (see `focus_window`'s comment), and
+    // unlike the fire-and-forget commands above this one reads the reply:
+    // every failure -- no bus, rejected call, bad body -- is `false`, never
+    // a panic on this foreign (panel loop) thread. Each collapse is logged
+    // with its kind first, so a silent `false` never hides which leg failed.
+    fn spawn_app(&self, app_id: &str) -> bool {
+        let msg = match self.conn.call_method(
+            Some(COMPOSITOR_BUS_NAME),
+            COMPOSITOR_PATH,
+            Some(COMPOSITOR_IFACE),
+            SPAWN_APP_MEMBER,
+            &(app_id,),
+        ) {
+            Ok(msg) => msg,
+            Err(err) => {
+                tracing::warn!(?err, app_id, "SpawnApp call failed; collapsing to false");
+                return false;
+            }
+        };
+        match msg.body().deserialize::<bool>() {
+            Ok(ok) => ok,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    app_id,
+                    "SpawnApp reply decode failed; collapsing to false"
+                );
+                false
+            }
+        }
     }
 }
 

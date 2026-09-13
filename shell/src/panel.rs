@@ -36,36 +36,41 @@ pub const BAR_HEIGHT: i32 = 28;
 /// The clipboard popover's surface size.
 pub const POPOVER_SIZE: (u32, u32) = (320, 280);
 
+/// Where the bar anchors: the parsed form of `Appearance.bar_position`.
+/// Parsed once at the config boundary (`main.rs`) instead of re-matched on
+/// every `spec` call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarPosition {
+    Top,
+    Bottom,
+}
+
+impl From<&str> for BarPosition {
+    /// `"top"` → `Top`; anything else (including `"bottom"`) → `Bottom`.
+    /// Silent by design: the caller warns on unrecognized values (the binary
+    /// does at its parse site, [`spec`] does on its `&str` path), so the
+    /// fallback is always diagnosed exactly once.
+    fn from(value: &str) -> Self {
+        if value == "top" {
+            Self::Top
+        } else {
+            Self::Bottom
+        }
+    }
+}
+
 /// The panel's surface: anchored left/right plus the configured edge,
 /// `Layer::Top`, no keyboard.
 ///
-/// Every value is the layer-shell call it replaces. The anchored edge follows
-/// `Appearance.bar_position` (`"bottom"` default, `"top"` option; the settings
-/// UI writes it): bottom anchors Left+Right+Bottom, anything else anchors
-/// Left+Right+Top. The VM-console short-viewport caveat in the source comment
-/// stands — a bottom bar can land below the visible area on a display whose
-/// viewport is shorter than the reported output — but the user asked for the
-/// edge, so the edge is theirs; only the anchored edge changes, never the
-/// exclusive zone. `keyboard: None` matches GTK4 layer-shell's unset default; the
-/// panel takes no keyboard focus. The popover's search field is a toolkit
-/// `SearchEntry` (M6.1 Spec 2), so it joins the entry-family IME sessions
-/// whenever it takes focus. `exclusive_zone` is the literal `BAR_HEIGHT` because `LayerSpec`
-/// has no "auto" (contract §6 P5-D6). The initial size is `(800, 28)`, the
-/// pair `set_default_size(800, 28)` + `set_size_request(-1, 28)` forced: a
-/// 0-height layer surface never commits a real buffer.
-///
-/// Public and in the library (P5 Task 12) so the integration harness drives
-/// exactly the surface the binary opens, not a copy that can drift.
+/// The parsed core behind [`spec`]: every value is the layer-shell call it
+/// replaces (see `spec`'s doc for the full contract). Prefer this wherever
+/// the position is already parsed; [`spec`] is the `&str` compatibility
+/// path.
 #[must_use]
-pub fn spec(bar_position: &str) -> SurfaceSpec {
-    // The settings UI restricts the value to the `"top"`/`"bottom"` domain,
-    // but the contract type is a plain `String`: anything unrecognized falls
-    // back to `"bottom"`, the config default (`config/src/defaults.rs`), so a
-    // hand-edited value can never produce an unanchored (floating) surface.
-    let edge = if bar_position == "top" {
-        zwlr_layer_surface_v1::Anchor::Top
-    } else {
-        zwlr_layer_surface_v1::Anchor::Bottom
+pub fn spec_for(position: BarPosition) -> SurfaceSpec {
+    let edge = match position {
+        BarPosition::Top => zwlr_layer_surface_v1::Anchor::Top,
+        BarPosition::Bottom => zwlr_layer_surface_v1::Anchor::Bottom,
     };
     SurfaceSpec {
         role: Role::Layer(LayerSpec {
@@ -86,6 +91,40 @@ pub fn spec(bar_position: &str) -> SurfaceSpec {
         title: "icedtea-shell".to_string(),
         app_id: "org.icedtea.Shell".to_string(),
     }
+}
+
+/// The panel's surface from the raw `Appearance.bar_position` string.
+///
+/// The `&str` compatibility path over [`spec_for`]: `"top"` anchors
+/// Left+Right+Top, `"bottom"` anchors Left+Right+Bottom. The settings UI
+/// restricts the value to that domain, but the contract type is a plain
+/// `String`: anything unrecognized warns and falls back to `"bottom"`, the
+/// config default (`config/src/defaults.rs`), so a hand-edited value can
+/// never produce an unanchored (floating) surface.
+///
+/// Public and in the library (P5 Task 12) so the integration harness drives
+/// exactly the surface the binary opens, not a copy that can drift.
+/// Prefer [`spec_for`] with an already-parsed [`BarPosition`] in new code.
+#[must_use]
+pub fn spec(bar_position: &str) -> SurfaceSpec {
+    if bar_position != "top" && bar_position != "bottom" {
+        tracing::warn!(
+            value = bar_position,
+            "unrecognized bar_position, falling back to bottom"
+        );
+    }
+    spec_for(BarPosition::from(bar_position))
+}
+
+/// The panel's surface at the default edge.
+///
+/// Deprecated: prefer an explicit `spec("bottom")` (or
+/// `spec_for(BarPosition::Bottom)`) so the edge choice stays visible at the
+/// call site. Kept only for callers written before the position became a
+/// parameter.
+#[must_use]
+pub fn default_spec() -> SurfaceSpec {
+    spec("bottom")
 }
 
 pub struct PanelModel {
@@ -198,6 +237,7 @@ impl PanelModel {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Msg {
     /// One compositor update, from the inbox. `Arc`, not `Rc`: `Msg` is `Send`.
     Compositor(Arc<CompositorUpdate>),
@@ -271,8 +311,9 @@ impl CompositorCommands for Offline {
         tracing::warn!(app_id, "no session bus; spawn_app dropped");
         false
     }
-    fn quit(&self) {
+    fn quit(&self) -> bool {
         tracing::warn!("no session bus; quit dropped");
+        false
     }
 }
 
@@ -857,6 +898,12 @@ mod tests {
     /// A recording `CompositorCommands`. `RefCell`, not `Mutex`: these unit
     /// tests are single-threaded, and so is `update`. The cross-thread mock
     /// the harness tests need lives in `shell/tests/support/mod.rs`.
+    ///
+    /// One of four `MockWm`s (the others: `shell/tests/support/mod.rs`,
+    /// `shell/tests/launcher.rs`, `shell/src/launcher_view.rs`'s unit
+    /// tests — threading genuinely differs, so no structural unification).
+    /// Each must implement every [`CompositorCommands`] method:
+    /// `focus_window`, `close_window`, `set_workspace`, `spawn_app`, `quit`.
     #[derive(Default)]
     pub(crate) struct MockWm {
         pub(crate) calls: RefCell<Vec<(String, u32)>>,
@@ -877,8 +924,9 @@ mod tests {
             self.spawns.borrow_mut().push(app_id.to_string());
             true
         }
-        fn quit(&self) {
+        fn quit(&self) -> bool {
             self.calls.borrow_mut().push(("quit".into(), 0));
+            true
         }
     }
 

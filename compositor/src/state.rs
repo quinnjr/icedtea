@@ -1227,18 +1227,92 @@ fn parse_spawn_argv(cmd: &str) -> Option<(String, Vec<String>)> {
 /// crate must not depend on the shell crate). `pub` for the cross-crate
 /// parity test (`tests/launcher_parity.rs`), which pins the duplication
 /// against drift -- see that file.
+///
+/// Trusted-writer boundary: the `SpawnApp` path execs `Exec` lines read from
+/// these roots, so anyone who can write to either root can run code as this
+/// process's user. That is exactly the XDG installer's own trust model (both
+/// roots are writable only by the user and root), and `lookup_app_exec`
+/// additionally refuses symlinks so a planted link cannot smuggle in a file
+/// from outside the roots -- but nothing here re-verifies ownership or
+/// permissions at read time, so these roots must never be pointed at a
+/// world-writable or network-mounted dir.
 pub fn default_app_dirs() -> Vec<PathBuf> {
     let user = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"))
         .join(".local/share/applications");
-    vec![PathBuf::from("/usr/share/applications"), user]
+    vec![user, PathBuf::from("/usr/share/applications")]
 }
 
 /// Desktop environment name the `SpawnApp` resolver shows up as for
 /// `OnlyShowIn`/`NotShowIn`, mirroring `icedtea-shell`'s
 /// `launcher::SHOW_IN_ENV`.
+// SYNC: mirrored in shell/src/launcher/mod.rs; launcher_parity test is the sync gate
 const SHOW_IN_ENV: &str = "icedtea";
+
+/// Whether a `.desktop` `TryExec` value names a binary that is actually
+/// present: a value containing `/` must be an executable file at that path,
+/// a bare name is searched on `PATH` (executable bit required either way).
+/// The freedesktop spec uses this to skip entries whose program is not
+/// installed; the `SpawnApp` path honors it the same way so a stale desktop
+/// file resolves to nothing instead of reaching `Command::spawn`. An empty
+/// value constrains nothing.
+fn try_exec_resolves(prog: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let is_executable_file = |path: &std::path::Path| -> bool {
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    };
+    let prog = prog.trim();
+    if prog.is_empty() {
+        return true;
+    }
+    if prog.contains('/') {
+        return is_executable_file(std::path::Path::new(prog));
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(prog)))
+    })
+}
+
+/// Field codes stripped from an `Exec` value before spawn: the freedesktop
+/// `%f %F %u %U %d %D %n %N %i %c %k %v %m` placeholders carry file/URL/icon
+/// arguments the v1 launcher never supplies, so exec'ing them literally
+/// would hand every launched app a garbage argv (a literal `%f`). Mirrors
+/// `shell::launcher::DesktopEntry::display_exec`'s strip rule -- same
+/// single-scan order (strip first, unescape `%%` after, so `"%%f"` reads as
+/// an escaped percent plus `f`, not a field code) so both sides agree on
+/// what runs versus what is shown. Any other `%x` sequence and a lone `%`
+/// stay verbatim. No whitespace collapsing here (unlike the display form):
+/// the result feeds `parse_spawn_argv` directly, and collapsing would
+/// corrupt quoted multi-space arguments.
+fn strip_exec_field_codes(raw: &str) -> String {
+    // Placeholder for an escaped percent: strip first, unescape after, in a
+    // single scan so `"%%f"` cannot collapse into a field code.
+    const ESCAPED: char = '\u{E000}';
+    const CODES: &[char] = &[
+        'f', 'F', 'u', 'U', 'd', 'D', 'n', 'N', 'i', 'c', 'k', 'v', 'm',
+    ];
+    let mut stripped = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            stripped.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('%') => {
+                chars.next();
+                stripped.push(ESCAPED);
+            }
+            Some(next) if CODES.contains(next) => {
+                chars.next();
+            }
+            _ => stripped.push('%'),
+        }
+    }
+    stripped.replace(ESCAPED, "%")
+}
 
 /// Parse one `.desktop` file's text down to its raw `Exec` value, mirroring
 /// the Task 1 entry rules (`shell/src/launcher/entry.rs`): requires a
@@ -1276,6 +1350,7 @@ pub fn parse_desktop_exec(text: &str) -> Option<String> {
             && key.ends_with(']')
             && key[..open] == *"Name"
             && locale_name.is_none()
+            && !value.is_empty()
         {
             locale_name = Some(value.to_string());
             continue;
@@ -1316,6 +1391,26 @@ pub fn parse_desktop_exec(text: &str) -> Option<String> {
         return None;
     }
     if listed("NotShowIn").contains(&SHOW_IN_ENV) {
+        return None;
+    }
+    // No terminal routing in v1: a `Terminal=true` entry cannot be honored
+    // (there is no terminal emulator to host it), so refuse -- with a warn,
+    // since this is a real app the user asked for -- rather than spawn its
+    // program detached from any terminal.
+    if values
+        .get("Terminal")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        tracing::warn!("SpawnApp: refusing Terminal=true entry (no terminal routing in v1)");
+        return None;
+    }
+    // A `TryExec` binary that is not installed means the entry is stale --
+    // skip it (silently: stale files are routine, not suspicious) rather
+    // than hand `Command::spawn` a program that is not there.
+    if values
+        .get("TryExec")
+        .is_some_and(|prog| !try_exec_resolves(prog))
+    {
         return None;
     }
     Some(exec)
@@ -4589,9 +4684,11 @@ impl State {
         self.app_dirs = dirs;
     }
 
-    /// Resolve `app_id` to its raw `Exec` string via the server-side index
-    /// copy: the first `<root>/<app_id>.desktop` across `app_dirs`, parsed
-    /// with the Task 1 entry rules ([`parse_desktop_exec`]). Returns `None`
+    /// Resolve `app_id` to its launch-ready `Exec` string via the server-side
+    /// index copy: the first `<root>/<app_id>.desktop` across `app_dirs`,
+    /// parsed with the Task 1 entry rules ([`parse_desktop_exec`]) and
+    /// stripped of freedesktop field codes ([`strip_exec_field_codes`]) so
+    /// the caller can hand it straight to `parse_spawn_argv`. Returns `None`
     /// for an unknown, hidden, or malformed id -- the `SpawnApp` caller must
     /// then spawn nothing and reply `false`.
     ///
@@ -4609,8 +4706,16 @@ impl State {
     /// profiling ever shows this stalling the loop (e.g. a root on a hung
     /// network FS), the follow-up is a cached id->exec index refreshed on
     /// a worker thread -- do NOT inline more I/O here meanwhile.
+    /// Deliberately, failed lookups are uncached too: a negative-result
+    /// cache would need an invalidation story (installs/uninstalls land at
+    /// any time) that belongs to that same cached-index design, not to a
+    /// bolt-on here.
     fn lookup_app_exec(&self, app_id: &str) -> Option<String> {
+        // `NAME_MAX` (255) bound: `<app_id>.desktop` must fit in one path
+        // component, so anything longer can never resolve -- reject it
+        // before touching the filesystem rather than after a failed join.
         if app_id.is_empty()
+            || app_id.len() > 255
             || app_id == "."
             || app_id == ".."
             || !app_id
@@ -4624,7 +4729,28 @@ impl State {
             // Unreadable roots are skipped, never fatal -- same leniency as
             // the launcher's own scan (`continue`, not `?`: one missing root
             // must not veto the roots after it).
-            let Ok(text) = std::fs::read_to_string(root.join(&file_name)) else {
+            let path = root.join(&file_name);
+            // `O_NOFOLLOW`-style open: never resolve a symlink here.
+            // `symlink_metadata` does not follow the final component, so a
+            // planted `<app_id>.desktop` symlink pointing outside the
+            // trusted roots (at an attacker-chosen file whose `Exec` line
+            // this process would then run) is refused instead of read.
+            // Skips *every* symlink, not just escaping ones: a legitimate
+            // install is a real file, and distinguishing "escapes" from
+            // "points inside" buys nothing once the link itself is
+            // untrusted. (TOCTOU between this check and the read below is
+            // accepted: swapping a real file for a link in the gap still
+            // requires write access to the root, which is already the
+            // trusted-writer boundary `default_app_dirs` documents.)
+            let is_link = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta.is_symlink(),
+                Err(_) => continue,
+            };
+            if is_link {
+                tracing::warn!(%app_id, "SpawnApp: refusing symlinked desktop file");
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
             // First readable hit wins: `app_dirs` order is the shadowing
@@ -4632,7 +4758,7 @@ impl State {
             // looking -- a user overlay shadows a system file only when it
             // itself resolves.
             if let Some(exec) = parse_desktop_exec(&text) {
-                return Some(exec);
+                return Some(strip_exec_field_codes(&exec));
             }
         }
         None
@@ -4716,10 +4842,27 @@ impl State {
                 // replies `false` having spawned nothing.
                 let ok = match self.lookup_app_exec(&app_id) {
                     Some(exec) => match parse_spawn_argv(&exec) {
-                        Some((program, args)) => std::process::Command::new(program)
-                            .args(args)
-                            .spawn()
-                            .is_ok(),
+                        Some((program, args)) => {
+                            match std::process::Command::new(&program).args(&args).spawn() {
+                                Ok(child) => {
+                                    // Reaped on a tiny detached thread: `wait`
+                                    // must run for every child or it stays a
+                                    // zombie, and it must not run here or a
+                                    // long-lived app stalls the main loop.
+                                    let _ = std::thread::Builder::new()
+                                        .name(format!("spawn-reaper-{app_id}"))
+                                        .spawn(move || {
+                                            let mut child = child;
+                                            let _ = child.wait();
+                                        });
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%app_id, program = %program, %e, "SpawnApp: spawn failed");
+                                    false
+                                }
+                            }
+                        }
                         None => {
                             tracing::warn!(
                                 %app_id,
@@ -8854,6 +8997,169 @@ mod tests {
         assert_eq!(parse_spawn_argv(r#""""#), None);
         assert_eq!(parse_spawn_argv("''"), None);
         assert_eq!(parse_spawn_argv(r#"""  """#), None);
+    }
+
+    // Review: an empty `Name[xx]` variant must not shadow a valid plain
+    // `Name` -- before the `!value.is_empty()` guard the empty variant won
+    // (`Some("")`), failed the non-empty filter, and poisoned the entry.
+    #[test]
+    fn parse_desktop_exec_empty_locale_name_does_not_shadow_plain_name() {
+        assert_eq!(
+            parse_desktop_exec("[Desktop Entry]\nName[de]=\nName=Files\nExec=files\n"),
+            Some("files".to_string())
+        );
+        assert_eq!(
+            parse_desktop_exec("[Desktop Entry]\nName[de]=\nExec=files\n"),
+            None
+        );
+    }
+
+    // Review: field codes must be stripped (not exec'd literally) and `%%`
+    // unescaped, mirroring the shell's `display_exec` rule -- minus the
+    // whitespace collapsing, which would corrupt quoted multi-space args.
+    #[test]
+    fn strip_exec_field_codes_mirrors_the_display_rule() {
+        // Every code token is dropped but its separators stay (no
+        // whitespace collapsing here): 13 codes between single spaces
+        // leave 14 spaces.
+        assert_eq!(
+            strip_exec_field_codes("foo %f %F %u %U %d %D %n %N %i %c %k %v %m bar"),
+            format!("foo{}bar", " ".repeat(14))
+        );
+        assert_eq!(strip_exec_field_codes("foo%fbar"), "foobar");
+        assert_eq!(strip_exec_field_codes("100%% done"), "100% done");
+        assert_eq!(strip_exec_field_codes("foo %%f bar"), "foo %f bar");
+        assert_eq!(
+            strip_exec_field_codes("run %d %Q 50% off"),
+            "run  %Q 50% off"
+        );
+        // No whitespace collapsing: quoted multi-space args survive intact
+        // for `parse_spawn_argv`.
+        assert_eq!(strip_exec_field_codes("foo \"a  b\" %f"), "foo \"a  b\" ");
+    }
+
+    // Review: `Terminal=true` has no terminal to route to in v1, so the
+    // entry refuses (with a warn); `Terminal=false` (or absent) resolves.
+    #[test]
+    fn parse_desktop_exec_refuses_terminal_entries() {
+        assert_eq!(
+            parse_desktop_exec("[Desktop Entry]\nName=T\nExec=t\nTerminal=true\n"),
+            None
+        );
+        assert_eq!(
+            parse_desktop_exec("[Desktop Entry]\nName=T\nExec=t\nTerminal=TRUE\n"),
+            None
+        );
+        assert_eq!(
+            parse_desktop_exec("[Desktop Entry]\nName=T\nExec=t\nTerminal=false\n"),
+            Some("t".to_string())
+        );
+    }
+
+    // Review: `TryExec` gates on the binary being installed (absolute path
+    // or `PATH` search); a stale entry resolves to nothing.
+    #[test]
+    fn parse_desktop_exec_honors_try_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("myapp");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let present = format!(
+            "[Desktop Entry]\nName=A\nExec=a\nTryExec={}\n",
+            exe.display()
+        );
+        assert_eq!(
+            parse_desktop_exec(&present),
+            Some("a".to_string()),
+            "installed TryExec binary resolves"
+        );
+        assert_eq!(
+            parse_desktop_exec(
+                "[Desktop Entry]\nName=A\nExec=a\nTryExec=/nonexistent-icedtea-bin\n"
+            ),
+            None,
+            "missing absolute TryExec skips the entry"
+        );
+        assert_eq!(
+            parse_desktop_exec("[Desktop Entry]\nName=A\nExec=a\nTryExec=icedtea-no-such-binary\n"),
+            None,
+            "missing PATH TryExec skips the entry"
+        );
+        let not_exe = dir.path().join("notexe");
+        std::fs::write(&not_exe, "x").unwrap();
+        let present_not_exe = format!(
+            "[Desktop Entry]\nName=A\nExec=a\nTryExec={}\n",
+            not_exe.display()
+        );
+        assert_eq!(
+            parse_desktop_exec(&present_not_exe),
+            None,
+            "present-but-not-executable TryExec skips the entry"
+        );
+    }
+
+    // Review: overlong ids can never resolve (`NAME_MAX`) and are rejected
+    // before any filesystem touch.
+    #[test]
+    fn lookup_app_exec_rejects_overlong_app_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ok.desktop"),
+            "[Desktop Entry]\nName=O\nExec=ok\n",
+        )
+        .unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.set_app_dirs(vec![dir.path().to_path_buf()]);
+        assert_eq!(state.lookup_app_exec("ok"), Some("ok".to_string()));
+        assert_eq!(state.lookup_app_exec(&"a".repeat(256)), None);
+    }
+
+    // Review: a symlinked `<app_id>.desktop` is refused, never followed --
+    // a planted link must not redirect the read (and the exec) outside the
+    // trusted roots. A real file next to it still resolves, stripped.
+    #[test]
+    #[cfg(unix)]
+    fn lookup_app_exec_refuses_symlinked_desktop_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("good.desktop"),
+            "[Desktop Entry]\nName=G\nExec=good %f %%\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("target.desktop"),
+            "[Desktop Entry]\nName=T\nExec=evil\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("target.desktop"),
+            dir.path().join("link.desktop"),
+        )
+        .unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.set_app_dirs(vec![dir.path().to_path_buf()]);
+        assert_eq!(state.lookup_app_exec("link"), None);
+        assert_eq!(
+            state.lookup_app_exec("good"),
+            Some("good  %".to_string()),
+            "real file resolves with field codes stripped and %% unescaped"
+        );
+    }
+
+    // Cross-agent contract C6: user dir shadows system (user-first order,
+    // matching the shell side; the parity test pins the equality).
+    #[test]
+    fn default_app_dirs_lists_user_before_system() {
+        let dirs = default_app_dirs();
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs[0].ends_with(".local/share/applications"));
+        assert!(dirs[1].ends_with("usr/share/applications"));
     }
 
     // Review finding (HIGH, lex-review testing): every test above drives

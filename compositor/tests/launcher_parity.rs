@@ -10,12 +10,12 @@
 //! through to the system entry on the compositor side (`lookup_app_exec`)
 //! and the launcher-side index resolves the same entry (`DesktopIndex`).
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-
-use icedtea_compositor::dbus::DbCommand;
 use icedtea_compositor::state::{self, State};
 use icedtea_config::default_config;
+
+mod support;
+
+use support::{assert_quiescent, spawn_app, tmpdir, wait_for, write_entry};
 
 /// Shell-side decision for one file's text: the raw `Exec` iff the entry
 /// parses and is visible in this desktop, mirroring exactly what the
@@ -123,65 +123,12 @@ fn default_app_dirs_agree_on_both_sides() {
     );
 }
 
-fn tmpdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("icedtea-parity-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("parity temp dir");
-    dir
-}
-
-/// Duplicated from `launcher_spawn.rs` (each integration binary stands
-/// alone -- the `BOOT_LOCK` precedent): probe first, skip visibly without
-/// `touch`, fail loudly under `REQUIRE_TOUCH`.
-fn touch_on_path() -> bool {
-    let present = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join("touch").is_file()))
-        .unwrap_or(false);
-    if !present && std::env::var_os("REQUIRE_TOUCH").is_some() {
-        panic!(
-            "REQUIRE_TOUCH is set but the `touch` binary is not on PATH; \
-             the shadowing parity test cannot run and must not be reported as passing"
-        );
-    }
-    present
-}
-
-fn write_entry(dir: &Path, name: &str, text: &str) {
-    std::fs::write(dir.join(format!("{name}.desktop")), text)
-        .unwrap_or_else(|_| panic!("seed {name}.desktop"));
-}
-
-fn spawn_app(state: &mut State, app_id: &str) -> bool {
-    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-    state.handle_command(DbCommand::SpawnApp {
-        app_id: app_id.to_string(),
-        reply: reply_tx,
-    });
-    reply_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("SpawnApp replies")
-}
-
-fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !path.exists() {
-        if Instant::now() >= deadline {
-            panic!("expected spawn side effect at {path:?}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// A hidden/malformed overlay in one root falls through to the other
 /// root's entry on BOTH sides (compositor `lookup_app_exec` keeps looking;
 /// the launcher index drops hidden/unparseable files so `find` lands on
 /// the same surviving entry).
 #[test]
 fn shadowing_fall_through_agrees_on_both_sides() {
-    if !touch_on_path() {
-        eprintln!("SKIP: `touch` is not on PATH; the shadowing parity test cannot run");
-        return;
-    }
     let root = tmpdir("shadow");
     let sys = root.join("sys");
     let user = root.join("user");
@@ -284,11 +231,9 @@ fn shadowing_fall_through_agrees_on_both_sides() {
         "launcher resolves baz via system entry, got {:?}",
         baz.exec
     );
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(
-        !user_sentinel_c.exists(),
-        "system first-hit must shadow the user overlay, yet {user_sentinel_c:?} exists"
-    );
+    assert_quiescent("system first-hit must shadow the user overlay", || {
+        !user_sentinel_c.exists()
+    });
 
     let _ = std::fs::remove_dir_all(&root);
 }
