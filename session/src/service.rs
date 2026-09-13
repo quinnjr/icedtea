@@ -130,7 +130,7 @@ mod tests {
     use zbus::zvariant::OwnedObjectPath;
 
     use super::*;
-    use crate::logind::{Logind, LogindCall, RecordingLogind};
+    use crate::logind::{InhibitMode, Logind, LogindCall, RecordingLogind};
     use crate::wm_client::{RecordingWm, WmCall};
 
     fn service(locked: bool) -> (SessionInterface, Arc<RecordingLogind>, Arc<RecordingWm>) {
@@ -150,7 +150,7 @@ mod tests {
             OwnedObjectPath::try_from("/org/freedesktop/login1/session/c1")
                 .expect("a logind session path is a valid D-Bus object path")
         }
-        fn inhibit(&self, _what: &str, _why: &str) -> io::Result<OwnedFd> {
+        fn inhibit(&self, _what: &str, _why: &str, _mode: InhibitMode) -> io::Result<OwnedFd> {
             Err(io::Error::other("logind unavailable"))
         }
         fn lock(&self) -> io::Result<()> {

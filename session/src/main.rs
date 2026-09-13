@@ -11,8 +11,11 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use icedtea_session::logind::ZbusLogind;
-use icedtea_session::service::{self, SESSION_BUS_NAME, SESSION_IFACE, SESSION_PATH};
+use icedtea_session::flow::LockFlow;
+use icedtea_session::logind::{self, Logind, ZbusLogind};
+use icedtea_session::service::{
+    self, SESSION_BUS_NAME, SESSION_IFACE, SESSION_PATH, SharedLogind, SharedWm,
+};
 use icedtea_session::wm_client::ZbusWmClient;
 
 fn main() -> ExitCode {
@@ -96,6 +99,7 @@ fn run_daemon() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let session_path = logind.session_path();
 
     let wm = match ZbusWmClient::new() {
         Ok(wm) => wm,
@@ -105,7 +109,20 @@ fn run_daemon() -> ExitCode {
         }
     };
 
-    let _service = match service::spawn(Arc::new(logind), Arc::new(wm)) {
+    let logind: SharedLogind = Arc::new(logind);
+    let wm: SharedWm = Arc::new(wm);
+
+    // Arm the power-key block inhibitor and the sleep delay inhibitor, then
+    // drive them (and the locker funnel) from logind's signals on their own
+    // thread.
+    let flow = Arc::new(LockFlow::new(
+        Arc::clone(&logind),
+        Arc::clone(&wm),
+        &config.power,
+    ));
+    logind::spawn_signal_loop(session_path, flow);
+
+    let _service = match service::spawn(logind, wm) {
         Ok(conn) => conn,
         Err(err) => {
             tracing::error!(
@@ -116,7 +133,7 @@ fn run_daemon() -> ExitCode {
         }
     };
 
-    tracing::info!("org.icedtea.Session registered; idle/sleep wiring lands in later tasks");
+    tracing::info!("org.icedtea.Session registered; watching logind sleep/lock signals");
     loop {
         std::thread::park();
     }
