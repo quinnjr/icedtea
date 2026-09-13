@@ -196,9 +196,10 @@ pub enum DbCommand {
     PopupsDismissed {
         reply: Sender<usize>,
     },
-    /// Test-only: read `wlr::Runtime::is_session_locked` via `wayland`'s
-    /// runtime handle. Not reachable from `CompositorInterface` -- only the test
-    /// harness sends this, same reasoning as `DragIconPosition`.
+    /// Read `wlr::Runtime::is_session_locked` via `wayland`'s runtime handle.
+    /// Backs both `CompositorInterface::is_locked` (the production `IsLocked()`
+    /// D-Bus method) and the test harness's `session_locked()` round-trip. The
+    /// variant shape is unchanged from its original test-only form.
     SessionLocked {
         reply: Sender<bool>,
     },
@@ -421,6 +422,7 @@ pub fn event_signal_name(event: &Event) -> &'static str {
         Event::GestureBegan => "GestureBegan",
         Event::GestureEnded => "GestureEnded",
         Event::SwitchToggled { .. } => "SwitchToggled",
+        Event::SessionLockChanged(_) => "SessionLockChanged",
     }
 }
 
@@ -573,6 +575,19 @@ impl CompositorInterface {
     fn reload_config(&self) {
         self.send(DbCommand::ReloadConfig);
     }
+    /// Whether the session is currently locked (A3). Synchronous round-trip
+    /// like `get_state`: the main loop answers the moment it drains the
+    /// `SessionLocked` command (see `State::handle_command`), so this blocks
+    /// the zbus dispatch for this connection only as long as one loop
+    /// iteration takes. A dropped reply (loop gone) reads as `false` rather
+    /// than panicking. This is the production promotion of the previously
+    /// test-only `SessionLocked` read; the `icedtea-session` daemon polls it
+    /// both before spawning a locker and while waiting for a lock to confirm.
+    fn is_locked(&self) -> bool {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::SessionLocked { reply: reply_tx });
+        reply_rx.recv().unwrap_or(false)
+    }
     fn quit(&self, #[zbus(header)] header: zbus::message::Header<'_>) {
         if !caller_is_self(&header) {
             return;
@@ -673,6 +688,7 @@ pub fn spawn_service(
             //   GestureBegan   t
             //   GestureEnded   t
             //   SwitchToggled  (tb)
+            //   SessionLockChanged (tb)
             // (M7: the gesture signals carry no payload beyond `seq` -- the
             // phase is the member name itself, since the full-fidelity
             // gesture data already reached clients through the crate's token
@@ -740,6 +756,13 @@ pub fn spawn_service(
                     COMPOSITOR_BUS_NAME,
                     name,
                     &(seq, *lid_closed),
+                ),
+                Event::SessionLockChanged(locked) => emitter_conn.emit_signal(
+                    dest,
+                    COMPOSITOR_PATH,
+                    COMPOSITOR_BUS_NAME,
+                    name,
+                    &(seq, *locked),
                 ),
             };
             if let Err(err) = result {
@@ -813,6 +836,62 @@ mod tests {
             !body.contains("direction=\"in\"") && !body.contains("direction=\"out\""),
             "Quit takes no arguments and returns nothing: {body}"
         );
+    }
+
+    /// Pins the wire member `icedtea-session`'s `WmClient` calls into
+    /// (A3): member `IsLocked` taking no arguments and returning one bool.
+    /// Generated from the live interface object, not a repeated literal —
+    /// removing or renaming the method fails here instead of degrading to a
+    /// silent no-method call at runtime.
+    #[test]
+    fn is_locked_is_exposed_as_is_locked_with_bool_out() {
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let (_held, wake) =
+            std::os::unix::net::UnixStream::pair().expect("wake pair for interface probe");
+        let iface = CompositorInterface { cmd_tx, wake };
+        let mut xml = String::new();
+        iface.introspect_to_writer(&mut xml, 0);
+        let method = xml
+            .split("<method")
+            .find(|chunk| chunk.contains("name=\"IsLocked\""))
+            .expect("IsLocked member present in introspection XML: {xml}");
+        let body = &method[..method.find("</method>").unwrap_or(method.len())];
+        assert!(
+            !body.contains("direction=\"in\""),
+            "IsLocked takes no arguments: {body}"
+        );
+        assert!(
+            body.contains("type=\"b\"") && body.contains("direction=\"out\""),
+            "IsLocked returns one bool out-arg: {body}"
+        );
+    }
+
+    /// `CompositorInterface::is_locked` delegates to the existing
+    /// `DbCommand::SessionLocked` round-trip: it sends that command and
+    /// returns the bool the compositor loop answers with. Exercised here by
+    /// answering the command from a second thread while the interface
+    /// method blocks on the reply, which is exactly the production hand-off
+    /// minus the bus.
+    #[test]
+    fn is_locked_delegates_to_the_session_locked_round_trip() {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (_held, wake) =
+            std::os::unix::net::UnixStream::pair().expect("wake pair for interface probe");
+        let iface = CompositorInterface { cmd_tx, wake };
+
+        let answer =
+            std::thread::spawn(move || match cmd_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(DbCommand::SessionLocked { reply }) => {
+                    let _ = reply.send(true);
+                }
+                other => panic!("expected DbCommand::SessionLocked, got {other:?}"),
+            });
+
+        assert!(
+            iface.is_locked(),
+            "is_locked must return the bool the loop answered with"
+        );
+        answer.join().expect("round-trip thread must not panic");
     }
 
     /// The sender-credential gate is a plain UID equality: same UID is
@@ -895,6 +974,15 @@ mod tests {
         assert_eq!(
             event_signal_name(&Event::SwitchToggled { lid_closed: false }),
             "SwitchToggled"
+        );
+        // A3: the lock-state signal, both polarities.
+        assert_eq!(
+            event_signal_name(&Event::SessionLockChanged(true)),
+            "SessionLockChanged"
+        );
+        assert_eq!(
+            event_signal_name(&Event::SessionLockChanged(false)),
+            "SessionLockChanged"
         );
     }
 

@@ -32,6 +32,12 @@ pub enum Event {
     SwitchToggled {
         lid_closed: bool,
     },
+    /// A3: the session lock state changed. `true` means the session is now
+    /// locked, `false` that it unlocked. Emitted by the consumer's
+    /// `SeatHandler::session_lock_changed`, the same callback that tracks
+    /// `State::session_locked`, so a session daemon can subscribe instead of
+    /// polling. Signals, not widgets: the shell folds but does not render.
+    SessionLockChanged(bool),
 }
 
 /// An [`Event`] tagged with the `seq` its producing mutation advanced the
