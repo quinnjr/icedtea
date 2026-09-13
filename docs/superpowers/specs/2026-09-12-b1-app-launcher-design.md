@@ -27,7 +27,12 @@ One new surface in the existing shell process (the panel's own pattern:
   (the default), top-left when `top`. `Layer::Top`, no exclusive zone
   (overlay — never pushes windows around).
 - **Focus:** takes keyboard focus on open; closes on Escape, on
-  focus-loss to a normal window, or on successful launch.
+  successful launch, or on Start-button toggle. There is deliberately no
+  close-on-focus-loss path: as an exclusive-keyboard layer-shell surface
+  the launcher receives no focus-loss event a client can observe, so
+  focus loss cannot be a close trigger. A compositor-driven unmap or
+  kill is covered by the supervisor's done-channel reap, which frees the
+  menu slot exactly as a self-dismissal would.
 - **Start button:** joins the bar's left end and toggles the launcher.
   The bar keeps its existing rest-state gates; the launcher gets its own
   open/closed/rest gates.

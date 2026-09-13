@@ -318,7 +318,20 @@ fn open_type_launch_reaches_the_compositor_and_records_recency() {
                 ScriptStep::Event(key(xkbcommon::xkb::keysyms::KEY_m, "m")),
                 ScriptStep::Event(key(xkbcommon::xkb::keysyms::KEY_u, "u")),
                 ScriptStep::Event(key(xkbcommon::xkb::keysyms::KEY_s, "s")),
-                ScriptStep::Message(LauncherMsg::ActivateSelected),
+                // A real Enter key through `route`: the focused search box
+                // fires `SearchActivated`, which launches the top hit.
+                ScriptStep::Event(InputEvent::Key(KeyEvent {
+                    keycode: 0,
+                    keysym: xkbcommon::xkb::Keysym::from(xkbcommon::xkb::keysyms::KEY_Return),
+                    base: xkbcommon::xkb::Keysym::from(xkbcommon::xkb::keysyms::KEY_Return),
+                    utf8: None,
+                    mods: Mods::empty(),
+                    consumed: Mods::empty(),
+                    pressed: true,
+                    repeat: false,
+                    serial: 0,
+                    time_ms: 0,
+                })),
             ],
         )
         .expect("the open → type → launch script runs offscreen");

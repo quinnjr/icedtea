@@ -434,8 +434,9 @@ impl CompositorInterface {
     /// `get_state`: the main loop answers the moment it drains the
     /// `SpawnApp` command (see `State::handle_command`), so this blocks the
     /// zbus dispatch for this connection only as long as one loop iteration
-    /// plus the `spawn` itself takes. A dead loop (dropped reply) reads as
-    /// `false`, never a panic.
+    /// plus the `spawn` itself takes. A dropped reply (loop gone) reads as
+    /// `false`; anything subtler (a wedged-but-alive loop) still blocks to
+    /// the channel wait, never a panic.
     fn spawn_app(&self, app_id: String) -> bool {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::SpawnApp {

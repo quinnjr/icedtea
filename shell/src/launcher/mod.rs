@@ -5,7 +5,9 @@
 
 pub mod entry;
 
-pub use entry::{DesktopEntry, parse_entry, parse_entry_with_id};
+pub use entry::{
+    DesktopEntry, Locale, parse_entry, parse_entry_with_id, parse_entry_with_id_and_locale,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,8 +46,14 @@ impl DesktopIndex {
 
     /// Scan `dirs` for `*.desktop` files and return the visible entries,
     /// sorted by app id for a deterministic order. Unreadable files and
-    /// unparseable content are skipped, never fatal.
+    /// unparseable content are skipped, never fatal. An app id appearing in
+    /// more than one dir is kept once — the first dir in `dirs` order wins
+    /// (system dirs precede the user dir in [`default_dirs`], so the
+    /// system entry shadows the user's), matching the first-hit-wins
+    /// compositor lookup.
     pub fn scan(dirs: &[PathBuf]) -> Vec<DesktopEntry> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
         let mut apps = Vec::new();
         for dir in dirs {
             let dir_entries = match std::fs::read_dir(dir) {
@@ -65,12 +73,13 @@ impl DesktopIndex {
                     .file_stem()
                     .and_then(|stem| stem.to_str())
                     .unwrap_or("");
-                if id.is_empty() {
+                if id.is_empty() || seen.contains(id) {
                     continue;
                 }
                 let visible =
                     parse_entry_with_id(id, &text).filter(|entry| entry.visible_in(SHOW_IN_ENV));
                 if let Some(entry) = visible {
+                    seen.insert(id.to_string());
                     apps.push(entry);
                 }
             }
@@ -474,6 +483,59 @@ mod tests {
     }
 
     #[test]
+    fn display_exec_unescapes_escaped_percent_after_stripping() {
+        // `%%` is an escaped literal percent, not a field code: stripping
+        // runs first (no `%x` code here), then `%%` → `%`.
+        let e = parse_entry("[Desktop Entry]\nName=F\nExec=foo %%f bar\n").unwrap();
+        assert_eq!(e.display_exec(), "foo %f bar");
+        let e = parse_entry("[Desktop Entry]\nName=F\nExec=100%% done\n").unwrap();
+        assert_eq!(e.display_exec(), "100% done");
+    }
+
+    #[test]
+    fn display_exec_strips_embedded_codes_and_keeps_unknown_sequences() {
+        // Rule: `%x` for a known field code is dropped wherever it occurs;
+        // `%%` unescapes after; any other `%x` and a lone `%` stay verbatim.
+        let e = parse_entry("[Desktop Entry]\nName=F\nExec=foo%fbar\n").unwrap();
+        assert_eq!(e.display_exec(), "foobar");
+        let e = parse_entry("[Desktop Entry]\nName=F\nExec=run %d %Q 50% off\n").unwrap();
+        assert_eq!(e.display_exec(), "run %d %Q 50% off");
+    }
+
+    #[test]
+    fn locale_exact_match_wins_over_first_variant() {
+        let text = "[Desktop Entry]\nName=Files\nName[fr]=Fichiers\nName[de]=Dateien\nExec=files\n";
+        let de = Locale {
+            lang: Some("de_DE.UTF-8".into()),
+            language: vec![],
+        };
+        let e = parse_entry_with_id_and_locale("files", text, Some(&de)).unwrap();
+        assert_eq!(e.name, "Dateien");
+        let fr = Locale {
+            lang: None,
+            language: vec!["fr".into(), "de".into()],
+        };
+        let e = parse_entry_with_id_and_locale("files", text, Some(&fr)).unwrap();
+        assert_eq!(e.name, "Fichiers", "LANGUAGE order decides");
+    }
+
+    #[test]
+    fn locale_falls_back_to_first_variant_then_plain_name() {
+        let text = "[Desktop Entry]\nName=Files\nName[fr]=Fichiers\nName[de]=Dateien\nExec=files\n";
+        let es = Locale {
+            lang: Some("es".into()),
+            language: vec![],
+        };
+        let e = parse_entry_with_id_and_locale("files", text, Some(&es)).unwrap();
+        assert_eq!(e.name, "Fichiers", "no exact match: first variant wins");
+        let e = parse_entry_with_id_and_locale("files", text, None).unwrap();
+        assert_eq!(e.name, "Fichiers", "no locale: first variant wins");
+        let plain = "[Desktop Entry]\nName=Files\nExec=files\n";
+        let e = parse_entry_with_id_and_locale("files", plain, Some(&es)).unwrap();
+        assert_eq!(e.name, "Files");
+    }
+
+    #[test]
     fn parse_returns_none_without_name_or_exec() {
         assert!(parse_entry("[Desktop Entry]\nName=NoExec\n").is_none());
         assert!(parse_entry("[Desktop Entry]\nExec=no-name\n").is_none());
@@ -541,6 +603,34 @@ mod tests {
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].id, "a");
         assert_eq!(apps[0].name, "App A");
+    }
+
+    #[test]
+    fn scan_dedupes_same_app_id_across_dirs_first_dir_wins() {
+        let sys = tmpdir();
+        let user = tmpdir();
+        std::fs::write(
+            sys.join("dup.desktop"),
+            "[Desktop Entry]\nName=System Copy\nExec=sys-dup\n",
+        )
+        .unwrap();
+        std::fs::write(
+            user.join("dup.desktop"),
+            "[Desktop Entry]\nName=User Copy\nExec=user-dup\n",
+        )
+        .unwrap();
+        std::fs::write(
+            user.join("only-user.desktop"),
+            "[Desktop Entry]\nName=U\nExec=u\n",
+        )
+        .unwrap();
+        let apps = DesktopIndex::scan(&[sys.clone(), user.clone()]);
+        std::fs::remove_dir_all(&sys).unwrap();
+        std::fs::remove_dir_all(&user).unwrap();
+        assert_eq!(apps.len(), 2);
+        let dup = apps.iter().find(|e| e.id == "dup").expect("one dup entry");
+        assert_eq!(dup.name, "System Copy", "first dir wins");
+        assert_eq!(dup.exec, "sys-dup");
     }
 
     #[test]
