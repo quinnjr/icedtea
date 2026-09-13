@@ -73,7 +73,18 @@ fn forward<T: Send + 'static>(
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let window = Window::open(panel::spec(), style::sheet(), FontDatabase::new())?;
+    // B1 Task 3: the anchored edge follows `Appearance.bar_position`.
+    // `load_or_default` never fails (missing/corrupt/locked DB -> defaults),
+    // so the bar always opens; a store the settings app currently holds
+    // locked reads back as defaults until the next restart.
+    let bar_position = icedtea_config::load_or_default(&icedtea_config::default_db_path())
+        .appearance
+        .bar_position;
+    let window = Window::open(
+        panel::spec(&bar_position),
+        style::sheet(),
+        FontDatabase::new(),
+    )?;
     let (inbox, tx) = Inbox::<Msg>::new()?;
     let width_tx = tx.clone();
 

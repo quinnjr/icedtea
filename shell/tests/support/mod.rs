@@ -179,7 +179,12 @@ impl Panel {
         let panel_thread = std::thread::spawn(move || {
             let window = match icedtea_ui::window::Window::open_at_path(
                 &socket_path,
-                panel::spec(),
+                // Top-anchored, not the config default: `Panel::point` reads
+                // window coordinates as output coordinates with no offset
+                // arithmetic, which holds only when the surface origin is the
+                // output origin. The bottom-anchored production path is pinned
+                // by `spec_anchors_the_configured_edge_...` instead.
+                panel::spec("top"),
                 style::sheet_for(theme),
                 FontDatabase::new(),
             ) {
@@ -531,12 +536,18 @@ impl Panel {
     /// cursor is not synchronous with the `motion_absolute` that triggers it,
     /// and `wlr_seat_pointer_notify_button` drops a button with no focused
     /// surface silently.
+    ///
+    /// 600ms, not 200ms: on a loaded dev box (software rendering, ~250ms
+    /// panel frames) the motion→focus round trip was measured at ~530ms, so
+    /// a 200ms settle pressed before focus was assigned and the click
+    /// vanished without a trace (B1 Task 3 diagnosis). The extra 400ms costs
+    /// seconds across the suite but buys clicks that actually land.
     pub fn click_button(&mut self, x: i32, y: i32, button: u32) {
         self.pointer
             .motion_absolute(f64::from(x), f64::from(y), self.output.0, self.output.1);
         self.pointer.frame();
         self.pointer.pump();
-        for _ in 0..8 {
+        for _ in 0..24 {
             std::thread::sleep(Duration::from_millis(25));
             self.pointer.pump();
         }

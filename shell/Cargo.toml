@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+icedtea-config = { path = "../config" }
 icedtea-contract = { path = "../contract" }
 icedtea-ui = { path = "../ui" }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }

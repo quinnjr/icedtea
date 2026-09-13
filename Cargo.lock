@@ -1320,6 +1320,7 @@ dependencies = [
  "crossbeam-channel",
  "futures-util",
  "icedtea-clipboard",
+ "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
  "icedtea-ui",
