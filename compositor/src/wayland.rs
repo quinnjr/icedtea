@@ -755,10 +755,8 @@ impl Wayland {
     /// the resolve and this call, and resurrecting it would leak a backend
     /// for a dead window.
     fn persist_backend(&mut self, id: WindowId, backend: AnyWindowBackend) {
-        if let (
-            std::collections::hash_map::Entry::Occupied(slot),
-            AnyWindowBackend::X11(x11),
-        ) = (self.x11_backends.entry(id), backend)
+        if let (std::collections::hash_map::Entry::Occupied(slot), AnyWindowBackend::X11(x11)) =
+            (self.x11_backends.entry(id), backend)
         {
             *slot.into_mut() = x11;
         }

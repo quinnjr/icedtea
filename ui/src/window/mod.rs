@@ -742,6 +742,11 @@ pub(crate) struct WindowState {
     /// Guards `ime_sync`: surrounding text is only meaningful inside a
     /// session, and sending it outside one is a protocol error.
     ime_enabled: bool,
+    /// Whether the compositor has entered this window's `zwp_text_input_v3`
+    /// (`enter` seen, cleared by `leave`). The relay only applies a client
+    /// `enable` to an entered text-input, so a caller that must synchronise an
+    /// enable with the seat exposes this.
+    text_input_entered: bool,
     /// The double-buffered client state: staged snapshots are diffed so
     /// unchanged surrounding text is never re-sent.
     ime_pending: crate::text_input::PendingState,
@@ -815,6 +820,7 @@ impl WindowState {
             text_input_manager: None,
             text_input: None,
             ime_enabled: false,
+            text_input_entered: false,
             ime_pending: crate::text_input::PendingState::new(),
             ime_done_serials: Vec::new(),
             events: Vec::new(),
@@ -1744,6 +1750,15 @@ impl Window {
     #[must_use]
     pub fn ime_ready(&self) -> bool {
         self.state.text_input.is_some()
+    }
+
+    /// Whether the compositor has entered this window's `zwp_text_input_v3`
+    /// and not yet left. The IME relay only applies a client `enable` to an
+    /// entered text-input, so a test that focuses a field to start
+    /// composition waits on this before the focus that enables.
+    #[must_use]
+    pub fn text_input_entered(&self) -> bool {
+        self.state.text_input_entered
     }
 
     /// Enable IME composition for the focused text field: `enable` plus the
@@ -3312,6 +3327,8 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WindowState {
             zwp_text_input_v3::Event::Done { serial } => {
                 state.ime_done_serials.push(serial);
             }
+            zwp_text_input_v3::Event::Enter { .. } => state.text_input_entered = true,
+            zwp_text_input_v3::Event::Leave { .. } => state.text_input_entered = false,
             _ => {}
         }
     }

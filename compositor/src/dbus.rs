@@ -89,7 +89,6 @@ use zbus::zvariant::OwnedValue;
 /// so downstream exhaustive matches should include a wildcard arm.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum DbCommand {
     Focus(WindowId),
     Close(WindowId),
