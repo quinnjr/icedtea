@@ -1,5 +1,11 @@
 use crate::{AltTabState, Appearance, WindowId, WindowInfo, WindowUpdate, WorkspaceInfo};
 
+/// A compositor event forwarded to session-bus subscribers.
+///
+/// Note: this enum is **not** `#[non_exhaustive]`. Adding a variant is
+/// therefore a source-breaking change for any downstream crate that matches it
+/// exhaustively, so new events are added only with that in mind; the compositor's
+/// own `contract`-linked consumers are updated in lockstep.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     WindowOpened(WindowInfo),
@@ -36,7 +42,8 @@ pub enum Event {
     /// locked, `false` that it unlocked. Emitted by the consumer's
     /// `SeatHandler::session_lock_changed`, the same callback that tracks
     /// `State::session_locked`, so a session daemon can subscribe instead of
-    /// polling. Signals, not widgets: the shell folds but does not render.
+    /// polling. A signal, not a widget: it has no presentational consumer —
+    /// the shell currently drops it.
     SessionLockChanged(bool),
 }
 

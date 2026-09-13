@@ -1294,17 +1294,14 @@ dependencies = [
 name = "icedtea-session"
 version = "0.1.0"
 dependencies = [
- "crossbeam-channel",
  "futures-util",
  "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
- "serde",
  "tempfile",
  "tracing",
  "wayland-client",
  "wayland-protocols",
- "wayland-protocols-wlr",
  "zbus",
 ]
 

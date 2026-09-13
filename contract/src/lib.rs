@@ -37,6 +37,13 @@ pub const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 ///   / `SwitchToggled` signals.
 /// * `6` -- B1 launcher: `SpawnApp(s)->(b)` (launch-by-id method taking one
 ///   app-id string and returning one bool).
+///
+/// A3 deliberately does **not** bump this: `IsLocked()` on `org.icedtea.WM`
+/// and the `SessionLockChanged(bool)` event are purely additive (one new
+/// method, one new signal variant; no existing signature or signal changed),
+/// so a client compiled against `6` keeps working unchanged. This counter
+/// exists to name *breaking signature* mismatches (see the `F7` rationale
+/// above) — an additive change is not one, so there is nothing to resolve.
 pub const COMPOSITOR_CONTRACT_VERSION: u32 = 6;
 
 pub use clipboard::{CLIP_BUS_NAME, CLIP_PATH, ClipEntry, ClipKind};

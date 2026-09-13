@@ -9,11 +9,8 @@ icedtea-contract = { path = "../contract" }
 icedtea-config = { path = "../config" }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 zbus.workspace = true
-crossbeam-channel.workspace = true
 futures-util = "0.3"
-serde.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
