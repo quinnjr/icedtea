@@ -7,9 +7,20 @@
 //! `shell/src/compositor_client.rs`'s `CompositorProxy`.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_IFACE, COMPOSITOR_PATH};
 use zbus::blocking::Connection;
+
+/// Deadline on every method call this client makes.
+///
+/// `IsLocked` is polled inside the pre-sleep wait; without a bound a stalled
+/// compositor would hold that wait — and therefore the sleep delay inhibitor —
+/// open indefinitely, defeating the 3s budget. 750ms keeps the worst case
+/// (`SLEEP_LOCK_BUDGET` + one in-flight call = 3.75s) under logind's 5s
+/// `InhibitDelayMaxSec`, and is ample for a healthy compositor's reply.
+/// `Quit` is bounded too: a wedged compositor must not hang the logout CLI.
+pub const COMPOSITOR_CALL_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Wire member for [`WmClient::is_locked`], kept named so the pin test below
 /// can check it against the compositor's `IsLocked` introspection test
@@ -40,11 +51,13 @@ pub struct ZbusWmClient {
 }
 
 impl ZbusWmClient {
-    /// Open the session bus. `Err` if it is unavailable.
+    /// Open the session bus with [`COMPOSITOR_CALL_TIMEOUT`] on every call
+    /// made through it. `Err` if the bus is unavailable.
     pub fn new() -> zbus::Result<Self> {
-        Ok(Self {
-            conn: Connection::session()?,
-        })
+        let conn = zbus::blocking::connection::Builder::session()?
+            .method_timeout(COMPOSITOR_CALL_TIMEOUT)
+            .build()?;
+        Ok(Self { conn })
     }
 
     fn call(&self, member: &str) -> zbus::Result<zbus::Message> {

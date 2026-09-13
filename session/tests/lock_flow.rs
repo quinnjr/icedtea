@@ -153,6 +153,50 @@ fn prepare_for_sleep_spawns_one_locker_and_releases_after_the_marker() {
     );
 }
 
+/// A locker already running when sleep is announced might not have taken the
+/// lock yet (an idle trigger racing the suspend). `PrepareForSleep(true)` must
+/// still wait for the compositor to confirm — a running process is not proof
+/// the screen is secured.
+#[test]
+fn prepare_for_sleep_waits_for_an_unconfirmed_running_locker() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("unconfirmed");
+    let logind = Arc::new(RecordingLogind::new(session_path()));
+    let wm = Arc::new(MarkerWm::new(&marker));
+    let flow = LockFlow::with_timing(
+        logind,
+        wm.clone(),
+        Some(locker_command(&marker, 0.3, 2.0)),
+        true,
+        Duration::from_millis(10),
+        Duration::from_secs(2),
+    );
+
+    flow.on_idle();
+    assert!(flow.locker_running(), "idle spawned a locker");
+    assert!(
+        !wm.observed_locked.load(Ordering::SeqCst),
+        "the running locker has not taken the lock yet"
+    );
+
+    let start = Instant::now();
+    flow.on_prepare_for_sleep(true);
+    let elapsed = start.elapsed();
+
+    assert!(marker.exists());
+    assert!(
+        wm.observed_locked.load(Ordering::SeqCst),
+        "prepare-for-sleep waited for the running locker to confirm the lock"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "did not skip the wait on an unconfirmed locker: {elapsed:?}"
+    );
+    assert_eq!(marker_lines(&marker), 1, "no second locker spawned");
+
+    flow.on_unlock();
+}
+
 /// A locker that never confirms the lock still must not hold sleep past the
 /// budget: the flow returns (releasing the inhibitor) anyway.
 #[test]
