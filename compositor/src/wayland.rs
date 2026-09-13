@@ -92,10 +92,394 @@ impl PopupKey {
 /// wlr xdg toplevel; `X11` is a managed (non-override-redirect) Xwayland
 /// surface. Override-redirect X11 surfaces are never modelled and so never
 /// carry a `SurfaceKey`.
+///
+/// Retained for the focus path only (`focus_key` / `apply_focus_key`);
+/// window ops dispatch via [`backend`](Wayland::backend).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfaceKey {
     Xdg(ToplevelKey),
     X11(wlr::XwaylandSurfaceId),
+}
+
+/// A window's client backend as an object: the per-op `match SurfaceKey`
+/// arms that used to live in every seam method now live exactly once, in
+/// the `WindowBackend` impls below. `Wayland::backend` resolves one per
+/// call, so adding a surface kind means adding an impl, not re-threading
+/// a dozen matches.
+///
+/// `SurfaceKey` above stays for the focus path (`focus_key` /
+/// `apply_focus_key`), whose `None`-means-clear fallback has no backend
+/// object to hang on — unifying it would drag `State`'s focus callers
+/// along for no parity gain.
+#[derive(Clone, Copy)]
+struct XdgBackend {
+    toplevel: ToplevelKey,
+}
+
+/// An X11 window's backend: its surface id plus the pushed-state memo.
+/// The memo lives here rather than in a `Wayland` map so the "what did we
+/// last push" state travels with the object that decides what to push;
+/// `Wayland` persists the whole backend per window (`x11_backends`) across
+/// calls.
+///
+/// `pushed` is `None` until the first push: `None` forces every atom write
+/// (a fresh binding has no last-pushed state to compare against), and each
+/// push fills the fields it owns. `Some` compares against the memo and
+/// skips unchanged atoms.
+#[derive(Clone, Copy)]
+struct X11Backend {
+    sid: wlr::XwaylandSurfaceId,
+    pushed: Option<X11PushedState>,
+}
+
+/// One backend per surface kind behind [`AnyWindowBackend`].
+///
+/// Every method takes the `wlr::Runtime` explicitly rather than holding
+/// it: the runtime handle is owned by `Wayland`, and borrowing it into a
+/// long-lived backend object would tie the object's lifetime to a borrow
+/// no call site can sustain. Immutable methods take `&self`; the two that
+/// record pushed state (`configure`, `set_minimized`) take `&mut self`
+/// and the caller writes the backend back.
+trait WindowBackend {
+    fn configure(
+        &mut self,
+        rt: &wlr::Runtime,
+        content: Rectangle,
+        activated: bool,
+        maximized: bool,
+        fullscreen: bool,
+    );
+    fn set_position(&self, rt: &wlr::Runtime, x: i32, y: i32);
+    fn set_visible(&self, rt: &wlr::Runtime, visible: bool);
+    fn set_minimized(&mut self, rt: &wlr::Runtime, minimized: bool);
+    fn raise(&self, rt: &wlr::Runtime, ssd: Option<&SsdVisual>);
+    fn close(&self, rt: &wlr::Runtime);
+}
+
+/// The SSD node factories plus the content-to-frame origin: one path per
+/// surface kind hiding the xdg-tree vs. toplevel-band split from `sync_ssd`.
+trait SsdFactory {
+    fn ssd_origin(&self, content_x: i32, content_y: i32) -> (i32, i32);
+    fn make_ssd_rect(
+        &self,
+        rt: &wlr::Runtime,
+        w: i32,
+        h: i32,
+        color: [f32; 4],
+    ) -> Option<wlr::RectId>;
+    fn make_ssd_buffer(
+        &self,
+        rt: &wlr::Runtime,
+        w: i32,
+        h: i32,
+        px: &[u8],
+    ) -> Option<wlr::BufferId>;
+}
+
+impl WindowBackend for XdgBackend {
+    fn configure(
+        &mut self,
+        rt: &wlr::Runtime,
+        content: Rectangle,
+        activated: bool,
+        maximized: bool,
+        fullscreen: bool,
+    ) {
+        rt.set_toplevel_size(self.toplevel.0, content.width, content.height);
+        rt.set_toplevel_activated(self.toplevel.0, activated);
+        rt.set_toplevel_maximized(self.toplevel.0, maximized);
+        rt.set_toplevel_fullscreen(self.toplevel.0, fullscreen);
+    }
+
+    fn set_position(&self, rt: &wlr::Runtime, x: i32, y: i32) {
+        rt.set_toplevel_position(self.toplevel.0, x, y);
+    }
+
+    fn set_visible(&self, rt: &wlr::Runtime, visible: bool) {
+        rt.set_toplevel_visible(self.toplevel.0, visible);
+    }
+
+    fn set_minimized(&mut self, _rt: &wlr::Runtime, _minimized: bool) {
+        // xdg-shell has no minimized toplevel state to push (a client
+        // requests minimize; the WM just hides the window) — hiding is
+        // already carried by `set_visible`.
+    }
+
+    fn raise(&self, rt: &wlr::Runtime, _ssd: Option<&SsdVisual>) {
+        rt.raise_toplevel(self.toplevel.0);
+    }
+
+    fn close(&self, rt: &wlr::Runtime) {
+        rt.close_toplevel(self.toplevel.0);
+    }
+}
+
+impl SsdFactory for XdgBackend {
+    fn ssd_origin(&self, content_x: i32, content_y: i32) -> (i32, i32) {
+        (content_x, content_y)
+    }
+
+    fn make_ssd_rect(
+        &self,
+        rt: &wlr::Runtime,
+        w: i32,
+        h: i32,
+        color: [f32; 4],
+    ) -> Option<wlr::RectId> {
+        rt.add_rect_in_toplevel(self.toplevel.0, w, h, color)
+    }
+
+    fn make_ssd_buffer(
+        &self,
+        rt: &wlr::Runtime,
+        w: i32,
+        h: i32,
+        px: &[u8],
+    ) -> Option<wlr::BufferId> {
+        rt.add_buffer_in_toplevel(self.toplevel.0, w, h, px)
+    }
+}
+
+impl WindowBackend for X11Backend {
+    fn configure(
+        &mut self,
+        rt: &wlr::Runtime,
+        content: Rectangle,
+        activated: bool,
+        maximized: bool,
+        fullscreen: bool,
+    ) {
+        // An X11 window is configured to the whole **content** rect
+        // (position *and* size), not just a size: xdg clients do not
+        // know where they are, but X11 clients place themselves and
+        // must be told the geometry the WM granted, inside the SSD.
+        // Geometry is always sent — it is exactly what changes on a drag
+        // frame — but the `_NET_WM_STATE` atoms are memoized so an
+        // unchanged one costs no atom write + xwm flush (review finding
+        // #6). `None` forces every atom write (see `X11Backend::pushed`);
+        // `Some` skips the atoms whose value has not changed since the
+        // last push.
+        rt.configure_xwayland_surface(
+            self.sid,
+            wlr::Box2D::new(content.x, content.y, content.width, content.height),
+        );
+        match self.pushed {
+            None => {
+                rt.activate_xwayland_surface(self.sid, activated);
+                rt.set_xwayland_surface_maximized(self.sid, maximized);
+                rt.set_xwayland_surface_fullscreen(self.sid, fullscreen);
+                // `minimized` (owned by `set_minimized`) untouched.
+                self.pushed = Some(X11PushedState {
+                    activated,
+                    maximized,
+                    fullscreen,
+                    minimized: false,
+                });
+            }
+            Some(mut memo) => {
+                if memo.activated != activated {
+                    rt.activate_xwayland_surface(self.sid, activated);
+                }
+                if memo.maximized != maximized {
+                    rt.set_xwayland_surface_maximized(self.sid, maximized);
+                }
+                if memo.fullscreen != fullscreen {
+                    rt.set_xwayland_surface_fullscreen(self.sid, fullscreen);
+                }
+                // `minimized` (owned by `set_minimized`) untouched.
+                memo.activated = activated;
+                memo.maximized = maximized;
+                memo.fullscreen = fullscreen;
+                self.pushed = Some(memo);
+            }
+        }
+    }
+
+    fn set_position(&self, rt: &wlr::Runtime, x: i32, y: i32) {
+        rt.set_xwayland_surface_position(self.sid, x, y);
+    }
+
+    fn set_visible(&self, rt: &wlr::Runtime, visible: bool) {
+        rt.set_xwayland_surface_visible(self.sid, visible);
+    }
+
+    fn set_minimized(&mut self, rt: &wlr::Runtime, minimized: bool) {
+        // Skip the atom write + xwm flush when the value is unchanged
+        // from what this window last received (see `X11Backend::pushed`).
+        // `None` (never pushed) always writes.
+        match self.pushed {
+            Some(memo) if memo.minimized == minimized => {}
+            Some(mut memo) => {
+                rt.set_xwayland_surface_minimized(self.sid, minimized);
+                memo.minimized = minimized;
+                self.pushed = Some(memo);
+            }
+            None => {
+                rt.set_xwayland_surface_minimized(self.sid, minimized);
+                self.pushed = Some(X11PushedState {
+                    minimized,
+                    ..X11PushedState::default()
+                });
+            }
+        }
+    }
+
+    fn raise(&self, rt: &wlr::Runtime, ssd: Option<&SsdVisual>) {
+        // An xdg toplevel's SSD rides its own scene tree, so one
+        // `raise_toplevel` lifts the whole window. An X11 window's
+        // scene node lives directly in the toplevel band and its SSD
+        // nodes are band siblings, so raising the window means raising
+        // the surface node *and* each decoration node above the other
+        // windows in the band, then restacking the X11 window itself
+        // for stacking parity with X11-native clients.
+        rt.raise_xwayland_surface(self.sid);
+        if let Some(visual) = ssd {
+            rt.raise_rect(visual.band);
+            for rect in visual.buttons.into_iter().flatten() {
+                rt.raise_rect(rect);
+            }
+            if let Some(title) = visual.title {
+                rt.raise_buffer(title);
+            }
+            for glyph in visual.button_glyphs.into_iter().flatten() {
+                rt.raise_buffer(glyph);
+            }
+        }
+        rt.restack_xwayland_surface(self.sid, None, true);
+    }
+
+    fn close(&self, rt: &wlr::Runtime) {
+        rt.close_xwayland_surface(self.sid);
+    }
+}
+
+impl SsdFactory for X11Backend {
+    fn ssd_origin(&self, _content_x: i32, _content_y: i32) -> (i32, i32) {
+        (0, 0)
+    }
+
+    fn make_ssd_rect(
+        &self,
+        rt: &wlr::Runtime,
+        w: i32,
+        h: i32,
+        color: [f32; 4],
+    ) -> Option<wlr::RectId> {
+        rt.add_rect_in_band(wlr::Band::Toplevel, w, h, color).ok()
+    }
+
+    fn make_ssd_buffer(
+        &self,
+        rt: &wlr::Runtime,
+        w: i32,
+        h: i32,
+        px: &[u8],
+    ) -> Option<wlr::BufferId> {
+        rt.add_buffer_in_band(wlr::Band::Toplevel, w, h, px)
+    }
+}
+
+/// One value per surface kind implementing both backend traits. The
+/// business logic lives once per kind, in the `WindowBackend` and
+/// `SsdFactory` impls above; this enum's impls are the per-method 2-arm
+/// delegates that forward each call to the kind it holds. Callers never
+/// match on the kind themselves: they resolve once per call through
+/// [`backend`](Wayland::backend) — the dispatch point this enum shares
+/// with [`surface_key`](Wayland::surface_key) — then call trait methods.
+/// `X11Backend` travels by value (surface id plus an optional four-bool
+/// memo — cheaper than a borrow chain through two maps) and the caller
+/// writes it back (via `persist_backend`) when a `&mut self` method may
+/// have moved its memo.
+#[derive(Clone, Copy)]
+enum AnyWindowBackend {
+    Xdg(XdgBackend),
+    X11(X11Backend),
+}
+
+impl WindowBackend for AnyWindowBackend {
+    fn configure(
+        &mut self,
+        rt: &wlr::Runtime,
+        content: Rectangle,
+        activated: bool,
+        maximized: bool,
+        fullscreen: bool,
+    ) {
+        match self {
+            AnyWindowBackend::Xdg(b) => b.configure(rt, content, activated, maximized, fullscreen),
+            AnyWindowBackend::X11(b) => b.configure(rt, content, activated, maximized, fullscreen),
+        }
+    }
+
+    fn set_position(&self, rt: &wlr::Runtime, x: i32, y: i32) {
+        match self {
+            AnyWindowBackend::Xdg(b) => b.set_position(rt, x, y),
+            AnyWindowBackend::X11(b) => b.set_position(rt, x, y),
+        }
+    }
+
+    fn set_visible(&self, rt: &wlr::Runtime, visible: bool) {
+        match self {
+            AnyWindowBackend::Xdg(b) => b.set_visible(rt, visible),
+            AnyWindowBackend::X11(b) => b.set_visible(rt, visible),
+        }
+    }
+
+    fn set_minimized(&mut self, rt: &wlr::Runtime, minimized: bool) {
+        match self {
+            AnyWindowBackend::Xdg(b) => b.set_minimized(rt, minimized),
+            AnyWindowBackend::X11(b) => b.set_minimized(rt, minimized),
+        }
+    }
+
+    fn raise(&self, rt: &wlr::Runtime, ssd: Option<&SsdVisual>) {
+        match self {
+            AnyWindowBackend::Xdg(b) => b.raise(rt, ssd),
+            AnyWindowBackend::X11(b) => b.raise(rt, ssd),
+        }
+    }
+
+    fn close(&self, rt: &wlr::Runtime) {
+        match self {
+            AnyWindowBackend::Xdg(b) => b.close(rt),
+            AnyWindowBackend::X11(b) => b.close(rt),
+        }
+    }
+}
+
+impl SsdFactory for AnyWindowBackend {
+    fn ssd_origin(&self, content_x: i32, content_y: i32) -> (i32, i32) {
+        match self {
+            AnyWindowBackend::Xdg(b) => b.ssd_origin(content_x, content_y),
+            AnyWindowBackend::X11(b) => b.ssd_origin(content_x, content_y),
+        }
+    }
+
+    fn make_ssd_rect(
+        &self,
+        rt: &wlr::Runtime,
+        w: i32,
+        h: i32,
+        color: [f32; 4],
+    ) -> Option<wlr::RectId> {
+        match self {
+            AnyWindowBackend::Xdg(b) => b.make_ssd_rect(rt, w, h, color),
+            AnyWindowBackend::X11(b) => b.make_ssd_rect(rt, w, h, color),
+        }
+    }
+
+    fn make_ssd_buffer(
+        &self,
+        rt: &wlr::Runtime,
+        w: i32,
+        h: i32,
+        px: &[u8],
+    ) -> Option<wlr::BufferId> {
+        match self {
+            AnyWindowBackend::Xdg(b) => b.make_ssd_buffer(rt, w, h, px),
+            AnyWindowBackend::X11(b) => b.make_ssd_buffer(rt, w, h, px),
+        }
+    }
 }
 
 /// Every scene node one server-side-decorated window's title bar is made
@@ -218,6 +602,10 @@ fn shift_button_color(base: [f32; 4], state: ButtonState) -> [f32; 4] {
 /// so any future path that changes one of these on the surface outside these two
 /// seams must invalidate the window's entry (drop it) or the next matching sync
 /// will be suppressed as a redundant no-op.
+///
+/// The never-pushed marker lives on [`X11Backend::pushed`] (`None` until the
+/// first push forces every atom write), not here: this struct only ever
+/// holds post-push values.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct X11PushedState {
     minimized: bool,
@@ -236,22 +624,18 @@ pub struct Wayland {
     /// toplevel → model, so both directions are hot.
     toplevel_to_window: HashMap<ToplevelKey, WindowId>,
     window_to_toplevel: HashMap<WindowId, ToplevelKey>,
-    /// Which model window each managed X11 (Xwayland) surface backs — the
-    /// second half of the [`SurfaceKey`] generalization (M2). A model
-    /// `WindowId` is backed by *either* an xdg toplevel (the maps above) or a
-    /// managed X11 surface (this map), never both, so every outbound seam
-    /// method below dispatches on which of the two a window resolves through
-    /// and pushes state to the matching `wlr` setter. The reverse (surface →
-    /// window) is not needed here — `state.rs`'s Xwayland handlers keep their
-    /// own `XwaylandSurfaceId → WindowId` side-table for that direction.
-    window_to_x11: HashMap<WindowId, wlr::XwaylandSurfaceId>,
-    /// The `_NET_WM_STATE`-bearing attributes last pushed to each managed X11
-    /// window (see [`X11PushedState`]), so [`set_minimized`](Wayland::set_minimized)
-    /// and [`configure`](Wayland::configure) can each skip a redundant atom write
-    /// and xwm flush. Keyed by `WindowId` (never reused, and a remap mints a
-    /// fresh row), and dropped in [`forget`](Wayland::forget) with the rest of
-    /// the window's state.
-    x11_pushed: HashMap<WindowId, X11PushedState>,
+    /// Which model window each managed X11 (Xwayland) surface backs, and
+    /// what was last pushed to it — the second half of the [`SurfaceKey`]
+    /// generalization (M2). A model `WindowId` is backed by *either* an xdg
+    /// toplevel (the maps above) or a managed X11 surface (this map), never
+    /// both. Each value carries its surface id plus its pushed-state memo
+    /// ([`X11Backend`]); the reverse (surface → window) is not needed here
+    /// — `state.rs`'s Xwayland handlers keep their own
+    /// `XwaylandSurfaceId → WindowId` side-table for that direction.
+    /// Keyed by `WindowId` (never reused, and a remap mints a fresh row),
+    /// and dropped in [`forget`](Wayland::forget) with the rest of the
+    /// window's state.
+    x11_backends: HashMap<WindowId, X11Backend>,
     /// One [`SsdVisual`] per window currently wearing server-side
     /// decorations, keyed the same way the toplevel maps are (review finding
     /// I2). `None` (no entry) means gone -- nothing is painted for that
@@ -299,7 +683,13 @@ impl Wayland {
     /// Xwayland counterpart of [`bind`](Wayland::bind) (M2). A window is bound
     /// through exactly one of the two.
     pub fn bind_x11(&mut self, id: WindowId, surface: wlr::XwaylandSurfaceId) {
-        self.window_to_x11.insert(id, surface);
+        self.x11_backends
+            .entry(id)
+            .and_modify(|b| b.sid = surface)
+            .or_insert_with(|| X11Backend {
+                sid: surface,
+                pushed: None,
+            });
     }
 
     /// Drop every trace of model window `id`.
@@ -310,8 +700,7 @@ impl Wayland {
         if let Some(key) = self.window_to_toplevel.remove(&id) {
             self.toplevel_to_window.remove(&key);
         }
-        self.window_to_x11.remove(&id);
-        self.x11_pushed.remove(&id);
+        self.x11_backends.remove(&id);
         self.remove_ssd(id);
     }
 
@@ -324,32 +713,61 @@ impl Wayland {
     }
 
     /// Which client surface backs `id`, or `None` for a model-only window
-    /// (every window in a test that never bound one). This is the dispatch
-    /// point every outbound method below runs through.
+    /// (every window in a test that never bound one). Derived from
+    /// [`backend`](Wayland::backend) so the focus path dispatches through
+    /// the same single point as the window-op seams; retained as a
+    /// `SurfaceKey` because the focus path (`focus_key` / `apply_focus_key`)
+    /// and its `None`-means-clear fallback have no backend object to hang
+    /// on.
     fn surface_key(&self, id: WindowId) -> Option<SurfaceKey> {
-        if let Some(key) = self.window_to_toplevel.get(&id) {
-            return Some(SurfaceKey::Xdg(*key));
-        }
-        self.window_to_x11.get(&id).copied().map(SurfaceKey::X11)
+        self.backend(id).map(|b| match b {
+            AnyWindowBackend::Xdg(x) => SurfaceKey::Xdg(x.toplevel),
+            AnyWindowBackend::X11(x) => SurfaceKey::X11(x.sid),
+        })
     }
 
     /// Whether `id` has a client behind it — xdg or X11. `false` for
     /// model-only windows.
     pub fn is_backed(&self, id: WindowId) -> bool {
-        self.window_to_toplevel.contains_key(&id) || self.window_to_x11.contains_key(&id)
+        self.window_to_toplevel.contains_key(&id) || self.x11_backends.contains_key(&id)
     }
 
-    /// Resolve `id` to the runtime handle and surface key needed to act on
-    /// it, or `None` if either is missing.
-    ///
-    /// `None` means gone, not error: a model-only build has no runtime, and
-    /// a window with no bound surface is normal (see `forget`). Callers
-    /// treat either case as a silent no-op.
-    fn resolve(&self, id: WindowId) -> Option<(&wlr::Runtime, SurfaceKey)> {
-        let (Some(runtime), Some(key)) = (self.runtime(), self.surface_key(id)) else {
-            return None;
-        };
-        Some((runtime, key))
+    /// Resolve `id` to its owned backend object, or `None` for a model-only
+    /// window. This is the single dispatch point for the six window-op
+    /// seams below (configure, position, visible, minimized, raise, close)
+    /// plus the SSD factories — and shared with [`surface_key`](Wayland::surface_key),
+    /// so the focus path resolves through it too. Each caller resolves
+    /// once, then calls trait methods, instead of matching per method. `X11Backend` travels by
+    /// value (a surface id plus four bools); mutating calls write it back
+    /// so the memo persists.
+    fn backend(&self, id: WindowId) -> Option<AnyWindowBackend> {
+        if let Some(key) = self.window_to_toplevel.get(&id) {
+            return Some(AnyWindowBackend::Xdg(XdgBackend { toplevel: *key }));
+        }
+        self.x11_backends
+            .get(&id)
+            .cloned()
+            .map(AnyWindowBackend::X11)
+    }
+
+    /// Write a mutated backend back into the map — but only when the window
+    /// still has a row there. `forget` may have dropped the entry between
+    /// the resolve and this call, and resurrecting it would leak a backend
+    /// for a dead window.
+    fn persist_backend(&mut self, id: WindowId, backend: AnyWindowBackend) {
+        if let (
+            std::collections::hash_map::Entry::Occupied(slot),
+            AnyWindowBackend::X11(x11),
+        ) = (self.x11_backends.entry(id), backend)
+        {
+            *slot.into_mut() = x11;
+        }
+    }
+
+    /// The runtime plus `id`'s backend, or `None` on any miss (no runtime,
+    /// no binding). The one resolver for the five dispatching seams below.
+    fn resolved_backend(&self, id: WindowId) -> Option<(wlr::Runtime, AnyWindowBackend)> {
+        Some((self.runtime().cloned()?, self.backend(id)?))
     }
 
     /// Stage `content` (already in **content** space — the caller applied
@@ -368,60 +786,19 @@ impl Wayland {
         maximized: bool,
         fullscreen: bool,
     ) {
-        let Some((runtime, key)) = self.resolve(id) else {
+        let Some((runtime, mut backend)) = self.resolved_backend(id) else {
             return;
         };
-        match key {
-            SurfaceKey::Xdg(key) => {
-                runtime.set_toplevel_size(key.0, content.width, content.height);
-                runtime.set_toplevel_activated(key.0, activated);
-                runtime.set_toplevel_maximized(key.0, maximized);
-                runtime.set_toplevel_fullscreen(key.0, fullscreen);
-            }
-            SurfaceKey::X11(sid) => {
-                // An X11 window is configured to the whole **content** rect
-                // (position *and* size), not just a size: xdg clients do not
-                // know where they are, but X11 clients place themselves and
-                // must be told the geometry the WM granted, inside the SSD.
-                // Geometry is always sent — it is exactly what changes on a drag
-                // frame — but the `_NET_WM_STATE` atoms are memoized so an
-                // unchanged one costs no atom write + xwm flush (review finding
-                // #6). `None` (never pushed) forces the first sync to send all.
-                let prev = self.x11_pushed.get(&id).copied();
-                runtime.configure_xwayland_surface(
-                    sid,
-                    wlr::Box2D::new(content.x, content.y, content.width, content.height),
-                );
-                if prev.map(|p| p.activated) != Some(activated) {
-                    runtime.activate_xwayland_surface(sid, activated);
-                }
-                if prev.map(|p| p.maximized) != Some(maximized) {
-                    runtime.set_xwayland_surface_maximized(sid, maximized);
-                }
-                if prev.map(|p| p.fullscreen) != Some(fullscreen) {
-                    runtime.set_xwayland_surface_fullscreen(sid, fullscreen);
-                }
-                // `runtime`'s borrow ends above; record what we pushed, leaving
-                // `minimized` (owned by `set_minimized`) untouched.
-                let entry = self.x11_pushed.entry(id).or_default();
-                entry.activated = activated;
-                entry.maximized = maximized;
-                entry.fullscreen = fullscreen;
-            }
-        }
+        backend.configure(&runtime, content, activated, maximized, fullscreen);
+        self.persist_backend(id, backend);
     }
 
     /// Move the window's scene node. `x`/`y` are **content**-space.
     pub fn set_position(&self, id: WindowId, x: i32, y: i32) {
-        let Some((runtime, key)) = self.resolve(id) else {
+        let Some((runtime, backend)) = self.resolved_backend(id) else {
             return;
         };
-        match key {
-            SurfaceKey::Xdg(key) => {
-                runtime.set_toplevel_position(key.0, x, y);
-            }
-            SurfaceKey::X11(sid) => runtime.set_xwayland_surface_position(sid, x, y),
-        }
+        backend.set_position(&runtime, x, y);
     }
 
     /// Show or hide the window's scene node.
@@ -432,15 +809,10 @@ impl Wayland {
     /// drawn, so returning to that workspace does not make the client
     /// re-render from nothing.
     pub fn set_visible(&self, id: WindowId, visible: bool) {
-        let Some((runtime, key)) = self.resolve(id) else {
+        let Some((runtime, backend)) = self.resolved_backend(id) else {
             return;
         };
-        match key {
-            SurfaceKey::Xdg(key) => {
-                runtime.set_toplevel_visible(key.0, visible);
-            }
-            SurfaceKey::X11(sid) => runtime.set_xwayland_surface_visible(sid, visible),
-        }
+        backend.set_visible(&runtime, visible);
     }
 
     /// Reflect the model's minimized state back to the client.
@@ -455,21 +827,11 @@ impl Wayland {
     /// never learns it was minimized. Silent no-op on a miss, like every other
     /// seam here.
     pub fn set_minimized(&mut self, id: WindowId, minimized: bool) {
-        let Some((runtime, key)) = self.resolve(id) else {
+        let Some((runtime, mut backend)) = self.resolved_backend(id) else {
             return;
         };
-        match key {
-            SurfaceKey::Xdg(_) => {}
-            SurfaceKey::X11(sid) => {
-                // Skip the atom write + xwm flush when the value is unchanged
-                // from what this window last received (see `x11_pushed`).
-                if self.x11_pushed.get(&id).map(|p| p.minimized) == Some(minimized) {
-                    return;
-                }
-                runtime.set_xwayland_surface_minimized(sid, minimized);
-                self.x11_pushed.entry(id).or_default().minimized = minimized;
-            }
-        }
+        backend.set_minimized(&runtime, minimized);
+        self.persist_backend(id, backend);
     }
 
     /// Raise the window above its siblings.
@@ -479,37 +841,10 @@ impl Wayland {
     /// off, a focused window is still activated and configured, it just keeps
     /// its place in the stack.
     pub fn raise(&self, id: WindowId) {
-        let Some((runtime, key)) = self.resolve(id) else {
+        let Some((runtime, backend)) = self.resolved_backend(id) else {
             return;
         };
-        match key {
-            SurfaceKey::Xdg(key) => {
-                runtime.raise_toplevel(key.0);
-            }
-            SurfaceKey::X11(sid) => {
-                // An xdg toplevel's SSD rides its own scene tree, so one
-                // `raise_toplevel` lifts the whole window. An X11 window's
-                // scene node lives directly in the toplevel band and its SSD
-                // nodes are band siblings, so raising the window means raising
-                // the surface node *and* each decoration node above the other
-                // windows in the band, then restacking the X11 window itself
-                // for stacking parity with X11-native clients.
-                runtime.raise_xwayland_surface(sid);
-                if let Some(visual) = self.ssd.get(&id) {
-                    runtime.raise_rect(visual.band);
-                    for rect in visual.buttons.into_iter().flatten() {
-                        runtime.raise_rect(rect);
-                    }
-                    if let Some(title) = visual.title {
-                        runtime.raise_buffer(title);
-                    }
-                    for glyph in visual.button_glyphs.into_iter().flatten() {
-                        runtime.raise_buffer(glyph);
-                    }
-                }
-                runtime.restack_xwayland_surface(sid, None, true);
-            }
-        }
+        backend.raise(&runtime, self.ssd.get(&id));
     }
 
     /// Point the seat's keyboard at `id`, or at nothing.
@@ -697,16 +1032,11 @@ impl Wayland {
     /// it only happens across two separate `run_all` calls, which is outside
     /// what a single close request can detect or a headless test can set up.
     pub fn close(&self, id: WindowId) -> bool {
-        let Some(key) = self.surface_key(id) else {
+        let Some(backend) = self.backend(id) else {
             return false;
         };
         if let Some(runtime) = self.runtime() {
-            match key {
-                SurfaceKey::Xdg(key) => {
-                    runtime.close_toplevel(key.0);
-                }
-                SurfaceKey::X11(sid) => runtime.close_xwayland_surface(sid),
-            }
+            backend.close(runtime);
         }
         true
     }
@@ -823,28 +1153,17 @@ impl Wayland {
         // band siblings positioned in absolute scene coordinates (origin
         // `(0, 0)`), riding the window's z-order via `raise` instead of a
         // parent tree.
-        let Some(sk) = self.surface_key(id) else {
+        let Some(backend) = self.backend(id) else {
             return;
         };
-        let (ox, oy) = match sk {
-            SurfaceKey::Xdg(_) => (content.x, content.y),
-            SurfaceKey::X11(_) => (0, 0),
-        };
+        let (ox, oy) = backend.ssd_origin(content.x, content.y);
         // Node factories that hide the xdg-tree vs. toplevel-band split so the
         // decoration-building logic below is one path for both surface kinds.
-        let make_rect = |w: i32, h: i32, color: [f32; 4]| -> Option<wlr::RectId> {
-            match sk {
-                SurfaceKey::Xdg(key) => runtime.add_rect_in_toplevel(key.0, w, h, color),
-                SurfaceKey::X11(_) => runtime
-                    .add_rect_in_band(wlr::Band::Toplevel, w, h, color)
-                    .ok(),
-            }
+        let make_ssd_rect = |w: i32, h: i32, color: [f32; 4]| -> Option<wlr::RectId> {
+            backend.make_ssd_rect(&runtime, w, h, color)
         };
-        let make_buffer = |w: i32, h: i32, px: &[u8]| -> Option<wlr::BufferId> {
-            match sk {
-                SurfaceKey::Xdg(key) => runtime.add_buffer_in_toplevel(key.0, w, h, px),
-                SurfaceKey::X11(_) => runtime.add_buffer_in_band(wlr::Band::Toplevel, w, h, px),
-            }
+        let make_ssd_buffer = |w: i32, h: i32, px: &[u8]| -> Option<wlr::BufferId> {
+            backend.make_ssd_buffer(&runtime, w, h, px)
         };
         let width = bar.width.max(1);
         let height = bar.height.max(1);
@@ -856,12 +1175,12 @@ impl Wayland {
         // under it.
         //
         // Not the `entry` API the `map_entry` lint suggests: the value is
-        // fallible to build (`make_rect` can return `None`, on which this must
+        // fallible to build (`make_ssd_rect` can return `None`, on which this must
         // early-return having inserted nothing), which `or_insert_with` cannot
         // express.
         #[allow(clippy::map_entry)]
         if !self.ssd.contains_key(&id) {
-            let Some(band) = make_rect(width, height, band_color) else {
+            let Some(band) = make_ssd_rect(width, height, band_color) else {
                 return;
             };
             self.ssd.insert(
@@ -897,7 +1216,7 @@ impl Wayland {
             };
             let slot = &mut visual.buttons[i];
             if slot.is_none() {
-                *slot = make_rect(r.width.max(1), r.height.max(1), color);
+                *slot = make_ssd_rect(r.width.max(1), r.height.max(1), color);
             }
             let Some(rect) = *slot else { continue };
             runtime.set_rect_size(rect, r.width.max(1), r.height.max(1));
@@ -923,7 +1242,7 @@ impl Wayland {
                                 runtime.remove_buffer(stale);
                             }
                             visual.button_glyphs[i] =
-                                make_buffer(raster.width, raster.height, raster.pixels);
+                                make_ssd_buffer(raster.width, raster.height, raster.pixels);
                         }
                         visual.button_glyph_keys[i] = if visual.button_glyphs[i].is_some() {
                             Some(raster_key)
@@ -964,7 +1283,7 @@ impl Wayland {
                         if let Some(stale) = visual.title.take() {
                             runtime.remove_buffer(stale);
                         }
-                        visual.title = make_buffer(raster.width, raster.height, raster.pixels);
+                        visual.title = make_ssd_buffer(raster.width, raster.height, raster.pixels);
                     }
                     // Only claim the generation if a node actually holds it:
                     // a refused `add_buffer_in_toplevel` must be retried on
@@ -1244,5 +1563,113 @@ mod tests {
         assert!(!wayland.popup_is_grabbing(a));
         assert_eq!(wayland.dismiss_popup(a), 0);
         assert!(!wayland.has_explicit_grab());
+    }
+
+    /// Write-back persistence: `configure` must persist the mutated X11
+    /// memo into the map. Mutation check: delete the `persist_backend`
+    /// call and the final assertion fails (the map still holds `None`).
+    #[test]
+    fn configure_persists_the_x11_memo_write_back() {
+        let runtime = wlr::Runtime::new().expect("runtime");
+        let mut w = Wayland::new();
+        w.attach(runtime);
+        let id = WindowId(11);
+        w.bind_x11(id, wlr::XwaylandSurfaceId::dangling_for_test());
+        assert!(
+            w.x11_backends.get(&id).map(|b| b.pushed) == Some(None),
+            "a fresh binding has never pushed"
+        );
+
+        w.configure(
+            id,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            true,
+            true,
+            true,
+        );
+        assert!(
+            w.x11_backends.get(&id).map(|b| b.pushed)
+                == Some(Some(X11PushedState {
+                    activated: true,
+                    maximized: true,
+                    fullscreen: true,
+                    minimized: false,
+                })),
+            "configure must write the pushed memo back into the map"
+        );
+    }
+
+    /// First-sync: a fresh (`None`) memo forces every atom write, so even
+    /// an all-false first configure records `Some(all-false)` afterwards —
+    /// the old `None`-forces-all behavior, made explicit.
+    #[test]
+    fn first_sync_with_all_false_still_records_the_memo() {
+        let runtime = wlr::Runtime::new().expect("runtime");
+        let mut w = Wayland::new();
+        w.attach(runtime);
+        let id = WindowId(12);
+        w.bind_x11(id, wlr::XwaylandSurfaceId::dangling_for_test());
+
+        w.configure(
+            id,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            false,
+            false,
+            false,
+        );
+        assert!(
+            w.x11_backends.get(&id).map(|b| b.pushed) == Some(Some(X11PushedState::default())),
+            "even an all-false first sync leaves a Some memo behind"
+        );
+    }
+
+    /// `ssd_origin` dispatches on the backend kind: an xdg toplevel's
+    /// decoration rides its own tree (content origin), an X11 window's
+    /// nodes are band siblings in absolute scene coordinates.
+    #[test]
+    fn ssd_origin_comes_from_the_backend_kind() {
+        let xdg = AnyWindowBackend::Xdg(XdgBackend {
+            toplevel: ToplevelKey::for_test(1),
+        });
+        assert_eq!(xdg.ssd_origin(100, 200), (100, 200));
+
+        let x11 = AnyWindowBackend::X11(X11Backend {
+            sid: wlr::XwaylandSurfaceId::dangling_for_test(),
+            pushed: None,
+        });
+        assert_eq!(x11.ssd_origin(100, 200), (0, 0));
+    }
+
+    /// bind/forget/is_backed/close round-trip on an X11-bound id: backed
+    /// once bound, `close` reports "wait for the destroy" while backed
+    /// (the dangling surface makes the runtime call a miss, never a
+    /// panic), and unbacked once forgotten.
+    #[test]
+    fn x11_bind_forget_close_round_trip() {
+        let runtime = wlr::Runtime::new().expect("runtime");
+        let mut w = Wayland::new();
+        let id = WindowId(13);
+        assert!(!w.is_backed(id));
+        assert!(!w.close(id));
+
+        w.bind_x11(id, wlr::XwaylandSurfaceId::dangling_for_test());
+        assert!(w.is_backed(id));
+
+        w.attach(runtime);
+        assert!(w.close(id), "a bound id reports a live client");
+
+        w.forget(id);
+        assert!(!w.is_backed(id));
+        assert!(!w.close(id));
     }
 }
