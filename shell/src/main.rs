@@ -9,6 +9,7 @@ use std::sync::Arc;
 use icedtea_shell::clip_client::{self, ClipCommands, ClipProxy};
 use icedtea_shell::clipboard::ClipUpdate;
 use icedtea_shell::compositor_client::{self, CompositorCommands, CompositorProxy};
+use icedtea_shell::launcher_view;
 use icedtea_shell::panel::{self, Msg, Offline, PanelModel};
 use icedtea_shell::style;
 use icedtea_shell::taskbar::CompositorUpdate;
@@ -73,9 +74,41 @@ fn forward<T: Send + 'static>(
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let window = Window::open(panel::spec(), style::sheet(), FontDatabase::new())?;
+    // B1 Task 3: the anchored edge follows `Appearance.bar_position`.
+    // `load_or_default` never fails (missing/corrupt/locked DB -> defaults),
+    // so the bar always opens; a store the settings app currently holds
+    // locked reads back as defaults until the next restart.
+    let bar_position = icedtea_config::load_or_default(&icedtea_config::default_db_path())
+        .appearance
+        .bar_position;
+    // Parse once at the config boundary: warn here on unrecognized values
+    // (panel::spec would warn again on its own &str path, which is why the
+    // binary calls spec_for with the already-parsed position instead).
+    if bar_position != "top" && bar_position != "bottom" {
+        tracing::warn!(
+            value = %bar_position,
+            "unrecognized Appearance.bar_position, falling back to bottom"
+        );
+    }
+    let position = panel::BarPosition::from(bar_position.as_str());
+    let window = Window::open(
+        panel::spec_for(position),
+        style::sheet(),
+        FontDatabase::new(),
+    )?;
     let (inbox, tx) = Inbox::<Msg>::new()?;
     let width_tx = tx.clone();
+
+    // B1 Task 5: the launcher's second surface lives on its own thread
+    // under `launcher_view::supervise`. The panel's Start toggle reports
+    // down `launcher_tx`; the supervisor reports self-closes back through
+    // the panel inbox as `Msg::LauncherClosed`.
+    let (launcher_tx, launcher_rx) = std::sync::mpsc::channel::<bool>();
+    let launcher_panel_tx = tx.clone();
+    let launcher_bar = bar_position.clone();
+    std::thread::spawn(move || {
+        launcher_view::supervise(launcher_rx, launcher_panel_tx, launcher_bar);
+    });
 
     // Each client's proxy, forward thread and worker are created together: when
     // `*Proxy::new()` fails (no session bus) the arm installs `Offline` and
@@ -114,7 +147,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // anchor. The whole frame hook is `panel::frame_hook`, the one factory the
     // integration harness calls too (M5 finding #3), so there is a single
     // source of truth for what a frame publishes.
-    let model = PanelModel::new(wm, clip);
+    let mut model = PanelModel::new(wm, clip);
+    model.launcher_ctl = Some(launcher_tx);
     let clip_rect = model.clip_rect.clone();
     let open_popover = model.open_popover_cell.clone();
     let bar_width = model.bar_width;

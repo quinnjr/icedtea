@@ -11,11 +11,14 @@ pub const DB_WORKSPACES: TableDefinition<&'static str, &'static [u8]> =
     TableDefinition::new("workspaces");
 pub const DB_DISPLAYS: TableDefinition<&'static str, &'static [u8]> =
     TableDefinition::new("displays");
+pub const DB_LAUNCHER: TableDefinition<&'static str, &'static [u8]> =
+    TableDefinition::new("launcher");
 
 pub const KEY_SCHEMA_VERSION: &str = "schema_version";
 pub const KEY_APPEARANCE: &str = "appearance";
 pub const KEY_BEHAVIOR: &str = "behavior";
 pub const KEY_WORKSPACES: &str = "workspaces";
 pub const KEY_DISPLAYS: &str = "displays";
+pub const KEY_LAUNCHER: &str = "launcher";
 pub const KEY_ACTION_COUNT: &str = "action_count";
 pub const KEY_ACTION: &str = "action:";

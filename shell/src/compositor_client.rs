@@ -14,6 +14,25 @@ use crate::taskbar::CompositorUpdate;
 
 const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 
+/// Wire member for `CompositorCommands::spawn_app`, kept as a named
+/// constant (rather than an inline literal at the call) so the unit test
+/// below can pin it against the compositor's
+/// `CompositorInterface::spawn_app` (see `compositor/src/dbus.rs`'s
+/// `spawn_app_is_exposed_as_spawn_app_with_string_in_bool_out`).
+///
+/// A reminder, not a guard — the real pin is that compositor introspection
+/// test: if the literals disagree, the proxy call reaches no method and
+/// every launch silently reports `false`.
+const SPAWN_APP_MEMBER: &str = "SpawnApp";
+
+/// Wire member for `CompositorCommands::quit`, kept as a named constant for
+/// the same reason as [`SPAWN_APP_MEMBER`].
+///
+/// A reminder, not a guard — the real pin is the compositor introspection
+/// test (`quit_is_exposed_as_quit_with_no_arguments`): if the literals
+/// disagree, the logout call reaches no method and the session never ends.
+const QUIT_MEMBER: &str = "Quit";
+
 /// Spawn the signal worker. It seeds with `GetState`, then forwards every
 /// `org.icedtea.Compositor` signal as a [`CompositorUpdate`] until the bus drops.
 ///
@@ -159,6 +178,16 @@ pub trait CompositorCommands {
     fn focus_window(&self, id: u32);
     fn close_window(&self, id: u32);
     fn set_workspace(&self, id: u32);
+    /// Launch one allowlisted app by `.desktop` id via the compositor's
+    /// `SpawnApp` method. Returns the compositor's reply (`false` for an
+    /// unknown id, an unparseable `Exec`, a spawn failure, or a dead bus) --
+    /// never panics: this runs on the panel's loop thread.
+    fn spawn_app(&self, app_id: &str) -> bool;
+    /// End the session through the compositor's `Quit` path (the launcher
+    /// power row's log-out). Returns whether the call was issued: a dead
+    /// bus means the session is already going away (`false`), never a
+    /// panic on the panel's loop thread.
+    fn quit(&self) -> bool;
 }
 
 /// Issues `org.icedtea.Compositor` commands from the panel's loop thread.
@@ -205,6 +234,53 @@ impl CompositorCommands for CompositorProxy {
             &(id,),
         );
     }
+    // The logout path: `Quit` ends the session through the same
+    // `CompositorInterface` the other commands call into (see
+    // `compositor/src/dbus.rs`'s `quit`). The bool is whether the call
+    // was issued, so the launcher can tell a dead bus (already going
+    // away) from a delivered logout.
+    fn quit(&self) -> bool {
+        self.conn
+            .call_method(
+                Some(COMPOSITOR_BUS_NAME),
+                COMPOSITOR_PATH,
+                Some(COMPOSITOR_IFACE),
+                QUIT_MEMBER,
+                &(),
+            )
+            .is_ok()
+    }
+    // The wire member is `SpawnApp` (see `focus_window`'s comment), and
+    // unlike the fire-and-forget commands above this one reads the reply:
+    // every failure -- no bus, rejected call, bad body -- is `false`, never
+    // a panic on this foreign (panel loop) thread. Each collapse is logged
+    // with its kind first, so a silent `false` never hides which leg failed.
+    fn spawn_app(&self, app_id: &str) -> bool {
+        let msg = match self.conn.call_method(
+            Some(COMPOSITOR_BUS_NAME),
+            COMPOSITOR_PATH,
+            Some(COMPOSITOR_IFACE),
+            SPAWN_APP_MEMBER,
+            &(app_id,),
+        ) {
+            Ok(msg) => msg,
+            Err(err) => {
+                tracing::warn!(?err, app_id, "SpawnApp call failed; collapsing to false");
+                return false;
+            }
+        };
+        match msg.body().deserialize::<bool>() {
+            Ok(ok) => ok,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    app_id,
+                    "SpawnApp reply decode failed; collapsing to false"
+                );
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -227,5 +303,21 @@ mod tests {
         assert!(older.contains("v1") && older.contains("v2"), "{older}");
         let absent = version_mismatch(None, 2).expect("no property at all is a mismatch");
         assert!(absent.contains("Version"), "{absent}");
+    }
+
+    /// Pins the `SpawnApp` wire member the proxy calls: it must stay
+    /// identical to the member `compositor/src/dbus.rs` exposes (pinned on
+    /// that side by `spawn_app_is_exposed_as_spawn_app_with_string_in_bool_out`).
+    #[test]
+    fn spawn_app_member_matches_the_compositor_interface() {
+        assert_eq!(SPAWN_APP_MEMBER, "SpawnApp");
+    }
+
+    /// Pins the `Quit` wire member the logout path calls: it must stay
+    /// identical to the member `compositor/src/dbus.rs`'s `quit` exposes
+    /// (`fn quit` → `Quit`, the same zbus PascalCase rule as `SpawnApp`).
+    #[test]
+    fn quit_member_matches_the_compositor_interface() {
+        assert_eq!(QUIT_MEMBER, "Quit");
     }
 }

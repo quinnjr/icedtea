@@ -76,7 +76,11 @@ const KEPT_SUITES: &[(&str, usize)] = &[
     // fold arms).
     ("src/taskbar.rs", 8),
     ("src/clipboard.rs", 2),
-    ("src/compositor_client.rs", 1),
+    // B1: 1 -> 3 (Task 4 added `spawn_app_member_...` for the `SpawnApp`
+    // wire member, Task 6 added `quit_member_...` for the logout `Quit`
+    // member; the count was already 2 when Task 6 started — Task 4 had
+    // not recorded its addition).
+    ("src/compositor_client.rs", 3),
     ("tests/live_dbus.rs", 1),
 ];
 
@@ -231,6 +235,32 @@ fn every_shell_gate_the_contract_names_exists() {
     assert!(
         missing.is_empty(),
         "the contract names these shell gates and they do not exist: {missing:#?}"
+    );
+}
+
+/// Mutation check: delete the `spawn_app` call in
+/// `LauncherModel::launch` (`shell/src/launcher_view.rs`); this must fail
+/// naming it. Restore.
+///
+/// The e2e (`open_type_launch_reaches_the_compositor_and_records_recency`)
+/// claims deletion-testing for that call; this gate pins the claim to the
+/// source so a refactor that reroutes launching around `spawn_app` fails
+/// loudly instead of silently voiding the e2e's premise.
+#[test]
+fn launcher_launch_reaches_spawn_app() {
+    let source = std::fs::read_to_string(crate_dir().join("src/launcher_view.rs"))
+        .expect("read shell/src/launcher_view.rs");
+    let launch_at = source.find("fn launch(&mut self, id: &str)").expect(
+        "shell/src/launcher_view.rs still has LauncherModel::launch (the deletion-tested function)",
+    );
+    let body = &source[launch_at..];
+    let body = &body[..body
+        .find("\n    fn ")
+        .expect("launch has a following sibling")];
+    assert!(
+        body.contains("self.wm.spawn_app(id)"),
+        "LauncherModel::launch no longer calls spawn_app -- \
+         the launch e2e's deletion-tested claim is void"
     );
 }
 

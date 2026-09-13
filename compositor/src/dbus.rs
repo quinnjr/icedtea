@@ -62,6 +62,7 @@
 //!   setting the flag; the join is bounded by the `recv_timeout` tick
 //!   (200ms) it's waiting on, not by traffic on `events_rx`.
 
+use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,9 +72,16 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_PATH, Event, SeqEvent, Snapshot, WindowId};
 use zbus::blocking::Connection;
 use zbus::interface;
+use zbus::zvariant::OwnedValue;
 
 /// Commands sent from the D-Bus interface thread to the compositor's main
 /// loop. Applied to `State` by `State::handle_command`.
+///
+/// `#[non_exhaustive]` (review): this enum grows a variant every time the
+/// test harness needs a new oracle, and every consumer lives either in this
+/// crate (unaffected by the attribute) or in an integration-test crate that
+/// only *constructs* variants (still allowed) -- so a new variant can never
+/// be a silent-match bug downstream.
 ///
 /// The `Test-only` variants are an internal harness channel, not wire API:
 /// they are never exposed through `CompositorInterface` and remain subject
@@ -81,6 +89,7 @@ use zbus::interface;
 /// so downstream exhaustive matches should include a wildcard arm.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum DbCommand {
     Focus(WindowId),
     Close(WindowId),
@@ -92,6 +101,18 @@ pub enum DbCommand {
     ReloadConfig,
     Quit,
     GetState(Sender<Snapshot>),
+    /// Launch one allowlisted app by `.desktop` id (the B1 launcher path).
+    /// The compositor resolves `app_id` against its own index copy and
+    /// execs the entry's `Exec` via `parse_spawn_argv` + a direct
+    /// `Command::spawn` -- no argv ever crosses the bus (see
+    /// `State::apply_action`'s doc for why a raw spawn passthrough would be
+    /// a remote code-execution path). Replies `true` on a successful spawn,
+    /// `false` for an unknown id, an unparseable `Exec`, or a spawn failure.
+    /// Round-trip shape follows `GetState` above.
+    SpawnApp {
+        app_id: String,
+        reply: Sender<bool>,
+    },
     /// Test-only: synthesize a touch-down at `(x, y)` for touch point `id`
     /// via `wlr::Runtime::inject_touch_down`, replying with the grab serial
     /// it mints (`None` if there is no seat or no surface under the point).
@@ -424,6 +445,76 @@ impl CompositorInterface {
     }
 }
 
+/// Pure same-UID gate for the D-Bus sender-credential check below: a caller
+/// may drive `spawn_app`/`quit` only when its UID equals the compositor's
+/// own. Extracted as a pure function so the policy itself (`==`, nothing
+/// subtler) is unit-testable without a bus; the D-Bus plumbing around it is
+/// covered by the live tests.
+pub fn sender_uid_allowed(caller_uid: u32, compositor_uid: u32) -> bool {
+    caller_uid == compositor_uid
+}
+
+/// This process's own effective UID, parsed from `/proc/self/status`'s
+/// `Uid:` line (real, effective, saved, fs: the second field). Dependency-
+/// free (`rustix` here lacks the `process` feature and there is no `libc`
+/// dependency to call `getuid` through; `UnixStream::peer_cred` would be
+/// the same `SO_PEERCRED` source but is still unstable). The effective UID
+/// is exactly what the bus daemon observes via `SO_PEERCRED` and reports
+/// as `UnixUserID`, so the two sides of [`sender_uid_allowed`] are
+/// comparable.
+fn current_uid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().nth(1))
+        .and_then(|uid| uid.parse().ok())
+}
+
+/// Resolve one D-Bus sender's UID via
+/// `org.freedesktop.DBus.GetConnectionCredentials`. `None` on any failure
+/// (no bus, unknown name, missing `UnixUserID`) -- callers treat
+/// unresolvable as denied (fail-closed).
+///
+/// A fresh `Connection` per call, deliberately: issuing the lookup on the
+/// dispatch connection from inside its own method handler risks stalling
+/// that connection's executor, while a short-lived second connection only
+/// ever blocks this handler thread. These calls (`spawn_app`, `quit`) are
+/// rare enough that one extra connection setup each is negligible.
+fn caller_uid(sender: &str) -> Option<u32> {
+    let conn = Connection::session().ok()?;
+    let reply = conn
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionCredentials",
+            &(sender,),
+        )
+        .ok()?;
+    let creds: HashMap<String, OwnedValue> = reply.body().deserialize().ok()?;
+    creds.get("UnixUserID").and_then(|v| u32::try_from(v).ok())
+}
+
+/// Fail-closed gate shared by `spawn_app` and `quit`: allow only callers
+/// whose UID matches this process's own, so a bus-forwarded caller or any
+/// other user on the machine cannot launch programs or quit the compositor
+/// through this interface. `header` is a `#[zbus(header)]` injection -- not
+/// a wire argument, so the introspection XML (and the shell-side pin tests)
+/// is unchanged.
+fn caller_is_self(header: &zbus::message::Header<'_>) -> bool {
+    let (Some(sender), Some(own)) = (header.sender(), current_uid()) else {
+        tracing::warn!("denying D-Bus call with no sender or no own UID");
+        return false;
+    };
+    let sender = sender.as_str();
+    let allowed = caller_uid(sender).is_some_and(|uid| sender_uid_allowed(uid, own));
+    if !allowed {
+        tracing::warn!(sender, "denying D-Bus call from foreign-UID sender");
+    }
+    allowed
+}
+
 #[interface(name = "org.icedtea.Compositor")]
 impl CompositorInterface {
     fn focus_window(&self, id: u32) {
@@ -483,8 +574,32 @@ impl CompositorInterface {
     fn reload_config(&self) {
         self.send(DbCommand::ReloadConfig);
     }
-    fn quit(&self) {
+    fn quit(&self, #[zbus(header)] header: zbus::message::Header<'_>) {
+        if !caller_is_self(&header) {
+            return;
+        }
         self.send(DbCommand::Quit);
+    }
+    /// Launch one allowlisted app by id. Synchronous round-trip like
+    /// `get_state`: the main loop answers the moment it drains the
+    /// `SpawnApp` command (see `State::handle_command`), so this blocks the
+    /// zbus dispatch for this connection only as long as one loop iteration
+    /// plus the `spawn` itself takes. A dropped reply (loop gone) reads as
+    /// `false`; a loop that stays wedged past the 5s round-trip budget also
+    /// reads as `false` (timeout-means-false, never a panic, never a hang);
+    /// anything subtler still blocks only to that budget.
+    fn spawn_app(&self, app_id: String, #[zbus(header)] header: zbus::message::Header<'_>) -> bool {
+        if !caller_is_self(&header) {
+            return false;
+        }
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::SpawnApp {
+            app_id,
+            reply: reply_tx,
+        });
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or(false)
     }
 }
 
@@ -643,6 +758,86 @@ mod tests {
     use icedtea_contract::{
         AltTabState, Appearance, Rectangle, WindowInfo, WindowUpdate, WorkspaceInfo,
     };
+    use zbus::object_server::Interface as _;
+
+    /// Pins the wire contract the shell's `CompositorProxy::spawn_app`
+    /// calls into (pinned on that side by `compositor_client.rs`'s
+    /// `spawn_app_member_matches_the_compositor_interface`): member
+    /// `SpawnApp` taking one string and returning one bool. Generated from
+    /// the live interface object, not a repeated literal -- a method rename
+    /// or signature change fails here instead of degrading to a silent
+    /// no-method call (every launch reporting `false`) at runtime.
+    #[test]
+    fn spawn_app_is_exposed_as_spawn_app_with_string_in_bool_out() {
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let (_held, wake) =
+            std::os::unix::net::UnixStream::pair().expect("wake pair for interface probe");
+        let iface = CompositorInterface { cmd_tx, wake };
+        let mut xml = String::new();
+        iface.introspect_to_writer(&mut xml, 0);
+        let method = xml
+            .split("<method")
+            .find(|chunk| chunk.contains("name=\"SpawnApp\""))
+            .expect("SpawnApp member present in introspection XML: {xml}");
+        let body = &method[..method.find("</method>").unwrap_or(method.len())];
+        assert!(
+            body.contains("type=\"s\"") && body.contains("direction=\"in\""),
+            "SpawnApp takes one string in-arg: {body}"
+        );
+        assert!(
+            body.contains("type=\"b\"") && body.contains("direction=\"out\""),
+            "SpawnApp returns one bool out-arg: {body}"
+        );
+    }
+
+    /// Pins the wire member the shell's logout path calls into (pinned on
+    /// that side by `compositor_client.rs`'s
+    /// `quit_member_matches_the_compositor_interface`): member `Quit`
+    /// taking no arguments and returning none. Generated from the live
+    /// interface object, not a repeated literal — removing or renaming the
+    /// method fails here instead of degrading to a silent no-method call
+    /// (logout doing nothing) at runtime.
+    #[test]
+    fn quit_is_exposed_as_quit_with_no_arguments() {
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let (_held, wake) =
+            std::os::unix::net::UnixStream::pair().expect("wake pair for interface probe");
+        let iface = CompositorInterface { cmd_tx, wake };
+        let mut xml = String::new();
+        iface.introspect_to_writer(&mut xml, 0);
+        let method = xml
+            .split("<method")
+            .find(|chunk| chunk.contains("name=\"Quit\""))
+            .expect("Quit member present in introspection XML: {xml}");
+        let body = &method[..method.find("</method>").unwrap_or(method.len())];
+        assert!(
+            !body.contains("direction=\"in\"") && !body.contains("direction=\"out\""),
+            "Quit takes no arguments and returns nothing: {body}"
+        );
+    }
+
+    /// The sender-credential gate is a plain UID equality: same UID is
+    /// allowed, any other UID is not. The D-Bus plumbing around it
+    /// (`caller_uid`'s round trip) is covered by the live tests; this pins
+    /// the policy itself.
+    #[test]
+    fn sender_uid_gate_allows_only_the_same_uid() {
+        assert!(sender_uid_allowed(1000, 1000));
+        assert!(sender_uid_allowed(0, 0));
+        assert!(!sender_uid_allowed(1000, 1001));
+        assert!(!sender_uid_allowed(0, 1000));
+        // The process can always resolve its own UID from
+        // `/proc/self/status` -- a `None` here would fail-closed every
+        // local call, including the shell's.
+        assert!(
+            current_uid().is_some(),
+            "own UID must be resolvable or every same-user call denies itself"
+        );
+        // An unresolvable sender denies: no bus name can answer this, with
+        // or without a live session bus (no bus: `Connection::session()`
+        // fails; live bus: the daemon errors on the unknown name).
+        assert_eq!(caller_uid(":1.icedtea-nonexistent-sender"), None);
+    }
 
     #[test]
     fn event_names_match_interface() {

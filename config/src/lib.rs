@@ -38,10 +38,61 @@ pub struct Behavior {
     pub snap_enabled: bool,
 }
 
+/// Standard 1x1 tile span: the size a tile group gets when none was stored
+/// (pre-size configs) or newly created.
+pub fn default_tile_size() -> u32 {
+    1
+}
+
+/// One named tile group holding ordered app ids.
+///
+/// Mirrors `shell::launcher::TileGroup` (Task 1): the config crate cannot
+/// depend on the shell crate, so the shape is duplicated here for
+/// persistence and converted at the shell boundary (`config_ext.rs`).
+/// Keep the two shapes in sync when either changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TileGroup {
+    /// Group display name.
+    pub name: String,
+    /// Member app ids in tile order.
+    pub ids: Vec<String>,
+    /// Tile span in grid units (`1` = standard 1x1 tile).
+    #[serde(default = "default_tile_size")]
+    pub size: u32,
+}
+
+impl Default for TileGroup {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            ids: Vec::new(),
+            size: default_tile_size(),
+        }
+    }
+}
+
+/// Launcher stores persisted beside `appearance`: ordered pinned app ids,
+/// ordered tile groups, and launch-frequency/recency counts
+/// (app id → (launch count, last-seen seq), mirroring Task 1's
+/// `RecencyStore` map). `Default` (all empty) is what a pre-launcher
+/// config degrades to via `#[serde(default)]`.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LauncherConfig {
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    #[serde(default)]
+    pub tile_groups: Vec<TileGroup>,
+    #[serde(default)]
+    pub recency: HashMap<String, (u64, u64)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Config {
     pub keybindings: HashMap<String, KeyCombo>,
     pub appearance: Appearance,
+    #[serde(default)]
+    pub launcher: LauncherConfig,
     pub behavior: Behavior,
     pub workspace_names: Vec<String>,
     pub displays: Vec<DisplayConfig>,
@@ -308,6 +359,11 @@ fn read_config_from_db(db: Database) -> Config {
         {
             cfg.displays = displays;
         }
+        if let Ok(launcher_table) = read_txn.open_table(DB_LAUNCHER)
+            && let Some(launcher) = read_json::<LauncherConfig>(&launcher_table, KEY_LAUNCHER)
+        {
+            cfg.launcher = launcher;
+        }
         if let Ok(kb_table) = read_txn.open_table(DB_KEYBINDINGS)
             && read_json::<u64>(&kb_table, KEY_ACTION_COUNT).unwrap_or(0) > 0
         {
@@ -345,24 +401,46 @@ fn read_config_from_db(db: Database) -> Config {
 }
 
 impl Config {
+    /// Persist the whole config: every section table is rewritten from this
+    /// in-memory copy.
+    ///
+    /// Last-writer-wins: a caller holding a stale copy clobbers fresher rows
+    /// another writer persisted since (notably the launcher's
+    /// [`Config::save_launcher`] rows — a full `save` from a stale config
+    /// reverts fresh pins/recency; see
+    /// `full_save_with_stale_launcher_clobbers_fresh_rows` for the pinned
+    /// behavior). Prefer the scoped saves ([`Config::save_launcher`],
+    /// [`Config::save_displays`]) wherever the caller does not own every
+    /// section; the settings app is currently the only full-`save` caller
+    /// and owns all sections, but it is still racy against the launcher's
+    /// write-back, which is why this is documented as still-open.
     pub fn save(&self, db: &Database) -> Result<(), redb::Error> {
         let write_txn = db.begin_write()?;
         {
             let mut meta = write_txn.open_table(DB_META)?;
-            let version = serde_json::to_vec(&crate::SCHEMA_VERSION).unwrap();
+            let version =
+                serde_json::to_vec(&crate::SCHEMA_VERSION).map_err(std::io::Error::other)?;
             meta.insert(KEY_SCHEMA_VERSION, version.as_slice())?;
             let mut appearance = write_txn.open_table(DB_APPEARANCE)?;
-            let appearance_bytes = serde_json::to_vec(&self.appearance).unwrap();
+            let appearance_bytes =
+                serde_json::to_vec(&self.appearance).map_err(std::io::Error::other)?;
             appearance.insert(KEY_APPEARANCE, appearance_bytes.as_slice())?;
             let mut behavior = write_txn.open_table(DB_BEHAVIOR)?;
-            let behavior_bytes = serde_json::to_vec(&self.behavior).unwrap();
+            let behavior_bytes =
+                serde_json::to_vec(&self.behavior).map_err(std::io::Error::other)?;
             behavior.insert(KEY_BEHAVIOR, behavior_bytes.as_slice())?;
             let mut workspaces = write_txn.open_table(DB_WORKSPACES)?;
-            let workspace_bytes = serde_json::to_vec(&self.workspace_names).unwrap();
+            let workspace_bytes =
+                serde_json::to_vec(&self.workspace_names).map_err(std::io::Error::other)?;
             workspaces.insert(KEY_WORKSPACES, workspace_bytes.as_slice())?;
             let mut displays = write_txn.open_table(DB_DISPLAYS)?;
-            let displays_bytes = serde_json::to_vec(&self.displays).unwrap();
+            let displays_bytes =
+                serde_json::to_vec(&self.displays).map_err(std::io::Error::other)?;
             displays.insert(KEY_DISPLAYS, displays_bytes.as_slice())?;
+            let mut launcher = write_txn.open_table(DB_LAUNCHER)?;
+            let launcher_bytes =
+                serde_json::to_vec(&self.launcher).map_err(std::io::Error::other)?;
+            launcher.insert(KEY_LAUNCHER, launcher_bytes.as_slice())?;
             let mut keybindings = write_txn.open_table(DB_KEYBINDINGS)?;
             // Review finding #3: clear every existing row FIRST. `insert`
             // upserts, so without this a binding that was removed from
@@ -372,13 +450,41 @@ impl Config {
             // any user deletion. Wiping the table makes the write authoritative:
             // exactly the current set persists, nothing more.
             keybindings.retain(|_k, _v| false)?;
-            let count = serde_json::to_vec(&(self.keybindings.len() as u64)).unwrap();
+            let count = serde_json::to_vec(&(self.keybindings.len() as u64))
+                .map_err(std::io::Error::other)?;
             keybindings.insert(KEY_ACTION_COUNT, count.as_slice())?;
             for (action, combo) in &self.keybindings {
                 let key = format!("{KEY_ACTION}{action}");
-                let combo_bytes = serde_json::to_vec(combo).unwrap();
+                let combo_bytes = serde_json::to_vec(combo).map_err(std::io::Error::other)?;
                 keybindings.insert(key.as_str(), combo_bytes.as_slice())?;
             }
+        }
+        Ok(write_txn.commit()?)
+    }
+
+    /// Persist ONLY the launcher section, touching no other table (B1
+    /// launcher write-back). The shell is a *second* writer of the shared
+    /// config DB -- it saves on every launcher close -- but it must never
+    /// own the appearance/keybindings/workspaces/displays sections, which
+    /// the settings app and the compositor write. [`Config::save`]
+    /// rewrites the entire file and would clobber a concurrent edit to
+    /// those sections with this process's (possibly stale) in-memory copy.
+    /// This scoped save writes `DB_LAUNCHER` alone, so a pin or a recorded
+    /// launch can never revert an unrelated on-disk edit. It is the ONLY
+    /// save the launcher's persist path calls.
+    pub fn save_launcher(&self, db: &Database) -> Result<(), redb::Error> {
+        let write_txn = db.begin_write()?;
+        {
+            let mut launcher = write_txn.open_table(DB_LAUNCHER)?;
+            // No `unwrap`: unlike the main-thread saves above, this runs on
+            // the launcher's foreign write-back thread (`run_surface` →
+            // `persist_launcher_config`), where the crate's never-panic
+            // contract holds absolutely. Serialization of this section is
+            // infallible in practice (string-keyed maps, no floats), so the
+            // mapping below is unreachable hardening, not a live error path.
+            let launcher_bytes =
+                serde_json::to_vec(&self.launcher).map_err(std::io::Error::other)?;
+            launcher.insert(KEY_LAUNCHER, launcher_bytes.as_slice())?;
         }
         Ok(write_txn.commit()?)
     }
@@ -527,6 +633,16 @@ mod tests {
             },
         );
         seeded.displays = sample_displays();
+        seeded.launcher.pinned.push("firefox".to_string());
+        seeded.launcher.tile_groups.push(TileGroup {
+            name: "Web".to_string(),
+            ids: vec!["firefox".to_string()],
+            size: 2,
+        });
+        seeded
+            .launcher
+            .recency
+            .insert("firefox".to_string(), (3, 7));
         {
             let db = open(&path).unwrap();
             seeded.save(&db).unwrap();
@@ -561,6 +677,103 @@ mod tests {
         assert_eq!(loaded.appearance, seeded.appearance);
         assert_eq!(loaded.keybindings, seeded.keybindings);
         assert_eq!(loaded.behavior, seeded.behavior);
+        assert_eq!(loaded.launcher, seeded.launcher);
+    }
+
+    #[test]
+    fn save_launcher_round_trips_through_its_scoped_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let mut cfg = default_config();
+        cfg.launcher.pinned.push("firefox".to_string());
+        cfg.launcher.recency.insert("firefox".to_string(), (2, 5));
+        {
+            let db = open(&path).unwrap();
+            cfg.save_launcher(&db).unwrap();
+        }
+        let loaded = load_or_default(&path);
+        assert_eq!(loaded.launcher.pinned, vec!["firefox".to_string()]);
+        assert_eq!(loaded.launcher.recency.get("firefox"), Some(&(2, 5)));
+    }
+
+    #[test]
+    fn save_launcher_leaves_other_sections_intact() {
+        // The launcher's write-back persists its stores through this scoped
+        // save, which must NEVER touch appearance/behavior/workspaces/
+        // displays/keybindings (the same rule `save_displays` keeps for the
+        // compositor's scoped save).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        let mut seeded = default_config();
+        seeded.workspace_names = vec!["keepme".into()];
+        seeded.appearance.wallpaper = Some("/custom/wall.png".into());
+        {
+            let db = open(&path).unwrap();
+            seeded.save(&db).unwrap();
+        }
+
+        // A launcher-only view that agrees on nothing but its own section.
+        let mut launcher_view = default_config();
+        launcher_view.workspace_names = vec!["SHOULD_NOT_PERSIST".into()];
+        launcher_view.launcher.pinned.push("music".to_string());
+        {
+            let db = open(&path).unwrap();
+            launcher_view.save_launcher(&db).unwrap();
+        }
+
+        let loaded = load_or_default(&path);
+        assert_eq!(loaded.launcher.pinned, vec!["music".to_string()]);
+        assert_eq!(loaded.workspace_names, seeded.workspace_names);
+        assert_eq!(loaded.appearance, seeded.appearance);
+        assert_eq!(loaded.keybindings, seeded.keybindings);
+        assert_eq!(loaded.behavior, seeded.behavior);
+        assert_eq!(loaded.displays, seeded.displays);
+    }
+
+    #[test]
+    fn full_save_with_stale_launcher_clobbers_fresh_rows() {
+        // Mirror of `save_launcher_leaves_other_sections_intact`, in the
+        // other direction: a full `save` from a config that is stale in the
+        // launcher section reverts fresher launcher rows another writer
+        // persisted since. This pins the actual last-writer-wins behavior —
+        // making the stale full save merge instead would need restructuring
+        // (read-merge-write or per-section ownership everywhere), so this
+        // stays open and the scoped saves remain the mitigation.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        let mut seeded = default_config();
+        seeded.launcher.pinned.push("old-pin".to_string());
+        {
+            let db = open(&path).unwrap();
+            seeded.save(&db).unwrap();
+        }
+
+        // The launcher's write-back persists fresh rows through its scoped
+        // save (it never touches other sections).
+        let mut fresh = default_config();
+        fresh.launcher.pinned.push("fresh-pin".to_string());
+        {
+            let db = open(&path).unwrap();
+            fresh.save_launcher(&db).unwrap();
+        }
+        assert_eq!(
+            load_or_default(&path).launcher.pinned,
+            vec!["fresh-pin".to_string()]
+        );
+
+        // A stale full save (e.g. the settings app holding a pre-write
+        // in-memory copy) clobbers those fresh rows with its own.
+        {
+            let db = open(&path).unwrap();
+            seeded.save(&db).unwrap();
+        }
+        assert_eq!(
+            load_or_default(&path).launcher.pinned,
+            vec!["old-pin".to_string()],
+            "full save is last-writer-wins: still open, use scoped saves"
+        );
     }
 
     #[test]
@@ -628,6 +841,101 @@ mod tests {
         // And `load_or_default` (the fresh-boot wrapper) still degrades to
         // defaults on that same lock, as documented.
         assert_eq!(load_or_default(&path), default_config());
+    }
+
+    #[test]
+    fn default_launcher_stores_are_empty() {
+        let cfg = default_config();
+        assert!(cfg.launcher.pinned.is_empty());
+        assert!(cfg.launcher.tile_groups.is_empty());
+        assert!(cfg.launcher.recency.is_empty());
+    }
+
+    #[test]
+    fn launcher_config_serde_round_trip() {
+        let mut cfg = default_config();
+        cfg.launcher.pinned.push("firefox".to_string());
+        cfg.launcher.tile_groups.push(TileGroup {
+            name: "Web".to_string(),
+            ids: vec!["firefox".to_string()],
+            size: 2,
+        });
+        cfg.launcher.recency.insert("firefox".to_string(), (3, 7));
+        let bytes = serde_json::to_vec(&cfg).unwrap();
+        let back: Config = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_launcher() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let mut cfg = default_config();
+        cfg.launcher.pinned.push("firefox".to_string());
+        cfg.launcher.tile_groups.push(TileGroup {
+            name: "Web".to_string(),
+            ids: vec!["firefox".to_string()],
+            size: 2,
+        });
+        cfg.launcher.recency.insert("firefox".to_string(), (3, 7));
+        {
+            let db = open(&path).unwrap();
+            cfg.save(&db).unwrap();
+        }
+        let loaded = load_or_default(&path);
+        assert_eq!(loaded.launcher.pinned, vec!["firefox".to_string()]);
+        assert_eq!(loaded.launcher.tile_groups.len(), 1);
+        assert_eq!(loaded.launcher.tile_groups[0].name, "Web");
+        assert_eq!(
+            loaded.launcher.tile_groups[0].ids,
+            vec!["firefox".to_string()]
+        );
+        assert_eq!(loaded.launcher.tile_groups[0].size, 2);
+        assert_eq!(loaded.launcher.recency.get("firefox"), Some(&(3, 7)));
+    }
+
+    #[test]
+    fn missing_launcher_table_loads_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let db = open(&path).unwrap();
+        {
+            // Write an "old-format" DB that never touched DB_LAUNCHER,
+            // simulating a file saved before this section existed.
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(DB_APPEARANCE).unwrap();
+                let bytes = serde_json::to_vec(&default_config().appearance).unwrap();
+                table.insert(KEY_APPEARANCE, bytes.as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        drop(db);
+        let cfg = load_or_default(&path);
+        assert!(cfg.launcher.pinned.is_empty());
+        assert!(cfg.launcher.tile_groups.is_empty());
+        assert!(cfg.launcher.recency.is_empty());
+    }
+
+    #[test]
+    fn tile_group_missing_size_deserializes_to_default() {
+        // Tile groups saved before the size field existed must still parse,
+        // degrading to the standard 1x1 tile size.
+        let group: TileGroup =
+            serde_json::from_value(serde_json::json!({"name": "Web", "ids": ["firefox"]})).unwrap();
+        assert_eq!(group.size, default_tile_size());
+    }
+
+    #[test]
+    fn missing_launcher_field_deserializes_to_empty() {
+        // Config JSON saved before the launcher field existed must still
+        // parse, degrading the launcher stores to empty.
+        let mut value = serde_json::to_value(default_config()).unwrap();
+        value.as_object_mut().unwrap().remove("launcher");
+        let back: Config = serde_json::from_value(value).unwrap();
+        assert!(back.launcher.pinned.is_empty());
+        assert!(back.launcher.tile_groups.is_empty());
+        assert!(back.launcher.recency.is_empty());
     }
 
     #[test]

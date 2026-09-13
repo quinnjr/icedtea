@@ -1223,6 +1223,7 @@ dependencies = [
  "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
+ "icedtea-shell",
  "image",
  "rustix 1.1.4",
  "signal-hook",
@@ -1320,12 +1321,14 @@ dependencies = [
  "crossbeam-channel",
  "futures-util",
  "icedtea-clipboard",
+ "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
  "icedtea-ui",
  "tracing",
  "tracing-subscriber",
  "wayland-protocols-wlr",
+ "xkbcommon 0.9.0",
  "zbus",
 ]
 

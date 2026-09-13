@@ -480,6 +480,7 @@ fn panel_paints_every_probe_point_at_rest(theme: Theme) {
     ))));
     for id in [
         "bar",
+        "start",
         "workspaces",
         "windows",
         "clip",
@@ -645,5 +646,61 @@ fn a_focused_window_button_looks_different_from_an_unfocused_one() {
     assert!(
         !support::same(after, before),
         "the `focused` class must change what the button paints: {before:?} -> {after:?}"
+    );
+}
+
+/// B1 Task 3: `spec()` honors `Appearance.bar_position` — a bottom config
+/// anchors Left+Right+Bottom (never Top), a top config anchors
+/// Left+Right+Top (never Bottom), and the exclusive zone is the identical
+/// `BAR_HEIGHT` either way (only the anchored edge changes).
+#[test]
+fn spec_anchors_the_configured_edge_with_an_identical_exclusive_zone() {
+    use icedtea_ui::window::Role;
+    use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+
+    fn anchor_and_zone(bar_position: &str) -> (Anchor, i32) {
+        match &panel::spec(bar_position).role {
+            Role::Layer(layer) => (layer.anchor, layer.exclusive_zone),
+            role => panic!("the panel must stay a layer surface, got {role:?}"),
+        }
+    }
+
+    let (bottom_anchor, bottom_zone) = anchor_and_zone("bottom");
+    assert!(
+        bottom_anchor.contains(Anchor::Bottom),
+        "a bottom bar anchors the bottom edge"
+    );
+    assert!(
+        !bottom_anchor.contains(Anchor::Top),
+        "a bottom bar must not also anchor the top edge"
+    );
+    assert!(
+        bottom_anchor.contains(Anchor::Left) && bottom_anchor.contains(Anchor::Right),
+        "a bottom bar still spans the output: {bottom_anchor:?}"
+    );
+
+    let (top_anchor, top_zone) = anchor_and_zone("top");
+    assert!(
+        top_anchor.contains(Anchor::Top),
+        "a top bar anchors the top edge"
+    );
+    assert!(
+        !top_anchor.contains(Anchor::Bottom),
+        "a top bar must not also anchor the bottom edge"
+    );
+    assert!(
+        top_anchor.contains(Anchor::Left) && top_anchor.contains(Anchor::Right),
+        "a top bar still spans the output: {top_anchor:?}"
+    );
+
+    assert_eq!(
+        bottom_zone,
+        panel::BAR_HEIGHT,
+        "the exclusive zone is BAR_HEIGHT on a bottom bar"
+    );
+    assert_eq!(
+        top_zone,
+        panel::BAR_HEIGHT,
+        "the exclusive zone is the identical BAR_HEIGHT on a top bar"
     );
 }

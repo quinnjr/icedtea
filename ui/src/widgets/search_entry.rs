@@ -84,6 +84,17 @@ impl<Msg: Clone + 'static> Controller<Msg> for SearchEntryC {
 
     fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {
         node.add_class("search");
+        // P3's focus ring only walks nodes carrying `FOCUSABLE_CLASS`, and
+        // this controller predates the `Universal` helper that seeds it
+        // from `Kind::is_focusable_by_default` (true for `SearchEntry`) —
+        // so without this line no search entry is ever a Tab stop and the
+        // B1 launcher's open-time focus landing (`App::route`'s
+        // `KeyboardEnter`-when-empty arm) walks straight past the search
+        // box to the first button. The sibling text-entry controllers
+        // (`EntryC`, `PasswordEntryC`, `TextViewC`) have the same gap;
+        // they are left untouched on purpose (out of scope — widening Tab
+        // order toolkit-wide is a separate change with its own gates).
+        node.add_class(crate::window::focus::FOCUSABLE_CLASS);
         SearchEntryC {
             edit: TextEditState::build(node, props.str(PropName::Text).unwrap_or(""), cx),
             delay_ms: u32::try_from(
@@ -257,6 +268,29 @@ mod tests {
             Headless::new(),
             build_widget::<String>(Kind::SearchEntry, &props),
         )
+    }
+
+    #[test]
+    fn all_entry_family_widgets_are_tab_stops() {
+        // The focus ring only walks nodes carrying `FOCUSABLE_CLASS`: every
+        // text-entry kind must seed it at build, or Tab (and the C4
+        // open-time focus landing) walks straight past it.
+        for kind in [
+            Kind::Entry,
+            Kind::SearchEntry,
+            Kind::PasswordEntry,
+            Kind::TextView,
+        ] {
+            let built = build_widget::<String>(kind, &Props::default());
+            assert!(
+                built
+                    .node
+                    .classes()
+                    .iter()
+                    .any(|c| c.as_str() == crate::window::focus::FOCUSABLE_CLASS),
+                "{kind:?} must carry FOCUSABLE_CLASS to be a Tab stop"
+            );
+        }
     }
 
     #[test]

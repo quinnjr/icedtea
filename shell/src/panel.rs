@@ -36,29 +36,48 @@ pub const BAR_HEIGHT: i32 = 28;
 /// The clipboard popover's surface size.
 pub const POPOVER_SIZE: (u32, u32) = (320, 280);
 
-/// The panel's surface: anchored left/right/top, `Layer::Top`, no keyboard.
+/// Where the bar anchors: the parsed form of `Appearance.bar_position`.
+/// Parsed once at the config boundary (`main.rs`) instead of re-matched on
+/// every `spec` call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarPosition {
+    Top,
+    Bottom,
+}
+
+impl From<&str> for BarPosition {
+    /// `"top"` → `Top`; anything else (including `"bottom"`) → `Bottom`.
+    /// Silent by design: the caller warns on unrecognized values (the binary
+    /// does at its parse site, [`spec`] does on its `&str` path), so the
+    /// fallback is always diagnosed exactly once.
+    fn from(value: &str) -> Self {
+        if value == "top" {
+            Self::Top
+        } else {
+            Self::Bottom
+        }
+    }
+}
+
+/// The panel's surface: anchored left/right plus the configured edge,
+/// `Layer::Top`, no keyboard.
 ///
-/// Every value is the layer-shell call it replaces. Anchored **top**, not
-/// bottom: the source comment stands — a bottom bar lands below the visible
-/// area on a display whose viewport is shorter than the reported output (a VM
-/// console). `keyboard: None` matches GTK4 layer-shell's unset default; the
-/// panel takes no keyboard focus. The popover's search field is a toolkit
-/// `SearchEntry` (M6.1 Spec 2), so it joins the entry-family IME sessions
-/// whenever it takes focus. `exclusive_zone` is the literal `BAR_HEIGHT` because `LayerSpec`
-/// has no "auto" (contract §6 P5-D6). The initial size is `(800, 28)`, the
-/// pair `set_default_size(800, 28)` + `set_size_request(-1, 28)` forced: a
-/// 0-height layer surface never commits a real buffer.
-///
-/// Public and in the library (P5 Task 12) so the integration harness drives
-/// exactly the surface the binary opens, not a copy that can drift.
+/// The parsed core behind [`spec`]: every value is the layer-shell call it
+/// replaces (see `spec`'s doc for the full contract). Prefer this wherever
+/// the position is already parsed; [`spec`] is the `&str` compatibility
+/// path.
 #[must_use]
-pub fn spec() -> SurfaceSpec {
+pub fn spec_for(position: BarPosition) -> SurfaceSpec {
+    let edge = match position {
+        BarPosition::Top => zwlr_layer_surface_v1::Anchor::Top,
+        BarPosition::Bottom => zwlr_layer_surface_v1::Anchor::Bottom,
+    };
     SurfaceSpec {
         role: Role::Layer(LayerSpec {
             layer: zwlr_layer_shell_v1::Layer::Top,
             anchor: zwlr_layer_surface_v1::Anchor::Left
                 | zwlr_layer_surface_v1::Anchor::Right
-                | zwlr_layer_surface_v1::Anchor::Top,
+                | edge,
             margin: [0, 0, 0, 0],
             exclusive_zone: BAR_HEIGHT,
             keyboard: zwlr_layer_surface_v1::KeyboardInteractivity::None,
@@ -72,6 +91,40 @@ pub fn spec() -> SurfaceSpec {
         title: "icedtea-shell".to_string(),
         app_id: "org.icedtea.Shell".to_string(),
     }
+}
+
+/// The panel's surface from the raw `Appearance.bar_position` string.
+///
+/// The `&str` compatibility path over [`spec_for`]: `"top"` anchors
+/// Left+Right+Top, `"bottom"` anchors Left+Right+Bottom. The settings UI
+/// restricts the value to that domain, but the contract type is a plain
+/// `String`: anything unrecognized warns and falls back to `"bottom"`, the
+/// config default (`config/src/defaults.rs`), so a hand-edited value can
+/// never produce an unanchored (floating) surface.
+///
+/// Public and in the library (P5 Task 12) so the integration harness drives
+/// exactly the surface the binary opens, not a copy that can drift.
+/// Prefer [`spec_for`] with an already-parsed [`BarPosition`] in new code.
+#[must_use]
+pub fn spec(bar_position: &str) -> SurfaceSpec {
+    if bar_position != "top" && bar_position != "bottom" {
+        tracing::warn!(
+            value = bar_position,
+            "unrecognized bar_position, falling back to bottom"
+        );
+    }
+    spec_for(BarPosition::from(bar_position))
+}
+
+/// The panel's surface at the default edge.
+///
+/// Deprecated: prefer an explicit `spec("bottom")` (or
+/// `spec_for(BarPosition::Bottom)`) so the edge choice stays visible at the
+/// call site. Kept only for callers written before the position became a
+/// parameter.
+#[must_use]
+pub fn default_spec() -> SurfaceSpec {
+    spec("bottom")
 }
 
 pub struct PanelModel {
@@ -139,6 +192,16 @@ pub struct PanelModel {
     /// `None` when no keyboard is tracked. `view` renders the `#layout`
     /// label from it, or nothing at all while `None`.
     pub keyboard_layout: Option<String>,
+    /// Whether the launcher is open, toggled by the Start button (B1 Task 3).
+    /// Folded in `update`'s `Msg::StartClicked` arm; `view` marks `#start`
+    /// `active` from it. Task 5 opens the launcher surface itself off this bit.
+    pub launcher_open: bool,
+    /// The launcher supervisor thread's control channel (B1 Task 5): the
+    /// second surface lives on its own thread with its own `App`, and this
+    /// is how the toggle reaches it. `None` wherever no supervisor runs
+    /// (unit tests, the panel-only integration harness) — the bit still
+    /// folds, only the surface boot is skipped.
+    pub launcher_ctl: Option<std::sync::mpsc::Sender<bool>>,
 }
 
 impl PanelModel {
@@ -157,20 +220,24 @@ impl PanelModel {
             clip_query: String::new(),
             clip_query_cell: Rc::new(RefCell::new(String::new())),
             // `spec()`'s own initial size, the same width the surface opens
-            // with before its first real configure arrives.
+            // with before its first real configure arrives. The size is
+            // edge-independent, so the position argument is arbitrary here.
             #[allow(
                 clippy::cast_possible_wrap,
                 reason = "spec()'s initial width is a small literal constant"
             )]
-            bar_width: spec().size.0 as i32,
+            bar_width: spec("bottom").size.0 as i32,
             ime_active: false,
             shortcuts_inhibited: false,
             keyboard_layout: None,
+            launcher_open: false,
+            launcher_ctl: None,
         }
     }
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Msg {
     /// One compositor update, from the inbox. `Arc`, not `Rc`: `Msg` is `Send`.
     Compositor(Arc<CompositorUpdate>),
@@ -192,6 +259,13 @@ pub enum Msg {
     },
 
     ClipButtonClicked,
+    /// The Start button was clicked (B1 Task 3): `update` toggles
+    /// `launcher_open`. Task 5 opens the launcher surface itself off that bit.
+    StartClicked,
+    /// The launcher surface closed itself (B1 Task 5: Escape, successful
+    /// launch), reported back by the supervisor thread through
+    /// the panel inbox. Clears `launcher_open` so `#start` drops `active`.
+    LauncherClosed,
     PopoverOpened(PopupKey),
     PopoverDismissed(PopupKey),
     ClipActivated(u64),
@@ -232,6 +306,14 @@ impl CompositorCommands for Offline {
     }
     fn set_workspace(&self, id: u32) {
         tracing::warn!(id, "no session bus; set_workspace dropped");
+    }
+    fn spawn_app(&self, app_id: &str) -> bool {
+        tracing::warn!(app_id, "no session bus; spawn_app dropped");
+        false
+    }
+    fn quit(&self) -> bool {
+        tracing::warn!("no session bus; quit dropped");
+        false
     }
 }
 
@@ -291,6 +373,24 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
             Cmd::Task(Rc::new(move || wm.close_window(id)))
         }
         Msg::WindowPointerUp { .. } => Cmd::None,
+        Msg::StartClicked => {
+            m.launcher_open = !m.launcher_open;
+            // Report the new state to the supervisor thread that owns the
+            // launcher surface (B1 Task 5). `None` means no supervisor runs
+            // — the bit still folds, only the surface boot is skipped. A
+            // dead receiver means the supervisor thread died; the menu
+            // simply never opens, and the warning is the diagnosis.
+            if let Some(tx) = &m.launcher_ctl
+                && tx.send(m.launcher_open).is_err()
+            {
+                tracing::warn!("the launcher supervisor is gone; Start does nothing");
+            }
+            Cmd::None
+        }
+        Msg::LauncherClosed => {
+            m.launcher_open = false;
+            Cmd::None
+        }
         Msg::ClipButtonClicked => match m.open_popover {
             Some(key) => {
                 // An app-initiated close: `Cmd::ClosePopup` tears the surface
@@ -379,16 +479,18 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
 
 /// The whole bar. `#bar` is what `style.css`'s first selector names.
 ///
-/// The input indicators sit between the windows and the clip button while
-/// active, and render nothing at all while inactive -- so the bar's children
-/// stay exactly `workspaces, windows, clip` when none shows (contract
-/// §3.3's order, pinned by `the_bar_holds_...`).
+/// The Start button leads unconditionally, then contract §3.3's order
+/// (workspaces, windows, clip). The input indicators sit between the windows
+/// and the clip button while active, and render nothing at all while
+/// inactive -- so the bar's children stay exactly
+/// `start, workspaces, windows, clip` when none shows (contract §3.3's order,
+/// pinned by `the_bar_holds_...`, led by the Start button).
 pub fn view(m: &PanelModel) -> View<Msg> {
     // M7: the touch indicator sits between the windows and the clip
     // button when (and only when) a touch point is down. Conditional, not
     // always-present-but-dim: an indicator for a state that is almost
     // always off should take no layout space while off.
-    let mut children = vec![workspaces(m), windows(m)];
+    let mut children = vec![start_button(m), workspaces(m), windows(m)];
     if let Some(indicator) = ime_indicator(m) {
         children.push(indicator);
     }
@@ -408,6 +510,22 @@ pub fn view(m: &PanelModel) -> View<Msg> {
         // the one mechanism that actually reaches taffy for a plain box's
         // centred, non-`ChildLayout` child.
         .width_request(m.bar_width)
+}
+
+/// The launcher's toggle at the bar's left end (B1 Task 3). `active` while
+/// the launcher is open, the same class `#workspaces button.active` uses
+/// for the same "this is the one" meaning. Task 5 opens the launcher
+/// surface itself off `launcher_open`; this button only folds the bit.
+fn start_button(m: &PanelModel) -> View<Msg> {
+    let view = button("start")
+        .id("start")
+        .class("start")
+        .on_click(Msg::StartClicked);
+    if m.launcher_open {
+        view.class("active")
+    } else {
+        view
+    }
 }
 
 /// M7: the touch-activity indicator. Present only while a touch point is
@@ -780,9 +898,16 @@ mod tests {
     /// A recording `CompositorCommands`. `RefCell`, not `Mutex`: these unit
     /// tests are single-threaded, and so is `update`. The cross-thread mock
     /// the harness tests need lives in `shell/tests/support/mod.rs`.
+    ///
+    /// One of four `MockWm`s (the others: `shell/tests/support/mod.rs`,
+    /// `shell/tests/launcher.rs`, `shell/src/launcher_view.rs`'s unit
+    /// tests — threading genuinely differs, so no structural unification).
+    /// Each must implement every [`CompositorCommands`] method:
+    /// `focus_window`, `close_window`, `set_workspace`, `spawn_app`, `quit`.
     #[derive(Default)]
     pub(crate) struct MockWm {
         pub(crate) calls: RefCell<Vec<(String, u32)>>,
+        pub(crate) spawns: RefCell<Vec<String>>,
     }
 
     impl CompositorCommands for MockWm {
@@ -794,6 +919,14 @@ mod tests {
         }
         fn set_workspace(&self, id: u32) {
             self.calls.borrow_mut().push(("workspace".into(), id));
+        }
+        fn spawn_app(&self, app_id: &str) -> bool {
+            self.spawns.borrow_mut().push(app_id.to_string());
+            true
+        }
+        fn quit(&self) -> bool {
+            self.calls.borrow_mut().push(("quit".into(), 0));
+            true
         }
     }
 
@@ -956,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_holds_workspaces_windows_and_the_clip_button() {
+    fn the_bar_holds_start_workspaces_windows_and_the_clip_button() {
         let (m, _, _) = seeded();
         let v = view(&m);
         assert_eq!(v.props.str(PropName::Id), Some("bar"));
@@ -967,8 +1100,13 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec![Some("workspaces"), Some("windows"), Some("clip")],
-            "contract §3.3's order: workspaces, windows, clip (no touch down, no indicator)"
+            vec![
+                Some("start"),
+                Some("workspaces"),
+                Some("windows"),
+                Some("clip")
+            ],
+            "the Start button leads, then contract §3.3's order: workspaces, windows, clip (no touch down, no indicator)"
         );
     }
 
@@ -1007,6 +1145,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                Some("start"),
                 Some("workspaces"),
                 Some("windows"),
                 Some("touch"),
@@ -1568,7 +1707,12 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec![Some("workspaces"), Some("windows"), Some("clip")],
+            vec![
+                Some("start"),
+                Some("workspaces"),
+                Some("windows"),
+                Some("clip")
+            ],
             "contract §3.3's order is unchanged while no indicator shows"
         );
     }
@@ -1592,7 +1736,12 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec![Some("workspaces"), Some("windows"), Some("clip")],
+            vec![
+                Some("start"),
+                Some("workspaces"),
+                Some("windows"),
+                Some("clip")
+            ],
             "contract §3.3's order is unchanged while no IME is active"
         );
     }
@@ -1622,6 +1771,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                Some("start"),
                 Some("workspaces"),
                 Some("windows"),
                 Some("inhibit"),
@@ -1656,6 +1806,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                Some("start"),
                 Some("workspaces"),
                 Some("windows"),
                 Some("layout"),
@@ -1725,5 +1876,121 @@ mod tests {
             by_id(&view(&m), "ime").is_none(),
             "deactivate must remove the indicator again"
         );
+    }
+
+    /// B1 Task 3 (RED): the Start button is the bar's first child — the
+    /// launcher toggle at the bar's left end — carrying the `start` id and
+    /// the `.start` class.
+    #[test]
+    fn the_start_button_is_the_first_child_of_the_bar() {
+        let (m, _, _) = seeded();
+        let v = view(&m);
+        let ids: Vec<Option<&str>> = v
+            .children
+            .iter()
+            .map(|c| c.props.str(PropName::Id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                Some("start"),
+                Some("workspaces"),
+                Some("windows"),
+                Some("clip")
+            ],
+            "the Start button leads the bar, ahead of contract §3.3's order"
+        );
+        let start = by_id(&v, "start").expect("the Start button");
+        assert_eq!(start.props.str(PropName::Label), Some("start"));
+        let classes = match start.props.get(PropName::Classes) {
+            Some(icedtea_ui::view::Prop::Classes(list)) => {
+                list.iter().map(|c| c.to_string()).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+        assert!(classes.contains(&"start".to_string()));
+    }
+
+    /// B1 Task 3 (RED): clicking Start emits the launcher toggle, and the
+    /// fold flips `launcher_open` each time — open, then shut again.
+    #[test]
+    fn clicking_start_toggles_the_launcher_open_state() {
+        let (m, _, _) = seeded();
+        let v = view(&m);
+        let msg = by_id(&v, "start")
+            .expect("start")
+            .handlers
+            .fire_unit(EventKind::Click)
+            .expect("a click handler");
+        assert!(matches!(msg, Msg::StartClicked));
+        let mut m = m;
+        assert!(!m.launcher_open, "the launcher starts closed");
+        let _ = update(&mut m, msg);
+        assert!(m.launcher_open, "one click opens it");
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(!m.launcher_open, "a second click shuts it again");
+    }
+
+    /// B1 Task 3 (RED): the Start button marks itself `active` while the
+    /// launcher is open — the same class `#workspaces button.active` uses
+    /// for the same "this is the one" meaning — and drops it on close.
+    #[test]
+    fn the_start_button_marks_itself_active_while_the_launcher_is_open() {
+        let (mut m, _, _) = seeded();
+        let classes = |m: &PanelModel| -> Vec<String> {
+            match by_id(&view(m), "start")
+                .expect("start")
+                .props
+                .get(PropName::Classes)
+            {
+                Some(icedtea_ui::view::Prop::Classes(list)) => {
+                    list.iter().map(|c| c.to_string()).collect()
+                }
+                _ => Vec::new(),
+            }
+        };
+        assert!(!classes(&m).contains(&"active".to_string()));
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(classes(&m).contains(&"active".to_string()));
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(!classes(&m).contains(&"active".to_string()));
+    }
+
+    /// B1 Task 5 (RED): the toggle reports its new state to the launcher
+    /// supervisor thread, which owns the second surface. The bit folds
+    /// first; the channel carries the outcome.
+    #[test]
+    fn start_click_reports_the_new_state_to_the_launcher_supervisor() {
+        let (mut m, _, _) = panel();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        m.launcher_ctl = Some(tx);
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(m.launcher_open);
+        assert_eq!(rx.try_recv(), Ok(true));
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(!m.launcher_open);
+        assert_eq!(rx.try_recv(), Ok(false));
+    }
+
+    /// B1 Task 5 (RED): without a supervisor (the integration harness, unit
+    /// tests) the toggle only folds the bit — no channel, no panic.
+    #[test]
+    fn start_click_without_a_supervisor_only_folds_the_bit() {
+        let (mut m, _, _) = panel();
+        assert!(m.launcher_ctl.is_none());
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(m.launcher_open);
+    }
+
+    /// B1 Task 5 (RED): the launcher's own close paths (Escape, launch)
+    /// report back through `LauncherClosed`, clearing the bit
+    /// the Start button's `active` class reads.
+    #[test]
+    fn the_launcher_close_notification_clears_the_open_bit() {
+        let (mut m, _, _) = panel();
+        let _ = update(&mut m, Msg::StartClicked);
+        assert!(m.launcher_open);
+        let _ = update(&mut m, Msg::LauncherClosed);
+        assert!(!m.launcher_open);
     }
 }

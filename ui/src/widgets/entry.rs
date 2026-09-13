@@ -21,7 +21,7 @@ use crate::view::controller::{Controller, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{EditOutcome, TextEditState, UndoStack};
 use crate::widgets::{PointerState, content_rect_local, local_rect, shift_event};
-use crate::window::focus::FocusCause;
+use crate::window::focus::{FOCUSABLE_CLASS, FocusCause};
 use crate::window::keyboard::Mods;
 use crate::window::popup::PopupKey;
 
@@ -148,6 +148,10 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
     }
 
     fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {
+        // The focus ring only walks nodes carrying `FOCUSABLE_CLASS`
+        // (mirrors `SearchEntryC::build`); without this no entry is ever a
+        // Tab stop.
+        node.add_class(FOCUSABLE_CLASS);
         let mut edit = TextEditState::build(node, props.str(PropName::Text).unwrap_or(""), cx);
         edit.visibility = props.bool(PropName::Visibility, true);
         edit.max_length = match props.int(PropName::MaxLength, 0) {

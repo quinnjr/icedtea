@@ -74,6 +74,11 @@ signal-hook = "0.3"
 # tests/support). `client_protocol.rs` drives it; the clipboard/shell crates
 # reuse the same harness in their own tests.
 icedtea-harness = { path = "../harness" }
+# Test-only, for `tests/launcher_parity.rs`'s cross-crate drift pin: the
+# compositor keeps its own `.desktop` parse copy (see `state.rs`'s
+# `parse_desktop_exec`), and the parity test feeds both sides the same
+# inputs. No cycle: the shell crate never depends on the compositor.
+icedtea-shell = { path = "../shell" }
 
 # The client half of `tests/support`: a real wayland client that speaks
 # xdg-shell to the compositor under test over a real socket. Dev-only --

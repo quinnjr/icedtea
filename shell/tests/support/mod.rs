@@ -40,21 +40,50 @@ const POLL: Duration = Duration::from_millis(50);
 ///
 /// `Arc<Mutex<_>>`, unlike `panel.rs`'s unit-test mock: the panel runs on its
 /// own thread here and the assertions read from the test's.
+///
+/// One of four `MockWm`s (the others: `shell/tests/launcher.rs`,
+/// `shell/src/launcher_view.rs`'s unit tests, `shell/src/panel.rs`'s unit
+/// tests — threading genuinely differs, so no structural unification).
+/// Each must implement every `CompositorCommands` method: `focus_window`,
+/// `close_window`, `set_workspace`, `spawn_app`, `quit`.
 #[derive(Clone, Default)]
-pub struct MockWm(pub Arc<Mutex<Vec<(String, u32)>>>);
+pub struct MockWm {
+    pub calls: Arc<Mutex<Vec<(String, u32)>>>,
+    pub spawns: Arc<Mutex<Vec<String>>>,
+}
 
 impl CompositorCommands for MockWm {
     fn focus_window(&self, id: u32) {
-        self.0.lock().expect("wm calls").push(("focus".into(), id));
+        self.calls
+            .lock()
+            .expect("wm calls")
+            .push(("focus".into(), id));
     }
     fn close_window(&self, id: u32) {
-        self.0.lock().expect("wm calls").push(("close".into(), id));
+        self.calls
+            .lock()
+            .expect("wm calls")
+            .push(("close".into(), id));
     }
     fn set_workspace(&self, id: u32) {
-        self.0
+        self.calls
             .lock()
             .expect("wm calls")
             .push(("workspace".into(), id));
+    }
+    fn spawn_app(&self, app_id: &str) -> bool {
+        self.spawns
+            .lock()
+            .expect("wm spawn calls")
+            .push(app_id.to_string());
+        true
+    }
+    fn quit(&self) -> bool {
+        self.calls
+            .lock()
+            .expect("wm calls")
+            .push(("quit".into(), 0));
+        true
     }
 }
 
@@ -179,7 +208,12 @@ impl Panel {
         let panel_thread = std::thread::spawn(move || {
             let window = match icedtea_ui::window::Window::open_at_path(
                 &socket_path,
-                panel::spec(),
+                // Top-anchored, not the config default: `Panel::point` reads
+                // window coordinates as output coordinates with no offset
+                // arithmetic, which holds only when the surface origin is the
+                // output origin. The bottom-anchored production path is pinned
+                // by `spec_anchors_the_configured_edge_...` instead.
+                panel::spec("top"),
                 style::sheet_for(theme),
                 FontDatabase::new(),
             ) {
@@ -291,7 +325,13 @@ impl Panel {
 
     #[must_use]
     pub fn wm_calls(&self) -> Vec<(String, u32)> {
-        self.wm.0.lock().expect("wm calls").clone()
+        self.wm.calls.lock().expect("wm calls").clone()
+    }
+
+    /// App ids recorded via `CompositorCommands::spawn_app`.
+    #[must_use]
+    pub fn spawn_calls(&self) -> Vec<String> {
+        self.wm.spawns.lock().expect("wm spawn calls").clone()
     }
 
     #[must_use]
@@ -579,12 +619,21 @@ impl Panel {
     /// cursor is not synchronous with the `motion_absolute` that triggers it,
     /// and `wlr_seat_pointer_notify_button` drops a button with no focused
     /// surface silently.
+    ///
+    /// 600ms, not 200ms: on a loaded dev box (software rendering, ~250ms
+    /// panel frames) the motion→focus round trip was measured at ~530ms, so
+    /// a 200ms settle pressed before focus was assigned and the click
+    /// vanished without a trace (B1 Task 3 diagnosis). The extra 400ms costs
+    /// seconds across the suite but buys clicks that actually land.
+    ///
+    /// Stays a fixed settle: focus assignment lives inside the compositor,
+    /// so no pollable condition exists on the test side to wait on instead.
     pub fn click_button(&mut self, x: i32, y: i32, button: u32) {
         self.pointer
             .motion_absolute(f64::from(x), f64::from(y), self.output.0, self.output.1);
         self.pointer.frame();
         self.pointer.pump();
-        for _ in 0..8 {
+        for _ in 0..24 {
             std::thread::sleep(Duration::from_millis(25));
             self.pointer.pump();
         }

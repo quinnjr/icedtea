@@ -560,6 +560,12 @@ pub struct App<M, Msg> {
     popup_hook: Option<Box<dyn Fn(PopupEvent) -> Option<Msg>>>,
     /// Where `run` writes `probe`/`alloc` lines, when asked (M5-D9, P0-D4).
     probe_report: Option<std::path::PathBuf>,
+    /// Opt-in (C4, B1 launcher): focus the first focusable node when a
+    /// `KeyboardEnter` arrives with an empty focus ring. Default OFF — a
+    /// neutral router must not steal focus on every window; only the
+    /// launcher surface boot sets this (via
+    /// [`App::with_autofocus_first`]).
+    autofocus_first: bool,
     /// Observes the live window once per rendered frame (M5-D5's `on_frame`).
     #[allow(
         clippy::type_complexity,
@@ -625,6 +631,9 @@ struct Runtime<Msg> {
     /// common case — no press is tracked and routing is exactly what it was
     /// before M6.
     dnd: Option<ActiveDrag>,
+    /// C4 opt-in, copied from [`App::with_autofocus_first`]: whether the
+    /// `KeyboardEnter`-when-empty arm below may focus the first widget.
+    autofocus_first: bool,
 }
 
 /// One window's in-flight drag: the position machine plus the nodes.
@@ -769,6 +778,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             popup_hook: None,
             probe_report: std::env::var_os("ICEDTEA_PROBE_REPORT").map(std::path::PathBuf::from),
             frame_hook: None,
+            autofocus_first: false,
         }
     }
 
@@ -861,6 +871,18 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     #[must_use]
     pub fn with_probe_report(mut self, path: std::path::PathBuf) -> Self {
         self.probe_report = Some(path);
+        self
+    }
+
+    /// Opt in to open-time focus landing: a `KeyboardEnter` that finds an
+    /// empty focus ring focuses the first focusable node in reading order,
+    /// so typing reaches (e.g.) the launcher's search box with no prior
+    /// Tab. Default OFF — see the field doc. The launcher surface boot
+    /// calls `.with_autofocus_first(true)`; every other app keeps the
+    /// neutral router.
+    #[must_use]
+    pub fn with_autofocus_first(mut self, on: bool) -> Self {
+        self.autofocus_first = on;
         self
     }
 
@@ -1084,6 +1106,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             quit: false,
             popups: Vec::new(),
             next_popup_key: 0,
+            autofocus_first: self.autofocus_first,
         };
 
         let mut surface = skia_rs_safe::canvas::Surface::new_raster_n32_premul(
@@ -1744,6 +1767,41 @@ fn route<Msg: Clone + 'static>(
         }
         InputEvent::KeyboardEnter { target, .. } => {
             rt.keyboard_target = *target;
+            // Open-time focus landing (B1 launcher): a surface whose focus
+            // ring is empty would otherwise swallow every key until the
+            // first Tab or click — `route_surface` delivers `Key` only to
+            // the focused node. When the compositor hands a *window*
+            // surface the keyboard and nothing holds the focus yet, grant
+            // it to the first focusable node in reading order, so typing
+            // reaches (e.g.) the launcher's search box with no prior Tab.
+            //
+            // Why here and not as `Cmd::Focus` from the app's `update`:
+            // `Cmd::Focus` carries a retained `Node` handle, and only the
+            // runtime (or a controller's `cx.node`) can mint one — an
+            // `update` has no access to the tree, so no app-level code can
+            // construct the command for its own search box. This arm
+            // performs the same move one level down (`FocusRing::set_focus`
+            // with `Programmatic`, exactly what the `Cmd::Focus` arm in
+            // `drain` does), following the `KeyboardEnter`-when-empty
+            // precedent `window-probe` runs in its own loop. The move is
+            // announced as `FocusIn` by `route_surface`'s trailing
+            // `sync_focus`, like any other programmatic move.
+            //
+            // Window surfaces only: a popup's tree is swapped in below,
+            // after this point, so a popup enter must not focus the
+            // window's first widget underneath it.
+            //
+            // C4-gated (default off): only an app that opted in via
+            // `App::with_autofocus_first(true)` — the B1 launcher — lands
+            // focus here. Every other window keeps the neutral behavior
+            // (no focus stolen on enter).
+            if rt.autofocus_first && *target == SurfaceTarget::Window && rt.focus.focus().is_none()
+            {
+                let next = navigate(&rt.root, &rt.layout, None, FocusDirection::TabForward);
+                if let Some(node) = next {
+                    rt.focus.set_focus(Some(&node), FocusCause::Programmatic);
+                }
+            }
             *target
         }
         InputEvent::KeyboardLeave => {
@@ -2364,6 +2422,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             quit: false,
             popups: Vec::new(),
             next_popup_key: 0,
+            autofocus_first: self.autofocus_first,
         };
 
         rebuild(&mut self, &mut rt, &sheet, &mut fonts, &mut icons, &clock);
@@ -3040,6 +3099,7 @@ mod tests {
             quit: false,
             popups: Vec::new(),
             next_popup_key: 0,
+            autofocus_first: false,
         }
     }
 
@@ -3359,6 +3419,90 @@ mod tests {
         let a: Vec<Option<(u8, u8, u8, u8)>> = (0..80).map(|x| frames.pixel(0, x, 20)).collect();
         let b: Vec<Option<(u8, u8, u8, u8)>> = (0..80).map(|x| frames.pixel(1, x, 20)).collect();
         assert_ne!(a, b, "the label did not repaint after the model changed");
+    }
+
+    /// B1 launcher open-time focus, pinned at the framework level behind
+    /// the C4 opt-in: the launcher boot calls
+    /// `.with_autofocus_first(true)`, so when the compositor hands an
+    /// `Exclusive` surface the keyboard via `KeyboardEnter` with an empty
+    /// ring, the first focusable node takes it — a typed key lands in the
+    /// search entry with no prior Tab or click. Default-off: without the
+    /// flag the same enter steals nothing. The third run is the negative
+    /// control: without the enter, keys route only to the focused node (of
+    /// which there is none), and the frame never changes.
+    #[test]
+    fn keyboard_enter_with_an_empty_ring_focuses_the_first_widget() {
+        use crate::view::builders::search_entry;
+
+        #[derive(Clone)]
+        struct Typed(String);
+
+        fn update(model: &mut String, msg: Typed) -> Cmd<Typed> {
+            model.clone_from(&msg.0);
+            Cmd::None
+        }
+        #[allow(
+            clippy::ptr_arg,
+            reason = "the `App::new` view signature names `&Model`, here `&String`"
+        )]
+        fn view(model: &String) -> crate::view::View<Typed> {
+            search_entry(model).on_change(|text: &str| Typed(text.to_owned()))
+        }
+
+        fn key_a() -> crate::window::InputEvent {
+            let key = crate::window::keyboard::Keymap::from_string(include_str!(
+                "../../tests/fixtures/keymaps/us.xkb"
+            ))
+            .expect("the vendored us keymap compiles")
+            .translate(38, true, 1, 0); // evdev 38 == `a`
+            crate::window::InputEvent::Key(key)
+        }
+
+        fn run(opt_in: bool, with_enter: bool) -> crate::view::app::Frames {
+            let mut script = vec![ScriptStep::Capture];
+            if with_enter {
+                script.push(ScriptStep::Event(
+                    crate::window::InputEvent::keyboard_enter(1),
+                ));
+            }
+            script.push(ScriptStep::Event(key_a()));
+            script.push(ScriptStep::Capture);
+            App::new(String::new(), update, view)
+                .with_autofocus_first(opt_in)
+                .with_fonts(crate::text::FontDatabase::probe_only())
+                .with_icons(crate::icons::IconTheme::with_name_and_roots(
+                    "hicolor",
+                    vec![],
+                ))
+                .run_offscreen((200, 40), Rc::new(crate::anim::ManualClock::new()), script)
+                .expect("the offscreen loop runs")
+        }
+
+        fn row(frames: &crate::view::app::Frames, frame: usize) -> Vec<Option<(u8, u8, u8, u8)>> {
+            (0..200).map(|x| frames.pixel(frame, x, 20)).collect()
+        }
+
+        let entered = run(true, true);
+        assert_eq!(entered.len(), 2);
+        assert_ne!(
+            row(&entered, 0),
+            row(&entered, 1),
+            "after KeyboardEnter the typed key must reach the search entry"
+        );
+        let default_off = run(false, true);
+        assert_eq!(default_off.len(), 2);
+        assert_eq!(
+            row(&default_off, 0),
+            row(&default_off, 1),
+            "default-off: KeyboardEnter without the opt-in must steal no focus"
+        );
+        let unentered = run(true, false);
+        assert_eq!(unentered.len(), 2);
+        assert_eq!(
+            row(&unentered, 0),
+            row(&unentered, 1),
+            "without KeyboardEnter the key must go nowhere"
+        );
     }
 
     #[test]
