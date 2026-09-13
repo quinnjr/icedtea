@@ -1,17 +1,18 @@
 //! `icedtea-session` — the logind session/seat daemon and its CLI.
 //!
 //! With no argument it boots the daemon: it reads config, resolves this login
-//! session, opens the session bus, and registers `org.icedtea.Session` (the
-//! idle notifier and sleep-inhibitor wiring land in later tasks, so the daemon
-//! then parks). With a subcommand (`lock`, `suspend`, `hibernate`, `poweroff`,
-//! `reboot`, `logout`) it is a thin CLI that calls the matching
-//! `org.icedtea.Session` method over the session bus and exits — non-zero when
-//! no daemon is there, never a panic.
+//! session, opens the session bus, and registers `org.icedtea.Session`, arms
+//! the logind signal/inhibitor flow, and (when `lock_idle_timeout_ms` is set)
+//! starts the `ext_idle_notifier_v1` idle→lock client. With a subcommand
+//! (`lock`, `suspend`, `hibernate`, `poweroff`, `reboot`, `logout`) it is a
+//! thin CLI that calls the matching `org.icedtea.Session` method over the
+//! session bus and exits — non-zero when no daemon is there, never a panic.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use icedtea_session::flow::LockFlow;
+use icedtea_session::idle;
 use icedtea_session::logind::{self, Logind, ZbusLogind};
 use icedtea_session::service::{
     self, SESSION_BUS_NAME, SESSION_IFACE, SESSION_PATH, SharedLogind, SharedWm,
@@ -120,7 +121,20 @@ fn run_daemon() -> ExitCode {
         Arc::clone(&wm),
         &config.power,
     ));
-    logind::spawn_signal_loop(session_path, flow);
+    let events: logind::SharedLogindEvents = flow.clone();
+    logind::spawn_signal_loop(session_path, events);
+
+    // Idle→lock rides the same `LockFlow` funnel as lock-before-sleep, so an
+    // idle timeout and an imminent suspend cannot spawn two lockers. `None`
+    // leaves idle-lock disabled and starts no client (spec Decision 7).
+    match idle::spawn(Arc::clone(&flow), config.power.lock_idle_timeout_ms) {
+        Ok(Some(_idle)) => tracing::info!("idle-lock client armed"),
+        Ok(None) => {}
+        Err(err) => tracing::warn!(
+            %err,
+            "could not start the idle-lock client; idle-lock is off this session"
+        ),
+    }
 
     let _service = match service::spawn(logind, wm) {
         Ok(conn) => conn,

@@ -3,6 +3,7 @@
 //! The binary (`main.rs`) is a thin wiring layer over these.
 
 pub mod flow;
+pub mod idle;
 pub mod logind;
 pub mod policy;
 pub mod service;
