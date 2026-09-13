@@ -770,6 +770,15 @@ pub struct State {
     /// only ever overridden by tests, which need an isolated temp DB rather
     /// than the real XDG path.
     pub config_path: Option<PathBuf>,
+    /// Directories scanned for `<app_id>.desktop` files by
+    /// `handle_command`'s `SpawnApp` arm (the B1 launcher path). The
+    /// compositor keeps its OWN index copy -- resolved at spawn time from
+    /// these roots -- so no argv ever crosses D-Bus (see `apply_action`'s
+    /// doc for the hardening rationale). Defaults to the two XDG locations,
+    /// mirroring `icedtea-shell`'s `launcher::default_dirs` (duplicated, not
+    /// shared: this crate must not depend on the shell crate); tests point
+    /// it at a temp dir via `set_app_dirs`.
+    app_dirs: Vec<PathBuf>,
     /// Set by `set_config_reload_sender` once the caller has somewhere to
     /// send reload results (in production, `lib.rs`'s `run()`, which also
     /// keeps the paired receiver -- see `config_reload_rx`).
@@ -1213,6 +1222,102 @@ fn parse_spawn_argv(cmd: &str) -> Option<(String, Vec<String>)> {
     Some((program, words.collect()))
 }
 
+/// The two XDG locations `State::app_dirs` defaults to, mirroring
+/// `icedtea-shell`'s `launcher::default_dirs` (duplicated, not shared: this
+/// crate must not depend on the shell crate).
+fn default_app_dirs() -> Vec<PathBuf> {
+    let user = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".local/share/applications");
+    vec![PathBuf::from("/usr/share/applications"), user]
+}
+
+/// Desktop environment name the `SpawnApp` resolver shows up as for
+/// `OnlyShowIn`/`NotShowIn`, mirroring `icedtea-shell`'s
+/// `launcher::SHOW_IN_ENV`.
+const SHOW_IN_ENV: &str = "icedtea";
+
+/// Parse one `.desktop` file's text down to its raw `Exec` value, mirroring
+/// the Task 1 entry rules (`shell/src/launcher/entry.rs`): requires a
+/// `[Desktop Entry]` group with a non-empty `Name` (any `Name[locale]`
+/// variant counts) and a non-empty `Exec` (first occurrence of each plain
+/// key wins); honors `NoDisplay=true` and the `OnlyShowIn`/`NotShowIn`
+/// gating against [`SHOW_IN_ENV`]. Returns `None` for anything hidden or
+/// malformed -- the `SpawnApp` caller must then spawn nothing.
+fn parse_desktop_exec(text: &str) -> Option<String> {
+    let mut in_entry_group = false;
+    let mut seen_entry_group = false;
+    let mut locale_name: Option<String> = None;
+    let mut values: HashMap<String, String> = HashMap::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_entry_group = line == "[Desktop Entry]";
+            seen_entry_group = seen_entry_group || in_entry_group;
+            continue;
+        }
+        if !in_entry_group {
+            continue;
+        }
+        let (raw_key, value) = match line.split_once('=') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let key = raw_key.trim();
+        let value = value.trim();
+        if let Some(open) = key.find('[')
+            && key.ends_with(']')
+            && key[..open] == *"Name"
+            && locale_name.is_none()
+        {
+            locale_name = Some(value.to_string());
+            continue;
+        }
+        values
+            .entry(key.to_string())
+            .or_insert_with(|| value.to_string());
+    }
+    if !seen_entry_group {
+        return None;
+    }
+    locale_name
+        .or_else(|| values.get("Name").cloned())
+        .filter(|name| !name.is_empty())?;
+    let exec = values
+        .get("Exec")
+        .cloned()
+        .filter(|exec| !exec.is_empty())?;
+    if values
+        .get("NoDisplay")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        return None;
+    }
+    let listed = |key: &str| -> Vec<&str> {
+        values
+            .get(key)
+            .map(|v| {
+                v.split(';')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let only_show_in = listed("OnlyShowIn");
+    if !only_show_in.is_empty() && !only_show_in.contains(&SHOW_IN_ENV) {
+        return None;
+    }
+    if listed("NotShowIn").contains(&SHOW_IN_ENV) {
+        return None;
+    }
+    Some(exec)
+}
+
 impl State {
     pub fn new(config: Config, dbus_tx: crossbeam_channel::Sender<SeqEvent>) -> Self {
         let workspace_names = config.workspace_names.clone();
@@ -1254,6 +1359,7 @@ impl State {
             cursor_visible: false,
             cursor_pos: None,
             config_path: None,
+            app_dirs: default_app_dirs(),
             config_reload_tx: None,
             config_reload_rx: None,
             output_ids: HashMap::new(),
@@ -4473,6 +4579,52 @@ impl State {
         });
     }
 
+    /// Override the `.desktop` scan roots `handle_command`'s `SpawnApp`
+    /// arm resolves app ids against. Production never calls this (the
+    /// `State::new` XDG default stands); tests point it at a temp dir.
+    pub fn set_app_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.app_dirs = dirs;
+    }
+
+    /// Resolve `app_id` to its raw `Exec` string via the server-side index
+    /// copy: the first `<root>/<app_id>.desktop` across `app_dirs`, parsed
+    /// with the Task 1 entry rules ([`parse_desktop_exec`]). Returns `None`
+    /// for an unknown, hidden, or malformed id -- the `SpawnApp` caller must
+    /// then spawn nothing and reply `false`.
+    ///
+    /// `app_id` is restricted to file-stem characters (`A-Za-z0-9`, `-_.`),
+    /// so an untrusted D-Bus caller cannot smuggle a path (`../…`, absolute
+    /// paths, separators) into the join below and make the compositor read
+    /// -- and exec -- an arbitrary desktop file.
+    fn lookup_app_exec(&self, app_id: &str) -> Option<String> {
+        if app_id.is_empty()
+            || app_id == "."
+            || app_id == ".."
+            || !app_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return None;
+        }
+        let file_name = format!("{app_id}.desktop");
+        for root in &self.app_dirs {
+            // Unreadable roots are skipped, never fatal -- same leniency as
+            // the launcher's own scan (`continue`, not `?`: one missing root
+            // must not veto the roots after it).
+            let Ok(text) = std::fs::read_to_string(root.join(&file_name)) else {
+                continue;
+            };
+            // First readable hit wins: `app_dirs` order is the shadowing
+            // order, and a hit that parses to hidden/malformed keeps
+            // looking -- a user overlay shadows a system file only when it
+            // itself resolves.
+            if let Some(exec) = parse_desktop_exec(&text) {
+                return Some(exec);
+            }
+        }
+        None
+    }
+
     pub fn handle_command(&mut self, cmd: crate::dbus::DbCommand) -> Option<()> {
         use crate::dbus::DbCommand;
         match cmd {
@@ -4538,6 +4690,42 @@ impl State {
                 return Some(());
             }
             DbCommand::Quit => self.quitting = true,
+            DbCommand::SpawnApp { app_id, reply } => {
+                // SECURITY (hardening rationale, see `apply_action`'s doc):
+                // the raw `"spawn"` action execs a caller-supplied command
+                // string and must NEVER be wired to a D-Bus passthrough --
+                // that would be a remote code-execution path. This arm takes
+                // only an app id and resolves it against the compositor's
+                // OWN index copy (`lookup_app_exec`): no argv crosses the
+                // bus, and the exec goes through exactly the same direct
+                // (no-shell) `parse_spawn_argv` + `Command::spawn` path as a
+                // config keybinding. An unknown id or an unparseable `Exec`
+                // replies `false` having spawned nothing.
+                let ok = match self.lookup_app_exec(&app_id) {
+                    Some(exec) => match parse_spawn_argv(&exec) {
+                        Some((program, args)) => std::process::Command::new(program)
+                            .args(args)
+                            .spawn()
+                            .is_ok(),
+                        None => {
+                            tracing::warn!(
+                                %app_id,
+                                "SpawnApp: unparseable Exec; spawning nothing"
+                            );
+                            false
+                        }
+                    },
+                    None => {
+                        tracing::warn!(
+                            %app_id,
+                            "SpawnApp: unknown or hidden app id; spawning nothing"
+                        );
+                        false
+                    }
+                };
+                let _ = reply.send(ok);
+                return Some(());
+            }
             DbCommand::InjectTouchDown {
                 x,
                 y,

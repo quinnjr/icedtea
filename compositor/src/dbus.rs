@@ -90,6 +90,18 @@ pub enum DbCommand {
     ReloadConfig,
     Quit,
     GetState(Sender<Snapshot>),
+    /// Launch one allowlisted app by `.desktop` id (the B1 launcher path).
+    /// The compositor resolves `app_id` against its own index copy and
+    /// execs the entry's `Exec` via `parse_spawn_argv` + a direct
+    /// `Command::spawn` -- no argv ever crosses the bus (see
+    /// `State::apply_action`'s doc for why a raw spawn passthrough would be
+    /// a remote code-execution path). Replies `true` on a successful spawn,
+    /// `false` for an unknown id, an unparseable `Exec`, or a spawn failure.
+    /// Round-trip shape follows `GetState` above.
+    SpawnApp {
+        app_id: String,
+        reply: Sender<bool>,
+    },
     /// Test-only: synthesize a touch-down at `(x, y)` for touch point `id`
     /// via `wlr::Runtime::inject_touch_down`, replying with the grab serial
     /// it mints (`None` if there is no seat or no surface under the point).
@@ -417,6 +429,20 @@ impl CompositorInterface {
     }
     fn quit(&self) {
         self.send(DbCommand::Quit);
+    }
+    /// Launch one allowlisted app by id. Synchronous round-trip like
+    /// `get_state`: the main loop answers the moment it drains the
+    /// `SpawnApp` command (see `State::handle_command`), so this blocks the
+    /// zbus dispatch for this connection only as long as one loop iteration
+    /// plus the `spawn` itself takes. A dead loop (dropped reply) reads as
+    /// `false`, never a panic.
+    fn spawn_app(&self, app_id: String) -> bool {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::SpawnApp {
+            app_id,
+            reply: reply_tx,
+        });
+        reply_rx.recv().unwrap_or(false)
     }
 }
 

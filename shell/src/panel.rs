@@ -256,6 +256,10 @@ impl CompositorCommands for Offline {
     fn set_workspace(&self, id: u32) {
         tracing::warn!(id, "no session bus; set_workspace dropped");
     }
+    fn spawn_app(&self, app_id: &str) -> bool {
+        tracing::warn!(app_id, "no session bus; spawn_app dropped");
+        false
+    }
 }
 
 impl ClipCommands for Offline {
@@ -828,6 +832,7 @@ mod tests {
     #[derive(Default)]
     pub(crate) struct MockWm {
         pub(crate) calls: RefCell<Vec<(String, u32)>>,
+        pub(crate) spawns: RefCell<Vec<String>>,
     }
 
     impl CompositorCommands for MockWm {
@@ -839,6 +844,10 @@ mod tests {
         }
         fn set_workspace(&self, id: u32) {
             self.calls.borrow_mut().push(("workspace".into(), id));
+        }
+        fn spawn_app(&self, app_id: &str) -> bool {
+            self.spawns.borrow_mut().push(app_id.to_string());
+            true
         }
     }
 

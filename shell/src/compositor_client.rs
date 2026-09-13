@@ -159,6 +159,11 @@ pub trait CompositorCommands {
     fn focus_window(&self, id: u32);
     fn close_window(&self, id: u32);
     fn set_workspace(&self, id: u32);
+    /// Launch one allowlisted app by `.desktop` id via the compositor's
+    /// `SpawnApp` method. Returns the compositor's reply (`false` for an
+    /// unknown id, an unparseable `Exec`, a spawn failure, or a dead bus) --
+    /// never panics: this runs on the panel's loop thread.
+    fn spawn_app(&self, app_id: &str) -> bool;
 }
 
 /// Issues `org.icedtea.Compositor` commands from the panel's loop thread.
@@ -204,6 +209,23 @@ impl CompositorCommands for CompositorProxy {
             "SetWorkspace",
             &(id,),
         );
+    }
+    // The wire member is `SpawnApp` (see `focus_window`'s comment), and
+    // unlike the fire-and-forget commands above this one reads the reply:
+    // every failure -- no bus, rejected call, bad body -- is `false`, never
+    // a panic on this foreign (panel loop) thread.
+    fn spawn_app(&self, app_id: &str) -> bool {
+        self.conn
+            .call_method(
+                Some(COMPOSITOR_BUS_NAME),
+                COMPOSITOR_PATH,
+                Some(COMPOSITOR_IFACE),
+                "SpawnApp",
+                &(app_id,),
+            )
+            .ok()
+            .and_then(|msg| msg.body().deserialize::<bool>().ok())
+            .unwrap_or(false)
     }
 }
 

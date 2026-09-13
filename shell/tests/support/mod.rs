@@ -41,7 +41,10 @@ const POLL: Duration = Duration::from_millis(50);
 /// `Arc<Mutex<_>>`, unlike `panel.rs`'s unit-test mock: the panel runs on its
 /// own thread here and the assertions read from the test's.
 #[derive(Clone, Default)]
-pub struct MockWm(pub Arc<Mutex<Vec<(String, u32)>>>);
+pub struct MockWm(
+    pub Arc<Mutex<Vec<(String, u32)>>>,
+    pub Arc<Mutex<Vec<String>>>,
+);
 
 impl CompositorCommands for MockWm {
     fn focus_window(&self, id: u32) {
@@ -55,6 +58,13 @@ impl CompositorCommands for MockWm {
             .lock()
             .expect("wm calls")
             .push(("workspace".into(), id));
+    }
+    fn spawn_app(&self, app_id: &str) -> bool {
+        self.1
+            .lock()
+            .expect("wm spawn calls")
+            .push(app_id.to_string());
+        true
     }
 }
 
@@ -297,6 +307,12 @@ impl Panel {
     #[must_use]
     pub fn wm_calls(&self) -> Vec<(String, u32)> {
         self.wm.0.lock().expect("wm calls").clone()
+    }
+
+    /// App ids recorded via `CompositorCommands::spawn_app`.
+    #[must_use]
+    pub fn spawn_calls(&self) -> Vec<String> {
+        self.wm.1.lock().expect("wm spawn calls").clone()
     }
 
     #[must_use]
