@@ -252,13 +252,34 @@ impl PinStore {
     }
 }
 
+/// Standard 1x1 tile span assigned to newly created groups.
+pub fn default_tile_size() -> u32 {
+    1
+}
+
 /// One named tile group holding ordered app ids.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+///
+/// Mirrored by `config::TileGroup` for persistence (the config crate cannot
+/// depend on this crate; conversion happens at the shell boundary in
+/// `config_ext.rs`). Keep the two shapes in sync when either changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TileGroup {
     /// Group display name.
     pub name: String,
     /// Member app ids in tile order.
     pub ids: Vec<String>,
+    /// Tile span in grid units (`1` = standard 1x1 tile).
+    pub size: u32,
+}
+
+impl Default for TileGroup {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            ids: Vec::new(),
+            size: default_tile_size(),
+        }
+    }
 }
 
 /// Named tile groups (ordered) with ordered member ids.
@@ -285,6 +306,7 @@ impl TileStore {
         self.groups.push(TileGroup {
             name: group.to_string(),
             ids: vec![app_id.to_string()],
+            size: default_tile_size(),
         });
     }
 }
@@ -510,6 +532,14 @@ mod tests {
         assert_eq!(groups[0].name, "Web");
         assert_eq!(groups[0].ids, vec!["firefox".to_string()]);
         assert_eq!(groups[1].name, "Media");
+    }
+
+    #[test]
+    fn tile_store_assign_uses_default_size() {
+        let mut tiles = TileStore::default();
+        tiles.assign("Web", "firefox");
+        assert_eq!(tiles.groups().len(), 1);
+        assert_eq!(tiles.groups()[0].size, default_tile_size());
     }
 
     #[test]

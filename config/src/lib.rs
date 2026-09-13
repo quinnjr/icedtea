@@ -38,17 +38,37 @@ pub struct Behavior {
     pub snap_enabled: bool,
 }
 
+/// Standard 1x1 tile span: the size a tile group gets when none was stored
+/// (pre-size configs) or newly created.
+pub fn default_tile_size() -> u32 {
+    1
+}
+
 /// One named tile group holding ordered app ids.
 ///
 /// Mirrors `shell::launcher::TileGroup` (Task 1): the config crate cannot
 /// depend on the shell crate, so the shape is duplicated here for
-/// persistence and converted at the shell boundary.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// persistence and converted at the shell boundary (`config_ext.rs`).
+/// Keep the two shapes in sync when either changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TileGroup {
     /// Group display name.
     pub name: String,
     /// Member app ids in tile order.
     pub ids: Vec<String>,
+    /// Tile span in grid units (`1` = standard 1x1 tile).
+    #[serde(default = "default_tile_size")]
+    pub size: u32,
+}
+
+impl Default for TileGroup {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            ids: Vec::new(),
+            size: default_tile_size(),
+        }
+    }
 }
 
 /// Launcher stores persisted beside `appearance`: ordered pinned app ids,
@@ -338,6 +358,11 @@ fn read_config_from_db(db: Database) -> Config {
         {
             cfg.displays = displays;
         }
+        if let Ok(launcher_table) = read_txn.open_table(DB_LAUNCHER)
+            && let Some(launcher) = read_json::<LauncherConfig>(&launcher_table, KEY_LAUNCHER)
+        {
+            cfg.launcher = launcher;
+        }
         if let Ok(kb_table) = read_txn.open_table(DB_KEYBINDINGS)
             && read_json::<u64>(&kb_table, KEY_ACTION_COUNT).unwrap_or(0) > 0
         {
@@ -393,6 +418,9 @@ impl Config {
             let mut displays = write_txn.open_table(DB_DISPLAYS)?;
             let displays_bytes = serde_json::to_vec(&self.displays).unwrap();
             displays.insert(KEY_DISPLAYS, displays_bytes.as_slice())?;
+            let mut launcher = write_txn.open_table(DB_LAUNCHER)?;
+            let launcher_bytes = serde_json::to_vec(&self.launcher).unwrap();
+            launcher.insert(KEY_LAUNCHER, launcher_bytes.as_slice())?;
             let mut keybindings = write_txn.open_table(DB_KEYBINDINGS)?;
             // Review finding #3: clear every existing row FIRST. `insert`
             // upserts, so without this a binding that was removed from
@@ -557,6 +585,16 @@ mod tests {
             },
         );
         seeded.displays = sample_displays();
+        seeded.launcher.pinned.push("firefox".to_string());
+        seeded.launcher.tile_groups.push(TileGroup {
+            name: "Web".to_string(),
+            ids: vec!["firefox".to_string()],
+            size: 2,
+        });
+        seeded
+            .launcher
+            .recency
+            .insert("firefox".to_string(), (3, 7));
         {
             let db = open(&path).unwrap();
             seeded.save(&db).unwrap();
@@ -591,6 +629,7 @@ mod tests {
         assert_eq!(loaded.appearance, seeded.appearance);
         assert_eq!(loaded.keybindings, seeded.keybindings);
         assert_eq!(loaded.behavior, seeded.behavior);
+        assert_eq!(loaded.launcher, seeded.launcher);
     }
 
     #[test]
@@ -675,11 +714,72 @@ mod tests {
         cfg.launcher.tile_groups.push(TileGroup {
             name: "Web".to_string(),
             ids: vec!["firefox".to_string()],
+            size: 2,
         });
         cfg.launcher.recency.insert("firefox".to_string(), (3, 7));
         let bytes = serde_json::to_vec(&cfg).unwrap();
         let back: Config = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_launcher() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let mut cfg = default_config();
+        cfg.launcher.pinned.push("firefox".to_string());
+        cfg.launcher.tile_groups.push(TileGroup {
+            name: "Web".to_string(),
+            ids: vec!["firefox".to_string()],
+            size: 2,
+        });
+        cfg.launcher.recency.insert("firefox".to_string(), (3, 7));
+        {
+            let db = open(&path).unwrap();
+            cfg.save(&db).unwrap();
+        }
+        let loaded = load_or_default(&path);
+        assert_eq!(loaded.launcher.pinned, vec!["firefox".to_string()]);
+        assert_eq!(loaded.launcher.tile_groups.len(), 1);
+        assert_eq!(loaded.launcher.tile_groups[0].name, "Web");
+        assert_eq!(
+            loaded.launcher.tile_groups[0].ids,
+            vec!["firefox".to_string()]
+        );
+        assert_eq!(loaded.launcher.tile_groups[0].size, 2);
+        assert_eq!(loaded.launcher.recency.get("firefox"), Some(&(3, 7)));
+    }
+
+    #[test]
+    fn missing_launcher_table_loads_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let db = open(&path).unwrap();
+        {
+            // Write an "old-format" DB that never touched DB_LAUNCHER,
+            // simulating a file saved before this section existed.
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(DB_APPEARANCE).unwrap();
+                let bytes = serde_json::to_vec(&default_config().appearance).unwrap();
+                table.insert(KEY_APPEARANCE, bytes.as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        drop(db);
+        let cfg = load_or_default(&path);
+        assert!(cfg.launcher.pinned.is_empty());
+        assert!(cfg.launcher.tile_groups.is_empty());
+        assert!(cfg.launcher.recency.is_empty());
+    }
+
+    #[test]
+    fn tile_group_missing_size_deserializes_to_default() {
+        // Tile groups saved before the size field existed must still parse,
+        // degrading to the standard 1x1 tile size.
+        let group: TileGroup =
+            serde_json::from_value(serde_json::json!({"name": "Web", "ids": ["firefox"]})).unwrap();
+        assert_eq!(group.size, default_tile_size());
     }
 
     #[test]
