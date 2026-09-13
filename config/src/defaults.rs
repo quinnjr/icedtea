@@ -3,6 +3,18 @@ use std::collections::HashMap;
 use crate::{Behavior, Config, KeyCombo, LauncherConfig, Power};
 use contract::Appearance;
 
+/// The default power/suspend/hibernate key bindings (spec Decision 4), as
+/// `(action, keysym)`. Exposed to the config read path: a stored keybindings
+/// table replaces the defaults wholesale, so a config saved before A3 would
+/// otherwise leave these keys unbound while the session daemon still takes the
+/// power-key block inhibitor — a silent no-op. The read path backfills only the
+/// missing entries, so a user's own bindings are kept.
+pub const POWER_KEY_BINDINGS: [(&str, &str); 3] = [
+    ("spawn:icedtea-session lock", "XF86_PowerOff"),
+    ("spawn:icedtea-session suspend", "XF86_Sleep"),
+    ("spawn:icedtea-session hibernate", "XF86_Hibernate"),
+];
+
 pub fn default_config() -> Config {
     let mut keybindings = HashMap::new();
     let insert = |map: &mut HashMap<String, KeyCombo>, action: &str, mods: &[&str], key: &str| {
@@ -45,24 +57,9 @@ pub fn default_config() -> Config {
             &key,
         );
     }
-    insert(
-        &mut keybindings,
-        "spawn:icedtea-session lock",
-        &[],
-        "XF86_PowerOff",
-    );
-    insert(
-        &mut keybindings,
-        "spawn:icedtea-session suspend",
-        &[],
-        "XF86_Sleep",
-    );
-    insert(
-        &mut keybindings,
-        "spawn:icedtea-session hibernate",
-        &[],
-        "XF86_Hibernate",
-    );
+    for (action, key) in POWER_KEY_BINDINGS {
+        insert(&mut keybindings, action, &[], key);
+    }
 
     Config {
         keybindings,

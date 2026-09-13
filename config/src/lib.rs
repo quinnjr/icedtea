@@ -420,6 +420,20 @@ fn read_config_from_db(db: Database) -> Config {
                 cfg.keybindings = keybindings;
             }
         }
+        // A3 power-key defaults: a stored keybindings table
+        // replaces `default_config()`'s map wholesale, so a config saved before
+        // A3 would otherwise load with those keys unbound while
+        // `icedtea-session` still takes logind's power-key block inhibitor —
+        // every power key a silent no-op. Only *missing* entries are added, so
+        // a user's own binding for one of these actions is never overwritten.
+        for (action, key) in defaults::POWER_KEY_BINDINGS {
+            cfg.keybindings
+                .entry(action.to_string())
+                .or_insert_with(|| KeyCombo {
+                    modifiers: Vec::new(),
+                    key: key.to_string(),
+                });
+        }
         Ok::<Config, redb::Error>(cfg)
     }));
 
@@ -853,6 +867,38 @@ mod tests {
             "a removed binding must not resurrect after reload"
         );
         assert_eq!(loaded.keybindings, cfg.keybindings);
+    }
+
+    /// An A3-upgraded config: the stored keybindings table predates the
+    /// power-key defaults, so it replaces the default map without them.
+    /// Loading must backfill them, or the session daemon's power-key block
+    /// inhibitor would leave the keys unbound (a silent no-op).
+    #[test]
+    fn an_older_stored_config_gains_the_power_key_bindings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        let mut cfg = default_config();
+        for (action, _) in defaults::POWER_KEY_BINDINGS {
+            cfg.keybindings.remove(action);
+        }
+        {
+            let db = open(&path).unwrap();
+            cfg.save(&db).unwrap();
+        }
+
+        let loaded = load_or_default(&path);
+        for (action, key) in defaults::POWER_KEY_BINDINGS {
+            let combo = loaded
+                .keybindings
+                .get(action)
+                .unwrap_or_else(|| panic!("{action:?} must be backfilled on load"));
+            assert!(
+                combo.modifiers.is_empty(),
+                "{action:?} carries no modifiers"
+            );
+            assert_eq!(combo.key, key, "{action:?} is bound to {key}");
+        }
     }
 
     #[test]
