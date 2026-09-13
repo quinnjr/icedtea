@@ -8932,6 +8932,7 @@ impl wlr::SeatHandler for State {
     /// the seat and scene in one go.
     fn session_lock_changed(&mut self, locked: bool) {
         self.session_locked = locked;
+        self.emit(Event::SessionLockChanged(locked));
         // Findings F5/F15, still needed after `wlr` 0.20.26: the crate drops
         // a named shape on a pointer-*focus* change, and a lock engaging (or
         // releasing) under a stationary pointer is not one -- no pointer
@@ -8945,6 +8946,10 @@ impl wlr::SeatHandler for State {
                 None => self.sync_seat_focus(),
             }
         }
+        // Same emit-then-flush pattern as `gesture_began`/`apply_switch_toggle`:
+        // `emit` only queues, so the signal reaches `dbus_tx` (and the shell)
+        // only once `emit_pending` drains it.
+        self.emit_pending();
     }
 
     /// A client asked, via `cursor-shape-v1`, to name the seat cursor.

@@ -201,9 +201,9 @@ standalone daemon crate, a small compositor-side D-Bus addition, and a new
 ```
 session/
   Cargo.toml            # icedtea-session; deps: zbus, wayland-client,
-                         # wayland-protocols-wlr (ext-idle-notify is a wlr-*
-                         # staging protocol, same crate clipboard already
-                         # depends on for wlr-data-control), icedtea-contract,
+                         # wayland-protocols (ext-idle-notify is a staging
+                         # protocol here, behind its `staging` feature),
+                         # icedtea-contract,
                          # icedtea-config, crossbeam-channel, tracing
   src/
     lib.rs               # wiring / re-exports for tests

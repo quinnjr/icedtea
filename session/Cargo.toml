@@ -1,0 +1,18 @@
+[package]
+name = "icedtea-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+icedtea-contract = { path = "../contract" }
+icedtea-config = { path = "../config" }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+zbus.workspace = true
+futures-util = "0.3"
+tracing.workspace = true
+
+[dev-dependencies]
+icedtea-harness = { path = "../harness" }
+tempfile = "3"

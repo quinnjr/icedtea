@@ -38,6 +38,38 @@ pub struct Behavior {
     pub snap_enabled: bool,
 }
 
+/// Session/power policy consumed by the `icedtea-session` logind integration.
+///
+/// All locking is opt-in: `locker_command` defaults to `None`, and both
+/// idle-lock and lock-before-sleep are refused without a configured locker
+/// (Decision 2). `lock_before_sleep` defaults to `true` so the attempt is armed
+/// the moment a locker is configured, while remaining a no-op until then.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Power {
+    /// Shell command spawned to actually secure the screen (must itself bind
+    /// ext_session_lock_manager_v1 and authenticate before unlocking).
+    pub locker_command: Option<String>,
+    /// Lock after this many milliseconds of seat idle. `None` disables
+    /// idle-lock even with a locker configured (opt-in, matches swayidle).
+    pub lock_idle_timeout_ms: Option<u64>,
+    /// Attempt to lock before suspend/hibernate. A no-op without a configured
+    /// `locker_command`.
+    pub lock_before_sleep: bool,
+}
+
+// Manual rather than derived: `lock_before_sleep` defaults to `true`, which a
+// derive could not express, and serde's field-level `default` on
+// `Config.power` relies on this `Default` for legacy configs.
+impl Default for Power {
+    fn default() -> Self {
+        Self {
+            locker_command: None,
+            lock_idle_timeout_ms: None,
+            lock_before_sleep: true,
+        }
+    }
+}
+
 /// Standard 1x1 tile span: the size a tile group gets when none was stored
 /// (pre-size configs) or newly created.
 pub fn default_tile_size() -> u32 {
@@ -94,6 +126,8 @@ pub struct Config {
     #[serde(default)]
     pub launcher: LauncherConfig,
     pub behavior: Behavior,
+    #[serde(default)]
+    pub power: Power,
     pub workspace_names: Vec<String>,
     pub displays: Vec<DisplayConfig>,
 }
@@ -348,6 +382,11 @@ fn read_config_from_db(db: Database) -> Config {
         {
             cfg.behavior = b;
         }
+        if let Ok(power_table) = read_txn.open_table(DB_POWER)
+            && let Some(p) = read_json::<Power>(&power_table, KEY_POWER)
+        {
+            cfg.power = p;
+        }
         if let Ok(ws_table) = read_txn.open_table(DB_WORKSPACES)
             && let Some(names) = read_json::<Vec<String>>(&ws_table, KEY_WORKSPACES)
             && !names.is_empty()
@@ -380,6 +419,35 @@ fn read_config_from_db(db: Database) -> Config {
             if !keybindings.is_empty() {
                 cfg.keybindings = keybindings;
             }
+        }
+        // A3 power-key defaults: a stored keybindings table
+        // replaces `default_config()`'s map wholesale, so a config saved before
+        // A3 would otherwise load with those keys unbound while
+        // `icedtea-session` still takes logind's power-key block inhibitor —
+        // every power key a silent no-op. Only *missing* entries are added, so
+        // a user's own binding for one of these actions is never overwritten;
+        // and a default whose keysym the user already bound to *another* action
+        // is skipped, so the backfill never introduces a duplicate chord.
+        for (action, key) in defaults::POWER_KEY_BINDINGS {
+            if cfg.keybindings.contains_key(action) {
+                continue;
+            }
+            let keysym_taken = cfg.keybindings.values().any(|combo| combo.key == key);
+            if keysym_taken {
+                tracing::debug!(
+                    action,
+                    key,
+                    "power-key default skipped: the keysym is already bound"
+                );
+                continue;
+            }
+            cfg.keybindings.insert(
+                action.to_string(),
+                KeyCombo {
+                    modifiers: Vec::new(),
+                    key: key.to_string(),
+                },
+            );
         }
         Ok::<Config, redb::Error>(cfg)
     }));
@@ -429,6 +497,9 @@ impl Config {
             let behavior_bytes =
                 serde_json::to_vec(&self.behavior).map_err(std::io::Error::other)?;
             behavior.insert(KEY_BEHAVIOR, behavior_bytes.as_slice())?;
+            let mut power = write_txn.open_table(DB_POWER)?;
+            let power_bytes = serde_json::to_vec(&self.power).map_err(std::io::Error::other)?;
+            power.insert(KEY_POWER, power_bytes.as_slice())?;
             let mut workspaces = write_txn.open_table(DB_WORKSPACES)?;
             let workspace_bytes =
                 serde_json::to_vec(&self.workspace_names).map_err(std::io::Error::other)?;
@@ -813,6 +884,85 @@ mod tests {
         assert_eq!(loaded.keybindings, cfg.keybindings);
     }
 
+    /// An A3-upgraded config: the stored keybindings table predates the
+    /// power-key defaults, so it replaces the default map without them.
+    /// Loading must backfill them, or the session daemon's power-key block
+    /// inhibitor would leave the keys unbound (a silent no-op).
+    #[test]
+    fn an_older_stored_config_gains_the_power_key_bindings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        let mut cfg = default_config();
+        for (action, _) in defaults::POWER_KEY_BINDINGS {
+            cfg.keybindings.remove(action);
+        }
+        {
+            let db = open(&path).unwrap();
+            cfg.save(&db).unwrap();
+        }
+
+        let loaded = load_or_default(&path);
+        for (action, key) in defaults::POWER_KEY_BINDINGS {
+            let combo = loaded
+                .keybindings
+                .get(action)
+                .unwrap_or_else(|| panic!("{action:?} must be backfilled on load"));
+            assert!(
+                combo.modifiers.is_empty(),
+                "{action:?} carries no modifiers"
+            );
+            assert_eq!(combo.key, key, "{action:?} is bound to {key}");
+        }
+    }
+
+    /// If the user already bound a power keysym to a different action (here
+    /// `close`), the backfill must skip the corresponding default rather than
+    /// introduce a second action on the same keysym.
+    #[test]
+    fn the_power_key_backfill_does_not_duplicate_an_already_bound_keysym() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        let mut cfg = default_config();
+        for (action, _) in defaults::POWER_KEY_BINDINGS {
+            cfg.keybindings.remove(action);
+        }
+        cfg.keybindings.insert(
+            "close".into(),
+            KeyCombo {
+                modifiers: Vec::new(),
+                key: "XF86_PowerOff".into(),
+            },
+        );
+        {
+            let db = open(&path).unwrap();
+            cfg.save(&db).unwrap();
+        }
+
+        let loaded = load_or_default(&path);
+        assert!(
+            !loaded
+                .keybindings
+                .contains_key("spawn:icedtea-session lock"),
+            "the power-key default must be skipped when its keysym is taken"
+        );
+        assert_eq!(
+            loaded
+                .keybindings
+                .get("close")
+                .map(|combo| combo.key.as_str()),
+            Some("XF86_PowerOff"),
+            "the user's own binding is preserved"
+        );
+        let on_power_off = loaded
+            .keybindings
+            .iter()
+            .filter(|(_, combo)| combo.key == "XF86_PowerOff")
+            .count();
+        assert_eq!(on_power_off, 1, "exactly one action binds XF86_PowerOff");
+    }
+
     #[test]
     fn try_load_reports_locked_when_file_already_open() {
         // Review finding #2: a cross-process open collision (redb takes a
@@ -936,6 +1086,92 @@ mod tests {
         assert!(back.launcher.pinned.is_empty());
         assert!(back.launcher.tile_groups.is_empty());
         assert!(back.launcher.recency.is_empty());
+    }
+
+    #[test]
+    fn default_power_matches_spec() {
+        let cfg = default_config();
+        assert_eq!(
+            cfg.power,
+            Power {
+                locker_command: None,
+                lock_idle_timeout_ms: None,
+                lock_before_sleep: true,
+            }
+        );
+    }
+
+    #[test]
+    fn power_serde_round_trip() {
+        let power = Power {
+            locker_command: Some("gtklock".into()),
+            lock_idle_timeout_ms: Some(300_000),
+            lock_before_sleep: false,
+        };
+        let bytes = serde_json::to_vec(&power).unwrap();
+        let back: Power = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, power);
+    }
+
+    #[test]
+    fn legacy_config_without_power_decodes_to_defaults() {
+        let mut value = serde_json::to_value(default_config()).unwrap();
+        value.as_object_mut().unwrap().remove("power");
+        let back: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            back.power,
+            Power {
+                locker_command: None,
+                lock_idle_timeout_ms: None,
+                lock_before_sleep: true,
+            }
+        );
+    }
+
+    #[test]
+    fn save_then_load_round_trips_power() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let mut cfg = default_config();
+        cfg.power = Power {
+            locker_command: Some("swaylock".into()),
+            lock_idle_timeout_ms: Some(60_000),
+            lock_before_sleep: false,
+        };
+        {
+            let db = open(&path).unwrap();
+            cfg.save(&db).unwrap();
+        }
+        let loaded = load_or_default(&path);
+        assert_eq!(loaded.power, cfg.power);
+    }
+
+    #[test]
+    fn missing_power_table_loads_default() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+        let db = open(&path).unwrap();
+        {
+            // An "old-format" DB written before this section existed must
+            // degrade the power section to its default, not fail the load.
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(DB_APPEARANCE).unwrap();
+                let bytes = serde_json::to_vec(&default_config().appearance).unwrap();
+                table.insert(KEY_APPEARANCE, bytes.as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        drop(db);
+        let cfg = load_or_default(&path);
+        assert_eq!(
+            cfg.power,
+            Power {
+                locker_command: None,
+                lock_idle_timeout_ms: None,
+                lock_before_sleep: true,
+            }
+        );
     }
 
     #[test]

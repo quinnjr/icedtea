@@ -1291,6 +1291,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "icedtea-session"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "icedtea-config",
+ "icedtea-contract",
+ "icedtea-harness",
+ "tempfile",
+ "tracing",
+ "wayland-client",
+ "wayland-protocols",
+ "zbus",
+]
+
+[[package]]
 name = "icedtea-settings"
 version = "0.1.0"
 dependencies = [

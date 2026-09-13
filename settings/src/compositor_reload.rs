@@ -8,12 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use icedtea_config::Config;
-use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_PATH};
-
-// zbus's #[interface] exposes Rust methods in PascalCase, so the wire
-// member is ReloadConfig (matching FocusWindow/CloseWindow/SetWorkspace in
-// shell/src/compositor_client.rs).
-const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
+use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_IFACE, COMPOSITOR_PATH};
 
 /// How long [`ReloadClient::on_bus`] waits for a session bus to hand it a
 /// connection.
@@ -80,6 +75,9 @@ impl ReloadClient {
         let Some(conn) = &self.conn else {
             return ReloadOutcome::CompositorAbsent;
         };
+        // zbus's #[interface] exposes Rust methods in PascalCase, so the wire
+        // member is ReloadConfig (matching FocusWindow/CloseWindow/SetWorkspace
+        // in shell/src/compositor_client.rs).
         match conn.call_method(
             Some(COMPOSITOR_BUS_NAME),
             COMPOSITOR_PATH,

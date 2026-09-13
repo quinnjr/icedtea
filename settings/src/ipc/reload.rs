@@ -6,6 +6,7 @@
 //! arrives here as a [`ReloadRequest`] and every answer leaves as a
 //! `Msg::Applied` on the inbox.
 
+use icedtea_contract::COMPOSITOR_IFACE;
 use icedtea_ui::view::InboxSender;
 
 use crate::app::Msg;
@@ -27,7 +28,6 @@ pub enum ReloadRequest {
     Shutdown,
 }
 
-const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 /// The signal member name is **not** PascalCase — zbus exposes `#[interface]`
 /// *methods* in PascalCase (`ReloadConfig`) but leaves signal names alone
 /// (contract §0, and `shell/src/clip_client.rs:37,41` proves both halves).

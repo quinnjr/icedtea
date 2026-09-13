@@ -1982,9 +1982,17 @@ fn session_lock_locks_isolates_input_and_unlocks() {
     );
     let pre_lock_keys = app.key_events();
 
+    // A3: the production lock-state read (wire `IsLocked()`, backed by the
+    // same `DbCommand::SessionLocked` round-trip `session_locked()` uses)
+    // must report false before any locker takes the lock.
+    assert!(!comp.session_locked(), "session must start unlocked");
+
     let mut locker = SessionLockClient::spawn(&comp.socket);
     locker.lock();
     assert!(locker.wait_locked(), "session never reported locked");
+    // A3: the lock transition reaches subscribers as a
+    // `SessionLockChanged(true)` signal, and the lock-state read agrees.
+    comp.wait_event(|e| matches!(e, Event::SessionLockChanged(true)));
     assert!(
         comp.session_locked(),
         "compositor is_session_locked() is false"
@@ -2008,6 +2016,9 @@ fn session_lock_locks_isolates_input_and_unlocks() {
     );
 
     locker.unlock();
+    // A3: the unlock transition reaches subscribers as a
+    // `SessionLockChanged(false)` signal too.
+    comp.wait_event(|e| matches!(e, Event::SessionLockChanged(false)));
     assert!(!comp.session_locked(), "still locked after unlock");
 
     // Unlock restores focus: a fresh key now reaches the app again.

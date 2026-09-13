@@ -1,7 +1,19 @@
 use std::collections::HashMap;
 
-use crate::{Behavior, Config, KeyCombo, LauncherConfig};
+use crate::{Behavior, Config, KeyCombo, LauncherConfig, Power};
 use contract::Appearance;
+
+/// The default power/suspend/hibernate key bindings (spec Decision 4), as
+/// `(action, keysym)`. Exposed to the config read path: a stored keybindings
+/// table replaces the defaults wholesale, so a config saved before A3 would
+/// otherwise leave these keys unbound while the session daemon still takes the
+/// power-key block inhibitor — a silent no-op. The read path backfills only the
+/// missing entries, so a user's own bindings are kept.
+pub const POWER_KEY_BINDINGS: [(&str, &str); 3] = [
+    ("spawn:icedtea-session lock", "XF86_PowerOff"),
+    ("spawn:icedtea-session suspend", "XF86_Sleep"),
+    ("spawn:icedtea-session hibernate", "XF86_Hibernate"),
+];
 
 pub fn default_config() -> Config {
     let mut keybindings = HashMap::new();
@@ -45,6 +57,9 @@ pub fn default_config() -> Config {
             &key,
         );
     }
+    for (action, key) in POWER_KEY_BINDINGS {
+        insert(&mut keybindings, action, &[], key);
+    }
 
     Config {
         keybindings,
@@ -65,6 +80,7 @@ pub fn default_config() -> Config {
             hide_bar_on_fullscreen: true,
             snap_enabled: true,
         },
+        power: Power::default(),
         launcher: LauncherConfig {
             pinned: vec![],
             tile_groups: vec![],
@@ -72,5 +88,35 @@ pub fn default_config() -> Config {
         },
         workspace_names: vec!["1".into(), "2".into(), "3".into(), "4".into()],
         displays: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_binds_the_power_keys_to_the_session_cli() {
+        let config = default_config();
+        for (action, key) in [
+            ("spawn:icedtea-session lock", "XF86_PowerOff"),
+            ("spawn:icedtea-session suspend", "XF86_Sleep"),
+            ("spawn:icedtea-session hibernate", "XF86_Hibernate"),
+        ] {
+            let combo = config
+                .keybindings
+                .get(action)
+                .unwrap_or_else(|| panic!("default config is missing {action:?}"));
+            assert!(
+                combo.modifiers.is_empty(),
+                "{action:?} must carry no modifiers"
+            );
+            assert_eq!(combo.key, key, "{action:?} must be bound to {key}");
+            assert_ne!(
+                crate::key_name_to_keysym(&combo.key),
+                0,
+                "{action:?} key {key} must resolve to a real keysym"
+            );
+        }
     }
 }
