@@ -31,6 +31,40 @@ fn state_with_app_dir(dir: &std::path::Path) -> State {
     state
 }
 
+/// Whether the `touch` binary is on `PATH`, mirroring `xwayland.rs`'s
+/// `xwayland_on_path` skip pattern: the spawn-positive tests exec `touch`
+/// as the entry's program, so without it they skip visibly instead of
+/// failing. Set `REQUIRE_TOUCH=1` (in CI, where coreutils IS installed)
+/// to turn that skip into a loud failure, so a broken provisioning step
+/// can never masquerade as a passing spawn suite.
+fn touch_on_path() -> bool {
+    let present = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join("touch").is_file()))
+        .unwrap_or(false);
+    if !present && std::env::var_os("REQUIRE_TOUCH").is_some() {
+        panic!(
+            "REQUIRE_TOUCH is set but the `touch` binary is not on PATH; \
+             the SpawnApp spawn-positive tests cannot run and must not be reported as passing"
+        );
+    }
+    present
+}
+
+/// Seed `dir/name.desktop` with `Exec=touch "<sentinel>"`. The quotes keep
+/// the sentinel one word under `parse_spawn_argv`'s shlex-style split even
+/// when `temp_dir` carries spaces, so the test is hermetic w.r.t. the
+/// runner's temp path.
+fn seed_touch_entry(dir: &std::path::Path, name: &str, sentinel: &std::path::Path) {
+    std::fs::write(
+        dir.join(format!("{name}.desktop")),
+        format!(
+            "[Desktop Entry]\nName={name}\nExec=touch \"{}\"\n",
+            sentinel.display()
+        ),
+    )
+    .unwrap_or_else(|_| panic!("seed {name}.desktop"));
+}
+
 /// Send `SpawnApp` and block for the round-trip reply, exactly as
 /// `CompositorInterface::spawn_app` does (bounded channel, `GetState` shape).
 fn spawn_app(state: &mut State, app_id: &str) -> bool {
@@ -63,19 +97,13 @@ fn spawn_app_unknown_id_returns_false_and_spawns_nothing() {
 
 #[test]
 fn spawn_app_known_id_spawns_entry_exec() {
+    if !touch_on_path() {
+        eprintln!("SKIP: `touch` is not on PATH; the SpawnApp spawn-positive test cannot run");
+        return;
+    }
     let dir = tmpdir("known");
     let sentinel = dir.join("launched.ok");
-    // Direct argv exec, no shell: `touch <sentinel>` word-splits cleanly.
-    // (`sentinel` comes from `temp_dir`, which carries no spaces here, so
-    // the shlex-style split keeps it one word.)
-    std::fs::write(
-        dir.join("probe.desktop"),
-        format!(
-            "[Desktop Entry]\nName=Probe\nExec=touch {}\n",
-            sentinel.display()
-        ),
-    )
-    .expect("seed probe.desktop");
+    seed_touch_entry(&dir, "probe", &sentinel);
     let mut state = state_with_app_dir(&dir);
 
     let ok = spawn_app(&mut state, "probe");
@@ -122,15 +150,11 @@ fn spawn_app_rejects_traversal_and_non_stem_ids_without_spawning() {
     // `sub/../evil` resolves through the filesystem to this file, so it
     // replies `true` (and touches the sentinel) the moment the file-stem
     // charset guard in `lookup_app_exec` is loosened -- the loud failure
-    // that pins the allowlist boundary.
-    std::fs::write(
-        dir.join("evil.desktop"),
-        format!(
-            "[Desktop Entry]\nName=Evil\nExec=touch {}\n",
-            sentinel.display()
-        ),
-    )
-    .expect("seed evil.desktop");
+    // that pins the allowlist boundary. (That loudness needs `touch` on
+    // PATH; without it the replies below still pin the guard, but the
+    // sentinel check is vacuous -- hence no skip here, unlike the
+    // spawn-positive test above.)
+    seed_touch_entry(&dir, "evil", &sentinel);
     // `sub/` exists so `sub/../evil` resolves through the filesystem to
     // the entry above -- without the guard it would reply `true`.
     std::fs::create_dir_all(dir.join("sub")).expect("seed sub dir");

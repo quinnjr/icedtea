@@ -1224,8 +1224,10 @@ fn parse_spawn_argv(cmd: &str) -> Option<(String, Vec<String>)> {
 
 /// The two XDG locations `State::app_dirs` defaults to, mirroring
 /// `icedtea-shell`'s `launcher::default_dirs` (duplicated, not shared: this
-/// crate must not depend on the shell crate).
-fn default_app_dirs() -> Vec<PathBuf> {
+/// crate must not depend on the shell crate). `pub` for the cross-crate
+/// parity test (`tests/launcher_parity.rs`), which pins the duplication
+/// against drift -- see that file.
+pub fn default_app_dirs() -> Vec<PathBuf> {
     let user = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"))
@@ -1245,7 +1247,8 @@ const SHOW_IN_ENV: &str = "icedtea";
 /// key wins); honors `NoDisplay=true` and the `OnlyShowIn`/`NotShowIn`
 /// gating against [`SHOW_IN_ENV`]. Returns `None` for anything hidden or
 /// malformed -- the `SpawnApp` caller must then spawn nothing.
-fn parse_desktop_exec(text: &str) -> Option<String> {
+/// `pub` for the cross-crate parity test (`tests/launcher_parity.rs`).
+pub fn parse_desktop_exec(text: &str) -> Option<String> {
     let mut in_entry_group = false;
     let mut seen_entry_group = false;
     let mut locale_name: Option<String> = None;
@@ -4596,6 +4599,16 @@ impl State {
     /// so an untrusted D-Bus caller cannot smuggle a path (`../…`, absolute
     /// paths, separators) into the join below and make the compositor read
     /// -- and exec -- an arbitrary desktop file.
+    ///
+    /// Main-loop cost note (review): this runs synchronously on the
+    /// `handle_command` path, but the work is bounded -- at most
+    /// `app_dirs.len()` (two in production) single-file reads of small
+    /// (~hundreds of bytes) `.desktop` files, with unreadable roots
+    /// skipped fast (`continue`, no retry/backoff) and an early return on
+    /// the first resolving hit. No directory scan, no recursion. IF
+    /// profiling ever shows this stalling the loop (e.g. a root on a hung
+    /// network FS), the follow-up is a cached id->exec index refreshed on
+    /// a worker thread -- do NOT inline more I/O here meanwhile.
     fn lookup_app_exec(&self, app_id: &str) -> Option<String> {
         if app_id.is_empty()
             || app_id == "."

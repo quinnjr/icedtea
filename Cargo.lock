@@ -1223,6 +1223,7 @@ dependencies = [
  "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
+ "icedtea-shell",
  "image",
  "rustix 1.1.4",
  "signal-hook",

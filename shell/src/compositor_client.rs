@@ -18,7 +18,7 @@ const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 /// constant (rather than an inline literal at the call) so the unit test
 /// below can pin it against the compositor's
 /// `CompositorInterface::spawn_app` (see `compositor/src/dbus.rs`'s
-/// `spawn_app_is_exposed_as_SpawnApp_with_string_in_bool_out`): the two
+/// `spawn_app_is_exposed_as_spawn_app_with_string_in_bool_out`): the two
 /// literals must agree, or the proxy call reaches no method and every
 /// launch silently reports `false`.
 const SPAWN_APP_MEMBER: &str = "SpawnApp";
@@ -262,7 +262,7 @@ mod tests {
 
     /// Pins the `SpawnApp` wire member the proxy calls: it must stay
     /// identical to the member `compositor/src/dbus.rs` exposes (pinned on
-    /// that side by `spawn_app_is_exposed_as_SpawnApp_with_string_in_bool_out`).
+    /// that side by `spawn_app_is_exposed_as_spawn_app_with_string_in_bool_out`).
     #[test]
     fn spawn_app_member_matches_the_compositor_interface() {
         assert_eq!(SPAWN_APP_MEMBER, "SpawnApp");

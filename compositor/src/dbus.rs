@@ -611,7 +611,7 @@ mod tests {
     /// or signature change fails here instead of degrading to a silent
     /// no-method call (every launch reporting `false`) at runtime.
     #[test]
-    fn spawn_app_is_exposed_as_SpawnApp_with_string_in_bool_out() {
+    fn spawn_app_is_exposed_as_spawn_app_with_string_in_bool_out() {
         let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
         let (_held, wake) =
             std::os::unix::net::UnixStream::pair().expect("wake pair for interface probe");
