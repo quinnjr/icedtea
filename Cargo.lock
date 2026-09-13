@@ -1291,6 +1291,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "icedtea-session"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "icedtea-config",
+ "icedtea-contract",
+ "icedtea-harness",
+ "serde",
+ "tracing",
+ "wayland-client",
+ "wayland-protocols-wlr",
+ "zbus",
+]
+
+[[package]]
 name = "icedtea-settings"
 version = "0.1.0"
 dependencies = [
