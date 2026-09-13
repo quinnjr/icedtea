@@ -20,6 +20,7 @@
 use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use wayland_client::protocol::wl_registry;
 use wayland_client::protocol::wl_seat::WlSeat;
@@ -155,6 +156,50 @@ pub fn run(conn: Connection, timeout_ms: u32, flow: Arc<LockFlow>) {
     }
 }
 
+/// How many times to try opening the ambient Wayland display before giving up.
+const CONNECT_ATTEMPTS: u32 = 10;
+/// Delay between Wayland connection attempts.
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Connect to the ambient Wayland display, retrying briefly.
+///
+/// `icedtea-session` and the compositor are independent session units with no
+/// ordering between them, so the compositor's socket may not exist yet when
+/// the daemon starts. Without a retry that transient becomes permanent:
+/// idle-lock would stay off for the daemon's whole life.
+fn connect_with_retry() -> io::Result<Connection> {
+    retry_connect(
+        Connection::connect_to_env,
+        CONNECT_ATTEMPTS,
+        CONNECT_RETRY_DELAY,
+    )
+}
+
+/// Run `connect` up to `attempts` times, sleeping `delay` between tries; the
+/// last error is returned if every attempt fails.
+fn retry_connect<E>(
+    mut connect: impl FnMut() -> Result<Connection, E>,
+    attempts: u32,
+    delay: Duration,
+) -> io::Result<Connection>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut last = None;
+    for attempt in 0..attempts {
+        match connect() {
+            Ok(conn) => return Ok(conn),
+            Err(err) => last = Some(err),
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    Err(io::Error::other(
+        last.expect("at least one connection attempt"),
+    ))
+}
+
 /// Start the idle-lock client on its own thread.
 ///
 /// `None` disables idle-lock (spec Decision 7): no connection is opened and no
@@ -167,9 +212,33 @@ pub fn spawn(flow: Arc<LockFlow>, timeout_ms: Option<u64>) -> io::Result<Option<
         return Ok(None);
     };
     let timeout_ms = u32::try_from(timeout_ms).unwrap_or(u32::MAX);
-    let conn = Connection::connect_to_env().map_err(io::Error::other)?;
+    let conn = connect_with_retry()?;
     let handle = std::thread::Builder::new()
         .name("icedtea-session-idle".to_string())
         .spawn(move || run(conn, timeout_ms, flow))?;
     Ok(Some(handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// A connection that never succeeds is retried exactly `attempts` times,
+    /// then reported as an error — the retry is bounded.
+    #[test]
+    fn retry_connect_is_bounded() {
+        let attempts = AtomicU32::new(0);
+        let result = retry_connect(
+            || -> io::Result<Connection> {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("no compositor"))
+            },
+            3,
+            Duration::from_millis(1),
+        );
+        assert!(result.is_err(), "a never-ready display gives up");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "bounded to 3 attempts");
+    }
 }
