@@ -37,9 +37,11 @@ pub const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 ///   / `SwitchToggled` signals.
 /// * `6` -- B1 launcher: `SpawnApp(s)->(b)` (launch-by-id method taking one
 ///   app-id string and returning one bool).
-/// * `7` -- A3 session lock: `IsLocked()->(b)` on the
-///   [`COMPOSITOR_IFACE`] interface, plus the `SessionLockChanged(bool)`
-///   signal.
+/// * `7` -- names the already-shipped A3 session-lock surface:
+///   `IsLocked()->(b)` on the [`COMPOSITOR_IFACE`] interface and the
+///   `SessionLockChanged(bool)` signal. Both shipped additively at revision
+///   `6` (which deliberately did not bump for them); this revision only
+///   records them in the ledger so a client can discover the surface.
 ///
 /// Additive changes are recorded here too, not only signature rewrites: a
 /// client compiled against an older revision needs to know whether a method
