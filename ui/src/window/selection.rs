@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
-    wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
+    wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, QueueHandle, event_created_child};
 use wayland_protocols::wp::primary_selection::zv1::client::{
@@ -173,6 +173,35 @@ pub(crate) struct ClipboardShared {
     primary_mimes: Vec<String>,
     primary_source: Option<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1>,
     primary_payload: String,
+
+    /// The live drag's `wl_data_source` (M6 §7), serving `Send` from
+    /// `drag_payload`. Cleared on `Cancelled`/`DndFinished`.
+    drag_source: Option<wl_data_source::WlDataSource>,
+    /// The bytes a toolkit drag offered, keyed by MIME, for the drag source.
+    drag_payload: Option<crate::dnd::DragPayload>,
+}
+
+impl ClipboardShared {
+    /// The exact bytes a drag `wl_data_source.send` for `mime` must serve, or
+    /// `None` when the flavor was not offered (the peer gets an empty pipe).
+    #[must_use]
+    fn drag_send_bytes(&self, mime: &str) -> Option<Vec<u8>> {
+        self.drag_payload
+            .as_ref()
+            .and_then(|payload| payload.data_for(&[mime]))
+            .map(|(_, data)| data.to_vec())
+    }
+
+    /// Drop the drag source and payload once the compositor reports the drag
+    /// spent (`Cancelled`/`DndFinished`), but only when `is_drag_source`
+    /// identifies the event's object as the current drag source -- the same
+    /// `wl_data_source` type also serves the clipboard.
+    fn clear_drag_if(&mut self, is_drag_source: bool) {
+        if is_drag_source {
+            self.drag_source = None;
+            self.drag_payload = None;
+        }
+    }
 }
 
 /// `wl_data_device` + `zwp_primary_selection_device_v1`, bound the moment the
@@ -192,8 +221,10 @@ pub struct Clipboard {
 
 /// Where a [`Clipboard`]'s text actually lives.
 enum Transport {
-    /// A real connection: sources, offers and pipes.
-    Wayland(Wayland),
+    /// A real connection: sources, offers and pipes. Shared behind `Rc` so a
+    /// [`ClientSeat`] can borrow the same transport instead of cloning each
+    /// protocol object per drag.
+    Wayland(Rc<Wayland>),
     /// No connection: two in-process slots.
     Offscreen(Offscreen),
 }
@@ -246,7 +277,7 @@ impl Clipboard {
             .as_ref()
             .map(|manager| manager.get_device(seat, &qh, ()));
         Self {
-            transport: Transport::Wayland(Wayland {
+            transport: Transport::Wayland(Rc::new(Wayland {
                 conn,
                 qh,
                 manager,
@@ -254,7 +285,7 @@ impl Clipboard {
                 primary_manager,
                 primary_device,
                 shared,
-            }),
+            })),
         }
     }
 
@@ -363,6 +394,25 @@ impl Clipboard {
         read_offer_fd(read.into(), deadline)
     }
 
+    /// The compositor-seat bridge for a toolkit drag (M6 §7): a `DragSeat`
+    /// that starts a real `wl_data_device.start_drag` on `surface`.
+    ///
+    /// `None` for an in-process (offscreen) clipboard, so a compositor-less
+    /// run keeps every drag toolkit-internal.
+    #[must_use]
+    pub(crate) fn drag_seat(
+        &mut self,
+        surface: wl_surface::WlSurface,
+    ) -> Option<Box<dyn crate::dnd::DragSeat>> {
+        let Transport::Wayland(wl) = &self.transport else {
+            return None;
+        };
+        Some(Box::new(ClientSeat {
+            transport: Rc::clone(wl),
+            surface,
+        }))
+    }
+
     /// Whether a clipboard offer is currently available to [`Clipboard::paste`].
     #[must_use]
     pub fn has_selection(&self) -> bool {
@@ -380,6 +430,55 @@ impl Clipboard {
             Transport::Wayland(wl) => wl.shared.borrow().primary_offer.is_some(),
             Transport::Offscreen(slots) => slots.primary.is_some(),
         }
+    }
+}
+
+/// The real [`crate::dnd::DragSeat`]: it starts the drag on the client's
+/// `wl_data_device`, offering the payload's MIMEs, and lets the compositor
+/// (M4.2's wlr port) route `enter`/`motion`/`drop` across surfaces.
+///
+/// The destination half is the compositor's; a drag delivered *into* one of
+/// this client's surfaces is not routed to toolkit targets yet (see the M6
+/// spec §7's remaining-gap note).
+struct ClientSeat {
+    /// The clipboard's shared transport: the protocol objects live here once,
+    /// not copied into every seat.
+    transport: Rc<Wayland>,
+    surface: wl_surface::WlSurface,
+}
+
+impl crate::dnd::DragSeat for ClientSeat {
+    fn offer_drag(&mut self, request: &crate::dnd::SeatDragRequest) -> crate::dnd::SeatDragResult {
+        use crate::dnd::SeatDragResult;
+        // wlroots validates `serial` against the grant table it recorded for
+        // this client (M4.2 decision 3); a zero serial is never one, and an
+        // empty offer has nothing to negotiate. Refuse rather than issue a
+        // request the compositor will drop. The grant table itself lives in
+        // `WindowState`, which this seam cannot see, so a nonzero serial is
+        // issued on the compositor's behalf and may still be rejected there.
+        if !request.is_offerable() {
+            return SeatDragResult::Refused;
+        }
+        let source = self
+            .transport
+            .manager
+            .create_data_source(&self.transport.qh, ());
+        for mime in request.mimes() {
+            source.offer(mime.to_owned());
+        }
+        source.set_actions(wl_data_device_manager::DndAction::Copy);
+        {
+            let mut shared = self.transport.shared.borrow_mut();
+            shared.drag_source = Some(source.clone());
+            shared.drag_payload = Some(request.payload.clone());
+        }
+        self.transport
+            .device
+            .start_drag(Some(&source), &self.surface, None, request.serial);
+        if let Err(err) = self.transport.conn.flush() {
+            tracing::warn!(%err, "flush after start_drag failed; the connection may be dead");
+        }
+        SeatDragResult::Accepted
     }
 }
 
@@ -440,12 +539,32 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WindowState {
         let Some(shared) = state.clipboard_shared.as_ref() else {
             return;
         };
-        if let wl_data_source::Event::Send { mime_type, fd } = event
-            && mime_type == TEXT_MIME
-            && shared.borrow().source.as_ref() == Some(source)
-        {
-            let payload = shared.borrow().payload.clone();
-            write_offer_fd(fd, payload.as_bytes(), SEND_DEADLINE);
+        match event {
+            wl_data_source::Event::Send { mime_type, fd } => {
+                // The same object serves the clipboard (one MIME) and a
+                // toolkit drag (its whole offer); decide which from identity.
+                let bytes: Option<Vec<u8>> = {
+                    let shared = shared.borrow();
+                    if shared.source.as_ref() == Some(source) && mime_type == TEXT_MIME {
+                        Some(shared.payload.clone().into_bytes())
+                    } else if shared.drag_source.as_ref() == Some(source) {
+                        shared.drag_send_bytes(mime_type.as_str())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(bytes) = bytes {
+                    write_offer_fd(fd, &bytes, SEND_DEADLINE);
+                }
+            }
+            // A finished/cancelled drag source is spent; drop it so a stale
+            // `send` cannot serve a dead drag.
+            wl_data_source::Event::Cancelled | wl_data_source::Event::DndFinished => {
+                let mut shared = shared.borrow_mut();
+                let is_drag_source = shared.drag_source.as_ref() == Some(source);
+                shared.clear_drag_if(is_drag_source);
+            }
+            _ => {}
         }
     }
 }
@@ -546,7 +665,8 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{TEXT_MIME, read_offer_fd, write_offer_fd};
+    use super::{ClipboardShared, TEXT_MIME, read_offer_fd, write_offer_fd};
+    use crate::dnd::{DragPayload, TEXT_PLAIN};
     use std::io::Write;
     use std::time::Duration;
 
@@ -640,5 +760,35 @@ mod tests {
             "read {} bytes",
             text.len()
         );
+    }
+
+    #[test]
+    fn a_drag_send_serves_exactly_the_offered_flavor() {
+        let mut shared = ClipboardShared::default();
+        // No drag payload: nothing to serve.
+        assert_eq!(shared.drag_send_bytes(TEXT_PLAIN), None);
+        shared.drag_payload = Some(DragPayload::offer_text("chip-payload"));
+        // The offered flavor yields its exact bytes ...
+        assert_eq!(
+            shared.drag_send_bytes(TEXT_PLAIN),
+            Some(b"chip-payload".to_vec())
+        );
+        // ... and an unoffered one yields nothing (the peer gets an empty pipe).
+        assert_eq!(shared.drag_send_bytes("application/x-nothing"), None);
+    }
+
+    #[test]
+    fn a_spent_drag_source_clears_only_for_the_drag_source() {
+        let mut shared = ClipboardShared {
+            drag_payload: Some(DragPayload::offer_text("x")),
+            ..Default::default()
+        };
+        // A clipboard-source event must not clear the live drag.
+        shared.clear_drag_if(false);
+        assert!(shared.drag_payload.is_some());
+        // The drag source's own `Cancelled`/`DndFinished` clears both slots.
+        shared.clear_drag_if(true);
+        assert!(shared.drag_source.is_none());
+        assert!(shared.drag_payload.is_none());
     }
 }

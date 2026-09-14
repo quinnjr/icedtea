@@ -61,12 +61,24 @@ classes, pseudo-classes).
   `ui/tests/a11y.rs` acceptance tests; `accesskit = "0.25"` dependency
   (default-on `a11y` feature flag gating the module so `--no-default-features`
   keeps the old tree).
-- **OUT (deferred, tracked as follow-ups):** the AT-SPI bus connection
-  (`accesskit_unix` adapter, async event pump, action-request handling
-  back into `App`), bounds/transform plumbing from `LayoutTree`, text
-  caret/selection ranges, live-region announcements, and full-catalogue
-  role coverage beyond §Mapping. The adapter exposes `take_update()` so
-  the bus slice needs no mapping changes.
+- **Shipped in the follow-up (bus) slice:** the AT-SPI bus connection
+  (`ui/src/a11y_bus.rs`, feature `a11y-bus`, off by default) wraps
+  `accesskit_unix`'s adapter with the version-aligned `accesskit 0.25` /
+  `accesskit_unix 0.23` pairing and publishes `A11yTree`'s output on the
+  session D-Bus; layout bounds from `LayoutTree` (`build_full_with_layout` /
+  `update_with_layout`); `DropDown` option children (a synthetic
+  `ListBox`/`ListBoxOption` subtree keyed by `ListItem::id`) and `Expanded`;
+  and live regions (`Statusbar`/`InfoBar`/`AlertDialog`). The bus half still
+  has **no runtime caller**: nothing in `App`/`Window` constructs an
+  `A11yTree` or drives an `A11yBus` — it is an unattached seam exercised only
+  by the tests.
+- **OUT (the genuine remainder):** action requests are recorded
+  (`A11yBus::take_actions`) but not dispatched back into `App`; text
+  caret/selection ranges (needs a `Role::TextRun` subtree accesskit's
+  `TextSelection` indexes into, which the widget model does not publish);
+  layout **transforms** (only border-box bounds are published); bounds for
+  the synthesized `DropDown` listbox/options (no `LayoutTree` allocation);
+  and full-catalogue role coverage beyond §Mapping.
 
 ## Mapping (widget → accesskit node)
 
@@ -82,7 +94,7 @@ maintain (`DISABLED`, `CHECKED`, `SELECTED`) plus the window focus ring.
 | `PasswordEntry` | `PasswordInput` | masked value **not** exposed (empty `value`) | `Disabled`, `ReadOnly` as above |
 | `CheckButton` | `CheckBox` | `Label` | `Toggled::True/False` ← `:checked`; `Mixed` ← `:indeterminate`; `Disabled` |
 | `Switch` | `Switch` | `Label` or tooltip | `Toggled` ← `:checked`; `Disabled` |
-| `DropDown` | `ComboBox` (value = selected item text from `Model`+`Selected` props) | `Selected` index → parent `value` | `Disabled`; option children + `Expanded` deferred to the bus slice (options are controller-owned CSS subnodes, not `Instance`s) |
+| `DropDown` | `ComboBox` (value = selected item text from `Model`+`Selected` props) | `Selected` index → parent `value` | `Disabled`; option children exposed as a synthetic `ListBox` of `ListBoxOption`s (the rows are controller-owned CSS subnodes, not `Instance`s), keyed by `ListItem::id`; `Expanded` from the prop; `HasPopup::Listbox` |
 | `ListBox` + `ListBoxRow`, `ListView` rows | `ListBox` + `ListBoxOption` | row text | `Selected` ← `:selected`; `Multiselectable` ← `SelectionMode::Multiple` |
 | `SpinButton`, `Scale`, `ProgressBar`, `LevelBar` | `SpinButton`, `Slider`, `ProgressIndicator`, `Meter` | `Label`/tooltip | numeric value/min/max |
 | Panel/taskbar items (shell `Button`/`MenuButton` instances) | same as their `Kind` | same | same; window root is `Role::Window` with `Label` = app id |
@@ -144,7 +156,10 @@ gallery_gate render tests) are out of scope; any other failure is reported.
 
 ## Follow-ups (not this slice)
 
-- AT-SPI bus adapter (`accesskit_unix` version-aligned) + action
-  handling (Click/Focus/SetValue back into `App`).
-- Bounds/transform from `LayoutTree`, text caret/selection, live regions.
-- Catalogue-wide role audit beyond §Mapping.
+- **Shipped since:** the AT-SPI bus adapter (`ui/src/a11y_bus.rs`,
+  `accesskit_unix` version-aligned), layout bounds from `LayoutTree`,
+  `DropDown` option children + `Expanded`, and live regions (see "The cut").
+- **Still open:** action dispatch (Click/Focus/SetValue) back into `App`;
+  text caret/selection; layout transforms; bounds for the synthetic option
+  nodes; a catalogue-wide role audit beyond §Mapping. No runtime caller
+  drives the bus yet — `App`/`Window` wiring is the missing piece.

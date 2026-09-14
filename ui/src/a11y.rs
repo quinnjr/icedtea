@@ -3,25 +3,42 @@
 //!
 //! This is M6's first accesskit slice (see
 //! `docs/superpowers/specs/2026-09-12-m6-accesskit-design.md`): it builds the
-//! node mapping — role, name, state — with stable [`NodeId`]s across
-//! reconciles, but wires no AT-SPI bus. The bus adapter (a follow-up) consumes
-//! [`A11yTree::update`] output unchanged, so this slice needs no re-design,
-//! only a sink.
+//! node mapping — role, name, state, bounds — with stable [`NodeId`]s across
+//! reconciles. The AT-SPI bus sink lives in `crate::a11y_bus` behind the
+//! `a11y-bus` feature and consumes [`A11yTree::build_full`] output unchanged.
 //!
 //! The adapter is read-only over the toolkit: it walks the [`Instance`] tree
 //! (never the CSS subnodes a controller owns), reads names from props and
 //! states from the retained [`Node`], and changes no rendering or input
 //! behavior. [`NodeId`]: accesskit::NodeId
 
-use accesskit::{Action, Node as A11yNode, NodeId, Role, Toggled, TreeId, TreeInfo, TreeUpdate};
+use accesskit::{
+    Action, HasPopup, Live, Node as A11yNode, NodeId, Role, Toggled, TreeId, TreeInfo, TreeUpdate,
+};
 
 use crate::css::node::{Node, PseudoStates};
-use crate::view::{Instance, Kind, Prop, PropName};
+use crate::layout::LayoutTree;
+use crate::view::{Instance, Kind, ListItem, Prop, PropName};
 use crate::widgets::types::SelectionMode;
+use crate::widgets::{MessageType, WidgetEnum};
 use crate::window::focus::FOCUSABLE_CLASS;
 
 /// The synthetic root's id. Real widgets allocate from 1.
 const ROOT_ID: NodeId = NodeId(0);
+
+/// The key space for adapter-synthesized nodes.
+///
+/// A `DropDown`'s listbox and its options share one owning [`NodeId`] but must
+/// never share a slot. A single `u64` slot made an option whose model id was
+/// `u64::MAX` alias the listbox's own sentinel, so the two are
+/// distinct variants instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyntheticSlot {
+    /// The controller-owned listbox itself.
+    ListBox,
+    /// One option, keyed by its [`ListItem::id`](crate::view::ListItem).
+    Option(u64),
+}
 
 /// The in-process a11y tree: stable id assignment plus the last update.
 pub struct A11yTree {
@@ -29,6 +46,15 @@ pub struct A11yTree {
     /// Every instance node seen so far, so a reconcile that keeps an
     /// `Instance` keeps its [`NodeId`].
     ids: Vec<(Node, NodeId)>,
+    /// Ids for nodes the adapter synthesizes rather than reads off the
+    /// retained tree — a `DropDown`'s listbox and its options, which are
+    /// controller-owned CSS subnodes with no [`Instance`]. The key is
+    /// `(owning node id, [`SyntheticSlot`])`, so the listbox has its own key
+    /// space and an option's slot is the model's own stable identity.
+    synthetic: Vec<((NodeId, SyntheticSlot), NodeId)>,
+    /// The synthetic slots the build in progress referenced, so everything
+    /// else can be pruned when it finishes.
+    synthetic_seen: Vec<(NodeId, SyntheticSlot)>,
     last: Option<TreeUpdate>,
 }
 
@@ -45,6 +71,8 @@ impl A11yTree {
         A11yTree {
             next: 1,
             ids: Vec::new(),
+            synthetic: Vec::new(),
+            synthetic_seen: Vec::new(),
             last: None,
         }
     }
@@ -59,13 +87,75 @@ impl A11yTree {
         instances: &[Instance<Msg>],
         focus: Option<&Node>,
     ) -> TreeUpdate {
+        self.build_impl(instances, focus, None)
+    }
+
+    /// A full rebuild that also publishes each node's bounds.
+    ///
+    /// `layout` is the frame's [`LayoutTree`]; every instance node with an
+    /// allocation gets its `border_box` translated into the parent's
+    /// coordinate space, which is the space accesskit's [`Rect`] is in. The
+    /// synthetic root's bounds are the union of the top-level allocations.
+    ///
+    /// [`Rect`]: accesskit::Rect
+    pub fn build_full_with_layout<Msg>(
+        &mut self,
+        instances: &[Instance<Msg>],
+        focus: Option<&Node>,
+        layout: &LayoutTree,
+    ) -> TreeUpdate {
+        self.build_impl(instances, focus, Some(layout))
+    }
+
+    /// Rebuild after a reconcile. Identical to [`A11yTree::build_full`] in
+    /// this slice — ids are stable by construction, which is what the
+    /// transition test asserts; true diffing is bus-slice work.
+    pub fn update<Msg>(&mut self, instances: &[Instance<Msg>], focus: Option<&Node>) -> TreeUpdate {
+        self.build_full(instances, focus)
+    }
+
+    /// [`A11yTree::update`], with the frame's layout for bounds.
+    pub fn update_with_layout<Msg>(
+        &mut self,
+        instances: &[Instance<Msg>],
+        focus: Option<&Node>,
+        layout: &LayoutTree,
+    ) -> TreeUpdate {
+        self.build_full_with_layout(instances, focus, layout)
+    }
+
+    /// The shared body of the `build_full*`/`update*` pair.
+    fn build_impl<Msg>(
+        &mut self,
+        instances: &[Instance<Msg>],
+        focus: Option<&Node>,
+        layout: Option<&LayoutTree>,
+    ) -> TreeUpdate {
         let mut out = Vec::new();
         let mut children = Vec::with_capacity(instances.len());
+        self.synthetic_seen.clear();
+        // The synthetic root's coordinate origin: top-level nodes are
+        // relative to the window, not to each other.
+        let origin = (0.0_f32, 0.0_f32);
+        let mut extent = (0.0_f32, 0.0_f32);
         for instance in instances {
-            children.push(self.describe(instance, None, &mut out));
+            children.push(self.describe(instance, None, &mut out, layout, Some(origin)));
+            if let Some(alloc) = layout.and_then(|tree| tree.allocation(&instance.node)) {
+                let box_ = alloc.border_box;
+                extent.0 = extent.0.max(box_.x + box_.width);
+                extent.1 = extent.1.max(box_.y + box_.height);
+            }
         }
         let mut root = A11yNode::new(Role::Window);
         root.set_children(children);
+        if layout.is_some() {
+            root.set_bounds(accesskit::Rect::new(
+                0.0,
+                0.0,
+                f64::from(extent.0),
+                f64::from(extent.1),
+            ));
+        }
         out.push((ROOT_ID, root));
 
         let focus_id = focus
@@ -84,15 +174,12 @@ impl A11yTree {
             tree_id: TreeId::ROOT,
             focus: focus_id,
         };
+        // Prune synthetic ids this frame never referenced, so a removed or
+        // rebuilt drop-down cannot grow the map without bound.
+        let seen = std::mem::take(&mut self.synthetic_seen);
+        self.synthetic.retain(|(key, _)| seen.contains(key));
         self.last = Some(update.clone());
         update
-    }
-
-    /// Rebuild after a reconcile. Identical to [`A11yTree::build_full`] in
-    /// this slice — ids are stable by construction, which is what the
-    /// transition test asserts; true diffing is bus-slice work.
-    pub fn update<Msg>(&mut self, instances: &[Instance<Msg>], focus: Option<&Node>) -> TreeUpdate {
-        self.build_full(instances, focus)
     }
 
     /// The last update this tree produced, if any.
@@ -122,6 +209,28 @@ impl A11yTree {
         id
     }
 
+    /// The stable id for an adapter-synthesized node (a `DropDown`'s listbox
+    /// or one of its options). `slot` distinguishes the listbox from an
+    /// option and gives an option the model item's own id, so a re-sorted
+    /// model keeps ids without an option's id ever colliding with the
+    /// listbox's.
+    fn synthetic_id(&mut self, owner: NodeId, slot: SyntheticSlot) -> NodeId {
+        if !self.synthetic_seen.contains(&(owner, slot)) {
+            self.synthetic_seen.push((owner, slot));
+        }
+        if let Some((_, id)) = self
+            .synthetic
+            .iter()
+            .find(|((o, s), _)| *o == owner && *s == slot)
+        {
+            return *id;
+        }
+        let id = NodeId(self.next);
+        self.next += 1;
+        self.synthetic.push(((owner, slot), id));
+        id
+    }
+
     /// Describe one instance (and, unless it synthesizes its children, its
     /// subtree), pushing into `out` in pre-order so a name lookup finds the
     /// parent before any same-named descendant.
@@ -133,17 +242,31 @@ impl A11yTree {
         instance: &Instance<Msg>,
         option_at: Option<(usize, usize)>,
         out: &mut Vec<(NodeId, A11yNode)>,
+        layout: Option<&LayoutTree>,
+        parent_origin: Option<(f32, f32)>,
     ) -> NodeId {
         let id = self.id_for(&instance.node);
+        let abs = layout
+            .and_then(|tree| tree.allocation(&instance.node))
+            .map(|a| a.border_box);
+        // The origin a child's bounds are measured against is this node's own
+        // border-box origin. A node with no allocation establishes none, so
+        // its descendants' bounds are skipped rather than reported against a
+        // grandparent's origin with the parent's box missing.
+        let origin = abs.map(|b| (b.x, b.y));
         // Reserve the parent's slot first: child ids are needed for
         // `set_children`, but the parent must still land before them.
         let slot = out.len();
         let mut children = Vec::with_capacity(instance.children.len());
-        if instance.kind != Kind::DropDown {
+        if instance.kind == Kind::DropDown {
             // `DropDown` takes no application children and its option rows
-            // are controller-owned CSS subnodes, not `Instance`s; exposing
-            // them is bus-slice work (spec §Mapping). Everything else
-            // recurses over the retained child instances.
+            // are controller-owned CSS subnodes, not `Instance`s. Expose the
+            // model's options as a synthetic listbox subtree instead: role +
+            // label + selection from the same props the controller read.
+            if let Some(list) = self.drop_down_options(instance, id, out) {
+                children.push(list);
+            }
+        } else {
             let mut option_index = 0;
             let option_total = instance
                 .children
@@ -156,17 +279,78 @@ impl A11yTree {
                     option_index += 1;
                     at
                 });
-                children.push(self.describe(child, at, out));
+                children.push(self.describe(child, at, out, layout, origin));
             }
         }
         let mut node = A11yNode::new(role_of(instance.kind));
         fill(instance, &mut node, option_at);
         apply_common(instance, &mut node);
+        if let (Some(b), Some((px, py))) = (abs, parent_origin) {
+            node.set_bounds(accesskit::Rect::new(
+                f64::from(b.x - px),
+                f64::from(b.y - py),
+                f64::from(b.x - px + b.width),
+                f64::from(b.y - py + b.height),
+            ));
+        }
         if !children.is_empty() {
             node.set_children(children);
         }
         out.insert(slot, (id, node));
         id
+    }
+
+    /// Synthesize the `DropDown`'s option subtree from its `Model` and
+    /// `Selected` props: one `ListBox` child holding one `ListBoxOption` per
+    /// model item. Returns the listbox id, or `None` for an empty model.
+    ///
+    /// The options are controller-owned CSS subnodes with no `Instance`, so
+    /// their ids come from [`A11yTree::synthetic_id`] keyed by the model's
+    /// own [`ListItem::id`](crate::view::ListItem), which survives a
+    /// reconcile that reorders the model.
+    fn drop_down_options<Msg>(
+        &mut self,
+        instance: &Instance<Msg>,
+        owner: NodeId,
+        out: &mut Vec<(NodeId, A11yNode)>,
+    ) -> Option<NodeId> {
+        let items = match instance.props.get(PropName::Model) {
+            Some(Prop::Items(items)) if !items.is_empty() => items,
+            _ => return None,
+        };
+        let selected = instance.props.int(PropName::Selected, 0).max(0) as usize;
+        let list_id = self.synthetic_id(owner, SyntheticSlot::ListBox);
+        // First occurrence wins: a model carrying duplicate `ListItem::id`s
+        // must still emit one node per id, or the `TreeUpdate` repeats a
+        // `NodeId` and is malformed.
+        let mut seen_ids: Vec<u64> = Vec::with_capacity(items.len());
+        let unique: Vec<&ListItem> = items
+            .iter()
+            .filter(|item| {
+                if seen_ids.contains(&item.id) {
+                    false
+                } else {
+                    seen_ids.push(item.id);
+                    true
+                }
+            })
+            .collect();
+        let mut option_ids = Vec::with_capacity(unique.len());
+        for (position, item) in unique.iter().enumerate() {
+            let option_id = self.synthetic_id(owner, SyntheticSlot::Option(item.id));
+            option_ids.push(option_id);
+            let mut option = A11yNode::new(Role::ListBoxOption);
+            option.set_label(item.text.to_string());
+            option.set_selected(position == selected);
+            option.set_position_in_set(position);
+            option.set_size_of_set(unique.len());
+            option.add_action(Action::Click);
+            out.push((option_id, option));
+        }
+        let mut list = A11yNode::new(Role::ListBox);
+        list.set_children(option_ids);
+        out.push((list_id, list));
+        Some(list_id)
     }
 }
 
@@ -189,6 +373,10 @@ fn role_of(kind: Kind) -> Role {
         Kind::Scale => Role::Slider,
         Kind::ProgressBar => Role::ProgressIndicator,
         Kind::LevelBar => Role::Meter,
+        // Live regions need a role the platform tree keeps: accesskit filters
+        // `GenericContainer`, and a status/alert is never one.
+        Kind::Statusbar => Role::Status,
+        Kind::InfoBar => Role::Alert,
         Kind::AlertDialog => Role::AlertDialog,
         Kind::Window | Kind::ShortcutsWindow | Kind::AboutDialog => Role::Window,
         _ => Role::GenericContainer,
@@ -257,6 +445,8 @@ fn fill<Msg>(instance: &Instance<Msg>, node: &mut A11yNode, option_at: Option<(u
             if let Some(current) = drop_down_value(props) {
                 node.set_value(current);
             }
+            node.set_expanded(props.bool(PropName::Expanded, false));
+            node.set_has_popup(HasPopup::Listbox);
             node.add_action(Action::Click);
         }
         Kind::ListBox => {
@@ -293,6 +483,35 @@ fn fill<Msg>(instance: &Instance<Msg>, node: &mut A11yNode, option_at: Option<(u
         }
         Kind::LevelBar => {
             set_numeric(props, node);
+        }
+        // Live regions: the value the widget model already carries, announced
+        // as it changes. Nothing is fabricated — an empty statusbar or an
+        // unrevealed info bar carries no announcement.
+        Kind::Statusbar => {
+            if let Some(text) = props.str(PropName::Text).filter(|text| !text.is_empty()) {
+                node.set_value(text);
+                node.set_live(Live::Polite);
+            }
+        }
+        Kind::InfoBar => {
+            if props.bool(PropName::Reveal, false) {
+                // Warnings and errors interrupt; info and questions wait.
+                let kind =
+                    MessageType::from_prop(props.get(PropName::MessageType), MessageType::Info);
+                node.set_live(match kind {
+                    MessageType::Warning | MessageType::Error => Live::Assertive,
+                    _ => Live::Polite,
+                });
+            }
+        }
+        Kind::AlertDialog => {
+            if let Some(message) = props.str(PropName::Message) {
+                node.set_label(message);
+            }
+            if let Some(detail) = props.str(PropName::Detail) {
+                node.set_description(detail);
+            }
+            node.set_live(Live::Assertive);
         }
         _ => {}
     }

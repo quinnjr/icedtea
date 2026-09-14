@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::css::node::Node;
 use crate::css::value::image::IconRef;
-use crate::view::controller::{Controller, Event, EventCx};
+use crate::view::controller::{Controller, DndState, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::{PointerState, Universal};
 use crate::window::focus::FocusCause;
@@ -84,6 +84,9 @@ pub struct ButtonC {
     pub activating_until: Option<Duration>,
     pointer: PointerState,
     universal: Universal,
+    /// M6 drag-and-drop: `Button` is a source/target when the view opts it in
+    /// (a dedicated controller is no longer kept out by the trait defaults).
+    dnd: DndState,
 }
 
 impl ButtonC {
@@ -120,6 +123,19 @@ impl<Msg: Clone + 'static> Controller<Msg> for ButtonC {
         Kind::Button
     }
 
+    fn drag_offer(&self) -> Option<crate::dnd::DragPayload> {
+        self.dnd.offer()
+    }
+
+    fn drop_accepts(&self, offered: &[&str]) -> bool {
+        self.dnd.accepts(offered)
+    }
+
+    fn cancel_press(&mut self, node: &Node) {
+        self.pointer.pressed = false;
+        node.set_state(crate::css::node::PseudoStates::ACTIVE, false);
+    }
+
     fn build(node: &Node, props: &Props, _cx: &mut BuildCx<'_>) -> Self {
         let image = props.get(PropName::Icon).is_some().then(|| {
             let image = Node::new("image");
@@ -144,10 +160,14 @@ impl<Msg: Clone + 'static> Controller<Msg> for ButtonC {
             activating_until: None,
             pointer: PointerState::default(),
             universal: Universal::new(node, Kind::Button),
+            dnd: DndState::default(),
         }
     }
 
     fn set_prop(&mut self, node: &Node, name: PropName, value: &Prop, _cx: &mut BuildCx<'_>) {
+        if self.dnd.set_prop(node, name, value) {
+            return;
+        }
         match (name, value) {
             (PropName::Label, Prop::Str(_)) => {
                 if self.label.is_none() {
@@ -172,6 +192,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for ButtonC {
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
+        if let Some(out) = self.dnd.on_event(ev, cx) {
+            return out;
+        }
         let bounds = cx
             .tree
             .allocation(cx.node)

@@ -54,8 +54,15 @@ const COMPOSITOR_UNLOCK_SETTLE_POLLS: u32 = 3;
 /// unreachable. One transient 750ms call timeout must not release sleep
 /// seconds early, but a genuinely dead compositor must not burn the budget.
 const PRE_SLEEP_UNREACHABLE_POLLS: u64 = 3;
+/// How long [`LockFlow::terminate_locker`] gives a `SIGKILL`ed locker to be
+/// reaped before it abandons the wait. `SIGKILL` cannot be blocked, but a
+/// process wedged in uninterruptible sleep (`D` state, e.g. blocked on a hung
+/// filesystem) will not act on it, and an unbounded `wait()` would then pin
+/// the calling thread — which on the external-unlock path is the whole session
+/// flow.
+const LOCKER_REAP_BUDGET: Duration = Duration::from_secs(2);
 
-/// The child-process operations [`locker_waiter`] and [`terminate_locker`]
+/// The child-process operations [`locker_waiter`] and [`LockFlow::terminate_locker`]
 /// need, so a test can inject a child whose `try_wait` fails without racing a
 /// real process. Implemented for [`Child`]; production is unchanged.
 trait LockerChild: Send {
@@ -204,7 +211,25 @@ pub struct LockFlow {
     /// always uses `sh`.
     #[cfg(test)]
     locker_shell: Option<&'static str>,
+    /// Test-only override for the process-group signal, so
+    /// [`Self::terminate_locker`]'s warn-and-fall-back path is reachable
+    /// without racing a real process group. Production always signals the
+    /// real group.
+    #[cfg(test)]
+    group_kill: GroupKill,
     state: Arc<Mutex<FlowState>>,
+}
+
+/// How a locker's process group is signalled. Production always sends
+/// `SIGKILL` to the real group; a test can substitute a failing
+/// implementation so [`LockFlow::terminate_locker`]'s fallback reap (and its
+/// warn) is exercised hermetically. Mirrors [`LockFlow`]'s `locker_shell`
+/// test-only override shape.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupKill {
+    Real,
+    Fail,
 }
 
 impl LockFlow {
@@ -239,6 +264,8 @@ impl LockFlow {
             budget,
             #[cfg(test)]
             locker_shell: None,
+            #[cfg(test)]
+            group_kill: GroupKill::Real,
             state: Arc::new(Mutex::new(FlowState {
                 sleep: None,
                 power_key: None,
@@ -479,7 +506,7 @@ impl LockFlow {
             drop(guard);
             if let Some(mut slot) = slot {
                 tracing::info!("external unlock; terminating the running locker");
-                terminate_locker(&mut *slot.child);
+                self.terminate_locker(&mut *slot.child);
             }
             return;
         };
@@ -536,7 +563,7 @@ impl LockFlow {
             tracing::info!(
                 "compositor reports unlocked and no self-unlock is in flight; terminating the running locker"
             );
-            terminate_locker(&mut *slot.child);
+            self.terminate_locker(&mut *slot.child);
         }
     }
 
@@ -638,6 +665,84 @@ impl LockFlow {
         }
     }
 
+    /// Signal the locker's process group. Production sends the in-process
+    /// `kill(-pgid, SIGKILL)` [`Self::terminate_locker`] relies on; a test can
+    /// substitute a failure so the fallback `child.kill()`/`wait()` reap (and
+    /// the warn it logs) is reachable without racing a real process group.
+    fn group_kill(&self, pgid: Pid) -> Result<(), rustix::io::Errno> {
+        #[cfg(test)]
+        if self.group_kill == GroupKill::Fail {
+            return Err(rustix::io::Errno::IO);
+        }
+        kill_process_group(pgid, Signal::KILL)
+    }
+
+    /// SIGKILL the locker's whole process group, then reap it. The locker is
+    /// spawned as its own process-group leader (`process_group(0)` in
+    /// [`Self::spawn_locker`]), so this reaches the configured command's own
+    /// descendant processes rather than only the `sh` wrapper. The group is
+    /// signalled in-process through [`Self::group_kill`] — no shell is
+    /// spawned, so a pid/pgid-reuse race can no longer signal an unrelated
+    /// same-user group through a shell that resolves the negative pid later.
+    /// `child.kill()` and a bounded `try_wait` reap ([`Self::reap_terminated`])
+    /// run even when the group signal fails, so no zombie is left behind in
+    /// the ordinary case and a wedged locker cannot hang this thread.
+    fn terminate_locker(&self, child: &mut (dyn LockerChild + Send)) {
+        let pid = child.id();
+        match i32::try_from(pid).ok().and_then(Pid::from_raw) {
+            Some(pgid) => {
+                if let Err(err) = self.group_kill(pgid) {
+                    tracing::warn!(%err, pid, "could not signal the locker process group");
+                }
+            }
+            // An out-of-range pid, or `0`, has no pgid of its own. The group
+            // signal is skipped entirely, so say so rather than falling
+            // through to the direct kill without a trace.
+            None => {
+                tracing::warn!(
+                    pid,
+                    "locker pid has no signalable process group; killing it directly"
+                );
+            }
+        }
+        if let Err(err) = child.kill() {
+            tracing::warn!(%err, pid, "could not kill the locker; it may still be running");
+        }
+        Self::reap_terminated(child);
+    }
+
+    /// Reap a killed locker without blocking forever. Polls `try_wait` for a
+    /// bounded window instead of calling the unbounded `wait()`: `SIGKILL`
+    /// leaves the child dead and reapable in every ordinary case, but a
+    /// process stuck in uninterruptible sleep would otherwise pin this thread
+    /// until it wakes. Abandoning the wait is logged; the child is left for
+    /// init to reap rather than hanging the flow.
+    fn reap_terminated(child: &mut (dyn LockerChild + Send)) {
+        let deadline = Instant::now() + LOCKER_REAP_BUDGET;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        pid = child.id(),
+                        "could not reap the locker; abandoning the wait"
+                    );
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    pid = child.id(),
+                    "locker survived SIGKILL past the reap budget; abandoning the wait"
+                );
+                return;
+            }
+            std::thread::sleep(LOCKER_WAIT_POLL);
+        }
+    }
+
     /// Spawn the configured locker, install it as the active generation, and
     /// start the waiter that reaps it and mirrors its exit into
     /// `Session.Unlock`.
@@ -657,7 +762,7 @@ impl LockFlow {
         // argv and never invokes a shell; the two are not equivalent. To keep
         // an external unlock effective, the shell is started in its own
         // process group and the whole group is killed by
-        // [`terminate_locker`], not just the `sh` wrapper.
+        // [`Self::terminate_locker`], not just the `sh` wrapper.
         let mut child = match Command::new(self.locker_shell())
             .arg("-c")
             .arg(command)
@@ -676,7 +781,7 @@ impl LockFlow {
                 // Lost the race: another trigger committed first. Drop our
                 // just-spawned child instead of overwriting the winner.
                 drop(state);
-                terminate_locker(&mut child);
+                self.terminate_locker(&mut child);
                 tracing::info!("a locker was already running; dropped the duplicate spawn");
                 return LockAttempt::AlreadyRunning;
             }
@@ -732,7 +837,7 @@ impl LockFlow {
         let Some(mut slot) = slot else {
             return;
         };
-        terminate_locker(&mut *slot.child);
+        self.terminate_locker(&mut *slot.child);
         commit_unlock(&self.state, &*self.logind, generation);
     }
 
@@ -901,26 +1006,6 @@ fn commit_unlock(
         remove_self_unlock(&mut guard, generation);
     }
     true
-}
-
-/// SIGKILL the locker's whole process group, then reap it. The locker is
-/// spawned as its own process-group leader (`process_group(0)` in
-/// [`LockFlow::spawn_locker`]), so this reaches the configured command's own
-/// descendant processes rather than only the `sh` wrapper. The group is
-/// signalled in-process with `kill(-pgid, SIGKILL)` — no shell is spawned, so
-/// a pid/pgid-reuse race can no longer signal an unrelated same-user group
-/// through a shell that resolves the negative pid later. `child.kill()` and
-/// `child.wait()` remain the reap.
-fn terminate_locker(child: &mut (dyn LockerChild + Send)) {
-    let pid = child.id();
-    if let Ok(raw) = i32::try_from(pid)
-        && let Some(pgid) = Pid::from_raw(raw)
-        && let Err(err) = kill_process_group(pgid, Signal::KILL)
-    {
-        tracing::warn!(%err, pid, "could not signal the locker process group");
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Poll `try_wait` until the locker exits (or an external unlock took it),
@@ -2113,6 +2198,79 @@ mod tests {
             logind.calls().contains(&LogindCall::Lock),
             "the lock was still attempted: {:?}",
             logind.calls()
+        );
+    }
+
+    /// A `tracing` writer that appends into a shared buffer, so a test can
+    /// assert that a failure branch was logged.
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The group-kill failure branch, reached through the `#[cfg(test)]`
+    /// `group_kill` seam (mirroring `locker_shell`): when
+    /// `kill_process_group` fails, `terminate_locker` still falls back to
+    /// `child.kill()`/`wait()` (reaping a real child, so no zombie) and logs
+    /// the failure. This is the external-unlock path, so no clean
+    /// `Session.Unlock` is issued either.
+    #[test]
+    fn a_failed_group_kill_falls_back_to_kill_and_reap_without_a_clean_unlock() {
+        let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
+        let mut flow = test_flow(logind.clone());
+
+        // A real child, so "no zombie" is a real reaping observable.
+        let child = sleeping_child();
+        let pid = child.id();
+        {
+            let mut state = flow.state();
+            state.active_generation = 1;
+            state.locker = Some(LockerSlot {
+                generation: 1,
+                child: Box::new(child),
+            });
+        }
+        // Force the group signal to fail, leaving only the fallback reap.
+        flow.group_kill = GroupKill::Fail;
+
+        let logs = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || BufWriter(Arc::clone(&sink)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // No self-unlock marker -> external unlock; terminate, no Unlock.
+            flow.on_unlock();
+        });
+
+        assert!(!flow.locker_running(), "the slot was cleared");
+        assert!(
+            !pid_alive(pid),
+            "the fallback kill/reap must leave no zombie"
+        );
+        assert!(
+            !logind.calls().contains(&LogindCall::Unlock),
+            "an external unlock must not issue a clean Session.Unlock: {:?}",
+            logind.calls()
+        );
+        let logged =
+            String::from_utf8_lossy(&logs.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+        assert!(
+            logged.contains("could not signal the locker process group"),
+            "the group-kill failure must be logged; got: {logged}"
         );
     }
 }

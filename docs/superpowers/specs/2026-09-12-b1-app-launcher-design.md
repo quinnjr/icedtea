@@ -126,6 +126,70 @@ Win7 left rail + Win10 right pane:
 - A separate launcher process (same-process surface keeps one
   event loop, one config handle, one D-Bus connection).
 
+## Deferred work (B1 follow-up)
+
+The three launcher items v1 left out. All live in the pure core
+(`shell/src/launcher/`) or the view (`shell/src/launcher_view.rs`); none adds
+a D-Bus method, a config table, or a dependency, and pin/unpin is untouched.
+
+### Non-app search providers
+
+A minimal seam: `launcher::provider::SearchProvider` (`kind` + `search`) over
+`SearchResult { kind, id, title, subtitle, score, weight }`, with
+`ProviderKind = App | Settings | File` and a pure `rank_results` that sorts by
+score desc, weight desc, kind tie-rank (App, Settings, File), then
+case-insensitive title, then id — so every provider merges into one
+deterministic ranked list. A non-empty search query renders that list in the
+All pane; the pinned rail and tiles stay app-only.
+
+- **Files** (`FilesProvider`): a bounded, read-only index of
+  `$XDG_DESKTOP_DIR` / `$XDG_DOCUMENTS_DIR` / `$XDG_DOWNLOAD_DIR` (falling
+  back to `$HOME/Desktop|Documents|Downloads`) plus
+  `$XDG_DATA_HOME/recently-used.xbel`, parsed by `parse_recent`
+  (`href="file://…"` → `%XX`-decoded path, capped). Entries cap at
+  `MAX_FILE_RESULTS`, newest-mtime first, which is also the ranking weight.
+  Selecting a file opens it with the desktop's registered handler through a
+  local `xdg-open` helper — the power row's own local-helper pattern. The
+  compositor `SpawnApp` path is app-id-only and is deliberately **not**
+  extended to carry a path (no raw argv over D-Bus).
+- **Settings** (`SettingsProvider`): the settings pages as results whose id is
+  the page name; selecting one asks the compositor to spawn
+  `org.icedtea.Settings`. The page list is mirrored here (SYNC note) because
+  the shell crate does not depend on `icedtea-settings`. The page id is
+  discarded before the call — the compositor `SpawnApp` path is app-id-only
+  and carries no argv — so a settings result opens the app on its default
+  page, not the searched page.
+
+Tests: each provider's parse/query (recent-xbel parse, page/name match,
+`scan` bounding), and a merge/rank test that pins the cross-provider order.
+
+### Tile drag-reorder
+
+Tiles ride the M6 toolkit DnD (`ui/src/dnd.rs`) directly: each tile is a
+`GenericC` node (`Kind::ListBoxRow`, M6-D2's source/target kind) carrying
+`DragSource` = app id and `DropAccept = "text/plain"`, plus `on_drop`. A drop
+folds `LauncherMsg::ReorderTile { source, target }`; `TileStore::reorder`
+removes the source from its group and inserts it at the target's slot in the
+target's group (cross-group move included; a group left empty is pruned). The
+order round-trips through the existing `LauncherConfig.tile_groups` on the
+next close write-back, exactly like pin/unpin. Dragging arms M6's drag latch,
+so that release is a drop, never a click.
+
+Tests: `TileStore::reorder` unit tests (within-group, cross-group, no-op) plus
+an integration test that reorders, closes, reloads the saved config, and
+asserts the re-seeded view renders the new order.
+
+### Adaptive ordering
+
+The recency/frequency tiebreak becomes a pure `RecencyStore::adaptive_score`:
+`weight = count * (DECAY_WINDOW + 1) / (DECAY_WINDOW + age)`, `DECAY_WINDOW = 32`,
+`age = seq - last_seen` (saturating). Integer-only and deterministic: frequency
+lifts the weight, staleness decays it, a never-launched app scores 0. `Matcher`
+uses it as the score-tie tiebreak in place of the raw count.
+
+Tests: formula unit tests (frequency doubles at equal age; recent beats stale
+at equal count; a stale single-use decays to 0) and the matcher ordering.
+
 ## Risks
 
 - **Fuzzy quality on huge app sets** — hundreds of `.desktop` files

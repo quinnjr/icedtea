@@ -4,9 +4,15 @@
 //! returns, and every behavior is unit-testable without a compositor.
 
 pub mod entry;
+pub mod provider;
+pub mod recent;
 
 pub use entry::{
     DesktopEntry, Locale, parse_entry, parse_entry_with_id, parse_entry_with_id_and_locale,
+};
+pub use provider::{
+    AppsProvider, FileEntry, FilesProvider, ProviderKind, SearchProvider, SearchResult,
+    SettingsProvider, default_file_dirs, rank_results,
 };
 
 use std::collections::HashMap;
@@ -35,6 +41,11 @@ pub fn default_dirs() -> Vec<PathBuf> {
 
 /// Cap on distinct apps tracked by [`RecencyStore`]; oldest prune first.
 pub const MAX_RECENCY_ENTRIES: usize = 200;
+
+/// Half-life-style window for [`RecencyStore::adaptive_score`]: an entry
+/// `DECAY_WINDOW` launches old scores about half of a fresh one of the same
+/// launch count. Fixed and integer-only so the ordering is deterministic.
+pub const DECAY_WINDOW: u64 = 32;
 
 /// Every `*.desktop` path under `dirs`, in dir order. Unreadable dirs are
 /// skipped, never fatal; `read_dir` errors on individual entries are
@@ -177,6 +188,28 @@ impl RecencyStore {
             .unwrap_or(0)
     }
 
+    /// Adaptive ordering weight for `app_id`: launch frequency decayed by
+    /// staleness, the ordering signal beyond the raw count tiebreak.
+    ///
+    /// Formula (integer-only, pure, deterministic):
+    ///
+    /// ```text
+    /// age    = seq - last_seen            (saturating)
+    /// weight = count * (DECAY_WINDOW + 1) / (DECAY_WINDOW + age)
+    /// ```
+    ///
+    /// A just-used entry scores its count; an entry `DECAY_WINDOW` launches
+    /// old scores about half; a never-recorded id scores 0. Frequency raises
+    /// the weight, staleness lowers it, so a frequent recent app outranks an
+    /// equally-matching stale one.
+    pub fn adaptive_score(&self, app_id: &str) -> u64 {
+        let Some((count, seen)) = self.counts.get(app_id) else {
+            return 0;
+        };
+        let age = self.seq.saturating_sub(*seen);
+        count.saturating_mul(DECAY_WINDOW + 1) / (DECAY_WINDOW + age)
+    }
+
     /// Number of distinct apps currently tracked.
     pub fn len(&self) -> usize {
         self.counts.len()
@@ -192,7 +225,8 @@ impl RecencyStore {
 ///
 /// Scoring per field (name, each keyword, exec basename), best field wins:
 /// exact 300 > prefix 200 > word-boundary 100 > substring 25.
-/// Ties break on recency count, then case-insensitive name, then id.
+/// Ties break on the adaptive recency weight
+/// ([`RecencyStore::adaptive_score`]), then case-insensitive name, then id.
 #[derive(Debug, Clone, Copy)]
 pub struct Matcher<'a> {
     index: &'a DesktopIndex,
@@ -223,16 +257,12 @@ impl<'a> Matcher<'a> {
         }
         let mut scored: Vec<(u32, u64, &DesktopEntry)> = Vec::new();
         for app in &self.index.apps {
-            let mut best = field_score(&app.name.to_lowercase(), &normalized);
-            for keyword in &app.keywords {
-                best = best.max(field_score(&keyword.to_lowercase(), &normalized));
-            }
-            let basename = app.exec_basename().to_lowercase();
-            if !basename.is_empty() {
-                best = best.max(field_score(&basename, &normalized));
-            }
+            let best = entry_score(app, &normalized);
             if best > 0 {
-                let recency = self.recency.map(|store| store.count(&app.id)).unwrap_or(0);
+                let recency = self
+                    .recency
+                    .map(|store| store.adaptive_score(&app.id))
+                    .unwrap_or(0);
                 scored.push((best, recency, app));
             }
         }
@@ -264,6 +294,21 @@ fn field_score(field: &str, query: &str) -> u32 {
     } else {
         0
     }
+}
+
+/// Best field score for one entry against a lowercased, non-empty query:
+/// the maximum of the display name, every keyword, and the exec basename.
+/// Shared by [`Matcher`] and the provider seam so app scoring stays one rule.
+pub(crate) fn entry_score(entry: &DesktopEntry, normalized: &str) -> u32 {
+    let mut best = field_score(&entry.name.to_lowercase(), normalized);
+    for keyword in &entry.keywords {
+        best = best.max(field_score(&keyword.to_lowercase(), normalized));
+    }
+    let basename = entry.exec_basename().to_lowercase();
+    if !basename.is_empty() {
+        best = best.max(field_score(&basename, normalized));
+    }
+    best
 }
 
 /// Rank `query` against `index` with no recency signal.
@@ -345,6 +390,55 @@ impl TileStore {
             ids: ids.to_vec(),
             size,
         });
+    }
+
+    /// Move `source` to just before `target`, within a group or across
+    /// groups (the target's group is the destination). Returns whether the
+    /// store changed: unknown ids, `source == target`, or a move that is
+    /// already satisfied (`source` immediately before `target` in the same
+    /// group) are a no-op.
+    ///
+    /// A group the move empties is pruned, so a cross-group move never
+    /// leaves a ghost group behind. The ordering this writes is exactly
+    /// what [`LauncherModel::snapshot`](crate::launcher_view::LauncherModel)
+    /// persists through `LauncherConfig::tile_groups`.
+    pub fn reorder(&mut self, source: &str, target: &str) -> bool {
+        if source == target {
+            return false;
+        }
+        let Some((src_group, src_index)) = self.locate(source) else {
+            return false;
+        };
+        let Some((mut dst_group, dst_index)) = self.locate(target) else {
+            return false;
+        };
+        if src_group == dst_group && src_index + 1 == dst_index {
+            return false;
+        }
+        let moved = self.groups[src_group].ids.remove(src_index);
+        // Removing a tile before the target in the same group shifts the
+        // target one slot left.
+        let mut insert_at = dst_index;
+        if src_group == dst_group && src_index < dst_index {
+            insert_at -= 1;
+        }
+        if self.groups[src_group].ids.is_empty() && src_group != dst_group {
+            self.groups.remove(src_group);
+            if src_group < dst_group {
+                dst_group -= 1;
+            }
+        }
+        let insert_at = insert_at.min(self.groups[dst_group].ids.len());
+        self.groups[dst_group].ids.insert(insert_at, moved);
+        true
+    }
+
+    /// The `(group index, member index)` of `id`, if assigned anywhere.
+    fn locate(&self, id: &str) -> Option<(usize, usize)> {
+        self.groups
+            .iter()
+            .enumerate()
+            .find_map(|(group, slot)| slot.ids.iter().position(|x| x == id).map(|i| (group, i)))
     }
 }
 
@@ -874,6 +968,127 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].ids, vec!["epiphany".to_string()]);
         assert_eq!(groups[0].size, 3);
+    }
+
+    #[test]
+    fn tile_store_reorder_moves_within_a_group() {
+        let mut tiles = TileStore::default();
+        tiles.ingest(
+            "Web",
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            1,
+        );
+        assert!(tiles.reorder("c", "a"));
+        assert_eq!(
+            tiles.groups()[0].ids,
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+        assert!(
+            !tiles.reorder("c", "a"),
+            "already immediately before a: a no-op reports no change"
+        );
+        assert_eq!(
+            tiles.groups()[0].ids,
+            vec!["c".to_string(), "a".to_string(), "b".to_string()],
+            "repeating the move leaves the order unchanged"
+        );
+    }
+
+    #[test]
+    fn tile_store_reorder_moves_across_groups_and_prunes_the_emptied_one() {
+        let mut tiles = TileStore::default();
+        tiles.ingest("Web", &["a".to_string()], 1);
+        tiles.ingest("Media", &["b".to_string(), "c".to_string()], 2);
+        assert!(tiles.reorder("a", "c"));
+        assert_eq!(tiles.groups().len(), 1, "the emptied Web group is pruned");
+        let media = &tiles.groups()[0];
+        assert_eq!(media.name, "Media");
+        assert_eq!(
+            media.ids,
+            vec!["b".to_string(), "a".to_string(), "c".to_string()]
+        );
+        assert_eq!(media.size, 2, "the destination group keeps its size");
+    }
+
+    #[test]
+    fn tile_store_reorder_rejects_unknown_ids_and_self_moves() {
+        let mut tiles = TileStore::default();
+        tiles.ingest("Web", &["a".to_string(), "b".to_string()], 1);
+        assert!(!tiles.reorder("a", "a"), "self move");
+        assert!(!tiles.reorder("a", "missing"), "unknown target");
+        assert!(!tiles.reorder("missing", "a"), "unknown source");
+        assert_eq!(
+            tiles.groups()[0].ids,
+            vec!["a".to_string(), "b".to_string()],
+            "no rejected call mutated the store"
+        );
+    }
+
+    #[test]
+    fn adaptive_score_is_frequency_weighted_and_decays_with_age() {
+        let mut rec = RecencyStore::default();
+        rec.record("twice");
+        rec.record("twice");
+        rec.record("once");
+        assert_eq!(rec.adaptive_score("twice"), 2, "age 0: weight is the count");
+        assert_eq!(rec.adaptive_score("once"), 1);
+        assert_eq!(rec.adaptive_score("never"), 0);
+        // Age the entries by recording other launches.
+        for i in 0..DECAY_WINDOW {
+            rec.record(&format!("filler-{i}"));
+        }
+        let aged_twice = rec.adaptive_score("twice");
+        let aged_once = rec.adaptive_score("once");
+        assert!(
+            aged_twice < 2 && aged_once < 1,
+            "staleness must decay the weight: twice={aged_twice} once={aged_once}"
+        );
+        assert!(
+            aged_twice >= aged_once,
+            "frequency still leads at equal age: {aged_twice} >= {aged_once}"
+        );
+    }
+
+    #[test]
+    fn adaptive_score_recent_beats_stale_at_equal_count() {
+        let mut rec = RecencyStore::default();
+        rec.record("stale");
+        for i in 0..DECAY_WINDOW {
+            rec.record(&format!("filler-{i}"));
+        }
+        rec.record("recent");
+        assert!(
+            rec.adaptive_score("recent") > rec.adaptive_score("stale"),
+            "equal count, fresher must win: {} > {}",
+            rec.adaptive_score("recent"),
+            rec.adaptive_score("stale")
+        );
+    }
+
+    #[test]
+    fn matcher_adaptive_ordering_prefers_the_frequent_recent_app() {
+        let idx = DesktopIndex::from_entries(vec![
+            entry("Fire Alpha", "fire-alpha"),
+            entry("Fire Beta", "fire-beta"),
+        ]);
+        let mut rec = RecencyStore::default();
+        rec.record("fire-beta");
+        rec.record("fire-beta");
+        rec.record("fire-alpha");
+        let ranked = Matcher::new(&idx).with_recency(&rec).rank("fire");
+        assert_eq!(ranked[0].id, "fire-beta", "two fresh launches outrank one");
+    }
+
+    #[test]
+    fn adaptive_score_snapshot_round_trips_through_restore() {
+        let mut rec = RecencyStore::default();
+        rec.record("a");
+        rec.record("b");
+        rec.record("a");
+        let score = rec.adaptive_score("a");
+        let mut back = RecencyStore::default();
+        back.restore(&rec.snapshot());
+        assert_eq!(back.adaptive_score("a"), score);
     }
 
     #[test]

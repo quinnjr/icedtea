@@ -17,6 +17,7 @@ wrapper over wlroots 0.20.
 | `icedtea-session` | logind/seat daemon serving `org.icedtea.Session`: lock/suspend/hibernate/poweroff/reboot/logout, idle→lock, and sleep + power-key inhibitors. |
 | `icedtea-settings` | GTK4 settings & multi-monitor display-manager app. |
 | `icedtea-shell` | Shell surfaces (taskbar) driving the compositor over D-Bus. |
+| `icedtea-ui` | Pure-Rust, GTK4-theme-compatible widget toolkit shared by settings and shell: CSS engine, layout, widgets, reactive view layer (no GTK). |
 | `icedtea-contract` | Shared IPC vocabulary (D-Bus names, wire types) every component depends on. |
 | `icedtea-config` | Configuration model. |
 | `icedtea-harness` | Test harness that boots a headless compositor and drives it as a real Wayland/D-Bus client. |

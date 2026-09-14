@@ -354,31 +354,64 @@ impl DragSession {
 }
 
 /// What the toolkit would hand the compositor seat to start a cross-surface
-/// drag: the arming press serial (M4.2's grab-serial validation input) and
-/// the offered MIME list.
+/// drag: the arming press serial (M4.2's grab-serial validation input) and the
+/// payload bytes the seat must serve on `receive`.
+///
+/// `#[non_exhaustive]`: adding a field to this seam must not break a
+/// downstream struct-literal constructor. Build one with
+/// [`SeatDragRequest::new`]; read the MIME list through
+/// [`SeatDragRequest::mimes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SeatDragRequest {
     /// The press serial that armed this drag.
     pub serial: u32,
-    /// Offered flavors, in source preference order.
-    pub mimes: Vec<String>,
+    /// The payload bytes, keyed by MIME, for the seat's `wl_data_source.send`.
+    pub payload: DragPayload,
+}
+
+impl SeatDragRequest {
+    /// The request a toolkit drag start produces for `serial` over `payload`.
+    #[must_use]
+    pub fn new(serial: u32, payload: DragPayload) -> Self {
+        SeatDragRequest { serial, payload }
+    }
+
+    /// Offered flavors, in source preference order. Derived from the payload
+    /// so the two can never disagree.
+    #[must_use]
+    pub fn mimes(&self) -> Vec<&str> {
+        self.payload.offered_mimes()
+    }
+
+    /// Whether the request is worth issuing: a serial the compositor can
+    /// validate and at least one offered flavor to negotiate.
+    #[must_use]
+    pub fn is_offerable(&self) -> bool {
+        self.serial != 0 && !self.payload.is_empty()
+    }
 }
 
 /// The seat's answer to [`DragSeat::offer_drag`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeatDragResult {
-    /// The serial validated and the drag is live on the seat.
+    /// The request was *issued* — `wl_data_device.start_drag` was called. The
+    /// compositor may still reject it afterwards (an invalid serial, a
+    /// surface it will not route), so this says nothing about the drag
+    /// reaching a destination.
     Accepted,
-    /// Bad serial or no seat: the drag stays toolkit-internal (or dies).
+    /// The request was not issued at all: bad serial, empty offer or no seat.
+    /// The drag stays toolkit-internal (or dies).
     Refused,
 }
 
 /// The compositor-seat seam (§7 of the design).
 ///
-/// The v1 runtime holds no seat — every drag is toolkit-internal — so this
-/// trait exists for the compositor wiring to implement and for tests to stub.
-/// A real seat validates `request.serial` against its grant table (M4.2
-/// decision 3) and only then calls `wl_data_device.start_drag`.
+/// The windowed runtime holds the real implementation
+/// (`window::selection::ClientSeat`), which validates `request.serial`
+/// against the compositor's grant table (wlroots' M4.2 decision-3 gate) and
+/// calls `wl_data_device.start_drag`; an offscreen run or a unit test holds
+/// none or a [`StubSeat`], and the drag stays toolkit-internal.
 pub trait DragSeat {
     /// Offer a drag to the seat.
     fn offer_drag(&mut self, request: &SeatDragRequest) -> SeatDragResult;
@@ -543,10 +576,12 @@ mod tests {
 
     #[test]
     fn the_stub_seat_logs_requests_and_answers_on_command() {
-        let request = SeatDragRequest {
-            serial: 41,
-            mimes: vec![TEXT_PLAIN.to_owned()],
-        };
+        let request = SeatDragRequest::new(41, DragPayload::offer_text("payload"));
+        assert_eq!(request.mimes(), vec![TEXT_PLAIN]);
+        assert_eq!(
+            request.payload.data_for(&[TEXT_PLAIN]),
+            Some((TEXT_PLAIN, b"payload".as_slice()))
+        );
         let mut accepting = StubSeat::accepting();
         assert_eq!(accepting.offer_drag(&request), SeatDragResult::Accepted);
         assert_eq!(accepting.log(), std::slice::from_ref(&request));
@@ -554,5 +589,13 @@ mod tests {
         let mut refusing = StubSeat::refusing();
         assert_eq!(refusing.offer_drag(&request), SeatDragResult::Refused);
         assert_eq!(refusing.log(), &[request]);
+    }
+
+    #[test]
+    fn a_zero_serial_or_empty_offer_is_not_offerable() {
+        assert!(!SeatDragRequest::new(0, DragPayload::offer_text("x")).is_offerable());
+        assert!(!SeatDragRequest::new(7, DragPayload::empty()).is_offerable());
+        assert!(!SeatDragRequest::new(0, DragPayload::empty()).is_offerable());
+        assert!(SeatDragRequest::new(7, DragPayload::offer_text("x")).is_offerable());
     }
 }

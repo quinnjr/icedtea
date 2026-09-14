@@ -1705,6 +1705,21 @@ impl Window {
         self.clipboard.as_mut().expect("just initialized above")
     }
 
+    /// The real compositor-seat bridge for cross-surface drags (M6 §7).
+    ///
+    /// Builds the clipboard/data device on first use, as an app's first frame
+    /// already does, then returns a `DragSeat` that starts a real
+    /// `wl_data_device.start_drag` on this window's surface. `None` when the
+    /// seat is missing or the compositor advertised no
+    /// `wl_data_device_manager` (the clipboard degraded to its in-process
+    /// transport).
+    #[must_use]
+    pub fn take_drag_seat(&mut self) -> Option<Box<dyn crate::dnd::DragSeat>> {
+        self.state.seat.as_ref()?;
+        let surface = self.surface.wl_surface().clone();
+        self.clipboard().drag_seat(surface)
+    }
+
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.state.closed

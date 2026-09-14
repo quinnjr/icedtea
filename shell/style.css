@@ -85,7 +85,9 @@
 }
 
 /* The keyboard selection: the same `active` vocabulary `#workspaces
-   button.active` uses for the same "this is the one" meaning. */
+   button.active` uses for the same "this is the one" meaning. Tiles are
+   plain buttons too (carrying DnD), so this rule covers them and the tiles
+   pane needs no bespoke class. */
 #launcher button.active {
     font-weight: bold;
 }
