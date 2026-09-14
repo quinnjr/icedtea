@@ -20,7 +20,7 @@
 use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wayland_client::protocol::wl_registry;
 use wayland_client::protocol::wl_seat::WlSeat;
@@ -107,12 +107,14 @@ wayland_client::delegate_noop!(IdleClient: ignore idle_notifier::ExtIdleNotifier
 wayland_client::delegate_noop!(IdleClient: ignore WlSeat);
 
 /// Why one [`run_session`] pass ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionEnd {
     /// The compositor connection dropped (or the initial roundtrip failed):
     /// reconnect and re-arm.
     Disconnected,
-    /// The compositor does not offer the idle protocol (or a seat): retrying
-    /// cannot help, so the client stops.
+    /// No idle protocol/seat/notification was advertised after a settled
+    /// roundtrip. Retried a bounded number of times (a compositor restart can
+    /// race global advertisement), then treated as terminal.
     Unsupported,
 }
 
@@ -122,44 +124,74 @@ enum SessionEnd {
 /// On a dropped connection (a compositor restart or crash) this reconnects to
 /// the ambient Wayland display with capped exponential backoff and re-arms the
 /// timer, rather than leaving idle-lock off for the daemon's whole life. A
-/// compositor that never advertises the idle protocol is not retried: retrying
-/// cannot make the global appear.
+/// compositor that does not advertise the idle protocol is retried a bounded
+/// number of times (the globals may simply not have been advertised yet), then
+/// stops.
 pub fn run(conn: Connection, timeout_ms: u32, flow: Arc<LockFlow>) {
-    run_with(conn, timeout_ms, flow, connect_with_retry);
+    run_reconnecting(
+        Ok(conn),
+        connect_with_retry,
+        |conn| run_session(conn, timeout_ms, &flow),
+        BackoffPolicy::PRODUCTION,
+    );
 }
 
-/// [`run`] with an injectable connect seam, so the reconnect path is testable.
-fn run_with(
-    conn: Connection,
-    timeout_ms: u32,
-    flow: Arc<LockFlow>,
-    connect: impl Fn() -> io::Result<Connection>,
+/// Reconnect-with-backoff loop for the idle client, generic over the session
+/// handle so the loop itself is testable without a Wayland connection.
+///
+/// `initial` is the already-open connection (`Ok`) or the initial connect's
+/// failure (`Err`). Every `Disconnected` grows the backoff *before*
+/// reconnecting, and the backoff is reset to the minimum only after a session
+/// stayed up for at least [`BackoffPolicy::residency`] — so a compositor that
+/// accepts and then immediately drops cannot hot-spin. An `Unsupported` session
+/// is retried up to [`BackoffPolicy::unsupported_limit`] times consecutively
+/// before the loop gives up, so a startup/advertisement race is survivable
+/// while a compositor that truly lacks the protocol is eventually abandoned.
+fn run_reconnecting<S>(
+    initial: io::Result<S>,
+    mut connect: impl FnMut() -> io::Result<S>,
+    mut run_session: impl FnMut(&S) -> SessionEnd,
+    policy: BackoffPolicy,
 ) {
-    let mut conn = conn;
-    let mut backoff = RECONNECT_MIN;
+    let mut backoff = policy.min;
+    let mut unsupported_streak: u32 = 0;
+    let mut current = initial;
     loop {
-        if matches!(
-            run_session(&conn, timeout_ms, &flow),
-            SessionEnd::Unsupported
-        ) {
-            return;
-        }
-        conn = loop {
-            match connect() {
-                Ok(fresh) => break fresh,
-                Err(err) => {
-                    tracing::warn!(
-                        %err,
-                        ?backoff,
-                        "ext-idle-notify reconnect failed; retrying"
-                    );
-                    std::thread::sleep(backoff);
-                    backoff = next_backoff(backoff);
-                }
+        let session = match current {
+            Ok(session) => session,
+            Err(err) => {
+                tracing::warn!(%err, ?backoff, "ext-idle-notify connect failed; retrying");
+                std::thread::sleep(backoff);
+                backoff = policy.next(backoff);
+                current = connect();
+                continue;
             }
         };
-        backoff = RECONNECT_MIN;
-        tracing::info!("ext-idle-notify reconnected; re-arming idle-lock");
+        let started = Instant::now();
+        match run_session(&session) {
+            SessionEnd::Disconnected => {
+                unsupported_streak = 0;
+                if started.elapsed() >= policy.residency {
+                    backoff = policy.min;
+                }
+                std::thread::sleep(backoff);
+                backoff = policy.next(backoff);
+            }
+            SessionEnd::Unsupported => {
+                unsupported_streak += 1;
+                if unsupported_streak >= policy.unsupported_limit {
+                    tracing::warn!(
+                        attempts = unsupported_streak,
+                        "ext-idle-notify: idle protocol still unsupported; giving up"
+                    );
+                    return;
+                }
+                std::thread::sleep(backoff);
+                backoff = policy.next(backoff);
+            }
+        }
+        tracing::info!("ext-idle-notify reconnecting; re-arming idle-lock");
+        current = connect();
     }
 }
 
@@ -224,11 +256,43 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(200);
 const RECONNECT_MIN: Duration = Duration::from_millis(200);
 /// Ceiling on the reconnect backoff.
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// Minimum residency a session must reach before its end resets the reconnect
+/// backoff: a compositor that accepts and immediately drops must not reset the
+/// delay and hot-spin.
+const RECONNECT_RESIDENCY: Duration = Duration::from_secs(5);
+/// How many consecutive `Unsupported` sessions to retry before giving up. A
+/// compositor restart can race global advertisement, so "not advertised yet"
+/// must not be terminal; a compositor that never implements the protocol is
+/// abandoned after this many attempts.
+const UNSUPPORTED_RETRY_LIMIT: u32 = 3;
 
-/// The next reconnect backoff: double the current one, capped at
-/// [`RECONNECT_MAX`].
-fn next_backoff(current: Duration) -> Duration {
-    (current * 2).min(RECONNECT_MAX)
+/// The reconnect loop's timing policy, a value so tests can drive the loop with
+/// millisecond delays instead of the production seconds.
+#[derive(Debug, Clone, Copy)]
+struct BackoffPolicy {
+    /// First backoff after a dropped session/failed connect.
+    min: Duration,
+    /// Ceiling on the backoff.
+    max: Duration,
+    /// Minimum session residency before the backoff resets to `min`.
+    residency: Duration,
+    /// Consecutive `Unsupported` sessions tolerated before giving up.
+    unsupported_limit: u32,
+}
+
+impl BackoffPolicy {
+    /// Production timing.
+    const PRODUCTION: Self = Self {
+        min: RECONNECT_MIN,
+        max: RECONNECT_MAX,
+        residency: RECONNECT_RESIDENCY,
+        unsupported_limit: UNSUPPORTED_RETRY_LIMIT,
+    };
+
+    /// The next backoff: double the current one, capped at [`Self::max`].
+    fn next(self, current: Duration) -> Duration {
+        (current * 2).min(self.max)
+    }
 }
 
 /// Connect to the ambient Wayland display, retrying briefly.
@@ -294,16 +358,34 @@ fn spawn_with_connect(
         return Ok(None);
     };
     let timeout_ms = u32::try_from(timeout_ms).unwrap_or(u32::MAX);
-    let conn = connect()?;
+    // The idle thread is started even when the initial connect fails: the
+    // compositor and this daemon are independent units with no ordering, so a
+    // not-yet-existing socket must become a retry rather than idle-lock being
+    // off for the daemon's whole life.
     let handle = std::thread::Builder::new()
         .name("icedtea-session-idle".to_string())
-        .spawn(move || run_with(conn, timeout_ms, flow, connect))?;
+        .spawn(move || {
+            let initial = connect();
+            if let Err(err) = &initial {
+                tracing::warn!(
+                    %err,
+                    "idle-lock: initial compositor connect failed; retrying with backoff"
+                );
+            }
+            run_reconnecting(
+                initial,
+                connect,
+                |conn| run_session(conn, timeout_ms, &flow),
+                BackoffPolicy::PRODUCTION,
+            );
+        })?;
     Ok(Some(handle))
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -359,8 +441,160 @@ mod tests {
     /// outage does not hammer the socket or balloon the delay unbounded.
     #[test]
     fn reconnect_backoff_doubles_and_caps() {
-        assert_eq!(next_backoff(RECONNECT_MIN), Duration::from_millis(400));
-        assert_eq!(next_backoff(Duration::from_secs(20)), RECONNECT_MAX);
-        assert_eq!(next_backoff(RECONNECT_MAX), RECONNECT_MAX);
+        let policy = BackoffPolicy::PRODUCTION;
+        assert_eq!(policy.next(RECONNECT_MIN), Duration::from_millis(400));
+        assert_eq!(policy.next(Duration::from_secs(20)), RECONNECT_MAX);
+        assert_eq!(policy.next(RECONNECT_MAX), RECONNECT_MAX);
+    }
+
+    /// A compositor that accepts and then immediately drops must not hot-spin:
+    /// each `Disconnected` is spaced by a growing backoff. Driven through the
+    /// same `run_reconnecting` body `run`/`spawn` use, with millisecond delays;
+    /// the last session is terminal so the loop returns.
+    #[test]
+    fn fast_disconnects_back_off_instead_of_hot_spinning() {
+        let policy = BackoffPolicy {
+            min: Duration::from_millis(5),
+            max: Duration::from_millis(40),
+            residency: Duration::from_secs(60),
+            unsupported_limit: 1,
+        };
+        let stamps = Arc::new(Mutex::new(Vec::new()));
+        let start = Instant::now();
+        let mut calls = 0u32;
+        let sink = Arc::clone(&stamps);
+        run_reconnecting(
+            Ok(()),
+            || Ok(()),
+            move |_| {
+                sink.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(start.elapsed());
+                calls += 1;
+                if calls < 4 {
+                    SessionEnd::Disconnected
+                } else {
+                    // One consecutive Unsupported is terminal under limit 1.
+                    SessionEnd::Unsupported
+                }
+            },
+            policy,
+        );
+        let stamps = stamps.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(stamps.len() >= 4, "the loop ran its sessions: {stamps:?}");
+        let gaps: Vec<Duration> = stamps.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.len() >= 3, "enough gaps to see growth: {gaps:?}");
+        assert!(gaps[1] >= gaps[0], "backoff must not shrink: {gaps:?}");
+        assert!(gaps[2] >= gaps[1], "backoff must not shrink: {gaps:?}");
+        assert!(gaps[2] > gaps[0], "backoff must grow: {gaps:?}");
+    }
+
+    /// An initial connect failure still enters the reconnect loop (this is the
+    /// same body `spawn` runs on its thread): the first successful connect is
+    /// followed by a session rather than the loop never starting.
+    #[test]
+    fn initial_connect_failure_still_runs_the_reconnect_loop() {
+        let policy = BackoffPolicy {
+            min: Duration::from_millis(1),
+            max: Duration::from_millis(4),
+            residency: Duration::from_secs(60),
+            unsupported_limit: 1,
+        };
+        let connects = Arc::new(Mutex::new(0u32));
+        let sessions = Arc::new(Mutex::new(0u32));
+        let c = Arc::clone(&connects);
+        let s = Arc::clone(&sessions);
+        run_reconnecting(
+            Err(io::Error::other("compositor socket does not exist yet")),
+            move || {
+                *c.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                Ok(())
+            },
+            move |_| {
+                *s.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                SessionEnd::Unsupported
+            },
+            policy,
+        );
+        assert_eq!(
+            *connects.lock().unwrap_or_else(|e| e.into_inner()),
+            1,
+            "the loop retried the connect after the initial failure"
+        );
+        assert_eq!(
+            *sessions.lock().unwrap_or_else(|e| e.into_inner()),
+            1,
+            "a session ran after the retried connect"
+        );
+    }
+
+    /// Missing globals are retried a bounded number of times, then abandoned —
+    /// so a startup race is survivable while a compositor that truly lacks the
+    /// protocol does not retry forever.
+    #[test]
+    fn unsupported_globals_are_retried_a_bounded_number_of_times() {
+        let policy = BackoffPolicy {
+            min: Duration::from_millis(1),
+            max: Duration::from_millis(4),
+            residency: Duration::from_secs(60),
+            unsupported_limit: 3,
+        };
+        let calls = Arc::new(Mutex::new(0u32));
+        let sink = Arc::clone(&calls);
+        run_reconnecting(
+            Ok(()),
+            || Ok(()),
+            move |_| {
+                *sink.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                SessionEnd::Unsupported
+            },
+            policy,
+        );
+        assert_eq!(
+            *calls.lock().unwrap_or_else(|e| e.into_inner()),
+            3,
+            "missing globals are retried to the limit, then the loop gives up"
+        );
+    }
+
+    /// A `Disconnected` session resets the unsupported-retry budget, so a
+    /// compositor restart that races global advertisement does not permanently
+    /// disable idle-lock: after the reconnect, a fresh run of unsupported
+    /// sessions is tolerated again. The script would stop after four sessions
+    /// (three consecutive Unsupported) without the reset.
+    #[test]
+    fn a_disconnect_resets_the_unsupported_retry_budget() {
+        let policy = BackoffPolicy {
+            min: Duration::from_millis(1),
+            max: Duration::from_millis(4),
+            residency: Duration::from_secs(60),
+            unsupported_limit: 3,
+        };
+        let script = [
+            SessionEnd::Unsupported,
+            SessionEnd::Unsupported,
+            SessionEnd::Disconnected,
+            SessionEnd::Unsupported,
+            SessionEnd::Unsupported,
+            SessionEnd::Unsupported,
+        ];
+        let index = Arc::new(Mutex::new(0usize));
+        let idx = Arc::clone(&index);
+        run_reconnecting(
+            Ok(()),
+            || Ok(()),
+            move |_| {
+                let mut guard = idx.lock().unwrap_or_else(|e| e.into_inner());
+                let end = script[(*guard).min(script.len() - 1)];
+                *guard += 1;
+                end
+            },
+            policy,
+        );
+        assert_eq!(
+            *index.lock().unwrap_or_else(|e| e.into_inner()),
+            script.len(),
+            "the disconnect reset the budget and the loop retried past it"
+        );
     }
 }

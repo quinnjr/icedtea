@@ -14,9 +14,7 @@
 //! `settings/tests/interaction.rs` takes, when no `dbus-daemon` binary exists
 //! — **CI must provide `dbus-daemon` for these to run**.
 
-use std::io::{BufRead, BufReader};
 use std::os::fd::OwnedFd;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,8 +25,9 @@ use icedtea_session::logind::{
 };
 use zbus::zvariant::{OwnedFd as ZOwnedFd, OwnedObjectPath};
 
-/// How long a freshly spawned `dbus-daemon` gets to print its address.
-const BUS_BOOT: Duration = Duration::from_secs(5);
+mod support;
+
+use support::{PrivateBus, SKIP_MARKER, spawn};
 
 const LOGIN1_NAME: &str = "org.freedesktop.login1";
 const MANAGER_PATH: &str = "/org/freedesktop/login1";
@@ -36,44 +35,6 @@ const SESSION_PATH: &str = "/org/freedesktop/login1/session/c1";
 const MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
 const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
 const NO_BUS: &str = "no dbus-daemon (could not start a private session bus)";
-
-/// A private session-bus instance this test owns outright, killed on drop.
-struct PrivateBus {
-    address: String,
-    child: Child,
-}
-
-impl PrivateBus {
-    fn spawn() -> Option<PrivateBus> {
-        let mut child = Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--print-address"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let stdout = child.stdout.take()?;
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let started = Instant::now();
-        if reader.read_line(&mut line).ok()? == 0 || started.elapsed() > BUS_BOOT {
-            let _ = child.kill();
-            return None;
-        }
-        let address = line.trim().to_string();
-        if address.is_empty() {
-            let _ = child.kill();
-            return None;
-        }
-        Some(PrivateBus { address, child })
-    }
-}
-
-impl Drop for PrivateBus {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 /// Everything the mock observed.
 #[derive(Default)]
@@ -184,7 +145,7 @@ impl FakeLogind {
     /// `Err(NO_BUS)` when no `dbus-daemon` can be started (the visible-skip
     /// case); any other `Err` is a real setup failure the test must surface.
     fn spawn() -> Result<FakeLogind, String> {
-        let bus = PrivateBus::spawn().ok_or_else(|| NO_BUS.to_string())?;
+        let bus = spawn().ok_or_else(|| NO_BUS.to_string())?;
         let recorded = Arc::new(Recorded::default());
         let service = zbus::blocking::connection::Builder::address(bus.address.as_str())
             .map_err(|e| format!("address: {e}"))?
@@ -292,7 +253,7 @@ fn fake_logind(test: &str) -> Option<FakeLogind> {
     match FakeLogind::spawn() {
         Ok(fake) => Some(fake),
         Err(err) if err == NO_BUS => {
-            eprintln!("LEXSKIP: {test} skipped — {NO_BUS}");
+            eprintln!("{SKIP_MARKER} {test} skipped — {NO_BUS}");
             None
         }
         Err(err) => panic!("fake logind setup failed: {err}"),
