@@ -180,11 +180,14 @@ threshold crossing.
 M4.2's machine:
 
 1. At the threshold crossing the runtime offers the drag to
-   `dnd::DragSeat` — `offer_drag(&SeatDragRequest{serial, mimes, payload})`
-   — with the recorded arming press serial, the offered MIME list, and the
-   bytes. On `Accepted` the compositor owns target routing and the toolkit
-   stops its own in-surface hit-testing; `Refused`/no seat keeps the drag
-   internal unchanged.
+   `dnd::DragSeat` — `offer_drag(&SeatDragRequest{serial, payload})` (the
+   MIME list is derived from the payload via `SeatDragRequest::mimes()`) —
+   with the recorded arming press serial, the offered MIME list, and the
+   bytes. The offer is issued whenever a seat is present. `Accepted` means
+   only that `wl_data_device.start_drag` was *called* (the compositor may
+   still reject it); it does **not** suppress the toolkit's own in-surface
+   hit-testing, because §7's destination half is not wired and disabling the
+   in-surface path would leave every drop dead.
 2. `ui/src/window/selection.rs`'s `ClientSeat` is the real implementation:
    it creates a `wl_data_source`, offers the MIMEs, stashes the payload for
    `wl_data_source.send`, and calls `wl_data_device.start_drag` on the
@@ -198,27 +201,32 @@ M4.2's machine:
 
 **Compositor/toolkit remainder (NOT implemented):**
 
-- **Destination-in routing.** A drag delivered *into* this client's surface
-  is not routed to toolkit targets yet: `wl_data_device.enter`/`motion`/
-  `drop` on the destination side are ignored by `WindowState`. The source
-  half works; same-surface drops keep using §§2–5 because the toolkit only
-  offloads once the seat accepts and, today, it remains the source's own
-  surface that drives the bytes.
+- **Destination-in routing.** A drag delivered *into* this client from
+  elsewhere is not routed to toolkit targets yet: `wl_data_device.enter`/
+  `motion`/`drop` on the destination side are ignored by `WindowState`. The
+  source half works, and a same-surface drop keeps using §§2–5: the toolkit
+  always runs its own in-surface hit-testing, and offloading the source to
+  the seat does not turn that off (the compositor's destination half would
+  otherwise be the only delivery path, and it does not exist yet).
+  Cross-surface drops into this client remain the gap.
 - **Drag icon.** `start_drag` passes `None` for the icon surface, so M4.2's
   `wlr_scene_drag_icon` has nothing to render. A toolkit drag image is the
   paint-layer follow-up §6 names.
 - **Compositor-reported outcome.** When a drag is offloaded, the toolkit's
-  own `DragEnd{dropped}` reports the in-surface target state (usually
-  `false`); the authoritative drop is the compositor's (`wl_data_source`
-  `dnd_drop_performed`/`dnd_finished`), which `ClientSeat` uses only to
-  retire the source. Folding that back into a model message is the follow-up.
+  own `DragEnd{dropped}` still reports its in-surface result (now the real
+  outcome of a same-surface drop, since in-surface routing continues); for a
+  cross-surface drop the authoritative drop is the compositor's
+  (`wl_data_source` `dnd_drop_performed`/`dnd_finished`), which `ClientSeat`
+  uses only to retire the source. Folding that back into a model message is
+  the follow-up.
 
-The seam: `dnd::DragSeat` — `offer_drag(&SeatDragRequest{serial, mimes,
-payload}) -> SeatDragResult` — with `StubSeat` (scripted accept/refuse + call
-log) for the toolkit half and `ClientSeat` for a live window. Unit tests
-prove the request shape (serial = the arming press serial; MIME list = the
-offered list; bytes = the payload) against a recording stub, and that an
-accepting stub suppresses internal target routing.
+The seam: `dnd::DragSeat` — `offer_drag(&SeatDragRequest{serial,
+payload}) -> SeatDragResult` (MIMEs via `SeatDragRequest::mimes()`) — with
+`StubSeat` (scripted accept/refuse + call log) for the toolkit half and
+`ClientSeat` for a live window. Unit tests prove the request shape (serial =
+the arming press serial; MIME list = the offered list; bytes = the payload)
+against a recording stub; an accepting stub no longer changes the toolkit
+half, because its result does not gate in-surface routing.
 
 ## 8. Tests
 
@@ -242,8 +250,10 @@ accepting stub suppresses internal target routing.
      `cancel_press` keeps it from also clicking.
   6. a recording `DragSeat`: a `Refused` seat leaves the drag internal and
      sees the request shape (serial = the arming press serial, mimes, bytes);
-     an `Accepted` seat offloads the drag and the toolkit stops routing
-     `DragEnter`/`DragMotion`/`Drop` to the in-surface target.
+     an `Accepted` seat issues the offer but leaves the toolkit's in-surface
+     routing unchanged, so `DragEnter`/`DragMotion`/`Drop` still reach the
+     target (`Accepted` means "start_drag was called", not "the compositor
+     took over delivery").
 - Deletion-verified: drop the `DragStart` latch-clear ⇒ the post-drag
   release clicks (test 1's click-counter assertion fails).
 

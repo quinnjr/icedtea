@@ -155,7 +155,10 @@ All pane; the pinned rail and tiles stay app-only.
 - **Settings** (`SettingsProvider`): the settings pages as results whose id is
   the page name; selecting one asks the compositor to spawn
   `org.icedtea.Settings`. The page list is mirrored here (SYNC note) because
-  the shell crate does not depend on `icedtea-settings`.
+  the shell crate does not depend on `icedtea-settings`. The page id is
+  discarded before the call — the compositor `SpawnApp` path is app-id-only
+  and carries no argv — so a settings result opens the app on its default
+  page, not the searched page.
 
 Tests: each provider's parse/query (recent-xbel parse, page/name match,
 `scan` bounding), and a merge/rank test that pins the cross-provider order.
