@@ -55,6 +55,11 @@ pub struct ListBoxC {
     universal: Universal,
     /// M6 drag-and-drop: the list is a source/target when the view opts in.
     dnd: DndState,
+    /// The row a left press landed on, held until the release. Activation is
+    /// deferred to the release so the arming press of a list-box drag source
+    /// does not also activate; `cancel_press` clears it when a
+    /// drag actually begins.
+    pressed_row: Option<usize>,
 }
 
 impl ListBoxC {
@@ -125,6 +130,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListBoxC {
             activate_single: props.bool(PropName::ActivateOnSingleClick, true),
             universal: Universal::new(node, Kind::ListBox),
             dnd: DndState::default(),
+            pressed_row: None,
         }
     }
 
@@ -134,6 +140,12 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListBoxC {
 
     fn drop_accepts(&self, offered: &[&str]) -> bool {
         self.dnd.accepts(offered)
+    }
+
+    fn cancel_press(&mut self, _node: &Node) {
+        // The completing release of a drag is a drop/cancel, never a row
+        // activation.
+        self.pressed_row = None;
     }
 
     fn set_prop(&mut self, node: &Node, name: PropName, value: &Prop, _cx: &mut BuildCx<'_>) {
@@ -181,6 +193,17 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListBoxC {
                 if let Some(index) = self.row_at(cx.tree, *local) {
                     self.cursor = Some(index);
                     changed = self.selection.select(index);
+                    self.pressed_row = Some(index);
+                    cx.handled = true;
+                }
+            }
+            Event::PointerUp { button, local, .. } if *button == crate::window::layer::BTN_LEFT => {
+                // Activation lands on the release, not the arming press, so a
+                // press that turns into a drag never activates the row. A
+                // release off the pressed row is not an activation either.
+                if let Some(index) = self.pressed_row.take()
+                    && self.row_at(cx.tree, *local) == Some(index)
+                {
                     cx.handled = true;
                     if self.activate_single
                         && let Some(msg) = cx.handlers.fire_index(EventKind::Activate, index)
@@ -333,6 +356,63 @@ mod tests {
                 .unwrap()
                 .states()
                 .contains(PseudoStates::SELECTED)
+        );
+    }
+
+    /// A list box that is a drag source must not also activate the row its
+    /// arming press landed on: `deliver` clears the press latch before
+    /// `DragStart`, so the completing release is a drop/cancel, not a click.
+    #[test]
+    fn a_drag_source_does_not_activate_on_the_arming_press() {
+        let node = Node::with_classes(Kind::ListBox.css_name(), Kind::ListBox.base_classes());
+        for _ in 0..2 {
+            node.append_child(&Node::new("row"));
+        }
+        let mut hx = Headless::new();
+        let mut props = props(SelectionMode::Single);
+        props.set(PropName::DragSource, Prop::Str("row".into()));
+        let mut c = {
+            let mut cx = hx.cx();
+            build_controller::<usize>(Kind::ListBox, &node, &props, &mut cx)
+        };
+        hx.place_rows(&node, 30.0);
+        let mut cx = hx.event_cx_with_handlers(&node, |h| {
+            h.set(EventKind::Activate, Handler::Index(std::rc::Rc::new(|i| i)));
+            h.set(EventKind::DragStart, Handler::Unit(99));
+        });
+
+        // Arm the press on row 0: selection happens, activation does not.
+        let pressed = c.on_event(
+            &Event::PointerDown {
+                button: 0x110,
+                local: (5.0, 5.0),
+                serial: 1,
+            },
+            &mut cx,
+        );
+        assert!(
+            pressed.is_empty(),
+            "an arming press must not activate, saw {pressed:?}"
+        );
+
+        // A threshold-crossing motion begins the drag; `deliver` clears the
+        // press latch first, exactly as it does for a real drag.
+        c.cancel_press(&node);
+        let drag = c.on_event(&Event::DragStart, &mut cx);
+        assert_eq!(drag, vec![99], "the drag-start handler still fires");
+
+        // The completing release is a drop/cancel, never an activation.
+        let released = c.on_event(
+            &Event::PointerUp {
+                button: 0x110,
+                local: (5.0, 5.0),
+                serial: 2,
+            },
+            &mut cx,
+        );
+        assert!(
+            released.is_empty(),
+            "the release after a drag must not activate, saw {released:?}"
         );
     }
 

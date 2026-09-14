@@ -18,13 +18,27 @@ use accesskit::{
 
 use crate::css::node::{Node, PseudoStates};
 use crate::layout::LayoutTree;
-use crate::view::{Instance, Kind, Prop, PropName};
+use crate::view::{Instance, Kind, ListItem, Prop, PropName};
 use crate::widgets::types::SelectionMode;
 use crate::widgets::{MessageType, WidgetEnum};
 use crate::window::focus::FOCUSABLE_CLASS;
 
 /// The synthetic root's id. Real widgets allocate from 1.
 const ROOT_ID: NodeId = NodeId(0);
+
+/// The key space for adapter-synthesized nodes.
+///
+/// A `DropDown`'s listbox and its options share one owning [`NodeId`] but must
+/// never share a slot. A single `u64` slot made an option whose model id was
+/// `u64::MAX` alias the listbox's own sentinel, so the two are
+/// distinct variants instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyntheticSlot {
+    /// The controller-owned listbox itself.
+    ListBox,
+    /// One option, keyed by its [`ListItem::id`](crate::view::ListItem).
+    Option(u64),
+}
 
 /// The in-process a11y tree: stable id assignment plus the last update.
 pub struct A11yTree {
@@ -35,10 +49,12 @@ pub struct A11yTree {
     /// Ids for nodes the adapter synthesizes rather than reads off the
     /// retained tree — a `DropDown`'s listbox and its options, which are
     /// controller-owned CSS subnodes with no [`Instance`]. The key is
-    /// `(owning node id, slot)`: slot `u64::MAX` is the listbox, and each
-    /// option uses its [`ListItem::id`](crate::view::ListItem), which is the
-    /// model's own stable identity.
-    synthetic: Vec<((NodeId, u64), NodeId)>,
+    /// `(owning node id, [`SyntheticSlot`])`, so the listbox has its own key
+    /// space and an option's slot is the model's own stable identity.
+    synthetic: Vec<((NodeId, SyntheticSlot), NodeId)>,
+    /// The synthetic slots the build in progress referenced, so everything
+    /// else can be pruned when it finishes.
+    synthetic_seen: Vec<(NodeId, SyntheticSlot)>,
     last: Option<TreeUpdate>,
 }
 
@@ -56,6 +72,7 @@ impl A11yTree {
             next: 1,
             ids: Vec::new(),
             synthetic: Vec::new(),
+            synthetic_seen: Vec::new(),
             last: None,
         }
     }
@@ -116,12 +133,13 @@ impl A11yTree {
     ) -> TreeUpdate {
         let mut out = Vec::new();
         let mut children = Vec::with_capacity(instances.len());
+        self.synthetic_seen.clear();
         // The synthetic root's coordinate origin: top-level nodes are
         // relative to the window, not to each other.
         let origin = (0.0_f32, 0.0_f32);
         let mut extent = (0.0_f32, 0.0_f32);
         for instance in instances {
-            children.push(self.describe(instance, None, &mut out, layout, origin));
+            children.push(self.describe(instance, None, &mut out, layout, Some(origin)));
             if let Some(alloc) = layout.and_then(|tree| tree.allocation(&instance.node)) {
                 let box_ = alloc.border_box;
                 extent.0 = extent.0.max(box_.x + box_.width);
@@ -156,6 +174,10 @@ impl A11yTree {
             tree_id: TreeId::ROOT,
             focus: focus_id,
         };
+        // Prune synthetic ids this frame never referenced, so a removed or
+        // rebuilt drop-down cannot grow the map without bound.
+        let seen = std::mem::take(&mut self.synthetic_seen);
+        self.synthetic.retain(|(key, _)| seen.contains(key));
         self.last = Some(update.clone());
         update
     }
@@ -188,9 +210,14 @@ impl A11yTree {
     }
 
     /// The stable id for an adapter-synthesized node (a `DropDown`'s listbox
-    /// or one of its options). `slot` is `u64::MAX` for the listbox and the
-    /// model item's own id for an option, so a re-sorted model keeps ids.
-    fn synthetic_id(&mut self, owner: NodeId, slot: u64) -> NodeId {
+    /// or one of its options). `slot` distinguishes the listbox from an
+    /// option and gives an option the model item's own id, so a re-sorted
+    /// model keeps ids without an option's id ever colliding with the
+    /// listbox's.
+    fn synthetic_id(&mut self, owner: NodeId, slot: SyntheticSlot) -> NodeId {
+        if !self.synthetic_seen.contains(&(owner, slot)) {
+            self.synthetic_seen.push((owner, slot));
+        }
         if let Some((_, id)) = self
             .synthetic
             .iter()
@@ -216,13 +243,17 @@ impl A11yTree {
         option_at: Option<(usize, usize)>,
         out: &mut Vec<(NodeId, A11yNode)>,
         layout: Option<&LayoutTree>,
-        parent_origin: (f32, f32),
+        parent_origin: Option<(f32, f32)>,
     ) -> NodeId {
         let id = self.id_for(&instance.node);
         let abs = layout
             .and_then(|tree| tree.allocation(&instance.node))
             .map(|a| a.border_box);
-        let origin = abs.map_or(parent_origin, |b| (b.x, b.y));
+        // The origin a child's bounds are measured against is this node's own
+        // border-box origin. A node with no allocation establishes none, so
+        // its descendants' bounds are skipped rather than reported against a
+        // grandparent's origin with the parent's box missing.
+        let origin = abs.map(|b| (b.x, b.y));
         // Reserve the parent's slot first: child ids are needed for
         // `set_children`, but the parent must still land before them.
         let slot = out.len();
@@ -254,12 +285,12 @@ impl A11yTree {
         let mut node = A11yNode::new(role_of(instance.kind));
         fill(instance, &mut node, option_at);
         apply_common(instance, &mut node);
-        if let Some(b) = abs {
+        if let (Some(b), Some((px, py))) = (abs, parent_origin) {
             node.set_bounds(accesskit::Rect::new(
-                f64::from(b.x - parent_origin.0),
-                f64::from(b.y - parent_origin.1),
-                f64::from(b.x - parent_origin.0 + b.width),
-                f64::from(b.y - parent_origin.1 + b.height),
+                f64::from(b.x - px),
+                f64::from(b.y - py),
+                f64::from(b.x - px + b.width),
+                f64::from(b.y - py + b.height),
             ));
         }
         if !children.is_empty() {
@@ -288,16 +319,31 @@ impl A11yTree {
             _ => return None,
         };
         let selected = instance.props.int(PropName::Selected, 0).max(0) as usize;
-        let list_id = self.synthetic_id(owner, u64::MAX);
-        let mut option_ids = Vec::with_capacity(items.len());
-        for (position, item) in items.iter().enumerate() {
-            let option_id = self.synthetic_id(owner, item.id);
+        let list_id = self.synthetic_id(owner, SyntheticSlot::ListBox);
+        // First occurrence wins: a model carrying duplicate `ListItem::id`s
+        // must still emit one node per id, or the `TreeUpdate` repeats a
+        // `NodeId` and is malformed.
+        let mut seen_ids: Vec<u64> = Vec::with_capacity(items.len());
+        let unique: Vec<&ListItem> = items
+            .iter()
+            .filter(|item| {
+                if seen_ids.contains(&item.id) {
+                    false
+                } else {
+                    seen_ids.push(item.id);
+                    true
+                }
+            })
+            .collect();
+        let mut option_ids = Vec::with_capacity(unique.len());
+        for (position, item) in unique.iter().enumerate() {
+            let option_id = self.synthetic_id(owner, SyntheticSlot::Option(item.id));
             option_ids.push(option_id);
             let mut option = A11yNode::new(Role::ListBoxOption);
             option.set_label(item.text.to_string());
             option.set_selected(position == selected);
             option.set_position_in_set(position);
-            option.set_size_of_set(items.len());
+            option.set_size_of_set(unique.len());
             option.add_action(Action::Click);
             out.push((option_id, option));
         }

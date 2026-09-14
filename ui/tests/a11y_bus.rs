@@ -80,3 +80,39 @@ fn the_atspi_adapter_is_constructed_and_fed_without_a_session_bus() {
     );
     assert!(bus.take_actions().is_empty(), "no AT asked for anything");
 }
+
+#[test]
+fn publishing_an_unbuilt_tree_is_a_no_op() {
+    let recorder = Recording::default();
+    let mut bus = A11yBus::with_sink(Box::new(recorder.clone()));
+    let tree = icedtea_ui::a11y::A11yTree::new();
+
+    bus.publish_tree(&tree);
+
+    assert!(
+        recorder.updates.lock().unwrap().is_empty(),
+        "nothing pushed"
+    );
+    assert!(bus.latest().is_none(), "nothing cached");
+    assert_eq!(bus.publish_count(), 0, "nothing counted");
+}
+
+#[test]
+fn an_unactivated_bus_reports_inactive_and_counts_its_publishes() {
+    let recorder = Recording::default();
+    let mut bus = A11yBus::with_sink(Box::new(recorder.clone()));
+
+    assert!(
+        !bus.is_active(),
+        "no assistive technology has activated the adapter"
+    );
+    bus.publish(sample_update());
+    bus.publish(sample_update());
+
+    assert_eq!(bus.publish_count(), 2, "each publish is counted");
+    assert!(
+        !bus.is_active(),
+        "publishing with no AT never flips activation"
+    );
+    assert_eq!(recorder.updates.lock().unwrap().len(), 2);
+}

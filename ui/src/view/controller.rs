@@ -328,6 +328,24 @@ pub trait Controller<Msg>: std::any::Any {
 /// dedicated controller opt in with one field plus a two-line delegation in
 /// `set_prop`/`on_event`, while `cancel_press` clears whatever press latch
 /// that controller owns.
+///
+/// **Adoption recipe** — a dedicated controller becomes a drag source/target
+/// with exactly these edits; the first five are mechanical, the last is a
+/// convention the trait cannot enforce:
+///
+/// 1. add a `dnd: DndState` field, initialised `DndState::default()`;
+/// 2. `fn drag_offer(&self) { self.dnd.offer() }`;
+/// 3. `fn drop_accepts(&self, offered: &[&str]) { self.dnd.accepts(offered) }`;
+/// 4. early-return from `set_prop` on `self.dnd.set_prop(node, name, value)`;
+/// 5. early-return from `on_event` on `self.dnd.on_event(ev, cx)`;
+/// 6. override `cancel_press` to clear the controller's own press latch and
+///    its `:active` state — the framework calls it just before `DragStart`,
+///    and a controller that skips it would fire a click from the drag's
+///    completing release.
+///
+/// Step 6 is convention-only because the default is a no-op and the trait has
+/// no way to know which field is the latch; every opt-in controller in this
+/// crate (see `ButtonC`/`LabelC`/`EntryC`/`ListBoxC`) overrides it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DndState {
     /// The `DragSource` prop's payload text. `Some` makes this node a source.

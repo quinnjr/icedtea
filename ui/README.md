@@ -594,17 +594,34 @@ cargo test -p icedtea-ui
 `ui/src/a11y.rs` maps the retained `Instance` tree to an
 `accesskit::TreeUpdate`: role, name, state, option children and bounds, with
 stable `NodeId`s across reconciles. `ui/src/a11y_bus.rs` (feature `a11y-bus`,
-off by default) feeds that update to `accesskit_unix`'s AT-SPI adapter,
-selecting the `accesskit 0.25` / `accesskit_unix 0.23` pairing that shares one
-schema. Both live behind cargo features — `a11y` is on by default, `a11y-bus`
-is not — so `--no-default-features` builds neither. `A11yTree` is read-only
-over the toolkit: it changes no rendering or input behavior.
+off by default) constructs `accesskit_unix`'s AT-SPI adapter and owns the
+publish path — `A11yBus::publish_tree` hands `A11yTree::build_full`'s output
+to it — selecting the `accesskit 0.25` / `accesskit_unix 0.23` pairing that
+shares one schema. **Neither half is wired into the runtime yet:** nothing in
+`App`/`Window` constructs an `A11yTree`, rebuilds one per frame, or drives an
+`A11yBus`; they are standalone seams whose only drivers are `ui/tests/a11y.rs`
+and, under `cargo test -p icedtea-ui --features a11y-bus`,
+`ui/tests/a11y_bus.rs`. That gate is deliberate: `a11y-bus` is off by default
+because enabling it links `accesskit_unix` and pulls zbus/atspi, and its test
+target declares `required-features = ["a11y-bus"]` so the default run skips it
+instead of compiling an empty binary. The `a11y` feature is on by default;
+`--no-default-features` builds neither. `A11yTree` is read-only over the
+toolkit: it changes no rendering or input behavior.
 
 - `A11yTree::build_full` / `update` build the tree; the `*_with_layout`
   variants add each node's border-box bounds from the frame's `LayoutTree`.
+  A node with no allocation establishes no coordinate origin, so its
+  descendants' bounds are skipped rather than measured against a
+  grandparent's origin.
 - A `DropDown`'s model items are exposed as a `ListBox` of `ListBoxOption`
   children (the rows are controller-owned CSS subnodes, not `Instance`s),
-  keyed by `ListItem::id` so their ids survive a rebuild.
+  keyed by `ListItem::id` so their ids survive a rebuild. The listbox and its
+  options occupy separate key spaces, and duplicate item ids are dropped
+  (first wins), so every emitted `NodeId` is unique.
+- The unattached bus still reports its own health: `A11yBus::is_active` is
+  true only once an AT has activated the adapter, `A11yBus::publish_count`
+  counts publishes, and the first publish with no AT present logs a one-shot
+  `warn!`.
 - Live regions come from the widget model: a non-empty `Statusbar` is
   `Live::Polite`, a revealed `InfoBar` polite or assertive by message type,
   and an `AlertDialog` assertive.

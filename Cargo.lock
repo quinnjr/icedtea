@@ -1424,6 +1424,7 @@ dependencies = [
  "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
+ "icedtea-settings",
  "icedtea-ui",
  "tracing",
  "tracing-subscriber",

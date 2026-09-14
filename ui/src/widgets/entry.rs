@@ -13,7 +13,7 @@
 
 use std::rc::Rc;
 
-use crate::css::node::Node;
+use crate::css::node::{Node, PseudoStates};
 use crate::css::value::image::IconRef;
 use crate::layout::Rect;
 use crate::text_input::{ContentHint, ContentPurpose};
@@ -156,6 +156,15 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
 
     fn drop_accepts(&self, offered: &[&str]) -> bool {
         self.dnd.accepts(offered)
+    }
+
+    fn cancel_press(&mut self, _node: &Node) {
+        // Mirror `ButtonC`/`LabelC`: the entry's press latch drives the `text`
+        // subnode's `:active` (see this controller's own `PointerState`
+        // observe below), so a drag beginning on the entry must clear both or
+        // the completing release still reads as a click.
+        self.pointer.pressed = false;
+        self.edit.text_node.set_state(PseudoStates::ACTIVE, false);
     }
 
     fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {

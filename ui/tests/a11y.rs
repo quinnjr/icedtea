@@ -491,3 +491,169 @@ fn focus_on_a_gone_node_falls_back_to_the_root() {
         "a focus no node owns must rest on the root, never dangle"
     );
 }
+
+fn drop_down_with(items: Vec<ListItem>) -> View<Msg> {
+    View::new(Kind::DropDown)
+        .key("dd")
+        .prop(PropName::Model, Prop::Items(Rc::from(items)))
+}
+
+/// A duplicated [`ListItem::id`] must not emit a second node with the same
+/// [`accesskit::NodeId`] — that is a malformed `TreeUpdate`. First wins.
+#[test]
+fn duplicate_item_ids_yield_unique_nodes_and_first_wins() {
+    let mut hx = Harness::new();
+    let (_root, instances) = build_all(
+        &mut hx,
+        vec![drop_down_with(vec![
+            ListItem::new(7, "First"),
+            ListItem::new(7, "Second"),
+        ])],
+    );
+    let update = A11yTree::new().build_full(&instances, None);
+
+    let mut ids: Vec<_> = update.nodes.iter().map(|(id, _)| *id).collect();
+    ids.sort_by_key(|id| id.0);
+    let emitted = ids.len();
+    ids.dedup();
+    assert_eq!(emitted, ids.len(), "every emitted NodeId is unique");
+
+    let options: Vec<_> = update
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.role() == Role::ListBoxOption)
+        .collect();
+    assert_eq!(options.len(), 1, "the duplicate id is dropped");
+    assert_eq!(options[0].1.label(), Some("First"), "the first wins");
+}
+
+/// An option whose model id is `u64::MAX` once collided with the listbox's
+/// own `u64::MAX` sentinel and shared its `NodeId`; the two key spaces are
+/// distinct now.
+#[test]
+fn an_option_id_of_u64_max_does_not_alias_the_listbox() {
+    let mut hx = Harness::new();
+    let (_root, instances) = build_all(
+        &mut hx,
+        vec![drop_down_with(vec![ListItem::new(u64::MAX, "Max")])],
+    );
+    let update = A11yTree::new().build_full(&instances, None);
+
+    let combo = update
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == Role::ComboBox)
+        .expect("a ComboBox node");
+    let list_id = combo.1.children()[0];
+    let option = update
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == Role::ListBoxOption)
+        .expect("an option node");
+    assert_ne!(
+        option.0, list_id,
+        "the option no longer aliases the listbox"
+    );
+    assert_eq!(option.1.label(), Some("Max"));
+}
+
+#[test]
+fn an_unrevealed_info_bar_is_not_a_live_region() {
+    let mut hx = Harness::new();
+    let (_root, instances) = build_all(&mut hx, vec![View::new(Kind::InfoBar).key("info")]);
+    let update = A11yTree::new().build_full(&instances, None);
+    let info = update
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == Role::Alert)
+        .map(|(_, n)| n.clone())
+        .expect("an Alert node");
+    assert_eq!(info.live(), None, "a hidden info bar announces nothing");
+}
+
+#[test]
+fn a_revealed_info_bar_without_an_error_is_polite() {
+    let mut hx = Harness::new();
+    let (_root, instances) = build_all(
+        &mut hx,
+        vec![
+            View::new(Kind::InfoBar)
+                .key("info")
+                .prop(PropName::Reveal, Prop::Bool(true))
+                .prop(PropName::MessageType, MessageType::Info.to_prop()),
+        ],
+    );
+    let update = A11yTree::new().build_full(&instances, None);
+    let info = update
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == Role::Alert)
+        .map(|(_, n)| n.clone())
+        .expect("an Alert node");
+    assert_eq!(
+        info.live(),
+        Some(Live::Polite),
+        "an info bar waits rather than interrupting"
+    );
+}
+
+/// A synthetic id is only retained while its node is in the frame: once the
+/// drop-down leaves, rebuilding without one prunes it, so the map cannot grow
+/// without bound.
+#[test]
+fn synthetic_ids_are_pruned_when_a_drop_down_leaves_the_tree() {
+    let mut hx = Harness::new();
+    let (_root, instances) =
+        build_all(&mut hx, vec![drop_down_with(vec![ListItem::new(1, "One")])]);
+    let mut tree = A11yTree::new();
+    let first = tree.build_full(&instances, None);
+    let one_id = first
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == Role::ListBoxOption)
+        .map(|(id, _)| *id)
+        .expect("the option");
+
+    // A frame with no drop-down at all: nothing references the synthetic id.
+    let (_empty_root, empty) = build_all(&mut hx, vec![button("Save")]);
+    tree.build_full(&empty, None);
+
+    // Reintroducing the same model allocates a fresh id — the old pairing was
+    // pruned rather than kept forever.
+    let again = tree.build_full(&instances, None);
+    let one_again = again
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == Role::ListBoxOption)
+        .map(|(id, _)| *id)
+        .expect("the option again");
+    assert_ne!(
+        one_id, one_again,
+        "the pruned synthetic id was re-allocated"
+    );
+}
+
+/// A node with no layout allocation establishes no coordinate origin, so its
+/// descendants' bounds must be skipped rather than reported against a
+/// grandparent's origin with the parent's box missing.
+#[test]
+fn bounds_are_skipped_below_an_allocation_less_ancestor() {
+    let mut hx = Harness::new();
+    let outer = || View::new(Kind::Box).key("outer").child(button("Save"));
+    let (root, mut instances) = build_all(&mut hx, vec![outer()]);
+    let layout = lay_out(&mut hx, &root);
+
+    // Pull the allocated button instance out and re-parent it under a fresh,
+    // never-laid-out box: the button still has its stale allocation, its new
+    // parent has none.
+    let detached_button = instances[0].children.pop().expect("the button child");
+    let (_root2, mut detached) = build_all(&mut hx, vec![View::new(Kind::Box).key("detached")]);
+    detached[0].children.push(detached_button);
+
+    let update = A11yTree::new().build_full_with_layout(&detached, None, &layout);
+    let (_, save) = node_with_label(&update, "Save");
+    assert!(
+        save.bounds().is_none(),
+        "a child of an allocation-less parent carries no bounds"
+    );
+}

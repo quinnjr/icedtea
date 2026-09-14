@@ -18,13 +18,21 @@ skia-rs-safe = { version = "0.4.0", default-features = false, features = [
 bitflags = "2"
 # M6 accesskit slice: the in-process a11y tree (`ui/src/a11y.rs`) builds
 # `accesskit::TreeUpdate`s. Optional so `--no-default-features` keeps the
-# old tree; the AT-SPI bus adapter is a follow-up.
+# old tree; the AT-SPI bus adapter over it lives in `ui/src/a11y_bus.rs`
+# behind its own `a11y-bus` feature.
 accesskit = { version = "0.25", optional = true }
 # M6 accesskit bus slice: `ui/src/a11y_bus.rs` feeds those `TreeUpdate`s to
 # the AT-SPI bus. 0.23.0 (2026-08-29) pairs with `accesskit ^0.25`, so the
 # two crates share one schema; optional and behind its own `a11y-bus`
 # feature so the default build links no D-Bus.
-accesskit_unix = { version = "0.23", optional = true, default-features = true }
+#
+# `async-io` is accesskit_unix's only needed feature and cannot be dropped:
+# its `lib.rs` hard-errors unless `async-io` or `tokio` is enabled. It pulls
+# the crate's async runtime; the `zbus`/`atspi` chain is unconditional either
+# way, so listing it explicitly beats relying on `default`.
+accesskit_unix = { version = "0.23", optional = true, default-features = false, features = [
+    "async-io",
+] }
 cssparser = "0.37"
 selectors = "0.40"
 precomputed-hash = "0.1"
@@ -61,9 +69,6 @@ a11y = ["dep:accesskit"]
 a11y-bus = ["a11y", "dep:accesskit_unix"]
 
 [dev-dependencies]
-# `a11y.rs`'s bounds test lays a reconciled tree out itself; `FixedMeasure`
-# names `taffy::Size`, so the test crate needs the same pin.
-taffy = "0.14"
 icedtea-harness = { path = "../harness" }
 # `support::wait_for_probe_window` hands back the compositor's own
 # `WindowInfo`; a test's poll loop over `Compositor::snapshot` has nowhere
@@ -71,6 +76,15 @@ icedtea-harness = { path = "../harness" }
 icedtea-contract = { path = "../contract" }
 icedtea-compositor = { path = "../compositor" }
 tempfile = "3"
+
+[[test]]
+name = "a11y_bus"
+path = "tests/a11y_bus.rs"
+# The file is `#![cfg(feature = "a11y-bus")]`, so without this it compiles
+# to an empty binary and no gate ever exercises the bus. `required-features`
+# makes `cargo test -p icedtea-ui --features a11y-bus` the real gate; the
+# default run skips the target instead of passing vacuously.
+required-features = ["a11y-bus"]
 
 [[bin]]
 name = "themed-button"
