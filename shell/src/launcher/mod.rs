@@ -360,26 +360,28 @@ pub enum PowerAction {
     PowerOff,
 }
 
-/// The exact shell-out a [`PowerAction`] runs: program plus its args.
+/// The exact CLI invocation a [`PowerAction`] runs: program plus subcommand.
 ///
-/// `Logout` is `None`: it takes the compositor quit path (no shell-out).
-/// Every other action is the spec §Spawn+power shell-out until A3 logind
-/// replaces it. Programs are absolute paths so the launch never depends on
-/// the caller's `PATH`.
+/// `Logout` is `None`: it takes the compositor quit path (no CLI). Every
+/// other action calls the A3 `icedtea-session` helper, which forwards to
+/// `org.icedtea.Session` over the session bus. The program is resolved
+/// through `PATH`, exactly like the compositor's `spawn:` actions and the
+/// default power-key bindings (`spawn:icedtea-session lock`/`suspend`/
+/// `hibernate`) it shares a command name with.
 #[must_use]
 pub fn power_argv(action: PowerAction) -> Option<(&'static str, &'static [&'static str])> {
     match action {
-        PowerAction::Lock => Some(("/usr/bin/loginctl", &["lock-session"])),
+        PowerAction::Lock => Some(("icedtea-session", &["lock"])),
         PowerAction::Logout => None,
-        PowerAction::Suspend => Some(("/usr/bin/systemctl", &["suspend"])),
-        PowerAction::Reboot => Some(("/usr/bin/systemctl", &["reboot"])),
-        PowerAction::PowerOff => Some(("/usr/bin/systemctl", &["poweroff"])),
+        PowerAction::Suspend => Some(("icedtea-session", &["suspend"])),
+        PowerAction::Reboot => Some(("icedtea-session", &["reboot"])),
+        PowerAction::PowerOff => Some(("icedtea-session", &["poweroff"])),
     }
 }
 
 /// The launcher status line for a failed [`PowerAction`]: it names the
-/// action and carries the underlying cause, so a shell-out failure is never
-/// silent (spec §Spawn+power). Tested as a pure mapping, not via exec.
+/// action and carries the underlying cause, so a failed session-CLI call is
+/// never silent (spec §Spawn+power). Tested as a pure mapping, not via exec.
 #[must_use]
 pub fn power_error_message(action: PowerAction, detail: &str) -> String {
     let name = match action {
@@ -392,12 +394,12 @@ pub fn power_error_message(action: PowerAction, detail: &str) -> String {
     format!("Could not {name}: {detail}")
 }
 
-/// Run one [`power_argv`] shell-out with an internal ~30s bound, so a slow
+/// Run one [`power_argv`] command with an internal ~30s bound, so a slow
 /// or hung helper can never wedge the caller: the child is polled to exit,
 /// killed (and reaped) on timeout, and a timed-out [`std::io::Error`] is
 /// returned.
 ///
-/// The sibling view calls this instead of shelling out directly, so the
+/// The sibling view calls this instead of spawning directly, so the
 /// argv contract ([`power_argv`]) and the execution bound live together in
 /// the unit-testable core.
 pub(crate) fn run_power_command(
@@ -858,40 +860,24 @@ mod tests {
     }
 
     #[test]
-    fn power_argv_matches_the_shell_out_contract() {
-        assert_eq!(
-            power_argv(PowerAction::Lock),
-            Some(("/usr/bin/loginctl", ["lock-session"].as_slice()))
-        );
-        assert_eq!(
-            power_argv(PowerAction::Suspend),
-            Some(("/usr/bin/systemctl", ["suspend"].as_slice()))
-        );
-        assert_eq!(
-            power_argv(PowerAction::Reboot),
-            Some(("/usr/bin/systemctl", ["reboot"].as_slice()))
-        );
-        assert_eq!(
-            power_argv(PowerAction::PowerOff),
-            Some(("/usr/bin/systemctl", ["poweroff"].as_slice()))
-        );
+    fn power_argv_matches_the_session_cli_contract() {
+        for (action, subcommand) in [
+            (PowerAction::Lock, "lock"),
+            (PowerAction::Suspend, "suspend"),
+            (PowerAction::Reboot, "reboot"),
+            (PowerAction::PowerOff, "poweroff"),
+        ] {
+            assert_eq!(
+                power_argv(action),
+                Some(("icedtea-session", [subcommand].as_slice())),
+                "{action:?} forwards to the `icedtea-session {subcommand}` CLI"
+            );
+        }
         assert_eq!(
             power_argv(PowerAction::Logout),
             None,
             "logout takes the compositor quit path, never a shell-out"
         );
-        for action in [
-            PowerAction::Lock,
-            PowerAction::Suspend,
-            PowerAction::Reboot,
-            PowerAction::PowerOff,
-        ] {
-            let (program, _) = power_argv(action).expect("a shell-out");
-            assert!(
-                program.starts_with('/'),
-                "{action:?}: the program must be absolute, got {program:?}"
-            );
-        }
     }
 
     #[test]

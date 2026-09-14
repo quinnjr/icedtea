@@ -57,7 +57,7 @@ standalone daemon crate, a small compositor-side D-Bus addition, and a new
   `"spawn:terminal"`; `compositor/src/state.rs:3081`'s `"spawn"` arm does
   `std::process::Command::new("sh").arg("-c").arg(&cmd).spawn()`. **No
   compositor code change is needed to bind a power key to a shell command** —
-  a default binding of `"spawn:loginctl suspend"` on `XF86PowerOff` already
+  a default binding of `"spawn:loginctl suspend"` on `XF86_PowerOff` already
   works today, mechanically. What's missing is *policy*: a bare
   `loginctl suspend` bypasses lock-before-sleep entirely, which is the actual
   gap A3 closes.
@@ -133,7 +133,7 @@ standalone daemon crate, a small compositor-side D-Bus addition, and a new
    it tells logind not to act on those keys itself; the compositor still
    receives `KEY_POWER`/`KEY_SLEEP` as ordinary input events through libinput
    (logind doesn't grab the device exclusively — it's a passive listener too),
-   which xkb resolves to `XF86PowerOff`/`XF86Sleep` keysyms, matched by the
+   which xkb resolves to `XF86_PowerOff`/`XF86_Sleep` keysyms, matched by the
    **existing** keybinding system with **zero compositor code changes**. Only
    `config::defaults::default_config` gains new default bindings (Milestone 3).
    `handle-lid-switch` is **not** in this inhibitor set — Decision 3 leaves lid
@@ -204,7 +204,7 @@ session/
                          # wayland-protocols (ext-idle-notify is a staging
                          # protocol here, behind its `staging` feature),
                          # icedtea-contract,
-                         # icedtea-config, crossbeam-channel, tracing
+                         # icedtea-config, futures-util, tracing
   src/
     lib.rs               # wiring / re-exports for tests
     main.rs               # boot: open config, connect system+session buses,
@@ -338,7 +338,7 @@ if `icedtea-session` exits — matching "no session daemon means no DE-aware
 power handling" being the safe failure mode, same reasoning as Decision 2).
 This is the *only* code for power-key handling — no keybinding dispatch, no
 keysym matching, lives in this crate at all. The actual reaction to
-`XF86PowerOff`/`XF86Sleep`/`XF86Hibernate` keysyms is an ordinary compositor
+`XF86_PowerOff`/`XF86_Sleep`/`XF86_Hibernate` keysyms is an ordinary compositor
 keybinding (Decision 4), added as new `config::defaults::default_config`
 entries (Milestone 3):
 

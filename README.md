@@ -14,6 +14,7 @@ wrapper over wlroots 0.20.
 | `icedtea-compositor` | The Wayland compositor: window management, decorations, workspaces, XWayland, and the standard client-compat protocols. Serves `org.icedtea.Compositor` for control and window enumeration. |
 | `icedtea-clipboard` | Headless clipboard-history daemon (`org.icedtea.Clipboard`). |
 | `icedtea-notifications` | Notification daemon serving `org.freedesktop.Notifications` + an `org.icedtea.Notifications` query/DND surface. |
+| `icedtea-session` | logind/seat daemon serving `org.icedtea.Session`: lock/suspend/hibernate/poweroff/reboot/logout, idle→lock, and sleep + power-key inhibitors. |
 | `icedtea-settings` | GTK4 settings & multi-monitor display-manager app. |
 | `icedtea-shell` | Shell surfaces (taskbar) driving the compositor over D-Bus. |
 | `icedtea-contract` | Shared IPC vocabulary (D-Bus names, wire types) every component depends on. |

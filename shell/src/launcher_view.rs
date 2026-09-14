@@ -8,9 +8,9 @@
 //! right-click pin/unpin) and [`view()`] (search box, pinned rail, All-apps
 //! list, tiles pane, power row).
 //!
-//! The power row shells out per `launcher::power_argv` (logout takes the
-//! compositor quit path); every failure surfaces as `status`, never
-//! silently.
+//! The power row invokes the `icedtea-session` CLI per `launcher::power_argv`
+//! (logout takes the compositor quit path); every failure surfaces as
+//! `status`, never silently.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -110,8 +110,8 @@ pub enum LauncherMsg {
     Ignore,
     /// A single-letter jump in the All-apps list (empty query only).
     LetterJump(char),
-    /// The power row: shell-outs per `launcher::power_argv`, logout via
-    /// the compositor quit path.
+    /// The power row: `icedtea-session` CLI calls per `launcher::power_argv`,
+    /// logout via the compositor quit path.
     Power(PowerAction),
     /// Escape or the Start button toggling shut. No *keyboard* focus-loss
     /// path exists under `Exclusive` on a compliant compositor; a
@@ -153,8 +153,8 @@ pub struct LauncherModel {
     /// Fires after a close fold (successful launch, Escape): the supervisor
     /// resets the panel's `launcher_open` bit through it.
     pub on_close: Option<Rc<dyn Fn()>>,
-    /// How a power action shells out. Defaults to [`run_power_command`];
-    /// tests override it so no test ever execs `loginctl`/`systemctl`.
+    /// How a power action is invoked. Defaults to [`run_power_command`];
+    /// tests override it so no test ever execs `icedtea-session`.
     power_run: fn(&str, &[&str]) -> std::io::Result<()>,
     /// Write-back for the pin/tile/recency stores. Called with
     /// [`LauncherModel::snapshot`] on every close (successful launch,
@@ -225,15 +225,18 @@ fn persist_launcher_config_once(
     Ok(())
 }
 
-/// The one real power shell-out (spec §Spawn+power): `program` + `args` is
-/// exactly [`power_argv`]'s output. Both an io failure (binary missing) and
-/// a non-zero exit (polkit-denied, the spec's own risk) are failures, so a
-/// refusal surfaces as a launcher status line, never silently.
+/// The one real power invocation: `program` + `args` is exactly
+/// [`power_argv`]'s output (the `icedtea-session` CLI). Both an io failure
+/// (binary missing) and a non-zero exit (no session daemon, or logind
+/// refusing) are failures, so a refusal surfaces as a launcher status line,
+/// never silently.
 ///
 /// A thin adapter over the core's bounded runner (internal ~30s bound, so
 /// a hung helper can never wedge the fold); kept under this name so the
 /// `power_run` call sites and tests never exec through another path.
-// A3-logind (DE roadmap A3, no ticket system): replace run_power_command's core shell-out with logind client; delete power_run when done.
+// A3-logind: the power row routes through the `icedtea-session` CLI to
+// `org.icedtea.Session`; this adapter maps its exit status to a launcher
+// result.
 fn run_power_command(program: &str, args: &[&str]) -> std::io::Result<()> {
     let status = core_run_power_command(program, args)?;
     if status.success() {
@@ -492,9 +495,9 @@ pub fn update(m: &mut LauncherModel, msg: LauncherMsg) -> Cmd<LauncherMsg> {
                 .position(|e| e.name.to_lowercase().starts_with(&needle));
             Cmd::None
         }
-        // Power backends (spec §Spawn+power): each action shells out per
+        // Power actions: each calls the `icedtea-session` CLI per
         // [`power_argv`], except logout, which takes the compositor quit
-        // path. A shell-out failure surfaces as `m.status`, never silently;
+        // path. A failed call surfaces as `m.status`, never silently;
         // a success dismisses the menu (the session is going away, or the
         // locker covers it).
         LauncherMsg::Power(action) => handle_power(m, action),
@@ -502,14 +505,17 @@ pub fn update(m: &mut LauncherModel, msg: LauncherMsg) -> Cmd<LauncherMsg> {
     }
 }
 
-/// One power action (extracted from [`update`]): shell-outs route through
-/// [`power_argv`] and `power_run`, logout takes the compositor quit path.
+/// One power action (extracted from [`update`]): the `icedtea-session` CLI
+/// route goes through [`power_argv`] and `power_run`, logout takes the
+/// compositor quit path.
 /// Logout needs a confirm press — the first arms with a status, the second
 /// quits — and a refused quit (`false`, a dead bus) is a logout-failed
 /// status, never a silent dismissal.
 fn handle_power(m: &mut LauncherModel, action: PowerAction) -> Cmd<LauncherMsg> {
     match power_argv(action) {
-        // A3-logind (DE roadmap A3, no ticket system): replace power_run routing with logind client; delete power_run when done.
+        // A3-logind: the power row is migrated — the `icedtea-session` CLI
+        // owns the org.icedtea.Session call; `power_run` stays as the
+        // injection seam for tests.
         Some((program, args)) => match (m.power_run)(program, args) {
             Ok(()) => m.close(),
             Err(err) => {
@@ -846,9 +852,9 @@ fn tile_row(entry: &DesktopEntry, size: u32, selected: bool) -> View<LauncherMsg
 
 /// The bottom row: lock / log out / suspend / restart / shut down.
 /// View-only: each button folds `LauncherMsg::Power`, which [`update`]
-/// routes through [`power_argv`] (shell-out via `power_run`, logout via
-/// the compositor quit path with a confirm press); every failure surfaces
-/// as `status`, never silently.
+/// routes through [`power_argv`] (the `icedtea-session` CLI via `power_run`,
+/// logout via the compositor quit path with a confirm press); every failure
+/// surfaces as `status`, never silently.
 fn power_row() -> View<LauncherMsg> {
     box_(
         Orientation::Horizontal,
@@ -1215,13 +1221,13 @@ mod tests {
     }
 
     /// A power runner that always succeeds, standing in for the real
-    /// `loginctl`/`systemctl` shell-out (which no test may execute).
+    /// `icedtea-session` CLI (which no test may execute).
     fn ok_power(_program: &str, _args: &[&str]) -> std::io::Result<()> {
         Ok(())
     }
 
     /// A power runner that always fails, standing in for a denied or
-    /// missing `loginctl`/`systemctl`.
+    /// missing `icedtea-session`.
     fn denied_power(_program: &str, _args: &[&str]) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -1611,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn power_shell_out_success_closes_the_menu() {
+    fn power_cli_success_closes_the_menu() {
         let (mut m, wm) = seeded();
         m.open = true;
         m.power_run = ok_power;
@@ -1626,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn power_shell_out_failure_reports_a_status_line_and_stays_open() {
+    fn power_cli_failure_reports_a_status_line_and_stays_open() {
         let (mut m, _) = seeded();
         m.open = true;
         m.power_run = denied_power;
