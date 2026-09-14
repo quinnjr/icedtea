@@ -17,4 +17,5 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }
+icedtea-compositor = { path = "../compositor" }
 tempfile = "3"
