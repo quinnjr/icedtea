@@ -9,7 +9,9 @@ use crate::anim::{Clock, ManualClock};
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::ResolveEnv;
 use crate::css::node::Node;
-use crate::dnd::{DragOutcome, DragPayload, DragSession, DragTransition};
+use crate::dnd::{
+    DragOutcome, DragPayload, DragSession, DragTransition, SeatDragRequest, SeatDragResult,
+};
 use crate::icons::IconTheme;
 use crate::layout::{Container, LayoutError, LayoutTree, Measure};
 use crate::paint::{ImageCache, PaintCx};
@@ -289,6 +291,12 @@ pub fn deliver<Msg: Clone + 'static>(
             // ends the dispatch and there is no bubble to fire on.
             if phase == Phase::Target || phase == Phase::Bubble {
                 out.extend(fire_pointer_handlers(event, &*handlers));
+            }
+            // M6: a `DragStart` means the completing release is a drop/cancel,
+            // never a click, so the pressed node clears its own press latch
+            // before the shared `DndState` records the drag.
+            if phase == Phase::Target && matches!(event, Event::DragStart) {
+                controller.cancel_press(own);
             }
             out.extend(controller.on_event(event, &mut ecx));
             // `cx.handled` ends the whole dispatch (deviation D19, recorded in
@@ -572,6 +580,11 @@ pub struct App<M, Msg> {
         reason = "one boxed closure, at most one per app"
     )]
     frame_hook: Option<Box<dyn FnMut(&crate::window::Window)>>,
+    /// The compositor-seat seam (M6 §7): when set, a drag that crosses the
+    /// threshold is offered to it and, on [`crate::dnd::SeatDragResult::Accepted`],
+    /// the compositor owns the rest of the drag. `None` (the default, and
+    /// every offscreen run) keeps the drag entirely toolkit-internal.
+    drag_seat: Option<Box<dyn crate::dnd::DragSeat>>,
 }
 
 impl<M: std::fmt::Debug, Msg> std::fmt::Debug for App<M, Msg> {
@@ -631,6 +644,9 @@ struct Runtime<Msg> {
     /// common case — no press is tracked and routing is exactly what it was
     /// before M6.
     dnd: Option<ActiveDrag>,
+    /// The compositor-seat seam, from [`App::with_drag_seat`] (or the live
+    /// window's data device under `App::run`). `None` on every offscreen run.
+    seat: Option<Box<dyn crate::dnd::DragSeat>>,
     /// C4 opt-in, copied from [`App::with_autofocus_first`]: whether the
     /// `KeyboardEnter`-when-empty arm below may focus the first widget.
     autofocus_first: bool,
@@ -646,6 +662,9 @@ struct ActiveDrag {
     source: Node,
     payload: DragPayload,
     target: Option<Node>,
+    /// The seat accepted the offer: the compositor now owns target routing,
+    /// so the toolkit stops its own hit-testing for this drag (§7).
+    offloaded: bool,
 }
 
 /// One open popup surface's own retained tree.
@@ -779,6 +798,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             probe_report: std::env::var_os("ICEDTEA_PROBE_REPORT").map(std::path::PathBuf::from),
             frame_hook: None,
             autofocus_first: false,
+            drag_seat: None,
         }
     }
 
@@ -883,6 +903,18 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
     #[must_use]
     pub fn with_autofocus_first(mut self, on: bool) -> Self {
         self.autofocus_first = on;
+        self
+    }
+
+    /// Inject the compositor-seat seam (§7 of the M6 DnD design).
+    ///
+    /// A windowed run builds the real seat from its live `wl_data_device`; a
+    /// test injects a scripted one to prove the toolkit offers the drag (the
+    /// arming serial and the offered payload) at the threshold crossing.
+    /// `run_offscreen` without this keeps every drag toolkit-internal.
+    #[must_use]
+    pub fn with_drag_seat(mut self, seat: Box<dyn crate::dnd::DragSeat>) -> Self {
+        self.drag_seat = Some(seat);
         self
     }
 
@@ -1093,6 +1125,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             focus: <FocusRing as Default>::default(),
             grab: ImplicitGrab::default(),
             dnd: None,
+            seat: self.drag_seat.take(),
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
@@ -1925,10 +1958,21 @@ fn route_surface<Msg: Clone + 'static>(
                 match drag.session.motion(point) {
                     DragTransition::BeganDragging => {
                         pending.push((drag.source.clone(), Event::DragStart));
+                        // §7: offer the drag to the compositor seat. On
+                        // `Accepted` the compositor owns target routing and
+                        // the toolkit stops its own hit-testing below; a
+                        // `Refused`/absent seat keeps the drag internal.
+                        if let Some(seat) = rt.seat.as_mut() {
+                            let serial = drag.session.serial().unwrap_or(0);
+                            let request = SeatDragRequest::new(serial, drag.payload.clone());
+                            if seat.offer_drag(&request) == SeatDragResult::Accepted {
+                                drag.offloaded = true;
+                            }
+                        }
                     }
                     DragTransition::None | DragTransition::StillArmed | DragTransition::Moved => {}
                 }
-                if drag.session.is_dragging() {
+                if drag.session.is_dragging() && !drag.offloaded {
                     // Bypass `aim`'s grab override on purpose: while buttons
                     // are held the grab pins every motion to the press node
                     // and a target under the cursor would never highlight.
@@ -2002,6 +2046,7 @@ fn route_surface<Msg: Clone + 'static>(
                             source: node,
                             payload,
                             target: None,
+                            offloaded: false,
                         });
                     }
                 } else {
@@ -2026,6 +2071,7 @@ fn route_surface<Msg: Clone + 'static>(
                             source,
                             payload,
                             mut target,
+                            ..
                         } = drag;
                         if session.release() == DragOutcome::FinishedDrag {
                             let dropped = target.is_some();
@@ -2409,6 +2455,7 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
             focus: <FocusRing as Default>::default(),
             grab: ImplicitGrab::default(),
             dnd: None,
+            seat: self.drag_seat.take(),
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),
@@ -2426,6 +2473,12 @@ impl<M: 'static, Msg: Clone + 'static> App<M, Msg> {
         };
 
         rebuild(&mut self, &mut rt, &sheet, &mut fonts, &mut icons, &clock);
+
+        // §7: a windowed run with no injected seat gets the real one off the
+        // window's data device, so a drag can cross surfaces.
+        if rt.seat.is_none() {
+            rt.seat = window.take_drag_seat();
+        }
 
         // M5-D9, P0-D4: lines written by `write_probe_report` only when they
         // differ from what is already here.
@@ -3086,6 +3139,7 @@ mod tests {
             focus: <FocusRing as Default>::default(),
             grab: ImplicitGrab::default(),
             dnd: None,
+            seat: None,
             hovered: None,
             focused: None,
             last_pointer: (0.0, 0.0),

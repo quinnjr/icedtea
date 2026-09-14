@@ -21,7 +21,7 @@ use crate::css::computed::ComputedStyle;
 use crate::css::node::{Node, PseudoStates};
 use crate::layout::{Allocation, Rect};
 use crate::text::{Ellipsize, MarkupSpan, TextLayout, TextStyle, WrapMode, parse_markup};
-use crate::view::controller::{Controller, Event, EventCx, PaintCx};
+use crate::view::controller::{Controller, DndState, Event, EventCx, PaintCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::{PointerState, Universal};
 
@@ -164,6 +164,8 @@ pub struct LabelC {
     universal: Universal,
     /// The width the layout was last built at, so `measure` can reuse it.
     built_width: Option<f32>,
+    /// M6 drag-and-drop: a `Label` is a source/target when the view opts in.
+    dnd: DndState,
 }
 
 impl LabelC {
@@ -261,6 +263,19 @@ impl<Msg: Clone + 'static> Controller<Msg> for LabelC {
         Kind::Label
     }
 
+    fn drag_offer(&self) -> Option<crate::dnd::DragPayload> {
+        self.dnd.offer()
+    }
+
+    fn drop_accepts(&self, offered: &[&str]) -> bool {
+        self.dnd.accepts(offered)
+    }
+
+    fn cancel_press(&mut self, node: &Node) {
+        self.pointer.pressed = false;
+        node.set_state(PseudoStates::ACTIVE, false);
+    }
+
     fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {
         let mut this = LabelC {
             layout: TextLayout::build(
@@ -296,6 +311,7 @@ impl<Msg: Clone + 'static> Controller<Msg> for LabelC {
             pointer: PointerState::default(),
             universal: Universal::new(node, Kind::Label),
             built_width: None,
+            dnd: DndState::default(),
         };
         this.rebuild(node, cx, None);
         this
@@ -303,6 +319,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for LabelC {
 
     fn set_prop(&mut self, node: &Node, name: PropName, value: &Prop, cx: &mut BuildCx<'_>) {
         if self.universal.apply(node, Kind::Label, name, value) {
+            return;
+        }
+        if self.dnd.set_prop(node, name, value) {
             return;
         }
         match name {
@@ -339,6 +358,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for LabelC {
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
+        if let Some(out) = self.dnd.on_event(ev, cx) {
+            return out;
+        }
         let alloc = cx.tree.allocation(cx.node).map(|a| a.content_box);
         let clicked = self.pointer.observe(
             cx.node,

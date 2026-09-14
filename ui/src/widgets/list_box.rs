@@ -33,6 +33,7 @@
 //! test; this is dead code for every real widget instance.
 use crate::css::node::{Node, PseudoStates};
 use crate::layout::{BoxDirection, Container, LayoutTree};
+use crate::view::controller::DndState;
 use crate::view::{BuildCx, Controller, Event, EventCx, EventKind, Kind, Prop, PropName, Props};
 use crate::widgets::types::{Selection, SelectionMode};
 use crate::widgets::{Universal, local_rect, prop_bool, prop_u16, set_container};
@@ -52,6 +53,8 @@ pub struct ListBoxC {
     /// `GtkListBox:activate-on-single-click`.
     pub activate_single: bool,
     universal: Universal,
+    /// M6 drag-and-drop: the list is a source/target when the view opts in.
+    dnd: DndState,
 }
 
 impl ListBoxC {
@@ -121,10 +124,22 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListBoxC {
             mode,
             activate_single: props.bool(PropName::ActivateOnSingleClick, true),
             universal: Universal::new(node, Kind::ListBox),
+            dnd: DndState::default(),
         }
     }
 
+    fn drag_offer(&self) -> Option<crate::dnd::DragPayload> {
+        self.dnd.offer()
+    }
+
+    fn drop_accepts(&self, offered: &[&str]) -> bool {
+        self.dnd.accepts(offered)
+    }
+
     fn set_prop(&mut self, node: &Node, name: PropName, value: &Prop, _cx: &mut BuildCx<'_>) {
+        if self.dnd.set_prop(node, name, value) {
+            return;
+        }
         match name {
             PropName::SelectionMode => {
                 self.mode = SelectionMode::from_u16(prop_u16(value, 1));
@@ -154,6 +169,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for ListBoxC {
         use crate::window::keyboard::Mods;
         use xkbcommon::xkb::keysyms;
 
+        if let Some(out) = self.dnd.on_event(ev, cx) {
+            return out;
+        }
         let mut out = Vec::new();
         let mut changed = false;
         match ev {
