@@ -496,6 +496,18 @@ impl Compositor {
         runtime_dir().join(&self.socket)
     }
 
+    /// A clone of the command-wake pipe's write half, so a second owner -- the
+    /// production `dbus::spawn_service` wired to this same loop -- can nudge
+    /// the loop after pushing onto [`Self::commands`]. `spawn_service` requires
+    /// exactly this: the write half of a `backend::wake_source` registered
+    /// against the loop's runtime. Keeping it private previously forced a test
+    /// to hand the service an unregistered pipe and then poll the loop by hand.
+    pub fn wake_handle(&self) -> UnixStream {
+        self.wake
+            .try_clone()
+            .expect("clone the compositor command-wake pipe")
+    }
+
     /// Send a command the way `dbus::CompositorInterface::send` does: onto the
     /// channel, then a nudge on the wake pipe.
     pub fn send(&self, cmd: DbCommand) {

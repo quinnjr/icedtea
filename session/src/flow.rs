@@ -54,6 +54,13 @@ const COMPOSITOR_UNLOCK_SETTLE_POLLS: u32 = 3;
 /// unreachable. One transient 750ms call timeout must not release sleep
 /// seconds early, but a genuinely dead compositor must not burn the budget.
 const PRE_SLEEP_UNREACHABLE_POLLS: u64 = 3;
+/// How long [`LockFlow::terminate_locker`] gives a `SIGKILL`ed locker to be
+/// reaped before it abandons the wait. `SIGKILL` cannot be blocked, but a
+/// process wedged in uninterruptible sleep (`D` state, e.g. blocked on a hung
+/// filesystem) will not act on it, and an unbounded `wait()` would then pin
+/// the calling thread — which on the external-unlock path is the whole session
+/// flow.
+const LOCKER_REAP_BUDGET: Duration = Duration::from_secs(2);
 
 /// The child-process operations [`locker_waiter`] and [`LockFlow::terminate_locker`]
 /// need, so a test can inject a child whose `try_wait` fails without racing a
@@ -677,18 +684,63 @@ impl LockFlow {
     /// signalled in-process through [`Self::group_kill`] — no shell is
     /// spawned, so a pid/pgid-reuse race can no longer signal an unrelated
     /// same-user group through a shell that resolves the negative pid later.
-    /// `child.kill()` and `child.wait()` remain the reap, and run even when
-    /// the group signal fails, so no zombie is left behind either way.
+    /// `child.kill()` and a bounded `try_wait` reap ([`Self::reap_terminated`])
+    /// run even when the group signal fails, so no zombie is left behind in
+    /// the ordinary case and a wedged locker cannot hang this thread.
     fn terminate_locker(&self, child: &mut (dyn LockerChild + Send)) {
         let pid = child.id();
-        if let Ok(raw) = i32::try_from(pid)
-            && let Some(pgid) = Pid::from_raw(raw)
-            && let Err(err) = self.group_kill(pgid)
-        {
-            tracing::warn!(%err, pid, "could not signal the locker process group");
+        match i32::try_from(pid).ok().and_then(Pid::from_raw) {
+            Some(pgid) => {
+                if let Err(err) = self.group_kill(pgid) {
+                    tracing::warn!(%err, pid, "could not signal the locker process group");
+                }
+            }
+            // An out-of-range pid, or `0`, has no pgid of its own. The group
+            // signal is skipped entirely, so say so rather than falling
+            // through to the direct kill without a trace.
+            None => {
+                tracing::warn!(
+                    pid,
+                    "locker pid has no signalable process group; killing it directly"
+                );
+            }
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Err(err) = child.kill() {
+            tracing::warn!(%err, pid, "could not kill the locker; it may still be running");
+        }
+        Self::reap_terminated(child);
+    }
+
+    /// Reap a killed locker without blocking forever. Polls `try_wait` for a
+    /// bounded window instead of calling the unbounded `wait()`: `SIGKILL`
+    /// leaves the child dead and reapable in every ordinary case, but a
+    /// process stuck in uninterruptible sleep would otherwise pin this thread
+    /// until it wakes. Abandoning the wait is logged; the child is left for
+    /// init to reap rather than hanging the flow.
+    fn reap_terminated(child: &mut (dyn LockerChild + Send)) {
+        let deadline = Instant::now() + LOCKER_REAP_BUDGET;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        pid = child.id(),
+                        "could not reap the locker; abandoning the wait"
+                    );
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    pid = child.id(),
+                    "locker survived SIGKILL past the reap budget; abandoning the wait"
+                );
+                return;
+            }
+            std::thread::sleep(LOCKER_WAIT_POLL);
+        }
     }
 
     /// Spawn the configured locker, install it as the active generation, and
