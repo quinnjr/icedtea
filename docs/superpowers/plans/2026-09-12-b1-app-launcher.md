@@ -141,15 +141,15 @@ fn rank_prefers_prefix_over_substring() {
 **Interfaces:**
 - Consumes: Tasks 4–5. Produces: working power row; proven spawn path.
 
-- [ ] **Step 1: Write failing tests** — pure argv builders: `power_argv(Lock) == ["loginctl","lock-session"]`, suspend/poweroff/reboot likewise, logout → compositor quit path (no argv); each shell-out failure surfaces as a launcher status line (test the status-message mapping, not the exec).
+- [ ] **Step 1: Write failing tests** — pure argv builders: `power_argv(Lock) == ["icedtea-session","lock"]`, suspend/reboot/poweroff likewise, logout → compositor quit path (no argv); each invocation failure surfaces as a launcher status line (test the status-message mapping, not the exec).
 - [ ] **Step 2: Run** — FAIL
-- [ ] **Step 3: Implement** builders + handlers (`Command::new().args().status()`, failure → status line; every call site commented `// A3-logind: replace with logind client`). Launch path: Enter → `spawn_app(entry.id)` → on `true`, record recency + close.
+- [ ] **Step 3: Implement** builders + handlers (a bounded `Command::new().args()` runner, failure → status line; the `icedtea-session` program is resolved once per process to an absolute path, not a click-time `PATH` lookup). Launch path: Enter → `spawn_app(entry.id)` → on `true`, record recency + close.
 - [ ] **Step 4: Write failing e2e** open-from-Start → type → launch asserts spawn reached compositor (observability: `DbCommand::SpawnApp` reply `true` + a `MockWm`-recorded call) and recency recorded; then gut the `spawn_app` call and confirm FAIL (deletion test), restore.
 - [ ] **Step 5: Run** full gates — PASS
 - [ ] **Step 6: Commit** `feat(shell): power row backends + launcher e2e`
 
 ## Self-Review
 
-- Spec §Architecture → Tasks 3+5 (surface/process); §Position config → Task 3; §Index+stores → Tasks 1+2; §Layout+keyboard → Task 5; §Spawn+power → Tasks 4+6; §Testing → Tasks 1/5/6 (unit, render, e2e+deletion); §Out of scope respected (no file providers, no tile DnD, no adaptive ordering, no A3, no separate process).
+- Spec §Architecture → Tasks 3+5 (surface/process); §Position config → Task 3; §Index+stores → Tasks 1+2; §Layout+keyboard → Task 5; §Spawn+power → Tasks 4+6; §Testing → Tasks 1/5/6 (unit, render, e2e+deletion); §Out of scope respected (no file providers, no tile DnD, no adaptive ordering, no logind implementation of its own — the power row invokes the A3 `icedtea-session` CLI, no separate process).
 - No placeholders; every step names files, exact names (`parse_spawn_argv`, `SpawnApp`, `SearchEntryExt::on_search`, `bar_position`), and expected outputs.
 - Type consistency: `DesktopEntry/LauncherConfig/PinStore/TileStore/RecencyStore`, `spawn_app(&str)->bool`, `DbCommand::SpawnApp{app_id,reply}`, `bar_position: String` threaded unchanged.

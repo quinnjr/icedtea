@@ -10,7 +10,9 @@ pub use entry::{
 };
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use icedtea_config::{TileGroup, default_tile_size};
 
@@ -360,22 +362,67 @@ pub enum PowerAction {
     PowerOff,
 }
 
+/// The session CLI's binary name, as configured in the default power-key
+/// bindings and installed by the `session` crate.
+const SESSION_CLI_NAME: &str = "icedtea-session";
+
+/// Resolve [`SESSION_CLI_NAME`] to an absolute path once per process.
+///
+/// The launcher's power actions are privileged (lock/suspend/reboot/poweroff),
+/// so they must not run whichever `icedtea-session` happens to be first on a
+/// `PATH` that could be shadowed or mutated between load and click. The first
+/// executable found is cached in a `OnceLock`; if the binary is genuinely not
+/// installed the bare name is kept, so the spawn fails with `NotFound` and the
+/// failure surfaces as a launcher status line rather than silently doing
+/// nothing.
+fn session_cli_program() -> &'static str {
+    static RESOLVED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| resolve_on_path(SESSION_CLI_NAME, std::env::var_os("PATH").as_deref()))
+        .as_deref()
+        .and_then(Path::to_str)
+        .unwrap_or(SESSION_CLI_NAME)
+}
+
+/// The first executable named `name` in `path_env` (a `PATH` value), or `None`.
+/// Pure over its arguments so the resolution rule is testable without touching
+/// the real environment. Empty `PATH` entries (which mean "the current
+/// directory") are skipped: a privileged action must not pick up a binary
+/// dropped in the launcher's working directory.
+fn resolve_on_path(name: &str, path_env: Option<&OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path_env?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Is `path` a regular file with at least one execute bit set? Close enough to
+/// `which` for a same-user daemon binary; an unreadable directory or missing
+/// file simply means "not here, keep looking".
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 /// The exact CLI invocation a [`PowerAction`] runs: program plus subcommand.
 ///
 /// `Logout` is `None`: it takes the compositor quit path (no CLI). Every
 /// other action calls the A3 `icedtea-session` helper, which forwards to
-/// `org.icedtea.Session` over the session bus. The program is resolved
-/// through `PATH`, exactly like the compositor's `spawn:` actions and the
-/// default power-key bindings (`spawn:icedtea-session lock`/`suspend`/
-/// `hibernate`) it shares a command name with.
+/// `org.icedtea.Session` over the session bus. The program is the absolute
+/// path resolved once by [`session_cli_program`] (falling back to the bare
+/// name only when the binary is not installed), so a privileged action never
+/// depends on the `PATH` in effect at click time.
 #[must_use]
 pub fn power_argv(action: PowerAction) -> Option<(&'static str, &'static [&'static str])> {
+    let program = session_cli_program();
     match action {
-        PowerAction::Lock => Some(("icedtea-session", &["lock"])),
+        PowerAction::Lock => Some((program, &["lock"])),
         PowerAction::Logout => None,
-        PowerAction::Suspend => Some(("icedtea-session", &["suspend"])),
-        PowerAction::Reboot => Some(("icedtea-session", &["reboot"])),
-        PowerAction::PowerOff => Some(("icedtea-session", &["poweroff"])),
+        PowerAction::Suspend => Some((program, &["suspend"])),
+        PowerAction::Reboot => Some((program, &["reboot"])),
+        PowerAction::PowerOff => Some((program, &["poweroff"])),
     }
 }
 
@@ -867,10 +914,20 @@ mod tests {
             (PowerAction::Reboot, "reboot"),
             (PowerAction::PowerOff, "poweroff"),
         ] {
+            let (program, args) = power_argv(action).expect("a session-CLI invocation");
             assert_eq!(
-                power_argv(action),
-                Some(("icedtea-session", [subcommand].as_slice())),
+                args,
+                [subcommand].as_slice(),
                 "{action:?} forwards to the `icedtea-session {subcommand}` CLI"
+            );
+            assert!(
+                program.ends_with(SESSION_CLI_NAME),
+                "{action:?}: program must be the session CLI, got {program:?}"
+            );
+            assert!(
+                program == SESSION_CLI_NAME || program.starts_with('/'),
+                "{action:?}: program must be an absolute path when installed, \
+                 or the bare name when not, got {program:?}"
             );
         }
         assert_eq!(
@@ -878,6 +935,40 @@ mod tests {
             None,
             "logout takes the compositor quit path, never a shell-out"
         );
+    }
+
+    /// The resolution rule: the first executable of the name wins, an
+    /// empty `PATH` entry (cwd) is skipped, and a non-executable earlier
+    /// candidate does not shadow a later executable one.
+    #[test]
+    fn resolve_on_path_prefers_the_first_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tmpdir();
+        let second = tmpdir();
+        let no_exec = first.join(SESSION_CLI_NAME);
+        std::fs::write(&no_exec, b"not executable").unwrap();
+        std::fs::set_permissions(&no_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let executable = second.join(SESSION_CLI_NAME);
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The empty middle entry stands for "the current directory" and must
+        // be ignored.
+        let path_env =
+            std::ffi::OsString::from(format!("{}::{}", first.display(), second.display()));
+        assert_eq!(
+            resolve_on_path(SESSION_CLI_NAME, Some(&path_env)),
+            Some(executable)
+        );
+    }
+
+    #[test]
+    fn resolve_on_path_returns_none_when_absent_or_unset() {
+        let dir = tmpdir();
+        let path_env = dir.into_os_string();
+        assert_eq!(resolve_on_path(SESSION_CLI_NAME, Some(&path_env)), None);
+        assert_eq!(resolve_on_path(SESSION_CLI_NAME, None), None);
     }
 
     #[test]

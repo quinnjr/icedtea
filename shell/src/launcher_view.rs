@@ -234,7 +234,7 @@ fn persist_launcher_config_once(
 /// A thin adapter over the core's bounded runner (internal ~30s bound, so
 /// a hung helper can never wedge the fold); kept under this name so the
 /// `power_run` call sites and tests never exec through another path.
-// A3-logind: the power row routes through the `icedtea-session` CLI to
+// The power row routes through the `icedtea-session` CLI to
 // `org.icedtea.Session`; this adapter maps its exit status to a launcher
 // result.
 fn run_power_command(program: &str, args: &[&str]) -> std::io::Result<()> {
@@ -513,9 +513,8 @@ pub fn update(m: &mut LauncherModel, msg: LauncherMsg) -> Cmd<LauncherMsg> {
 /// status, never a silent dismissal.
 fn handle_power(m: &mut LauncherModel, action: PowerAction) -> Cmd<LauncherMsg> {
     match power_argv(action) {
-        // A3-logind: the power row is migrated — the `icedtea-session` CLI
-        // owns the org.icedtea.Session call; `power_run` stays as the
-        // injection seam for tests.
+        // The `icedtea-session` CLI owns the org.icedtea.Session call;
+        // `power_run` stays as the injection seam for tests.
         Some((program, args)) => match (m.power_run)(program, args) {
             Ok(()) => m.close(),
             Err(err) => {
