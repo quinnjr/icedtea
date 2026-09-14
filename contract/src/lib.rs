@@ -37,14 +37,19 @@ pub const COMPOSITOR_IFACE: &str = "org.icedtea.Compositor";
 ///   / `SwitchToggled` signals.
 /// * `6` -- B1 launcher: `SpawnApp(s)->(b)` (launch-by-id method taking one
 ///   app-id string and returning one bool).
+/// * `7` -- names the already-shipped A3 session-lock surface:
+///   `IsLocked()->(b)` on the [`COMPOSITOR_IFACE`] interface and the
+///   `SessionLockChanged(bool)` signal. Both shipped additively at revision
+///   `6` (which deliberately did not bump for them); this revision only
+///   records them in the ledger so a client can discover the surface.
 ///
-/// A3 deliberately does **not** bump this: `IsLocked()` on `org.icedtea.WM`
-/// and the `SessionLockChanged(bool)` event are purely additive (one new
-/// method, one new signal variant; no existing signature or signal changed),
-/// so a client compiled against `6` keeps working unchanged. This counter
-/// exists to name *breaking signature* mismatches (see the `F7` rationale
-/// above) — an additive change is not one, so there is nothing to resolve.
-pub const COMPOSITOR_CONTRACT_VERSION: u32 = 6;
+/// Additive changes are recorded here too, not only signature rewrites: a
+/// client compiled against an older revision needs to know whether a method
+/// it plans to call (or a signal it plans to subscribe to) exists on the
+/// peer, and this property is the only revision the compositor advertises.
+/// The count still names the `F7` *signature* mismatch above; it is never
+/// needed to decode an old reply, only to discover the peer's surface.
+pub const COMPOSITOR_CONTRACT_VERSION: u32 = 7;
 
 pub use clipboard::{CLIP_BUS_NAME, CLIP_PATH, ClipEntry, ClipKind};
 pub use event::{Event, SeqEvent};

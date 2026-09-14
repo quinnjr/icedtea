@@ -54,13 +54,14 @@ standalone daemon crate, a small compositor-side D-Bus addition, and a new
   `zbus::blocking::Connection` for outgoing commands.
 - **Keybindings already support arbitrary exec.** `config::defaults::default_config`
   populates a `HashMap<String, KeyCombo>` keyed by action strings like
-  `"spawn:terminal"`; `compositor/src/state.rs:3081`'s `"spawn"` arm does
-  `std::process::Command::new("sh").arg("-c").arg(&cmd).spawn()`. **No
-  compositor code change is needed to bind a power key to a shell command** —
-  a default binding of `"spawn:loginctl suspend"` on `XF86PowerOff` already
-  works today, mechanically. What's missing is *policy*: a bare
-  `loginctl suspend` bypasses lock-before-sleep entirely, which is the actual
-  gap A3 closes.
+  `"spawn:terminal"`; the compositor's `"spawn"` arm word-splits the command
+  with `parse_spawn_argv` and runs it directly
+  (`std::process::Command::new(program).args(args)`), **not** through a shell
+  (no `sh -c`). **No compositor code change is needed to bind a power key to a
+  command** — a default binding like `"spawn:icedtea-session suspend"` on
+  `XF86_Sleep` works today, mechanically. What's missing is *policy*: a bare
+  suspend bypasses lock-before-sleep entirely, which is the actual gap A3
+  closes.
 - **No switch-device (lid) support in the `wlr` crate today.** `SW_LID` is a
   libinput *switch* device event (`WLR_INPUT_DEVICE_SWITCH`), not a keyboard
   keysym; `grep`ing `compositor/src/*.rs` and `config/src/*.rs` for
@@ -99,7 +100,7 @@ standalone daemon crate, a small compositor-side D-Bus addition, and a new
      independently, same as the clipboard daemon today.
 2. **Locking is delegated to a configured external locker; this daemon never
    implements a password prompt.** `config::Power::locker_command: Option<String>`
-   (a shell command, spawned the same way `state.rs`'s `"spawn"` arm does)
+   (a shell command, spawned with `sh -c`)
    names the program to run to actually secure the screen — it is expected to
    bind `ext_session_lock_manager_v1` itself (any real locker: `swaylock`,
    `gtklock`, and eventually Track B's `icedtea-lockscreen` from B2). Building
@@ -133,7 +134,7 @@ standalone daemon crate, a small compositor-side D-Bus addition, and a new
    it tells logind not to act on those keys itself; the compositor still
    receives `KEY_POWER`/`KEY_SLEEP` as ordinary input events through libinput
    (logind doesn't grab the device exclusively — it's a passive listener too),
-   which xkb resolves to `XF86PowerOff`/`XF86Sleep` keysyms, matched by the
+   which xkb resolves to `XF86_PowerOff`/`XF86_Sleep` keysyms, matched by the
    **existing** keybinding system with **zero compositor code changes**. Only
    `config::defaults::default_config` gains new default bindings (Milestone 3).
    `handle-lid-switch` is **not** in this inhibitor set — Decision 3 leaves lid
@@ -204,7 +205,7 @@ session/
                          # wayland-protocols (ext-idle-notify is a staging
                          # protocol here, behind its `staging` feature),
                          # icedtea-contract,
-                         # icedtea-config, crossbeam-channel, tracing
+                         # icedtea-config, futures-util, tracing
   src/
     lib.rs               # wiring / re-exports for tests
     main.rs               # boot: open config, connect system+session buses,
@@ -267,10 +268,9 @@ policy or by an external `loginctl lock-session`:
 
 - **`Lock` signal received** → if not already locked (`IsLocked()` against
   `org.icedtea.WM`) and a `locker_command` is configured, spawn it
-  (`std::process::Command::new("sh").arg("-c").arg(cmd).spawn()`, same
-  invocation shape as `state.rs`'s `"spawn"` keybinding arm, deliberately —
-  one exec convention across the codebase) and start a background thread that
-  `.wait()`s on the child.
+  (`std::process::Command::new("sh").arg("-c").arg(cmd).spawn()`, matching how
+  a configured shell command is conventionally launched) and start a
+  background thread that `.wait()`s on the child.
 - **Child process exits** → treat as "the locker's job is done" (it is
   trusted to have only exited after successfully authenticating an unlock,
   exactly as `swaylock`/`gtklock` behave — they exit on successful unlock,
@@ -338,7 +338,7 @@ if `icedtea-session` exits — matching "no session daemon means no DE-aware
 power handling" being the safe failure mode, same reasoning as Decision 2).
 This is the *only* code for power-key handling — no keybinding dispatch, no
 keysym matching, lives in this crate at all. The actual reaction to
-`XF86PowerOff`/`XF86Sleep`/`XF86Hibernate` keysyms is an ordinary compositor
+`XF86_PowerOff`/`XF86_Sleep`/`XF86_Hibernate` keysyms is an ordinary compositor
 keybinding (Decision 4), added as new `config::defaults::default_config`
 entries (Milestone 3):
 
@@ -446,6 +446,14 @@ Type=simple
 ExecStart=%h/.cargo/bin/icedtea-session
 Restart=always
 RestartSec=1
+# Standard user-service hardening. `RestrictAddressFamilies=AF_UNIX` is
+# required (Wayland and D-Bus are both Unix-socket transports); the rest keeps
+# the daemon (and the locker it spawns) to reading the system and home.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
 
 [Install]
 WantedBy=graphical-session.target

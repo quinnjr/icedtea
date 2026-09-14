@@ -14,12 +14,37 @@ use schema::*;
 pub use keys::{MODIFIER_TOKENS, key_name_to_keysym, keysym_to_key_name};
 
 /// Written into `DB_META` on every `Config::save`, for the future settings
-/// crate (the plan's single config writer) to use for migrations. It is
-/// deliberately never read/checked here: `load_or_default` already falls
-/// back per-field for anything missing or unparsable, so an unknown/older
-/// on-disk layout degrades gracefully without needing a version check on
-/// this read path.
-pub const SCHEMA_VERSION: u64 = 1;
+/// crate (the plan's single config writer) to use for migrations. Mostly the
+/// read path still degrades per-field for anything missing or unparsable, but
+/// this value IS read in one place: the A3 power-key backfill in
+/// [`read_config_from_db`], gated on the fixed [`A3_SCHEMA_VERSION`] boundary
+/// rather than on this live value (see that constant).
+pub const SCHEMA_VERSION: u64 = 2;
+
+/// Schema version that introduced the A3 power-key defaults.
+///
+/// The backfill in [`read_config_from_db`] compares the stored version against
+/// this fixed boundary, not the live [`SCHEMA_VERSION`]: gating on the live
+/// value would re-run the A3 migration on every future schema bump and could
+/// resurrect a power binding a user deliberately removed. Bumping
+/// `SCHEMA_VERSION` therefore does NOT re-arm the backfill.
+const A3_SCHEMA_VERSION: u64 = 2;
+
+/// What `DB_META`'s schema-version row tells us, distinguishing a genuinely
+/// absent version (a fresh or pre-A3 config, where the backfill is wanted) from
+/// one that is present but unreadable (where migrating could resurrect removed
+/// bindings, so the read path must not).
+#[derive(Debug, PartialEq, Eq)]
+enum StoredSchemaVersion {
+    /// No `DB_META` table, no version key, or a legacy value: the config
+    /// predates versioned writes, so the A3 backfill applies.
+    Absent,
+    /// A readable version number.
+    Known(u64),
+    /// The table/key exists but its bytes are not a `u64`. Treated as "do not
+    /// touch": a corrupt version must never drive a migration.
+    Unreadable,
+}
 
 pub use contract::Appearance;
 pub use contract::DisplayConfig;
@@ -229,6 +254,28 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Do two bindings name the same chord? A keysym has many spellings
+/// (`XF86_PowerOff` vs the canonical `KEY_XF86PowerOff` the settings app
+/// captures), so identity is the *resolved keysym* plus the modifier set
+/// (order- and case-insensitive), never the raw key string. Names that resolve
+/// to no keysym fall back to an exact string compare so two distinct unknown
+/// names are not treated as one chord.
+fn same_chord(a: &KeyCombo, b: &KeyCombo) -> bool {
+    let a_sym = key_name_to_keysym(&a.key);
+    let b_sym = key_name_to_keysym(&b.key);
+    if a_sym != b_sym || (a_sym == 0 && a.key != b.key) {
+        return false;
+    }
+    normalized_modifiers(a) == normalized_modifiers(b)
+}
+
+fn normalized_modifiers(combo: &KeyCombo) -> Vec<String> {
+    let mut mods: Vec<String> = combo.modifiers.iter().map(|m| m.to_uppercase()).collect();
+    mods.sort();
+    mods.dedup();
+    mods
+}
+
 fn read_json<T: DeserializeOwned>(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &'static str,
@@ -238,6 +285,35 @@ fn read_json<T: DeserializeOwned>(
         .ok()
         .flatten()
         .and_then(|v| serde_json::from_slice(v.value()).ok())
+}
+
+/// Read the stored schema version, distinguishing "no version" (migrate) from
+/// "present but unreadable" (do not migrate). A missing table or key is
+/// [`StoredSchemaVersion::Absent`]; a table or key that errors surfaces as
+/// [`StoredSchemaVersion::Unreadable`] so a corrupt meta cannot drive the
+/// non-idempotent A3 backfill.
+fn read_stored_schema_version(read_txn: &redb::ReadTransaction) -> StoredSchemaVersion {
+    let table = match read_txn.open_table(DB_META) {
+        Ok(table) => table,
+        Err(_) => return StoredSchemaVersion::Absent,
+    };
+    match table.get(KEY_SCHEMA_VERSION) {
+        Ok(Some(value)) => classify_schema_version(Some(value.value())),
+        Ok(None) => StoredSchemaVersion::Absent,
+        Err(_) => StoredSchemaVersion::Unreadable,
+    }
+}
+
+/// Classify the raw `KEY_SCHEMA_VERSION` bytes. Split from the table read so
+/// the absent/garbage distinction is unit-testable without a database.
+fn classify_schema_version(raw: Option<&[u8]>) -> StoredSchemaVersion {
+    match raw {
+        None => StoredSchemaVersion::Absent,
+        Some(bytes) => match serde_json::from_slice::<u64>(bytes) {
+            Ok(version) => StoredSchemaVersion::Known(version),
+            Err(_) => StoredSchemaVersion::Unreadable,
+        },
+    }
 }
 
 /// Outcome of [`try_load`]: the load path that must NOT silently turn a live
@@ -420,34 +496,53 @@ fn read_config_from_db(db: Database) -> Config {
                 cfg.keybindings = keybindings;
             }
         }
-        // A3 power-key defaults: a stored keybindings table
-        // replaces `default_config()`'s map wholesale, so a config saved before
-        // A3 would otherwise load with those keys unbound while
-        // `icedtea-session` still takes logind's power-key block inhibitor —
-        // every power key a silent no-op. Only *missing* entries are added, so
-        // a user's own binding for one of these actions is never overwritten;
-        // and a default whose keysym the user already bound to *another* action
-        // is skipped, so the backfill never introduces a duplicate chord.
-        for (action, key) in defaults::POWER_KEY_BINDINGS {
-            if cfg.keybindings.contains_key(action) {
-                continue;
-            }
-            let keysym_taken = cfg.keybindings.values().any(|combo| combo.key == key);
-            if keysym_taken {
-                tracing::debug!(
-                    action,
-                    key,
-                    "power-key default skipped: the keysym is already bound"
+        // A3 power-key defaults, applied ONCE as a migration. A stored
+        // keybindings table replaces `default_config()`'s map wholesale, so a
+        // config saved before A3 would otherwise load with those keys unbound
+        // while `icedtea-session` still takes logind's power-key block
+        // inhibitor — every power key a silent no-op. Gating on the fixed
+        // `A3_SCHEMA_VERSION` boundary means this only runs for pre-A3 data; a
+        // config saved by A3+ is never touched, so a user who deliberately
+        // removed a power binding does not get it re-added on the next load
+        // (and a later `SCHEMA_VERSION` bump does not re-arm it). Within the
+        // migration, a user's own binding for one of these actions is never
+        // overwritten, and a default whose chord (resolved keysym + modifiers)
+        // is already bound to *another* action is skipped, so the backfill
+        // never introduces a duplicate chord.
+        match read_stored_schema_version(&read_txn) {
+            // At or beyond A3: the binding set is authoritative, run nothing.
+            StoredSchemaVersion::Known(version) if version >= A3_SCHEMA_VERSION => {}
+            // Present but unreadable/garbage. Migrating here could resurrect a
+            // deliberately removed binding, so choose the safe non-mutating
+            // direction and warn instead.
+            StoredSchemaVersion::Unreadable => {
+                tracing::warn!(
+                    "config schema version is present but unreadable; skipping the A3 \
+                     power-key backfill rather than risk resurrecting removed bindings"
                 );
-                continue;
             }
-            cfg.keybindings.insert(
-                action.to_string(),
-                KeyCombo {
-                    modifiers: Vec::new(),
-                    key: key.to_string(),
-                },
-            );
+            // Absent (fresh/pre-A3) or a version older than A3: migrate.
+            StoredSchemaVersion::Absent | StoredSchemaVersion::Known(_) => {
+                for (action, key) in defaults::POWER_KEY_BINDINGS {
+                    if cfg.keybindings.contains_key(action) {
+                        continue;
+                    }
+                    let default_combo = defaults::build_combo(&[], key);
+                    if cfg
+                        .keybindings
+                        .values()
+                        .any(|combo| same_chord(combo, &default_combo))
+                    {
+                        tracing::debug!(
+                            action,
+                            key,
+                            "power-key default skipped: the chord is already bound"
+                        );
+                        continue;
+                    }
+                    cfg.keybindings.insert(action.to_string(), default_combo);
+                }
+            }
         }
         Ok::<Config, redb::Error>(cfg)
     }));
@@ -584,6 +679,50 @@ impl Config {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Force the stored schema version, simulating a config written before A3
+    /// (which stamped `1`). `Config::save` always stamps the current version.
+    fn set_stored_schema_version(path: &Path, version: u64) {
+        let db = open(path).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut meta = write_txn.open_table(DB_META).unwrap();
+            let bytes = serde_json::to_vec(&version).unwrap();
+            meta.insert(KEY_SCHEMA_VERSION, bytes.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    /// Overwrite the version row with bytes that are not a JSON `u64`,
+    /// simulating a corrupt/partially-written meta value.
+    fn set_raw_schema_version(path: &Path, bytes: &[u8]) {
+        let db = open(path).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut meta = write_txn.open_table(DB_META).unwrap();
+            meta.insert(KEY_SCHEMA_VERSION, bytes).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    /// Drop the whole meta table, simulating a config written before versioned
+    /// saves existed.
+    fn delete_meta_table(path: &Path) {
+        let db = open(path).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        write_txn.delete_table(DB_META).unwrap();
+        write_txn.commit().unwrap();
+    }
+
+    /// Remove every power-key action from a default config, as if the user had
+    /// deleted them.
+    fn config_without_power_bindings() -> Config {
+        let mut cfg = default_config();
+        for (action, _) in defaults::POWER_KEY_BINDINGS {
+            cfg.keybindings.remove(action);
+        }
+        cfg
+    }
 
     #[test]
     fn defaults_are_parseable() {
@@ -884,23 +1023,20 @@ mod tests {
         assert_eq!(loaded.keybindings, cfg.keybindings);
     }
 
-    /// An A3-upgraded config: the stored keybindings table predates the
-    /// power-key defaults, so it replaces the default map without them.
-    /// Loading must backfill them, or the session daemon's power-key block
-    /// inhibitor would leave the keys unbound (a silent no-op).
+    /// The A3 migration: a pre-A3 config (schema version 1) whose stored
+    /// keybindings table predates the power-key defaults replaces the default
+    /// map without them. Loading must backfill them, or the session daemon's
+    /// power-key block inhibitor would leave the keys unbound (a silent no-op).
     #[test]
-    fn an_older_stored_config_gains_the_power_key_bindings() {
+    fn a_pre_a3_config_gains_the_power_key_bindings() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("cfg.redb");
 
-        let mut cfg = default_config();
-        for (action, _) in defaults::POWER_KEY_BINDINGS {
-            cfg.keybindings.remove(action);
-        }
         {
             let db = open(&path).unwrap();
-            cfg.save(&db).unwrap();
+            config_without_power_bindings().save(&db).unwrap();
         }
+        set_stored_schema_version(&path, 1);
 
         let loaded = load_or_default(&path);
         for (action, key) in defaults::POWER_KEY_BINDINGS {
@@ -916,49 +1052,204 @@ mod tests {
         }
     }
 
+    /// The migration is one-time: a config written by A3+ (schema version 2)
+    /// that lacks the power bindings must NOT regain them, so a deliberate
+    /// removal is an expressible state. This also pins that the gate is the
+    /// fixed `A3_SCHEMA_VERSION`, not the live `SCHEMA_VERSION` (see
+    /// `a_schema_newer_than_a3_does_not_backfill_power_keys`).
+    #[test]
+    fn an_a3_config_without_power_bindings_does_not_regain_them() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        {
+            let db = open(&path).unwrap();
+            config_without_power_bindings().save(&db).unwrap();
+        }
+
+        let loaded = load_or_default(&path);
+        for (action, _) in defaults::POWER_KEY_BINDINGS {
+            assert!(
+                !loaded.keybindings.contains_key(action),
+                "{action:?} was deliberately removed and must stay removed"
+            );
+        }
+    }
+
+    /// Finding 2: the backfill is gated on the fixed `A3_SCHEMA_VERSION`, not
+    /// on the live `SCHEMA_VERSION`. A config stamped with a version past A3
+    /// (simulating a future schema bump) must not re-run the A3 migration and
+    /// resurrect a binding the user removed.
+    #[test]
+    fn a_schema_newer_than_a3_does_not_backfill_power_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        {
+            let db = open(&path).unwrap();
+            config_without_power_bindings().save(&db).unwrap();
+        }
+        set_stored_schema_version(&path, A3_SCHEMA_VERSION + 1);
+
+        let loaded = load_or_default(&path);
+        for (action, _) in defaults::POWER_KEY_BINDINGS {
+            assert!(
+                !loaded.keybindings.contains_key(action),
+                "{action:?} must not be backfilled past the A3 boundary"
+            );
+        }
+    }
+
+    /// A config with no `DB_META` table at all predates versioned saves, so it
+    /// is pre-A3 and MUST be migrated (the absent case).
+    #[test]
+    fn an_absent_meta_table_still_backfills_the_power_key_bindings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        {
+            let db = open(&path).unwrap();
+            config_without_power_bindings().save(&db).unwrap();
+        }
+        delete_meta_table(&path);
+
+        let loaded = load_or_default(&path);
+        for (action, _) in defaults::POWER_KEY_BINDINGS {
+            assert!(
+                loaded.keybindings.contains_key(action),
+                "{action:?} must be backfilled when the meta table is absent"
+            );
+        }
+    }
+
+    /// Finding 1: a version row that is present but garbage must NOT be treated
+    /// as pre-A3. Migrating on unreadable bytes could resurrect a binding the
+    /// user removed, so the read path warns and leaves the bindings alone.
+    #[test]
+    fn an_unreadable_schema_version_does_not_backfill_power_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.redb");
+
+        {
+            let db = open(&path).unwrap();
+            config_without_power_bindings().save(&db).unwrap();
+        }
+        set_raw_schema_version(&path, b"not a version");
+
+        let loaded = load_or_default(&path);
+        for (action, _) in defaults::POWER_KEY_BINDINGS {
+            assert!(
+                !loaded.keybindings.contains_key(action),
+                "{action:?} must not be backfilled from an unreadable version"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_schema_version_distinguishes_absent_known_and_garbage() {
+        assert_eq!(classify_schema_version(None), StoredSchemaVersion::Absent);
+        assert_eq!(
+            classify_schema_version(Some(b"1")),
+            StoredSchemaVersion::Known(1)
+        );
+        assert_eq!(
+            classify_schema_version(Some(b"2")),
+            StoredSchemaVersion::Known(A3_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            classify_schema_version(Some(b"")),
+            StoredSchemaVersion::Unreadable
+        );
+        assert_eq!(
+            classify_schema_version(Some(b"not a version")),
+            StoredSchemaVersion::Unreadable
+        );
+        // A float/negative is not a valid `u64` and must not be guessed at.
+        assert_eq!(
+            classify_schema_version(Some(b"-1")),
+            StoredSchemaVersion::Unreadable
+        );
+    }
+
+    /// Finding 4: `same_chord` identity is the resolved keysym plus the
+    /// normalized modifier set, not the raw strings.
+    #[test]
+    fn same_chord_resolves_keysym_spellings_and_normalizes_modifiers() {
+        let combo = |mods: &[&str], key: &str| KeyCombo {
+            modifiers: mods.iter().map(|m| (*m).to_string()).collect(),
+            key: key.to_string(),
+        };
+
+        // Same keysym, different spelling (`XF86_PowerOff` vs the canonical
+        // `KEY_XF86PowerOff` the settings app captures).
+        assert!(same_chord(
+            &combo(&[], "XF86_PowerOff"),
+            &combo(&[], "KEY_XF86PowerOff")
+        ));
+
+        // Modifier order and case do not matter.
+        assert!(same_chord(
+            &combo(&["SUPER", "SHIFT"], "KEY_q"),
+            &combo(&["shift", "super"], "KEY_q")
+        ));
+
+        // Distinct unknown names must NOT collapse to one chord.
+        assert!(!same_chord(
+            &combo(&[], "NotARealKey"),
+            &combo(&[], "AlsoNotARealKey")
+        ));
+
+        // Different keysyms and different modifier sets are different chords.
+        assert!(!same_chord(&combo(&[], "KEY_q"), &combo(&[], "KEY_w")));
+        assert!(!same_chord(
+            &combo(&["SUPER"], "KEY_q"),
+            &combo(&["SUPER", "SHIFT"], "KEY_q")
+        ));
+    }
+
     /// If the user already bound a power keysym to a different action (here
     /// `close`), the backfill must skip the corresponding default rather than
-    /// introduce a second action on the same keysym.
+    /// introduce a second action on the same chord. The user binding uses the
+    /// `KEY_XF86PowerOff` spelling the settings app captures, which is the SAME
+    /// keysym as the default's `XF86_PowerOff` but a different string.
     #[test]
     fn the_power_key_backfill_does_not_duplicate_an_already_bound_keysym() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("cfg.redb");
 
-        let mut cfg = default_config();
-        for (action, _) in defaults::POWER_KEY_BINDINGS {
-            cfg.keybindings.remove(action);
-        }
+        let mut cfg = config_without_power_bindings();
         cfg.keybindings.insert(
             "close".into(),
             KeyCombo {
                 modifiers: Vec::new(),
-                key: "XF86_PowerOff".into(),
+                key: "KEY_XF86PowerOff".into(),
             },
         );
         {
             let db = open(&path).unwrap();
             cfg.save(&db).unwrap();
         }
+        set_stored_schema_version(&path, 1);
 
         let loaded = load_or_default(&path);
         assert!(
             !loaded
                 .keybindings
                 .contains_key("spawn:icedtea-session lock"),
-            "the power-key default must be skipped when its keysym is taken"
+            "the power-key default must be skipped when its chord is taken"
         );
         assert_eq!(
             loaded
                 .keybindings
                 .get("close")
                 .map(|combo| combo.key.as_str()),
-            Some("XF86_PowerOff"),
+            Some("KEY_XF86PowerOff"),
             "the user's own binding is preserved"
         );
         let on_power_off = loaded
             .keybindings
-            .iter()
-            .filter(|(_, combo)| combo.key == "XF86_PowerOff")
+            .values()
+            .filter(|combo| key_name_to_keysym(&combo.key) == key_name_to_keysym("XF86_PowerOff"))
             .count();
         assert_eq!(on_power_off, 1, "exactly one action binds XF86_PowerOff");
     }

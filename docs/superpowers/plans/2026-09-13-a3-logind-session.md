@@ -6,7 +6,7 @@
 
 **Architecture:** One new workspace crate `session` (binary `icedtea-session`), shaped exactly like `clipboard`: a `#[interface]` D-Bus service, a `wayland-client` protocol client (`ext_idle_notifier_v1`), and `systemd --user` unit. Policy is pure (`session/src/policy.rs`); logind and the compositor are reached through trait seams so every decision is unit-testable without real D-Bus. The only compositor change is additive: `IsLocked()` on `org.icedtea.Compositor` and a `SessionLockChanged` signal.
 
-**Tech Stack:** Rust, `zbus` 5 (blocking + `zbus::block_on` async signal streams, no tokio), `wayland-client` + `wayland-protocols` (`staging`, for `ext-idle-notify-v1`) + `wayland-protocols-wlr`, `icedtea-contract`, `icedtea-config`, `crossbeam-channel`, `tracing`.
+**Tech Stack:** Rust, `zbus` 5 (blocking + `zbus::block_on` async signal streams, no tokio), `wayland-client` + `wayland-protocols` (`staging`, for `ext-idle-notify-v1`), `futures-util`, `icedtea-contract`, `icedtea-config`, `tracing`.
 
 **Spec:** `../specs/2026-08-20-icedtea-logind-session-design.md`
 
@@ -146,7 +146,7 @@
 - Test: full workspace
 
 **Interfaces:**
-- Produces: `icedtea-session.service` (mirror `clipboard/systemd/icedtea-clipboard.service`); default bindings `XF86PowerOff`/`XF86Sleep`/`XF86Hibernate` → `spawn:icedtea-session lock` (and suspend/poweroff per the spec's Milestone 3 note).
+- Produces: `icedtea-session.service` (mirror `clipboard/systemd/icedtea-clipboard.service`); default bindings `XF86_PowerOff` → `spawn:icedtea-session lock`, `XF86_Sleep` → `spawn:icedtea-session suspend`, `XF86_Hibernate` → `spawn:icedtea-session hibernate` (per the spec's Milestone 3 note).
 
 - [ ] **Step 1: Failing test** — `default_config()` contains the three power-key bindings with the expected commands.
 - [ ] **Step 2: Run** — FAIL.
@@ -156,6 +156,7 @@
 
 ## Self-Review
 
-- Spec §Decisions 1–8 → Tasks 3 (crate/discovery), 4 (service/CLI/Logout), 5 (inhibitors/funnel/bounded), 6 (idle), 1 (config), 2 (compositor surface), 7 (unit/bindings). Spec §Testing items 1–5 → Tasks 5, 6, 4/2; success criteria 1–7 each map to a task test.
+- Spec §Decisions 1–8 → Tasks 3 (crate/discovery), 4 (service/CLI/Logout), 5 (inhibitors/funnel/bounded), 6 (idle), 1 (config), 2 (compositor surface), 7 (unit/bindings). Spec §Testing items 1–5 → Tasks 5, 6, 4/2.
+- **Known gaps:** the production `ZbusWmClient` (the session daemon's live client of `org.icedtea.Compositor`'s `IsLocked()`/`Quit()` and its `SessionLockChanged` subscription) is not exercised end-to-end, and no test boots the session daemon against a *real* compositor driven through a configured locker. What **is** now covered on a live bus: criterion 5's `IsLocked()` method and `SessionLockChanged` signal round-trip over a real session bus (`compositor/src/dbus.rs::is_locked_and_session_lock_changed_round_trip_over_a_session_bus`), criterion 6's CLI route reaching a real `org.icedtea.Session` service over a private bus (`session/tests/cli.rs`), and logind session discovery/inhibit/power/lock/unlock/signal handling against a fake logind over a private bus (`session/tests/fake_logind.rs`).
 - No placeholders: every step names files, exact type/method names, and expected output.
 - Type consistency: `Power{locker_command,lock_idle_timeout_ms,lock_before_sleep}`, `Logind`/`WmClient` seams, `Event::SessionLockChanged(bool)`, `IsLocked` wire member, `org.icedtea.Session` methods threaded unchanged.

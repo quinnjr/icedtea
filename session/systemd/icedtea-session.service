@@ -3,12 +3,34 @@ Description=icedtea session/seat manager (logind integration)
 Documentation=https://github.com/quinnjr/icedtea-wm
 PartOf=graphical-session.target
 After=graphical-session.target
+# No ordering on the compositor: like icedtea-shell, icedtea-session reaches
+# the compositor's Wayland socket (idle-lock binds ext_idle_notifier_v1) and
+# its org.icedtea.Compositor D-Bus name, retrying on connect while either is
+# still coming up rather than gating the unit on it.
 
 [Service]
 Type=simple
 ExecStart=%h/.cargo/bin/icedtea-session
 Restart=always
 RestartSec=1
+# Standard user-service hardening. `RestrictAddressFamilies=AF_UNIX` is
+# required (Wayland and D-Bus are both Unix-socket transports); the rest keeps
+# the daemon to reading the system and home.
+#
+# NOTE: these directives are inherited by the `locker_command` this daemon
+# spawns (e.g. swaylock/gtklock), so the locker is held to the same namespaces:
+# `ProtectSystem=strict` + `ProtectHome=read-only` deny it writes anywhere but
+# private tmp, `PrivateTmp` gives it a fresh /tmp, and
+# `RestrictAddressFamilies=AF_UNIX` denies it TCP/UDP/other sockets. A locker
+# that needs to write under `$HOME` (caches, `.local/state`, crash logs), read
+# devices, or open a non-UNIX socket will fail under this unit; such a locker
+# must be wrapped in its own transient scope with its own hardening rather than
+# loosening the session daemon.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
 
 [Install]
 WantedBy=graphical-session.target

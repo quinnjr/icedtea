@@ -8,23 +8,28 @@ use contract::Appearance;
 /// table replaces the defaults wholesale, so a config saved before A3 would
 /// otherwise leave these keys unbound while the session daemon still takes the
 /// power-key block inhibitor — a silent no-op. The read path backfills only the
-/// missing entries, so a user's own bindings are kept.
+/// missing entries (once, gated on `SCHEMA_VERSION`), so a user's own bindings
+/// are kept.
 pub const POWER_KEY_BINDINGS: [(&str, &str); 3] = [
     ("spawn:icedtea-session lock", "XF86_PowerOff"),
     ("spawn:icedtea-session suspend", "XF86_Sleep"),
     ("spawn:icedtea-session hibernate", "XF86_Hibernate"),
 ];
 
+/// Build a `KeyCombo` from modifier tokens and a key name. Single source of
+/// truth for combo shape: `default_config` and the A3 power-key backfill both
+/// go through this so their normalization cannot diverge.
+pub(crate) fn build_combo(mods: &[&str], key: &str) -> KeyCombo {
+    KeyCombo {
+        modifiers: mods.iter().map(|m| m.to_string()).collect(),
+        key: key.to_string(),
+    }
+}
+
 pub fn default_config() -> Config {
     let mut keybindings = HashMap::new();
     let insert = |map: &mut HashMap<String, KeyCombo>, action: &str, mods: &[&str], key: &str| {
-        map.insert(
-            action.to_string(),
-            KeyCombo {
-                modifiers: mods.iter().map(|m| m.to_string()).collect(),
-                key: key.to_string(),
-            },
-        );
+        map.insert(action.to_string(), build_combo(mods, key));
     };
     insert(&mut keybindings, "close", &["SUPER"], "KEY_q");
     insert(&mut keybindings, "fullscreen", &["SUPER"], "KEY_f");

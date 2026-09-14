@@ -13,13 +13,21 @@ use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use zbus::blocking::Connection;
 use zbus::zvariant::OwnedObjectPath;
 
 /// Named the daemon claims in the `who` field of every `Inhibit` call.
-const INHIBIT_WHO: &str = "icedtea-session";
+pub const INHIBIT_WHO: &str = "icedtea-session";
+
+/// `interactive` passed to every power action (`Suspend`/`Hibernate`/
+/// `PowerOff`/`Reboot`). `false` because these calls come from the user's own
+/// authenticated session daemon, so logind may not raise a polkit prompt for
+/// them — exactly how `loginctl` calls them from an already-privileged
+/// session context. Named so the wire-level test can pin it.
+pub const POWER_ACTION_INTERACTIVE: bool = false;
 
 /// Deadline on every method call to the system bus.
 ///
@@ -120,20 +128,60 @@ impl SessionResolver for Connection {
 
 /// Resolve the logind session object for this process.
 ///
-/// `xdg_session_id` is `$XDG_SESSION_ID` when set (the `pam_systemd` path); it
-/// is preferred because it does not depend on this process sharing the login
-/// session's cgroup. An empty string is treated as absent (a misconfigured or
-/// blank `$XDG_SESSION_ID` must not be handed to `GetSession`), so it falls
-/// back to the pid path. With no id (an unusual/manual launch), the pid
-/// fallback walks the cgroup membership, matching `loginctl`'s own "current
-/// session".
+/// `xdg_session_id` is `$XDG_SESSION_ID` when set (the `pam_systemd` path). It
+/// is environment-controlled and therefore untrusted: a same-user actor can
+/// point it at another session and redirect this daemon's `Lock`/`Unlock`.
+/// So it is treated as a *hint*, cross-checked against logind's authoritative
+/// pid-derived session ([`SessionResolver::get_session_by_pid`], which walks
+/// cgroup membership and cannot be spoofed from the environment):
+///
+/// * the hint and the pid session agree — use the hint;
+/// * they disagree — the hint is a redirect, log and use the pid session;
+/// * the hint lookup fails — it is stale or malformed, so it is not a usable
+///   session; log and fall through to the authoritative pid lookup;
+/// * the pid lookup fails — it is inconclusive (a `systemd --user` service is
+///   outside the login session's cgroup), so the hint is trusted rather than
+///   making discovery fatal.
+///
+/// Discovery only fails when a lookup that is *required* on its path fails:
+/// with no usable hint that is the pid lookup, and after a failed hint lookup
+/// it is the pid lookup too (the hint is not usable as a fallback). A failed
+/// hint lookup must never abort before the pid attempt.
+///
+/// An empty string is treated as absent (a misconfigured or blank
+/// `$XDG_SESSION_ID` must not be handed to `GetSession`), falling straight
+/// through to the pid path.
 pub fn resolve_session<C: SessionResolver + ?Sized>(
     conn: &C,
     xdg_session_id: Option<&str>,
     pid: u32,
 ) -> zbus::Result<OwnedObjectPath> {
     match xdg_session_id.filter(|id| !id.is_empty()) {
-        Some(session_id) => conn.get_session(session_id),
+        Some(session_id) => {
+            let hinted = match conn.get_session(session_id) {
+                Ok(hinted) => hinted,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        session_id,
+                        "XDG_SESSION_ID lookup failed; falling back to the pid-derived session"
+                    );
+                    return conn.get_session_by_pid(pid);
+                }
+            };
+            match conn.get_session_by_pid(pid) {
+                Ok(actual) if actual != hinted => {
+                    tracing::warn!(
+                        hinted = %hinted,
+                        actual = %actual,
+                        "XDG_SESSION_ID resolves to a different session than this process's; \
+                         ignoring the untrusted hint"
+                    );
+                    Ok(actual)
+                }
+                _ => Ok(hinted),
+            }
+        }
         None => conn.get_session_by_pid(pid),
     }
 }
@@ -278,28 +326,28 @@ impl Logind for ZbusLogind {
     fn suspend(&self) -> io::Result<()> {
         self.manager()
             .map_err(io::Error::other)?
-            .suspend(false)
+            .suspend(POWER_ACTION_INTERACTIVE)
             .map_err(io::Error::other)
     }
 
     fn hibernate(&self) -> io::Result<()> {
         self.manager()
             .map_err(io::Error::other)?
-            .hibernate(false)
+            .hibernate(POWER_ACTION_INTERACTIVE)
             .map_err(io::Error::other)
     }
 
     fn power_off(&self) -> io::Result<()> {
         self.manager()
             .map_err(io::Error::other)?
-            .power_off(false)
+            .power_off(POWER_ACTION_INTERACTIVE)
             .map_err(io::Error::other)
     }
 
     fn reboot(&self) -> io::Result<()> {
         self.manager()
             .map_err(io::Error::other)?
-            .reboot(false)
+            .reboot(POWER_ACTION_INTERACTIVE)
             .map_err(io::Error::other)
     }
 }
@@ -309,6 +357,10 @@ impl Logind for ZbusLogind {
 pub enum LogindCall {
     GetSession(String),
     GetSessionByPid(u32),
+    /// `who` is deliberately absent: it is the production constant
+    /// [`INHIBIT_WHO`], not a caller argument, so recording it here would only
+    /// re-assert the constant the seam test already reads. The wire-level test
+    /// in `tests/fake_logind.rs` pins the actual `who` sent to logind.
     Inhibit {
         what: String,
         why: String,
@@ -340,6 +392,11 @@ impl std::fmt::Debug for LockEcho {
 #[derive(Debug, Clone)]
 pub struct RecordingLogind {
     session_path: OwnedObjectPath,
+    /// What [`SessionResolver::get_session_by_pid`] answers. Equal to
+    /// `session_path` unless [`Self::with_paths`] deliberately diverges them,
+    /// so the untrusted-env-hint cross-check in [`resolve_session`] is
+    /// testable.
+    pid_session_path: OwnedObjectPath,
     calls: Arc<Mutex<Vec<LogindCall>>>,
     /// The write end of every pipe whose read end [`Logind::inhibit`] handed
     /// out, so [`Self::live_inhibitors`] can tell whether the caller's guard
@@ -349,19 +406,54 @@ pub struct RecordingLogind {
     /// call, so a test can drive the single funnel (`LockFlow::on_lock`) the
     /// way the real logind signal loop does.
     lock_echo: Arc<Mutex<Option<LockEcho>>>,
+    /// When set, [`SessionResolver::get_session`] fails with this message,
+    /// modelling a stale or malformed `$XDG_SESSION_ID`.
+    hint_lookup_error: Option<String>,
+    /// When set, [`SessionResolver::get_session_by_pid`] fails with this
+    /// message, modelling a `systemd --user` service outside the login
+    /// session's cgroup.
+    pid_lookup_error: Option<String>,
 }
 
 impl RecordingLogind {
     /// Build a recording double whose session resolves to `session_path`.
     pub fn new(session_path: &str) -> Self {
-        let session_path = OwnedObjectPath::try_from(session_path)
+        Self::with_paths(session_path, session_path)
+    }
+
+    /// Build a double whose `$XDG_SESSION_ID` lookup answers `hinted` and whose
+    /// pid fallback answers `pid_path`, so [`resolve_session`]'s redirect check
+    /// can be exercised.
+    pub fn with_paths(hinted_path: &str, pid_path: &str) -> Self {
+        let session_path = OwnedObjectPath::try_from(hinted_path)
+            .expect("a logind session path is a valid D-Bus object path");
+        let pid_session_path = OwnedObjectPath::try_from(pid_path)
             .expect("a logind session path is a valid D-Bus object path");
         Self {
             session_path,
+            pid_session_path,
             calls: Arc::new(Mutex::new(Vec::new())),
             inhibitors: Arc::new(Mutex::new(Vec::new())),
             lock_echo: Arc::new(Mutex::new(None)),
+            hint_lookup_error: None,
+            pid_lookup_error: None,
         }
+    }
+
+    /// Make `$XDG_SESSION_ID`'s [`SessionResolver::get_session`] lookup fail
+    /// with `message`.
+    #[must_use]
+    pub fn with_hint_lookup_error(mut self, message: impl Into<String>) -> Self {
+        self.hint_lookup_error = Some(message.into());
+        self
+    }
+
+    /// Make the pid-derived [`SessionResolver::get_session_by_pid`] lookup fail
+    /// with `message`.
+    #[must_use]
+    pub fn with_pid_lookup_error(mut self, message: impl Into<String>) -> Self {
+        self.pid_lookup_error = Some(message.into());
+        self
     }
 
     /// Register the `Lock` signal echo invoked synchronously from
@@ -398,12 +490,18 @@ impl RecordingLogind {
 impl SessionResolver for RecordingLogind {
     fn get_session(&self, session_id: &str) -> zbus::Result<OwnedObjectPath> {
         self.record(LogindCall::GetSession(session_id.to_string()));
+        if let Some(message) = &self.hint_lookup_error {
+            return Err(zbus::Error::Failure(message.clone()));
+        }
         Ok(self.session_path.clone())
     }
 
     fn get_session_by_pid(&self, pid: u32) -> zbus::Result<OwnedObjectPath> {
         self.record(LogindCall::GetSessionByPid(pid));
-        Ok(self.session_path.clone())
+        if let Some(message) = &self.pid_lookup_error {
+            return Err(zbus::Error::Failure(message.clone()));
+        }
+        Ok(self.pid_session_path.clone())
     }
 }
 
@@ -517,19 +615,132 @@ pub trait LogindEvents: Send + Sync {
 /// A shared [`LogindEvents`] sink.
 pub type SharedLogindEvents = Arc<dyn LogindEvents>;
 
+/// How many *consecutive* signal-loop failures the supervisor tolerates before
+/// it gives up and takes the process down.
+const SIGNAL_LOOP_MAX_ATTEMPTS: u32 = 5;
+/// First delay between signal-loop re-subscription attempts.
+const SIGNAL_LOOP_BACKOFF: Duration = Duration::from_millis(500);
+/// Ceiling on the signal-loop re-subscription backoff.
+const SIGNAL_LOOP_BACKOFF_MAX: Duration = Duration::from_secs(8);
+/// A subscription that stays up at least this long is healthy: it clears the
+/// consecutive-failure count and the backoff, so unrelated transient drops
+/// spread across a long-lived daemon never accumulate into the exit cap.
+const SIGNAL_LOOP_RESET_AFTER: Duration = Duration::from_secs(30);
+
+/// Tuning for [`supervise_with`]. Production uses [`SUPERVISE_POLICY`]; tests
+/// use a zero-backoff policy so the loop runs without real waits.
+#[derive(Debug, Clone, Copy)]
+struct SupervisePolicy {
+    /// Consecutive failed runs tolerated before `exit` is called.
+    max_attempts: u32,
+    /// Delay before the first re-subscription attempt.
+    backoff: Duration,
+    /// Ceiling on the exponential backoff.
+    backoff_max: Duration,
+    /// A run that stayed up at least this long resets the count.
+    reset_after: Duration,
+}
+
+/// The production supervision policy.
+const SUPERVISE_POLICY: SupervisePolicy = SupervisePolicy {
+    max_attempts: SIGNAL_LOOP_MAX_ATTEMPTS,
+    backoff: SIGNAL_LOOP_BACKOFF,
+    backoff_max: SIGNAL_LOOP_BACKOFF_MAX,
+    reset_after: SIGNAL_LOOP_RESET_AFTER,
+};
+
 /// Subscribe to logind's `PrepareForSleep` and this session's `Lock`/`Unlock`
 /// on a dedicated thread (`zbus::block_on`, no tokio), forwarding each to
-/// `events`. Errors are logged; a dropped bus ends the loop.
-pub fn spawn_signal_loop(session_path: OwnedObjectPath, events: SharedLogindEvents) {
-    let spawned = std::thread::Builder::new()
+/// `events`.
+///
+/// The thread is supervised, not detached into silence: whenever
+/// [`run_signal_loop`] returns — including a *clean* stream end, which would
+/// otherwise leave the process alive and registered while the only
+/// locker-spawn site (the `Lock` handler) can never run — the loop logs an
+/// error, re-subscribes with exponential backoff, and after
+/// [`SIGNAL_LOOP_MAX_ATTEMPTS`] *consecutive* failures calls
+/// [`std::process::exit`] so the systemd unit's `Restart=always` recovers the
+/// daemon. The returned [`JoinHandle`] is for the caller to monitor; the
+/// thread itself exits the process rather than completing.
+pub fn spawn_signal_loop(
+    session_path: OwnedObjectPath,
+    events: SharedLogindEvents,
+) -> io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
         .name("icedtea-session-logind".to_string())
-        .spawn(move || {
-            if let Err(err) = zbus::block_on(run_signal_loop(&session_path, events)) {
-                tracing::error!(%err, "logind signal subscription ended");
+        .spawn(move || supervise_signal_loop(session_path, events))
+}
+
+/// Keep [`run_signal_loop`] subscribed, or terminate the process so systemd
+/// restarts it. Never returns.
+fn supervise_signal_loop(session_path: OwnedObjectPath, events: SharedLogindEvents) -> ! {
+    supervise_with(
+        SUPERVISE_POLICY,
+        || zbus::block_on(run_signal_loop(&session_path, events.clone())),
+        exit_process,
+    );
+    unreachable!("supervise_with returns only after calling exit, which does not return")
+}
+
+/// [`std::process::exit`] behind a `()`-returning signature so it fits the
+/// `exit` seam [`supervise_with`] exposes to tests.
+fn exit_process(code: i32) {
+    std::process::exit(code);
+}
+
+/// Run `run` under `policy`, calling `exit` when it cannot stay subscribed.
+///
+/// `run` returns when one subscription ends: `Ok` for a clean stream end,
+/// `Err` for a failed subscription. Either way the daemon is no longer
+/// receiving signals, so both count as a fault. A run that lasted at least
+/// `policy.reset_after` is healthy and resets the consecutive-failure count, so
+/// the cap measures *consecutive* failures rather than a daemon-lifetime total.
+///
+/// Split from [`supervise_signal_loop`] so the whole decision — including the
+/// `process::exit` — is unit-testable without a system bus or a real process
+/// exit.
+fn supervise_with(
+    policy: SupervisePolicy,
+    mut run: impl FnMut() -> zbus::Result<()>,
+    mut exit: impl FnMut(i32),
+) {
+    let mut attempt = 0u32;
+    let mut backoff = policy.backoff;
+    loop {
+        let started = std::time::Instant::now();
+        let result = run();
+        if started.elapsed() >= policy.reset_after {
+            if attempt > 0 {
+                tracing::info!(
+                    attempt,
+                    "logind signal subscription recovered; resetting the failure count"
+                );
             }
-        });
-    if let Err(err) = spawned {
-        tracing::error!(%err, "could not spawn the logind signal thread");
+            attempt = 0;
+            backoff = policy.backoff;
+        }
+        attempt += 1;
+        match result {
+            Ok(()) => tracing::error!(
+                attempt,
+                "logind signal stream ended cleanly while the daemon is still registered; re-subscribing"
+            ),
+            Err(err) => tracing::error!(
+                attempt,
+                %err,
+                "logind signal subscription failed; re-subscribing"
+            ),
+        }
+        if attempt >= policy.max_attempts {
+            tracing::error!(
+                attempt,
+                "logind signal loop could not stay subscribed; exiting so the service manager restarts it"
+            );
+            exit(1);
+            return;
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(policy.backoff_max);
     }
 }
 
@@ -537,9 +748,21 @@ async fn run_signal_loop(
     session_path: &OwnedObjectPath,
     events: SharedLogindEvents,
 ) -> zbus::Result<()> {
+    let conn = zbus::Connection::system().await?;
+    run_signal_loop_on(conn, session_path, events).await
+}
+
+/// [`run_signal_loop`] over a caller-supplied connection. Production passes a
+/// system-bus connection; the fake-logind integration test passes a private
+/// session bus so the dispatch of real `PrepareForSleep`/`Lock`/`Unlock`
+/// signals is exercised end to end without touching `systemd-logind`.
+pub async fn run_signal_loop_on(
+    conn: zbus::Connection,
+    session_path: &OwnedObjectPath,
+    events: SharedLogindEvents,
+) -> zbus::Result<()> {
     use futures_util::StreamExt as _;
 
-    let conn = zbus::Connection::system().await?;
     // One rule per connection: logind sends both Manager and Session signals
     // from the same well-known sender, so dispatch is by interface/path below.
     let rule = zbus::MatchRule::builder()
@@ -581,13 +804,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_session_prefers_the_xdg_session_id() {
+    fn resolve_session_trusts_the_xdg_hint_when_the_pid_agrees() {
         let logind = RecordingLogind::new("/org/freedesktop/login1/session/c7");
         let path = resolve_session(&logind, Some("c7"), 4242).expect("resolves");
         assert_eq!(path.as_str(), "/org/freedesktop/login1/session/c7");
+        // The hint is cross-checked against the authoritative pid session.
         assert_eq!(
             logind.calls(),
-            vec![LogindCall::GetSession("c7".to_string())]
+            vec![
+                LogindCall::GetSession("c7".to_string()),
+                LogindCall::GetSessionByPid(4242),
+            ]
         );
     }
 
@@ -599,11 +826,23 @@ mod tests {
         assert_eq!(logind.calls(), vec![LogindCall::GetSessionByPid(4242)]);
     }
 
+    /// A same-user actor can point `$XDG_SESSION_ID` at another session. The
+    /// pid-derived session is authoritative, so the redirect is dropped.
     #[test]
-    fn resolve_session_ignores_the_pid_when_an_id_is_present() {
-        let logind = RecordingLogind::new("/org/freedesktop/login1/session/c1");
-        let _ = resolve_session(&logind, Some("c1"), 4242).expect("resolves");
-        assert!(!logind.calls().contains(&LogindCall::GetSessionByPid(4242)));
+    fn resolve_session_ignores_a_hint_that_points_at_a_different_session() {
+        let logind = RecordingLogind::with_paths(
+            "/org/freedesktop/login1/session/attacker",
+            "/org/freedesktop/login1/session/c1",
+        );
+        let path = resolve_session(&logind, Some("attacker"), 4242).expect("resolves");
+        assert_eq!(path.as_str(), "/org/freedesktop/login1/session/c1");
+        assert_eq!(
+            logind.calls(),
+            vec![
+                LogindCall::GetSession("attacker".to_string()),
+                LogindCall::GetSessionByPid(4242),
+            ]
+        );
     }
 
     #[test]
@@ -612,6 +851,55 @@ mod tests {
         let path = resolve_session(&logind, Some(""), 4242).expect("resolves");
         assert_eq!(path.as_str(), "/org/freedesktop/login1/session/c1");
         assert_eq!(logind.calls(), vec![LogindCall::GetSessionByPid(4242)]);
+    }
+
+    /// A stale or malformed `$XDG_SESSION_ID` must not make discovery fatal.
+    /// The failed hint lookup falls through to the authoritative pid session.
+    #[test]
+    fn resolve_session_falls_back_to_the_pid_when_the_hint_lookup_fails() {
+        let logind = RecordingLogind::with_paths(
+            "/org/freedesktop/login1/session/attacker",
+            "/org/freedesktop/login1/session/c1",
+        )
+        .with_hint_lookup_error("NoSuchSession");
+        let path = resolve_session(&logind, Some("attacker"), 4242).expect("resolves");
+        assert_eq!(path.as_str(), "/org/freedesktop/login1/session/c1");
+        assert_eq!(
+            logind.calls(),
+            vec![
+                LogindCall::GetSession("attacker".to_string()),
+                LogindCall::GetSessionByPid(4242),
+            ],
+            "the pid lookup must still be attempted after the hint lookup fails"
+        );
+    }
+
+    /// A `systemd --user` service is outside the login session's cgroup, so its
+    /// pid lookup is inconclusive. The untrusted hint is then the only signal
+    /// and is trusted rather than making discovery fatal.
+    #[test]
+    fn resolve_session_trusts_the_hint_when_the_pid_lookup_fails() {
+        let logind = RecordingLogind::new("/org/freedesktop/login1/session/c1")
+            .with_pid_lookup_error("NoSuchProcess");
+        let path = resolve_session(&logind, Some("c1"), 4242).expect("resolves");
+        assert_eq!(path.as_str(), "/org/freedesktop/login1/session/c1");
+        assert_eq!(
+            logind.calls(),
+            vec![
+                LogindCall::GetSession("c1".to_string()),
+                LogindCall::GetSessionByPid(4242),
+            ]
+        );
+    }
+
+    /// Both lookups failing is the only fatal discovery path when a hint is set.
+    #[test]
+    fn resolve_session_is_fatal_when_the_hint_and_pid_lookups_both_fail() {
+        let logind = RecordingLogind::new("/org/freedesktop/login1/session/c1")
+            .with_hint_lookup_error("NoSuchSession")
+            .with_pid_lookup_error("NoSuchProcess");
+        let err = resolve_session(&logind, Some("c1"), 4242).expect_err("both lookups fail");
+        assert!(matches!(err, zbus::Error::Failure(message) if message == "NoSuchProcess"));
     }
 
     #[test]
@@ -681,6 +969,17 @@ mod tests {
         );
     }
 
+    /// The `who` string and the non-interactive power flag are both pinned:
+    /// the fake-logind integration test checks them on the actual wire, and
+    /// this keeps the constants themselves honest.
+    #[test]
+    fn inhibit_who_and_power_interactive_are_the_reviewed_values() {
+        assert_eq!(INHIBIT_WHO, "icedtea-session");
+        // `as u8` rather than `!POWER_ACTION_INTERACTIVE` so clippy's
+        // `assertions_on_constants` does not fire on the pin.
+        assert_eq!(POWER_ACTION_INTERACTIVE as u8, 0);
+    }
+
     /// The dispatch table, isolated from the bus: only `PrepareForSleep`, and
     /// only this session's `Lock`/`Unlock`, are acted on.
     #[test]
@@ -717,5 +1016,83 @@ mod tests {
             None
         );
         assert_eq!(classify_signal(None, None, None, session), None);
+    }
+
+    /// Test policy with no real backoff waits, so the supervisor can be driven
+    /// to its exit in-process. `reset_after` is set high unless a test wants to
+    /// exercise the healthy-run reset.
+    fn test_policy(max_attempts: u32, reset_after: Duration) -> SupervisePolicy {
+        SupervisePolicy {
+            max_attempts,
+            backoff: Duration::ZERO,
+            backoff_max: Duration::ZERO,
+            reset_after,
+        }
+    }
+
+    /// A runner that always errors must be retried exactly
+    /// [`SIGNAL_LOOP_MAX_ATTEMPTS`] times and then exit the process once.
+    #[test]
+    fn supervise_with_exits_after_the_maximum_consecutive_failures() {
+        let mut runs = 0u32;
+        let mut exits = Vec::new();
+        supervise_with(
+            test_policy(5, Duration::from_secs(3600)),
+            || {
+                runs += 1;
+                Err(zbus::Error::Failure("stream failed".to_string()))
+            },
+            |code| exits.push(code),
+        );
+        assert_eq!(runs, 5, "the runner is retried up to the cap");
+        assert_eq!(exits, vec![1], "the process is exited exactly once");
+    }
+
+    /// A clean stream end is a fault too: the daemon is still registered but
+    /// can no longer receive signals.
+    #[test]
+    fn supervise_with_treats_a_clean_stream_end_as_a_fault() {
+        let mut runs = 0u32;
+        let mut exits = Vec::new();
+        supervise_with(
+            test_policy(5, Duration::from_secs(3600)),
+            || {
+                runs += 1;
+                Ok(())
+            },
+            |code| exits.push(code),
+        );
+        assert_eq!(runs, 5);
+        assert_eq!(exits, vec![1]);
+    }
+
+    /// A subscription that survives `reset_after` is healthy and clears the
+    /// consecutive-failure count, so two early transient drops plus the later
+    /// streak is two events, not one cumulative five. Without the reset the
+    /// third (healthy) run would already reach the cap and exit.
+    #[test]
+    fn supervise_with_resets_the_count_after_a_healthy_run() {
+        let mut runs = 0u32;
+        let mut exits = Vec::new();
+        supervise_with(
+            test_policy(3, Duration::from_millis(50)),
+            || {
+                runs += 1;
+                if runs == 3 {
+                    // Stay up past the health threshold before dropping, then
+                    // drop immediately on the runs after it. The sleep is
+                    // measured against a real monotonic clock, so it guarantees
+                    // the reset regardless of scheduling.
+                    std::thread::sleep(Duration::from_millis(80));
+                }
+                Err(zbus::Error::Failure("stream failed".to_string()))
+            },
+            |code| exits.push(code),
+        );
+        assert_eq!(
+            runs, 5,
+            "two failures, a healthy run that resets, then three consecutive failures"
+        );
+        assert_eq!(exits, vec![1]);
     }
 }

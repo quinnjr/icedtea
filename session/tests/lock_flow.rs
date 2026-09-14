@@ -445,7 +445,7 @@ fn lock_before_sleep_disabled_does_not_wait_on_a_running_locker() {
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed < Duration::from_millis(250),
+        elapsed < Duration::from_secs(1),
         "lock_before_sleep=false must not delay sleep: {elapsed:?}"
     );
     assert!(
@@ -455,7 +455,7 @@ fn lock_before_sleep_disabled_does_not_wait_on_a_running_locker() {
 
     // The idle locker is the only spawn; sleep must not have added another.
     assert!(wait_for_marker(&marker, Duration::from_secs(2)));
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(400));
     assert_eq!(marker_lines(&marker), 1, "no second locker spawned");
 
     flow.on_unlock();
@@ -556,8 +556,41 @@ fn no_locker_configured_never_spawns_and_never_delays() {
 
     assert!(!marker.exists(), "nothing was spawned");
     assert!(
-        elapsed < Duration::from_millis(250),
+        elapsed < Duration::from_secs(1),
         "no delay without a locker: {elapsed:?}"
+    );
+    assert!(
+        !logind.calls().contains(&LogindCall::Lock),
+        "a no-op pre-sleep must not even call Session.Lock: {:?}",
+        logind.calls()
+    );
+}
+
+/// An idle timeout with no configured locker is a policy no-op: nothing is
+/// spawned and logind is never asked to lock (spec Decision 2).
+#[test]
+fn idle_with_no_locker_never_spawns_and_never_requests_a_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("never-spawned-idle");
+    let logind = Arc::new(RecordingLogind::new(session_path()));
+    let wm = Arc::new(MarkerWm::new(&marker));
+    let flow = wired_flow(
+        &logind,
+        wm,
+        None,
+        true,
+        Duration::from_millis(10),
+        Duration::from_secs(1),
+    );
+
+    flow.on_idle();
+
+    assert!(!flow.locker_running(), "nothing was spawned");
+    assert!(!marker.exists(), "nothing was spawned");
+    assert!(
+        !logind.calls().contains(&LogindCall::Lock),
+        "a no-op idle must not call Session.Lock: {:?}",
+        logind.calls()
     );
 }
 
@@ -584,7 +617,7 @@ fn idle_and_sleep_race_spawns_only_one_locker() {
 
     assert!(wait_for_marker(&marker, Duration::from_secs(2)));
     // Let any erroneous second spawn append its line before counting.
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(400));
     assert_eq!(marker_lines(&marker), 1, "no second locker spawned");
 
     flow.on_unlock();

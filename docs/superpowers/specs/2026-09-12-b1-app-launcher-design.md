@@ -6,7 +6,8 @@
 everyday-leverage surface and a signature piece of the DE's identity").
 **Decisions of record:** full Win7/10 shape in one milestone; bottom-anchored
 by default with a top option; launch via the compositor spawn action;
-power row shells out until A3 logind replaces it; dedicated layer-shell
+power row routes through the A3 `icedtea-session` CLI (logind backend);
+dedicated layer-shell
 surface (approach A — not a panel popup or in-bar expander).
 
 ## Goal
@@ -91,11 +92,13 @@ Win7 left rail + Win10 right pane:
   `parse_spawn_argv` + `Command::spawn` path) — no argv crosses the bus
   (see the `apply_action` hardening ban on wiring `spawn` to D-Bus).
   Recency is recorded on success.
-- **Power row** shells out (`loginctl lock-session`, session quit via
-  the compositor quit path, `systemctl suspend/poweroff/reboot`).
-  Every failure surfaces as a status line in the launcher (never
-  silent), and every call site is marked for A3-logind replacement.
-  Lock prefers the compositor session-lock path where available.
+- **Power row** invokes the A3 `icedtea-session` CLI (`lock`, `suspend`,
+  `reboot`, `poweroff`); log out takes the compositor quit path. The
+  program is resolved once per process to an absolute path rather than
+  trusting a click-time `PATH` lookup (the session crate installs it at
+  `%h/.cargo/bin/icedtea-session`). Every failure surfaces as a status
+  line in the launcher (never silent); lock policy (configured locker +
+  session-lock path) lives in the session daemon, not here.
 
 ## Testing
 
@@ -117,7 +120,8 @@ Win7 left rail + Win10 right pane:
 - Tile drag-reorder (pin/unpin + group assignment suffice; reorder is
   a follow-up, possibly riding the M6 DnD work).
 - Usage-based adaptive ordering beyond recency/frequency tiebreaks.
-- A3 logind backends (power row is shell-out with marked call sites).
+- The logind backend implementation itself (owned by the A3 `session`
+  crate; this launcher only invokes its `icedtea-session` CLI).
 - Session restore / "reopen last apps".
 - A separate launcher process (same-process surface keeps one
   event loop, one config handle, one D-Bus connection).
@@ -130,9 +134,9 @@ Win7 left rail + Win10 right pane:
   corpus drawn from the real system set.
 - **Stale index** — apps installed while the shell runs. Mitigation:
   mtime-gated rescan on every open (cheap when nothing changed).
-- **Power-row failure modes** — `systemctl` absent or polkit-denied.
-  Mitigation: failure as status line, never silent; A3 replaces all
-  of it.
+- **Power-row failure modes** — `icedtea-session` absent, or the
+  session daemon unreachable / logind refusing.
+  Mitigation: failure as status line, never silent.
 - **`bar_position` may be live already** — if something honors it,
   this spec's wiring must merge with, not fork, that path. Flagged as
   the implementer's first verification step.
