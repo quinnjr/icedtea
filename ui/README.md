@@ -589,10 +589,35 @@ cargo test -p icedtea-ui
   kind and inherited flag, asserted both ways — nothing missing, nothing
   invented — in registry order.
 
+## Accessibility (M6)
+
+`ui/src/a11y.rs` maps the retained `Instance` tree to an
+`accesskit::TreeUpdate`: role, name, state, option children and bounds, with
+stable `NodeId`s across reconciles. `ui/src/a11y_bus.rs` (feature `a11y-bus`,
+off by default) feeds that update to `accesskit_unix`'s AT-SPI adapter,
+selecting the `accesskit 0.25` / `accesskit_unix 0.23` pairing that shares one
+schema. Both live behind cargo features — `a11y` is on by default, `a11y-bus`
+is not — so `--no-default-features` builds neither. `A11yTree` is read-only
+over the toolkit: it changes no rendering or input behavior.
+
+- `A11yTree::build_full` / `update` build the tree; the `*_with_layout`
+  variants add each node's border-box bounds from the frame's `LayoutTree`.
+- A `DropDown`'s model items are exposed as a `ListBox` of `ListBoxOption`
+  children (the rows are controller-owned CSS subnodes, not `Instance`s),
+  keyed by `ListItem::id` so their ids survive a rebuild.
+- Live regions come from the widget model: a non-empty `Statusbar` is
+  `Live::Polite`, a revealed `InfoBar` polite or assertive by message type,
+  and an `AlertDialog` assertive.
+- Deferred: action requests (Click/Focus/SetValue) are recorded but not yet
+  dispatched back into `App`; text caret/selection needs a `Role::TextRun`
+  subtree accesskit's `TextSelection` indexes into, which the widget model
+  does not publish.
+
 ## Deliberately not covered by M3
 
 Input methods and `text-input-v3`, the emoji chooser, drag and drop, and
-`accesskit` accessibility (M6). Markup beyond `<b><i><span>`. GL and video
+`accesskit` accessibility (M6 — now shipped, see above). Markup beyond
+`<b><i><span>`. GL and video
 widgets (`GLArea`, `Video`, `MediaControls`), the portal-backed choosers
 (file, print, app) and `LockButton`, and the deprecated widgets GTK 4.22 itself
 retired — except `Statusbar`, `InfoBar` and `ShortcutsWindow`, which Adwaita

@@ -7,6 +7,8 @@
 
 #[cfg(feature = "a11y")]
 pub mod a11y;
+#[cfg(feature = "a11y-bus")]
+pub mod a11y_bus;
 pub mod anim;
 pub mod app;
 pub mod css;
