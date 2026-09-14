@@ -1982,16 +1982,21 @@ fn session_lock_locks_isolates_input_and_unlocks() {
     );
     let pre_lock_keys = app.key_events();
 
-    // A3: the production lock-state read (wire `IsLocked()`, backed by the
-    // same `DbCommand::SessionLocked` round-trip `session_locked()` uses)
-    // must report false before any locker takes the lock.
+    // A3: the harness's lock-state read, sent straight onto `cmd_tx` as
+    // `DbCommand::SessionLocked` (the same command the production
+    // `IsLocked()` wire method forwards), must report false before any
+    // locker takes the lock. This path does NOT exercise zbus serialization
+    // or dispatch -- that is covered by `dbus.rs`'s live-bus
+    // `is_locked_and_session_lock_changed_round_trip_over_a_session_bus`.
     assert!(!comp.session_locked(), "session must start unlocked");
 
     let mut locker = SessionLockClient::spawn(&comp.socket);
     locker.lock();
     assert!(locker.wait_locked(), "session never reported locked");
-    // A3: the lock transition reaches subscribers as a
-    // `SessionLockChanged(true)` signal, and the lock-state read agrees.
+    // A3: the lock transition reaches the in-process `SeqEvent` channel as
+    // `SessionLockChanged(true)` (read here via `comp.wait_event`, the
+    // harness's direct channel consumer, not a bus subscriber), and the
+    // lock-state read agrees.
     comp.wait_event(|e| matches!(e, Event::SessionLockChanged(true)));
     assert!(
         comp.session_locked(),
@@ -2016,8 +2021,8 @@ fn session_lock_locks_isolates_input_and_unlocks() {
     );
 
     locker.unlock();
-    // A3: the unlock transition reaches subscribers as a
-    // `SessionLockChanged(false)` signal too.
+    // A3: the unlock transition reaches the in-process `SeqEvent` channel as
+    // `SessionLockChanged(false)` too.
     comp.wait_event(|e| matches!(e, Event::SessionLockChanged(false)));
     assert!(!comp.session_locked(), "still locked after unlock");
 

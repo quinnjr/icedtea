@@ -423,6 +423,10 @@ pub fn event_signal_name(event: &Event) -> &'static str {
         Event::GestureEnded => "GestureEnded",
         Event::SwitchToggled { .. } => "SwitchToggled",
         Event::SessionLockChanged(_) => "SessionLockChanged",
+        // `Event` is `#[non_exhaustive]` (a cross-crate match needs this arm).
+        // A future variant must add an explicit arm here *and* in `emit_event`
+        // below; the sentinel is never emitted, it only keeps this total.
+        _ => "UnknownEvent",
     }
 }
 
@@ -444,7 +448,24 @@ impl CompositorInterface {
         let _ = self.cmd_tx.send(cmd);
         crate::backend::wake(&self.wake);
     }
+
+    /// The `SessionLocked` round-trip body shared by the `IsLocked` wire
+    /// method and its timeout test: forward the command, then wait at most
+    /// `budget` for the loop's answer, treating a timeout or a dropped reply
+    /// as `false`. Extracted so the timeout-means-false policy can be tested
+    /// against a short budget without waiting the production one out.
+    fn is_locked_within(&self, budget: Duration) -> bool {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::SessionLocked { reply: reply_tx });
+        reply_rx.recv_timeout(budget).unwrap_or(false)
+    }
 }
+
+/// Reply budget for `IsLocked`'s synchronous `SessionLocked` round-trip,
+/// matching `spawn_app`'s. Unbounded `recv` here was a DoS (review finding):
+/// a wedged-but-alive loop would park the zbus dispatch thread forever, and
+/// the session daemon polls `IsLocked` every 100ms while waiting for a lock.
+const SESSION_LOCK_REPLY_BUDGET: Duration = Duration::from_secs(5);
 
 /// Pure same-UID gate for the D-Bus sender-credential check below: a caller
 /// may drive `spawn_app`/`quit` only when its UID equals the compositor's
@@ -579,14 +600,26 @@ impl CompositorInterface {
     /// like `get_state`: the main loop answers the moment it drains the
     /// `SessionLocked` command (see `State::handle_command`), so this blocks
     /// the zbus dispatch for this connection only as long as one loop
-    /// iteration takes. A dropped reply (loop gone) reads as `false` rather
-    /// than panicking. This is the production promotion of the previously
-    /// test-only `SessionLocked` read; the `icedtea-session` daemon polls it
-    /// both before spawning a locker and while waiting for a lock to confirm.
+    /// iteration takes. A dropped reply (loop gone) reads as `false`; a loop
+    /// that stays wedged past the 5s budget also reads as `false`
+    /// (timeout-means-false, never a panic, never a hang) -- see
+    /// [`SESSION_LOCK_REPLY_BUDGET`]. This is the production promotion of the
+    /// previously test-only `SessionLocked` read; the `icedtea-session`
+    /// daemon polls it both before spawning a locker and while waiting for a
+    /// lock to confirm.
+    ///
+    /// **Threat model (review finding).** Lock state is deliberately
+    /// world-readable to any peer on the same-user session bus, and this
+    /// method is intentionally ungated. `SessionLockChanged` is already a
+    /// broadcast signal (`dest: None`), so gating only the method would be
+    /// inconsistent; and the polling session daemon calls this every 100ms,
+    /// so a per-call `caller_uid` resolution (a fresh bus connection each
+    /// time, see [`caller_uid`]) would add a round-trip to every poll. Lock
+    /// state is a presence/timing oracle only to peers already in the user's
+    /// session; treat the session bus as same-user-trust and do not put
+    /// anything more sensitive on this interface.
     fn is_locked(&self) -> bool {
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        self.send(DbCommand::SessionLocked { reply: reply_tx });
-        reply_rx.recv().unwrap_or(false)
+        self.is_locked_within(SESSION_LOCK_REPLY_BUDGET)
     }
     fn quit(&self, #[zbus(header)] header: zbus::message::Header<'_>) {
         if !caller_is_self(&header) {
@@ -615,6 +648,127 @@ impl CompositorInterface {
             .recv_timeout(Duration::from_secs(5))
             .unwrap_or(false)
     }
+}
+
+/// Serialize one `contract::Event` into its D-Bus signal on `conn`. Extracted
+/// from the emitter thread so the production arms can be driven over a real
+/// session bus by the wire test below (review finding: the `SessionLockChanged`
+/// signal was previously only name-mapped in a unit test, never emitted on a
+/// bus). Returns the `emit_signal` result so the caller can log; a broadcast
+/// signal with no subscriber is not an error.
+///
+/// Review finding I2: `seq` is the first argument of every signal, so a
+/// subscriber can drop signals already folded into the `GetState()` snapshot
+/// it started from (`seq <= snapshot.seq`) and detect a gap (`seq >
+/// last_seen + 1`) that means it must re-sync. Recorded signatures (kept in
+/// step with `contract`'s own `wire_signatures_are_locked` test -- the
+/// `attention` bit added the fifth `b` to `WindowInfo` and a SIXTH `ab` to
+/// `WindowUpdate` -- whose bools run
+/// maximized/minimized/fullscreen/focused/mapped/attention -- which is what
+/// `COMPOSITOR_CONTRACT_VERSION` 2 names. Version 3 appended
+/// `Snapshot.ime_active` to `GetState`'s reply; version 4 appends
+/// `Snapshot.keyboard_layout` / `Snapshot.shortcuts_inhibited` (signature
+/// `...ubasb`), which no signal below carries):
+///   WindowOpened   t(ussuu(iiii)bbbbb)
+///   WindowClosed   tu
+///   WindowUpdated  tu(asa(iiii)auabababababab)
+///   WorkspaceSet   tub
+///   WorkspaceList  ta(us)
+///   AltTabState    t(baut)
+///   ConfigReloaded t(siii(sss)as)
+///   GestureBegan   t
+///   GestureEnded   t
+///   SwitchToggled  (tb)
+///   SessionLockChanged (tb)
+/// (M7: the gesture signals carry no payload beyond `seq` -- the phase is the
+/// member name itself, since the full-fidelity gesture data already reached
+/// clients through the crate's token path and never belonged on this feed. A
+/// bare `seq` rather than a 1-tuple keeps the body an ordinary `u64`.)
+fn emit_event(conn: &Connection, seq: u64, event: &Event) -> zbus::Result<()> {
+    let name = event_signal_name(event);
+    let dest: Option<&str> = None;
+    let result = match event {
+        Event::WindowOpened(info) => conn.emit_signal(
+            dest,
+            COMPOSITOR_PATH,
+            COMPOSITOR_BUS_NAME,
+            name,
+            &(seq, info.clone()),
+        ),
+        Event::WindowClosed(id) => conn.emit_signal(
+            dest,
+            COMPOSITOR_PATH,
+            COMPOSITOR_BUS_NAME,
+            name,
+            &(seq, id.0),
+        ),
+        Event::WindowUpdated { id, update } => conn.emit_signal(
+            dest,
+            COMPOSITOR_PATH,
+            COMPOSITOR_BUS_NAME,
+            name,
+            &(seq, id.0, update.clone()),
+        ),
+        Event::WorkspaceSet { id, active } => conn.emit_signal(
+            dest,
+            COMPOSITOR_PATH,
+            COMPOSITOR_BUS_NAME,
+            name,
+            &(seq, *id, *active),
+        ),
+        Event::WorkspaceList(ws) => conn.emit_signal(
+            dest,
+            COMPOSITOR_PATH,
+            COMPOSITOR_BUS_NAME,
+            name,
+            &(seq, ws.clone()),
+        ),
+        Event::AltTabState(s) => conn.emit_signal(
+            dest,
+            COMPOSITOR_PATH,
+            COMPOSITOR_BUS_NAME,
+            name,
+            &(seq, s.clone()),
+        ),
+        Event::ConfigReloaded(a) => conn.emit_signal(
+            dest,
+            COMPOSITOR_PATH,
+            COMPOSITOR_BUS_NAME,
+            name,
+            &(seq, a.clone()),
+        ),
+        Event::GestureBegan => {
+            conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &seq)
+        }
+        Event::GestureEnded => {
+            conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &seq)
+        }
+        Event::SwitchToggled { lid_closed } => conn.emit_signal(
+            dest,
+            COMPOSITOR_PATH,
+            COMPOSITOR_BUS_NAME,
+            name,
+            &(seq, *lid_closed),
+        ),
+        Event::SessionLockChanged(locked) => conn.emit_signal(
+            dest,
+            COMPOSITOR_PATH,
+            COMPOSITOR_BUS_NAME,
+            name,
+            &(seq, *locked),
+        ),
+        // `Event` is `#[non_exhaustive]` (a cross-crate match needs this
+        // arm). A future variant must add an explicit arm above; dropping it
+        // loudly beats emitting a signal no subscriber's match rule names.
+        _ => {
+            tracing::warn!(signal = name, "unhandled Event variant; no signal emitted");
+            Ok(())
+        }
+    };
+    if let Err(err) = &result {
+        tracing::warn!(signal = name, error = %err, "failed to emit D-Bus signal");
+    }
+    result
 }
 
 /// Spawn the D-Bus service: connects to the session bus, registers
@@ -662,112 +816,7 @@ pub fn spawn_service(
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
             };
-            let name = event_signal_name(&event);
-            let dest: Option<&str> = None;
-            // Review finding I2: `seq` is the first argument of every
-            // signal, so a subscriber can drop signals already folded into
-            // the `GetState()` snapshot it started from (`seq <=
-            // snapshot.seq`) and detect a gap (`seq > last_seen + 1`) that
-            // means it must re-sync. Recorded signatures (kept in step with
-            // `contract`'s own `wire_signatures_are_locked` test -- the
-            // `attention` bit added the fifth `b` to `WindowInfo` and a
-            // SIXTH `ab` to `WindowUpdate` -- whose bools run
-            // maximized/minimized/fullscreen/focused/mapped/attention --
-            // which is what `COMPOSITOR_CONTRACT_VERSION` 2 names.
-            // Version 3 appended `Snapshot.ime_active` to `GetState`'s
-            // reply; version 4 appends `Snapshot.keyboard_layout` /
-            // `Snapshot.shortcuts_inhibited` (signature `...ubasb`),
-            // which no signal below carries):
-            //   WindowOpened   t(ussuu(iiii)bbbbb)
-            //   WindowClosed   tu
-            //   WindowUpdated  tu(asa(iiii)auabababababab)
-            //   WorkspaceSet   tub
-            //   WorkspaceList  ta(us)
-            //   AltTabState    t(baut)
-            //   ConfigReloaded t(siii(sss)as)
-            //   GestureBegan   t
-            //   GestureEnded   t
-            //   SwitchToggled  (tb)
-            //   SessionLockChanged (tb)
-            // (M7: the gesture signals carry no payload beyond `seq` -- the
-            // phase is the member name itself, since the full-fidelity
-            // gesture data already reached clients through the crate's token
-            // path and never belonged on this feed. A bare `seq` rather
-            // than a 1-tuple keeps the body an ordinary `u64`.)
-            let result = match &event {
-                Event::WindowOpened(info) => emitter_conn.emit_signal(
-                    dest,
-                    COMPOSITOR_PATH,
-                    COMPOSITOR_BUS_NAME,
-                    name,
-                    &(seq, info.clone()),
-                ),
-                Event::WindowClosed(id) => emitter_conn.emit_signal(
-                    dest,
-                    COMPOSITOR_PATH,
-                    COMPOSITOR_BUS_NAME,
-                    name,
-                    &(seq, id.0),
-                ),
-                Event::WindowUpdated { id, update } => emitter_conn.emit_signal(
-                    dest,
-                    COMPOSITOR_PATH,
-                    COMPOSITOR_BUS_NAME,
-                    name,
-                    &(seq, id.0, update.clone()),
-                ),
-                Event::WorkspaceSet { id, active } => emitter_conn.emit_signal(
-                    dest,
-                    COMPOSITOR_PATH,
-                    COMPOSITOR_BUS_NAME,
-                    name,
-                    &(seq, *id, *active),
-                ),
-                Event::WorkspaceList(ws) => emitter_conn.emit_signal(
-                    dest,
-                    COMPOSITOR_PATH,
-                    COMPOSITOR_BUS_NAME,
-                    name,
-                    &(seq, ws.clone()),
-                ),
-                Event::AltTabState(s) => emitter_conn.emit_signal(
-                    dest,
-                    COMPOSITOR_PATH,
-                    COMPOSITOR_BUS_NAME,
-                    name,
-                    &(seq, s.clone()),
-                ),
-                Event::ConfigReloaded(a) => emitter_conn.emit_signal(
-                    dest,
-                    COMPOSITOR_PATH,
-                    COMPOSITOR_BUS_NAME,
-                    name,
-                    &(seq, a.clone()),
-                ),
-                Event::GestureBegan => {
-                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &seq)
-                }
-                Event::GestureEnded => {
-                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &seq)
-                }
-                Event::SwitchToggled { lid_closed } => emitter_conn.emit_signal(
-                    dest,
-                    COMPOSITOR_PATH,
-                    COMPOSITOR_BUS_NAME,
-                    name,
-                    &(seq, *lid_closed),
-                ),
-                Event::SessionLockChanged(locked) => emitter_conn.emit_signal(
-                    dest,
-                    COMPOSITOR_PATH,
-                    COMPOSITOR_BUS_NAME,
-                    name,
-                    &(seq, *locked),
-                ),
-            };
-            if let Err(err) = result {
-                tracing::warn!(signal = name, error = %err, "failed to emit D-Bus signal");
-            }
+            let _ = emit_event(&emitter_conn, seq, &event);
         }
     });
 
@@ -778,7 +827,8 @@ pub fn spawn_service(
 mod tests {
     use super::*;
     use icedtea_contract::{
-        AltTabState, Appearance, Rectangle, WindowInfo, WindowUpdate, WorkspaceInfo,
+        AltTabState, Appearance, COMPOSITOR_IFACE, Rectangle, WindowInfo, WindowUpdate,
+        WorkspaceInfo,
     };
     use zbus::object_server::Interface as _;
 
@@ -892,6 +942,138 @@ mod tests {
             "is_locked must return the bool the loop answered with"
         );
         answer.join().expect("round-trip thread must not panic");
+    }
+
+    /// Review finding (DoS): `IsLocked` must not block forever on a
+    /// wedged-but-alive loop. `is_locked_within` is the same send +
+    /// `recv_timeout` body `is_locked` runs, so a 50ms budget here pins the
+    /// timeout-means-false policy without waiting the production 5s out: a
+    /// never-answered `SessionLocked` reads `false` and returns at the budget.
+    #[test]
+    fn is_locked_times_out_to_false_without_an_answer() {
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let (_held, wake) =
+            std::os::unix::net::UnixStream::pair().expect("wake pair for interface probe");
+        let iface = CompositorInterface { cmd_tx, wake };
+
+        let start = std::time::Instant::now();
+        assert!(
+            !iface.is_locked_within(Duration::from_millis(50)),
+            "a never-answered SessionLocked must read as false"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "timeout-means-false must return at its budget, not hang"
+        );
+    }
+
+    /// A live session-bus round-trip for A3's lock surface. The harness's
+    /// M4.4 test in `client_protocol.rs` drives `DbCommand` directly and
+    /// reads the in-process `SeqEvent` channel -- it never touches zbus. This
+    /// serves the real `CompositorInterface` and calls the real emitter arm
+    /// (`emit_event`) over zbus, asserting `IsLocked` both polarities and
+    /// `SessionLockChanged` both polarities as a subscriber would see them.
+    /// Skips visibly when no session bus is available.
+    ///
+    /// No `request_name`: the interface is served on this test's own
+    /// unique-name connection, so it never races a real compositor (or a
+    /// parallel test) for `org.icedtea.Compositor`.
+    #[test]
+    fn is_locked_and_session_lock_changed_round_trip_over_a_session_bus() {
+        let Ok(service_conn) = Connection::session() else {
+            eprintln!("SKIP: no session bus available");
+            return;
+        };
+        let Ok(client_conn) = Connection::session() else {
+            eprintln!("SKIP: no second session-bus connection");
+            return;
+        };
+
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (_held, wake) =
+            std::os::unix::net::UnixStream::pair().expect("wake pair for interface probe");
+        service_conn
+            .object_server()
+            .at(COMPOSITOR_PATH, CompositorInterface { cmd_tx, wake })
+            .expect("register CompositorInterface at COMPOSITOR_PATH");
+
+        // Answer each `SessionLocked` in the order the test asks; default
+        // false if the test under-feeds (never hang the dispatch thread).
+        let (answers_tx, answers_rx) = crossbeam_channel::unbounded::<bool>();
+        let _answer = std::thread::spawn(move || {
+            while let Ok(cmd) = cmd_rx.recv() {
+                if let DbCommand::SessionLocked { reply } = cmd {
+                    let _ = reply.send(answers_rx.try_recv().unwrap_or(false));
+                }
+            }
+        });
+
+        // Subscribe before emitting, so neither signal can race ahead.
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface(COMPOSITOR_IFACE)
+            .expect("interface")
+            .path(COMPOSITOR_PATH)
+            .expect("path")
+            .member("SessionLockChanged")
+            .expect("member")
+            .build();
+        let mut signals =
+            zbus::blocking::MessageIterator::for_match_rule(rule, &client_conn, Some(4))
+                .expect("subscribe to SessionLockChanged");
+
+        answers_tx.send(false).expect("queue unlocked answer");
+        answers_tx.send(true).expect("queue locked answer");
+
+        let dest = service_conn.unique_name().expect("unique name").to_owned();
+        let dest = dest.as_str();
+        let is_locked = |conn: &Connection| -> bool {
+            conn.call_method(
+                Some(dest),
+                COMPOSITOR_PATH,
+                Some(COMPOSITOR_IFACE),
+                "IsLocked",
+                &(),
+            )
+            .expect("IsLocked round-trip")
+            .body()
+            .deserialize()
+            .expect("IsLocked bool reply")
+        };
+
+        assert!(
+            !is_locked(&client_conn),
+            "IsLocked must report the queued false"
+        );
+
+        // Drive the production emitter arm, not a copy of its body.
+        emit_event(&service_conn, 1, &Event::SessionLockChanged(true)).expect("emit locked");
+        let msg = signals
+            .next()
+            .expect("subscription ended before SessionLockChanged(true)")
+            .expect("SessionLockChanged(true) message");
+        let (seq, locked): (u64, bool) = msg
+            .body()
+            .deserialize()
+            .expect("SessionLockChanged body is (seq, locked)");
+        assert!(seq > 0, "signal carries its sequence number");
+        assert!(locked, "first signal must be SessionLockChanged(true)");
+
+        assert!(
+            is_locked(&client_conn),
+            "IsLocked must report the queued true"
+        );
+
+        emit_event(&service_conn, 2, &Event::SessionLockChanged(false)).expect("emit unlocked");
+        let msg = signals
+            .next()
+            .expect("subscription ended before SessionLockChanged(false)")
+            .expect("SessionLockChanged(false) message");
+        let (_seq, locked): (u64, bool) = msg
+            .body()
+            .deserialize()
+            .expect("SessionLockChanged body is (seq, locked)");
+        assert!(!locked, "second signal must be SessionLockChanged(false)");
     }
 
     /// The sender-credential gate is a plain UID equality: same UID is

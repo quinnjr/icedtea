@@ -2,10 +2,15 @@ use crate::{AltTabState, Appearance, WindowId, WindowInfo, WindowUpdate, Workspa
 
 /// A compositor event forwarded to session-bus subscribers.
 ///
-/// Note: this enum is **not** `#[non_exhaustive]`. Adding a variant is
-/// therefore a source-breaking change for any downstream crate that matches it
-/// exhaustively, so new events are added only with that in mind; the compositor's
-/// own `contract`-linked consumers are updated in lockstep.
+/// `#[non_exhaustive]`: this enum gains variants as new compositor features
+/// land, and a downstream exhaustive `match` would otherwise turn every such
+/// addition into a source break (review finding: the additive
+/// `SessionLockChanged` variant had no present consumer, so breaking
+/// exhaustive matchers bought nothing). Cross-crate consumers must carry a
+/// wildcard arm; within `contract`'s own crate a wildcard is not required.
+/// The compositor's `dbus.rs` emitter is the one in-repo cross-crate matcher
+/// and carries an explicit wildcard for that reason.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     WindowOpened(WindowInfo),
@@ -42,8 +47,12 @@ pub enum Event {
     /// locked, `false` that it unlocked. Emitted by the consumer's
     /// `SeatHandler::session_lock_changed`, the same callback that tracks
     /// `State::session_locked`, so a session daemon can subscribe instead of
-    /// polling. A signal, not a widget: it has no presentational consumer —
-    /// the shell currently drops it.
+    /// polling.
+    ///
+    /// Intended consumer: the session daemon's `WmClient`, built by a sibling
+    /// (it currently subscribes to the D-Bus `SessionLockChanged` signal
+    /// directly rather than consuming this `Event`). A signal, not a widget:
+    /// it has no presentational consumer — the shell currently drops it.
     SessionLockChanged(bool),
 }
 
