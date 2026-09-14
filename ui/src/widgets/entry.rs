@@ -17,7 +17,7 @@ use crate::css::node::Node;
 use crate::css::value::image::IconRef;
 use crate::layout::Rect;
 use crate::text_input::{ContentHint, ContentPurpose};
-use crate::view::controller::{Controller, Event, EventCx};
+use crate::view::controller::{Controller, DndState, Event, EventCx};
 use crate::view::{BuildCx, EventKind, Handler, Kind, Prop, PropName, Props, View};
 use crate::widgets::edit::{EditOutcome, TextEditState, UndoStack};
 use crate::widgets::{PointerState, content_rect_local, local_rect, shift_event};
@@ -130,6 +130,9 @@ pub struct EntryC {
     pub menu: Option<PopupKey>,
     editable: bool,
     pointer: PointerState,
+    /// M6 drag-and-drop: an `Entry` can offer its text as a source and accept
+    /// a drop when the view opts in (the shared helper, deviation M6-D2).
+    dnd: DndState,
 }
 
 impl EntryC {
@@ -145,6 +148,14 @@ impl EntryC {
 impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
     fn kind(&self) -> Kind {
         Kind::Entry
+    }
+
+    fn drag_offer(&self) -> Option<crate::dnd::DragPayload> {
+        self.dnd.offer()
+    }
+
+    fn drop_accepts(&self, offered: &[&str]) -> bool {
+        self.dnd.accepts(offered)
     }
 
     fn build(node: &Node, props: &Props, cx: &mut BuildCx<'_>) -> Self {
@@ -188,12 +199,16 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
             menu: None,
             editable: props.bool(PropName::Editable, true),
             pointer: PointerState::default(),
+            dnd: DndState::default(),
         };
         this.apply(node);
         this
     }
 
     fn set_prop(&mut self, node: &Node, name: PropName, value: &Prop, cx: &mut BuildCx<'_>) {
+        if self.dnd.set_prop(node, name, value) {
+            return;
+        }
         match (name, value) {
             (PropName::Text, Prop::Str(text)) => self.edit.set_text(text, cx),
             (PropName::Editable, Prop::Bool(on)) => self.editable = *on,
@@ -214,6 +229,9 @@ impl<Msg: Clone + 'static> Controller<Msg> for EntryC {
     }
 
     fn on_event(&mut self, ev: &Event, cx: &mut EventCx<'_, Msg>) -> Vec<Msg> {
+        if let Some(out) = self.dnd.on_event(ev, cx) {
+            return out;
+        }
         // An icon press reports its index and consumes the event.
         for (index, icon) in self.icons.iter().enumerate() {
             let Some(icon) = icon.as_ref() else {

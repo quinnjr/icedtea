@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 use icedtea_ui::anim::ManualClock;
 use icedtea_ui::css::cascade::CompiledSheet;
+use icedtea_ui::dnd::{DragSeat, SeatDragRequest, SeatDragResult};
 use icedtea_ui::icons::IconTheme;
 use icedtea_ui::text::FontDatabase;
 use icedtea_ui::view::Instance;
@@ -66,6 +67,8 @@ fn sheet() -> CompiledSheet {
         "window { background-color: #ffffff; }
          box { background-color: #ffffff; }
          row { background-color: #ffffff; min-width: 200px; min-height: 24px; }
+         button { background-color: #ffffff; min-width: 200px; min-height: 24px; }
+         entry { background-color: #ffffff; min-width: 200px; min-height: 24px; }
          .drop-target-active { background-color: #ff0000; }",
     )
 }
@@ -102,10 +105,63 @@ fn find<'a>(instances: &'a [Instance<Msg>], name: &str) -> &'a Instance<Msg> {
     walk(&instances[0], name).unwrap_or_else(|| panic!("no instance keyed {name}"))
 }
 
+/// The dedicated kinds' pair: a `Button` source and an `Entry` target (the
+/// controllers the v1 generic-only shape kept out of DnD).
+fn dedicated_dnd_view(_model: &()) -> View<Msg> {
+    box_::<Msg>(
+        Orientation::Vertical,
+        [
+            widget::<Msg>(Kind::Button)
+                .key("chip")
+                .prop(icedtea_ui::view::PropName::Label, "chip")
+                .drag_source("chip-payload")
+                .on_drag_start(Msg::DragStarted)
+                .on_drag_end(Msg::DragEnded)
+                .on_click(Msg::Clicked),
+            widget::<Msg>(Kind::Entry)
+                .key("target")
+                .prop(icedtea_ui::view::PropName::Text, "target")
+                .drop_accept("text/plain")
+                .on_drag_enter(Msg::Entered)
+                .on_drag_motion(|_, _| Msg::Moved)
+                .on_drag_leave(Msg::Left)
+                .on_drop(|text: &str| Msg::Dropped(text.to_owned())),
+        ],
+    )
+    .key("root")
+}
+
+fn dedicated_dnd_app(log: Rc<RefCell<Vec<String>>>) -> App<(), Msg> {
+    App::new(
+        (),
+        move |_model: &mut (), msg: Msg| -> Cmd<Msg> {
+            log.borrow_mut().push(match msg {
+                Msg::Dropped(text) => format!("dropped:{text}"),
+                Msg::DragStarted => "started".to_owned(),
+                Msg::DragEnded(dropped) => format!("ended:{dropped}"),
+                Msg::Entered => "entered".to_owned(),
+                Msg::Moved => "moved".to_owned(),
+                Msg::Left => "left".to_owned(),
+                Msg::Clicked => "clicked".to_owned(),
+            });
+            Cmd::None
+        },
+        dedicated_dnd_view,
+    )
+    .with_sheet(sheet())
+    .with_fonts(FontDatabase::probe_only())
+    .with_icons(IconTheme::with_name_and_roots("hicolor", Vec::new()))
+}
+
 /// Centers of the chip and the target, from the layout itself.
 fn geometry() -> ((f64, f64), (f64, f64)) {
+    geometry_of(dnd_view)
+}
+
+/// [`geometry`], over any view function with the same key names.
+fn geometry_of(view: fn(&()) -> View<Msg>) -> ((f64, f64), (f64, f64)) {
     let clock: Rc<ManualClock> = Rc::new(ManualClock::new());
-    let probe = App::new((), |_: &mut (), _: Msg| Cmd::None, dnd_view)
+    let probe = App::new((), |_: &mut (), _: Msg| Cmd::None, view)
         .with_sheet(sheet())
         .with_fonts(FontDatabase::probe_only())
         .with_icons(IconTheme::with_name_and_roots("hicolor", Vec::new()))
@@ -162,6 +218,33 @@ fn button(pressed: bool, serial: u32) -> ScriptStep<Msg> {
         serial,
         time_ms: 0,
     })
+}
+
+/// A scripted seat whose request log a test can read after the run: the
+/// `DragSeat` half of §7, driven without a live compositor.
+struct RecordingSeat {
+    answer: SeatDragResult,
+    log: Rc<RefCell<Vec<SeatDragRequest>>>,
+}
+
+impl RecordingSeat {
+    fn new(answer: SeatDragResult) -> (Self, Rc<RefCell<Vec<SeatDragRequest>>>) {
+        let log: Rc<RefCell<Vec<SeatDragRequest>>> = Rc::default();
+        (
+            RecordingSeat {
+                answer,
+                log: Rc::clone(&log),
+            },
+            log,
+        )
+    }
+}
+
+impl DragSeat for RecordingSeat {
+    fn offer_drag(&mut self, request: &SeatDragRequest) -> SeatDragResult {
+        self.log.borrow_mut().push(request.clone());
+        self.answer
+    }
 }
 
 #[test]
@@ -293,6 +376,139 @@ fn escape_mid_drag_cancels_and_clears_the_highlight() {
         ],
         "Escape must leave the target and end the drag un-dropped"
     );
+}
+
+#[test]
+fn a_dedicated_button_source_drops_onto_a_dedicated_entry_target() {
+    let (chip, target) = geometry_of(dedicated_dnd_view);
+    let log: Rc<RefCell<Vec<String>>> = Rc::default();
+    let clock: Rc<ManualClock> = Rc::new(ManualClock::new());
+    dedicated_dnd_app(Rc::clone(&log))
+        .run_offscreen(
+            (240, 120),
+            Rc::clone(&clock),
+            vec![
+                enter(chip.0, chip.1, 1),
+                button(true, 2),
+                motion(chip.0 + 15.0, chip.1),
+                motion(target.0, target.1),
+                button(false, 3),
+            ],
+        )
+        .expect("the offscreen loop runs");
+
+    assert_eq!(
+        log.borrow().as_slice(),
+        &[
+            "started",
+            "entered",
+            "moved",
+            "dropped:chip-payload",
+            "ended:true"
+        ],
+        "a Button source and an Entry target must take part in DnD \
+         (v1's GenericC-only shape kept them out)"
+    );
+}
+
+#[test]
+fn a_dedicated_source_drag_released_over_itself_is_not_a_click() {
+    let (chip, _) = geometry_of(dedicated_dnd_view);
+    let log: Rc<RefCell<Vec<String>>> = Rc::default();
+    let clock: Rc<ManualClock> = Rc::new(ManualClock::new());
+    dedicated_dnd_app(Rc::clone(&log))
+        .run_offscreen(
+            (240, 120),
+            Rc::clone(&clock),
+            vec![
+                enter(chip.0, chip.1, 1),
+                button(true, 2),
+                // Past the threshold, then back onto the source: the release
+                // is inside the Button, so without the drag's press-latch
+                // clear it would also click.
+                motion(chip.0 + 15.0, chip.1),
+                motion(chip.0, chip.1),
+                button(false, 3),
+            ],
+        )
+        .expect("the offscreen loop runs");
+
+    assert_eq!(
+        log.borrow().as_slice(),
+        &["started", "ended:false"],
+        "a drag is never also a click, even when released over its source"
+    );
+}
+
+#[test]
+fn a_refusing_seat_sees_the_request_and_leaves_the_drag_internal() {
+    let (chip, target) = geometry();
+    let log: Rc<RefCell<Vec<String>>> = Rc::default();
+    let (seat, seat_log) = RecordingSeat::new(SeatDragResult::Refused);
+    let clock: Rc<ManualClock> = Rc::new(ManualClock::new());
+    dnd_app(Rc::clone(&log))
+        .with_drag_seat(Box::new(seat))
+        .run_offscreen(
+            (240, 120),
+            Rc::clone(&clock),
+            vec![
+                enter(chip.0, chip.1, 1),
+                button(true, 2),
+                motion(chip.0 + 15.0, chip.1),
+                motion(target.0, target.1),
+                button(false, 3),
+            ],
+        )
+        .expect("the offscreen loop runs");
+
+    // A refused offer must not change the toolkit half at all.
+    assert_eq!(
+        log.borrow().as_slice(),
+        &[
+            "started",
+            "entered",
+            "moved",
+            "dropped:chip-payload",
+            "ended:true"
+        ],
+    );
+    let requests = seat_log.borrow();
+    assert_eq!(requests.len(), 1, "exactly one offer per drag");
+    // The arming press serial (the second scripted press) and the offered
+    // payload, which the real seat validates against M4.2's grant table.
+    assert_eq!(requests[0].serial, 2);
+    assert_eq!(requests[0].mimes, vec!["text/plain".to_owned()]);
+    assert_eq!(
+        requests[0].payload.data_for(&["text/plain"]),
+        Some(("text/plain", b"chip-payload".as_slice()))
+    );
+}
+
+#[test]
+fn an_accepting_seat_offloads_the_drag_so_the_toolkit_stops_targeting() {
+    let (chip, target) = geometry();
+    let log: Rc<RefCell<Vec<String>>> = Rc::default();
+    let (seat, seat_log) = RecordingSeat::new(SeatDragResult::Accepted);
+    let clock: Rc<ManualClock> = Rc::new(ManualClock::new());
+    dnd_app(Rc::clone(&log))
+        .with_drag_seat(Box::new(seat))
+        .run_offscreen(
+            (240, 120),
+            Rc::clone(&clock),
+            vec![
+                enter(chip.0, chip.1, 1),
+                button(true, 2),
+                motion(chip.0 + 15.0, chip.1),
+                motion(target.0, target.1),
+                button(false, 3),
+            ],
+        )
+        .expect("the offscreen loop runs");
+
+    // Once the compositor owns the drag, the toolkit's own hit-testing goes
+    // quiet: no `DragEnter`/`DragMotion`/`Drop` for the in-surface target.
+    assert_eq!(log.borrow().as_slice(), &["started", "ended:false"]);
+    assert_eq!(seat_log.borrow().len(), 1);
 }
 
 #[test]
