@@ -5,6 +5,7 @@
 
 pub mod entry;
 pub mod provider;
+pub mod recent;
 
 pub use entry::{
     DesktopEntry, Locale, parse_entry, parse_entry_with_id, parse_entry_with_id_and_locale,
@@ -393,7 +394,9 @@ impl TileStore {
 
     /// Move `source` to just before `target`, within a group or across
     /// groups (the target's group is the destination). Returns whether the
-    /// store changed: unknown ids, or `source == target`, are a no-op.
+    /// store changed: unknown ids, `source == target`, or a move that is
+    /// already satisfied (`source` immediately before `target` in the same
+    /// group) are a no-op.
     ///
     /// A group the move empties is pruned, so a cross-group move never
     /// leaves a ghost group behind. The ordering this writes is exactly
@@ -409,6 +412,9 @@ impl TileStore {
         let Some((mut dst_group, dst_index)) = self.locate(target) else {
             return false;
         };
+        if src_group == dst_group && src_index + 1 == dst_index {
+            return false;
+        }
         let moved = self.groups[src_group].ids.remove(src_index);
         // Removing a tile before the target in the same group shifts the
         // target one slot left.
@@ -977,7 +983,10 @@ mod tests {
             tiles.groups()[0].ids,
             vec!["c".to_string(), "a".to_string(), "b".to_string()]
         );
-        assert!(tiles.reorder("c", "a"), "already before a: idempotent");
+        assert!(
+            !tiles.reorder("c", "a"),
+            "already immediately before a: a no-op reports no change"
+        );
         assert_eq!(
             tiles.groups()[0].ids,
             vec!["c".to_string(), "a".to_string(), "b".to_string()],

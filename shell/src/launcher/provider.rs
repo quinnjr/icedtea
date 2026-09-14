@@ -10,10 +10,13 @@
 //! the compositor spawn path is app-id-only (see the B1 spec's "Deferred
 //! work").
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::{DesktopIndex, RecencyStore, entry_score, field_score};
+
+pub use super::recent::parse_recent;
 
 /// The settings app id the launcher asks the compositor to spawn. Mirrors
 /// `settings/src/main.rs`'s `APP_ID` and the desktop file's stem.
@@ -35,6 +38,11 @@ pub const SETTINGS_PAGES: &[(&str, &str)] = &[
 /// Cap on files one [`FilesProvider`] holds (and can return). Keeps the
 /// per-open scan bounded on a large home directory.
 pub const MAX_FILE_RESULTS: usize = 200;
+
+/// Cap on the bytes read from `recently-used.xbel`. The file is untrusted
+/// (any process may write it), so the whole-document read is bounded; a
+/// truncated document still parses its leading entries.
+pub const MAX_RECENT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Which provider a result came from. Declaration order is the tie-rank
 /// [`rank_results`] applies on an exact score/weight tie: apps, then
@@ -184,25 +192,29 @@ pub struct FilesProvider {
 impl FilesProvider {
     /// Index every regular, non-hidden file directly under `dirs`, newest
     /// first, capped at `limit`. Unreadable dirs and entries are skipped.
+    ///
+    /// Collection stops once `limit` entries are gathered, and symlinks are
+    /// rejected (only regular files whose dirent is not a link), so a link
+    /// cannot smuggle an out-of-root target into the index. The final sort
+    /// in [`FilesProvider::from_entries`] still orders and caps the result.
     pub fn scan(dirs: &[PathBuf], limit: usize) -> Self {
         let mut entries = Vec::new();
-        for dir in dirs {
+        'dirs: for dir in dirs {
             let Ok(read) = std::fs::read_dir(dir) else {
                 continue;
             };
             for dirent in read.flatten() {
+                if entries.len() >= limit {
+                    break 'dirs;
+                }
                 let path = dirent.path();
-                let Some(name) = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(str::to_string)
-                else {
+                let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
                     continue;
                 };
                 if name.starts_with('.') {
                     continue;
                 }
-                let Ok(meta) = dirent.metadata() else {
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
                 if !meta.is_file() {
@@ -220,18 +232,23 @@ impl FilesProvider {
 
     /// Index the paths in a recent-files (`recently-used.xbel`) document,
     /// newest first as the document lists them, capped at `limit`.
+    ///
+    /// The document is untrusted input, so every candidate is confined to
+    /// `$HOME`: hidden or `..` components, symlinks, non-regular files, and
+    /// paths outside the home root are dropped. No home means no results.
     pub fn from_recent(xbel: &str, limit: usize) -> Self {
+        let Some(home) = home_dir().and_then(|h| std::fs::canonicalize(h).ok()) else {
+            return Self::default();
+        };
+        Self::from_recent_within(xbel, limit, &home)
+    }
+
+    /// [`FilesProvider::from_recent`] with the confinement root injected, so
+    /// the rule is testable without touching the real `$HOME`.
+    fn from_recent_within(xbel: &str, limit: usize, root: &Path) -> Self {
         let entries = parse_recent(xbel, limit)
             .into_iter()
-            .filter_map(|path| {
-                let name = path.file_name()?.to_str()?.to_string();
-                let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                Some(FileEntry {
-                    path,
-                    name,
-                    modified,
-                })
-            })
+            .filter_map(|path| file_entry_within(&path, root))
             .collect();
         Self::from_entries(entries, limit)
     }
@@ -240,16 +257,31 @@ impl FilesProvider {
     /// and capped. Read-only; failures degrade to an empty provider.
     pub fn from_env() -> Self {
         let mut merged = Self::scan(&default_file_dirs(), MAX_FILE_RESULTS);
-        if let Ok(xbel) = std::fs::read_to_string(default_recent_path()) {
-            merged.merge(Self::from_recent(&xbel, MAX_FILE_RESULTS));
+        if let Ok(file) = std::fs::File::open(default_recent_path()) {
+            let mut bytes = Vec::new();
+            if file.take(MAX_RECENT_BYTES).read_to_end(&mut bytes).is_ok() {
+                let xbel = String::from_utf8_lossy(&bytes);
+                merged.merge(Self::from_recent(&xbel, MAX_FILE_RESULTS));
+            }
         }
         merged
     }
 
-    /// Dedupe by path, sort newest-mtime first (path breaks ties), cap.
-    fn from_entries(mut entries: Vec<FileEntry>, limit: usize) -> Self {
+    /// Dedupe by path (keeping the newest mtime), sort newest-mtime first
+    /// (path breaks ties), cap.
+    fn from_entries(entries: Vec<FileEntry>, limit: usize) -> Self {
+        use std::collections::HashMap;
+        let mut by_path: HashMap<PathBuf, FileEntry> = HashMap::new();
+        for entry in entries {
+            match by_path.get(&entry.path) {
+                Some(existing) if existing.modified >= entry.modified => {}
+                _ => {
+                    by_path.insert(entry.path.clone(), entry);
+                }
+            }
+        }
+        let mut entries: Vec<FileEntry> = by_path.into_values().collect();
         entries.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.path.cmp(&b.path)));
-        entries.dedup_by(|a, b| a.path == b.path);
         entries.truncate(limit);
         Self { entries }
     }
@@ -303,12 +335,55 @@ impl SearchProvider for FilesProvider {
     }
 }
 
-/// The default file-index roots: the XDG user dirs, falling back to the
-/// conventional `$HOME` names, keeping only those that exist.
-pub fn default_file_dirs() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME")
+/// The real home directory, or `None` when `$HOME` is unset/empty. Never a
+/// literal `~`: that is not a path the filesystem resolves.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"));
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// A regular, non-hidden file at `path`, canonicalized and required to be
+/// under `root`. `root` is expected canonical. Symlinks are rejected before
+/// canonicalization resolves them.
+fn file_entry_within(path: &Path, root: &Path) -> Option<FileEntry> {
+    if path
+        .components()
+        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if !canonical.starts_with(root) {
+        return None;
+    }
+    let name = canonical.file_name()?.to_string_lossy().into_owned();
+    Some(FileEntry {
+        path: canonical,
+        name,
+        modified: meta.modified().ok(),
+    })
+}
+
+/// Canonical `dir` iff it is a directory under `home` (itself canonical).
+/// Keeps a rogue `XDG_*_DIR` (e.g. `/` or `/etc`) from indexing a whole
+/// tree, and drops the conventional fallback when it does not exist.
+fn confined_to_home(dir: &Path, home: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(dir).ok()?;
+    (canonical.is_dir() && canonical.starts_with(home)).then_some(canonical)
+}
+
+/// The default file-index roots: the XDG user dirs, falling back to the
+/// conventional `$HOME` names. Each must exist and resolve under the real
+/// `$HOME`; an unset home yields no roots.
+pub fn default_file_dirs() -> Vec<PathBuf> {
+    let Some(home) = home_dir().and_then(|h| std::fs::canonicalize(h).ok()) else {
+        return Vec::new();
+    };
     [
         ("XDG_DESKTOP_DIR", "Desktop"),
         ("XDG_DOCUMENTS_DIR", "Documents"),
@@ -320,83 +395,20 @@ pub fn default_file_dirs() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| home.join(fallback));
-        dir.is_dir().then_some(dir)
+        confined_to_home(&dir, &home)
     })
     .collect()
 }
 
-/// The recent-files document path: `$XDG_DATA_HOME/recently-used.xbel`.
+/// The recent-files document path: `$XDG_DATA_HOME/recently-used.xbel`,
+/// falling back under the real home. An unset home degrades to a relative
+/// path that simply fails to open.
 pub fn default_recent_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"));
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| home.join(".local/share"))
+        .unwrap_or_else(|| home_dir().unwrap_or_default().join(".local/share"))
         .join("recently-used.xbel")
-}
-
-/// Extract up to `limit` local paths from a `recently-used.xbel`, in
-/// document order (newest first in the real file). Non-`file://` schemes,
-/// malformed escapes and duplicates are dropped.
-pub fn parse_recent(xbel: &str, limit: usize) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for line in xbel.lines() {
-        if out.len() >= limit {
-            break;
-        }
-        let Some(start) = line.find("href=\"") else {
-            continue;
-        };
-        let rest = &line[start + "href=\"".len()..];
-        let Some(end) = rest.find('"') else {
-            continue;
-        };
-        let Some(path) = decode_file_uri(&rest[..end]) else {
-            continue;
-        };
-        if !out.contains(&path) {
-            out.push(path);
-        }
-    }
-    out
-}
-
-/// Decode a `file://` URI to a local path. `None` for any other scheme, a
-/// non-localhost authority, a malformed escape, non-UTF-8 bytes, or a NUL.
-fn decode_file_uri(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    let path_part = match rest.find('/') {
-        Some(0) => rest,
-        Some(slash) if &rest[..slash] == "localhost" => &rest[slash..],
-        _ => return None,
-    };
-    let bytes = percent_decode(path_part)?;
-    if bytes.contains(&0) {
-        return None;
-    }
-    let decoded = String::from_utf8(bytes).ok()?;
-    (!decoded.is_empty()).then(|| PathBuf::from(decoded))
-}
-
-/// `%XX` decoding. `None` on a truncated or non-hex escape.
-fn percent_decode(s: &str) -> Option<Vec<u8>> {
-    let raw = s.as_bytes();
-    let mut out = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        if raw[i] == b'%' {
-            let hex = raw.get(i + 1..i + 3)?;
-            let text = std::str::from_utf8(hex).ok()?;
-            out.push(u8::from_str_radix(text, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(raw[i]);
-            i += 1;
-        }
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -413,36 +425,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn parse_recent_decodes_local_uris_and_skips_other_schemes() {
-        let xbel = r#"<?xml version="1.0"?>
-<bookmarks>
-  <bookmark href="file:///home/u/My%20Docs/notes.txt" modified="2026-01-01T00:00:00Z"/>
-  <bookmark href="https://example.com/page"/>
-  <bookmark href="file:///home/u/a.txt"/>
-  <bookmark href="file:///home/u/%ZZ.txt"/>
-  <bookmark href="file:///home/u/a.txt"/>
-</bookmarks>"#;
-        let paths = parse_recent(xbel, 10);
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from("/home/u/My Docs/notes.txt"),
-                PathBuf::from("/home/u/a.txt"),
-            ],
-            "decoded, deduped, non-file schemes and bad escapes dropped"
-        );
-    }
-
-    #[test]
-    fn parse_recent_caps_at_the_limit() {
-        let mut xbel = String::new();
-        for i in 0..10 {
-            xbel.push_str(&format!("<bookmark href=\"file:///tmp/f{i}\"/>\n"));
-        }
-        assert_eq!(parse_recent(&xbel, 3).len(), 3);
     }
 
     #[test]
@@ -463,6 +445,163 @@ mod tests {
             "hidden files stay out"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_scan_rejects_symlinks_and_keeps_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tmpdir();
+        std::fs::write(dir.join("real.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.join("real.txt"), dir.join("link.txt")).unwrap();
+        std::fs::write(dir.join(std::ffi::OsStr::from_bytes(b"bad\xff.txt")), b"x").unwrap();
+
+        let provider = FilesProvider::scan(std::slice::from_ref(&dir), 10);
+        assert!(
+            provider.search("link").is_empty(),
+            "a symlink is not a regular file"
+        );
+        assert!(
+            provider
+                .search("real")
+                .iter()
+                .any(|r| r.title == "real.txt"),
+            "the real file survives"
+        );
+        assert!(
+            provider
+                .search("bad")
+                .iter()
+                .any(|r| r.title.contains("bad")),
+            "a non-UTF8 name is kept via lossy conversion, not dropped"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_from_recent_rejects_hidden_symlink_and_out_of_root_paths() {
+        let root = tmpdir();
+        let outside = tmpdir();
+        let good = root.join("notes.txt");
+        std::fs::write(&good, b"x").unwrap();
+        let hidden_dir = root.join(".ssh");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        let hidden = hidden_dir.join("id_rsa");
+        std::fs::write(&hidden, b"key").unwrap();
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        let outsider = outside.join("away.txt");
+        std::fs::write(&outsider, b"x").unwrap();
+        let dir_target = root.join("adir");
+        std::fs::create_dir_all(&dir_target).unwrap();
+
+        let xbel = format!(
+            "<bookmark href=\"file://{}\"/>\n\
+             <bookmark href=\"file://{}\"/>\n\
+             <bookmark href=\"file://{}\"/>\n\
+             <bookmark href=\"file://{}\"/>\n\
+             <bookmark href=\"file://{}\"/>\n",
+            good.display(),
+            hidden.display(),
+            link.display(),
+            outsider.display(),
+            dir_target.display(),
+        );
+        let root = std::fs::canonicalize(&root).unwrap();
+        let provider = FilesProvider::from_recent_within(&xbel, 10, &root);
+        assert_eq!(provider.len(), 1, "only the plain regular file survives");
+        assert!(
+            provider
+                .search("notes")
+                .iter()
+                .any(|r| r.title == "notes.txt"),
+            "the allowed file is still indexed"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn from_entries_dedupes_the_same_path_across_mtimes() {
+        use std::time::Duration;
+
+        let at = |secs: u64| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        let x = PathBuf::from("/home/u/x.txt");
+        let provider = FilesProvider::from_entries(
+            vec![
+                FileEntry {
+                    path: x.clone(),
+                    name: "x.txt".to_string(),
+                    modified: at(10),
+                },
+                FileEntry {
+                    path: PathBuf::from("/home/u/mid.txt"),
+                    name: "mid.txt".to_string(),
+                    modified: at(20),
+                },
+                FileEntry {
+                    path: x.clone(),
+                    name: "x.txt".to_string(),
+                    modified: at(30),
+                },
+            ],
+            10,
+        );
+        assert_eq!(provider.len(), 2, "one entry per path, not per mtime");
+        let kept = provider
+            .entries
+            .iter()
+            .find(|entry| entry.path == x)
+            .expect("x is kept");
+        assert_eq!(kept.modified, at(30), "the newest mtime wins");
+    }
+
+    #[test]
+    fn confined_to_home_requires_an_existing_dir_under_home() {
+        let root = tmpdir();
+        let inside = root.join("Documents");
+        std::fs::create_dir_all(&inside).unwrap();
+        let file = root.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let outside = tmpdir();
+
+        let home = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(
+            confined_to_home(&inside, &home),
+            Some(std::fs::canonicalize(&inside).unwrap()),
+            "a real dir under home is accepted"
+        );
+        assert_eq!(confined_to_home(&file, &home), None, "a file is not a dir");
+        assert_eq!(
+            confined_to_home(&outside, &home),
+            None,
+            "a dir outside home is rejected"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn settings_pages_and_app_id_stay_in_sync_with_icedtea_settings() {
+        let expected: Vec<(&str, &str)> = icedtea_settings::pages::PageId::ALL
+            .iter()
+            .map(|page| (page.name(), page.title()))
+            .collect();
+        assert_eq!(
+            SETTINGS_PAGES,
+            expected.as_slice(),
+            "SETTINGS_PAGES drifted from icedtea_settings::pages::PageId::ALL"
+        );
+        let desktop = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../settings/data/org.icedtea.Settings.desktop");
+        assert_eq!(
+            SETTINGS_APP_ID,
+            desktop
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default(),
+            "SETTINGS_APP_ID drifted from the settings desktop file stem"
+        );
     }
 
     #[test]
