@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use icedtea_shell::compositor_client::CompositorCommands;
+use icedtea_shell::launcher::ProviderKind;
 use icedtea_shell::launcher_view::{self, LAUNCHER_SIZE, LauncherModel, LauncherMsg};
 use icedtea_shell::style;
 use icedtea_ui::anim::{Clock, ManualClock};
@@ -241,7 +242,13 @@ fn pin_and_recency_survive_close_and_reopen() {
             persist_launcher_config(&path, &cfg).expect("test write-back")
         }));
         let _ = launcher_view::update(&mut model, LauncherMsg::TogglePin("music".into()));
-        let _ = launcher_view::update(&mut model, LauncherMsg::ActivateApp("firefox".into()));
+        let _ = launcher_view::update(
+            &mut model,
+            LauncherMsg::ActivateResult {
+                kind: ProviderKind::App,
+                id: "firefox".into(),
+            },
+        );
     }
 
     let stored = icedtea_config::load_or_default(&db_path).launcher;

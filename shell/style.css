@@ -85,23 +85,9 @@
 }
 
 /* The keyboard selection: the same `active` vocabulary `#workspaces
-   button.active` uses for the same "this is the one" meaning. */
+   button.active` uses for the same "this is the one" meaning. Tiles are
+   plain buttons too (carrying DnD), so this rule covers them and the tiles
+   pane needs no bespoke class. */
 #launcher button.active {
     font-weight: bold;
-}
-
-/* Tiles are `GenericC` `ListBoxRow`s (M6-D2 requires that kind to be a drag
-   source/target), so they do not inherit the theme's `button` chrome the way
-   an app row does; `.tile` restores a comparable surface so a tile is visible
-   and its `active` selection reads. */
-#launcher .tile {
-    padding: 8px;
-    margin: 2px;
-    border-radius: 6px;
-    background-color: rgba(255, 255, 255, 0.08);
-}
-
-#launcher .tile.active {
-    font-weight: bold;
-    background-color: rgba(255, 255, 255, 0.18);
 }

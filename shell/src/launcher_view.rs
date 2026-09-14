@@ -16,11 +16,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 
-use icedtea_ui::view::builders::{SearchEntryExt, box_, button, label, search_entry, widget};
-use icedtea_ui::view::{Cmd, Kind, PropName, View};
+use icedtea_ui::view::builders::{SearchEntryExt, box_, button, label, search_entry};
+use icedtea_ui::view::{Cmd, View};
 use icedtea_ui::widgets::Orientation;
 use icedtea_ui::window::keyboard::KeyEvent;
 use icedtea_ui::window::pointer::{BTN_LEFT, BTN_RIGHT};
@@ -92,6 +93,7 @@ pub fn spec(bar_position: &str) -> SurfaceSpec {
 pub use crate::launcher::PowerAction;
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum LauncherMsg {
     /// The search box changed (per keystroke and debounced alike).
     SearchChanged(String),
@@ -105,10 +107,9 @@ pub enum LauncherMsg {
     MoveRight,
     /// Enter outside the search box: launch the selection, else the top hit.
     ActivateSelected,
-    /// Left-click (or pointer release with `BTN_LEFT`) on an app row.
-    ActivateApp(String),
-    /// Activate a non-app result: a settings page (name) or a file (path).
-    /// The app rows keep [`LauncherMsg::ActivateApp`].
+    /// Activate one result: an app (id), a settings page (name), or a file
+    /// (absolute path). Left-click on any row folds this, and the `kind`
+    /// picks the activation path ([`LauncherModel::activate`]).
     ActivateResult {
         /// Which provider the result came from.
         kind: ProviderKind,
@@ -278,21 +279,102 @@ fn run_power_command(program: &str, args: &[&str]) -> std::io::Result<()> {
     }
 }
 
-/// Open one file with the desktop's registered handler, via the local
+/// The local file dispatcher's binary name.
+const XDG_OPEN_NAME: &str = "xdg-open";
+
+/// The first executable named `name` in `path_env` (a `PATH` value), or `None`.
+///
+/// Mirrors the power path's `launcher::resolve_on_path`, which is private to
+/// the `launcher` module this branch does not own. Empty `PATH` entries (which
+/// mean "the current directory") are skipped: a file open must not pick up a
+/// binary dropped in the launcher's working directory. Pure over its
+/// arguments so the rule is testable without touching the real environment.
+fn resolve_on_path(name: &str, path_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path_env?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Is `path` a regular file with at least one execute bit set?
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// The `xdg-open` program, resolved once at first use and cached: a `PATH`
+/// shadowed or mutated between menu load and click cannot redirect the open
+/// (the same reasoning as the power path's `session_cli_program`). Falls back
+/// to the bare name when the binary is not installed, so the spawn fails with
+/// `NotFound` and surfaces as a launcher status line rather than nothing.
+fn xdg_open_program() -> &'static str {
+    static RESOLVED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| resolve_on_path(XDG_OPEN_NAME, std::env::var_os("PATH").as_deref()))
+        .as_deref()
+        .and_then(std::path::Path::to_str)
+        .unwrap_or(XDG_OPEN_NAME)
+}
+
+/// Open one file with the desktop's registered handler via the local
 /// `xdg-open` dispatcher — the same local-helper pattern the power row uses
-/// for `icedtea-session`. The compositor `SpawnApp` path takes an app id and
-/// no argv, so it cannot carry a file path; this deliberately does **not**
-/// extend that D-Bus interface with argv. The child is reaped on a detached
-/// thread so a long-lived handler never zombies.
+/// for `icedtea-session`. The program is resolved once
+/// ([`xdg_open_program`]), so a `PATH` mutated between menu load and click
+/// cannot redirect the open; the child is reaped on a detached thread so a
+/// long-lived handler never zombies and never blocks the launcher loop. A
+/// non-zero exit is logged with the path ([`open_exit_result`]) — it cannot
+/// become a status line without a channel back into the model, which this
+/// fire-and-forget seam does not have. The compositor `SpawnApp` path takes
+/// an app id and no argv, so it cannot carry a file path; this deliberately
+/// does **not** extend that D-Bus interface with argv.
 fn xdg_open(path: &str) -> std::io::Result<()> {
-    let child = std::process::Command::new("xdg-open").arg(path).spawn()?;
+    open_detached(xdg_open_program(), path)
+}
+
+/// Spawn `program -- path`, refusing an empty or `-`-leading path before any
+/// spawn (either would read as an option) and passing `--` as defense in
+/// depth. The child is reaped off-thread; split from [`xdg_open`] so tests
+/// can drive a stub program hermetically.
+fn open_detached(program: &str, path: &str) -> std::io::Result<()> {
+    if path.is_empty() || path.starts_with('-') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to open a path that starts with '-': {path:?}"),
+        ));
+    }
+    let child = std::process::Command::new(program)
+        .arg("--")
+        .arg(path)
+        .spawn()?;
+    let path = path.to_string();
     let _ = std::thread::Builder::new()
         .name("xdg-open-reaper".into())
         .spawn(move || {
             let mut child = child;
-            let _ = child.wait();
+            match child.wait() {
+                Ok(status) => {
+                    if let Err(detail) = open_exit_result(status, &path) {
+                        tracing::warn!(path = %path, %detail, "xdg-open reported a failure");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(path = %path, %err, "xdg-open could not be reaped");
+                }
+            }
         });
     Ok(())
+}
+
+/// Map one reaped `xdg-open` exit to success/failure for the log. Split out
+/// so a real non-zero exit is testable without the detached thread.
+fn open_exit_result(status: std::process::ExitStatus, path: &str) -> Result<(), String> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("xdg-open exited with {status} opening {path}"))
+    }
 }
 
 /// Which visual pane a row belongs to: the pinned rail, the All-apps list,
@@ -477,9 +559,17 @@ impl LauncherModel {
     }
 
     /// Spawn the settings app through the same compositor path as an app.
-    /// `page` names the settings page for the failure line only: the
-    /// compositor `SpawnApp` call takes an app id and no argv, so the page
-    /// cannot cross it (no raw argv over D-Bus).
+    ///
+    /// `page` **cannot** cross the compositor `SpawnApp` call: that D-Bus
+    /// member takes an app id and no argv, and there is no env channel, so
+    /// neither a `--page` argument nor the settings app's own
+    /// `ICEDTEA_SETTINGS_PAGE` seam (`settings/src/main.rs` reads it via
+    /// `page_from_env`) can be set from here. A page-routed open needs an
+    /// argv/env-carrying spawn — which would mean changing the compositor's
+    /// D-Bus contract (out of scope for this branch, and deliberately not a
+    /// raw-argv-over-D-Bus path) or a post-spawn page-selection IPC to the
+    /// settings app. Until one exists the page id feeds the label/failure
+    /// line only, and "Displays" opens Settings on its default page.
     fn spawn_settings(&mut self, page: &str) -> Cmd<LauncherMsg> {
         let label = SETTINGS_PAGES
             .iter()
@@ -597,10 +687,30 @@ pub fn update(m: &mut LauncherModel, msg: LauncherMsg) -> Cmd<LauncherMsg> {
         LauncherMsg::MoveLeft | LauncherMsg::MoveRight => {
             move_pane(m, matches!(msg, LauncherMsg::MoveRight))
         }
-        LauncherMsg::ActivateApp(id) => m.launch(&id),
         LauncherMsg::ActivateResult { kind, id } => m.activate(kind, &id),
         LauncherMsg::ReorderTile { source, target } => {
-            m.tiles.reorder(&source, &target);
+            // A user-initiated drop that changes nothing is one of: a
+            // self-drop (`source == target`, deliberate), a move already
+            // satisfied (`source` already immediately before `target`), or a
+            // stale id (the tile vanished from under the drag, e.g. a filter
+            // change). `TileStore::reorder` reports `false` for all three, so
+            // the stale case is told apart by an endpoint no longer being
+            // assigned to any group — only that case is worth a log.
+            if !m.tiles.reorder(&source, &target) && source != target {
+                let known = |id: &str| {
+                    m.tiles
+                        .groups()
+                        .iter()
+                        .any(|group| group.ids.iter().any(|assigned| assigned == id))
+                };
+                if !known(&source) || !known(&target) {
+                    tracing::warn!(
+                        %source,
+                        %target,
+                        "launcher tile drop ignored: unknown or stale id"
+                    );
+                }
+            }
             Cmd::None
         }
         LauncherMsg::TogglePin(id) => {
@@ -866,7 +976,13 @@ fn tiles_pane(
                 .iter()
                 .filter(|id| result_ids.contains(&id.as_str()))
                 .filter_map(|id| m.index.find(id))
-                .map(|entry| tile_row(entry, group.size, m.selected_for(&entry.id, results)))
+                .map(|entry| {
+                    tile_row(
+                        entry,
+                        group.size,
+                        m.selected_for(ProviderKind::App, &entry.id, results),
+                    )
+                })
                 .collect();
             if members.is_empty() {
                 return None;
@@ -911,7 +1027,10 @@ fn row_button(
             if pressed == BTN_RIGHT {
                 LauncherMsg::TogglePin(pin_id.clone())
             } else if pressed == BTN_LEFT {
-                LauncherMsg::ActivateApp(launch_id.clone())
+                LauncherMsg::ActivateResult {
+                    kind: ProviderKind::App,
+                    id: launch_id.clone(),
+                }
             } else {
                 LauncherMsg::Ignore
             }
@@ -953,7 +1072,7 @@ fn result_row(
     results: &[SearchResult],
     top: Option<&str>,
 ) -> View<LauncherMsg> {
-    let selected = m.selected_for(&result.id, results);
+    let selected = m.selected_for(result.kind, &result.id, results);
     match result.kind {
         ProviderKind::App => match m.index.find(&result.id) {
             Some(entry) => app_row(entry, kind, selected, top),
@@ -990,14 +1109,15 @@ fn result_button(
     row
 }
 
-/// One tile: a `GenericC` row (M6-D2's drag source/target kind) carrying the
-/// group-size width, the app id as its drag payload, a `text/plain` drop
-/// target, and the keyboard-selection class so a pane jump into the tiles
-/// pane lights the tile, not just its All twin.
+/// One tile: an app row ([`row_button`]) carrying the group-size width, the
+/// app id as its drag payload, a `text/plain` drop target, and the
+/// keyboard-selection class so a pane jump into the tiles pane lights the
+/// tile, not just its All twin. `ButtonC` carries DnD, so the tile keeps the
+/// theme's button chrome and needs no bespoke `.tile` rule.
 ///
 /// Left-click launches and right-click pins through the same handlers an app
-/// row uses; M6's drag latch suppresses the click on a drop, so a reorder
-/// never also launches.
+/// row uses; a drag's completing release is a drop/cancel, never a
+/// `PointerUp`, so a reorder never also launches.
 fn tile_row(entry: &DesktopEntry, size: u32, selected: bool) -> View<LauncherMsg> {
     // Clamped width math: `size` is config-controlled (hand-editable
     // redb), so a 0 span must still paint one unit and a huge span must
@@ -1010,28 +1130,19 @@ fn tile_row(entry: &DesktopEntry, size: u32, selected: bool) -> View<LauncherMsg
     let width = size.clamp(1, MAX_TILE_SPAN) as i32 * TILE_PX;
     let source = entry.id.clone();
     let target = entry.id.clone();
-    let launch = entry.id.clone();
-    let pin = entry.id.clone();
-    let mut row = widget::<LauncherMsg>(Kind::ListBoxRow)
-        .key(stable_key(&format!("tile:{}", entry.id)))
-        .id(&format!("tile_{}", entry.id))
-        .prop(PropName::Label, entry.name.as_str())
-        .width_request(width)
-        .class("tile")
-        .drag_source(&source)
-        .drop_accept("text/plain")
-        .on_drop(move |payload: &str| LauncherMsg::ReorderTile {
-            source: payload.to_string(),
-            target: target.clone(),
-        })
-        .on_click(LauncherMsg::ActivateApp(launch))
-        .on_pointer_up_with_button(move |_, _, pressed| {
-            if pressed == BTN_RIGHT {
-                LauncherMsg::TogglePin(pin.clone())
-            } else {
-                LauncherMsg::Ignore
-            }
-        });
+    let mut row = row_button(
+        "tile",
+        stable_key(&format!("tile:{}", entry.id)),
+        &entry.name,
+        &entry.id,
+        Some(width),
+    )
+    .drag_source(&source)
+    .drop_accept("text/plain")
+    .on_drop(move |payload: &str| LauncherMsg::ReorderTile {
+        source: payload.to_string(),
+        target: target.clone(),
+    });
     if selected {
         row = row.class("active");
     }
@@ -1102,11 +1213,15 @@ fn root_key(ev: &KeyEvent) -> Option<LauncherMsg> {
 }
 
 impl LauncherModel {
-    /// True when `id` is the keyboard-selected row of `results`.
-    fn selected_for(&self, id: &str, results: &[SearchResult]) -> bool {
+    /// True when the `(kind, id)` row is the keyboard-selected one of
+    /// `results`. The kind is part of the match because the merged result
+    /// list mixes apps, settings pages and files, and Up/Down select across
+    /// all three: a settings or file row must light when the keyboard lands
+    /// on it, exactly as Enter activates it.
+    fn selected_for(&self, kind: ProviderKind, id: &str, results: &[SearchResult]) -> bool {
         self.selected
             .and_then(|i| results.get(i))
-            .is_some_and(|result| result.kind == ProviderKind::App && result.id == id)
+            .is_some_and(|result| result.kind == kind && result.id == id)
     }
 }
 
@@ -1627,6 +1742,45 @@ mod tests {
     }
 
     #[test]
+    fn arrow_selecting_a_non_app_result_marks_it_active() {
+        // Settings: "displays" is a Settings result (no file provider needed).
+        let (mut m, _) = seeded();
+        let _ = update(&mut m, LauncherMsg::SearchChanged("displays".into()));
+        let results = m.results();
+        let idx = results
+            .iter()
+            .position(|r| r.kind == ProviderKind::Settings && r.id == "displays")
+            .expect("displays is a settings result");
+        m.selected = Some(idx);
+        let settings_id = format!("settings_{}", stable_key("displays"));
+        assert!(
+            classes(&view(&m), &settings_id).contains(&"active".to_string()),
+            "the keyboard-selected settings row must carry .active"
+        );
+
+        // Files: the same highlight path through `result_button`.
+        let dir =
+            std::env::temp_dir().join(format!("icedtea-launcher-active-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("report.txt"), b"x").expect("fixture");
+        let (mut m, _) = seeded();
+        m.files = Some(FilesProvider::scan(std::slice::from_ref(&dir), 10));
+        let _ = update(&mut m, LauncherMsg::SearchChanged("report".into()));
+        let results = m.results();
+        let idx = results
+            .iter()
+            .position(|r| r.kind == ProviderKind::File)
+            .expect("report.txt is a file result");
+        m.selected = Some(idx);
+        let file_id = format!("file_{}", stable_key(&results[idx].id));
+        assert!(
+            classes(&view(&m), &file_id).contains(&"active".to_string()),
+            "the keyboard-selected file row must carry .active"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
     fn selection_clamps_at_both_ends() {
         let (mut m, _) = seeded();
         let _ = update(&mut m, LauncherMsg::MoveUp);
@@ -1700,7 +1854,13 @@ mod tests {
         let (mut m, wm) = seeded();
         m.wm = Rc::new(MockWm::failing());
         m.open = true;
-        let cmd = update(&mut m, LauncherMsg::ActivateApp("music".into()));
+        let cmd = update(
+            &mut m,
+            LauncherMsg::ActivateResult {
+                kind: ProviderKind::App,
+                id: "music".into(),
+            },
+        );
         assert_eq!(wm.spawns.borrow().as_slice(), [] as [String; 0]);
         assert_eq!(m.recency.count("music"), 0, "no recency without success");
         assert!(m.open, "a failed launch keeps the menu open");
@@ -1714,7 +1874,13 @@ mod tests {
     fn activating_an_unknown_id_reports_a_status_line_and_spawns_nothing() {
         let (mut m, wm) = seeded();
         m.open = true;
-        let cmd = update(&mut m, LauncherMsg::ActivateApp("no-such-app".into()));
+        let cmd = update(
+            &mut m,
+            LauncherMsg::ActivateResult {
+                kind: ProviderKind::App,
+                id: "no-such-app".into(),
+            },
+        );
         assert!(wm.spawns.borrow().is_empty());
         assert!(m.open);
         assert!(!quits(&cmd));
@@ -1757,7 +1923,13 @@ mod tests {
             .handlers
             .fire_pair_button(EventKind::PointerUp, 4.0, 4.0, BTN_LEFT)
             .expect("a pointer-up handler");
-        assert!(matches!(msg, LauncherMsg::ActivateApp(_)));
+        assert!(matches!(
+            msg,
+            LauncherMsg::ActivateResult {
+                kind: ProviderKind::App,
+                ..
+            }
+        ));
         m.open = true;
         let _ = update(&mut m, msg);
         assert_eq!(wm.spawns.borrow().as_slice(), ["music".to_string()]);
@@ -1878,6 +2050,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The real file-open seam, hermetically: `-`-leading and empty paths are
+    /// refused before any spawn, a missing program is a spawn failure (no
+    /// panic), and `/bin/true`/`/bin/false` pin the reaped-exit mapping the
+    /// detached reaper logs. This is the `xdg-open` path with the program
+    /// stubbed, never a real browser.
+    #[test]
+    fn open_detached_refuses_option_like_paths_and_maps_exit_status() {
+        for bad in ["-rf", "--", ""] {
+            let err = open_detached("/bin/true", bad).expect_err("refused before spawning");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert!(
+            open_detached("/bin/true", "/tmp/report.txt").is_ok(),
+            "a real spawn succeeds"
+        );
+        assert!(
+            open_detached("/nonexistent-xdg-open-icedtea", "/tmp/report.txt").is_err(),
+            "a missing program is a spawn failure, never a panic"
+        );
+        // The reaped status is what the detached reaper logs.
+        let ok = std::process::Command::new("/bin/true")
+            .status()
+            .expect("/bin/true runs");
+        assert!(
+            open_exit_result(ok, "/tmp/report.txt").is_ok(),
+            "exit 0 is success"
+        );
+        let failed = std::process::Command::new("/bin/false")
+            .status()
+            .expect("/bin/false runs");
+        let detail = open_exit_result(failed, "/tmp/report.txt").expect_err("exit 1 is a failure");
+        assert!(
+            detail.contains("report.txt"),
+            "the failed open names the path: {detail}"
+        );
+    }
+
     #[test]
     fn close_persists_pins_tiles_and_recency_for_reopen() {
         let (mut m, _) = seeded();
@@ -1889,7 +2098,13 @@ mod tests {
         // the menu — the close is what writes back.
         let _ = update(&mut m, LauncherMsg::TogglePin("music".into()));
         m.open = true;
-        let _ = update(&mut m, LauncherMsg::ActivateApp("firefox".into()));
+        let _ = update(
+            &mut m,
+            LauncherMsg::ActivateResult {
+                kind: ProviderKind::App,
+                id: "firefox".into(),
+            },
+        );
         let snapshots = saved.borrow();
         assert_eq!(snapshots.len(), 1, "one close, one write-back");
         let cfg = &snapshots[0];
@@ -2061,6 +2276,27 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_tile_drop_is_a_no_op_and_never_panics() {
+        let (mut m, _) = seeded();
+        m.tiles
+            .ingest("Web", &["firefox".to_string(), "music".to_string()], 2);
+        let before = m.tiles.groups()[0].ids.clone();
+        let cmd = update(
+            &mut m,
+            LauncherMsg::ReorderTile {
+                source: "ghost".into(),
+                target: "firefox".into(),
+            },
+        );
+        assert!(matches!(cmd, Cmd::None));
+        assert_eq!(
+            m.tiles.groups()[0].ids,
+            before,
+            "an unknown source changes nothing"
+        );
+    }
+
+    #[test]
     fn a_settings_result_spawns_the_settings_app() {
         let (mut m, wm) = seeded();
         m.open = true;
@@ -2073,6 +2309,29 @@ mod tests {
         );
         assert!(!m.open, "the settings spawn dismisses the menu");
         assert!(quits(&cmd));
+    }
+
+    #[test]
+    fn a_failed_settings_spawn_reports_a_status_line_and_stays_open() {
+        let (mut m, wm) = seeded();
+        m.wm = Rc::new(MockWm::failing());
+        m.open = true;
+        let cmd = update(
+            &mut m,
+            LauncherMsg::ActivateResult {
+                kind: ProviderKind::Settings,
+                id: "displays".into(),
+            },
+        );
+        assert!(
+            wm.spawns.borrow().is_empty(),
+            "no spawn reached a live wm on the failing path"
+        );
+        assert!(m.open, "a failed settings spawn keeps the menu open");
+        assert!(!quits(&cmd));
+        let status = m.status.clone().expect("a status line");
+        assert!(status.contains("Settings"), "names Settings: {status}");
+        assert!(by_id(&view(&m), "launcher_status").is_some());
     }
 
     #[test]
@@ -2107,6 +2366,33 @@ mod tests {
         assert!(!m.open, "opening a file dismisses the menu");
         assert!(quits(&cmd));
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_failed_file_open_reports_a_status_line_and_stays_open() {
+        let (mut m, _) = seeded();
+        m.open = true;
+        m.file_open = Rc::new(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no registered handler",
+            ))
+        });
+        let cmd = update(
+            &mut m,
+            LauncherMsg::ActivateResult {
+                kind: ProviderKind::File,
+                id: "/tmp/report.txt".into(),
+            },
+        );
+        assert!(m.open, "a failed open keeps the menu open");
+        assert!(!quits(&cmd));
+        let status = m.status.clone().expect("a status line");
+        assert!(
+            status.contains("Could not open"),
+            "the failure surfaces: {status}"
+        );
+        assert!(by_id(&view(&m), "launcher_status").is_some());
     }
 
     #[test]
