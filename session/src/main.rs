@@ -95,9 +95,12 @@ fn call_outcome(result: zbus::Result<()>) -> ExitCode {
     }
 }
 
-/// Boot the daemon: resolve this login session, open the buses, and register
-/// `org.icedtea.Session`. Parks once registered so the connection and process
-/// stay alive until the signal/idle/sleep wiring lands in a later task.
+/// Boot the daemon: resolve this login session, open the buses, register
+/// `org.icedtea.Session`, arm the idle-lock client and the compositor
+/// lock-change cross-check, then join the supervised logind signal thread.
+/// That thread runs for the daemon's lifetime and only returns if it panicked,
+/// so this returns `FAILURE` and lets systemd's `Restart=always` recover the
+/// service rather than keep running with a dead lock funnel.
 fn run_daemon() -> ExitCode {
     let config = icedtea_config::load_or_default(&icedtea_config::default_db_path());
     let locker = config.power.locker_command.as_deref().unwrap_or("(none)");

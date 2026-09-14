@@ -11,8 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_IFACE, COMPOSITOR_PATH};
+use icedtea_contract::{
+    COMPOSITOR_BUS_NAME, COMPOSITOR_CONTRACT_VERSION, COMPOSITOR_IFACE, COMPOSITOR_PATH,
+};
 use zbus::blocking::Connection;
+
+/// First delay between lock-change re-subscription attempts.
+const LOCK_CHANGED_BACKOFF: Duration = Duration::from_millis(500);
+/// Ceiling on the lock-change re-subscription backoff.
+const LOCK_CHANGED_BACKOFF_MAX: Duration = Duration::from_secs(8);
 
 /// Deadline on every method call this client makes.
 ///
@@ -85,9 +92,9 @@ pub trait WmClient {
     /// Provided (rather than required) so existing test doubles — including
     /// ones a sibling owns — compile unchanged; a double that does not model
     /// the subscription inherits the error-returning default. `ZbusWmClient`
-    /// overrides it with the real signal-match loop. The daemon's `flow`
-    /// should consume this to kill a still-running locker on an external
-    /// unlock that arrives without a matching logind `Unlock`.
+    /// overrides it with the real signal-match loop. `main` consumes this to
+    /// kill a still-running locker on an external unlock that arrives without
+    /// a matching logind `Unlock`.
     fn subscribe_lock_changed(
         &self,
         _on_change: Box<dyn FnMut(bool) + Send + 'static>,
@@ -103,6 +110,31 @@ pub struct ZbusWmClient {
     conn: Connection,
 }
 
+/// Compare the compositor's advertised contract revision against the one this
+/// binary was compiled with, returning a description of the mismatch or `None`
+/// when they agree.
+///
+/// `remote` is `None` when the compositor does not expose the `Version`
+/// property at all — a build older than the property — which is itself a
+/// mismatch worth naming. Mirrors
+/// `shell/src/compositor_client.rs::version_mismatch` so both clients name the
+/// same skew the same way; never fatal here, because a signature-compatible
+/// skew still works and the daemon has no restart authority over the
+/// compositor.
+pub fn version_mismatch(remote: Option<u32>, local: u32) -> Option<String> {
+    match remote {
+        Some(v) if v == local => None,
+        Some(v) => Some(format!(
+            "compositor speaks org.icedtea.Compositor contract v{v}, this session daemon was \
+             built for v{local}; restart whichever side is stale"
+        )),
+        None => Some(format!(
+            "compositor exposes no org.icedtea.Compositor `Version` property (a build older than \
+             contract v{local}); restart it"
+        )),
+    }
+}
+
 impl ZbusWmClient {
     /// Open the session bus with [`COMPOSITOR_CALL_TIMEOUT`] on every call
     /// made through it. `Err` if the bus is unavailable.
@@ -110,7 +142,39 @@ impl ZbusWmClient {
         let conn = zbus::blocking::connection::Builder::session()?
             .method_timeout(COMPOSITOR_CALL_TIMEOUT)
             .build()?;
-        Ok(Self { conn })
+        Ok(Self::with_connection(conn))
+    }
+
+    /// Build over an already-open session connection and read the
+    /// compositor's advertised contract `Version` once, warning — never
+    /// failing — on a mismatch. The fake-compositor tests use this seam;
+    /// production calls [`Self::new`].
+    pub fn with_connection(conn: Connection) -> Self {
+        let client = Self { conn };
+        if let Some(complaint) = client.contract_mismatch() {
+            tracing::warn!("{complaint}");
+        }
+        client
+    }
+
+    /// The contract mismatch between the compositor and this build, or `None`
+    /// when they agree. Public so the `wm_bus` test can pin the v6 case.
+    pub fn contract_mismatch(&self) -> Option<String> {
+        version_mismatch(self.read_contract_version(), COMPOSITOR_CONTRACT_VERSION)
+    }
+
+    /// Read the compositor's advertised `Version` property. `None` when the
+    /// property is absent or unreadable — itself reported as a mismatch by
+    /// [`version_mismatch`].
+    pub fn read_contract_version(&self) -> Option<u32> {
+        let proxy = zbus::blocking::Proxy::new(
+            &self.conn,
+            COMPOSITOR_BUS_NAME,
+            COMPOSITOR_PATH,
+            COMPOSITOR_IFACE,
+        )
+        .ok()?;
+        proxy.get_property::<u32>("Version").ok()
     }
 
     fn call(&self, member: &str) -> zbus::Result<zbus::Message> {
@@ -125,21 +189,11 @@ impl ZbusWmClient {
 }
 
 impl WmClient for ZbusWmClient {
+    /// One decode path: [`Self::lock_state`] owns the timeout and the
+    /// call/decode logging, and this collapses its tri-state to the bool the
+    /// trait promises (anything but a confirmed lock is `false`).
     fn is_locked(&self) -> bool {
-        let msg = match self.call(IS_LOCKED_MEMBER) {
-            Ok(msg) => msg,
-            Err(err) => {
-                tracing::warn!(?err, "IsLocked call failed; collapsing to false");
-                return false;
-            }
-        };
-        match msg.body().deserialize::<bool>() {
-            Ok(locked) => locked,
-            Err(err) => {
-                tracing::warn!(?err, "IsLocked reply decode failed; collapsing to false");
-                false
-            }
-        }
+        matches!(self.lock_state(), LockState::Locked)
     }
 
     fn lock_state(&self) -> LockState {
@@ -174,48 +228,102 @@ impl WmClient for ZbusWmClient {
         &self,
         mut on_change: Box<dyn FnMut(bool) + Send + 'static>,
     ) -> io::Result<JoinHandle<()>> {
+        // Reuse this client's own session connection, so the subscription
+        // rides the same bus as every other call (and, under test, the same
+        // private bus) instead of opening a second one.
+        let conn = self.conn.inner().clone();
         std::thread::Builder::new()
             .name("icedtea-session-wm-lock".to_string())
-            .spawn(move || {
-                zbus::block_on(async move {
-                    if let Err(err) = run_lock_changed_loop(&mut *on_change).await {
-                        // A subscription that cannot be re-established is
-                        // logged but not fatal: unlike the logind loop, lock
-                        // state is still observable through `is_locked`, so
-                        // this daemon degrades to polling rather than dying.
-                        tracing::error!(
-                            %err,
-                            "compositor SessionLockChanged subscription ended; lock-state changes \
-                             will not be pushed"
-                        );
-                    }
-                });
-            })
+            .spawn(move || supervise_lock_changed_loop(conn, &mut *on_change))
     }
 }
 
-/// Forward every `org.icedtea.Compositor` `SessionLockChanged(bool)` signal to
-/// `on_change` until the connection drops. The signal body is `(seq, locked)`
-/// (matching the compositor emitter's `WorkspaceSet`-style shape).
-async fn run_lock_changed_loop(on_change: &mut (dyn FnMut(bool) + Send)) -> zbus::Result<()> {
+/// Keep [`run_lock_changed_loop_on`] subscribed for the daemon's lifetime.
+///
+/// Mirrors `logind`'s supervised loop in shape — a clean stream end is not
+/// silent and the subscription is re-established with capped exponential
+/// backoff — but deliberately does *not* take the process down after a fixed
+/// number of attempts. This is an auxiliary cross-check, not the primary lock
+/// driver, and lock state is still observable through `WmClient::lock_state`;
+/// killing the daemon (and with it the logind inhibit wiring) because the
+/// compositor's signal stream is unavailable would be strictly worse than
+/// logging that the cross-check is degraded. Never returns.
+fn supervise_lock_changed_loop(conn: zbus::Connection, on_change: &mut (dyn FnMut(bool) + Send)) {
+    let mut backoff = LOCK_CHANGED_BACKOFF;
+    loop {
+        match zbus::block_on(run_lock_changed_loop_on(conn.clone(), on_change)) {
+            Ok(()) => {
+                tracing::warn!("compositor SessionLockChanged stream ended cleanly; re-subscribing")
+            }
+            Err(err) => tracing::warn!(
+                %err,
+                "compositor SessionLockChanged subscription failed; re-subscribing"
+            ),
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(LOCK_CHANGED_BACKOFF_MAX);
+    }
+}
+
+/// Subscribe to `org.icedtea.Compositor`'s `SessionLockChanged(bool)` on
+/// `conn` and forward every change to `on_change`.
+///
+/// The match rule pins the sender to [`COMPOSITOR_BUS_NAME`] (as
+/// `logind.rs` pins `org.freedesktop.login1`), so a same-user session-bus peer
+/// cannot forge an `SessionLockChanged(false)` and drive the locker down. Each
+/// delivered message's sender is *also* checked against the current owner of
+/// that name before the body is trusted: the bus-level match already excludes
+/// other senders, but a forged signal there would unlock the screen, so it is
+/// worth verifying rather than assuming. The owner is re-resolved the first
+/// time a message's sender does not match the cached owner, so a compositor
+/// restart does not wedge the check. Bodies that are not `(seq, locked)` are
+/// ignored (no panic). Public so `session/tests/wm_bus.rs` can drive it on a
+/// private bus.
+pub async fn run_lock_changed_loop_on(
+    conn: zbus::Connection,
+    on_change: &mut (dyn FnMut(bool) + Send),
+) -> zbus::Result<()> {
     use futures_util::StreamExt as _;
 
-    let conn = zbus::Connection::session().await?;
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
+        .sender(COMPOSITOR_BUS_NAME)?
         .interface(COMPOSITOR_IFACE)?
         .path(COMPOSITOR_PATH)?
         .member(SESSION_LOCK_CHANGED_MEMBER)?
         .build();
     let mut stream = zbus::MessageStream::for_match_rule(rule, &conn, None).await?;
 
+    let mut owner = compositor_owner(&conn).await;
     while let Some(message) = stream.next().await {
         let message = message?;
+        let header = message.header();
+        let sender = header.sender().map(|sender| sender.as_str().to_string());
+        if sender.as_deref() != owner.as_ref().map(|owner| owner.as_str()) {
+            // The owner may have changed (compositor restart); re-resolve once
+            // before rejecting, so a fresh owner is not locked out.
+            owner = compositor_owner(&conn).await;
+            if sender.as_deref() != owner.as_ref().map(|owner| owner.as_str()) {
+                tracing::warn!(
+                    ?sender,
+                    "ignoring SessionLockChanged from a non-compositor sender"
+                );
+                continue;
+            }
+        }
         if let Ok((_seq, locked)) = message.body().deserialize::<(u64, bool)>() {
             on_change(locked);
         }
     }
     Ok(())
+}
+
+/// The unique name currently owning `org.icedtea.Compositor`, or `None` when
+/// the name is unowned or the bus cannot be queried.
+async fn compositor_owner(conn: &zbus::Connection) -> Option<zbus::names::OwnedUniqueName> {
+    let dbus = zbus::fdo::DBusProxy::new(conn).await.ok()?;
+    let name = zbus::names::BusName::try_from(COMPOSITOR_BUS_NAME).ok()?;
+    dbus.get_name_owner(name).await.ok()
 }
 
 /// One recorded interaction with the [`WmClient`] seam.
