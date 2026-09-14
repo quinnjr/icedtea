@@ -9,9 +9,7 @@ use crate::anim::{Clock, ManualClock};
 use crate::css::cascade::CompiledSheet;
 use crate::css::computed::ResolveEnv;
 use crate::css::node::Node;
-use crate::dnd::{
-    DragOutcome, DragPayload, DragSession, DragTransition, SeatDragRequest, SeatDragResult,
-};
+use crate::dnd::{DragOutcome, DragPayload, DragSession, DragTransition, SeatDragRequest};
 use crate::icons::IconTheme;
 use crate::layout::{Container, LayoutError, LayoutTree, Measure};
 use crate::paint::{ImageCache, PaintCx};
@@ -662,9 +660,6 @@ struct ActiveDrag {
     source: Node,
     payload: DragPayload,
     target: Option<Node>,
-    /// The seat accepted the offer: the compositor now owns target routing,
-    /// so the toolkit stops its own hit-testing for this drag (§7).
-    offloaded: bool,
 }
 
 /// One open popup surface's own retained tree.
@@ -1958,21 +1953,25 @@ fn route_surface<Msg: Clone + 'static>(
                 match drag.session.motion(point) {
                     DragTransition::BeganDragging => {
                         pending.push((drag.source.clone(), Event::DragStart));
-                        // §7: offer the drag to the compositor seat. On
-                        // `Accepted` the compositor owns target routing and
-                        // the toolkit stops its own hit-testing below; a
-                        // `Refused`/absent seat keeps the drag internal.
+                        // §7: offer the drag to the compositor seat. The
+                        // compositor's destination half (enter/motion/drop
+                        // back into this client) is not wired yet, so an
+                        // `Accepted` offer must NOT suppress the toolkit's
+                        // own in-surface hit-testing below -- doing so left
+                        // every drop dead until the external path exists.
+                        // The offer is issued unconditionally when a seat is
+                        // present; the result is recorded only insofar as a
+                        // future external handler may use it to avoid
+                        // duplicate delivery.
                         if let Some(seat) = rt.seat.as_mut() {
                             let serial = drag.session.serial().unwrap_or(0);
                             let request = SeatDragRequest::new(serial, drag.payload.clone());
-                            if seat.offer_drag(&request) == SeatDragResult::Accepted {
-                                drag.offloaded = true;
-                            }
+                            let _ = seat.offer_drag(&request);
                         }
                     }
                     DragTransition::None | DragTransition::StillArmed | DragTransition::Moved => {}
                 }
-                if drag.session.is_dragging() && !drag.offloaded {
+                if drag.session.is_dragging() {
                     // Bypass `aim`'s grab override on purpose: while buttons
                     // are held the grab pins every motion to the press node
                     // and a target under the cursor would never highlight.
@@ -2046,7 +2045,6 @@ fn route_surface<Msg: Clone + 'static>(
                             source: node,
                             payload,
                             target: None,
-                            offloaded: false,
                         });
                     }
                 } else {

@@ -181,6 +181,29 @@ pub(crate) struct ClipboardShared {
     drag_payload: Option<crate::dnd::DragPayload>,
 }
 
+impl ClipboardShared {
+    /// The exact bytes a drag `wl_data_source.send` for `mime` must serve, or
+    /// `None` when the flavor was not offered (the peer gets an empty pipe).
+    #[must_use]
+    fn drag_send_bytes(&self, mime: &str) -> Option<Vec<u8>> {
+        self.drag_payload
+            .as_ref()
+            .and_then(|payload| payload.data_for(&[mime]))
+            .map(|(_, data)| data.to_vec())
+    }
+
+    /// Drop the drag source and payload once the compositor reports the drag
+    /// spent (`Cancelled`/`DndFinished`), but only when `is_drag_source`
+    /// identifies the event's object as the current drag source -- the same
+    /// `wl_data_source` type also serves the clipboard.
+    fn clear_drag_if(&mut self, is_drag_source: bool) {
+        if is_drag_source {
+            self.drag_source = None;
+            self.drag_payload = None;
+        }
+    }
+}
+
 /// `wl_data_device` + `zwp_primary_selection_device_v1`, bound the moment the
 /// compositor advertised both manager globals and `Window::open`'s roundtrips
 /// saw a `wl_seat`.
@@ -198,8 +221,10 @@ pub struct Clipboard {
 
 /// Where a [`Clipboard`]'s text actually lives.
 enum Transport {
-    /// A real connection: sources, offers and pipes.
-    Wayland(Wayland),
+    /// A real connection: sources, offers and pipes. Shared behind `Rc` so a
+    /// [`ClientSeat`] can borrow the same transport instead of cloning each
+    /// protocol object per drag.
+    Wayland(Rc<Wayland>),
     /// No connection: two in-process slots.
     Offscreen(Offscreen),
 }
@@ -252,7 +277,7 @@ impl Clipboard {
             .as_ref()
             .map(|manager| manager.get_device(seat, &qh, ()));
         Self {
-            transport: Transport::Wayland(Wayland {
+            transport: Transport::Wayland(Rc::new(Wayland {
                 conn,
                 qh,
                 manager,
@@ -260,7 +285,7 @@ impl Clipboard {
                 primary_manager,
                 primary_device,
                 shared,
-            }),
+            })),
         }
     }
 
@@ -383,12 +408,8 @@ impl Clipboard {
             return None;
         };
         Some(Box::new(ClientSeat {
-            conn: wl.conn.clone(),
-            qh: wl.qh.clone(),
-            manager: wl.manager.clone(),
-            device: wl.device.clone(),
+            transport: Rc::clone(wl),
             surface,
-            shared: Rc::clone(&wl.shared),
         }))
     }
 
@@ -420,12 +441,10 @@ impl Clipboard {
 /// this client's surfaces is not routed to toolkit targets yet (see the M6
 /// spec §7's remaining-gap note).
 struct ClientSeat {
-    conn: Connection,
-    qh: QueueHandle<WindowState>,
-    manager: wl_data_device_manager::WlDataDeviceManager,
-    device: wl_data_device::WlDataDevice,
+    /// The clipboard's shared transport: the protocol objects live here once,
+    /// not copied into every seat.
+    transport: Rc<Wayland>,
     surface: wl_surface::WlSurface,
-    shared: Rc<RefCell<ClipboardShared>>,
 }
 
 impl crate::dnd::DragSeat for ClientSeat {
@@ -434,23 +453,29 @@ impl crate::dnd::DragSeat for ClientSeat {
         // wlroots validates `serial` against the grant table it recorded for
         // this client (M4.2 decision 3); a zero serial is never one, and an
         // empty offer has nothing to negotiate. Refuse rather than issue a
-        // request the compositor will drop.
-        if request.serial == 0 || request.mimes.is_empty() {
+        // request the compositor will drop. The grant table itself lives in
+        // `WindowState`, which this seam cannot see, so a nonzero serial is
+        // issued on the compositor's behalf and may still be rejected there.
+        if !request.is_offerable() {
             return SeatDragResult::Refused;
         }
-        let source = self.manager.create_data_source(&self.qh, ());
-        for mime in &request.mimes {
-            source.offer(mime.clone());
+        let source = self
+            .transport
+            .manager
+            .create_data_source(&self.transport.qh, ());
+        for mime in request.mimes() {
+            source.offer(mime.to_owned());
         }
         source.set_actions(wl_data_device_manager::DndAction::Copy);
         {
-            let mut shared = self.shared.borrow_mut();
+            let mut shared = self.transport.shared.borrow_mut();
             shared.drag_source = Some(source.clone());
             shared.drag_payload = Some(request.payload.clone());
         }
-        self.device
+        self.transport
+            .device
             .start_drag(Some(&source), &self.surface, None, request.serial);
-        if let Err(err) = self.conn.flush() {
+        if let Err(err) = self.transport.conn.flush() {
             tracing::warn!(%err, "flush after start_drag failed; the connection may be dead");
         }
         SeatDragResult::Accepted
@@ -523,11 +548,7 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WindowState {
                     if shared.source.as_ref() == Some(source) && mime_type == TEXT_MIME {
                         Some(shared.payload.clone().into_bytes())
                     } else if shared.drag_source.as_ref() == Some(source) {
-                        shared
-                            .drag_payload
-                            .as_ref()
-                            .and_then(|payload| payload.data_for(&[mime_type.as_str()]))
-                            .map(|(_, data)| data.to_vec())
+                        shared.drag_send_bytes(mime_type.as_str())
                     } else {
                         None
                     }
@@ -540,10 +561,8 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WindowState {
             // `send` cannot serve a dead drag.
             wl_data_source::Event::Cancelled | wl_data_source::Event::DndFinished => {
                 let mut shared = shared.borrow_mut();
-                if shared.drag_source.as_ref() == Some(source) {
-                    shared.drag_source = None;
-                    shared.drag_payload = None;
-                }
+                let is_drag_source = shared.drag_source.as_ref() == Some(source);
+                shared.clear_drag_if(is_drag_source);
             }
             _ => {}
         }
@@ -646,7 +665,8 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{TEXT_MIME, read_offer_fd, write_offer_fd};
+    use super::{ClipboardShared, TEXT_MIME, read_offer_fd, write_offer_fd};
+    use crate::dnd::{DragPayload, TEXT_PLAIN};
     use std::io::Write;
     use std::time::Duration;
 
@@ -740,5 +760,35 @@ mod tests {
             "read {} bytes",
             text.len()
         );
+    }
+
+    #[test]
+    fn a_drag_send_serves_exactly_the_offered_flavor() {
+        let mut shared = ClipboardShared::default();
+        // No drag payload: nothing to serve.
+        assert_eq!(shared.drag_send_bytes(TEXT_PLAIN), None);
+        shared.drag_payload = Some(DragPayload::offer_text("chip-payload"));
+        // The offered flavor yields its exact bytes ...
+        assert_eq!(
+            shared.drag_send_bytes(TEXT_PLAIN),
+            Some(b"chip-payload".to_vec())
+        );
+        // ... and an unoffered one yields nothing (the peer gets an empty pipe).
+        assert_eq!(shared.drag_send_bytes("application/x-nothing"), None);
+    }
+
+    #[test]
+    fn a_spent_drag_source_clears_only_for_the_drag_source() {
+        let mut shared = ClipboardShared {
+            drag_payload: Some(DragPayload::offer_text("x")),
+            ..Default::default()
+        };
+        // A clipboard-source event must not clear the live drag.
+        shared.clear_drag_if(false);
+        assert!(shared.drag_payload.is_some());
+        // The drag source's own `Cancelled`/`DndFinished` clears both slots.
+        shared.clear_drag_if(true);
+        assert!(shared.drag_source.is_none());
+        assert!(shared.drag_payload.is_none());
     }
 }

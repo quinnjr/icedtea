@@ -477,7 +477,7 @@ fn a_refusing_seat_sees_the_request_and_leaves_the_drag_internal() {
     // The arming press serial (the second scripted press) and the offered
     // payload, which the real seat validates against M4.2's grant table.
     assert_eq!(requests[0].serial, 2);
-    assert_eq!(requests[0].mimes, vec!["text/plain".to_owned()]);
+    assert_eq!(requests[0].mimes(), vec!["text/plain"]);
     assert_eq!(
         requests[0].payload.data_for(&["text/plain"]),
         Some(("text/plain", b"chip-payload".as_slice()))
@@ -485,7 +485,7 @@ fn a_refusing_seat_sees_the_request_and_leaves_the_drag_internal() {
 }
 
 #[test]
-fn an_accepting_seat_offloads_the_drag_so_the_toolkit_stops_targeting() {
+fn an_accepting_seat_still_delivers_an_in_surface_drop() {
     let (chip, target) = geometry();
     let log: Rc<RefCell<Vec<String>>> = Rc::default();
     let (seat, seat_log) = RecordingSeat::new(SeatDragResult::Accepted);
@@ -505,10 +505,23 @@ fn an_accepting_seat_offloads_the_drag_so_the_toolkit_stops_targeting() {
         )
         .expect("the offscreen loop runs");
 
-    // Once the compositor owns the drag, the toolkit's own hit-testing goes
-    // quiet: no `DragEnter`/`DragMotion`/`Drop` for the in-surface target.
-    assert_eq!(log.borrow().as_slice(), &["started", "ended:false"]);
-    assert_eq!(seat_log.borrow().len(), 1);
+    // The `wl_data_device` destination half (enter/motion/drop back into
+    // this client) is not wired, so an accepted seat offer must NOT suppress
+    // the toolkit's own hit-testing: the in-surface target is still reached
+    // and the `Drop` still fires. (`Accepted` means "request issued", not
+    // "a destination will be routed to".)
+    assert_eq!(
+        log.borrow().as_slice(),
+        &[
+            "started",
+            "entered",
+            "moved",
+            "dropped:chip-payload",
+            "ended:true"
+        ],
+        "an accepting seat must not kill an in-surface drop"
+    );
+    assert_eq!(seat_log.borrow().len(), 1, "the offer is still issued");
 }
 
 #[test]
