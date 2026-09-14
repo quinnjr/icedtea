@@ -270,6 +270,94 @@ fn pin_and_recency_survive_close_and_reopen() {
     node_by_id(&probe, "pinned_music");
 }
 
+/// Tile drag-reorder round-trips: a reorder in session 1 reaches
+/// `LauncherConfig.tile_groups` on close, and session 2 (a fresh model seeded
+/// from disk) renders the persisted order.
+#[test]
+fn tile_reorder_round_trips_through_save_and_reopen() {
+    use icedtea_shell::launcher_view::persist_launcher_config;
+
+    let dir = app_dir();
+    let db_dir = TempDir::new("launcher-reorder");
+    let db_path = db_dir.path().join("cfg.redb");
+
+    // Session 1: reorder, then close to write the stores back.
+    {
+        let wm = Rc::new(MockWm {
+            spawns: RefCell::new(Vec::new()),
+            succeed: Cell::new(true),
+        });
+        let mut model = LauncherModel::new(wm);
+        model.dirs = vec![dir.path().to_path_buf()];
+        model.seed(&icedtea_config::LauncherConfig {
+            pinned: Vec::new(),
+            tile_groups: vec![icedtea_config::TileGroup {
+                name: "Web".to_string(),
+                ids: vec![
+                    "firefox".to_string(),
+                    "firetools".to_string(),
+                    "music".to_string(),
+                ],
+                size: 1,
+            }],
+            recency: std::collections::HashMap::new(),
+        });
+        model.open();
+        let path = db_path.clone();
+        model.on_persist = Some(Rc::new(move |cfg| {
+            persist_launcher_config(&path, &cfg).expect("test write-back")
+        }));
+        let _ = launcher_view::update(
+            &mut model,
+            LauncherMsg::ReorderTile {
+                source: "music".into(),
+                target: "firefox".into(),
+            },
+        );
+        let _ = launcher_view::update(&mut model, LauncherMsg::Close);
+    }
+
+    let stored = icedtea_config::load_or_default(&db_path).launcher;
+    let web = stored
+        .tile_groups
+        .iter()
+        .find(|g| g.name == "Web")
+        .expect("the Web group persisted");
+    assert_eq!(
+        web.ids,
+        vec![
+            "music".to_string(),
+            "firefox".to_string(),
+            "firetools".to_string()
+        ],
+        "the reorder persisted: {:?}",
+        web.ids
+    );
+
+    // Session 2: a fresh model seeded from disk renders the new order.
+    let wm = Rc::new(MockWm {
+        spawns: RefCell::new(Vec::new()),
+        succeed: Cell::new(true),
+    });
+    let mut reopened = LauncherModel::new(wm);
+    reopened.dirs = vec![dir.path().to_path_buf()];
+    reopened.seed(&stored);
+    reopened.open();
+    let probe = probe(Theme::Dark, reopened);
+    let order: Vec<String> = probe
+        .root()
+        .descendants()
+        .filter_map(|n| n.id())
+        .map(|id| id.as_str().to_string())
+        .filter(|id| id.starts_with("tile_") && !id.starts_with("tile_group_"))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["tile_music", "tile_firefox", "tile_firetools"],
+        "the view re-renders in the persisted order"
+    );
+}
+
 /// Full launch path (Task 6 Step 4): open → type a real query → launch.
 /// The typed keys travel the live route (compositor `KeyboardEnter`, then
 /// key events into the focused search box); the launch folds through the

@@ -19,8 +19,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 
-use icedtea_ui::view::builders::{SearchEntryExt, box_, button, label, search_entry};
-use icedtea_ui::view::{Cmd, View};
+use icedtea_ui::view::builders::{SearchEntryExt, box_, button, label, search_entry, widget};
+use icedtea_ui::view::{Cmd, Kind, PropName, View};
 use icedtea_ui::widgets::Orientation;
 use icedtea_ui::window::keyboard::KeyEvent;
 use icedtea_ui::window::pointer::{BTN_LEFT, BTN_RIGHT};
@@ -29,9 +29,12 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 use xkbcommon::xkb;
 
 use crate::compositor_client::CompositorCommands;
+use crate::launcher::provider::{SETTINGS_APP_ID, SETTINGS_PAGES};
 use crate::launcher::{
-    DesktopEntry, DesktopIndex, Matcher, PinStore, RecencyStore, TileStore, default_dirs,
-    desktop_paths, power_argv, power_error_message, run_power_command as core_run_power_command,
+    AppsProvider, DesktopEntry, DesktopIndex, FilesProvider, Matcher, PinStore, ProviderKind,
+    RecencyStore, SearchProvider, SearchResult, SettingsProvider, TileStore, default_dirs,
+    desktop_paths, power_argv, power_error_message, rank_results,
+    run_power_command as core_run_power_command,
 };
 
 /// The launcher's initial surface size: a menu, not a bar — fixed, modest,
@@ -104,6 +107,23 @@ pub enum LauncherMsg {
     ActivateSelected,
     /// Left-click (or pointer release with `BTN_LEFT`) on an app row.
     ActivateApp(String),
+    /// Activate a non-app result: a settings page (name) or a file (path).
+    /// The app rows keep [`LauncherMsg::ActivateApp`].
+    ActivateResult {
+        /// Which provider the result came from.
+        kind: ProviderKind,
+        /// The result's launch key.
+        id: String,
+    },
+    /// A tile dropped onto another tile: move `source` to `target`'s slot
+    /// (within the group, or across groups). Fired by the toolkit DnD
+    /// `on_drop`; the payload text is the source app id.
+    ReorderTile {
+        /// The dragged app id (the drag payload).
+        source: String,
+        /// The app id the tile was dropped on.
+        target: String,
+    },
     /// Right-click on an app row.
     TogglePin(String),
     /// Any other pointer button on an app row: inert by design.
@@ -128,6 +148,9 @@ const _: fn() = || {
     assert_send::<LauncherMsg>();
 };
 
+/// Opens one file result; injected so tests never exec `xdg-open`.
+pub type FileOpener = Rc<dyn Fn(&str) -> std::io::Result<()>>;
+
 /// The launcher's model: the pure core's stores plus the view state.
 ///
 /// `wm` is `Rc`, not `Arc`: like the panel's, it never crosses a thread —
@@ -148,6 +171,10 @@ pub struct LauncherModel {
     /// XDG dirs rescanned on [`LauncherModel::open`]. `pub` for the
     /// supervisor (production) and hermetic tmpdirs (tests).
     pub dirs: Vec<PathBuf>,
+    /// Bounded file index behind the files search provider. `None` (unit
+    /// tests) means no file results; `run_surface` fills it from the XDG
+    /// user dirs + recent list (`FilesProvider::from_env`).
+    pub files: Option<FilesProvider>,
     scanned: (usize, Option<SystemTime>),
     wm: Rc<dyn CompositorCommands>,
     /// Fires after a close fold (successful launch, Escape): the supervisor
@@ -156,6 +183,9 @@ pub struct LauncherModel {
     /// How a power action is invoked. Defaults to [`run_power_command`];
     /// tests override it so no test ever execs `icedtea-session`.
     power_run: fn(&str, &[&str]) -> std::io::Result<()>,
+    /// How a file result is opened. Defaults to the local `xdg-open` helper
+    /// (the power row's pattern); tests inject a recorder so no test execs.
+    file_open: FileOpener,
     /// Write-back for the pin/tile/recency stores. Called with
     /// [`LauncherModel::snapshot`] on every close (successful launch,
     /// power action, Escape); `run_surface` points it at the config DB,
@@ -248,6 +278,23 @@ fn run_power_command(program: &str, args: &[&str]) -> std::io::Result<()> {
     }
 }
 
+/// Open one file with the desktop's registered handler, via the local
+/// `xdg-open` dispatcher — the same local-helper pattern the power row uses
+/// for `icedtea-session`. The compositor `SpawnApp` path takes an app id and
+/// no argv, so it cannot carry a file path; this deliberately does **not**
+/// extend that D-Bus interface with argv. The child is reaped on a detached
+/// thread so a long-lived handler never zombies.
+fn xdg_open(path: &str) -> std::io::Result<()> {
+    let child = std::process::Command::new("xdg-open").arg(path).spawn()?;
+    let _ = std::thread::Builder::new()
+        .name("xdg-open-reaper".into())
+        .spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+    Ok(())
+}
+
 /// Which visual pane a row belongs to: the pinned rail, the All-apps list,
 /// or the tiles pane. One index space orders them Pinned → All → Tiled,
 /// which is what the Left/Right pane jumps navigate.
@@ -272,10 +319,12 @@ impl LauncherModel {
             status: None,
             logout_armed: false,
             dirs: default_dirs(),
+            files: None,
             scanned: (0, None),
             wm,
             on_close: None,
             power_run: run_power_command,
+            file_open: Rc::new(xdg_open),
             on_persist: None,
         }
     }
@@ -325,51 +374,73 @@ impl LauncherModel {
         self.open = true;
     }
 
-    /// The current filtered list: the matcher over name + keywords + exec
-    /// basename, recency as tiebreak. Empty query returns every app in
-    /// index order.
+    /// The current filtered app list: the matcher over name + keywords +
+    /// exec basename, adaptive-recency as tiebreak. Empty query returns
+    /// every app in index order. Feeds the pinned rail and the tiles pane,
+    /// which stay apps-only.
     fn filtered(&self) -> Vec<&DesktopEntry> {
         Matcher::new(&self.index)
             .with_recency(&self.recency)
             .rank(&self.query)
     }
 
-    /// Which pane an entry renders in. Pinned wins over tiled — a pinned
-    /// tile still reads as pinned.
-    fn section_of(&self, entry: &DesktopEntry) -> Section {
-        if self.pins.is_pinned(&entry.id) {
-            Section::Pinned
-        } else if self
-            .tiles
-            .groups()
-            .iter()
-            .any(|group| group.ids.iter().any(|id| id == &entry.id))
-        {
-            Section::Tiled
-        } else {
-            Section::All
+    /// The ranked result list the All pane renders and the keyboard selection
+    /// indexes: every app in index order on an empty query, otherwise apps +
+    /// settings + files merged by [`rank_results`]. The app subset keeps
+    /// [`Matcher`]'s order, so the empty-query view is unchanged from the
+    /// apps-only launcher.
+    fn results(&self) -> Vec<SearchResult> {
+        if self.query.trim().is_empty() {
+            return self
+                .index
+                .apps()
+                .iter()
+                .map(|app| SearchResult {
+                    kind: ProviderKind::App,
+                    id: app.id.clone(),
+                    title: app.name.clone(),
+                    subtitle: Some(app.display_exec()),
+                    score: 0,
+                    weight: self.recency.adaptive_score(&app.id),
+                })
+                .collect();
         }
+        let mut results = AppsProvider {
+            index: &self.index,
+            recency: &self.recency,
+        }
+        .search(&self.query);
+        results.extend(SettingsProvider.search(&self.query));
+        if let Some(files) = &self.files {
+            results.extend(files.search(&self.query));
+        }
+        rank_results(results)
     }
 
     /// The keyboard's one index space, in visual order: the pinned rail's
-    /// rows, then every All-apps row, then the tiles pane's rows (group and
-    /// member order — the exact order [`tiles_pane`] renders). Entries can
-    /// render in several panes at once (a pinned tile appears three times),
-    /// so one filtered index may own several visual rows; each row carries
-    /// its pane and its filtered index.
-    fn visual_rows(&self, filtered: &[&DesktopEntry]) -> Vec<(Section, usize)> {
+    /// rows, then every All row, then the tiles pane's rows (group and member
+    /// order — the exact order [`tiles_pane`] renders). A result can render
+    /// in several panes at once (a pinned tile appears three times), so one
+    /// result index may own several visual rows; each row carries its pane
+    /// and its result index.
+    fn visual_rows(&self, results: &[SearchResult]) -> Vec<(Section, usize)> {
         let mut rows = Vec::new();
         rows.extend(
-            filtered
+            results
                 .iter()
                 .enumerate()
-                .filter(|(_, entry)| self.section_of(entry) == Section::Pinned)
+                .filter(|(_, result)| {
+                    result.kind == ProviderKind::App && self.pins.is_pinned(&result.id)
+                })
                 .map(|(i, _)| (Section::Pinned, i)),
         );
-        rows.extend((0..filtered.len()).map(|i| (Section::All, i)));
+        rows.extend((0..results.len()).map(|i| (Section::All, i)));
         for group in self.tiles.groups() {
             for id in &group.ids {
-                if let Some(i) = filtered.iter().position(|entry| entry.id == *id) {
+                if let Some(i) = results
+                    .iter()
+                    .position(|result| result.kind == ProviderKind::App && &result.id == id)
+                {
                     rows.push((Section::Tiled, i));
                 }
             }
@@ -377,11 +448,22 @@ impl LauncherModel {
         rows
     }
 
+    /// Activate one result by kind: an app launches, a settings page asks the
+    /// compositor for the settings app, a file opens through the injected
+    /// opener (`xdg-open` in production).
+    fn activate(&mut self, kind: ProviderKind, id: &str) -> Cmd<LauncherMsg> {
+        match kind {
+            ProviderKind::App => self.launch(id),
+            ProviderKind::Settings => self.spawn_settings(id),
+            ProviderKind::File => self.open_file(id),
+        }
+    }
+
     /// Launch one app id: `spawn_app` on success records recency and closes;
     /// on failure (or an unknown id) a status line explains, and the menu
     /// stays open.
     fn launch(&mut self, id: &str) -> Cmd<LauncherMsg> {
-        let Some(entry) = self.index.find(id) else {
+        let Some(name) = self.index.find(id).map(|entry| entry.name.clone()) else {
             self.status = Some(format!("Unknown application: {id}"));
             return Cmd::None;
         };
@@ -389,8 +471,47 @@ impl LauncherModel {
             self.recency.record(id);
             self.close()
         } else {
-            self.status = Some(format!("Could not launch {}", entry.name));
+            self.status = Some(format!("Could not launch {name}"));
             Cmd::None
+        }
+    }
+
+    /// Spawn the settings app through the same compositor path as an app.
+    /// `page` names the settings page for the failure line only: the
+    /// compositor `SpawnApp` call takes an app id and no argv, so the page
+    /// cannot cross it (no raw argv over D-Bus).
+    fn spawn_settings(&mut self, page: &str) -> Cmd<LauncherMsg> {
+        let label = SETTINGS_PAGES
+            .iter()
+            .find(|(name, _)| *name == page)
+            .map(|(_, title)| format!("Settings · {title}"))
+            .unwrap_or_else(|| "Settings".to_string());
+        self.spawn_app_id(SETTINGS_APP_ID, &label, false)
+    }
+
+    /// The one app-spawn fold: success closes (optionally recording
+    /// recency), failure surfaces a status line and keeps the menu open.
+    fn spawn_app_id(&mut self, id: &str, label: &str, record: bool) -> Cmd<LauncherMsg> {
+        if self.wm.spawn_app(id) {
+            if record {
+                self.recency.record(id);
+            }
+            self.close()
+        } else {
+            self.status = Some(format!("Could not launch {label}"));
+            Cmd::None
+        }
+    }
+
+    /// Open one file path through the injected opener; success closes, an io
+    /// failure surfaces the cause as a status line.
+    fn open_file(&mut self, path: &str) -> Cmd<LauncherMsg> {
+        match (self.file_open)(path) {
+            Ok(()) => self.close(),
+            Err(err) => {
+                self.status = Some(format!("Could not open {path}: {err}"));
+                Cmd::None
+            }
         }
     }
 
@@ -434,17 +555,19 @@ impl LauncherModel {
 
     /// Launch the selection, else the top hit; nothing when the list is
     /// empty. A stale selection (list shrank under it) falls back to the
-    /// top hit rather than launching nothing.
+    /// top hit rather than launching nothing. Works over the merged result
+    /// list, so Enter on a settings or file result opens that too.
     fn launch_selected(&mut self) -> Cmd<LauncherMsg> {
-        let ids: Vec<String> = self.filtered().iter().map(|e| e.id.clone()).collect();
-        let Some(id) = self
+        let results = self.results();
+        let Some(result) = self
             .selected
-            .and_then(|i| ids.get(i))
-            .or_else(|| ids.first())
+            .and_then(|i| results.get(i))
+            .or_else(|| results.first())
         else {
             return Cmd::None;
         };
-        self.launch(id)
+        let (kind, id) = (result.kind, result.id.clone());
+        self.activate(kind, &id)
     }
 }
 
@@ -475,6 +598,11 @@ pub fn update(m: &mut LauncherModel, msg: LauncherMsg) -> Cmd<LauncherMsg> {
             move_pane(m, matches!(msg, LauncherMsg::MoveRight))
         }
         LauncherMsg::ActivateApp(id) => m.launch(&id),
+        LauncherMsg::ActivateResult { kind, id } => m.activate(kind, &id),
+        LauncherMsg::ReorderTile { source, target } => {
+            m.tiles.reorder(&source, &target);
+            Cmd::None
+        }
         LauncherMsg::TogglePin(id) => {
             if m.pins.is_pinned(&id) {
                 m.pins.unpin(&id);
@@ -545,13 +673,13 @@ fn handle_power(m: &mut LauncherModel, action: PowerAction) -> Cmd<LauncherMsg> 
 /// Left/Right across panes (extracted from [`update`]): jump between the
 /// section starts of [`LauncherModel::visual_rows`] — pinned rail, then
 /// All-apps, then tiles — so the tiles pane is reachable even when every
-/// tile is also pinned. The selection stays a filtered index (what
-/// Up/Down, launch and highlight all address); a duplicated entry resolves
-/// to its first visual row, and every occurrence shares one id, so all of
-/// them light together.
+/// tile is also pinned. The selection stays a result index (what Up/Down,
+/// launch and highlight all address); a duplicated entry resolves to its
+/// first visual row, and every occurrence shares one id, so all of them
+/// light together.
 fn move_pane(m: &mut LauncherModel, right: bool) -> Cmd<LauncherMsg> {
-    let entries = m.filtered();
-    let rows = m.visual_rows(&entries);
+    let results = m.results();
+    let rows = m.visual_rows(&results);
     if rows.is_empty() {
         m.selected = None;
         return Cmd::None;
@@ -579,10 +707,10 @@ fn move_pane(m: &mut LauncherModel, right: bool) -> Cmd<LauncherMsg> {
     Cmd::None
 }
 
-/// Up/Down within the filtered list (extracted from [`update`]: pure
+/// Up/Down within the result list (extracted from [`update`]: pure
 /// selection fold, no behavior of its own).
 fn move_vertical(m: &mut LauncherModel, up: bool) -> Cmd<LauncherMsg> {
-    let len = m.filtered().len();
+    let len = m.results().len();
     m.selected = match (m.selected, len) {
         (_, 0) => None,
         (None, _) => {
@@ -646,9 +774,9 @@ fn fingerprint(dirs: &[PathBuf]) -> (usize, Option<SystemTime>) {
 /// machinery); the keyboard selection carries `active`, the same class the
 /// bar uses for the same "this is the one" meaning.
 pub fn view(m: &LauncherModel) -> View<LauncherMsg> {
-    let filtered = m.filtered();
-    let top = filtered.first().map(|e| e.id.clone());
-    let mut children = vec![search_box(m), body(m, &filtered, top.as_deref())];
+    let results = m.results();
+    let top = results.first().map(|result| result.id.clone());
+    let mut children = vec![search_box(m), body(m, &results, top.as_deref())];
     if let Some(status) = &m.status {
         children.push(label(status).id("launcher_status"));
     }
@@ -671,38 +799,30 @@ fn search_box(m: &LauncherModel) -> View<LauncherMsg> {
         .on_activate(LauncherMsg::SearchActivated)
 }
 
-/// The menu body: left rail (pinned, then All-apps) beside the tiles pane.
-fn body(m: &LauncherModel, filtered: &[&DesktopEntry], top: Option<&str>) -> View<LauncherMsg> {
-    let ids: Vec<&str> = filtered.iter().map(|e| e.id.as_str()).collect();
+/// The menu body: left rail (pinned, then All results) beside the tiles pane.
+fn body(m: &LauncherModel, results: &[SearchResult], top: Option<&str>) -> View<LauncherMsg> {
+    let ids: Vec<&str> = results.iter().map(|result| result.id.as_str()).collect();
     box_(
         Orientation::Horizontal,
-        [left_rail(m, filtered, top), tiles_pane(m, filtered, &ids)],
+        [left_rail(m, results, top), tiles_pane(m, results, &ids)],
     )
     .id("launcher_body")
 }
 
-/// Pinned rail over the scrollable alphabetical All-apps list.
-fn left_rail(
-    m: &LauncherModel,
-    filtered: &[&DesktopEntry],
-    top: Option<&str>,
-) -> View<LauncherMsg> {
-    let pinned: Vec<&DesktopEntry> = filtered
+/// Pinned rail over the scrollable All-results list.
+fn left_rail(m: &LauncherModel, results: &[SearchResult], top: Option<&str>) -> View<LauncherMsg> {
+    let pinned_rows: Vec<View<LauncherMsg>> = results
         .iter()
-        .filter(|e| m.pins.is_pinned(&e.id))
-        .copied()
+        .filter(|result| result.kind == ProviderKind::App && m.pins.is_pinned(&result.id))
+        .map(|result| result_row(m, result, RowKind::Pinned, results, top))
         .collect();
-    let pinned_rows: Vec<View<LauncherMsg>> = pinned
+    let all_rows: Vec<View<LauncherMsg>> = results
         .iter()
-        .map(|e| app_row(e, RowKind::Pinned, m.selected_for(&e.id, filtered), top))
+        .map(|result| result_row(m, result, RowKind::All, results, top))
         .collect();
-    let all_rows: Vec<View<LauncherMsg>> = filtered
-        .iter()
-        .map(|e| app_row(e, RowKind::All, m.selected_for(&e.id, filtered), top))
-        .collect();
-    // Letter jump lives on the All-apps list: with an empty query a
-    // single-letter key selects the first app starting with it; while
-    // filtering, letters belong to the search box instead.
+    // Letter jump lives on the All list: with an empty query a single-letter
+    // key selects the first app starting with it; while filtering, letters
+    // belong to the search box instead.
     let query_empty = m.query.trim().is_empty();
     let all = box_(Orientation::Vertical, all_rows)
         .id("launcher_all")
@@ -730,10 +850,11 @@ fn left_rail(
 /// The tiles pane: one group container per tile group, holding the member
 /// rows that match the filter. Each tile's width follows its group's
 /// [`TileGroup`](icedtea_config::TileGroup) `size` in [`TILE_PX`] units.
+/// Tiles are drag sources and drop targets, so a drop reorders them.
 fn tiles_pane(
     m: &LauncherModel,
-    filtered: &[&DesktopEntry],
-    filtered_ids: &[&str],
+    results: &[SearchResult],
+    result_ids: &[&str],
 ) -> View<LauncherMsg> {
     let groups: Vec<View<LauncherMsg>> = m
         .tiles
@@ -743,9 +864,9 @@ fn tiles_pane(
             let members: Vec<View<LauncherMsg>> = group
                 .ids
                 .iter()
-                .filter(|id| filtered_ids.contains(&id.as_str()))
+                .filter(|id| result_ids.contains(&id.as_str()))
                 .filter_map(|id| m.index.find(id))
-                .map(|e| tile_row(e, group.size, m.selected_for(&e.id, filtered)))
+                .map(|entry| tile_row(entry, group.size, m.selected_for(&entry.id, results)))
                 .collect();
             if members.is_empty() {
                 return None;
@@ -823,9 +944,60 @@ fn app_row(
     row
 }
 
-/// One tile: a [`row_button`] with the `tile_` prefix and the group-size
-/// width, plus the keyboard-selection class so a pane jump into the tiles
-/// pane lights the tile, not just its All-apps twin.
+/// Render one result in a pane: an app result uses its row button; a
+/// settings or file result uses a plain activation button.
+fn result_row(
+    m: &LauncherModel,
+    result: &SearchResult,
+    kind: RowKind,
+    results: &[SearchResult],
+    top: Option<&str>,
+) -> View<LauncherMsg> {
+    let selected = m.selected_for(&result.id, results);
+    match result.kind {
+        ProviderKind::App => match m.index.find(&result.id) {
+            Some(entry) => app_row(entry, kind, selected, top),
+            None => label(&result.title),
+        },
+        ProviderKind::Settings => result_button("settings", result, selected, top),
+        ProviderKind::File => result_button("file", result, selected, top),
+    }
+}
+
+/// One non-app result row: a plain button that activates its result. The
+/// node id is hashed (a file id is a path) and prefixed per provider so the
+/// `app_`/`pinned_` probes never collide with it.
+fn result_button(
+    prefix: &str,
+    result: &SearchResult,
+    selected: bool,
+    top: Option<&str>,
+) -> View<LauncherMsg> {
+    let id = result.id.clone();
+    let mut row = button(&result.title)
+        .key(stable_key(&format!("{prefix}:{}", result.id)))
+        .id(&format!("{prefix}_{}", stable_key(&result.id)))
+        .on_click(LauncherMsg::ActivateResult {
+            kind: result.kind,
+            id,
+        });
+    if top == Some(result.id.as_str()) {
+        row = row.class("suggested-action");
+    }
+    if selected {
+        row = row.class("active");
+    }
+    row
+}
+
+/// One tile: a `GenericC` row (M6-D2's drag source/target kind) carrying the
+/// group-size width, the app id as its drag payload, a `text/plain` drop
+/// target, and the keyboard-selection class so a pane jump into the tiles
+/// pane lights the tile, not just its All twin.
+///
+/// Left-click launches and right-click pins through the same handlers an app
+/// row uses; M6's drag latch suppresses the click on a drop, so a reorder
+/// never also launches.
 fn tile_row(entry: &DesktopEntry, size: u32, selected: bool) -> View<LauncherMsg> {
     // Clamped width math: `size` is config-controlled (hand-editable
     // redb), so a 0 span must still paint one unit and a huge span must
@@ -836,13 +1008,29 @@ fn tile_row(entry: &DesktopEntry, size: u32, selected: bool) -> View<LauncherMsg
         reason = "the span is capped at MAX_TILE_SPAN units, far below i32::MAX / TILE_PX"
     )]
     let width = size.clamp(1, MAX_TILE_SPAN) as i32 * TILE_PX;
-    let mut row = row_button(
-        "tile",
-        stable_key(&format!("tile:{}", entry.id)),
-        &entry.name,
-        &entry.id,
-        Some(width),
-    );
+    let source = entry.id.clone();
+    let target = entry.id.clone();
+    let launch = entry.id.clone();
+    let pin = entry.id.clone();
+    let mut row = widget::<LauncherMsg>(Kind::ListBoxRow)
+        .key(stable_key(&format!("tile:{}", entry.id)))
+        .id(&format!("tile_{}", entry.id))
+        .prop(PropName::Label, entry.name.as_str())
+        .width_request(width)
+        .drag_source(&source)
+        .drop_accept("text/plain")
+        .on_drop(move |payload: &str| LauncherMsg::ReorderTile {
+            source: payload.to_string(),
+            target: target.clone(),
+        })
+        .on_click(LauncherMsg::ActivateApp(launch))
+        .on_pointer_up_with_button(move |_, _, pressed| {
+            if pressed == BTN_RIGHT {
+                LauncherMsg::TogglePin(pin.clone())
+            } else {
+                LauncherMsg::Ignore
+            }
+        });
     if selected {
         row = row.class("active");
     }
@@ -913,11 +1101,11 @@ fn root_key(ev: &KeyEvent) -> Option<LauncherMsg> {
 }
 
 impl LauncherModel {
-    /// True when `id` is the keyboard-selected row of `filtered`.
-    fn selected_for(&self, id: &str, filtered: &[&DesktopEntry]) -> bool {
+    /// True when `id` is the keyboard-selected row of `results`.
+    fn selected_for(&self, id: &str, results: &[SearchResult]) -> bool {
         self.selected
-            .and_then(|i| filtered.get(i))
-            .is_some_and(|e| e.id == id)
+            .and_then(|i| results.get(i))
+            .is_some_and(|result| result.kind == ProviderKind::App && result.id == id)
     }
 }
 
@@ -1117,6 +1305,9 @@ fn run_surface(
     let mut model = LauncherModel::new(wm);
     let db_path = icedtea_config::default_db_path();
     model.seed(&icedtea_config::load_or_default(&db_path).launcher);
+    // The files provider is a runtime-only, bounded, read-only index of the
+    // XDG user dirs + recent list. Unit tests leave `files` at `None`.
+    model.files = Some(FilesProvider::from_env());
     model.on_close = Some(notify.clone());
     // Write-back for the next open: pin/unpin + recency mutations reach
     // the launcher table on every close. Failures warn and drop — a dead
@@ -1832,6 +2023,89 @@ mod tests {
             .props
             .int(PropName::WidthRequest, 0);
         assert_eq!(width, i64::from(TILE_PX), "a clamped tile is one unit wide");
+    }
+
+    #[test]
+    fn tiles_are_drag_sources_and_drop_targets() {
+        let (m, _) = seeded();
+        let v = view(&m);
+        let tile = by_id(&v, "tile_firefox").expect("tile");
+        assert_eq!(
+            tile.props.str(PropName::DragSource),
+            Some("firefox"),
+            "the tile offers its app id as the drag payload"
+        );
+        assert!(
+            tile.props.get(PropName::DropAccept).is_some(),
+            "the tile accepts drops"
+        );
+    }
+
+    #[test]
+    fn dropping_a_tile_reorders_the_tile_store() {
+        let (mut m, _) = seeded();
+        m.tiles
+            .ingest("Web", &["firefox".to_string(), "music".to_string()], 2);
+        let _ = update(
+            &mut m,
+            LauncherMsg::ReorderTile {
+                source: "music".into(),
+                target: "firefox".into(),
+            },
+        );
+        assert_eq!(
+            m.tiles.groups()[0].ids,
+            vec!["music".to_string(), "firefox".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_settings_result_spawns_the_settings_app() {
+        let (mut m, wm) = seeded();
+        m.open = true;
+        let _ = update(&mut m, LauncherMsg::SearchChanged("displays".into()));
+        let cmd = update(&mut m, LauncherMsg::ActivateSelected);
+        assert_eq!(
+            wm.spawns.borrow().as_slice(),
+            [crate::launcher::provider::SETTINGS_APP_ID.to_string()],
+            "a settings page opens the settings app"
+        );
+        assert!(!m.open, "the settings spawn dismisses the menu");
+        assert!(quits(&cmd));
+    }
+
+    #[test]
+    fn a_file_result_opens_through_the_injected_opener() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "icedtea-launcher-file-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("report.txt"), b"x").expect("fixture");
+
+        let (mut m, _) = seeded();
+        m.files = Some(FilesProvider::scan(std::slice::from_ref(&dir), 10));
+        m.open = true;
+        let opened: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = opened.clone();
+        m.file_open = Rc::new(move |path| {
+            sink.borrow_mut().push(path.to_string());
+            Ok(())
+        });
+        let _ = update(&mut m, LauncherMsg::SearchChanged("report".into()));
+        let cmd = update(&mut m, LauncherMsg::ActivateSelected);
+        assert!(
+            opened.borrow()[0].ends_with("report.txt"),
+            "the file path reaches the opener: {:?}",
+            opened.borrow()
+        );
+        assert!(!m.open, "opening a file dismisses the menu");
+        assert!(quits(&cmd));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
