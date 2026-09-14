@@ -15,12 +15,24 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use zbus::blocking::Connection;
 use zbus::interface;
 
 use crate::logind::Logind;
 use crate::wm_client::WmClient;
+
+/// How long `Lock()` waits for the compositor to confirm the session actually
+/// locked before replying with an error. `Session.Lock` only *sets*
+/// `LockedHint` and emits the signal that spawns the locker; without a
+/// confirmation a missing/denied `locker_command` would otherwise reply
+/// success while the screen stays unlocked (the CLI would exit 0). Generous
+/// enough for a healthy compositor to take the lock, short enough not to wedge
+/// the caller.
+const LOCK_CONFIRM_BUDGET: Duration = Duration::from_secs(2);
+/// How often [`SessionInterface::confirm_locked`] re-checks the compositor.
+const LOCK_CONFIRM_POLL: Duration = Duration::from_millis(50);
 
 /// The `org.icedtea.Session` bus name.
 pub const SESSION_BUS_NAME: &str = "org.icedtea.Session";
@@ -39,12 +51,36 @@ pub type SharedWm = Arc<dyn WmClient + Send + Sync>;
 pub struct SessionInterface {
     logind: SharedLogind,
     wm: SharedWm,
+    /// How long [`SessionInterface::lock`] waits for confirmation; a field so
+    /// tests can shorten it.
+    lock_confirm_budget: Duration,
 }
 
 impl SessionInterface {
     /// Build the interface from its two trait seams.
     pub fn new(logind: SharedLogind, wm: SharedWm) -> Self {
-        Self { logind, wm }
+        Self {
+            logind,
+            wm,
+            lock_confirm_budget: LOCK_CONFIRM_BUDGET,
+        }
+    }
+
+    /// Poll the compositor until it reports locked, or the confirmation budget
+    /// elapses. Used by [`Self::lock`] so a lock request that spawned nothing
+    /// (no/denied `locker_command`) is not reported as a success.
+    fn confirm_locked(&self) -> bool {
+        let deadline = Instant::now() + self.lock_confirm_budget;
+        loop {
+            if self.wm.is_locked() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            std::thread::sleep(LOCK_CONFIRM_POLL.min(deadline - now));
+        }
     }
 }
 
@@ -61,9 +97,26 @@ fn call_logind(operation: &str, result: io::Result<()>) -> zbus::fdo::Result<()>
 
 #[interface(name = "org.icedtea.Session")]
 impl SessionInterface {
-    /// `Session.Lock()` on the login1 proxy.
+    /// `Session.Lock()` on the login1 proxy, confirmed against the compositor.
+    ///
+    /// `Session.Lock` only sets logind's `LockedHint` and emits the signal that
+    /// drives the locker-spawn funnel; it does not by itself lock the screen.
+    /// A successful call is therefore not proof of a lock — a missing or
+    /// refused `locker_command` leaves the session unlocked. This replies `Ok`
+    /// only once the compositor confirms the lock within
+    /// [`LOCK_CONFIRM_BUDGET`]; otherwise it is an error reply (the CLI exits
+    /// non-zero) with an error-level log.
     fn lock(&self) -> zbus::fdo::Result<()> {
-        call_logind("lock", self.logind.lock())
+        call_logind("lock", self.logind.lock())?;
+        if self.confirm_locked() {
+            return Ok(());
+        }
+        tracing::error!(
+            "org.icedtea.Session.Lock: compositor did not confirm the lock; reporting failure"
+        );
+        Err(zbus::fdo::Error::Failed(
+            "lock failed: session did not lock".to_string(),
+        ))
     }
 
     /// `Manager.Suspend(false)`: `false` is logind's non-interactive flag (this
@@ -203,10 +256,35 @@ mod tests {
     }
 
     #[test]
-    fn lock_calls_logind_once() {
-        let (iface, logind, _wm) = service(false);
-        iface.lock().expect("recording logind succeeds");
+    fn lock_calls_logind_once_and_confirms_with_the_compositor() {
+        let (iface, logind, wm) = service(true);
+        iface
+            .lock()
+            .expect("recording logind succeeds and wm confirms");
         assert_eq!(logind.calls(), vec![LogindCall::Lock]);
+        assert_eq!(wm.calls(), vec![WmCall::IsLocked]);
+    }
+
+    /// A `Lock()` that never reaches a confirmed locked state — no locker was
+    /// spawned, or the spawn was refused — must be an error reply, so the
+    /// `lock` CLI exits non-zero instead of reporting a lock that never
+    /// happened.
+    #[test]
+    fn lock_is_an_error_reply_when_the_compositor_never_confirms() {
+        let (mut iface, logind, wm) = service(false);
+        iface.lock_confirm_budget = Duration::from_millis(50);
+        match iface.lock() {
+            Err(zbus::fdo::Error::Failed(message)) => {
+                assert!(message.contains("lock"), "names the operation: {message}");
+            }
+            other => panic!("expected fdo::Error::Failed, got {other:?}"),
+        }
+        assert_eq!(
+            logind.calls(),
+            vec![LogindCall::Lock],
+            "the session lock was still requested once"
+        );
+        assert!(wm.calls().contains(&WmCall::IsLocked));
     }
 
     #[test]

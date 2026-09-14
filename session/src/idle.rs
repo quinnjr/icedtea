@@ -106,15 +106,73 @@ impl Dispatch<idle_notification::ExtIdleNotificationV1, ()> for IdleClient {
 wayland_client::delegate_noop!(IdleClient: ignore idle_notifier::ExtIdleNotifierV1);
 wayland_client::delegate_noop!(IdleClient: ignore WlSeat);
 
+/// Why one [`run_session`] pass ended.
+enum SessionEnd {
+    /// The compositor connection dropped (or the initial roundtrip failed):
+    /// reconnect and re-arm.
+    Disconnected,
+    /// The compositor does not offer the idle protocol (or a seat): retrying
+    /// cannot help, so the client stops.
+    Unsupported,
+}
+
 /// Run the idle client on `conn` until it drops, routing `idled` into `flow`.
 /// Blocks; callers run it on a thread.
+///
+/// On a dropped connection (a compositor restart or crash) this reconnects to
+/// the ambient Wayland display with capped exponential backoff and re-arms the
+/// timer, rather than leaving idle-lock off for the daemon's whole life. A
+/// compositor that never advertises the idle protocol is not retried: retrying
+/// cannot make the global appear.
 pub fn run(conn: Connection, timeout_ms: u32, flow: Arc<LockFlow>) {
+    run_with(conn, timeout_ms, flow, connect_with_retry);
+}
+
+/// [`run`] with an injectable connect seam, so the reconnect path is testable.
+fn run_with(
+    conn: Connection,
+    timeout_ms: u32,
+    flow: Arc<LockFlow>,
+    connect: impl Fn() -> io::Result<Connection>,
+) {
+    let mut conn = conn;
+    let mut backoff = RECONNECT_MIN;
+    loop {
+        if matches!(
+            run_session(&conn, timeout_ms, &flow),
+            SessionEnd::Unsupported
+        ) {
+            return;
+        }
+        conn = loop {
+            match connect() {
+                Ok(fresh) => break fresh,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        ?backoff,
+                        "ext-idle-notify reconnect failed; retrying"
+                    );
+                    std::thread::sleep(backoff);
+                    backoff = next_backoff(backoff);
+                }
+            }
+        };
+        backoff = RECONNECT_MIN;
+        tracing::info!("ext-idle-notify reconnected; re-arming idle-lock");
+    }
+}
+
+/// One connect-and-dispatch session on `conn`. Returns when the connection
+/// ends or the protocol is unsupported; never panics on the Wayland callback
+/// thread.
+fn run_session(conn: &Connection, timeout_ms: u32, flow: &Arc<LockFlow>) -> SessionEnd {
     let mut queue = conn.new_event_queue::<IdleClient>();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
 
     let mut client = IdleClient {
-        flow,
+        flow: Arc::clone(flow),
         timeout_ms,
         notifier: None,
         seat: None,
@@ -122,8 +180,8 @@ pub fn run(conn: Connection, timeout_ms: u32, flow: Arc<LockFlow>) {
     };
 
     if queue.roundtrip(&mut client).is_err() {
-        tracing::warn!("ext-idle-notify: registry roundtrip failed; idle-lock is off");
-        return;
+        tracing::warn!("ext-idle-notify: registry roundtrip failed; reconnecting");
+        return SessionEnd::Disconnected;
     }
     client.ensure_notification(&qh);
 
@@ -133,24 +191,26 @@ pub fn run(conn: Connection, timeout_ms: u32, flow: Arc<LockFlow>) {
     // than blocking on events that can never fire.
     if client.notifier.is_none() {
         tracing::warn!("compositor did not advertise ext_idle_notifier_v1; idle-lock is inactive");
-        return;
+        return SessionEnd::Unsupported;
     }
     if client.seat.is_none() {
         tracing::warn!("compositor advertised no wl_seat; idle-lock is inactive");
-        return;
+        return SessionEnd::Unsupported;
     }
     if client.notification.is_none() {
         tracing::warn!("could not request an idle notification; idle-lock is inactive");
-        return;
+        return SessionEnd::Unsupported;
     }
-    tracing::debug!(timeout_ms, "ext-idle-notify armed");
+    // Only now, after the connection is live and both globals are bound and
+    // the notification is requested, is the idle-lock client truly armed.
+    tracing::info!(timeout_ms, "idle-lock client armed");
 
     loop {
         match queue.blocking_dispatch(&mut client) {
             Ok(_) => {}
             Err(err) => {
                 tracing::info!(%err, "ext-idle-notify connection ended");
-                break;
+                return SessionEnd::Disconnected;
             }
         }
     }
@@ -160,6 +220,16 @@ pub fn run(conn: Connection, timeout_ms: u32, flow: Arc<LockFlow>) {
 const CONNECT_ATTEMPTS: u32 = 10;
 /// Delay between Wayland connection attempts.
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(200);
+/// First backoff after a dropped Wayland connection.
+const RECONNECT_MIN: Duration = Duration::from_millis(200);
+/// Ceiling on the reconnect backoff.
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// The next reconnect backoff: double the current one, capped at
+/// [`RECONNECT_MAX`].
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(RECONNECT_MAX)
+}
 
 /// Connect to the ambient Wayland display, retrying briefly.
 ///
@@ -176,46 +246,58 @@ fn connect_with_retry() -> io::Result<Connection> {
 }
 
 /// Run `connect` up to `attempts` times, sleeping `delay` between tries; the
-/// last error is returned if every attempt fails.
-fn retry_connect<E>(
-    mut connect: impl FnMut() -> Result<Connection, E>,
+/// last error is returned if every attempt fails. `attempts == 0` is an error,
+/// not a panic.
+fn retry_connect<T, E>(
+    mut connect: impl FnMut() -> Result<T, E>,
     attempts: u32,
     delay: Duration,
-) -> io::Result<Connection>
+) -> Result<T, io::Error>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
     let mut last = None;
     for attempt in 0..attempts {
         match connect() {
-            Ok(conn) => return Ok(conn),
+            Ok(value) => return Ok(value),
             Err(err) => last = Some(err),
         }
         if attempt + 1 < attempts {
             std::thread::sleep(delay);
         }
     }
-    Err(io::Error::other(
-        last.expect("at least one connection attempt"),
-    ))
+    match last {
+        Some(err) => Err(io::Error::other(err)),
+        None => Err(io::Error::other("retry_connect called with zero attempts")),
+    }
 }
 
 /// Start the idle-lock client on its own thread.
 ///
 /// `None` disables idle-lock (spec Decision 7): no connection is opened and no
 /// thread is started, so the result is `Ok(None)`. `Some(ms)` connects to the
-/// ambient Wayland display and requests one timer at `ms` milliseconds, clamped
-/// to the protocol's `u32`.
+/// ambient Wayland display (with a brief retry) and requests one timer at `ms`
+/// milliseconds, clamped to the protocol's `u32`; the thread reconnects with
+/// backoff if that connection later drops.
 pub fn spawn(flow: Arc<LockFlow>, timeout_ms: Option<u64>) -> io::Result<Option<JoinHandle<()>>> {
+    spawn_with_connect(flow, timeout_ms, connect_with_retry)
+}
+
+/// [`spawn`] with an injectable connect seam.
+fn spawn_with_connect(
+    flow: Arc<LockFlow>,
+    timeout_ms: Option<u64>,
+    connect: impl Fn() -> io::Result<Connection> + Send + 'static,
+) -> io::Result<Option<JoinHandle<()>>> {
     let Some(timeout_ms) = timeout_ms else {
         tracing::info!("idle-lock disabled (lock_idle_timeout_ms unset)");
         return Ok(None);
     };
     let timeout_ms = u32::try_from(timeout_ms).unwrap_or(u32::MAX);
-    let conn = connect_with_retry()?;
+    let conn = connect()?;
     let handle = std::thread::Builder::new()
         .name("icedtea-session-idle".to_string())
-        .spawn(move || run(conn, timeout_ms, flow))?;
+        .spawn(move || run_with(conn, timeout_ms, flow, connect))?;
     Ok(Some(handle))
 }
 
@@ -240,5 +322,45 @@ mod tests {
         );
         assert!(result.is_err(), "a never-ready display gives up");
         assert_eq!(attempts.load(Ordering::SeqCst), 3, "bounded to 3 attempts");
+    }
+
+    /// A transient connect failure is retried and succeeds on the third try.
+    #[test]
+    fn retry_connect_recovers_after_transient_failures() {
+        let attempts = AtomicU32::new(0);
+        let result = retry_connect(
+            || -> io::Result<u8> {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(io::Error::other("no compositor yet"))
+                } else {
+                    Ok(7)
+                }
+            },
+            3,
+            Duration::from_millis(1),
+        );
+        assert_eq!(result.expect("third attempt succeeds"), 7);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "two failures then a success"
+        );
+    }
+
+    /// `attempts == 0` returns an error rather than panicking.
+    #[test]
+    fn retry_connect_with_zero_attempts_is_an_error() {
+        let result = retry_connect(|| -> io::Result<u8> { Ok(1) }, 0, Duration::from_millis(1));
+        assert!(result.is_err(), "zero attempts must not panic or succeed");
+    }
+
+    /// The reconnect backoff doubles and is capped, so a long compositor
+    /// outage does not hammer the socket or balloon the delay unbounded.
+    #[test]
+    fn reconnect_backoff_doubles_and_caps() {
+        assert_eq!(next_backoff(RECONNECT_MIN), Duration::from_millis(400));
+        assert_eq!(next_backoff(Duration::from_secs(20)), RECONNECT_MAX);
+        assert_eq!(next_backoff(RECONNECT_MAX), RECONNECT_MAX);
     }
 }

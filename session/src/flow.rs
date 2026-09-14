@@ -22,7 +22,8 @@
 //! runs on a dedicated worker — blocking the loop would starve the funnel.
 
 use std::collections::VecDeque;
-use std::process::{Child, Command};
+use std::os::unix::process::CommandExt as _;
+use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -31,12 +32,13 @@ use icedtea_config::Power;
 use crate::logind::{Logind, LogindEvents, PowerKeyInhibitor, SleepInhibitor};
 use crate::policy::{self, Decision, LockReason};
 use crate::service::{SharedLogind, SharedWm};
+use crate::wm_client::LockState;
 
 /// How often the bounded pre-sleep wait re-checks `IsLocked()`.
 pub const SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Hard ceiling on the pre-sleep wait (spec Decision 5) — comfortably inside
 /// logind's 5s default `InhibitDelayMaxSec`. A single in-flight `IsLocked` call
-/// may overshoot this by up to [`COMPOSITOR_CALL_TIMEOUT`]; the two together
+/// may overshoot this by up to [`crate::wm_client::COMPOSITOR_CALL_TIMEOUT`]; the two together
 /// stay under 5s (pinned by a unit test).
 pub const SLEEP_LOCK_BUDGET: Duration = Duration::from_secs(3);
 /// How often the locker-waiter thread checks whether the locker exited.
@@ -71,7 +73,22 @@ struct FlowState {
     /// and queue two echoes before either is delivered: the first echo must not
     /// consume the second's marker, or the second would be misread as external
     /// and kill an unrelated running locker.
-    self_unlock_gens: VecDeque<u64>,
+    self_unlock_gens: VecDeque<SelfUnlockMarker>,
+}
+
+/// One in-flight self-unlock echo marker: the locker generation whose exit
+/// prompted the `Session.Unlock()` this daemon issued, and a lifetime bound
+/// (see [`SELF_UNLOCK_MARKER_TTL`]).
+///
+/// The generation correlates the marker to the locker it belongs to. The
+/// lifetime bound keeps a *lost* echo (the `Unlock` signal never delivered,
+/// e.g. logind restarted) from swallowing the next genuine external unlock:
+/// once the marker expires it no longer absorbs a signal, so an external
+/// unlock still kills a live locker.
+#[derive(Debug, Clone, Copy)]
+struct SelfUnlockMarker {
+    generation: u64,
+    expires_at: Instant,
 }
 
 /// Defensive ceiling on [`FlowState::self_unlock_gens`]. Only a handful of
@@ -80,31 +97,41 @@ struct FlowState {
 /// the queue without limit. The oldest marker is dropped past the cap.
 const MAX_SELF_UNLOCK_MARKERS: usize = 64;
 
+/// How long a self-unlock marker may absorb an `Unlock` signal. A local-bus
+/// echo lands in well under a millisecond and a stalled `Session.Unlock()`
+/// call is itself bounded by [`crate::logind::LOGIND_CALL_TIMEOUT`], so 2s is
+/// ample for every legitimate echo; past it the marker is treated as lost and
+/// stops masking external unlocks.
+const SELF_UNLOCK_MARKER_TTL: Duration = Duration::from_secs(2);
+
 /// Record that the daemon issued a `Session.Unlock()` for `generation`; its
 /// echo is now in flight. Appends to the FIFO, pruning the oldest marker at the
-/// defensive cap.
+/// defensive cap, and stamps the lifetime bound above.
 fn push_self_unlock(state: &mut FlowState, generation: u64) {
     if state.self_unlock_gens.len() >= MAX_SELF_UNLOCK_MARKERS {
         state.self_unlock_gens.pop_front();
     }
-    state.self_unlock_gens.push_back(generation);
+    state.self_unlock_gens.push_back(SelfUnlockMarker {
+        generation,
+        expires_at: Instant::now() + SELF_UNLOCK_MARKER_TTL,
+    });
 }
 
-/// Drop one recorded marker for `generation` after a failed `Session.Unlock()`
-/// call. A failed call produces no echo, so the marker must not linger and
-/// swallow a later external unlock.
+/// Drop the newest recorded marker for `generation` after a failed
+/// `Session.Unlock()` call. A failed call produces no echo, so the marker must
+/// not linger and swallow a later external unlock.
 fn remove_self_unlock(state: &mut FlowState, generation: u64) {
     if let Some(idx) = state
         .self_unlock_gens
         .iter()
-        .rposition(|&g| g == generation)
+        .rposition(|marker| marker.generation == generation)
     {
         state.self_unlock_gens.remove(idx);
     }
 }
 
-/// What [`LockFlow::request_lock`] did, so the sleep path knows whether a
-/// confirmation still has to be awaited.
+/// What [`LockFlow::request_lock`] did, consumed by [`LockFlow::on_lock`] to
+/// log the outcome of the funnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockAttempt {
     /// A new locker was spawned; the lock is not confirmed yet.
@@ -114,7 +141,8 @@ enum LockAttempt {
     AlreadyRunning,
     /// The compositor already reports locked.
     Locked,
-    /// Policy refused (a no-op); nothing will lock this cycle.
+    /// Policy refused, or the spawn failed (a no-op): nothing will lock this
+    /// cycle.
     Refused,
 }
 
@@ -226,19 +254,17 @@ impl LockFlow {
         // request and the bounded wait run on the worker. A policy no-op —
         // no locker configured, or `lock_before_sleep` disabled — must not
         // delay sleep, so it releases immediately and spawns no worker.
-        match policy::decide(
-            LockReason::PrepareForSleep,
-            false,
-            self.locker_command.is_some(),
-            self.lock_before_sleep,
-        ) {
-            Decision::SpawnLocker => {}
-            Decision::NoOp(why) => {
-                tracing::warn!(reason = ?LockReason::PrepareForSleep, why, "not locking");
-                self.release_sleep();
-                return;
-            }
+        if !self.should_request_lock(LockReason::PrepareForSleep) {
+            self.release_sleep();
+            return;
         }
+        // A delay inhibitor is one-shot and only re-armed on resume. If the
+        // daemon never got one (the boot acquisition failed, or a resume's
+        // re-arm failed), there is nothing to hold sleep open, so try a fresh
+        // `Inhibit` right before the wait. If it still cannot be taken, the
+        // lock-before-sleep hold cannot be honored: log that at error level
+        // so the lost invariant is visible.
+        self.ensure_sleep_guard(LockReason::PrepareForSleep);
         // Move the guard off this thread and into the worker, which owns and
         // releases it. If the worker cannot start, dropping the closure drops
         // the guard, so the inhibitor is still released.
@@ -246,6 +272,11 @@ impl LockFlow {
             let mut state = self.state();
             state.sleep.take()
         };
+        if sleep.is_none() {
+            tracing::error!(
+                "suspend announced with no sleep delay inhibitor; the lock-before-sleep hold cannot be honored"
+            );
+        }
         let logind = Arc::clone(&self.logind);
         let wm = Arc::clone(&self.wm);
         let poll_interval = self.poll_interval;
@@ -261,6 +292,54 @@ impl LockFlow {
         }
     }
 
+    /// Whether policy says to request a lock for `reason`, logging the refusal
+    /// reason at warn level. The single pre-decide gate shared by the idle
+    /// request path ([`Self::request_logind_lock`]) and the pre-sleep path
+    /// ([`Self::on_prepare_for_sleep`]); the funnel's own `decide` call in
+    /// [`Self::request_lock`] additionally checks the live lock state.
+    fn should_request_lock(&self, reason: LockReason) -> bool {
+        match policy::decide(
+            reason,
+            false,
+            self.locker_command.is_some(),
+            self.lock_before_sleep,
+        ) {
+            Decision::SpawnLocker => true,
+            Decision::NoOp(why) => {
+                tracing::warn!(reason = ?reason, why, "not locking");
+                false
+            }
+        }
+    }
+
+    /// Ensure a sleep delay inhibitor is held, acquiring a fresh one if the
+    /// last was consumed (or never taken) and logging at error level when it
+    /// cannot be honored. The acquire call is made outside the state lock, so
+    /// it never blocks another flow operation on the mutex.
+    fn ensure_sleep_guard(&self, reason: LockReason) {
+        if self.state().sleep.is_some() {
+            return;
+        }
+        match SleepInhibitor::acquire(&*self.logind) {
+            Ok(guard) => {
+                let mut state = self.state();
+                if state.sleep.is_none() {
+                    state.sleep = Some(guard);
+                    tracing::debug!(reason = ?reason, "sleep delay inhibitor re-armed");
+                } else {
+                    // Another path armed one between our check and here; keep
+                    // the existing guard and drop ours.
+                    drop(guard);
+                }
+            }
+            Err(err) => tracing::error!(
+                %err,
+                reason = ?reason,
+                "could not acquire a sleep delay inhibitor; the lock-before-sleep hold cannot be honored"
+            ),
+        }
+    }
+
     /// An idle timeout: ask logind to lock this session, which emits the `Lock`
     /// signal the spawn funnel handles (spec Decision 7). No sleep inhibitor is
     /// involved, so there is nothing to release.
@@ -269,9 +348,21 @@ impl LockFlow {
     }
 
     /// An explicit `Session.Lock` (an external lock, or logind's echo of our
-    /// own request): the funnel that actually spawns the locker.
+    /// own request): the funnel that actually spawns the locker. The outcome
+    /// is logged; a refusal means nothing locked this cycle, which the idle and
+    /// pre-sleep paths rely on (and which [`crate::service`] surfaces to the
+    /// `lock` CLI by confirming against the compositor).
     pub fn on_lock(&self) {
-        let _ = self.request_lock(LockReason::Idle);
+        match self.request_lock(LockReason::Idle) {
+            LockAttempt::Spawned => tracing::debug!("lock funnel spawned a locker"),
+            LockAttempt::AlreadyRunning => {
+                tracing::debug!("lock funnel found a locker already running")
+            }
+            LockAttempt::Locked => tracing::debug!("lock funnel found the session already locked"),
+            LockAttempt::Refused => tracing::error!(
+                "lock request refused: no locker was spawned, the session is not locked"
+            ),
+        }
     }
 
     /// An `Unlock` signal from logind: either the echo of our own
@@ -288,28 +379,57 @@ impl LockFlow {
     /// a locker that spawned *after* it (a greater generation) therefore
     /// survives, and no locker is killed. With no marker the signal is
     /// external, so the current locker is killed.
+    ///
+    /// Markers are lifetime-bounded ([`SELF_UNLOCK_MARKER_TTL`]): a marker for
+    /// an echo that was never delivered is pruned, so the next genuine external
+    /// unlock is not swallowed and still kills the running locker.
     pub fn on_unlock(&self) {
+        let now = Instant::now();
         let mut guard = self.state();
+        guard
+            .self_unlock_gens
+            .retain(|marker| marker.expires_at > now);
         let Some(marker) = guard.self_unlock_gens.pop_front() else {
             let slot = guard.locker.take();
             drop(guard);
             if let Some(mut slot) = slot {
                 tracing::info!("external unlock; terminating the running locker");
-                if let Err(err) = slot.child.kill() {
-                    tracing::warn!(%err, "could not kill the locker on external unlock");
-                }
-                let _ = slot.child.wait();
+                terminate_locker(&mut slot.child);
             }
             return;
         };
         match guard.locker.as_ref().map(|slot| slot.generation) {
-            Some(current) if current > marker => tracing::debug!(
-                marker,
+            Some(current) if current > marker.generation => tracing::debug!(
+                marker = marker.generation,
                 current,
                 "our earlier Session.Unlock echo; a newer locker survives"
             ),
-            _ => tracing::debug!(marker, "ignoring the echo of our own Session.Unlock"),
+            _ => tracing::debug!(
+                marker = marker.generation,
+                "ignoring the echo of our own Session.Unlock"
+            ),
         }
+    }
+
+    /// The compositor's authoritative `SessionLockChanged(bool)` signal, fed
+    /// from the daemon's subscription as an additional cross-check on
+    /// logind's `Lock`/`Unlock` funnel.
+    ///
+    /// A transition to *locked* needs no action: logind's `Lock` is the
+    /// primary driver and has already asked the funnel to spawn a locker. A
+    /// transition to *unlocked* is the Wayland side of an unlock that already
+    /// happened, so it is routed through the same external-unlock handling as
+    /// logind's `Unlock` ([`Self::on_unlock`]): a still-running locker is
+    /// terminated, while a self-unlock marker absorbs an unlock that is one of
+    /// our own echoes so a newer locker survives. This matters because logind
+    /// will not always deliver an `Unlock` for an external unlock, and the
+    /// compositor's own state is the authority on whether the screen is
+    /// actually unlocked.
+    pub fn on_session_lock_changed(&self, locked: bool) {
+        if locked {
+            return;
+        }
+        self.on_unlock();
     }
 
     /// Whether a locker child is currently running.
@@ -322,25 +442,16 @@ impl LockFlow {
     /// the `Lock` signal. Returns whether the request was issued.
     ///
     /// Idle uses this directly (on its own thread). The pre-sleep path does
-    /// *not*: its request must run off the signal loop, so it duplicates this
-    /// policy gate in [`Self::on_prepare_for_sleep`] and issues the call on
-    /// its worker.
+    /// *not*: its request must run off the signal loop, so it shares
+    /// [`Self::should_request_lock`] and issues the call on its worker.
     fn request_logind_lock(&self, reason: LockReason) -> bool {
-        match policy::decide(
-            reason,
-            false,
-            self.locker_command.is_some(),
-            self.lock_before_sleep,
-        ) {
-            Decision::SpawnLocker => match self.logind.lock() {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(%err, reason = ?reason, "Session.Lock call failed");
-                    false
-                }
-            },
-            Decision::NoOp(why) => {
-                tracing::warn!(reason = ?reason, why, "not locking");
+        if !self.should_request_lock(reason) {
+            return false;
+        }
+        match self.logind.lock() {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(%err, reason = ?reason, "Session.Lock call failed");
                 false
             }
         }
@@ -382,16 +493,25 @@ impl LockFlow {
     /// The install is atomic against concurrent triggers: the process is
     /// spawned outside the state lock, then committed under it only if no other
     /// locker is installed. The loser in a race drops its own child (rather
-    /// than orphaning it) and reports [`LockAttempt::AlreadyRunning`] so the
-    /// pre-sleep path still awaits the winner's confirmation.
+    /// than orphaning it) and reports [`LockAttempt::AlreadyRunning`].
     fn spawn_locker(&self) -> LockAttempt {
         let Some(command) = self.locker_command.as_deref() else {
             tracing::warn!("SpawnLocker with no locker_command; refusing to lock");
             return LockAttempt::Refused;
         };
-        // Same invocation shape as the compositor's `"spawn"` arm: a shell so
-        // the command string can carry its own arguments.
-        let mut child = match Command::new("sh").arg("-c").arg(command).spawn() {
+        // The configured string is shell-interpreted so it may carry its own
+        // arguments (and, in tests, compound steps). This is deliberately NOT
+        // the compositor's hardened no-shell `"spawn"` path, which parses an
+        // argv and never invokes a shell; the two are not equivalent. To keep
+        // an external unlock effective, the shell is started in its own
+        // process group and the whole group is killed by
+        // [`terminate_locker`], not just the `sh` wrapper.
+        let mut child = match Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .process_group(0)
+            .spawn()
+        {
             Ok(child) => child,
             Err(err) => {
                 tracing::warn!(%err, command, "could not spawn the locker");
@@ -404,8 +524,7 @@ impl LockFlow {
                 // Lost the race: another trigger committed first. Drop our
                 // just-spawned child instead of overwriting the winner.
                 drop(state);
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_locker(&mut child);
                 tracing::info!("a locker was already running; dropped the duplicate spawn");
                 return LockAttempt::AlreadyRunning;
             }
@@ -453,24 +572,13 @@ impl LockFlow {
             if !current || guard.active_generation != generation {
                 return;
             }
-            let slot = guard.locker.take();
-            if slot.is_some() {
-                push_self_unlock(&mut guard, generation);
-            }
-            slot
+            guard.locker.take()
         };
         let Some(mut slot) = slot else {
             return;
         };
-        let _ = slot.child.kill();
-        let _ = slot.child.wait();
-        if let Err(err) = self.logind.unlock() {
-            tracing::warn!(%err, "Session.Unlock after locker-waiter spawn failure failed");
-            // A failed call produces no echo; do not let an unconsumed marker
-            // swallow a later external unlock.
-            let mut state = self.state();
-            remove_self_unlock(&mut state, generation);
-        }
+        terminate_locker(&mut slot.child);
+        commit_unlock(&self.state, &*self.logind, generation);
     }
 
     /// Take the sleep inhibitor (if armed) and drop it, closing the fd.
@@ -519,6 +627,13 @@ impl LogindEvents for LockFlow {
 /// confirmed, budget exceeded, or a failed request). It runs on its own
 /// thread because the `Lock` signal the request triggers is delivered to the
 /// signal loop, which must stay free to process it.
+///
+/// The wait distinguishes a slow locker from an unreachable compositor using
+/// the tri-state [`LockState`] read: `Unreachable` is definitive, so the wait
+/// stops at once and proceeds unlocked rather than burning the budget and
+/// then misreporting it as "locker did not confirm". When sleep is released
+/// without confirmation, it is logged at error level: the suspend is
+/// proceeding with the session UNLOCKED.
 fn run_pre_sleep_lock(
     logind: SharedLogind,
     wm: SharedWm,
@@ -527,19 +642,33 @@ fn run_pre_sleep_lock(
     _sleep: Option<SleepInhibitor>,
 ) {
     if let Err(err) = logind.lock() {
-        tracing::warn!(%err, "Session.Lock call failed");
+        tracing::error!(%err, "Session.Lock call failed; suspend proceeding with session UNLOCKED");
         return;
     }
     let deadline = Instant::now() + budget;
+    let mut polls: u64 = 0;
     loop {
-        if wm.is_locked() {
-            return;
+        polls += 1;
+        match wm.lock_state() {
+            LockState::Locked => return,
+            // No amount of further polling can confirm a lock the compositor
+            // cannot even be asked about, so stop early and release.
+            LockState::Unreachable => {
+                tracing::error!(
+                    polls,
+                    budget_ms = budget.as_millis() as u64,
+                    "suspend proceeding with session UNLOCKED: compositor unreachable"
+                );
+                return;
+            }
+            LockState::Unlocked => {}
         }
         let now = Instant::now();
         if now >= deadline {
-            tracing::warn!(
+            tracing::error!(
+                polls,
                 budget_ms = budget.as_millis() as u64,
-                "locker did not confirm the lock within the budget; releasing sleep"
+                "suspend proceeding with session UNLOCKED: locker did not confirm within the budget"
             );
             return;
         }
@@ -547,16 +676,19 @@ fn run_pre_sleep_lock(
     }
 }
 
-/// Issue the post-exit `Session.Unlock` for a waiter, but only while its
-/// `generation` is still the most recent spawn. The generation check and the
-/// `self_unlock_gens` marker happen under the state lock so a new spawn cannot
-/// install itself between the check and the commit; the blocking logind call
-/// itself is made outside the lock, so a stalled system bus cannot block the
-/// sleep-inhibitor release or any other flow path. The marker records *which*
-/// generation's exit prompted the unlock, so [`LockFlow::on_unlock`] can tell
-/// the echo apart from an external unlock and lets a newer locker survive; the
-/// FIFO keeps two back-to-back exits' echoes distinct.
-fn finish_locker(
+/// Commit a `Session.Unlock()` for `generation`, but only while it is still the
+/// most recent spawn. The generation check and the `self_unlock_gens` marker
+/// happen under the state lock so a new spawn cannot install itself between the
+/// check and the commit; the blocking logind call itself is made outside the
+/// lock, so a stalled system bus cannot block the sleep-inhibitor release or
+/// any other flow path. The marker records *which* generation's exit prompted
+/// the unlock, so [`LockFlow::on_unlock`] can tell the echo apart from an
+/// external unlock and lets a newer locker survive; the FIFO keeps two
+/// back-to-back exits' echoes distinct. On a failed call (no echo will come)
+/// the marker is removed again. Shared by the waiter's natural-exit path
+/// ([`finish_locker`]) and the waiter-spawn-failure teardown
+/// ([`LockFlow::abandon_locker`]).
+fn commit_unlock(
     state: &Mutex<FlowState>,
     logind: &(dyn Logind + Send + Sync),
     generation: u64,
@@ -578,56 +710,115 @@ fn finish_locker(
     true
 }
 
+/// [`commit_unlock`] for a locker that exited naturally; see its doc.
+fn finish_locker(
+    state: &Mutex<FlowState>,
+    logind: &(dyn Logind + Send + Sync),
+    generation: u64,
+) -> bool {
+    commit_unlock(state, logind, generation)
+}
+
+/// SIGKILL the locker's whole process group, then reap it. The locker is
+/// spawned as its own process-group leader (`process_group(0)` in
+/// [`LockFlow::spawn_locker`]), so this reaches the configured command's own
+/// descendant processes rather than only the `sh` wrapper. `sh` is already
+/// required to spawn the locker, so its builtin `kill` is used to signal the
+/// negative pgid; `child.kill()` is kept as a fallback if that fails.
+fn terminate_locker(child: &mut Child) {
+    let pid = child.id();
+    if let Err(err) = Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -KILL -- -{pid} 2>/dev/null"))
+        .status()
+    {
+        tracing::warn!(%err, pid, "could not signal the locker process group");
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Poll `try_wait` until the locker exits (or an external unlock took it),
 /// then mirror a natural exit into `Session.Unlock`. A locker is trusted to
-/// exit only after a successful unlock, exactly as `swaylock`/`gtklock` do.
+/// exit only after a successful unlock, exactly as `swaylock`/`gtklock` do; a
+/// locker that exited **unsuccessfully** (e.g. an instantly-dying `exit 127`)
+/// did not confirm the unlock, so its exit is logged at error level and no
+/// `Session.Unlock` is issued — a failed spawn must never look like a clean
+/// lock cycle.
 fn locker_waiter(state: Arc<Mutex<FlowState>>, logind: SharedLogind, generation: u64) {
+    /// What one polling iteration observed under the state lock.
+    enum Wait {
+        /// Still running.
+        Running,
+        /// Exited with a status this waiter owns.
+        Exited(ExitStatus),
+        /// The wait itself failed; the child (taken for reaping) is carried.
+        Unknown(Child),
+        /// A newer locker replaced this one, or an external unlock took it.
+        Replaced,
+    }
     loop {
-        // A child to reap on the error path. Taken out under the state lock so
-        // a new spawn cannot install itself in the gap; the blocking `wait()`
-        // then happens outside the lock, so a slow reap cannot stall every
-        // other flow path.
-        let mut orphan: Option<Child> = None;
-        let exited = {
+        let outcome = {
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
             match guard.locker.as_mut() {
                 Some(slot) if slot.generation == generation => match slot.child.try_wait() {
-                    Ok(Some(_status)) => {
+                    Ok(Some(status)) => {
                         guard.locker = None;
-                        true
+                        Wait::Exited(status)
                     }
-                    Ok(None) => false,
+                    Ok(None) => Wait::Running,
                     Err(err) => {
                         tracing::warn!(%err, "could not wait on the locker; reaping it");
-                        // Reap before dropping the handle so the child cannot
-                        // become a zombie.
-                        orphan = guard.locker.take().map(|slot| slot.child);
-                        true
+                        // Take the child so it can be reaped (no zombie), but
+                        // its exit status is unknown: not a confirmed cycle.
+                        match guard.locker.take().map(|slot| slot.child) {
+                            Some(child) => Wait::Unknown(child),
+                            None => Wait::Replaced,
+                        }
                     }
                 },
-                // A newer locker replaced this one, or an external unlock took
-                // it: that path owns the cleanup.
-                _ => return,
+                _ => Wait::Replaced,
             }
         };
-        if let Some(mut child) = orphan {
-            let _ = child.wait();
+        match outcome {
+            Wait::Running => std::thread::sleep(LOCKER_WAIT_POLL),
+            Wait::Replaced => return,
+            Wait::Unknown(mut child) => {
+                let _ = child.wait();
+                tracing::error!(
+                    generation,
+                    "locker exit status unknown; not treating this as a clean unlock"
+                );
+                return;
+            }
+            Wait::Exited(status) => {
+                if status.success() {
+                    finish_locker(&state, &*logind, generation);
+                } else {
+                    tracing::error!(
+                        generation,
+                        code = status.code(),
+                        "locker exited without confirming the unlock; leaving the session locked"
+                    );
+                }
+                return;
+            }
         }
-        if exited {
-            finish_locker(&state, &*logind, generation);
-            return;
-        }
-        std::thread::sleep(LOCKER_WAIT_POLL);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::os::fd::OwnedFd;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use zbus::zvariant::OwnedObjectPath;
 
     use super::*;
-    use crate::logind::{LOGIND_CALL_TIMEOUT, LogindCall, RecordingLogind};
-    use crate::wm_client::{COMPOSITOR_CALL_TIMEOUT, RecordingWm};
+    use crate::logind::{InhibitMode, LOGIND_CALL_TIMEOUT, LogindCall, RecordingLogind};
+    use crate::wm_client::{COMPOSITOR_CALL_TIMEOUT, RecordingWm, WmCall, WmClient};
 
     fn test_flow(logind: Arc<RecordingLogind>) -> LockFlow {
         LockFlow::with_timing(
@@ -638,6 +829,141 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(50),
         )
+    }
+
+    /// A [`Logind`] double wrapping a [`RecordingLogind`] that can be told to
+    /// fail selected calls, so the flow's failure paths are exercisable.
+    struct FaultyLogind {
+        inner: RecordingLogind,
+        delay_inhibit_failures: AtomicUsize,
+        unlock_fails: AtomicBool,
+    }
+
+    impl FaultyLogind {
+        fn new(inner: RecordingLogind) -> Self {
+            Self {
+                inner,
+                delay_inhibit_failures: AtomicUsize::new(0),
+                unlock_fails: AtomicBool::new(false),
+            }
+        }
+
+        /// Refuse the next `n` `delay`-mode inhibits, then succeed.
+        fn fail_delay_inhibits(&self, n: usize) {
+            self.delay_inhibit_failures.store(n, Ordering::SeqCst);
+        }
+
+        fn fail_unlock(&self) {
+            self.unlock_fails.store(true, Ordering::SeqCst);
+        }
+
+        fn calls(&self) -> Vec<LogindCall> {
+            self.inner.calls()
+        }
+    }
+
+    impl Logind for FaultyLogind {
+        fn session_path(&self) -> OwnedObjectPath {
+            self.inner.session_path()
+        }
+
+        fn inhibit(&self, what: &str, why: &str, mode: InhibitMode) -> io::Result<OwnedFd> {
+            if mode == InhibitMode::Delay && self.delay_inhibit_failures.load(Ordering::SeqCst) > 0
+            {
+                self.delay_inhibit_failures.fetch_sub(1, Ordering::SeqCst);
+                // Record the attempt (and drop the fd) so the call is visible.
+                let _ = self.inner.inhibit(what, why, mode)?;
+                return Err(io::Error::other("inhibit refused"));
+            }
+            self.inner.inhibit(what, why, mode)
+        }
+
+        fn lock(&self) -> io::Result<()> {
+            self.inner.lock()
+        }
+
+        fn unlock(&self) -> io::Result<()> {
+            self.inner.unlock()?;
+            if self.unlock_fails.load(Ordering::SeqCst) {
+                return Err(io::Error::other("unlock refused"));
+            }
+            Ok(())
+        }
+
+        fn suspend(&self) -> io::Result<()> {
+            self.inner.suspend()
+        }
+
+        fn hibernate(&self) -> io::Result<()> {
+            self.inner.hibernate()
+        }
+
+        fn power_off(&self) -> io::Result<()> {
+            self.inner.power_off()
+        }
+
+        fn reboot(&self) -> io::Result<()> {
+            self.inner.reboot()
+        }
+    }
+
+    /// A [`WmClient`] whose `is_locked` blocks both concurrent callers on a
+    /// barrier, so a double-spawn race deterministically passes the "is a
+    /// locker running?" read in both threads before either commits.
+    struct BarrierWm {
+        barrier: Arc<std::sync::Barrier>,
+    }
+
+    impl WmClient for BarrierWm {
+        fn is_locked(&self) -> bool {
+            self.barrier.wait();
+            false
+        }
+
+        fn quit(&self) -> bool {
+            false
+        }
+    }
+
+    /// A [`WmClient`] whose tri-state read is permanently `Unreachable`, so the
+    /// pre-sleep wait's distinction between "cannot ask" and "answered
+    /// unlocked" is exercisable.
+    struct UnreachableWm;
+
+    impl WmClient for UnreachableWm {
+        fn is_locked(&self) -> bool {
+            false
+        }
+
+        fn lock_state(&self) -> LockState {
+            LockState::Unreachable
+        }
+
+        fn quit(&self) -> bool {
+            false
+        }
+    }
+
+    fn inhibit_count(calls: &[LogindCall], mode: InhibitMode) -> usize {
+        calls
+            .iter()
+            .filter(|call| matches!(call, LogindCall::Inhibit { mode: m, .. } if *m == mode))
+            .count()
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 
     fn sleeping_child() -> Child {
@@ -825,7 +1151,7 @@ mod tests {
                 child: sleeping_child(),
             });
             // `finish_locker` already issued an Unlock whose echo is in flight.
-            state.self_unlock_gens.push_back(5);
+            push_self_unlock(&mut state, 5);
         }
 
         flow.on_unlock();
@@ -858,7 +1184,7 @@ mod tests {
                 child: sleeping_child(),
             });
             // The unlock was issued for generation 2; locker 3 is newer.
-            state.self_unlock_gens.push_back(2);
+            push_self_unlock(&mut state, 2);
         }
 
         flow.on_unlock();
@@ -893,8 +1219,8 @@ mod tests {
             });
             // Unlocks for generations 1 and 2 were issued; both echoes are in
             // flight while newer locker 3 is running.
-            state.self_unlock_gens.push_back(1);
-            state.self_unlock_gens.push_back(2);
+            push_self_unlock(&mut state, 1);
+            push_self_unlock(&mut state, 2);
         }
 
         // First echo: consumes marker 1, leaves marker 2, kills nothing.
@@ -907,7 +1233,7 @@ mod tests {
             flow.state()
                 .self_unlock_gens
                 .iter()
-                .copied()
+                .map(|marker| marker.generation)
                 .collect::<Vec<_>>(),
             vec![2],
             "the first echo consumed only the first marker"
@@ -968,7 +1294,7 @@ mod tests {
             flow.state()
                 .self_unlock_gens
                 .iter()
-                .copied()
+                .map(|marker| marker.generation)
                 .collect::<Vec<_>>(),
             vec![7]
         );
@@ -978,11 +1304,29 @@ mod tests {
     /// locker: the read-decide-commit is atomic, so the loser drops its
     /// duplicate child instead of orphaning it and overwriting the winner.
     /// `active_generation` is bumped only on a commit, so it is the direct
-    /// count of committed lockers — the pre-fix code would reach 2 here.
+    /// count of committed lockers. The interleaving is made deterministic by a
+    /// [`WmClient`] double that barriers both threads past the `is_locked` read
+    /// before either reaches the spawn commit; the loser's child is observed
+    /// reaped (no surviving duplicate process).
     #[test]
     fn concurrent_triggers_commit_only_one_locker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pids_file = dir.path().join("pids");
         let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
-        let flow = Arc::new(test_flow(logind.clone()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let flow = Arc::new(LockFlow::with_timing(
+            logind.clone(),
+            Arc::new(BarrierWm {
+                barrier: Arc::clone(&barrier),
+            }),
+            Some(format!(
+                "echo $$ >> '{}'; exec sleep 30",
+                pids_file.display()
+            )),
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        ));
         let weak = Arc::downgrade(&flow);
         logind.set_lock_echo(move || {
             if let Some(flow) = weak.upgrade() {
@@ -990,15 +1334,10 @@ mod tests {
             }
         });
 
-        let barrier = Arc::new(std::sync::Barrier::new(2));
         let mut handles = Vec::new();
         for _ in 0..2 {
             let flow = Arc::clone(&flow);
-            let barrier = Arc::clone(&barrier);
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                flow.on_idle();
-            }));
+            handles.push(std::thread::spawn(move || flow.on_idle()));
         }
         for handle in handles {
             handle.join().expect("trigger thread");
@@ -1013,7 +1352,237 @@ mod tests {
             assert!(state.locker.is_some(), "the committed locker is installed");
         }
 
+        // Exactly one spawned locker may still be alive: the loser must have
+        // been killed and reaped, not left as an orphaned duplicate.
+        let alive = std::fs::read_to_string(&pids_file)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| pid_alive(*pid))
+            .count();
+        assert_eq!(alive, 1, "exactly one locker survived the race");
+
         flow.on_unlock();
         assert!(!flow.locker_running());
+    }
+
+    /// A locker that exits unsuccessfully (here `exit 127`) did not confirm an
+    /// unlock: its exit must not be mirrored into a clean `Session.Unlock`.
+    #[test]
+    fn an_unsuccessful_locker_exit_does_not_issue_a_clean_unlock() {
+        let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
+        let flow = LockFlow::with_timing(
+            logind.clone(),
+            Arc::new(RecordingWm::new(false)),
+            Some("exit 127".to_string()),
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        );
+
+        flow.on_lock();
+        assert!(
+            wait_until(|| !flow.locker_running(), Duration::from_secs(2)),
+            "the failing locker exited"
+        );
+        assert!(
+            !logind.calls().contains(&LogindCall::Unlock),
+            "a failed locker exit must not look like a clean unlock: {:?}",
+            logind.calls()
+        );
+    }
+
+    /// A self-unlock marker whose echo was never delivered must not swallow a
+    /// later genuine external unlock: once its lifetime bound passes, the
+    /// external unlock still kills the running locker.
+    #[test]
+    fn an_expired_self_unlock_marker_does_not_mask_an_external_unlock() {
+        let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
+        let flow = test_flow(logind);
+        {
+            let mut state = flow.state();
+            state.active_generation = 4;
+            state.locker = Some(LockerSlot {
+                generation: 4,
+                child: sleeping_child(),
+            });
+            // The unlock for generation 4 was issued long ago and its echo was
+            // lost; the marker is now past its lifetime bound.
+            state.self_unlock_gens.push_back(SelfUnlockMarker {
+                generation: 4,
+                expires_at: Instant::now() - Duration::from_secs(1),
+            });
+        }
+
+        flow.on_unlock();
+        assert!(
+            !flow.locker_running(),
+            "an external unlock must not be masked by an expired marker"
+        );
+    }
+
+    /// A failed `Session.Unlock()` (which produces no echo) must remove its
+    /// marker, so it cannot absorb a later external unlock.
+    #[test]
+    fn a_failed_unlock_removes_its_marker() {
+        let logind = Arc::new(FaultyLogind::new(RecordingLogind::new(
+            "/org/freedesktop/login1/session/c1",
+        )));
+        logind.fail_unlock();
+        let flow = LockFlow::with_timing(
+            logind.clone(),
+            Arc::new(RecordingWm::new(false)),
+            Some("sleep 30".to_string()),
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        );
+        flow.state().active_generation = 3;
+
+        assert!(finish_locker(&flow.state, &*logind, 3));
+        assert!(logind.calls().contains(&LogindCall::Unlock));
+        assert!(
+            flow.state().self_unlock_gens.is_empty(),
+            "a failed unlock must leave no marker behind"
+        );
+    }
+
+    /// A missing sleep delay inhibitor at suspend is re-attempted right before
+    /// the pre-sleep wait rather than silently leaving lock-before-sleep off.
+    #[test]
+    fn prepare_for_sleep_reacquires_a_missing_delay_inhibitor() {
+        let logind = Arc::new(FaultyLogind::new(RecordingLogind::new(
+            "/org/freedesktop/login1/session/c1",
+        )));
+        // The boot acquisition of the delay inhibitor fails; the power-key
+        // block acquire still succeeds.
+        logind.fail_delay_inhibits(1);
+        let flow = LockFlow::with_timing(
+            logind.clone(),
+            Arc::new(RecordingWm::new(false)),
+            Some("sleep 30".to_string()),
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            inhibit_count(&logind.calls(), InhibitMode::Delay),
+            1,
+            "the boot delay inhibit was attempted and refused"
+        );
+
+        flow.on_prepare_for_sleep(true);
+
+        assert_eq!(
+            inhibit_count(&logind.calls(), InhibitMode::Delay),
+            2,
+            "a fresh delay inhibitor was attempted at suspend"
+        );
+
+        flow.on_unlock();
+    }
+
+    /// An idle timeout with no configured locker is a policy no-op: it must not
+    /// even ask logind to lock (spec Decision 2).
+    #[test]
+    fn idle_with_no_locker_never_requests_a_lock() {
+        let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
+        let flow = LockFlow::with_timing(
+            logind.clone(),
+            Arc::new(RecordingWm::new(false)),
+            None,
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        );
+
+        flow.on_idle();
+        assert!(!flow.locker_running(), "nothing was spawned");
+        assert!(
+            !logind.calls().contains(&LogindCall::Lock),
+            "a no-op idle must not call Session.Lock: {:?}",
+            logind.calls()
+        );
+    }
+
+    /// An unreachable compositor is not a slow locker: the tri-state read is
+    /// definitive, so the wait stops well inside the budget and releases the
+    /// delay inhibitor rather than burning the whole budget and then
+    /// misreporting it as "locker did not confirm".
+    #[test]
+    fn an_unreachable_compositor_releases_without_burning_the_budget() {
+        let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
+        let flow = LockFlow::with_timing(
+            logind.clone(),
+            Arc::new(UnreachableWm),
+            Some("sleep 30".to_string()),
+            true,
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        );
+
+        let start = Instant::now();
+        flow.on_prepare_for_sleep(true);
+
+        assert!(
+            wait_until(|| logind.live_inhibitors() == 1, Duration::from_millis(500)),
+            "the delay inhibitor was released"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "an unreachable compositor must not burn the budget: {:?}",
+            start.elapsed()
+        );
+
+        flow.on_unlock();
+    }
+
+    /// The `SessionLockChanged` subscription is the additional authoritative
+    /// cross-check: a fired transition to unlocked kills a still-running
+    /// locker through the same external-unlock handling logind's `Unlock` gets,
+    /// while a transition to locked is a no-op.
+    #[test]
+    fn a_subscribed_external_unlock_kills_the_running_locker() {
+        let logind = Arc::new(RecordingLogind::new("/org/freedesktop/login1/session/c1"));
+        let wm = Arc::new(RecordingWm::new(false));
+        let flow = Arc::new(LockFlow::with_timing(
+            logind,
+            wm.clone(),
+            Some("sleep 30".to_string()),
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        ));
+        {
+            let mut state = flow.state();
+            state.active_generation = 1;
+            state.locker = Some(LockerSlot {
+                generation: 1,
+                child: sleeping_child(),
+            });
+        }
+
+        let weak = Arc::downgrade(&flow);
+        let handle = wm
+            .subscribe_lock_changed(Box::new(move |locked| {
+                if let Some(flow) = weak.upgrade() {
+                    flow.on_session_lock_changed(locked);
+                }
+            }))
+            .expect("the recording double supports subscriptions");
+        assert_eq!(wm.calls(), vec![WmCall::SubscribeLockChanged]);
+
+        // A transition to locked changes nothing on this side.
+        wm.fire_lock_changed(true);
+        assert!(flow.locker_running(), "a lock transition is a no-op");
+
+        // A transition to unlocked is the external-unlock path: the locker dies.
+        wm.fire_lock_changed(false);
+        assert!(
+            !flow.locker_running(),
+            "the subscribed external unlock killed the running locker"
+        );
+
+        drop(handle);
     }
 }

@@ -108,8 +108,10 @@ fn one_idle_timeout_spawns_exactly_one_locker() {
         wait_for_marker(&marker, Duration::from_secs(5)),
         "the idle timeout never spawned the locker"
     );
-    // Give a buggy re-request time to fire a second time before counting.
-    std::thread::sleep(Duration::from_millis(200));
+    // Give a buggy re-request time to fire a second time before counting. A
+    // generous settle (not a tight wall-clock pin) so parallel-load jitter
+    // cannot make this flaky.
+    std::thread::sleep(Duration::from_millis(500));
 
     assert_eq!(
         marker_lines(&marker),
@@ -150,7 +152,7 @@ fn unset_idle_timeout_starts_no_client_and_never_locks() {
         "lock_idle_timeout_ms=None must not start an idle client"
     );
 
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(400));
     assert!(
         !marker.exists(),
         "no locker may be spawned with idle-lock off"
