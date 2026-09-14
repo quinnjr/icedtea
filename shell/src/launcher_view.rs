@@ -1017,6 +1017,7 @@ fn tile_row(entry: &DesktopEntry, size: u32, selected: bool) -> View<LauncherMsg
         .id(&format!("tile_{}", entry.id))
         .prop(PropName::Label, entry.name.as_str())
         .width_request(width)
+        .class("tile")
         .drag_source(&source)
         .drop_accept("text/plain")
         .on_drop(move |payload: &str| LauncherMsg::ReorderTile {
