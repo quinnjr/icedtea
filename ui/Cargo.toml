@@ -20,6 +20,11 @@ bitflags = "2"
 # `accesskit::TreeUpdate`s. Optional so `--no-default-features` keeps the
 # old tree; the AT-SPI bus adapter is a follow-up.
 accesskit = { version = "0.25", optional = true }
+# M6 accesskit bus slice: `ui/src/a11y_bus.rs` feeds those `TreeUpdate`s to
+# the AT-SPI bus. 0.23.0 (2026-08-29) pairs with `accesskit ^0.25`, so the
+# two crates share one schema; optional and behind its own `a11y-bus`
+# feature so the default build links no D-Bus.
+accesskit_unix = { version = "0.23", optional = true, default-features = true }
 cssparser = "0.37"
 selectors = "0.40"
 precomputed-hash = "0.1"
@@ -50,8 +55,15 @@ default = ["fontconfig", "a11y"]
 fontconfig = ["dep:fontconfig"]
 # M6 accesskit slice: `ui/src/a11y.rs` and its `ui/tests/a11y.rs` gate.
 a11y = ["dep:accesskit"]
+# M6 accesskit bus slice: the AT-SPI adapter (`ui/src/a11y_bus.rs`) over
+# `accesskit_unix`. Off by default: it pulls zbus/atspi and starts a D-Bus
+# event loop, which only a live desktop session wants. Implies `a11y`.
+a11y-bus = ["a11y", "dep:accesskit_unix"]
 
 [dev-dependencies]
+# `a11y.rs`'s bounds test lays a reconciled tree out itself; `FixedMeasure`
+# names `taffy::Size`, so the test crate needs the same pin.
+taffy = "0.14"
 icedtea-harness = { path = "../harness" }
 # `support::wait_for_probe_window` hands back the compositor's own
 # `WindowInfo`; a test's poll loop over `Compositor::snapshot` has nowhere
