@@ -3,12 +3,24 @@ Description=icedtea session/seat manager (logind integration)
 Documentation=https://github.com/quinnjr/icedtea-wm
 PartOf=graphical-session.target
 After=graphical-session.target
+# No ordering on the compositor: like icedtea-shell, icedtea-session reaches
+# the compositor's Wayland socket (idle-lock binds ext_idle_notifier_v1) and
+# its org.icedtea.Compositor D-Bus name, retrying on connect while either is
+# still coming up rather than gating the unit on it.
 
 [Service]
 Type=simple
 ExecStart=%h/.cargo/bin/icedtea-session
 Restart=always
 RestartSec=1
+# Standard user-service hardening. `RestrictAddressFamilies=AF_UNIX` is
+# required (Wayland and D-Bus are both Unix-socket transports); the rest keeps
+# the daemon (and the locker it spawns) to reading the system and home.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
 
 [Install]
 WantedBy=graphical-session.target

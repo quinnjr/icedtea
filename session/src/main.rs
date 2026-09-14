@@ -20,6 +20,17 @@ use icedtea_session::service::{
 use icedtea_session::wm_client::ZbusWmClient;
 
 fn main() -> ExitCode {
+    // Install the subscriber before anything else, including the CLI path:
+    // every safety `warn!`/`error!` (releasing sleep unlocked, startup
+    // failures) and the CLI's only error output goes through `tracing`, and
+    // without this they are silently dropped. Same posture as `shell`'s
+    // `main`.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let arg = std::env::args().nth(1);
     match arg.as_deref() {
         None => run_daemon(),
@@ -122,7 +133,13 @@ fn run_daemon() -> ExitCode {
         &config.power,
     ));
     let events: logind::SharedLogindEvents = flow.clone();
-    logind::spawn_signal_loop(session_path, events);
+    let signal = match logind::spawn_signal_loop(session_path, events) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::error!(%err, "could not spawn the logind signal thread; exiting");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Idle→lock rides the same `LockFlow` funnel as lock-before-sleep, so an
     // idle timeout and an imminent suspend cannot spawn two lockers. `None`
@@ -130,11 +147,32 @@ fn run_daemon() -> ExitCode {
     // idle thread is daemon-lifetime, so its handle is deliberately dropped
     // (detached) here.
     match idle::spawn(Arc::clone(&flow), config.power.lock_idle_timeout_ms) {
-        Ok(Some(_idle)) => tracing::info!("idle-lock client armed"),
+        // The "armed" line is emitted by `idle` itself once the client has
+        // connected and validated the compositor's notifier/seat globals;
+        // logging it here would claim readiness before that thread has run.
+        Ok(Some(_idle)) => {}
         Ok(None) => {}
         Err(err) => tracing::warn!(
             %err,
             "could not start the idle-lock client; idle-lock is off this session"
+        ),
+    }
+
+    // Cross-check logind's `Lock`/`Unlock` funnel against the compositor's own
+    // authoritative lock state: a `SessionLockChanged(false)` that is not one
+    // of our own unlock echoes means the Wayland session unlocked externally,
+    // so a still-running locker must be killed. The logind funnel remains the
+    // primary driver; this subscription is additional. The subscription thread
+    // is daemon-lifetime, so its handle is deliberately dropped (detached).
+    let lock_flow = Arc::clone(&flow);
+    match wm.subscribe_lock_changed(Box::new(move |locked| {
+        lock_flow.on_session_lock_changed(locked);
+    })) {
+        Ok(_subscription) => tracing::debug!("compositor SessionLockChanged subscription armed"),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not subscribe to the compositor's SessionLockChanged; the external-unlock \
+             cross-check is off this session"
         ),
     }
 
@@ -150,8 +188,22 @@ fn run_daemon() -> ExitCode {
     };
 
     tracing::info!("org.icedtea.Session registered; watching logind sleep/lock signals");
-    loop {
-        std::thread::park();
+    // The signal loop supervises itself and exits the process when it can no
+    // longer stay subscribed, so `join` only returns if that thread panicked.
+    // Either way the daemon must not keep running with a dead logind loop (the
+    // lock funnel would never fire); a non-zero exit hands recovery to systemd
+    // `Restart=always`.
+    match signal.join() {
+        Ok(()) => {
+            tracing::error!("logind signal loop ended; exiting so the service manager restarts it");
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            tracing::error!(
+                "logind signal thread panicked; exiting so the service manager restarts it"
+            );
+            ExitCode::FAILURE
+        }
     }
 }
 
