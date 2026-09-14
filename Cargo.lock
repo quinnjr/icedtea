@@ -1295,6 +1295,7 @@ name = "icedtea-session"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "icedtea-compositor",
  "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
