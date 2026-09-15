@@ -115,12 +115,22 @@ pub fn spawn(tx: Sender<NotifUpdate>) {
     std::thread::spawn(move || {
         let mut backoff = std::time::Duration::from_secs(1);
         loop {
+            let started = std::time::Instant::now();
             match zbus::block_on(run(tx.clone())) {
                 Ok(()) => break, // The shell exited before the next signal.
                 Err(err) => {
+                    // A run that lived a healthy life resets the backoff: a
+                    // fresh failure after hours of stability must not wait
+                    // out a delay earned by an old flap sequence.
+                    if started.elapsed() > std::time::Duration::from_secs(60) {
+                        backoff = std::time::Duration::from_secs(1);
+                    }
                     tracing::warn!(%err, ?backoff, "notification worker lost the bus; retrying");
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+                    if tx.is_closed() {
+                        break; // The shell exited during the backoff sleep.
+                    }
                 }
             }
         }
@@ -131,19 +141,12 @@ async fn run(tx: Sender<NotifUpdate>) -> zbus::Result<()> {
     let conn = zbus::Connection::session().await?;
     let proxy = zbus::Proxy::new(&conn, NOTIF_BUS_NAME, NOTIF_PATH, ICEDTEA_IFACE).await?;
 
-    // Seed from the current active set before watching deltas.
-    let seed: Vec<Notification> = proxy.call(GET_ACTIVE_MEMBER, &()).await?;
-    if tx.send(NotifUpdate::Snapshot(seed)).await.is_err() {
-        return Ok(()); // The shell exited before the first signal.
-    }
-
     // Pin the subscription to the daemon that owns the well-known name: any
     // session-bus peer can emit a signal with our path and member, so a
     // path-only rule would let a hostile app spoof `DoNotDisturbChanged`
     // (silently suppressing popups) or `NotificationRemoved` (hiding a live
     // alert). Resolving the owner unique name and matching `sender` rejects
-    // impostors; the interface check below is defense-in-depth. The owner is
-    // resolved on every (re)connect, so a daemon restart re-pins cleanly.
+    // impostors; the interface check below is defense-in-depth.
     let owner: zbus::names::OwnedUniqueName = conn
         .call_method(
             Some("org.freedesktop.DBus"),
@@ -163,16 +166,52 @@ async fn run(tx: Sender<NotifUpdate>) -> zbus::Result<()> {
         .path(NOTIF_PATH)?
         .sender(owner.clone())?
         .build();
-    let mut stream = zbus::MessageStream::for_match_rule(rule, &conn, None).await?;
+    let stream = zbus::MessageStream::for_match_rule(rule, &conn, None).await?;
+    // The pin goes stale if the daemon restarts under a new unique name —
+    // the bus stays up, so no transport error would ever fire and the worker
+    // would idle forever on a dead pin. Watch the bus's own
+    // `NameOwnerChanged` and bail to `spawn`'s reconnect path (which
+    // re-resolves the owner and re-seeds) when our daemon's owner changes.
+    let owner_rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.DBus")?
+        .path("/org/freedesktop/DBus")?
+        .interface("org.freedesktop.DBus")?
+        .member("NameOwnerChanged")?
+        .build();
+    let owner_stream = zbus::MessageStream::for_match_rule(owner_rule, &conn, None).await?;
+    let mut merged = futures_util::stream::select(stream, owner_stream);
+
+    // Subscribe BEFORE seeding: any signal emitted between the `GetActive`
+    // read and the rule install would otherwise be lost with no resync until
+    // the next reconnect. Snapshot-then-delta stays safe because every delta
+    // handler is idempotent (`apply_added` dedups by id, closes/suppressions
+    // are retains).
+    let seed: Vec<Notification> = proxy.call(GET_ACTIVE_MEMBER, &()).await?;
+    if tx.send(NotifUpdate::Snapshot(seed)).await.is_err() {
+        return Ok(()); // The shell exited before the first signal.
+    }
 
     loop {
-        match stream.next().await {
+        match merged.next().await {
             Some(Ok(msg)) => {
-                // Belt and suspenders: the match rule already pins the
-                // sender, but a rule is only as trustworthy as the bus that
-                // enforces it — drop anything that is not from the daemon
-                // owner or not on one of the two notification interfaces.
                 let header = msg.header();
+                // Daemon restart under a new owner: drop the stale pin and
+                // let `spawn` reconnect (fresh owner + fresh seed).
+                if header
+                    .member()
+                    .as_ref()
+                    .is_some_and(|m| m.as_str() == "NameOwnerChanged")
+                {
+                    if let Ok((name, _, _)) = msg.body().deserialize::<(String, String, String)>()
+                        && name == NOTIF_BUS_NAME
+                    {
+                        return Err(zbus::Error::Failure(
+                            "notification daemon owner changed; re-resolving".to_string(),
+                        ));
+                    }
+                    continue;
+                }
                 let from_daemon = header
                     .sender()
                     .is_some_and(|s| s.as_str() == owner.as_str());
@@ -208,7 +247,14 @@ async fn run(tx: Sender<NotifUpdate>) -> zbus::Result<()> {
                         decode_action(&body).map(|(id, key)| NotifUpdate::ActionInvoked { id, key })
                     }
                     Some(DND_CHANGED_MEMBER) => decode_bool(&body).map(NotifUpdate::DndChanged),
-                    _ => None,
+                    // The rule admits every signal the daemon emits on this
+                    // path: an unknown member is either a daemon addition we
+                    // should handle or a mis-pinned constant — either way it
+                    // must be visible, never silently discarded.
+                    _ => {
+                        tracing::warn!(?member, ?iface, "unknown notification signal; dropping");
+                        None
+                    }
                 };
                 if let Some(update) = update
                     && tx.send(update).await.is_err()
@@ -280,19 +326,30 @@ fn decode_action(body: &zbus::message::Body) -> Option<(u32, String)> {
 /// accept that form (falling back to a bare value so an emitter-side shape
 /// change degrades to a dropped signal, never a panic on this thread). One
 /// macro stamps out every single-value decoder so the tolerance policy lives
-/// in exactly one place.
+/// in exactly one place — including the warn log: a daemon payload change
+/// must be visible in the logs, not a silent delivery stop.
 macro_rules! decode_single {
-    ($name:ident, $ty:ty) => {
+    ($name:ident, $ty:ty, $member:expr) => {
         fn $name(body: &zbus::message::Body) -> Option<$ty> {
             if let Ok((v,)) = body.deserialize::<($ty,)>() {
                 return Some(v);
             }
-            body.deserialize::<$ty>().ok()
+            match body.deserialize::<$ty>() {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        member = $member,
+                        "signal body decode failed; dropping"
+                    );
+                    None
+                }
+            }
         }
     };
 }
-decode_single!(decode_id, u32);
-decode_single!(decode_bool, bool);
+decode_single!(decode_id, u32, NOTIFICATION_ADDED_MEMBER);
+decode_single!(decode_bool, bool, DND_CHANGED_MEMBER);
 
 /// The notification command surface — abstracted so a test can inject a
 /// recording mock in place of the real D-Bus proxy.
@@ -858,12 +915,42 @@ mod tests {
         assert_eq!(m.history()[0].id, 50);
     }
 
+    #[test]
+    fn snapshot_truncates_history_to_the_daemon_ring_bound() {
+        let mut m = NotifModel::default();
+        let seed: Vec<Notification> = (0..HISTORY_MAX + 50)
+            .map(|i| mk("chat", i as u32))
+            .collect();
+        m.apply_snapshot(seed);
+        // Deleting the `drain(..drop)` block (or draining the newest end)
+        // must break this test: a reconnect re-seed is the balloon path.
+        assert_eq!(m.history().len(), HISTORY_MAX);
+        assert_eq!(m.history()[0].id, 50);
+    }
+
+    /// `HISTORY_MAX` mirrors the daemon's closed-ring bound by value — the
+    /// coupling is deliberate (the shell's live-set history never needs more
+    /// than the daemon remembers), and this pin breaks the moment the daemon
+    /// bumps its ring without updating the client.
+    #[test]
+    fn history_bound_matches_the_daemon_ring() {
+        const DAEMON_STORE: &str = include_str!("../../notifications/src/store.rs");
+        assert!(
+            DAEMON_STORE.contains(&format!("pub const HISTORY_MAX: usize = {HISTORY_MAX};")),
+            "daemon HISTORY_MAX drifted from the client's {HISTORY_MAX}"
+        );
+    }
+
     /// The signal decoders, driven with real `Message::signal` bodies (no
     /// bus needed): the 1-tuple struct form the daemon emits, the bare-value
     /// fallback, and a malformed body that must degrade to `None` — never a
-    /// panic on the worker thread.
-    fn signal_body(member: &str, body: &(u32,)) -> zbus::message::Body {
-        zbus::message::Message::signal(NOTIF_PATH, ICEDTEA_IFACE, member)
+    /// panic on the worker thread. Every decoder test builds through this
+    /// one helper so a bus-shape or assertion-style change edits one place.
+    fn signal_body<T>(iface: &str, member: &str, body: &T) -> zbus::message::Body
+    where
+        T: serde::Serialize + zbus::zvariant::Type,
+    {
+        zbus::message::Message::signal(NOTIF_PATH, iface, member)
             .expect("test signal builds")
             .build(body)
             .expect("test body serializes")
@@ -873,50 +960,47 @@ mod tests {
     #[test]
     fn decode_accepts_tuple_and_bare_id_forms() {
         assert_eq!(
-            decode_id(&signal_body(NOTIFICATION_ADDED_MEMBER, &(7,))),
+            decode_id(&signal_body(
+                ICEDTEA_IFACE,
+                NOTIFICATION_ADDED_MEMBER,
+                &(7u32,)
+            )),
             Some(7)
         );
-        let bare =
-            zbus::message::Message::signal(NOTIF_PATH, ICEDTEA_IFACE, NOTIFICATION_ADDED_MEMBER)
-                .expect("test signal builds")
-                .build(&7u32)
-                .expect("test body serializes")
-                .body();
+        let bare = signal_body(ICEDTEA_IFACE, NOTIFICATION_ADDED_MEMBER, &7u32);
         assert_eq!(decode_id(&bare), Some(7));
     }
 
     #[test]
     fn decode_drops_malformed_bodies_without_panic() {
-        let wrong_shape =
-            zbus::message::Message::signal(NOTIF_PATH, ICEDTEA_IFACE, NOTIFICATION_ADDED_MEMBER)
-                .expect("test signal builds")
-                .build(&("not-an-id",))
-                .expect("test body serializes")
-                .body();
+        let wrong_shape = signal_body(ICEDTEA_IFACE, NOTIFICATION_ADDED_MEMBER, &("not-an-id",));
         assert_eq!(decode_id(&wrong_shape), None);
         assert_eq!(decode_bool(&wrong_shape), None);
+        assert_eq!(decode_closed(&wrong_shape), None);
+        assert_eq!(decode_removed(&wrong_shape), None);
+        assert_eq!(decode_action(&wrong_shape), None);
         // A reasoned close still decodes; an Undefined reason is suppression.
-        let closed =
-            zbus::message::Message::signal(NOTIF_PATH, STANDARD_IFACE, NOTIFICATION_CLOSED_MEMBER)
-                .expect("test signal builds")
-                .build(&(4u32, 1u32))
-                .expect("test body serializes")
-                .body();
+        let closed = signal_body(STANDARD_IFACE, NOTIFICATION_CLOSED_MEMBER, &(4u32, 1u32));
         assert_eq!(decode_closed(&closed), Some(4));
-        let suppressed =
-            zbus::message::Message::signal(NOTIF_PATH, ICEDTEA_IFACE, NOTIFICATION_REMOVED_MEMBER)
-                .expect("test signal builds")
-                .build(&(5u32, CloseReason::Undefined))
-                .expect("test body serializes")
-                .body();
+        let suppressed = signal_body(
+            ICEDTEA_IFACE,
+            NOTIFICATION_REMOVED_MEMBER,
+            &(5u32, CloseReason::Undefined),
+        );
         assert_eq!(decode_removed(&suppressed), Some((5, true)));
-        let really_closed =
-            zbus::message::Message::signal(NOTIF_PATH, ICEDTEA_IFACE, NOTIFICATION_REMOVED_MEMBER)
-                .expect("test signal builds")
-                .build(&(6u32, CloseReason::Expired))
-                .expect("test body serializes")
-                .body();
+        let really_closed = signal_body(
+            ICEDTEA_IFACE,
+            NOTIFICATION_REMOVED_MEMBER,
+            &(6u32, CloseReason::Expired),
+        );
         assert_eq!(decode_removed(&really_closed), Some((6, false)));
+        // Actions decode id+key together; a dropped key kills the click.
+        let action = signal_body(
+            STANDARD_IFACE,
+            ACTION_INVOKED_MEMBER,
+            &(7u32, "default".to_string()),
+        );
+        assert_eq!(decode_action(&action), Some((7, "default".to_string())));
     }
 
     #[test]

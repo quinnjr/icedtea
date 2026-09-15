@@ -25,6 +25,8 @@ fn mock_records_commands_and_feeds_the_model() {
     mock.close_notification(7);
     model.apply_closed(7);
     assert!(model.visible().is_empty());
+    // A close drops the center entry too — not just the popup.
+    assert!(model.history().is_empty());
 
     assert_eq!(mock.invoked(), vec![(7, "default".to_string())]);
     assert_eq!(mock.closed(), vec![7]);
@@ -44,4 +46,22 @@ fn mock_dnd_round_trip_suppresses_popups_but_keeps_history() {
     assert!(model.visible().is_empty());
     assert_eq!(model.history().len(), 1);
     assert!(mock.dnd());
+}
+
+#[test]
+fn suppression_hides_only_the_suppressed_card() {
+    let mut model = NotifModel::default();
+    model.apply_added(mk("chat", 1));
+    model.apply_added(mk("chat", 2));
+    model.set_dnd(true);
+
+    // Unknown ids are a no-op: a suppression must never wipe the stack.
+    model.apply_suppressed(999);
+    assert_eq!(model.visible().len(), 2);
+
+    model.apply_suppressed(1);
+    assert_eq!(model.visible().len(), 1);
+    assert_eq!(model.visible()[0].id, 2);
+    // ...and both center entries survive the suppression.
+    assert_eq!(model.history().len(), 2);
 }
