@@ -60,8 +60,22 @@ fn notifier_proxy_commands_reach_the_real_service() {
     let _daemon = match service::spawn(store, chg_tx, chg_rx, tick_tx) {
         Ok(conn) => conn,
         Err(err) => {
+            // SKIP only for environmental conditions (no bus, name taken by
+            // a real daemon). Any other spawn failure is a service bug and
+            // must fail — and CI sets NOTIF_LIVE_MUST_RUN=1 so even an
+            // environmental skip fails loudly instead of passing vacuously.
+            let must_run = std::env::var("NOTIF_LIVE_MUST_RUN").is_ok();
+            let no_bus = format!("{err:?}").contains("No such file")
+                || format!("{err:?}").contains("Connection refused");
+            let environmental = matches!(
+                err,
+                icedtea_notifications::service::SpawnError::NameTaken(_)
+            ) || no_bus;
+            if must_run || !environmental {
+                panic!("live notification service failed to spawn: {err:?}");
+            }
             eprintln!(
-                "SKIP: cannot register {NOTIF_BUS_NAME} ({err}) -- bus down or a daemon is running"
+                "SKIP: cannot register {NOTIF_BUS_NAME} ({err:?}) -- bus down or a daemon is running"
             );
             return;
         }
@@ -109,4 +123,51 @@ fn notifier_proxy_commands_reach_the_real_service() {
     assert!(!active.iter().any(|n| n.id == id2));
     let history = proxy.get_history().expect("GetHistory must succeed");
     assert!(history.iter().any(|n| n.id == id2));
+}
+
+/// The `None`-on-failure arms the trait contract depends on ("unreachable,
+/// retain last-known — never reconcile against a phantom empty set"),
+/// proven on a private bus where the name is unowned: the bus daemon itself
+/// answers `NameHasNoOwner`, so every read must be `None`, never a collapsed
+/// default. Hermetic — never touches (or steals) the session-bus name, so it
+/// runs everywhere `dbus-daemon` exists and cannot interfere with the live
+/// round-trip test above.
+#[test]
+fn proxy_reads_return_none_when_the_name_is_unowned() {
+    use std::io::BufRead as _;
+
+    let must_run = std::env::var("NOTIF_LIVE_MUST_RUN").is_ok();
+    let mut bus = match std::process::Command::new("dbus-daemon")
+        .args(["--session", "--print-address=1", "--nofork"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(bus) => bus,
+        Err(err) => {
+            if must_run {
+                panic!("NOTIF_LIVE_MUST_RUN=1 but dbus-daemon is unavailable: {err:?}");
+            }
+            eprintln!("SKIP: dbus-daemon unavailable ({err:?})");
+            return;
+        }
+    };
+    let address = {
+        let stdout = bus.stdout.take().expect("piped stdout");
+        std::io::BufReader::new(stdout)
+            .lines()
+            .next()
+            .expect("bus prints an address")
+            .expect("address line reads")
+    };
+    let conn = zbus::blocking::connection::Builder::address(address.as_str())
+        .expect("private bus address parses")
+        .build()
+        .expect("private bus connects");
+    let proxy = NotifierProxy::from_connection(conn);
+    let (active, history, dnd) = (proxy.get_active(), proxy.get_history(), proxy.get_dnd());
+    let _ = bus.kill();
+    assert_eq!(active, None);
+    assert_eq!(history, None);
+    assert_eq!(dnd, None);
 }
