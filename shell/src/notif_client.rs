@@ -343,20 +343,20 @@ fn classify(msg: &zbus::message::Message, owner: &zbus::names::OwnedUniqueName) 
     }
 }
 
+/// The one warn-and-drop arm behind every signal decoder: a daemon payload
+/// change must be visible in the logs (the member-name pin tests stay green
+/// through a payload change), never a silent delivery stop.
+fn decode_failed<T>(member: &str, err: impl std::fmt::Debug) -> Option<T> {
+    tracing::warn!(?err, member, "signal body decode failed; dropping");
+    None
+}
+
 /// Standard `NotificationClosed(id, reason_code)`: the code is informational
-/// only (any close drops the card), so keep just the id. A body that fails
-/// to decode is a daemon-side shape change — warn loudly (the member-name
-/// pin tests stay green through a payload change) and drop the signal.
+/// only (any close drops the card), so keep just the id.
 fn decode_closed(body: &zbus::message::Body) -> Option<u32> {
     match body.deserialize::<(u32, u32)>() {
         Ok((id, _)) => Some(id),
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "NotificationClosed body decode failed; dropping signal"
-            );
-            None
-        }
+        Err(err) => decode_failed(NOTIFICATION_CLOSED_MEMBER, err),
     }
 }
 
@@ -365,13 +365,7 @@ fn decode_closed(body: &zbus::message::Body) -> Option<u32> {
 fn decode_removed(body: &zbus::message::Body) -> Option<(u32, bool)> {
     match body.deserialize::<(u32, CloseReason)>() {
         Ok((id, reason)) => Some((id, reason == CloseReason::Undefined)),
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "NotificationRemoved body decode failed; dropping signal"
-            );
-            None
-        }
+        Err(err) => decode_failed(NOTIFICATION_REMOVED_MEMBER, err),
     }
 }
 
@@ -379,19 +373,15 @@ fn decode_removed(body: &zbus::message::Body) -> Option<(u32, bool)> {
 fn decode_action(body: &zbus::message::Body) -> Option<(u32, String)> {
     match body.deserialize::<(u32, String)>() {
         Ok(v) => Some(v),
-        Err(err) => {
-            tracing::warn!(?err, "ActionInvoked body decode failed; dropping signal");
-            None
-        }
+        Err(err) => decode_failed(ACTION_INVOKED_MEMBER, err),
     }
 }
 
 /// `emit_signal` bodies for id-only signals arrive as a 1-tuple struct;
 /// accept that form (falling back to a bare value so an emitter-side shape
 /// change degrades to a dropped signal, never a panic on this thread). One
-/// macro stamps out every single-value decoder so the tolerance policy lives
-/// in exactly one place — including the warn log: a daemon payload change
-/// must be visible in the logs, not a silent delivery stop.
+/// macro stamps out every single-value decoder; the warn-and-drop policy
+/// lives in [`decode_failed`], shared with the tuple decoders.
 macro_rules! decode_single {
     ($name:ident, $ty:ty, $member:expr) => {
         fn $name(body: &zbus::message::Body) -> Option<$ty> {
@@ -400,14 +390,7 @@ macro_rules! decode_single {
             }
             match body.deserialize::<$ty>() {
                 Ok(v) => Some(v),
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        member = $member,
-                        "signal body decode failed; dropping"
-                    );
-                    None
-                }
+                Err(err) => decode_failed($member, err),
             }
         }
     };
@@ -482,10 +465,6 @@ impl NotifierProxy {
     fn get_vec(&self, iface: &str, member: &str) -> Option<Vec<Notification>> {
         self.call(iface, member)
     }
-
-    fn get_bool(&self, member: &str) -> Option<bool> {
-        self.call(ICEDTEA_IFACE, member)
-    }
 }
 
 impl NotifierCommands for NotifierProxy {
@@ -525,7 +504,7 @@ impl NotifierCommands for NotifierProxy {
         }
     }
     fn get_dnd(&self) -> Option<bool> {
-        self.get_bool(GET_DND_MEMBER)
+        self.call(ICEDTEA_IFACE, GET_DND_MEMBER)
     }
     fn set_dnd(&self, on: bool) {
         if let Err(err) = self.conn.call_method(
@@ -643,7 +622,15 @@ impl NotifModel {
     pub fn apply_added(&mut self, n: Notification) {
         self.history.retain(|m| m.id != n.id);
         self.history.push(n.clone());
-        self.truncate_history();
+        // Eviction must also retire popups: without this, a cross-app flood
+        // (200 `mail` cards after 3 visible `chat` cards) ages the `chat`
+        // cards out of `history` while their popups stay up — visible would
+        // stop being a subset of history and the center would miss live
+        // popups.
+        if self.truncate_history() {
+            let live: std::collections::HashSet<u32> = self.history.iter().map(|n| n.id).collect();
+            self.visible.retain(|n| live.contains(&n.id));
+        }
         if self.dnd && n.urgency != Urgency::Critical {
             return;
         }
@@ -715,9 +702,15 @@ impl NotifModel {
     /// The one history-bound enforcer (oldest evicted first): every path
     /// that grows `history` funnels through here so the bound can neither
     /// drift between call sites nor degrade to O(n²) `remove(0)` loops.
-    fn truncate_history(&mut self) {
-        if self.history.len() > HISTORY_MAX {
-            self.history.drain(..self.history.len() - HISTORY_MAX);
+    /// Returns whether anything was evicted (the caller retires orphaned
+    /// popups in that case).
+    fn truncate_history(&mut self) -> bool {
+        let len = self.history.len();
+        if len > HISTORY_MAX {
+            self.history.drain(..len - HISTORY_MAX);
+            true
+        } else {
+            false
         }
     }
 
@@ -858,16 +851,19 @@ mod tests {
     /// quoted member string never appears in the daemon source.
     #[test]
     fn method_members_match_the_daemon_interface() {
-        for member in [
-            GET_ACTIVE_MEMBER,
-            GET_HISTORY_MEMBER,
-            INVOKE_ACTION_MEMBER,
-            GET_DND_MEMBER,
-            SET_DND_MEMBER,
+        // Explicit wire→method table: zbus derives the PascalCase member
+        // from the snake_case fn, but the test pins both spellings
+        // literally rather than reimplementing the convention.
+        for (member, method) in [
+            (GET_ACTIVE_MEMBER, "fn get_active"),
+            (GET_HISTORY_MEMBER, "fn get_history"),
+            (INVOKE_ACTION_MEMBER, "fn invoke_action"),
+            (GET_DND_MEMBER, "fn get_do_not_disturb"),
+            (SET_DND_MEMBER, "fn set_do_not_disturb"),
         ] {
             assert!(
-                DAEMON_SERVICE.contains(&format!("fn {}", to_snake(member))),
-                "{member} has no matching method in notifications/src/service.rs"
+                DAEMON_SERVICE.contains(method),
+                "{member} has no matching {method} in notifications/src/service.rs"
             );
         }
     }
@@ -901,20 +897,6 @@ mod tests {
                 "{member} is never emitted in notifications/src/service.rs"
             );
         }
-    }
-
-    /// `fn get_active` ↔ `GetActive`: the daemon's method names are the
-    /// snake_case of the PascalCase wire members (zbus `#[interface]`
-    /// convention). Only used by the pin test above.
-    fn to_snake(pascal: &str) -> String {
-        let mut out = String::new();
-        for (i, ch) in pascal.char_indices() {
-            if ch.is_uppercase() && i > 0 {
-                out.push('_');
-            }
-            out.extend(ch.to_lowercase());
-        }
-        out
     }
 
     #[test]
@@ -976,6 +958,24 @@ mod tests {
         assert_eq!(m.history().len(), HISTORY_MAX);
         // Oldest evicted first: the survivors are the newest cards.
         assert_eq!(m.history()[0].id, 50);
+    }
+
+    #[test]
+    fn history_eviction_retires_orphaned_popups() {
+        let mut m = NotifModel::default();
+        for i in 0..3 {
+            m.apply_added(mk("chat", i));
+        }
+        assert_eq!(m.visible().len(), 3);
+        // A cross-app flood ages the `chat` cards out of history: their
+        // popups must retire too, keeping visible a subset of history.
+        for i in 0..HISTORY_MAX {
+            m.apply_added(mk("mail", 1000 + i as u32));
+        }
+        assert_eq!(m.history().len(), HISTORY_MAX);
+        assert!(!m.visible().iter().any(|n| n.app_name == "chat"));
+        let live: std::collections::HashSet<u32> = m.history().iter().map(|n| n.id).collect();
+        assert!(m.visible().iter().all(|n| live.contains(&n.id)));
     }
 
     #[test]
