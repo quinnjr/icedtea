@@ -1058,6 +1058,10 @@ mod tests {
         );
         let bare = signal_body(ICEDTEA_IFACE, NOTIFICATION_ADDED_MEMBER, &7u32);
         assert_eq!(decode_id(&bare), Some(7));
+        // The bare-value fallback is per-decoder: prove it for `bool` too,
+        // not just `u32`.
+        let bare_bool = signal_body(ICEDTEA_IFACE, DND_CHANGED_MEMBER, &true);
+        assert_eq!(decode_bool(&bare_bool), Some(true));
     }
 
     #[test]
@@ -1124,6 +1128,19 @@ mod tests {
         assert_eq!(
             classify(&closed, &o),
             SignalAction::Forward(NotifUpdate::Removed(4))
+        );
+
+        // A reasoned close on the icedtea interface is a real close, not a
+        // suppression: gutting the `else` arm must break this test.
+        let reasoned = signal_from(
+            ":1.42",
+            ICEDTEA_IFACE,
+            NOTIFICATION_REMOVED_MEMBER,
+            &(6u32, CloseReason::Expired),
+        );
+        assert_eq!(
+            classify(&reasoned, &o),
+            SignalAction::Forward(NotifUpdate::Removed(6))
         );
 
         let action = signal_from(
