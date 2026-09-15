@@ -31,7 +31,12 @@ use wayland_client::{Dispatch, QueueHandle};
 /// Copies `min(src.len(), dst.len()) / 4` whole pixels; a partial trailing
 /// pixel is ignored rather than half-written.
 pub fn skia_rgba_to_shm_argb(src: &[u8], dst: &mut [u8]) {
-    for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+    for (s, d) in src
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<4>().0)
+    {
         d[0] = s[2]; // B
         d[1] = s[1]; // G
         d[2] = s[0]; // R
@@ -446,8 +451,8 @@ mod tests {
 
         let mut dst = vec![0u8; 4 * 4 * 4];
         skia_rgba_to_shm_argb(surface.pixels(), &mut dst);
-        for pixel in dst.chunks_exact(4) {
-            assert_eq!(pixel, [0xE4, 0x84, 0x35, 0xFF]);
+        for pixel in dst.as_chunks::<4>().0 {
+            assert_eq!(*pixel, [0xE4, 0x84, 0x35, 0xFF]);
         }
     }
 
