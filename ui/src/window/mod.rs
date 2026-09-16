@@ -199,7 +199,7 @@ impl SurfaceStates {
     #[must_use]
     pub fn from_wire(states: &[u8]) -> SurfaceStates {
         let mut out = SurfaceStates::empty();
-        for chunk in states.chunks_exact(4) {
+        for chunk in states.as_chunks::<4>().0 {
             let raw = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             out |= match raw {
                 1 => SurfaceStates::MAXIMIZED,

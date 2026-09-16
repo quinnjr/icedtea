@@ -13,12 +13,15 @@ xkbcommon.workspace = true
 zbus.workspace = true
 async-channel = "2"
 futures-util = "0.3"
+serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 icedtea-harness = { path = "../harness" }
 icedtea-clipboard = { path = "../clipboard" }
+icedtea-notifications = { path = "../notifications" }
+serde.workspace = true
 # The page table and app id in `launcher::provider` mirror this crate; the
 # `settings_pages_and_app_id_stay_in_sync_with_icedtea_settings` test is the
 # gate (the shell crate's production build does not depend on settings).

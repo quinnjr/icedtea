@@ -8667,7 +8667,7 @@ impl State {
         // already scaled by the alpha, which is what the scene graph
         // composites.
         const BG: [u8; 4] = [17, 17, 17, 220];
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             if p[3] == 0 {
                 p.copy_from_slice(&BG);
             }
