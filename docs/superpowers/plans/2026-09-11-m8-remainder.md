@@ -82,23 +82,13 @@ fn dangling_keyboard_group_misses_cleanly() {
 
 **Files:** Modify `compositor/src/state.rs`, `contract/src/types.rs`, `shell/src/panel.rs`, `harness/src/lib.rs`; Test `compositor/tests/client_protocol.rs`
 
-**Interfaces:** Consumes wlr 0.20.33-dev via `[patch]` (workspace root, mirrors B6/M8 — drop at B-FINAL), `Runtime::keyboard_state`, `KeyboardGroupId` layout, `ShortcutsInhibitorToggled` event, tablet tool events
+**Interfaces:** Consumes published wlr 0.20.35 (the 0.20.33-dev `[patch]` originally specified here is superseded — see Step 1), `Runtime::keyboard_state`, `KeyboardGroupId` layout, `ShortcutsInhibitorToggled` event, tablet tool events
 
-- [ ] **Step 1: Establish [patch]** `Cargo.toml` workspace root `[patch.crates-io] wlr = { path = "<wlr-m8-remainder worktree>/crates/wlr" }`, note drop at publish, `cargo update -p wlr`, `cargo build -p icedtea-compositor` green
-- [ ] **Step 2: Failing e2e — inhibit blocks compositor binding**
-```rust
-#[test]
-fn shortcuts_inhibit_blocks_binding_while_active() {
-    // spawn + IME client not needed; bring up an inhibitor, press SUPER+2 (workspace switch), assert no switch, deactivate, assert switch again
-}
-```
-- [ ] **Step 3: Implement** `SeatHandler::shortcuts_inhibitor_toggled` arm storing active flag, `SeatHandler::key` early-return skipping `dispatcher` when active (same ordering as grab, additional gate), `Snapshot { keyboard_layout: Option<String>, shortcuts_inhibited: bool }` with `serde(default)` and v3→4 bump, panel badge `active` class.
-- [ ] **Step 4: Failing e2e — tablet tool reaches surface**
-```rust
-#[test]
-fn tablet_tool_tip_reaches_surface() { /* virtual tablet tool proximity_in + tip down → expected surface gets tool event */ }
-```
-- [ ] **Step 5: Implement** cursor attach for tablet tools (`wlr_cursor_attach_input_device` pattern), pad deltas as scroll-like panel updates, harness `VirtualKeyboardClient`/`VirtualPointerClient` doubles recording payloads+serials
+- [x] **Step 1: Establish [patch]** — SUPERSEDED 2026-09-17: locked wlr is 0.20.35 (published, past the 0.20.33 target), so no `[patch]` is needed; the whole Task 4 below builds against the published API.
+- [x] **Step 2: Failing e2e — inhibit blocks compositor binding** — present (`compositor/tests/client_protocol.rs`, inhibit isolation test with pre-lock delivery baseline).
+- [x] **Step 3: Implement** — present with a documented deviation: no `shortcuts_inhibitor_toggled` arm; `State::shortcuts_inhibited()` polls the runtime because the crate announces nothing on compositor-driven transitions (see its doc). Gate at `SeatHandler::key`, `Snapshot` fields + panel badge all live.
+- [ ] **Step 4: Failing e2e — tablet tool reaches surface** — DEFERRED 2026-09-17 with rationale in `client_protocol.rs` (~line 3604): wlroots 0.20 has no virtual-tablet injection protocol and headless has no physical tablet, so no client can produce tool traffic.
+- [x] **Step 5: Implement** — done with documented deviations 2026-09-17: cursor attach comes from the crate attaching every input device (see `compositor/src/lib.rs` tablet-manager comment; no tablet-specific call exists or is needed); pad deltas are unimplementable through this crate version's notification-only `tablet_pad_event` (opaque id, no readers), so `State` implements both tablet arms as debug-log no-ops with dangling-id harmlessness pinned by `tablet_notifications_without_a_runtime_emit_nothing`; virtual-keyboard/pointer delivery is proven both-sides by existing e2e (grab-interception baseline, lock isolation).
 - [ ] **Step 6: Run** both e2e PASS, full workspace suite, clippy, fmt
 - [ ] **Step 7: Commit** `feat(compositor): M8 remainder consumer (inhibit, layout, tablet, virtual)`
 

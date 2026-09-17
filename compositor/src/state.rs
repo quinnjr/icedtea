@@ -8919,6 +8919,28 @@ impl wlr::SeatHandler for State {
         self.apply_switch_toggle(state.switch_type, state.on);
     }
 
+    /// A tablet tool did something (M8): observed and ignored. The id is
+    /// opaque -- the crate exposes no per-tool state readers -- and the
+    /// tool's client-bound traffic (proximity, tip, axes) already flows
+    /// through wlroots' `zwp_tablet_manager_v2` with no compositor
+    /// involvement, while pointer motion arrives because the crate attaches
+    /// every input device to the cursor. There is nothing truthful to do
+    /// here, so this logs at debug and emits nothing; a dangling id is
+    /// harmless by construction (see
+    /// `tablet_notifications_without_a_runtime_emit_nothing`).
+    fn tablet_tool_event(&mut self, _id: wlr::TabletToolId) {
+        tracing::debug!("tablet tool notification with no per-tool state to read; ignoring");
+    }
+
+    /// A tablet pad did something -- button, ring or strip (M8): same terms
+    /// as [`SeatHandler::tablet_tool_event`]. Pad traffic reaches
+    /// tablet-aware clients through wlroots itself; the pad id names
+    /// hardware this model never addresses, so this logs at debug and
+    /// emits nothing, and a dangling id is harmless by construction.
+    fn tablet_pad_event(&mut self, _id: wlr::TabletPadId) {
+        tracing::debug!("tablet pad notification with no per-pad state to read; ignoring");
+    }
+
     /// Track `wlr::Runtime::is_session_locked` locally so this model stops
     /// fighting the crate's own focus refusal while locked (see
     /// `session_locked`'s doc on the struct field). On `locked = true`,
@@ -16684,6 +16706,26 @@ mod tests {
         assert!(
             !state.session_locked,
             "a switch must never drive the session lock flag"
+        );
+    }
+
+    /// M8: tablet tool/pad notifications without a runtime stay silent --
+    /// the ids are opaque (no per-tool state readers on the crate side)
+    /// and client traffic flows through wlroots itself, so there is nothing
+    /// truthful to do here; guessing would only invent behavior. Dangling
+    /// ids must be harmless.
+    #[test]
+    fn tablet_notifications_without_a_runtime_emit_nothing() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        wlr::SeatHandler::tablet_tool_event(
+            &mut state,
+            wlr::TabletToolId::dangling_nth_for_test(0),
+        );
+        wlr::SeatHandler::tablet_pad_event(&mut state, wlr::TabletPadId::dangling_nth_for_test(0));
+        assert!(
+            rx.try_recv().is_err(),
+            "tablet notifications must stay silent"
         );
     }
 
