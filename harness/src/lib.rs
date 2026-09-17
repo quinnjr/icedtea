@@ -35,7 +35,7 @@ use icedtea_contract::{Event, SeqEvent, Snapshot};
 
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
+    wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
     wl_data_source, wl_keyboard, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm, wl_shm_pool,
     wl_surface, wl_touch,
 };
@@ -59,6 +59,9 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
 };
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
     zwp_keyboard_shortcuts_inhibit_manager_v1, zwp_keyboard_shortcuts_inhibitor_v1,
+};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_confined_pointer_v1, zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
@@ -1357,6 +1360,31 @@ struct ClientState {
     /// How many `zwp_input_method_keyboard_grab_v2.modifiers` events this
     /// client has received.
     im_grab_modifier_events: u32,
+
+    // --- linux-dmabuf (dmabuf smoke tests) ---
+    /// Bound whenever advertised; used by [`DmabufClient`].
+    linux_dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    /// The advertised `zwp_linux_dmabuf_v1` version, recorded at bind time
+    /// (the object itself exposes no version query without the `Proxy`
+    /// trait; this keeps the pin a plain field read).
+    linux_dmabuf_version: Option<u32>,
+    /// Every `(format, modifier)` pair decoded from the default feedback's
+    /// format table, in table order. The table fd arrives once per feedback
+    /// object; it is read and decoded in the `Dispatch` impl, never stored.
+    dmabuf_format_entries: Vec<(u32, u64)>,
+    /// Every format-table index named by any tranche's `tranche_formats`,
+    /// in arrival order.
+    dmabuf_tranche_indices: Vec<u16>,
+    /// Set on the default feedback's `done`.
+    dmabuf_done: bool,
+    /// The `wl_buffer` from the last successful `create_params` → `create`.
+    dmabuf_buffer: Option<wl_buffer::WlBuffer>,
+    /// Set on `zwp_linux_buffer_params_v1.failed`.
+    dmabuf_failed: bool,
+    /// Set on the next `wl_callback.done`. No other client creates frame
+    /// callbacks, so this flag can only mean the dmabuf first frame
+    /// completed.
+    dmabuf_frame_done: bool,
 }
 
 impl ClientState {
@@ -1464,6 +1492,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 }
                 "zwp_idle_inhibit_manager_v1" => {
                     state.idle_inhibit_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_linux_dmabuf_v1" => {
+                    state.linux_dmabuf_version = Some(version);
+                    state.linux_dmabuf = Some(registry.bind(name, version.min(5), qh, ()));
                 }
                 "zwp_keyboard_shortcuts_inhibit_manager_v1" => {
                     state.shortcuts_inhibit_manager =
@@ -6459,5 +6491,311 @@ mod tests {
         pointer.motion_absolute(11.0, 11.0, 100, 100);
         pointer.frame();
         pointer.pump();
+    }
+}
+
+delegate_noop!(ClientState: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
+
+impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+        event: zwp_linux_dmabuf_feedback_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, .. } => {
+                // One 16-byte entry per format: u32 format, u32 pad, u32
+                // modifier_hi, u32 modifier_lo, all native-endian on the wire
+                // (little-endian everywhere this runs).
+                let mut file: std::fs::File = fd.into();
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes).expect("format table fd reads");
+                for entry in bytes.as_chunks::<16>().0 {
+                    let format = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+                    let mod_hi = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+                    let mod_lo = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]);
+                    state
+                        .dmabuf_format_entries
+                        .push((format, ((mod_hi as u64) << 32) | mod_lo as u64));
+                }
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::TrancheFormats { indices } => {
+                state.dmabuf_tranche_indices.extend(
+                    indices
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_ne_bytes([c[0], c[1]])),
+                );
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::Done => {
+                state.dmabuf_done = true;
+            }
+            _ => {}
+        }
+    }
+}
+impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, ()> for ClientState {
+    event_created_child!(ClientState, zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, [
+        zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (wl_buffer::WlBuffer, ()),
+    ]);
+
+    fn event(
+        state: &mut Self,
+        _: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        event: zwp_linux_buffer_params_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_linux_buffer_params_v1::Event::Created { buffer } => {
+                state.dmabuf_buffer = Some(buffer);
+            }
+            zwp_linux_buffer_params_v1::Event::Failed => {
+                state.dmabuf_failed = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.dmabuf_frame_done = true;
+        }
+    }
+}
+
+/// `DRM_FORMAT_ARGB8888` (`fourcc('A','R','2','4')`): the format the probe
+/// watched a real Tauri v2 app negotiate, so the format every tranche set
+/// here must offer.
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+
+/// A `zwp_linux_dmabuf_v1` client: binds the global, collects the default
+/// feedback's format table + tranches, and (where a render node exists)
+/// imports a real GBM buffer and presents it on a mapped toplevel. The
+/// Tauri v2 / WebKitGTK negotiation path, driven against a headless
+/// compositor.
+pub struct DmabufClient {
+    conn: Connection,
+    queue: EventQueue<ClientState>,
+    qh: QueueHandle<ClientState>,
+    state: ClientState,
+    dmabuf: zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    #[allow(dead_code)]
+    feedback: zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+    surface: wl_surface::WlSurface,
+    /// `#[allow(dead_code)]`: never read after mapping, but destroying
+    /// either object unmaps the toplevel — they are keepalives, like the
+    /// presented buffer below.
+    #[allow(dead_code)]
+    xdg_surface: xdg_surface::XdgSurface,
+    /// `#[allow(dead_code)]`: see `xdg_surface`.
+    #[allow(dead_code)]
+    toplevel: xdg_toplevel::XdgToplevel,
+    /// The presented dmabuf `wl_buffer`, kept alive as long as the surface
+    /// may still be showing it.
+    buffer: Option<wl_buffer::WlBuffer>,
+}
+
+impl DmabufClient {
+    /// Connect, bind `zwp_linux_dmabuf_v1`, and request the default
+    /// feedback. Panics if the compositor did not advertise linux_dmabuf.
+    pub fn spawn(socket: &str) -> DmabufClient {
+        let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
+        let dmabuf = state
+            .linux_dmabuf
+            .clone()
+            .expect("compositor did not advertise zwp_linux_dmabuf_v1");
+        let feedback = dmabuf.get_default_feedback(&qh, ());
+        conn.flush().expect("flush get_default_feedback");
+        queue.roundtrip(&mut state).expect("feedback roundtrip");
+
+        let compositor = state
+            .compositor
+            .clone()
+            .expect("compositor did not advertise wl_compositor");
+        let wm_base = state
+            .wm_base
+            .clone()
+            .expect("compositor did not advertise xdg_wm_base");
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let toplevel = xdg_surface.get_toplevel(&qh, ());
+        toplevel.set_app_id("dmabuf.smoke".to_string());
+        toplevel.set_title("dmabuf smoke".to_string());
+        // Initial-commit handshake first (empty commit, wait configure);
+        // the dmabuf attach lands after, in `import_and_present`.
+        surface.commit();
+        conn.flush().expect("flush");
+        let deadline = Instant::now() + TIMEOUT;
+        while state.configures == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "no xdg_surface.configure within {TIMEOUT:?}"
+            );
+            queue.roundtrip(&mut state).expect("configure roundtrip");
+        }
+
+        DmabufClient {
+            conn,
+            queue,
+            qh,
+            state,
+            dmabuf,
+            feedback,
+            surface,
+            xdg_surface,
+            toplevel,
+            buffer: None,
+        }
+    }
+
+    /// The advertised `zwp_linux_dmabuf_v1` version (requested min(5)).
+    pub fn version(&self) -> u32 {
+        self.state.linux_dmabuf_version.unwrap_or(0)
+    }
+
+    /// Pump until the default feedback delivers table + tranches + `done`,
+    /// or `TIMEOUT` elapses. Returns whether it did.
+    pub fn wait_feedback(&mut self) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.state.dmabuf_done {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// The `(format, modifier)` pairs the tranches actually offer, resolved
+    /// through the format table.
+    pub fn tranches(&self) -> Vec<(u32, u64)> {
+        self.state
+            .dmabuf_tranche_indices
+            .iter()
+            .filter_map(|i| self.state.dmabuf_format_entries.get(*i as usize).copied())
+            .collect()
+    }
+
+    /// Whether any tranche offers the Tauri format.
+    pub fn has_argb8888(&self) -> bool {
+        self.tranches()
+            .iter()
+            .any(|(format, _)| *format == DRM_FORMAT_ARGB8888)
+    }
+
+    /// Allocate a real GBM ARGB8888 buffer (first tranche entry offering
+    /// the format), import it through `create_params`, attach it to the
+    /// mapped toplevel, and commit with damage + a frame callback.
+    /// Returns `None` (caller SKIPs visibly) when there is no render node,
+    /// the allocation fails, or the compositor rejects the import — all
+    /// environment-shaped outcomes, not assertion failures.
+    pub fn import_and_present(&mut self) -> Option<()> {
+        let node = std::fs::read_dir("/dev/dri")
+            .ok()?
+            .flatten()
+            .find_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                name.starts_with("renderD").then(|| entry.path())
+            })?;
+        let file = std::fs::File::open(&node).ok()?;
+        let device = gbm::Device::new(file).ok()?;
+        let (_, modifier) = self
+            .tranches()
+            .into_iter()
+            .find(|(format, _)| *format == DRM_FORMAT_ARGB8888)?;
+        let (w, h) = match self.state.configured {
+            Some((w, h)) if w > 0 && h > 0 => (w as u32, h as u32),
+            _ => (320, 240),
+        };
+        let bo = device
+            .create_buffer_object_with_modifiers::<()>(
+                w,
+                h,
+                gbm::Format::Argb8888,
+                [gbm::Modifier::from(modifier)].into_iter(),
+            )
+            .or_else(|_| {
+                device.create_buffer_object::<()>(
+                    w,
+                    h,
+                    gbm::Format::Argb8888,
+                    gbm::BufferObjectFlags::RENDERING,
+                )
+            })
+            .ok()?;
+        let fd = bo.fd().ok()?;
+        let planes = bo.plane_count();
+        let params = self.dmabuf.create_params(&self.qh, ());
+        self.state.dmabuf_buffer = None;
+        self.state.dmabuf_failed = false;
+        for plane in 0..planes {
+            params.add(
+                fd.as_fd(),
+                plane,
+                bo.offset(plane as i32),
+                bo.stride_for_plane(plane as i32),
+                (modifier >> 32) as u32,
+                modifier as u32,
+            );
+        }
+        params.create(
+            w as i32,
+            h as i32,
+            DRM_FORMAT_ARGB8888,
+            zwp_linux_buffer_params_v1::Flags::empty(),
+        );
+        self.conn.flush().ok()?;
+        let deadline = Instant::now() + TIMEOUT;
+        while self.state.dmabuf_buffer.is_none() && !self.state.dmabuf_failed {
+            assert!(
+                Instant::now() < deadline,
+                "create_params neither created nor failed within {TIMEOUT:?}"
+            );
+            self.queue.roundtrip(&mut self.state).ok()?;
+        }
+        if self.state.dmabuf_failed {
+            eprintln!("SKIP: compositor rejected the GBM import here — wire path unproven");
+            return None;
+        }
+        let buffer = self.state.dmabuf_buffer.clone()?;
+        self.surface.attach(Some(&buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, w as i32, h as i32);
+        self.state.dmabuf_frame_done = false;
+        self.surface.frame(&self.qh, ());
+        self.surface.commit();
+        self.conn.flush().ok()?;
+        self.buffer = Some(buffer);
+        Some(())
+    }
+
+    /// Pump until the present commit's frame callback completes, or
+    /// `TIMEOUT` elapses. Returns whether it did.
+    pub fn wait_first_frame(&mut self) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.state.dmabuf_frame_done {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.queue.roundtrip(&mut self.state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
 }
