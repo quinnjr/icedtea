@@ -8919,24 +8919,27 @@ impl wlr::SeatHandler for State {
         self.apply_switch_toggle(state.switch_type, state.on);
     }
 
-    /// A tablet tool did something (M8): observed and ignored. The id is
-    /// opaque -- the crate exposes no per-tool state readers -- and the
-    /// tool's client-bound traffic (proximity, tip, axes) already flows
-    /// through wlroots' `zwp_tablet_manager_v2` with no compositor
-    /// involvement, while pointer motion arrives because the crate attaches
-    /// every input device to the cursor. There is nothing truthful to do
-    /// here, so this logs at debug and emits nothing; a dangling id is
-    /// harmless by construction (see
+    /// A tablet tool did something (M8): notification only, currently
+    /// unforwarded. The id is opaque -- the crate exposes no per-tool state
+    /// readers -- and client delivery would require driving
+    /// `wlr_send_tablet_v2_*`, for which no safe wrapper exists yet (see
+    /// the crate's `emit_tablet_tool_event`: wlroots forwards nothing
+    /// itself). So this logs at debug and emits nothing for now;
+    /// tablet-aware clients do NOT yet receive tool traffic -- only cursor
+    /// motion, which arrives because the crate attaches every input device
+    /// to the cursor. A dangling id is harmless by construction (see
     /// `tablet_notifications_without_a_runtime_emit_nothing`).
     fn tablet_tool_event(&mut self, _id: wlr::TabletToolId) {
         tracing::debug!("tablet tool notification with no per-tool state to read; ignoring");
     }
 
     /// A tablet pad did something -- button, ring or strip (M8): same terms
-    /// as [`SeatHandler::tablet_tool_event`]. Pad traffic reaches
-    /// tablet-aware clients through wlroots itself; the pad id names
-    /// hardware this model never addresses, so this logs at debug and
-    /// emits nothing, and a dangling id is harmless by construction.
+    /// as [`SeatHandler::tablet_tool_event`]. Pad feedback flows through the
+    /// pad's grabs only when driven by the compositor, and no safe wrapper
+    /// exists yet either -- so, like tool traffic, pad traffic does NOT yet
+    /// reach tablet-aware clients. The pad id names hardware this model
+    /// never addresses, so this logs at debug and emits nothing, and a
+    /// dangling id is harmless by construction.
     fn tablet_pad_event(&mut self, _id: wlr::TabletPadId) {
         tracing::debug!("tablet pad notification with no per-pad state to read; ignoring");
     }
