@@ -6524,6 +6524,17 @@ mod tests {
         );
     }
 
+    /// `read_format_table` never panics: an unseekable fd (a pipe read end,
+    /// standing in for any non-rewindable fd) surfaces as `Err` for the
+    /// Dispatch call site's `.expect("format table fd rewinds")` to pin,
+    /// rather than panicking inside the helper.
+    #[test]
+    fn dmabuf_format_table_read_rejects_unseekable_fd() {
+        let (read_end, _write_end) = std::io::pipe().expect("pipe");
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(read_end));
+        assert!(super::read_format_table(file).is_err());
+    }
+
     /// The harness never touches the session's runtime directory: its
     /// socket lives under a private, pid-named, 0700 `XDG_RUNTIME_DIR`, and
     /// the process env points there so spawned apps inherit it.
@@ -6677,6 +6688,26 @@ fn resolve_tranche_entries(entries: &[(u32, u64)], indices: &[u16]) -> Vec<(u32,
     resolved
 }
 
+/// Read a `zwp_linux_dmabuf_feedback_v1.format_table` fd into bytes.
+///
+/// Rewinds first: the protocol expects clients to mmap this fd
+/// (offset-insensitive), but a `read()` starts at the description's current
+/// offset — and wlroots re-sends the same table file for later feedback
+/// objects, so the second `format_table` (e.g. the per-surface one) arrives
+/// positioned at EOF and reads back zero bytes. The table always starts at
+/// offset 0.
+///
+/// Returns `Err`, never panics: an unseekable/unreadable fd surfaces here
+/// for the call site's `.expect("format table fd rewinds")` to pin, rather
+/// than panicking inside the helper (see the unit test).
+fn read_format_table(mut file: std::fs::File) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for ClientState {
     fn event(
         state: &mut Self,
@@ -6688,19 +6719,8 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for Cl
     ) {
         match event {
             zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, .. } => {
-                let mut file: std::fs::File = fd.into();
-                // Rewind: the protocol expects clients to mmap this fd
-                // (offset-insensitive), but a `read()` starts at the
-                // description's current offset — and wlroots re-sends the
-                // same table file for later feedback objects, so the second
-                // `format_table` (e.g. the per-surface one) arrives
-                // positioned at EOF and reads back zero bytes. The table
-                // always starts at offset 0.
-                use std::io::Seek as _;
-                file.seek(std::io::SeekFrom::Start(0))
-                    .expect("format table fd rewinds");
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut file, &mut bytes).expect("format table fd reads");
+                let file: std::fs::File = fd.into();
+                let bytes = read_format_table(file).expect("format table fd rewinds");
                 state
                     .dmabuf_format_entries
                     .extend(decode_format_table(&bytes));
@@ -6889,6 +6909,11 @@ impl DmabufClient {
     /// collected into the shared state simultaneously — the default object's
     /// rows are cleared first, so `tranches()` afterwards reflects only the
     /// surface feedback.
+    ///
+    /// A flush failure (the transport died under us) returns `false` rather
+    /// than panicking: like [`DmabufClient::wait_first_frame`]'s
+    /// `pump_until` error path, "the compositor is gone" is a falsifiable
+    /// outcome a test can assert on, not a harness bug.
     pub fn dmabuf_feedback_surface(&mut self) -> bool {
         self.feedback.destroy();
         self.state.dmabuf_format_entries.clear();
@@ -6897,7 +6922,10 @@ impl DmabufClient {
         self.feedback = self
             .dmabuf
             .get_surface_feedback(&self.surface, &self.qh, ());
-        self.conn.flush().expect("flush get_surface_feedback");
+        if let Err(e) = self.conn.flush() {
+            eprintln!("DmabufClient surface-feedback flush failed: {e}");
+            return false;
+        }
         self.wait_feedback()
     }
 
@@ -6939,11 +6967,31 @@ impl DmabufClient {
                 return None;
             }
         };
-        let node = match entries.flatten().find_map(|entry| {
+        // Explicit per-entry handling, not `.flatten()`: an iteration
+        // error means the listing itself is unreliable (not merely "no
+        // renderD node yet"), so it SKIPs with its own message naming the
+        // OS error rather than falling through to the absence message below.
+        let mut node = None;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    eprintln!(
+                        "SKIP: cannot iterate /dev/dri entries while looking for a render node: {e}"
+                    );
+                    return None;
+                }
+            };
             let name = entry.file_name();
-            let name = name.to_str()?;
-            name.starts_with("renderD").then(|| entry.path())
-        }) {
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with("renderD") {
+                node = Some(entry.path());
+                break;
+            }
+        }
+        let node = match node {
             Some(node) => node,
             None => {
                 eprintln!("SKIP: no renderD node in /dev/dri — GBM allocation impossible here");
@@ -6988,7 +7036,11 @@ impl DmabufClient {
             [gbm::Modifier::from(requested)].into_iter(),
         ) {
             Ok(bo) => bo,
-            Err(_) => {
+            Err(e) => {
+                eprintln!(
+                    "dmabuf: requested tranche modifier 0x{requested:016x} refused ({e}), \
+                     falling back to plain GBM allocation"
+                );
                 let bo = match device.create_buffer_object::<()>(
                     w,
                     h,
