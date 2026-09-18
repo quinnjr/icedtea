@@ -6650,12 +6650,33 @@ mod tests {
         // Unpredictable per-run suffix (no new dev-dependency): a pid-only
         // name in a shared temp dir is pre-creatable/symlinkable by another
         // local user (CWE-377), and this test creates and removes a tree.
-        let nonce = std::collections::hash_map::RandomState::new();
-        let root = std::env::temp_dir().join(format!(
-            "icedtea-dmabuf-probe-{:x}",
-            std::hash::BuildHasher::hash_one(&nonce, std::process::id())
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        // `create_dir` (not `create_dir_all`) fails atomically on collision
+        // instead of silently reusing a pre-existing entry, and the new tree
+        // is made 0700 before anything is written inside it.
+        let mut attempt = 0;
+        let root = loop {
+            let nonce = std::collections::hash_map::RandomState::new();
+            let candidate = std::env::temp_dir().join(format!(
+                "icedtea-dmabuf-probe-{:x}",
+                std::hash::BuildHasher::hash_one(&nonce, std::process::id())
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => {
+                    std::fs::set_permissions(
+                        &candidate,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                    )
+                    .expect("restrict probe temp dir to the owner");
+                    break candidate;
+                }
+                // Astronomically unlikely with a random 64-bit suffix; try a
+                // fresh nonce a few times before giving up loudly.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 8 => {
+                    attempt += 1;
+                }
+                Err(e) => panic!("create probe temp dir {candidate:?}: {e}"),
+            }
+        };
         let missing = root.join("absent");
 
         assert_eq!(
