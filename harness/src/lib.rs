@@ -6640,6 +6640,55 @@ mod tests {
         );
     }
 
+    /// `render_node_at`'s absence-vs-error contract, against synthetic paths
+    /// (the `/dev/dri` base is otherwise uninjectable): a missing directory is
+    /// GPU-less absence (`Ok(None)`), while a real-but-unreadable listing (a
+    /// file where a directory was expected) is a surfaced `Err` — the two must
+    /// not collapse, which is the whole point of `has_render_node`'s `Result`.
+    #[test]
+    fn dmabuf_render_node_probe_distinguishes_absence_from_error() {
+        let root =
+            std::env::temp_dir().join(format!("icedtea-dmabuf-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let missing = root.join("absent");
+
+        assert_eq!(
+            super::render_node_at(&missing).expect("absence is not an error"),
+            None,
+            "a nonexistent base directory is absence, not a read fault"
+        );
+
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).expect("create empty listing dir");
+        assert_eq!(
+            super::render_node_at(&empty).expect("empty listing"),
+            None,
+            "a readable directory with no renderD entry is absence"
+        );
+
+        let populated = root.join("populated");
+        std::fs::create_dir_all(&populated).expect("create populated dir");
+        std::fs::write(populated.join("renderD128"), b"").expect("seed a fake node");
+        assert_eq!(
+            super::render_node_at(&populated)
+                .expect("listing finds the node")
+                .as_deref()
+                .and_then(std::path::Path::file_name),
+            Some(std::ffi::OsStr::new("renderD128")),
+            "the first renderD entry is resolved relative to the base"
+        );
+
+        let not_a_dir = root.join("not-a-dir");
+        std::fs::write(&not_a_dir, b"").expect("seed a non-directory");
+        assert!(
+            super::render_node_at(&not_a_dir).is_err(),
+            "a base that exists but is not a directory is a read fault, \
+             not absence — it must surface as Err"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The harness never touches the session's runtime directory: its
     /// socket lives under a private, pid-named, 0700 `XDG_RUNTIME_DIR`, and
     /// the process env points there so spawned apps inherit it.
@@ -6914,28 +6963,40 @@ where
     Ok(None)
 }
 
-/// Resolve the first DRM render node under `/dev/dri`, if any.
+/// Resolve the first DRM render node under `base`, if any.
 ///
-/// `Ok(None)` is a GPU-less host (no `renderD*` entry); `Err` is a listing
-/// that could not be read at all (the `read_dir` itself or a per-entry
-/// iteration error) — a distinct failure that
-/// [`DmabufClient::import_and_present`] SKIPs with its own message. Shared by
-/// that method and [`has_render_node`], so the render-node probe exists once.
-fn render_node() -> std::io::Result<Option<std::path::PathBuf>> {
-    let base = std::path::Path::new("/dev/dri");
-    let names = std::fs::read_dir(base)?.map(|entry| entry.map(|entry| entry.file_name()));
+/// `Ok(None)` is a GPU-less host (no `renderD*` entry, or `base` does not
+/// exist at all — a missing `/dev/dri` *is* absence, not a read failure);
+/// `Err` is a listing that could not be read (a per-entry iteration error, or
+/// a `read_dir` failure other than absence, e.g. `EACCES`) — a distinct
+/// failure that [`DmabufClient::import_and_present`] SKIPs with its own
+/// message. Parameterized over `base` so the probe is unit-testable against
+/// synthetic paths; [`render_node`] is the `/dev/dri` wrapper.
+fn render_node_at(base: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    let names = match std::fs::read_dir(base) {
+        Ok(entries) => entries.map(|entry| entry.map(|entry| entry.file_name())),
+        // A missing directory is PC-less/GPU-less absence, not a read fault.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     Ok(scan_render_node(names)?.map(|name| base.join(name)))
+}
+
+/// Resolve the first DRM render node under `/dev/dri`, if any. See
+/// [`render_node_at`] for the absence-vs-error contract.
+fn render_node() -> std::io::Result<Option<std::path::PathBuf>> {
+    render_node_at(std::path::Path::new("/dev/dri"))
 }
 
 /// Whether a DRM render node (`/dev/dri/renderD*`) exists: the environment
 /// precondition GBM allocation needs, and the probe
 /// [`DmabufClient::import_and_present`] uses.
 ///
-/// `Ok(false)` is a GPU-less host (a genuine absence); `Err` is a listing
-/// that could not be read at all — a distinct failure a caller can name in
-/// its SKIP message rather than collapsing into "no render node". Returning
-/// a `bool` would make an unreadable `/dev/dri` indistinguishable from a
-/// host that truly has no GPU.
+/// `Ok(false)` is a GPU-less host (no node, or `/dev/dri` absent); `Err` is a
+/// listing that could not be read at all — a distinct failure a caller can
+/// name in its SKIP message rather than collapsing into "no render node".
+/// Returning a `bool` would make an unreadable `/dev/dri` indistinguishable
+/// from a host that truly has no GPU.
 pub fn has_render_node() -> std::io::Result<bool> {
     render_node().map(|node| node.is_some())
 }
