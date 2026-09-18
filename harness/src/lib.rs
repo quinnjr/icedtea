@@ -6647,8 +6647,14 @@ mod tests {
     /// not collapse, which is the whole point of `has_render_node`'s `Result`.
     #[test]
     fn dmabuf_render_node_probe_distinguishes_absence_from_error() {
-        let root =
-            std::env::temp_dir().join(format!("icedtea-dmabuf-probe-{}", std::process::id()));
+        // Unpredictable per-run suffix (no new dev-dependency): a pid-only
+        // name in a shared temp dir is pre-creatable/symlinkable by another
+        // local user (CWE-377), and this test creates and removes a tree.
+        let nonce = std::collections::hash_map::RandomState::new();
+        let root = std::env::temp_dir().join(format!(
+            "icedtea-dmabuf-probe-{:x}",
+            std::hash::BuildHasher::hash_one(&nonce, std::process::id())
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let missing = root.join("absent");
 
@@ -6670,12 +6676,11 @@ mod tests {
         std::fs::create_dir_all(&populated).expect("create populated dir");
         std::fs::write(populated.join("renderD128"), b"").expect("seed a fake node");
         assert_eq!(
-            super::render_node_at(&populated)
-                .expect("listing finds the node")
-                .as_deref()
-                .and_then(std::path::Path::file_name),
-            Some(std::ffi::OsStr::new("renderD128")),
-            "the first renderD entry is resolved relative to the base"
+            super::render_node_at(&populated).expect("listing finds the node"),
+            Some(populated.join("renderD128")),
+            "the first renderD entry is resolved relative to the base, not \
+             returned as a bare relative name the caller would open against \
+             its own CWD"
         );
 
         let not_a_dir = root.join("not-a-dir");
