@@ -16713,10 +16713,11 @@ mod tests {
     }
 
     /// M8: tablet tool/pad notifications without a runtime stay silent --
-    /// the ids are opaque (no per-tool state readers on the crate side)
-    /// and client traffic flows through wlroots itself, so there is nothing
-    /// truthful to do here; guessing would only invent behavior. Dangling
-    /// ids must be harmless.
+    /// the ids are opaque (no per-tool state readers on the crate side) and
+    /// wlroots forwards no tool/pad traffic itself (delivery needs
+    /// compositor-driven `wlr_send_tablet_v2_*`, no safe wrapper yet), so
+    /// there is nothing truthful to do here; guessing would only invent
+    /// behavior. Dangling ids must be harmless.
     #[test]
     fn tablet_notifications_without_a_runtime_emit_nothing() {
         let (tx, rx) = crossbeam_channel::unbounded();
