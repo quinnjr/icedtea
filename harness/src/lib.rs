@@ -6465,8 +6465,8 @@ impl GammaControlClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        Compositor, VirtualPointerClient, decode_format_table, decode_tranche_indices,
-        resolve_tranche_entries,
+        Compositor, VirtualPointerClient, clear_feedback_state, decode_format_table,
+        decode_tranche_indices, resolve_tranche_entries, scan_render_node,
     };
 
     /// One 16-byte format-table entry: u32 format, 4 pad bytes, u64
@@ -6526,13 +6526,109 @@ mod tests {
 
     /// `read_format_table` never panics: an unseekable fd (a pipe read end,
     /// standing in for any non-rewindable fd) surfaces as `Err` for the
-    /// Dispatch call site's `.expect("format table fd rewinds")` to pin,
-    /// rather than panicking inside the helper.
+    /// Dispatch call site's `.expect("format table fd can be rewound and
+    /// read")` to pin, rather than panicking inside the helper.
     #[test]
     fn dmabuf_format_table_read_rejects_unseekable_fd() {
         let (read_end, _write_end) = std::io::pipe().expect("pipe");
         let file = std::fs::File::from(std::os::fd::OwnedFd::from(read_end));
         assert!(super::read_format_table(file).is_err());
+    }
+
+    /// The read-failure sibling of the unseekable case: a seekable but
+    /// unreadable fd (write-only `/dev/null`) fails at the `read`, not the
+    /// `seek`. Both surface as `Err` — the one `.expect` covers both, hence
+    /// its "can be rewound and read" label — and their `kind`s stay distinct
+    /// (`ESPIPE` for the pipe's rewind, `EBADF` for the write-only read),
+    /// which is what makes the label honest rather than a merged mystery.
+    #[test]
+    fn dmabuf_format_table_read_rejects_write_only_fd() {
+        let (read_end, _write_end) = std::io::pipe().expect("pipe");
+        let unseekable = std::fs::File::from(std::os::fd::OwnedFd::from(read_end));
+        let unreadable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null write-only");
+        let seek_err =
+            super::read_format_table(unseekable).expect_err("an unseekable fd must fail");
+        let read_err =
+            super::read_format_table(unreadable).expect_err("an unreadable fd must fail");
+        assert_ne!(
+            seek_err.kind(),
+            read_err.kind(),
+            "the rewind failure ({:?}) and the read failure ({:?}) must stay distinguishable",
+            seek_err.kind(),
+            read_err.kind()
+        );
+    }
+
+    /// The clear path `DmabufClient::dmabuf_feedback_surface` runs before
+    /// requesting per-surface feedback drops the default offer's rows and
+    /// resets the `done` latch, so the surface collection can never union
+    /// with the default one and the fresh feedback is genuinely awaited.
+    /// Hermetic: a `ClientState` is seeded directly, no compositor or GPU.
+    #[test]
+    fn dmabuf_feedback_clear_drops_prior_rows() {
+        let mut state = super::ClientState {
+            dmabuf_format_entries: vec![(super::DRM_FORMAT_ARGB8888, 0u64), (0x3432_5852, 0u64)],
+            dmabuf_tranche_indices: vec![0, 1],
+            dmabuf_done: true,
+            ..Default::default()
+        };
+        assert!(
+            !resolve_tranche_entries(&state.dmabuf_format_entries, &state.dmabuf_tranche_indices)
+                .is_empty(),
+            "precondition: the seeded default offer resolves to rows"
+        );
+        clear_feedback_state(&mut state);
+        assert!(
+            resolve_tranche_entries(&state.dmabuf_format_entries, &state.dmabuf_tranche_indices)
+                .is_empty(),
+            "clearing must drop every default-offer row, never union with the surface feedback"
+        );
+        assert!(
+            !state.dmabuf_done,
+            "clearing must reset the done latch so the surface feedback is awaited"
+        );
+    }
+
+    /// The render-node scan's iteration-error arm is not its absence arm: a
+    /// per-entry error surfaces as `Err` (the listing is unreliable) rather
+    /// than `Ok(None)` (no render node). Synthetic `[Ok(card), Err]` proves
+    /// the distinction without a real or flaky `/dev/dri`; the clean
+    /// found/absent outcomes are pinned alongside it.
+    #[test]
+    fn dmabuf_render_node_scan_reports_iteration_error() {
+        let erroring = scan_render_node(
+            [
+                Ok(std::ffi::OsString::from("card1")),
+                Err(std::io::Error::other("synthetic readdir failure")),
+            ]
+            .into_iter(),
+        );
+        assert!(
+            erroring.is_err(),
+            "an entry iteration error must surface as Err (unreliable listing), \
+             not Ok(None) (absence): {erroring:?}"
+        );
+        assert_eq!(
+            scan_render_node([Ok(std::ffi::OsString::from("card1"))].into_iter())
+                .expect("clean listing"),
+            None,
+            "a clean listing with no renderD entry is absence (Ok(None))"
+        );
+        assert_eq!(
+            scan_render_node(
+                [
+                    Ok(std::ffi::OsString::from("card1")),
+                    Ok(std::ffi::OsString::from("renderD128")),
+                ]
+                .into_iter(),
+            )
+            .expect("clean listing"),
+            Some(std::ffi::OsString::from("renderD128")),
+            "the first renderD entry is found"
+        );
     }
 
     /// The harness never touches the session's runtime directory: its
@@ -6698,8 +6794,11 @@ fn resolve_tranche_entries(entries: &[(u32, u64)], indices: &[u16]) -> Vec<(u32,
 /// offset 0.
 ///
 /// Returns `Err`, never panics: an unseekable/unreadable fd surfaces here
-/// for the call site's `.expect("format table fd rewinds")` to pin, rather
-/// than panicking inside the helper (see the unit test).
+/// for the call site's `.expect("format table fd can be rewound and read")`
+/// to pin, rather than panicking inside the helper (see the unit tests). Both
+/// failure sites are distinguishable before that `expect` collapses them: a
+/// non-rewindable fd fails at the `seek`, a seekable-but-unreadable one at
+/// the `read`.
 fn read_format_table(mut file: std::fs::File) -> std::io::Result<Vec<u8>> {
     use std::io::{Read as _, Seek as _};
     file.seek(std::io::SeekFrom::Start(0))?;
@@ -6720,7 +6819,8 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for Cl
         match event {
             zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, .. } => {
                 let file: std::fs::File = fd.into();
-                let bytes = read_format_table(file).expect("format table fd rewinds");
+                let bytes =
+                    read_format_table(file).expect("format table fd can be rewound and read");
                 state
                     .dmabuf_format_entries
                     .extend(decode_format_table(&bytes));
@@ -6782,6 +6882,63 @@ impl Dispatch<wl_callback::WlCallback, ()> for ClientState {
 /// here must offer.
 const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 
+/// Scan a `/dev/dri`-style listing for the first `renderD*` render node.
+///
+/// Generic over the entry-name iterator so the per-entry iteration-error arm
+/// is unit-testable without a real, possibly-flaky `/dev/dri`: a synthetic
+/// `[Ok(card), Err(..)]` sequence proves an unreliable listing surfaces as
+/// `Err` rather than collapsing into the `Ok(None)` absence case. Non-UTF8
+/// names are skipped — they cannot spell a `renderD*` node.
+fn scan_render_node<I>(names: I) -> std::io::Result<Option<std::ffi::OsString>>
+where
+    I: Iterator<Item = std::io::Result<std::ffi::OsString>>,
+{
+    for name in names {
+        let name = name?;
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with("renderD") {
+            return Ok(Some(name.into()));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve the first DRM render node under `/dev/dri`, if any.
+///
+/// `Ok(None)` is a GPU-less host (no `renderD*` entry); `Err` is a listing
+/// that could not be read at all (the `read_dir` itself or a per-entry
+/// iteration error) — a distinct failure that
+/// [`DmabufClient::import_and_present`] SKIPs with its own message. Shared by
+/// that method and [`has_render_node`], so the render-node probe exists once.
+fn render_node() -> std::io::Result<Option<std::path::PathBuf>> {
+    let base = std::path::Path::new("/dev/dri");
+    let names = std::fs::read_dir(base)?.map(|entry| entry.map(|entry| entry.file_name()));
+    Ok(scan_render_node(names)?.map(|name| base.join(name)))
+}
+
+/// Whether a DRM render node (`/dev/dri/renderD*`) exists: the environment
+/// precondition GBM allocation needs, and the probe
+/// [`DmabufClient::import_and_present`] uses.
+///
+/// A `false` here is not itself a SKIP — a listing that could not be read is
+/// also `false` — so a caller that must exercise the import path (rather than
+/// SKIP) checks this first and prints its own SKIP message.
+#[must_use]
+pub fn has_render_node() -> bool {
+    matches!(render_node(), Ok(Some(_)))
+}
+
+/// Drop the default feedback's collected rows and `done` latch before a fresh
+/// feedback begins collecting into the same state, so
+/// [`DmabufClient::tranches`] can never union the two offers.
+fn clear_feedback_state(state: &mut ClientState) {
+    state.dmabuf_format_entries.clear();
+    state.dmabuf_tranche_indices.clear();
+    state.dmabuf_done = false;
+}
+
 /// A `zwp_linux_dmabuf_v1` client: binds the global, collects the default
 /// feedback's format table + tranches, and (where a render node exists)
 /// imports a real GBM buffer and presents it on a mapped toplevel. The
@@ -6812,6 +6969,14 @@ pub struct DmabufClient {
     /// The presented dmabuf `wl_buffer`, kept alive as long as the surface
     /// may still be showing it.
     buffer: Option<wl_buffer::WlBuffer>,
+    /// Why the most recent [`DmabufClient::pump_until`] stopped without its
+    /// predicate holding: `true` when a roundtrip failed (the transport died
+    /// mid-wait), `false` when the wait merely timed out. Reset at the top of
+    /// every `pump_until`, so it always describes the wait just run. A `bool`
+    /// rather than an `io::ErrorKind`: `EventQueue::roundtrip` returns a
+    /// `DispatchError`, which exposes no `io::ErrorKind`, and all a test needs
+    /// is the deterministic error-vs-timeout distinction.
+    last_pump_errored: bool,
 }
 
 impl DmabufClient {
@@ -6857,6 +7022,7 @@ impl DmabufClient {
             xdg_surface,
             toplevel,
             buffer: None,
+            last_pump_errored: false,
         }
     }
 
@@ -6869,6 +7035,7 @@ impl DmabufClient {
     /// (the connection died mid-wait) breaks early with an `eprintln!`
     /// naming the error rather than spinning silently to the timeout.
     fn pump_until(&mut self, pred: impl Fn(&Self) -> bool) -> bool {
+        self.last_pump_errored = false;
         let deadline = Instant::now() + TIMEOUT;
         loop {
             if pred(self) {
@@ -6879,6 +7046,7 @@ impl DmabufClient {
             }
             if let Err(e) = self.queue.roundtrip(&mut self.state) {
                 eprintln!("DmabufClient pump roundtrip failed: {e}");
+                self.last_pump_errored = true;
                 return false;
             }
             if pred(self) {
@@ -6886,6 +7054,15 @@ impl DmabufClient {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Why the most recent wait on this client stopped without completing:
+    /// `true` when a roundtrip failed (the transport died mid-wait), `false`
+    /// when the wait simply timed out. Lets a test assert the error path
+    /// deterministically instead of bounding wall-clock time.
+    #[must_use]
+    pub fn last_pump_errored(&self) -> bool {
+        self.last_pump_errored
     }
 
     /// Pump until the default feedback delivers table + tranches + `done`,
@@ -6907,18 +7084,18 @@ impl DmabufClient {
     /// tailor tranches to the surface, so the default feedback's offer alone
     /// does not prove what the surface gets. Both feedbacks are never
     /// collected into the shared state simultaneously — the default object's
-    /// rows are cleared first, so `tranches()` afterwards reflects only the
-    /// surface feedback.
+    /// rows are cleared first ([`clear_feedback_state`]), so `tranches()`
+    /// afterwards reflects only the surface feedback.
     ///
-    /// A flush failure (the transport died under us) returns `false` rather
-    /// than panicking: like [`DmabufClient::wait_first_frame`]'s
-    /// `pump_until` error path, "the compositor is gone" is a falsifiable
-    /// outcome a test can assert on, not a harness bug.
+    /// A `false` return conflates two causes and the caller's message should
+    /// name both: the surface feedback never completed within `TIMEOUT`, or
+    /// the transport died under us (the flush failed, or `pump_until`'s
+    /// roundtrip errored). Like [`DmabufClient::wait_first_frame`]'s error
+    /// path, "the compositor is gone" is a falsifiable outcome a test can
+    /// assert on, not a harness bug.
     pub fn dmabuf_feedback_surface(&mut self) -> bool {
         self.feedback.destroy();
-        self.state.dmabuf_format_entries.clear();
-        self.state.dmabuf_tranche_indices.clear();
-        self.state.dmabuf_done = false;
+        clear_feedback_state(&mut self.state);
         self.feedback = self
             .dmabuf
             .get_surface_feedback(&self.surface, &self.qh, ());
@@ -6960,41 +7137,16 @@ impl DmabufClient {
     /// test would need a second compositor configuration that rejects on
     /// purpose; the structural split here plus Tier 2 IS the coverage.)
     pub fn import_and_present(&mut self) -> Option<()> {
-        let entries = match std::fs::read_dir("/dev/dri") {
-            Ok(entries) => entries,
-            Err(e) => {
-                eprintln!("SKIP: cannot list /dev/dri for GBM allocation: {e}");
+        let node = match render_node() {
+            Ok(Some(node)) => node,
+            Ok(None) => {
+                eprintln!("SKIP: no renderD node in /dev/dri — GBM allocation impossible here");
                 return None;
             }
-        };
-        // Explicit per-entry handling, not `.flatten()`: an iteration
-        // error means the listing itself is unreliable (not merely "no
-        // renderD node yet"), so it SKIPs with its own message naming the
-        // OS error rather than falling through to the absence message below.
-        let mut node = None;
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    eprintln!(
-                        "SKIP: cannot iterate /dev/dri entries while looking for a render node: {e}"
-                    );
-                    return None;
-                }
-            };
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name.starts_with("renderD") {
-                node = Some(entry.path());
-                break;
-            }
-        }
-        let node = match node {
-            Some(node) => node,
-            None => {
-                eprintln!("SKIP: no renderD node in /dev/dri — GBM allocation impossible here");
+            Err(e) => {
+                eprintln!(
+                    "SKIP: cannot read the /dev/dri listing while looking for a render node: {e}"
+                );
                 return None;
             }
         };

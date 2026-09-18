@@ -39,7 +39,7 @@
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use icedtea_harness::{Compositor, DmabufClient, advertised_globals};
+use icedtea_harness::{Compositor, DmabufClient, advertised_globals, has_render_node};
 use wayland_client::protocol::{wl_buffer, wl_registry};
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, delegate_noop, event_created_child,
@@ -68,26 +68,20 @@ fn dmabuf_feedback_v4_with_usable_tranches() {
         client.has_argb8888(),
         "dmabuf feedback offers no ARGB8888 tranche: the Tauri format is missing"
     );
-    // The surface half of the same contract: the path WebKitGTK binds.
-    // Snapshot the default offer's row count first: the surface request must
-    // REPLACE the collected rows (the harness clears before re-collecting),
-    // never union with them. Length equality catches a clear-regression that
-    // would double the union. Full refetch-freshness — proving the surface
-    // rows were re-read from the new table rather than re-decoded — needs
-    // fixture support beyond this scope.
-    let default_rows = client.tranches().len();
+    // The surface half of the same contract: the path WebKitGTK binds. Full
+    // replace-vs-union proof (that the surface collection drops the default
+    // offer rather than appending to it) lives in the harness unit test
+    // `dmabuf_feedback_clear_drops_prior_rows`; here we only assert the
+    // surface feedback itself delivered a usable set. Deliberately no
+    // row-count parity with the default offer: a compositor may tailor
+    // per-surface tranches (see this file's header), so equal counts are
+    // neither required nor a contract.
     assert!(
         client.dmabuf_feedback_surface(),
-        "per-surface dmabuf feedback never delivered format table + tranches + done"
+        "per-surface dmabuf feedback never delivered format table + tranches + done \
+         (or the transport died before it could)"
     );
     let surface_rows = client.tranches();
-    assert_eq!(
-        default_rows,
-        surface_rows.len(),
-        "surface feedback unioned with the default offer instead of replacing it \
-         (default {default_rows} rows, surface {} rows)",
-        surface_rows.len()
-    );
     assert!(
         !surface_rows.is_empty(),
         "surface dmabuf feedback delivered no tranches to choose from"
@@ -246,14 +240,21 @@ fn dmabuf_garbage_modifier_is_rejected_with_failed() {
     // check. A sized temp file sails through the bounds checks and dies
     // exactly where it should: 0xDEADBEEF_CAFEF00D is offered by no driver
     // on any planet, so the import fails with `Failed`.
-    let backing =
-        std::env::temp_dir().join(format!("icedtea-dmabuf-garbage-{}", std::process::id()));
-    let file = std::fs::File::create(&backing).expect("create dmabuf backing file");
-    file.set_len(65536).expect("size dmabuf backing file");
+    //
+    // `NamedTempFile`, not a `temp_dir()`-joined pid name: the name is
+    // random and created with `O_EXCL` (no symlink-clobber), and RAII
+    // unlinks it on both the normal and panic paths. It must outlive the
+    // import (the fd has to stay valid until the outcome arrives), so it is
+    // held to the end of the test.
+    let backing = tempfile::NamedTempFile::new().expect("create dmabuf backing file");
+    backing
+        .as_file()
+        .set_len(65536)
+        .expect("size dmabuf backing file");
     let garbage: u64 = 0xDEAD_BEEF_CAFE_F00D;
     let params = dmabuf.create_params(&qh, ());
     params.add(
-        file.as_fd(),
+        backing.as_file().as_fd(),
         0,
         0,
         256,
@@ -287,18 +288,39 @@ fn dmabuf_garbage_modifier_is_rejected_with_failed() {
         "compositor neither failed nor created garbage-modifier import 0x{garbage:016x} within 5s \
          (a protocol-error kill would also land here, as a roundtrip error)"
     );
-    // The backing file outlives the import (the fd must stay valid until
-    // the outcome arrives); unlink it now that the verdict is in.
-    std::fs::remove_file(&backing).expect("remove dmabuf backing file");
+    // `backing` (a `NamedTempFile`) unlinks itself on drop, here and on the
+    // panic path; nothing to clean up by hand.
+}
+
+/// Extract the string message from a `catch_unwind` payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 /// Transport death mid-import panics, never a silent SKIP: with the
-/// compositor gone the create_params flush fails and `import_and_present`
-/// panics naming the flush. `drop` joins the compositor thread, so the
-/// socket is fully closed before the import starts — no kill-timing race.
+/// compositor gone the import's transport error is a panic. GPU-gated —
+/// `import_and_present` returns `None` at its render-node/GBM guards long
+/// before any flush, so on a host with no render node the path is simply
+/// unprovable and the test SKIPs visibly rather than failing.
+///
+/// `drop` joins the compositor thread, so the socket is fully closed before
+/// the import starts — no kill-timing race. Depending on how the FIN is
+/// handled the panic can land at the `create_params` flush (the socket is
+/// already tearing down) or at the roundtrip that follows (a graceful FIN
+/// lets the first flush succeed), so the assertion matches the shared
+/// `"dmabuf create_params"` prefix, not one exact site.
 #[test]
-#[should_panic(expected = "flush failed")]
 fn dmabuf_import_panics_when_transport_dies() {
+    if !has_render_node() {
+        eprintln!("SKIP: no renderD node — transport-death import path unprovable here");
+        return;
+    }
     let comp = Compositor::spawn();
     let mut client = DmabufClient::spawn(&comp.socket);
     assert!(
@@ -306,11 +328,29 @@ fn dmabuf_import_panics_when_transport_dies() {
         "no dmabuf feedback to choose an import format from"
     );
     drop(comp);
-    let _ = client.import_and_present();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = client.import_and_present();
+    }));
+    match outcome {
+        Ok(_) => panic!(
+            "import_and_present returned on a dead transport instead of panicking; \
+             the render-node/GBM guards must not have been the stop"
+        ),
+        Err(payload) => {
+            let message = panic_message(&*payload);
+            assert!(
+                message.contains("dmabuf create_params"),
+                "transport death must panic at the create_params flush or the following \
+                 roundtrip, got: {message}"
+            );
+        }
+    }
 }
 
 /// Surface feedback against a dead connection returns `false` — the flush /
-/// `pump_until` roundtrip-error path — never panics. Deterministic: `drop`
+/// `pump_until` roundtrip-error path — never panics. A `false` there names
+/// either cause (`dmabuf_feedback_surface`'s doc): feedback never completed,
+/// or the transport is gone; here it is deterministically the latter. `drop`
 /// joins the compositor thread, so the socket is fully closed before the
 /// request goes out; no timing dependence.
 #[test]
@@ -324,26 +364,24 @@ fn dmabuf_surface_feedback_false_on_dead_connection() {
     );
 }
 
-/// A dead connection fails `wait_first_frame` with `false`, and fast: the
-/// roundtrip errors immediately instead of spinning to TIMEOUT. The 2s bound
-/// against the 5s TIMEOUT leaves 3s of CI-slowness margin while still proving
-/// no full-timeout spin — an error-false that took the whole TIMEOUT would
-/// mean the error path was never hit and the wait merely expired.
+/// A dead connection fails `wait_first_frame` with `false`, and the stop is
+/// a recorded transport error, not a silent full-`TIMEOUT` spin: the
+/// roundtrip errors immediately and `pump_until` latches the error kind.
+/// Asserting the latched kind is deterministic — unlike a wall-clock bound,
+/// which a loaded CI runner can flake.
 #[test]
-fn dmabuf_wait_first_frame_false_fast_on_dead_connection() {
+fn dmabuf_wait_first_frame_false_when_transport_dead() {
     let comp = Compositor::spawn();
     let mut client = DmabufClient::spawn(&comp.socket);
     drop(comp);
-    let start = Instant::now();
     let completed = client.wait_first_frame();
-    let elapsed = start.elapsed();
     assert!(
         !completed,
         "wait_first_frame against a dead compositor returned true"
     );
     assert!(
-        elapsed < Duration::from_secs(2),
-        "dead-connection wait_first_frame took {elapsed:?}: \
-         the error path should fail fast, not spin toward TIMEOUT"
+        client.last_pump_errored(),
+        "the wait must stop on a recorded transport error; an error-free false would mean \
+         the roundtrip never failed and the wait merely spun to TIMEOUT"
     );
 }
