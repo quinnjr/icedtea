@@ -1381,9 +1381,15 @@ struct ClientState {
     dmabuf_buffer: Option<wl_buffer::WlBuffer>,
     /// Set on `zwp_linux_buffer_params_v1.failed`.
     dmabuf_failed: bool,
-    /// Set on the next `wl_callback.done`. No other client creates frame
-    /// callbacks, so this flag can only mean the dmabuf first frame
-    /// completed.
+    /// Set on the next `wl_callback.done` on this connection.
+    ///
+    /// Per-client, not per-process: every client connection gets a fresh
+    /// `ClientState` from `connect_and_bind`, so a frame callback on one
+    /// connection can never set another client's flag. And exactly-once per
+    /// present: [`DmabufClient`] issues a single `wl_surface.frame` per
+    /// `import_and_present` (resetting this flag first), so this flag means
+    /// that present's first frame completed — never some other client's,
+    /// nor a stale one.
     dmabuf_frame_done: bool,
 }
 
@@ -2791,6 +2797,84 @@ fn connect_and_bind(
     (conn, queue, qh, state)
 }
 
+/// Create a surface + `xdg_surface` + toplevel, set its app_id/title, do the
+/// initial empty commit, and wait for the first `xdg_surface.configure`.
+///
+/// Shared by `TestClient::map_with` and [`DmabufClient::spawn`]: both need
+/// the identical "commit, await configure, ack, attach, commit" opening —
+/// the ack happens inside the `Dispatch` impl, so by the time this returns
+/// the toplevel is configured and ready for its first real attach. A second
+/// implementation of the wait would be one more place for the
+/// roundtrip-vs-`blocking_dispatch` reasoning below to drift out of sync
+/// with reality.
+///
+/// What this deliberately does NOT cover: `TestClient`'s decoration (created
+/// between `get_toplevel` and the initial commit when `decorated`, since the
+/// protocol forbids creating it once a buffer exists) and either caller's
+/// first real attach (`TestClient` attaches shm here; `DmabufClient`
+/// attaches its GBM import later, in `import_and_present`).
+fn map_empty_toplevel(
+    conn: &Connection,
+    queue: &mut EventQueue<ClientState>,
+    qh: &QueueHandle<ClientState>,
+    state: &mut ClientState,
+    app_id: &str,
+    title: &str,
+    decorated: bool,
+) -> (
+    wl_surface::WlSurface,
+    xdg_surface::XdgSurface,
+    xdg_toplevel::XdgToplevel,
+    Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+) {
+    let compositor = state
+        .compositor
+        .clone()
+        .expect("compositor did not advertise wl_compositor");
+    let wm_base = state
+        .wm_base
+        .clone()
+        .expect("compositor did not advertise xdg_wm_base");
+
+    let surface = compositor.create_surface(qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, qh, ());
+    let toplevel = xdg_surface.get_toplevel(qh, ());
+    toplevel.set_app_id(app_id.to_string());
+    toplevel.set_title(title.to_string());
+    let decoration = decorated.then(|| {
+        let manager = state
+            .decoration_manager
+            .clone()
+            .expect("compositor did not advertise zxdg_decoration_manager_v1");
+        // No `set_mode` call at all: the client states no preference and
+        // leaves the decision entirely to the compositor.
+        manager.get_toplevel_decoration(&toplevel, qh, ())
+    });
+    // The initial-commit handshake: an empty commit, then wait for the
+    // compositor's first configure (acked inside the `Dispatch` impl).
+    surface.commit();
+    conn.flush().expect("flush");
+
+    // `roundtrip`, not `blocking_dispatch`, for the same reason
+    // `wait_until` uses it: `blocking_dispatch` returns only once *some*
+    // event has been dispatched, so against a compositor that is alive
+    // but never answers the initial commit it blocks forever and the
+    // deadline below is never re-evaluated — a wedged CI job with no
+    // output instead of a 5s assertion failure. A roundtrip's own
+    // `wl_display.sync` reply is guaranteed by any live loop, so the
+    // deadline stays honest.
+    let deadline = Instant::now() + TIMEOUT;
+    while state.configures == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no xdg_surface.configure within {TIMEOUT:?}"
+        );
+        queue.roundtrip(state).expect("configure roundtrip");
+    }
+
+    (surface, xdg_surface, toplevel, decoration)
+}
+
 /// Connect, complete the registry roundtrip, and return the interface names of
 /// every global the compositor advertised. Lets a test assert a global exists
 /// without the harness having to bind it.
@@ -3186,54 +3270,13 @@ impl TestClient {
         let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
         pre_map(&mut state, &qh);
 
-        let compositor = state
-            .compositor
-            .clone()
-            .expect("compositor did not advertise wl_compositor");
         let shm = state
             .shm
             .clone()
             .expect("compositor did not advertise wl_shm");
-        let wm_base = state
-            .wm_base
-            .clone()
-            .expect("compositor did not advertise xdg_wm_base");
 
-        let surface = compositor.create_surface(&qh, ());
-        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-        let toplevel = xdg_surface.get_toplevel(&qh, ());
-        toplevel.set_app_id(app_id.to_string());
-        toplevel.set_title(title.to_string());
-        let decoration = decorated.then(|| {
-            let manager = state
-                .decoration_manager
-                .clone()
-                .expect("compositor did not advertise zxdg_decoration_manager_v1");
-            // No `set_mode` call at all: the client states no preference and
-            // leaves the decision entirely to the compositor.
-            manager.get_toplevel_decoration(&toplevel, &qh, ())
-        });
-        // The initial-commit handshake: an empty commit, then wait for the
-        // compositor's first configure (acked inside the `Dispatch` impl).
-        surface.commit();
-        conn.flush().expect("flush");
-
-        // `roundtrip`, not `blocking_dispatch`, for the same reason
-        // `wait_until` uses it: `blocking_dispatch` returns only once *some*
-        // event has been dispatched, so against a compositor that is alive
-        // but never answers the initial commit it blocks forever and the
-        // deadline below is never re-evaluated — a wedged CI job with no
-        // output instead of a 5s assertion failure. A roundtrip's own
-        // `wl_display.sync` reply is guaranteed by any live loop, so the
-        // deadline stays honest.
-        let deadline = Instant::now() + TIMEOUT;
-        while state.configures == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "no xdg_surface.configure within {TIMEOUT:?}"
-            );
-            queue.roundtrip(&mut state).expect("configure roundtrip");
-        }
+        let (surface, xdg_surface, toplevel, decoration) =
+            map_empty_toplevel(&conn, &mut queue, &qh, &mut state, app_id, title, decorated);
 
         // A configure of 0x0 means "you choose"; the compositor's
         // `initial_commit` normally sizes us, so this is the safety net.
@@ -6421,7 +6464,65 @@ impl GammaControlClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{Compositor, VirtualPointerClient};
+    use super::{
+        Compositor, VirtualPointerClient, decode_format_table, decode_tranche_indices,
+        resolve_tranche_entries,
+    };
+
+    /// One 16-byte format-table entry: u32 format, 4 pad bytes, u64
+    /// modifier, native-endian — the protocol xml's own layout.
+    fn table_entry(format: u32, modifier: u64) -> [u8; 16] {
+        let mut entry = [0u8; 16];
+        entry[0..4].copy_from_slice(&format.to_ne_bytes());
+        entry[8..16].copy_from_slice(&modifier.to_ne_bytes());
+        entry
+    }
+
+    /// The modifier decode pins the native-endian layout with an asymmetric
+    /// modifier (`0x0100000000000001`, Intel-style): the old split hi/lo
+    /// read decoded this as `0x0000000101000000` on little-endian (low half
+    /// sits at the low address), which only passed because headless
+    /// tranches offer LINEAR (0, symmetric under the split). No GPU needed.
+    #[test]
+    fn dmabuf_format_table_decodes_modifiers_native_endian() {
+        let modifier = 0x0100_0000_0000_0001u64;
+        let entry = table_entry(super::DRM_FORMAT_ARGB8888, modifier);
+        assert_eq!(
+            decode_format_table(&entry),
+            vec![(super::DRM_FORMAT_ARGB8888, modifier)]
+        );
+    }
+
+    /// A 20-byte table (one entry + 4 trailing bytes) decodes to exactly
+    /// the one complete entry; the leftover is ignored, not a second row.
+    #[test]
+    fn dmabuf_format_table_ignores_trailing_bytes() {
+        let mut bytes = table_entry(super::DRM_FORMAT_ARGB8888, 0).to_vec();
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(
+            decode_format_table(&bytes),
+            vec![(super::DRM_FORMAT_ARGB8888, 0)]
+        );
+    }
+
+    /// An odd-length `tranche_formats` payload decodes to exactly the
+    /// complete indices; the trailing byte is ignored.
+    #[test]
+    fn dmabuf_tranche_indices_ignore_trailing_byte() {
+        let bytes = [0x01u8, 0x00, 0x02, 0x00, 0xFF];
+        assert_eq!(decode_tranche_indices(&bytes), vec![1u16, 2u16]);
+    }
+
+    /// Tranche indices past the end of the format table resolve to nothing:
+    /// only the in-range rows survive, in index order.
+    #[test]
+    fn dmabuf_tranche_resolution_drops_out_of_range_indices() {
+        let entries = vec![(super::DRM_FORMAT_ARGB8888, 0u64), (0x3432_5852, 0u64)];
+        assert_eq!(
+            resolve_tranche_entries(&entries, &[0, 7, 1, 255]),
+            vec![(super::DRM_FORMAT_ARGB8888, 0u64), (0x3432_5852, 0u64)]
+        );
+    }
 
     /// The harness never touches the session's runtime directory: its
     /// socket lives under a private, pid-named, 0700 `XDG_RUNTIME_DIR`, and
@@ -6496,6 +6597,86 @@ mod tests {
 
 delegate_noop!(ClientState: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
 
+/// Decode a `zwp_linux_dmabuf_feedback_v1.format_table` payload: one 16-byte
+/// entry per format — a u32 format, 4 bytes of unused padding, then the
+/// modifier as a single u64, all native-endian on the wire (the protocol
+/// xml's own words).
+///
+/// The modifier MUST be read as one `u64::from_ne_bytes` over bytes 8..16:
+/// splitting it into hi/lo halves misplaces them on little-endian (the low
+/// half sits at the low address). This passed unnoticed while every headless
+/// tranche offered only LINEAR (0, symmetric under the split).
+///
+/// Pure so the layout is pinned hermetically (see the unit tests): trailing
+/// bytes that do not fill a whole entry are ignored, with an `eprintln!`
+/// naming the count — the single place that logging lives.
+fn decode_format_table(bytes: &[u8]) -> Vec<(u32, u64)> {
+    let (entries, leftover) = bytes.as_chunks::<16>();
+    if !leftover.is_empty() {
+        eprintln!(
+            "dmabuf format table has {} trailing bytes after {} complete entries; ignoring",
+            leftover.len(),
+            entries.len()
+        );
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            let format = u32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let modifier = u64::from_ne_bytes([
+                entry[8], entry[9], entry[10], entry[11], entry[12], entry[13], entry[14],
+                entry[15],
+            ]);
+            (format, modifier)
+        })
+        .collect()
+}
+
+/// Decode a `tranche_formats` payload: tightly packed native-endian u16
+/// indices into the format table. Pure, for the same hermetic-test reason
+/// as [`decode_format_table`]; a trailing odd byte is ignored with an
+/// `eprintln!` — the single place that logging lives.
+fn decode_tranche_indices(bytes: &[u8]) -> Vec<u16> {
+    let (indices, leftover) = bytes.as_chunks::<2>();
+    if !leftover.is_empty() {
+        eprintln!(
+            "dmabuf tranche formats has {} trailing bytes after {} complete indices; ignoring",
+            leftover.len(),
+            indices.len()
+        );
+    }
+    indices
+        .iter()
+        .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+        .collect()
+}
+
+/// Resolve tranche indices against the decoded format table, dropping
+/// out-of-range indices with an `eprintln!` naming the count — a tranche
+/// naming a row that does not exist is a compositor bug, never a tranche.
+/// Pure, so the malformed-index case is pinned hermetically like the decodes
+/// above.
+fn resolve_tranche_entries(entries: &[(u32, u64)], indices: &[u16]) -> Vec<(u32, u64)> {
+    let mut dropped = 0u32;
+    let resolved = indices
+        .iter()
+        .filter_map(|i| match entries.get(*i as usize) {
+            Some(entry) => Some(*entry),
+            None => {
+                dropped += 1;
+                None
+            }
+        })
+        .collect();
+    if dropped > 0 {
+        eprintln!(
+            "dmabuf tranches name {dropped} out-of-range format-table indices (table holds {} entries); ignoring",
+            entries.len()
+        );
+    }
+    resolved
+}
+
 impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for ClientState {
     fn event(
         state: &mut Self,
@@ -6507,29 +6688,27 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for Cl
     ) {
         match event {
             zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, .. } => {
-                // One 16-byte entry per format: u32 format, u32 pad, u32
-                // modifier_hi, u32 modifier_lo, all native-endian on the wire
-                // (little-endian everywhere this runs).
                 let mut file: std::fs::File = fd.into();
+                // Rewind: the protocol expects clients to mmap this fd
+                // (offset-insensitive), but a `read()` starts at the
+                // description's current offset — and wlroots re-sends the
+                // same table file for later feedback objects, so the second
+                // `format_table` (e.g. the per-surface one) arrives
+                // positioned at EOF and reads back zero bytes. The table
+                // always starts at offset 0.
+                use std::io::Seek as _;
+                file.seek(std::io::SeekFrom::Start(0))
+                    .expect("format table fd rewinds");
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut bytes).expect("format table fd reads");
-                for entry in bytes.as_chunks::<16>().0 {
-                    let format = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-                    let mod_hi = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
-                    let mod_lo = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]);
-                    state
-                        .dmabuf_format_entries
-                        .push((format, ((mod_hi as u64) << 32) | mod_lo as u64));
-                }
+                state
+                    .dmabuf_format_entries
+                    .extend(decode_format_table(&bytes));
             }
             zwp_linux_dmabuf_feedback_v1::Event::TrancheFormats { indices } => {
-                state.dmabuf_tranche_indices.extend(
-                    indices
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|c| u16::from_ne_bytes([c[0], c[1]])),
-                );
+                state
+                    .dmabuf_tranche_indices
+                    .extend(decode_tranche_indices(&indices));
             }
             zwp_linux_dmabuf_feedback_v1::Event::Done => {
                 state.dmabuf_done = true;
@@ -6594,6 +6773,11 @@ pub struct DmabufClient {
     qh: QueueHandle<ClientState>,
     state: ClientState,
     dmabuf: zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    /// `#[allow(dead_code)]`: never read after the default feedback is
+    /// requested, but destroying the object would withdraw that feedback —
+    /// it is the keepalive for the feedback stream, like `xdg_surface` /
+    /// `toplevel` below (deliberately replaced, never just dropped, by
+    /// [`DmabufClient::dmabuf_feedback_surface`]).
     #[allow(dead_code)]
     feedback: zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
     surface: wl_surface::WlSurface,
@@ -6613,6 +6797,13 @@ pub struct DmabufClient {
 impl DmabufClient {
     /// Connect, bind `zwp_linux_dmabuf_v1`, and request the default
     /// feedback. Panics if the compositor did not advertise linux_dmabuf.
+    ///
+    /// Documented-uncovered panic branches: every `expect` below names a
+    /// global a working compositor always advertises (`zwp_linux_dmabuf_v1`,
+    /// `wl_compositor`, `xdg_wm_base`). Proving one of those panics would
+    /// need a deliberately deficient compositor, which is stub
+    /// infrastructure out of all proportion to the static expect strings
+    /// already reviewed in code — so they stay uncovered on purpose.
     pub fn spawn(socket: &str) -> DmabufClient {
         let (conn, mut queue, qh, mut state) = connect_and_bind(socket);
         let dmabuf = state
@@ -6623,31 +6814,17 @@ impl DmabufClient {
         conn.flush().expect("flush get_default_feedback");
         queue.roundtrip(&mut state).expect("feedback roundtrip");
 
-        let compositor = state
-            .compositor
-            .clone()
-            .expect("compositor did not advertise wl_compositor");
-        let wm_base = state
-            .wm_base
-            .clone()
-            .expect("compositor did not advertise xdg_wm_base");
-        let surface = compositor.create_surface(&qh, ());
-        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-        let toplevel = xdg_surface.get_toplevel(&qh, ());
-        toplevel.set_app_id("dmabuf.smoke".to_string());
-        toplevel.set_title("dmabuf smoke".to_string());
         // Initial-commit handshake first (empty commit, wait configure);
         // the dmabuf attach lands after, in `import_and_present`.
-        surface.commit();
-        conn.flush().expect("flush");
-        let deadline = Instant::now() + TIMEOUT;
-        while state.configures == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "no xdg_surface.configure within {TIMEOUT:?}"
-            );
-            queue.roundtrip(&mut state).expect("configure roundtrip");
-        }
+        let (surface, xdg_surface, toplevel, _) = map_empty_toplevel(
+            &conn,
+            &mut queue,
+            &qh,
+            &mut state,
+            "dmabuf.smoke",
+            "dmabuf smoke",
+            false,
+        );
 
         DmabufClient {
             conn,
@@ -6668,28 +6845,70 @@ impl DmabufClient {
         self.state.linux_dmabuf_version.unwrap_or(0)
     }
 
-    /// Pump until the default feedback delivers table + tranches + `done`,
-    /// or `TIMEOUT` elapses. Returns whether it did.
-    pub fn wait_feedback(&mut self) -> bool {
+    /// Pump until `pred` holds or `TIMEOUT` elapses. A roundtrip that fails
+    /// (the connection died mid-wait) breaks early with an `eprintln!`
+    /// naming the error rather than spinning silently to the timeout.
+    fn pump_until(&mut self, pred: impl Fn(&Self) -> bool) -> bool {
         let deadline = Instant::now() + TIMEOUT;
-        while !self.state.dmabuf_done {
+        loop {
+            if pred(self) {
+                return true;
+            }
             if Instant::now() >= deadline {
                 return false;
             }
-            let _ = self.queue.roundtrip(&mut self.state);
+            if let Err(e) = self.queue.roundtrip(&mut self.state) {
+                eprintln!("DmabufClient pump roundtrip failed: {e}");
+                return false;
+            }
+            if pred(self) {
+                return true;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
-        true
+    }
+
+    /// Pump until the default feedback delivers table + tranches + `done`,
+    /// or `TIMEOUT` elapses. Returns whether it did.
+    ///
+    /// The `false` arm is documented-uncovered: `spawn` always requests the
+    /// default feedback and a working server always answers it in practice,
+    /// so no honest run ever takes it — and faking a deficient compositor
+    /// just to watch it fail would prove nothing about this client.
+    pub fn wait_feedback(&mut self) -> bool {
+        self.pump_until(|c| c.state.dmabuf_done)
+    }
+
+    /// Destroy the default feedback, clear the collected table/tranche
+    /// state, request per-surface feedback on the mapped toplevel, and pump
+    /// to `done`. Returns whether the surface feedback completed.
+    ///
+    /// This is the path WebKitGTK actually binds (v4+): the compositor may
+    /// tailor tranches to the surface, so the default feedback's offer alone
+    /// does not prove what the surface gets. Both feedbacks are never
+    /// collected into the shared state simultaneously — the default object's
+    /// rows are cleared first, so `tranches()` afterwards reflects only the
+    /// surface feedback.
+    pub fn dmabuf_feedback_surface(&mut self) -> bool {
+        self.feedback.destroy();
+        self.state.dmabuf_format_entries.clear();
+        self.state.dmabuf_tranche_indices.clear();
+        self.state.dmabuf_done = false;
+        self.feedback = self
+            .dmabuf
+            .get_surface_feedback(&self.surface, &self.qh, ());
+        self.conn.flush().expect("flush get_surface_feedback");
+        self.wait_feedback()
     }
 
     /// The `(format, modifier)` pairs the tranches actually offer, resolved
-    /// through the format table.
+    /// through the format table (out-of-range indices dropped — see
+    /// [`resolve_tranche_entries`]).
     pub fn tranches(&self) -> Vec<(u32, u64)> {
-        self.state
-            .dmabuf_tranche_indices
-            .iter()
-            .filter_map(|i| self.state.dmabuf_format_entries.get(*i as usize).copied())
-            .collect()
+        resolve_tranche_entries(
+            &self.state.dmabuf_format_entries,
+            &self.state.dmabuf_tranche_indices,
+        )
     }
 
     /// Whether any tranche offers the Tauri format.
@@ -6702,45 +6921,105 @@ impl DmabufClient {
     /// Allocate a real GBM ARGB8888 buffer (first tranche entry offering
     /// the format), import it through `create_params`, attach it to the
     /// mapped toplevel, and commit with damage + a frame callback.
-    /// Returns `None` (caller SKIPs visibly) when there is no render node,
-    /// the allocation fails, or the compositor rejects the import — all
-    /// environment-shaped outcomes, not assertion failures.
+    ///
+    /// Returns `None` (the caller SKIPs visibly) ONLY for environment
+    /// absence: no renderD node, a GBM open/device failure, no ARGB tranche
+    /// to import, or a BO/fd failure — each with an `eprintln!` naming the
+    /// stage and the OS error. Anything else is red, never a skip:
+    /// transport errors (`flush`/`roundtrip` failing) panic with the error,
+    /// and a compositor `Failed` panics too — a rejecting compositor is a
+    /// contract violation, not a missing GPU. (A dedicated rejection-shape
+    /// test would need a second compositor configuration that rejects on
+    /// purpose; the structural split here plus Tier 2 IS the coverage.)
     pub fn import_and_present(&mut self) -> Option<()> {
-        let node = std::fs::read_dir("/dev/dri")
-            .ok()?
-            .flatten()
-            .find_map(|entry| {
-                let name = entry.file_name();
-                let name = name.to_str()?;
-                name.starts_with("renderD").then(|| entry.path())
-            })?;
-        let file = std::fs::File::open(&node).ok()?;
-        let device = gbm::Device::new(file).ok()?;
-        let (_, modifier) = self
+        let entries = match std::fs::read_dir("/dev/dri") {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("SKIP: cannot list /dev/dri for GBM allocation: {e}");
+                return None;
+            }
+        };
+        let node = match entries.flatten().find_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            name.starts_with("renderD").then(|| entry.path())
+        }) {
+            Some(node) => node,
+            None => {
+                eprintln!("SKIP: no renderD node in /dev/dri — GBM allocation impossible here");
+                return None;
+            }
+        };
+        let file = match std::fs::File::open(&node) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("SKIP: cannot open DRM node {}: {e}", node.display());
+                return None;
+            }
+        };
+        let device = match gbm::Device::new(file) {
+            Ok(device) => device,
+            Err(e) => {
+                eprintln!("SKIP: cannot open a GBM device on {}: {e}", node.display());
+                return None;
+            }
+        };
+        let (_, requested) = match self
             .tranches()
             .into_iter()
-            .find(|(format, _)| *format == DRM_FORMAT_ARGB8888)?;
+            .find(|(format, _)| *format == DRM_FORMAT_ARGB8888)
+        {
+            Some(found) => found,
+            None => {
+                eprintln!("SKIP: dmabuf feedback offers no ARGB8888 tranche to import");
+                return None;
+            }
+        };
         let (w, h) = match self.state.configured {
             Some((w, h)) if w > 0 && h > 0 => (w as u32, h as u32),
-            _ => (320, 240),
+            _ => (FALLBACK_SIZE.0 as u32, FALLBACK_SIZE.1 as u32),
         };
-        let bo = device
-            .create_buffer_object_with_modifiers::<()>(
-                w,
-                h,
-                gbm::Format::Argb8888,
-                [gbm::Modifier::from(modifier)].into_iter(),
-            )
-            .or_else(|_| {
-                device.create_buffer_object::<()>(
+        // Prefer the tranche's own modifier; fall back to whatever the
+        // driver hands out when it refuses the request.
+        let bo = match device.create_buffer_object_with_modifiers::<()>(
+            w,
+            h,
+            gbm::Format::Argb8888,
+            [gbm::Modifier::from(requested)].into_iter(),
+        ) {
+            Ok(bo) => bo,
+            Err(_) => {
+                let bo = match device.create_buffer_object::<()>(
                     w,
                     h,
                     gbm::Format::Argb8888,
                     gbm::BufferObjectFlags::RENDERING,
-                )
-            })
-            .ok()?;
-        let fd = bo.fd().ok()?;
+                ) {
+                    Ok(bo) => bo,
+                    Err(e) => {
+                        eprintln!("SKIP: GBM buffer allocation {w}x{h} ARGB8888 failed: {e}");
+                        return None;
+                    }
+                };
+                let actual: u64 = bo.modifier().into();
+                eprintln!(
+                    "dmabuf: requested tranche modifier 0x{requested:016x} unavailable, fell back to allocated 0x{actual:016x}"
+                );
+                bo
+            }
+        };
+        // The wire must describe the buffer that was ALLOCATED, not the one
+        // that was requested: on the primary path they coincide, but the
+        // fallback above may hand back a different modifier, and describing
+        // the requested one would import garbage (or fail).
+        let allocated: u64 = bo.modifier().into();
+        let fd = match bo.fd() {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("SKIP: cannot export a dmabuf fd from the GBM buffer: {e}");
+                return None;
+            }
+        };
         let planes = bo.plane_count();
         let params = self.dmabuf.create_params(&self.qh, ());
         self.state.dmabuf_buffer = None;
@@ -6751,8 +7030,8 @@ impl DmabufClient {
                 plane,
                 bo.offset(plane as i32),
                 bo.stride_for_plane(plane as i32),
-                (modifier >> 32) as u32,
-                modifier as u32,
+                (allocated >> 32) as u32,
+                allocated as u32,
             );
         }
         params.create(
@@ -6761,26 +7040,39 @@ impl DmabufClient {
             DRM_FORMAT_ARGB8888,
             zwp_linux_buffer_params_v1::Flags::empty(),
         );
-        self.conn.flush().ok()?;
+        if let Err(e) = self.conn.flush() {
+            panic!("dmabuf create_params flush failed: {e}");
+        }
         let deadline = Instant::now() + TIMEOUT;
         while self.state.dmabuf_buffer.is_none() && !self.state.dmabuf_failed {
             assert!(
                 Instant::now() < deadline,
                 "create_params neither created nor failed within {TIMEOUT:?}"
             );
-            self.queue.roundtrip(&mut self.state).ok()?;
+            if let Err(e) = self.queue.roundtrip(&mut self.state) {
+                panic!("dmabuf create_params roundtrip failed: {e}");
+            }
         }
         if self.state.dmabuf_failed {
-            eprintln!("SKIP: compositor rejected the GBM import here — wire path unproven");
-            return None;
+            panic!(
+                "compositor rejected the GBM import (zwp_linux_buffer_params_v1.failed) \
+                for {w}x{h} ARGB8888 modifier 0x{allocated:016x}: a rejecting compositor is a \
+                contract violation, never a skip"
+            );
         }
-        let buffer = self.state.dmabuf_buffer.clone()?;
+        let buffer = self
+            .state
+            .dmabuf_buffer
+            .clone()
+            .expect("create_params delivered neither a buffer nor a failure");
         self.surface.attach(Some(&buffer), 0, 0);
         self.surface.damage_buffer(0, 0, w as i32, h as i32);
         self.state.dmabuf_frame_done = false;
         self.surface.frame(&self.qh, ());
         self.surface.commit();
-        self.conn.flush().ok()?;
+        if let Err(e) = self.conn.flush() {
+            panic!("dmabuf present flush failed: {e}");
+        }
         self.buffer = Some(buffer);
         Some(())
     }
@@ -6788,14 +7080,6 @@ impl DmabufClient {
     /// Pump until the present commit's frame callback completes, or
     /// `TIMEOUT` elapses. Returns whether it did.
     pub fn wait_first_frame(&mut self) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
-        while !self.state.dmabuf_frame_done {
-            if Instant::now() >= deadline {
-                return false;
-            }
-            let _ = self.queue.roundtrip(&mut self.state);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        true
+        self.pump_until(|c| c.state.dmabuf_frame_done)
     }
 }
