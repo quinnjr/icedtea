@@ -68,18 +68,29 @@ fn dmabuf_feedback_v4_with_usable_tranches() {
         client.has_argb8888(),
         "dmabuf feedback offers no ARGB8888 tranche: the Tauri format is missing"
     );
-    // The surface half of the same contract: the path WebKitGTK binds. Full
-    // replace-vs-union proof (that the surface collection drops the default
-    // offer rather than appending to it) lives in the harness unit test
-    // `dmabuf_feedback_clear_drops_prior_rows`; here we only assert the
-    // surface feedback itself delivered a usable set. Deliberately no
-    // row-count parity with the default offer: a compositor may tailor
-    // per-surface tranches (see this file's header), so equal counts are
-    // neither required nor a contract.
+    // The surface half of the same contract: the path WebKitGTK binds. The
+    // call-site oracle for the replace-vs-union invariant is the roundtrip
+    // counter: after `wait_feedback` above the `done` latch is set, so
+    // deleting `clear_feedback_state` from `dmabuf_feedback_surface` makes
+    // its `pump_until` return `true` on the stale latch with ZERO
+    // roundtrips. Requiring the counter to advance proves a fresh wait
+    // actually ran, i.e. the latch was reset at the call site. Content-level
+    // distinctness (no default-only row surviving) is NOT asserted: headless
+    // surface and default tranches are identical in practice, so a
+    // default-only row is unprovable here; the hermetic unit test
+    // `dmabuf_feedback_clear_drops_prior_rows` pins the table/index clears,
+    // and this counter pins the call site that runs them.
+    let roundtrips_before_surface = client.pump_roundtrips();
     assert!(
         client.dmabuf_feedback_surface(),
         "per-surface dmabuf feedback never delivered format table + tranches + done \
          (or the transport died before it could)"
+    );
+    assert!(
+        client.pump_roundtrips() > roundtrips_before_surface,
+        "dmabuf_feedback_surface returned with no roundtrip: it answered on the default \
+         feedback's stale done latch instead of clearing it and awaiting the surface \
+         feedback (replace-vs-union must be reset at this call site)"
     );
     let surface_rows = client.tranches();
     assert!(
@@ -115,8 +126,26 @@ fn dmabuf_import_completes_a_first_frame() {
         client.wait_feedback(),
         "no dmabuf feedback to choose an import format from"
     );
+    // An unreadable /dev/dri listing is a distinct SKIP from a GPU-less host
+    // (`has_render_node` surfaces the listing error rather than collapsing it
+    // to `false`); import_and_present names its own GBM/BO/fd stage if the
+    // node exists but cannot be used.
+    match has_render_node() {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("SKIP: no renderD node in /dev/dri — GBM allocation impossible here");
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "SKIP: /dev/dri listing unreadable while probing for a render node: {e} \
+                 (distinct from a GPU-less host)"
+            );
+            return;
+        }
+    }
     let Some(()) = client.import_and_present() else {
-        eprintln!("SKIP: no DRM render node for GBM allocation — import path unproven here");
+        eprintln!("SKIP: render node present but the GBM import failed (see the stage above)");
         return;
     };
     assert!(
@@ -304,10 +333,13 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Transport death mid-import panics, never a silent SKIP: with the
-/// compositor gone the import's transport error is a panic. GPU-gated —
-/// `import_and_present` returns `None` at its render-node/GBM guards long
-/// before any flush, so on a host with no render node the path is simply
-/// unprovable and the test SKIPs visibly rather than failing.
+/// compositor gone the import's transport error is a panic. No GPU gate and
+/// no GBM allocation — `begin_import` is the transport half of
+/// `import_and_present` (create_params → add → create → flush → roundtrip),
+/// so a harmless `/dev/null` fd reaches the flush on any host. Gating instead
+/// on `has_render_node` used to hard-fail hosts whose render node exists but
+/// cannot actually be used for GBM (containers, headless VMs): the test then
+/// took `import_and_present`'s `Ok(_) => panic!` arm on an environment SKIP.
 ///
 /// `drop` joins the compositor thread, so the socket is fully closed before
 /// the import starts — no kill-timing race. Depending on how the FIN is
@@ -317,24 +349,23 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// `"dmabuf create_params"` prefix, not one exact site.
 #[test]
 fn dmabuf_import_panics_when_transport_dies() {
-    if !has_render_node() {
-        eprintln!("SKIP: no renderD node — transport-death import path unprovable here");
-        return;
-    }
+    use std::os::fd::AsFd as _;
+
     let comp = Compositor::spawn();
     let mut client = DmabufClient::spawn(&comp.socket);
     assert!(
         client.wait_feedback(),
-        "no dmabuf feedback to choose an import format from"
+        "no dmabuf feedback before the transport-death import"
     );
     drop(comp);
+    let backing = std::fs::File::open("/dev/null").expect("open /dev/null");
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = client.import_and_present();
+        let _ = client.begin_import(backing.as_fd(), &[(0, 256)], 64, 64, 0x3432_5241, 0);
     }));
     match outcome {
         Ok(_) => panic!(
-            "import_and_present returned on a dead transport instead of panicking; \
-             the render-node/GBM guards must not have been the stop"
+            "begin_import returned on a dead transport instead of panicking; the \
+             create_params flush or the roundtrip must have been the stop"
         ),
         Err(payload) => {
             let message = panic_message(&*payload);

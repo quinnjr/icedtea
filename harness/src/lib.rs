@@ -26,7 +26,7 @@
 //! instead, via `Connection::from_socket`.
 
 use std::io::Write as _;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -6582,6 +6582,15 @@ mod tests {
         );
         clear_feedback_state(&mut state);
         assert!(
+            state.dmabuf_format_entries.is_empty(),
+            "clearing must drop the default feedback's format-table rows"
+        );
+        assert!(
+            state.dmabuf_tranche_indices.is_empty(),
+            "clearing must drop the default feedback's tranche-index rows too, not only the \
+             format table — a surviving tranche index would resolve against the surface table"
+        );
+        assert!(
             resolve_tranche_entries(&state.dmabuf_format_entries, &state.dmabuf_tranche_indices)
                 .is_empty(),
             "clearing must drop every default-offer row, never union with the surface feedback"
@@ -6922,12 +6931,13 @@ fn render_node() -> std::io::Result<Option<std::path::PathBuf>> {
 /// precondition GBM allocation needs, and the probe
 /// [`DmabufClient::import_and_present`] uses.
 ///
-/// A `false` here is not itself a SKIP — a listing that could not be read is
-/// also `false` — so a caller that must exercise the import path (rather than
-/// SKIP) checks this first and prints its own SKIP message.
-#[must_use]
-pub fn has_render_node() -> bool {
-    matches!(render_node(), Ok(Some(_)))
+/// `Ok(false)` is a GPU-less host (a genuine absence); `Err` is a listing
+/// that could not be read at all — a distinct failure a caller can name in
+/// its SKIP message rather than collapsing into "no render node". Returning
+/// a `bool` would make an unreadable `/dev/dri` indistinguishable from a
+/// host that truly has no GPU.
+pub fn has_render_node() -> std::io::Result<bool> {
+    render_node().map(|node| node.is_some())
 }
 
 /// Drop the default feedback's collected rows and `done` latch before a fresh
@@ -6977,6 +6987,12 @@ pub struct DmabufClient {
     /// `DispatchError`, which exposes no `io::ErrorKind`, and all a test needs
     /// is the deterministic error-vs-timeout distinction.
     last_pump_errored: bool,
+    /// Every `pump_until` roundtrip attempted on this client, successful or
+    /// not. A test-visible liveness oracle: a wait that returns on an
+    /// already-true predicate (a stale `dmabuf_done` left set by an earlier
+    /// feedback) performs zero roundtrips, so observing this advance proves
+    /// a fresh wait actually ran rather than a `true` return on stale state.
+    pump_roundtrips: u64,
 }
 
 impl DmabufClient {
@@ -7023,6 +7039,7 @@ impl DmabufClient {
             toplevel,
             buffer: None,
             last_pump_errored: false,
+            pump_roundtrips: 0,
         }
     }
 
@@ -7044,7 +7061,9 @@ impl DmabufClient {
             if Instant::now() >= deadline {
                 return false;
             }
-            if let Err(e) = self.queue.roundtrip(&mut self.state) {
+            let roundtrip = self.queue.roundtrip(&mut self.state);
+            self.pump_roundtrips += 1;
+            if let Err(e) = roundtrip {
                 eprintln!("DmabufClient pump roundtrip failed: {e}");
                 self.last_pump_errored = true;
                 return false;
@@ -7063,6 +7082,14 @@ impl DmabufClient {
     #[must_use]
     pub fn last_pump_errored(&self) -> bool {
         self.last_pump_errored
+    }
+
+    /// How many `pump_until` roundtrips this client has attempted (see the
+    /// field): a liveness oracle for "a fresh wait actually ran" that a
+    /// plain `true` return cannot give when a stale latch is involved.
+    #[must_use]
+    pub fn pump_roundtrips(&self) -> u64 {
+        self.pump_roundtrips
     }
 
     /// Pump until the default feedback delivers table + tranches + `done`,
@@ -7121,6 +7148,64 @@ impl DmabufClient {
         self.tranches()
             .iter()
             .any(|(format, _)| *format == DRM_FORMAT_ARGB8888)
+    }
+
+    /// Import `fd` (one `(offset, stride)` per plane) as a dmabuf through
+    /// `zwp_linux_buffer_params_v1` and await the compositor's
+    /// `created` / `failed` outcome: `Some(())` on `created` (the buffer is
+    /// left in `state.dmabuf_buffer`), `None` on `failed`.
+    ///
+    /// This is the transport half of [`DmabufClient::import_and_present`],
+    /// split out so the transport-death path is testable with any valid fd
+    /// and NO GPU allocation: it reads no render node, opens no GBM device,
+    /// and allocates no buffer object. Transport failures are red, never a
+    /// skip — a `flush` failure panics `"dmabuf create_params flush failed"`,
+    /// a `roundtrip` failure panics `"dmabuf create_params roundtrip
+    /// failed"`, and a wait past `TIMEOUT` asserts. A compositor `Failed` is
+    /// deliberately returned as `None` here rather than panicking: only
+    /// [`DmabufClient::import_and_present`] knows the import was a real GBM
+    /// buffer, so the reject≠skip panic (a rejecting compositor is a
+    /// contract violation) lives there, keeping this method transport-only.
+    pub fn begin_import(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        planes: &[(u32, u32)],
+        w: i32,
+        h: i32,
+        format: u32,
+        modifier: u64,
+    ) -> Option<()> {
+        let params = self.dmabuf.create_params(&self.qh, ());
+        self.state.dmabuf_buffer = None;
+        self.state.dmabuf_failed = false;
+        for (plane, (offset, stride)) in planes.iter().copied().enumerate() {
+            params.add(
+                fd,
+                plane as u32,
+                offset,
+                stride,
+                (modifier >> 32) as u32,
+                modifier as u32,
+            );
+        }
+        params.create(w, h, format, zwp_linux_buffer_params_v1::Flags::empty());
+        if let Err(e) = self.conn.flush() {
+            panic!("dmabuf create_params flush failed: {e}");
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        while self.state.dmabuf_buffer.is_none() && !self.state.dmabuf_failed {
+            assert!(
+                Instant::now() < deadline,
+                "create_params neither created nor failed within {TIMEOUT:?}"
+            );
+            if let Err(e) = self.queue.roundtrip(&mut self.state) {
+                panic!("dmabuf create_params roundtrip failed: {e}");
+            }
+        }
+        if self.state.dmabuf_failed {
+            return None;
+        }
+        Some(())
     }
 
     /// Allocate a real GBM ARGB8888 buffer (first tranche entry offering
@@ -7224,40 +7309,20 @@ impl DmabufClient {
                 return None;
             }
         };
-        let planes = bo.plane_count();
-        let params = self.dmabuf.create_params(&self.qh, ());
-        self.state.dmabuf_buffer = None;
-        self.state.dmabuf_failed = false;
-        for plane in 0..planes {
-            params.add(
+        let planes: Vec<(u32, u32)> = (0..bo.plane_count())
+            .map(|plane| (bo.offset(plane as i32), bo.stride_for_plane(plane as i32)))
+            .collect();
+        if self
+            .begin_import(
                 fd.as_fd(),
-                plane,
-                bo.offset(plane as i32),
-                bo.stride_for_plane(plane as i32),
-                (allocated >> 32) as u32,
-                allocated as u32,
-            );
-        }
-        params.create(
-            w as i32,
-            h as i32,
-            DRM_FORMAT_ARGB8888,
-            zwp_linux_buffer_params_v1::Flags::empty(),
-        );
-        if let Err(e) = self.conn.flush() {
-            panic!("dmabuf create_params flush failed: {e}");
-        }
-        let deadline = Instant::now() + TIMEOUT;
-        while self.state.dmabuf_buffer.is_none() && !self.state.dmabuf_failed {
-            assert!(
-                Instant::now() < deadline,
-                "create_params neither created nor failed within {TIMEOUT:?}"
-            );
-            if let Err(e) = self.queue.roundtrip(&mut self.state) {
-                panic!("dmabuf create_params roundtrip failed: {e}");
-            }
-        }
-        if self.state.dmabuf_failed {
+                &planes,
+                w as i32,
+                h as i32,
+                DRM_FORMAT_ARGB8888,
+                allocated,
+            )
+            .is_none()
+        {
             panic!(
                 "compositor rejected the GBM import (zwp_linux_buffer_params_v1.failed) \
                 for {w}x{h} ARGB8888 modifier 0x{allocated:016x}: a rejecting compositor is a \
