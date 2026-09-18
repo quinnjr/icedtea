@@ -127,10 +127,13 @@ pub fn run() {
     if let Err(err) = runtime.create_shortcuts_inhibit_manager(&display) {
         tracing::error!(%err, "shortcuts inhibition is unavailable");
     }
-    // Bridges tablet tools and pads to tablet-aware clients
-    // (`zwp_tablet_manager_v2`). Non-fatal: without it a tablet still moves
-    // the cursor (the crate attaches every input device to it, tablet
-    // included), but no client ever sees tool/pad traffic.
+    // Advertises tablet tools and pads to tablet-aware clients
+    // (`zwp_tablet_manager_v2`): protocol objects exist, but tool/pad
+    // EVENTS still need compositor-driven `wlr_send_tablet_v2_*` forwards
+    // (no safe wrapper yet), so clients see the devices, not their
+    // traffic. Non-fatal: without it a tablet still moves the cursor (the
+    // crate attaches every input device to it, tablet included), but no
+    // client ever sees tool/pad traffic.
     if let Err(err) = runtime.create_tablet_manager(&display) {
         tracing::error!(%err, "tablet input is unavailable");
     }
