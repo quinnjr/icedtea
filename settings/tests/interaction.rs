@@ -172,11 +172,10 @@ fn apply_reaches_reload_config_on_the_mock() {
     }
     assert!(toggled, "the switch toggle never reached the model");
 
-    // `#status` no longer carries `hexpand`, so the footer's action cluster is
-    // content-sized and sits wholly inside the window. Assert that geometry,
-    // then click Apply's centre: a footer block wider than the surface would
-    // push the button past the right edge (and this gate would fail at the
-    // assertion *or* the click would miss).
+    // The action cluster leads the footer (`#status` follows with `hexpand`),
+    // so the buttons' positions do not depend on the status text — the
+    // invariant the footer regression broke. Assert Apply is fully inside the
+    // window, then click its centre.
     let apply = driver.alloc("apply");
     assert!(
         apply.x + apply.w <= driver.window_right(),

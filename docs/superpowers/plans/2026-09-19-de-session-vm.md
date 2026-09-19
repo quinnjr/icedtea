@@ -317,13 +317,18 @@ Expected: PASS (5 tests).
 #!/bin/sh
 # Start the icedtea desktop session through the user manager.
 #
-# The command a display manager runs at login (wdm, in the VM): the session
-# IS the systemd target. `--wait` blocks for the session's lifetime, because
-# the display manager hands the display over and only takes it back when this
-# command exits; the target deactivates when the compositor stops (Requires=),
-# so logout (or the compositor's bounded restart giving up) returns here.
+# The one command a login session runs: the session IS the systemd target.
+# `--wait` is load-bearing — whoever launched this command hands the display
+# over and only takes it back when the command exits, which is when the target
+# deactivates (its compositor `Requires` stops it on logout).
 set -eu
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# The launcher hands the user manager only the session's own environment;
+# import the graphical/session variables the DE reads before starting it. Best
+# effort: a minimal login with none of them set still starts the session.
+systemctl --user import-environment DISPLAY XDG_SESSION_TYPE XDG_SESSION_ID || true
+
 exec systemctl --user start --wait icedtea-session.target
 ```
 
@@ -917,7 +922,7 @@ Add `Halign`/`Valign`/`Hexpand`/`Vexpand` to `CENTRAL_UNIVERSAL` (`ui/src/widget
 
 Split `flush_layout` into two phases so a controller's placement is never overwritten by the prop-derived child layout: phase 1 applies node records and direct child layouts, phase 2 runs `homogeneous`/`grid_from_children`/`overlay_from_children`. `PENDING` is an unordered hash table, so the old single pass was a race. In the `homogeneous` pass, `on == true` forces expansion starting from the unaligned centring (so the forced axis does not stretch the other); `on == false` resets only a child that set no `Hexpand`/`Vexpand` prop of its own, leaving a child with its own request to the universal pass (both names go into `RECORDED_PROP_NAMES`), because `GtkBox:homogeneous` only forces expansion while set and must not clear a child's own request. `GridC`'s cell-placement path keeps its historical `Fill` base (`child_layout_of`); only the universal arms and the homogeneous force path use the centred base.
 
-The arms' unaligned base also changes the geometry of the settings pages that had leaned on the coupling: `#status`/`displays_status` drop their `hexpand` (the review's sanctioned fallback) so the footer clusters stay content-sized and inside the window, and the info-bar/calendar/picture pixel fixtures return to their intrinsic-centred coordinates.
+The arms' unaligned base also changes the geometry of the settings pages that had leaned on the coupling: both footer clusters lead with their action buttons and let the status label take the remaining width (`#status`/`displays_status` carry `hexpand`), so the buttons' hit targets do not move with the status text, and the info-bar/calendar/picture pixel fixtures return to their intrinsic-centred coordinates.
 
 Tests: `ui/tests/widget_pixels.rs` gains `a_hexpanding_child_takes_the_leftover_space`, `halign_end_pins_a_child_to_the_right_edge`, and the two `removing_*_restores_centring` removal-path tests. Reconcile the fixtures whose geometry changes now that the props work: `a_picture_decodes_and_draws_an_embedded_png` (the image fills the surface, so assert the decoded colour directly), `clicking_an_info_bars_close_button_fires_close` (close button now at the trailing edge) and `clicking_a_calendar_day_selects_it` (the grid stretches to the window), plus the stale "hexpand is inert" notes. Also fix `shell/tests/support/mod.rs::labels_under` to read only the last `frame N` snapshot (each block is complete), which is what its absence assertions always assumed.
 

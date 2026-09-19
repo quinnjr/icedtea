@@ -243,6 +243,73 @@ fn dragging_a_head_snaps_it_and_updates_the_model() {
     assert_eq!(driver.state("displays.selected").as_deref(), Some("0"));
 }
 
+/// The action cluster must not move when `displays_status` changes.
+///
+/// `displays_status` is rewritten at runtime — a Test/Apply fold sets
+/// "Testing…"/"Applying…", the reply sets "Applied"/"Rejected", `on_outputs`
+/// clears it — so a leading, content-sized status label would shift
+/// Test/Revert/Apply by the width difference between one message and the
+/// next. The footer instead leads with the buttons and gives the status label
+/// the remaining width (`hexpand`), pinning the cluster to the footer's
+/// leading edge. This is the same invariant `settings/src/app.rs::footer`
+/// pins for the shared footer.
+///
+/// The status change is made observable without reading the label: a drag
+/// dirties the page (`displays.dirty`), and a successful Apply returns it to
+/// `false` with the status at "Applied" — a persistent model change.
+///
+/// Mutation check: restore the pre-fix order (`displays_status` first, no
+/// `hexpand`); "Ready" and "Applied" have different widths, the centred
+/// cluster shifts, and the `assert_eq!` below fails. Restore.
+#[test]
+fn the_displays_action_buttons_do_not_move_with_the_status_text() {
+    let mut driver = SettingsDriver::open(TEST_THEME, "displays");
+    assert!(driver.wait_state("displays.dirty", "false", REACT));
+
+    // Dirty the page so Apply is live. The drag also proves the model is up.
+    let canvas = driver.alloc("displays_canvas");
+    let from = (canvas.x + canvas.w / 2, canvas.y + canvas.h / 2);
+    let to = (canvas.x + canvas.w - 8, canvas.y + canvas.h - 8);
+    driver.drag(from, to);
+    assert!(
+        driver.wait_state("displays.dirty", "true", REACT),
+        "the drag never dirtied the page"
+    );
+
+    // The status is still "Ready" here: the drag dirties the model but does
+    // not touch `displays_status`. Read the cluster's pinned geometry.
+    let test_before = driver.alloc("displays_test");
+    let apply_before = driver.alloc("displays_apply");
+
+    // Apply moves the status text "Ready" -> "Applying…" -> "Applied" and the
+    // reply returns `displays.dirty` to false. Retry the click like the other
+    // pointer gates: a button sent back to back with the motion that first
+    // entered the surface can be dropped before focus is assigned.
+    let mut applied = false;
+    for _ in 0..5 {
+        driver.click(
+            apply_before.x + apply_before.w / 2,
+            apply_before.y + apply_before.h / 2,
+        );
+        if driver.wait_state("displays.dirty", "false", Duration::from_millis(1_500)) {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "Apply never reached the compositor");
+
+    let test_after = driver.alloc("displays_test");
+    let apply_after = driver.alloc("displays_apply");
+    assert_eq!(
+        test_after.x, test_before.x,
+        "Test moved with the status text: {test_before:?} -> {test_after:?}"
+    );
+    assert_eq!(
+        apply_after.x, apply_before.x,
+        "Apply moved with the status text: {apply_before:?} -> {apply_after:?}"
+    );
+}
+
 /// Contract §2.8's P7-D54 regression: an embedded `DropDown` list must open
 /// sized to its content rather than at a flat 240px.
 ///

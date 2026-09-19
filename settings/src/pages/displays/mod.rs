@@ -233,6 +233,13 @@ pub fn revert(m: &mut SettingsModel) {
 /// Apply is held insensitive while a request is outstanding so a
 /// `HeadsChanged`-driven repaint cannot re-enable it under one (state.rs
 /// finding #15); Test is held for the same reason.
+///
+/// The action cluster leads and the status label takes the remaining width
+/// (`hexpand`). `displays_status` changes at runtime (`on_outputs`, `submit`),
+/// so a leading status label would move Test/Revert/Apply whenever its text
+/// changed — the same invariant `settings/src/app.rs::footer` pins for the
+/// shared footer. Leading the cluster keeps the buttons' hit targets fixed
+/// whatever the status says.
 #[must_use]
 pub fn footer(m: &SettingsModel) -> View<Msg> {
     let dirty = m.displays.dirty;
@@ -246,7 +253,6 @@ pub fn footer(m: &SettingsModel) -> View<Msg> {
     box_(
         Orientation::Horizontal,
         [
-            label(status).id("displays_status").halign(Align::Start),
             button("Test")
                 .id("displays_test")
                 .sensitive(live && !busy)
@@ -259,6 +265,10 @@ pub fn footer(m: &SettingsModel) -> View<Msg> {
                 .id("displays_apply")
                 .sensitive(live && dirty && !busy)
                 .on_click(Msg::DisplaysApply),
+            label(status)
+                .id("displays_status")
+                .hexpand(true)
+                .halign(Align::Start),
         ],
     )
     .spacing(8u32)
