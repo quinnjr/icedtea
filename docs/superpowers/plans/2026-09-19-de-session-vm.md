@@ -150,7 +150,6 @@ fn name_mode_matches_a_bus_owner() {
         .output()
         .expect("run");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(!recorded.exists() || fs::read_to_string(&recorded).is_ok());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -724,23 +723,29 @@ Add to `shell/src/panel.rs`'s `#[cfg(test)] mod tests`:
     /// The bar is a `CenterBox` (start/centre/end), not the old single
     /// centred row: the clock lives in the end group, so the left and right
     /// groups are pushed to the bar's edges (`Container::Center` maps to
-    /// `JustifyContent::SPACE_BETWEEN`).
+    /// `JustifyContent::SPACE_BETWEEN`). `View`'s fields are public, so the
+    /// structure is asserted directly.
     #[test]
     fn the_bar_splits_into_start_and_end_groups() {
-        let model = PanelModel::default();
+        let (model, _wm, _clip) = panel();
         let view = super::view(&model);
         assert_eq!(
-            view.kind(),
+            view.kind,
             icedtea_ui::view::Kind::CenterBox,
             "the bar must be a CenterBox so its groups sit at the edges"
+        );
+        assert_eq!(
+            view.children.len(),
+            3,
+            "a CenterBox carries exactly start/centre/end"
         );
     }
 
     #[test]
     fn a_tick_records_the_clock_label() {
-        let mut model = PanelModel::default();
+        let (mut model, _wm, _clip) = panel();
         assert_eq!(model.clock, None);
-        super::update(&mut model, Msg::Tick);
+        let _ = super::update(&mut model, Msg::Tick);
         assert!(
             model.clock.as_deref().is_some_and(|c| c.len() == 5 && c.as_bytes()[2] == b':'),
             "a tick must record an HH:MM label, got {:?}",
@@ -875,11 +880,14 @@ Add a function beside `forward`:
 fn clock_tick(tx: InboxSender<Msg>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
-            // Sleep to the next minute boundary (+ a beat, so the wall clock
-            // has actually crossed it), then tick.
-            let now = jiff::Zoned::now();
-            let secs = u64::from(now.second()) + 1;
-            std::thread::sleep(std::time::Duration::from_secs(60 - secs.min(60)));
+            // Sleep to the next minute boundary, then tick. `60 - second` is 0
+            // exactly on the boundary, so clamp that to a full minute —
+            // otherwise the loop busy-spins for the rest of that second.
+            let wait = match 60 - u64::from(jiff::Zoned::now().second()) {
+                0 => 60,
+                n => n,
+            };
+            std::thread::sleep(std::time::Duration::from_secs(wait));
             if tx.send(Msg::Tick).is_err() {
                 break;
             }
