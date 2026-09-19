@@ -78,6 +78,39 @@ pub fn has_ink(frames: &Frames, frame: usize, size: (u32, u32)) -> bool {
 }
 
 #[test]
+fn a_buttons_label_inks_its_glyphs() {
+    // mutation: drop the `set_text` in `ButtonC::build`/`set_prop` and the
+    // labelled frame collapses onto the blank one -- the label subnode keeps
+    // its box but draws no glyphs.
+    use icedtea_ui::view::builders::button;
+
+    let size = (120, 48);
+    let blank = run(
+        (),
+        |_model: &mut (), _msg: ()| Cmd::None,
+        |_model: &()| button("").hexpand(true),
+        size,
+        vec![ScriptStep::Capture],
+    );
+    let labelled = run(
+        (),
+        |_model: &mut (), _msg: ()| Cmd::None,
+        |_model: &()| button("HH:MM").hexpand(true),
+        size,
+        vec![ScriptStep::Capture],
+    );
+
+    let differing = (0..size.1)
+        .flat_map(|y| (0..size.0).map(move |x| (x, y)))
+        .filter(|&(x, y)| blank.pixel(0, x, y) != labelled.pixel(0, x, y))
+        .count();
+    assert!(
+        differing > 50,
+        "the button's label must ink glyphs; only {differing} px differ from a blank label"
+    );
+}
+
+#[test]
 fn a_separator_inks_its_adwaita_line_at_rest() {
     // mutation: return `false` from SeparatorC's node build so no node is
     // attached, and the frame becomes a single flat colour.

@@ -90,6 +90,12 @@ pub struct ButtonC {
 }
 
 impl ButtonC {
+    /// The chrome subnodes `build` attaches itself: the optional `image`
+    /// (first) and `label` (second), both ahead of any view child.
+    fn chrome_count(&self) -> usize {
+        usize::from(self.label.is_some()) + usize::from(self.image.is_some())
+    }
+
     /// GTK sets `.image-button`/`.text-button` from the content it finds.
     ///
     /// Touches only the class that actually needs to change: `set_prop` calls
@@ -123,6 +129,19 @@ impl<Msg: Clone + 'static> Controller<Msg> for ButtonC {
         Kind::Button
     }
 
+    /// The `image`/`label` subnodes are this controller's own chrome, attached
+    /// in `build` before any view child could arrive. Reconcile's trim step
+    /// must be told they are there -- without this it detaches the label on
+    /// the first pass and the button (a flat `.text-button`) paints no glyphs
+    /// at all. Same P8-D72 shape as `LinkButtonC`.
+    fn child_index(&self, view_index: usize) -> usize {
+        view_index + self.chrome_count()
+    }
+
+    fn reserved_total(&self, view_count: usize) -> usize {
+        view_count + self.chrome_count()
+    }
+
     fn drag_offer(&self) -> Option<crate::dnd::DragPayload> {
         self.dnd.offer()
     }
@@ -142,8 +161,14 @@ impl<Msg: Clone + 'static> Controller<Msg> for ButtonC {
             node.append_child(&image);
             image
         });
-        let label = props.str(PropName::Label).map(|_| {
+        let label = props.str(PropName::Label).map(|text| {
             let label = Node::new("label");
+            // The `label` subnode carries no controller of its own, so its
+            // text lives on the row-binding side table and is drawn by
+            // `paint_row` (the same path `LinkButtonC` and every recycling
+            // view's rows take). Without this the button measured and painted
+            // with no glyphs.
+            crate::widgets::set_text(&label, text);
             node.append_child(&label);
             label
         });
@@ -169,11 +194,14 @@ impl<Msg: Clone + 'static> Controller<Msg> for ButtonC {
             return;
         }
         match (name, value) {
-            (PropName::Label, Prop::Str(_)) => {
+            (PropName::Label, Prop::Str(text)) => {
                 if self.label.is_none() {
                     let label = Node::new("label");
                     node.append_child(&label);
                     self.label = Some(label);
+                }
+                if let Some(label) = self.label.as_ref() {
+                    crate::widgets::set_text(label, text);
                 }
             }
             (PropName::ShowArrow, Prop::Bool(on)) => {
