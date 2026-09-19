@@ -45,7 +45,11 @@ wait_name() {
   target="$1"
   i=0
   while [ "$i" -lt "$TRIES" ]; do
-    if busctl --user list --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "$target"; then
+    # `busctl --user list` also lists activatable units by name in column 1,
+    # but those own no connection (the connection column reads
+    # `(activatable)`): a name that is merely activatable is not ready.
+    if busctl --user list --no-legend 2>/dev/null \
+      | awk -v t="$target" '$1 == t && $0 !~ /\(activatable\)/ { found = 1 } END { exit !found }'; then
       return 0
     fi
     i=$((i + 1))

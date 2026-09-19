@@ -45,19 +45,31 @@ fn every_unit_verifies_under_systemd() {
         cmd.arg(f);
     }
     let out = cmd.output().expect("run systemd-analyze");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "systemd-analyze verify failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        "systemd-analyze verify failed:\n{stderr}"
+    );
+    // Unknown keys are warnings, not errors: verify still exits 0. Fail
+    // explicitly so a misplaced directive (e.g. RequiredBy= in [Unit]) cannot
+    // slip through a green `status.success()`.
+    assert!(
+        !stderr.contains("Unknown key") && !stderr.contains("ignoring"),
+        "systemd-analyze verify ignored a directive:\n{stderr}"
     );
 }
 
 #[test]
-fn the_target_wants_every_component() {
+fn the_target_pulls_in_every_component() {
     let target =
         std::fs::read_to_string(units_dir().join("icedtea-session.target")).expect("target file");
+    // The compositor is the one hard dependency: a desktop without a
+    // compositor is no session, so its exit stops the target.
+    assert!(
+        target.contains("Requires=icedtea-compositor.service"),
+        "the session target must hard-require the compositor"
+    );
     for unit in [
-        "icedtea-compositor.service",
         "icedtea-wayland-env.service",
         "icedtea-notifications.service",
         "icedtea-clipboard.service",

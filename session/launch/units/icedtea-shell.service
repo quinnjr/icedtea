@@ -8,6 +8,8 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
+Environment=RUST_LOG=info
+Environment=GDK_BACKEND=wayland
 ExecStartPre=/usr/bin/env icedtea-wait name org.icedtea.Clipboard
 ExecStart=/usr/bin/env icedtea-shell
 Restart=on-failure

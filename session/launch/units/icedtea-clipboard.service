@@ -8,6 +8,8 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
+Environment=RUST_LOG=info
+Environment=GDK_BACKEND=wayland
 ExecStartPre=/usr/bin/env icedtea-wait wayland
 ExecStart=/usr/bin/env icedtea-clipboard
 Restart=on-failure

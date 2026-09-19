@@ -5,4 +5,10 @@
 # manager would run on bare metal: the session IS the systemd target.
 set -eu
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# A tty autologin hands the user manager only the tty's environment; import
+# the graphical/session variables the DE reads before starting it. Best
+# effort: a minimal login with none of them set still starts the session.
+systemctl --user import-environment DISPLAY XDG_SESSION_TYPE XDG_SESSION_ID || true
+
 exec systemctl --user start icedtea-session.target

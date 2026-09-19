@@ -8,6 +8,8 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
+Environment=RUST_LOG=info
+Environment=GDK_BACKEND=wayland
 # Needs the compositor's org.icedtea.WM on the bus (its SessionLockChanged
 # subscription), not the Wayland socket itself.
 ExecStartPre=/usr/bin/env icedtea-wait name org.icedtea.WM
