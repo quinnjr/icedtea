@@ -153,12 +153,11 @@ fn apply_reaches_reload_config_on_the_mock() {
 
     // Dirty the model: toggle a switch, which enables Revert and Apply.
     //
-    // The footer's status label carries `hexpand`, so it fills the footer and a
-    // text change no longer moves any geometry: the old
-    // `wait_for_frame_after` signal (a `frame <n>` line written by
-    // `write_probe_report` only when a `probe`/`alloc` line changed) never
-    // fires for this toggle. Wait on the app's own `status` line instead, which
-    // is appended on the fold that flips the model. The click also races
+    // The old `wait_for_frame_after` signal (a `frame <n>` line written by
+    // `write_probe_report` only when a `probe`/`alloc` line changed) is not a
+    // reliable tell for this toggle. Wait on the app's own `status` line
+    // instead, which is appended on the fold that flips the model and so is
+    // independent of geometry. The click also races
     // asynchronous pointer-focus assignment on a freshly-booted window (the
     // race `SettingsDriver::click`'s own settle loop documents), so retry it
     // until the fold lands.

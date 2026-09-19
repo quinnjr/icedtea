@@ -505,9 +505,8 @@ impl SettingsDriver {
     ///
     /// The status line is appended by the app on the fold that changes it
     /// (`settings/src/probe.rs`), independent of geometry, so it is the signal
-    /// that still distinguishes states now that the footer's `hexpand` status
-    /// label makes a text change geometry-neutral (`write_probe_report`'s
-    /// `frame <n>` lines only move when some `probe`/`alloc` line changes).
+    /// to wait on where `write_probe_report`'s `frame <n>` lines only move when
+    /// some `probe`/`alloc` line changes.
     #[must_use]
     pub fn wait_for_status(&self, want: &str, timeout: Duration) -> bool {
         let started = Instant::now();
