@@ -258,6 +258,7 @@ fn session_start_imports_environment_then_starts_target() {
         lines.contains(&"import-environment")
             && lines.contains(&"XDG_SESSION_TYPE")
             && lines.contains(&"start")
+            && lines.contains(&"--wait")
             && lines.contains(&"icedtea-session.target"),
         "systemctl argv was {argv:?}"
     );

@@ -84,6 +84,24 @@ fn the_target_pulls_in_every_component() {
 }
 
 #[test]
+fn the_session_daemon_waits_for_the_compositor_bus_name() {
+    let unit =
+        std::fs::read_to_string(units_dir().join("icedtea-session.service")).expect("session unit");
+    // The daemon's readiness gate must name the compositor's real bus name —
+    // the contract constant the compositor `request_name`s. A stale
+    // `org.icedtea.WM` here leaves the unit waiting forever, so the session
+    // target never becomes active even though the desktop is up.
+    let expected = format!(
+        "ExecStartPre=/usr/bin/env icedtea-wait name {}",
+        icedtea_contract::COMPOSITOR_BUS_NAME
+    );
+    assert!(
+        unit.contains(&expected),
+        "icedtea-session.service must wait for the compositor bus name ({expected})"
+    );
+}
+
+#[test]
 fn the_wayland_env_publisher_refreshes_on_compositor_restart() {
     let unit = std::fs::read_to_string(units_dir().join("icedtea-wayland-env.service"))
         .expect("wayland-env unit");

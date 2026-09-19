@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=icedtea
+Comment=icedtea Wayland desktop
+Exec=/usr/local/bin/icedtea-session-start
+TryExec=/usr/local/bin/icedtea-session-start
+Type=Application
+DesktopNames=icedtea

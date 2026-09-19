@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Root-phase provisioning: packages, seat management, console autologin.
+# Root-phase provisioning: packages, seat management, session units, and the
+# wdm display-manager login path.
 set -euo pipefail
 
 # The box snapshot predates current package signatures; refresh the keyring
@@ -23,75 +24,45 @@ pacman -S --noconfirm --needed \
 systemctl enable --now seatd.service
 usermod -aG seat,video,input vagrant
 
-# Auto-login vagrant on tty1 so the VirtualBox GUI window lands on a shell
-# ready to launch the compositor.
-mkdir -p /etc/systemd/system/getty@tty1.service.d
-cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'EOF'
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin vagrant --noclear %I $TERM
-EOF
+# The DE's own session definition, installed where systemd finds it. The
+# units and helpers come from the repo (session/launch/), so the VM runs the
+# same session artifacts bare metal would.
+mkdir -p /etc/systemd/user /usr/share/icedtea
+install -m 0644 /home/vagrant/icedtea-wm/session/launch/units/*.service /etc/systemd/user/
+install -m 0644 /home/vagrant/icedtea-wm/session/launch/units/icedtea-session.target /etc/systemd/user/
+install -m 0755 /home/vagrant/icedtea-wm/session/launch/icedtea-wait /usr/local/bin/icedtea-wait
+install -m 0755 /home/vagrant/icedtea-wm/session/launch/icedtea-session-start /usr/local/bin/icedtea-session-start
+install -m 0644 /home/vagrant/icedtea-wm/session/assets/default-wallpaper.png /usr/share/icedtea/default-wallpaper.png
+
+# The display manager is wdm, the box's Wayland DM. It lists the repo's
+# session entry and runs it at login, so both are repo-owned; enable wdm and
+# never disable display-manager.service (the old tty1 path did, leaving the
+# VM with no login path of its own).
+install -m 0644 /home/vagrant/icedtea-wm/session/launch/icedtea.desktop /usr/share/wayland-sessions/icedtea.desktop
+install -d -m 0755 /etc/wdm
+install -m 0644 /home/vagrant/icedtea-wm/session/launch/wdm.toml /etc/wdm/wdm.toml
+systemctl enable wdm.service
+
+# The old launcher and its hint are gone: the session is the systemd target
+# wdm starts, not a script that spawns the components itself.
+rm -f /usr/local/bin/icedtea /usr/local/bin/icedtea-hint.sh /usr/bin/icedtea-session
+rm -f /etc/profile.d/icedtea-session.sh
+
+# An already-provisioned VM carries the retired tty1 trigger files on disk;
+# remove them (not just stop writing them) so tty1 stays a plain recovery
+# console and wdm is the only session trigger.
+rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf
+rmdir /etc/systemd/system/getty@tty1.service.d 2>/dev/null || true
+rm -f /etc/profile.d/icedtea-hint.sh
 systemctl daemon-reload
 
-# Launcher: run the compositor on this TTY's DRM device, then bring up the
-# clipboard daemon and the GTK4 shell as layer-shell clients on the same
-# Wayland socket and session bus. Run from a TTY, not over ssh.
-cat > /usr/local/bin/icedtea <<'EOF'
-#!/bin/sh
-# Ensure a D-Bus session bus (org.icedtea.WM / .Clipboard live on it).
-if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
-  exec dbus-run-session -- "$0" "$@"
-fi
-export RUST_LOG="${RUST_LOG:-info}"
-BIN=/home/vagrant/icedtea-wm/target/release
-
-# VirtualBox's vmwgfx GLES2 path is flaky under wlroots; force wlroots'
-# software (pixman) renderer so frames actually reach the screen.
-export WLR_RENDERER="${WLR_RENDERER:-pixman}"
-
-# The compositor takes the DRM master, creates its wayland socket, and claims
-# org.icedtea.WM on the session bus (provided by the systemd --user session).
-"$BIN/icedtea-compositor" >/tmp/icedtea-comp.log 2>&1 &
-COMP=$!
-
-# Tear the clients down with the compositor.
-trap 'kill "$CLIP" "$SHELL_PID" 2>/dev/null; kill "$COMP" 2>/dev/null' INT TERM EXIT
-
-# Wait for the compositor's wayland socket to appear.
-WAYLAND_DISPLAY=
-i=0
-while [ "$i" -lt 100 ]; do
-  for s in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
-    case "$s" in *.lock) continue ;; esac
-    [ -S "$s" ] && WAYLAND_DISPLAY=$(basename "$s") && break
-  done
-  [ -n "$WAYLAND_DISPLAY" ] && break
-  i=$((i + 1)); sleep 0.1
-done
-if [ -z "$WAYLAND_DISPLAY" ]; then
-  echo "icedtea: compositor never created a wayland socket" >&2
-  wait "$COMP"; exit 1
-fi
-export WAYLAND_DISPLAY
-export GDK_BACKEND=wayland                      # force GTK onto Wayland, not X11
-export GSK_RENDERER="${GSK_RENDERER:-cairo}"    # GTK software rendering, no GPU
-
-# The socket file appears the instant add_socket_auto runs, before the
-# compositor is dispatching; give it a beat so early clients don't get
-# NoCompositor.
-sleep 1
-
-# Start the clipboard daemon first and give it a moment to claim
-# org.icedtea.Clipboard before the shell's clip client connects.
-"$BIN/icedtea-clipboard" >/tmp/icedtea-clip.log 2>&1 & CLIP=$!
-sleep 0.7
-"$BIN/icedtea-shell" >/tmp/icedtea-shell.log 2>&1 & SHELL_PID=$!
-
-wait "$COMP"
+# Guest-only rendering choices: wlroots on VirtualBox's vmwgfx needs the
+# software paths, and these must NOT be baked into the units (a bare-metal
+# session would otherwise be forced onto software rendering).
+install -d -m 0755 /home/vagrant/.config/environment.d
+cat > /home/vagrant/.config/environment.d/99-icedtea-vm.conf <<'EOF'
+WLR_RENDERER=pixman
+GSK_RENDERER=cairo
+GDK_BACKEND=wayland
 EOF
-chmod +x /usr/local/bin/icedtea
-
-# One-line hint on the autologin shell.
-cat > /etc/profile.d/icedtea-hint.sh <<'EOF'
-[ "$(tty)" = /dev/tty1 ] && echo 'icedtea-wm VM ready: run `icedtea` to start the compositor + shell.'
-EOF
+chown -R vagrant:vagrant /home/vagrant/.config
