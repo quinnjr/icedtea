@@ -662,6 +662,7 @@ magick -size 1920x1080 \
   -fill '#89b4fa' -draw 'circle 960,560 960,300' \
   -blur 0x120 \
   -resize 1920x1080 \
+  -depth 8 -strip -alpha off \
   session/assets/default-wallpaper.png
 ```
 
