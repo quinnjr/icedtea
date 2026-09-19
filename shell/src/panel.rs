@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use icedtea_contract::ClipEntry;
 use icedtea_ui::layout::{Align, Rect};
-use icedtea_ui::view::builders::{SearchEntryExt, box_, button, search_entry};
+use icedtea_ui::view::builders::{SearchEntryExt, box_, button, center_box, search_entry};
 use icedtea_ui::view::{Cmd, InboxSender, View};
 use icedtea_ui::widgets::Orientation;
 use icedtea_ui::window::pointer::BTN_MIDDLE;
@@ -192,6 +192,11 @@ pub struct PanelModel {
     /// `None` when no keyboard is tracked. `view` renders the `#layout`
     /// label from it, or nothing at all while `None`.
     pub keyboard_layout: Option<String>,
+    /// The last formatted wall-clock label (`"HH:MM"`), or `None` before the
+    /// first [`Msg::Tick`]. The value is the formatted string, not the instant:
+    /// `view` renders what `update` stored, so nothing re-reads the clock
+    /// during layout (a formatting failure would panic mid-frame).
+    pub clock: Option<String>,
     /// Whether the launcher is open, toggled by the Start button (B1 Task 3).
     /// Folded in `update`'s `Msg::StartClicked` arm; `view` marks `#start`
     /// `active` from it. Task 5 opens the launcher surface itself off this bit.
@@ -230,6 +235,7 @@ impl PanelModel {
             ime_active: false,
             shortcuts_inhibited: false,
             keyboard_layout: None,
+            clock: None,
             launcher_open: false,
             launcher_ctl: None,
         }
@@ -275,6 +281,10 @@ pub enum Msg {
     },
     ClipRemoved(u64),
     ClipCleared,
+    /// One minute elapsed, from the clock thread. Carries nothing: the
+    /// handler reads the wall clock, so a delayed tick still shows the
+    /// current time rather than the time the tick was scheduled for.
+    Tick,
     /// The popover's search field changed (M6.1 Spec 2). Fires per keystroke
     /// like every entry-family `Change` — including IME commits, which land
     /// as buffer writes — so CJK/compose input filters rows as it commits.
@@ -349,6 +359,10 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
         }
         Msg::SurfaceWidth(w) => {
             m.bar_width = w;
+            Cmd::None
+        }
+        Msg::Tick => {
+            m.clock = Some(format_clock(&jiff::Zoned::now()));
             Cmd::None
         }
         Msg::Clip(u) => {
@@ -479,37 +493,47 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
 
 /// The whole bar. `#bar` is what `style.css`'s first selector names.
 ///
-/// The Start button leads unconditionally, then contract §3.3's order
-/// (workspaces, windows, clip). The input indicators sit between the windows
-/// and the clip button while active, and render nothing at all while
-/// inactive -- so the bar's children stay exactly
-/// `start, workspaces, windows, clip` when none shows (contract §3.3's order,
-/// pinned by `the_bar_holds_...`, led by the Start button).
+/// A `CenterBox` split into a start group and an end group: the Start button
+/// leads the start group, then contract §3.3's order (workspaces, windows),
+/// then the input indicators while active. The end group carries the clock
+/// and the clip button. The middle slot is empty, so the two groups sit at
+/// the bar's edges (see the inline note).
 pub fn view(m: &PanelModel) -> View<Msg> {
-    // M7: the touch indicator sits between the windows and the clip
-    // button when (and only when) a touch point is down. Conditional, not
-    // always-present-but-dim: an indicator for a state that is almost
-    // always off should take no layout space while off.
-    let mut children = vec![start_button(m), workspaces(m), windows(m)];
+    // The bar is a CenterBox: the start group (launcher, workspaces, window
+    // tiles) sits at the left edge, the indicators and clock at the right,
+    // with an empty centre. `Container::Center` maps to
+    // `JustifyContent::SPACE_BETWEEN`, so the two groups are pushed apart —
+    // a plain `Box` centres its child, which is what made the old bar read
+    // as a floating cluster. See the spec's panel section.
+    let mut start = vec![start_button(m), workspaces(m), windows(m)];
     if let Some(indicator) = ime_indicator(m) {
-        children.push(indicator);
+        start.push(indicator);
     }
     if let Some(indicator) = layout_indicator(m) {
-        children.push(indicator);
+        start.push(indicator);
     }
     if let Some(indicator) = inhibit_indicator(m) {
-        children.push(indicator);
+        start.push(indicator);
     }
     if let Some(indicator) = touch_indicator(m) {
-        children.push(indicator);
+        start.push(indicator);
     }
-    children.push(clip_button(m));
-    box_(Orientation::Horizontal, children)
-        .id("bar")
-        // See `bar_width`'s doc comment and `style.css`'s `#bar` rule: this is
-        // the one mechanism that actually reaches taffy for a plain box's
-        // centred, non-`ChildLayout` child.
-        .width_request(m.bar_width)
+
+    let mut end = Vec::new();
+    if let Some(clock) = clock_label(m) {
+        end.push(clock);
+    }
+    end.push(clip_button(m));
+
+    center_box(
+        box_(Orientation::Horizontal, start),
+        box_(Orientation::Horizontal, Vec::new()),
+        box_(Orientation::Horizontal, end),
+    )
+    .id("bar")
+    // See `bar_width`'s doc comment: a pixel width request is the one
+    // mechanism that reaches taffy for a plain (non-`ChildLayout`) bar.
+    .width_request(m.bar_width)
 }
 
 /// The launcher's toggle at the bar's left end (B1 Task 3). `active` while
@@ -588,6 +612,14 @@ fn workspaces(m: &PanelModel) -> View<Msg> {
 /// lives here.
 fn clamp_label(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(256).collect()
+}
+
+/// Format a wall-clock instant as the panel's `"HH:MM"` label.
+///
+/// Pure so it is unit-testable without a compositor or a real clock; the
+/// timer thread supplies a live `Zoned` and stores the result.
+fn format_clock(now: &jiff::Zoned) -> String {
+    now.strftime("%H:%M").to_string()
 }
 
 /// One button per window, keyed by window id.
@@ -678,6 +710,14 @@ fn clip_button(m: &PanelModel) -> View<Msg> {
     } else {
         view
     }
+}
+
+/// The right-end wall clock. Renders nothing before the first tick, so a
+/// shell that has not yet woken its clock thread shows no stale time.
+fn clock_label(m: &PanelModel) -> Option<View<Msg>> {
+    m.clock
+        .as_deref()
+        .map(|label| button(label).id("clock").class("clock"))
 }
 
 /// The popover's body, as a `Cmd::OpenPopup` payload can build it.
@@ -1057,6 +1097,30 @@ mod tests {
         v.children.iter().find_map(|c| by_id(c, id))
     }
 
+    /// The bar's three `CenterBox` groups, in start/centre/end order (Task 3).
+    fn bar_groups(v: &View<Msg>) -> (&View<Msg>, &View<Msg>, &View<Msg>) {
+        match &v.children[..] {
+            [start, center, end] => (start, center, end),
+            _ => panic!("the bar is a CenterBox with exactly start/centre/end"),
+        }
+    }
+
+    /// The `Id` props of `v`'s direct children.
+    fn child_ids(v: &View<Msg>) -> Vec<Option<&str>> {
+        v.children
+            .iter()
+            .map(|c| c.props.str(PropName::Id))
+            .collect()
+    }
+
+    /// The bar's ids reading left to right: the start group's children then
+    /// the end group's (the centre is intentionally empty). The end group
+    /// carries the clock only after a tick, so a fresh bar ends at `clip`.
+    fn bar_ids(v: &View<Msg>) -> Vec<Option<&str>> {
+        let (start, _center, end) = bar_groups(v);
+        child_ids(start).into_iter().chain(child_ids(end)).collect()
+    }
+
     /// The `Label` prop of every direct child of the container `id` names.
     fn labels(v: &View<Msg>, id: &str) -> Vec<String> {
         by_id(v, id)
@@ -1093,11 +1157,7 @@ mod tests {
         let (m, _, _) = seeded();
         let v = view(&m);
         assert_eq!(v.props.str(PropName::Id), Some("bar"));
-        let ids: Vec<Option<&str>> = v
-            .children
-            .iter()
-            .map(|c| c.props.str(PropName::Id))
-            .collect();
+        let ids = bar_ids(&v);
         assert_eq!(
             ids,
             vec![
@@ -1137,11 +1197,7 @@ mod tests {
             }))),
         );
         let v = view(&m);
-        let ids: Vec<Option<&str>> = v
-            .children
-            .iter()
-            .map(|c| c.props.str(PropName::Id))
-            .collect();
+        let ids = bar_ids(&v);
         assert_eq!(
             ids,
             vec![
@@ -1700,11 +1756,7 @@ mod tests {
             by_id(&v, "layout").is_none(),
             "an untracked layout must leave no label in the bar"
         );
-        let ids: Vec<Option<&str>> = v
-            .children
-            .iter()
-            .map(|c| c.props.str(PropName::Id))
-            .collect();
+        let ids = bar_ids(&v);
         assert_eq!(
             ids,
             vec![
@@ -1729,11 +1781,7 @@ mod tests {
             by_id(&v, "ime").is_none(),
             "an inactive IME must leave no indicator in the bar"
         );
-        let ids: Vec<Option<&str>> = v
-            .children
-            .iter()
-            .map(|c| c.props.str(PropName::Id))
-            .collect();
+        let ids = bar_ids(&v);
         assert_eq!(
             ids,
             vec![
@@ -1763,11 +1811,7 @@ mod tests {
             "INHIBIT",
             "the badge is a static generic label, like the IME precedent"
         );
-        let ids: Vec<Option<&str>> = v
-            .children
-            .iter()
-            .map(|c| c.props.str(PropName::Id))
-            .collect();
+        let ids = bar_ids(&v);
         assert_eq!(
             ids,
             vec![
@@ -1798,11 +1842,7 @@ mod tests {
             label.props.str(PropName::Label).unwrap_or_default(),
             "English (US)"
         );
-        let ids: Vec<Option<&str>> = v
-            .children
-            .iter()
-            .map(|c| c.props.str(PropName::Id))
-            .collect();
+        let ids = bar_ids(&v);
         assert_eq!(
             ids,
             vec![
@@ -1885,11 +1925,7 @@ mod tests {
     fn the_start_button_is_the_first_child_of_the_bar() {
         let (m, _, _) = seeded();
         let v = view(&m);
-        let ids: Vec<Option<&str>> = v
-            .children
-            .iter()
-            .map(|c| c.props.str(PropName::Id))
-            .collect();
+        let ids = bar_ids(&v);
         assert_eq!(
             ids,
             vec![
@@ -1992,5 +2028,49 @@ mod tests {
         assert!(m.launcher_open);
         let _ = update(&mut m, Msg::LauncherClosed);
         assert!(!m.launcher_open);
+    }
+
+    #[test]
+    fn the_clock_formats_as_zero_padded_hh_mm() {
+        let zoned: jiff::Zoned = "2026-09-19T09:05:00[UTC]".parse().expect("parse");
+        assert_eq!(super::format_clock(&zoned), "09:05");
+        let afternoon: jiff::Zoned = "2026-09-19T23:59:00[UTC]".parse().expect("parse");
+        assert_eq!(super::format_clock(&afternoon), "23:59");
+    }
+
+    /// The bar is a `CenterBox` (start/centre/end), not the old single
+    /// centred row: the clock lives in the end group, so the left and right
+    /// groups are pushed to the bar's edges (`Container::Center` maps to
+    /// `JustifyContent::SPACE_BETWEEN`). `View`'s fields are public, so the
+    /// structure is asserted directly.
+    #[test]
+    fn the_bar_splits_into_start_and_end_groups() {
+        let (model, _wm, _clip) = panel();
+        let view = super::view(&model);
+        assert_eq!(
+            view.kind,
+            icedtea_ui::view::Kind::CenterBox,
+            "the bar must be a CenterBox so its groups sit at the edges"
+        );
+        assert_eq!(
+            view.children.len(),
+            3,
+            "a CenterBox carries exactly start/centre/end"
+        );
+    }
+
+    #[test]
+    fn a_tick_records_the_clock_label() {
+        let (mut model, _wm, _clip) = panel();
+        assert_eq!(model.clock, None);
+        let _ = super::update(&mut model, Msg::Tick);
+        assert!(
+            model
+                .clock
+                .as_deref()
+                .is_some_and(|c| c.len() == 5 && c.as_bytes()[2] == b':'),
+            "a tick must record an HH:MM label, got {:?}",
+            model.clock
+        );
     }
 }

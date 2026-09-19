@@ -73,6 +73,33 @@ fn forward<T: Send + 'static>(
     })
 }
 
+/// Wake the panel on every minute boundary so the clock advances.
+///
+/// The toolkit deliberately does not repaint an idle surface ("the whole
+/// difference between this and a busy loop"), so a clock cannot simply be
+/// read during layout: something has to ask for the redraw. This mirrors
+/// `forward`'s worker + inbox shape — a message into the same inbox the
+/// D-Bus forwards use — rather than adding a toolkit scheduling API (spec D5).
+/// A failed send means the app dropped its inbox (shutdown), so the thread
+/// ends the same quiet way `forward` does.
+fn clock_tick(tx: InboxSender<Msg>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        loop {
+            // Sleep to the next minute boundary, then tick. `60 - second` is 0
+            // exactly on the boundary, so clamp that to a full minute —
+            // otherwise the loop busy-spins for the rest of that second.
+            let wait = match 60 - u64::from(jiff::Zoned::now().second().unsigned_abs()) {
+                0 => 60,
+                n => n,
+            };
+            std::thread::sleep(std::time::Duration::from_secs(wait));
+            if tx.send(Msg::Tick).is_err() {
+                break;
+            }
+        }
+    })
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // B1 Task 3: the anchored edge follows `Appearance.bar_position`.
     // `load_or_default` never fails (missing/corrupt/locked DB -> defaults),
@@ -141,6 +168,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Rc::new(Offline)
         }
     };
+
+    // The clock thread wakes the panel on every minute boundary; the
+    // immediate tick seeds `PanelModel.clock` so the clock appears before
+    // the first minute elapses rather than up to 59 s later.
+    let _clock = clock_tick(tx.clone());
+    let _ = tx.send(Msg::Tick);
 
     // P5-D9: `update` has no `&Window`, so the `clip` button's box is published
     // once per frame into the cell the model shares with it — the popover's
