@@ -25,6 +25,33 @@ use icedtea_contract::SeqEvent;
 
 use state::State;
 
+/// Where the session's default wallpaper is installed. Provisioning copies
+/// `session/assets/default-wallpaper.png` here; tests and unusual installs
+/// override it with `ICEDTEA_DEFAULT_WALLPAPER`.
+pub const DEFAULT_WALLPAPER_PATH: &str = "/usr/share/icedtea/default-wallpaper.png";
+
+/// Resolve which wallpaper to show: the configured path if set, else the
+/// `ICEDTEA_DEFAULT_WALLPAPER` override, else the installed default when it
+/// exists, else none (today's flat background).
+///
+/// A fresh install has `Appearance.wallpaper == None`; without this the
+/// desktop is a bare colour until someone opens settings and picks an image.
+fn resolve_wallpaper(
+    configured: Option<&str>,
+    env_override: Option<&std::ffi::OsStr>,
+    installed: &std::path::Path,
+) -> Option<String> {
+    if let Some(path) = configured {
+        return Some(path.to_string());
+    }
+    if let Some(path) = env_override {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    installed
+        .exists()
+        .then(|| installed.to_string_lossy().into_owned())
+}
+
 /// Boot and run the compositor.
 ///
 /// Ordering is load-bearing and each step says why:
@@ -267,7 +294,11 @@ pub fn run() {
         cmd_wake_write,
     );
 
-    let wallpaper_path = state.config.appearance.wallpaper.clone();
+    let wallpaper_path = resolve_wallpaper(
+        state.config.appearance.wallpaper.as_deref(),
+        std::env::var_os("ICEDTEA_DEFAULT_WALLPAPER").as_deref(),
+        std::path::Path::new(DEFAULT_WALLPAPER_PATH),
+    );
     state.spawn_wallpaper(wallpaper_path);
 
     if let Err(err) = backend.run_all(&display, &mut state, &runtime, wlr::Until::Stop) {
@@ -389,5 +420,43 @@ pub fn create_compat_globals(
     }
     if let Err(err) = runtime.create_power_manager(display) {
         tracing::error!(%err, "output power management unavailable; clients cannot request power modes");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn wallpaper_resolution_prefers_config_then_env_then_installed() {
+        let dir = std::env::temp_dir().join(format!("icedtea-wall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let installed = dir.join("default.png");
+        std::fs::write(&installed, b"x").expect("asset");
+
+        assert_eq!(
+            super::resolve_wallpaper(
+                Some("/custom.png"),
+                Some(std::ffi::OsStr::new("/env.png")),
+                &installed
+            ),
+            Some("/custom.png".to_string()),
+            "a configured wallpaper always wins"
+        );
+        assert_eq!(
+            super::resolve_wallpaper(None, Some(std::ffi::OsStr::new("/env.png")), &installed),
+            Some("/env.png".to_string()),
+            "the env override beats the installed default"
+        );
+        assert_eq!(
+            super::resolve_wallpaper(None, None, &installed),
+            Some(installed.to_string_lossy().into_owned()),
+            "an existing installed default is used when config and env are unset"
+        );
+        assert_eq!(
+            super::resolve_wallpaper(None, None, &dir.join("missing.png")),
+            None,
+            "no installed default means no wallpaper (the flat background)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
