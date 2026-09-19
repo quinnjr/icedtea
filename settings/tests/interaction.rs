@@ -153,15 +153,15 @@ fn apply_reaches_reload_config_on_the_mock() {
 
     // Dirty the model: toggle a switch, which enables Revert and Apply.
     //
-    // Reconciliation (fix round 2): the footer's status label carries
-    // `hexpand`, which is honored now, so it fills the footer and a text change
-    // no longer moves any geometry. The old `wait_for_frame_after` signal (a
-    // `frame <n>` line written by `write_probe_report` only when a
-    // `probe`/`alloc` line changed) therefore never fires for this toggle; wait
-    // on the app's own `status` line instead, which is appended on the fold
-    // that flips the model. The click also races asynchronous pointer-focus
-    // assignment on a freshly-booted window (the race `SettingsDriver::click`'s
-    // own settle loop documents), so retry it until the fold lands.
+    // The footer's status label carries `hexpand`, so it fills the footer and a
+    // text change no longer moves any geometry: the old
+    // `wait_for_frame_after` signal (a `frame <n>` line written by
+    // `write_probe_report` only when a `probe`/`alloc` line changed) never
+    // fires for this toggle. Wait on the app's own `status` line instead, which
+    // is appended on the fold that flips the model. The click also races
+    // asynchronous pointer-focus assignment on a freshly-booted window (the
+    // race `SettingsDriver::click`'s own settle loop documents), so retry it
+    // until the fold lands.
     let switch = driver.alloc("behavior_raise_on_focus");
     let mut toggled = false;
     for _ in 0..5 {
@@ -173,14 +173,18 @@ fn apply_reaches_reload_config_on_the_mock() {
     }
     assert!(toggled, "the switch toggle never reached the model");
 
-    // The switch's own `halign(Align::Start)` is honored now too, so the
-    // trailing Apply button sits at the footer's right edge instead of
-    // centring. The footer's right edge overflows the 640px window by ~30px
-    // (the nav switcher's min-content sets the root to 670), so click the
-    // button's visible portion — the part the surface can receive — rather
-    // than its centre, which is clipped.
+    // `#status` no longer carries `hexpand`, so the footer's action cluster is
+    // content-sized and sits wholly inside the window. Assert that geometry,
+    // then click Apply's centre: a footer block wider than the surface would
+    // push the button past the right edge (and this gate would fail at the
+    // assertion *or* the click would miss).
     let apply = driver.alloc("apply");
-    driver.click(apply.x + 4, apply.y + apply.h / 2);
+    assert!(
+        apply.x + apply.w <= driver.window_right(),
+        "Apply ({apply:?}) must be fully inside the window (right edge {})",
+        driver.window_right()
+    );
+    driver.click(apply.x + apply.w / 2, apply.y + apply.h / 2);
 
     let deadline = Instant::now() + REACT;
     while Instant::now() < deadline && calls.load(Ordering::SeqCst) == 0 {

@@ -745,10 +745,14 @@ impl Universal {
             // Mutate the one field in the child's existing layout -- never a
             // fresh `ChildLayout::default()` -- because a specific controller
             // (grid, overlay, paned, frame, stack) may already have set
-            // `absolute`, `grid`, `margin` or the other alignment axis.
+            // `absolute`, `grid`, `margin` or the other alignment axis. When
+            // nothing recorded a layout, the base is the *unaligned* centring,
+            // not `ChildLayout::default()`'s `Align::Fill`: otherwise a lone
+            // `.hexpand(true)` would also stretch the cross axis, coupling the
+            // axes these props name separately.
             PropName::Hexpand | PropName::Vexpand => {
                 let on = matches!(value, Prop::Bool(true));
-                let mut cl = child_layout_of(node);
+                let mut cl = child_layout_or_centred(node);
                 if name == PropName::Hexpand {
                     cl.hexpand = on;
                 } else {
@@ -758,12 +762,15 @@ impl Universal {
                 true
             }
             PropName::Halign | PropName::Valign => {
-                // Absent or wrongly typed restores the field default, Fill.
+                // Absent or wrongly typed restores the *unaligned* centring,
+                // not `Align::Fill`: a node that never had the prop is
+                // centred, so setting then clearing it returns to that same
+                // state.
                 let align = match value {
                     Prop::Align(a) => *a,
-                    _ => Align::Fill,
+                    _ => Align::Center,
                 };
-                let mut cl = child_layout_of(node);
+                let mut cl = child_layout_or_centred(node);
                 if name == PropName::Halign {
                     cl.halign = align;
                 } else {
@@ -870,11 +877,11 @@ pub use headless::{BuiltWidget, Headless, build_widget};
 #[doc(inline)]
 pub use state::flush_layout;
 pub(crate) use state::{
-    apply_universal, child_layout_of, container_of, forget_subtree, mark_grid_children,
-    mark_overlay_children, measure_row, paint_row, props_of, record_props, row_index_of,
-    row_text_height, set_child_layout, set_container, set_displayed, set_gap, set_homogeneous,
-    set_icon, set_row_classes, set_row_index, set_size_request, set_text, set_transition_progress,
-    size_request_of, text_of,
+    apply_universal, child_layout_of, child_layout_or_centred, container_of, forget_subtree,
+    mark_grid_children, mark_overlay_children, measure_row, paint_row, props_of, record_props,
+    row_index_of, row_text_height, set_child_layout, set_container, set_displayed, set_gap,
+    set_homogeneous, set_icon, set_row_classes, set_row_index, set_size_request, set_text,
+    set_transition_progress, size_request_of, text_of,
 };
 
 /// The `:hover`/`:active` bookkeeping every pointer-reactive widget shares.

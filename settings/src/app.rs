@@ -791,10 +791,7 @@ fn footer(m: &SettingsModel) -> View<Msg> {
     box_(
         Orientation::Horizontal,
         [
-            label(footer_text(m))
-                .id("status")
-                .hexpand(true)
-                .halign(Align::Start),
+            label(footer_text(m)).id("status").halign(Align::Start),
             // Dirty is not enough: a worker that never started accepts the
             // request and never answers, so the button would stay live and
             // the footer would park on "Applying…" for the session. Revert

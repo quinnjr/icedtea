@@ -23,8 +23,9 @@
 //! `clicking_an_info_bars_close_button_fires_close`,
 //! `clicking_a_calendar_day_selects_it`) were `#[ignore]`d on that defect and
 //! are green assertions again; each carries the geometry its coordinates come
-//! from, because those widgets sit at their intrinsic size, centred — none of
-//! them requests `hexpand` or `halign`.
+//! from. Those views request `hexpand`/`vexpand`, which name only their own
+//! axis, so each widget grows on the axis it names and stays centred on the
+//! other — the coordinates are that geometry, not a full-surface stretch.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -410,13 +411,14 @@ fn clicking_an_info_bars_close_button_fires_close() {
         vec![
             // `InfoBarC` reports the close button's own 24x24 as its
             // intrinsic size (see `InfoBarC::measure`) because that button is
-            // a subnode with no taffy box. `hexpand` is honored now, so the
-            // bar stretches to this 300px window and `InfoBarC::close_rect`
-            // packs the 24x24 button at the trailing edge: x 276..300,
-            // y 0..24. (150, 24), the centred coordinate this test used while
-            // `hexpand` was inert, is bare window now; x=285 was the original
-            // plan's guess and is finally right.
-            ScriptStep::Event(InputEvent::pointer_enter(288.0, 12.0, 1)),
+            // a subnode with no taffy box. `hexpand` names only its own axis
+            // now, and a root child of the window's column does not grow
+            // horizontally from it, so the bar is that square, centred in this
+            // 300x48 window at x 138..162, y 12..36, with the button filling
+            // it. (288, 12) was the stretched coordinate from when `hexpand`
+            // also stretched the cross axis; the intrinsic-centred point is
+            // back.
+            ScriptStep::Event(InputEvent::pointer_enter(150.0, 24.0, 1)),
             ScriptStep::Event(InputEvent::PointerButton {
                 button: 0x110,
                 pressed: true,
@@ -599,15 +601,11 @@ fn a_picture_decodes_and_draws_an_embedded_png() {
         (64, 64),
         vec![ScriptStep::Capture],
     );
-    // The picture now stretches to the surface (`hexpand`/`vexpand` are
-    // honored), so every pixel is the decoded red. `has_ink` counts distinct
-    // colours and would read this single-colour fill as "no ink"; assert the
-    // decoded colour directly instead.
-    let centre = frames.pixel(0, 32, 32).expect("centre pixel");
-    assert!(
-        centre.0 > 200 && centre.1 < 40 && centre.2 < 40 && centre.3 > 200,
-        "the decoded PNG must paint red at its centre, got {centre:?}"
-    );
+    // `hexpand`/`vexpand` name only their own axis, and a root child of the
+    // window's column grows vertically from `vexpand` but not horizontally
+    // from `hexpand`, so the image stays a narrow intrinsic-width column and
+    // `has_ink` sees decoded red against the window background.
+    assert!(has_ink(&frames, 0, (64, 64)), "the decoded PNG must ink");
 }
 
 #[test]
@@ -1251,15 +1249,17 @@ fn clicking_a_calendar_day_selects_it() {
             ScriptStep::Capture,
             // `CalendarC` reports its own intrinsic size (7 columns of 24px
             // over a 32px header plus one 24px row per week, see
-            // `CalendarC::measure`), but `hexpand`/`vexpand` are honored now,
-            // so the calendar stretches to fill this 280x240 window: its
-            // content box is x 1..279, y 1..239 (Adwaita's 1px padding), and
-            // the cells are 278/7 wide by (238-32)/6 tall. March 1st 2026 is a
-            // Sunday (column 6), which puts the 10th in column 1, row 2 --
-            // x 40.7..80.4, y 101.7..136. (60, 118) lands inside it.
+            // `CalendarC::measure`) because its `header`/`grid`/day labels
+            // have no taffy box. `hexpand`/`vexpand` name only their own axis
+            // now, so the calendar is centred horizontally at its 168px
+            // intrinsic width and only grows vertically: centred in this
+            // 280x240 window its content box is x 56..224, y 1..239, and the
+            // cells are 24 wide by (238-32)/6 tall. March 1st 2026 is a Sunday
+            // (column 6), which puts the 10th in column 1, row 2 -- window
+            // x 81..105, y ~102..137. (92, 124) lands inside it.
             ScriptStep::Event(InputEvent::PointerEnter {
-                x: 60.0,
-                y: 118.0,
+                x: 92.0,
+                y: 124.0,
                 serial: 1,
                 target: icedtea_ui::window::SurfaceTarget::Window,
             }),
@@ -2504,10 +2504,13 @@ fn region_inked(frames: &Frames, frame: usize, x0: u32, x1: u32, y0: u32, y1: u3
 struct SetEnd(bool);
 
 /// `Hexpand` now reaches layout: a growing child in a row takes the leftover
-/// space, so its allocation reaches the row's right edge.
+/// space, so its allocation reaches the row's right edge -- and it changes
+/// *only* the main axis, leaving the cross axis centred.
 ///
 /// mutation: drop the `Hexpand`/`Vexpand` arm from `Universal::apply`; the
-/// children sit centred as a group and `190..200` is window background.
+/// children sit centred as a group and `190..200` is window background. The
+/// cross-axis assertion catches the separate regression where the arm's base
+/// (`ChildLayout::default()`) also made the child `Align::Fill` vertically.
 #[test]
 fn a_hexpanding_child_takes_the_leftover_space() {
     use icedtea_ui::view::builders::{box_, button, label};
@@ -2522,6 +2525,7 @@ fn a_hexpanding_child_takes_the_leftover_space() {
                 [label("L"), button("R").hexpand(true)],
             )
             .width_request(200)
+            .height_request(40)
         },
         (200, 40),
         vec![ScriptStep::Capture],
@@ -2530,23 +2534,33 @@ fn a_hexpanding_child_takes_the_leftover_space() {
         region_inked(&frames, 0, 190, 200, 8, 32),
         "the hexpanding button must reach the row's right edge"
     );
+    assert!(
+        !region_inked(&frames, 0, 40, 190, 0, 3),
+        "hexpand must grow the main axis only; the child stays centred on the cross axis"
+    );
 }
 
 /// `Halign::End` now reaches layout: the child is pinned to the row's right
-/// edge instead of centring.
+/// edge instead of centring -- and it changes *only* the main axis, leaving
+/// the cross axis centred.
 ///
-/// mutation: drop the `Halign`/`Valign` arm from `Universal::apply`; the label
-/// centres near x=100 and `180..200` stays blank.
+/// mutation: drop the `Halign`/`Valign` arm from `Universal::apply`; the child
+/// centres near x=100 and `180..200` stays blank. The cross-axis assertion
+/// catches the arm's base stretching the child vertically.
 #[test]
 fn halign_end_pins_a_child_to_the_right_edge() {
     use icedtea_ui::layout::Align;
-    use icedtea_ui::view::builders::{box_, label};
+    use icedtea_ui::view::builders::{box_, button};
     use icedtea_ui::widgets::Orientation;
 
     let frames = run(
         (),
         |_m: &mut (), _msg: ()| Cmd::None,
-        |_m: &()| box_(Orientation::Horizontal, [label("R").halign(Align::End)]).width_request(200),
+        |_m: &()| {
+            box_(Orientation::Horizontal, [button("R").halign(Align::End)])
+                .width_request(200)
+                .height_request(40)
+        },
         (200, 40),
         vec![ScriptStep::Capture],
     );
@@ -2555,8 +2569,12 @@ fn halign_end_pins_a_child_to_the_right_edge() {
         "an end-aligned child must not sit at the left"
     );
     assert!(
-        region_inked(&frames, 0, 180, 200, 0, 40),
+        region_inked(&frames, 0, 150, 200, 18, 22),
         "an end-aligned child must reach the right edge"
+    );
+    assert!(
+        !region_inked(&frames, 0, 150, 200, 0, 3),
+        "halign must move the main axis only; the child stays centred on the cross axis"
     );
 }
 
@@ -2602,8 +2620,8 @@ fn removing_hexpand_restores_centring() {
     );
 }
 
-/// The removal path for `Halign`: `Prop::None` restores `Align::Fill`, so the
-/// label centres again after an `End` was set.
+/// The removal path for `Halign`: `Prop::None` restores the unaligned
+/// centring, so the child centres again after an `End` was set.
 #[test]
 fn removing_halign_end_restores_centring() {
     use icedtea_ui::layout::Align;
@@ -2641,5 +2659,40 @@ fn removing_halign_end_restores_centring() {
     assert!(
         !region_inked(&frames, 2, 180, 200, 0, 40),
         "removing the prop restores centring"
+    );
+}
+
+/// `GtkBox:homogeneous` is honored: with it set, every child expands on the
+/// main axis, so two buttons split the row instead of sitting centred as a
+/// natural-width cluster. This is the only exercise of `flush_layout`'s
+/// `homogeneous == true` branch -- no widget in the tree sets it, so the
+/// `false` default never reaches the force path.
+///
+/// mutation: drop the `on` force in `flush_layout`'s homogeneous pass; the
+/// buttons sit centred as a cluster and `160..200` stays blank.
+#[test]
+fn a_homogeneous_box_gives_every_child_the_same_main_axis_extent() {
+    use icedtea_ui::view::builders::{BoxExt, box_, button};
+    use icedtea_ui::widgets::Orientation;
+
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| {
+            box_(Orientation::Horizontal, [button("A"), button("B")])
+                .homogeneous(true)
+                .width_request(200)
+                .height_request(40)
+        },
+        (200, 40),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        region_inked(&frames, 0, 160, 200, 18, 22),
+        "a homogeneous box must expand every child across the row"
+    );
+    assert!(
+        !region_inked(&frames, 0, 160, 200, 0, 3),
+        "homogeneous expansion must not stretch the cross axis"
     );
 }

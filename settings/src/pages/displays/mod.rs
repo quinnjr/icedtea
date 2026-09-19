@@ -136,8 +136,8 @@ pub const STATUS_APPLYING: &str = "Applying\u{2026}";
 /// was inert for a plain `Container::Box` child, so an empty label measured
 /// zero-width and never painted — no longer holds, since the alignment and
 /// expansion props are honored on plain children now. The product choice
-/// stands on its own: a visible empty node is still zero-width and paints
-/// nothing, and "Ready" is the honest idle status anyway.
+/// stands on its own: an empty label paints no glyphs whatever width it is
+/// given, and "Ready" is the honest idle status anyway.
 pub const STATUS_READY: &str = "Ready";
 
 /// Reset the pending edits back to the last-known head snapshot.
@@ -246,10 +246,7 @@ pub fn footer(m: &SettingsModel) -> View<Msg> {
     box_(
         Orientation::Horizontal,
         [
-            label(status)
-                .id("displays_status")
-                .hexpand(true)
-                .halign(Align::Start),
+            label(status).id("displays_status").halign(Align::Start),
             button("Test")
                 .id("displays_test")
                 .sensitive(live && !busy)

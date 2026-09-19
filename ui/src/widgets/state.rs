@@ -18,7 +18,7 @@ use selectors::Element as _;
 use selectors::OpaqueElement;
 
 use crate::css::node::{Node, NodeInner};
-use crate::layout::{ChildLayout, Container};
+use crate::layout::{Align, ChildLayout, Container};
 use crate::view::{BuildCx, Kind, Prop, PropName, Props};
 
 use super::{Orientation, Universal, grid, overlay, types};
@@ -347,12 +347,49 @@ pub(crate) fn props_of(node: &Node) -> Props {
         .unwrap_or_default()
 }
 
-/// The child layout last recorded for `node`.
+/// The child layout last recorded for `node`, or `ChildLayout::default()`.
+///
+/// Used by `GridC`'s cell-placement path, which has always started grid
+/// children from the `Fill` default; the universal arms use
+/// [`child_layout_or_centred`] instead so they do not couple the axes.
 #[must_use]
 pub(crate) fn child_layout_of(node: &Node) -> ChildLayout {
     NODE_CHILD
         .with(|m| m.borrow().get(node).copied())
         .unwrap_or_default()
+}
+
+/// The child layout last recorded for `node`, or the *unaligned* base when
+/// none was recorded.
+///
+/// A node with no recorded [`ChildLayout`] is not `Align::Fill`: every
+/// container reproduces "unaligned" with `align_items`/`justify_items:
+/// CENTER` (`Container::Box`'s `layout.rs:678`, `Container::Center`'s `:691`,
+/// `Grid`'s `:709-710` and `Leaf`), so changing one axis from
+/// [`centred_child_layout`] leaves the other exactly as the node would have
+/// laid out before any alignment/expansion prop was set.
+/// `ChildLayout::default()` cannot serve as that base -- its `Align::Fill`
+/// default would make a lone `.hexpand(true)` also stretch the cross axis,
+/// coupling the axes the props name separately.
+#[must_use]
+pub(crate) fn child_layout_or_centred(node: &Node) -> ChildLayout {
+    NODE_CHILD
+        .with(|m| m.borrow().get(node).copied())
+        .unwrap_or_else(centred_child_layout)
+}
+
+/// The unaligned child layout: centred on both axes, everything else default.
+///
+/// `LayoutTree::child_layout`/this module's table return nothing for a node
+/// no controller or universal arm has laid out yet; this is what that
+/// "nothing" means in taffy terms.
+#[must_use]
+pub(crate) fn centred_child_layout() -> ChildLayout {
+    ChildLayout {
+        halign: Align::Center,
+        valign: Align::Center,
+        ..ChildLayout::default()
+    }
 }
 
 thread_local! {
@@ -785,21 +822,22 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
             if let Some((on, orientation)) = entry.homogeneous {
                 let horizontal = orientation == Orientation::Horizontal;
                 for child in node.children() {
-                    let mut cl = tree.child_layout(&child).unwrap_or_default();
-                    // `homogeneous == true` forces expansion on. When it is
-                    // off, only a child that asked for nothing itself is reset
-                    // -- a child carrying its own `Hexpand`/`Vexpand` prop is
-                    // left to the universal pass that already applied it, so
-                    // this pass cannot clobber an explicit request. Reading the
-                    // prop is also what releases a child an earlier homogeneous
-                    // frame forced, since `GtkBox:homogeneous` only *forces*
-                    // expansion while set.
                     let asked = if horizontal {
                         props_of(&child).get(PropName::Hexpand).is_some()
                     } else {
                         props_of(&child).get(PropName::Vexpand).is_some()
                     };
                     if on {
+                        // Forcing expansion on starts from the *unaligned*
+                        // centring, so the named axis grows without the other
+                        // stretching (the same coupling the universal arms
+                        // avoid). `homogeneous == false` keeps the historical
+                        // base: it only resets a child that asked for nothing
+                        // itself, leaving a child with its own prop to the
+                        // universal pass.
+                        let mut cl = tree
+                            .child_layout(&child)
+                            .unwrap_or_else(centred_child_layout);
                         if horizontal {
                             cl.hexpand = true;
                         } else {
@@ -807,6 +845,7 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
                         }
                         tree.set_child_layout(&child, cl);
                     } else if !asked {
+                        let mut cl = tree.child_layout(&child).unwrap_or_default();
                         if horizontal {
                             cl.hexpand = false;
                         } else {

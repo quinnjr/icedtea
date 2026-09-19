@@ -184,6 +184,9 @@ pub struct SettingsDriver {
     /// decoration drawn above the client area. Added to every window-local
     /// coordinate `alloc`/`point` hands back before it reaches a caller.
     origin: (i32, i32),
+    /// The window's compositor-assigned size, so a gate can assert a widget is
+    /// not pushed past the visible right/bottom edge.
+    window_size: (i32, i32),
 }
 
 impl SettingsDriver {
@@ -257,9 +260,12 @@ impl SettingsDriver {
             boot_background,
             page_root: page.to_string(),
             origin: (0, 0),
+            window_size: (0, 0),
         };
         driver.wait_for_first_frame();
-        driver.origin = driver.wait_for_window_origin();
+        let (origin, size) = driver.wait_for_window_origin();
+        driver.origin = origin;
+        driver.window_size = size;
         driver
     }
 
@@ -269,7 +275,7 @@ impl SettingsDriver {
     ///
     /// If the settings window never enters the compositor's model within
     /// [`BOOT`].
-    fn wait_for_window_origin(&self) -> (i32, i32) {
+    fn wait_for_window_origin(&self) -> ((i32, i32), (i32, i32)) {
         let started = Instant::now();
         while started.elapsed() < BOOT {
             if let Some(window) = self
@@ -280,11 +286,18 @@ impl SettingsDriver {
                 .find(|w| w.app_id == SETTINGS_APP_ID)
             {
                 let g = window.geometry;
-                return (g.x, g.y + TITLE_BAR_HEIGHT);
+                return ((g.x, g.y + TITLE_BAR_HEIGHT), (g.width, g.height));
             }
             std::thread::sleep(POLL);
         }
         panic!("the settings window never entered the compositor's model within {BOOT:?}");
+    }
+
+    /// The right edge of the window's frame, in output coordinates: a widget
+    /// whose `alloc` right edge exceeds this is clipped by the surface.
+    #[must_use]
+    pub fn window_right(&self) -> i32 {
+        self.origin.0 + self.window_size.0
     }
 
     /// Block until anything paints over the background.
