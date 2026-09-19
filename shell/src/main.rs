@@ -85,13 +85,10 @@ fn forward<T: Send + 'static>(
 fn clock_tick(tx: InboxSender<Msg>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
-            // Sleep to the next minute boundary, then tick. `60 - second` is 0
-            // exactly on the boundary, so clamp that to a full minute —
-            // otherwise the loop busy-spins for the rest of that second.
-            let wait = match 60 - u64::from(jiff::Zoned::now().second().unsigned_abs()) {
-                0 => 60,
-                n => n,
-            };
+            // Sleep to the next minute boundary, then tick. The arithmetic
+            // (and its zero-on-the-boundary clamp) lives in
+            // `panel::next_minute_wait`, which is unit-tested.
+            let wait = panel::next_minute_wait(jiff::Zoned::now().second().unsigned_abs());
             std::thread::sleep(std::time::Duration::from_secs(wait));
             if tx.send(Msg::Tick).is_err() {
                 break;

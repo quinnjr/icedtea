@@ -784,6 +784,18 @@ Add the pure formatter next to `clamp_label`:
 fn format_clock(now: &jiff::Zoned) -> String {
     now.strftime("%H:%M").to_string()
 }
+
+/// Seconds to sleep from `second` past the minute to the next minute boundary.
+///
+/// Pure so the tick thread's only arithmetic is unit-testable: `0` (exactly on
+/// the boundary) must wait a full minute, not busy-spin for the rest of that
+/// second. `second` is 0..=59, the range `jiff::Zoned::second` yields.
+pub fn next_minute_wait(second: u8) -> u64 {
+    match 60 - u64::from(second) {
+        0 => 60,
+        n => n,
+    }
+}
 ```
 
 Add the `Msg` variant (to the `pub enum Msg`):
@@ -812,26 +824,30 @@ Rewrite `view` to a `CenterBox` (start / centre / end):
 ```rust
 pub fn view(m: &PanelModel) -> View<Msg> {
     // The bar is a CenterBox: the start group (launcher, workspaces, window
-    // tiles) sits at the left edge, the indicators and clock at the right,
-    // with an empty centre. `Container::Center` maps to
+    // tiles) sits at the left edge, the indicators, clock and clip button at
+    // the right, with an empty centre. `Container::Center` maps to
     // `JustifyContent::SPACE_BETWEEN`, so the two groups are pushed apart —
     // a plain `Box` centres its child, which is what made the old bar read
     // as a floating cluster. See the spec's panel section.
-    let mut start = vec![start_button(m), workspaces(m), windows(m)];
+    let start = vec![start_button(m), workspaces(m), windows(m)];
+
+    // The end group opens with a spacer that takes the group's free space, so
+    // the indicators, clock and clip sit flush against the right edge rather
+    // than centring in the group's (grown) half. Contract §3.3's order within
+    // the group is indicators, clock, clip.
+    let mut end = vec![end_spacer()];
     if let Some(indicator) = ime_indicator(m) {
-        start.push(indicator);
+        end.push(indicator);
     }
     if let Some(indicator) = layout_indicator(m) {
-        start.push(indicator);
+        end.push(indicator);
     }
     if let Some(indicator) = inhibit_indicator(m) {
-        start.push(indicator);
+        end.push(indicator);
     }
     if let Some(indicator) = touch_indicator(m) {
-        start.push(indicator);
+        end.push(indicator);
     }
-
-    let mut end = Vec::new();
     if let Some(clock) = clock_label(m) {
         end.push(clock);
     }
@@ -847,6 +863,13 @@ pub fn view(m: &PanelModel) -> View<Msg> {
     // mechanism that reaches taffy for a plain (non-`ChildLayout`) bar.
     .width_request(m.bar_width)
 }
+
+/// A layout-only spacer leading the end group; see `view`'s note.
+fn end_spacer() -> View<Msg> {
+    box_(Orientation::Horizontal, Vec::new())
+        .id("end_spacer")
+        .hexpand(true)
+}
 ```
 
 Ensure `center_box` is imported (`use icedtea_ui::view::builders::center_box;` or the path the file already uses for `box_`).
@@ -856,6 +879,7 @@ Add the `Tick` arm to `update` (beside the other arms):
 ```rust
         Msg::Tick => {
             m.clock = Some(format_clock(&jiff::Zoned::now()));
+            Cmd::None
         }
 ```
 
@@ -881,13 +905,10 @@ Add a function beside `forward`:
 fn clock_tick(tx: InboxSender<Msg>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
-            // Sleep to the next minute boundary, then tick. `60 - second` is 0
-            // exactly on the boundary, so clamp that to a full minute —
-            // otherwise the loop busy-spins for the rest of that second.
-            let wait = match 60 - u64::from(jiff::Zoned::now().second()) {
-                0 => 60,
-                n => n,
-            };
+            // Sleep to the next minute boundary, then tick. The arithmetic
+            // (and its zero-on-the-boundary clamp) lives in
+            // `panel::next_minute_wait`, which is unit-tested.
+            let wait = panel::next_minute_wait(jiff::Zoned::now().second().unsigned_abs());
             std::thread::sleep(std::time::Duration::from_secs(wait));
             if tx.send(Msg::Tick).is_err() {
                 break;

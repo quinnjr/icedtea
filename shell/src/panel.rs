@@ -494,32 +494,36 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
 /// The whole bar. `#bar` is what `style.css`'s first selector names.
 ///
 /// A `CenterBox` split into a start group and an end group: the Start button
-/// leads the start group, then contract §3.3's order (workspaces, windows),
-/// then the input indicators while active. The end group carries the clock
-/// and the clip button. The middle slot is empty, so the two groups sit at
-/// the bar's edges (see the inline note).
+/// leads the start group, then contract §3.3's order (workspaces, windows).
+/// The input indicators, the clock and the clip button live in the end group,
+/// held against the right edge by a leading spacer. The middle slot is empty,
+/// so the two groups sit at the bar's edges (see the inline note).
 pub fn view(m: &PanelModel) -> View<Msg> {
     // The bar is a CenterBox: the start group (launcher, workspaces, window
-    // tiles) sits at the left edge, the indicators and clock at the right,
-    // with an empty centre. `Container::Center` maps to
+    // tiles) sits at the left edge, the indicators, clock and clip button at
+    // the right, with an empty centre. `Container::Center` maps to
     // `JustifyContent::SPACE_BETWEEN`, so the two groups are pushed apart —
     // a plain `Box` centres its child, which is what made the old bar read
     // as a floating cluster. See the spec's panel section.
-    let mut start = vec![start_button(m), workspaces(m), windows(m)];
+    let start = vec![start_button(m), workspaces(m), windows(m)];
+
+    // The end group opens with a spacer that takes the group's free space, so
+    // the indicators, clock and clip sit flush against the right edge rather
+    // than centring in the group's (grown) half. Contract §3.3's order within
+    // the group is indicators, clock, clip.
+    let mut end = vec![end_spacer()];
     if let Some(indicator) = ime_indicator(m) {
-        start.push(indicator);
+        end.push(indicator);
     }
     if let Some(indicator) = layout_indicator(m) {
-        start.push(indicator);
+        end.push(indicator);
     }
     if let Some(indicator) = inhibit_indicator(m) {
-        start.push(indicator);
+        end.push(indicator);
     }
     if let Some(indicator) = touch_indicator(m) {
-        start.push(indicator);
+        end.push(indicator);
     }
-
-    let mut end = Vec::new();
     if let Some(clock) = clock_label(m) {
         end.push(clock);
     }
@@ -534,6 +538,23 @@ pub fn view(m: &PanelModel) -> View<Msg> {
     // See `bar_width`'s doc comment: a pixel width request is the one
     // mechanism that reaches taffy for a plain (non-`ChildLayout`) bar.
     .width_request(m.bar_width)
+}
+
+/// A layout-only spacer that leads the end group and absorbs its free space,
+/// so the indicators, clock and `clip` sit flush against the bar's right
+/// edge. Carries an id so a test can pin both its position and its
+/// `Hexpand` request; it paints nothing and handles no events.
+///
+/// NOTE: `PropName::Hexpand` has no consumer for a plain `Box` child anywhere
+/// in `icedtea-ui`'s layout path yet (`ui/tests/widget_pixels.rs`'s
+/// `stepping_a_spin_button...` note; `settings/src/pages/displays/mod.rs`'s
+/// `STATUS_READY` note). The spacer mirrors `windows()`'s own
+/// `.hexpand(true)` so the intended right-justification is expressed at the
+/// view level and starts working the moment that gap is closed.
+fn end_spacer() -> View<Msg> {
+    box_(Orientation::Horizontal, Vec::new())
+        .id("end_spacer")
+        .hexpand(true)
 }
 
 /// The launcher's toggle at the bar's left end (B1 Task 3). `active` while
@@ -620,6 +641,18 @@ fn clamp_label(s: &str) -> String {
 /// timer thread supplies a live `Zoned` and stores the result.
 fn format_clock(now: &jiff::Zoned) -> String {
     now.strftime("%H:%M").to_string()
+}
+
+/// Seconds to sleep from `second` past the minute to the next minute boundary.
+///
+/// Pure so the tick thread's only arithmetic is unit-testable: `0` (exactly on
+/// the boundary) must wait a full minute, not busy-spin for the rest of that
+/// second. `second` is 0..=59, the range `jiff::Zoned::second` yields.
+pub fn next_minute_wait(second: u8) -> u64 {
+    match 60 - u64::from(second) {
+        0 => 60,
+        n => n,
+    }
 }
 
 /// One button per window, keyed by window id.
@@ -1113,12 +1146,25 @@ mod tests {
             .collect()
     }
 
-    /// The bar's ids reading left to right: the start group's children then
-    /// the end group's (the centre is intentionally empty). The end group
-    /// carries the clock only after a tick, so a fresh bar ends at `clip`.
-    fn bar_ids(v: &View<Msg>) -> Vec<Option<&str>> {
-        let (start, _center, end) = bar_groups(v);
-        child_ids(start).into_iter().chain(child_ids(end)).collect()
+    /// The start group's `Id`s: the launcher, workspaces and window tiles,
+    /// and nothing else.
+    fn start_ids(v: &View<Msg>) -> Vec<Option<&str>> {
+        let (start, _center, _end) = bar_groups(v);
+        child_ids(start)
+    }
+
+    /// The end group's `Id`s: the leading spacer, then the indicators, the
+    /// clock (only after a tick) and `clip`.
+    fn end_ids(v: &View<Msg>) -> Vec<Option<&str>> {
+        let (_start, _center, end) = bar_groups(v);
+        child_ids(end)
+    }
+
+    /// The `Id`s of the bar's empty centre slot: always empty, asserted so a
+    /// stray child cannot hide between the groups.
+    fn centre_ids(v: &View<Msg>) -> Vec<Option<&str>> {
+        let (_start, center, _end) = bar_groups(v);
+        child_ids(center)
     }
 
     /// The `Label` prop of every direct child of the container `id` names.
@@ -1157,23 +1203,25 @@ mod tests {
         let (m, _, _) = seeded();
         let v = view(&m);
         assert_eq!(v.props.str(PropName::Id), Some("bar"));
-        let ids = bar_ids(&v);
         assert_eq!(
-            ids,
-            vec![
-                Some("start"),
-                Some("workspaces"),
-                Some("windows"),
-                Some("clip")
-            ],
-            "the Start button leads, then contract §3.3's order: workspaces, windows, clip (no touch down, no indicator)"
+            start_ids(&v),
+            vec![Some("start"), Some("workspaces"), Some("windows")],
+            "the left group is the Start button, then contract §3.3's order: workspaces, windows"
+        );
+        assert!(
+            centre_ids(&v).is_empty(),
+            "the centre slot is empty so the groups sit at the edges"
+        );
+        assert_eq!(
+            end_ids(&v),
+            vec![Some("end_spacer"), Some("clip")],
+            "the right group is the spacer, then the indicators/clock and clip (no indicator and no clock before the first tick)"
         );
     }
 
-    /// M7: while a touch point is down the bar gains a `#touch` indicator
-    /// between the windows and the clip button, carrying the `active`
-    /// class; with no touch down the bar is exactly the three-node shape
-    /// the test above pins.
+    /// M7: while a touch point is down the bar gains a `#touch` indicator in
+    /// the right group, carrying the `active` class; with no touch down the
+    /// bar is exactly the shape the test above pins.
     #[test]
     fn a_touch_down_adds_an_active_touch_indicator_to_the_bar() {
         let (mut m, _, _) = seeded();
@@ -1197,17 +1245,15 @@ mod tests {
             }))),
         );
         let v = view(&m);
-        let ids = bar_ids(&v);
         assert_eq!(
-            ids,
-            vec![
-                Some("start"),
-                Some("workspaces"),
-                Some("windows"),
-                Some("touch"),
-                Some("clip")
-            ],
-            "the indicator sits between windows and clip"
+            start_ids(&v),
+            vec![Some("start"), Some("workspaces"), Some("windows")],
+            "the touch indicator must not move into the left group"
+        );
+        assert_eq!(
+            end_ids(&v),
+            vec![Some("end_spacer"), Some("touch"), Some("clip")],
+            "the indicator sits in the right group, ahead of clip"
         );
         let classes = match by_id(&v, "touch")
             .expect("touch indicator")
@@ -1756,16 +1802,15 @@ mod tests {
             by_id(&v, "layout").is_none(),
             "an untracked layout must leave no label in the bar"
         );
-        let ids = bar_ids(&v);
         assert_eq!(
-            ids,
-            vec![
-                Some("start"),
-                Some("workspaces"),
-                Some("windows"),
-                Some("clip")
-            ],
-            "contract §3.3's order is unchanged while no indicator shows"
+            start_ids(&v),
+            vec![Some("start"), Some("workspaces"), Some("windows")],
+            "no indicator shows, so the left group is only launcher, workspaces, windows"
+        );
+        assert_eq!(
+            end_ids(&v),
+            vec![Some("end_spacer"), Some("clip")],
+            "and the right group is the spacer and clip while no indicator shows"
         );
     }
 
@@ -1781,16 +1826,15 @@ mod tests {
             by_id(&v, "ime").is_none(),
             "an inactive IME must leave no indicator in the bar"
         );
-        let ids = bar_ids(&v);
         assert_eq!(
-            ids,
-            vec![
-                Some("start"),
-                Some("workspaces"),
-                Some("windows"),
-                Some("clip")
-            ],
-            "contract §3.3's order is unchanged while no IME is active"
+            start_ids(&v),
+            vec![Some("start"), Some("workspaces"), Some("windows")],
+            "an inactive IME leaves the left group unchanged"
+        );
+        assert_eq!(
+            end_ids(&v),
+            vec![Some("end_spacer"), Some("clip")],
+            "an inactive IME leaves the right group as the spacer and clip"
         );
     }
 
@@ -1811,17 +1855,15 @@ mod tests {
             "INHIBIT",
             "the badge is a static generic label, like the IME precedent"
         );
-        let ids = bar_ids(&v);
         assert_eq!(
-            ids,
-            vec![
-                Some("start"),
-                Some("workspaces"),
-                Some("windows"),
-                Some("inhibit"),
-                Some("clip")
-            ],
-            "the badge sits between the windows and the clip button"
+            start_ids(&v),
+            vec![Some("start"), Some("workspaces"), Some("windows")],
+            "the badge must not move into the left group"
+        );
+        assert_eq!(
+            end_ids(&v),
+            vec![Some("end_spacer"), Some("inhibit"), Some("clip")],
+            "the badge sits in the right group, ahead of clip"
         );
     }
 
@@ -1842,17 +1884,15 @@ mod tests {
             label.props.str(PropName::Label).unwrap_or_default(),
             "English (US)"
         );
-        let ids = bar_ids(&v);
         assert_eq!(
-            ids,
-            vec![
-                Some("start"),
-                Some("workspaces"),
-                Some("windows"),
-                Some("layout"),
-                Some("clip")
-            ],
-            "the label sits between the windows and the clip button"
+            start_ids(&v),
+            vec![Some("start"), Some("workspaces"), Some("windows")],
+            "the label must not move into the left group"
+        );
+        assert_eq!(
+            end_ids(&v),
+            vec![Some("end_spacer"), Some("layout"), Some("clip")],
+            "the label sits in the right group, ahead of clip"
         );
     }
 
@@ -1879,9 +1919,16 @@ mod tests {
             classes.contains(&"active".to_string()),
             "indicator must carry active styling"
         );
-        // Bar order: workspaces, windows, ime, clip — checked via by_id order below.
-        assert!(by_id(&v, "workspaces").is_some());
-        assert!(by_id(&v, "clip").is_some());
+        assert_eq!(
+            start_ids(&v),
+            vec![Some("start"), Some("workspaces"), Some("windows")],
+            "the IME indicator must not move into the left group"
+        );
+        assert_eq!(
+            end_ids(&v),
+            vec![Some("end_spacer"), Some("ime"), Some("clip")],
+            "the IME indicator sits in the right group, ahead of clip"
+        );
     }
 
     #[test]
@@ -1918,23 +1965,23 @@ mod tests {
         );
     }
 
-    /// B1 Task 3 (RED): the Start button is the bar's first child — the
-    /// launcher toggle at the bar's left end — carrying the `start` id and
-    /// the `.start` class.
+    /// B1 Task 3 (RED): the Start button is the first child of the bar's
+    /// start group — the launcher toggle at the bar's left end — carrying the
+    /// `start` id and the `.start` class; `clip` closes the end group at the
+    /// right edge.
     #[test]
-    fn the_start_button_is_the_first_child_of_the_bar() {
+    fn the_start_button_leads_the_start_group_and_clip_ends_the_bar() {
         let (m, _, _) = seeded();
         let v = view(&m);
-        let ids = bar_ids(&v);
         assert_eq!(
-            ids,
-            vec![
-                Some("start"),
-                Some("workspaces"),
-                Some("windows"),
-                Some("clip")
-            ],
-            "the Start button leads the bar, ahead of contract §3.3's order"
+            start_ids(&v).first().copied(),
+            Some(Some("start")),
+            "the Start button leads the start group, ahead of contract §3.3's order"
+        );
+        assert_eq!(
+            end_ids(&v).last().copied(),
+            Some(Some("clip")),
+            "clip closes the end group at the bar's right edge"
         );
         let start = by_id(&v, "start").expect("the Start button");
         assert_eq!(start.props.str(PropName::Label), Some("start"));
@@ -2057,6 +2104,67 @@ mod tests {
             3,
             "a CenterBox carries exactly start/centre/end"
         );
+        assert!(
+            centre_ids(&view).is_empty(),
+            "the centre slot must stay empty, not hide a stray child"
+        );
+        assert_eq!(
+            start_ids(&view),
+            vec![Some("start"), Some("workspaces"), Some("windows")],
+            "the left group holds only the launcher, workspaces and window tiles"
+        );
+    }
+
+    /// The end group opens with a spacer carrying `hexpand`, which is what
+    /// pushes the indicators, clock and clip to the right edge instead of
+    /// centring them in the group's grown half. Pinned structurally (see
+    /// `end_spacer`'s note on the toolkit's still-open `Hexpand` gap).
+    #[test]
+    fn the_end_group_leads_with_a_hexpanding_spacer() {
+        let (model, _wm, _clip) = panel();
+        let view = super::view(&model);
+        let spacer = by_id(&view, "end_spacer").expect("the end group's leading spacer");
+        assert!(
+            spacer.props.bool(PropName::Hexpand, false),
+            "the spacer must request hexpand so the end content sits flush right"
+        );
+        assert_eq!(
+            end_ids(&view).first().copied(),
+            Some(Some("end_spacer")),
+            "the spacer leads the end group"
+        );
+    }
+
+    /// The clock joins the end group between the indicators and `clip`, and
+    /// never the start group.
+    #[test]
+    fn the_clock_sits_in_the_end_group_before_clip() {
+        let (mut model, _wm, _clip) = panel();
+        let _ = super::update(&mut model, Msg::Tick);
+        let view = super::view(&model);
+        assert_eq!(
+            end_ids(&view),
+            vec![Some("end_spacer"), Some("clock"), Some("clip")],
+            "the clock sits in the end group, ahead of clip"
+        );
+        assert!(
+            !start_ids(&view).contains(&Some("clock")),
+            "the clock must not appear in the left group"
+        );
+    }
+
+    /// The tick thread's wait never busy-spins and never skips a tick: exactly
+    /// on the boundary (`0`) waits a full minute, one second past waits 59, and
+    /// the last second waits 1.
+    #[test]
+    fn a_minute_wait_never_spins_or_skips_a_tick() {
+        assert_eq!(
+            super::next_minute_wait(0),
+            60,
+            "on the boundary waits a minute"
+        );
+        assert_eq!(super::next_minute_wait(1), 59);
+        assert_eq!(super::next_minute_wait(59), 1);
     }
 
     #[test]
