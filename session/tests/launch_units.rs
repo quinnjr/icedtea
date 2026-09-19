@@ -82,3 +82,20 @@ fn the_target_pulls_in_every_component() {
         );
     }
 }
+
+#[test]
+fn the_wayland_env_publisher_refreshes_on_compositor_restart() {
+    let unit = std::fs::read_to_string(units_dir().join("icedtea-wayland-env.service"))
+        .expect("wayland-env unit");
+    // A compositor restart must propagate to the publisher (PartOf=), which
+    // re-waits for the socket and re-publishes; its ExecStop clears the old
+    // value first so a stale WAYLAND_DISPLAY cannot survive.
+    assert!(
+        unit.contains("PartOf=icedtea-compositor.service"),
+        "a compositor restart must propagate to the publisher"
+    );
+    assert!(
+        unit.contains("ExecStop=") && unit.contains("unset-environment WAYLAND_DISPLAY"),
+        "the publisher must clear the stale WAYLAND_DISPLAY on stop"
+    );
+}
