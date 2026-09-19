@@ -317,11 +317,14 @@ Expected: PASS (5 tests).
 #!/bin/sh
 # Start the icedtea desktop session through the user manager.
 #
-# The one command a tty autologin runs here, and the command a display
-# manager would run on bare metal: the session IS the systemd target.
+# The command a display manager runs at login (wdm, in the VM): the session
+# IS the systemd target. `--wait` blocks for the session's lifetime, because
+# the display manager hands the display over and only takes it back when this
+# command exits; the target deactivates when the compositor stops (Requires=),
+# so logout (or the compositor's bounded restart giving up) returns here.
 set -eu
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-exec systemctl --user start icedtea-session.target
+exec systemctl --user start --wait icedtea-session.target
 ```
 
 `chmod +x session/launch/icedtea-session-start`.
@@ -974,14 +977,19 @@ git commit -m "feat(shell): bar CenterBox split + minute-ticking clock"
 - Modify: `Vagrantfile`
 - Modify: `vagrant/provision-system.sh`
 - Modify: `vagrant/provision-build.sh`
+- Modify: `session/launch/icedtea-session-start` (add `--wait`; see Task 1 Step 5)
+- Modify: `session/tests/launch_scripts.rs` (pin `--wait`)
+- Create: `session/launch/icedtea.desktop`
+- Create: `session/launch/wdm.toml`
 - Create: `vagrant/verify.sh`
 
 **Interfaces:**
 - Consumes: the units and helpers from Task 1, the asset from Task 2, all binaries from the build.
+- Produces: a VM that boots to the `wdm` greeter; logging in runs `icedtea-session-start --wait`, which starts the units. `vagrant/verify.sh` logs in by typing at the greeter and asserts the desktop by pixels.
 
-- [ ] **Step 1: Install units, helpers, and asset in `vagrant/provision-system.sh`**
+- [ ] **Step 1: Install the session, the display-manager entry, and the asset in `vagrant/provision-system.sh`**
 
-Replace the launcher block (the `cat > /usr/local/bin/icedtea … EOF` heredoc and the `icedtea-hint.sh` heredoc, lines ~36–97) with:
+Delete the tty1 bypass: the `systemctl disable --now display-manager.service` line and the `getty@tty1` autologin drop-in (the block that sets `ExecStart=-/sbin/agetty --autologin vagrant …`). **wdm is the login path and must be enabled, not disabled.** Then replace the old launcher block (the `cat > /usr/local/bin/icedtea … EOF` and `icedtea-hint.sh` heredocs, and the tty1 `/etc/profile.d/icedtea-session.sh`) with:
 
 ```sh
 # The DE's own session definition, installed where systemd finds it. The
@@ -994,6 +1002,20 @@ install -m 0755 /home/vagrant/icedtea-wm/session/launch/icedtea-wait /usr/local/
 install -m 0755 /home/vagrant/icedtea-wm/session/launch/icedtea-session-start /usr/local/bin/icedtea-session-start
 install -m 0644 /home/vagrant/icedtea-wm/session/assets/default-wallpaper.png /usr/share/icedtea/default-wallpaper.png
 
+# The display manager is wdm, the box's Wayland DM. It lists the repo's
+# session entry and runs it at login, so both are repo-owned; enable wdm and
+# never disable display-manager.service (the old tty1 path did, leaving the
+# VM with no login path of its own).
+install -m 0644 /home/vagrant/icedtea-wm/session/launch/icedtea.desktop /usr/share/wayland-sessions/icedtea.desktop
+install -d -m 0755 /etc/wdm
+install -m 0644 /home/vagrant/icedtea-wm/session/launch/wdm.toml /etc/wdm/wdm.toml
+systemctl enable wdm.service
+
+# The old launcher and its hint are gone: the session is the systemd target
+# wdm starts, not a script that spawns the components itself.
+rm -f /usr/local/bin/icedtea /usr/local/bin/icedtea-hint.sh /usr/bin/icedtea-session
+rm -f /etc/profile.d/icedtea-session.sh
+
 # Guest-only rendering choices: wlroots on VirtualBox's vmwgfx needs the
 # software paths, and these must NOT be baked into the units (a bare-metal
 # session would otherwise be forced onto software rendering).
@@ -1004,13 +1026,31 @@ GSK_RENDERER=cairo
 GDK_BACKEND=wayland
 EOF
 chown -R vagrant:vagrant /home/vagrant/.config
+```
 
-# tty1 autologin starts the session target, the one command a display
-# manager would run on bare metal. Guarded by the tty so ssh logins do not
-# start a second session.
-cat > /etc/profile.d/icedtea-session.sh <<'EOF'
-[ "$(tty)" = /dev/tty1 ] && [ -z "${WAYLAND_DISPLAY:-}" ] && exec icedtea-session-start
-EOF
+The session entry (`session/launch/icedtea.desktop`) and `wdm.toml` (new files):
+
+```ini
+[Desktop Entry]
+Name=icedtea
+Comment=icedtea Wayland desktop
+Exec=/usr/local/bin/icedtea-session-start
+TryExec=/usr/local/bin/icedtea-session-start
+Type=Application
+DesktopNames=icedtea
+```
+
+```toml
+# wdm configuration, owned by the repo so the VM's login path is checked in.
+vt = 7
+default_session = "icedtea.desktop"
+
+[greeter]
+command = "/usr/lib/wdm/wdm-webkit-greeter --theme default"
+user = "wdm"
+
+[keyboard]
+layout = "us"
 ```
 
 This also removes the old `sleep 1`/`sleep 0.7` ordering hacks: `icedtea-wait` replaces them.
@@ -1030,29 +1070,59 @@ cd ~/icedtea-wm
 cargo build --release
 
 # The units resolve binaries through PATH (`/usr/bin/env icedtea-…`), so link
-# every session binary the same way an installed system would.
+# every session binary the same way an installed system would. This phase runs
+# as vagrant; /usr/local/bin is root-owned, so create the links with sudo.
 for bin in icedtea-compositor icedtea-clipboard icedtea-notifications icedtea-session icedtea-shell; do
-  ln -sf ~/icedtea-wm/target/release/$bin /usr/local/bin/$bin
+  sudo ln -sf ~/icedtea-wm/target/release/$bin /usr/local/bin/$bin
 done
 
-# rsync excludes .git/, so the guest cannot ask git what it is running. Stamp
-# it at build time; `vagrant/verify.sh` prints this, so "the VM runs stale
-# code" is visible rather than guessed.
+# rsync excludes .git/, so the guest cannot ask git what it is running. The
+# Vagrantfile computes the host revision at provision time and passes it here
+# in the provisioner environment; `vagrant/verify.sh` prints this, so "the VM
+# runs stale code" is visible rather than guessed.
 {
-  echo "rev=$(git -C /vagrant rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "rev=${ICEDTEA_BUILD_REV:-unknown}"
   echo "built=$(date -u +%FT%TZ)"
 } > ~/icedtea-wm/BUILD_INFO
 cat ~/icedtea-wm/BUILD_INFO
+
+# Re-provisioning must leave a login prompt, not a stale session: restart wdm
+# so the greeter is what the console shows. It is safe to restart while a
+# session is live (wdm has already handed the display over); wdm picks the
+# console back up when the session command exits.
+sudo systemctl restart wdm.service || true
 ```
 
-- [ ] **Step 3: Force a rebuild on rsync in `Vagrantfile`**
+> The `ICEDTEA_BUILD_REV` fix matters: the box's `/home/vagrant/icedtea-wm` has
+> no `.git` (rsync excludes it) and `/vagrant` does not exist, so the earlier
+> `git -C /vagrant rev-parse` always stamped `rev=unknown`. The Vagrantfile
+> computes the host revision instead (Step 3).
 
-The rsync of `BUILD_INFO` is host-missing on first push, so provision-build still owns it. No change needed beyond confirming `.git/` stays excluded and the workspace `Cargo.toml`/`session/` are synced (they are: the folder syncs `.`). Leave the provider block as-is (VMSVGA, gui, 4 GB, 4 CPUs). Add a comment on the sync block:
+- [ ] **Step 3: Pass the host revision and keep the sync excludes in `Vagrantfile`**
+
+Compute the revision on the host (where `.git` exists) at `vagrant up`/`provision` time and hand it to the build provisioner's environment; leave `.git/` excluded and keep the worktree-local dirs out of the sync. Leave the provider block as-is (VMSVGA, gui, 4 GB, 4 CPUs).
+
+```ruby
+# The guest has no `.git` (rsync excludes it), so stamp the host revision here
+# and hand it to the build provisioner for BUILD_INFO.
+build_rev = `git -C "#{File.dirname(__FILE__)}" rev-parse --short HEAD 2>/dev/null`.strip
+build_rev = "unknown" if build_rev.empty?
+```
 
 ```ruby
   # rsync (one-way, host -> guest). `session/`, the unit files and the
   # wallpaper asset ride this same tree: provisioning installs them from the
   # guest's copy, so the VM's session is always the checked-in one.
+  config.vm.synced_folder ".", "/home/vagrant/icedtea-wm",
+    type: "rsync",
+    rsync__args: ["--archive", "--delete"],
+    rsync__exclude: [".git/", "target/", ".remember/", ".superpowers/", ".claude/", ".vagrant/", ".worktrees/"]
+```
+
+```ruby
+  config.vm.provision "build", type: "shell",
+    path: "vagrant/provision-build.sh", privileged: false,
+    env: { "ICEDTEA_BUILD_REV" => build_rev }
 ```
 
 - [ ] **Step 4: Write `vagrant/verify.sh`**
@@ -1061,26 +1131,59 @@ The rsync of `BUILD_INFO` is host-missing on first push, so provision-build stil
 #!/usr/bin/env bash
 # Prove the VM is showing a usable icedtea desktop, or fail loudly.
 #
-# Run against a booted VM (or let this boot it). Every assertion is against
-# pixels or unit state, so a black screen, a missing panel, or a missing
-# wallpaper fails here instead of looking "fine" from a shell — the failure
-# mode the design exists to remove.
+# wdm is the login path (the VM has no autologin), so this logs in by typing
+# the credentials at the greeter with injected scancodes, then asserts the
+# desktop by pixels and unit state. A black screen, a missing panel, or a
+# missing wallpaper fails here instead of looking "fine" from a shell — the
+# failure mode the design exists to remove.
 #
 # Hosts need: vagrant, VBoxManage, ImageMagick (`magick`). Usage:
-#   vagrant/verify.sh            # resume/boot, wait, assert
+#   vagrant/verify.sh            # resume/boot, log in, wait, assert
 set -euo pipefail
 
 VM="icedtea-wm"
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${VERIFY_OUT:-/tmp/icedtea-verify}"
 mkdir -p "$OUT"
+
+# Typed at the greeter. Override for a non-default box.
+GREETER_USER="${GREETER_USER:-vagrant}"
+GREETER_PASS="${GREETER_PASS:-vagrant}"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 command -v VBoxManage >/dev/null || fail "VBoxManage not found"
 command -v magick >/dev/null || fail "ImageMagick (magick) not found"
 
-# 1. Boot if needed and wait for the session units.
+# `systemctl --user` over ssh needs the user manager's runtime dir and bus;
+# a bare `vagrant ssh -c` has neither, so route every user-manager call here.
+ssh_user() {
+  vagrant ssh -c "XDG_RUNTIME_DIR=/run/user/\$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$(id -u)/bus $*"
+}
+
+# --- console keyboard injection (PS/2 set 1 scancodes) -------------------
+declare -A SC=(
+  [a]=1e [b]=30 [c]=2e [d]=20 [e]=12 [f]=21 [g]=22 [h]=23 [i]=17 [j]=24
+  [k]=25 [l]=26 [m]=32 [n]=31 [o]=18 [p]=19 [q]=10 [r]=13 [s]=1f [t]=14
+  [u]=16 [v]=2f [w]=11 [x]=2d [y]=15 [z]=2c
+  [0]=0b [1]=02 [2]=03 [3]=04 [4]=05 [5]=06 [6]=07 [7]=08 [8]=09 [9]=0a
+  [-]=0c [.]=34 [_]=0c [@]=1a
+)
+type_scancode() {  # each arg: a hex make code
+  local codes=() c
+  for c in "$@"; do codes+=("$c" "$(printf '%02x' $(( 0x$c | 0x80 )))"); done
+  VBoxManage controlvm "$VM" keyboardputscancode "${codes[@]}" >/dev/null
+}
+type_text() {  # $1 = lower-case ASCII
+  local s="$1" i ch
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    [ -n "${SC[$ch]:-}" ] || fail "no scancode for '$ch'"
+    type_scancode "${SC[$ch]}"
+    sleep 0.05
+  done
+}
+
+# 1. Boot if needed.
 state=$(VBoxManage showvminfo "$VM" --machinereadable | sed -n 's/^VMState="\(.*\)"$/\1/p')
 case "$state" in
   running) ;;
@@ -1089,20 +1192,45 @@ case "$state" in
 esac
 
 echo "== BUILD_INFO =="
-vagrant ssh -c 'cat ~/icedtea-wm/BUILD_INFO' || fail "cannot read BUILD_INFO"
+build_info=$(vagrant ssh -c 'cat ~/icedtea-wm/BUILD_INFO' | tr -d '\r') || fail "cannot read BUILD_INFO"
+printf '%s\n' "$build_info"
+[ "$(printf '%s\n' "$build_info" | sed -n 's/^rev=//p')" != "unknown" ] \
+  || fail "BUILD_INFO carries no revision — the VM cannot say what it runs"
 
-# 2. The session is actually up. Poll, because systemd start is async.
-active() { vagrant ssh -c "systemctl --user is-active $1" 2>/dev/null | tr -d '\r'; }
+# 2. Log in at the wdm greeter (there is no autologin). Skip if a session is
+# already up from a previous login. The greeter's username field is focused on
+# a fresh boot; type the user, Tab to the password field, type it, Enter.
+session_active() {
+  [ "$(ssh_user systemctl --user is-active icedtea-session.target 2>/dev/null | tr -d '\r')" = "active" ]
+}
+if ! session_active; then
+  echo "== logging in at the wdm greeter as $GREETER_USER =="
+  VBoxManage controlvm "$VM" screenshotpng "$OUT/greeter.png" >/dev/null
+  type_text "$GREETER_USER"
+  type_scancode 0f   # Tab -> password field
+  type_text "$GREETER_PASS"
+  type_scancode 1c   # Enter
+  sleep 8
+  if ! session_active; then
+    VBoxManage controlvm "$VM" screenshotpng "$OUT/greeter-after.png" >/dev/null
+    fail "login did not start the session — inspect $OUT/greeter.png and $OUT/greeter-after.png"
+  fi
+fi
+
+# 3. The session is actually up. Poll, because systemd start is async.
+active() { ssh_user systemctl --user is-active "$1" 2>/dev/null | tr -d '\r'; }
 i=0
-until [ "$(active icedtea-session.target)" = "active" ] && [ "$(active icedtea-shell.service)" = "active" ] && [ "$(active icedtea-compositor.service)" = "active" ]; do
+until [ "$(active icedtea-session.target)" = "active" ] \
+   && [ "$(active icedtea-shell.service)" = "active" ] \
+   && [ "$(active icedtea-compositor.service)" = "active" ]; do
   i=$((i + 1)); [ "$i" -lt 60 ] || {
-    vagrant ssh -c 'systemctl --user list-units "icedtea-*" --no-pager; journalctl --user -u icedtea-compositor -n 20 --no-pager' || true
+    ssh_user 'systemctl --user list-units "icedtea-*" --no-pager; journalctl --user -u icedtea-compositor -n 20 --no-pager' || true
     fail "session units did not become active within 60s"
   }
   sleep 1
 done
 
-# 3. Capture and assert the desktop is there.
+# 4. Capture and assert the desktop is there.
 VBoxManage controlvm "$VM" screenshotpng "$OUT/desktop.png" >/dev/null
 mean() { magick "$1" -colorspace Gray -format '%[fx:mean]' info:; }
 
@@ -1110,8 +1238,7 @@ desktop_mean=$(mean "$OUT/desktop.png")
 awk "BEGIN { exit !($desktop_mean > 0.005) }" || fail "screen is (near) black (mean $desktop_mean)"
 
 # The panel bar is a distinct dark band across the top row.
-magick "$OUT/desktop.png" -crop x4+0+0 +repage -format '%[fx:mean]' info: > "$OUT/bar.txt"
-bar_mean=$(cat "$OUT/bar.txt")
+bar_mean=$(magick "$OUT/desktop.png" -crop x4+0+0 +repage -format '%[fx:mean]' info:)
 # The wallpaper must differ from the flat default background (the flat navy
 # reads ~0.119 in grey; a wallpaper shifts it). Assert the centre region is
 # not the flat colour.
@@ -1120,8 +1247,12 @@ awk "BEGIN { exit !($centre > 0.01) }" || fail "desktop is a flat colour — no 
 
 echo "desktop mean=$desktop_mean bar mean=$bar_mean centre sd=$centre"
 
-# 4. An app window opens and changes the frame.
-vagrant ssh -c 'export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 GDK_BACKEND=wayland; nohup foot >/tmp/foot.log 2>&1 & sleep 3; pgrep -x foot >/dev/null' \
+# 5. An app window opens and changes the frame. The compositor's
+# WAYLAND_DISPLAY is published by the session, not by this ssh login, so read
+# it from the user manager and detach the client so ssh returns.
+wdisplay=$(ssh_user 'systemctl --user show-environment' | sed -n 's/^WAYLAND_DISPLAY=//p' | tr -d '\r')
+[ -n "$wdisplay" ] || fail "the session published no WAYLAND_DISPLAY"
+vagrant ssh -c "export XDG_RUNTIME_DIR=/run/user/\$(id -u) GDK_BACKEND=wayland WAYLAND_DISPLAY=$wdisplay; setsid foot >/tmp/foot.log 2>&1 </dev/null & sleep 3; pgrep -x foot >/dev/null" \
   || fail "foot did not start"
 VBoxManage controlvm "$VM" screenshotpng "$OUT/desktop-foot.png" >/dev/null
 delta=$(magick compare -metric AE "$OUT/desktop.png" "$OUT/desktop-foot.png" null: 2>&1 || true)
@@ -1140,14 +1271,20 @@ vagrant provision
 vagrant/verify.sh
 ```
 
-Expected: `BUILD_INFO` prints the current `develop` revision, all three units become `active`, and the script prints `PASS` with screenshots. Inspect `$OUT/desktop.png`: a wallpaper is visible and the bar shows a start button on the left and an `HH:MM` clock on the right.
+Expected: `BUILD_INFO` prints the branch's revision (not `unknown`), the greeter login starts the session, the three units become `active`, and the script prints `PASS` with screenshots. Inspect `$OUT/desktop.png`: a wallpaper is visible and the bar shows a start button on the left and an `HH:MM` clock on the right. If the greeter needs a different field order (or a click to focus), adjust the `type_text`/`type_scancode` sequence in Step 4 and say so — the sequence is the one part of this script that is empirical.
+
+Also pin the Task 1 change: add `lines.contains(&"--wait")` to the assertion in `session/tests/launch_scripts.rs`'s `session_start_imports_environment_then_starts_target`, and run `cargo test -p icedtea-session --test launch_scripts`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Vagrantfile vagrant/provision-system.sh vagrant/provision-build.sh vagrant/verify.sh
-git commit -m "feat(vagrant): install the DE session, stamp the build, verify by screenshot"
+git add Vagrantfile vagrant/provision-system.sh vagrant/provision-build.sh vagrant/verify.sh \
+  session/launch/icedtea.desktop session/launch/wdm.toml \
+  session/launch/icedtea-session-start session/tests/launch_scripts.rs
+git commit -m "feat(vagrant): boot the VM into the icedtea session through wdm"
 ```
+
+Commit **only these paths**: there is unrelated uncommitted work in the tree (`ui/src/widgets/button.rs`, `ui/tests/widget_pixels.rs`) that this task must neither stage nor revert.
 
 ---
 
@@ -1155,7 +1292,7 @@ git commit -m "feat(vagrant): install the DE session, stamp the build, verify by
 
 **Spec coverage:**
 
-- §1 session composition (units, graph, compositor `RequiredBy`/others `Wants`, readiness via `icedtea-wait` + env publisher, trigger, environment drop-in) → Task 1 (units, helpers, tests) and Task 4 Steps 1–3 (install, trigger, drop-in). Covered.
+- §1 session composition (units, graph, compositor `RequiredBy`/others `Wants`, readiness via `icedtea-wait` + env publisher, trigger, environment drop-in) → Task 1 (units, helpers, tests) and Task 4 Steps 1–3 (install, wdm session entry + `wdm.toml` + enable wdm, `--wait`, drop-in). Covered. (The trigger is the `wdm` display manager, not a tty1 autologin — D8 — so provisioning enables wdm instead of disabling `display-manager.service`, and `verify.sh` logs in at the greeter — D9.)
 - §2 wallpaper default (env → installed → flat, asset, provisioning install) → Task 2 (resolver + asset) and Task 4 Step 1 (install). Covered.
 - §3 panel (CenterBox split, clock, tick thread, time crate) → Task 3. Covered. (The design said "`justify-content: space-between`"; the toolkit hardcodes `JustifyContent::CENTER` for a plain `Box` and exposes `Container::Center`/`center_box` for `SPACE_BETWEEN` — the plan uses `center_box`, which is the mechanism that actually yields the split while keeping `#bar`'s background painted. This is a like-for-like implementation of the design's intent, noted here for the executor.)
 - §4 provisioning, freshness (`BUILD_INFO`), verification (`verify.sh` pixel asserts) → Task 4. Covered.

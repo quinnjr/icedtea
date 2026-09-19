@@ -31,8 +31,10 @@ Two outcomes define success:
 
 ## Non-goals
 
-- No display manager, greeter, or login UI. Startup stays "autologin tty1 runs
-  the session target"; a DM on bare metal would run the same target.
+- No new display manager, greeter, or login UI. The VM's existing Wayland
+  display manager (`wdm`) is the login path: it lists the repo's session entry
+  and runs the same target bare metal would. Provisioning configures wdm and
+  enables it rather than disabling it.
 - No changes to the session daemon's behaviour (lock/idle/logind semantics).
   It is started and supervised; its features are not redesigned here.
 - No GPU acceleration work. The VM keeps wlroots' `pixman` renderer, which is
@@ -81,6 +83,14 @@ one-line fix.
   the DE processes already carry `XDG_SESSION_ID=1` and run on the real user
   bus at `/run/user/1000/bus` (so the current script's `dbus-run-session`
   fallback is not taken).
+- **A Wayland display manager is present and configured.** The box has `wdm`
+  0.10.2 (`wdm-wayland`, `wdm-greeter`, `wdm-webkit-greeter`) on VT 7, a
+  `/etc/wdm/wdm.toml` with `default_session = "icedtea.desktop"`, and a
+  `/usr/share/wayland-sessions/icedtea.desktop` whose `Exec` currently points
+  at a hand-written `/usr/bin/icedtea-session` wrapper (direct spawns with
+  `sleep`s, bypassing the units). Provisioning previously *disabled*
+  `display-manager.service` to force the tty1 path; this design instead owns
+  the session entry and `wdm.toml` and enables wdm.
 
 ## Architecture
 
@@ -128,12 +138,30 @@ Publishing the discovered name to the user manager is how the rest of the
 session learns it, with no cross-repo crate change and no assumption that the
 compositor won `wayland-0`.
 
-**Trigger.** tty1 autologin runs `icedtea-session-start`, a tiny wrapper that
-ensures the user-manager environment is imported (`systemctl --user
-import-environment` for the graphical/session variables it needs) and runs
-`systemctl --user start icedtea-session.target`. This is the same command a
-display manager would run on bare metal, which is the point: the VM's boot
+**Trigger.** The VM's display manager `wdm` (a Wayland DM, `wdm-wayland`; the
+box already has it installed and configured on VT 7) runs the session command
+at login. The repo ships the session entry —
+`/usr/share/wayland-sessions/icedtea.desktop`, `Exec=icedtea-session-start`
+— and a `wdm.toml` whose `default_session = "icedtea.desktop"`, and
+provisioning enables `wdm.service`. `icedtea-session-start` imports the
+graphical/session variables the user manager needs (`systemctl --user
+import-environment DISPLAY XDG_SESSION_TYPE XDG_SESSION_ID`) and runs
+`systemctl --user start --wait icedtea-session.target`. `--wait` is
+load-bearing: wdm hands the display to the session command and returns to the
+greeter when it exits, so the command must block for the session's lifetime.
+The target already stops when the compositor stops (`Requires=`, D3), so the
+command returns on logout or on the compositor's bounded restart giving up.
+This is the same command a display manager runs on bare metal: the VM's boot
 path and the DE's real boot path are one artifact.
+
+> **Addendum, 2026-09-19 (wdm pivot).** This section originally specified a
+> tty1 autologin and had provisioning disable `display-manager.service`. That
+> bypassed the box's `wdm` display manager and was rejected: wdm stays and is
+> the login path. The session entry and `wdm.toml` are repo-owned so the VM's
+> session is the checked-in one, and `icedtea-session-start` gained `--wait`
+> so wdm regains control when the session ends. The old hand-written
+> `/usr/bin/icedtea-session` wrapper (direct compositor/clipboard/shell spawns
+> with `sleep`s) is retired: wdm now starts the systemd user target.
 
 **Environment.** The environment the current script sets per-component moves
 into the units as far as it is universal (`GDK_BACKEND=wayland`, `RUST_LOG`),
@@ -196,17 +224,23 @@ generated, redistributable image kept in the repo.
 
 - **Provisioning** (`vagrant/provision-system.sh`, `Vagrantfile`): install the
   wait helper, the units to the systemd user unit path, and the wallpaper
-  asset; make tty1 start `icedtea-session.target`; drop the guest-only
-  renderer environment drop-in; remove the old `/usr/local/bin/icedtea`
-  script and its hint. The build phase builds the current tree; rsync stays
-  the source of truth for what is built.
+  asset; install the repo's `icedtea.desktop` session entry under
+  `/usr/share/wayland-sessions/` and the repo's `wdm.toml` under `/etc/wdm/`,
+  and **enable** `wdm.service` (never disable `display-manager.service`); drop
+  the guest-only renderer environment drop-in; remove the old
+  `/usr/local/bin/icedtea` script, the hand-written `/usr/bin/icedtea-session`
+  wrapper, and their hints. The build phase builds the current tree; rsync
+  stays the source of truth for what is built.
 - **Freshness.** Because `.git/` is excluded, provisioning writes a
   `BUILD_INFO` file into the guest (revision + build time) at build time, and
   the verification script prints it, so "the VM runs stale code" is visible
   rather than guessed.
 - **Verification** (`vagrant/verify.sh`, runnable against a booted VM):
-  1. wait for `icedtea-session.target` to be active and for the units to be
-     `active` (via `systemctl --user is-active`), failing loudly otherwise;
+  1. log in at the `wdm` greeter by typing the credentials with
+     `VBoxManage controlvm … keyboardputscancode` (wdm has no autologin, so a
+     login step is required), then wait for `icedtea-session.target` to be
+     active and for the units to be `active` (via `systemctl --user
+     is-active`), failing loudly otherwise;
   2. `VBoxManage controlvm … screenshotpng` the console;
   3. assert on pixels: the desktop is **not** the flat default (a wallpaper is
      present), the panel bar colour is present across the top edge, and the
@@ -228,6 +262,8 @@ generated, redistributable image kept in the repo.
 | D5 | Clock: shell timer thread, not toolkit `next_wake()` | Smallest change; reuses existing worker/wake patterns; no toolkit surface change |
 | D6 | Add one time crate for local-time formatting | The workspace has none; local time (not UTC) is required for a desktop clock |
 | D7 | Screenshot assertions as the acceptance gate | Turns "silent death"/black desktop into a loud, automated failure — the fidelity claim is proven, not assumed |
+| D8 | `wdm` (the box's Wayland DM) is the login path, not a tty1 autologin; provisioning enables it and ships the session entry + `wdm.toml` | Using the real display manager makes the VM's login path the one bare metal has, instead of a VM-only bypass that also disabled the DM; `icedtea-session-start --wait` is what lets wdm return to the greeter when the session ends |
+| D9 | Automated verification logs in by typing at the greeter with `VBoxManage keyboardputscancode` | wdm has no autologin (no config key, no PAM module), so a fully automated gate must drive the greeter; the alternative was a manual login step that is not a one-command gate |
 
 ## Failure handling
 
@@ -250,10 +286,10 @@ generated, redistributable image kept in the repo.
   the new left/right `panel::view` structure (existing shell test patterns);
   a unit test for the wallpaper fallback resolution order (env → installed →
   flat default) on the compositor side.
-- **VM (the real proof):** `vagrant/verify.sh` as above — session active,
-  wallpaper present, bar present, `foot` window appears — with its screenshots
-  and `BUILD_INFO` revision in the output. A change that breaks the desktop
-  fails this.
+- **VM (the real proof):** `vagrant/verify.sh` as above — log in at the wdm
+  greeter, session active, wallpaper present, bar present, `foot` window
+  appears — with its screenshots and `BUILD_INFO` revision in the output. A
+  change that breaks the desktop fails this.
 
 ## Risks
 
@@ -286,6 +322,7 @@ The work splits into independent units, each with its own verification:
 3. **Panel layout + clock** — left/right `panel::view`, `style.css`, the time
    crate, the timer thread, the formatter and view tests.
 4. **Provisioning + freshness + verification** — `Vagrantfile`/provision
-   rewrite to install the units and asset and start the target; `BUILD_INFO`
-   stamp; `vagrant/verify.sh` with pixel assertions; the first
+   rewrite to install the units, asset, session entry and `wdm.toml`, and
+   enable wdm; `icedtea-session-start --wait`; `BUILD_INFO` stamp;
+   `vagrant/verify.sh` with the greeter login and pixel assertions; the first
    end-to-end VM run that proves the whole thing.
