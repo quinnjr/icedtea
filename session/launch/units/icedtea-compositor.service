@@ -1,0 +1,15 @@
+[Unit]
+Description=icedtea compositor (Wayland/DRM)
+Documentation=https://github.com/quinnjr/icedtea
+# A desktop without a compositor is no session at all: its exit stops the
+# session target, and its own restart policy drives recovery.
+RequiredBy=icedtea-session.target
+Before=icedtea-wayland-env.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env icedtea-compositor
+Restart=on-failure
+RestartSec=1

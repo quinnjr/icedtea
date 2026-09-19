@@ -1,0 +1,77 @@
+#!/bin/sh
+# icedtea-wait — block until a session resource exists, or time out.
+#
+# Usage:
+#   icedtea-wait wayland          # exit 0 once a Wayland socket exists (print its name)
+#   icedtea-wait wayland-env      # ...and publish WAYLAND_DISPLAY to the user manager
+#   icedtea-wait name <bus-name>  # exit 0 once the session bus owns <bus-name>
+#
+# systemd runs this as an ExecStart/ExecStartPre, so a timeout must FAIL the
+# unit (non-zero), never hang it. ICEDTEA_WAIT_TIMEOUT (seconds) bounds the wait.
+set -eu
+
+TIMEOUT="${ICEDTEA_WAIT_TIMEOUT:-15}"
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+TRIES=$((TIMEOUT * 10))
+
+# The first real socket under the runtime dir: skip lock files, accept only
+# sockets. Mirrors the scan the old launcher script did.
+wayland_socket() {
+  for s in "$RUNTIME"/wayland-[0-9]*; do
+    case "$s" in *.lock) continue ;; esac
+    if [ -S "$s" ]; then
+      basename "$s"
+      return 0
+    fi
+  done
+  return 1
+}
+
+wait_wayland() {
+  i=0
+  while [ "$i" -lt "$TRIES" ]; do
+    if name=$(wayland_socket); then
+      printf '%s\n' "$name"
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.1
+  done
+  echo "icedtea-wait: no Wayland socket in $RUNTIME after ${TIMEOUT}s" >&2
+  return 1
+}
+
+wait_name() {
+  target="$1"
+  i=0
+  while [ "$i" -lt "$TRIES" ]; do
+    if busctl --user list --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "$target"; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.1
+  done
+  echo "icedtea-wait: $target not owned on the session bus after ${TIMEOUT}s" >&2
+  return 1
+}
+
+case "${1:-}" in
+  wayland)
+    wait_wayland
+    ;;
+  wayland-env)
+    # The socket name is chosen at runtime (`Display::add_socket_auto`); the
+    # compositor sets WAYLAND_DISPLAY only in its own environment, so client
+    # units learn it through the user manager instead.
+    name=$(wait_wayland)
+    systemctl --user set-environment "WAYLAND_DISPLAY=$name"
+    ;;
+  name)
+    [ $# -ge 2 ] || { echo "icedtea-wait: 'name' needs a bus name" >&2; exit 2; }
+    wait_name "$2"
+    ;;
+  *)
+    echo "usage: icedtea-wait wayland|wayland-env|name <bus-name>" >&2
+    exit 2
+    ;;
+esac

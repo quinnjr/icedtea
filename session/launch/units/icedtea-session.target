@@ -1,0 +1,10 @@
+[Unit]
+Description=icedtea desktop session
+Documentation=https://github.com/quinnjr/icedtea
+Wants=icedtea-compositor.service
+Wants=icedtea-wayland-env.service
+Wants=icedtea-notifications.service
+Wants=icedtea-clipboard.service
+Wants=icedtea-session.service
+Wants=icedtea-shell.service
+After=icedtea-compositor.service

@@ -1,0 +1,11 @@
+[Unit]
+Description=icedtea notification daemon (org.freedesktop.Notifications)
+Documentation=https://github.com/quinnjr/icedtea
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env icedtea-notifications
+Restart=on-failure
+RestartSec=1

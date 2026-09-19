@@ -1,0 +1,16 @@
+[Unit]
+Description=icedtea session daemon (logind/idle/lock)
+Documentation=https://github.com/quinnjr/icedtea
+After=icedtea-wayland-env.service
+Wants=icedtea-wayland-env.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+# Needs the compositor's org.icedtea.WM on the bus (its SessionLockChanged
+# subscription), not the Wayland socket itself.
+ExecStartPre=/usr/bin/env icedtea-wait name org.icedtea.WM
+ExecStart=/usr/bin/env icedtea-session
+Restart=on-failure
+RestartSec=1

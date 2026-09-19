@@ -1,0 +1,11 @@
+[Unit]
+Description=icedtea session: publish WAYLAND_DISPLAY
+Documentation=https://github.com/quinnjr/icedtea
+After=icedtea-compositor.service
+Requires=icedtea-compositor.service
+Before=icedtea-clipboard.service icedtea-session.service icedtea-shell.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/env icedtea-wait wayland-env

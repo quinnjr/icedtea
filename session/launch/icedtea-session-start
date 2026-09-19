@@ -1,0 +1,8 @@
+#!/bin/sh
+# Start the icedtea desktop session through the user manager.
+#
+# The one command a tty autologin runs here, and the command a display
+# manager would run on bare metal: the session IS the systemd target.
+set -eu
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+exec systemctl --user start icedtea-session.target
