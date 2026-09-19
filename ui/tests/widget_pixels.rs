@@ -23,8 +23,8 @@
 //! `clicking_an_info_bars_close_button_fires_close`,
 //! `clicking_a_calendar_day_selects_it`) were `#[ignore]`d on that defect and
 //! are green assertions again; each carries the geometry its coordinates come
-//! from, because those widgets sit at their intrinsic size, centred, and not
-//! wherever `hexpand` suggests.
+//! from, because those widgets sit at their intrinsic size, centred — none of
+//! them requests `hexpand` or `halign`.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -410,12 +410,13 @@ fn clicking_an_info_bars_close_button_fires_close() {
         vec![
             // `InfoBarC` reports the close button's own 24x24 as its
             // intrinsic size (see `InfoBarC::measure`) because that button is
-            // a subnode with no taffy box; with no other children the bar is
-            // that square, centred in this 300x48 window at x 138..162,
-            // y 12..36, and the button fills it (`InfoBarC::close_rect`
-            // packs it at the trailing edge). x=285, this test's previous
-            // coordinate, is bare window and could never reach the widget.
-            ScriptStep::Event(InputEvent::pointer_enter(150.0, 24.0, 1)),
+            // a subnode with no taffy box. `hexpand` is honored now, so the
+            // bar stretches to this 300px window and `InfoBarC::close_rect`
+            // packs the 24x24 button at the trailing edge: x 276..300,
+            // y 0..24. (150, 24), the centred coordinate this test used while
+            // `hexpand` was inert, is bare window now; x=285 was the original
+            // plan's guess and is finally right.
+            ScriptStep::Event(InputEvent::pointer_enter(288.0, 12.0, 1)),
             ScriptStep::Event(InputEvent::PointerButton {
                 button: 0x110,
                 pressed: true,
@@ -598,7 +599,15 @@ fn a_picture_decodes_and_draws_an_embedded_png() {
         (64, 64),
         vec![ScriptStep::Capture],
     );
-    assert!(has_ink(&frames, 0, (64, 64)), "the decoded PNG must ink");
+    // The picture now stretches to the surface (`hexpand`/`vexpand` are
+    // honored), so every pixel is the decoded red. `has_ink` counts distinct
+    // colours and would read this single-colour fill as "no ink"; assert the
+    // decoded colour directly instead.
+    let centre = frames.pixel(0, 32, 32).expect("centre pixel");
+    assert!(
+        centre.0 > 200 && centre.1 < 40 && centre.2 < 40 && centre.3 > 200,
+        "the decoded PNG must paint red at its centre, got {centre:?}"
+    );
 }
 
 #[test]
@@ -1015,10 +1024,9 @@ fn dragging_a_scale_moves_the_slider_and_reports_the_value() {
             ScriptStep::Capture,
             // `ScaleC` reports its own intrinsic content size (150x18, see
             // `ScaleC::measure`) since its `trough` has no taffy box of its
-            // own to size against; centred in a 200-wide window with 12px of
-            // Adwaita padding on every side, the content box runs x 25..175,
-            // y 12..30 — these points must land inside it, unlike the
-            // window-relative coordinates a real hexpand would allow.
+            // own to size against; `hexpand` is honored now, so the scale
+            // stretches to this 200-wide window and these points land inside
+            // its content box.
             ScriptStep::Event(InputEvent::PointerEnter {
                 x: 30.0,
                 y: 16.0,
@@ -1243,16 +1251,15 @@ fn clicking_a_calendar_day_selects_it() {
             ScriptStep::Capture,
             // `CalendarC` reports its own intrinsic size (7 columns of 24px
             // over a 32px header plus one 24px row per week, see
-            // `CalendarC::measure`) because its `header`/`grid`/day labels
-            // have no taffy box; centred in this 280x240 window March 2026's
-            // six rows put the content box at x 56..224, y 32..208, so the
-            // 24x24 day cells start at y 64. March 1st 2026 is a Sunday
-            // (column 6), which puts the 10th in column 1, row 2 --
-            // x 80..104, y 112..136. (60, 120), this test's previous
-            // coordinate, is bare window left of the calendar.
+            // `CalendarC::measure`), but `hexpand`/`vexpand` are honored now,
+            // so the calendar stretches to fill this 280x240 window: its
+            // content box is x 1..279, y 1..239 (Adwaita's 1px padding), and
+            // the cells are 278/7 wide by (238-32)/6 tall. March 1st 2026 is a
+            // Sunday (column 6), which puts the 10th in column 1, row 2 --
+            // x 40.7..80.4, y 101.7..136. (60, 118) lands inside it.
             ScriptStep::Event(InputEvent::PointerEnter {
-                x: 92.0,
-                y: 124.0,
+                x: 60.0,
+                y: 118.0,
                 serial: 1,
                 target: icedtea_ui::window::SurfaceTarget::Window,
             }),
@@ -1740,10 +1747,9 @@ fn peeking_a_password_entry_reveals_the_text() {
             ScriptStep::Capture,
             // Plan reconciliation: the plan's script clicks at a fixed
             // `x: 188.0` assuming the entry fills the whole 200px window, but
-            // `hexpand` has no layout-level implementation yet (only the prop
-            // is stored — nothing in `layout.rs` reads it), and a bare root
-            // widget is otherwise sized to its own intrinsic content and
-            // centred (see `Entry`'s and `TextView`'s own notes). A
+            // this entry requests no `hexpand`, and a bare root widget is
+            // sized to its own intrinsic content and centred (see `Entry`'s
+            // and `TextView`'s own notes). A
             // `PasswordEntry` showing "hunter2" masked plus its reserved peek
             // band measures to a `78x34` box centred in this window, putting
             // the peek band at local x `[106, 130]`; `118.0` lands inside it.
@@ -1856,14 +1862,13 @@ fn stepping_a_spin_button_repeats_while_the_button_is_held() {
 
     // Plan reconciliation: the plan clicked at `(130.0, 12.0)`, assuming the
     // control fills most of the 140px-wide window. Nothing in this crate
-    // stretches a bare root widget to its window (every container centres
-    // its children on both axes with an `AUTO` size — `layout.rs`'s
-    // `taffy_style` — and `Prop::Hexpand` has no consumer anywhere in the
-    // layout code yet), so a value-0/digits-0 `SpinButton` measures to its
-    // content's natural, small width and sits centred. `SpinButtonC` had no
-    // `measure` at all in the plan (see [`STEPPER_SIZE`]'s doc comment), so
-    // this also depends on the `measure` this task adds; with it the control
-    // is `text_width + 2*STEPPER_SIZE` wide, centred, and `(85.0, 20.0)` is
+    // stretches a bare root widget to its window when the widget does not ask
+    // (every container centres a child that requested no `hexpand`/`halign`),
+    // so a value-0/digits-0 `SpinButton` measures to its content's natural,
+    // small width and sits centred. `SpinButtonC` had no `measure` at all in
+    // the plan (see [`STEPPER_SIZE`]'s doc comment), so this also depends on
+    // the `measure` this task adds; with it the control is
+    // `text_width + 2*STEPPER_SIZE` wide, centred, and `(85.0, 20.0)` is
     // inside its `up` stepper for this window size.
     let frames = run(
         0.0f64,
@@ -2484,4 +2489,157 @@ fn a_scrollbars_slider_moves_with_its_value() {
     );
     let differs = (0..200).any(|x| (0..40).any(|y| left.pixel(0, x, y) != right.pixel(0, x, y)));
     assert!(differs, "the slider did not move with the value");
+}
+
+/// `true` if any pixel in `[x0, x1) x [y0, y1)` differs from the surface's
+/// top-left pixel, which a `run` view with no painted root leaves as the
+/// window background.
+fn region_inked(frames: &Frames, frame: usize, x0: u32, x1: u32, y0: u32, y1: u32) -> bool {
+    let background = frames.pixel(frame, 0, 0);
+    (x0..x1).any(|x| (y0..y1).any(|y| frames.pixel(frame, x, y) != background))
+}
+
+/// Toggles the alignment/expansion props on the `proptest` views below.
+#[derive(Clone, Debug, PartialEq)]
+struct SetEnd(bool);
+
+/// `Hexpand` now reaches layout: a growing child in a row takes the leftover
+/// space, so its allocation reaches the row's right edge.
+///
+/// mutation: drop the `Hexpand`/`Vexpand` arm from `Universal::apply`; the
+/// children sit centred as a group and `190..200` is window background.
+#[test]
+fn a_hexpanding_child_takes_the_leftover_space() {
+    use icedtea_ui::view::builders::{box_, button, label};
+    use icedtea_ui::widgets::Orientation;
+
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| {
+            box_(
+                Orientation::Horizontal,
+                [label("L"), button("R").hexpand(true)],
+            )
+            .width_request(200)
+        },
+        (200, 40),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        region_inked(&frames, 0, 190, 200, 8, 32),
+        "the hexpanding button must reach the row's right edge"
+    );
+}
+
+/// `Halign::End` now reaches layout: the child is pinned to the row's right
+/// edge instead of centring.
+///
+/// mutation: drop the `Halign`/`Valign` arm from `Universal::apply`; the label
+/// centres near x=100 and `180..200` stays blank.
+#[test]
+fn halign_end_pins_a_child_to_the_right_edge() {
+    use icedtea_ui::layout::Align;
+    use icedtea_ui::view::builders::{box_, label};
+    use icedtea_ui::widgets::Orientation;
+
+    let frames = run(
+        (),
+        |_m: &mut (), _msg: ()| Cmd::None,
+        |_m: &()| box_(Orientation::Horizontal, [label("R").halign(Align::End)]).width_request(200),
+        (200, 40),
+        vec![ScriptStep::Capture],
+    );
+    assert!(
+        !region_inked(&frames, 0, 0, 80, 0, 40),
+        "an end-aligned child must not sit at the left"
+    );
+    assert!(
+        region_inked(&frames, 0, 180, 200, 0, 40),
+        "an end-aligned child must reach the right edge"
+    );
+}
+
+/// The removal path: a prop that disappears is reconciled as `Prop::None`, and
+/// the arm must restore the field's default (centring), not leave the last
+/// value in place.
+#[test]
+fn removing_hexpand_restores_centring() {
+    use icedtea_ui::view::builders::{box_, button, label};
+    use icedtea_ui::widgets::Orientation;
+
+    let frames = run(
+        false,
+        |m: &mut bool, SetEnd(on): SetEnd| {
+            *m = on;
+            Cmd::None
+        },
+        |on: &bool| {
+            let right = button("R");
+            let right = if *on { right.hexpand(true) } else { right };
+            box_(Orientation::Horizontal, [label("L"), right]).width_request(200)
+        },
+        (200, 40),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Message(SetEnd(true)),
+            ScriptStep::Capture,
+            ScriptStep::Message(SetEnd(false)),
+            ScriptStep::Capture,
+        ],
+    );
+    assert!(
+        !region_inked(&frames, 0, 190, 200, 8, 32),
+        "with no prop the children sit centred"
+    );
+    assert!(
+        region_inked(&frames, 1, 190, 200, 8, 32),
+        "hexpand expands the button to the right edge"
+    );
+    assert!(
+        !region_inked(&frames, 2, 190, 200, 8, 32),
+        "removing the prop restores centring"
+    );
+}
+
+/// The removal path for `Halign`: `Prop::None` restores `Align::Fill`, so the
+/// label centres again after an `End` was set.
+#[test]
+fn removing_halign_end_restores_centring() {
+    use icedtea_ui::layout::Align;
+    use icedtea_ui::view::builders::{box_, label};
+    use icedtea_ui::widgets::Orientation;
+
+    let frames = run(
+        false,
+        |m: &mut bool, SetEnd(on): SetEnd| {
+            *m = on;
+            Cmd::None
+        },
+        |on: &bool| {
+            let child = label("R");
+            let child = if *on { child.halign(Align::End) } else { child };
+            box_(Orientation::Horizontal, [child]).width_request(200)
+        },
+        (200, 40),
+        vec![
+            ScriptStep::Capture,
+            ScriptStep::Message(SetEnd(true)),
+            ScriptStep::Capture,
+            ScriptStep::Message(SetEnd(false)),
+            ScriptStep::Capture,
+        ],
+    );
+    assert!(
+        !region_inked(&frames, 0, 180, 200, 0, 40),
+        "with no prop the label centres"
+    );
+    assert!(
+        region_inked(&frames, 1, 180, 200, 0, 40),
+        "halign End pins the label to the right edge"
+    );
+    assert!(
+        !region_inked(&frames, 2, 180, 200, 0, 40),
+        "removing the prop restores centring"
+    );
 }

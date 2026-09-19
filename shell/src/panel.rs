@@ -167,17 +167,18 @@ pub struct PanelModel {
     /// The layer surface's current committed width.
     ///
     /// `#bar` must span the output like a taskbar (M5 Task 13, controller
-    /// ruling on Task 12's review), but it is `root`'s only child in a plain
-    /// box, which centres a child with no explicit `ChildLayout` at its own
-    /// content size -- and neither `View::hexpand`/`halign` nor a percentage
-    /// `min-width` reach around that (see `style.css`'s `#bar` rule for the
-    /// full reconciliation). A pixel `width_request` does reach taffy, so
-    /// `view` floors `#bar` to this width -- and unlike `clip_rect` (a
-    /// side-channel `update` only ever reads inside a handler a real click
-    /// message already triggered), this value feeds `view` itself, so it
-    /// must arrive through a real `Msg` fold (`Msg::SurfaceWidth`) rather
-    /// than a `Cell` `view` polls: nothing else guarantees another frame
-    /// ever runs to pick up a bare `Cell` write once the initial one lands.
+    /// ruling on Task 12's review), but it is `root`'s only child in the
+    /// window's box, which centres a child that asks for nothing at its own
+    /// content size. `View::halign` is honored now, so `halign: Fill` would
+    /// stretch it, but the span is driven from the surface's own committed
+    /// width instead: `view` floors `#bar` to this width with a pixel
+    /// `width_request` (see `style.css`'s `#bar` rule for the full
+    /// reconciliation). Unlike `clip_rect` (a side-channel `update` only ever
+    /// reads inside a handler a real click message already triggered), this
+    /// value feeds `view` itself, so it must arrive through a real `Msg` fold
+    /// (`Msg::SurfaceWidth`) rather than a `Cell` `view` polls: nothing else
+    /// guarantees another frame ever runs to pick up a bare `Cell` write once
+    /// the initial one lands.
     pub bar_width: i32,
     /// Whether an IME is currently active, from the latest `Snapshot` (M8-7).
     /// Folded in `update`'s `Msg::Compositor` arm; `view` renders the `#ime`
@@ -542,19 +543,11 @@ pub fn view(m: &PanelModel) -> View<Msg> {
 
 /// A layout-only spacer that leads the end group and absorbs its free space,
 /// so the indicators, clock and `clip` sit flush against the bar's right
-/// edge. Carries an id so a test can pin both its position and its
-/// `Hexpand` request; it paints nothing and handles no events.
-///
-/// NOTE: `PropName::Hexpand` has no consumer for a plain `Box` child anywhere
-/// in `icedtea-ui`'s layout path yet (`ui/tests/widget_pixels.rs`'s
-/// `stepping_a_spin_button...` note; `settings/src/pages/displays/mod.rs`'s
-/// `STATUS_READY` note). The spacer mirrors `windows()`'s own
-/// `.hexpand(true)` so the intended right-justification is expressed at the
-/// view level and starts working the moment that gap is closed.
+/// edge. It paints nothing and handles no events, so it deliberately carries
+/// no id: the shell's probe gate requires every id to paint, and an empty
+/// layout spacer never will.
 fn end_spacer() -> View<Msg> {
-    box_(Orientation::Horizontal, Vec::new())
-        .id("end_spacer")
-        .hexpand(true)
+    box_(Orientation::Horizontal, Vec::new()).hexpand(true)
 }
 
 /// The launcher's toggle at the bar's left end (B1 Task 3). `active` while
@@ -1214,7 +1207,7 @@ mod tests {
         );
         assert_eq!(
             end_ids(&v),
-            vec![Some("end_spacer"), Some("clip")],
+            vec![None, Some("clip")],
             "the right group is the spacer, then the indicators/clock and clip (no indicator and no clock before the first tick)"
         );
     }
@@ -1252,7 +1245,7 @@ mod tests {
         );
         assert_eq!(
             end_ids(&v),
-            vec![Some("end_spacer"), Some("touch"), Some("clip")],
+            vec![None, Some("touch"), Some("clip")],
             "the indicator sits in the right group, ahead of clip"
         );
         let classes = match by_id(&v, "touch")
@@ -1809,7 +1802,7 @@ mod tests {
         );
         assert_eq!(
             end_ids(&v),
-            vec![Some("end_spacer"), Some("clip")],
+            vec![None, Some("clip")],
             "and the right group is the spacer and clip while no indicator shows"
         );
     }
@@ -1833,7 +1826,7 @@ mod tests {
         );
         assert_eq!(
             end_ids(&v),
-            vec![Some("end_spacer"), Some("clip")],
+            vec![None, Some("clip")],
             "an inactive IME leaves the right group as the spacer and clip"
         );
     }
@@ -1862,7 +1855,7 @@ mod tests {
         );
         assert_eq!(
             end_ids(&v),
-            vec![Some("end_spacer"), Some("inhibit"), Some("clip")],
+            vec![None, Some("inhibit"), Some("clip")],
             "the badge sits in the right group, ahead of clip"
         );
     }
@@ -1891,7 +1884,7 @@ mod tests {
         );
         assert_eq!(
             end_ids(&v),
-            vec![Some("end_spacer"), Some("layout"), Some("clip")],
+            vec![None, Some("layout"), Some("clip")],
             "the label sits in the right group, ahead of clip"
         );
     }
@@ -1926,7 +1919,7 @@ mod tests {
         );
         assert_eq!(
             end_ids(&v),
-            vec![Some("end_spacer"), Some("ime"), Some("clip")],
+            vec![None, Some("ime"), Some("clip")],
             "the IME indicator sits in the right group, ahead of clip"
         );
     }
@@ -2115,22 +2108,29 @@ mod tests {
         );
     }
 
-    /// The end group opens with a spacer carrying `hexpand`, which is what
-    /// pushes the indicators, clock and clip to the right edge instead of
-    /// centring them in the group's grown half. Pinned structurally (see
-    /// `end_spacer`'s note on the toolkit's still-open `Hexpand` gap).
+    /// The end group opens with an id-less spacer carrying `hexpand`, which is
+    /// what pushes the indicators, clock and clip to the right edge.
     #[test]
     fn the_end_group_leads_with_a_hexpanding_spacer() {
         let (model, _wm, _clip) = panel();
         let view = super::view(&model);
-        let spacer = by_id(&view, "end_spacer").expect("the end group's leading spacer");
+        let (_start, _center, end) = bar_groups(&view);
+        let spacer = end
+            .children
+            .first()
+            .expect("the end group's leading spacer");
         assert!(
             spacer.props.bool(PropName::Hexpand, false),
             "the spacer must request hexpand so the end content sits flush right"
         );
         assert_eq!(
-            end_ids(&view).first().copied(),
-            Some(Some("end_spacer")),
+            spacer.props.str(PropName::Id),
+            None,
+            "the layout spacer carries no id, so the paint gate does not demand it paint"
+        );
+        assert_eq!(
+            end_ids(&view).first(),
+            Some(&None),
             "the spacer leads the end group"
         );
     }
@@ -2144,7 +2144,7 @@ mod tests {
         let view = super::view(&model);
         assert_eq!(
             end_ids(&view),
-            vec![Some("end_spacer"), Some("clock"), Some("clip")],
+            vec![None, Some("clock"), Some("clip")],
             "the clock sits in the end group, ahead of clip"
         );
         assert!(

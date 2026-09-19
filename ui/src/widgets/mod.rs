@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::css::node::{Node, PseudoStates};
-use crate::layout::Rect;
+use crate::layout::{Align, Rect};
 use crate::view::controller::{Controller, Event};
 use crate::view::{BuildCx, Kind, Prop, PropName, Props};
 use crate::window::focus::FOCUSABLE_CLASS;
@@ -731,6 +731,45 @@ impl Universal {
             }
             PropName::Selected => {
                 node.set_state(PseudoStates::SELECTED, matches!(value, Prop::Bool(true)));
+                true
+            }
+            // The four per-child alignment/expansion props. They are declared
+            // on `GtkWidget` and exposed by `View`, but until this arm landed
+            // nothing wrote them into a child's `ChildLayout`, so they were
+            // inert on any child whose controller did not happen to read them
+            // (only `overlay`/`action_bar` did). Applied centrally for the
+            // same reason as this module's other universal names: the 30
+            // controllers that never opted into a `Universal` would otherwise
+            // keep dropping them.
+            //
+            // Mutate the one field in the child's existing layout -- never a
+            // fresh `ChildLayout::default()` -- because a specific controller
+            // (grid, overlay, paned, frame, stack) may already have set
+            // `absolute`, `grid`, `margin` or the other alignment axis.
+            PropName::Hexpand | PropName::Vexpand => {
+                let on = matches!(value, Prop::Bool(true));
+                let mut cl = child_layout_of(node);
+                if name == PropName::Hexpand {
+                    cl.hexpand = on;
+                } else {
+                    cl.vexpand = on;
+                }
+                set_child_layout(node, cl);
+                true
+            }
+            PropName::Halign | PropName::Valign => {
+                // Absent or wrongly typed restores the field default, Fill.
+                let align = match value {
+                    Prop::Align(a) => *a,
+                    _ => Align::Fill,
+                };
+                let mut cl = child_layout_of(node);
+                if name == PropName::Halign {
+                    cl.halign = align;
+                } else {
+                    cl.valign = align;
+                }
+                set_child_layout(node, cl);
                 true
             }
             PropName::WidthRequest | PropName::HeightRequest => {

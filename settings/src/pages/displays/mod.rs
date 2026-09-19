@@ -131,15 +131,13 @@ pub const STATUS_APPLYING: &str = "Applying\u{2026}";
 /// Shown in place of an empty `displays_status`: nothing has happened yet,
 /// but the label must still say something.
 ///
-/// Reconciliation (Task 11): `hexpand` is a known, still-open gap for a plain
-/// `Container::Box` (`ui/tests/ingress.rs`'s own note — nothing in the
-/// generic layout path reads `Hexpand`/`Halign` for a `Box` child), so an
-/// empty-text label here is sized to its own zero-width measurement rather
-/// than grown to fill the row, and never paints. This is out of scope for P4
-/// to fix (it lives in `icedtea-ui`'s layout, not `pages/displays/*`), so the
-/// page instead never *shows* an empty label: idle reads as "Ready" rather
-/// than blank, which is the honest status anyway and happens to have a
-/// non-zero measured width like every other state `displays_status` takes.
+/// The page keeps an empty status label out of the tree on purpose: idle
+/// reads as "Ready" rather than blank. The original reason — that `hexpand`
+/// was inert for a plain `Container::Box` child, so an empty label measured
+/// zero-width and never painted — no longer holds, since the alignment and
+/// expansion props are honored on plain children now. The product choice
+/// stands on its own: a visible empty node is still zero-width and paints
+/// nothing, and "Ready" is the honest idle status anyway.
 pub const STATUS_READY: &str = "Ready";
 
 /// Reset the pending edits back to the last-known head snapshot.

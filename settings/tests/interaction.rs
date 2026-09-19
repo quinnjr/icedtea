@@ -152,30 +152,35 @@ fn apply_reaches_reload_config_on_the_mock() {
     let mut driver = SettingsDriver::open_on_bus(TEST_THEME, "behavior", Some(&bus.address));
 
     // Dirty the model: toggle a switch, which enables Revert and Apply.
-    let before_toggle = driver.frame_count();
+    //
+    // Reconciliation (fix round 2): the footer's status label carries
+    // `hexpand`, which is honored now, so it fills the footer and a text change
+    // no longer moves any geometry. The old `wait_for_frame_after` signal (a
+    // `frame <n>` line written by `write_probe_report` only when a
+    // `probe`/`alloc` line changed) therefore never fires for this toggle; wait
+    // on the app's own `status` line instead, which is appended on the fold
+    // that flips the model. The click also races asynchronous pointer-focus
+    // assignment on a freshly-booted window (the race `SettingsDriver::click`'s
+    // own settle loop documents), so retry it until the fold lands.
     let switch = driver.alloc("behavior_raise_on_focus");
-    driver.click(switch.x + switch.w / 2, switch.y + switch.h / 2);
+    let mut toggled = false;
+    for _ in 0..5 {
+        driver.click(switch.x + switch.w / 2, switch.y + switch.h / 2);
+        if driver.wait_for_status("Unsaved changes", Duration::from_millis(1_500)) {
+            toggled = true;
+            break;
+        }
+    }
+    assert!(toggled, "the switch toggle never reached the model");
 
-    // Reconciliation: the brief's literal code clicks Apply once, right after
-    // the switch, with no wait between the two. `Apply`'s `sensitive` is a
-    // *view* property that only flips once the toggle's own repaint has
-    // landed (`ui/src/view/app.rs`'s `write_probe_report` marks a fresh paint
-    // with a `frame <n>` line); a click sent before that repaint lands on the
-    // *previous*, still-disabled tree and reaches nothing. Retrying the send
-    // itself (rather than waiting for the repaint first) was tried and
-    // rejected: `SettingsDriver::click`'s round trip is slower than the app's
-    // own processing of an already-landed click, so a short retry loop
-    // fired the *same still-sensitive* Apply more than once — each one a
-    // genuine `Msg::Apply` (the model stays dirty until its own async
-    // `Cmd::Task` answers with `Msg::Applied`) — and the mock saw more than
-    // one `ReloadConfig`. Waiting for the repaint first and then clicking
-    // exactly once avoids both failure modes.
-    assert!(
-        driver.wait_for_frame_after(before_toggle, REACT),
-        "the switch's own repaint never landed within {REACT:?}"
-    );
+    // The switch's own `halign(Align::Start)` is honored now too, so the
+    // trailing Apply button sits at the footer's right edge instead of
+    // centring. The footer's right edge overflows the 640px window by ~30px
+    // (the nav switcher's min-content sets the root to 670), so click the
+    // button's visible portion — the part the surface can receive — rather
+    // than its centre, which is clipped.
     let apply = driver.alloc("apply");
-    driver.click(apply.x + apply.w / 2, apply.y + apply.h / 2);
+    driver.click(apply.x + 4, apply.y + apply.h / 2);
 
     let deadline = Instant::now() + REACT;
     while Instant::now() < deadline && calls.load(Ordering::SeqCst) == 0 {

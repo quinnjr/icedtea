@@ -688,11 +688,15 @@ git commit -m "feat(compositor): default wallpaper fallback + session asset"
 - Modify: `shell/src/panel.rs` (view split, `Msg::Tick`, clock state, `format_clock`)
 - Modify: `shell/src/main.rs` (tick thread, `Msg::Tick` handling)
 - Modify: `shell/style.css` (`#bar` group rules)
-- Test: inline `#[cfg(test)]` in `shell/src/panel.rs`
+- Modify: `ui/src/widgets/state.rs` (honor `Halign`/`Valign`/`Hexpand`/`Vexpand` on plain children; two-phase `flush_layout`; homogeneous no-clobber)
+- Modify: `ui/src/widgets/mod.rs` (the four `Universal::apply` arms)
+- Test: inline `#[cfg(test)]` in `shell/src/panel.rs`; `ui/tests/widget_pixels.rs`
 
 **Interfaces:**
 - Consumes: nothing from Tasks 1–2.
-- Produces: `panel::Msg::Tick`; `panel::PanelModel.clock: Option<String>`; `fn panel::format_clock(now: &jiff::Zoned) -> String`.
+- Produces: `panel::Msg::Tick`; `panel::PanelModel.clock: Option<String>`; `fn panel::format_clock(now: &jiff::Zoned) -> String`; `panel::next_minute_wait(second: u8) -> u64`.
+
+**Correction (fix round 2):** the original Task 3 was shell-only, but the panel's right-aligned end group needs the toolkit to honor `View::halign`/`valign`/`hexpand`/`vexpand` on a plain child. Those were declared contract props and publicly settable but **inert**: `Halign`/`Valign`/`Hexpand`/`Vexpand` were absent from `CENTRAL_UNIVERSAL` and no controller wrote them into a child's `ChildLayout`, and `BoxC`'s `homogeneous=false` reset every child's expansion. The ui half below makes them real; the shell spacer then works without a widget-specific controller.
 
 - [ ] **Step 1: Add the dependency**
 
@@ -883,6 +887,14 @@ Add the `Tick` arm to `update` (beside the other arms):
         }
 ```
 
+- [ ] **Step 4b: Honor the alignment/expansion props (icedtea-ui)**
+
+Add `Halign`/`Valign`/`Hexpand`/`Vexpand` to `CENTRAL_UNIVERSAL` (`ui/src/widgets/state.rs`) and add arms to `Universal::apply` (`ui/src/widgets/mod.rs`) that read `child_layout_of(node)`, mutate only the one field, and `set_child_layout(node, cl)` — never a fresh `ChildLayout::default()`, which would clobber the `absolute`/`grid`/`margin`/other-axis fields that `overlay`, `grid`, `paned`, `frame` and `stack` already set. A non-bool expansion value restores `false`; a non-align value restores `Align::Fill`.
+
+Split `flush_layout` into two phases so a controller's placement is never overwritten by the prop-derived child layout: phase 1 applies node records and direct child layouts, phase 2 runs `homogeneous`/`grid_from_children`/`overlay_from_children`. `PENDING` is an unordered hash table, so the old single pass was a race. In the `homogeneous` pass, `on == true` forces expansion; `on == false` resets only a child that set no `Hexpand`/`Vexpand` prop of its own, leaving a child with its own request to the universal pass (both names go into `RECORDED_PROP_NAMES`), because `GtkBox:homogeneous` only forces expansion while set and must not clear a child's own request.
+
+Tests: `ui/tests/widget_pixels.rs` gains `a_hexpanding_child_takes_the_leftover_space`, `halign_end_pins_a_child_to_the_right_edge`, and the two `removing_*_restores_centring` removal-path tests. Reconcile the fixtures whose geometry changes now that the props work: `a_picture_decodes_and_draws_an_embedded_png` (the image fills the surface, so assert the decoded colour directly), `clicking_an_info_bars_close_button_fires_close` (close button now at the trailing edge) and `clicking_a_calendar_day_selects_it` (the grid stretches to the window), plus the stale "hexpand is inert" notes. Also fix `shell/tests/support/mod.rs::labels_under` to read only the last `frame N` snapshot (each block is complete), which is what its absence assertions always assumed.
+
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p icedtea-shell --lib panel`
@@ -943,10 +955,12 @@ In `shell/style.css`, extend the `#bar` rule and add the clock rule. The bar's o
 - [ ] **Step 8: Gates + commit**
 
 ```bash
-cargo test -p icedtea-shell --lib
+# The toolkit change has app-wide blast radius, so the shell-only lib run is
+# not sufficient.
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-git add Cargo.toml Cargo.lock shell/Cargo.toml shell/src/panel.rs shell/src/main.rs shell/style.css
+git add Cargo.toml Cargo.lock shell/Cargo.toml shell/src/panel.rs shell/src/main.rs shell/style.css ui/src/widgets/state.rs ui/src/widgets/mod.rs ui/tests/widget_pixels.rs shell/tests/support/mod.rs
 git commit -m "feat(shell): bar CenterBox split + minute-ticking clock"
 ```
 

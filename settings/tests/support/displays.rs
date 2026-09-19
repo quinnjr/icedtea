@@ -488,6 +488,31 @@ impl SettingsDriver {
         false
     }
 
+    /// Poll until the app's own `status <text>` line reads `want`.
+    ///
+    /// The status line is appended by the app on the fold that changes it
+    /// (`settings/src/probe.rs`), independent of geometry, so it is the signal
+    /// that still distinguishes states now that the footer's `hexpand` status
+    /// label makes a text change geometry-neutral (`write_probe_report`'s
+    /// `frame <n>` lines only move when some `probe`/`alloc` line changes).
+    #[must_use]
+    pub fn wait_for_status(&self, want: &str, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            let current = self
+                .lines()
+                .into_iter()
+                .rev()
+                .find_map(|l| l.strip_prefix("status ").map(str::to_owned))
+                .unwrap_or_default();
+            if current.trim() == want {
+                return true;
+            }
+            std::thread::sleep(POLL);
+        }
+        false
+    }
+
     /// Poll until `key` reads something other than `before`, and return it.
     #[must_use]
     pub fn wait_state_change(

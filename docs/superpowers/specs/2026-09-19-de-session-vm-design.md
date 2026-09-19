@@ -179,6 +179,19 @@ generated, redistributable image kept in the repo.
   local-time formatting. This is the only new dependency in this design; it
   is confined to the shell's clock.
 
+> **Addendum, 2026-09-19 (fix round 2).** `View::halign`/`valign`/`hexpand`/
+> `vexpand` are now honored on a plain child. They were declared contract
+> props and publicly settable but **inert**: `Halign`/`Valign`/`Hexpand`/
+> `Vexpand` were absent from `CENTRAL_UNIVERSAL` (`ui/src/widgets/state.rs`)
+> and no controller wrote them into a child's `ChildLayout`, and a plain
+> `Box`'s `homogeneous == false` reset every child's expansion. The right
+> group's leading `Hexpand` spacer therefore did nothing. `icedtea-ui` now
+> writes these four props into the child's `ChildLayout` (mutating only their
+> own field), `flush_layout` applies controller-derived placements after the
+> prop-derived ones, and `homogeneous == false` restores the child's own
+> request instead of clearing it. Only nodes that set these props change
+> behaviour, and they move toward the props' declared meaning.
+
 ### 4. Provisioning, freshness, verification
 
 - **Provisioning** (`vagrant/provision-system.sh`, `Vagrantfile`): install the
