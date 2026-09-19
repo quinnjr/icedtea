@@ -1,4 +1,7 @@
-# wdm configuration, owned by the repo so the VM's login path is checked in.
+# Container harness, not DE architecture: wdm is this box's display manager and
+# this config is checked in so provisioning is reproducible. Nothing in the
+# DE's own session layer (the units, `icedtea.desktop`, `icedtea-session-start`)
+# names or depends on wdm.
 vt = 7
 default_session = "icedtea.desktop"
 

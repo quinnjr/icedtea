@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Root-phase provisioning: packages, seat management, session units, and the
-# wdm display-manager login path.
+# Root-phase provisioning: packages, seat management, the DE's session units,
+# and this box's login harness (wdm and its config — harness, not the DE's
+# session definition).
 set -euo pipefail
 
 # The box snapshot predates current package signatures; refresh the keyring
@@ -34,11 +35,19 @@ install -m 0755 /home/vagrant/icedtea-wm/session/launch/icedtea-wait /usr/local/
 install -m 0755 /home/vagrant/icedtea-wm/session/launch/icedtea-session-start /usr/local/bin/icedtea-session-start
 install -m 0644 /home/vagrant/icedtea-wm/session/assets/default-wallpaper.png /usr/share/icedtea/default-wallpaper.png
 
-# The display manager is wdm, the box's Wayland DM. It lists the repo's
-# session entry and runs it at login, so both are repo-owned; enable wdm and
-# never disable display-manager.service (the old tty1 path did, leaving the
-# VM with no login path of its own).
+# The DE ships one display-manager-agnostic session entry: a freedesktop
+# .desktop offered to both Wayland and X11 session managers, byte-for-byte
+# identical either way. The DE does not choose or configure a display manager.
+install -d -m 0755 /usr/share/wayland-sessions /usr/share/xsessions
 install -m 0644 /home/vagrant/icedtea-wm/session/launch/icedtea.desktop /usr/share/wayland-sessions/icedtea.desktop
+install -m 0644 /home/vagrant/icedtea-wm/session/launch/icedtea.desktop /usr/share/xsessions/icedtea.desktop
+
+# Container harness, not DE architecture: this box's login path is wdm (a
+# Wayland display manager) and its config is checked in so provisioning is
+# reproducible. Nothing in the DE's own session layer (the units, the entry,
+# `icedtea-session-start`) names or depends on wdm. Never disable
+# display-manager.service — the old tty1 path did, leaving the VM with no login
+# path of its own.
 install -d -m 0755 /etc/wdm
 install -m 0644 /home/vagrant/icedtea-wm/session/launch/wdm.toml /etc/wdm/wdm.toml
 systemctl enable wdm.service

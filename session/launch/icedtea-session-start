@@ -1,14 +1,14 @@
 #!/bin/sh
 # Start the icedtea desktop session through the user manager.
 #
-# The one command a display manager runs here: the session IS the systemd
-# target. `--wait` is load-bearing — the display manager hands the display to
-# this command and only takes it back when the command exits, which is when
-# the target deactivates (its compositor `Requires` stops it on logout).
+# The one command a login session runs: the session IS the systemd target.
+# `--wait` is load-bearing — whoever launched this command hands the display
+# over and only takes it back when the command exits, which is when the target
+# deactivates (its compositor `Requires` stops it on logout).
 set -eu
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
-# A display manager hands the user manager only the session's own environment;
+# The launcher hands the user manager only the session's own environment;
 # import the graphical/session variables the DE reads before starting it. Best
 # effort: a minimal login with none of them set still starts the session.
 systemctl --user import-environment DISPLAY XDG_SESSION_TYPE XDG_SESSION_ID || true
