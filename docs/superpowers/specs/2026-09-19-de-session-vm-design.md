@@ -94,29 +94,39 @@ systemd user unit files, and a small wait helper.
 | Unit | Needs | Ordering / dependency |
 |---|---|---|
 | `icedtea-compositor.service` | seat + DRM | `RequiredBy=icedtea-session.target`; owns `wayland-0` and `org.icedtea.WM` |
+| `icedtea-wayland-env.service` | compositor socket | oneshot, `After` compositor; waits for the socket and publishes `WAYLAND_DISPLAY` through the user manager (see readiness) |
 | `icedtea-notifications.service` | session bus | `Wants`; independent of Wayland, claims `org.freedesktop.Notifications` |
-| `icedtea-clipboard.service` | compositor socket, bus | `After`/`Wants` compositor; `ExecStartPre` waits for the Wayland socket |
-| `icedtea-session.service` | bus, `XDG_SESSION_ID`, `org.icedtea.WM` | `After`/`Wants` compositor |
-| `icedtea-shell.service` | compositor socket, `org.icedtea.Clipboard` | `After`/`Wants` compositor + clipboard; waits for both |
-| `icedtea-session.target` | — | `Wants=` the five; the single entry point |
+| `icedtea-clipboard.service` | compositor socket, bus | `After`/`Wants` `icedtea-wayland-env`; `ExecStartPre` waits for a bus name where needed |
+| `icedtea-session.service` | bus, `XDG_SESSION_ID`, `org.icedtea.WM` | `After`/`Wants` `icedtea-wayland-env` |
+| `icedtea-shell.service` | compositor socket, `org.icedtea.Clipboard` | `After`/`Wants` `icedtea-wayland-env` + clipboard |
+| `icedtea-session.target` | — | `Wants=` the six; the single entry point |
 
-Every unit is `Type=simple`, `Restart=on-failure` with a bounded
-`StartLimitBurst`, and logs to the journal. The compositor being `RequiredBy`
-the target is deliberate: a desktop without a compositor is not a degraded
-session, it is no session, so its exit stops the target and its own restart
-policy drives recovery. The other four are `Wants` so that a crashing shell
-cannot take the compositor (and with it the session) down.
+Every unit is `Type=simple` (the oneshot publisher excepted), `Restart=on-failure`
+with a bounded `StartLimitBurst`, and logs to the journal. The compositor being
+`RequiredBy` the target is deliberate: a desktop without a compositor is not a
+degraded session, it is no session, so its exit stops the target and its own
+restart policy drives recovery. The other units are `Wants` so that a crashing
+shell cannot take the compositor (and with it the session) down.
 
 **Readiness (the one real wrinkle).** `Type=simple` orders *exec*, not socket
-readiness; the compositor's Wayland socket appears asynchronously, which is
-why the current script polls for it and then sleeps. Rather than make the
-compositor `Type=notify` (which would add a libsystemd dependency and change
-compositor code), a repo-owned `icedtea-wait` helper runs as `ExecStartPre`
-for the three consumers that need the socket or a bus name. It takes a mode
-and an argument — `wayland` (poll `$XDG_RUNTIME_DIR/wayland-*` for a socket)
-and `name <bus-name>` (poll `busctl --user` for the name) — with a timeout and
-a non-zero exit on expiry, so a missing socket fails the unit rather than
-racing it.
+readiness; the compositor's Wayland socket appears asynchronously, which is why
+the current script polls for it and then sleeps. Rather than make the compositor
+`Type=notify` (which would add a libsystemd dependency and change compositor
+code), a repo-owned `icedtea-wait` helper runs as the publisher's `ExecStart`,
+and as `ExecStartPre` for consumers that need a bus name. It takes a mode and an
+argument — `wayland-env` (wait for a socket, then publish its basename to the
+user manager with `systemctl --user set-environment WAYLAND_DISPLAY=…`), `name
+<bus-name>` (poll `busctl --user` for the name), and a plain `wayland` check —
+with a timeout and a non-zero exit on expiry, so a missing socket or name fails
+the unit rather than racing it.
+
+The publisher exists because client components are separate processes that must
+*connect* to the compositor, and the `wlr` crate exposes only
+`Display::add_socket_auto` (no named-socket call): the socket name is chosen at
+runtime, and the compositor sets `WAYLAND_DISPLAY` only in its own environment.
+Publishing the discovered name to the user manager is how the rest of the
+session learns it, with no cross-repo crate change and no assumption that the
+compositor won `wayland-0`.
 
 **Trigger.** tty1 autologin runs `icedtea-session-start`, a tiny wrapper that
 ensures the user-manager environment is imported (`systemctl --user
@@ -199,7 +209,7 @@ generated, redistributable image kept in the repo.
 | # | Decision | Rationale |
 |---|---|---|
 | D1 | systemd `--user` units, not a shell script | Matches how real DEs start; gives ordering, bounded restart, and journal logs — the "trust" half — and is the same artifact on bare metal |
-| D2 | Readiness by `icedtea-wait` helper, not `Type=notify` | No libsystemd dependency, no compositor change; the helper also covers bus-name waits the current script fakes with `sleep` |
+| D2 | Readiness by `icedtea-wait` helper + an env-publisher unit, not `Type=notify` | No libsystemd dependency, no compositor change; the helper also covers bus-name waits the current script fakes with `sleep`, and publishing `WAYLAND_DISPLAY` is the only way separate client units can learn a runtime-chosen socket name |
 | D3 | compositor `RequiredBy` target; others `Wants` | No compositor means no session; a broken shell must not kill the compositor |
 | D4 | Wallpaper: installed default + fallback, not redb seeding | Fixes every fresh install, keeps appearance out of VM-only setup |
 | D5 | Clock: shell timer thread, not toolkit `next_wake()` | Smallest change; reuses existing worker/wake patterns; no toolkit surface change |
