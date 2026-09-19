@@ -430,9 +430,12 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-# Needs the compositor's org.icedtea.WM on the bus (its SessionLockChanged
-# subscription), not the Wayland socket itself.
-ExecStartPre=/usr/bin/env icedtea-wait name org.icedtea.WM
+# Needs the compositor's org.icedtea.Compositor on the bus (its
+# SessionLockChanged subscription), not the Wayland socket itself. The name
+# must be the compositor's real one (`compositor/src/dbus.rs`); an earlier
+# revision gated on `org.icedtea.WM`, which nothing owns, so the unit waited
+# forever and the session never started.
+ExecStartPre=/usr/bin/env icedtea-wait name org.icedtea.Compositor
 ExecStart=/usr/bin/env icedtea-session
 Restart=on-failure
 RestartSec=1
@@ -529,6 +532,24 @@ fn the_target_wants_every_component() {
             "the session target must want {unit}"
         );
     }
+}
+
+#[test]
+fn the_session_daemon_waits_for_the_compositor_bus_name() {
+    let unit =
+        std::fs::read_to_string(units_dir().join("icedtea-session.service")).expect("session unit");
+    // The daemon's readiness gate must name the compositor's real bus name —
+    // the contract constant the compositor `request_name`s. A stale
+    // `org.icedtea.WM` here leaves the unit waiting forever, so the session
+    // target never becomes active even though the desktop is up.
+    let expected = format!(
+        "ExecStartPre=/usr/bin/env icedtea-wait name {}",
+        icedtea_contract::COMPOSITOR_BUS_NAME
+    );
+    assert!(
+        unit.contains(&expected),
+        "icedtea-session.service must wait for the compositor bus name ({expected})"
+    );
 }
 ```
 
@@ -979,13 +1000,14 @@ git commit -m "feat(shell): bar CenterBox split + minute-ticking clock"
 - Modify: `vagrant/provision-build.sh`
 - Modify: `session/launch/icedtea-session-start` (add `--wait`; see Task 1 Step 5)
 - Modify: `session/tests/launch_scripts.rs` (pin `--wait`)
-- Create: `session/launch/icedtea.desktop`
-- Create: `session/launch/wdm.toml`
+- Create: `session/launch/icedtea.desktop` (DM-agnostic session entry)
+- Create: `session/launch/wdm.toml` (container DM config — harness, not DE)
 - Create: `vagrant/verify.sh`
 
 **Interfaces:**
 - Consumes: the units and helpers from Task 1, the asset from Task 2, all binaries from the build.
-- Produces: a VM that boots to the `wdm` greeter; logging in runs `icedtea-session-start --wait`, which starts the units. `vagrant/verify.sh` logs in by typing at the greeter and asserts the desktop by pixels.
+- Produces: a VM that boots to the container's display-manager greeter; logging in runs `icedtea-session-start --wait`, which starts the units. `vagrant/verify.sh` logs in by typing at the greeter and asserts the desktop by pixels.
+- Boundary: the session entry is **display-manager-agnostic** (same file, installed to both `xsessions/` and `wayland-sessions/`); `wdm.toml` and the scancode login are **container harness** (which DM this box runs), and no repo session-layer artifact names wdm.
 
 - [ ] **Step 1: Install the session, the display-manager entry, and the asset in `vagrant/provision-system.sh`**
 
@@ -1002,11 +1024,17 @@ install -m 0755 /home/vagrant/icedtea-wm/session/launch/icedtea-wait /usr/local/
 install -m 0755 /home/vagrant/icedtea-wm/session/launch/icedtea-session-start /usr/local/bin/icedtea-session-start
 install -m 0644 /home/vagrant/icedtea-wm/session/assets/default-wallpaper.png /usr/share/icedtea/default-wallpaper.png
 
-# The display manager is wdm, the box's Wayland DM. It lists the repo's
-# session entry and runs it at login, so both are repo-owned; enable wdm and
-# never disable display-manager.service (the old tty1 path did, leaving the
-# VM with no login path of its own).
+# The DE ships one display-manager-agnostic session entry: a freedesktop
+# .desktop offered to both Wayland and X11 session managers, identical either
+# way. The DE does not choose or configure a display manager.
 install -m 0644 /home/vagrant/icedtea-wm/session/launch/icedtea.desktop /usr/share/wayland-sessions/icedtea.desktop
+install -d -m 0755 /usr/share/xsessions
+install -m 0644 /home/vagrant/icedtea-wm/session/launch/icedtea.desktop /usr/share/xsessions/icedtea.desktop
+
+# This container's display manager is wdm (a Wayland DM; the box has it
+# installed). The wdm.toml and enabling wdm are harness for *this* box, not
+# part of the DE's session definition; never disable display-manager.service
+# (the old tty1 path did, leaving the VM with no login path of its own).
 install -d -m 0755 /etc/wdm
 install -m 0644 /home/vagrant/icedtea-wm/session/launch/wdm.toml /etc/wdm/wdm.toml
 systemctl enable wdm.service
@@ -1030,10 +1058,14 @@ chown -R vagrant:vagrant /home/vagrant/.config
 
 The session entry (`session/launch/icedtea.desktop`) and `wdm.toml` (new files):
 
+The session entry is deliberately protocol- and DM-agnostic: no `X-GDM-*`,
+no Wayland-only key, `Exec` pointing at the systemd-target launcher, and the
+same byte-for-byte file installed to both session directories.
+
 ```ini
 [Desktop Entry]
 Name=icedtea
-Comment=icedtea Wayland desktop
+Comment=icedtea desktop session
 Exec=/usr/local/bin/icedtea-session-start
 TryExec=/usr/local/bin/icedtea-session-start
 Type=Application
@@ -1041,7 +1073,9 @@ DesktopNames=icedtea
 ```
 
 ```toml
-# wdm configuration, owned by the repo so the VM's login path is checked in.
+# wdm configuration for this container. Harness, not DE architecture: the VM
+# installs it from the repo so the box's login path is checked in, but nothing
+# in the DE's own session layer depends on wdm.
 vt = 7
 default_session = "icedtea.desktop"
 
@@ -1273,7 +1307,12 @@ vagrant/verify.sh
 
 Expected: `BUILD_INFO` prints the branch's revision (not `unknown`), the greeter login starts the session, the three units become `active`, and the script prints `PASS` with screenshots. Inspect `$OUT/desktop.png`: a wallpaper is visible and the bar shows a start button on the left and an `HH:MM` clock on the right. If the greeter needs a different field order (or a click to focus), adjust the `type_text`/`type_scancode` sequence in Step 4 and say so — the sequence is the one part of this script that is empirical.
 
-Also pin the Task 1 change: add `lines.contains(&"--wait")` to the assertion in `session/tests/launch_scripts.rs`'s `session_start_imports_environment_then_starts_target`, and run `cargo test -p icedtea-session --test launch_scripts`.
+Also pin the Task 1 changes:
+- add `lines.contains(&"--wait")` to the assertion in `session/tests/launch_scripts.rs`'s `session_start_imports_environment_then_starts_target`;
+- the `icedtea-session.service` bus-name fix and its test (Task 1 Step 7) — apply them here if Task 1 shipped the stale `org.icedtea.WM` name;
+- run `cargo test -p icedtea-session --test launch_scripts --test launch_units`.
+
+And fix the branch regression this task's investigation found: `settings/tests/interaction.rs::apply_reaches_reload_config_on_the_mock` passes at `origin/develop` and up to `14a2b10`, and fails from `d247d1b` (the settings footer fallback). It asserts Apply reaches `ReloadConfig` exactly once but the click no longer lands. Diagnose whether the fallback broke the footer's hit target (the most likely cause) and fix the **product** — not by weakening the assertion; then confirm the test passes and that a mutation restoring the break re-fails it.
 
 - [ ] **Step 6: Commit**
 
