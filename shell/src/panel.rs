@@ -508,10 +508,12 @@ pub fn view(m: &PanelModel) -> View<Msg> {
     // as a floating cluster. See the spec's panel section.
     let start = vec![start_button(m), workspaces(m), windows(m)];
 
-    // The end group opens with a spacer that takes the group's free space, so
-    // the indicators, clock and clip sit flush against the right edge rather
-    // than centring in the group's (grown) half. Contract §3.3's order within
-    // the group is indicators, clock, clip.
+    // The end group opens with a spacer that grows, so within the group the
+    // indicators, clock and clip pack to the trailing edge rather than
+    // centring; the group itself is an outer `CenterBox` child, and
+    // `JustifyContent::SPACE_BETWEEN` is what pushes it (and the left group)
+    // apart across the bar. Contract §3.3's order within the group is
+    // indicators, clock, clip.
     let mut end = vec![end_spacer()];
     if let Some(indicator) = ime_indicator(m) {
         end.push(indicator);
@@ -639,8 +641,10 @@ fn format_clock(now: &jiff::Zoned) -> String {
 /// Seconds to sleep from `second` past the minute to the next minute boundary.
 ///
 /// Pure so the tick thread's only arithmetic is unit-testable: `0` (exactly on
-/// the boundary) must wait a full minute, not busy-spin for the rest of that
-/// second. `second` is 0..=59, the range `jiff::Zoned::second` yields.
+/// the boundary) waits a full minute, not zero. `second` is 0..=59, the range
+/// `jiff::Zoned::second` yields, so `60 - second` is `1..=60` and the `0` arm
+/// is unreachable from that range (`60 - 0` is already `60`); it is kept so a
+/// leap second reported as `60` cannot turn the wait into a busy loop.
 pub fn next_minute_wait(second: u8) -> u64 {
     match 60 - u64::from(second) {
         0 => 60,

@@ -191,19 +191,33 @@ fn apply_reaches_reload_config_on_the_mock() {
     // The action cluster leads the footer (`#status` follows with `hexpand`),
     // so the buttons' positions do not depend on the status text — the
     // invariant the footer regression broke. Assert Apply is fully inside the
-    // window, then click its centre.
-    let apply = driver.alloc("apply");
-    assert!(
-        apply.x + apply.w <= driver.window_right(),
-        "Apply ({apply:?}) must be fully inside the window (right edge {})",
-        driver.window_right()
-    );
-    driver.click(apply.x + apply.w / 2, apply.y + apply.h / 2);
-
-    let deadline = Instant::now() + REACT;
-    while Instant::now() < deadline && calls.load(Ordering::SeqCst) == 0 {
-        std::thread::sleep(Duration::from_millis(25));
+    // window, then click it.
+    //
+    // `status` is written from the fold, before Apply's `sensitive` (a view
+    // property) has repainted, so the first click can land on the previous,
+    // insensitive button. Apply is *not* a toggle -- re-clicking after it has
+    // taken effect re-sends the same request -- so retry the click until the
+    // compositor records exactly one call, re-reading the allocation each time
+    // in case the repaint moved it.
+    let mut called = false;
+    for _ in 0..5 {
+        let apply = driver.alloc("apply");
+        assert!(
+            apply.x + apply.w <= driver.window_right(),
+            "Apply ({apply:?}) must be fully inside the window (right edge {})",
+            driver.window_right()
+        );
+        driver.click(apply.x + apply.w / 2, apply.y + apply.h / 2);
+        let deadline = Instant::now() + REACT;
+        while Instant::now() < deadline && calls.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if calls.load(Ordering::SeqCst) > 0 {
+            called = true;
+            break;
+        }
     }
+    assert!(called, "Apply never reached the compositor");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,

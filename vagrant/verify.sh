@@ -36,19 +36,39 @@ declare -A SC=(
   [k]=25 [l]=26 [m]=32 [n]=31 [o]=18 [p]=19 [q]=10 [r]=13 [s]=1f [t]=14
   [u]=16 [v]=2f [w]=11 [x]=2d [y]=15 [z]=2c
   [0]=0b [1]=02 [2]=03 [3]=04 [4]=05 [5]=06 [6]=07 [7]=08 [8]=09 [9]=0a
-  [-]=0c [.]=34 [_]=0c [@]=1a
+  [-]=0c [.]=34
 )
+# Keys that require Shift on a US layout: the base make code to send under a
+# held Shift. Without this the table cannot type `@`, `_`, or any uppercase
+# letter -- it would either send the wrong glyph or fail.
+declare -A SC_SHIFT=(
+  [A]=1e [B]=30 [C]=2e [D]=20 [E]=12 [F]=21 [G]=22 [H]=23 [I]=17 [J]=24
+  [K]=25 [L]=26 [M]=32 [N]=31 [O]=18 [P]=19 [Q]=10 [R]=13 [S]=1f [T]=14
+  [U]=16 [V]=2f [W]=11 [X]=2d [Y]=15 [Z]=2c
+  [_]=0c [@]=03 [!]=02 [#]=04 [$]=05 [%]=06 [^]=07 [&]=08 [*]=09 [(]=0a [)]=0b
+  [+]=0d [{]=1a [}]=1b [|]=1c [:]=27 [\"]=28 [<]=33 [>]=34 [?]=35 [~]=29
+)
+SHIFT_MAKE=2a
+SHIFT_BREAK=aa
 type_scancode() {  # each arg: a hex make code
   local codes=() c
   for c in "$@"; do codes+=("$c" "$(printf '%02x' $(( 0x$c | 0x80 )))"); done
   VBoxManage controlvm "$VM" keyboardputscancode "${codes[@]}" >/dev/null
 }
-type_text() {  # $1 = lower-case ASCII
+type_text() {  # $1 = printable ASCII
   local s="$1" i ch
   for (( i=0; i<${#s}; i++ )); do
     ch="${s:i:1}"
-    [ -n "${SC[$ch]:-}" ] || fail "no scancode for '$ch'"
-    type_scancode "${SC[$ch]}"
+    if [ -n "${SC[$ch]:-}" ]; then
+      type_scancode "${SC[$ch]}"
+    elif [ -n "${SC_SHIFT[$ch]:-}" ]; then
+      # Hold Shift across the key: make shift, make+break key, break shift.
+      VBoxManage controlvm "$VM" keyboardputscancode \
+        "$SHIFT_MAKE" "${SC_SHIFT[$ch]}" \
+        "$(printf '%02x' $(( 0x${SC_SHIFT[$ch]} | 0x80 )))" "$SHIFT_BREAK" >/dev/null
+    else
+      fail "no scancode for '$ch'"
+    fi
     sleep 0.05
   done
 }
@@ -119,7 +139,12 @@ h=$(magick identify -format '%h' "$OUT/desktop.png")
 top_strip=$(magick "$OUT/desktop.png" -crop "x4+0+0" +repage -format '%[fx:mean]' info:)
 bottom_strip=$(magick "$OUT/desktop.png" -crop "x4+0+$((h - 4))" +repage -format '%[fx:mean]' info:)
 bar_mean=$(awk "BEGIN { print ($top_strip < $bottom_strip) ? $top_strip : $bottom_strip }")
-bar_y=$(awk "BEGIN { print ($top_strip < $bottom_strip) ? 0 : $h - 28 }")
+# The panel's own height (`shell/src/panel.rs`'s `BAR_HEIGHT`); a taller strip
+# than the bar would sample wallpaper below it, a shorter one might miss the
+# glyphs. Checked against the shipped 28px bar, and the one place this script
+# and the toolkit have to agree on a number.
+BAR_HEIGHT=28
+bar_y=$(( h - BAR_HEIGHT ))
 # The bar is near-black; a missing bar leaves the wallpaper there (~0.15).
 awk "BEGIN { exit !($bar_mean < 0.13) }" || fail "no dark panel band at either edge (top $top_strip bottom $bottom_strip)"
 
@@ -132,7 +157,7 @@ awk "BEGIN { exit !($centre > 0.01) }" || fail "desktop is a flat colour — no 
 # The panel's right group (clock + clip) must actually ink glyphs: a bar with
 # no text is the "panel present but unreadable" failure. Only labels paint
 # bright pixels (the button backgrounds read ~0.22 grey, the bar ~0.10).
-right_ink=$(magick "$OUT/desktop.png" -crop "300x28+$((w - 300))+$bar_y" +repage -colorspace Gray -threshold 50% -format '%[fx:mean]' info:)
+right_ink=$(magick "$OUT/desktop.png" -crop "300x$BAR_HEIGHT+$((w - 300))+$bar_y" +repage -colorspace Gray -threshold 50% -format '%[fx:mean]' info:)
 awk "BEGIN { exit !($right_ink > 0.005) }" || fail "panel's right group has no glyphs (clock/clip labels missing; bright fraction $right_ink)"
 
 echo "desktop mean=$desktop_mean bar mean=$bar_mean bar y=$bar_y centre sd=$centre right ink=$right_ink"

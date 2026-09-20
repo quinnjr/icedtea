@@ -5,7 +5,7 @@
 **Parent:** `2026-08-20-icedtea-de-roadmap.md`.
 **Decisions of record:** DE startup moves into the repo as systemd `--user`
 units (approach A); readiness by a repo-owned wait helper, not `Type=notify`;
-the compositor is `RequiredBy` the session target and the other four units are
+the compositor is `RequiredBy` the session target and the other five units are
 `Wants` (best-effort); the wallpaper falls back to an installed default asset
 rather than seeding the VM's redb config; the panel clock ticks from a
 shell-side timer thread, not a new toolkit wake API; one time crate is added
@@ -105,11 +105,11 @@ systemd user unit files, and a small wait helper.
 
 | Unit | Needs | Ordering / dependency |
 |---|---|---|
-| `icedtea-compositor.service` | seat + DRM | `RequiredBy=icedtea-session.target`; owns `wayland-0` and `org.icedtea.WM` |
+| `icedtea-compositor.service` | seat + DRM | `RequiredBy=icedtea-session.target`; owns `wayland-0` and `org.icedtea.Compositor` |
 | `icedtea-wayland-env.service` | compositor socket | oneshot, `After` compositor; waits for the socket and publishes `WAYLAND_DISPLAY` through the user manager (see readiness) |
 | `icedtea-notifications.service` | session bus | `Wants`; independent of Wayland, claims `org.freedesktop.Notifications` |
 | `icedtea-clipboard.service` | compositor socket, bus | `After`/`Wants` `icedtea-wayland-env`; `ExecStartPre` waits for a bus name where needed |
-| `icedtea-session.service` | bus, `XDG_SESSION_ID`, `org.icedtea.WM` | `After`/`Wants` `icedtea-wayland-env` |
+| `icedtea-session.service` | bus, `XDG_SESSION_ID`, `org.icedtea.Compositor` | `After`/`Wants` `icedtea-wayland-env` |
 | `icedtea-shell.service` | compositor socket, `org.icedtea.Clipboard` | `After`/`Wants` `icedtea-wayland-env` + clipboard |
 | `icedtea-session.target` | — | `Wants=` the six; the single entry point |
 
@@ -254,7 +254,9 @@ generated, redistributable image kept in the repo.
      is-active`), failing loudly otherwise;
   2. `VBoxManage controlvm … screenshotpng` the console;
   3. assert on pixels: the desktop is **not** the flat default (a wallpaper is
-     present), the panel bar colour is present across the top edge, and the
+     present), the panel bar colour is present along the bar's edge (the
+     default position is the bottom, so the script checks whichever edge is
+     darker), and the
      frame is not uniform (not a black/blank screen);
   4. launch `foot` as a client, screenshot again, and assert a window
      appeared (a large region of the frame changed and the taskbar gained a

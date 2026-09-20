@@ -82,7 +82,7 @@ fn name_mode_matches_a_bus_owner() {
     // `busctl --user list --no-legend` prints one name per line, first column.
     fs::write(
         tools.join("busctl"),
-        "#!/bin/sh\nprintf 'org.freedesktop.DBus  42  :1.1\\n'\nprintf 'org.icedtea.WM  7  :1.2\\n'\n",
+        "#!/bin/sh\nprintf 'org.freedesktop.DBus  42  :1.1\\n'\nprintf 'org.example.Fake  7  :1.2\\n'\n",
     )
     .expect("fake busctl");
     use std::os::unix::fs::PermissionsExt as _;
@@ -98,7 +98,7 @@ fn name_mode_matches_a_bus_owner() {
     );
     let out = Command::new(wait_script())
         .arg("name")
-        .arg("org.icedtea.WM")
+        .arg("org.example.Fake")
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("PATH", path)
         .env("ICEDTEA_WAIT_TIMEOUT", "2")

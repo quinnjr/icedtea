@@ -31,9 +31,17 @@
 }
 
 /* The clock is information, not a control: it keeps a button's metrics so
-   the end group stays optically even, but never lights up. */
-#bar button.clock {
+   the end group stays optically even, but never lights up. The button keeps
+   its `:hover`/`:active` states (it is still a `Button` for metrics), so the
+   background and border are cleared in every state, not just at rest. */
+#bar button.clock,
+#bar button.clock:hover,
+#bar button.clock:active,
+#bar button.clock:checked {
     background-image: none;
+    background-color: transparent;
+    border-color: transparent;
+    box-shadow: none;
     font-variant-numeric: tabular-nums;
 }
 

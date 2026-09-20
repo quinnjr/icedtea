@@ -306,7 +306,7 @@ const RECORDED_PROP_NAMES: [PropName; 18] = [
     PropName::ClipOverlay,
     // `stack::StackC::place`'s fourth reader (Task 15): a page's `Str`
     // name/title and `Bool` attention flag, all as cheap to keep as the
-    // nine above and re-derived the same way, from the child's own node.
+    // names above and re-derived the same way, from the child's own node.
     PropName::PageName,
     PropName::PageTitle,
     PropName::NeedsAttention,
@@ -828,13 +828,21 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
                         props_of(&child).get(PropName::Vexpand).is_some()
                     };
                     if on {
-                        // Forcing expansion on starts from the *unaligned*
-                        // centring, so the named axis grows without the other
-                        // stretching (the same coupling the universal arms
-                        // avoid). `homogeneous == false` keeps the historical
-                        // base: it only resets a child that asked for nothing
-                        // itself, leaving a child with its own prop to the
-                        // universal pass.
+                        // `on == true` starts from the *unaligned* centring
+                        // when the child has no layout of its own, so the
+                        // forced axis grows without the other stretching --
+                        // the same coupling the universal arms avoid.
+                        //
+                        // `homogeneous == false` deliberately keeps the
+                        // historical `Fill` base (`unwrap_or_default`): it is
+                        // the pass that *releases* a `GtkBox:homogeneous`
+                        // force, and a child it touches without its own
+                        // `Hexpand`/`Vexpand` prop must return to the plain
+                        // box default (fill the cell), not to the centred
+                        // one. Only the child's own expansion is reset; the
+                        // alignment axes are left as the tree already has
+                        // them. A child carrying its own prop is skipped
+                        // entirely and left to the universal pass.
                         let mut cl = tree
                             .child_layout(&child)
                             .unwrap_or_else(centred_child_layout);

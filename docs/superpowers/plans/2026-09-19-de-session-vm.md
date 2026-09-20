@@ -129,7 +129,7 @@ fn name_mode_matches_a_bus_owner() {
     // `busctl --user list --no-legend` prints one name per line, first column.
     fs::write(
         tools.join("busctl"),
-        "#!/bin/sh\nprintf ':1.1  42  org.freedesktop.DBus\\n'\nprintf ':1.2  7   org.icedtea.WM\\n'\n",
+        "#!/bin/sh\nprintf ':1.1  42  org.freedesktop.DBus\\n'\nprintf ':1.2  7   org.example.Fake\\n'\n",
     )
     .expect("fake busctl");
     use std::os::unix::fs::PermissionsExt as _;
@@ -143,7 +143,7 @@ fn name_mode_matches_a_bus_owner() {
     );
     let out = Command::new(wait_script())
         .arg("name")
-        .arg("org.icedtea.WM")
+        .arg("org.example.Fake")
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("PATH", path)
         .env("ICEDTEA_WAIT_TIMEOUT", "2")
@@ -1119,11 +1119,15 @@ done
 # Vagrantfile computes the host revision at provision time and passes it here
 # in the provisioner environment; `vagrant/verify.sh` prints this, so "the VM
 # runs stale code" is visible rather than guessed.
+#
+# Written outside ~/icedtea-wm on purpose: that tree is an rsync mirror with
+# `--delete`, and a guest-only file inside it is removed by the next sync.
+sudo mkdir -p /etc/icedtea
 {
   echo "rev=${ICEDTEA_BUILD_REV:-unknown}"
   echo "built=$(date -u +%FT%TZ)"
-} > ~/icedtea-wm/BUILD_INFO
-cat ~/icedtea-wm/BUILD_INFO
+} | sudo tee /etc/icedtea/BUILD_INFO
+cat /etc/icedtea/BUILD_INFO
 
 # Re-provisioning must leave a login prompt, not a stale session: restart wdm
 # so the greeter is what the console shows. It is safe to restart while a
@@ -1231,7 +1235,7 @@ case "$state" in
 esac
 
 echo "== BUILD_INFO =="
-build_info=$(vagrant ssh -c 'cat ~/icedtea-wm/BUILD_INFO' | tr -d '\r') || fail "cannot read BUILD_INFO"
+build_info=$(vagrant ssh -c 'cat /etc/icedtea/BUILD_INFO' | tr -d '\r') || fail "cannot read BUILD_INFO"
 printf '%s\n' "$build_info"
 [ "$(printf '%s\n' "$build_info" | sed -n 's/^rev=//p')" != "unknown" ] \
   || fail "BUILD_INFO carries no revision — the VM cannot say what it runs"

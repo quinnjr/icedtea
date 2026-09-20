@@ -163,9 +163,10 @@ mod tests {
         // when they carry no per-child `ChildLayout`
         // (`layout::Container::Box`'s doc comment). `PropName::Halign`/
         // `Vexpand` are honored on a plain child now, but this frame requests
-        // neither, so it still sizes to its content and lands centred;
-        // `(79, 15)`/`(79, 20)` are that same centred frame's own top border
-        // stroke and the background just inside it.
+        // neither, so it still sizes to its content and lands centred -- the
+        // centred *unaligned* base, not `Fill`; `(79, 15)`/`(79, 20)` are that
+        // same centred frame's own top border stroke and the background just
+        // inside it.
         let out = frames((), update, view, (160, 60), vec![ScriptStep::Capture]);
         let border = px(&out, 0, 79, 15);
         let interior = px(&out, 0, 79, 20);

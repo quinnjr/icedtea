@@ -18,7 +18,8 @@ pacman -S --noconfirm --needed \
   libinput libxkbcommon pixman libdrm mesa \
   seatd xorg-xwayland polkit \
   gtk4 gtk4-layer-shell dbus \
-  foot
+  foot \
+  wdm-wayland wdm-greeter wdm-webkit-greeter
 
 # wlroots takes the session through libseat -> seatd; the vagrant user needs
 # the seat group for that, plus video/input for the DRM and evdev nodes.
