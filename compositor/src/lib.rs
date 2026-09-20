@@ -36,7 +36,11 @@ pub const DEFAULT_WALLPAPER_PATH: &str = "/usr/share/icedtea/default-wallpaper.p
 ///
 /// A fresh install has `Appearance.wallpaper == None`; without this the
 /// desktop is a bare colour until someone opens settings and picks an image.
-fn resolve_wallpaper(
+///
+/// `pub(crate)` so the live-reload path resolves the same fallback the boot
+/// path does: clearing the configured wallpaper back to `None` must land on
+/// the installed default, not a flat background.
+pub(crate) fn resolve_wallpaper(
     configured: Option<&str>,
     env_override: Option<&std::ffi::OsStr>,
     installed: &std::path::Path,

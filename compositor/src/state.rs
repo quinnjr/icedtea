@@ -4079,8 +4079,10 @@ impl State {
     pub fn apply_reloaded_config(&mut self, cfg: Config) -> Vec<Event> {
         // Captured before `apply_config` overwrites `self.config` -- this is
         // the only way to tell whether the wallpaper *path* changed rather
-        // than merely being reapplied.
-        let old_wallpaper = self.config.appearance.wallpaper.clone();
+        // than merely being reapplied. Resolved through the same fallback the
+        // boot path uses, so a clear (Some -> None) is compared and spawned as
+        // the installed default, not as `None` (which would go flat).
+        let old_wallpaper = self.resolved_wallpaper();
 
         let events = self.apply_config(cfg);
         // Review finding I2: these used to be extended onto a separate
@@ -4108,7 +4110,8 @@ impl State {
         {
             runtime.set_rect_color(bg, render::wallpaper_color(&self.config.appearance));
         }
-        if self.config.appearance.wallpaper != old_wallpaper {
+        let new_wallpaper = self.resolved_wallpaper();
+        if new_wallpaper != old_wallpaper {
             // Carried-forward obligation (task 7 review): clear the decoded
             // image and tear down every wallpaper node *before* the fresh
             // decode can land, so `sync_wallpaper_nodes`'s existing-node
@@ -4116,8 +4119,7 @@ impl State {
             // doc) is never asked to show stale pixels under a new path.
             self.wallpaper.set_decoded(None);
             self.sync_wallpaper_nodes();
-            let path = self.config.appearance.wallpaper.clone();
-            self.spawn_wallpaper(path);
+            self.spawn_wallpaper(new_wallpaper);
         }
         // `apply_config` now preserves every window row across the reload, so
         // this re-sync repaints the surviving windows against the swapped-in
@@ -4584,6 +4586,19 @@ impl State {
     /// original alive on `State` (`set_wallpaper_wake`, called once at boot)
     /// closes that off the same way `config_reload_wake` already does for
     /// its own channel.
+    /// The wallpaper the current config resolves to, through the boot path's
+    /// fallback chain (configured -> `ICEDTEA_DEFAULT_WALLPAPER` -> installed
+    /// default -> none). Used by the reload path so a changed config is
+    /// compared and spawned on the *resolved* value, not the raw
+    /// `Appearance.wallpaper`.
+    fn resolved_wallpaper(&self) -> Option<String> {
+        crate::resolve_wallpaper(
+            self.config.appearance.wallpaper.as_deref(),
+            std::env::var_os("ICEDTEA_DEFAULT_WALLPAPER").as_deref(),
+            std::path::Path::new(crate::DEFAULT_WALLPAPER_PATH),
+        )
+    }
+
     pub fn spawn_wallpaper(&mut self, path: Option<String>) {
         let wake = self
             .wallpaper_wake

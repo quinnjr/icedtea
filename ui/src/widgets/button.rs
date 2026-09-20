@@ -206,8 +206,11 @@ impl<Msg: Clone + 'static> Controller<Msg> for ButtonC {
             }
             // A Label set to a non-string value (absent, or the reconciler's
             // `Prop::None`) clears the text rather than leaving the last one
-            // on the subnode: without this the label kept its old glyphs and
-            // `.text-button` class forever once it had ever been set.
+            // on the subnode. The label node itself stays attached -- chrome
+            // subnodes are attached once and never detached, since
+            // `child_index`/`reserved_total` count them for the reconciler's
+            // trim step -- so this clears the glyphs; the (now empty) label
+            // keeps `chrome_count` honest.
             (PropName::Label, _) => {
                 if let Some(label) = self.label.as_ref() {
                     crate::widgets::set_text(label, "");

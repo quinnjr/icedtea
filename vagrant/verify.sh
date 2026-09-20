@@ -46,7 +46,7 @@ declare -A SC_SHIFT=(
   [K]=25 [L]=26 [M]=32 [N]=31 [O]=18 [P]=19 [Q]=10 [R]=13 [S]=1f [T]=14
   [U]=16 [V]=2f [W]=11 [X]=2d [Y]=15 [Z]=2c
   [_]=0c [@]=03 [!]=02 [#]=04 [$]=05 [%]=06 [^]=07 [&]=08 [*]=09 [(]=0a [)]=0b
-  [+]=0d [{]=1a [}]=1b [|]=1c [:]=27 [\"]=28 [<]=33 [>]=34 [?]=35 [~]=29
+  [+]=0d [{]=1a [}]=1b [|]=2b [:]=27 [\"]=28 [<]=33 [>]=34 [?]=35 [~]=29
 )
 SHIFT_MAKE=2a
 SHIFT_BREAK=aa
@@ -144,7 +144,14 @@ bar_mean=$(awk "BEGIN { print ($top_strip < $bottom_strip) ? $top_strip : $botto
 # glyphs. Checked against the shipped 28px bar, and the one place this script
 # and the toolkit have to agree on a number.
 BAR_HEIGHT=28
-bar_y=$(( h - BAR_HEIGHT ))
+# The strip starts at whichever edge was darker above -- the same edge the
+# `bar_mean` assertion used -- so a top-positioned bar's glyphs are sampled
+# from the top, not from the wallpaper at the bottom.
+if awk "BEGIN { exit !($top_strip < $bottom_strip) }"; then
+  bar_y=0
+else
+  bar_y=$(( h - BAR_HEIGHT ))
+fi
 # The bar is near-black; a missing bar leaves the wallpaper there (~0.15).
 awk "BEGIN { exit !($bar_mean < 0.13) }" || fail "no dark panel band at either edge (top $top_strip bottom $bottom_strip)"
 

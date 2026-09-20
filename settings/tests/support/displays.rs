@@ -505,11 +505,11 @@ impl SettingsDriver {
     /// the new state: `Some(true)` for dirty (`Unsaved changes`), `Some(false)`
     /// for clean (`""`), `None` if it never changed.
     ///
-    /// This is the signal a **toggle** must wait on, not
-    /// [`wait_for_status`](Self::wait_for_status): a switch alternates, and a
-    /// click that lands is only observable as a *transition*. Waiting for a
-    /// fixed target cannot tell "the click landed and made it clean" from "the
-    /// click never landed", which is exactly the parity the caller needs.
+    /// This is the signal a **toggle** must wait on, rather than polling for a
+    /// fixed status target: a switch alternates, and a click that lands is
+    /// only observable as a *transition*. Waiting for a fixed target cannot
+    /// tell "the click landed and made it clean" from "the click never
+    /// landed", which is exactly the parity the caller needs.
     #[must_use]
     pub fn wait_for_status_change(&self, before: &str, timeout: Duration) -> Option<bool> {
         let started = Instant::now();
