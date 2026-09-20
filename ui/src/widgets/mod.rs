@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::css::node::{Node, PseudoStates};
-use crate::layout::Rect;
+use crate::layout::{Align, Rect};
 use crate::view::controller::{Controller, Event};
 use crate::view::{BuildCx, Kind, Prop, PropName, Props};
 use crate::window::focus::FOCUSABLE_CLASS;
@@ -733,6 +733,52 @@ impl Universal {
                 node.set_state(PseudoStates::SELECTED, matches!(value, Prop::Bool(true)));
                 true
             }
+            // The four per-child alignment/expansion props. They are declared
+            // on `GtkWidget` and exposed by `View`, but until this arm landed
+            // nothing wrote them into a child's `ChildLayout`, so they were
+            // inert on any child whose controller did not happen to read them
+            // (only `overlay`/`action_bar` did). Applied centrally for the
+            // same reason as this module's other universal names: the 30
+            // controllers that never opted into a `Universal` would otherwise
+            // keep dropping them.
+            //
+            // Mutate the one field in the child's existing layout -- never a
+            // fresh `ChildLayout::default()` -- because a specific controller
+            // (grid, overlay, paned, frame, stack) may already have set
+            // `absolute`, `grid`, `margin` or the other alignment axis. When
+            // nothing recorded a layout, the base is the *unaligned* centring,
+            // not `ChildLayout::default()`'s `Align::Fill`: otherwise a lone
+            // `.hexpand(true)` would also stretch the cross axis, coupling the
+            // axes these props name separately.
+            PropName::Hexpand | PropName::Vexpand => {
+                let on = matches!(value, Prop::Bool(true));
+                let mut cl = child_layout_or_centred(node);
+                if name == PropName::Hexpand {
+                    cl.hexpand = on;
+                } else {
+                    cl.vexpand = on;
+                }
+                set_child_layout(node, cl);
+                true
+            }
+            PropName::Halign | PropName::Valign => {
+                // Absent or wrongly typed restores the *unaligned* centring,
+                // not `Align::Fill`: a node that never had the prop is
+                // centred, so setting then clearing it returns to that same
+                // state.
+                let align = match value {
+                    Prop::Align(a) => *a,
+                    _ => Align::Center,
+                };
+                let mut cl = child_layout_or_centred(node);
+                if name == PropName::Halign {
+                    cl.halign = align;
+                } else {
+                    cl.valign = align;
+                }
+                set_child_layout(node, cl);
+                true
+            }
             PropName::WidthRequest | PropName::HeightRequest => {
                 // GTK's size request is universal, and until P8-D71's
                 // close-out nothing but `Label`/`Entry`/`DrawingArea` read
@@ -831,11 +877,11 @@ pub use headless::{BuiltWidget, Headless, build_widget};
 #[doc(inline)]
 pub use state::flush_layout;
 pub(crate) use state::{
-    apply_universal, child_layout_of, container_of, forget_subtree, mark_grid_children,
-    mark_overlay_children, measure_row, paint_row, props_of, record_props, row_index_of,
-    row_text_height, set_child_layout, set_container, set_displayed, set_gap, set_homogeneous,
-    set_icon, set_row_classes, set_row_index, set_size_request, set_text, set_transition_progress,
-    size_request_of, text_of,
+    apply_universal, child_layout_of, child_layout_or_centred, container_of, forget_subtree,
+    mark_grid_children, mark_overlay_children, measure_row, paint_row, props_of, record_props,
+    row_index_of, row_text_height, set_child_layout, set_container, set_displayed, set_gap,
+    set_homogeneous, set_icon, set_row_classes, set_row_index, set_size_request, set_text,
+    set_transition_progress, size_request_of, text_of,
 };
 
 /// The `:hover`/`:active` bookkeeping every pointer-reactive widget shares.

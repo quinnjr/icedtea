@@ -18,7 +18,7 @@ use selectors::Element as _;
 use selectors::OpaqueElement;
 
 use crate::css::node::{Node, NodeInner};
-use crate::layout::{ChildLayout, Container};
+use crate::layout::{Align, ChildLayout, Container};
 use crate::view::{BuildCx, Kind, Prop, PropName, Props};
 
 use super::{Orientation, Universal, grid, overlay, types};
@@ -170,10 +170,20 @@ thread_local! {
 /// The universal props [`apply_universal`] writes centrally, for *every*
 /// kind, whether or not that kind's controller owns a [`Universal`].
 ///
-/// Deliberately a subset of the fifteen [`Universal::apply`] knows. These six
-/// have exactly one meaning on every `GtkWidget` — a class list, an id, a
-/// focus default, a sensitivity, a size floor — so applying them centrally
-/// can only ever agree with a controller that also applies them.
+/// Deliberately a subset of the [`Universal::apply`] names. These ten have
+/// exactly one meaning on every `GtkWidget` — a class list, an id, a focus
+/// default, a sensitivity, a size floor, and the four per-child alignment/
+/// expansion properties — so applying them centrally can only ever agree with
+/// a controller that also applies them.
+///
+/// `Halign`/`Valign`/`Hexpand`/`Vexpand` were declared contract props and
+/// publicly settable (`View::halign`/`valign`/`hexpand`/`vexpand`) but absent
+/// from this list, and no controller wrote them into a child's [`ChildLayout`]
+/// either, so on a plain child they were silently inert — a row could not
+/// right-align a child or grow one without a widget-specific controller.
+/// Applying them centrally (mutating only their own field, never replacing the
+/// whole `ChildLayout`) is what makes them real for every kind at once.
+///
 /// `Checked`/`Indeterminate`/`Selected` are **not** here: a widget is free to
 /// give those names its own meaning (`ListView`'s `.selected(index)` is a
 /// model index, not a `:selected` flag on the view's own node), so writing a
@@ -185,6 +195,10 @@ const CENTRAL_UNIVERSAL: &[PropName] = &[
     PropName::Sensitive,
     PropName::WidthRequest,
     PropName::HeightRequest,
+    PropName::Halign,
+    PropName::Valign,
+    PropName::Hexpand,
+    PropName::Vexpand,
 ];
 
 /// Write one universal prop onto `node`, from the reconciler, before the
@@ -274,7 +288,7 @@ fn purge_tables() {
 /// `MeasureOverlay`/`ClipOverlay` (`Prop::Bool`) -- all four cheap, and all
 /// four re-derive a child's placement from the child's own node rather than
 /// owning that child's `Instance`.
-const RECORDED_PROP_NAMES: [PropName; 16] = [
+const RECORDED_PROP_NAMES: [PropName; 18] = [
     PropName::Column,
     PropName::Row,
     PropName::ColumnSpan,
@@ -282,11 +296,17 @@ const RECORDED_PROP_NAMES: [PropName; 16] = [
     PropName::Section,
     PropName::Halign,
     PropName::Valign,
+    // `flush_layout`'s `homogeneous` reader: after the central universal pass
+    // made these write a child's `ChildLayout`, `homogeneous == false` must
+    // restore the child's own request instead of clearing it, and it reads
+    // that request here.
+    PropName::Hexpand,
+    PropName::Vexpand,
     PropName::MeasureOverlay,
     PropName::ClipOverlay,
     // `stack::StackC::place`'s fourth reader (Task 15): a page's `Str`
     // name/title and `Bool` attention flag, all as cheap to keep as the
-    // nine above and re-derived the same way, from the child's own node.
+    // names above and re-derived the same way, from the child's own node.
     PropName::PageName,
     PropName::PageTitle,
     PropName::NeedsAttention,
@@ -327,12 +347,49 @@ pub(crate) fn props_of(node: &Node) -> Props {
         .unwrap_or_default()
 }
 
-/// The child layout last recorded for `node`.
+/// The child layout last recorded for `node`, or `ChildLayout::default()`.
+///
+/// Used by `GridC`'s cell-placement path, which has always started grid
+/// children from the `Fill` default; the universal arms use
+/// [`child_layout_or_centred`] instead so they do not couple the axes.
 #[must_use]
 pub(crate) fn child_layout_of(node: &Node) -> ChildLayout {
     NODE_CHILD
         .with(|m| m.borrow().get(node).copied())
         .unwrap_or_default()
+}
+
+/// The child layout last recorded for `node`, or the *unaligned* base when
+/// none was recorded.
+///
+/// A node with no recorded [`ChildLayout`] is not `Align::Fill`: every
+/// container reproduces "unaligned" with `align_items`/`justify_items:
+/// CENTER` (`Container::Box`'s `layout.rs:678`, `Container::Center`'s `:691`,
+/// `Grid`'s `:709-710` and `Leaf`), so changing one axis from
+/// [`centred_child_layout`] leaves the other exactly as the node would have
+/// laid out before any alignment/expansion prop was set.
+/// `ChildLayout::default()` cannot serve as that base -- its `Align::Fill`
+/// default would make a lone `.hexpand(true)` also stretch the cross axis,
+/// coupling the axes the props name separately.
+#[must_use]
+pub(crate) fn child_layout_or_centred(node: &Node) -> ChildLayout {
+    NODE_CHILD
+        .with(|m| m.borrow().get(node).copied())
+        .unwrap_or_else(centred_child_layout)
+}
+
+/// The unaligned child layout: centred on both axes, everything else default.
+///
+/// `LayoutTree::child_layout`/this module's table return nothing for a node
+/// no controller or universal arm has laid out yet; this is what that
+/// "nothing" means in taffy terms.
+#[must_use]
+pub(crate) fn centred_child_layout() -> ChildLayout {
+    ChildLayout {
+        halign: Align::Center,
+        valign: Align::Center,
+        ..ChildLayout::default()
+    }
 }
 
 thread_local! {
@@ -725,39 +782,88 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
     // on its own, or a pooled row a shrinking pool released.
     purge_tables();
     PENDING.with(|p| {
-        for pending in p.borrow().live_values() {
-            let Some(node) = &pending.node else { continue };
-            if let Some(container) = pending.container {
+        let pending = p.borrow();
+        // Phase 1: node-level records and *direct* child layouts -- what a
+        // controller wrote with `set_child_layout`, and the per-child
+        // `Halign`/`Valign`/`Hexpand`/`Vexpand` props the central universal
+        // pass now writes.
+        for entry in pending.live_values() {
+            let Some(node) = &entry.node else { continue };
+            if let Some(container) = entry.container {
                 tree.set_container(node, container);
             }
-            if let Some(child_layout) = pending.child_layout {
+            if let Some(child_layout) = entry.child_layout {
                 tree.set_child_layout(node, child_layout);
             }
-            if let Some(on) = pending.displayed {
+            if let Some(on) = entry.displayed {
                 tree.set_displayed(node, on);
             }
-            if let Some((w, h)) = pending.size_request {
+            if let Some((w, h)) = entry.size_request {
                 tree.set_size_floor(node, w, h);
             }
-            if let Some((gap, orientation)) = pending.gap {
+            if let Some((gap, orientation)) = entry.gap {
                 // GTK's own gap property and CSS `border-spacing` both
                 // apply; the larger wins, which is what GtkBox does when a
                 // theme sets both.
                 tree.set_gap_floor(node, gap, orientation == Orientation::Horizontal);
             }
-            if let Some((on, orientation)) = pending.homogeneous {
+        }
+        // Phase 2: container-derived child placements, recomputed from the
+        // children's own props/geometry. These run *after* phase 1 so a
+        // controller's placement is never clobbered by an explicit
+        // prop-derived layout written in phase 1: `overlay` replaces the whole
+        // layout, while `grid`/`homogeneous` merge into the phase-1 layout
+        // read back from the tree. `PENDING` is an unordered hash table, so
+        // interleaving the two (the old single pass) made this a race -- an
+        // overlay child's `absolute` could be overwritten by its own
+        // `Halign` prop record depending on iteration order.
+        for entry in pending.live_values() {
+            let Some(node) = &entry.node else { continue };
+            if let Some((on, orientation)) = entry.homogeneous {
                 let horizontal = orientation == Orientation::Horizontal;
                 for child in node.children() {
-                    let mut cl = tree.child_layout(&child).unwrap_or_default();
-                    if horizontal {
-                        cl.hexpand = on;
+                    let asked = if horizontal {
+                        props_of(&child).get(PropName::Hexpand).is_some()
                     } else {
-                        cl.vexpand = on;
+                        props_of(&child).get(PropName::Vexpand).is_some()
+                    };
+                    if on {
+                        // `on == true` starts from the *unaligned* centring
+                        // when the child has no layout of its own, so the
+                        // forced axis grows without the other stretching --
+                        // the same coupling the universal arms avoid.
+                        //
+                        // `homogeneous == false` deliberately keeps the
+                        // historical `Fill` base (`unwrap_or_default`): it is
+                        // the pass that *releases* a `GtkBox:homogeneous`
+                        // force, and a child it touches without its own
+                        // `Hexpand`/`Vexpand` prop must return to the plain
+                        // box default (fill the cell), not to the centred
+                        // one. Only the child's own expansion is reset; the
+                        // alignment axes are left as the tree already has
+                        // them. A child carrying its own prop is skipped
+                        // entirely and left to the universal pass.
+                        let mut cl = tree
+                            .child_layout(&child)
+                            .unwrap_or_else(centred_child_layout);
+                        if horizontal {
+                            cl.hexpand = true;
+                        } else {
+                            cl.vexpand = true;
+                        }
+                        tree.set_child_layout(&child, cl);
+                    } else if !asked {
+                        let mut cl = tree.child_layout(&child).unwrap_or_default();
+                        if horizontal {
+                            cl.hexpand = false;
+                        } else {
+                            cl.vexpand = false;
+                        }
+                        tree.set_child_layout(&child, cl);
                     }
-                    tree.set_child_layout(&child, cl);
                 }
             }
-            if pending.grid_from_children {
+            if entry.grid_from_children {
                 for child in node.children() {
                     let Some(place) = grid::GridC::placement_of(&props_of(&child)) else {
                         continue;
@@ -767,7 +873,7 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
                     tree.set_child_layout(&child, cl);
                 }
             }
-            if pending.overlay_from_children {
+            if entry.overlay_from_children {
                 for (index, child) in node.children().into_iter().enumerate() {
                     let cl = overlay::classify_overlay_child(index, &child);
                     tree.set_child_layout(&child, cl);
