@@ -501,6 +501,38 @@ impl SettingsDriver {
         false
     }
 
+    /// Wait for the model's dirty state to *change from* `before` and return
+    /// the new state: `Some(true)` for dirty (`Unsaved changes`), `Some(false)`
+    /// for clean (`""`), `None` if it never changed.
+    ///
+    /// This is the signal a **toggle** must wait on, not
+    /// [`wait_for_status`](Self::wait_for_status): a switch alternates, and a
+    /// click that lands is only observable as a *transition*. Waiting for a
+    /// fixed target cannot tell "the click landed and made it clean" from "the
+    /// click never landed", which is exactly the parity the caller needs.
+    #[must_use]
+    pub fn wait_for_status_change(&self, before: &str, timeout: Duration) -> Option<bool> {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            let current = self
+                .lines()
+                .into_iter()
+                .rev()
+                .find_map(|l| l.strip_prefix("status ").map(str::to_owned))
+                .unwrap_or_default();
+            let current = current.trim();
+            if current != before {
+                return match current {
+                    "Unsaved changes" => Some(true),
+                    "" => Some(false),
+                    _ => None,
+                };
+            }
+            std::thread::sleep(POLL);
+        }
+        None
+    }
+
     /// Poll until the app's own `status <text>` line reads `want`.
     ///
     /// The status line is appended by the app on the fold that changes it

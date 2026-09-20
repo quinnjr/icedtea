@@ -284,14 +284,23 @@ fn the_displays_action_buttons_do_not_move_with_the_status_text() {
     // Apply moves the status text "Ready" -> "Applying…" -> "Applied" and the
     // reply returns `displays.dirty` to false. Retry the click like the other
     // pointer gates: a button sent back to back with the motion that first
-    // entered the surface can be dropped before focus is assigned.
+    // entered the surface can be dropped before focus is assigned. Apply is
+    // not a toggle -- once the model is clean a retry re-sends the same
+    // request -- so re-clicking is safe here; only the *wait* window matters,
+    // and a tight one loses the race under load (the displays page is the
+    // slowest settings surface). Give each attempt a real window and stop as
+    // soon as the model is clean.
     let mut applied = false;
     for _ in 0..5 {
+        if driver.wait_state("displays.dirty", "false", Duration::from_millis(500)) {
+            applied = true;
+            break;
+        }
         driver.click(
             apply_before.x + apply_before.w / 2,
             apply_before.y + apply_before.h / 2,
         );
-        if driver.wait_state("displays.dirty", "false", Duration::from_millis(1_500)) {
+        if driver.wait_state("displays.dirty", "false", Duration::from_secs(5)) {
             applied = true;
             break;
         }

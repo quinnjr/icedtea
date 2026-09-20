@@ -153,24 +153,40 @@ fn apply_reaches_reload_config_on_the_mock() {
 
     // Dirty the model: toggle a switch, which enables Revert and Apply.
     //
-    // The old `wait_for_frame_after` signal (a `frame <n>` line written by
-    // `write_probe_report` only when a `probe`/`alloc` line changed) is not a
-    // reliable tell for this toggle. Wait on the app's own `status` line
-    // instead, which is appended on the fold that flips the model and so is
-    // independent of geometry. The click also races
-    // asynchronous pointer-focus assignment on a freshly-booted window (the
-    // race `SettingsDriver::click`'s own settle loop documents), so retry it
-    // until the fold lands.
+    // A `GtkSwitch` **alternates**: every delivered click flips the model
+    // between dirty and clean. A naive "click, then wait for `Unsaved changes`,
+    // retry" loop is therefore wrong -- when a retry lands after a second
+    // delivered click it reads the state back as clean, and the loop burns its
+    // attempts toggling back and forth (the race this test used to lose). Only
+    // the *first* click races asynchronous pointer-focus assignment on a
+    // freshly-booted window (the race `SettingsDriver`'s settle loop
+    // documents); once the pointer has been over the switch, clicks land. So
+    // click, wait for a *decided* status (dirty or clean), and stop as soon as
+    // the model is dirty -- a click that lands while dirty would clean it
+    // again, so parity is what we wait on, not a fixed retry count. The app's
+    // own `status` line is appended on the fold that flips the model and so is
+    // independent of geometry.
     let switch = driver.alloc("behavior_raise_on_focus");
-    let mut toggled = false;
-    for _ in 0..5 {
+    let mut dirty = false;
+    let mut before = String::new();
+    for _ in 0..8 {
         driver.click(switch.x + switch.w / 2, switch.y + switch.h / 2);
-        if driver.wait_for_status("Unsaved changes", Duration::from_millis(1_500)) {
-            toggled = true;
-            break;
+        match driver.wait_for_status_change(&before, Duration::from_secs(3)) {
+            Some(state) => {
+                dirty = state;
+                if dirty {
+                    break;
+                }
+                // The click landed and left the model clean; the next click
+                // flips it back to dirty.
+                before = String::new();
+            }
+            // No transition: the click did not land (the first-click focus
+            // race). Stay on the clean state and click again.
+            None => before = String::new(),
         }
     }
-    assert!(toggled, "the switch toggle never reached the model");
+    assert!(dirty, "the switch toggle never left the model dirty");
 
     // The action cluster leads the footer (`#status` follows with `hexpand`),
     // so the buttons' positions do not depend on the status text — the
