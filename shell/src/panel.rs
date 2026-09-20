@@ -646,7 +646,11 @@ fn format_clock(now: &jiff::Zoned) -> String {
 /// is unreachable from that range (`60 - 0` is already `60`); it is kept so a
 /// leap second reported as `60` cannot turn the wait into a busy loop.
 pub fn next_minute_wait(second: u8) -> u64 {
-    match 60 - u64::from(second) {
+    // `min(60)` keeps a value outside the documented range from underflowing
+    // (`u64` subtraction would panic in debug and wrap to a near-eternal sleep
+    // in release); this is a `pub` function, so it does not rely on the
+    // caller's range.
+    match 60 - u64::from(second.min(60)) {
         0 => 60,
         n => n,
     }

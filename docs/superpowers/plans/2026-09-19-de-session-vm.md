@@ -1170,6 +1170,15 @@ build_rev = "unknown" if build_rev.empty?
 
 - [ ] **Step 4: Write `vagrant/verify.sh`**
 
+> **Superseded by the shipped script (2026-09-20).** The listing below is the
+> original sketch; the committed `vagrant/verify.sh` differs in ways that
+> matter and the file, not this snippet, is authoritative: the scancode table
+> gained `SC_SHIFT` (shift-aware `@ _ !` and uppercase) and `|` is `2b`; the
+> greeter preselects the user, so the login is password-then-Enter (no
+> username/Tab); the panel strip uses a named `BAR_HEIGHT` on whichever edge is
+> darker; and the client `WAYLAND_DISPLAY` is read with `icedtea-wait wayland`
+> rather than `systemctl --user show-environment`.
+
 ```sh
 #!/usr/bin/env bash
 # Prove the VM is showing a usable icedtea desktop, or fail loudly.
